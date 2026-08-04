@@ -174,7 +174,25 @@ async fn forward_github_api(
     let (method, path, headers, body) = parse_http_request(request)
         .context("parsing intercepted github request")?;
 
-    let access = github_access(&method, &path, allowed_repos);
+    // `/graphql` carries its repo references in the body, not the
+    // path — gh CLI does most reads (repo list/view, pr, issue) over
+    // GraphQL, so it gets its own body-level allow-list filter. Only
+    // POST is real GraphQL traffic; anything else goes anonymous.
+    let path_no_query = path.split_once('?').map(|(p, _)| p).unwrap_or(&path);
+    let access = if path_no_query == "/graphql" {
+        if method.eq_ignore_ascii_case("POST") {
+            match crate::github_graphql::graphql_access(&body, allowed_repos) {
+                crate::github_graphql::GraphqlAccess::Authenticated => {
+                    GithubAccess::Authenticated
+                }
+                crate::github_graphql::GraphqlAccess::Anonymous => GithubAccess::Anonymous,
+            }
+        } else {
+            GithubAccess::Anonymous
+        }
+    } else {
+        github_access(&method, &path, allowed_repos)
+    };
     if let GithubAccess::Deny(reason) = &access {
         return Ok(error_response(403, reason));
     }
@@ -357,9 +375,10 @@ enum GithubAccess {
 /// - `/user/repos`, `/user/keys`, `/user/emails`, `/user/gpg_keys`,
 ///   any other `/user/*`: Anonymous (will 401 — matches "third
 ///   party can't see this").
-/// - `/graphql`, `/search/*`, `/rate_limit`, `/meta`, `/markdown`:
-///   Authenticated (utility endpoints; the GraphQL gap is the same
-///   v1 limitation as before — bodies aren't filterable).
+/// - `/rate_limit`, `/meta`, `/markdown`: Authenticated (utility
+///   endpoints, not user-scoped). `/graphql` is handled by the
+///   body-level filter in `github_graphql` before this function is
+///   consulted; here it falls through to Anonymous.
 /// - `/users/<x>`, `/orgs/<x>`, `/notifications`, anything else:
 ///   Anonymous (third-party-visible info; private state hidden by
 ///   GitHub).
@@ -428,8 +447,11 @@ fn github_access(method: &str, path: &str, allowed: &[String]) -> GithubAccess {
     }
 
     // Other utility endpoints are not user-scoped and are safe to
-    // forward authenticated (gh tooling uses them).
-    if matches!(p, "/graphql" | "/rate_limit" | "/meta" | "/markdown") {
+    // forward authenticated (gh tooling uses them). `/graphql` is NOT
+    // here: it names repos in the request *body*, so it has its own
+    // filter (`github_graphql::graphql_access`) — this path-only
+    // policy answers Anonymous for it as defense in depth.
+    if matches!(p, "/rate_limit" | "/meta" | "/markdown") {
         return GithubAccess::Authenticated;
     }
 
@@ -1317,12 +1339,23 @@ mod tests {
         // Non-user-scoped utility surfaces: gh tooling friendly,
         // safe to forward with auth.
         let allowed = al(&[]);
-        for path in ["/graphql", "/rate_limit", "/meta", "/markdown"] {
+        for path in ["/rate_limit", "/meta", "/markdown"] {
             assert!(
                 matches!(github_access("POST", path, &allowed), GithubAccess::Authenticated)
                     || matches!(github_access("GET", path, &allowed), GithubAccess::Authenticated),
                 "{path} should be Authenticated"
             );
+        }
+    }
+
+    #[test]
+    fn gh_access_graphql_path_is_anonymous_here() {
+        // /graphql gets its own body-level filter before this
+        // path-only policy runs; if it ever reaches github_access it
+        // must NOT be granted the token on path alone.
+        let allowed = al(&["wirenboard/agent-vm"]);
+        for m in ["GET", "POST"] {
+            assert_eq!(github_access(m, "/graphql", &allowed), GithubAccess::Anonymous);
         }
     }
 
