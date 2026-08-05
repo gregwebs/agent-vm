@@ -937,6 +937,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                 }
                 let mut ix = i
                     .hook(hook_argv)
+                    // The api.github.com rules buffer the whole request
+                    // so the hook can rule on a GraphQL body, and an
+                    // over-cap request is refused (fail-closed). The
+                    // 64 KiB default is tighter than GitHub's own
+                    // limits — a maximum-length issue comment is 65,536
+                    // characters, and base64 file uploads via the
+                    // contents API inflate 4/3 — so a legal request
+                    // would 413. 2 MiB covers those with room to spare;
+                    // the buffer is per connection and the hook holds
+                    // the request anyway.
+                    .max_request_bytes(2 * 1024 * 1024)
                     .rule(ANTHROPIC_OAUTH_HOST, "POST", ANTHROPIC_OAUTH_TOKEN_PATH)
                     .rule(OPENAI_OAUTH_HOST, "POST", OPENAI_OAUTH_TOKEN_PATH);
                 // Phase 6: intercept every method gh CLI uses on

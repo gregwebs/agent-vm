@@ -171,10 +171,61 @@ async fn forward_github_api(
     allowed_repos: &[String],
     state_dir: &Path,
 ) -> Result<Vec<u8>> {
-    let (method, path, headers, body) = parse_http_request(request)
+    let (method, raw_path, headers, body) = parse_http_request(request)
         .context("parsing intercepted github request")?;
 
-    let access = github_access(&method, &path, allowed_repos);
+    // RFC 7230 absolute-form (`GET https://api.github.com/repos/x`) is
+    // legal and GitHub accepts it. msb normalises it before matching
+    // rules, but the hook re-derives the upstream URL from this path,
+    // so normalise here too — otherwise we'd concatenate it onto the
+    // host and 502 on a malformed URL instead of applying policy.
+    let path = normalize_origin_form(&raw_path).to_string();
+
+    // `/graphql` carries its repo references in the body, not the
+    // path — gh CLI does most reads (repo list/view, pr, issue) over
+    // GraphQL, so it gets its own body-level allow-list filter. Only
+    // POST is real GraphQL traffic; anything else goes anonymous.
+    let (path_no_query, query_string) = match path.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path.as_str(), ""),
+    };
+    let access = if path_no_query == "/graphql" {
+        // Our verdict comes from the body, so the body must be the only
+        // thing GitHub can execute. Two guards on that:
+        //
+        //  * A query string is refused. We do not know that GitHub's
+        //    GraphQL endpoint ignores `?query=`, and if it ever reads it
+        //    (the graphql-ruby / Rails `params[:query]` idiom) the whole
+        //    filter is bypassed by a benign-looking body. gh never sends
+        //    one, so refusing costs nothing.
+        //  * A non-JSON content type is refused, so a body encoding
+        //    GitHub accepts but `serde_json` doesn't can't be judged on
+        //    a parse failure of a different grammar.
+        let content_type_is_json = headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("content-type")
+                && v.to_ascii_lowercase().starts_with("application/json")
+        });
+        if method.eq_ignore_ascii_case("POST") && query_string.is_empty() && content_type_is_json {
+            match crate::github_graphql::graphql_access(&body, allowed_repos) {
+                crate::github_graphql::GraphqlAccess::Authenticated => {
+                    GithubAccess::Authenticated
+                }
+                // Deny, not Anonymous. GitHub's GraphQL endpoint has no
+                // anonymous tier: a stripped-Authorization query comes
+                // back `403 API rate limit exceeded for <host IP>`,
+                // which tells the agent nothing true. Same posture — no
+                // token leaves — with a failure someone can act on.
+                crate::github_graphql::GraphqlAccess::Denied(why) => GithubAccess::Deny(why),
+            }
+        } else {
+            GithubAccess::Deny(
+                "agent-vm: /graphql requires POST, no query string, and a JSON content type"
+                    .to_string(),
+            )
+        }
+    } else {
+        github_access(&method, &path, allowed_repos)
+    };
     if let GithubAccess::Deny(reason) = &access {
         return Ok(error_response(403, reason));
     }
@@ -292,6 +343,37 @@ async fn forward_github_api(
     Ok(out)
 }
 
+/// Map an absolute-form request target to origin-form. Anything else
+/// is returned unchanged.
+fn normalize_origin_form(target: &str) -> &str {
+    for scheme in ["http://", "https://"] {
+        if target.len() >= scheme.len() && target[..scheme.len()].eq_ignore_ascii_case(scheme) {
+            let rest = &target[scheme.len()..];
+            return match rest.find('/') {
+                Some(slash) => &rest[slash..],
+                None => "/",
+            };
+        }
+    }
+    target
+}
+
+#[cfg(test)]
+mod origin_form_tests {
+    use super::normalize_origin_form;
+
+    #[test]
+    fn absolute_form_is_reduced_to_the_path() {
+        assert_eq!(
+            normalize_origin_form("https://api.github.com/repos/a/b"),
+            "/repos/a/b"
+        );
+        assert_eq!(normalize_origin_form("HTTPS://api.github.com/x?y=1"), "/x?y=1");
+        assert_eq!(normalize_origin_form("http://api.github.com"), "/");
+        assert_eq!(normalize_origin_form("/repos/a/b"), "/repos/a/b");
+    }
+}
+
 /// Parse buffered HTTP/1.1 request bytes into (method, path, headers,
 /// body). Headers are kept in original case for outbound. Best-effort
 /// — assumes well-formed input from the in-guest CLI tool, errors
@@ -357,9 +439,10 @@ enum GithubAccess {
 /// - `/user/repos`, `/user/keys`, `/user/emails`, `/user/gpg_keys`,
 ///   any other `/user/*`: Anonymous (will 401 — matches "third
 ///   party can't see this").
-/// - `/graphql`, `/search/*`, `/rate_limit`, `/meta`, `/markdown`:
-///   Authenticated (utility endpoints; the GraphQL gap is the same
-///   v1 limitation as before — bodies aren't filterable).
+/// - `/rate_limit`, `/meta`, `/markdown`: Authenticated (utility
+///   endpoints, not user-scoped). `/graphql` is handled by the
+///   body-level filter in `github_graphql` before this function is
+///   consulted; here it falls through to Anonymous.
 /// - `/users/<x>`, `/orgs/<x>`, `/notifications`, anything else:
 ///   Anonymous (third-party-visible info; private state hidden by
 ///   GitHub).
@@ -428,8 +511,11 @@ fn github_access(method: &str, path: &str, allowed: &[String]) -> GithubAccess {
     }
 
     // Other utility endpoints are not user-scoped and are safe to
-    // forward authenticated (gh tooling uses them).
-    if matches!(p, "/graphql" | "/rate_limit" | "/meta" | "/markdown") {
+    // forward authenticated (gh tooling uses them). `/graphql` is NOT
+    // here: it names repos in the request *body*, so it has its own
+    // filter (`github_graphql::graphql_access`) — this path-only
+    // policy answers Anonymous for it as defense in depth.
+    if matches!(p, "/rate_limit" | "/meta" | "/markdown") {
         return GithubAccess::Authenticated;
     }
 
@@ -1177,8 +1263,15 @@ fn http_200_json(body: &[u8]) -> Vec<u8> {
     build_response(200, "OK", body)
 }
 
+/// Synthesized error handed back to the in-guest client.
+///
+/// The body uses `message`, not `error`: go-gh unmarshals only
+/// `message` when it renders an `HTTPError`, so anything under another
+/// key is silently dropped and the user sees a bare status code. The
+/// whole point of denying rather than forwarding anonymously is that
+/// the reason reaches the person reading the terminal.
 fn error_response(code: u16, msg: &str) -> Vec<u8> {
-    let body = format!("{{\"error\":{}}}", json!(msg));
+    let body = format!("{{\"message\":{}}}", json!(msg));
     build_response(code, "Server Error", body.as_bytes())
 }
 
@@ -1317,12 +1410,23 @@ mod tests {
         // Non-user-scoped utility surfaces: gh tooling friendly,
         // safe to forward with auth.
         let allowed = al(&[]);
-        for path in ["/graphql", "/rate_limit", "/meta", "/markdown"] {
+        for path in ["/rate_limit", "/meta", "/markdown"] {
             assert!(
                 matches!(github_access("POST", path, &allowed), GithubAccess::Authenticated)
                     || matches!(github_access("GET", path, &allowed), GithubAccess::Authenticated),
                 "{path} should be Authenticated"
             );
+        }
+    }
+
+    #[test]
+    fn gh_access_graphql_path_is_anonymous_here() {
+        // /graphql gets its own body-level filter before this
+        // path-only policy runs; if it ever reaches github_access it
+        // must NOT be granted the token on path alone.
+        let allowed = al(&["wirenboard/agent-vm"]);
+        for m in ["GET", "POST"] {
+            assert_eq!(github_access(m, "/graphql", &allowed), GithubAccess::Anonymous);
         }
     }
 
