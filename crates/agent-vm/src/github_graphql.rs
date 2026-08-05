@@ -20,31 +20,42 @@
 //!
 //! * `query` root fields limited to: `repository(owner:, name:)` with
 //!   the resolved slug in the allow-list; `viewer` restricted to
-//!   scalar identity fields (`login`, `id`, `name`, `email`, `url`,
-//!   `databaseId`, `__typename`) — same information as REST `/user`;
-//!   `search` whose `query:` argument is scoped by positive `repo:`
-//!   qualifiers that are all allow-listed (what `gh pr status` sends);
-//!   `rateLimit` and schema introspection.
-//! * Repo-enumerating connection fields are rejected at **any**
-//!   depth, because `User`/`Organization` objects reachable from an
-//!   allowed subtree (e.g. `repository { owner { … } }`) re-expose
-//!   them: `repositories`, `repositoriesContributedTo`,
-//!   `topRepositories`, `starredRepositories`, `watching`,
-//!   `repositoryOwner`, `organization`, `enterprise`, `user`.
-//! * Any `repository`/`search` field carrying owner/name/query
-//!   arguments — wherever it appears — passes the same allow-list
-//!   check. (`repository` *without* those args, e.g. inside a search
-//!   result node, is a child object already scoped by its parent and
-//!   is fine.)
+//!   identity scalars (the same information REST `/user` exposes,
+//!   which the path policy already forwards authenticated); `search`
+//!   whose `query:` argument is scoped by allow-listed `repo:`
+//!   qualifiers; `rateLimit` and schema introspection.
+//! * Inside a scoped subtree, a field with **no selection set** is
+//!   free: GraphQL requires object-valued fields to carry one, so a
+//!   leaf is necessarily a scalar or enum and cannot smuggle a
+//!   `Repository` or `User`. Composite fields must be classified —
+//!   see [`REPO_YIELDING_FIELDS`], [`ACTOR_YIELDING_FIELDS`] and
+//!   [`COMPOSITE_ALLOWED_FIELDS`] — and anything unrecognised is
+//!   refused.
 //! * `mutation` root fields are not name-restricted (gh needs
 //!   `createPullRequest`, `mergePullRequest`, `addComment`, … and
 //!   their inputs are opaque node IDs we cannot map to a repo), but
-//!   their result subtrees get the same banned-field / argument
-//!   checks. Node IDs for private objects are only obtainable through
-//!   already-filtered reads, so the residual surface is writes to
-//!   *public* repos via forged/out-of-band IDs — the price of keeping
-//!   gh's PR workflow functional. `subscription` operations are
-//!   always anonymous.
+//!   their result subtrees get the same checks — mutation payloads
+//!   carry `viewer: User` and `repository: Repository` fields, so they
+//!   are a read channel too. `subscription` is always anonymous.
+//!
+//! **Why an allowlist.** The first version of this filter used a
+//! denylist of repo-enumerating field names. Review found nine
+//! distinct escapes out of an allowed subtree in an afternoon —
+//! `parent`/`source` to a fork's private upstream, `forks`,
+//! `collaborators`/`mentionableUsers`/`watchers`/`stargazers` to a
+//! `User` and from there to every repo the token can see,
+//! `headRepository`/`baseRepository`, `hovercard` contexts and
+//! mutation payloads to a full `viewer`. A name denylist cannot be
+//! made complete against a schema this size, and each omission is a
+//! silent leak. The allowlist inverts the failure mode: an omission
+//! makes some query go anonymous, which is visible and recoverable.
+//!
+//! **Residual surface.** Mutation roots are unrestricted, so an agent
+//! that obtains a node ID out of band can write to the object it
+//! names. Reads that would hand out such IDs are filtered, but "we
+//! filter the reads" is not the same claim as "the IDs are
+//! unobtainable" — treat the write surface as "any object whose ID the
+//! agent can guess or acquire elsewhere".
 //!
 //! Anything the parser doesn't understand — malformed JSON, GraphQL
 //! syntax we don't model, variables that aren't plain strings —
@@ -63,26 +74,158 @@ pub enum GraphqlAccess {
     Anonymous,
 }
 
-/// Repo-enumerating / cross-repo connection fields, banned at any
-/// depth. See module docs for why depth doesn't matter here.
-const BANNED_FIELDS: &[&str] = &[
+/// Fields whose value is, or contains, a `Repository`.
+///
+/// Reaching one from inside an allowed subtree re-opens the whole
+/// allow-list: `repository { parent { object { ... on Blob { text } } } }`
+/// reads the (possibly private) upstream of a fork. Only `repository`
+/// itself can be re-scoped by `owner:`/`name:` arguments; the rest have
+/// no such arguments, so they can never name an allow-listed repo.
+///
+/// A repo-yielding field that is NOT argument-scoped is not rejected
+/// outright — `search(...) { nodes { ... on PullRequest { repository
+/// { nameWithOwner } } } }` is ordinary gh traffic. Instead its
+/// selection set is restricted to scalar leaves, which cannot carry
+/// file contents or another repo's inventory.
+const REPO_YIELDING_FIELDS: &[&str] = &[
+    "repository",
     "repositories",
+    "repositoryOwner",
+    "parent",
+    "source",
+    "templateRepository",
+    "forks",
+    "headRepository",
+    "baseRepository",
     "repositoriesContributedTo",
     "topRepositories",
     "starredRepositories",
+    "pinnedRepositories",
     "watching",
-    "repositoryOwner",
-    "organization",
-    "enterprise",
-    "user",
 ];
 
-/// Scalar identity fields allowed under a root `viewer` selection —
-/// the GraphQL equivalent of the REST policy's authenticated `/user`.
-/// Everything else on `User` (pullRequests, issues, gists, …) spans
-/// repos and would leak private inventory.
-const VIEWER_SCALAR_FIELDS: &[&str] =
-    &["login", "id", "name", "email", "url", "databaseId", "__typename"];
+/// Fields whose value is a `User` / `Organization` / `Actor` /
+/// `Enterprise` — account-scoped objects that reach across every repo
+/// the token can see (`gists`, `pullRequests`, `issues`,
+/// `organizations`, `membersWithRole`, …).
+///
+/// These are not rejected outright, because `author { login }` appears
+/// in nearly every query gh sends. Their selection sets are instead
+/// restricted to identity scalars, at ANY depth — the generalisation of
+/// what used to be a root-only `viewer` rule that
+/// `pullRequest { hovercard { contexts { ... on ViewerHovercardContext
+/// { viewer { … } } } } }` walked straight around.
+const ACTOR_YIELDING_FIELDS: &[&str] = &[
+    "viewer",
+    "owner",
+    "author",
+    "editor",
+    "creator",
+    "user",
+    "actor",
+    "organization",
+    "enterprise",
+    "mergedBy",
+    "assignees",
+    "collaborators",
+    "mentionableUsers",
+    "assignableUsers",
+    "watchers",
+    "stargazers",
+    "participants",
+    "reviewers",
+    "requestedReviewer",
+    "requestedReviewers",
+    "suggestedReviewers",
+    "members",
+    "membersWithRole",
+    "followers",
+    "following",
+    "contributors",
+    "resourceOwner",
+    "sponsor",
+    "sponsorable",
+];
+
+/// Scalar identity fields permitted under an [`ACTOR_YIELDING_FIELDS`]
+/// field — the same information REST `/user` exposes, which the path
+/// policy already forwards authenticated.
+const IDENTITY_FIELDS: &[&str] = &[
+    "login",
+    "id",
+    "name",
+    "email",
+    "url",
+    "avatarUrl",
+    "databaseId",
+    "resourcePath",
+    "isViewer",
+    "__typename",
+];
+
+/// Connection plumbing, permitted inside an actor subtree so that
+/// `assignees(first: 10) { nodes { login } }` still works.
+const CONNECTION_FIELDS: &[&str] = &[
+    "nodes",
+    "edges",
+    "node",
+    "pageInfo",
+    "totalCount",
+    "hasNextPage",
+    "hasPreviousPage",
+    "endCursor",
+    "startCursor",
+];
+
+/// Composite (object-valued) fields we are willing to walk into inside
+/// an allow-listed repository subtree.
+///
+/// **This is an allowlist, and that is the point.** In GraphQL a field
+/// returning an object type MUST carry a selection set, and a field
+/// with no selection set is necessarily a scalar or enum. So scalars
+/// are free — they cannot smuggle a `Repository` or a `User` — and
+/// every field that *could* is either named here, or named in the two
+/// lists above, or rejected. A denylist of "dangerous field names"
+/// cannot be made complete against a schema this large; this inverts
+/// it, and the cost of an omission is that a query goes anonymous
+/// (visible, recoverable) rather than that it leaks (silent).
+const COMPOSITE_ALLOWED_FIELDS: &[&str] = &[
+    // connections
+    "nodes", "edges", "node", "pageInfo",
+    // issues / PRs
+    "pullRequests", "pullRequest", "issues", "issue", "issueOrPullRequest",
+    "comments", "reviews", "latestReviews", "latestOpinionatedReviews",
+    "reviewRequests", "reviewThreads", "commits", "files", "closingIssuesReferences",
+    "timelineItems", "reactionGroups", "reactions", "labels", "milestone",
+    "milestones", "projectCards", "assignedTo",
+    // refs / git objects
+    "ref", "refs", "defaultBranchRef", "target", "object", "commit", "history",
+    "tree", "entries", "blob", "associatedPullRequests", "statusCheckRollup",
+    "contexts", "checkSuites", "checkRuns", "status", "signature", "tag",
+    // repo metadata
+    "languages", "primaryLanguage", "licenseInfo", "repositoryTopics", "topic",
+    "releases", "release", "releaseAssets", "codeOfConduct", "fundingLinks",
+    "discussions", "discussion", "discussionCategories", "branchProtectionRules",
+    "rulesets", "environments", "deployments", "vulnerabilityAlerts",
+    "submodules", "packages", "watchers",
+];
+
+/// Cap on selection-set / value nesting. Without it a hostile document
+/// (`{a{a{a…`) overflows the stack and aborts the hook process — a
+/// self-inflicted DoS on the guest's GitHub access, and an unhandled
+/// crash in a security-critical subprocess.
+const MAX_DEPTH: usize = 64;
+
+/// Search qualifiers that cannot widen scope beyond the `repo:`
+/// qualifiers already checked. Anything else — including an unknown
+/// qualifier — rejects.
+const SAFE_SEARCH_QUALIFIERS: &[&str] = &[
+    "is", "in", "state", "type", "label", "milestone", "project", "status",
+    "author", "assignee", "mentions", "involves", "commenter", "review",
+    "reviewed-by", "review-requested", "team-review-requested", "draft",
+    "archived", "no", "base", "head", "sort", "created", "updated", "closed",
+    "merged", "comments", "interactions", "reactions", "language", "linked",
+];
 
 /// Cap on fragment-spread nesting during validation; combined with
 /// the visited-set cycle guard this bounds pathological documents.
@@ -173,17 +316,11 @@ fn arg<'a>(field: &'a Field, key: &str) -> Option<&'a Val> {
     field.args.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
-/// `repository`-shaped field check, applied at any depth. Fields
-/// *without* owner/name args are child objects scoped by their parent
-/// and pass; a field carrying either arg must resolve both to an
-/// allow-listed slug.
-fn repository_args_ok(field: &Field, ctx: &Ctx) -> bool {
-    let owner = arg(field, "owner");
-    let name = arg(field, "name");
-    if owner.is_none() && name.is_none() {
-        return true;
-    }
-    let (Some(owner), Some(name)) = (owner, name) else {
+/// True iff this field carries `owner:`/`name:` arguments that resolve
+/// to an allow-listed slug. Both must be present and resolvable —
+/// a half-specified pair rejects.
+fn repository_is_scoped(field: &Field, ctx: &Ctx) -> bool {
+    let (Some(owner), Some(name)) = (arg(field, "owner"), arg(field, "name")) else {
         return false;
     };
     match (ctx.resolve(owner), ctx.resolve(name)) {
@@ -193,18 +330,28 @@ fn repository_args_ok(field: &Field, ctx: &Ctx) -> bool {
 }
 
 /// `search(query: …)` is allowed only when the search string is
-/// positively scoped by `repo:` qualifiers that are all allow-listed
-/// (matching gh's own `repo:owner/name is:pr …` shape). Qualifiers
-/// that broaden scope (`org:`, `user:`, `owner:`) reject.
+/// positively scoped by `repo:` qualifiers that are all allow-listed.
+///
+/// Quoting is rejected outright. GitHub treats a fully-quoted token as
+/// a literal phrase rather than a qualifier, so `"repo:owner/name"`
+/// reads as scoped to a naive parser while being a completely
+/// unscoped, token-authenticated search to GitHub — and `NOT
+/// "repo:owner/name"` makes the phrase filter vacuous on top. Boolean
+/// operators and negated qualifiers reject for the same reason.
 fn search_args_ok(field: &Field, ctx: &Ctx) -> bool {
     let Some(q) = arg(field, "query").and_then(|v| ctx.resolve(v)) else {
         return false;
     };
+    // A quote anywhere means at least one token is a literal phrase to
+    // GitHub. We cannot tell which, so refuse the whole query.
+    if q.contains('"') || q.contains('\'') || q.contains('\\') {
+        return false;
+    }
     let mut saw_repo = false;
     for token in q.split_whitespace() {
-        let t = token.trim_matches('"');
-        let lower = t.to_ascii_lowercase();
-        if lower.starts_with("org:") || lower.starts_with("user:") || lower.starts_with("owner:") {
+        let lower = token.to_ascii_lowercase();
+        // Boolean operators can negate or widen the repo: scope.
+        if matches!(lower.as_str(), "not" | "or" | "and") {
             return false;
         }
         if let Some(slug) = lower.strip_prefix("repo:") {
@@ -212,13 +359,89 @@ fn search_args_ok(field: &Field, ctx: &Ctx) -> bool {
                 return false;
             }
             saw_repo = true;
+            continue;
+        }
+        match lower.split_once(':') {
+            // `-repo:allowed`, `org:`, `user:`, or any qualifier we
+            // don't recognise: refuse rather than guess.
+            Some((qual, _)) => {
+                if !SAFE_SEARCH_QUALIFIERS.contains(&qual) {
+                    return false;
+                }
+            }
+            // A bare term is ANDed with the repo: scope, so it cannot
+            // widen it — but a leading `-` negates.
+            None => {
+                if lower.starts_with('-') {
+                    return false;
+                }
+            }
         }
     }
     saw_repo
 }
 
-/// Shared per-field checks + recursion, used inside every allowed
-/// subtree (repository, search results, rateLimit, mutation results).
+/// Selection set of a field we will not walk into: every member must
+/// be a scalar leaf (no sub-selection). Used for a repo-yielding field
+/// that isn't argument-scoped, so `repository { nameWithOwner }` keeps
+/// working while `repository { object { ... on Blob { text } } }` and
+/// `forks { nodes { … } }` do not.
+fn validate_scalar_only(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet<String>) -> bool {
+    if depth > MAX_FRAGMENT_DEPTH || sel.is_empty() {
+        return false;
+    }
+    sel.iter().all(|s| match s {
+        Sel::Field(f) => f.sel.is_empty(),
+        Sel::Inline(inner) => validate_scalar_only(inner, ctx, depth, visiting),
+        Sel::Spread(name) => match ctx.fragments.get(name.as_str()) {
+            Some(frag) if visiting.insert(name.clone()) => {
+                let ok = validate_scalar_only(frag, ctx, depth + 1, visiting);
+                visiting.remove(name);
+                ok
+            }
+            _ => false,
+        },
+    })
+}
+
+/// Selection set under an actor-typed field: identity scalars only,
+/// plus connection plumbing so `assignees { nodes { login } }` works.
+fn validate_actor_subtree(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet<String>) -> bool {
+    if depth > MAX_FRAGMENT_DEPTH || sel.is_empty() {
+        return false;
+    }
+    sel.iter().all(|s| match s {
+        Sel::Field(f) => {
+            if f.sel.is_empty() {
+                // A leaf is a scalar; it must still be an identity
+                // field, since `gists`-style connections would 404
+                // without a selection set anyway and we prefer the
+                // explicit list.
+                IDENTITY_FIELDS.contains(&f.name.as_str())
+                    || CONNECTION_FIELDS.contains(&f.name.as_str())
+            } else {
+                CONNECTION_FIELDS.contains(&f.name.as_str())
+                    && validate_actor_subtree(&f.sel, ctx, depth, visiting)
+            }
+        }
+        Sel::Inline(inner) => validate_actor_subtree(inner, ctx, depth, visiting),
+        Sel::Spread(name) => match ctx.fragments.get(name.as_str()) {
+            Some(frag) if visiting.insert(name.clone()) => {
+                let ok = validate_actor_subtree(frag, ctx, depth + 1, visiting);
+                visiting.remove(name);
+                ok
+            }
+            _ => false,
+        },
+    })
+}
+
+/// Walk a selection set inside an already-scoped subtree.
+///
+/// Scalar leaves pass unconditionally (a field with no selection set
+/// cannot be an object). Composite fields must be classified: repo-
+/// yielding, actor-yielding, or explicitly allow-listed. Anything else
+/// rejects.
 fn validate_generic(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet<String>) -> bool {
     if depth > MAX_FRAGMENT_DEPTH {
         return false;
@@ -226,13 +449,39 @@ fn validate_generic(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet
     for s in sel {
         match s {
             Sel::Field(f) => {
-                if BANNED_FIELDS.contains(&f.name.as_str()) {
-                    return false;
-                }
-                if f.name == "repository" && !repository_args_ok(f, ctx) {
-                    return false;
-                }
+                let repo_yielding = REPO_YIELDING_FIELDS.contains(&f.name.as_str());
+                let actor_yielding = ACTOR_YIELDING_FIELDS.contains(&f.name.as_str());
+
                 if f.name == "search" && !search_args_ok(f, ctx) {
+                    return false;
+                }
+                if repo_yielding {
+                    // Argument-scoped to an allow-listed repo: walk it
+                    // like any other allowed subtree. Otherwise it may
+                    // only expose scalars.
+                    let ok = if repository_is_scoped(f, ctx) {
+                        validate_generic(&f.sel, ctx, depth, visiting)
+                    } else {
+                        validate_scalar_only(&f.sel, ctx, depth, visiting)
+                    };
+                    if !ok {
+                        return false;
+                    }
+                    continue;
+                }
+                if actor_yielding {
+                    if !validate_actor_subtree(&f.sel, ctx, depth, visiting) {
+                        return false;
+                    }
+                    continue;
+                }
+                if f.sel.is_empty() {
+                    // Scalar leaf: cannot carry an object.
+                    continue;
+                }
+                if !COMPOSITE_ALLOWED_FIELDS.contains(&f.name.as_str())
+                    && f.name != "search"
+                {
                     return false;
                 }
                 if !validate_generic(&f.sel, ctx, depth, visiting) {
@@ -276,16 +525,11 @@ fn validate_query_root(sel: &[Sel], ctx: &Ctx, depth: usize) -> bool {
             Sel::Field(f) => {
                 let mut visiting = HashSet::new();
                 let ok = match f.name.as_str() {
-                    // Must name an allow-listed repo explicitly —
-                    // unlike the generic rule, argless `repository`
-                    // at the root would be schema-invalid anyway.
                     "repository" => {
-                        arg(f, "owner").is_some()
-                            && arg(f, "name").is_some()
-                            && repository_args_ok(f, ctx)
+                        repository_is_scoped(f, ctx)
                             && validate_generic(&f.sel, ctx, depth, &mut visiting)
                     }
-                    "viewer" => validate_viewer(&f.sel),
+                    "viewer" => validate_actor_subtree(&f.sel, ctx, depth, &mut visiting),
                     "search" => {
                         search_args_ok(f, ctx)
                             && validate_generic(&f.sel, ctx, depth, &mut visiting)
@@ -319,30 +563,28 @@ fn validate_query_root(sel: &[Sel], ctx: &Ctx, depth: usize) -> bool {
     true
 }
 
-/// `viewer { … }` restricted to scalar identity fields: no arguments,
-/// no sub-selections, names from [`VIEWER_SCALAR_FIELDS`].
-fn validate_viewer(sel: &[Sel]) -> bool {
-    if sel.is_empty() {
-        return false;
-    }
-    sel.iter().all(|s| match s {
-        Sel::Field(f) => {
-            f.args.is_empty()
-                && f.sel.is_empty()
-                && VIEWER_SCALAR_FIELDS.contains(&f.name.as_str())
-        }
-        _ => false,
-    })
-}
-
 /// Mutation roots keep their names (see module docs) but the result
-/// subtrees and any owner/name-bearing fields still get checked.
+/// subtrees get the same checks as any other scoped subtree — mutation
+/// payloads carry `viewer: User` and `repository: Repository` fields,
+/// so they are a read channel too.
 fn validate_mutation_root(sel: &[Sel], ctx: &Ctx) -> bool {
     if sel.is_empty() {
         return false;
     }
     let mut visiting = HashSet::new();
-    validate_generic(sel, ctx, 0, &mut visiting)
+    for s in sel {
+        match s {
+            // A mutation root field's own arguments are opaque input
+            // objects; only its result subtree is walkable.
+            Sel::Field(f) => {
+                if !validate_generic(&f.sel, ctx, 0, &mut visiting) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 // ─── GraphQL document model ───────────────────────────────────────────
@@ -504,7 +746,14 @@ fn lex_string(rest: &str) -> Option<(String, usize)> {
                     b'b' => out.push('\u{8}'),
                     b'f' => out.push('\u{c}'),
                     b'u' => {
+                        // Exactly four hex digits. `from_str_radix`
+                        // alone would accept `+041`/`-041`, which
+                        // GitHub's lexer rejects — a divergence is a
+                        // divergence even when it fails safe.
                         let hex = rest.get(i + 2..i + 6)?;
+                        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            return None;
+                        }
                         let code = u32::from_str_radix(hex, 16).ok()?;
                         out.push(char::from_u32(code)?);
                         i += 4;
@@ -529,12 +778,19 @@ fn lex_string(rest: &str) -> Option<(String, usize)> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Current nesting depth, bounded by [`MAX_DEPTH`]. Plain
+    /// selection-set and list-value nesting recurse, so without this a
+    /// 64 KB `{a{a{a…` body overflows the stack and aborts the hook
+    /// process — fail-closed, but an unhandled crash and a trivial
+    /// self-inflicted DoS on the guest's GitHub access.
+    depth: usize,
 }
 
 fn parse_document(src: &str) -> Option<Doc> {
     let mut p = Parser {
         toks: lex(src)?,
         pos: 0,
+        depth: 0,
     };
     let mut doc = Doc {
         ops: Vec::new(),
@@ -663,6 +919,16 @@ impl Parser {
     }
 
     fn selection_set(&mut self) -> Option<Vec<Sel>> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return None;
+        }
+        let out = self.selection_set_inner();
+        self.depth -= 1;
+        out
+    }
+
+    fn selection_set_inner(&mut self) -> Option<Vec<Sel>> {
         self.expect_punct('{')?;
         let mut sels = Vec::new();
         loop {
@@ -720,6 +986,15 @@ impl Parser {
                         let key = self.name()?;
                         self.expect_punct(':')?;
                         let val = self.value()?;
+                        // GraphQL requires argument names to be unique
+                        // (spec 5.4.2). Ours takes the first match, so a
+                        // document repeating `owner:`/`name:` would be
+                        // judged on one pair and executed on another if
+                        // any server were lax. Refuse instead of relying
+                        // on someone else's validator.
+                        if args.iter().any(|(k, _)| *k == key) {
+                            return None;
+                        }
                         args.push((key, val));
                     }
                     _ => return None,
@@ -739,6 +1014,16 @@ impl Parser {
     /// (string literals and variables); everything else collapses to
     /// `Val::Other` but is still consumed structurally.
     fn value(&mut self) -> Option<Val> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return None;
+        }
+        let out = self.value_inner();
+        self.depth -= 1;
+        out
+    }
+
+    fn value_inner(&mut self) -> Option<Val> {
         match self.next()? {
             Tok::Str(s) => Some(Val::Str(s.clone())),
             Tok::Var(v) => Some(Val::Var(v.clone())),
@@ -1049,6 +1334,186 @@ mod tests {
             query A { repository(owner: "wirenboard", name: "wb-agent-tools") { name } }
             query B { viewer { repositories(first: 5) { nodes { name } } } }
         "#;
+        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous);
+    }
+
+    // ── attacks confirmed against the first version of this filter ──
+    //
+    // Each of these returned Authenticated before the policy was
+    // inverted from a name denylist to an allowlist. They are the
+    // regression suite for that inversion.
+
+    #[test]
+    fn quoted_repo_qualifier_in_search_is_refused() {
+        // GitHub treats a fully-quoted token as a literal phrase, not a
+        // qualifier: `"repo:o/r"` reads as scoped to a naive parser and
+        // is a global, token-authenticated search to GitHub. Adding NOT
+        // makes the phrase filter vacuous on top.
+        let q = r#"query($q: String!) { search(query: $q, type: REPOSITORY, first: 100) {
+            repositoryCount nodes { ... on Repository { nameWithOwner isPrivate } } } }"#;
+        for probe in [
+            "\"repo:wirenboard/wb-agent-tools\"",
+            "NOT \"repo:wirenboard/wb-agent-tools\" is:private",
+            "repo:wirenboard/wb-agent-tools OR repo:other/thing",
+            "-repo:wirenboard/wb-agent-tools",
+            "repo:wirenboard/wb-agent-tools org:wirenboard",
+            "repo:wirenboard/wb-agent-tools some-unknown-qualifier:x",
+        ] {
+            assert_eq!(
+                access(q, serde_json::json!({ "q": probe })),
+                GraphqlAccess::Anonymous,
+                "search query {probe:?} must not authenticate"
+            );
+        }
+        // The legitimate scoped form still works.
+        assert_eq!(
+            access(
+                q,
+                serde_json::json!({"q": "repo:wirenboard/wb-agent-tools is:pr is:open"})
+            ),
+            GraphqlAccess::Authenticated
+        );
+    }
+
+    #[test]
+    fn repository_yielding_fields_cannot_escape_the_allowed_subtree() {
+        // Every one of these reaches a different Repository from inside
+        // an allow-listed one. `parent`/`source` reach a fork's (maybe
+        // private) upstream; `forks`/`headRepository`/`baseRepository`
+        // reach arbitrary repos — and from any of them, file contents.
+        for field in [
+            "parent { object(expression: \"HEAD:.env\") { ... on Blob { text } } }",
+            "source { object(expression: \"HEAD:.env\") { ... on Blob { text } } }",
+            "templateRepository { object(expression: \"HEAD:.env\") { ... on Blob { text } } }",
+            "forks(first: 100) { nodes { nameWithOwner isPrivate } }",
+            "pullRequests(first: 1) { nodes { headRepository { object(expression: \"HEAD:.env\") { ... on Blob { text } } } } }",
+            "pullRequests(first: 1) { nodes { baseRepository { object(expression: \"HEAD:.env\") { ... on Blob { text } } } } }",
+        ] {
+            let q = format!(
+                r#"query {{ repository(owner: "wirenboard", name: "wb-agent-tools") {{ {field} }} }}"#
+            );
+            assert_eq!(
+                access(&q, serde_json::json!({})),
+                GraphqlAccess::Anonymous,
+                "escape via {field} must not authenticate"
+            );
+        }
+    }
+
+    #[test]
+    fn actor_fields_are_identity_only_at_any_depth() {
+        // A User reached from anywhere spans every repo the token can
+        // see: gists, pullRequests, issues, organizations. The old rule
+        // restricted `viewer` at the query root only, so any User
+        // reached at depth was unrestricted.
+        for field in [
+            "collaborators(first: 100) { nodes { pullRequests(first: 1) { nodes { title } } } }",
+            "mentionableUsers(first: 100) { nodes { gists(first: 10, privacy: ALL) { nodes { name } } } }",
+            "assignableUsers(first: 10) { nodes { organizations(first: 5) { nodes { login } } } }",
+            "watchers(first: 10) { nodes { issues(first: 5) { nodes { title } } } }",
+            "stargazers(first: 10) { nodes { gists(first: 5) { nodes { name } } } }",
+            "owner { ... on Organization { membersWithRole(first: 10) { nodes { login } } } }",
+            "pullRequests(first: 1) { nodes { author { ... on User { gists(first: 5) { nodes { name } } } } } }",
+        ] {
+            let q = format!(
+                r#"query {{ repository(owner: "wirenboard", name: "wb-agent-tools") {{ {field} }} }}"#
+            );
+            assert_eq!(
+                access(&q, serde_json::json!({})),
+                GraphqlAccess::Anonymous,
+                "escape via {field} must not authenticate"
+            );
+        }
+        // Identity selections on the same fields still work — this is
+        // what gh actually needs.
+        let ok = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
+            pullRequests(first: 5) { nodes { number title author { login } assignees(first: 5) { nodes { login } } } } } }"#;
+        assert_eq!(access(ok, serde_json::json!({})), GraphqlAccess::Authenticated);
+    }
+
+    #[test]
+    fn viewer_reached_at_depth_is_restricted_too() {
+        // `hovercard` contexts carry a full `viewer: User`, and mutation
+        // payloads do the same — both walked around the old root-only
+        // viewer rule.
+        let hovercard = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
+            pullRequest(number: 1) { hovercard { contexts { ... on ViewerHovercardContext {
+                viewer { gists(first: 10, privacy: ALL) { nodes { name } } } } } } } } }"#;
+        assert_eq!(access(hovercard, serde_json::json!({})), GraphqlAccess::Anonymous);
+
+        let mutation = r#"mutation($input: CreateUserListInput!) {
+            createUserList(input: $input) { viewer { gists(first: 10) { nodes { name } } } } }"#;
+        assert_eq!(access(mutation, serde_json::json!({})), GraphqlAccess::Anonymous);
+    }
+
+    #[test]
+    fn argless_repository_is_scalar_only() {
+        // `PullRequest.repository` reached from an unscoped parent used
+        // to be waved through as "already scoped by its parent". Scalars
+        // are fine (gh prints nameWithOwner); traversal is not.
+        let scalars = r#"query($q: String!) { search(query: $q, type: ISSUE, first: 10) {
+            nodes { ... on PullRequest { number repository { nameWithOwner } } } } }"#;
+        assert_eq!(
+            access(
+                scalars,
+                serde_json::json!({"q": "repo:wirenboard/wb-agent-tools is:pr"})
+            ),
+            GraphqlAccess::Authenticated
+        );
+        let traverse = r#"query($q: String!) { search(query: $q, type: ISSUE, first: 10) {
+            nodes { ... on PullRequest { repository {
+                object(expression: "HEAD:.env") { ... on Blob { text } } } } } } }"#;
+        assert_eq!(
+            access(
+                traverse,
+                serde_json::json!({"q": "repo:wirenboard/wb-agent-tools is:pr"})
+            ),
+            GraphqlAccess::Anonymous
+        );
+    }
+
+    #[test]
+    fn unknown_composite_fields_are_refused() {
+        // The allowlist's whole point: a field we don't know about, but
+        // which returns an object, must not be walked. Scalars stay free.
+        let unknown = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
+            someFutureConnection(first: 10) { nodes { secret } } } }"#;
+        assert_eq!(access(unknown, serde_json::json!({})), GraphqlAccess::Anonymous);
+        let scalar = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
+            someFutureScalar diskUsage isPrivate } }"#;
+        assert_eq!(access(scalar, serde_json::json!({})), GraphqlAccess::Authenticated);
+    }
+
+    #[test]
+    fn duplicate_arguments_are_refused() {
+        // Spec 5.4.2 makes this invalid, but ours took the first match
+        // while a lax server could take the last.
+        let q = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools",
+            owner: "victim", name: "private") { nameWithOwner } }"#;
+        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous);
+    }
+
+    #[test]
+    fn deep_nesting_is_refused_not_a_stack_overflow() {
+        // `{a{a{a…` used to overflow the stack and abort the hook — a
+        // self-inflicted DoS on the guest's own GitHub access.
+        let deep = format!(
+            "query {{ repository(owner: \"wirenboard\", name: \"wb-agent-tools\") {{ {}{} }} }}",
+            "nodes { ".repeat(5000),
+            "}".repeat(5000)
+        );
+        assert_eq!(access(&deep, serde_json::json!({})), GraphqlAccess::Anonymous);
+        let deep_list = format!(
+            "query {{ repository(owner: \"wirenboard\", name: \"wb-agent-tools\", x: {}{}) {{ name }} }}",
+            "[".repeat(5000),
+            "]".repeat(5000)
+        );
+        assert_eq!(access(&deep_list, serde_json::json!({})), GraphqlAccess::Anonymous);
+    }
+
+    #[test]
+    fn unicode_escape_requires_four_hex_digits() {
+        let q = r#"query { repository(owner: "wirenboard", name: "\u+041b-agent-tools") { name } }"#;
         assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous);
     }
 

@@ -178,9 +178,27 @@ async fn forward_github_api(
     // path — gh CLI does most reads (repo list/view, pr, issue) over
     // GraphQL, so it gets its own body-level allow-list filter. Only
     // POST is real GraphQL traffic; anything else goes anonymous.
-    let path_no_query = path.split_once('?').map(|(p, _)| p).unwrap_or(&path);
+    let (path_no_query, query_string) = match path.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path.as_str(), ""),
+    };
     let access = if path_no_query == "/graphql" {
-        if method.eq_ignore_ascii_case("POST") {
+        // Our verdict comes from the body, so the body must be the only
+        // thing GitHub can execute. Two guards on that:
+        //
+        //  * A query string is refused. We do not know that GitHub's
+        //    GraphQL endpoint ignores `?query=`, and if it ever reads it
+        //    (the graphql-ruby / Rails `params[:query]` idiom) the whole
+        //    filter is bypassed by a benign-looking body. gh never sends
+        //    one, so refusing costs nothing.
+        //  * A non-JSON content type is refused, so a body encoding
+        //    GitHub accepts but `serde_json` doesn't can't be judged on
+        //    a parse failure of a different grammar.
+        let content_type_is_json = headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("content-type")
+                && v.to_ascii_lowercase().starts_with("application/json")
+        });
+        if method.eq_ignore_ascii_case("POST") && query_string.is_empty() && content_type_is_json {
             match crate::github_graphql::graphql_access(&body, allowed_repos) {
                 crate::github_graphql::GraphqlAccess::Authenticated => {
                     GithubAccess::Authenticated
