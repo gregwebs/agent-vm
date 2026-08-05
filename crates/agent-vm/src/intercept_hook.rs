@@ -203,10 +203,18 @@ async fn forward_github_api(
                 crate::github_graphql::GraphqlAccess::Authenticated => {
                     GithubAccess::Authenticated
                 }
-                crate::github_graphql::GraphqlAccess::Anonymous => GithubAccess::Anonymous,
+                // Deny, not Anonymous. GitHub's GraphQL endpoint has no
+                // anonymous tier: a stripped-Authorization query comes
+                // back `403 API rate limit exceeded for <host IP>`,
+                // which tells the agent nothing true. Same posture — no
+                // token leaves — with a failure someone can act on.
+                crate::github_graphql::GraphqlAccess::Denied(why) => GithubAccess::Deny(why),
             }
         } else {
-            GithubAccess::Anonymous
+            GithubAccess::Deny(
+                "agent-vm: /graphql requires POST, no query string, and a JSON content type"
+                    .to_string(),
+            )
         }
     } else {
         github_access(&method, &path, allowed_repos)
@@ -1217,8 +1225,15 @@ fn http_200_json(body: &[u8]) -> Vec<u8> {
     build_response(200, "OK", body)
 }
 
+/// Synthesized error handed back to the in-guest client.
+///
+/// The body uses `message`, not `error`: go-gh unmarshals only
+/// `message` when it renders an `HTTPError`, so anything under another
+/// key is silently dropped and the user sees a bare status code. The
+/// whole point of denying rather than forwarding anonymously is that
+/// the reason reaches the person reading the terminal.
 fn error_response(code: u16, msg: &str) -> Vec<u8> {
-    let body = format!("{{\"error\":{}}}", json!(msg));
+    let body = format!("{{\"message\":{}}}", json!(msg));
     build_response(code, "Server Error", body.as_bytes())
 }
 

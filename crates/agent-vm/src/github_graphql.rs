@@ -61,6 +61,7 @@
 //! syntax we don't model, variables that aren't plain strings —
 //! resolves to **Anonymous**, never to Authenticated.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
@@ -70,8 +71,16 @@ use serde_json::Value;
 pub enum GraphqlAccess {
     /// Forward with the host user's real token.
     Authenticated,
-    /// Forward without Authorization (GitHub 401s the whole request).
-    Anonymous,
+    /// Refuse, telling the guest why.
+    ///
+    /// Not "forward anonymously": GitHub's GraphQL endpoint has no
+    /// anonymous tier, so a stripped-Authorization query always comes
+    /// back `403 API rate limit exceeded for <host IP>`. That is a
+    /// misleading answer to "your query wasn't scoped to an allowed
+    /// repo" — it names an IP the user doesn't recognise and points at
+    /// a limit they haven't hit. Same security posture, comprehensible
+    /// failure.
+    Denied(String),
 }
 
 /// Fields whose value is, or contains, a `Repository`.
@@ -145,6 +154,39 @@ const ACTOR_YIELDING_FIELDS: &[&str] = &[
     "resourceOwner",
     "sponsor",
     "sponsorable",
+    // gh sends these; identity-only keeps them cheap
+    "headRepositoryOwner",
+    "enabledBy",
+    "users",
+    "assignedActors",
+    "authors",
+];
+
+/// The subset of [`ACTOR_YIELDING_FIELDS`] that names a *single*
+/// account rather than a list of them.
+///
+/// Only these may nest inside another actor subtree. gh needs
+/// `requestedReviewer { ... on Team { organization { login } } }`, but
+/// allowing every actor field to nest would turn an actor subtree into
+/// an enumeration engine — `owner { membersWithRole { nodes { login } } }`
+/// lists a private org's membership, one identity scalar at a time.
+const ACTOR_SINGULAR_FIELDS: &[&str] = &[
+    "viewer",
+    "owner",
+    "author",
+    "editor",
+    "creator",
+    "user",
+    "actor",
+    "organization",
+    "enterprise",
+    "mergedBy",
+    "requestedReviewer",
+    "resourceOwner",
+    "sponsor",
+    "sponsorable",
+    "headRepositoryOwner",
+    "enabledBy",
 ];
 
 /// Scalar identity fields permitted under an [`ACTOR_YIELDING_FIELDS`]
@@ -160,6 +202,7 @@ const IDENTITY_FIELDS: &[&str] = &[
     "databaseId",
     "resourcePath",
     "isViewer",
+    "slug",
     "__typename",
 ];
 
@@ -196,7 +239,7 @@ const COMPOSITE_ALLOWED_FIELDS: &[&str] = &[
     "pullRequests", "pullRequest", "issues", "issue", "issueOrPullRequest",
     "comments", "reviews", "latestReviews", "latestOpinionatedReviews",
     "reviewRequests", "reviewThreads", "commits", "files", "closingIssuesReferences",
-    "timelineItems", "reactionGroups", "reactions", "labels", "milestone",
+    "reactionGroups", "reactions", "labels", "milestone",
     "milestones", "projectCards", "assignedTo",
     // refs / git objects
     "ref", "refs", "defaultBranchRef", "target", "object", "commit", "history",
@@ -207,8 +250,35 @@ const COMPOSITE_ALLOWED_FIELDS: &[&str] = &[
     "releases", "release", "releaseAssets", "codeOfConduct", "fundingLinks",
     "discussions", "discussion", "discussionCategories", "branchProtectionRules",
     "rulesets", "environments", "deployments", "vulnerabilityAlerts",
-    "submodules", "packages", "watchers",
+    "submodules", "packages",
+    // PR/issue shapes gh sends that the first cut missed
+    "autoMergeRequest", "baseRef", "branchProtectionRule", "mergeCommit",
+    "potentialMergeCommit", "checkSuite", "workflowRun", "workflow",
+    "checkRunCountsByState", "statusContextCountsByState",
+    "project", "column", "projectItems", "projects", "projectsV2",
+    "fieldValueByName", "latestRelease", "issueType", "subIssues",
+    "subIssuesSummary", "blockedBy", "blocking", "closedByPullRequestsReferences",
+    "issueTemplates", "pullRequestTemplates", "contactLinks", "label",
+    // introspection, so the documented `__schema` allowance actually works
+    "types", "fields", "inputFields", "interfaces", "enumValues",
+    "possibleTypes", "ofType", "args", "type", "directives",
+    "queryType", "mutationType", "subscriptionType",
 ];
+
+/// Scalars that are credentials or capability handles rather than
+/// display data. The "a leaf is only a scalar" reasoning is true but
+/// insufficient for these: `Repository.tempCloneToken` is documented as
+/// a "temporary authentication token for cloning this repository", so
+/// letting it out of an *unscoped* repo subtree hands over clone access
+/// to a repo that is not on the allow-list. `id`/`databaseId` are node
+/// handles, and mutation roots take node IDs.
+const CREDENTIAL_SCALARS: &[&str] = &["tempCloneToken", "tarballUrl", "zipballUrl"];
+
+/// Node handles. Harmless to read back for an object you just created
+/// (gh does, to chain mutations), but harvesting them for a repository
+/// *outside* the allow-list hands the agent exactly what an
+/// unrestricted mutation root takes as input.
+const NODE_ID_SCALARS: &[&str] = &["id", "databaseId"];
 
 /// Cap on selection-set / value nesting. Without it a hostile document
 /// (`{a{a{a…`) overflows the stack and aborts the hook process — a
@@ -216,16 +286,12 @@ const COMPOSITE_ALLOWED_FIELDS: &[&str] = &[
 /// crash in a security-critical subprocess.
 const MAX_DEPTH: usize = 64;
 
-/// Search qualifiers that cannot widen scope beyond the `repo:`
-/// qualifiers already checked. Anything else — including an unknown
-/// qualifier — rejects.
-const SAFE_SEARCH_QUALIFIERS: &[&str] = &[
-    "is", "in", "state", "type", "label", "milestone", "project", "status",
-    "author", "assignee", "mentions", "involves", "commenter", "review",
-    "reviewed-by", "review-requested", "team-review-requested", "draft",
-    "archived", "no", "base", "head", "sort", "created", "updated", "closed",
-    "merged", "comments", "interactions", "reactions", "language", "linked",
-];
+/// The only search qualifiers that set *scope*. GitHub ANDs
+/// qualifiers, so everything else can only narrow within the `repo:`
+/// scope already checked and needs no allowlist — an allowlist here
+/// just broke ordinary searches (`-label:wip`, `topic:cli`, or any
+/// bare term containing a colon, such as an error message).
+const SCOPE_QUALIFIERS: &[&str] = &["repo", "org", "user", "owner"];
 
 /// Cap on fragment-spread nesting during validation; combined with
 /// the visited-set cycle guard this bounds pathological documents.
@@ -235,17 +301,20 @@ const MAX_FRAGMENT_DEPTH: usize = 32;
 /// token. `allowed` is the per-launch `owner/repo` allow-list
 /// (compared case-insensitively).
 pub fn graphql_access(body: &[u8], allowed: &[String]) -> GraphqlAccess {
-    match evaluate(body, allowed) {
-        Some(true) => GraphqlAccess::Authenticated,
-        _ => GraphqlAccess::Anonymous,
-    }
+    evaluate(body, allowed)
 }
 
-fn evaluate(body: &[u8], allowed: &[String]) -> Option<bool> {
-    let json: Value = serde_json::from_slice(body).ok()?;
-    let query = json.get("query")?.as_str()?;
+fn evaluate(body: &[u8], allowed: &[String]) -> GraphqlAccess {
+    let deny = |m: &str| GraphqlAccess::Denied(format!("agent-vm: {m}"));
+
+    let Ok(json) = serde_json::from_slice::<Value>(body) else {
+        return deny("GraphQL request body is not JSON");
+    };
+    let Some(query) = json.get("query").and_then(|q| q.as_str()) else {
+        return deny("GraphQL request body has no string `query`");
+    };
     // `variables` may be absent or null; non-string values only matter
-    // if something we must resolve references them (then: Anonymous).
+    // if something we must resolve references them (then: denied).
     let variables: HashMap<String, String> = json
         .get("variables")
         .and_then(|v| v.as_object())
@@ -256,33 +325,56 @@ fn evaluate(body: &[u8], allowed: &[String]) -> Option<bool> {
         })
         .unwrap_or_default();
 
-    let doc = parse_document(query)?;
+    let Some(doc) = parse_document(query) else {
+        return deny("GraphQL document could not be parsed");
+    };
+    if doc.ops.is_empty() {
+        return deny("GraphQL document defines no operation");
+    }
     let fragments: HashMap<&str, &Vec<Sel>> = doc
         .fragments
         .iter()
         .map(|f| (f.name.as_str(), &f.sel))
         .collect();
 
-    // Every operation in the document must pass — gh sends one, but a
-    // crafted body could batch a benign op with a leaking one.
+    // Every operation must pass — gh sends one, but a crafted body
+    // could batch a benign op with a leaking one.
     for op in &doc.ops {
         let ctx = Ctx {
             allowed,
             variables: &variables,
             defaults: &op.var_defaults,
             fragments: &fragments,
+            reason: RefCell::new(None),
+            budget: Cell::new(VALIDATION_BUDGET),
         };
         let ok = match op.kind {
             OpKind::Query => validate_query_root(&op.sel, &ctx, 0),
             OpKind::Mutation => validate_mutation_root(&op.sel, &ctx),
-            OpKind::Subscription => false,
+            OpKind::Subscription => {
+                ctx.deny("subscriptions are not permitted");
+                false
+            }
         };
         if !ok {
-            return Some(false);
+            let why = ctx
+                .reason
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| "query is not scoped to an allow-listed repository".into());
+            let scope = if allowed.is_empty() {
+                "no repositories are on the allow-list for this sandbox".to_string()
+            } else {
+                format!("allowed: {}", allowed.join(", "))
+            };
+            return GraphqlAccess::Denied(format!("agent-vm: {why} ({scope})"));
         }
     }
-    Some(!doc.ops.is_empty())
+    GraphqlAccess::Authenticated
 }
+
+/// Validation steps allowed per operation. See `Ctx::budget`.
+const VALIDATION_BUDGET: u32 = 20_000;
 
 // ─── validation ───────────────────────────────────────────────────────
 
@@ -291,9 +383,39 @@ struct Ctx<'a> {
     variables: &'a HashMap<String, String>,
     defaults: &'a HashMap<String, String>,
     fragments: &'a HashMap<&'a str, &'a Vec<Sel>>,
+    /// Why the first rejection happened, so the guest gets told which
+    /// field cost it the token instead of GitHub's misleading
+    /// "rate limit exceeded" (its GraphQL endpoint has no anonymous
+    /// tier, so an unauthenticated query always 403s that way).
+    reason: RefCell<Option<String>>,
+    /// Remaining validation steps. Fragments are re-validated per
+    /// spread, so `fragment Fi { ...F(i+1) ...F(i+1) }` costs 2^N —
+    /// ~1 KB of query bought tens of minutes of HOST cpu, outside the
+    /// guest's limits. A flat budget bounds it regardless of shape.
+    budget: Cell<u32>,
 }
 
 impl Ctx<'_> {
+    /// Record the first rejection reason and return `false`, so call
+    /// sites read as `return ctx.deny(...)`.
+    fn deny(&self, msg: impl Into<String>) -> bool {
+        let mut r = self.reason.borrow_mut();
+        if r.is_none() {
+            *r = Some(msg.into());
+        }
+        false
+    }
+
+    /// Consume one unit of the validation budget.
+    fn spend(&self) -> bool {
+        let left = self.budget.get();
+        if left == 0 {
+            return self.deny("query is too complex to validate");
+        }
+        self.budget.set(left - 1);
+        true
+    }
+
     fn resolve(&self, v: &Val) -> Option<String> {
         match v {
             Val::Str(s) => Some(s.clone()),
@@ -342,43 +464,84 @@ fn search_args_ok(field: &Field, ctx: &Ctx) -> bool {
     let Some(q) = arg(field, "query").and_then(|v| ctx.resolve(v)) else {
         return false;
     };
-    // A quote anywhere means at least one token is a literal phrase to
-    // GitHub. We cannot tell which, so refuse the whole query.
-    if q.contains('"') || q.contains('\'') || q.contains('\\') {
-        return false;
-    }
+    let Some(tokens) = split_search_query(&q) else {
+        return false; // unbalanced quote: we can't tell what GitHub sees
+    };
     let mut saw_repo = false;
-    for token in q.split_whitespace() {
+    for (token, was_quoted) in tokens {
         let lower = token.to_ascii_lowercase();
-        // Boolean operators can negate or widen the repo: scope.
-        if matches!(lower.as_str(), "not" | "or" | "and") {
+        // `OR` widens; a quoted operator is just a search term.
+        if !was_quoted && matches!(lower.as_str(), "or") {
             return false;
         }
-        if let Some(slug) = lower.strip_prefix("repo:") {
-            if !ctx.allowed.iter().any(|a| a.eq_ignore_ascii_case(slug)) {
+        let (qualifier, value) = match lower.split_once(':') {
+            Some((q, v)) => (q, v),
+            // A bare term is ANDed with the repo: scope and can only
+            // narrow it — including a negated one.
+            None => continue,
+        };
+        // A fully quoted token is a literal phrase to GitHub, not a
+        // qualifier: `"repo:o/n"` scopes nothing while looking scoped.
+        if was_quoted {
+            continue;
+        }
+        let bare = qualifier.strip_prefix('-').unwrap_or(qualifier);
+        if SCOPE_QUALIFIERS.contains(&bare) {
+            // Only a positive `repo:` naming an allow-listed repo is
+            // acceptable; `org:`/`user:`/`owner:` and any negated form
+            // widen or invert the scope.
+            if qualifier != "repo" {
+                return false;
+            }
+            if !ctx.allowed.iter().any(|a| a.eq_ignore_ascii_case(value)) {
                 return false;
             }
             saw_repo = true;
-            continue;
         }
-        match lower.split_once(':') {
-            // `-repo:allowed`, `org:`, `user:`, or any qualifier we
-            // don't recognise: refuse rather than guess.
-            Some((qual, _)) => {
-                if !SAFE_SEARCH_QUALIFIERS.contains(&qual) {
-                    return false;
-                }
-            }
-            // A bare term is ANDed with the repo: scope, so it cannot
-            // widen it — but a leading `-` negates.
-            None => {
-                if lower.starts_with('-') {
-                    return false;
-                }
-            }
-        }
+        // Every other qualifier only narrows within the repo: scope
+        // (GitHub ANDs them), so it needs no allowlist.
     }
     saw_repo
+}
+
+/// Split a GitHub search query into tokens, tracking whether each was
+/// quoted. Returns `None` on an unbalanced quote.
+///
+/// Quote-awareness matters in both directions: `label:"help wanted"` is
+/// one qualifier (gh generates it from `--label`), while a *fully*
+/// quoted `"repo:o/n"` is a literal phrase that scopes nothing.
+fn split_search_query(q: &str) -> Option<Vec<(String, bool)>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut quoted_at_start = false;
+    let mut saw_quote = false;
+    for ch in q.chars() {
+        match ch {
+            '"' => {
+                if !in_quotes && cur.is_empty() {
+                    quoted_at_start = true;
+                }
+                saw_quote = true;
+                in_quotes = !in_quotes;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if !cur.is_empty() {
+                    out.push((std::mem::take(&mut cur), quoted_at_start && saw_quote));
+                }
+                quoted_at_start = false;
+                saw_quote = false;
+            }
+            c => cur.push(c),
+        }
+    }
+    if in_quotes {
+        return None;
+    }
+    if !cur.is_empty() {
+        out.push((cur, quoted_at_start && saw_quote));
+    }
+    Some(out)
 }
 
 /// Selection set of a field we will not walk into: every member must
@@ -386,20 +549,50 @@ fn search_args_ok(field: &Field, ctx: &Ctx) -> bool {
 /// that isn't argument-scoped, so `repository { nameWithOwner }` keeps
 /// working while `repository { object { ... on Blob { text } } }` and
 /// `forks { nodes { … } }` do not.
-fn validate_scalar_only(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet<String>) -> bool {
-    if depth > MAX_FRAGMENT_DEPTH || sel.is_empty() {
+fn validate_restricted_subtree(
+    sel: &[Sel],
+    ctx: &Ctx,
+    depth: usize,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    if !ctx.spend() || depth > MAX_FRAGMENT_DEPTH || sel.is_empty() {
         return false;
     }
     sel.iter().all(|s| match s {
-        Sel::Field(f) => f.sel.is_empty(),
-        Sel::Inline(inner) => validate_scalar_only(inner, ctx, depth, visiting),
+        Sel::Field(f) => {
+            if f.sel.is_empty() {
+                // A leaf is a scalar — but not every scalar is display
+                // data. See CREDENTIAL_SCALARS.
+                if CREDENTIAL_SCALARS.contains(&f.name.as_str())
+                    || NODE_ID_SCALARS.contains(&f.name.as_str())
+                {
+                    return ctx.deny(format!(
+                        "`{}` is a credential or node handle and is not readable for a repository outside the allow-list",
+                        f.name
+                    ));
+                }
+                true
+            } else if ACTOR_YIELDING_FIELDS.contains(&f.name.as_str()) {
+                // `parent { owner { login } }` — identity only, and we
+                // already hand out `parent { nameWithOwner }`.
+                validate_actor_subtree(&f.sel, ctx, depth, visiting)
+            } else if matches!(f.name.as_str(), "ref" | "defaultBranchRef") {
+                validate_restricted_subtree(&f.sel, ctx, depth, visiting)
+            } else {
+                ctx.deny(format!(
+                    "`{}` cannot be traversed on a repository outside the allow-list",
+                    f.name
+                ))
+            }
+        }
+        Sel::Inline(inner) => validate_restricted_subtree(inner, ctx, depth, visiting),
         Sel::Spread(name) => match ctx.fragments.get(name.as_str()) {
             Some(frag) if visiting.insert(name.clone()) => {
-                let ok = validate_scalar_only(frag, ctx, depth + 1, visiting);
+                let ok = validate_restricted_subtree(frag, ctx, depth + 1, visiting);
                 visiting.remove(name);
                 ok
             }
-            _ => false,
+            _ => ctx.deny(format!("fragment `{name}` is undefined or cyclic")),
         },
     })
 }
@@ -407,7 +600,7 @@ fn validate_scalar_only(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut Has
 /// Selection set under an actor-typed field: identity scalars only,
 /// plus connection plumbing so `assignees { nodes { login } }` works.
 fn validate_actor_subtree(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet<String>) -> bool {
-    if depth > MAX_FRAGMENT_DEPTH || sel.is_empty() {
+    if !ctx.spend() || depth > MAX_FRAGMENT_DEPTH || sel.is_empty() {
         return false;
     }
     sel.iter().all(|s| match s {
@@ -419,9 +612,24 @@ fn validate_actor_subtree(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut H
                 // explicit list.
                 IDENTITY_FIELDS.contains(&f.name.as_str())
                     || CONNECTION_FIELDS.contains(&f.name.as_str())
+                    || ctx.deny(format!(
+                        "`{}` is not an identity field; only identity scalars are readable on an account object",
+                        f.name
+                    ))
+            } else if CONNECTION_FIELDS.contains(&f.name.as_str())
+                || ACTOR_SINGULAR_FIELDS.contains(&f.name.as_str())
+            {
+                // A nested *singular* actor (gh sends
+                // `requestedReviewer { ... on Team { organization
+                // { login } } }`) stays identity-only. Member-listing
+                // connections are not allowed to nest — see
+                // ACTOR_SINGULAR_FIELDS.
+                validate_actor_subtree(&f.sel, ctx, depth, visiting)
             } else {
-                CONNECTION_FIELDS.contains(&f.name.as_str())
-                    && validate_actor_subtree(&f.sel, ctx, depth, visiting)
+                ctx.deny(format!(
+                    "`{}` is not an identity field; only identity scalars are readable on an account object",
+                    f.name
+                ))
             }
         }
         Sel::Inline(inner) => validate_actor_subtree(inner, ctx, depth, visiting),
@@ -443,7 +651,7 @@ fn validate_actor_subtree(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut H
 /// yielding, actor-yielding, or explicitly allow-listed. Anything else
 /// rejects.
 fn validate_generic(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet<String>) -> bool {
-    if depth > MAX_FRAGMENT_DEPTH {
+    if !ctx.spend() || depth > MAX_FRAGMENT_DEPTH {
         return false;
     }
     for s in sel {
@@ -453,7 +661,9 @@ fn validate_generic(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet
                 let actor_yielding = ACTOR_YIELDING_FIELDS.contains(&f.name.as_str());
 
                 if f.name == "search" && !search_args_ok(f, ctx) {
-                    return false;
+                    return ctx.deny(
+                        "`search` must be scoped by a repo: qualifier naming an allow-listed repository",
+                    );
                 }
                 if repo_yielding {
                     // Argument-scoped to an allow-listed repo: walk it
@@ -462,7 +672,7 @@ fn validate_generic(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet
                     let ok = if repository_is_scoped(f, ctx) {
                         validate_generic(&f.sel, ctx, depth, visiting)
                     } else {
-                        validate_scalar_only(&f.sel, ctx, depth, visiting)
+                        validate_restricted_subtree(&f.sel, ctx, depth, visiting)
                     };
                     if !ok {
                         return false;
@@ -482,7 +692,10 @@ fn validate_generic(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet
                 if !COMPOSITE_ALLOWED_FIELDS.contains(&f.name.as_str())
                     && f.name != "search"
                 {
-                    return false;
+                    return ctx.deny(format!(
+                        "`{}` is not in the set of fields readable inside an allow-listed repository",
+                        f.name
+                    ));
                 }
                 if !validate_generic(&f.sel, ctx, depth, visiting) {
                     return false;
@@ -529,7 +742,12 @@ fn validate_query_root(sel: &[Sel], ctx: &Ctx, depth: usize) -> bool {
                         repository_is_scoped(f, ctx)
                             && validate_generic(&f.sel, ctx, depth, &mut visiting)
                     }
-                    "viewer" => validate_actor_subtree(&f.sel, ctx, depth, &mut visiting),
+                    // `viewer` and `user(login:)` expose the same
+                    // identity surface REST `/user` already forwards
+                    // authenticated; gh needs `user` for --assignee.
+                    "viewer" | "user" => {
+                        validate_actor_subtree(&f.sel, ctx, depth, &mut visiting)
+                    }
                     "search" => {
                         search_args_ok(f, ctx)
                             && validate_generic(&f.sel, ctx, depth, &mut visiting)
@@ -537,7 +755,9 @@ fn validate_query_root(sel: &[Sel], ctx: &Ctx, depth: usize) -> bool {
                     "rateLimit" | "__typename" | "__schema" | "__type" => {
                         validate_generic(&f.sel, ctx, depth, &mut visiting)
                     }
-                    _ => false,
+                    other => ctx.deny(format!(
+                        "`{other}` is not a permitted query root; scope the query with repository(owner:, name:)"
+                    )),
                 };
                 if !ok {
                     return false;
@@ -563,6 +783,33 @@ fn validate_query_root(sel: &[Sel], ctx: &Ctx, depth: usize) -> bool {
     true
 }
 
+/// One object inside a mutation payload: scalar leaves only.
+///
+/// Node handles are allowed here (gh reads `pullRequest { id }` back to
+/// chain mutations) but credentials are not, and nothing may be
+/// traversed — traversal is what turned every mutation into a read
+/// primitive.
+fn validate_payload_object(sel: &[Sel], ctx: &Ctx) -> bool {
+    if !ctx.spend() || sel.is_empty() {
+        return false;
+    }
+    sel.iter().all(|s| match s {
+        Sel::Field(f) if f.sel.is_empty() => {
+            !CREDENTIAL_SCALARS.contains(&f.name.as_str())
+                || ctx.deny(format!("`{}` is a credential and is not readable", f.name))
+        }
+        Sel::Field(f) => ctx.deny(format!(
+            "mutation payloads may not be traversed; `{}` returns an object",
+            f.name
+        )),
+        Sel::Inline(inner) => validate_payload_object(inner, ctx),
+        Sel::Spread(name) => match ctx.fragments.get(name.as_str()) {
+            Some(frag) => validate_payload_object(frag, ctx),
+            None => ctx.deny(format!("fragment `{name}` is undefined")),
+        },
+    })
+}
+
 /// Mutation roots keep their names (see module docs) but the result
 /// subtrees get the same checks as any other scoped subtree — mutation
 /// payloads carry `viewer: User` and `repository: Repository` fields,
@@ -571,13 +818,26 @@ fn validate_mutation_root(sel: &[Sel], ctx: &Ctx) -> bool {
     if sel.is_empty() {
         return false;
     }
-    let mut visiting = HashSet::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+    let _ = &mut visiting;
     for s in sel {
         match s {
             // A mutation root field's own arguments are opaque input
-            // objects; only its result subtree is walkable.
+            // objects. Its *payload* used to get a full generic walk,
+            // which made every mutation a read primitive — `createRef`
+            // returns a `ref` you can walk to `Blob.text`, `updateIssue`
+            // returns the issue's body and comments. The payload is
+            // restricted instead: gh only ever reads scalars back
+            // (`pullRequest { number url }`).
             Sel::Field(f) => {
-                if !validate_generic(&f.sel, ctx, 0, &mut visiting) {
+                let payload_ok = f.sel.iter().all(|inner| match inner {
+                    Sel::Field(obj) if !obj.sel.is_empty() => {
+                        validate_payload_object(&obj.sel, ctx)
+                    }
+                    Sel::Field(_) => true,
+                    _ => ctx.deny("mutation payloads may only select scalar results"),
+                });
+                if !payload_ok {
                     return false;
                 }
             }
@@ -1105,8 +1365,32 @@ mod tests {
         .unwrap()
     }
 
-    fn access(query: &str, variables: serde_json::Value) -> GraphqlAccess {
-        graphql_access(&body(query, variables), &al())
+    /// Verdict without the reason string, so assertions stay readable.
+    #[derive(Debug, PartialEq, Eq)]
+    enum V {
+        Auth,
+        Denied,
+    }
+    const AUTH: V = V::Auth;
+    const DENIED: V = V::Denied;
+
+    fn v(a: GraphqlAccess) -> V {
+        match a {
+            GraphqlAccess::Authenticated => V::Auth,
+            GraphqlAccess::Denied(_) => V::Denied,
+        }
+    }
+
+    fn access(query: &str, variables: serde_json::Value) -> V {
+        v(graphql_access(&body(query, variables), &al()))
+    }
+
+    /// The reason text handed back to the guest.
+    fn why(query: &str, variables: serde_json::Value) -> String {
+        match graphql_access(&body(query, variables), &al()) {
+            GraphqlAccess::Denied(r) => r,
+            GraphqlAccess::Authenticated => panic!("expected a denial"),
+        }
     }
 
     // ── the reported leak: gh repo list ───────────────────────────
@@ -1127,14 +1411,14 @@ mod tests {
         }"#;
         assert_eq!(
             access(q, serde_json::json!({"owner": "evgeny-boger", "per_page": 30})),
-            GraphqlAccess::Anonymous
+            DENIED
         );
     }
 
     #[test]
     fn viewer_repositories_is_anonymous() {
         let q = "query { viewer { repositories(first: 100) { nodes { nameWithOwner } } } }";
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(q, serde_json::json!({})), DENIED);
     }
 
     #[test]
@@ -1142,7 +1426,7 @@ mod tests {
         // pullRequests on viewer spans private repos — not in the
         // scalar identity whitelist.
         let q = "query { viewer { login pullRequests(first: 10) { nodes { title } } } }";
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(q, serde_json::json!({})), DENIED);
     }
 
     // ── allowed-repo flows keep working ───────────────────────────
@@ -1161,7 +1445,7 @@ mod tests {
         }"#;
         assert_eq!(
             access(q, serde_json::json!({"owner": "wirenboard", "repo": "wb-agent-tools", "limit": 30})),
-            GraphqlAccess::Authenticated
+            AUTH
         );
     }
 
@@ -1172,7 +1456,7 @@ mod tests {
         }"#;
         assert_eq!(
             access(q, serde_json::json!({"owner": "wirenboard", "repo": "some-private"})),
-            GraphqlAccess::Anonymous
+            DENIED
         );
     }
 
@@ -1185,13 +1469,13 @@ mod tests {
                 object(expression: "HEAD:README.md") { ... on Blob { text } }
             }
         }"#;
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Authenticated);
+        assert_eq!(access(q, serde_json::json!({})), AUTH);
         let q_other = r#"query {
             repository(owner: "wirenboard", name: "secret-repo") {
                 object(expression: "HEAD:README.md") { ... on Blob { text } }
             }
         }"#;
-        assert_eq!(access(q_other, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(q_other, serde_json::json!({})), DENIED);
     }
 
     #[test]
@@ -1201,19 +1485,19 @@ mod tests {
         // path policy forwards authenticated.
         assert_eq!(
             access("query UserCurrent { viewer { login } }", serde_json::json!({})),
-            GraphqlAccess::Authenticated
+            AUTH
         );
         // Query shorthand form.
         assert_eq!(
             access("{ viewer { login } }", serde_json::json!({})),
-            GraphqlAccess::Authenticated
+            AUTH
         );
     }
 
     #[test]
     fn allowed_slug_is_case_insensitive() {
         let q = r#"query { repository(owner: "WirenBoard", name: "WB-Agent-Tools") { name } }"#;
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Authenticated);
+        assert_eq!(access(q, serde_json::json!({})), AUTH);
     }
 
     #[test]
@@ -1221,11 +1505,11 @@ mod tests {
         let q = r#"query($owner: String = "wirenboard", $name: String = "wb-agent-tools") {
             repository(owner: $owner, name: $name) { name }
         }"#;
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Authenticated);
+        assert_eq!(access(q, serde_json::json!({})), AUTH);
         // Request variables override defaults — and must be checked.
         assert_eq!(
             access(q, serde_json::json!({"owner": "wirenboard", "name": "secret-repo"})),
-            GraphqlAccess::Anonymous
+            DENIED
         );
     }
 
@@ -1238,15 +1522,15 @@ mod tests {
             query { repository(owner: "wirenboard", name: "wb-agent-tools") { ...parts } }
             fragment parts on Repository { name issues(first: 5) { nodes { title } } }
         "#;
-        assert_eq!(access(ok, serde_json::json!({})), GraphqlAccess::Authenticated);
+        assert_eq!(access(ok, serde_json::json!({})), AUTH);
         let leak = r#"
             query { repository(owner: "wirenboard", name: "wb-agent-tools") { owner { ...esc } } }
             fragment esc on RepositoryOwner { repositories(first: 5) { nodes { nameWithOwner } } }
         "#;
-        assert_eq!(access(leak, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(leak, serde_json::json!({})), DENIED);
         // Spread of an undefined fragment: refuse.
         let undef = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") { ...nope } }"#;
-        assert_eq!(access(undef, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(undef, serde_json::json!({})), DENIED);
     }
 
     #[test]
@@ -1257,7 +1541,7 @@ mod tests {
         let q = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
             owner { ... on Organization { repositories(first: 10) { nodes { name } } } }
         } }"#;
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(q, serde_json::json!({})), DENIED);
     }
 
     // ── search scoping (gh pr status) ─────────────────────────────
@@ -1269,16 +1553,16 @@ mod tests {
         } }"#;
         assert_eq!(
             access(q, serde_json::json!({"q": "repo:wirenboard/wb-agent-tools is:pr is:open"})),
-            GraphqlAccess::Authenticated
+            AUTH
         );
         assert_eq!(
             access(q, serde_json::json!({"q": "repo:wirenboard/other is:pr"})),
-            GraphqlAccess::Anonymous
+            DENIED
         );
         // No repo: qualifier → global search under the user's token.
         assert_eq!(
             access(q, serde_json::json!({"q": "is:pr author:@me"})),
-            GraphqlAccess::Anonymous
+            DENIED
         );
         // Broadening qualifiers reject even alongside repo:.
         assert_eq!(
@@ -1286,7 +1570,7 @@ mod tests {
                 q,
                 serde_json::json!({"q": "repo:wirenboard/wb-agent-tools user:evgeny-boger"})
             ),
-            GraphqlAccess::Anonymous
+            DENIED
         );
     }
 
@@ -1299,10 +1583,10 @@ mod tests {
         let create = r#"mutation CreatePullRequest($input: CreatePullRequestInput!) {
             createPullRequest(input: $input) { pullRequest { number url } }
         }"#;
-        assert_eq!(access(create, serde_json::json!({})), GraphqlAccess::Authenticated);
+        assert_eq!(access(create, serde_json::json!({})), AUTH);
         let merge = r#"mutation($id: ID!) { mergePullRequest(input: { pullRequestId: $id }) {
             pullRequest { merged } } }"#;
-        assert_eq!(access(merge, serde_json::json!({})), GraphqlAccess::Authenticated);
+        assert_eq!(access(merge, serde_json::json!({})), AUTH);
     }
 
     #[test]
@@ -1310,7 +1594,7 @@ mod tests {
         let q = r#"mutation($id: ID!) { updateSubscription(input: { subscribableId: $id, state: SUBSCRIBED }) {
             subscribable { ... on Repository { owner { repositories(first: 5) { nodes { name } } } } }
         } }"#;
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(q, serde_json::json!({})), DENIED);
     }
 
     // ── fail-closed shapes ────────────────────────────────────────
@@ -1321,10 +1605,12 @@ mod tests {
             "query { node(id: \"R_kgDOAbc\") { ... on Repository { name } } }",
             "query { nodes(ids: [\"R_kgDOAbc\"]) { id } }",
             "query { organization(login: \"wirenboard\") { name } }",
-            "query { user(login: \"someone\") { name } }",
+            // `user(login:)` IS permitted now, but identity-only — gh
+            // needs it for --assignee. Anything richer still refuses.
+            "query { user(login: \"someone\") { gists(first: 5) { nodes { name } } } }",
             "subscription { x { y } }",
         ] {
-            assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous, "{q}");
+            assert_eq!(access(q, serde_json::json!({})), DENIED, "{q}");
         }
     }
 
@@ -1334,7 +1620,7 @@ mod tests {
             query A { repository(owner: "wirenboard", name: "wb-agent-tools") { name } }
             query B { viewer { repositories(first: 5) { nodes { name } } } }
         "#;
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(q, serde_json::json!({})), DENIED);
     }
 
     // ── attacks confirmed against the first version of this filter ──
@@ -1357,11 +1643,10 @@ mod tests {
             "repo:wirenboard/wb-agent-tools OR repo:other/thing",
             "-repo:wirenboard/wb-agent-tools",
             "repo:wirenboard/wb-agent-tools org:wirenboard",
-            "repo:wirenboard/wb-agent-tools some-unknown-qualifier:x",
         ] {
             assert_eq!(
                 access(q, serde_json::json!({ "q": probe })),
-                GraphqlAccess::Anonymous,
+                DENIED,
                 "search query {probe:?} must not authenticate"
             );
         }
@@ -1371,7 +1656,7 @@ mod tests {
                 q,
                 serde_json::json!({"q": "repo:wirenboard/wb-agent-tools is:pr is:open"})
             ),
-            GraphqlAccess::Authenticated
+            AUTH
         );
     }
 
@@ -1394,7 +1679,7 @@ mod tests {
             );
             assert_eq!(
                 access(&q, serde_json::json!({})),
-                GraphqlAccess::Anonymous,
+                DENIED,
                 "escape via {field} must not authenticate"
             );
         }
@@ -1420,7 +1705,7 @@ mod tests {
             );
             assert_eq!(
                 access(&q, serde_json::json!({})),
-                GraphqlAccess::Anonymous,
+                DENIED,
                 "escape via {field} must not authenticate"
             );
         }
@@ -1428,7 +1713,7 @@ mod tests {
         // what gh actually needs.
         let ok = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
             pullRequests(first: 5) { nodes { number title author { login } assignees(first: 5) { nodes { login } } } } } }"#;
-        assert_eq!(access(ok, serde_json::json!({})), GraphqlAccess::Authenticated);
+        assert_eq!(access(ok, serde_json::json!({})), AUTH);
     }
 
     #[test]
@@ -1439,11 +1724,11 @@ mod tests {
         let hovercard = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
             pullRequest(number: 1) { hovercard { contexts { ... on ViewerHovercardContext {
                 viewer { gists(first: 10, privacy: ALL) { nodes { name } } } } } } } } }"#;
-        assert_eq!(access(hovercard, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(hovercard, serde_json::json!({})), DENIED);
 
         let mutation = r#"mutation($input: CreateUserListInput!) {
             createUserList(input: $input) { viewer { gists(first: 10) { nodes { name } } } } }"#;
-        assert_eq!(access(mutation, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(mutation, serde_json::json!({})), DENIED);
     }
 
     #[test]
@@ -1458,7 +1743,7 @@ mod tests {
                 scalars,
                 serde_json::json!({"q": "repo:wirenboard/wb-agent-tools is:pr"})
             ),
-            GraphqlAccess::Authenticated
+            AUTH
         );
         let traverse = r#"query($q: String!) { search(query: $q, type: ISSUE, first: 10) {
             nodes { ... on PullRequest { repository {
@@ -1468,7 +1753,7 @@ mod tests {
                 traverse,
                 serde_json::json!({"q": "repo:wirenboard/wb-agent-tools is:pr"})
             ),
-            GraphqlAccess::Anonymous
+            DENIED
         );
     }
 
@@ -1478,10 +1763,10 @@ mod tests {
         // which returns an object, must not be walked. Scalars stay free.
         let unknown = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
             someFutureConnection(first: 10) { nodes { secret } } } }"#;
-        assert_eq!(access(unknown, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(unknown, serde_json::json!({})), DENIED);
         let scalar = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
             someFutureScalar diskUsage isPrivate } }"#;
-        assert_eq!(access(scalar, serde_json::json!({})), GraphqlAccess::Authenticated);
+        assert_eq!(access(scalar, serde_json::json!({})), AUTH);
     }
 
     #[test]
@@ -1490,7 +1775,7 @@ mod tests {
         // while a lax server could take the last.
         let q = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools",
             owner: "victim", name: "private") { nameWithOwner } }"#;
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(q, serde_json::json!({})), DENIED);
     }
 
     #[test]
@@ -1502,19 +1787,170 @@ mod tests {
             "nodes { ".repeat(5000),
             "}".repeat(5000)
         );
-        assert_eq!(access(&deep, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(&deep, serde_json::json!({})), DENIED);
         let deep_list = format!(
             "query {{ repository(owner: \"wirenboard\", name: \"wb-agent-tools\", x: {}{}) {{ name }} }}",
             "[".repeat(5000),
             "]".repeat(5000)
         );
-        assert_eq!(access(&deep_list, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(&deep_list, serde_json::json!({})), DENIED);
     }
 
     #[test]
     fn unicode_escape_requires_four_hex_digits() {
         let q = r#"query { repository(owner: "wirenboard", name: "\u+041b-agent-tools") { name } }"#;
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(q, serde_json::json!({})), DENIED);
+    }
+
+    // ── from the over-restriction review: real gh traffic ──────────
+
+    #[test]
+    fn gh_label_search_with_a_quoted_value_still_works() {
+        // gh generates `label:"help wanted"` from `--label`. Rejecting
+        // every quote broke every multi-word label.
+        let q = r#"query($q: String!) { search(query: $q, type: ISSUE, first: 10) {
+            nodes { ... on Issue { number title } } } }"#;
+        for probe in [
+            "repo:wirenboard/wb-agent-tools label:\"help wanted\" state:open",
+            "repo:wirenboard/wb-agent-tools \"null pointer\"",
+            "repo:wirenboard/wb-agent-tools -label:wip",
+            "repo:wirenboard/wb-agent-tools error: cannot find",
+            "repo:wirenboard/wb-agent-tools topic:cli path:api",
+            "repo:wirenboard/wb-agent-tools don't",
+        ] {
+            assert_eq!(
+                access(q, serde_json::json!({ "q": probe })),
+                AUTH,
+                "search {probe:?} narrows within the repo and should work"
+            );
+        }
+        // An unbalanced quote is still refused: we can't tell what
+        // GitHub would see.
+        assert_eq!(
+            access(q, serde_json::json!({"q": "repo:wirenboard/wb-agent-tools \"oops"})),
+            DENIED
+        );
+    }
+
+    #[test]
+    fn gh_pr_and_repo_metadata_queries_work() {
+        // Shapes captured from real gh: the fork's parent is read for
+        // `gh repo clone` / `gh pr create`, and reviewers/labels for
+        // `gh pr view`.
+        let parent = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
+            name nameWithOwner defaultBranchRef { name }
+            parent { name nameWithOwner owner { login } defaultBranchRef { name } } } }"#;
+        assert_eq!(access(parent, serde_json::json!({})), AUTH);
+
+        let pr = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
+            pullRequests(first: 10) { nodes {
+                number title headRefName
+                headRepositoryOwner { login }
+                baseRef { name branchProtectionRule { requiresApprovingReviews } }
+                autoMergeRequest { enabledBy { login } }
+                reviewRequests(first: 5) { nodes { requestedReviewer {
+                    ... on User { login } ... on Team { slug organization { login } } } } }
+                reactionGroups { content users(first: 3) { nodes { login } } }
+            } } } }"#;
+        assert_eq!(access(pr, serde_json::json!({})), AUTH);
+
+        let assignee = r#"query { user(login: "evgeny-boger") { id login } }"#;
+        assert_eq!(access(assignee, serde_json::json!({})), AUTH);
+    }
+
+    #[test]
+    fn actor_connections_still_cannot_nest_inside_an_actor() {
+        // The nesting relaxation above must not re-open enumeration:
+        // a member-listing connection under an actor lists a private
+        // org's membership one login at a time.
+        let q = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
+            owner { ... on Organization { membersWithRole(first: 100) { nodes { login } } } } } }"#;
+        assert_eq!(access(q, serde_json::json!({})), DENIED);
+    }
+
+    #[test]
+    fn credential_scalars_do_not_ride_out_on_an_unscoped_repo() {
+        // `tempCloneToken` is documented as a clone credential, and
+        // node IDs are what mutation roots take. A leaf being "just a
+        // scalar" does not make it display data.
+        for field in ["tempCloneToken", "id", "databaseId", "tarballUrl", "zipballUrl"] {
+            let q = format!(
+                r#"query {{ repository(owner: "wirenboard", name: "wb-agent-tools") {{
+                    parent {{ nameWithOwner {field} }} }} }}"#
+            );
+            assert_eq!(
+                access(&q, serde_json::json!({})),
+                DENIED,
+                "{field} must not be readable on a repo outside the allow-list"
+            );
+        }
+        // Display metadata on the same unscoped parent is still fine.
+        let ok = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
+            parent { nameWithOwner isPrivate description } } }"#;
+        assert_eq!(access(ok, serde_json::json!({})), AUTH);
+    }
+
+    #[test]
+    fn mutation_payloads_are_not_a_read_channel() {
+        // A full walk of the payload made every mutation a read
+        // primitive: createRef hands back a ref you can walk to
+        // Blob.text, updateIssue hands back the issue body.
+        let read_via_ref = r#"mutation($i: CreateRefInput!) { createRef(input: $i) {
+            ref { target { ... on Commit { tree { entries {
+                object { ... on Blob { text } } } } } } } } }"#;
+        assert_eq!(access(read_via_ref, serde_json::json!({})), DENIED);
+        let read_via_issue = r#"mutation($i: UpdateIssueInput!) { updateIssue(input: $i) {
+            issue { title comments(first: 100) { nodes { body } } } } }"#;
+        assert_eq!(access(read_via_issue, serde_json::json!({})), DENIED);
+        // What gh actually reads back still works.
+        let gh = r#"mutation($i: CreatePullRequestInput!) { createPullRequest(input: $i) {
+            pullRequest { id number url } } }"#;
+        assert_eq!(access(gh, serde_json::json!({})), AUTH);
+    }
+
+    #[test]
+    fn exponential_fragment_expansion_is_bounded() {
+        // Fragments are re-validated per spread, so
+        // `fragment Fi { ...F(i+1) ...F(i+1) }` costs 2^N — about 1 KB
+        // of query bought tens of minutes of HOST cpu.
+        let mut doc = String::from(
+            "query { repository(owner: \"wirenboard\", name: \"wb-agent-tools\") { ...F0 } }\n",
+        );
+        for i in 0..24 {
+            doc.push_str(&format!(
+                "fragment F{i} on Repository {{ ...F{} ...F{} }}\n",
+                i + 1,
+                i + 1
+            ));
+        }
+        doc.push_str("fragment F24 on Repository { name }\n");
+        let start = std::time::Instant::now();
+        assert_eq!(access(&doc, serde_json::json!({})), DENIED);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "validation should be bounded, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn denial_says_which_field_was_the_problem() {
+        // Going anonymous made GitHub answer "rate limit exceeded for
+        // <host IP>", which is not a debuggable answer. The denial
+        // names the field and the allow-list instead.
+        let msg = why(
+            r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
+                someFutureConnection(first: 1) { nodes { x } } } }"#,
+            serde_json::json!({}),
+        );
+        assert!(msg.contains("someFutureConnection"), "unhelpful denial: {msg}");
+        assert!(msg.contains("wirenboard/wb-agent-tools"), "denial omits scope: {msg}");
+
+        let msg = why(
+            r#"query { repository(owner: "other", name: "repo") { name } }"#,
+            serde_json::json!({}),
+        );
+        assert!(msg.contains("repository"), "unhelpful denial: {msg}");
     }
 
     #[test]
@@ -1526,13 +1962,13 @@ mod tests {
             b"{\"query\": 1}",
             b"{\"query\": \"query { repository(owner: \\\"a\\\" }\"}", // bad syntax
         ] {
-            assert_eq!(graphql_access(raw, &al()), GraphqlAccess::Anonymous);
+            assert_eq!(v(graphql_access(raw, &al())), DENIED);
         }
         // Variables that aren't strings can't prove an allowed slug.
         let q = "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { name } }";
         assert_eq!(
             access(q, serde_json::json!({"owner": ["wirenboard"], "name": 3})),
-            GraphqlAccess::Anonymous
+            DENIED
         );
     }
 
@@ -1541,10 +1977,10 @@ mod tests {
         // `x: repositories` still enumerates; the policy keys on the
         // real field name, not the alias.
         let q = "query { viewer { x: login } }";
-        assert_eq!(access(q, serde_json::json!({})), GraphqlAccess::Authenticated);
+        assert_eq!(access(q, serde_json::json!({})), AUTH);
         let leak = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") {
             o: owner { r: repositories(first: 1) { nodes { name } } } } }"#;
-        assert_eq!(access(leak, serde_json::json!({})), GraphqlAccess::Anonymous);
+        assert_eq!(access(leak, serde_json::json!({})), DENIED);
     }
 
     #[test]
@@ -1554,18 +1990,21 @@ mod tests {
         // repo-scoped authenticates.
         let none: Vec<String> = Vec::new();
         assert_eq!(
-            graphql_access(&body("{ viewer { login } }", serde_json::json!({})), &none),
-            GraphqlAccess::Authenticated
+            v(graphql_access(
+                &body("{ viewer { login } }", serde_json::json!({})),
+                &none
+            )),
+            AUTH
         );
         assert_eq!(
-            graphql_access(
+            v(graphql_access(
                 &body(
                     r#"{ repository(owner: "wirenboard", name: "wb-agent-tools") { name } }"#,
                     serde_json::json!({})
                 ),
                 &none
-            ),
-            GraphqlAccess::Anonymous
+            )),
+            DENIED
         );
     }
 }
