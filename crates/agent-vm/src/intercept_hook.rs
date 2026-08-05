@@ -171,8 +171,15 @@ async fn forward_github_api(
     allowed_repos: &[String],
     state_dir: &Path,
 ) -> Result<Vec<u8>> {
-    let (method, path, headers, body) = parse_http_request(request)
+    let (method, raw_path, headers, body) = parse_http_request(request)
         .context("parsing intercepted github request")?;
+
+    // RFC 7230 absolute-form (`GET https://api.github.com/repos/x`) is
+    // legal and GitHub accepts it. msb normalises it before matching
+    // rules, but the hook re-derives the upstream URL from this path,
+    // so normalise here too — otherwise we'd concatenate it onto the
+    // host and 502 on a malformed URL instead of applying policy.
+    let path = normalize_origin_form(&raw_path).to_string();
 
     // `/graphql` carries its repo references in the body, not the
     // path — gh CLI does most reads (repo list/view, pr, issue) over
@@ -334,6 +341,37 @@ async fn forward_github_api(
     out.extend_from_slice(b"Connection: close\r\n\r\n");
     out.extend_from_slice(&body_bytes);
     Ok(out)
+}
+
+/// Map an absolute-form request target to origin-form. Anything else
+/// is returned unchanged.
+fn normalize_origin_form(target: &str) -> &str {
+    for scheme in ["http://", "https://"] {
+        if target.len() >= scheme.len() && target[..scheme.len()].eq_ignore_ascii_case(scheme) {
+            let rest = &target[scheme.len()..];
+            return match rest.find('/') {
+                Some(slash) => &rest[slash..],
+                None => "/",
+            };
+        }
+    }
+    target
+}
+
+#[cfg(test)]
+mod origin_form_tests {
+    use super::normalize_origin_form;
+
+    #[test]
+    fn absolute_form_is_reduced_to_the_path() {
+        assert_eq!(
+            normalize_origin_form("https://api.github.com/repos/a/b"),
+            "/repos/a/b"
+        );
+        assert_eq!(normalize_origin_form("HTTPS://api.github.com/x?y=1"), "/x?y=1");
+        assert_eq!(normalize_origin_form("http://api.github.com"), "/");
+        assert_eq!(normalize_origin_form("/repos/a/b"), "/repos/a/b");
+    }
 }
 
 /// Parse buffered HTTP/1.1 request bytes into (method, path, headers,
