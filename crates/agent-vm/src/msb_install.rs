@@ -16,8 +16,8 @@
 //! 2. `<exe-dir>/msb` — sibling of `agent-vm` in the install bundle.
 //!    This is what the npm distribution ships: each platform
 //!    subpackage drops `agent-vm` and `msb` into `bin/` side by side.
-//! 3. `<workspace>/vendor/microsandbox/target/release/msb` — dev
-//!    mode for `cargo run -p agent-vm` inside this repo.
+//! 3. `<workspace>/vendor/microsandbox/build/msb` — the signed output
+//!    produced by `just build-msb release` in a source checkout.
 //!
 //! The first existing candidate wins. The resolved binary's
 //! `--version` output MUST contain the `+agent-vm` marker (the
@@ -36,10 +36,14 @@ use anyhow::{Context, Result, bail};
 /// upstream binary.
 const PATCHED_VERSION_MARKER: &str = "+agent-vm";
 
-/// Path the dev workflow built msb at, relative to the workspace.
+/// Path to the signed dev build, relative to the workspace.
+///
+/// Do not use `target/release/msb` here on macOS: Cargo's raw output is
+/// linker-signed but lacks `com.apple.security.hypervisor`. The vendored
+/// `just build-msb` recipe copies that binary here and signs it with
+/// `msb-entitlements.plist`.
 fn workspace_built_msb() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vendor/microsandbox/target/release/msb")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/microsandbox/build/msb")
 }
 
 /// Sibling-of-current-exe path, the npm-bundle layout.
@@ -51,10 +55,8 @@ fn exe_sibling_msb() -> Option<PathBuf> {
 /// Resolve the path to the patched msb that agent-vm should use.
 ///
 /// Returns `Ok(Some(path))` on success, `Ok(None)` if no candidate
-/// exists at all (caller decides whether that's fatal — for dev
-/// flows like `agent-vm setup` it's the trigger to build one), or
-/// `Err` only on a present-but-broken candidate (e.g. one that
-/// fails to even execute).
+/// exists at all, or `Err` only on a present-but-broken candidate
+/// (e.g. one that fails to even execute).
 pub fn resolved_msb_path() -> Result<Option<PathBuf>> {
     if let Some(env_path) = std::env::var_os("MSB_PATH") {
         let p = PathBuf::from(&env_path);
@@ -149,7 +151,8 @@ pub fn point_at_msb() -> Result<()> {
         None => bail!(
             "agent-vm could not find its bundled `msb` binary.\n\
              - Installed via npm? The platform subpackage is missing — try `npm install -g @wirenboard/agent-vm --force`.\n\
-             - Running from source? Run `agent-vm setup` (or `cargo build --release -p microsandbox-cli --bin msb --manifest-path vendor/microsandbox/Cargo.toml`)."
+             - Running from source on Apple Silicon macOS? Run `just build-macos`.\n\
+             - Other source builds? Run `cd vendor/microsandbox && just build release`."
         ),
     };
 
@@ -207,100 +210,6 @@ fn verify_patched_marker(msb: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Build the patched msb from the vendored submodule (dev workflow
-/// only). Called by `agent-vm setup` when running from a source
-/// checkout — npm-installed agent-vm ships a prebuilt binary in the
-/// platform subpackage and never invokes this path.
-///
-/// Skips if the built binary is already newer than the network
-/// crate's source mtime.
-pub fn build_or_skip() -> Result<()> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vendor/microsandbox/Cargo.toml")
-        .canonicalize()
-        .context(
-            "vendor/microsandbox not present; \
-             run `git submodule update --init vendor/microsandbox` \
-             (only needed for source builds — `npm install -g @wirenboard/agent-vm` \
-             ships a prebuilt msb)",
-        )?;
-
-    if msb_is_fresh(&manifest).unwrap_or(false) {
-        println!(
-            "==> Patched msb already built; skipping \
-             (delete vendor/microsandbox/target/release/msb to force rebuild)"
-        );
-        return Ok(());
-    }
-
-    println!("==> Building patched msb from vendor/microsandbox (one-time, ~3-4 min)");
-    let status = Command::new("cargo")
-        .args(["build", "--release", "-p", "microsandbox-cli", "--bin", "msb"])
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .status()
-        .context("invoking cargo build for vendor/microsandbox")?;
-    if !status.success() {
-        bail!("cargo build microsandbox failed: {status}");
-    }
-    let built = workspace_built_msb();
-    if !built.exists() {
-        bail!("cargo build succeeded but {} not found", built.display());
-    }
-    println!("==> Patched msb at {}", built.display());
-    Ok(())
-}
-
-/// Heuristic freshness: built binary newer than the network-crate
-/// source. Cheap, good enough for "don't recompile every `setup`."
-fn msb_is_fresh(microsandbox_manifest: &std::path::Path) -> Result<bool> {
-    let built = workspace_built_msb();
-    if !built.exists() {
-        return Ok(false);
-    }
-    let built_mtime = std::fs::metadata(&built)?.modified()?;
-    let network_dir = microsandbox_manifest
-        .parent()
-        .context("manifest has no parent")?
-        .join("crates/network/lib");
-    let latest_src = walk_latest_mtime(&network_dir)?;
-    Ok(built_mtime >= latest_src)
-}
-
-fn walk_latest_mtime(root: &std::path::Path) -> Result<std::time::SystemTime> {
-    let mut latest = std::time::SystemTime::UNIX_EPOCH;
-    for entry in walkdir(root)? {
-        let meta = std::fs::metadata(&entry)?;
-        if meta.is_file()
-            && let Ok(m) = meta.modified()
-        {
-            if m > latest {
-                latest = m;
-            }
-        }
-    }
-    Ok(latest)
-}
-
-fn walkdir(root: &std::path::Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)
-            .with_context(|| format!("reading {}", dir.display()))?
-        {
-            let entry = entry?;
-            let p = entry.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else {
-                out.push(p);
-            }
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +223,14 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
         path
+    }
+
+    #[test]
+    fn source_checkout_uses_signed_just_artifact() {
+        assert!(
+            workspace_built_msb().ends_with("vendor/microsandbox/build/msb"),
+            "source checkout must not select Cargo's unsigned target/release/msb"
+        );
     }
 
     #[test]

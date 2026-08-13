@@ -5,11 +5,8 @@
 //! pulls into microsandbox's cache and verifies by booting a
 //! throwaway sandbox.
 //!
-//! Source-checkout users can build a local image with
-//! `images/build.sh` and point setup at it via
-//! `--image localhost:5000/agent-vm-template:latest`.
-
-use std::path::PathBuf;
+//! Local source builds and cache-only image imports are separate root
+//! workflows; setup intentionally pulls the selected registry image.
 
 use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
@@ -35,35 +32,6 @@ pub async fn run(args: Args) -> Result<()> {
     let image = args
         .image
         .unwrap_or_else(|| crate::defaults::DEFAULT_IMAGE_REF.to_string());
-
-    // Source-checkout dev workflow: rebuild the patched msb from the
-    // vendored microsandbox submodule if present. npm-installed
-    // agent-vm has no submodule and main()'s `point_at_msb` already
-    // discovered the prebuilt sibling — skip the rebuild entirely.
-    //
-    // If we appear to be running from a source checkout (the
-    // CARGO_MANIFEST_DIR parent has `images/`) but the submodule is
-    // NOT initialised, warn loudly: silently pulling ghcr.io is
-    // surprising for someone who just edited `images/Dockerfile` and
-    // expected `setup` to bake their changes in.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let vendor_present = manifest_dir
-        .join("../../vendor/microsandbox/Cargo.toml")
-        .exists();
-    if vendor_present {
-        crate::msb_install::build_or_skip()?;
-        crate::msb_install::point_at_msb()?;
-    } else if manifest_dir.join("../../images/Dockerfile").exists() {
-        eprintln!(
-            "warn: running from a source checkout but vendor/microsandbox is not \
-             initialised — skipping local msb rebuild and pulling {image} from the \
-             registry instead.\n\
-             If you intended a local build, run \
-             `git submodule update --init --recursive vendor/microsandbox`, \
-             then `images/build.sh` and \
-             `agent-vm setup --image localhost:5000/agent-vm-template:latest`."
-        );
-    }
 
     println!("==> Pulling {image} into the microsandbox cache");
     crate::pull::pull_image(&image).await?;
