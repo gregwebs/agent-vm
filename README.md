@@ -21,13 +21,12 @@ top of microsandbox. Living on `rewrite-microsandbox` until v1.
 
 ## Requirements
 
-- Linux with `/dev/kvm` (rw) — your user must be in the `kvm`
-  group: `sudo usermod -aG kvm $USER` and re-login.
-- Node.js 18+ (already there if you use Claude Code / Codex CLI /
-  OpenCode — they're all npm-distributed).
+- Linux with `/dev/kvm` (rw) and membership in the `kvm` group, or an
+  Apple Silicon Mac for the [supported source-build workflow](macos-build.md).
+- Node.js 18+ for the npm-distributed launchers.
 
-`~/.microsandbox/lib/libkrunfw.so.5.x` auto-installs on first
-launch.
+The packaged Linux workflow installs its matching libkrunfw on first launch.
+Apple Silicon source builds assemble a self-contained local runtime bundle.
 
 ## Quick start
 
@@ -47,21 +46,38 @@ The npm package bundles a prebuilt `agent-vm` binary, the patched
 
 ## Build from source
 
+Clone the repository and its recursive submodules:
+
 ```bash
 git clone -b rewrite-microsandbox https://github.com/wirenboard/agent-vm
 cd agent-vm
-git submodule update --init vendor/microsandbox
-sudo apt-get install -y libcap-ng-dev libdbus-1-dev pkg-config
-cargo build --release -p agent-vm
-cargo build --release --manifest-path vendor/microsandbox/Cargo.toml \
-    -p microsandbox-cli --bin msb
-./target/release/agent-vm setup       # uses the locally-built msb sibling
+git submodule update --init --recursive
 ```
 
-`agent-vm setup` pulls
-`ghcr.io/wirenboard/agent-vm-template:latest` by default; pass
-`--image localhost:5000/agent-vm-template:latest` to use a local image
-you've built via `images/build.sh`.
+On Apple Silicon macOS, follow the [canonical macOS guide](macos-build.md):
+
+```bash
+just build-macos
+```
+
+On Linux, install the host development packages, build the vendored runtime
+through its supported recipe, and then build agent-vm:
+
+```bash
+sudo apt-get install -y libcap-ng-dev libdbus-1-dev pkg-config
+(cd vendor/microsandbox && just build release)
+cargo build --release -p agent-vm
+./target/release/agent-vm setup
+```
+
+Source builds use the vendored recipe's `vendor/microsandbox/build/msb`
+artifact; `agent-vm setup` pulls and verifies the selected registry image but
+does not build `msb`.
+
+On macOS, `just import-image` loads an existing local `linux/arm64` Docker
+image directly into agent-vm's private cache without a registry. See
+[the macOS guide](macos-build.md) for the exact workflow. `images/build.sh`
+remains the separate registry-backed build-and-push option.
 
 ## Subcommands
 
