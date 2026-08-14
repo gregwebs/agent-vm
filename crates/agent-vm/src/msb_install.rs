@@ -17,7 +17,7 @@
 //!    This is what the npm distribution ships: each platform
 //!    subpackage drops `agent-vm` and `msb` into `bin/` side by side.
 //! 3. `<workspace>/vendor/microsandbox/build/msb` — the signed output
-//!    produced by `just build-msb release` in a source checkout.
+//!    produced by `script/build/macos.sh` in a source checkout.
 //!
 //! The first existing candidate wins. The resolved binary's
 //! `--version` output MUST contain the `+agent-vm` marker (the
@@ -39,8 +39,8 @@ const PATCHED_VERSION_MARKER: &str = "+agent-vm";
 /// Path to the signed dev build, relative to the workspace.
 ///
 /// Do not use `target/release/msb` here on macOS: Cargo's raw output is
-/// linker-signed but lacks `com.apple.security.hypervisor`. The vendored
-/// `just build-msb` recipe copies that binary here and signs it with
+/// linker-signed but lacks `com.apple.security.hypervisor`. The root macOS
+/// build script copies that binary here and signs it with
 /// `msb-entitlements.plist`.
 fn workspace_built_msb() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/microsandbox/build/msb")
@@ -151,7 +151,7 @@ pub fn point_at_msb() -> Result<()> {
         None => bail!(
             "agent-vm could not find its bundled `msb` binary.\n\
              - Installed via npm? The platform subpackage is missing — try `npm install -g @wirenboard/agent-vm --force`.\n\
-             - Running from source on Apple Silicon macOS? Run `just build-macos`.\n\
+             - Running from source on Apple Silicon macOS? Run `./script/build/macos.sh`.\n\
              - Other source builds? Run `cd vendor/microsandbox && just build release`."
         ),
     };
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn source_checkout_uses_signed_just_artifact() {
+    fn source_checkout_uses_signed_build_artifact() {
         assert!(
             workspace_built_msb().ends_with("vendor/microsandbox/build/msb"),
             "source checkout must not select Cargo's unsigned target/release/msb"

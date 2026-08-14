@@ -166,8 +166,9 @@ Docker's CLI remains the right interface for the registry-backed build script:
 it keeps host-shell volume, port-forwarding, and `docker inspect` details out
 of the Rust binary. Rebuilding the image does not require recompiling the
 binary, and rebuilding the binary does not unexpectedly mutate an image
-cache. Apple Silicon developers can instead use the root `import-image`
-recipe to load an existing native local Docker image without a registry.
+cache. Apple Silicon developers can instead use
+`script/build/import-image.sh` to load an existing native local Docker image
+without a registry.
 
 The Rust side does own the **verify** step (boot from the freshly pushed
 image, run the three `--version` commands), because that step is exactly the
@@ -537,11 +538,11 @@ signed source artifact at `vendor/microsandbox/build/msb`. The user's
 `~/.microsandbox/bin/msb` is never touched, so upstream-installed tooling on
 the same host keeps using its own prebuilt.
 
-The root source-build recipe owns production of the vendored runtime:
-`just build-macos` delegates to `vendor/microsandbox && just build release`
-and assembles the signed artifact with its firmware. `agent-vm setup` does not
-build or refresh `msb`; it only pulls and optionally boots the selected
-registry image. On macOS, Cargo's raw
+The root `script/build/macos.sh` source-build interface owns production of the
+vendored runtime. It directly drives the pinned vendored macOS build sequence
+and assembles the signed artifact with its firmware, so `just` is not a root
+build prerequisite. `agent-vm setup` does not build or refresh `msb`; it only
+pulls and optionally boots the selected registry image. On macOS, Cargo's raw
 `vendor/microsandbox/target/release/msb` lacks the required
 `com.apple.security.hypervisor` entitlement and is not a runnable substitute.
 

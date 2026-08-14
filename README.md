@@ -54,10 +54,11 @@ cd agent-vm
 git submodule update --init --recursive
 ```
 
-On Apple Silicon macOS, follow the [canonical macOS guide](macos-build.md):
+On Apple Silicon macOS, follow the [canonical macOS guide](macos-build.md).
+The workflow is directly executable and does not require `just`:
 
 ```bash
-just build-macos
+./script/build/macos.sh
 ```
 
 On Linux, install the host development packages, build the vendored runtime
@@ -74,10 +75,10 @@ Source builds use the vendored recipe's `vendor/microsandbox/build/msb`
 artifact; `agent-vm setup` pulls and verifies the selected registry image but
 does not build `msb`.
 
-On macOS, `just import-image` loads an existing local `linux/arm64` Docker
-image directly into agent-vm's private cache without a registry. See
-[the macOS guide](macos-build.md) for the exact workflow. `images/build.sh`
-remains the separate registry-backed build-and-push option.
+On macOS, `./script/build/import-image.sh` loads an existing local
+`linux/arm64` Docker image directly into agent-vm's private cache without a
+registry. See [the macOS guide](macos-build.md) for the exact workflow.
+`images/build.sh` remains the separate registry-backed build-and-push option.
 
 ## Subcommands
 

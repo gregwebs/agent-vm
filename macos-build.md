@@ -4,11 +4,11 @@ These instructions support Apple Silicon Macs (`arm64`, M1 or newer). Intel macO
 
 ## Prerequisites
 
-Install the Xcode Command Line Tools, Rust 1.91 or newer (1.92 is known good), `just`, and Docker Desktop:
+Install the Xcode Command Line Tools, Rust 1.91 or newer (1.92 is known good), and Docker Desktop:
 
 ```bash
 xcode-select --install
-brew install rustup just
+brew install rustup
 brew install --cask docker
 rustup-init -y
 source "$HOME/.cargo/env"
@@ -30,10 +30,10 @@ The vendored build compiles a Linux guest helper and firmware through Docker. Ke
 From the repository root, run the canonical build command:
 
 ```bash
-just build-macos
+./script/build/macos.sh
 ```
 
-The recipe checks the host, Rust version, Xcode tools, Docker, and submodules; builds the vendored signed runtime and release `agent-vm`; and verifies each artifact's architecture, code signature, and Hypervisor.framework entitlement. It assembles:
+The script checks the host, Rust version, Xcode tools, Docker, and submodules; builds the vendored signed runtime and release `agent-vm`; and verifies each artifact's architecture, code signature, and Hypervisor.framework entitlements. It assembles:
 
 ```text
 target/macos/
@@ -44,7 +44,7 @@ target/macos/
     └── libkrunfw.5.dylib
 ```
 
-Re-running `just build-macos` is safe. It retains Cargo and Docker incremental output and atomically replaces the verified bundle files without requiring manual copying, signing, or environment setup.
+Re-running `./script/build/macos.sh` is safe. It retains Cargo and Docker incremental output and atomically replaces the verified bundle files without requiring manual copying, signing, or environment setup. The macOS workflow does not require `just`.
 
 ## Import and boot a local image without a registry
 
@@ -61,16 +61,16 @@ docker buildx build \
 Import it directly into agent-vm's private microsandbox cache:
 
 ```bash
-just import-image agent-vm-template:latest
+./script/build/import-image.sh agent-vm-template:latest
 ```
 
 To use a different cache tag, pass both the Docker source and destination tag:
 
 ```bash
-just import-image my-local-image:dev agent-vm-template:dev
+./script/build/import-image.sh my-local-image:dev agent-vm-template:dev
 ```
 
-The recipe verifies the Docker image is exactly `linux/arm64`, resolves agent-vm's state directory, and pipes `docker save` into `msb image load`. It does not run a registry or create a caller-managed tar archive. `msb` currently stages stdin in a temporary file before ingesting it, so temporary free space roughly equal to the Docker archive is still required.
+The script accepts zero to two positional arguments. The Docker source defaults to `agent-vm-template:latest`, and the destination tag defaults to the source. It verifies the Docker image is exactly `linux/arm64`, resolves agent-vm's state directory, and pipes `docker save` into `msb image load`. It does not run a registry or create a caller-managed tar archive. `msb` currently stages stdin in a temporary file before ingesting it, so temporary free space roughly equal to the Docker archive is still required.
 
 Cache references are exact. Importing `agent-vm-template:latest` does not populate `ghcr.io/wirenboard/agent-vm-template:latest`.
 
@@ -98,7 +98,7 @@ A restrictive coding-agent Seatbelt profile can deny access to `com.apple.trustd
 
 ### Inspect the bundle
 
-The build recipe performs these checks automatically. To inspect them independently:
+The build script performs these checks automatically. To inspect them independently:
 
 ```bash
 file \
@@ -116,36 +116,39 @@ codesign -d --entitlements - --xml target/macos/bin/msb | plutil -p -
 
 All three `lipo` commands must print only `arm64`. The entitlements must include boolean `true` values for `com.apple.security.hypervisor` and `com.apple.security.cs.disable-library-validation`.
 
-Without `--xml`, newer `codesign` versions may print a human-oriented raw `[Dict]` representation that `plutil` cannot parse. The root recipe extracts XML to a file before validating the entitlement.
+Without `--xml`, newer `codesign` versions may print a human-oriented raw `[Dict]` representation that `plutil` cannot parse. The root build script extracts XML to a file before validating the entitlements.
 
 ### VM creation fails with `VmSetup(VmCreate)`
 
-This usually means macOS denied `hv_vm_create` because the running `msb` lacks the Hypervisor.framework entitlement. Cargo's raw `vendor/microsandbox/target/release/msb` is not a runnable source artifact on macOS. The supported runtime binary is `vendor/microsandbox/build/msb`, produced and signed by:
+This usually means macOS denied `hv_vm_create` because the running `msb` lacks
+the Hypervisor.framework entitlement. Cargo's raw
+`vendor/microsandbox/target/release/msb` is not a runnable source artifact on
+macOS. The supported runtime binary is `vendor/microsandbox/build/msb`,
+produced and signed as part of:
 
 ```bash
-(cd vendor/microsandbox && just build-msb release)
+./script/build/macos.sh
 ```
 
-Prefer `just build-macos`, which also verifies the signature and entitlement before publishing the bundle. Run runtime smoke tests from a normal Terminal without `sudo` or a sandbox wrapper.
+The script verifies the signature and both required entitlements before
+publishing the bundle. Run runtime smoke tests from a normal Terminal without
+`sudo` or a sandbox wrapper.
 
-### Low-level source build
+### Supported source rebuild
 
-For diagnosis, the two underlying builds are:
+For a complete source rebuild, use the root script:
 
 ```bash
-(cd vendor/microsandbox && just build release)
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --release -p agent-vm
+CARGO_NET_GIT_FETCH_WITH_CLI=true ./script/build/macos.sh
 ```
 
-The vendored build produces `build/msb` and `build/libkrunfw.5.dylib`. Never assemble a macOS bundle from the raw `vendor/microsandbox/target/release/msb`; only the fresh-inode copy under `build/` receives `msb-entitlements.plist`.
-
-If `vendor/microsandbox/build/libkrunfw.5.dylib` is absent even though the vendored recipe found an installed private copy, run:
-
-```bash
-(cd vendor/microsandbox && just build-libkrunfw)
-```
-
-`just build-macos` performs this recovery automatically.
+It drives the pinned vendored agentd, firmware, and `microsandbox-cli` build
+sequence directly, then builds `agent-vm`. The vendored build produces
+`build/msb` and `build/libkrunfw.5.dylib`. Never assemble a macOS bundle from
+the raw `vendor/microsandbox/target/release/msb`; only the fresh-inode copy
+under `build/` receives `msb-entitlements.plist`. If the repository-local
+firmware output is missing, the same script rebuilds and restores it
+automatically.
 
 ### Rust compiler is too old
 
@@ -156,7 +159,7 @@ rustup toolchain install 1.92
 rustup default 1.92
 ```
 
-If Cargo's built-in Git transport reports an SSL handshake failure, keep using the root recipe or set:
+If Cargo's built-in Git transport reports an SSL handshake failure, keep using the root build script or set:
 
 ```bash
 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --release -p agent-vm
@@ -173,7 +176,7 @@ Verify Docker can pull the vendored build images using the system CA bundle:
 ```bash
 SSL_CERT_FILE=/etc/ssl/cert.pem docker pull rust:alpine
 SSL_CERT_FILE=/etc/ssl/cert.pem docker pull fedora:latest
-SSL_CERT_FILE=/etc/ssl/cert.pem just build-macos
+SSL_CERT_FILE=/etc/ssl/cert.pem ./script/build/macos.sh
 ```
 
 ### Kernel extraction fails under Colima
