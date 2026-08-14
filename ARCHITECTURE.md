@@ -19,7 +19,7 @@ microsandbox-rewrite/
 │       ├── Cargo.toml
 │       └── src/main.rs         # hello-world sandbox boot
 ├── vendor/
-│   └── microsandbox/           # git submodule, wirenboard/microsandbox
+│   └── microsandbox/           # git submodule, gregwebs/microsandbox
 └── .gitmodules
 ```
 
@@ -35,7 +35,7 @@ our crate's manifest noise.
 - **Phase 3 requires extending microsandbox.** The new `SecretValue::File`
   variant lives in `microsandbox-network`. A path dep against a sibling
   checkout works for one developer but not for CI or contributors. A submodule
-  pinned to a branch on our fork (`wirenboard/microsandbox`) makes the
+  pinned to a branch on our fork (`gregwebs/microsandbox`) makes the
   checkout self-contained and the upstream diff reviewable.
 - **`[patch]` against crates.io** also works, but it duplicates the source-of-
   truth pointer (Cargo.lock + patch table) and hides the fact that we are
