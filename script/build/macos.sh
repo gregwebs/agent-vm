@@ -12,12 +12,34 @@ SCRIPT_DIR="$(cd "$script_dir_path" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+RUST_TOOLCHAIN=1.92
+
 usage() {
     cat <<'EOF'
 Usage: ./script/build/macos.sh
 
 Build and verify the Apple Silicon macOS bundle under target/macos.
 EOF
+}
+
+run_rust_tool() {
+    RUSTUP_AUTO_INSTALL=0 rustup run "$RUST_TOOLCHAIN" "$@"
+}
+
+rust_toolchain_error() {
+    local tool="$1"
+
+    echo "error: Rust toolchain $RUST_TOOLCHAIN is not installed or usable: failed to run '$tool'" >&2
+    echo "Install the complete known-good toolchain with 'rustup toolchain install $RUST_TOOLCHAIN'." >&2
+    echo "If rustup 1.29 fails on macOS with 'OSStatus -26276', retry once with its TLS-verifying curl backend:" >&2
+    echo "  RUSTUP_USE_CURL=1 rustup toolchain install $RUST_TOOLCHAIN" >&2
+}
+
+cargo_component_error() {
+    echo "error: Cargo component for Rust toolchain $RUST_TOOLCHAIN is not installed or usable" >&2
+    echo "Install or repair Cargo with 'rustup component add cargo --toolchain $RUST_TOOLCHAIN'." >&2
+    echo "If rustup 1.29 fails on macOS with 'OSStatus -26276', retry once with its TLS-verifying curl backend:" >&2
+    echo "  RUSTUP_USE_CURL=1 rustup component add cargo --toolchain $RUST_TOOLCHAIN" >&2
 }
 
 preflight() {
@@ -32,22 +54,17 @@ preflight() {
         exit 1
     fi
 
-    for tool in rustc cargo git docker codesign xcode-select file lipo plutil install cc; do
+    for tool in rustup git docker codesign xcode-select file lipo plutil install cc; do
         command -v "$tool" >/dev/null 2>&1 || {
             echo "error: required tool '$tool' was not found on PATH" >&2
             exit 1
         }
     done
-    xcode-select -p >/dev/null 2>&1 || {
-        echo "error: Xcode Command Line Tools are unavailable; run 'xcode-select --install'" >&2
-        exit 1
-    }
-    docker info >/dev/null 2>&1 || {
-        echo "error: Docker is installed but its daemon is unavailable; start Docker Desktop" >&2
-        exit 1
-    }
 
-    rust_version="$(rustc --version)"
+    if ! rust_version="$(run_rust_tool rustc --version)"; then
+        rust_toolchain_error rustc
+        exit 1
+    fi
     version="${rust_version#rustc }"
     version="${version%% *}"
     major="${version%%.*}"
@@ -62,6 +79,19 @@ preflight() {
         echo "Install the known-good toolchain with 'rustup toolchain install 1.92'." >&2
         exit 1
     fi
+    if ! run_rust_tool cargo --version >/dev/null; then
+        cargo_component_error
+        exit 1
+    fi
+
+    xcode-select -p >/dev/null 2>&1 || {
+        echo "error: Xcode Command Line Tools are unavailable; run 'xcode-select --install'" >&2
+        exit 1
+    }
+    docker info >/dev/null 2>&1 || {
+        echo "error: Docker is installed but its daemon is unavailable; start Docker Desktop" >&2
+        exit 1
+    }
 
     test -f vendor/microsandbox/Cargo.toml || {
         echo "error: vendor/microsandbox is not initialized; run 'git submodule update --init --recursive'" >&2
@@ -100,7 +130,7 @@ build_and_sign_msb() {
         cd vendor/microsandbox
         CARGO_NET_GIT_FETCH_WITH_CLI="${CARGO_NET_GIT_FETCH_WITH_CLI:-true}" \
             CARGO_TARGET_DIR="$REPO_ROOT/vendor/microsandbox/target" \
-            cargo build --release --no-default-features --features net,ssh -p microsandbox-cli
+            run_rust_tool cargo build --release --no-default-features --features net,ssh -p microsandbox-cli
         mkdir -p build
         install -m 0755 target/release/msb build/msb
         codesign --entitlements msb-entitlements.plist --force -s - build/msb
@@ -147,7 +177,7 @@ build_agent_vm() {
     echo "==> Building agent-vm"
     CARGO_NET_GIT_FETCH_WITH_CLI="${CARGO_NET_GIT_FETCH_WITH_CLI:-true}" \
         CARGO_TARGET_DIR="$REPO_ROOT/target" \
-        cargo build --release -p agent-vm
+        run_rust_tool cargo build --release -p agent-vm
     test -f target/release/agent-vm || {
         echo "error: Cargo did not produce target/release/agent-vm" >&2
         exit 1
