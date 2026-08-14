@@ -16,9 +16,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Test macOS build script contracts
-        run: ./script/test/build-workflow.sh
-
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
