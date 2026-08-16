@@ -36,20 +36,94 @@ use anyhow::{Context, Result, bail};
 /// upstream binary.
 const PATCHED_VERSION_MARKER: &str = "+agent-vm";
 
-/// Path to the signed dev build, relative to the workspace.
+/// Path to the signed dev build for a source workspace.
 ///
 /// Do not use `target/release/msb` here on macOS: Cargo's raw output is
 /// linker-signed but lacks `com.apple.security.hypervisor`. The root macOS
 /// build script copies that binary here and signs it with
 /// `msb-entitlements.plist`.
-fn workspace_built_msb() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/microsandbox/build/msb")
+fn source_built_msb(workspace: &std::path::Path) -> PathBuf {
+    workspace.join("vendor/microsandbox/build/msb")
 }
 
 /// Sibling-of-current-exe path, the npm-bundle layout.
 fn exe_sibling_msb() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     Some(exe.parent()?.join("msb"))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MissingMsbLayout {
+    SourceSubmoduleUninitialized,
+    SourceBuildMissing,
+    InstalledBundle,
+}
+
+/// Return the source workspace for a Cargo-produced executable.
+///
+/// Installed bundles can have been compiled in a source checkout, so this uses
+/// the runtime executable's layout and a source-tree marker rather than
+/// `CARGO_MANIFEST_DIR` baked in on the build host.
+fn source_workspace(exe: &std::path::Path) -> Option<&std::path::Path> {
+    let profile_dir = exe.parent()?;
+    let profile = profile_dir.file_name()?.to_str()?;
+    if !matches!(profile, "debug" | "release") {
+        return None;
+    }
+
+    let profile_parent = profile_dir.parent()?;
+    let workspace = if profile_parent.file_name()?.to_str()? == "target" {
+        profile_parent.parent()?
+    } else {
+        let target_dir = profile_parent.parent()?;
+        if target_dir.file_name()?.to_str()? != "target" {
+            return None;
+        }
+        target_dir.parent()?
+    };
+
+    workspace
+        .join("crates/agent-vm/Cargo.toml")
+        .is_file()
+        .then_some(workspace)
+}
+
+fn classify_missing_msb_layout(exe: &std::path::Path) -> MissingMsbLayout {
+    let Some(workspace) = source_workspace(exe) else {
+        return MissingMsbLayout::InstalledBundle;
+    };
+
+    if workspace.join("vendor/microsandbox/Cargo.toml").is_file() {
+        MissingMsbLayout::SourceBuildMissing
+    } else {
+        MissingMsbLayout::SourceSubmoduleUninitialized
+    }
+}
+
+fn missing_msb_diagnostic(layout: MissingMsbLayout) -> &'static str {
+    match layout {
+        MissingMsbLayout::SourceSubmoduleUninitialized => {
+            "agent-vm could not find its bundled `msb` binary.\n\
+             The source checkout's `vendor/microsandbox` submodule is uninitialized.\n\
+             Run:\n\
+               git submodule update --init --recursive vendor/microsandbox\n\
+             Then, on Apple Silicon macOS, build the signed runtime and agent-vm bundle:\n\
+               ./script/build/macos.sh"
+        }
+        MissingMsbLayout::SourceBuildMissing => {
+            "agent-vm could not find the signed source `msb` build artifact at `vendor/microsandbox/build/msb`.\n\
+             The `vendor/microsandbox` submodule is initialized, but the runtime has not been built.\n\
+             On Apple Silicon macOS, run:\n\
+               ./script/build/macos.sh\n\
+             Other source builds: run `cd vendor/microsandbox && just build release`."
+        }
+        MissingMsbLayout::InstalledBundle => {
+            "agent-vm could not find its bundled `msb` binary.\n\
+             - Installed via npm? The platform subpackage is missing — try `npm install -g @wirenboard/agent-vm --force`.\n\
+             - Running from source on Apple Silicon macOS? Run `./script/build/macos.sh`.\n\
+             - Other source builds? Run `cd vendor/microsandbox && just build release`."
+        }
+    }
 }
 
 /// Resolve the path to the patched msb that agent-vm should use.
@@ -95,9 +169,13 @@ pub fn resolved_msb_path() -> Result<Option<PathBuf>> {
     {
         return Ok(Some(p));
     }
-    let dev = workspace_built_msb();
-    if dev.exists() {
-        return Ok(Some(dev));
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(workspace) = source_workspace(&exe)
+    {
+        let dev = source_built_msb(workspace);
+        if dev.exists() {
+            return Ok(Some(dev));
+        }
     }
     Ok(None)
 }
@@ -148,12 +226,12 @@ pub fn point_at_msb_home() -> Result<PathBuf> {
 pub fn point_at_msb() -> Result<()> {
     let resolved = match resolved_msb_path()? {
         Some(p) => p,
-        None => bail!(
-            "agent-vm could not find its bundled `msb` binary.\n\
-             - Installed via npm? The platform subpackage is missing — try `npm install -g @wirenboard/agent-vm --force`.\n\
-             - Running from source on Apple Silicon macOS? Run `./script/build/macos.sh`.\n\
-             - Other source builds? Run `cd vendor/microsandbox && just build release`."
-        ),
+        None => {
+            let layout = std::env::current_exe()
+                .map(|exe| classify_missing_msb_layout(&exe))
+                .unwrap_or(MissingMsbLayout::InstalledBundle);
+            bail!("{}", missing_msb_diagnostic(layout));
+        }
     };
 
     verify_patched_marker(&resolved)?;
@@ -174,6 +252,13 @@ pub fn point_at_msb() -> Result<()> {
 /// it'd run, but agent-vm's hooks and SecretValue::File would be
 /// silently absent, producing inscrutable runtime errors instead.
 fn verify_patched_marker(msb: &std::path::Path) -> Result<()> {
+    verify_patched_marker_with_path_source(msb, std::env::var_os("MSB_PATH").is_some())
+}
+
+fn verify_patched_marker_with_path_source(
+    msb: &std::path::Path,
+    msb_path_is_explicit: bool,
+) -> Result<()> {
     let out = Command::new(msb)
         .arg("--version")
         .output()
@@ -192,7 +277,7 @@ fn verify_patched_marker(msb: &std::path::Path) -> Result<()> {
         // at this binary. If the user explicitly set MSB_PATH, "set
         // MSB_PATH explicitly" is the LAST thing they need to hear —
         // they need to unset it.
-        let hint = if std::env::var_os("MSB_PATH").is_some() {
+        let hint = if msb_path_is_explicit {
             "Your MSB_PATH points at this binary. `unset MSB_PATH` to use the \
              bundled patched msb, or point MSB_PATH at a patched build."
         } else {
@@ -225,10 +310,22 @@ mod tests {
         path
     }
 
+    fn write_source_checkout_marker(workspace: &std::path::Path) {
+        let manifest_dir = workspace.join("crates/agent-vm");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        std::fs::write(
+            manifest_dir.join("Cargo.toml"),
+            "[package]\nname = \"agent-vm\"\n",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn source_checkout_uses_signed_build_artifact() {
-        assert!(
-            workspace_built_msb().ends_with("vendor/microsandbox/build/msb"),
+        let workspace = std::path::Path::new("/source/agent-vm");
+        assert_eq!(
+            source_built_msb(workspace),
+            workspace.join("vendor/microsandbox/build/msb"),
             "source checkout must not select Cargo's unsigned target/release/msb"
         );
     }
@@ -240,22 +337,12 @@ mod tests {
         verify_patched_marker(&p).expect("patched marker should be accepted");
     }
 
-    /// Tests both branches of the rejection-hint logic in one test so
-    /// they don't race on the process-global MSB_PATH env var. cargo
-    /// test parallelises by default and we don't want to pull in
-    /// `serial_test` just for this.
     #[test]
     fn verify_marker_rejects_vanilla_with_branch_specific_hint() {
         let dir = tempfile::tempdir().unwrap();
         let p = write_fake_msb(dir.path(), "msb 0.4.6");
 
-        // Branch 1: MSB_PATH unset → hint mentions reinstall.
-        // SAFETY: see module top — these tests are the only place we
-        // mutate the env var; we serialise them by living in one
-        // function.
-        let prior = std::env::var_os("MSB_PATH");
-        unsafe { std::env::remove_var("MSB_PATH") };
-        let err1 = verify_patched_marker(&p).unwrap_err();
+        let err1 = verify_patched_marker_with_path_source(&p, false).unwrap_err();
         let msg1 = format!("{err1:?}");
         assert!(
             msg1.contains("upstream microsandbox"),
@@ -266,20 +353,12 @@ mod tests {
             "missing 'reinstall agent-vm' hint when MSB_PATH unset: {msg1}"
         );
 
-        // Branch 2: MSB_PATH set → hint blames MSB_PATH.
-        unsafe { std::env::set_var("MSB_PATH", "/anywhere") };
-        let err2 = verify_patched_marker(&p).unwrap_err();
+        let err2 = verify_patched_marker_with_path_source(&p, true).unwrap_err();
         let msg2 = format!("{err2:?}");
         assert!(
             msg2.contains("unset MSB_PATH"),
             "missing 'unset MSB_PATH' hint when MSB_PATH set: {msg2}"
         );
-
-        // Restore the var so we don't leak state to other tests.
-        match prior {
-            Some(v) => unsafe { std::env::set_var("MSB_PATH", v) },
-            None => unsafe { std::env::remove_var("MSB_PATH") },
-        }
     }
 
     #[test]
@@ -303,5 +382,97 @@ mod tests {
         let chosen = PathBuf::from(&env_val);
         assert!(chosen.exists());
         assert_eq!(chosen, p);
+    }
+
+    #[test]
+    fn missing_msb_layout_identifies_uninitialized_source_submodule() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_source_checkout_marker(workspace.path());
+        let exe = workspace.path().join("target/debug/agent-vm");
+
+        assert_eq!(
+            classify_missing_msb_layout(&exe),
+            MissingMsbLayout::SourceSubmoduleUninitialized
+        );
+    }
+
+    #[test]
+    fn missing_msb_layout_identifies_initialized_source_without_build() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_source_checkout_marker(workspace.path());
+        let submodule = workspace.path().join("vendor/microsandbox");
+        std::fs::create_dir_all(&submodule).unwrap();
+        std::fs::write(submodule.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let exe = workspace.path().join("target/release/agent-vm");
+
+        assert_eq!(
+            classify_missing_msb_layout(&exe),
+            MissingMsbLayout::SourceBuildMissing
+        );
+    }
+
+    #[test]
+    fn missing_msb_layout_keeps_bundles_outside_source_checkout() {
+        let workspace = tempfile::tempdir().unwrap();
+        let submodule = workspace.path().join("vendor/microsandbox");
+        std::fs::create_dir_all(&submodule).unwrap();
+        std::fs::write(submodule.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        for exe in [
+            std::path::Path::new("/opt/npm/bin/agent-vm"),
+            &workspace.path().join("target/release/agent-vm"),
+            &workspace.path().join("target/macos/bin/agent-vm"),
+        ] {
+            assert_eq!(
+                classify_missing_msb_layout(exe),
+                MissingMsbLayout::InstalledBundle,
+                "bundled executable {} must not inherit source-checkout diagnostics",
+                exe.display()
+            );
+        }
+    }
+
+    #[test]
+    fn uninitialized_source_diagnostic_names_submodule_and_recovery_commands() {
+        let message = missing_msb_diagnostic(MissingMsbLayout::SourceSubmoduleUninitialized);
+
+        assert_eq!(
+            message,
+            "agent-vm could not find its bundled `msb` binary.\n\
+             The source checkout's `vendor/microsandbox` submodule is uninitialized.\n\
+             Run:\n\
+               git submodule update --init --recursive vendor/microsandbox\n\
+             Then, on Apple Silicon macOS, build the signed runtime and agent-vm bundle:\n\
+               ./script/build/macos.sh"
+        );
+    }
+
+    #[test]
+    fn initialized_source_diagnostic_requires_signed_build_without_submodule_claim() {
+        let message = missing_msb_diagnostic(MissingMsbLayout::SourceBuildMissing);
+
+        assert_eq!(
+            message,
+            "agent-vm could not find the signed source `msb` build artifact at `vendor/microsandbox/build/msb`.\n\
+             The `vendor/microsandbox` submodule is initialized, but the runtime has not been built.\n\
+             On Apple Silicon macOS, run:\n\
+               ./script/build/macos.sh\n\
+             Other source builds: run `cd vendor/microsandbox && just build release`."
+        );
+        assert!(!message.contains("uninitialized"));
+    }
+
+    #[test]
+    fn installed_bundle_diagnostic_keeps_platform_package_recovery() {
+        let message = missing_msb_diagnostic(MissingMsbLayout::InstalledBundle);
+
+        assert_eq!(
+            message,
+            "agent-vm could not find its bundled `msb` binary.\n\
+             - Installed via npm? The platform subpackage is missing — try `npm install -g @wirenboard/agent-vm --force`.\n\
+             - Running from source on Apple Silicon macOS? Run `./script/build/macos.sh`.\n\
+             - Other source builds? Run `cd vendor/microsandbox && just build release`."
+        );
+        assert!(!message.contains("submodule is uninitialized"));
     }
 }
