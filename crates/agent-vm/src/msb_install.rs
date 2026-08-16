@@ -26,7 +26,10 @@
 //! shadowed by an upstream msb" error rather than producing weird
 //! runtime failures inside the sandbox.
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -35,6 +38,20 @@ use anyhow::{Context, Result, bail};
 /// build appends `+agent-vm.phase<N>` so we can detect a shadowing
 /// upstream binary.
 const PATCHED_VERSION_MARKER: &str = "+agent-vm";
+
+/// Opt-in switch: when truthy, agent-vm points msb's OCI image cache at the
+/// shared `~/.microsandbox/cache` a separately-installed msb uses (Homebrew
+/// on macOS, a distro package or `cargo install` on Linux) instead of its
+/// private `MSB_HOME/cache`. Off by default. See `point_at_msb_home`.
+const SHARE_MSB_CACHE_ENV: &str = "AGENT_VM_SHARE_MSB_CACHE";
+
+/// Explicit override for the shared cache directory (for a non-default
+/// install layout). Only consulted when `SHARE_MSB_CACHE_ENV` is truthy.
+const MSB_CACHE_DIR_ENV: &str = "AGENT_VM_MSB_CACHE_DIR";
+
+/// microsandbox's persisted config filename (mirrors
+/// `microsandbox_utils::CONFIG_FILENAME`). Written into `MSB_HOME`.
+const MSB_CONFIG_FILENAME: &str = "config.json";
 
 /// Path to the signed dev build for a source workspace.
 ///
@@ -180,6 +197,120 @@ pub fn resolved_msb_path() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// True for `1` or `true` (case-insensitive, trimmed). Everything else —
+/// including `0`, `false`, empty, and unset — is false. Kept in lockstep with
+/// the documented values in README.md.
+fn parse_flag(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).map(|v| parse_flag(&v)).unwrap_or(false)
+}
+
+/// Resolve the shared OCI cache directory to redirect `paths.cache` at.
+/// `AGENT_VM_MSB_CACHE_DIR` (non-empty) wins; otherwise `$HOME/.microsandbox/cache`.
+fn resolve_shared_cache_dir_from(
+    override_dir: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    if let Some(explicit) = override_dir
+        && !explicit.is_empty()
+    {
+        return Ok(PathBuf::from(explicit));
+    }
+    let home = home.filter(|h| !h.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{SHARE_MSB_CACHE_ENV} is set but $HOME is unset and \
+             {MSB_CACHE_DIR_ENV} was not provided; cannot locate the shared \
+             `.microsandbox/cache` directory. Unset {SHARE_MSB_CACHE_ENV} to \
+             use the private cache, or set {MSB_CACHE_DIR_ENV}."
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".microsandbox").join("cache"))
+}
+
+fn resolve_shared_cache_dir() -> Result<PathBuf> {
+    resolve_shared_cache_dir_from(
+        std::env::var_os(MSB_CACHE_DIR_ENV).as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Merge-write `paths.cache = <cache_dir>` into `MSB_HOME/config.json`.
+///
+/// Reads any existing config into a `serde_json::Value`, sets only
+/// `paths.cache`, and writes the document back. We merge into an untyped
+/// `Value` rather than round-tripping through microsandbox's `LocalConfig`
+/// on purpose: a full `LocalConfig` re-serialize would materialize every
+/// default field AND drop any keys a newer separately-installed msb wrote
+/// that agent-vm's pinned SDK doesn't model. Untyped merge keeps the file
+/// minimal and forward-compatible. Idempotent: re-running re-asserts the
+/// same key.
+///
+/// NOTE: this relies on msb reading `MSB_HOME/config.json`. agent-vm must not
+/// set `MSB_CONFIG_PATH` (which would redirect the SDK's config_path() and
+/// silently bypass this file). See module docs.
+fn write_shared_cache_config(msb_home: &Path, cache_dir: &Path) -> Result<()> {
+    let config_path = msb_home.join(MSB_CONFIG_FILENAME);
+
+    // JSON can only hold a UTF-8 path; reject non-UTF-8 rather than writing a
+    // lossily-mangled directory the user never asked for.
+    let cache_str = cache_dir.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "shared cache dir {} is not valid UTF-8; set {MSB_CACHE_DIR_ENV} to a UTF-8 path",
+            cache_dir.display()
+        )
+    })?;
+
+    let mut doc: serde_json::Value = match std::fs::read(&config_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "parsing existing {} (fix or remove it to re-enable shared cache)",
+                config_path.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", config_path.display())),
+    };
+
+    let obj = doc.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is not a JSON object; refusing to overwrite",
+            config_path.display()
+        )
+    })?;
+    let paths = obj
+        .entry("paths")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let paths_obj = paths.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "`paths` in {} is not a JSON object; refusing to overwrite",
+            config_path.display()
+        )
+    })?;
+    paths_obj.insert(
+        "cache".to_string(),
+        serde_json::Value::String(cache_str.to_string()),
+    );
+
+    // Ensure the shared cache dir exists before msb uses it. Skip the syscall
+    // when it already exists (the common shared-path case) so a transient mount
+    // issue on an existing dir can't fail an otherwise-idempotent re-run.
+    if !cache_dir.exists() {
+        std::fs::create_dir_all(cache_dir)
+            .with_context(|| format!("creating shared msb cache dir {}", cache_dir.display()))?;
+    }
+
+    let mut serialized = serde_json::to_vec_pretty(&doc).context("serializing msb config.json")?;
+    serialized.push(b'\n');
+    crate::host_paths::atomic_write(&config_path, &serialized, 0o644)
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    Ok(())
+}
+
 /// Point msb at the agent-vm-controlled state dir instead of
 /// `~/.microsandbox/`.
 ///
@@ -197,6 +328,23 @@ pub fn resolved_msb_path() -> Result<Option<PathBuf>> {
 /// (`MSB_PATH` → sibling `lib/`); writable bits (db, cache,
 /// sandboxes, logs, secrets, tls/CA) live here.
 ///
+/// ## Opt-in shared OCI image cache
+///
+/// Set `AGENT_VM_SHARE_MSB_CACHE=1` (or `true`) to redirect only the `cache`
+/// directory (OCI image layers/vmdk/manifests) at the shared
+/// `~/.microsandbox/cache` a separately-installed msb uses — override the
+/// location with `AGENT_VM_MSB_CACHE_DIR=<path>`. Everything else (`db/`,
+/// `tls/`, `secrets/`, `sandboxes/`, and `lib/`/libkrunfw) stays private
+/// under this `MSB_HOME`, so the shadowing hazard above is not
+/// reintroduced. Off by default: the other `msb` may be a different
+/// microsandbox version than the vendored fork, and the on-disk cache
+/// format is not guaranteed compatible across versions. Implemented by
+/// merge-writing `paths.cache` into `MSB_HOME/config.json`; this relies on
+/// msb reading that file, so agent-vm must never set `MSB_CONFIG_PATH`.
+/// When the flag is unset/falsey, `config.json` is never read or written —
+/// flipping the flag off later does NOT revert an already-written
+/// `config.json`; see README.md for the manual revert step.
+///
 /// Idempotent. Returns the path that was pinned.
 pub fn point_at_msb_home() -> Result<PathBuf> {
     let dir = crate::host_paths::state_root()
@@ -208,6 +356,17 @@ pub fn point_at_msb_home() -> Result<PathBuf> {
     // spins up. setenv() is not thread-safe; this ordering invariant
     // is the only thing that makes the call sound.
     unsafe { std::env::set_var("MSB_HOME", &dir) };
+
+    // Opt-in only: redirect the OCI image cache at the shared
+    // `~/.microsandbox/cache` a separately-installed msb uses. Off by
+    // default; when unset/falsey we do NOT read or write config.json at all
+    // (today's behaviour). db/tls/secrets/sandboxes stay private under
+    // MSB_HOME. See doc comment above + README.md.
+    if env_flag_enabled(SHARE_MSB_CACHE_ENV) {
+        let cache_dir = resolve_shared_cache_dir()?;
+        write_shared_cache_config(&dir, &cache_dir)?;
+    }
+
     Ok(dir)
 }
 
@@ -474,5 +633,195 @@ mod tests {
              - Other source builds? Run `cd vendor/microsandbox && just build release`."
         );
         assert!(!message.contains("submodule is uninitialized"));
+    }
+
+    // --- opt-in shared msb cache ---
+
+    #[test]
+    fn parse_flag_matches_documented_truthy_values_only() {
+        for truthy in ["1", "true", "TRUE", " true "] {
+            assert!(parse_flag(truthy), "expected {truthy:?} to be truthy");
+        }
+        for falsy in ["0", "false", "", "yes", "on", "nope"] {
+            assert!(!parse_flag(falsy), "expected {falsy:?} to be falsy");
+        }
+    }
+
+    #[test]
+    fn write_shared_cache_config_creates_config_on_empty_home() {
+        let msb_home = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_dir = cache_dir.path().join("shared-cache");
+
+        write_shared_cache_config(msb_home.path(), &cache_dir).unwrap();
+
+        let doc: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(msb_home.path().join(MSB_CONFIG_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc["paths"]["cache"],
+            serde_json::Value::String(cache_dir.to_str().unwrap().to_string())
+        );
+        assert!(cache_dir.is_dir(), "cache dir should have been created");
+    }
+
+    #[test]
+    fn write_shared_cache_config_merges_preserves_existing_keys() {
+        let msb_home = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_dir = cache_dir.path().join("shared-cache");
+        std::fs::write(
+            msb_home.path().join(MSB_CONFIG_FILENAME),
+            r#"{"log_level":"info","paths":{"msb":"/x/msb"}}"#,
+        )
+        .unwrap();
+
+        write_shared_cache_config(msb_home.path(), &cache_dir).unwrap();
+
+        let doc: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(msb_home.path().join(MSB_CONFIG_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc["log_level"],
+            serde_json::Value::String("info".to_string())
+        );
+        assert_eq!(
+            doc["paths"]["msb"],
+            serde_json::Value::String("/x/msb".to_string())
+        );
+        assert_eq!(
+            doc["paths"]["cache"],
+            serde_json::Value::String(cache_dir.to_str().unwrap().to_string())
+        );
+    }
+
+    #[test]
+    fn write_shared_cache_config_is_idempotent() {
+        let msb_home = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_dir = cache_dir.path().join("shared-cache");
+
+        write_shared_cache_config(msb_home.path(), &cache_dir).unwrap();
+        let first = std::fs::read(msb_home.path().join(MSB_CONFIG_FILENAME)).unwrap();
+        write_shared_cache_config(msb_home.path(), &cache_dir).unwrap();
+        let second = std::fs::read(msb_home.path().join(MSB_CONFIG_FILENAME)).unwrap();
+
+        assert_eq!(
+            first, second,
+            "re-running should produce byte-identical output"
+        );
+    }
+
+    #[test]
+    fn write_shared_cache_config_refuses_malformed_existing_config() {
+        let msb_home = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_dir = cache_dir.path().join("shared-cache");
+        std::fs::write(msb_home.path().join(MSB_CONFIG_FILENAME), "not json at all").unwrap();
+
+        let err = write_shared_cache_config(msb_home.path(), &cache_dir).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains(MSB_CONFIG_FILENAME),
+            "expected path in error: {msg}"
+        );
+        assert!(
+            msg.contains("fix or remove"),
+            "expected recovery hint in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn write_shared_cache_config_refuses_non_object_paths() {
+        let msb_home = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_dir = cache_dir.path().join("shared-cache");
+        std::fs::write(msb_home.path().join(MSB_CONFIG_FILENAME), r#"{"paths":42}"#).unwrap();
+
+        let err = write_shared_cache_config(msb_home.path(), &cache_dir).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("paths"),
+            "expected `paths` mentioned in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_shared_cache_dir_from_prefers_explicit_override() {
+        let override_dir = std::ffi::OsString::from("/explicit/cache");
+        let home = std::ffi::OsString::from("/home/user");
+        let resolved =
+            resolve_shared_cache_dir_from(Some(override_dir.as_os_str()), Some(home.as_os_str()))
+                .unwrap();
+        assert_eq!(resolved, PathBuf::from("/explicit/cache"));
+    }
+
+    #[test]
+    fn resolve_shared_cache_dir_from_falls_back_to_home() {
+        let home = std::ffi::OsString::from("/home/user");
+        let resolved = resolve_shared_cache_dir_from(None, Some(home.as_os_str())).unwrap();
+        assert_eq!(resolved, PathBuf::from("/home/user/.microsandbox/cache"));
+
+        let empty_override = std::ffi::OsString::from("");
+        let resolved =
+            resolve_shared_cache_dir_from(Some(empty_override.as_os_str()), Some(home.as_os_str()))
+                .unwrap();
+        assert_eq!(resolved, PathBuf::from("/home/user/.microsandbox/cache"));
+    }
+
+    #[test]
+    fn resolve_shared_cache_dir_from_errors_without_home_or_override() {
+        let err = resolve_shared_cache_dir_from(None, None).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("HOME"), "expected $HOME mentioned: {msg}");
+        assert!(
+            msg.contains(SHARE_MSB_CACHE_ENV),
+            "expected env var name: {msg}"
+        );
+        assert!(
+            msg.contains(MSB_CACHE_DIR_ENV),
+            "expected override env var name: {msg}"
+        );
+    }
+
+    /// Contract test: proves microsandbox's own `LocalConfig` actually
+    /// resolves the key/nesting this module writes. Without this, a silent
+    /// mis-nesting would still pass the tests above (they only check our own
+    /// JSON shape) yet redirect nothing, because `LocalConfig` is
+    /// `#[serde(default)]` and tolerates unknown/misplaced keys.
+    #[test]
+    fn written_config_is_honoured_by_microsandbox_local_config() {
+        let msb_home = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_dir = cache_dir.path().join("shared-cache");
+
+        write_shared_cache_config(msb_home.path(), &cache_dir).unwrap();
+
+        let bytes = std::fs::read(msb_home.path().join(MSB_CONFIG_FILENAME)).unwrap();
+        let cfg: microsandbox::config::LocalConfig = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(cfg.cache_dir(), cache_dir);
+    }
+
+    #[test]
+    fn write_shared_cache_config_rejects_non_utf8_cache_path() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let msb_home = tempfile::tempdir().unwrap();
+        // 0x80 is not a valid standalone UTF-8 byte.
+        let non_utf8 = std::ffi::OsStr::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]);
+        let cache_dir = PathBuf::from(non_utf8);
+
+        let err = write_shared_cache_config(msb_home.path(), &cache_dir).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.to_lowercase().contains("utf-8"),
+            "expected UTF-8 mentioned: {msg}"
+        );
+        assert!(
+            !msb_home.path().join(MSB_CONFIG_FILENAME).exists(),
+            "no config.json should be written on rejection"
+        );
     }
 }
