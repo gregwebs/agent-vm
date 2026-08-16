@@ -128,6 +128,40 @@ Env-var knobs (all opt-in; set to *any* value, empty included):
 | `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
 
+## Shared microsandbox image cache
+
+By default agent-vm keeps its microsandbox state — including the OCI image
+cache — entirely private under `~/.local/state/agent-vm/msb-home/`, so a
+separately installed `msb` (Homebrew on macOS; a distro package,
+`cargo install`, or a from-source build on Linux) can never shadow
+agent-vm's KVM-enabled `libkrunfw`. That also means agent-vm and any other
+`msb` install each store and pull their own copy of every image.
+
+Set `AGENT_VM_SHARE_MSB_CACHE=1` (accepted values: `1` or `true`) to opt into
+redirecting only agent-vm's image cache at the shared `~/.microsandbox/cache`
+directory that other `msb` uses, so image layers/vmdk/manifests aren't stored
+or pulled twice. Use `AGENT_VM_MSB_CACHE_DIR=<path>` to point at a
+non-default cache location instead.
+
+What stays private: `db/`, `tls/`, `secrets/`, and `sandboxes/` remain under
+`~/.local/state/agent-vm/msb-home/`; only the cache is shared. `libkrunfw` is
+unaffected (resolved via `MSB_PATH`, not the cache override), so the
+shadowing protection above is unchanged.
+
+Caveat: only enable this when the other `msb`'s version is close to the
+vendored fork's — the on-disk cache format (erofs/vmdk/manifest schema) is
+not guaranteed compatible across microsandbox versions. Avoid running the
+two concurrently against the shared cache with mismatched versions. If
+images misbehave, unset the variable to fall back to the private cache.
+
+**Reverting is a manual step.** The redirect is persisted to
+`~/.local/state/agent-vm/msb-home/config.json`. Unsetting
+`AGENT_VM_SHARE_MSB_CACHE` does **not** by itself restore the private cache —
+agent-vm only writes `config.json` when the flag is on, so a later flag-off
+run leaves the previously written `paths.cache` pointing at the shared
+directory. To fully revert, delete that `config.json` (or remove the
+`paths.cache` key from it).
+
 ## Chrome DevTools MCP
 
 The image ships chromium and a `chrome-devtools` MCP entry pinned to

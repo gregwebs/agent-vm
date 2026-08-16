@@ -200,3 +200,10 @@ SSL_CERT_FILE=/etc/ssl/cert.pem ./script/build/macos.sh
 ### Kernel extraction fails under Colima
 
 Some Colima VirtioFS configurations reject symlinks while extracting the Linux kernel. Use Docker Desktop for the firmware build; its file sharing handles the vendored libkrunfw source layout reliably.
+
+### Sharing the OCI image cache with a Homebrew `msb`
+
+This is not macOS-specific — see [Shared microsandbox image cache](README.md#shared-microsandbox-image-cache)
+in the main README, which covers agent-vm on any platform alongside any
+separately-installed `msb` (Homebrew, a distro package, `cargo install`,
+etc.).
