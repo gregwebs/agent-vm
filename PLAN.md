@@ -146,7 +146,7 @@ Carried over from the old plan; the IRQ/split-irqchip one (#3) is resolved.
 2. **ARCHITECTURE.md is the source of truth for the *why*.** Every nontrivial
    design choice gets a short subsection: chosen / rejected / why.
 3. **microsandbox changes go into the submodule**, on a branch of
-   `wirenboard/microsandbox`, never vendored copies. Merge the submodule
+   `gregwebs/microsandbox`, never vendored copies. Merge the submodule
    branch before the superproject (see AGENTS.md).
 4. **Bump the workspace version on every merge** into `rewrite-microsandbox`
    (see AGENTS.md).

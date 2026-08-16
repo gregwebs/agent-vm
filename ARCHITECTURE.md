@@ -19,7 +19,7 @@ microsandbox-rewrite/
 │       ├── Cargo.toml
 │       └── src/main.rs         # hello-world sandbox boot
 ├── vendor/
-│   └── microsandbox/           # git submodule, wirenboard/microsandbox
+│   └── microsandbox/           # git submodule, gregwebs/microsandbox
 └── .gitmodules
 ```
 
@@ -35,7 +35,7 @@ our crate's manifest noise.
 - **Phase 3 requires extending microsandbox.** The new `SecretValue::File`
   variant lives in `microsandbox-network`. A path dep against a sibling
   checkout works for one developer but not for CI or contributors. A submodule
-  pinned to a branch on our fork (`wirenboard/microsandbox`) makes the
+  pinned to a branch on our fork (`gregwebs/microsandbox`) makes the
   checkout self-contained and the upstream diff reviewable.
 - **`[patch]` against crates.io** also works, but it duplicates the source-of-
   truth pointer (Cargo.lock + patch table) and hides the fact that we are
@@ -85,7 +85,7 @@ images/
 
 crates/agent-vm/src/
 ├── main.rs           # clap entry; dispatches to subcommands
-└── setup.rs          # `agent-vm setup`: invoke build.sh, then verify in microsandbox
+└── setup.rs          # `agent-vm setup`: pull selected image, then verify in microsandbox
 ```
 
 ### Image distribution: local Docker registry vs. alternatives
@@ -155,18 +155,20 @@ re-measure with `docker images` when you care about exact bytes).
 Registry layer count is bounded by the `RUN` granularity in the
 Dockerfile.
 
-### Image build is shelled to Bash, not done in Rust
+### Registry-backed image building stays in Bash
 
-`crates/agent-vm/src/setup.rs::run_build_script` spawns
-`bash images/build.sh`. We don't talk to the Docker daemon directly because:
+`images/build.sh` builds and pushes through a loopback registry as a separate
+developer workflow. It is not invoked by `agent-vm setup`: setup pulls the
+selected registry reference with `PullPolicy::Always`, then optionally boots
+it for verification.
 
-- Docker has a CLI that every developer already knows how to read, run, and
-  debug. A Rust caller wrapping the API would only add a layer.
-- The build script is the right place for host-shell idioms (volumes,
-  port-forwarding the registry, `docker inspect` checks) and stays out of
-  the way of the Rust binary's logic.
-- Rebuilding the image doesn't require recompiling the binary, and vice
-  versa.
+Docker's CLI remains the right interface for the registry-backed build script:
+it keeps host-shell volume, port-forwarding, and `docker inspect` details out
+of the Rust binary. Rebuilding the image does not require recompiling the
+binary, and rebuilding the binary does not unexpectedly mutate an image
+cache. Apple Silicon developers can instead use
+`script/build/import-image.sh` to load an existing native local Docker image
+without a registry.
 
 The Rust side does own the **verify** step (boot from the freshly pushed
 image, run the three `--version` commands), because that step is exactly the
@@ -520,7 +522,7 @@ vendor/microsandbox/  (branch: agent-vm-secret-file)
         └── handler.rs          #   per-connection state machine
 
 crates/agent-vm/src/
-├── msb_install.rs              # new: build patched msb from vendor; point MSB_PATH at it
+├── msb_install.rs              # discover and validate patched msb; point MSB_PATH at it
 ├── intercept_hook.rs           # new: `agent-vm _intercept-hook` subprocess
 ├── secrets.rs                  # switched from Static(token) to File(<state>.secrets/{anthropic,openai})
 └── run.rs                      # registers the interceptor with two rules
@@ -528,15 +530,21 @@ crates/agent-vm/src/
 
 ### Patched `msb` shipped via `MSB_PATH`
 
-`agent-vm setup` now runs
-`cargo build --release -p microsandbox-cli --bin msb` in
-`vendor/microsandbox` and leaves the artifact at
-`vendor/microsandbox/target/release/msb`. At startup, every agent-vm
-invocation sets `MSB_PATH` to that path (top of microsandbox's
-resolution ladder), so the patched binary is what actually runs the
-VM. The user's `~/.microsandbox/bin/msb` is never touched and
-upstream-installed tooling on the same host keeps using its own
-prebuilt.
+At startup, every agent-vm invocation resolves and validates its patched
+`msb` before constructing the async runtime, then sets `MSB_PATH` to that
+binary (the top of microsandbox's resolution ladder). Discovery prefers an
+explicit `MSB_PATH`, then an `msb` sibling in an installed bundle, then the
+signed source artifact at `vendor/microsandbox/build/msb`. The user's
+`~/.microsandbox/bin/msb` is never touched, so upstream-installed tooling on
+the same host keeps using its own prebuilt.
+
+The root `script/build/macos.sh` source-build interface owns production of the
+vendored runtime. It directly drives the pinned vendored macOS build sequence
+and assembles the signed artifact with its firmware, so `just` is not a root
+build prerequisite. `agent-vm setup` does not build or refresh `msb`; it only
+pulls and optionally boots the selected registry image. On macOS, Cargo's raw
+`vendor/microsandbox/target/release/msb` lacks the required
+`com.apple.security.hypervisor` entitlement and is not a runnable substitute.
 
 The real msb binary lives in the `microsandbox-cli` crate; the
 `microsandbox` crate has a separate `microsandbox` binary that's

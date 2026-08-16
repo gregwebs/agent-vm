@@ -2457,8 +2457,8 @@ options ndots:2 timeout:1";
         // If origin happens to be non-github (rare), we still expect
         // the submodule slug.
         assert!(
-            slugs.iter().any(|s| s.eq_ignore_ascii_case("wirenboard/microsandbox")),
-            "expected wirenboard/microsandbox in scope, got {slugs:?}"
+            slugs.iter().any(|s| s.eq_ignore_ascii_case("gregwebs/microsandbox")),
+            "expected gregwebs/microsandbox in scope, got {slugs:?}"
         );
     }
 
