@@ -220,6 +220,7 @@ Networking (deny-by-default; flags compose):
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
   AGENT_VM_IMAGE_TAG                    same as --image
+  AGENT_VM_UPDATE_CHECK                 check the registry for a newer image (1|true|yes|on)
   AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls
   AGENT_VM_STATE_DIR                    override the per-project state dir
   AGENT_VM_PROFILE                      print per-phase boot timings
@@ -364,13 +365,15 @@ pub struct Args {
     #[arg(long, env = "AGENT_VM_IMAGE_TAG", value_name = "REF", help_heading = "Image")]
     image: Option<String>,
 
-    /// Skip the launch-time registry update check.
+    /// Check the registry for a newer image at launch (opt-in).
     ///
-    /// Don't HEAD the registry for a newer manifest digest (skips the
-    /// "==> A newer image is available …" banner). Useful in CI and on
-    /// flaky networks.
-    #[arg(long = "no-update-check", default_value_t = false, help_heading = "Image")]
-    no_update_check: bool,
+    /// HEADs the registry manifest and prints the "==> A newer image is
+    /// available …" banner if the cached image is stale. Off by default so a
+    /// normal launch makes no registry contact; run `agent-vm pull` to fetch an
+    /// update. Can also be enabled persistently with a truthy
+    /// `AGENT_VM_UPDATE_CHECK` (1|true|yes|on).
+    #[arg(long = "update-check", default_value_t = false, help_heading = "Image")]
+    update_check: bool,
 
     /// Args passed verbatim to the agent; use -- before any agent flags.
     ///
@@ -438,9 +441,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // PullPolicy::IfMissing keeps the slow part (pull + materialize) off
     // every launch. We separately HEAD the manifest at the registry via
     // image_check::check_for_update and print a banner if there's a newer
-    // image available — the user runs `agent-vm pull` explicitly to
-    // fetch it.
-    if !args.no_update_check {
+    // image available — but only when opted in via `--update-check` /
+    // `AGENT_VM_UPDATE_CHECK`; otherwise a normal launch makes no registry
+    // contact at all. The user runs `agent-vm pull` explicitly to fetch it.
+    let update_check_env = std::env::var("AGENT_VM_UPDATE_CHECK").ok();
+    if should_check_update(args.update_check, update_check_env.as_deref()) {
         // The update banner is purely informational, so keep it OFF the
         // launch critical path: seed the baseline pulled-digest marker
         // (so the banner has something to compare against on this launch,
@@ -1923,6 +1928,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn update_check_is_off_by_default_and_opt_in() {
+        // Default: no flag, no env → no probe.
+        assert!(!should_check_update(false, None));
+        assert!(!should_check_update(false, Some("")));
+        assert!(!should_check_update(false, Some("0")));
+        assert!(!should_check_update(false, Some("false")));
+        assert!(!should_check_update(false, Some("garbage")));
+        // Flag opt-in.
+        assert!(should_check_update(true, None));
+        // Env opt-in (repo truthy set).
+        assert!(should_check_update(false, Some("1")));
+        assert!(should_check_update(false, Some("true")));
+        assert!(should_check_update(false, Some("yes")));
+        assert!(should_check_update(false, Some("on")));
+        // Either input enables (flag OR env).
+        assert!(should_check_update(true, Some("0")));
+    }
+
+    #[test]
+    fn should_check_update_matches_repo_truthy_convention_exactly() {
+        // Uppercase variants in the repo's allowlist (mirrors
+        // pull::env_truthy) are truthy.
+        assert!(should_check_update(false, Some("TRUE")));
+        assert!(should_check_update(false, Some("YES")));
+        assert!(should_check_update(false, Some("ON")));
+        // The allowlist is NOT fully case-insensitive: mixed-case variants
+        // outside the exact literal set are left off by design (consistent
+        // with pull::env_truthy), so e.g. "True" does NOT enable the probe.
+        assert!(!should_check_update(false, Some("True")));
+        assert!(!should_check_update(false, Some("Yes")));
+        assert!(!should_check_update(false, Some("On")));
+        assert!(!should_check_update(false, Some("TrUe")));
+    }
+
+    #[test]
+    fn update_check_flag_parses_via_clap() {
+        // `Args` is normally flattened into a subcommand variant
+        // (`main.rs`'s `Cmd::Shell(run::Args)` etc.); wrap it the same way
+        // here so `--update-check` goes through real clap parsing rather
+        // than calling `should_check_update` directly.
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: Args,
+        }
+        use clap::Parser as _;
+
+        // No flag → off by default.
+        let cli = TestCli::try_parse_from(["agent-vm"]).expect("parses with no flags");
+        assert!(!cli.args.update_check);
+
+        // `--update-check` parses and flips the field on.
+        let cli = TestCli::try_parse_from(["agent-vm", "--update-check"])
+            .expect("parses --update-check");
+        assert!(cli.args.update_check);
+
+        // The removed `--no-update-check` flag is no longer a recognized
+        // option, but `agent_args` is a `trailing_var_arg` +
+        // `allow_hyphen_values` catch-all, so clap does NOT hard-reject an
+        // unknown `--xxx`: it silently absorbs it as a positional and
+        // forwards it to the launched agent/shell command instead of
+        // erroring. Lock in that (surprising but pre-existing, unrelated to
+        // this change) behavior so it doesn't silently change later.
+        let cli = TestCli::try_parse_from(["agent-vm", "--no-update-check"])
+            .expect("old flag string still parses (absorbed into agent_args, not rejected)");
+        assert!(!cli.args.update_check);
+        assert_eq!(cli.args.agent_args, vec!["--no-update-check".to_string()]);
+    }
+
+    #[test]
     fn shell_escape_handles_simple_and_quoted() {
         assert_eq!(shell_escape("foo"), "'foo'");
         assert_eq!(shell_escape("--flag=value with spaces"), "'--flag=value with spaces'");
@@ -2541,6 +2616,17 @@ async fn notify_if_update_available(image: &str) {
         // Err(Elapsed): probe exceeded the budget — stay quiet.
         _ => {}
     }
+}
+
+/// Whether to run the launch-time registry update probe.
+///
+/// Off by default. Enabled by the `--update-check` flag OR a truthy
+/// `AGENT_VM_UPDATE_CHECK` env var. `env_val` is the raw value of that
+/// variable (`None` when unset), so this stays pure and unit-testable.
+/// Truthy values match the repo convention (`1|true|yes|on`,
+/// see `pull::env_truthy`).
+fn should_check_update(flag: bool, env_val: Option<&str>) -> bool {
+    flag || matches!(env_val, Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
 }
 
 /// Wall-clock budget for the launch-path update probe. Bounds the worst

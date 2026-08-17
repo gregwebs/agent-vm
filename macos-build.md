@@ -82,7 +82,7 @@ From a disposable project directory, verify the cached image without a registry 
 ```bash
 /path/to/agent-vm/target/macos/bin/agent-vm shell \
   --image agent-vm-template:latest \
-  --no-update-check -- uname -m
+  -- uname -m
 ```
 
 The guest should print `aarch64`, the command should exit successfully, and the sandbox should stop cleanly. `agent-vm setup` is not a local-cache check: setup deliberately pulls its selected image with `PullPolicy::Always`.

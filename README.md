@@ -109,7 +109,7 @@ Each launcher accepts:
 | `--memory N` | VM memory GiB (default 2) |
 | `--cpus N` | vCPUs (default 2) |
 | `--image REF` | override the OCI image |
-| `--no-update-check` | skip the registry HEAD on launch |
+| `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
 | `--mount HOST[:GUEST]` | extra bind mount (one virtio-fs each, ~210 mount headroom) |
@@ -117,7 +117,8 @@ Each launcher accepts:
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
 `agent-vm shell -- -c 'cargo test'`.
 
-Env-var knobs (all opt-in; set to *any* value, empty included):
+Env-var knobs (all opt-in; most accept any value, empty included —
+`AGENT_VM_UPDATE_CHECK` is the exception, see its row):
 
 | var | what |
 |---|---|
@@ -127,6 +128,7 @@ Env-var knobs (all opt-in; set to *any* value, empty included):
 | `AGENT_VM_NO_CHROME_MCP` | skip the Chrome DevTools MCP entirely (no entry in claude.json, no chrome-user setup at boot) |
 | `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
+| `AGENT_VM_UPDATE_CHECK` | opt into the launch-time registry update check (accepted: `1`/`true`/`yes`/`on`) |
 
 ## Shared microsandbox image cache
 

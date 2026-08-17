@@ -107,7 +107,7 @@ main() {
         target/macos/bin/msb image load --tag "$tag"
 
     echo "==> Imported $tag"
-    printf 'Verify offline with:\n  %q shell --image %q --no-update-check -- uname -m\n' \
+    printf 'Verify offline with:\n  %q shell --image %q -- uname -m\n' \
         "$REPO_ROOT/target/macos/bin/agent-vm" "$tag"
     echo "Note: msb stages the incoming archive in temporary storage, so keep roughly one archive's worth of disk free."
 }
