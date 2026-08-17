@@ -11,7 +11,8 @@ booting in ~2 seconds, with:
   `git remote -v`; extend with `--repo OWNER/NAME`. `gh pr create`,
   `git push` etc. are filtered at the proxy — off-list calls get a 403
   before they reach GitHub.
-- **Sandbox is the boundary.** Root inside the VM, project bind-mounted
+- **Sandbox is the boundary.** The guest runs as your host user by
+  default (`--root` for the old root-guest behavior), project bind-mounted
   at its host path, `--dangerously-skip-permissions` set by default
   (the microVM is the only thing actually keeping the agent on rails).
 
@@ -113,6 +114,7 @@ Each launcher accepts:
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
 | `--mount HOST[:GUEST]` | extra bind mount (one virtio-fs each, ~210 mount headroom) |
+| `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
 `agent-vm shell -- -c 'cargo test'`.
@@ -129,6 +131,7 @@ Env-var knobs (all opt-in; most accept any value, empty included —
 | `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
 | `AGENT_VM_UPDATE_CHECK` | opt into the launch-time registry update check (accepted: `1`/`true`/`yes`/`on`) |
+| `AGENT_VM_ROOT` | same as `--root` (accepted: `1`/`true`/`yes`/`on`) |
 
 ## Shared microsandbox image cache
 
@@ -164,15 +167,41 @@ run leaves the previously written `paths.cache` pointing at the shared
 directory. To fully revert, delete that `config.json` (or remove the
 `paths.cache` key from it).
 
+## Guest user / `--root`
+
+By default the in-guest agent runs as **the host user** — the same
+uid/gid that invoked `agent-vm` — instead of root. This is defense-in-depth
+on top of the microVM boundary itself; matching the host uid is also
+required to keep write access to the project/state bind mounts (a
+non-root guest uid only gets owner bits on those when it equals the real
+host uid). `whoami`/`id` inside the guest report a user named `agent`
+resolving to your host uid/gid; `$HOME` is `/agent-vm-state/home` (a
+directory inside the per-project state dir), with the same
+`.claude`/`.gitconfig`/`.config/gh`/etc. dotfile symlinks root mode has
+always had, just rooted there instead of at `/root`.
+
+Pass `--root` (or set `AGENT_VM_ROOT=1`) to restore the previous
+behavior: guest uid 0, `HOME=/root`. You need `--root` for:
+
+- **Docker-in-VM** — `dockerd` needs root; there's no non-root path for it.
+- Anything else that specifically expects to run as root inside the guest.
+
+See [`docs/adr/0001-non-root-guest-via-native-user.md`](docs/adr/0001-non-root-guest-via-native-user.md)
+for the full design rationale.
+
 ## Chrome DevTools MCP
 
 The image ships chromium and a `chrome-devtools` MCP entry pinned to
 `chrome-devtools-mcp@1.0.1`. To keep chromium's nested user-namespace
-sandbox active (we'd rather not pass `--no-sandbox`) the MCP runs as a
-dedicated `chrome` user via a sudo wrapper at
-`/usr/local/bin/agent-vm-chrome-mcp`. The launcher installs the
-per-boot microsandbox MITM CA into chrome's NSS DB at startup so
-chromium accepts the intercepted TLS chain without
+sandbox active (we'd rather not pass `--no-sandbox`) chromium needs to run
+as a non-root user. In the default non-root guest mode the agent is
+already non-root, so the MCP wrapper (`agent-vm-chrome-mcp`) just runs
+chromium directly as that user — no `sudo` involved — and imports the
+microsandbox MITM CA into its own per-user NSS DB. Under `--root` the
+wrapper instead re-execs the MCP under a dedicated `chrome` user via a
+sudo wrapper, same as before this change. Either way the launcher/wrapper
+installs the per-boot microsandbox MITM CA into the running user's NSS DB
+at startup so chromium accepts the intercepted TLS chain without
 `--acceptInsecureCerts` (which would trust *any* untrusted cert).
 
 If the CA install fails (e.g. someone broke the in-image sudoers rule)
