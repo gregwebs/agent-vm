@@ -440,7 +440,7 @@ check_import() {
     assert_file_contains "$fixture/calls.log" "MSB_HOME=$expected_home args=image load --tag $expected_tag payload=fake-archive"
     printf -v expected_agent_vm '%q' "$fixture/target/macos/bin/agent-vm"
     printf -v expected_shell_tag '%q' "$expected_tag"
-    assert_contains "$output" "  $expected_agent_vm shell --image $expected_shell_tag --no-update-check -- uname -m"
+    assert_contains "$output" "  $expected_agent_vm shell --image $expected_shell_tag -- uname -m"
     set -- "$fixture"/*.tar
     [[ ! -e "$1" ]] || fail "import created a caller-managed tar"
 }
