@@ -46,7 +46,7 @@ LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm to
 # makes any other use of the image correct too.
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
-    PATH=/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin \
+    PATH=/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin \
     LANG=C.UTF-8
 
 # Image-API contract version. Bump on BREAKING image changes only
@@ -165,13 +165,17 @@ RUN apt-get update \
  && ln -sf /usr/bin/chromium /opt/google/chrome/chrome
 
 # Dedicated `chrome` user so chromium's user-namespace sandbox can
-# initialize. As root chromium refuses to set up its sandbox and the
-# CDP target closes immediately (`Protocol error
-# (Target.setDiscoverTargets): Target closed`); the alternative is
-# `--no-sandbox`, which we'd rather not pass — the microVM is the
+# initialize — needed in ROOT mode only. As root chromium refuses to
+# set up its sandbox and the CDP target closes immediately (`Protocol
+# error (Target.setDiscoverTargets): Target closed`); the alternative
+# is `--no-sandbox`, which we'd rather not pass — the microVM is the
 # outer boundary, but keeping chromium's nested sandbox active is a
 # real defence-in-depth gain when the agent makes the browser load
-# untrusted content.
+# untrusted content. In the default NON-root mode the agent process
+# is already a non-root uid, which alone satisfies the same sandbox
+# precondition, so the wrapper below runs chromium directly instead
+# of transiting through this `chrome` user (the sudoers rule only
+# grants `root -> chrome`; there's no non-root path to it anyway).
 #
 # /etc/passwd is edited by hand because debian-slim doesn't ship
 # `useradd`. Empty NSS DB is created at image time so the per-launch
@@ -180,9 +184,10 @@ RUN apt-get update \
 # (chrome -> root) transition is allowed.
 #
 # The wrapper script is what the in-image Chrome MCP entry actually
-# launches: it re-execs `npx chrome-devtools-mcp@latest` under the
-# `chrome` user with stdin/stdout preserved so the MCP JSON-RPC pipe
-# from claude still works.
+# launches: in root mode it re-execs `npx chrome-devtools-mcp@latest`
+# under the `chrome` user with stdin/stdout preserved so the MCP
+# JSON-RPC pipe from claude still works; in non-root mode it runs the
+# same command directly as the invoking (already non-root) user.
 RUN echo 'chrome:x:9999:9999:Chrome MCP:/home/chrome:/bin/bash' >> /etc/passwd \
  && echo 'chrome:!:19000:0:99999:7:::' >> /etc/shadow \
  && echo 'chrome:x:9999:' >> /etc/group \
@@ -195,67 +200,107 @@ RUN echo 'chrome:x:9999:9999:Chrome MCP:/home/chrome:/bin/bash' >> /etc/passwd \
  && printf '%s\n' \
         '#!/bin/bash' \
         '# agent-vm chrome MCP wrapper.' \
-        '# Re-exec the MCP server under the `chrome` user so chromium'\''s' \
-        '# user-namespace sandbox initializes (it refuses to as root).' \
+        '#' \
+        '# Root mode (--root/AGENT_VM_ROOT): re-exec the MCP server under the' \
+        '# dedicated `chrome` user so chromium'\''s user-namespace sandbox' \
+        '# initializes (it refuses to as root).' \
+        '#' \
+        '# Non-root mode (the default -- crates/agent-vm/src/run.rs): the' \
+        '# agent already runs as a non-root uid, which alone satisfies' \
+        '# chromium'\''s sandbox precondition, and the sudoers rule below only' \
+        '# grants root -> chrome (there is no non-root -> chrome path) -- so' \
+        '# run chromium directly as whoever invoked us instead.' \
+        '#' \
         '# Args (npx + chrome-devtools-mcp + flags) come from the MCP' \
-        '# config in ~/.claude.json; we just switch UID.' \
-        '#' \
-        '# Preserve list (passed through sudo'\''s env_reset):' \
-        '#  - NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / CURL_CA_BUNDLE /' \
-        '#    REQUESTS_CA_BUNDLE: agentd boot-sets these so any HTTPS' \
-        '#    client trusts the microsandbox MITM CA. Without them' \
-        '#    node fails `npx -y` with SELF_SIGNED_CERT_IN_CHAIN.' \
-        '#  - PATH: needed so npx is findable (sudo'\''s secure_path' \
-        '#    would otherwise replace it).' \
-        '#  - HTTP_PROXY / HTTPS_PROXY / NO_PROXY (upper/lowercase):' \
-        '#    NOT set by agentd (microsandbox uses transparent network' \
-        '#    interception, no HTTP proxy env). Forwarded so that a' \
-        '#    user-supplied MCP `env:` block or .agent-vm.runtime.sh' \
-        '#    setting these is honoured by chromium.' \
-        '#  - CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS / CI / DEBUG:' \
-        '#    user/MCP-config opt-outs and debugging knobs that' \
-        '#    chrome-devtools-mcp documents.' \
-        '#  - TZ / LANG / LC_ALL / TMPDIR: locale + sane temp paths.' \
-        '#' \
-        '# NOT in the preserve list (deliberate):' \
-        '#  - USER / LOGNAME: sudo'\''s default `env_reset` policy re-' \
-        '#    derives these from the target passwd entry. Adding them' \
-        '#    here would forward root'\''s USER into the chrome session.' \
-        '#  - HOME: set by `-H` from chrome'\''s passwd entry (not by' \
-        '#    env passthrough).' \
-        '#' \
-        '# `cd /home/chrome` keeps chromium'\''s default CWD writable' \
-        '# (the agent runs as root in /workspace, where chrome (UID' \
-        '# 9999) cannot write; tools that emit relative paths' \
-        '# (./trace.json, ./screenshot.png) would otherwise EACCES).' \
-        '# Diagnostic on failure so Claude doesn'\''t just see the MCP' \
-        '# transport close before handshake with no breadcrumb.' \
+        '# config in ~/.claude.json; we just decide whether/how to switch UID.' \
         'set -e' \
-        'cd /home/chrome 2>/dev/null || {' \
-        '    echo "agent-vm-chrome-mcp: cannot cd to /home/chrome -- image misconfigured?" >&2' \
+        'if [ "$(id -u)" = 0 ]; then' \
+        '    # Preserve list (passed through sudo'\''s env_reset):' \
+        '    #  - NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / CURL_CA_BUNDLE /' \
+        '    #    REQUESTS_CA_BUNDLE: agentd boot-sets these so any HTTPS' \
+        '    #    client trusts the microsandbox MITM CA. Without them' \
+        '    #    node fails `npx -y` with SELF_SIGNED_CERT_IN_CHAIN.' \
+        '    #  - PATH: needed so npx is findable (sudo'\''s secure_path' \
+        '    #    would otherwise replace it).' \
+        '    #  - HTTP_PROXY / HTTPS_PROXY / NO_PROXY (upper/lowercase):' \
+        '    #    NOT set by agentd (microsandbox uses transparent network' \
+        '    #    interception, no HTTP proxy env). Forwarded so that a' \
+        '    #    user-supplied MCP `env:` block or .agent-vm.runtime.sh' \
+        '    #    setting these is honoured by chromium.' \
+        '    #  - CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS / CI / DEBUG:' \
+        '    #    user/MCP-config opt-outs and debugging knobs that' \
+        '    #    chrome-devtools-mcp documents.' \
+        '    #  - TZ / LANG / LC_ALL / TMPDIR: locale + sane temp paths.' \
+        '    #' \
+        '    # NOT in the preserve list (deliberate):' \
+        '    #  - USER / LOGNAME: sudo'\''s default `env_reset` policy re-' \
+        '    #    derives these from the target passwd entry. Adding them' \
+        '    #    here would forward root'\''s USER into the chrome session.' \
+        '    #  - HOME: set by `-H` from chrome'\''s passwd entry (not by' \
+        '    #    env passthrough).' \
+        '    #' \
+        '    # `cd /home/chrome` keeps chromium'\''s default CWD writable' \
+        '    # (root runs the agent in /workspace, where chrome (UID' \
+        '    # 9999) cannot write; tools that emit relative paths' \
+        '    # (./trace.json, ./screenshot.png) would otherwise EACCES).' \
+        '    # Diagnostic on failure so Claude doesn'\''t just see the MCP' \
+        '    # transport close before handshake with no breadcrumb.' \
+        '    cd /home/chrome 2>/dev/null || {' \
+        '        echo "agent-vm-chrome-mcp: cannot cd to /home/chrome -- image misconfigured?" >&2' \
+        '        exit 1' \
+        '    }' \
+        '    # Import the microsandbox MITM CA into the chrome-owned NSS DB so' \
+        '    # chromium trusts the intercept proxy. chromium on Linux ignores' \
+        '    # the system CA bundle (which curl/node use), honouring only its' \
+        '    # built-in roots + this per-user NSS DB. Done here, once, at MCP' \
+        '    # startup -- NOT on every agent-vm launch (previously a ~270ms' \
+        '    # certutil fork in the launcher prelude) -- and skipped when' \
+        '    # chrome is unused (the MCP server is only spawned when enabled).' \
+        '    # The DB is chrome-owned (UID 9999), so drop to chrome to write it.' \
+        '    # Non-fatal: a failure should warn, not kill the MCP.' \
+        '    _ca=/usr/local/share/ca-certificates/microsandbox-ca.crt' \
+        '    if [ -f "$_ca" ]; then' \
+        '        sudo -u chrome -n -- certutil -d sql:/home/chrome/.pki/nssdb -A \' \
+        '            -t C,, -n microsandbox -i "$_ca" \' \
+        '            || echo "agent-vm-chrome-mcp: warning: failed to import microsandbox CA (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2' \
+        '    fi' \
+        '    exec sudo -u chrome -H -n \' \
+        '        --preserve-env=NODE_EXTRA_CA_CERTS,SSL_CERT_FILE,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE \' \
+        '        --preserve-env=PATH,HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \' \
+        '        --preserve-env=CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS,CI,DEBUG \' \
+        '        --preserve-env=TZ,LANG,LC_ALL,TMPDIR \' \
+        '        -- "$@"' \
+        'fi' \
+        '' \
+        '# Non-root: cd into the agent'\''s own writable $HOME (NOT' \
+        '# /home/chrome, which is owned by uid 9999 and unwritable by a' \
+        '# non-root agent) -- same relative-path-artifact rationale as the' \
+        '# root branch'\''s `cd /home/chrome` above.' \
+        'cd "$HOME" 2>/dev/null || {' \
+        '    echo "agent-vm-chrome-mcp: cannot cd to \$HOME ($HOME) -- image or guest HOME misconfigured?" >&2' \
         '    exit 1' \
         '}' \
-        '# Import the microsandbox MITM CA into the chrome-owned NSS DB so' \
-        '# chromium trusts the intercept proxy. chromium on Linux ignores' \
-        '# the system CA bundle (which curl/node use), honouring only its' \
-        '# built-in roots + this per-user NSS DB. Done here, once, at MCP' \
-        '# startup -- NOT on every agent-vm launch (previously a ~270ms' \
-        '# certutil fork in the launcher prelude) -- and skipped when' \
-        '# chrome is unused (the MCP server is only spawned when enabled).' \
-        '# The DB is chrome-owned (UID 9999), so drop to chrome to write it.' \
-        '# Non-fatal: a failure should warn, not kill the MCP.' \
+        '# Own NSS DB (persists in the state bind across launches) since' \
+        '# there'\''s no `chrome` user in this path; import the MITM CA into it' \
+        '# the same way the root branch does for chrome'\''s DB. Non-fatal --' \
+        '# same as the CA import below: a failure here should warn (chromium' \
+        '# then just distrusts the intercept CA), not kill the MCP transport' \
+        '# via `set -e`.' \
+        'mkdir -p "$HOME/.pki/nssdb"' \
+        '[ -f "$HOME/.pki/nssdb/cert9.db" ] || certutil -d sql:"$HOME/.pki/nssdb" -N --empty-password \' \
+        '    || echo "agent-vm-chrome-mcp: warning: failed to initialize NSS DB (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2' \
         '_ca=/usr/local/share/ca-certificates/microsandbox-ca.crt' \
         'if [ -f "$_ca" ]; then' \
-        '    sudo -u chrome -n -- certutil -d sql:/home/chrome/.pki/nssdb -A \' \
-        '        -t C,, -n microsandbox -i "$_ca" \' \
+        '    certutil -d sql:"$HOME/.pki/nssdb" -A -t C,, -n microsandbox -i "$_ca" \' \
         '        || echo "agent-vm-chrome-mcp: warning: failed to import microsandbox CA (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2' \
         'fi' \
-        'exec sudo -u chrome -H -n \' \
-        '    --preserve-env=NODE_EXTRA_CA_CERTS,SSL_CERT_FILE,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE \' \
-        '    --preserve-env=PATH,HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \' \
-        '    --preserve-env=CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS,CI,DEBUG \' \
-        '    --preserve-env=TZ,LANG,LC_ALL,TMPDIR \' \
-        '    -- "$@"' \
+        '# Caveat: "non-root satisfies chromium'\''s sandbox" holds only if the' \
+        '# guest kernel permits unprivileged user namespaces. A CDP target' \
+        '# that closes immediately here points at that, not at this wrapper.' \
+        '# No sudo/exec-user-switch needed -- we'\''re already the agent user,' \
+        '# so the env agentd boot-set (NODE_EXTRA_CA_CERTS, PATH, etc.) is' \
+        '# inherited directly.' \
+        'exec "$@"' \
         > /usr/local/bin/agent-vm-chrome-mcp \
  && chmod 0755 /usr/local/bin/agent-vm-chrome-mcp
 
@@ -580,28 +625,44 @@ RUN printf '%s\n' \
 # auto-set by images/build.sh on TLS-intercept dev hosts; CI never
 # sets it) turns the three RUNs into warnings instead.
 
+# Shared, world-readable prefix for the agent installs below — NOT /root,
+# which is mode 0700 and unreadable by the non-root guest user agent-vm
+# boots by default (crates/agent-vm/src/run.rs). Each installer RUN sets
+# HOME=/opt/agent for the duration of the install (so the upstream
+# installer script drops its files there) and re-asserts a+rX afterward, in
+# case the installer itself narrowed permissions on something. This also
+# relocates codex's packages/ tree off /root — codex resolves packages/
+# relative to its install location, not via the runtime CODEX_HOME env, so
+# without this a non-root guest's codex would fail to load even though
+# CODEX_HOME already points elsewhere for config/auth.
+RUN mkdir -p /opt/agent && chmod 755 /opt/agent
+
 # Codex CLI official installer.
 ARG AGENT_VERSION_CODEX=
 RUN : "codex ${AGENT_VERSION_CODEX}" \
- && agent-vm-install codex sh \
-        https://github.com/openai/codex/releases/latest/download/install.sh
+ && HOME=/opt/agent agent-vm-install codex sh \
+        https://github.com/openai/codex/releases/latest/download/install.sh \
+ && chmod -R a+rX /opt/agent
 
-# OpenCode official installer. Installs into ~/.opencode/bin; PATH already
-# includes it. Symlink into /usr/local/bin so non-login shells find it too.
-# The symlink is best-effort — under soft-fail mode the install may have
-# been skipped, in which case there's nothing to link.
+# OpenCode official installer. Installs into $HOME/.opencode/bin (=
+# /opt/agent/.opencode/bin); PATH already includes it. Symlink into
+# /usr/local/bin so non-login shells find it too. The symlink is
+# best-effort — under soft-fail mode the install may have been skipped, in
+# which case there's nothing to link.
 ARG AGENT_VERSION_OPENCODE=
 RUN : "opencode ${AGENT_VERSION_OPENCODE}" \
- && agent-vm-install opencode bash https://opencode.ai/install \
- && { [ -x /root/.opencode/bin/opencode ] \
-        && ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode \
-        || true; }
+ && HOME=/opt/agent agent-vm-install opencode bash https://opencode.ai/install \
+ && { [ -x /opt/agent/.opencode/bin/opencode ] \
+        && ln -sf /opt/agent/.opencode/bin/opencode /usr/local/bin/opencode \
+        || true; } \
+ && chmod -R a+rX /opt/agent
 
 # Claude Code official installer. MUST precede the LSP-plugin install below,
-# which invokes /root/.local/bin/claude.
+# which invokes /opt/agent/.local/bin/claude.
 ARG AGENT_VERSION_CLAUDE=
 RUN : "claude ${AGENT_VERSION_CLAUDE}" \
- && agent-vm-install claude bash https://claude.ai/install.sh
+ && HOME=/opt/agent agent-vm-install claude bash https://claude.ai/install.sh \
+ && chmod -R a+rX /opt/agent
 
 # Claude Code LSP plugins (C/C++, Python, TypeScript, Go) baked in so
 # in-VM Claude has code intelligence on first launch. Ports the four
@@ -626,46 +687,58 @@ RUN : "claude ${AGENT_VERSION_CLAUDE}" \
 # both already present, which the marketplace clone + plugin resolution
 # need.
 #
-# Invoke claude by ABSOLUTE PATH (/root/.local/bin/claude): the installer
-# drops the binary there but the only ENV PATH in this file is
-# /usr/local/cargo/bin:$PATH, and Docker RUN uses a non-login /bin/sh that
-# never sources the shell profile the installer edits. A bare `claude`
-# would hit command-not-found (rc 127), every `|| echo skipped` guard would
-# fire, and the RUN would still exit 0 — baking a GREEN image with ZERO LSP
-# plugins. The absolute path matches the `--version` sanity check below and
-# the OpenCode block's /root/.opencode/bin/opencode.
+# Invoke claude by ABSOLUTE PATH (/opt/agent/.local/bin/claude): the
+# installer drops the binary there but Docker RUN uses a non-login /bin/sh
+# that never sources the shell profile the installer edits, so a bare
+# `claude` risks command-not-found (rc 127) if PATH resolution ever
+# changes. The absolute path matches the `--version` sanity check below and
+# the OpenCode block's /opt/agent/.opencode/bin/opencode.
+#
+# HOME=/opt/agent on every invocation: `claude plugin install` writes
+# plugins to $HOME/.claude/plugins, and the Dockerfile's global
+# `ENV HOME=/root` is otherwise still in effect for this RUN. Without this,
+# claude would keep writing plugins to /root/.claude/plugins — invisible to
+# the D2 stash below, which now reads from the relocated
+# /opt/agent/.claude/plugins — silently shipping the guest with ZERO LSP
+# plugins (seed-claude-plugins.sh would find nothing to seed and no-op).
 #
 # A `claude plugin list` runs after the loop so the build log shows which
 # plugins actually landed — without it the best-effort guards would hide a
 # total no-op behind a clean build. If `marketplace add` ever rejects the
 # `owner/repo` shorthand, swap in the explicit URL
 # https://github.com/anthropics/claude-plugins-official.git.
-RUN { /root/.local/bin/claude plugin marketplace add anthropics/claude-plugins-official \
+RUN { HOME=/opt/agent /opt/agent/.local/bin/claude plugin marketplace add anthropics/claude-plugins-official \
         || echo "==> LSP marketplace add skipped (will lazy-add at first plugin use)"; } \
  && for lsp in clangd-lsp pyright-lsp typescript-lsp gopls-lsp; do \
-        /root/.local/bin/claude plugin install "${lsp}@claude-plugins-official" \
+        HOME=/opt/agent /opt/agent/.local/bin/claude plugin install "${lsp}@claude-plugins-official" \
         || echo "==> LSP plugin ${lsp} skipped (install at runtime if needed)"; \
     done \
  && echo "==> LSP plugins installed at build time:" \
- && { /root/.local/bin/claude plugin list || true; }
+ && { HOME=/opt/agent /opt/agent/.local/bin/claude plugin list || true; } \
+ && chmod -R a+rX /opt/agent
 
-# D2 fix: the running guest symlinks /root/.claude -> /agent-vm-state/claude
-# (persistence, run.rs), which shadows the plugin tree baked just above so the
-# booted guest's `claude plugin list` shows nothing. Stash the plugins +
-# settings to a NON-shadowed path and ship a first-boot seed script; the
-# launcher prelude calls it before exec'ing the agent.
+# D2 fix: the running guest symlinks $HOME/.claude -> /agent-vm-state/claude
+# (persistence, run.rs — /root/.claude in root mode, <state_dir>/home/.claude
+# in the default non-root mode), which shadows the plugin tree baked just
+# above so the booted guest's `claude plugin list` shows nothing. Stash the
+# plugins + settings to a NON-shadowed path and ship a first-boot seed
+# script; the launcher prelude calls it before exec'ing the agent. Source is
+# /opt/agent/.claude/... (relocated above, alongside HOME=/opt/agent), not
+# /root/.claude — reading the old root path here would silently make this
+# stash (and thus every non-root guest's LSP plugins) a no-op.
 # Best-effort like the LSP install above: if a transient blip skipped the
 # plugins, stash nothing rather than hard-failing the image — the first-boot
 # seed then becomes a no-op and plugins lazy-install at runtime.
 RUN mkdir -p /opt/agent-vm/claude-seed \
- && if [ -d /root/.claude/plugins ]; then \
-        cp -a /root/.claude/plugins /opt/agent-vm/claude-seed/plugins; \
-        [ -f /root/.claude/settings.json ] \
-            && cp -a /root/.claude/settings.json /opt/agent-vm/claude-seed/settings.json; \
+ && if [ -d /opt/agent/.claude/plugins ]; then \
+        cp -a /opt/agent/.claude/plugins /opt/agent-vm/claude-seed/plugins; \
+        [ -f /opt/agent/.claude/settings.json ] \
+            && cp -a /opt/agent/.claude/settings.json /opt/agent-vm/claude-seed/settings.json; \
         echo "==> stashed claude LSP plugins for first-boot seeding"; \
     else \
-        echo "==> no /root/.claude/plugins to stash (LSP install skipped); D2 seed is a no-op"; \
-    fi
+        echo "==> no /opt/agent/.claude/plugins to stash (LSP install skipped); D2 seed is a no-op"; \
+    fi \
+ && chmod -R a+rX /opt/agent-vm/claude-seed
 COPY seed-claude-plugins.sh /opt/agent-vm/seed-claude-plugins.sh
 RUN chmod +x /opt/agent-vm/seed-claude-plugins.sh
 

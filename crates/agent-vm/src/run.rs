@@ -166,7 +166,10 @@ impl Agent {
     /// this, two concurrent `agent-vm shell` invocations in the same
     /// project would have the later-exiting shell wholesale clobber
     /// the earlier shell's commands (the symlink target is the same
-    /// host file, see `run.rs`'s `.symlink(... "/root/.bash_history" ...)`).
+    /// host file — `.bash_history` in [`crate::session::GUEST_HOME_LINKS`],
+    /// wired up per guest-user mode by the `.patch()` block in `launch()`
+    /// (root mode) or [`crate::session::ProjectSession::provision_guest_home`]
+    /// (non-root mode)).
     fn default_args(self) -> &'static [&'static str] {
         match self {
             Agent::Claude => &["--dangerously-skip-permissions"],
@@ -220,6 +223,7 @@ Networking (deny-by-default; flags compose):
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
   AGENT_VM_IMAGE_TAG                    same as --image
+  AGENT_VM_ROOT                         same as --root (1|true|yes|on)
   AGENT_VM_UPDATE_CHECK                 check the registry for a newer image (1|true|yes|on)
   AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls
   AGENT_VM_STATE_DIR                    override the per-project state dir
@@ -375,6 +379,19 @@ pub struct Args {
     #[arg(long = "update-check", default_value_t = false, help_heading = "Image")]
     update_check: bool,
 
+    /// Run the guest as root (uid 0) instead of the default host user.
+    ///
+    /// Historical behavior: `HOME=/root`, the Chrome MCP runs via `sudo -u
+    /// chrome`, and docker-in-VM works (dockerd needs root — non-root has
+    /// no way to run it). The default (non-root) mode runs the in-guest
+    /// agent as the invoking host user for defense-in-depth on top of the
+    /// microVM boundary; matching the host uid is also required to keep
+    /// write access to the project/state bind mounts (see CONTEXT.md
+    /// "Guest user"). Can also be enabled persistently with a truthy
+    /// `AGENT_VM_ROOT` (1|true|yes|on).
+    #[arg(long = "root", default_value_t = false, help_heading = "Guest user")]
+    root: bool,
+
     /// Args passed verbatim to the agent; use -- before any agent flags.
     ///
     /// Forwarded verbatim to the in-sandbox agent command. Use `--` if
@@ -384,8 +401,27 @@ pub struct Args {
 }
 
 pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
+    // Resolve root vs. non-root guest mode up front — it gates dir
+    // provisioning, the rootfs patch block, and the guest env/exec wiring
+    // further down, so it has to be known before any of that runs.
+    let root_mode = should_run_root(args.root, env::var("AGENT_VM_ROOT").ok().as_deref());
+    // Non-root mode runs the guest exec as the invoking host user. SAFETY:
+    // getuid()/getgid() are argument-free libc calls with no preconditions
+    // and cannot fail.
+    let guest_identity: Option<(u32, u32)> = if root_mode {
+        None
+    } else {
+        Some(unsafe { (libc::getuid(), libc::getgid()) })
+    };
+    let guest_user = guest_identity.map(|(uid, gid)| format!("{uid}:{gid}"));
+
     let session = ProjectSession::for_cwd()?;
     session.ensure_dirs()?;
+    if !root_mode {
+        session
+            .provision_guest_home()
+            .context("provisioning non-root guest HOME")?;
+    }
     // Reap any orphan sandbox dirs left by earlier crashed launchers in
     // this same project before we boot. See
     // `reap_stale_project_sandboxes` for the full rationale.
@@ -426,8 +462,10 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // back when libkrun only handed out 11 virtio IRQs total. Today
     // it's still the better shape: one virtio-fs server, one rootfs
     // patch entry per agent, and a stable on-host layout. Codex needs
-    // the env-var path because its CLI binary lives under
-    // /root/.codex/packages, which a symlink would shadow.
+    // the env-var path because its CLI binary lives under its install
+    // prefix's .codex/packages (/opt/agent/.codex/packages in the
+    // image; /root/.codex/packages under --root), which a symlink
+    // would shadow.
     let host_path = session
         .project_dir
         .to_str()
@@ -637,6 +675,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .workdir(krun_workdir)
         .volume(project_guest_path.clone(), |m| m.bind(&session.project_dir))
         .volume("/agent-vm-state", |m| m.bind(&session.state_dir));
+    // EXPERIMENTAL VERIFICATION PATCH -- NOT PART OF THE REVIEWED CHANGE.
+    // Testing whether setting .user() on the sandbox builder (not just the
+    // per-exec attach/exec builders) fixes bind_identity_map's InitResolved
+    // default_user (see vendor/microsandbox report_init_context/resolve_default_user).
+    if let Some(u) = &guest_user {
+        builder = builder.user(u.clone());
+    }
     // Phase 7: extra `--mount HOST[:GUEST]` binds. Each gets its own
     // .volume() — and we also have to mkdir the guest path in the
     // patch builder so microsandbox's workdir/rootfs validation passes
@@ -669,51 +714,64 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             for parent in patch_builder_steps.drain(..) {
                 p = p.mkdir(parent, None);
             }
-            p.mkdir("/root/.local", None)
-                .mkdir("/root/.local/share", None)
-                .mkdir("/root/.config", None)
-                .symlink("/agent-vm-state/claude", "/root/.claude", true)
-                // Onboarding-state file lives at $HOME root, not in
-                // .claude/. Without persistence the in-VM Claude
-                // re-runs the theme picker every launch.
-                .symlink("/agent-vm-state/claude.json", "/root/.claude.json", true)
-                .symlink(
-                    "/agent-vm-state/opencode",
-                    "/root/.local/share/opencode",
-                    true,
-                )
-                // OpenCode reads its config from $XDG_CONFIG_HOME/opencode/
-                // (=~/.config/opencode/), file `opencode.json`. Distinct
-                // from the data dir above — wire it separately.
-                .symlink(
-                    "/agent-vm-state/opencode-config",
-                    "/root/.config/opencode",
-                    true,
-                )
-                // D1: GitHub Copilot CLI reads/writes ~/.copilot/
-                // (config.json with trusted_folders + the placeholder
-                // token, plus its session state). secrets::refresh
-                // writes the config under <state>/copilot; this exposes
-                // it at the standard path inside the guest.
-                .symlink("/agent-vm-state/copilot", "/root/.copilot", true)
-                // Phase 6: gh/git config sits at /root/.gitconfig and
-                // /root/.config/gh. write_guest_gh_config writes both
-                // into state_dir; these symlinks expose them at the
-                // standard paths inside the guest. (Symlink targets
-                // are valid only when the underlying file/dir was
-                // written; if no gh token was captured, the symlinks
-                // dangle but nothing references them.)
-                .symlink("/agent-vm-state/gitconfig", "/root/.gitconfig", true)
-                .symlink("/agent-vm-state/gh-config", "/root/.config/gh", true)
-                // Persistent per-project bash history. secrets::refresh
-                // touches `<state>/bash_history` so the symlink target
-                // exists on first launch. Bash saves on exit (clean
-                // `exit` or Ctrl-D, NOT Ctrl-C of the launcher).
-                .symlink(
-                    "/agent-vm-state/bash_history",
-                    "/root/.bash_history",
-                    true,
-                )
+            if root_mode {
+                // Root mode: the dotfile symlinks live at un-shadowed
+                // rootfs paths (/root/...), so baking them via `.patch()`
+                // is correct — nothing mounts over /root at runtime.
+                p = p
+                    .mkdir("/root/.local", None)
+                    .mkdir("/root/.local/share", None)
+                    .mkdir("/root/.config", None);
+                for (suffix, target_name) in crate::session::GUEST_HOME_LINKS {
+                    p = p.symlink(
+                        format!("/agent-vm-state/{target_name}"),
+                        format!("/root/{suffix}"),
+                        true,
+                    );
+                }
+                p
+            } else {
+                // Non-root mode: the HOME dir + its dotfile symlinks are
+                // instead provisioned host-side (ProjectSession::
+                // provision_guest_home, called above) because
+                // /agent-vm-state is a *runtime* bind mount that shadows
+                // whatever a `.patch()` bakes at that path. /etc/passwd and
+                // /etc/group are real rootfs, unaffected by that bind, so
+                // appending the guest's identity here is correct.
+                let (uid, gid) = guest_identity.expect("non-root mode always has an identity");
+                p = p.append(
+                    "/etc/passwd",
+                    format!("agent:x:{uid}:{gid}::/agent-vm-state/home:/bin/bash\n"),
+                );
+                // Skip the /etc/group append when gid falls in the
+                // system-reserved range (Debian/most distros: 0-999),
+                // which is where a base image's own groups live (e.g.
+                // Debian's dialout=20 — also macOS's default primary
+                // group, staff=20, a real collision risk since this repo
+                // is developed on macOS). A duplicate line there would
+                // only be cosmetic — agentd resolves the numeric gid
+                // directly regardless of whether a name is attached to
+                // it — but skipping keeps /etc/group sane.
+                //
+                // This is a heuristic, not a literal "does this gid
+                // already exist in /etc/group" check: `PatchBuilder`
+                // (vendor/microsandbox/sdk/rust/lib/sandbox/types.rs:495)
+                // only exposes write operations (`.text()`/`.file()`/
+                // `.append()`/`.symlink()`/`.mkdir()`) — there is no read
+                // API to inspect the base image's `/etc/group` contents
+                // from here, so an exact-presence check would mean
+                // reaching into the pulled OCI image's layers directly
+                // (bypassing the SDK) just for this guard. The
+                // system-reserved-range convention is stable across
+                // Debian/Ubuntu/most distros and covers every group the
+                // current base image defines, so it is the practical
+                // choice; a future base image adding a >= 1000 group
+                // would at worst produce a cosmetic duplicate line.
+                if gid >= 1000 {
+                    p = p.append("/etc/group", format!("agent:x:{gid}:\n"));
+                }
+                p
+            }
         })
         .env("CODEX_HOME", "/agent-vm-state/codex");
 
@@ -1001,14 +1059,29 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // shell rc files of /root. attach() launches the agent directly via
     // execve, so re-publish the same PATH here.
     //
-    // `/usr/sbin` is here because dockerd, runc, iptables and docker-proxy
-    // live there in debian, and dockerd does PATH lookups for its helper
-    // binaries at runtime (not just at exec). Keep this list in sync with
-    // the `ENV PATH=…` in images/Dockerfile.
+    // Agent binaries live under the shared, world-readable /opt/agent
+    // prefix (not /root) so both root and non-root guests resolve them
+    // identically. `/usr/sbin` is here because dockerd, runc, iptables and
+    // docker-proxy live there in debian, and dockerd does PATH lookups for
+    // its helper binaries at runtime (not just at exec). Keep this list in
+    // sync with the `ENV PATH=…` in images/Dockerfile.
     builder = builder.env(
         "PATH",
-        "/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin",
+        "/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin",
     );
+
+    // Non-root mode: point the guest at its host-provisioned HOME (see
+    // ProjectSession::provision_guest_home) and a friendly username.
+    // agentd also derives HOME from the /etc/passwd entry appended above,
+    // but an explicit exec-env HOME wins over that and is unambiguous
+    // either way. Root mode needs none of this — the image's own
+    // ENV HOME=/root and the root passwd entry already do the job.
+    if !root_mode {
+        builder = builder
+            .env("HOME", "/agent-vm-state/home")
+            .env("USER", "agent")
+            .env("LOGNAME", "agent");
+    }
 
     // Environment injected into every guest regardless of agent/project.
     // Kept as one list so the set is discoverable and guard-testable (see
@@ -1224,7 +1297,16 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         // leaves cwd unset, falling back to that placeholder; `attach_with`
         // lets us set it, matching the streaming path below.
         sandbox
-            .attach_with(cmd, |a| a.args(agent_args).cwd(project_guest_path.clone()))
+            .attach_with(cmd, |a| {
+                // PID 1 (agentd) must stay root to `setuid` per exec, so
+                // `.user(...)` is set here on the attach/exec builder, NOT
+                // on the sandbox builder above.
+                let mut a = a.args(agent_args).cwd(project_guest_path.clone());
+                if let Some(u) = &guest_user {
+                    a = a.user(u.clone());
+                }
+                a
+            })
             .await
             .with_context(|| {
                 format!(
@@ -1245,7 +1327,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         use tokio::io::AsyncWriteExt as _;
         let mut handle = sandbox
             .exec_stream_with(cmd, |e| {
-                e.args(agent_args).cwd(project_guest_path.clone())
+                let mut e = e.args(agent_args).cwd(project_guest_path.clone());
+                if let Some(u) = &guest_user {
+                    e = e.user(u.clone());
+                }
+                e
             })
             .await
             .with_context(|| {
@@ -1862,10 +1948,13 @@ const STRIP_IPV6_NAMESERVERS: &str =
     "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true";
 
 /// Seed the image's baked Claude LSP plugins into the persistent state dir on
-/// first boot (PLAN.md D2). The image installs them under `/root/.claude`, but
-/// the persistence symlink (`/root/.claude -> /agent-vm-state/claude`) shadows
-/// that tree so the booted guest's `claude plugin list` is empty. The image
-/// ships `/opt/agent-vm/seed-claude-plugins.sh`, which copies the stash into
+/// first boot (PLAN.md D2). The image installs them at build time under
+/// `/opt/agent/.claude` (shared, world-readable prefix — see the non-root
+/// guest ADR), but the runtime persistence symlink — `~/.claude ->
+/// /agent-vm-state/claude`, i.e. `/root/.claude` in `--root` mode or
+/// `<state_dir>/home/.claude` in the non-root default — shadows that tree so
+/// the booted guest's `claude plugin list` is empty. The image ships
+/// `/opt/agent-vm/seed-claude-plugins.sh`, which copies the stash into
 /// the state dir once. Guarded on the script's presence so older images (no
 /// stash) are an inert no-op, and idempotent so it only does work on first boot.
 const SEED_CLAUDE_PLUGINS: &str =
@@ -1944,6 +2033,41 @@ mod tests {
         assert!(should_check_update(false, Some("on")));
         // Either input enables (flag OR env).
         assert!(should_check_update(true, Some("0")));
+    }
+
+    #[test]
+    fn root_mode_is_off_by_default_and_opt_in() {
+        // Default: non-root guest.
+        assert!(!should_run_root(false, None));
+        assert!(!should_run_root(false, Some("")));
+        assert!(!should_run_root(false, Some("0")));
+        assert!(!should_run_root(false, Some("false")));
+        assert!(!should_run_root(false, Some("garbage")));
+        // Flag opt-in.
+        assert!(should_run_root(true, None));
+        // Env opt-in (repo truthy set).
+        assert!(should_run_root(false, Some("1")));
+        assert!(should_run_root(false, Some("true")));
+        assert!(should_run_root(false, Some("yes")));
+        assert!(should_run_root(false, Some("on")));
+        // Either input enables (flag OR env).
+        assert!(should_run_root(true, Some("0")));
+    }
+
+    #[test]
+    fn root_flag_parses_via_clap() {
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: Args,
+        }
+        use clap::Parser as _;
+
+        let cli = TestCli::try_parse_from(["agent-vm"]).expect("parses with no flags");
+        assert!(!cli.args.root);
+
+        let cli = TestCli::try_parse_from(["agent-vm", "--root"]).expect("parses --root");
+        assert!(cli.args.root);
     }
 
     #[test]
@@ -2626,6 +2750,16 @@ async fn notify_if_update_available(image: &str) {
 /// Truthy values match the repo convention (`1|true|yes|on`,
 /// see `pull::env_truthy`).
 fn should_check_update(flag: bool, env_val: Option<&str>) -> bool {
+    flag || matches!(env_val, Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+}
+
+/// Whether the guest runs as root (uid 0) instead of the default non-root
+/// (host-uid) mode. Enabled by the `--root` flag OR a truthy `AGENT_VM_ROOT`
+/// env var. `env_val` is the raw value of that variable (`None` when
+/// unset), so this stays pure and unit-testable — mirrors
+/// [`should_check_update`]'s flag-or-truthy-env shape and the same
+/// `1|true|yes|on` truthiness convention (`pull::env_truthy`).
+fn should_run_root(flag: bool, env_val: Option<&str>) -> bool {
     flag || matches!(env_val, Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
 }
 

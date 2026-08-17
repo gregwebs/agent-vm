@@ -132,10 +132,20 @@ run plus the dev tools that are universally useful:
   `/opt/google/chrome/chrome` to `/usr/bin/chromium` so puppeteer's
   default discovery paths resolve. Dedicated `chrome` user (UID 9999)
   with home `/home/chrome`, empty NSS DB at `~/.pki/nssdb`, sudoers
-  rule `root ALL=(chrome) NOPASSWD: ALL`, and a wrapper at
-  `/usr/local/bin/agent-vm-chrome-mcp` that re-execs the MCP under
-  that user. Pre-warmed npm cache for `chrome-devtools-mcp@1.0.1`
-  under `/home/chrome/.npm/_npx/` so first launch is a cache hit.
+  rule `root ALL=(chrome) NOPASSWD: ALL` — used only in `--root` mode.
+  The wrapper at `/usr/local/bin/agent-vm-chrome-mcp` branches on
+  `id -u`: as root it re-execs the MCP under the `chrome` user (the
+  sudoers rule only grants `root -> chrome`, so there's no non-root
+  path to it); in the default non-root mode the agent is already a
+  non-root uid — which alone satisfies chromium's user-namespace
+  sandbox precondition — so the wrapper runs chromium directly, `cd`s
+  into the agent's own `$HOME` instead of `/home/chrome` (uid 9999,
+  unwritable by the agent), and imports the MITM CA into its own NSS
+  DB at `$HOME/.pki/nssdb`. Pre-warmed npm cache for
+  `chrome-devtools-mcp@1.0.1` under `/home/chrome/.npm/_npx/` so first
+  launch is a cache hit (root mode only; non-root's `$HOME` is a fresh
+  per-project state dir with no pre-warmed npm cache, so first non-root
+  Chrome MCP launch pays the npx download).
 - `gh` from cli.github.com/packages (Phase 6 — gh/git credential
   injection).
 - Node.js 22 from NodeSource (needed by Claude Code, OpenCode, MCP servers).
@@ -237,13 +247,22 @@ Resolution:
 
 - One bind mount for `cwd → /workspace` (the project).
 - One bind mount for `<state-dir> → /agent-vm-state` (everything else).
-- The agents' expected paths are wired up *inside* the rootfs by Phase 1's
-  `patch` API (rootfs symlinks baked into the upper overlay before VM start):
-  - `/root/.claude → /agent-vm-state/claude`
-  - `/root/.local/share/opencode → /agent-vm-state/opencode`
+- The agents' expected paths are wired up under `$HOME` — `/root` in
+  `--root` mode, `/agent-vm-state/home` in the non-root default (see
+  "Guest user" above):
+  - `$HOME/.claude → /agent-vm-state/claude`
+  - `$HOME/.local/share/opencode → /agent-vm-state/opencode`
   - Codex uses the `CODEX_HOME=/agent-vm-state/codex` env var instead of a
-    symlink, because `/root/.codex/packages/...` in the base image contains
-    the codex binary itself and a symlink would shadow it.
+    symlink, because `<install-prefix>/.codex/packages/...` contains the
+    codex binary itself and a symlink would shadow it.
+
+  Root mode's symlinks are baked into the rootfs upper overlay before VM
+  start, via Phase 1's `patch` API (`/root/...` is un-shadowed rootfs, so
+  this is correct there). Non-root mode's are provisioned host-side
+  instead, in `<state_dir>/home` — `/agent-vm-state` is itself a *runtime*
+  bind mount, which would shadow anything a patch baked at that path
+  before the mount lands. Both modes draw from the same
+  `session::GUEST_HOME_LINKS` mapping.
 
 This keeps us at two virtio bind mounts no matter how many agents we add
 later, and leaves plenty of IRQ headroom for user-supplied `--mount`
@@ -323,8 +342,12 @@ The Phase 1 Dockerfile puts the agent binaries on `PATH` via an `ENV`
 directive, but that PATH only takes effect when an interactive shell sources
 the image's profile. `attach()` and `exec()` both spawn the command via
 `execve` directly, so we re-publish the same PATH on the sandbox builder
-(`/root/.local/bin:/root/.claude/local/bin:/root/.opencode/bin:/usr/local/
-bin:/usr/bin:/bin`). Otherwise `agent-vm claude` would `ENOENT` immediately.
+(`/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/
+bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin`). Otherwise `agent-vm claude`
+would `ENOENT` immediately. Agent binaries live under `/opt/agent` (a
+shared, world-readable prefix, `chmod -R a+rX`) rather than `/root`, so the
+same PATH resolves identically whether the guest is running non-root
+(default) or as root (`--root`) — see "Guest user" above.
 
 ### Tunables: env-var-driven for now
 
@@ -453,10 +476,44 @@ rejects it normally, which is at least a comprehensible failure.
 ### `IS_SANDBOX=1`
 
 Claude Code refuses to run as root with
-`--dangerously-skip-permissions` unless `IS_SANDBOX=1` is set. The
-in-guest user is root, and the whole point of the microVM is that
-the sandbox itself is the boundary — so we set `IS_SANDBOX=1` on
-the builder. Same env var the original Bash agent-vm used.
+`--dangerously-skip-permissions` unless `IS_SANDBOX=1` is set. By
+default (non-root guest — see "Guest user" below) that root-refusal
+simply never triggers, since the in-guest user isn't root; under
+`--root`/`AGENT_VM_ROOT` it does still trigger, which is exactly what
+`IS_SANDBOX=1` is for. Either way the whole point of the microVM is
+that the sandbox itself is the boundary, so we set `IS_SANDBOX=1`
+unconditionally on the builder — same env var the original Bash
+agent-vm used, and harmless when the guest is non-root.
+
+### Guest user (non-root by default) / `--root`
+
+See `docs/adr/0001-non-root-guest-via-native-user.md` for the full
+rationale. Summary: `run.rs`'s `launch()` resolves root-vs-non-root mode
+up front (`--root` flag OR truthy `AGENT_VM_ROOT`, mirroring
+`should_check_update`'s flag-or-env pattern). In the default non-root
+mode it computes `libc::getuid()`/`getgid()` and passes `"{uid}:{gid}"`
+to microsandbox's `.user(...)` on the attach/exec builders — *not* the
+sandbox builder, since `agentd` (PID 1) must stay root to `setuid` per
+exec. The guest env sets `HOME=/agent-vm-state/home`, `USER=agent`,
+`LOGNAME=agent`; `/etc/passwd`+`/etc/group` get an `agent` entry for
+the uid via `.patch().append(...)` (real rootfs, unaffected by the
+`/agent-vm-state` runtime bind).
+
+The one wrinkle: `/agent-vm-state` is a *runtime* bind mount, and
+`.patch()` bakes into the rootfs's `upper.ext4` **before** the VM
+boots — so anything a patch writes under `/agent-vm-state/...` is
+invisible once the bind mount lands. Root mode's `/root/...` dotfile
+symlinks are unaffected (un-shadowed rootfs), but the non-root guest's
+`HOME` and its dotfile symlinks live *under* `/agent-vm-state`, so they
+have to be materialized host-side instead —
+`ProjectSession::provision_guest_home` (`session.rs`) creates
+`<state_dir>/home` and its dotfile symlinks (dangling on the host,
+resolving correctly once bind-mounted into the guest), using the same
+`GUEST_HOME_LINKS` mapping that root mode's `.patch()` block draws from.
+
+`--root`/`AGENT_VM_ROOT` restores the legacy root guest. Docker-in-VM
+needs it (dockerd needs root); the Chrome MCP's `sudo -u chrome` path
+(below) is also root-mode-only.
 
 ### Smoke verification
 
