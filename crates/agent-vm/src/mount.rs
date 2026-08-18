@@ -3,22 +3,24 @@
 //! the two entry points `run.rs`'s `launch()` calls; everything else here
 //! is a private implementation detail of the grammar.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use microsandbox::sandbox::MountBuilder;
 
 use crate::run::guest_path_is_mountable;
 
-/// A recognized `--mount` mode keyword. `ro`/`rw` today. `follow-links`
-/// (issue #11) slots in as another variant here plus one `from_keyword`
-/// arm, one `keyword` arm, and one `INCOMPATIBLE_MODES` entry — no change to
-/// the grammar or the accumulation/validation control flow (see
-/// `parse_extra_mounts`).
+/// A recognized `--mount` mode keyword: `ro`, `rw`, or `follow-links`
+/// (issue #11 — auto-discover and bind-mount the real directories that
+/// symlinks under `HOST` transitively resolve to; see
+/// [`discover_followed_targets`]/[`expand_follow_links`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MountMode {
     ReadOnly,
     ReadWrite,
+    FollowLinks,
 }
 
 impl MountMode {
@@ -28,6 +30,7 @@ impl MountMode {
         match kw {
             "ro" => Some(MountMode::ReadOnly),
             "rw" => Some(MountMode::ReadWrite),
+            "follow-links" => Some(MountMode::FollowLinks),
             _ => None,
         }
     }
@@ -38,18 +41,20 @@ impl MountMode {
         match self {
             MountMode::ReadOnly => "ro",
             MountMode::ReadWrite => "rw",
+            MountMode::FollowLinks => "follow-links",
         }
     }
 }
 
 /// Mode-keyword pairs that cannot appear together on one mount. This is the
-/// single place the conflict policy lives — adding `follow-links` in issue
-/// #11 means adding the variant above and one row here, e.g.
-/// `(MountMode::ReadWrite, MountMode::FollowLinks)`. Note `ro`+`follow-links`
-/// is intentionally NOT listed, because they coexist (follow-links implies
+/// single place the conflict policy lives. Note `ro`+`follow-links` is
+/// intentionally NOT listed, because they coexist (follow-links implies
 /// read-only) — which is precisely why a single mutually-exclusive
 /// `Option<MountMode>` slot would be wrong.
-const INCOMPATIBLE_MODES: &[(MountMode, MountMode)] = &[(MountMode::ReadOnly, MountMode::ReadWrite)];
+const INCOMPATIBLE_MODES: &[(MountMode, MountMode)] = &[
+    (MountMode::ReadOnly, MountMode::ReadWrite),
+    (MountMode::ReadWrite, MountMode::FollowLinks),
+];
 
 /// True iff `a` and `b` may not appear on the same mount (order-independent).
 fn modes_conflict(a: MountMode, b: MountMode) -> bool {
@@ -64,8 +69,16 @@ fn modes_conflict(a: MountMode, b: MountMode) -> bool {
 pub(crate) struct ExtraMount {
     pub(crate) host: PathBuf,
     pub(crate) guest: PathBuf,
-    /// Resolved from the parsed mode set: true iff `ro` was among them.
+    /// Resolved from the parsed mode set: true iff `ro` (or `follow-links`,
+    /// which implies `ro`) was among them.
     pub(crate) readonly: bool,
+    /// True iff `follow-links` was among the parsed modes. Consumed by
+    /// [`expand_follow_links`], which walks `host` on the host side and
+    /// appends one read-only `ExtraMount` per discovered symlink-target
+    /// directory. Mounts appended by that walk carry `follow_links: false`
+    /// (the walk does not recurse into a discovered target's own targets
+    /// beyond what it already resolved transitively).
+    pub(crate) follow_links: bool,
 }
 
 /// A `GUEST` segment must start with `/` or `.`; anything trailing that
@@ -154,7 +167,8 @@ pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
             }
             let mode = MountMode::from_keyword(kw).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--mount {entry:?}: unknown mode keyword {kw:?} (expected `ro` or `rw`)"
+                    "--mount {entry:?}: unknown mode keyword {kw:?} \
+                     (expected `ro`, `rw`, or `follow-links`)"
                 )
             })?;
             if let Some(&prev) = modes.iter().find(|&&prev| modes_conflict(prev, mode)) {
@@ -166,14 +180,16 @@ pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
             }
             modes.push(mode);
         }
-        let readonly = modes.contains(&MountMode::ReadOnly);
+        let follow_links = modes.contains(&MountMode::FollowLinks);
+        // follow-links implies read-only; bare follow-links behaves as ro.
+        let readonly = modes.contains(&MountMode::ReadOnly) || follow_links;
 
         // Canonicalize host so we follow symlinks; the bind target
         // needs to be a real path on the host.
         let host = host
             .canonicalize()
             .with_context(|| format!("canonicalizing --mount host {host_s:?}"))?;
-        out.push(ExtraMount { host, guest, readonly });
+        out.push(ExtraMount { host, guest, readonly, follow_links });
     }
     Ok(out)
 }
@@ -185,6 +201,217 @@ pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
 pub(crate) fn configure_extra_mount(m: MountBuilder, host: PathBuf, readonly: bool) -> MountBuilder {
     let m = m.bind(host);
     if readonly { m.readonly() } else { m }
+}
+
+/// Depth cap on symlink-*follow* chains specifically — NOT on plain
+/// directory nesting under `HOST` or a discovered target (see the
+/// `link_depth` bookkeeping in [`discover_followed_targets`], which only
+/// increments when a symlink is followed). Termination is already
+/// guaranteed by the canonicalized `visited` set (finitely many distinct
+/// real paths), so this cap is belt-and-suspenders against pathological
+/// symlink chains; 40 is deep enough for any real skill farm while still
+/// bounding a runaway chain.
+const MAX_LINK_DEPTH: usize = 40;
+
+/// Walk `root` (already canonicalized) on the host side and return the
+/// distinct canonicalized *directory* targets reachable by following the
+/// symlinks it transitively contains, plus warnings for anything skipped
+/// along the way (symlink-to-file, dangling symlink, unreadable
+/// subdirectory, depth-cap hit).
+///
+/// Returning warnings as data instead of `eprintln!`ing them keeps this
+/// function side-effect-free so tests can assert on the warning text, not
+/// just on what got left out of the returned target list — see
+/// `discover_file_target_skipped`/`discover_dangling_skipped`. The caller
+/// (`expand_follow_links`, and ultimately `launch()`) decides how/whether
+/// to print them.
+///
+/// `home` is the invoking user's already-canonicalized `$HOME`. A resolved
+/// directory target outside it is a hard error naming both the symlink and
+/// the target (safety guardrail — see issue #9/#11).
+fn discover_followed_targets(root: &Path, home: &Path) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    // (directory to scan, symlink-follow depth so far).
+    let mut worklist: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+
+    while let Some((dir, link_depth)) = worklist.pop() {
+        // Canonicalized visited-set: two symlinks resolving to the same
+        // real path (or a symlink back to an already-walked ancestor)
+        // collapse to one entry here, which is what actually terminates
+        // cycles — the depth cap above is a secondary bound.
+        if !visited.insert(dir.clone()) {
+            continue;
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                // A permission-denied (or otherwise unreadable) subdir must
+                // not abort the whole launch — warn and move on.
+                warnings.push(format!("skipping unreadable directory {}: {e}", dir.display()));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warnings.push(format!("skipping unreadable entry under {}: {e}", dir.display()));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            // lstat (no follow) so we can tell "is a symlink" from "is a
+            // real dir/file" without resolving anything yet.
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    warnings.push(format!("skipping {}: {e}", path.display()));
+                    continue;
+                }
+            };
+            if !meta.file_type().is_symlink() {
+                if meta.is_dir() {
+                    // Already visible via the HOST bind (or a discovered
+                    // parent's own bind) — don't add it to `out`, just
+                    // descend to find symlinks nested further down.
+                    // Directory nesting does not consume `link_depth`.
+                    worklist.push((path, link_depth));
+                }
+                // A plain file is already visible via the HOST bind too;
+                // nothing to do.
+                continue;
+            }
+            if link_depth >= MAX_LINK_DEPTH {
+                warnings.push(format!(
+                    "skipping symlink {} — exceeded max follow depth ({MAX_LINK_DEPTH}); \
+                     possible pathological symlink chain",
+                    path.display()
+                ));
+                continue;
+            }
+            let target = match path.canonicalize() {
+                Ok(t) => t,
+                Err(_) => {
+                    warnings.push(format!("skipping dangling symlink {}", path.display()));
+                    continue;
+                }
+            };
+            let target_meta = match fs::metadata(&target) {
+                Ok(m) => m,
+                Err(e) => {
+                    warnings.push(format!(
+                        "skipping symlink {} -> {}: {e}",
+                        path.display(),
+                        target.display()
+                    ));
+                    continue;
+                }
+            };
+            if !target_meta.is_dir() {
+                warnings.push(format!(
+                    "skipping symlink {} -> {} (not a directory)",
+                    path.display(),
+                    target.display()
+                ));
+                continue;
+            }
+            if !target.starts_with(home) {
+                anyhow::bail!(
+                    "--mount follow-links: symlink {} resolves to {}, which is outside your \
+                     $HOME ({}); refusing to mount it",
+                    path.display(),
+                    target.display(),
+                    home.display()
+                );
+            }
+            // Dedup within this walk. Note this does not special-case a
+            // target that lands *inside* `root` or another already-
+            // discovered target (see `expand_follow_links` doc) — that's
+            // a redundant-but-harmless extra bind at its own real path,
+            // not a correctness issue.
+            if !out.contains(&target) {
+                out.push(target.clone());
+            }
+            worklist.push((target, link_depth + 1));
+        }
+    }
+    Ok((out, warnings))
+}
+
+/// Given the parsed mounts, append the auto-discovered read-only mounts for
+/// every `follow_links` entry, then dedup identical mounts and reject
+/// guest-path collisions. `home` is the invoking user's `$HOME` (or `None`
+/// when unset). If any entry has `follow_links` and `home` is `None`, this
+/// is a hard error (the guardrail can't run without a `$HOME`); when no
+/// entry follows links, `home` is unused and `None` is fine. Pure w.r.t.
+/// the sandbox; touches only the filesystem under the mounted trees.
+///
+/// Returns the finalized mount list plus every warning collected while
+/// discovering targets, for the caller to print (see `launch()`).
+pub(crate) fn expand_follow_links(
+    mounts: Vec<ExtraMount>,
+    home: Option<&Path>,
+) -> Result<(Vec<ExtraMount>, Vec<String>)> {
+    if !mounts.iter().any(|m| m.follow_links) {
+        return Ok((mounts, Vec::new()));
+    }
+    let home = home.context(
+        "$HOME is not set — required for --mount follow-links (pass --root to run as root \
+         instead, or drop follow-links)",
+    )?;
+    // Canonicalize once so the guardrail's `starts_with` comparison is
+    // real-path vs. real-path (macOS `/var` vs `/private/var`, etc.).
+    let home_canon = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+
+    let mut warnings = Vec::new();
+    let mut expanded = mounts;
+    let mut discovered_targets: Vec<PathBuf> = Vec::new();
+    for m in &expanded {
+        if !m.follow_links {
+            continue;
+        }
+        let (targets, mut w) = discover_followed_targets(&m.host, &home_canon)?;
+        warnings.append(&mut w);
+        discovered_targets.extend(targets);
+    }
+    for target in discovered_targets {
+        // The original follow-links mount (the HOST bind itself) stays in
+        // the list unchanged; this appends one read-only mount per
+        // distinct discovered real target, at its own real path.
+        expanded.push(ExtraMount {
+            host: target.clone(),
+            guest: target,
+            readonly: true,
+            follow_links: false,
+        });
+    }
+
+    // Finalize across the whole resulting list: dedup a guest path that
+    // repeats with the *same* host (two symlinks resolving to the same
+    // real path, or the same target discovered from two separate
+    // `--mount …:follow-links` entries); hard-error a guest path claimed
+    // by two *different* hosts. Preserve first-seen order for stable,
+    // testable output and stable `==> Mounting …` log ordering.
+    let mut host_by_guest: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut finalized = Vec::with_capacity(expanded.len());
+    for m in expanded {
+        match host_by_guest.get(&m.guest) {
+            Some(existing_host) if *existing_host == m.host => continue,
+            Some(existing_host) => anyhow::bail!(
+                "--mount: guest path {} is claimed by two different host paths {} and {}",
+                m.guest.display(),
+                existing_host.display(),
+                m.host.display()
+            ),
+            None => {
+                host_by_guest.insert(m.guest.clone(), m.host.clone());
+                finalized.push(m);
+            }
+        }
+    }
+    Ok((finalized, warnings))
 }
 
 #[cfg(test)]
@@ -396,5 +623,302 @@ mod tests {
 
         let em_def = &parse_extra_mounts(&["/".into()]).unwrap()[0];
         assert!(!built_readonly(em_def.host.to_str().unwrap(), em_def.readonly));
+    }
+
+    // ── follow-links: grammar/parse (issue #11) ────────────────────
+
+    #[test]
+    fn parse_follow_links_implies_readonly() {
+        let parsed = parse_extra_mounts(&["/:follow-links".into()]).expect("ok");
+        assert!(parsed[0].readonly);
+        assert!(parsed[0].follow_links);
+    }
+
+    #[test]
+    fn parse_follow_links_with_ro_ok() {
+        let parsed = parse_extra_mounts(&["/:ro:follow-links".into()]).expect("ok, ro+follow-links coexist");
+        assert!(parsed[0].readonly);
+        assert!(parsed[0].follow_links);
+    }
+
+    #[test]
+    fn parse_rw_follow_links_conflicts() {
+        for entry in ["/:rw:follow-links", "/:follow-links:rw"] {
+            let err = parse_extra_mounts(&[entry.into()])
+                .expect_err("rw+follow-links must conflict")
+                .to_string();
+            assert!(err.contains("conflicting"), "got: {err}");
+            assert!(err.contains("rw") && err.contains("follow-links"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_follow_links_with_guest() {
+        let parsed = parse_extra_mounts(&["/:/g:follow-links".into()]).expect("ok");
+        assert_eq!(parsed[0].guest, std::path::Path::new("/g"));
+        assert!(parsed[0].readonly);
+        assert!(parsed[0].follow_links);
+    }
+
+    #[test]
+    fn parse_unknown_mode_lists_follow_links() {
+        let err = parse_extra_mounts(&["/:bogus-mode".into()])
+            .expect_err("unknown mode must error")
+            .to_string();
+        assert!(err.contains("follow-links"), "got: {err}");
+    }
+
+    // ── follow-links: discovery / expand (issue #11) ────────────────
+
+    use std::os::unix::fs::symlink;
+
+    /// Canonicalize a freshly-created tempdir's path up front — macOS
+    /// resolves `/var` -> `/private/var`, so anything compared against
+    /// `discover_followed_targets`'s (canonicalized) output needs to start
+    /// from a canonical base.
+    fn canon(p: &Path) -> PathBuf {
+        p.canonicalize().expect("canonicalize")
+    }
+
+    #[test]
+    fn discover_direct_dir_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        let outside = home_path.join("outside_dir");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, host.join("foo")).unwrap();
+
+        let (targets, warnings) = discover_followed_targets(&host, &home_path).expect("ok");
+        assert_eq!(targets, vec![outside]);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn discover_transitive() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        let a = home_path.join("a");
+        let b = home_path.join("b");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        symlink(&a, host.join("foo")).unwrap();
+        symlink(&b, a.join("bar")).unwrap();
+
+        let (mut targets, warnings) = discover_followed_targets(&host, &home_path).expect("ok");
+        targets.sort();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(targets, expected, "both the direct and transitive target must be discovered");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn discover_terminates_on_cycle() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        let a = home_path.join("a");
+        let b = home_path.join("b");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        symlink(&a, host.join("into_a")).unwrap();
+        symlink(&b, a.join("x")).unwrap();
+        symlink(&a, b.join("y")).unwrap();
+
+        let (mut targets, _warnings) =
+            discover_followed_targets(&host, &home_path).expect("must terminate, not hang");
+        targets.sort();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(targets, expected, "each real path discovered exactly once despite the cycle");
+    }
+
+    #[test]
+    fn discover_self_referential_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        fs::create_dir_all(&host).unwrap();
+        symlink(&host, host.join("loop")).unwrap();
+
+        let (targets, _warnings) =
+            discover_followed_targets(&host, &home_path).expect("must terminate, not hang");
+        assert_eq!(targets, vec![host]);
+    }
+
+    #[test]
+    fn discover_file_target_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        fs::create_dir_all(&host).unwrap();
+        let file = home_path.join("some_file");
+        fs::write(&file, "hi").unwrap();
+        symlink(&file, host.join("f")).unwrap();
+
+        let (targets, warnings) = discover_followed_targets(&host, &home_path).expect("ok, not an error");
+        assert!(targets.is_empty());
+        assert!(
+            warnings.iter().any(|w| w.contains("not a directory")),
+            "expected a 'not a directory' warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn discover_dangling_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        fs::create_dir_all(&host).unwrap();
+        symlink(home_path.join("nonexistent"), host.join("d")).unwrap();
+
+        let (targets, warnings) = discover_followed_targets(&host, &home_path).expect("ok, not an error");
+        assert!(targets.is_empty());
+        assert!(
+            warnings.iter().any(|w| w.contains("dangling")),
+            "expected a dangling-symlink warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn discover_outside_home_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        // `home` for the guardrail is a *subdir*, so the symlink target
+        // (a sibling of that subdir) resolves outside it.
+        let narrow_home = home_path.join("subhome");
+        let host = home_path.join("host");
+        let outside = home_path.join("outside_dir");
+        fs::create_dir_all(&narrow_home).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, host.join("foo")).unwrap();
+
+        let err = discover_followed_targets(&host, &narrow_home)
+            .expect_err("target outside $HOME must be a hard error")
+            .to_string();
+        assert!(err.contains(&host.join("foo").display().to_string()), "got: {err}");
+        assert!(err.contains(&outside.display().to_string()), "got: {err}");
+    }
+
+    #[test]
+    fn expand_dedups_same_realpath() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        let target = home_path.join("target");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        symlink(&target, host.join("a")).unwrap();
+        symlink(&target, host.join("b")).unwrap();
+
+        let mounts = vec![ExtraMount {
+            host: host.clone(),
+            guest: host,
+            readonly: true,
+            follow_links: true,
+        }];
+        let (expanded, warnings) = expand_follow_links(mounts, Some(&home_path)).expect("ok");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let target_mounts: Vec<_> = expanded.iter().filter(|m| m.host == target).collect();
+        assert_eq!(
+            target_mounts.len(),
+            1,
+            "two symlinks resolving to the same real path must dedup to one mount"
+        );
+    }
+
+    #[test]
+    fn expand_guest_collision_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        let target = home_path.join("target");
+        let explicit_host = home_path.join("explicit-host");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&explicit_host).unwrap();
+        symlink(&target, host.join("a")).unwrap();
+
+        let mounts = vec![
+            ExtraMount {
+                host: host.clone(),
+                guest: host,
+                readonly: true,
+                follow_links: true,
+            },
+            ExtraMount {
+                // An explicit mount claims the discovered target's real
+                // path as its GUEST, from a different HOST.
+                host: explicit_host.clone(),
+                guest: target.clone(),
+                readonly: false,
+                follow_links: false,
+            },
+        ];
+        let err = expand_follow_links(mounts, Some(&home_path))
+            .expect_err("two different hosts claiming the same guest must be a hard error")
+            .to_string();
+        assert!(err.contains(&target.display().to_string()), "got: {err}");
+        assert!(err.contains(&explicit_host.display().to_string()), "got: {err}");
+    }
+
+    #[test]
+    fn expand_leaves_non_follow_mounts_untouched() {
+        let mounts = vec![ExtraMount {
+            host: "/".into(),
+            guest: "/g".into(),
+            readonly: false,
+            follow_links: false,
+        }];
+        let (expanded, warnings) =
+            expand_follow_links(mounts, None).expect("no follow-links entries, $HOME unneeded");
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].guest, std::path::Path::new("/g"));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn expand_without_home_errors_only_when_follow_links_present() {
+        let mounts = vec![ExtraMount {
+            host: "/".into(),
+            guest: "/".into(),
+            readonly: false,
+            follow_links: true,
+        }];
+        let err = expand_follow_links(mounts, None)
+            .expect_err("follow-links with no $HOME must be a hard error")
+            .to_string();
+        assert!(err.contains("HOME"), "got: {err}");
+    }
+
+    #[test]
+    fn discovered_mount_builds_readonly_bind_volume() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        let target = home_path.join("target");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        symlink(&target, host.join("a")).unwrap();
+
+        let mounts = vec![ExtraMount {
+            host: host.clone(),
+            guest: host,
+            readonly: true,
+            follow_links: true,
+        }];
+        let (expanded, _warnings) = expand_follow_links(mounts, Some(&home_path)).expect("ok");
+        let discovered = expanded
+            .iter()
+            .find(|m| m.host == target)
+            .expect("discovered target present in expanded list");
+        assert!(discovered.readonly);
+        assert!(built_readonly(discovered.host.to_str().unwrap(), discovered.readonly));
     }
 }
