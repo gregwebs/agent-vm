@@ -14,7 +14,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
-use microsandbox::{Sandbox, sandbox::PullPolicy};
+use microsandbox::{
+    Sandbox,
+    sandbox::{MountBuilder, PullPolicy},
+};
 
 use crate::session::ProjectSession;
 use crate::user;
@@ -211,7 +214,7 @@ Examples (claude shown; codex/opencode/shell take the same options):
   agent-vm shell -- cargo test                run one command, then exit
   agent-vm claude -- --model opus --resume    forward args to the agent
   agent-vm claude --memory 8 --cpus 4         a bigger sandbox
-  agent-vm claude --mount ~/ref -p 3000:3000  extra mount + publish a port
+  agent-vm claude --mount ~/ref:ro            read-only extra mount
   agent-vm claude --repo owner/other-repo     widen the GitHub allow-list
 
 Networking (deny-by-default; flags compose):
@@ -263,8 +266,11 @@ pub struct Args {
 
     /// Bind an extra host directory into the guest (repeatable).
     ///
-    /// Format `HOST[:GUEST]`; `GUEST` defaults to `HOST` (mirror at the
-    /// same absolute path).
+    /// Format `HOST[:GUEST][:ro|:rw]`; `GUEST` defaults to `HOST` (mirror at
+    /// the same absolute path). Append `:ro` for a read-only bind or `:rw`
+    /// for read-write (the default). `GUEST`, if given, must be an absolute
+    /// path (start with `/`); a trailing token that isn't a path is parsed
+    /// as a mode keyword, e.g. `--mount ~/ref:ro`.
     ///
     /// Each `--mount` consumes one virtio-fs device. The microsandbox
     /// runtime enables msb_krun's userspace split irqchip, which on
@@ -274,7 +280,7 @@ pub struct Args {
     /// (shared with rootfs, network, vsock, console, and any
     /// `--volume` disks — call it ~210 user mounts for the common
     /// config). You can stop worrying about it for typical workloads.
-    #[arg(long = "mount", value_name = "HOST[:GUEST]", help_heading = "Mounts & ports")]
+    #[arg(long = "mount", value_name = "HOST[:GUEST][:ro|:rw]", help_heading = "Mounts & ports")]
     mount: Vec<String>,
 
     /// Publish a guest TCP port to the host, docker-style (repeatable).
@@ -697,17 +703,21 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let mut extra_mount_mkdirs: Vec<String> = Vec::new();
     for em in &extra_mounts {
         eprintln!(
-            "==> Mounting {} -> {}",
+            "==> Mounting {} -> {}{}",
             em.host.display(),
-            em.guest.display()
+            em.guest.display(),
+            if em.readonly { " (read-only)" } else { "" }
         );
         let host = em.host.clone();
+        let readonly = em.readonly;
         let guest_str = em
             .guest
             .to_str()
             .context("--mount guest path must be UTF-8")?
             .to_string();
-        builder = builder.volume(guest_str.clone(), move |m| m.bind(host.clone()));
+        builder = builder.volume(guest_str.clone(), move |m| {
+            configure_extra_mount(m, host, readonly)
+        });
         extra_mount_mkdirs.extend(mkdir_chain(&em.guest));
     }
     builder = builder
@@ -1514,11 +1524,62 @@ fn pid_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// One `--mount HOST[:GUEST]` argument resolved into separate paths.
+/// A recognized `--mount` mode keyword. `ro`/`rw` today. `follow-links`
+/// (issue #11) slots in as another variant here plus one `from_keyword`
+/// arm, one `keyword` arm, and one `INCOMPATIBLE_MODES` entry — no change to
+/// the grammar or the accumulation/validation control flow (see
+/// `parse_extra_mounts`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MountMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl MountMode {
+    /// Classify one trailing suffix segment as a mode keyword.
+    /// `None` = not a known keyword (caller raises "unknown mode").
+    fn from_keyword(kw: &str) -> Option<MountMode> {
+        match kw {
+            "ro" => Some(MountMode::ReadOnly),
+            "rw" => Some(MountMode::ReadWrite),
+            _ => None,
+        }
+    }
+
+    /// The canonical keyword, for error messages that name the offending
+    /// token (matches the `parse_publish_args` idiom).
+    fn keyword(self) -> &'static str {
+        match self {
+            MountMode::ReadOnly => "ro",
+            MountMode::ReadWrite => "rw",
+        }
+    }
+}
+
+/// Mode-keyword pairs that cannot appear together on one mount. This is the
+/// single place the conflict policy lives — adding `follow-links` in issue
+/// #11 means adding the variant above and one row here, e.g.
+/// `(MountMode::ReadWrite, MountMode::FollowLinks)`. Note `ro`+`follow-links`
+/// is intentionally NOT listed, because they coexist (follow-links implies
+/// read-only) — which is precisely why a single mutually-exclusive
+/// `Option<MountMode>` slot would be wrong.
+const INCOMPATIBLE_MODES: &[(MountMode, MountMode)] = &[(MountMode::ReadOnly, MountMode::ReadWrite)];
+
+/// True iff `a` and `b` may not appear on the same mount (order-independent).
+fn modes_conflict(a: MountMode, b: MountMode) -> bool {
+    INCOMPATIBLE_MODES
+        .iter()
+        .any(|&(x, y)| (x, y) == (a, b) || (x, y) == (b, a))
+}
+
+/// One `--mount HOST[:GUEST][:MODE][:MODE]...` argument resolved into
+/// separate paths plus the mode(s) it carried.
 #[derive(Debug)]
 struct ExtraMount {
     host: PathBuf,
     guest: PathBuf,
+    /// Resolved from the parsed mode set: true iff `ro` was among them.
+    readonly: bool,
 }
 
 /// One `--publish [HOST_BIND:]HOST_PORT:GUEST_PORT[/proto]` entry, parsed.
@@ -1658,18 +1719,57 @@ fn parse_allow_egress(raw: &[String]) -> Result<Vec<ipnetwork::IpNetwork>> {
     Ok(out)
 }
 
-/// Parse the raw `--mount` argv strings into `(host, guest)` pairs.
-/// `HOST` alone defaults `GUEST` to the same absolute path (mirror).
-/// `HOST:GUEST` lets you remap. Errors clearly on absolute-path
-/// requirements (relative paths are confusing across host/guest).
+/// A `GUEST` segment must start with `/` or `.`; anything trailing that
+/// doesn't is a mode keyword. This is the sole rule that disambiguates
+/// `HOST:GUEST` from `HOST:MODE` (e.g. `HOST:ro`) since both are a single
+/// segment right after `HOST`.
+fn segment_is_guest_path(seg: &str) -> bool {
+    seg.starts_with('/') || seg.starts_with('.')
+}
+
+/// Parse the raw `--mount` argv strings into `ExtraMount`s.
+///
+/// Grammar: `HOST[:GUEST][:MODE][:MODE]...`. `HOST` alone defaults `GUEST`
+/// to the same absolute path (mirror), read-write. `GUEST`, if present,
+/// must be the segment immediately after `HOST` and must start with `/` or
+/// `.` (see [`segment_is_guest_path`]); everything after that is a mode
+/// keyword (`ro`/`rw` — see [`MountMode`]). Path validity is checked before
+/// mode keywords so `relativehost:bogus` reports the host error, not
+/// "unknown mode". `ro`+`rw` together, and any keyword `MountMode` doesn't
+/// recognize, are hard parse-time errors.
+///
+/// Known, deliberate deviation from the pre-mode-suffix grammar: previously
+/// `HOST:GUEST` split on the *first* colon only, so a `GUEST` could contain
+/// literal trailing colons (e.g. `/h:/g:x` kept `guest = "/g:x"`). The new
+/// grammar splits on every colon, so trailing colon-separated tokens are
+/// now interpreted as mode keywords instead — `/h:/g:x` now fails as
+/// "unknown mode keyword \"x\"". Colon-bearing guest paths were
+/// undocumented/pathological; this change is intentional and pinned by
+/// `parse_extra_mounts_colon_in_guest_now_mode_error`.
+///
+/// Second deliberate deviation, same bucket: a relative `GUEST` with no
+/// leading `/` or `.` (e.g. `/abs-host:relative-guest`) used to fail with
+/// "guest path must be absolute". Since a bare trailing segment is now
+/// classified as a mode keyword rather than a guest path, it instead fails
+/// as "unknown mode keyword \"relative-guest\"" — still a hard error, just a
+/// different message. Pinned by `parse_extra_mounts_rejects_relative_paths`.
 fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
     let mut out = Vec::with_capacity(raw.len());
     for entry in raw {
-        let (host_s, guest_s) = match entry.split_once(':') {
-            Some((h, g)) => (h.trim().to_string(), g.trim().to_string()),
-            None => (entry.trim().to_string(), entry.trim().to_string()),
+        let mut segs = entry.split(':').map(str::trim);
+        let host_s = segs.next().unwrap_or_default().to_string();
+        let mut tail: Vec<&str> = segs.collect();
+
+        // Optional GUEST: only the first tail segment, and only if it
+        // looks like a path. Otherwise GUEST mirrors HOST (today's default).
+        let guest_s = if tail.first().is_some_and(|s| segment_is_guest_path(s)) {
+            tail.remove(0).to_string()
+        } else {
+            host_s.clone()
         };
-        if host_s.is_empty() || guest_s.is_empty() {
+
+        // --- Path validation first, so path errors beat mode errors. ---
+        if host_s.is_empty() {
             anyhow::bail!("--mount value {entry:?} must be HOST[:GUEST] (non-empty)");
         }
         let host = PathBuf::from(&host_s);
@@ -1691,14 +1791,51 @@ fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
                  carried into the guest; pass a guest path without tabs/newlines"
             );
         }
+
+        // --- Then classify the remaining tail segments as mode keywords. ---
+        let mut modes: Vec<MountMode> = Vec::new();
+        for kw in tail {
+            if kw.is_empty() {
+                // e.g. `/h::ro` — a stray `::`. Point at it rather than
+                // reporting "unknown mode keyword \"\"".
+                anyhow::bail!(
+                    "--mount {entry:?}: empty segment (stray `:`); expected \
+                     HOST[:GUEST][:MODE]..."
+                );
+            }
+            let mode = MountMode::from_keyword(kw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--mount {entry:?}: unknown mode keyword {kw:?} (expected `ro` or `rw`)"
+                )
+            })?;
+            if let Some(&prev) = modes.iter().find(|&&prev| modes_conflict(prev, mode)) {
+                anyhow::bail!(
+                    "--mount {entry:?}: conflicting modes `{}` and `{}` — pick one",
+                    prev.keyword(),
+                    mode.keyword()
+                );
+            }
+            modes.push(mode);
+        }
+        let readonly = modes.contains(&MountMode::ReadOnly);
+
         // Canonicalize host so we follow symlinks; the bind target
         // needs to be a real path on the host.
         let host = host
             .canonicalize()
             .with_context(|| format!("canonicalizing --mount host {host_s:?}"))?;
-        out.push(ExtraMount { host, guest });
+        out.push(ExtraMount { host, guest, readonly });
     }
     Ok(out)
+}
+
+/// Configure a bind-mount `MountBuilder` for an `ExtraMount`: bind the host
+/// path and apply `.readonly()` when the mount was parsed `:ro`. Factored
+/// out of the `.volume(...)` closure so the readonly wiring has a boot-free
+/// unit seam (see `extra_mount_ro_propagates_readonly_into_built_volume`).
+fn configure_extra_mount(m: MountBuilder, host: PathBuf, readonly: bool) -> MountBuilder {
+    let m = m.bind(host);
+    if readonly { m.readonly() } else { m }
 }
 
 /// Build the GitHub repo allow-list by scanning `project_dir` and
@@ -2346,6 +2483,151 @@ options ndots:2 timeout:1";
             err.contains("control characters"),
             "error should call out control characters, got: {err}"
         );
+    }
+
+    // ── parse_extra_mounts: `[:ro|:rw]` mode suffixes ─────────────
+
+    #[test]
+    fn parse_extra_mounts_mode_defaults_readwrite() {
+        // AC-1: unchanged behavior for the pre-existing forms, plus the
+        // new `readonly` field defaulting false.
+        let parsed = parse_extra_mounts(&["/".into()]).expect("ok");
+        assert!(!parsed[0].readonly);
+        let parsed = parse_extra_mounts(&["/:/g".into()]).expect("ok");
+        assert_eq!(parsed[0].guest, std::path::Path::new("/g"));
+        assert!(!parsed[0].readonly);
+    }
+
+    #[test]
+    fn parse_extra_mounts_ro_no_guest() {
+        let parsed = parse_extra_mounts(&["/:ro".into()]).expect("ok");
+        assert_eq!(parsed[0].guest, std::path::Path::new("/"));
+        assert!(parsed[0].readonly);
+    }
+
+    #[test]
+    fn parse_extra_mounts_rw_no_guest() {
+        let parsed = parse_extra_mounts(&["/:rw".into()]).expect("ok");
+        assert_eq!(parsed[0].guest, std::path::Path::new("/"));
+        assert!(!parsed[0].readonly);
+    }
+
+    #[test]
+    fn parse_extra_mounts_guest_and_ro() {
+        let parsed = parse_extra_mounts(&["/:/g:ro".into()]).expect("ok");
+        assert_eq!(parsed[0].guest, std::path::Path::new("/g"));
+        assert!(parsed[0].readonly);
+    }
+
+    #[test]
+    fn parse_extra_mounts_guest_and_rw() {
+        let parsed = parse_extra_mounts(&["/:/g:rw".into()]).expect("ok");
+        assert_eq!(parsed[0].guest, std::path::Path::new("/g"));
+        assert!(!parsed[0].readonly);
+    }
+
+    #[test]
+    fn parse_extra_mounts_conflicting_modes_ro_then_rw() {
+        let err = parse_extra_mounts(&["/:ro:rw".into()])
+            .expect_err("ro:rw must conflict")
+            .to_string();
+        assert!(err.contains("conflicting"), "got: {err}");
+        assert!(err.contains("ro") && err.contains("rw"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_extra_mounts_conflicting_modes_rw_then_ro() {
+        // Same assertion, reversed order — proves order-independence.
+        let err = parse_extra_mounts(&["/:rw:ro".into()])
+            .expect_err("rw:ro must conflict")
+            .to_string();
+        assert!(err.contains("conflicting"), "got: {err}");
+        assert!(err.contains("ro") && err.contains("rw"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_extra_mounts_unknown_mode() {
+        let err = parse_extra_mounts(&["/:bogus-mode".into()])
+            .expect_err("unknown mode must error")
+            .to_string();
+        assert!(err.contains("bogus-mode"), "got: {err}");
+        assert!(err.contains("unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_extra_mounts_guest_vs_mode_disambiguation() {
+        // Leading '/' -> classified as GUEST, then ':ro' is a mode.
+        let parsed = parse_extra_mounts(&["/:/mnt/ref:ro".into()]).expect("ok");
+        assert_eq!(parsed[0].guest, std::path::Path::new("/mnt/ref"));
+        assert!(parsed[0].readonly);
+
+        // Leading '.' -> classified as GUEST too, then rejected by the
+        // existing absolute-path check (not "unknown mode").
+        let err = parse_extra_mounts(&["/:./rel:ro".into()])
+            .expect_err("relative GUEST must be rejected")
+            .to_string();
+        assert!(err.contains("absolute"), "got: {err}");
+        assert!(!err.contains("unknown mode"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_extra_mounts_extra_path_in_mode_position() {
+        // Only one GUEST segment is accepted (the first); a second
+        // path-shaped segment in mode position is an unknown keyword.
+        let err = parse_extra_mounts(&["/:/g:/g2".into()])
+            .expect_err("second path segment must be rejected")
+            .to_string();
+        assert!(err.contains("unknown mode keyword"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_extra_mounts_empty_middle_segment() {
+        // A stray `::` should not surface as `unknown mode keyword ""`.
+        let err = parse_extra_mounts(&["/::ro".into()])
+            .expect_err("empty middle segment must be rejected")
+            .to_string();
+        assert!(
+            !err.contains("unknown mode keyword \"\""),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_extra_mounts_colon_in_guest_now_mode_error() {
+        // Deliberate, documented deviation from the old first-colon-only
+        // split: a trailing colon-separated token on a GUEST path is now
+        // parsed as a mode separator, not kept literal in the guest path.
+        let err = parse_extra_mounts(&["/:/mnt/ref:x".into()])
+            .expect_err("trailing 'x' must be an unknown mode")
+            .to_string();
+        assert!(err.contains("unknown mode"), "got: {err}");
+    }
+
+    // ── AC-5: parsed `ro` reaches the volume builder (boot-free) ──
+
+    fn built_readonly(host: &str, ro: bool) -> bool {
+        use microsandbox::sandbox::VolumeMount;
+        let vm = configure_extra_mount(MountBuilder::new("/g"), host.into(), ro)
+            .build()
+            .expect("bind mount builds");
+        match vm {
+            VolumeMount::Bind { options, .. } => options.readonly,
+            other => panic!("expected Bind mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_mount_ro_propagates_readonly_into_built_volume() {
+        let em = &parse_extra_mounts(&["/:ro".into()]).unwrap()[0];
+        assert!(em.readonly);
+        assert!(built_readonly(em.host.to_str().unwrap(), em.readonly));
+
+        let em_rw = &parse_extra_mounts(&["/:rw".into()]).unwrap()[0];
+        assert!(!em_rw.readonly);
+        assert!(!built_readonly(em_rw.host.to_str().unwrap(), em_rw.readonly));
+
+        let em_def = &parse_extra_mounts(&["/".into()]).unwrap()[0];
+        assert!(!built_readonly(em_def.host.to_str().unwrap(), em_def.readonly));
     }
 
     // ── guest-path predicates / resolve_project_guest_path ───────

@@ -113,7 +113,7 @@ Each launcher accepts:
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
-| `--mount HOST[:GUEST]` | extra bind mount (one virtio-fs each, ~210 mount headroom) |
+| `--mount HOST[:GUEST][:ro\|:rw]` | extra bind mount (one virtio-fs each, ~210 mount headroom); append `:ro` for a read-only bind, `:rw` is the default |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
