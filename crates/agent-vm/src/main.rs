@@ -7,6 +7,7 @@ mod host_paths;
 mod image_api_version;
 mod image_check;
 mod intercept_hook;
+mod mount;
 mod msb_install;
 mod pull;
 mod pull_progress;

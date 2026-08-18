@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
+use crate::mount;
 use crate::session::ProjectSession;
 use crate::user;
 
@@ -81,7 +82,7 @@ fn guest_path_is_cmdline_safe(s: &str) -> bool {
 /// except a control character — a TAB or newline in the path would break
 /// the framing, and other control bytes have no business in a mount point.
 /// Such a path can't be mirrored and falls back to `/workspace`.
-fn guest_path_is_mountable(s: &str) -> bool {
+pub(crate) fn guest_path_is_mountable(s: &str) -> bool {
     !s.chars().any(|c| c.is_control())
 }
 
@@ -211,7 +212,7 @@ Examples (claude shown; codex/opencode/shell take the same options):
   agent-vm shell -- cargo test                run one command, then exit
   agent-vm claude -- --model opus --resume    forward args to the agent
   agent-vm claude --memory 8 --cpus 4         a bigger sandbox
-  agent-vm claude --mount ~/ref -p 3000:3000  extra mount + publish a port
+  agent-vm claude --mount ~/ref:ro            read-only extra mount
   agent-vm claude --repo owner/other-repo     widen the GitHub allow-list
 
 Networking (deny-by-default; flags compose):
@@ -263,8 +264,11 @@ pub struct Args {
 
     /// Bind an extra host directory into the guest (repeatable).
     ///
-    /// Format `HOST[:GUEST]`; `GUEST` defaults to `HOST` (mirror at the
-    /// same absolute path).
+    /// Format `HOST[:GUEST][:ro|:rw]`; `GUEST` defaults to `HOST` (mirror at
+    /// the same absolute path). Append `:ro` for a read-only bind or `:rw`
+    /// for read-write (the default). `GUEST`, if given, must be an absolute
+    /// path (start with `/`); a trailing token that isn't a path is parsed
+    /// as a mode keyword, e.g. `--mount ~/ref:ro`.
     ///
     /// Each `--mount` consumes one virtio-fs device. The microsandbox
     /// runtime enables msb_krun's userspace split irqchip, which on
@@ -274,7 +278,7 @@ pub struct Args {
     /// (shared with rootfs, network, vsock, console, and any
     /// `--volume` disks — call it ~210 user mounts for the common
     /// config). You can stop worrying about it for typical workloads.
-    #[arg(long = "mount", value_name = "HOST[:GUEST]", help_heading = "Mounts & ports")]
+    #[arg(long = "mount", value_name = "HOST[:GUEST][:ro|:rw]", help_heading = "Mounts & ports")]
     mount: Vec<String>,
 
     /// Publish a guest TCP port to the host, docker-style (repeatable).
@@ -505,7 +509,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // Phase 7 (moved up): parse `--mount HOST[:GUEST]` so the
     // GitHub repo scan below can also walk each mount's remote +
     // submodules — matches main-branch claude-vm.sh behavior.
-    let extra_mounts = parse_extra_mounts(&args.mount).context("parsing --mount")?;
+    let extra_mounts = mount::parse_extra_mounts(&args.mount).context("parsing --mount")?;
     for em in &extra_mounts {
         if !em.host.exists() {
             anyhow::bail!("--mount host path {:?} does not exist", em.host);
@@ -637,7 +641,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // accesses), raising the virtio-mmio IRQ cap from 11 to ~219, so
     // we no longer need to warn or pre-cap on extra mounts. See the
     // vendored vm.rs `build_vm` for details.
-    let extra_mounts = parse_extra_mounts(&args.mount).context("parsing --mount")?;
+    let extra_mounts = mount::parse_extra_mounts(&args.mount).context("parsing --mount")?;
     for em in &extra_mounts {
         if !em.host.exists() {
             anyhow::bail!("--mount host path {:?} does not exist", em.host);
@@ -697,17 +701,21 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let mut extra_mount_mkdirs: Vec<String> = Vec::new();
     for em in &extra_mounts {
         eprintln!(
-            "==> Mounting {} -> {}",
+            "==> Mounting {} -> {}{}",
             em.host.display(),
-            em.guest.display()
+            em.guest.display(),
+            if em.readonly { " (read-only)" } else { "" }
         );
         let host = em.host.clone();
+        let readonly = em.readonly;
         let guest_str = em
             .guest
             .to_str()
             .context("--mount guest path must be UTF-8")?
             .to_string();
-        builder = builder.volume(guest_str.clone(), move |m| m.bind(host.clone()));
+        builder = builder.volume(guest_str.clone(), move |m| {
+            mount::configure_extra_mount(m, host, readonly)
+        });
         extra_mount_mkdirs.extend(mkdir_chain(&em.guest));
     }
     builder = builder
@@ -1514,13 +1522,6 @@ fn pid_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// One `--mount HOST[:GUEST]` argument resolved into separate paths.
-#[derive(Debug)]
-struct ExtraMount {
-    host: PathBuf,
-    guest: PathBuf,
-}
-
 /// One `--publish [HOST_BIND:]HOST_PORT:GUEST_PORT[/proto]` entry, parsed.
 #[derive(Clone, Debug)]
 struct PublishPort {
@@ -1654,49 +1655,6 @@ fn parse_allow_egress(raw: &[String]) -> Result<Vec<ipnetwork::IpNetwork>> {
             ipnetwork::IpNetwork::from(ip)
         };
         out.push(cidr);
-    }
-    Ok(out)
-}
-
-/// Parse the raw `--mount` argv strings into `(host, guest)` pairs.
-/// `HOST` alone defaults `GUEST` to the same absolute path (mirror).
-/// `HOST:GUEST` lets you remap. Errors clearly on absolute-path
-/// requirements (relative paths are confusing across host/guest).
-fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
-    let mut out = Vec::with_capacity(raw.len());
-    for entry in raw {
-        let (host_s, guest_s) = match entry.split_once(':') {
-            Some((h, g)) => (h.trim().to_string(), g.trim().to_string()),
-            None => (entry.trim().to_string(), entry.trim().to_string()),
-        };
-        if host_s.is_empty() || guest_s.is_empty() {
-            anyhow::bail!("--mount value {entry:?} must be HOST[:GUEST] (non-empty)");
-        }
-        let host = PathBuf::from(&host_s);
-        let guest = PathBuf::from(&guest_s);
-        if !host.is_absolute() {
-            anyhow::bail!("--mount host path {host_s:?} must be absolute");
-        }
-        if !guest.is_absolute() {
-            anyhow::bail!("--mount guest path {guest_s:?} must be absolute");
-        }
-        // The guest mount point reaches agentd via the boot-params side
-        // channel (not the kernel command line), so non-ASCII and spaces
-        // are fine — but a control character (TAB/newline) would break the
-        // `KEY\tVALUE\n` framing, so reject those. See
-        // `guest_path_is_mountable`.
-        if !guest_path_is_mountable(&guest_s) {
-            anyhow::bail!(
-                "--mount guest path {guest_s:?} contains control characters that can't be \
-                 carried into the guest; pass a guest path without tabs/newlines"
-            );
-        }
-        // Canonicalize host so we follow symlinks; the bind target
-        // needs to be a real path on the host.
-        let host = host
-            .canonicalize()
-            .with_context(|| format!("canonicalizing --mount host {host_s:?}"))?;
-        out.push(ExtraMount { host, guest });
     }
     Ok(out)
 }
@@ -2284,68 +2242,6 @@ options ndots:2 timeout:1";
         assert_eq!(parse_github_slug("https://github.com/./repo"), None);
         assert_eq!(parse_github_slug("https://github.com/owner/."), None);
         assert_eq!(parse_github_slug("git@github.com:../attacker.git"), None);
-    }
-
-    // ── parse_extra_mounts ───────────────────────────────────────
-
-    #[test]
-    fn parse_extra_mounts_mirror_form() {
-        // Mirror form: HOST alone → guest = host. Resolve against
-        // cwd so the host path canonicalize succeeds in the test.
-        // Use `/` which always exists.
-        let parsed = parse_extra_mounts(&["/".into()]).expect("ok");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].host, std::path::Path::new("/"));
-        assert_eq!(parsed[0].guest, std::path::Path::new("/"));
-    }
-
-    #[test]
-    fn parse_extra_mounts_remap_form() {
-        let parsed = parse_extra_mounts(&["/:/guest-mount".into()]).expect("ok");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].host, std::path::Path::new("/"));
-        assert_eq!(parsed[0].guest, std::path::Path::new("/guest-mount"));
-    }
-
-    #[test]
-    fn parse_extra_mounts_rejects_relative_paths() {
-        assert!(parse_extra_mounts(&["relative-host".into()]).is_err());
-        assert!(parse_extra_mounts(&["/abs-host:relative-guest".into()]).is_err());
-        assert!(parse_extra_mounts(&["relative-host:/abs-guest".into()]).is_err());
-    }
-
-    #[test]
-    fn parse_extra_mounts_rejects_empty_side() {
-        assert!(parse_extra_mounts(&[":/guest".into()]).is_err());
-        assert!(parse_extra_mounts(&["/host:".into()]).is_err());
-        assert!(parse_extra_mounts(&["".into()]).is_err());
-    }
-
-    #[test]
-    fn parse_extra_mounts_rejects_nonexistent_host_path_at_canonicalize() {
-        // canonicalize fails on missing paths → Err propagates.
-        let r = parse_extra_mounts(&["/this/path/does/not/exist/anywhere".into()]);
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn parse_extra_mounts_allows_non_ascii_guest_rejects_control_chars() {
-        // A non-ASCII guest mount point now travels via the boot-params
-        // side channel (not the cmdline), so it is accepted and mirrored.
-        // Host `/` exists so canonicalize succeeds.
-        let parsed = parse_extra_mounts(&["/:/монтаж".into()]).expect("non-ASCII guest is ok");
-        assert_eq!(parsed[0].guest, std::path::Path::new("/монтаж"));
-        // Plain ASCII guest path still works.
-        assert!(parse_extra_mounts(&["/:/mnt/ref".into()]).is_ok());
-        // A control char (TAB) would break the KEY\tVALUE boot-params
-        // framing, so it's rejected with guidance.
-        let err = parse_extra_mounts(&["/:/mnt/a\tb".into()])
-            .expect_err("control char in guest path must be rejected")
-            .to_string();
-        assert!(
-            err.contains("control characters"),
-            "error should call out control characters, got: {err}"
-        );
     }
 
     // ── guest-path predicates / resolve_project_guest_path ───────
