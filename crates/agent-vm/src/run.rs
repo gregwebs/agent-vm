@@ -213,6 +213,8 @@ Examples (claude shown; codex/opencode/shell take the same options):
   agent-vm claude -- --model opus --resume    forward args to the agent
   agent-vm claude --memory 8 --cpus 4         a bigger sandbox
   agent-vm claude --mount ~/ref:ro            read-only extra mount
+  agent-vm claude --mount ~/.claude/skills:ro:follow-links
+                                               follow symlinks in a skills dir
   agent-vm claude --repo owner/other-repo     widen the GitHub allow-list
 
 Networking (deny-by-default; flags compose):
@@ -264,13 +266,27 @@ pub struct Args {
 
     /// Bind an extra host directory into the guest (repeatable).
     ///
-    /// Format `HOST[:GUEST][:ro|:rw]`; `GUEST` defaults to `HOST` (mirror at
-    /// the same absolute path). Append `:ro` for a read-only bind or `:rw`
-    /// for read-write (the default). `GUEST`, if given, must be an absolute
-    /// path (start with `/`); a trailing token that isn't a path is parsed
-    /// as a mode keyword, e.g. `--mount ~/ref:ro`.
+    /// Format `HOST[:GUEST][:ro|:rw|:follow-links]`; `GUEST` defaults to
+    /// `HOST` (mirror at the same absolute path). Append `:ro` for a
+    /// read-only bind or `:rw` for read-write (the default). `GUEST`, if
+    /// given, must be an absolute path (start with `/`); a trailing token
+    /// that isn't a path is parsed as a mode keyword, e.g. `--mount ~/ref:ro`.
     ///
-    /// Each `--mount` consumes one virtio-fs device. The microsandbox
+    /// `:follow-links` additionally walks `HOST` on the host side and, for
+    /// every symlink it transitively contains that resolves to a directory,
+    /// bind-mounts that *real* directory into the guest at its own real
+    /// absolute host path. This is what makes symlinks whose target lies
+    /// outside `HOST` (e.g. a skills directory full of `foo -> /elsewhere`
+    /// links) resolve correctly in the guest — an ordinary bind mount only
+    /// exposes the `HOST` subtree, so the guest's `readlink()` would name a
+    /// path nothing is mounted at. `follow-links` implies `:ro` (bare
+    /// `--mount ~/ref:follow-links` behaves as `ro`); combining it with
+    /// `:rw` is a parse error. A resolved target outside your `$HOME` is a
+    /// hard error; a symlink to a file, or a dangling symlink, is skipped
+    /// with a warning. Example: `--mount ~/.claude/skills:ro:follow-links`.
+    ///
+    /// Each `--mount` (including each auto-discovered follow-links target)
+    /// consumes one virtio-fs device. The microsandbox
     /// runtime enables msb_krun's userspace split irqchip, which on
     /// x86_64 lifts the per-VM IRQ ceiling from 11 to ~219; aarch64 /
     /// riscv64 always had >200 GIC/AIA IRQs and are unchanged. Either
@@ -278,7 +294,7 @@ pub struct Args {
     /// (shared with rootfs, network, vsock, console, and any
     /// `--volume` disks — call it ~210 user mounts for the common
     /// config). You can stop worrying about it for typical workloads.
-    #[arg(long = "mount", value_name = "HOST[:GUEST][:ro|:rw]", help_heading = "Mounts & ports")]
+    #[arg(long = "mount", value_name = "HOST[:GUEST][:ro|:rw|:follow-links]", help_heading = "Mounts & ports")]
     mount: Vec<String>,
 
     /// Publish a guest TCP port to the host, docker-style (repeatable).
@@ -411,6 +427,10 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // further down, so it has to be known before any of that runs.
     let root_mode = user::should_run_root(args.root, env::var("AGENT_VM_ROOT").ok().as_deref());
     let guest_identity = user::resolve_guest_identity(root_mode)?;
+    // Independent of `guest_identity` (which is `None` under `--root`) so
+    // the `--mount …:follow-links` $HOME guardrail is still enforced in
+    // root mode instead of silently no-op'ing. See `mount::expand_follow_links`.
+    let mount_home = env::var("HOME").ok().map(PathBuf::from);
 
     let session = ProjectSession::for_cwd()?;
     session.ensure_dirs()?;
@@ -509,8 +529,18 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // Phase 7 (moved up): parse `--mount HOST[:GUEST]` so the
     // GitHub repo scan below can also walk each mount's remote +
     // submodules — matches main-branch claude-vm.sh behavior.
-    let extra_mounts = mount::parse_extra_mounts(&args.mount).context("parsing --mount")?;
-    for em in &extra_mounts {
+    //
+    // Deliberately scanned here on the *parsed*, pre-expansion list: the
+    // GitHub repo scan below (and the volume-building loop further down,
+    // via `expand_follow_links`) both need this list, but expansion walks
+    // the host filesystem to auto-discover `follow-links` symlink targets
+    // (issue #11), and those discovered directories should NOT feed the
+    // GitHub allow-list — a `follow-links` mount whose resolved skill dirs
+    // happen to contain git checkouts must not silently widen
+    // api.github.com access to remotes the user never asked for. Only the
+    // explicit `--mount` entries are scanned for repos.
+    let parsed_mounts = mount::parse_extra_mounts(&args.mount).context("parsing --mount")?;
+    for em in &parsed_mounts {
         if !em.host.exists() {
             anyhow::bail!("--mount host path {:?} does not exist", em.host);
         }
@@ -530,7 +560,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     if !args.no_git {
         allowed_repos.extend(detect_github_repos(
             &session.project_dir,
-            extra_mounts.iter().map(|m| m.host.as_path()),
+            parsed_mounts.iter().map(|m| m.host.as_path()),
         ));
     } else if !args.repo.is_empty() {
         eprintln!(
@@ -634,14 +664,30 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     )
     .context("writing guest gh/git config")?;
 
-    // Phase 7: parse `--mount HOST[:GUEST]` extras. The microsandbox
-    // runtime now enables msb_krun's userspace split irqchip (requires
-    // msb_krun >= 0.1.13 — earlier versions' userspace IOAPIC silently
-    // dropped IRQs on pin ≥ 32 and underflowed on RTE register
-    // accesses), raising the virtio-mmio IRQ cap from 11 to ~219, so
-    // we no longer need to warn or pre-cap on extra mounts. See the
-    // vendored vm.rs `build_vm` for details.
-    let extra_mounts = mount::parse_extra_mounts(&args.mount).context("parsing --mount")?;
+    // Phase 7 / issue #11: expand the parsed `--mount HOST[:GUEST]` extras —
+    // appending one read-only mount per symlink-target directory that any
+    // `:follow-links` entry's walk discovered, deduping repeats, and
+    // rejecting guest-path collisions (see `mount::expand_follow_links`).
+    // Reuses `parsed_mounts` from above rather than re-parsing `args.mount`
+    // (that used to be a duplicate `parse_extra_mounts` call here). The
+    // microsandbox runtime now enables msb_krun's userspace split irqchip
+    // (requires msb_krun >= 0.1.13 — earlier versions' userspace IOAPIC
+    // silently dropped IRQs on pin ≥ 32 and underflowed on RTE register
+    // accesses), raising the virtio-mmio IRQ cap from 11 to ~219, so we no
+    // longer need to warn or pre-cap on extra mounts (including
+    // follow-links' discovered ones). See the vendored vm.rs `build_vm`
+    // for details.
+    let (extra_mounts, follow_link_warnings) =
+        mount::expand_follow_links(parsed_mounts, mount_home.as_deref())
+            .context("expanding --mount follow-links")?;
+    for w in &follow_link_warnings {
+        eprintln!("==> {w}");
+    }
+    // Belt-and-suspenders: `parse_extra_mounts` already canonicalize()s
+    // every explicit HOST (which fails on a missing path), and every
+    // discovered mount's host is a path `canonicalize()` just succeeded
+    // on inside the follow-links walk — so this should never trip. Kept
+    // as a cheap final guard rather than the real existence check.
     for em in &extra_mounts {
         if !em.host.exists() {
             anyhow::bail!("--mount host path {:?} does not exist", em.host);
