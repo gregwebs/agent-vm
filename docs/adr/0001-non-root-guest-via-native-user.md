@@ -41,8 +41,20 @@ image `dev` user, and no root-then-drop entrypoint — unlike the sibling
 `claude-contained` project, which uses Apple's `container` runtime and
 therefore *does* need a gosu-style entrypoint to drop root.
 
-`.user(...)` is set on the attach/exec builders, **not** on the sandbox
-builder — PID 1 (`agentd`) must stay root so it can `setuid` per exec.
+`.user(...)` is set in **two** places, both load-bearing for different
+reasons, neither a substitute for the other:
+
+- On the **per-exec attach/exec builders** — governs the actual `setuid`
+  of the exec'd process. PID 1 (`agentd`) itself must stay root so it
+  *can* `setuid` per exec.
+- On the **sandbox builder itself** (`MSB_USER`) — drives agentd's
+  `InitResolved.default_user`, which the host installs as passthroughfs's
+  `BindIdentityMap { guest_uid, guest_gid, .. }`. This is what makes every
+  bind-mounted file (project/state/HOME) stat with owner bits matching the
+  guest's real uid via passthroughfs's `do_access`, instead of uid 0.
+  Without it, bind-mounted files would stat as uid 0 to the guest even
+  though the exec'd process runs as the real host uid, breaking write
+  access.
 
 Because `/agent-vm-state` is a *runtime bind mount* that shadows the
 rootfs upper layer where `.patch()` writes (patches bake into `upper.ext4`
