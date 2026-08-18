@@ -8,7 +8,7 @@
 //! `$HOME` is `/root` in `--root` mode; in the non-root default it's the
 //! *mirrored host* `$HOME` path (e.g. `/Users/claude`), bind-mounted from
 //! this host-owned `<state_dir>/home` (see [`GUEST_HOME_LINKS`],
-//! [`ProjectSession::provision_guest_home`], `run.rs`'s `core_dir_volumes`,
+//! [`ProjectSession::provision_guest_home`], `user.rs`'s `core_dir_volumes`,
 //! and `docs/adr/0002-mirror-host-home-and-username.md`).
 //!
 //! The sandbox *name* additionally carries the launcher PID
@@ -136,7 +136,7 @@ impl ProjectSession {
     /// Host-absolute HOME for the non-root guest — `<state_dir>/home`. This
     /// is the *host-side bind source*; the guest-visible mount path is the
     /// mirrored host `$HOME` (e.g. `/Users/claude`), not this path — see
-    /// `run.rs`'s `core_dir_volumes` and
+    /// `user.rs`'s `core_dir_volumes` and
     /// `docs/adr/0002-mirror-host-home-and-username.md`.
     pub fn guest_home_dir(&self) -> PathBuf {
         self.state_dir.join("home")
