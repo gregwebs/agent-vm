@@ -237,6 +237,41 @@ fn resolve_shared_cache_dir() -> Result<PathBuf> {
     )
 }
 
+/// Pure resolver for [`effective_cache_dir`]: shared-cache opt-in redirects
+/// to `shared`; otherwise `msb_home/cache`. Both inputs are passed
+/// explicitly (mirroring [`resolve_shared_cache_dir_from`]) so tests need
+/// not mutate process-wide env.
+fn effective_cache_dir_from(
+    share: bool,
+    msb_home: Option<&std::ffi::OsStr>,
+    shared: &Path,
+) -> Result<PathBuf> {
+    if share {
+        return Ok(shared.to_path_buf());
+    }
+    let msb_home = msb_home.ok_or_else(|| {
+        anyhow::anyhow!("MSB_HOME unset; point_at_msb_home() not called yet")
+    })?;
+    Ok(PathBuf::from(msb_home).join("cache"))
+}
+
+/// The OCI image cache directory the pinned `msb` actually uses in this
+/// process. Mirrors [`point_at_msb_home`]: `MSB_HOME/cache` unless the
+/// shared-cache opt-in redirected `paths.cache`. Must be called after
+/// `point_at_msb_home()` has set `MSB_HOME` — see that function's doc
+/// comment for why the two must never drift.
+pub fn effective_cache_dir() -> Result<PathBuf> {
+    let share = env_flag_enabled(SHARE_MSB_CACHE_ENV);
+    // Only resolve the shared dir when the flag is on (it may error on a
+    // bad env, e.g. no $HOME and no override).
+    let shared = if share {
+        resolve_shared_cache_dir()?
+    } else {
+        PathBuf::new()
+    };
+    effective_cache_dir_from(share, std::env::var_os("MSB_HOME").as_deref(), &shared)
+}
+
 /// Merge-write `paths.cache = <cache_dir>` into `MSB_HOME/config.json`.
 ///
 /// Reads any existing config into a `serde_json::Value`, sets only
@@ -769,6 +804,28 @@ mod tests {
             resolve_shared_cache_dir_from(Some(empty_override.as_os_str()), Some(home.as_os_str()))
                 .unwrap();
         assert_eq!(resolved, PathBuf::from("/home/user/.microsandbox/cache"));
+    }
+
+    #[test]
+    fn effective_cache_dir_from_uses_msb_home_when_not_shared() {
+        let msb_home = std::ffi::OsString::from("/h");
+        let resolved =
+            effective_cache_dir_from(false, Some(msb_home.as_os_str()), Path::new("/unused"))
+                .unwrap();
+        assert_eq!(resolved, PathBuf::from("/h/cache"));
+    }
+
+    #[test]
+    fn effective_cache_dir_from_errors_without_msb_home_when_not_shared() {
+        let err = effective_cache_dir_from(false, None, Path::new("/unused")).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("MSB_HOME"), "expected MSB_HOME mentioned: {msg}");
+    }
+
+    #[test]
+    fn effective_cache_dir_from_prefers_shared_when_opted_in() {
+        let resolved = effective_cache_dir_from(true, None, Path::new("/x")).unwrap();
+        assert_eq!(resolved, PathBuf::from("/x"));
     }
 
     #[test]

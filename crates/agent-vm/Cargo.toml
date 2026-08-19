@@ -15,6 +15,10 @@ path = "src/main.rs"
 # agent-vm never downloads the upstream msb+libkrunfw bundle — we ship our own
 # from-source msb. Keep net + keyring (the SDK's other defaults).
 microsandbox = { path = "../../vendor/microsandbox/sdk/rust", default-features = false, features = ["net", "keyring"] }
+# Direct dep (not re-exported by the SDK crate above) so run.rs/layer.rs can
+# read cached OCI image metadata (GlobalCache::read_image_metadata) and
+# import Reference/ImageConfig/CachedImageMetadata directly.
+microsandbox-image = { path = "../../vendor/microsandbox/crates/image" }
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "time"] }
 # `wrap_help` makes clap detect the terminal width and wrap long help
 # text to it; without it the multi-paragraph `--help` prose renders as

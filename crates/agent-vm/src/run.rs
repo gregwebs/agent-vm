@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
+use crate::layer;
 use crate::mount;
 use crate::session::ProjectSession;
 use crate::user;
@@ -44,6 +45,58 @@ const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 ///   exist in the guest image and would silently fall back to C). Also
 ///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
+
+/// The launcher's baked fallback guest `PATH` — kept in sync by hand with
+/// `images/Dockerfile`'s `ENV PATH=…`. Used only when the booted image's own
+/// OCI config declares no `PATH` (e.g. the image metadata isn't cached yet
+/// on a cold first run, before the pull that happens later in `launch()`).
+/// See [`path_from_config_env`] and [`image_config_path_and_digest`].
+const FALLBACK_GUEST_PATH: &str =
+    "/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin";
+
+/// Pulls the `PATH=` value out of an OCI config `env` vector (`KEY=VALUE`
+/// entries). Returns `None` when absent or empty — either way the caller
+/// falls back to [`FALLBACK_GUEST_PATH`]. The *last* `PATH=` entry wins,
+/// matching how a shell applies successive assignments (an image config can
+/// legally list `PATH` more than once across base+derived `ENV` layers).
+fn path_from_config_env(env: &[String]) -> Option<String> {
+    env.iter()
+        .filter_map(|e| e.strip_prefix("PATH="))
+        .next_back()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+}
+
+/// Best-effort read of the booted image's config `PATH`, plus the base
+/// image's manifest digest (fed to the tooling-layer hash in `layer.rs`).
+///
+/// Any miss — image metadata not cached yet on a first run, an unparseable
+/// image reference, or a cache I/O error — returns `(None, None)` so
+/// `launch()` stays on [`FALLBACK_GUEST_PATH`] and defers the layer hash.
+/// This is deliberately lenient: a PATH lookup failure must never abort a
+/// launch that would otherwise have worked identically to today.
+async fn image_config_path_and_digest(image: &str) -> (Option<String>, Option<String>) {
+    let Ok(cache_dir) = crate::msb_install::effective_cache_dir() else {
+        return (None, None);
+    };
+    let Ok(cache) = microsandbox_image::GlobalCache::new_async(&cache_dir).await else {
+        return (None, None);
+    };
+    let Ok(reference) = image.parse::<microsandbox_image::Reference>() else {
+        return (None, None);
+    };
+    match cache.read_image_metadata_async(&reference).await {
+        Ok(Some(md)) => (path_from_config_env(&md.config.env), Some(md.manifest_digest)),
+        _ => (None, None),
+    }
+}
+
+/// `AGENT_VM_LAYER=""` (clap's `env` does not filter empty values) must
+/// resolve as "unset", not as an explicit empty-path layer dir that would
+/// hard-error `resolve_layer_dir` on a missing Dockerfile.
+fn normalize_layer_flag(flag: Option<PathBuf>) -> Option<PathBuf> {
+    flag.filter(|p| !p.as_os_str().is_empty())
+}
 
 fn guest_path_is_safe(project: &Path) -> bool {
     let s = match project.to_str() {
@@ -399,6 +452,17 @@ pub struct Args {
     /// `AGENT_VM_UPDATE_CHECK` (1|true|yes|on).
     #[arg(long = "update-check", default_value_t = false, help_heading = "Image")]
     update_check: bool,
+
+    /// Tooling-layer directory (a Dockerfile built FROM the base image).
+    ///
+    /// Precedence: this flag, then $AGENT_VM_LAYER, then the default
+    /// `.agent-vm/layer/` in the project. An explicitly-pointed-at dir
+    /// missing a Dockerfile is an error; the default dir simply being
+    /// absent means "no layer". Building and booting the derived image is
+    /// not implemented yet (a later ticket) — for now the layer is only
+    /// resolved and, at debug log level, hashed and reported.
+    #[arg(long = "layer", env = "AGENT_VM_LAYER", value_name = "DIR", help_heading = "Image")]
+    layer: Option<PathBuf>,
 
     /// Run the guest as root (uid 0) instead of the default host user.
     ///
@@ -1105,12 +1169,58 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // prefix (not /root) so both root and non-root guests resolve them
     // identically. `/usr/sbin` is here because dockerd, runc, iptables and
     // docker-proxy live there in debian, and dockerd does PATH lookups for
-    // its helper binaries at runtime (not just at exec). Keep this list in
-    // sync with the `ENV PATH=…` in images/Dockerfile.
-    builder = builder.env(
-        "PATH",
-        "/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin",
-    );
+    // its helper binaries at runtime (not just at exec).
+    //
+    // The value now comes from the booted image's own OCI config `Env`
+    // (`PATH=…`) rather than a hard-coded literal, so a tooling-layer's
+    // `ENV PATH=/project/bin:$PATH` actually reaches the guest exec
+    // environment. FALLBACK_GUEST_PATH — kept in sync by hand with the
+    // `ENV PATH=…` in images/Dockerfile — is used only when the image
+    // metadata isn't available (e.g. a cold cache on first run, before this
+    // launch's own pull completes); for the base image the two are
+    // byte-identical today, so this is behavior-identical in the common
+    // case.
+    let (config_path, base_image_digest) = image_config_path_and_digest(&image).await;
+    let guest_path = config_path.unwrap_or_else(|| FALLBACK_GUEST_PATH.to_string());
+    builder = builder.env("PATH", guest_path);
+
+    // Tooling-layer resolution (issue #12). No image build/boot yet — that
+    // is the next ticket — so this only resolves the layer directory
+    // (fail-closed on a declared-but-broken layer) and, when debug logging
+    // is on, computes and reports the derived-image identity.
+    //
+    // resolve_layer_dir always runs: it is cheap (a couple of filesystem
+    // stats) and its fail-closed missing-Dockerfile error is genuinely
+    // wanted on every launch, not just debug ones. layer::resolve's
+    // full-tree content hash is NOT free — a layer may vendor a large
+    // tarball, and this module deliberately has no size cap — so it is
+    // gated behind DEBUG-level logging rather than run unconditionally for
+    // a debug line with no other consumer yet.
+    let layer_flag = normalize_layer_flag(args.layer.clone());
+    if let Some(layer_dir) = layer::resolve_layer_dir(layer_flag.as_deref(), &session.project_dir)?
+        && tracing::enabled!(tracing::Level::DEBUG)
+    {
+        match &base_image_digest {
+            Some(base_id) => {
+                let id = layer::resolve(&layer_dir, &session.project_dir, base_id)?;
+                tracing::debug!(
+                    tag = %id.tag,
+                    files = id.file_count,
+                    bytes = id.hashed_bytes,
+                    "resolved tooling layer (build not yet implemented)"
+                );
+            }
+            None => {
+                // Base image not cached yet ⇒ digest unknown ⇒ defer hashing
+                // to the build/boot ticket, which pulls before hashing.
+                // Surface the dir so a user knows the layer was seen.
+                tracing::debug!(
+                    dir = %layer_dir.display(),
+                    "tooling layer present; identity deferred (base image not cached)"
+                );
+            }
+        }
+    }
 
     // Non-root mode: mirror the host's own $HOME and username into the
     // guest (ADR-0002) — HOME is the host's literal $HOME string, USER/
@@ -2012,6 +2122,49 @@ fn shell_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_from_config_env_reads_the_path_entry() {
+        let env = vec!["LANG=C.UTF-8".to_string(), "PATH=/opt/agent/.local/bin:/usr/bin".to_string(), "TZ=UTC".to_string()];
+        assert_eq!(
+            path_from_config_env(&env),
+            Some("/opt/agent/.local/bin:/usr/bin".to_string())
+        );
+    }
+
+    #[test]
+    fn path_from_config_env_absent_is_none() {
+        let env = vec!["LANG=C.UTF-8".to_string()];
+        assert_eq!(path_from_config_env(&env), None);
+    }
+
+    #[test]
+    fn path_from_config_env_empty_value_is_none() {
+        let env = vec!["PATH=".to_string()];
+        assert_eq!(path_from_config_env(&env), None);
+    }
+
+    #[test]
+    fn path_from_config_env_last_entry_wins() {
+        let env = vec!["PATH=/first".to_string(), "PATH=/second".to_string()];
+        assert_eq!(path_from_config_env(&env), Some("/second".to_string()));
+    }
+
+    #[test]
+    fn path_from_config_env_ignores_non_path_keys_containing_path_substring() {
+        let env = vec!["XPATH=/should-not-match".to_string()];
+        assert_eq!(path_from_config_env(&env), None);
+    }
+
+    #[test]
+    fn normalize_layer_flag_treats_empty_as_unset() {
+        assert_eq!(normalize_layer_flag(Some(PathBuf::from(""))), None);
+        assert_eq!(
+            normalize_layer_flag(Some(PathBuf::from("/a/b"))),
+            Some(PathBuf::from("/a/b"))
+        );
+        assert_eq!(normalize_layer_flag(None), None);
+    }
 
     #[test]
     fn update_check_is_off_by_default_and_opt_in() {
