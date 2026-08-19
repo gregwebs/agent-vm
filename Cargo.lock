@@ -31,6 +31,7 @@ dependencies = [
  "ipnetwork",
  "libc",
  "microsandbox",
+ "microsandbox-image",
  "microsandbox-network",
  "reqwest",
  "serde_json",
