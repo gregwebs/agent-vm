@@ -1,16 +1,21 @@
 //! Turn a project's tooling layer directory into the identity of the derived
-//! image the launcher must (eventually) run.
+//! image, then build, registry-lessly load, and report on that derived
+//! image.
 //!
 //! Identity is a content hash rather than a recorded state file: the tag
 //! itself is the staleness check, so there is nothing to forget to write and
-//! nothing that can disagree with the image store. (ADR for the full
-//! tooling-layer design lands with the build/boot ticket that consumes this
-//! module.)
+//! nothing that can disagree with the image store. See
+//! `docs/adr/0003-project-tooling-layers.md` for the full design.
 //!
 //! Ported from `claude-contained`'s `internal/layer/{hash,layer}.go` and
 //! `internal/host/sanitize.go` — see those files for the original Go
-//! implementation this mirrors. This module only builds the identity; no
-//! image is built or booted here (that is the next ticket).
+//! implementation this mirrors.
+//!
+//! The module splits into two sections: identity (pure, no I/O beyond
+//! reading the layer directory to hash it) and build & load (the only
+//! I/O/process-spawning code here — `docker buildx build` plus a
+//! registry-less `microsandbox_image::load_archive` ingest). `run.rs`
+//! orchestrates calling both from `launch()`.
 
 use std::{
     fs,
@@ -20,6 +25,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+// `microsandbox_image::Digest` (a content digest) and `sha2::Digest` (the
+// hasher trait) share a name; the sha2 one is used pervasively below via
+// unqualified `Digest`/`Sha256`, so the image crate's type is referenced
+// fully-qualified at its two call sites instead of importing it here.
 use sha2::{Digest, Sha256};
 
 /// The derived images' repository name, separate from the base image's so a
@@ -543,6 +552,236 @@ pub fn resolve_layer_dir(flag: Option<&Path>, project_dir: &Path) -> Result<Opti
     }
 }
 
+// --- build & load ---
+//
+// Everything below is I/O and process-spawning: `docker buildx build` to
+// produce the derived image as an OCI archive, and a registry-less
+// `microsandbox_image::load_archive` ingest of that archive into the msb
+// cache. Nothing above this line touches the network, spawns a process, or
+// writes anything other than reading the layer directory to hash it.
+
+/// True iff the derived image `tag` is already ingested in `cache_dir`: its
+/// metadata is cached by a prior [`load_derived_image`] call AND its VMDK is
+/// materialized.
+///
+/// The VMDK check (not just metadata presence) matters: `load_archive`
+/// writes image metadata *after* materializing per-layer EROFS plus fsmeta
+/// and VMDK (verified in the vendored `microsandbox_image` crate — see
+/// `docs/adr/0003-project-tooling-layers.md`'s F5), so on a clean ingest
+/// metadata implies VMDK. The only gap is a raw-cache eviction of the VMDK
+/// while the metadata record survives; without this extra check that state
+/// would read as "cached", and a boot would fall through to a registry pull
+/// of a tag that has no registry — a hard failure instead of a rebuild.
+pub async fn derived_is_cached(cache_dir: &Path, tag: &str) -> Result<bool> {
+    let reference: microsandbox_image::Reference = tag
+        .parse()
+        .with_context(|| format!("parsing derived image tag {tag}"))?;
+    let cache = microsandbox_image::GlobalCache::new_async(cache_dir)
+        .await
+        .with_context(|| format!("opening image cache at {}", cache_dir.display()))?;
+    let Some(metadata) = cache
+        .read_image_metadata_async(&reference)
+        .await
+        .with_context(|| format!("reading cached image metadata for {tag}"))?
+    else {
+        return Ok(false);
+    };
+    let manifest_digest: microsandbox_image::Digest = metadata
+        .manifest_digest
+        .parse()
+        .with_context(|| format!("parsing cached manifest digest for {tag}"))?;
+    Ok(cache.is_vmdk_materialized(&manifest_digest))
+}
+
+/// Preflight: confirms `docker buildx` actually works before a launch
+/// prompts to build a tooling layer, so a missing/broken docker install
+/// surfaces as one clear, actionable error instead of a confusing failure
+/// partway through a build the user just confirmed.
+pub fn ensure_docker_buildx() -> Result<()> {
+    let status = std::process::Command::new("docker")
+        .args(["buildx", "version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("running `docker buildx version` failed; is docker installed and on PATH?")?;
+    if !status.success() {
+        bail!(
+            "`docker buildx version` exited non-zero; install Docker Buildx \
+             (https://docs.docker.com/build/architecture/#buildx) to build project tooling layers"
+        );
+    }
+    Ok(())
+}
+
+/// Pins the base reference to `<registry>/<repository>@<manifest_digest>` so
+/// docker's own `FROM` pull resolves to exactly the base image msb already
+/// cached & hashed (see `docs/adr/0003-project-tooling-layers.md`'s
+/// "Digest-pinned BASE_IMAGE" decision) — without this, docker independently
+/// re-resolves `FROM ghcr.io/.../agent-vm-template:latest` against the
+/// registry, which can race a moving `:latest` tag and silently build FROM a
+/// different image than the one the layer hash covers.
+///
+/// Any existing tag or digest on `base_ref` is discarded — `manifest_digest`
+/// always wins, so a caller can't accidentally pin the *previous* digest
+/// alongside a now-stale tag.
+///
+/// Parses `base_ref` through the same `Reference` type
+/// `image_config_path_and_digest` (`run.rs`) already uses for the booted
+/// image, so a `host:port/repo:tag`-shaped ref is never misparsed into
+/// stripping the registry-port colon instead of the tag colon. Falls back to
+/// hand-rolled string surgery only when `Reference`'s stricter grammar
+/// (lowercase-only repository segments) rejects the ref outright — the
+/// surgery has to make the same port-vs-tag-colon distinction by hand, which
+/// is the one subtle bug surface in this function and the reason it is
+/// unit-tested directly (`digest_pin_by_string_surgery_*` below).
+pub fn digest_pinned_base(base_ref: &str, manifest_digest: &str) -> Result<String> {
+    if let Ok(reference) = base_ref.parse::<microsandbox_image::Reference>() {
+        return Ok(reference
+            .clone_with_digest(manifest_digest.to_string())
+            .whole());
+    }
+    Ok(digest_pin_by_string_surgery(base_ref, manifest_digest))
+}
+
+/// Fallback for [`digest_pinned_base`] when `Reference` can't parse
+/// `base_ref`. Strips any existing `@digest`, then any trailing `:tag` —
+/// guarding the registry-port colon by only treating a colon *after* the
+/// last `/` as a tag separator — and appends `@manifest_digest`.
+fn digest_pin_by_string_surgery(base_ref: &str, manifest_digest: &str) -> String {
+    let base_ref = base_ref.split_once('@').map_or(base_ref, |(repo, _)| repo);
+    let last_slash = base_ref.rfind('/').map_or(0, |i| i + 1);
+    let repo = match base_ref[last_slash..].rfind(':') {
+        Some(i) => &base_ref[..last_slash + i],
+        None => base_ref,
+    };
+    format!("{repo}@{manifest_digest}")
+}
+
+/// Runs `docker buildx build` producing an OCI archive at `out_tar`
+/// containing exactly one image (`--provenance=false --sbom=false`
+/// suppresses the attestation manifests that would otherwise turn the
+/// archive into a multi-image index — see F7 in
+/// `docs/adr/0003-project-tooling-layers.md`).
+///
+/// Tries `compression=zstd` first (dedups against blobs the msb cache
+/// already holds for the base image, per ADR-0003); on any build failure it
+/// retries once with `compression=gzip` (F6: some older buildx/registries
+/// lack zstd) before giving up. Because stdout/stderr are inherited so the
+/// user sees live build progress, the failure text isn't captured to detect
+/// "specifically a zstd problem" — so this retries unconditionally on any
+/// non-zero exit. The accepted cost: a genuinely broken Dockerfile (bad
+/// syntax, unreachable FROM) fails, then fails again identically with gzip,
+/// doubling the wait for that case. That's judged acceptable because a
+/// build is confirmed (never automatic) and the error text a user sees is
+/// the same either way, just repeated.
+pub async fn build_derived_oci(id: &LayerIdentity, pinned_base: &str, out_tar: &Path) -> Result<()> {
+    match run_buildx(id, pinned_base, out_tar, "zstd").await {
+        Ok(()) => Ok(()),
+        Err(zstd_err) => {
+            eprintln!(
+                "==> docker buildx build (zstd output) failed for {}; retrying with gzip output: {zstd_err}",
+                id.tag
+            );
+            run_buildx(id, pinned_base, out_tar, "gzip").await.with_context(|| {
+                format!(
+                    "building tooling layer {} (gzip retry also failed; zstd attempt failed with: {zstd_err})",
+                    id.tag
+                )
+            })
+        }
+    }
+}
+
+/// The `docker buildx --platform` value for the host we are running on.
+///
+/// This MUST track `microsandbox_image::load_archive`'s own platform
+/// selection: `load_archive` materializes the archive's manifest matching
+/// `Platform::host_linux()` (`vendor/microsandbox/crates/image/lib/platform.rs`),
+/// which maps `std::env::consts::ARCH` (`x86_64` -> `amd64`, `aarch64` ->
+/// `arm64`, anything else passed through) — the *running host's*
+/// architecture, not a fixed value. A hardcoded `linux/amd64` built on an
+/// Apple-Silicon (`aarch64`) host produces an OCI archive that `load_archive`
+/// then rejects with "OCI layout contains no image manifests for the host
+/// platform", because it looks for the `arm64` manifest the build never
+/// emitted. Deriving the flag here with the identical mapping keeps the built
+/// image and the load/boot platform in lockstep on every supported host
+/// (see ADR-0003 and README "Requirements": Linux/KVM x86_64 and Apple
+/// Silicon are both first-class). The host arch is also exactly the platform
+/// msb resolved and cached for the base image, so docker's digest-pinned
+/// `FROM` pull selects the same base manifest the layer hash covers.
+fn host_oci_platform() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("linux/{arch}")
+}
+
+async fn run_buildx(
+    id: &LayerIdentity,
+    pinned_base: &str,
+    out_tar: &Path,
+    compression: &str,
+) -> Result<()> {
+    let out_tar_str = out_tar
+        .to_str()
+        .context("tooling-layer OCI archive path is not valid UTF-8")?;
+    let dockerfile_str = id
+        .dockerfile
+        .to_str()
+        .context("Dockerfile path is not valid UTF-8")?;
+    let dir_str = id
+        .dir
+        .to_str()
+        .context("tooling-layer directory path is not valid UTF-8")?;
+    let status = tokio::process::Command::new("docker")
+        .arg("buildx")
+        .arg("build")
+        .arg("--build-arg")
+        .arg(format!("BASE_IMAGE={pinned_base}"))
+        .arg("-f")
+        .arg(dockerfile_str)
+        .arg("--platform")
+        .arg(host_oci_platform())
+        .arg("--provenance=false")
+        .arg("--sbom=false")
+        .arg("--output")
+        .arg(format!("type=oci,dest={out_tar_str},compression={compression}"))
+        .arg(dir_str)
+        .status()
+        .await
+        .with_context(|| format!("spawning `docker buildx build` for tooling layer {}", id.tag))?;
+    if !status.success() {
+        bail!(
+            "`docker buildx build` failed for tooling layer {} ({compression} output, exit {})",
+            id.tag,
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "terminated by signal".to_string())
+        );
+    }
+    Ok(())
+}
+
+/// Ingests `tar` registry-lessly into `cache_dir`, tagging the archive's
+/// image `tag`. This is the step that materializes the per-layer EROFS plus
+/// fsmeta and VMDK (see [`derived_is_cached`] and
+/// `docs/adr/0003-project-tooling-layers.md`) — after this returns
+/// successfully, a boot of `tag` with `PullPolicy::IfMissing` resolves
+/// entirely from cache, with no registry contact.
+pub async fn load_derived_image(cache_dir: &Path, tar: &Path, tag: &str) -> Result<()> {
+    microsandbox_image::load_archive(
+        cache_dir,
+        tar,
+        microsandbox_image::ImageLoadOptions { tags: vec![tag.to_string()] },
+    )
+    .await
+    .with_context(|| format!("loading tooling layer {tag} into the msb cache"))?;
+    Ok(())
+}
+
 // hex encode/decode without a new dependency: sha2 already gives us
 // GenericArray output, and the hex alphabet is trivial to hand-roll. Kept
 // tiny and private to this module rather than pulling in the `hex` crate for
@@ -887,5 +1126,325 @@ mod tests {
         fs::write(layer_dir.join("Dockerfile"), "FROM scratch\n").unwrap();
         let got = resolve_layer_dir(None, project.path()).unwrap();
         assert_eq!(got, Some(layer_dir));
+    }
+
+    // --- digest_pinned_base() ---
+
+    #[test]
+    fn digest_pinned_base_pins_tagged_ref() {
+        let pinned = digest_pinned_base(
+            "ghcr.io/wirenboard/agent-vm-template:latest",
+            "sha256:abc",
+        )
+        .unwrap();
+        assert_eq!(pinned, "ghcr.io/wirenboard/agent-vm-template@sha256:abc");
+    }
+
+    #[test]
+    fn digest_pinned_base_handles_registry_port() {
+        // The tricky colon case: `localhost:5000` must stay intact as the
+        // registry host:port, and only the *tag* colon (after the `/`) gets
+        // replaced by the digest.
+        let pinned = digest_pinned_base("localhost:5000/x:latest", "sha256:def").unwrap();
+        assert_eq!(pinned, "localhost:5000/x@sha256:def");
+    }
+
+    #[test]
+    fn digest_pinned_base_handles_untagged_ref() {
+        // `Reference` normalizes a bare "nginx" to the fully-qualified
+        // docker.io/library/nginx form (the same normalization docker
+        // itself would apply to `FROM nginx`), so the plan's "or normalized
+        // form" allowance is exercised here: assert the digest is appended
+        // exactly once and the repository name survives, rather than
+        // pinning the literal input string.
+        let pinned = digest_pinned_base("nginx", "sha256:aaa").unwrap();
+        assert_eq!(pinned.matches('@').count(), 1, "pinned = {pinned}");
+        assert!(pinned.ends_with("@sha256:aaa"), "pinned = {pinned}");
+        assert!(pinned.contains("nginx"), "pinned = {pinned}");
+    }
+
+    #[test]
+    fn digest_pinned_base_normalizes_ref_that_already_has_a_digest() {
+        // A full 64-hex-char digest so `Reference::parse` accepts it as a
+        // valid existing digest (short/fake digests fail its length check
+        // and would instead exercise the string-surgery fallback below).
+        let old_digest = format!("sha256:{}", "a".repeat(64));
+        let base_ref = format!("ghcr.io/wirenboard/agent-vm-template@{old_digest}");
+        let pinned = digest_pinned_base(&base_ref, "sha256:newnew").unwrap();
+        // Defines the behavior: the caller's manifest_digest always wins,
+        // completely replacing any digest already embedded in base_ref.
+        assert_eq!(
+            pinned,
+            "ghcr.io/wirenboard/agent-vm-template@sha256:newnew"
+        );
+    }
+
+    // --- digest_pin_by_string_surgery() — the Reference-parse-failure fallback ---
+
+    #[test]
+    fn digest_pin_by_string_surgery_guards_registry_port_colon() {
+        // Uppercase in the repository segment makes `Reference::parse`
+        // reject the whole ref (its grammar requires lowercase repository
+        // components), forcing the fallback path — this is the case that
+        // must not confuse the `localhost:5000` port colon for a tag colon.
+        let base_ref = "localhost:5000/MyRepo:latest";
+        assert!(base_ref.parse::<microsandbox_image::Reference>().is_err());
+        assert_eq!(
+            digest_pin_by_string_surgery(base_ref, "sha256:ccc"),
+            "localhost:5000/MyRepo@sha256:ccc"
+        );
+    }
+
+    #[test]
+    fn digest_pin_by_string_surgery_untagged_ref_appends_digest() {
+        assert_eq!(
+            digest_pin_by_string_surgery("MyRepo", "sha256:ddd"),
+            "MyRepo@sha256:ddd"
+        );
+    }
+
+    #[test]
+    fn digest_pin_by_string_surgery_strips_existing_digest_first() {
+        assert_eq!(
+            digest_pin_by_string_surgery("host/MyRepo@sha256:old", "sha256:new"),
+            "host/MyRepo@sha256:new"
+        );
+    }
+
+    // --- host_oci_platform() ---
+
+    #[test]
+    fn host_oci_platform_matches_the_running_host_and_load_archive_mapping() {
+        // Must mirror microsandbox_image's Platform::host_linux() arch
+        // mapping exactly, so the image we build is the manifest
+        // load_archive materializes for this host (see the fn's doc and
+        // ADR-0003's platform note). Asserting against the same
+        // std::env::consts::ARCH the vendored crate reads keeps the two in
+        // lockstep regardless of which arch the test itself runs on.
+        let expected = match std::env::consts::ARCH {
+            "x86_64" => "linux/amd64".to_string(),
+            "aarch64" => "linux/arm64".to_string(),
+            other => format!("linux/{other}"),
+        };
+        assert_eq!(host_oci_platform(), expected);
+        // Never the bare, host-agnostic literal the plan originally
+        // hardcoded — that is precisely the bug this replaces on aarch64.
+        assert!(host_oci_platform().starts_with("linux/"));
+    }
+
+    // --- derived_is_cached() ---
+
+    #[tokio::test]
+    async fn derived_is_cached_is_false_when_nothing_was_ever_loaded() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cached = derived_is_cached(cache_dir.path(), "agent-vm-layer:my-app-deadbeef")
+            .await
+            .unwrap();
+        assert!(!cached);
+    }
+
+    #[tokio::test]
+    async fn derived_is_cached_rejects_an_unparseable_tag() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let err = derived_is_cached(cache_dir.path(), "NOT A VALID TAG")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("parsing derived image tag"));
+    }
+
+    // --- e2e: real docker buildx build + registry-less load ---
+    //
+    // `#[ignore]`d: needs a working `docker buildx` on PATH, plus a base
+    // image resolvable without a registry-less launcher of its own —
+    // either already present in docker's local image store, or pullable
+    // over the network. Defaults to `alpine:latest` (small, public,
+    // portable to any dev host with normal internet access); override with
+    // `AGENT_VM_E2E_BASE_IMAGE=<ref>` to point at a locally cached image
+    // instead (e.g. the real `agent-vm-template:latest`) on a host where
+    // outbound registry access is restricted. Run explicitly:
+    // `cargo test -p agent-vm --lib layer::tests::e2e -- --ignored`.
+    //
+    // This exercises the novel, riskiest part of this ticket for real —
+    // `docker buildx build --output type=oci` with a digest-pinned
+    // `BASE_IMAGE` (mirrors [`digest_pinned_base`]) producing an archive
+    // that `microsandbox_image::load_archive` then ingests registry-lessly,
+    // with no `registry:2` sidecar involved — without needing the full
+    // `agent-vm` CLI/session/mount machinery or an actual VM boot (which
+    // this test deliberately does not attempt; see
+    // `docs/adr/0003-project-tooling-layers.md` and the plan's note that a
+    // live VM boot needs Hypervisor.framework/KVM this dev sandbox may not
+    // have).
+
+    /// Resolves the e2e base image's local content digest (pulling it once
+    /// if it isn't already present and the pull succeeds), and pins it via
+    /// the same [`digest_pinned_base`] production code path `run.rs` uses.
+    /// Returns `None` — skip, don't fail — when neither a local copy nor a
+    /// network pull can produce one, so this e2e module degrades to a
+    /// no-op on a host with no docker at all rather than a false failure.
+    fn e2e_pinned_base() -> Option<(String, String)> {
+        let base = std::env::var("AGENT_VM_E2E_BASE_IMAGE").unwrap_or_else(|_| "alpine:latest".to_string());
+        let inspect = |base: &str| {
+            std::process::Command::new("docker")
+                .args(["image", "inspect", base, "--format", "{{.Id}}"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        let digest = inspect(&base).or_else(|| {
+            let pulled = std::process::Command::new("docker")
+                .args(["pull", "-q", &base])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            pulled.then(|| inspect(&base)).flatten()
+        })?;
+        let pinned = digest_pinned_base(&base, &digest).ok()?;
+        Some((base, pinned))
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_build_and_load_round_trip_through_derived_is_cached() {
+        if ensure_docker_buildx().is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some((base, pinned_base)) = e2e_pinned_base() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+        eprintln!("e2e base: {base} pinned to {pinned_base}");
+
+        let layer_dir = tempfile::tempdir().unwrap();
+        write_layer_file(
+            layer_dir.path(),
+            "Dockerfile",
+            &format!(
+                "ARG BASE_IMAGE={base}\n\
+                 FROM ${{BASE_IMAGE}}\n\
+                 RUN ln -s /bin/true /usr/local/bin/marker-tool\n\
+                 ENV PATH=/usr/local/bin:$PATH\n"
+            ),
+            0o644,
+        );
+        let id = resolve(
+            layer_dir.path(),
+            Path::new("/tmp/e2e-project"),
+            "sha256:e2e0000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        assert!(
+            !derived_is_cached(cache_dir.path(), &id.tag).await.unwrap(),
+            "must start uncached"
+        );
+
+        let tar = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+        build_derived_oci(&id, &pinned_base, tar.path())
+            .await
+            .expect("docker buildx build");
+        load_derived_image(cache_dir.path(), tar.path(), &id.tag)
+            .await
+            .expect("load_archive");
+
+        assert!(
+            derived_is_cached(cache_dir.path(), &id.tag).await.unwrap(),
+            "must be cached after load — this is the invariant boot's \
+             PullPolicy::IfMissing relies on to resolve from cache with no \
+             registry contact"
+        );
+
+        // PATH propagation: read the ingested image's config directly
+        // (mirrors run.rs's `image_config_path_and_digest`, inlined here so
+        // this crate-internal test doesn't reach across into `run.rs`).
+        let reference: microsandbox_image::Reference = id.tag.parse().unwrap();
+        let cache = microsandbox_image::GlobalCache::new_async(cache_dir.path())
+            .await
+            .unwrap();
+        let metadata = cache
+            .read_image_metadata_async(&reference)
+            .await
+            .unwrap()
+            .expect("metadata must be present after load_archive");
+        let path_entry = metadata
+            .config
+            .env
+            .iter()
+            .rev()
+            .find_map(|e| e.strip_prefix("PATH="));
+        let path_entry = path_entry.expect("derived image config must declare a PATH");
+        assert!(
+            path_entry.starts_with("/usr/local/bin:"),
+            "the layer's ENV PATH=/usr/local/bin:$PATH must merge into the \
+             derived image's config, prefixed ahead of the base's own PATH; got {path_entry:?}"
+        );
+
+        // No registry:2 sidecar: this whole test never started one, and
+        // load_archive/derived_is_cached never touch the network — the
+        // absence of network calls (not a `docker ps` grep) is the actual
+        // proof for the in-process ingest path this test exercises.
+    }
+
+    /// Companion to the round-trip test above: editing the layer (a second
+    /// symlink) changes [`resolve`]'s hash, so the *new* identity's tag is
+    /// correctly a fresh cache miss even though the *old* tag was already
+    /// ingested — pins the "edit invalidates the cache" behavior the ticket
+    /// calls "rebuild on edit" without needing to literally invoke
+    /// `docker buildx build` twice (that invariant belongs to `resolve`,
+    /// already covered by the hash tests above; this only confirms
+    /// `derived_is_cached` sees the two tags as unrelated cache entries).
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_editing_the_layer_is_a_fresh_cache_miss() {
+        if ensure_docker_buildx().is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some((base, pinned_base)) = e2e_pinned_base() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+
+        let layer_dir = tempfile::tempdir().unwrap();
+        write_layer_file(
+            layer_dir.path(),
+            "Dockerfile",
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\n"),
+            0o644,
+        );
+        let base_id = "sha256:e2e0000000000000000000000000000000000000000000000000000000000";
+        let before = resolve(layer_dir.path(), Path::new("/tmp/e2e-project"), base_id).unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let tar = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+        build_derived_oci(&before, &pinned_base, tar.path())
+            .await
+            .expect("docker buildx build");
+        load_derived_image(cache_dir.path(), tar.path(), &before.tag)
+            .await
+            .expect("load_archive");
+        assert!(derived_is_cached(cache_dir.path(), &before.tag).await.unwrap());
+
+        write_layer_file(
+            layer_dir.path(),
+            "Dockerfile",
+            &format!(
+                "ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nRUN ln -s /bin/true /usr/local/bin/marker-tool\n"
+            ),
+            0o644,
+        );
+        let after = resolve(layer_dir.path(), Path::new("/tmp/e2e-project"), base_id).unwrap();
+
+        assert_ne!(before.tag, after.tag, "editing the Dockerfile must change the tag");
+        assert!(
+            !derived_is_cached(cache_dir.path(), &after.tag).await.unwrap(),
+            "the edited layer's tag must be a fresh cache miss, triggering a rebuild"
+        );
+        // The old tag is untouched — still resolves from cache. Confirms
+        // the hash-as-staleness-check design (no state file to go stale):
+        // both identities coexist in the cache independently.
+        assert!(derived_is_cached(cache_dir.path(), &before.tag).await.unwrap());
     }
 }

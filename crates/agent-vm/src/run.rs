@@ -98,6 +98,122 @@ fn normalize_layer_flag(flag: Option<PathBuf>) -> Option<PathBuf> {
     flag.filter(|p| !p.as_os_str().is_empty())
 }
 
+/// Mirrors [`should_check_update`]'s flag-or-truthy-env pattern: the
+/// `--yes` flag OR a truthy `AGENT_VM_YES` skips the interactive
+/// tooling-layer-build confirmation, for CI/non-interactive callers. Truthy
+/// values match the repo convention (`1|true|yes|on`, see `pull::env_truthy`).
+fn should_auto_confirm(flag: bool, env_val: Option<&str>) -> bool {
+    flag || matches!(env_val, Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+}
+
+/// Interactive y/N confirmation before building a tooling layer (F3 in the
+/// plan/ADR-0003).
+///
+/// When `auto` is set (`--yes` / `$AGENT_VM_YES`), always confirms without
+/// prompting. Otherwise, when stdin isn't a terminal, returns an actionable
+/// error rather than hanging on a `read_line` that will never receive
+/// input — a non-interactive caller (CI, a script) needs to pass `--yes`
+/// explicitly, not have the launch appear to hang.
+async fn confirm_layer_build(tag: &str, auto: bool) -> Result<bool> {
+    if auto {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "tooling layer {tag} needs to be built, but stdin is not a terminal to confirm \
+             interactively. Re-run with --yes, or set AGENT_VM_YES=1."
+        );
+    }
+    eprint!("Build project tooling layer '{tag}'? [y/N] ");
+    std::io::Write::flush(&mut std::io::stderr()).ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading tooling-layer build confirmation from stdin")?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+/// If the project declares a tooling layer, build+load it (lazily, hash-
+/// cached, with confirmation on a miss — see ADR-0003) and return the
+/// derived tag to boot instead of `base_image`. Returns `Ok(None)` when
+/// there is no layer, so `launch()` boots `base_image` unchanged — a
+/// non-layer project's behavior is byte-identical to before this function
+/// existed.
+///
+/// Extracted out of `launch()` so the orchestration reads top-to-bottom
+/// without the surrounding ~150 lines of mount/credential/network setup
+/// interleaved with it, and so each step (cache hit, confirm, build, load)
+/// is a single `?`-propagated call a reader can follow in order.
+async fn resolve_boot_image_with_layer(
+    base_image: &str,
+    layer_flag: Option<&Path>,
+    project_dir: &Path,
+    auto_confirm: bool,
+) -> Result<Option<String>> {
+    let Some(layer_dir) = layer::resolve_layer_dir(layer_flag, project_dir)? else {
+        return Ok(None);
+    };
+
+    // 1. Ensure the base is cached and get its manifest digest — needed
+    //    both for the #12 content hash and to digest-pin docker's FROM
+    //    (ADR-0003). Reuse the existing best-effort reader; only pull the
+    //    base if it isn't cached yet (F4).
+    let (_path, mut base_digest) = image_config_path_and_digest(base_image).await;
+    if base_digest.is_none() {
+        eprintln!("==> Tooling layer present; pulling base {base_image} first…");
+        crate::pull::pull_image(base_image)
+            .await
+            .context("pulling base image to build the tooling layer FROM")?;
+        base_digest = image_config_path_and_digest(base_image).await.1;
+    }
+    let base_digest = base_digest.context(
+        "could not resolve base image digest after pull; cannot build a reproducible tooling layer",
+    )?;
+
+    // 2. Identity: content hash over the base digest + the layer directory
+    //    tree. The tag IS the staleness check (see layer.rs's module doc).
+    let id = layer::resolve(&layer_dir, project_dir, &base_digest)?;
+    let cache_dir = crate::msb_install::effective_cache_dir()?;
+
+    // 3. Hash hit ⇒ reuse the already-ingested derived image. No rebuild,
+    //    no prompt — this is the common-case fast path on every launch
+    //    after the first.
+    if layer::derived_is_cached(&cache_dir, &id.tag).await? {
+        eprintln!("==> Reusing cached tooling layer {}", id.tag);
+        return Ok(Some(id.tag));
+    }
+
+    // 4. Hash miss (new project or an edited layer) ⇒ confirm, build, load.
+    //    Any failure past this point is a hard fail — launch() must never
+    //    silently fall back to booting the plain base with a missing
+    //    toolchain (F2 in the plan/ADR-0003).
+    layer::ensure_docker_buildx()?;
+    if !confirm_layer_build(&id.tag, auto_confirm).await? {
+        anyhow::bail!(
+            "tooling layer {} not built (declined). Re-run and confirm, or pass --yes.",
+            id.tag
+        );
+    }
+    let pinned_base = layer::digest_pinned_base(base_image, &base_digest)?;
+    // Under `cache_dir`, not the system tmp (AGENTS.md) — RAII-cleaned via
+    // NamedTempFile's Drop regardless of how build/load below returns.
+    let tar = tempfile::Builder::new()
+        .prefix("agent-vm-layer-")
+        .suffix(".tar")
+        .tempfile_in(&cache_dir)
+        .context("creating tooling-layer OCI archive tempfile")?;
+    eprintln!("==> Building tooling layer {} …", id.tag);
+    layer::build_derived_oci(&id, &pinned_base, tar.path())
+        .await
+        .with_context(|| format!("building tooling layer {}", id.tag))?;
+    layer::load_derived_image(&cache_dir, tar.path(), &id.tag)
+        .await
+        .with_context(|| format!("loading tooling layer {} into the msb cache", id.tag))?;
+    eprintln!("==> Tooling layer {} ready", id.tag);
+    Ok(Some(id.tag))
+}
+
 fn guest_path_is_safe(project: &Path) -> bool {
     let s = match project.to_str() {
         Some(s) => s,
@@ -458,11 +574,22 @@ pub struct Args {
     /// Precedence: this flag, then $AGENT_VM_LAYER, then the default
     /// `.agent-vm/layer/` in the project. An explicitly-pointed-at dir
     /// missing a Dockerfile is an error; the default dir simply being
-    /// absent means "no layer". Building and booting the derived image is
-    /// not implemented yet (a later ticket) — for now the layer is only
-    /// resolved and, at debug log level, hashed and reported.
+    /// absent means "no layer". When a layer is declared, the derived
+    /// image (base + layer) is built, loaded registry-lessly, and booted
+    /// in place of the base — see `docs/adr/0003-project-tooling-layers.md`.
+    /// A hash miss (new/changed layer) prompts for confirmation unless
+    /// `--yes` / `$AGENT_VM_YES` is set.
     #[arg(long = "layer", env = "AGENT_VM_LAYER", value_name = "DIR", help_heading = "Image")]
     layer: Option<PathBuf>,
+
+    /// Assume "yes" to the tooling-layer build confirmation prompt.
+    ///
+    /// Needed for CI/non-interactive launches whenever the tooling-layer
+    /// hash doesn't already match a previously built/loaded derived image
+    /// (a new project, or an edited `.agent-vm/layer/Dockerfile`). Can also
+    /// be set persistently with a truthy `AGENT_VM_YES` (1|true|yes|on).
+    #[arg(long = "yes", short = 'y', default_value_t = false, help_heading = "Image")]
+    yes: bool,
 
     /// Run the guest as root (uid 0) instead of the default host user.
     ///
@@ -515,16 +642,40 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     );
     let _ = &session.project_hash;
 
-    let image = args
+    // `base_image` stays a separate binding from `image` for the lifetime of
+    // `launch()`: the opt-in registry update-check below (run.rs:566ish)
+    // must keep probing the *base*, never a reassigned tooling-layer tag,
+    // which has no registry to probe (see the call site's comment there).
+    let base_image = args
         .image
         .clone()
         .or_else(|| env::var("AGENT_VM_IMAGE_TAG").ok())
         .unwrap_or_else(|| crate::defaults::DEFAULT_IMAGE_REF.to_string());
+    let mut image = base_image.clone();
     let memory_mib: u32 = args
         .memory
         .checked_mul(1024)
         .context("--memory in GiB overflows u32 MiB")?;
     let cpus = args.cpus;
+
+    // Tooling-layer resolution (issue #13, on top of #12's identity-only
+    // plumbing): if the project declares `.agent-vm/layer/Dockerfile`,
+    // build+load the derived image now (lazily, hash-cached, with
+    // confirmation on a miss) and boot it instead of the base. No layer ⇒
+    // `image` is left as `base_image`, byte-identical to today.
+    let layer_flag = normalize_layer_flag(args.layer.clone());
+    let auto_confirm =
+        should_auto_confirm(args.yes, env::var("AGENT_VM_YES").ok().as_deref());
+    if let Some(derived) = resolve_boot_image_with_layer(
+        &base_image,
+        layer_flag.as_deref(),
+        &session.project_dir,
+        auto_confirm,
+    )
+    .await?
+    {
+        image = derived;
+    }
 
     // Mount the host project at the *same* absolute path inside the guest so
     // that anything the agent emits (compiler errors, stack traces, git
@@ -572,7 +723,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         // The banner prints if the ~0.9s ghcr.io round-trip resolves
         // during boot; otherwise it's simply skipped and the next launch
         // catches up. Previously this was awaited and blocked every boot.
-        let img = image.clone();
+        //
+        // Deliberately `base_image`, not `image`: when a tooling layer
+        // reassigned `image` to the registry-less derived tag
+        // (`agent-vm-layer:<hash>`), probing it would HEAD a nonexistent
+        // registry ref and always miss. The pulled-marker + update banner
+        // are a property of the base image the layer builds FROM.
+        let img = base_image.clone();
         tokio::spawn(async move {
             seed_pulled_marker_if_absent(&img).await;
             notify_if_update_available(&img).await;
@@ -1180,47 +1337,16 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // launch's own pull completes); for the base image the two are
     // byte-identical today, so this is behavior-identical in the common
     // case.
-    let (config_path, base_image_digest) = image_config_path_and_digest(&image).await;
+    // Reads the *derived* image's config once a tooling layer reassigned
+    // `image` above, so a layer's `ENV PATH=/project/bin:$PATH` actually
+    // reaches the guest exec environment (the whole point of #12's
+    // PATH-from-config change). The manifest digest this call also returns
+    // is unused here — `resolve_boot_image_with_layer` already fetched and
+    // used the *base* image's digest earlier, before any build — so only
+    // the PATH half of the tuple is bound.
+    let (config_path, _) = image_config_path_and_digest(&image).await;
     let guest_path = config_path.unwrap_or_else(|| FALLBACK_GUEST_PATH.to_string());
     builder = builder.env("PATH", guest_path);
-
-    // Tooling-layer resolution (issue #12). No image build/boot yet — that
-    // is the next ticket — so this only resolves the layer directory
-    // (fail-closed on a declared-but-broken layer) and, when debug logging
-    // is on, computes and reports the derived-image identity.
-    //
-    // resolve_layer_dir always runs: it is cheap (a couple of filesystem
-    // stats) and its fail-closed missing-Dockerfile error is genuinely
-    // wanted on every launch, not just debug ones. layer::resolve's
-    // full-tree content hash is NOT free — a layer may vendor a large
-    // tarball, and this module deliberately has no size cap — so it is
-    // gated behind DEBUG-level logging rather than run unconditionally for
-    // a debug line with no other consumer yet.
-    let layer_flag = normalize_layer_flag(args.layer.clone());
-    if let Some(layer_dir) = layer::resolve_layer_dir(layer_flag.as_deref(), &session.project_dir)?
-        && tracing::enabled!(tracing::Level::DEBUG)
-    {
-        match &base_image_digest {
-            Some(base_id) => {
-                let id = layer::resolve(&layer_dir, &session.project_dir, base_id)?;
-                tracing::debug!(
-                    tag = %id.tag,
-                    files = id.file_count,
-                    bytes = id.hashed_bytes,
-                    "resolved tooling layer (build not yet implemented)"
-                );
-            }
-            None => {
-                // Base image not cached yet ⇒ digest unknown ⇒ defer hashing
-                // to the build/boot ticket, which pulls before hashing.
-                // Surface the dir so a user knows the layer was seen.
-                tracing::debug!(
-                    dir = %layer_dir.display(),
-                    "tooling layer present; identity deferred (base image not cached)"
-                );
-            }
-        }
-    }
 
     // Non-root mode: mirror the host's own $HOME and username into the
     // guest (ADR-0002) — HOME is the host's literal $HOME string, USER/
@@ -2164,6 +2290,67 @@ mod tests {
             Some(PathBuf::from("/a/b"))
         );
         assert_eq!(normalize_layer_flag(None), None);
+    }
+
+    #[test]
+    fn should_auto_confirm_flag_or_env() {
+        // Default: neither set → prompt.
+        assert!(!should_auto_confirm(false, None));
+        assert!(!should_auto_confirm(false, Some("")));
+        assert!(!should_auto_confirm(false, Some("0")));
+        // Flag opt-in.
+        assert!(should_auto_confirm(true, None));
+        // Env opt-in, same truthy set as should_check_update.
+        assert!(should_auto_confirm(false, Some("1")));
+        assert!(should_auto_confirm(false, Some("true")));
+        assert!(should_auto_confirm(false, Some("yes")));
+        assert!(should_auto_confirm(false, Some("on")));
+        // Either input enables (flag OR env).
+        assert!(should_auto_confirm(true, Some("0")));
+    }
+
+    #[test]
+    fn yes_flag_parses_via_clap() {
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: Args,
+        }
+        use clap::Parser as _;
+
+        let cli = TestCli::try_parse_from(["agent-vm"]).expect("parses with no flags");
+        assert!(!cli.args.yes);
+
+        let cli = TestCli::try_parse_from(["agent-vm", "--yes"]).expect("parses --yes");
+        assert!(cli.args.yes);
+
+        // Short form.
+        let cli = TestCli::try_parse_from(["agent-vm", "-y"]).expect("parses -y");
+        assert!(cli.args.yes);
+    }
+
+    // `resolve_boot_image_with_layer` is only exercised end-to-end by the
+    // opt-in docker+registry e2e paths (see layer.rs's `#[ignore]`d
+    // `e2e_*` tests and the manual verification recorded for issue #13),
+    // but its "no layer declared" short circuit is pure and network-free:
+    // `layer::resolve_layer_dir` returns `Ok(None)` on a missing
+    // `.agent-vm/layer/` before this function's first `.await`, so this
+    // is safe to pin as an ordinary fast unit test. It locks in the
+    // guarantee that a non-layer project's boot path is byte-identical to
+    // before this ticket: no base-digest read, no docker, no msb-cache
+    // touch, `image` stays the base unchanged.
+    #[tokio::test]
+    async fn resolve_boot_image_with_layer_returns_none_for_a_project_with_no_layer() {
+        let project = tempfile::tempdir().unwrap();
+        let got = resolve_boot_image_with_layer(
+            "ghcr.io/wirenboard/agent-vm-template:latest",
+            None,
+            project.path(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, None);
     }
 
     #[test]

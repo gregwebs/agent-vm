@@ -79,3 +79,46 @@ The in-guest `$HOME` for the current guest user mode:
 
 Both modes share one symlink mapping,
 `session::GUEST_HOME_LINKS`, so the two provisioning paths can't drift.
+
+## Base image
+
+The OCI **guest template** agent-vm boots inside each per-project microVM
+(default `ghcr.io/wirenboard/agent-vm-template:latest`) — Debian plus the
+in-VM coding agents (Claude Code, Codex CLI, OpenCode). "Base image" and
+"guest template" name the same thing; use "base image" in code and docs that
+also talk about tooling layers, since it is the base a layer builds `FROM`.
+Resolved via `--image` / `AGENT_VM_IMAGE_TAG` / `defaults::DEFAULT_IMAGE_REF`
+(`run.rs`'s `base_image` binding). See
+`docs/adr/0003-project-tooling-layers.md`.
+
+## Tooling layer
+
+A project-owned `.agent-vm/layer/Dockerfile` (plus its build context — the
+rest of that directory) that adds project-specific tools `FROM` the base
+image: compilers, cross-toolchains, anything the base doesn't carry.
+Resolution precedence, applied by `layer::resolve_layer_dir`: `--layer` /
+`$AGENT_VM_LAYER` / the default `.agent-vm/layer/` under the project root. An
+explicitly-pointed-at directory missing a `Dockerfile` is a hard error; the
+*default* directory simply being absent means "no layer" (`Ok(None)`). See
+`docs/adr/0003-project-tooling-layers.md`.
+
+## Derived image
+
+Base image + tooling layer, built with `docker buildx build`, tagged
+`agent-vm-layer:<project-slug>-<hash>`, and booted in place of the base
+whenever the project declares a layer. Ingested **registry-lessly** — via
+`microsandbox_image::load_archive`, never a `registry:2` push — so booting a
+derived image makes no registry contact. See
+`docs/adr/0003-project-tooling-layers.md`.
+
+## Layer identity / hash
+
+The content hash `layer::resolve` computes over the base image's resolved
+manifest digest plus the whole tooling-layer directory tree (git-mode-
+normalized: only the execute bit is tracked, so checkout umask can't move
+the hash). The tag *is* the staleness check — there is no separate state
+file recording "what was last built" to fall out of sync with the image
+store. A hash hit reuses the already-ingested derived image with no rebuild
+and no confirmation prompt; a hash miss (new project, or an edited
+Dockerfile/layer file) prompts to build unless `--yes` / `$AGENT_VM_YES` is
+set. See `docs/adr/0003-project-tooling-layers.md`.
