@@ -35,10 +35,16 @@ console = "0.16"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 libc = "0.2"
 ipnetwork = "0.21"
+# The tooling-layer build (layer.rs) needs a private, RAII-cleaned temp path
+# for the OCI archive `docker buildx build --output type=oci` writes before
+# `load_archive` ingests it — a runtime need, not just a test fixture, so
+# this is promoted out of dev-dependencies (see the crate's other runtime
+# deps for the pattern; `tempfile::Builder::tempfile_in` is used to keep the
+# file under the msb cache dir rather than the system tmp, per AGENTS.md).
+tempfile = "3"
 
 # Integration tests that drive the actual secret-substitution layer
 # end-to-end with the hook's anonymisation logic. Kept out of release
 # deps so production builds don't pull in the entire network stack.
 [dev-dependencies]
 microsandbox-network = { path = "../../vendor/microsandbox/crates/network" }
-tempfile = "3"

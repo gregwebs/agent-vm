@@ -115,6 +115,8 @@ Each launcher accepts:
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
 | `--mount HOST[:GUEST][:ro\|:rw]` | extra bind mount (one virtio-fs each, ~210 mount headroom); append `:ro` for a read-only bind, `:rw` is the default |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
+| `--layer DIR` | project tooling-layer directory (default `.agent-vm/layer/`) — see [Project tooling layers](#project-tooling-layers) |
+| `--yes` / `-y` | assume "yes" to the tooling-layer build confirmation (CI/non-interactive) |
 
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
 `agent-vm shell -- -c 'cargo test'`.
@@ -132,6 +134,41 @@ Env-var knobs (all opt-in; most accept any value, empty included —
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
 | `AGENT_VM_UPDATE_CHECK` | opt into the launch-time registry update check (accepted: `1`/`true`/`yes`/`on`) |
 | `AGENT_VM_ROOT` | same as `--root` (accepted: `1`/`true`/`yes`/`on`) |
+| `AGENT_VM_LAYER` | same as `--layer` |
+| `AGENT_VM_YES` | same as `--yes` (accepted: `1`/`true`/`yes`/`on`) |
+
+## Project tooling layers
+
+A project can add tools on top of the base image — compilers,
+cross-toolchains, whatever the base doesn't carry — by dropping a
+`.agent-vm/layer/Dockerfile` in the project root (or pointing `--layer` /
+`AGENT_VM_LAYER` at another directory). When a layer is declared, `agent-vm
+claude`/`codex`/`opencode`/`copilot`/`shell` builds base + layer with
+`docker buildx build`, loads the result into the microsandbox image cache
+**registry-lessly** (no `registry:2` sidecar, no registry contact at boot),
+and boots that derived image instead of the base.
+
+The derived image is content-hash-identified — the tag itself
+(`agent-vm-layer:<project-slug>-<hash>`) is the staleness check. An
+unchanged layer boots straight from the cache on every launch after the
+first; editing the Dockerfile changes the hash and triggers a rebuild.
+Building requires `docker buildx` on the host and, unless the hash is
+already cached, a one-time confirmation:
+
+```
+Build project tooling layer 'agent-vm-layer:my-app-1a2b3c...'? [y/N]
+```
+
+Pass `--yes` (or set `AGENT_VM_YES=1`) to skip the prompt — required for
+CI/non-interactive launches. A build failure is a hard stop: agent-vm never
+falls back to booting the plain base with a missing toolchain.
+
+The Dockerfile must follow a small contract (start `ARG BASE_IMAGE=...` /
+`FROM ${BASE_IMAGE}`, keep `ENV PATH` additive, install world-readable
+tools; the launcher builds for the host's own architecture, `linux/amd64`
+on x86_64 and `linux/arm64` on Apple Silicon) — see
+[`docs/adr/0003-project-tooling-layers.md`](docs/adr/0003-project-tooling-layers.md)
+for the full contract and design rationale.
 
 ## Shared microsandbox image cache
 
