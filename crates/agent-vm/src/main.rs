@@ -9,6 +9,7 @@ mod image_check;
 mod intercept_hook;
 mod layer;
 mod mount;
+mod msb_cmd;
 mod msb_install;
 mod pull;
 mod pull_progress;
@@ -67,6 +68,11 @@ enum Cmd {
     /// Open a bash shell in a per-project sandbox.
     Shell(run::Args),
 
+    /// Forward arguments to the bundled `msb` with agent-vm's MSB_HOME/MSB_PATH
+    /// pinned (e.g. `agent-vm msb ls`, `agent-vm msb status`). Relies on
+    /// `needs_msb_setup` staying true for this variant — see main().
+    Msb(msb_cmd::Args),
+
     /// Exchange a string between the host and the sandbox.
     Clipboard(clipboard::Args),
 
@@ -103,6 +109,12 @@ fn main() -> Result<()> {
         // (db, sandboxes, cache, tls/CA, logs) lives here.
         msb_install::point_at_msb_home()?;
     }
+    // `msb_cmd::run` is fully synchronous (just spawns a child and waits);
+    // dispatch it before paying for a tokio runtime we'd otherwise spin up
+    // and immediately block on for a single `Command::status()` call.
+    if let Cmd::Msb(args) = cli.cmd {
+        return exit_with(msb_cmd::run(args)?);
+    }
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     runtime.block_on(async move {
         match cli.cmd {
@@ -115,6 +127,10 @@ fn main() -> Result<()> {
             Cmd::Shell(args) => exit_with(run::launch(run::Agent::Shell, args).await?),
             Cmd::Clipboard(args) => clipboard::run(args),
             Cmd::InterceptHook(args) => intercept_hook::run(args).await,
+            // Already dispatched and returned from, above, before the
+            // runtime was built — `Cmd` isn't `Clone`/`Copy`, so this arm
+            // exists only to satisfy exhaustiveness.
+            Cmd::Msb(_) => unreachable!("Cmd::Msb is dispatched pre-runtime, see above"),
         }
     })
 }

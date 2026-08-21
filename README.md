@@ -87,8 +87,16 @@ registry. See [the macOS guide](macos-build.md) for the exact workflow.
 claude | codex | opencode | shell   launch an agent in a per-project sandbox
 pull                                refresh the cached image
 setup                               pull base image + verify boot
+msb <args...>                       forward to the bundled msb (e.g. msb ls, msb status)
 clipboard {get,put} [--sys]         exchange a string with the project sandbox
 ```
+
+`agent-vm` keeps its sandbox registry under a private `MSB_HOME`
+(`~/.local/state/agent-vm/msb-home`), so a separately-installed `msb ls` won't
+show the sandboxes agent-vm launched — it reads the default
+`~/.microsandbox` instead. `agent-vm msb ls` (and any other `agent-vm msb
+<args...>`) forwards to the bundled `msb` with `MSB_HOME`/`MSB_PATH` already
+pointed at agent-vm's own state, so it sees the same sandboxes agent-vm does.
 
 ## Image release cadence
 
