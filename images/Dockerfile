@@ -8,12 +8,12 @@
 # (docker.io + containerd + runc + fuse-overlayfs), network/diagnostic
 # CLIs, codestyle-pinned Python linters (black/isort/pylint matching
 # `wirenboard/codestyle`), and a clone of `wirenboard/codestyle`
-# at /opt/wirenboard/codestyle. Two heavier blocks (WB
-# build-essentials family + armhf/arm64 cross toolchains) are
-# present in the Dockerfile but COMMENTED OUT for the initial
-# roll-out — see the "DEFERRED" RUN blocks below. Other heavy
-# extras (LSPs, additional MCP servers, docker-buildx) are
-# deliberately deferred too.
+# at /opt/wirenboard/codestyle. The WB C/C++ build-essentials
+# family and armhf/arm64 cross toolchains live as an opt-in example
+# tooling layer at examples/layers/wirenboard-cpp/ instead of in
+# this base image — see docs/adr/0003-project-tooling-layers.md.
+# Other heavy extras (LSPs, additional MCP servers, docker-buildx)
+# are deliberately deferred too.
 #
 # Layer policy: the file is ordered so the LAST RUN steps are the
 # agent installers (the most frequently updated content). Each is
@@ -379,102 +379,6 @@ RUN apt-get update \
 # Must come AFTER the nodejs RUN above — npx didn't exist before it.
 RUN sudo -u chrome -H npx -y chrome-devtools-mcp@1.0.1 --help >/dev/null 2>&1 \
  || echo "==> pre-warm skipped (will lazy-fetch chrome-devtools-mcp at first MCP call)"
-
-# Wiren Board C/C++ build essentials — DEFERRED.
-#
-# These two RUN blocks (build-essential family + armhf/arm64 cross
-# toolchains) are commented out for the initial roll-out. They
-# account for ~466 MiB compressed (~1.6 GB uncompressed) of the
-# original image size estimate; deferring them keeps the first
-# tooling-image bump lean while the layer ordering / cron-cache
-# wins land. Uncomment to re-enable when WB engineers actually
-# need the cross-compile path in-VM (the existing host
-# `schroot -c bullseye-amd64-sbuild …` workflow still works).
-#
-# Sourced from the union of debian/control Build-Depends across
-# wb-mqtt-serial, wb-mqtt-mbgate, wb-rules, wb-mqtt-confed and the
-# `cpp/local/linux-devenv.sh` / `cpp/ci/clang-*-subdirs.sh` scripts
-# in `wirenboard/codestyle`. When uncommenting, also re-add the
-# corresponding sanity-check probes for clang-format,
-# arm-linux-gnueabihf-gcc, aarch64-linux-gnu-gcc, and
-# qemu-arm-static at the bottom of the Dockerfile.
-#
-#   - build-essential: gcc/g++/make/dpkg-dev metapackage.
-#   - debhelper, devscripts, equivs, dpkg-cross: Debian packaging
-#     primitives. `debhelper (>= 10)` is mandated by every WB
-#     debian/control; `equivs` is required for `mk-build-deps -ir`
-#     (the recommended `linux-devenv.sh` install path).
-#   - pkg-config: standard build-time discovery.
-#   - clang-format, clang-tidy: the only formatters/linters WB
-#     codestyle ships configs for (`cpp/config/.clang-format`,
-#     `.clang-tidy`). `cpp/ci/clang-format-subdirs.sh` and
-#     `clang-tidy-subdirs.sh` call them directly.
-#   - libcurl4-openssl-dev, libgtest-dev, libgmock-dev,
-#     libmodbus-dev, libsystemd-dev: most-frequent C/C++ deps
-#     across the WB services (modbus serial gateway, MQTT bridge,
-#     etc).
-#   - gcovr: pinned in `python/vscode/.devcontainer/devcontainer.json`
-#     via the `coverage-gutters` extension; wb-mqtt-serial's
-#     Build-Depends lists it explicitly.
-#   - gdb-multiarch: install-listed by `cpp/local/linux-devenv.sh`;
-#     debugging cross-built armhf/arm64 binaries.
-#   - cmake, ninja-build: not in every WB repo but common enough
-#     (firmware repo uses cmake) that excluding them would catch
-#     people off guard.
-#   - python3-cups, python3-libgpiod, python3-pycurl: per the
-#     allowed-c-extensions list in `python/config/pyproject.toml`,
-#     so pylint can resolve imports in WB Python projects without
-#     spurious E0401.
-# RUN apt-get update \
-#  && apt-get install -y --no-install-recommends \
-#         build-essential \
-#         debhelper devscripts equivs dpkg-cross \
-#         pkg-config \
-#         clang-format clang-tidy \
-#         libcurl4-openssl-dev \
-#         libgtest-dev libgmock-dev \
-#         libmodbus-dev \
-#         libsystemd-dev \
-#         gcovr \
-#         gdb-multiarch \
-#         cmake ninja-build \
-#         python3-cups python3-libgpiod python3-pycurl \
-#  && rm -rf /var/lib/apt/lists/*
-
-# Wiren Board cross-build toolchains — armhf + arm64 — DEFERRED.
-#
-# See the deferment note on the build-essentials block above.
-#
-# Every flagship WB binary ships for one of these two architectures
-# (controllers are armhf, newer hardware is arm64); the canonical
-# build command in `codestyle/cpp/vscode/.vscode/tasks.json` is
-# `schroot -c bullseye-amd64-sbuild -- DEB_HOST_MULTIARCH=arm-…
-# make -j12`, and qemu-user-static is what makes the resulting
-# binary runnable on x86_64 for tests.
-#
-# Kept in a SEPARATE layer from the C/C++ essentials above because
-# it's the single biggest discretionary addition (~300 MB
-# uncompressed / ~258 MiB compressed). A future Dockerfile.slim
-# can keep this commented while uncommenting the build-essentials
-# block above.
-#
-#   - crossbuild-essential-armhf, crossbuild-essential-arm64:
-#     gcc-arm-linux-gnueabihf / gcc-aarch64-linux-gnu meta-packages.
-#   - qemu-user-static: registers binfmt handlers so an `armhf` or
-#     `arm64` ELF executes under qemu transparently. Required by
-#     the `[armhf]/[arm64] Run tests for debug` tasks in codestyle.
-#   - debootstrap, schroot, sbuild: the canonical WB build path is
-#     `sbuild` inside a `schroot` named `bullseye-amd64-sbuild`.
-#     The chroot itself is NOT created here (it's per-host, lives
-#     at /srv/chroot, and requires the schroot config; the user
-#     creates it on first need with `sbuild-createchroot`).
-# RUN apt-get update \
-#  && apt-get install -y --no-install-recommends \
-#         crossbuild-essential-armhf \
-#         crossbuild-essential-arm64 \
-#         qemu-user-static \
-#         debootstrap schroot sbuild \
-#  && rm -rf /var/lib/apt/lists/*
 
 # Python lint/format toolchain — pinned to the versions in
 # `wirenboard/codestyle/python/config/requirements.txt`. Pinning
