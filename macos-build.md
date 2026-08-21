@@ -203,7 +203,7 @@ Some Colima VirtioFS configurations reject symlinks while extracting the Linux k
 
 ### Sharing the OCI image cache with a Homebrew `msb`
 
-This is not macOS-specific — see [Shared microsandbox image cache](README.md#shared-microsandbox-image-cache)
-in the main README, which covers agent-vm on any platform alongside any
+This is not macOS-specific — see [Shared microsandbox image cache](USAGE.md#shared-microsandbox-image-cache)
+in the usage guide, which covers agent-vm on any platform alongside any
 separately-installed `msb` (Homebrew, a distro package, `cargo install`,
 etc.).

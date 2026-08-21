@@ -3,25 +3,9 @@
 Things that aren't obvious from the code and that I keep forgetting to
 tell you. Read once, then act on them silently.
 
-## After merging a feature branch, bump the workspace version
-
-Every merge into `rewrite-microsandbox` ships with a
-`workspace.package.version` bump in the root `Cargo.toml` and a
-follow-up `vX.Y.Z: bump for <feature>` commit. Skipping this leaves
-the next release boundary ambiguous and means downstream
-`agent-vm --version` lies about what's in the binary.
-
-Convention (look at `git log --oneline | grep "^[a-f0-9]* v"`):
-
-```
-git merge --no-ff <feature-branch>     # produces "Merge ...: ..."
-$EDITOR Cargo.toml                     # version = "0.1.N+1"
-git commit -am "v0.1.N+1: bump for <one-line feature>"
-```
-
-`Cargo.lock` will need refreshing — run a build after the bump to
-update it, then commit the lock alongside the version bump if it
-moved (it always does).
+> The post-merge workspace version bump lives in
+> [CONTRIBUTING.md](CONTRIBUTING.md#release--version-bump) — do it after
+> every merge into `rewrite-microsandbox`.
 
 ## Submodule merges go first
 
