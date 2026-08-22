@@ -1,4 +1,8 @@
 name: chrome-layer-contract
+
+permissions:
+  contents: read
+
 on:
   push:
     paths:
@@ -33,6 +37,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - run: |
           chmod +x script/check-image-promotion-gate.sh script/test/image-promotion-gate.sh script/test/chrome-layer-contract.sh script/test/chrome-layer-runtime.sh
           script/test/image-promotion-gate.sh

@@ -17,6 +17,11 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 5
+    # Give a newly published action release a week to surface breakage or
+    # get yanked before we pull it in — Dependabot's implicit default is
+    # only 3 days.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "ci"
     labels:
