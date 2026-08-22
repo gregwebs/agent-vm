@@ -42,3 +42,8 @@ additive (or don't set it at all), install tools world-readable
 | Example | Adds |
 |---|---|
 | [`wirenboard-cpp`](wirenboard-cpp/) | WB C/C++ build-essentials (debhelper, clang-format/clang-tidy, libcurl/libgtest/libmodbus/libsystemd-dev, cmake/ninja, ...) plus the armhf/arm64 cross toolchains, qemu-user-static, and the sbuild/schroot/debootstrap path. |
+| [`chrome-devtools`](chrome-devtools/) | Chromium, Chrome DevTools MCP wrapper, scoped NSS CA trust, and the Chrome capability marker. |
+
+## Chrome DevTools
+
+Copy `examples/layers/chrome-devtools` to `.agent-vm/layer`, or run `agent-vm claude --layer examples/layers/chrome-devtools --yes`. It installs Chromium and the Chrome DevTools MCP integration. Root guests use the dedicated `chrome` account; non-root guests run Chromium as their guest user. The layer pre-warms the npm cache for root mode only: arbitrary non-root guest homes remain persistent but download on first use. A project has one layer directory, so compose recipes (including the capability marker) when it needs Chrome plus another example.

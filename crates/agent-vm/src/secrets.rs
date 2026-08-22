@@ -1136,6 +1136,49 @@ fn refresh_openai(state_dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(token_file))
 }
 
+/// Synchronize the launcher-owned Chrome MCP entry without changing user MCPs.
+pub fn sync_chrome_mcp(state_dir: &Path, enabled: bool) -> Result<()> {
+    let _lock = ProjectRefreshLock::acquire(state_dir)
+        .context("acquiring per-project refresh lock for Chrome MCP")?;
+    let path = state_dir.join("claude.json");
+    let mut state: Value = match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).context("parsing claude.json")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let root = state.as_object_mut().context("~/.claude.json is not an object")?;
+    sync_chrome_mcp_value(root, enabled);
+    atomic_write(&path, serde_json::to_vec(&state)?.as_slice(), 0o644)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn chrome_mcp_entry() -> Value {
+    serde_json::json!({
+        "command": "/usr/local/bin/agent-vm-chrome-mcp",
+        "args": ["npx", "-y", "chrome-devtools-mcp@1.0.1", "--headless=true", "--isolated=true"],
+        "env": {"CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS": "1"},
+    })
+}
+
+fn sync_chrome_mcp_value(root: &mut serde_json::Map<String, Value>, enabled: bool) {
+    if enabled {
+        let entry = root.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
+        if !entry.is_object() {
+            tracing::warn!("replacing invalid mcpServers value while enabling Chrome MCP");
+            *entry = serde_json::json!({});
+        }
+        entry.as_object_mut().expect("object set above").insert("chrome-devtools".into(), chrome_mcp_entry());
+        return;
+    }
+    let Some(entry) = root.get_mut("mcpServers") else { return };
+    let Some(servers) = entry.as_object_mut() else {
+        tracing::warn!("leaving non-object mcpServers untouched while disabling Chrome MCP");
+        return;
+    };
+    servers.remove("chrome-devtools");
+    if servers.is_empty() { root.remove("mcpServers"); }
+}
+
 fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Result<()> {
     // Merge-on-existing to preserve user-side updates (project entries
     // etc.) but force-set the onboarding + per-folder trust flags
@@ -1171,109 +1214,6 @@ fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Res
     project
         .entry("history".to_string())
         .or_insert_with(|| serde_json::json!([]));
-
-    // Phase 7: Chrome DevTools MCP server. Force-set this entry so
-    // the in-VM Claude can drive a real headless Chromium for tasks
-    // that need browser interaction. The user-set `mcpServers` map
-    // is preserved otherwise. Opt out via AGENT_VM_NO_CHROME_MCP=1.
-    //
-    // The MCP runs under the dedicated `chrome` user via the
-    // `agent-vm-chrome-mcp` wrapper baked into the image. Two reasons
-    // we don't just `command: "npx"` like a normal MCP:
-    //
-    // - **Sandbox preservation.** chromium's user-namespace sandbox
-    //   refuses to initialize as root; if we launch it as root the
-    //   CDP target dies immediately and every tool call returns
-    //   `Protocol error (Target.setDiscoverTargets): Target closed`.
-    //   The microVM is already the outer security boundary, but
-    //   keeping chromium's nested sandbox is real defence-in-depth
-    //   for content the agent navigates to. Running the MCP under a
-    //   non-root user makes the sandbox work without `--no-sandbox`.
-    // - **Scoped CA trust.** Every outbound HTTPS connection from
-    //   the guest is MITM'd by microsandbox's intercept proxy. curl
-    //   and openssl trust the proxy's `microsandbox CA` because
-    //   debian's `update-ca-certificates` runs at guest boot. Chromium
-    //   on Linux ignores the system bundle and only honours its
-    //   built-in root store + the per-user NSS DB, so we need to
-    //   install just our one CA into chrome's NSS DB
-    //   (`/home/chrome/.pki/nssdb/`, populated by the launcher's bash
-    //   prelude at boot). With that, no `--acceptInsecureCerts` (which
-    //   would accept *any* untrusted cert) — only our CA is trusted.
-    // The map is created (or reused) regardless so the opt-out can
-    // also REMOVE a previously-written entry — without this, setting
-    // AGENT_VM_NO_CHROME_MCP after a launch without it would leave
-    // the stale entry in the on-disk claude.json and the MCP would
-    // keep spawning. We always own this key.
-    //
-    // `mcpServers: null` (left by an earlier buggy write, or a
-    // hand-edit) is treated as "no MCP servers" — we reset to {}
-    // rather than bail. The old `as_object_mut().context(...)?` form
-    // would have errored out the entire launch over a recoverable
-    // shape mismatch.
-    let mcp_entry = obj
-        .entry("mcpServers".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    if !mcp_entry.is_object() {
-        *mcp_entry = serde_json::json!({});
-    }
-    let mcp = mcp_entry
-        .as_object_mut()
-        .expect("mcp_entry coerced to object above");
-    let opting_out = std::env::var_os("AGENT_VM_NO_CHROME_MCP").is_some();
-    if opting_out {
-        mcp.remove("chrome-devtools");
-    } else {
-        mcp.insert(
-            "chrome-devtools".into(),
-            serde_json::json!({
-                "command": "/usr/local/bin/agent-vm-chrome-mcp",
-                "args": [
-                    "npx",
-                    "-y",
-                    // Pinned. The image's pre-warm RUN step in
-                    // images/Dockerfile bakes THIS version into
-                    // /home/chrome/.npm/_npx so first launch is a
-                    // cache hit; bump both together. Without a pin,
-                    // npx re-resolves `@latest` against the registry
-                    // on every launch and invalidates the cache as
-                    // soon as upstream publishes anything new.
-                    "chrome-devtools-mcp@1.0.1",
-                    "--headless=true",
-                    "--isolated=true",
-                ],
-                // Opt out of chrome-devtools-mcp's usage statistics
-                // (sent to Google's Clearcut endpoint). Two reasons,
-                // both matter for an agent-vm sandbox:
-                //  - It spawns a detached watchdog node child purely
-                //    to flush analytics on parent exit
-                //    (`telemetry/WatchdogClient.js`), doubling the
-                //    idle node-process count of this MCP for every
-                //    Claude session — even when no browser tool is
-                //    ever called.
-                //  - Per-tool-call events go to a Google endpoint;
-                //    we don't want a "I edited a file in my sandbox"
-                //    session to silently phone home with the URLs
-                //    and tool names the agent touched.
-                // The wrapper at /usr/local/bin/agent-vm-chrome-mcp
-                // whitelists this name in its sudo `--preserve-env`
-                // list so it propagates into the `chrome` user's
-                // env. `CI=1` would also work (same opt-out path)
-                // but is a less-targeted hammer that other tooling
-                // sniffs for unrelated behaviour changes.
-                "env": {
-                    "CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS": "1"
-                },
-            }),
-        );
-    }
-    // If we ended up with an empty mcpServers map *and* the user is
-    // opted out, drop the key entirely — don't materialise an empty
-    // object on disk that would surprise the user inspecting the
-    // file and could trip future Claude Code schema validation that
-    // requires absent-or-non-empty.
-    if opting_out && mcp.is_empty() {
-        obj.remove("mcpServers");
-    }
 
     atomic_write(path, serde_json::to_vec(&state)?.as_slice(), 0o644)?;
     Ok(())
@@ -1817,47 +1757,57 @@ mod tests {
         std::fs::remove_dir_all(&tmpdir).ok();
     }
 
-    // ── write_default_claude_root_state: chrome MCP shape ─────────
+    // ── sync_chrome_mcp ──────────────────────────────────────────
 
-    /// The `chrome-devtools` MCP entry must always carry the
-    /// `CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS=1` env var. Otherwise
-    /// every Claude session starts a detached node "telemetry
-    /// watchdog" child (see chrome-devtools-mcp's WatchdogClient.js)
-    /// purely to ship usage events to Google's Clearcut endpoint —
-    /// extra idle process per session AND a covert phone-home from a
-    /// supposedly-sandboxed environment. Both regress easily on a
-    /// refactor of the json! literal, hence this guard.
     #[test]
-    fn chrome_mcp_entry_disables_telemetry_watchdog() {
-        // Skip if the caller is explicitly opting OUT of the chrome
-        // MCP — that path removes the entry entirely and there's
-        // nothing to assert. eprintln so a dev who has the var set
-        // in their shell can see the test was a no-op rather than
-        // mistakenly believing the regression guard ran green.
-        if std::env::var_os("AGENT_VM_NO_CHROME_MCP").is_some() {
-            eprintln!(
-                "SKIP chrome_mcp_entry_disables_telemetry_watchdog: AGENT_VM_NO_CHROME_MCP set in env"
-            );
-            return;
+    fn sync_chrome_mcp_adds_exact_owned_entry_and_preserves_user_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("claude.json"), r#"{"other":true,"mcpServers":{"user":{"command":"mine"}}}"#).unwrap();
+        sync_chrome_mcp(dir.path(), true).unwrap();
+        let state: Value = serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap()).unwrap();
+        let chrome = &state["mcpServers"]["chrome-devtools"];
+        assert_eq!(chrome["command"], "/usr/local/bin/agent-vm-chrome-mcp");
+        assert_eq!(chrome["args"], serde_json::json!(["npx", "-y", "chrome-devtools-mcp@1.0.1", "--headless=true", "--isolated=true"]));
+        assert_eq!(chrome["env"]["CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"], "1");
+        assert_eq!(state["mcpServers"]["user"]["command"], "mine");
+        assert_eq!(state["other"], true);
+    }
+
+    #[test]
+    fn sync_chrome_mcp_removes_only_owned_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("claude.json"),
+            r#"{"other":true,"mcpServers":{"chrome-devtools":{"command":"stale"},"user":{"command":"mine"}}}"#,
+        )
+        .unwrap();
+        sync_chrome_mcp(dir.path(), false).unwrap();
+        let state: Value = serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap()).unwrap();
+        assert!(state["mcpServers"].get("chrome-devtools").is_none());
+        assert_eq!(state["mcpServers"]["user"]["command"], "mine");
+        assert_eq!(state["other"], true);
+    }
+
+    #[test]
+    fn disabling_preserves_non_object_user_value() {
+        for value in ["null", "\"text\"", "[]", "1", "true"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("claude.json"), format!(r#"{{"mcpServers":{value}}}"#)).unwrap();
+            sync_chrome_mcp(dir.path(), false).unwrap();
+            let state: Value = serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap()).unwrap();
+            assert_eq!(state["mcpServers"], serde_json::from_str::<Value>(value).unwrap());
         }
-        // tempfile (vs hand-rolled std::env::temp_dir() + PID + nanos)
-        // gives RAII cleanup on assertion-panic and a guaranteed-unique
-        // mkdtemp — both useful when this test fires under flaky
-        // conditions (concurrent test bins, clock-skewed CI).
-        let tmpdir = tempfile::tempdir().expect("tempdir");
-        let path = tmpdir.path().join("claude.json");
+    }
 
-        write_default_claude_root_state(&path, "/workspace/proj").unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let v: Value = serde_json::from_str(&raw).unwrap();
-
-        let chrome = &v["mcpServers"]["chrome-devtools"];
-        assert!(chrome.is_object(), "chrome-devtools entry missing");
-        assert_eq!(
-            chrome["env"]["CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"], "1",
-            "telemetry watchdog must be disabled — got {}",
-            chrome
-        );
+    #[test]
+    fn enabling_replaces_invalid_mcp_servers_value() {
+        for value in ["null", "\"text\"", "[]", "1", "true"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("claude.json"), format!(r#"{{"mcpServers":{value}}}"#)).unwrap();
+            sync_chrome_mcp(dir.path(), true).unwrap();
+            let state: Value = serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap()).unwrap();
+            assert!(state["mcpServers"]["chrome-devtools"].is_object());
+        }
     }
 
     // ── write_guest_gh_config identity wiring ─────────────────────

@@ -5,6 +5,7 @@ mod defaults;
 mod github_graphql;
 mod host_paths;
 mod image_api_version;
+mod image_capabilities;
 mod image_check;
 mod intercept_hook;
 mod layer;

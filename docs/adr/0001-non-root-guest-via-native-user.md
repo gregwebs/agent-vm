@@ -74,8 +74,9 @@ need it.
 - Matching the host uid is **required**, not optional, for a non-root
   guest to keep write access to the project/state bind mounts.
 - Docker-in-VM needs root (dockerd needs root), so it requires `--root`.
-- The Chrome MCP wrapper runs chromium directly as the agent user in
-  non-root mode instead of `sudo -u chrome` — the sudoers rule only grants
+- When the optional Chrome DevTools layer is installed, its MCP wrapper runs
+  chromium directly as the agent user in non-root mode instead of `sudo -u chrome` —
+  the sudoers rule only grants
   `root -> chrome`, so a non-root agent has no sudo path to that user
   anyway, and a non-root uid already satisfies chromium's user-namespace
   sandbox precondition on its own.

@@ -3,7 +3,6 @@
 # cancel host drift; drop_caches between rounds; mean/stdev. QUIET host only.
 set -u
 export PATH="/home/boger/work/board/tmp/agent-vm/.agent-vm-rust/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH"
-export AGENT_VM_NO_CHROME_MCP=1   # strip the run-phase certutil; we measure create only
 export MSB_PATH=/home/boger/work/board/tmp/agent-vm/vendor/microsandbox/target/release/msb
 AGENTVM=/home/boger/work/board/tmp/agent-vm/target/release/agent-vm
 LIBSO=/home/boger/work/board/tmp/agent-vm/vendor/microsandbox/target/release/libkrunfw.so.5.2.1

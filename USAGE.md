@@ -85,7 +85,7 @@ Env-var knobs (all opt-in; most accept any value, empty included —
 | `RUST_LOG` | tracing filter; default `warn`. e.g. `RUST_LOG=agent_vm=debug` |
 | `AGENT_VM_PROFILE` | print per-phase wall-time (create/run/stop/remove) |
 | `AGENT_VM_DEBUG_CONFIG` | dump the SandboxConfig JSON before boot |
-| `AGENT_VM_NO_CHROME_MCP` | skip the Chrome DevTools MCP entirely (no entry in claude.json, no chrome-user setup at boot) |
+| `AGENT_VM_NO_CHROME_MCP` | disable Chrome MCP auto-configuration for a Chrome-capable image/layer |
 | `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
 | `AGENT_VM_UPDATE_CHECK` | opt into the launch-time registry update check (accepted: `1`/`true`/`yes`/`on`) |
@@ -184,23 +184,16 @@ for the full design rationale.
 
 ## Chrome DevTools MCP
 
-The image ships chromium and a `chrome-devtools` MCP entry pinned to
-`chrome-devtools-mcp@1.0.1`. To keep chromium's nested user-namespace
-sandbox active (we'd rather not pass `--no-sandbox`) chromium needs to run
-as a non-root user. In the default non-root guest mode the agent is
-already non-root, so the MCP wrapper (`agent-vm-chrome-mcp`) just runs
-chromium directly as that user — no `sudo` involved — and imports the
-microsandbox MITM CA into its own per-user NSS DB. Under `--root` the
-wrapper instead re-execs the MCP under a dedicated `chrome` user via a
-sudo wrapper, same as before this change. Either way the launcher/wrapper
-installs the per-boot microsandbox MITM CA into the running user's NSS DB
-at startup so chromium accepts the intercepted TLS chain without
-`--acceptInsecureCerts` (which would trust *any* untrusted cert).
-
-If the CA install fails (e.g. someone broke the in-image sudoers rule)
-the launcher prints a warning naming the symptom — without it, every
-HTTPS navigate would silently return `ERR_CERT_AUTHORITY_INVALID`.
-Set `AGENT_VM_NO_CHROME_MCP=1` to skip the whole setup.
+The base image does not include Chromium. Select the marker-bearing
+[`chrome-devtools` tooling layer](examples/layers/chrome-devtools/) to install
+it and have the launcher add its owned `mcpServers.chrome-devtools` entry.
+Removing the layer removes that stale owned entry while preserving other MCPs.
+`AGENT_VM_NO_CHROME_MCP=1` removes the automatic entry but leaves Chromium
+available for manual use. The wrapper preserves Chromium's nested sandbox:
+non-root guests run it directly and root guests switch only to the dedicated
+`chrome` user. It imports the per-install microsandbox CA into that user's NSS
+database rather than using an insecure certificate flag, and disables MCP
+telemetry.
 
 ## Credentials
 

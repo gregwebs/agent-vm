@@ -127,25 +127,7 @@ run plus the dev tools that are universally useful:
 
 - Base: `ca-certificates`, `curl`, `wget`, `git`, `jq`, `bash`,
   `python3`/`pip`, `ripgrep`, `fd-find`.
-- Chromium + `fonts-liberation` + `sudo` + `libnss3-tools` for the
-  Chrome DevTools MCP (Phase 7). Symlinks `/usr/bin/google-chrome` and
-  `/opt/google/chrome/chrome` to `/usr/bin/chromium` so puppeteer's
-  default discovery paths resolve. Dedicated `chrome` user (UID 9999)
-  with home `/home/chrome`, empty NSS DB at `~/.pki/nssdb`, sudoers
-  rule `root ALL=(chrome) NOPASSWD: ALL` — used only in `--root` mode.
-  The wrapper at `/usr/local/bin/agent-vm-chrome-mcp` branches on
-  `id -u`: as root it re-execs the MCP under the `chrome` user (the
-  sudoers rule only grants `root -> chrome`, so there's no non-root
-  path to it); in the default non-root mode the agent is already a
-  non-root uid — which alone satisfies chromium's user-namespace
-  sandbox precondition — so the wrapper runs chromium directly, `cd`s
-  into the agent's own `$HOME` instead of `/home/chrome` (uid 9999,
-  unwritable by the agent), and imports the MITM CA into its own NSS
-  DB at `$HOME/.pki/nssdb`. Pre-warmed npm cache for
-  `chrome-devtools-mcp@1.0.1` under `/home/chrome/.npm/_npx/` so first
-  launch is a cache hit (root mode only; non-root's `$HOME` is a fresh
-  per-project state dir with no pre-warmed npm cache, so first non-root
-  Chrome MCP launch pays the npx download).
+- Chromium and the Chrome DevTools MCP are an opt-in `examples/layers/chrome-devtools` layer. API 2 detects its marker after boot and configures the launcher-owned MCP entry only when advertised. The wrapper retains scoped NSS CA trust and the root-to-`chrome` transition when the layer is installed.
 - `gh` from cli.github.com/packages (Phase 6 — gh/git credential
   injection).
 - Node.js 22 from NodeSource (needed by Claude Code, OpenCode, MCP servers).
@@ -159,8 +141,7 @@ no in-VM proxy needed), GitHub Copilot CLI. Each line we keep is a
 line that has to keep working through `apt-get update` churn, so the
 bar to add anything is "needed by an in-scope agent flow."
 
-Resulting image: a few GB uncompressed (chromium is the largest
-contributor at ~400 MB, followed by Node.js and the agent CLIs;
+Resulting image: a few GB uncompressed (Node.js and the agent CLIs are the largest contributors and the agent CLIs;
 re-measure with `docker images` when you care about exact bytes).
 Registry layer count is bounded by the `RUN` granularity in the
 Dockerfile.

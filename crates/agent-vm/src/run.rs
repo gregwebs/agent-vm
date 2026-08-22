@@ -402,7 +402,7 @@ Environment:
   AGENT_VM_STATE_DIR                    override the per-project state dir
   AGENT_VM_PROFILE                      print per-phase boot timings
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
-  AGENT_VM_NO_CHROME_MCP                skip the Chrome DevTools MCP setup
+  AGENT_VM_NO_CHROME_MCP                disable Chrome MCP auto-configuration for Chrome-capable images
   RUST_LOG                              tracing filter (e.g. agent_vm=debug)";
 
 #[derive(ClapArgs)]
@@ -1443,9 +1443,18 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // expects. Out-of-range → clear actionable error instead of
     // mysterious mount-not-found / agent-crashing-on-startup
     // failures inside the VM.
-    crate::image_api_version::check(&sandbox)
+    let image_api = crate::image_api_version::check(&sandbox)
         .await
         .context("verifying image-API contract version")?;
+    let chrome_mcp_enabled = crate::image_capabilities::chrome_mcp_enabled(
+        &sandbox,
+        &image,
+        image_api,
+        env::var_os("AGENT_VM_NO_CHROME_MCP").is_some(),
+    )
+    .await;
+    crate::secrets::sync_chrome_mcp(&session.state_dir, chrome_mcp_enabled)
+        .context("synchronizing Chrome MCP configuration")?;
 
     // Subscribe to the runtime's auto-publish event stream and
     // surface each mapping to the user. Spawned regardless of
@@ -1551,8 +1560,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // critical path. It now lives in the in-image `agent-vm-chrome-mcp`
     // wrapper, so it runs once when the chrome MCP actually starts: off
     // the launch path, and skipped entirely when chrome is unused. The CA
-    // is per-install (not bakeable into the shared image); see
-    // images/Dockerfile. So no chrome prelude is injected here anymore —
+    // is per-install (not bakeable into the shared image); see the opt-in
+    // Chrome DevTools layer wrapper. So no chrome prelude is injected here anymore —
     // we pass an empty string for it.
     //
     // Assemble the in-guest `bash -c` line via `build_agent_shell_line`,

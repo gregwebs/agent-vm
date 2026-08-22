@@ -113,9 +113,11 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let home = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
+        // The relay socket lives below the state directory. macOS's default
+        // temporary root is long enough to exceed Unix's socket-path limit.
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let state = tempfile::tempdir_in("/tmp").unwrap();
+        let project = tempfile::tempdir_in("/tmp").unwrap();
         let fake_msb = write_fake_msb(home.path());
         Self { home, state, project, fake_msb }
     }

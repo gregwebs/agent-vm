@@ -97,27 +97,20 @@ conntrack/iptables ~62ms, nf_tables ~3ms). So it's a real but *minor* secondary 
 - **Guest memory** (real wall-clock, but EPT/page-materialization under nested virt, not
   struct-page init): create ≈ 1.49s @1G / 1.68–1.92s @2G / 2.9s @4G. Lower the default
   (`AGENT_VM_MEMORY_GIB`, currently 2) for sessions that don't need 2 GiB (~0.2s+).
-- **Chrome-MCP CA `certutil` (~270ms)** in the `run` phase — **fixed on this branch.**
-  `run.rs` used to run `sudo -u chrome certutil -A …` synchronously in the in-guest
-  prelude before exec'ing the agent, on *every* launch. But chromium ignores the system
-  CA bundle (which `update-ca-certificates` already populates at boot) and only honors
-  its per-user NSS DB, so the CA must be imported there or chrome-devtools-mcp fails
-  every HTTPS page with `ERR_CERT_AUTHORITY_INVALID`. The cert can't be baked into the
-  shared image (the CA is generated per-install on the host); the import repeated every
-  launch only because the NSS DB lives in the ephemeral rootfs. **Fix:** moved the import
-  into the in-image `agent-vm-chrome-mcp` wrapper (`images/Dockerfile`) — it runs once at
-  MCP startup, as the `chrome` user that owns the DB, off the launch critical path and
-  skipped entirely when chrome is unused. Measured: `run` phase 310ms → ~38ms.
-  **Coupling:** the `run.rs` and Dockerfile changes must ship together — until the
-  template image is rebuilt with the new wrapper, dropping the prelude import would leave
-  chrome MCP without the CA.
+- **Chrome-MCP CA `certutil` (~270ms)** in the `run` phase — **fixed.**
+  The launcher used to import the CA synchronously before every agent exec. Chromium
+  honors its per-user NSS DB rather than only the system CA bundle, so the opt-in
+  `examples/layers/chrome-devtools/agent-vm-chrome-mcp` wrapper imports the per-install
+  CA when the MCP starts. This keeps the work off the launch critical path and skips it
+  entirely unless the Chrome DevTools layer is selected. Measured: `run` phase 310ms →
+  ~38ms.
 
 ## Recommended order (by impact × safety)
 
 1. **Cache the git identity** + **non-blocking update-check** — ~2.19s, implemented here,
    zero downside, no rebuild. This *is* the regression fix.
-2. **Chrome-MCP certutil moved into the image wrapper** — ~270ms off the `run` phase,
-   implemented on this branch (run.rs + images/Dockerfile; ship together).
+2. **Chrome-MCP certutil moved into the opt-in layer wrapper** — ~270ms off the `run`
+   phase when the Chrome DevTools layer is selected.
 3. **Lower default guest memory** if 2 GiB is more than agents need — ~0.2s+.
 4. Kernel: leave it. The ~190ms it adds is mostly required (KVM, conntrack). Do **not**
    enable deferred-page-init or chase split_irqchip. Optionally drop nf_tables/IPv6 NF to

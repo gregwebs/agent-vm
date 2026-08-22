@@ -245,3 +245,15 @@ existing per-image flock already prevents a torn cache write.
   content-hash identity, cache-hit reuse, registry-less ingest, PATH
   propagation, edit-invalidates-cache — was verified working in that same
   round-trip once the platform matched.
+
+### Optional image capabilities (API 2)
+
+API 1 implicitly includes Chrome DevTools. Beginning with API 2, optional
+features advertise an empty marker file after their layer's build-time sanity
+checks pass. Chrome uses `/etc/agent-vm-capabilities/chrome-devtools-mcp`.
+The launcher checks the booted sandbox after creation: this works on cold pulls,
+unlike OCI cache metadata, and avoids treating layer directory names as a
+capability protocol. New launchers retain API-1 Chrome compatibility; old
+launchers reject the API-2 base through the image-version range check. Layers
+may append their dedicated passwd/group entries while leaving both files
+appendable for the launcher's guest identity machinery.
