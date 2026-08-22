@@ -94,8 +94,8 @@ read — that one is a fallback for the unrelated *session state root*
   a hardcoded literal, so it always "worked" regardless of host env.
   `--root` mode is unaffected: it never calls `resolve_host_home`.
 - **Host-uid collision with a base-image passwd entry** is an accepted
-  risk: if the host uid ever matched an image user (it doesn't today —
-  the image has only `chrome:9999`/root), `getpwuid` would return the
+  risk: if the host uid ever matched an image user (the optional Chrome DevTools
+  layer adds `chrome:9999`; otherwise only root is present), `getpwuid` would return the
   image's entry instead of nothing, and username resolution would still
   produce a plausible (if wrong) name. A prepend to `/etc/passwd` instead
   of an append could mitigate this if it ever bites.

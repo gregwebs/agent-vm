@@ -63,11 +63,28 @@ jobs:
           # fsmeta/VMDK materialization on THAT digest, so an unchanged
           # `:latest` becomes a true no-op pull (0 bytes) instead of
           # re-downloading the whole image. A new commit, or any changed
-          # agent layer, moves the digest as it should. Without this the
+          # agent layer, moves the digest as it should. Chrome DevTools is an
+          # opt-in layer and does not affect this base-image cache. Without this the
           # config carried a fresh build timestamp every hour, so every
           # cron `:latest` had a new manifest digest and consumers
           # re-pulled ~700 MiB of byte-identical layers hourly.
           echo "epoch=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether latest may be promoted
+        id: latest
+        run: |
+          set -euo pipefail
+          minimum=$(tr -d '[:space:]' < images/min-agent-vm-version)
+          main=$(npm view @wirenboard/agent-vm version 2>/dev/null || true)
+          x64=$(npm view @wirenboard/agent-vm-linux-x64 version 2>/dev/null || true)
+          arm64=$(npm view @wirenboard/agent-vm-linux-arm64 version 2>/dev/null || true)
+          if script/check-image-promotion-gate.sh "$minimum" "$main" "$x64" "$arm64"; then
+            echo "tag=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+            echo "Published cross-platform launcher $main satisfies $minimum; latest promotion enabled."
+          else
+            echo "::warning::the required cross-platform launcher is unavailable or incompatible (minimum=$minimum main=$main x64=$x64 arm64=$arm64); immutable candidate tags will be pushed but latest remains unchanged"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -173,8 +190,8 @@ jobs:
           # unchanged hourly build a pure cache hit (identical
           # agent-layer digests → `:latest` consumers re-pull nothing)
           # instead of re-emitting ~200 MiB of fresh-but-identical
-          # agent layers every hour. The heavy apt/chromium/docker/
-          # node layers below the args stay cached regardless.
+          # agent layers every hour. The heavy apt/docker/node layers below the
+          # args stay cached regardless; Chrome DevTools is opt-in.
           build-args: |
             AGENT_VERSION_CODEX=${{ steps.ver.outputs.codex }}
             AGENT_VERSION_OPENCODE=${{ steps.ver.outputs.opencode }}
@@ -208,7 +225,7 @@ jobs:
           # already documents that workflow_dispatch happens from
           # there too (release-npm.yml:96).
           tags: |
-            ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && format('{0}:latest', env.IMAGE) || '' }}
+            ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && steps.latest.outputs.tag || '' }}
             ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && format('{0}:{1}', env.IMAGE, steps.ts.outputs.tag) || '' }}
             ${{ env.IMAGE }}:sha-${{ github.sha }}
           # Tag with the short SHA too so we can trace any image

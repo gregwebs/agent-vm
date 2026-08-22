@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+
+import_ca() {
+    local home=$1 ca=/usr/local/share/ca-certificates/microsandbox-ca.crt
+    mkdir -p "$home/.pki/nssdb" || { echo "agent-vm-chrome-mcp: warning: failed to initialize NSS DB" >&2; return; }
+    [ -f "$home/.pki/nssdb/cert9.db" ] || certutil -d "sql:$home/.pki/nssdb" -N --empty-password \
+        || { echo "agent-vm-chrome-mcp: warning: failed to initialize NSS DB (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2; return; }
+    [ ! -f "$ca" ] || certutil -d "sql:$home/.pki/nssdb" -A -t C,, -n microsandbox -i "$ca" \
+        || echo "agent-vm-chrome-mcp: warning: failed to import microsandbox CA (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2
+}
+
+if [ "$(id -u)" = 0 ]; then
+    cd /home/chrome || { echo "agent-vm-chrome-mcp: cannot cd to /home/chrome" >&2; exit 1; }
+    if ! sudo -u chrome -n -- bash -c "$(declare -f import_ca); import_ca /home/chrome"; then
+        echo "agent-vm-chrome-mcp: warning: failed to prepare chrome NSS DB (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2
+    fi
+    exec sudo -u chrome -H -n \
+        --preserve-env=NODE_EXTRA_CA_CERTS,SSL_CERT_FILE,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE \
+        --preserve-env=PATH,HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \
+        --preserve-env=CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS,CI,DEBUG \
+        --preserve-env=TZ,LANG,LC_ALL,TMPDIR -- "$@"
+fi
+cd "$HOME" || { echo "agent-vm-chrome-mcp: cannot cd to HOME" >&2; exit 1; }
+import_ca "$HOME"
+exec "$@"

@@ -21,7 +21,7 @@
 # `AGENT_VERSION_*` ARG (see below), so the hourly cron rebuilds an
 # installer layer ONLY when that agent actually released — an
 # unchanged build is a pure cache hit. Everything earlier — Debian
-# base, chromium, docker engine, Python lint pins, codestyle clone —
+# base, docker engine, Python lint pins, codestyle clone —
 # stays cached across rebuilds, so users pulling `:latest` re-download
 # only the layer(s) for whichever agent actually changed (and nothing
 # at all when none did).
@@ -55,7 +55,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # and tooling additions (build-essential, ssh, etc.) do NOT change
 # this — they're additive. See `crates/agent-vm/src/defaults.rs`
 # for the matching range in the binary.
-RUN echo 1 > /etc/agent-vm-image-version
+RUN echo 2 > /etc/agent-vm-image-version
 
 # Conditionally trust a host-supplied CA bundle. Only fires when
 # `images/build.sh` is invoked on a host that sits behind a TLS-
@@ -145,168 +145,6 @@ RUN apt-get update \
         htop lsof strace tmux \
  && rm -rf /var/lib/apt/lists/*
 
-# Chromium for the chrome-devtools MCP server (Phase 7). The MCP
-# launches it headless. Debian's chromium package is large (~400 MB)
-# but is the simplest source; users who don't want it can pass
-# AGENT_VM_NO_CHROME_MCP=1 to suppress the server entry in agent
-# settings.
-#
-# `sudo` + `libnss3-tools` are here because the chrome MCP runs as a
-# dedicated non-root `chrome` user (see the next RUN block). sudo is
-# how the wrapper drops into it; libnss3-tools (`certutil`) is how the
-# launcher injects the per-boot microsandbox CA into chrome's NSS DB.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        chromium \
-        fonts-liberation \
-        sudo \
-        libnss3-tools \
- && rm -rf /var/lib/apt/lists/* \
- && ln -sf /usr/bin/chromium /usr/bin/google-chrome \
- && ln -sf /usr/bin/chromium /usr/bin/google-chrome-stable \
- && mkdir -p /opt/google/chrome \
- && ln -sf /usr/bin/chromium /opt/google/chrome/chrome
-
-# Dedicated `chrome` user so chromium's user-namespace sandbox can
-# initialize — needed in ROOT mode only. As root chromium refuses to
-# set up its sandbox and the CDP target closes immediately (`Protocol
-# error (Target.setDiscoverTargets): Target closed`); the alternative
-# is `--no-sandbox`, which we'd rather not pass — the microVM is the
-# outer boundary, but keeping chromium's nested sandbox active is a
-# real defence-in-depth gain when the agent makes the browser load
-# untrusted content. In the default NON-root mode the agent process
-# is already a non-root uid, which alone satisfies the same sandbox
-# precondition, so the wrapper below runs chromium directly instead
-# of transiting through this `chrome` user (the sudoers rule only
-# grants `root -> chrome`; there's no non-root path to it anyway).
-#
-# /etc/passwd is edited by hand because debian-slim doesn't ship
-# `useradd`. Empty NSS DB is created at image time so the per-launch
-# `certutil -A` only has to add the CA, not also format the DB.
-# Sudoers rule keeps `root -> chrome` password-less; no other
-# (chrome -> root) transition is allowed.
-#
-# The wrapper script is what the in-image Chrome MCP entry actually
-# launches: in root mode it re-execs `npx chrome-devtools-mcp@latest`
-# under the `chrome` user with stdin/stdout preserved so the MCP
-# JSON-RPC pipe from claude still works; in non-root mode it runs the
-# same command directly as the invoking (already non-root) user.
-RUN echo 'chrome:x:9999:9999:Chrome MCP:/home/chrome:/bin/bash' >> /etc/passwd \
- && echo 'chrome:!:19000:0:99999:7:::' >> /etc/shadow \
- && echo 'chrome:x:9999:' >> /etc/group \
- && mkdir -p /home/chrome/.pki/nssdb \
- && certutil -d sql:/home/chrome/.pki/nssdb -N --empty-password \
- && chown -R 9999:9999 /home/chrome \
- && echo 'root ALL=(chrome) NOPASSWD: ALL' \
-        > /etc/sudoers.d/agent-vm-chrome \
- && chmod 0440 /etc/sudoers.d/agent-vm-chrome \
- && printf '%s\n' \
-        '#!/bin/bash' \
-        '# agent-vm chrome MCP wrapper.' \
-        '#' \
-        '# Root mode (--root/AGENT_VM_ROOT): re-exec the MCP server under the' \
-        '# dedicated `chrome` user so chromium'\''s user-namespace sandbox' \
-        '# initializes (it refuses to as root).' \
-        '#' \
-        '# Non-root mode (the default -- crates/agent-vm/src/run.rs): the' \
-        '# agent already runs as a non-root uid, which alone satisfies' \
-        '# chromium'\''s sandbox precondition, and the sudoers rule below only' \
-        '# grants root -> chrome (there is no non-root -> chrome path) -- so' \
-        '# run chromium directly as whoever invoked us instead.' \
-        '#' \
-        '# Args (npx + chrome-devtools-mcp + flags) come from the MCP' \
-        '# config in ~/.claude.json; we just decide whether/how to switch UID.' \
-        'set -e' \
-        'if [ "$(id -u)" = 0 ]; then' \
-        '    # Preserve list (passed through sudo'\''s env_reset):' \
-        '    #  - NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / CURL_CA_BUNDLE /' \
-        '    #    REQUESTS_CA_BUNDLE: agentd boot-sets these so any HTTPS' \
-        '    #    client trusts the microsandbox MITM CA. Without them' \
-        '    #    node fails `npx -y` with SELF_SIGNED_CERT_IN_CHAIN.' \
-        '    #  - PATH: needed so npx is findable (sudo'\''s secure_path' \
-        '    #    would otherwise replace it).' \
-        '    #  - HTTP_PROXY / HTTPS_PROXY / NO_PROXY (upper/lowercase):' \
-        '    #    NOT set by agentd (microsandbox uses transparent network' \
-        '    #    interception, no HTTP proxy env). Forwarded so that a' \
-        '    #    user-supplied MCP `env:` block or .agent-vm.runtime.sh' \
-        '    #    setting these is honoured by chromium.' \
-        '    #  - CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS / CI / DEBUG:' \
-        '    #    user/MCP-config opt-outs and debugging knobs that' \
-        '    #    chrome-devtools-mcp documents.' \
-        '    #  - TZ / LANG / LC_ALL / TMPDIR: locale + sane temp paths.' \
-        '    #' \
-        '    # NOT in the preserve list (deliberate):' \
-        '    #  - USER / LOGNAME: sudo'\''s default `env_reset` policy re-' \
-        '    #    derives these from the target passwd entry. Adding them' \
-        '    #    here would forward root'\''s USER into the chrome session.' \
-        '    #  - HOME: set by `-H` from chrome'\''s passwd entry (not by' \
-        '    #    env passthrough).' \
-        '    #' \
-        '    # `cd /home/chrome` keeps chromium'\''s default CWD writable' \
-        '    # (root runs the agent in /workspace, where chrome (UID' \
-        '    # 9999) cannot write; tools that emit relative paths' \
-        '    # (./trace.json, ./screenshot.png) would otherwise EACCES).' \
-        '    # Diagnostic on failure so Claude doesn'\''t just see the MCP' \
-        '    # transport close before handshake with no breadcrumb.' \
-        '    cd /home/chrome 2>/dev/null || {' \
-        '        echo "agent-vm-chrome-mcp: cannot cd to /home/chrome -- image misconfigured?" >&2' \
-        '        exit 1' \
-        '    }' \
-        '    # Import the microsandbox MITM CA into the chrome-owned NSS DB so' \
-        '    # chromium trusts the intercept proxy. chromium on Linux ignores' \
-        '    # the system CA bundle (which curl/node use), honouring only its' \
-        '    # built-in roots + this per-user NSS DB. Done here, once, at MCP' \
-        '    # startup -- NOT on every agent-vm launch (previously a ~270ms' \
-        '    # certutil fork in the launcher prelude) -- and skipped when' \
-        '    # chrome is unused (the MCP server is only spawned when enabled).' \
-        '    # The DB is chrome-owned (UID 9999), so drop to chrome to write it.' \
-        '    # Non-fatal: a failure should warn, not kill the MCP.' \
-        '    _ca=/usr/local/share/ca-certificates/microsandbox-ca.crt' \
-        '    if [ -f "$_ca" ]; then' \
-        '        sudo -u chrome -n -- certutil -d sql:/home/chrome/.pki/nssdb -A \' \
-        '            -t C,, -n microsandbox -i "$_ca" \' \
-        '            || echo "agent-vm-chrome-mcp: warning: failed to import microsandbox CA (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2' \
-        '    fi' \
-        '    exec sudo -u chrome -H -n \' \
-        '        --preserve-env=NODE_EXTRA_CA_CERTS,SSL_CERT_FILE,CURL_CA_BUNDLE,REQUESTS_CA_BUNDLE \' \
-        '        --preserve-env=PATH,HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy \' \
-        '        --preserve-env=CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS,CI,DEBUG \' \
-        '        --preserve-env=TZ,LANG,LC_ALL,TMPDIR \' \
-        '        -- "$@"' \
-        'fi' \
-        '' \
-        '# Non-root: cd into the agent'\''s own writable $HOME (NOT' \
-        '# /home/chrome, which is owned by uid 9999 and unwritable by a' \
-        '# non-root agent) -- same relative-path-artifact rationale as the' \
-        '# root branch'\''s `cd /home/chrome` above.' \
-        'cd "$HOME" 2>/dev/null || {' \
-        '    echo "agent-vm-chrome-mcp: cannot cd to \$HOME ($HOME) -- image or guest HOME misconfigured?" >&2' \
-        '    exit 1' \
-        '}' \
-        '# Own NSS DB (persists in the state bind across launches) since' \
-        '# there'\''s no `chrome` user in this path; import the MITM CA into it' \
-        '# the same way the root branch does for chrome'\''s DB. Non-fatal --' \
-        '# same as the CA import below: a failure here should warn (chromium' \
-        '# then just distrusts the intercept CA), not kill the MCP transport' \
-        '# via `set -e`.' \
-        'mkdir -p "$HOME/.pki/nssdb"' \
-        '[ -f "$HOME/.pki/nssdb/cert9.db" ] || certutil -d sql:"$HOME/.pki/nssdb" -N --empty-password \' \
-        '    || echo "agent-vm-chrome-mcp: warning: failed to initialize NSS DB (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2' \
-        '_ca=/usr/local/share/ca-certificates/microsandbox-ca.crt' \
-        'if [ -f "$_ca" ]; then' \
-        '    certutil -d sql:"$HOME/.pki/nssdb" -A -t C,, -n microsandbox -i "$_ca" \' \
-        '        || echo "agent-vm-chrome-mcp: warning: failed to import microsandbox CA (HTTPS may fail ERR_CERT_AUTHORITY_INVALID)" >&2' \
-        'fi' \
-        '# Caveat: "non-root satisfies chromium'\''s sandbox" holds only if the' \
-        '# guest kernel permits unprivileged user namespaces. A CDP target' \
-        '# that closes immediately here points at that, not at this wrapper.' \
-        '# No sudo/exec-user-switch needed -- we'\''re already the agent user,' \
-        '# so the env agentd boot-set (NODE_EXTRA_CA_CERTS, PATH, etc.) is' \
-        '# inherited directly.' \
-        'exec "$@"' \
-        > /usr/local/bin/agent-vm-chrome-mcp \
- && chmod 0755 /usr/local/bin/agent-vm-chrome-mcp
-
 # GitHub CLI from the official apt repo (Phase 6).
 RUN install -dm 755 /etc/apt/keyrings \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -361,27 +199,6 @@ RUN apt-get update \
  && mkdir -p /etc/docker \
  && printf '%s\n' '{' '  "storage-driver": "fuse-overlayfs"' '}' \
         > /etc/docker/daemon.json
-
-# Pre-warm chrome-devtools-mcp's npm cache as the chrome user so the
-# first browser tool call in any sandbox doesn't pay the multi-second
-# `npx -y` fetch cost. `--help` exits cleanly after install/version-
-# check; it's the cheapest exercise of the full install path.
-#
-# Pinned to a known-good version. The runtime MCP config in
-# `crates/agent-vm/src/secrets.rs::write_default_claude_root_state`
-# pins the SAME version — bump both together. Without the pin the
-# cache stops being useful the first time upstream cuts a release:
-# `npx -y` re-resolves `@latest` against the registry and re-
-# downloads under the writable upper layer.
-#
-# Best-effort: `|| true` because npm-registry transient failure or a
-# bad `--help` exit code shouldn't fail the whole `agent-vm setup`.
-# A missing cache costs a multi-second fetch on first browser tool
-# call; failing the image build is much worse.
-#
-# Must come AFTER the nodejs RUN above — npx didn't exist before it.
-RUN sudo -u chrome -H npx -y chrome-devtools-mcp@1.0.1 --help >/dev/null 2>&1 \
- || echo "==> pre-warm skipped (will lazy-fetch chrome-devtools-mcp at first MCP call)"
 
 # Python lint/format toolchain — pinned to the versions in
 # `wirenboard/codestyle/python/config/requirements.txt`. Pinning
@@ -598,7 +415,7 @@ RUN : "claude ${AGENT_VERSION_CLAUDE}" \
 # resolves against it. The bare repo URL is what the original git-cloned
 # by hand; `marketplace add` lets the CLI manage the clone + index for us.
 #
-# Best-effort per the chrome-mcp pre-warm style above: a transient
+# Best-effort: a transient
 # registry/clone blip during the hourly build must not fail the whole
 # image. Each step is guarded with `|| echo skipped`; a missing plugin
 # costs in-VM code intelligence for that language, not a broken image —

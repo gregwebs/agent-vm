@@ -1,0 +1,73 @@
+name: chrome-layer-contract
+
+permissions:
+  contents: read
+
+on:
+  push:
+    paths:
+      - 'images/**'
+      - 'examples/layers/chrome-devtools/**'
+      - 'script/check-image-promotion-gate.sh'
+      - 'script/test/image-promotion-gate.sh'
+      - 'script/test/chrome-layer-contract.sh'
+      - 'script/test/chrome-layer-runtime.sh'
+      - '.github/workflows/chrome-layer-contract.yml'
+      - 'crates/agent-vm/src/image_capabilities.rs'
+      - 'crates/agent-vm/src/secrets.rs'
+  pull_request:
+    paths:
+      - 'images/**'
+      - 'examples/layers/chrome-devtools/**'
+      - 'script/check-image-promotion-gate.sh'
+      - 'script/test/image-promotion-gate.sh'
+      - 'script/test/chrome-layer-contract.sh'
+      - 'script/test/chrome-layer-runtime.sh'
+      - '.github/workflows/chrome-layer-contract.yml'
+      - 'crates/agent-vm/src/image_capabilities.rs'
+      - 'crates/agent-vm/src/secrets.rs'
+jobs:
+  contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: |
+          chmod +x script/check-image-promotion-gate.sh script/test/image-promotion-gate.sh script/test/chrome-layer-contract.sh script/test/chrome-layer-runtime.sh
+          script/test/image-promotion-gate.sh
+          script/test/chrome-layer-contract.sh
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      # driver: docker (not the docker-container default) so the base and
+      # api1_base images built with --load below stay visible to the
+      # derived-layer builds' `FROM $BASE_IMAGE` — they all share the
+      # daemon's local image store instead of an isolated buildkit
+      # container that can't see a previous build's --load output and
+      # falls through to pulling the plain tag from Docker Hub.
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        with:
+          driver: docker
+      - name: Build and inspect API-2 base and derived layer
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          suffix=${PLATFORM//\//-}
+          base=agent-vm-contract-base-$suffix
+          layer=agent-vm-contract-layer-$suffix
+          api1_base=agent-vm-contract-api1-base-$suffix
+          api1_layer=agent-vm-contract-api1-layer-$suffix
+          mkdir .contract-api1
+          git archive 695b31d758a9383daa7b9a116466c41af3705fab images | tar -x -C .contract-api1 --strip-components=1
+          docker buildx build --platform "$PLATFORM" --load -t "$base" -f images/Dockerfile images
+          docker buildx build --platform "$PLATFORM" --load -t "$layer" \
+            --build-arg BASE_IMAGE="$base" examples/layers/chrome-devtools
+          docker buildx build --platform "$PLATFORM" --load -t "$api1_base" -f .contract-api1/Dockerfile .contract-api1
+          docker buildx build --platform "$PLATFORM" --load -t "$api1_layer" \
+            --build-arg BASE_IMAGE="$api1_base" examples/layers/chrome-devtools
+          script/test/chrome-layer-runtime.sh "$base" "$layer" "$api1_layer"
