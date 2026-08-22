@@ -123,7 +123,10 @@ RUN --mount=type=secret,id=hostca,target=/tmp/hostca.crt,required=false \
 #     user-side apt sources `.agent-vm.runtime.sh` adds).
 #   - less, vim-tiny, file, unzip, zip, rsync, htop, lsof, strace,
 #     tmux: standard "I'm in a shell, I need a tool" muscle-memory
-#     set. Each is <5 MB; the bundle is well under 30 MB.
+#     set. Each is <5 MB; the bundle is well under 30 MB. The second
+#     multiplexer, zellij, is NOT in Debian's archive and is bigger
+#     than anything in this list — it comes from an upstream release
+#     tarball in its own RUN further down, where its size is argued.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -428,9 +431,10 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 # auto-set on TLS-intercept hosts) downgrade to a warning.
 #
 # `AGENT_INSTALL_SOFT_FAIL` is also consumed by the three agent
-# installers + the sanity check below; declared here at first use
-# so a single toggle covers everything that might legitimately fail
-# in a dev sandbox but must succeed in CI.
+# installers + the zellij download below + the sanity check below;
+# declared here at first use so a single toggle covers everything
+# that might legitimately fail in a dev sandbox but must succeed in
+# CI.
 ARG CODESTYLE_REF=master
 ARG AGENT_INSTALL_SOFT_FAIL=
 RUN git clone --depth=1 --branch "${CODESTYLE_REF}" \
@@ -438,6 +442,20 @@ RUN git clone --depth=1 --branch "${CODESTYLE_REF}" \
         /opt/wirenboard/codestyle \
  || { msg="==> wirenboard/codestyle clone FAILED (ref=${CODESTYLE_REF}) — re-clone in-VM with: git clone https://github.com/wirenboard/codestyle.git /opt/wirenboard/codestyle"; \
       if [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then echo "$msg (soft-fail mode)"; else echo "$msg" >&2; exit 1; fi; }
+
+# zellij is shipped beside tmux because Debian 13 does not package it. The
+# statically linked musl release asset keeps working if the Debian base moves.
+# This dedicated layer stays below the agent installers so their hourly
+# rebuilds do not re-fetch it, and above larger later installs. Changing a pin
+# or the mounted installer invalidates this layer and later layers; a cache
+# miss in any earlier parent layer still invalidates it through Docker's layer
+# cascade. The pins are literal distributed-archive checksums, so reviewing a
+# bump does not trust a checksum fetched from the same network source.
+ARG ZELLIJ_VERSION=0.45.0
+ARG ZELLIJ_SHA256_AMD64=ab8b2494d80c20c07da4361041a25b96b93c73df992d2d54143e70fb9b1a1063
+ARG ZELLIJ_SHA256_ARM64=d8b311d0f9ec7a03f3341563331aac12c9f52990ecc96a36ed44b1add9dfa035
+RUN --mount=type=bind,source=install-zellij.sh,target=/tmp/install-zellij.sh,ro \
+    bash /tmp/install-zellij.sh
 
 # Per-agent cache keys (the three `ARG AGENT_VERSION_*` below, one
 # per installer RUN). The workflow resolves each agent's current
@@ -662,8 +680,11 @@ RUN npm install -g @github/copilot && copilot --version
 # Agent CLIs (claude/opencode/codex) are HARD-required unless
 # `AGENT_INSTALL_SOFT_FAIL` is set, in which case they're SOFT
 # (missing → warning, not failure) — matches the policy on the
-# installer RUNs above. /opt/wirenboard/codestyle follows the same
-# policy (its clone RUN above also honors AGENT_INSTALL_SOFT_FAIL).
+# installer RUNs above. /opt/wirenboard/codestyle and zellij follow
+# the same policy (their RUNs above also honor AGENT_INSTALL_SOFT_FAIL,
+# scoped to the network fetch only — see the zellij RUN's comment for
+# why a checksum mismatch is never soft-failable even though a
+# download failure is).
 RUN set -e \
  && echo "== HARD requirements ==" \
  && dockerd --version >/dev/null \
@@ -676,6 +697,13 @@ RUN set -e \
  && ssh -V >/dev/null 2>&1 \
  && sshpass -V >/dev/null 2>&1 \
  && ping -V >/dev/null 2>&1 \
+ && { if zellij --version >/dev/null 2>&1; then \
+          echo "  zellij: $(zellij --version 2>&1 | head -1)"; \
+      elif [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then \
+          echo "  zellij: MISSING (soft-fail mode)"; \
+      else \
+          echo "  zellij: MISSING — hard sanity failure" >&2; exit 1; \
+      fi; } \
  && { if [ -d /opt/wirenboard/codestyle ]; then \
           echo "  codestyle clone: OK"; \
       elif [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then \
