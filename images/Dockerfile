@@ -443,97 +443,19 @@ RUN git clone --depth=1 --branch "${CODESTYLE_REF}" \
  || { msg="==> wirenboard/codestyle clone FAILED (ref=${CODESTYLE_REF}) — re-clone in-VM with: git clone https://github.com/wirenboard/codestyle.git /opt/wirenboard/codestyle"; \
       if [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then echo "$msg (soft-fail mode)"; else echo "$msg" >&2; exit 1; fi; }
 
-# zellij — the second terminal multiplexer, shipped beside tmux (base
-# apt RUN above) so a user who reaches for either one finds it. Its
-# own RUN because none of this file's three existing install patterns
-# fit: zellij is absent from Debian's archive through trixie (so not
-# apt), the only third-party apt source is unofficial, and upstream
-# publishes no non-interactive installer script (zellij.dev/launch is
-# an interactive try-it-now launcher). What is left is the release
-# tarball. The musl asset is statically linked, so it keeps working
-# if the Debian base moves out from under it.
-#
-# Size: the plain Linux-musl tarball is ~18-19 MB compressed and
-# extracts to a ~44-50 MB binary (it embeds a WebAssembly runtime for
-# zellij's plugin system) — far outside the "<5 MB each" bucket the
-# base apt bundle above targets, and beyond this file's earlier
-# refusal to add docker-buildx for "+20 MB compressed". zellij ships
-# here anyway (maintainer decision, issue #23): unlike buildx it is
-# the feature this PR exists to add, not an incidental convenience,
-# and upstream also publishes a smaller `zellij-no-web-*` asset
-# (~14-15 MB compressed) that was considered and rejected in favor of
-# the standard asset, to keep zellij's default feature set intact for
-# users who reach for it. Track this weight if it ever needs
-# revisiting.
-#
-# Earns its own layer (see the layer-count rule above the base apt
-# RUN): it is invalidated by ZELLIJ_VERSION/ZELLIJ_SHA256_* and by
-# nothing else. Folding it into the codestyle RUN above would couple
-# two independent version keys — a CODESTYLE_REF bump would re-fetch
-# zellij and vice versa.
-#
-# Position is deliberate; see the layer policy at the top of this
-# file. BELOW the three agent installer layers, so the hourly
-# agent-release rebuilds never re-run this download (every avoided
-# network fetch is one fewer way for the cron build to fail).
-# ABOVE chromium/node/docker/pip, so a hand-made ZELLIJ_VERSION bump
-# does not drag ~500 MiB of unrelated build work with it. It does
-# re-run the best-effort LSP block below, so review a bump like any
-# other image change.
-#
-# ZELLIJ_VERSION is hand-pinned and bumped by a maintainer, like
-# CODESTYLE_REF above and the chrome-devtools-mcp pin — deliberately
-# NOT wired into build-image.yml's `releases/latest` resolution, which
-# exists for the coding-agent products this image ships. A utility
-# does not need day-of-release freshness, and a fourth GitHub API
-# lookup is a fourth way for an hourly build to fail.
-#
-# The sha256 pins freeze the exact artifact in git, so a truncated or
-# substituted download fails the build instead of shipping a broken
-# binary (CODING_STANDARDS.md "Infrastructure" / "Version pinning").
-# Fetching a checksum at build time would add nothing over TLS — the
-# value is the literal being reviewable in the diff. Values are the
-# sha256 of the DISTRIBUTED .tar.gz (computed locally at pin time);
-# upstream's own .sha256sum sidecars hash the extracted binary path
-# from their release CI instead, so they aren't usable directly as a
-# checksum for the downloaded archive. Bump all three ARGs together.
-#
-# AGENT_INSTALL_SOFT_FAIL (declared above at first use) gates ONLY the
-# download, like the codestyle clone: hard-fails in CI, degrades to a
-# warning on the TLS-intercept dev hosts where images/build.sh sets
-# the flag — GitHub release-asset URLs are exactly what curl 56 hits
-# there. A checksum MISMATCH is never soft-failable: a substituted
-# artifact is a different event from an unreachable one, and the hosts
-# that trip the flag are the ones running a MITM proxy.
+# zellij is shipped beside tmux because Debian 13 does not package it. The
+# statically linked musl release asset keeps working if the Debian base moves.
+# This dedicated layer stays below the agent installers so their hourly
+# rebuilds do not re-fetch it, and above larger later installs. Changing a pin
+# or the mounted installer invalidates this layer and later layers; a cache
+# miss in any earlier parent layer still invalidates it through Docker's layer
+# cascade. The pins are literal distributed-archive checksums, so reviewing a
+# bump does not trust a checksum fetched from the same network source.
 ARG ZELLIJ_VERSION=0.45.0
 ARG ZELLIJ_SHA256_AMD64=ab8b2494d80c20c07da4361041a25b96b93c73df992d2d54143e70fb9b1a1063
 ARG ZELLIJ_SHA256_ARM64=d8b311d0f9ec7a03f3341563331aac12c9f52990ecc96a36ed44b1add9dfa035
-RUN set -eu \
- && arch=$(dpkg --print-architecture) \
- && case "$arch" in \
-        amd64) target=x86_64-unknown-linux-musl; sum="${ZELLIJ_SHA256_AMD64}" ;; \
-        arm64) target=aarch64-unknown-linux-musl; sum="${ZELLIJ_SHA256_ARM64}" ;; \
-        *) echo "==> zellij: no upstream release asset for dpkg arch '$arch'" >&2; exit 1 ;; \
-    esac \
- && url="https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-${target}.tar.gz" \
- && d=$(mktemp -d) \
- && trap 'rm -rf "$d"' EXIT INT TERM \
- && if ! curl -fsSL --retry 5 --retry-all-errors --http1.1 "$url" -o "$d/z.tar.gz"; then \
-        msg="==> zellij DOWNLOAD FAILED (${url}) — install in-VM with: curl -fsSL ${url} | tar -xz -C /usr/local/bin"; \
-        if [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then \
-            echo "$msg (soft-fail mode; image will ship without zellij)"; \
-            exit 0; \
-        fi; \
-        echo "$msg" >&2; \
-        exit 1; \
-    fi \
- && { echo "${sum}  $d/z.tar.gz" | sha256sum --status -c - \
-      || { echo "==> zellij: sha256 MISMATCH for ${url} (expected ${sum}) — refusing to install" >&2; exit 1; }; } \
- && tar -xzf "$d/z.tar.gz" -C "$d" \
- && bin=$(find "$d" -type f -name zellij | head -n 1) \
- && { [ -n "$bin" ] || { echo "==> zellij: no 'zellij' binary inside ${url}" >&2; exit 1; }; } \
- && install -m 0755 "$bin" /usr/local/bin/zellij \
- && zellij --version
+RUN --mount=type=bind,source=install-zellij.sh,target=/tmp/install-zellij.sh,ro \
+    bash /tmp/install-zellij.sh
 
 # Per-agent cache keys (the three `ARG AGENT_VERSION_*` below, one
 # per installer RUN). The workflow resolves each agent's current
