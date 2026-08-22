@@ -19,7 +19,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # for npm provenance
 
 jobs:
   resolve-version:
@@ -31,7 +30,7 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ github.event_name }}" == 'workflow_dispatch' ]]; then
-            v="${{ inputs.version }}"
+            v="${INPUTS_VERSION}"
           else
             # tag form: v1.2.3 -> 1.2.3
             v="${GITHUB_REF_NAME#v}"
@@ -40,6 +39,8 @@ jobs:
             echo "::error::version $v is not a valid semver"; exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
+        env:
+          INPUTS_VERSION: ${{ inputs.version }}
 
   # Two parallel build jobs, one per binary. Each has its own
   # Swatinem/rust-cache@v2 keyed on the relevant Cargo.lock — no
@@ -79,7 +80,7 @@ jobs:
     # blocking the x64 release; they re-enable automatically once green.
     continue-on-error: ${{ matrix.cross || false }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         # No submodules — the agent-vm crate doesn't need
         # vendor/microsandbox source to compile (it depends on
         # microsandbox via a path dep, but we have it at the
@@ -88,6 +89,7 @@ jobs:
         # Keep recursive checkout.
         with:
           submodules: 'recursive'
+          persist-credentials: false
 
       - name: Install Rust toolchain + linux deps
         env:
@@ -113,8 +115,8 @@ jobs:
               libcap-ng-dev libdbus-1-dev libsqlite3-dev pkg-config
           fi
 
-      - name: Cargo cache (rust-cache)
-        uses: Swatinem/rust-cache@v2
+      - name: Cargo cache (rust-cache) # zizmor: ignore[cache-poisoning] tag pushes + workflow_dispatch require repo write access, so cache poisoning via an untrusted PR isn't reachable here; restoring is required for the force-save speedup below to pay off.
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Workspace root → cache target/. Action auto-keys on
           # rustc version + OS + Cargo.lock hash + a default salt.
@@ -129,7 +131,7 @@ jobs:
           # every release re-paid a cold build (~5 min). Force-save
           # so subsequent runs (re-dispatch, redo-after-publish-fail
           # etc.) restore from the previous build's target/.
-          save-if: ${{ true }}
+          save-if: true
           # Cache the *full* target/ including path-dep crates.
           # Default cache-workspace-crates=false strips
           # vendor/microsandbox/crates/* artefacts before save, so
@@ -176,7 +178,7 @@ jobs:
           cargo build --release --target ${{ matrix.cargo_target }} -p agent-vm
 
       - name: Upload agent-vm binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: agent-vm-bin-${{ matrix.platform }}
           path: target/${{ matrix.cargo_target }}/release/agent-vm
@@ -216,9 +218,10 @@ jobs:
       # via env here too. No-op on the native x64 leg.
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           submodules: 'recursive'
+          persist-credentials: false
 
       - name: Install Rust toolchain + linux deps
         env:
@@ -239,8 +242,8 @@ jobs:
               libcap-ng-dev libdbus-1-dev libsqlite3-dev pkg-config
           fi
 
-      - name: Cargo cache (rust-cache)
-        uses: Swatinem/rust-cache@v2
+      - name: Cargo cache (rust-cache) # zizmor: ignore[cache-poisoning] tag pushes + workflow_dispatch require repo write access, so cache poisoning via an untrusted PR isn't reachable here; restoring is required for the force-save speedup below to pay off.
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Cache vendor/microsandbox's target/. Action picks up the
           # right Cargo.lock automatically from the workspaces map.
@@ -252,7 +255,7 @@ jobs:
           key: msb-${{ matrix.platform }}
           # See build-agent-vm; release runs are off main so default
           # save-if would skip every release. Force-save.
-          save-if: ${{ true }}
+          save-if: true
           # Keep path-dep artefacts (microsandbox workspace internals)
           # cached too — default strips them and forces re-link.
           cache-all-crates: "true"
@@ -300,7 +303,7 @@ jobs:
             -p microsandbox-cli --bin msb
 
       - name: Upload msb binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: msb-bin-${{ matrix.platform }}
           path: vendor/microsandbox/target/${{ matrix.cargo_target }}/release/msb
@@ -336,12 +339,13 @@ jobs:
     # ported (see the build step). Fail-tolerated so it never blocks x64.
     continue-on-error: ${{ matrix.cross || false }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         # Need the patch file + LIBKRUNFW_VERSION constant. Submodules
         # via the vendor path; recursive not required for libkrunfw
         # itself (cloned separately below).
         with:
           submodules: true
+          persist-credentials: false
 
       - name: Resolve libkrunfw version from vendor/microsandbox
         id: lkv
@@ -354,9 +358,9 @@ jobs:
           test -n "$libkrunfw_version" || { echo "::error::could not extract libkrunfw version"; exit 1; }
           echo "libkrunfw_version=$libkrunfw_version" >> "$GITHUB_OUTPUT"
 
-      - name: Cache libkrunfw build output
+      - name: Cache libkrunfw build output # zizmor: ignore[cache-poisoning] tag pushes + workflow_dispatch require repo write access, so cache poisoning via an untrusted PR isn't reachable here; the cache-hit gate below needs the actual restore, not just a lookup.
         id: lk-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           # Key on version + arch + sha256 of the patches that affect
           # this arch + workflow file. Hash only `*_${arch}.patch` so an
@@ -439,7 +443,7 @@ jobs:
           cp libkrunfw.so."${LK_V}" ../libkrunfw-out/
 
       - name: Upload libkrunfw artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: libkrunfw-${{ matrix.platform }}
           path: libkrunfw-out/libkrunfw.so.*
@@ -469,7 +473,7 @@ jobs:
     # subpackage (see build-agent-vm).
     continue-on-error: ${{ matrix.cross || false }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         # We need vendor/microsandbox source to read LIBKRUNFW_VERSION
         # and LIBKRUNFW_ABI constants. Recursive fetch needed for the
         # libkrunfw sub-submodule? Actually no — we only need the
@@ -477,15 +481,16 @@ jobs:
         # level) is enough; saves the libkrunfw clone time.
         with:
           submodules: true
+          persist-credentials: false
 
       - name: Download agent-vm binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: agent-vm-bin-${{ matrix.platform }}
           path: npm-dist/agent-vm-${{ matrix.platform }}/bin/
 
       - name: Download msb binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: msb-bin-${{ matrix.platform }}
           path: npm-dist/agent-vm-${{ matrix.platform }}/bin/
@@ -511,7 +516,7 @@ jobs:
           echo "libkrunfw_abi=$libkrunfw_abi"         >> "$GITHUB_OUTPUT"
 
       - name: Download patched libkrunfw artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: libkrunfw-${{ matrix.platform }}
           path: npm-dist/agent-vm-${{ matrix.platform }}/lib/
@@ -547,7 +552,7 @@ jobs:
           chmod +x "npm-dist/agent-vm-${{ matrix.platform }}/bin/msb"
 
       - name: Upload assembled platform subpackage
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: agent-vm-${{ matrix.platform }}
           path: npm-dist/agent-vm-${{ matrix.platform }}/
@@ -557,8 +562,13 @@ jobs:
   publish:
     needs: [resolve-version, package]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # for npm provenance
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # No `registry-url:` on purpose — that input makes setup-node write
       # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into .npmrc.
@@ -566,19 +576,23 @@ jobs:
       # an empty authToken and npm errors `ENEEDAUTH` instead of falling
       # back to OIDC. Without it, npm uses the default registry
       # (registry.npmjs.org) and the OIDC trusted-publishing flow.
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: '22'
+          # No package.json at repo root for auto-detection to key off, but
+          # be explicit: this release job has no business restoring an npm
+          # dependency cache before `npm publish`.
+          package-manager-cache: false
 
       # npm trusted publishing (OIDC) needs npm >= 11.5.1; node 22 ships
-      # npm 10.x. With this + `id-token: write` (set at the workflow level)
+      # npm 10.x. With this + `id-token: write` (set on this job, above)
       # and a trusted publisher configured on npmjs.com for each package,
       # `npm publish` exchanges the GitHub OIDC token for short-lived
       # registry credentials — no long-lived NPM_TOKEN secret — and attaches
       # provenance automatically.
-      - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1)
+      - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1) # zizmor: ignore[adhoc-packages] self-upgrading the npm CLI has no lockfile to install from; pinned to an exact version above instead of `latest`.
         run: |
-          npm install -g npm@latest
+          npm install -g npm@12.0.2
           npm --version
 
       # Download each platform artifact into its own subpackage
@@ -594,7 +608,7 @@ jobs:
       # checkout; the artifact carries bin/ + lib/ on top of it.
       # download-artifact will create missing parents.
       - name: Download linux-x64 artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: agent-vm-linux-x64
           path: npm-dist/agent-vm-linux-x64/
@@ -604,7 +618,7 @@ jobs:
         # best-effort until shippable). Tolerate a missing artifact; the
         # publish loop below skips any platform without a built binary.
         continue-on-error: true
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: agent-vm-linux-arm64
           path: npm-dist/agent-vm-linux-arm64/
@@ -655,7 +669,7 @@ jobs:
 
       - name: Publish platform subpackages first
         # No NODE_AUTH_TOKEN — auth is via OIDC trusted publishing (see the
-        # setup-node note above and the workflow-level `id-token: write`).
+        # setup-node note above and this job's `id-token: write`).
         env:
           V: ${{ needs.resolve-version.outputs.version }}
         run: |
