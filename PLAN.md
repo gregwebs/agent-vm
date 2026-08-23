@@ -23,8 +23,7 @@ Working and verified for daily use:
   allow-list** enforced at the proxy (off-list push → clean 403).
 - **Security snapshot** of the three credential files (SHA-256 at launch,
   re-checked on exit).
-- **DX:** `--mount`, `clipboard get/put`, `agent-vm-ccusage`, Chrome DevTools
-  MCP (chromium as a dedicated user with the MITM CA trusted in its NSS DB).
+- **DX:** `--mount`, `clipboard get/put`, `agent-vm-ccusage`, Chrome DevTools MCP as an opt-in tooling layer (with the MITM CA trusted in its NSS DB).
 - **Image + distribution:** `setup` (Docker build + boot-verify), `pull` +
   per-launch update banner, image-API-version lock, bundled patched `msb` +
   libkrunfw, auto-install of the runtime.

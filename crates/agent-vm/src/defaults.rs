@@ -35,8 +35,14 @@ pub const DEFAULT_IMAGE_REF: &str = "ghcr.io/wirenboard/agent-vm-template:latest
 /// changed env-var contracts, removed in-VM binaries, etc.
 /// Routine updates of agent versions don't bump this.
 pub const MIN_SUPPORTED_IMAGE_API: u32 = 1;
-pub const MAX_SUPPORTED_IMAGE_API: u32 = 1;
+pub const MAX_SUPPORTED_IMAGE_API: u32 = 2;
 
 /// Path the image writes its API version to. Read by agent-vm
 /// from inside the guest immediately after boot.
 pub const IMAGE_API_VERSION_PATH: &str = "/etc/agent-vm-image-version";
+
+/// API 2 requires optional image features to advertise an explicit marker.
+pub const FIRST_ADVERTISED_CAPABILITIES_IMAGE_API: u32 = 2;
+
+/// Marker written last by the Chrome DevTools tooling layer after its checks pass.
+pub const CHROME_MCP_CAPABILITY_PATH: &str = "/etc/agent-vm-capabilities/chrome-devtools-mcp";
