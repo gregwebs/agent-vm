@@ -19,6 +19,11 @@ microsandbox = { path = "../../vendor/microsandbox/sdk/rust", default-features =
 # read cached OCI image metadata (GlobalCache::read_image_metadata) and
 # import Reference/ImageConfig/CachedImageMetadata directly.
 microsandbox-image = { path = "../../vendor/microsandbox/crates/image" }
+# Direct dep so agent-vm can read the vendored migration set and derive the
+# bundled schema-version identifier (see src/msb_schema.rs). Already in the
+# build graph transitively via the microsandbox SDK crate; this just makes
+# Migrator nameable here. No new compilation.
+microsandbox-migration = { path = "../../vendor/microsandbox/crates/migration" }
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "time"] }
 # `wrap_help` makes clap detect the terminal width and wrap long help
 # text to it; without it the multi-paragraph `--help` prose renders as
