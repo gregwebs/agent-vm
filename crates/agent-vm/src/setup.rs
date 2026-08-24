@@ -29,6 +29,11 @@ pub struct Args {
 }
 
 pub async fn run(args: Args) -> Result<()> {
+    // setup also reaches connect_and_migrate (via Sandbox::builder/build and
+    // Sandbox::remove), so it can hit the same forward-migrated-DB crash as
+    // the boot path. See src/msb_preflight.rs and issue #30.
+    crate::msb_preflight::ensure_db_not_ahead().await?;
+
     let image = args
         .image
         .unwrap_or_else(|| crate::defaults::DEFAULT_IMAGE_REF.to_string());

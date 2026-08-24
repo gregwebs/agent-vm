@@ -39,6 +39,49 @@ fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
 }
 
+/// Build a real SQLite file at `path` with a `seaql_migrations` table
+/// holding `versions`. Used by the msb.db preflight-guard tests below (see
+/// issue #30 / `src/msb_preflight.rs`); independent of the preflight code
+/// under test.
+fn seed_sqlite_db(path: &Path, versions: &[&str]) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        use sqlx::Row as _;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&url)
+            .await
+            .expect("connect to fixture db");
+        sqlx::query(
+            "CREATE TABLE seaql_migrations (version VARCHAR NOT NULL PRIMARY KEY, applied_at BIGINT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create seaql_migrations table");
+        for v in versions {
+            sqlx::query("INSERT INTO seaql_migrations (version, applied_at) VALUES (?, 0)")
+                .bind(*v)
+                .execute(&pool)
+                .await
+                .expect("insert migration row");
+        }
+        let count: i64 = sqlx::query("SELECT COUNT(*) AS c FROM seaql_migrations")
+            .fetch_one(&pool)
+            .await
+            .expect("count rows")
+            .get("c");
+        assert_eq!(count as usize, versions.len());
+        pool.close().await;
+    });
+}
+
+const FUTURE_MIGRATION: &str = "m29990101_000001_future_thing";
+const BUNDLED_MIGRATION: &str = "m20260305_000001_create_image_tables";
+
 /// Write a fake `msb` that:
 /// - answers a bare `--version` (exactly one arg) with the patched-build
 ///   marker, satisfying `point_at_msb()`'s preflight check;
@@ -147,6 +190,10 @@ impl Harness {
 
     fn record_path(&self) -> PathBuf {
         self.record_file.path().join("record")
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.msb_home().join("db").join("msb.db")
     }
 
     /// Run `agent-vm msb <args>` with `HOME`, `AGENT_VM_STATE_DIR`,
@@ -260,4 +307,48 @@ fn msb_exit_code_propagates_from_child() {
     );
 
     assert_eq!(out.status.code(), Some(7), "stderr:\n{}", stderr_of(&out));
+}
+
+/// The preflight guard (issue #30, `src/msb_preflight.rs`) must block the
+/// passthrough BEFORE the child msb is spawned when the private db was
+/// forward-migrated by a newer microsandbox: exit non-zero, name the
+/// offending migration and the `#28` recovery command, and never invoke
+/// the fake msb (no record file written).
+#[test]
+fn msb_ls_blocked_by_ahead_db_before_child_spawns() {
+    let h = Harness::new();
+    seed_sqlite_db(&h.db_path(), &[BUNDLED_MIGRATION, FUTURE_MIGRATION]);
+
+    let out = h.run_msb(&["ls"], &[]);
+
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; stderr:\n{}",
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(FUTURE_MIGRATION), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("agent-vm doctor --reset-msb-db"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !h.record_path().exists(),
+        "fake msb must never have been invoked for a blocked run"
+    );
+}
+
+/// A behind/in-sync db (subset of the bundled migration set) must proceed
+/// past the guard unchanged and reach the child msb, exactly like the
+/// no-db case already covered above.
+#[test]
+fn msb_ls_reaches_child_when_db_is_behind_or_in_sync() {
+    let h = Harness::new();
+    seed_sqlite_db(&h.db_path(), &[BUNDLED_MIGRATION]);
+
+    let out = h.run_msb(&["ls"], &[]);
+
+    assert!(out.status.success(), "stderr:\n{}", stderr_of(&out));
+    let record = h.read_record();
+    assert!(record.contains("ARG1=ls"), "record:\n{record}");
 }

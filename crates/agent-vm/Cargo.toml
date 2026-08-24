@@ -24,6 +24,13 @@ microsandbox-image = { path = "../../vendor/microsandbox/crates/image" }
 # build graph transitively via the microsandbox SDK crate; this just makes
 # Migrator nameable here. No new compilation.
 microsandbox-migration = { path = "../../vendor/microsandbox/crates/migration" }
+# Direct dep only so src/msb_preflight.rs can name Database/Statement/query_all
+# to read applied seaql_migrations without going through the SDK's crashing
+# open path (Migrator::up). Already in the build graph transitively (SDK +
+# microsandbox-migration both depend on it); requested features are a subset
+# of what the vendored workspace already enables (vendor/microsandbox/Cargo.toml),
+# so this adds no new sea-orm compilation. See issue #30.
+sea-orm = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "time"] }
 # `wrap_help` makes clap detect the terminal width and wrap long help
 # text to it; without it the multi-paragraph `--help` prose renders as
@@ -53,3 +60,9 @@ tempfile = "3"
 # deps so production builds don't pull in the entire network stack.
 [dev-dependencies]
 microsandbox-network = { path = "../../vendor/microsandbox/crates/network" }
+# Used only by the msb_preflight / preflight_boot / msb_passthrough tests to
+# CONSTRUCT a valid SQLite fixture DB with a seaql_migrations table (a plain
+# `std::fs::write` of arbitrary bytes, as doctor_reset.rs's fixture does, is
+# not a valid SQLite file and so is insufficient here). Already in the build
+# graph via sea-orm's sqlx-sqlite feature. See issue #30.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }

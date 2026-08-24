@@ -169,7 +169,9 @@ schema — and the older bundled `msb` agent-vm ships can then never open
 that database again. Every subsequent `agent-vm` command that talks to the
 db (`claude`, `codex`, `shell`, ...) fails.
 
-Recover with:
+agent-vm detects this up front — on `shell`/`run` and on `agent-vm msb
+<args...>` — and stops with a message naming the offending migration(s)
+instead of letting the raw sea-orm error through. Recover with:
 
 ```
 agent-vm doctor --reset-msb-db

@@ -33,6 +33,11 @@ pub struct Args {
 /// Forward to the pinned `msb`. Returns the exit code to hand to
 /// `std::process::exit`.
 pub fn run(args: Args) -> Result<i32> {
+    // Guard the private DB before handing it to the child msb, which would
+    // otherwise open+migrate it and hit the opaque missing-file error. Any
+    // msb subcommand can open the DB, so this must live here, not only on
+    // the boot path. See issue #30.
+    crate::msb_preflight::ensure_db_not_ahead_blocking()?;
     // point_at_msb() set MSB_PATH in main()'s prologue; read it back rather
     // than re-resolving so we forward to the exact binary already
     // version-verified, with no second `--version` spawn.

@@ -16,6 +16,12 @@
 //! directory entirely — no agent-vm code creates, opens, or writes it)
 //! recreates it fresh at the bundled schema and re-pulls images on first
 //! boot.
+//!
+//! Historically this ahead-of-bundle condition surfaced as an opaque raw
+//! sea-orm error the first time any command opened the db. `src/msb_preflight.rs`
+//! (#30) now detects it up front on the boot path and the `agent-vm msb`
+//! passthrough, and its error message points here — closing the loop
+//! between "detect" (#30) and "recover" (this command, #28).
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
