@@ -115,6 +115,52 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
     }
 }
 
+/// Run `child`, but unlike `run_with_timeout`, treat hitting `deadline` as
+/// expected rather than a test failure: kill it and return whatever
+/// stdout/stderr it produced up to that point. Used for the "proceeds past
+/// the guard" case, where what happens next is real boot machinery
+/// (sandbox reaping, Sandbox::builder/start) that has no fake/stub in this
+/// harness — on some platforms it fails fast (e.g. a short-socket-path
+/// error), on others it can block for a long time on hypervisor/network
+/// access this test environment doesn't have. Either way, the guard's own
+/// behavior (did it print the ahead-db message?) is decided long before
+/// that point, so a bounded, always-killed run is sufficient and avoids a
+/// platform-dependent hang.
+fn run_briefly_then_kill(mut cmd: Command, deadline: Duration) -> Output {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn agent-vm");
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + deadline;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait failed") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break child.wait().expect("wait after kill failed");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    Output {
+        status,
+        stdout: stdout_handle.join().unwrap(),
+        stderr: stderr_handle.join().unwrap(),
+    }
+}
+
 struct Harness {
     #[allow(dead_code)] // kept alive for the tempdir's Drop; HOME points into it
     home: tempfile::TempDir,
@@ -145,7 +191,7 @@ impl Harness {
         self.msb_home().join("db").join("msb.db")
     }
 
-    fn run_shell(&self) -> Output {
+    fn shell_cmd(&self) -> Command {
         let mut cmd = Command::new(agent_vm_bin());
         cmd.env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -154,7 +200,20 @@ impl Harness {
             .env("MSB_PATH", &self.fake_msb)
             .current_dir(self.cwd.path())
             .arg("shell");
-        run_with_timeout(cmd, Duration::from_secs(15))
+        cmd
+    }
+
+    fn run_shell(&self) -> Output {
+        run_with_timeout(self.shell_cmd(), Duration::from_secs(15))
+    }
+
+    /// Like `run_shell`, but for the "proceeds past the guard" case: real
+    /// boot machinery beyond the guard has no fake/stub here and its
+    /// eventual outcome is platform-dependent (see `run_briefly_then_kill`),
+    /// so this always kills the process after a short, bounded window
+    /// instead of requiring it to exit.
+    fn run_shell_briefly(&self) -> Output {
+        run_briefly_then_kill(self.shell_cmd(), Duration::from_secs(3))
     }
 }
 
@@ -192,12 +251,15 @@ fn behind_or_in_sync_db_proceeds_past_the_guard() {
     // Subset of bundled -> behind/in-sync, not ahead.
     seed_sqlite_db(&h.db_path(), &[BUNDLED_MIGRATION]);
 
-    let out = h.run_shell();
-
     // The guard must not be what stops this run — it should proceed past
-    // the preflight and fail later for lack of Hypervisor/base image (this
-    // test environment has neither). We only assert the preflight message
-    // is absent; the eventual boot failure is expected and not asserted on.
+    // the preflight into real boot machinery (sandbox reaping, Sandbox
+    // builder/start) that this harness has no fake/stub for. What happens
+    // next is platform-dependent (fails fast on some platforms, can block
+    // on hypervisor/network access on others) and is not what this test is
+    // about, so we always kill the process after a short window rather than
+    // require it to exit. We only assert the preflight message is absent.
+    let out = h.run_shell_briefly();
+
     let stderr = stderr_of(&out);
     assert!(
         !stderr.contains("NEWER than this build"),
