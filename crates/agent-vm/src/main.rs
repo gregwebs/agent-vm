@@ -13,6 +13,7 @@ mod layer;
 mod mount;
 mod msb_cmd;
 mod msb_install;
+mod msb_preflight;
 mod msb_schema;
 mod pull;
 mod pull_progress;

@@ -613,6 +613,13 @@ pub struct Args {
 }
 
 pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
+    // Fail fast if the private msb.db was forward-migrated by a newer
+    // microsandbox than this build understands, instead of letting the SDK
+    // surface sea-orm's opaque "Migration file ... is missing" error on
+    // the first DB open (reap_stale_project_sandboxes below, then the
+    // Sandbox builder). See src/msb_preflight.rs and issue #30.
+    crate::msb_preflight::ensure_db_not_ahead().await?;
+
     // Resolve root vs. non-root guest mode up front — it gates dir
     // provisioning, the rootfs patch block, and the guest env/exec wiring
     // further down, so it has to be known before any of that runs.

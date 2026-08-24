@@ -23,6 +23,47 @@ pub fn bundled_schema_version() -> String {
         .expect("bundled microsandbox migration set must be non-empty")
 }
 
+/// Report that the on-disk DB carries migrations the bundled Migrator
+/// lacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbAheadOfBundle {
+    /// Applied migration names present in the DB but absent from the
+    /// bundled migration set, sorted ascending. Non-empty by
+    /// construction.
+    pub extra_migrations: Vec<String>,
+}
+
+/// Compare the DB's applied `seaql_migrations` names against the
+/// bundled `Migrator`'s known migration names. `Some(report)` iff the
+/// DB is ahead (carries at least one migration the bundle does not
+/// know).
+///
+/// Pure: callers pass the already-read applied names, so #31 can reuse
+/// this for its legacy-adoption check without any DB access. Compares
+/// full `.name()` strings (not the `m<date>_<seq>` id) to match
+/// sea-orm's own set difference exactly, so this fires in precisely
+/// the cases that would otherwise crash.
+pub fn db_ahead_of_bundle(applied_versions: &[String]) -> Option<DbAheadOfBundle> {
+    let bundled: std::collections::HashSet<String> = Migrator::get_migration_files()
+        .iter()
+        .map(|m| m.name().to_string())
+        .collect();
+    let mut extra: Vec<String> = applied_versions
+        .iter()
+        .filter(|v| !bundled.contains(*v))
+        .cloned()
+        .collect();
+    extra.sort();
+    extra.dedup();
+    if extra.is_empty() {
+        None
+    } else {
+        Some(DbAheadOfBundle {
+            extra_migrations: extra,
+        })
+    }
+}
+
 /// Extract the schema-id prefix (m<date>_<seq>) from a full migration
 /// name like m20260606_000001_named_volume_kinds giving m20260606_000001.
 /// The id is the first two underscore-delimited fields. If a name
@@ -109,6 +150,58 @@ mod tests {
             msg.contains("must be non-empty"),
             "unexpected message: {msg}"
         );
+    }
+
+    #[test]
+    fn db_ahead_of_bundle_is_none_for_empty_input() {
+        assert_eq!(db_ahead_of_bundle(&[]), None);
+    }
+
+    #[test]
+    fn db_ahead_of_bundle_is_none_when_applied_is_subset_of_bundled() {
+        let applied = vec!["m20260305_000001_create_image_tables".to_string()];
+        assert_eq!(db_ahead_of_bundle(&applied), None);
+    }
+
+    #[test]
+    fn db_ahead_of_bundle_reports_unknown_future_migration() {
+        let applied = vec![
+            "m20260305_000001_create_image_tables".to_string(),
+            "m29990101_000001_future_thing".to_string(),
+        ];
+        assert_eq!(
+            db_ahead_of_bundle(&applied),
+            Some(DbAheadOfBundle {
+                extra_migrations: vec!["m29990101_000001_future_thing".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn db_ahead_of_bundle_sorts_and_dedups_multiple_extras() {
+        let applied = vec![
+            "m29990101_000002_future_two".to_string(),
+            "m29990101_000001_future_one".to_string(),
+            "m29990101_000001_future_one".to_string(),
+        ];
+        assert_eq!(
+            db_ahead_of_bundle(&applied),
+            Some(DbAheadOfBundle {
+                extra_migrations: vec![
+                    "m29990101_000001_future_one".to_string(),
+                    "m29990101_000002_future_two".to_string(),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn db_ahead_of_bundle_full_bundled_set_is_not_ahead_of_itself() {
+        let applied: Vec<String> = Migrator::get_migration_files()
+            .iter()
+            .map(|m| m.name().to_string())
+            .collect();
+        assert_eq!(db_ahead_of_bundle(&applied), None);
     }
 
     #[test]
