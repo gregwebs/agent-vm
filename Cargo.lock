@@ -32,6 +32,7 @@ dependencies = [
  "libc",
  "microsandbox",
  "microsandbox-image",
+ "microsandbox-migration",
  "microsandbox-network",
  "reqwest",
  "serde_json",
