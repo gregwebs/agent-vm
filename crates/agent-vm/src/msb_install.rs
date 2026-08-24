@@ -346,6 +346,21 @@ fn write_shared_cache_config(msb_home: &Path, cache_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The private `MSB_HOME` path agent-vm pins msb at: `state_root()/msb-home`.
+///
+/// Side-effect-free (no dir creation, no env mutation) — the single source
+/// of truth for the path itself, shared by [`point_at_msb_home`] (which
+/// creates and pins it for boot) and any other caller (e.g. `doctor`) that
+/// only needs to know where it is. Kept separate from
+/// `std::env::var("MSB_HOME")` reads on purpose: recomputing from the same
+/// pure inputs works whether or not `point_at_msb_home()` has run in this
+/// process, and doesn't depend on the setenv-before-runtime invariant.
+pub fn msb_home_dir() -> Result<PathBuf> {
+    Ok(crate::host_paths::state_root()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve agent-vm state root ($HOME unset?)"))?
+        .join("msb-home"))
+}
+
 /// Point msb at the agent-vm-controlled state dir instead of
 /// `~/.microsandbox/`.
 ///
@@ -382,9 +397,7 @@ fn write_shared_cache_config(msb_home: &Path, cache_dir: &Path) -> Result<()> {
 ///
 /// Idempotent. Returns the path that was pinned.
 pub fn point_at_msb_home() -> Result<PathBuf> {
-    let dir = crate::host_paths::state_root()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve agent-vm state root ($HOME unset?)"))?
-        .join("msb-home");
+    let dir = msb_home_dir()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating MSB_HOME at {}", dir.display()))?;
     // SAFETY: like [`point_at_msb`], called before the tokio runtime

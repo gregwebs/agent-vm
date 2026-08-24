@@ -160,6 +160,32 @@ run leaves the previously written `paths.cache` pointing at the shared
 directory. To fully revert, delete that `config.json` (or remove the
 `paths.cache` key from it).
 
+## Recovering from a forward-migrated microsandbox db
+
+sea-orm migrations in microsandbox are one-way. If a newer, separately
+installed `msb` ever opens agent-vm's private
+`~/.local/state/agent-vm/msb-home/db/msb.db`, it forward-migrates the
+schema — and the older bundled `msb` agent-vm ships can then never open
+that database again. Every subsequent `agent-vm` command that talks to the
+db (`claude`, `codex`, `shell`, ...) fails.
+
+Recover with:
+
+```
+agent-vm doctor --reset-msb-db
+```
+
+This moves `msb-home/db/` (including the `-wal`/`-shm`/lock files) aside to
+a timestamped `db.reset-<epoch-seconds>` sibling — non-destructive, and
+reversible: the command prints the exact `mv` to undo it. It resolves
+`MSB_HOME` the same way `agent-vm` itself does, so it only ever touches
+agent-vm's private state, never a separate `~/.microsandbox` install. If no
+`db/` exists, it prints a no-op message and exits 0.
+
+The next `agent-vm shell`/`run` finds no `db/` and lets the bundled `msb`
+recreate it fresh at its own schema, re-pulling images on first boot — no
+further action needed.
+
 ## Guest user / `--root`
 
 By default the in-guest agent runs as **the host user** — the same

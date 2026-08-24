@@ -2,6 +2,7 @@
 
 mod clipboard;
 mod defaults;
+mod doctor;
 mod github_graphql;
 mod host_paths;
 mod image_api_version;
@@ -77,6 +78,10 @@ enum Cmd {
     /// Exchange a string between the host and the sandbox.
     Clipboard(clipboard::Args),
 
+    /// Diagnostic / maintenance operations for agent-vm's private
+    /// microsandbox state (e.g. --reset-msb-db).
+    Doctor(doctor::Args),
+
     /// Internal: invoked by msb's interceptor hook for matched OAuth
     /// refresh requests. Reads the request on stdin, writes an
     /// HTTP response on stdout. Not meant for direct use.
@@ -116,6 +121,12 @@ fn main() -> Result<()> {
     if let Cmd::Msb(args) = cli.cmd {
         return exit_with(msb_cmd::run(args)?);
     }
+    // doctor is also pure sync fs work (no VM/network I/O); dispatch it
+    // before the runtime for the same reason as Msb above.
+    if let Cmd::Doctor(args) = cli.cmd {
+        doctor::run(args)?;
+        return Ok(());
+    }
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     runtime.block_on(async move {
         match cli.cmd {
@@ -132,6 +143,7 @@ fn main() -> Result<()> {
             // runtime was built — `Cmd` isn't `Clone`/`Copy`, so this arm
             // exists only to satisfy exhaustiveness.
             Cmd::Msb(_) => unreachable!("Cmd::Msb is dispatched pre-runtime, see above"),
+            Cmd::Doctor(_) => unreachable!("Cmd::Doctor is dispatched pre-runtime, see above"),
         }
     })
 }
