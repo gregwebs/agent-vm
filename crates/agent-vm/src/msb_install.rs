@@ -52,6 +52,28 @@ const MSB_CACHE_DIR_ENV: &str = "AGENT_VM_MSB_CACHE_DIR";
 /// microsandbox's persisted config filename (mirrors
 /// `microsandbox_utils::CONFIG_FILENAME`). Written into `MSB_HOME`.
 const MSB_CONFIG_FILENAME: &str = "config.json";
+const LEGACY_MSB_HOME_NAME: &str = "msb-home";
+// This travels with an atomically adopted home. It makes a retry finish
+// snapshot recovery if configuration fails after the rename.
+const SNAPSHOT_REINDEX_PENDING_MARKER: &str = ".agent-vm-snapshot-reindex-pending";
+// Kept beside, rather than inside, a rejected target: a post-rename identity
+// failure must survive even when the target itself is the untrusted replacement.
+const ADOPTION_REJECTED_MARKER_SUFFIX: &str = ".agent-vm-adoption-rejected";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaHomePaths {
+    legacy: PathBuf,
+    current: PathBuf,
+}
+
+impl SchemaHomePaths {
+    fn new(state_root: &Path, schema_id: &str) -> Self {
+        Self {
+            legacy: state_root.join(LEGACY_MSB_HOME_NAME),
+            current: state_root.join(format!("{LEGACY_MSB_HOME_NAME}-{schema_id}")),
+        }
+    }
+}
 
 /// Path to the signed dev build for a source workspace.
 ///
@@ -249,9 +271,8 @@ fn effective_cache_dir_from(
     if share {
         return Ok(shared.to_path_buf());
     }
-    let msb_home = msb_home.ok_or_else(|| {
-        anyhow::anyhow!("MSB_HOME unset; point_at_msb_home() not called yet")
-    })?;
+    let msb_home = msb_home
+        .ok_or_else(|| anyhow::anyhow!("MSB_HOME unset; point_at_msb_home() not called yet"))?;
     Ok(PathBuf::from(msb_home).join("cache"))
 }
 
@@ -346,19 +367,449 @@ fn write_shared_cache_config(msb_home: &Path, cache_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The private `MSB_HOME` path agent-vm pins msb at: `state_root()/msb-home`.
-///
-/// Side-effect-free (no dir creation, no env mutation) — the single source
-/// of truth for the path itself, shared by [`point_at_msb_home`] (which
-/// creates and pins it for boot) and any other caller (e.g. `doctor`) that
-/// only needs to know where it is. Kept separate from
-/// `std::env::var("MSB_HOME")` reads on purpose: recomputing from the same
-/// pure inputs works whether or not `point_at_msb_home()` has run in this
-/// process, and doesn't depend on the setenv-before-runtime invariant.
+/// The private schema-namespaced `MSB_HOME` path agent-vm pins msb at.
+/// Side-effect-free, so doctor and startup share the same name calculation.
 pub fn msb_home_dir() -> Result<PathBuf> {
-    Ok(crate::host_paths::state_root()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve agent-vm state root ($HOME unset?)"))?
-        .join("msb-home"))
+    let state_root = crate::host_paths::state_root()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve agent-vm state root ($HOME unset?)"))?;
+    Ok(SchemaHomePaths::new(&state_root, &crate::msb_schema::bundled_schema_version()).current)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeEntry {
+    Absent,
+    RealDirectory,
+    Unsupported,
+}
+
+fn home_entry(path: &Path) -> Result<HomeEntry> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(HomeEntry::RealDirectory)
+        }
+        Ok(_) => Ok(HomeEntry::Unsupported),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HomeEntry::Absent),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading metadata for {}", path.display()))
+        }
+    }
+}
+
+/// Creation is followed by another metadata check so a final-component
+/// symlink/file race is never silently accepted.
+fn create_fresh_schema_home(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("creating MSB_HOME at {}", path.display()))?;
+    match home_entry(path)? {
+        HomeEntry::RealDirectory => Ok(()),
+        HomeEntry::Absent | HomeEntry::Unsupported => anyhow::bail!(
+            "schema MSB_HOME {} is not a real directory after creation",
+            path.display()
+        ),
+    }
+}
+
+fn snapshot_reindex_backend(
+    home: &Path,
+    shared_cache: Option<&Path>,
+) -> microsandbox::LocalBackendBuilder {
+    let backend = microsandbox::LocalBackend::builder().home(home);
+    match shared_cache {
+        Some(cache_dir) => backend.cache_dir(cache_dir),
+        None => backend,
+    }
+}
+
+const SNAPSHOT_REINDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SNAPSHOT_REINDEX_RECOVERY_COMMAND: &str = "agent-vm msb snapshot reindex";
+
+fn snapshot_reindex_warning(home: &Path, error: &anyhow::Error) -> String {
+    format!(
+        "adopted snapshots under {} could not be reindexed ({error}); run `{SNAPSHOT_REINDEX_RECOVERY_COMMAND}`",
+        home.display(),
+    )
+}
+
+fn try_reindex_adopted_snapshots(home: &Path, shared_cache: Option<&Path>) -> Result<()> {
+    let snapshots = home.join("snapshots");
+    if !snapshots.is_dir() {
+        return Ok(());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building runtime to reindex adopted snapshots")?;
+    runtime.block_on(async {
+        tokio::time::timeout(SNAPSHOT_REINDEX_TIMEOUT, async {
+            let backend = snapshot_reindex_backend(home, shared_cache)
+                .build()
+                .await
+                .map_err(anyhow::Error::from)?;
+            microsandbox::with_backend(backend, async {
+                let required = microsandbox::Snapshot::list_dir(&snapshots)
+                    .await
+                    .map_err(anyhow::Error::from)?
+                    .len();
+                let indexed = microsandbox::Snapshot::reindex(&snapshots)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                if indexed != required {
+                    anyhow::bail!(
+                        "snapshot reindex indexed {indexed} of {required} required artifacts"
+                    );
+                }
+                Ok(())
+            })
+            .await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out after {SNAPSHOT_REINDEX_TIMEOUT:?}"))?
+    })
+}
+
+fn reindex_adopted_snapshots(home: &Path, shared_cache: Option<&Path>) {
+    match try_reindex_adopted_snapshots(home, shared_cache) {
+        Ok(()) => {
+            let marker = home.join(SNAPSHOT_REINDEX_PENDING_MARKER);
+            if let Err(error) = std::fs::remove_file(&marker)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(home = %home.display(), error = %error, "leaving snapshot recovery marker for retry");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(home = %home.display(), error = %error, "{}", snapshot_reindex_warning(home, &error))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaHomePreparation {
+    ExistingOrFresh,
+    SnapshotReindexPending,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyAdoptionProof {
+    home: FileIdentity,
+    db_parent: Option<FileIdentity>,
+    db: Option<FileIdentity>,
+}
+
+/// Capture the exact directory and database entries that inspection authorized.
+/// A rename by path alone cannot bind the source to inspection, so successful
+/// adoption is accepted only after these identities are found under `current`.
+#[cfg(unix)]
+fn capture_legacy_adoption_proof(legacy: &Path) -> Result<LegacyAdoptionProof> {
+    let db_parent_path = legacy.join("db");
+    let db_parent = match home_entry(&db_parent_path)? {
+        HomeEntry::Absent => None,
+        HomeEntry::RealDirectory => Some(file_identity(&db_parent_path)?),
+        HomeEntry::Unsupported => anyhow::bail!(
+            "legacy database parent {} is not a real directory",
+            db_parent_path.display()
+        ),
+    };
+    let db_path = db_parent_path.join("msb.db");
+    let db = match std::fs::symlink_metadata(&db_path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            Some(file_identity(&db_path)?)
+        }
+        Ok(_) => anyhow::bail!(
+            "legacy database {} is not a regular file",
+            db_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading metadata for {}", db_path.display()));
+        }
+    };
+    Ok(LegacyAdoptionProof {
+        home: file_identity(legacy)?,
+        db_parent,
+        db,
+    })
+}
+
+#[cfg(unix)]
+fn verify_adopted_legacy_proof(current: &Path, proof: &LegacyAdoptionProof) -> Result<()> {
+    if home_entry(current)? != HomeEntry::RealDirectory || file_identity(current)? != proof.home {
+        anyhow::bail!(
+            "legacy MSB_HOME changed while being adopted; refusing to accept {}",
+            current.display()
+        );
+    }
+    let db_parent_path = current.join("db");
+    match proof.db_parent {
+        Some(expected)
+            if home_entry(&db_parent_path)? == HomeEntry::RealDirectory
+                && file_identity(&db_parent_path)? == expected => {}
+        Some(_) => anyhow::bail!(
+            "legacy database parent changed while being adopted; refusing to accept {}",
+            current.display()
+        ),
+        None if home_entry(&db_parent_path)? == HomeEntry::Absent => {}
+        None => anyhow::bail!(
+            "legacy database parent appeared while being adopted; refusing to accept {}",
+            current.display()
+        ),
+    }
+    let db_path = db_parent_path.join("msb.db");
+    match proof.db {
+        Some(expected) if file_identity(&db_path)? == expected => Ok(()),
+        Some(_) => anyhow::bail!(
+            "legacy database changed while being adopted; refusing to accept {}",
+            current.display()
+        ),
+        None => match std::fs::symlink_metadata(&db_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => anyhow::bail!(
+                "legacy database appeared while being adopted; refusing to accept {}",
+                current.display()
+            ),
+            Err(error) => {
+                Err(error).with_context(|| format!("reading metadata for {}", db_path.display()))
+            }
+        },
+    }
+}
+
+#[cfg(not(unix))]
+compile_error!("schema-home adoption requires Unix no-clobber rename support");
+
+#[cfg(target_os = "macos")]
+fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
+
+    unsafe extern "C" {
+        fn renameatx_np(
+            fromfd: libc::c_int,
+            from: *const libc::c_char,
+            tofd: libc::c_int,
+            to: *const libc::c_char,
+            flags: libc::c_uint,
+        ) -> libc::c_int;
+    }
+    const RENAME_EXCL: libc::c_uint = 0x0000_0004;
+    let source = CString::new(source.as_os_str().as_bytes()).unwrap();
+    let target = CString::new(target.as_os_str().as_bytes()).unwrap();
+    let result = unsafe {
+        renameatx_np(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
+
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    let source = CString::new(source.as_os_str().as_bytes()).unwrap();
+    let target = CString::new(target.as_os_str().as_bytes()).unwrap();
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_no_replace(_source: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-clobber directory rename is unavailable on this platform",
+    ))
+}
+
+fn rejected_adoption_marker(current: &Path) -> Result<PathBuf> {
+    let name = current.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "schema MSB_HOME {} has no final path component",
+            current.display()
+        )
+    })?;
+    Ok(current.with_file_name(format!(
+        "{}{}",
+        name.to_string_lossy(),
+        ADOPTION_REJECTED_MARKER_SUFFIX
+    )))
+}
+
+fn reject_adopted_target<T>(current: &Path, identity_error: anyhow::Error) -> Result<T> {
+    let marker = rejected_adoption_marker(current)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            writeln!(file, "{identity_error:#}").with_context(|| {
+                format!("writing rejected-adoption marker {}", marker.display())
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("persisting rejected-adoption marker {}", marker.display())
+            });
+        }
+    }
+    Err(identity_error.context(format!(
+        "refusing to use {} after failed adoption validation; inspect it and {} before retrying",
+        current.display(),
+        marker.display()
+    )))
+}
+
+/// Prepare the current schema home without merging or deleting existing state.
+fn prepare_schema_msb_home(paths: &SchemaHomePaths) -> Result<SchemaHomePreparation> {
+    prepare_schema_msb_home_with_rename(paths, rename_no_replace)
+}
+
+/// The injected rename keeps the defined post-rename reconciliation cases
+/// deterministic in tests rather than depending on filesystem timing.
+fn prepare_schema_msb_home_with_rename(
+    paths: &SchemaHomePaths,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<SchemaHomePreparation> {
+    let rejected_marker = rejected_adoption_marker(&paths.current)?;
+    match std::fs::symlink_metadata(&rejected_marker) {
+        Ok(_) => anyhow::bail!(
+            "schema MSB_HOME {} was rejected after a failed adoption validation; inspect it and {} before retrying",
+            paths.current.display(),
+            rejected_marker.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", rejected_marker.display()));
+        }
+    }
+    match home_entry(&paths.current)? {
+        HomeEntry::RealDirectory => {
+            return Ok(
+                if paths
+                    .current
+                    .join(SNAPSHOT_REINDEX_PENDING_MARKER)
+                    .is_file()
+                {
+                    SchemaHomePreparation::SnapshotReindexPending
+                } else {
+                    SchemaHomePreparation::ExistingOrFresh
+                },
+            );
+        }
+        HomeEntry::Unsupported => anyhow::bail!(
+            "schema MSB_HOME {} exists but is not a real directory",
+            paths.current.display()
+        ),
+        HomeEntry::Absent => {}
+    }
+    match home_entry(&paths.legacy)? {
+        HomeEntry::Absent => create_fresh_schema_home(&paths.current)?,
+        HomeEntry::Unsupported => {
+            tracing::warn!(legacy = %paths.legacy.display(), target = %paths.current.display(), "legacy MSB_HOME is not a real directory; retaining it and creating a fresh schema home");
+            create_fresh_schema_home(&paths.current)?;
+        }
+        HomeEntry::RealDirectory => {
+            let proof = match capture_legacy_adoption_proof(&paths.legacy) {
+                Ok(proof) => proof,
+                Err(error) => {
+                    tracing::warn!(legacy = %paths.legacy.display(), target = %paths.current.display(), error = %error, "legacy MSB_HOME has an unsafe database path; retaining it and creating a fresh schema home");
+                    create_fresh_schema_home(&paths.current)?;
+                    return Ok(SchemaHomePreparation::ExistingOrFresh);
+                }
+            };
+            match crate::msb_db::inspect_schema_blocking(&paths.legacy.join("db/msb.db"))? {
+                crate::msb_db::SchemaCompatibility::Compatible => {
+                    match rename(&paths.legacy, &paths.current) {
+                        Ok(()) => {
+                            if let Err(identity_error) =
+                                verify_adopted_legacy_proof(&paths.current, &proof)
+                            {
+                                return reject_adopted_target(&paths.current, identity_error);
+                            }
+                            // This is recorded after the proof binds the renamed home to the
+                            // inspected source, but before optional configuration can fail.
+                            std::fs::write(
+                                paths.current.join(SNAPSHOT_REINDEX_PENDING_MARKER),
+                                b"pending\n",
+                            )
+                            .with_context(|| {
+                                format!("marking adopted snapshots in {}", paths.current.display())
+                            })?;
+                            return Ok(SchemaHomePreparation::SnapshotReindexPending);
+                        }
+                        Err(_) if home_entry(&paths.current)? == HomeEntry::RealDirectory => {
+                            return Ok(SchemaHomePreparation::ExistingOrFresh);
+                        }
+                        Err(_) if home_entry(&paths.legacy)? == HomeEntry::Absent => {
+                            create_fresh_schema_home(&paths.current)?;
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "adopting legacy MSB_HOME {} -> {}",
+                                    paths.legacy.display(),
+                                    paths.current.display()
+                                )
+                            });
+                        }
+                    }
+                }
+                crate::msb_db::SchemaCompatibility::Ahead(report) => {
+                    tracing::warn!(legacy = %paths.legacy.display(), target = %paths.current.display(), migrations = ?report.extra_migrations, "legacy MSB_HOME has a newer schema; retaining it and creating a fresh schema home");
+                    create_fresh_schema_home(&paths.current)?;
+                }
+                crate::msb_db::SchemaCompatibility::Unreadable { error } => {
+                    tracing::warn!(legacy = %paths.legacy.display(), target = %paths.current.display(), error = %error, "legacy MSB_HOME could not be inspected; retaining it and creating a fresh schema home");
+                    create_fresh_schema_home(&paths.current)?;
+                }
+            }
+        }
+    }
+    Ok(SchemaHomePreparation::ExistingOrFresh)
 }
 
 /// Point msb at the agent-vm-controlled state dir instead of
@@ -397,22 +848,34 @@ pub fn msb_home_dir() -> Result<PathBuf> {
 ///
 /// Idempotent. Returns the path that was pinned.
 pub fn point_at_msb_home() -> Result<PathBuf> {
-    let dir = msb_home_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating MSB_HOME at {}", dir.display()))?;
-    // SAFETY: like [`point_at_msb`], called before the tokio runtime
-    // spins up. setenv() is not thread-safe; this ordering invariant
-    // is the only thing that makes the call sound.
-    unsafe { std::env::set_var("MSB_HOME", &dir) };
+    let state_root = crate::host_paths::state_root()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve agent-vm state root ($HOME unset?)"))?;
+    let paths = SchemaHomePaths::new(&state_root, &crate::msb_schema::bundled_schema_version());
+    // SAFETY: this happens before SQLite inspection: SQLx can create a
+    // connection worker even on a current-thread runtime, so setenv must
+    // precede it as well as main's multithread Tokio runtime.
+    unsafe { std::env::set_var("MSB_HOME", &paths.current) };
+    let preparation = prepare_schema_msb_home(&paths)?;
+    let dir = paths.current;
 
     // Opt-in only: redirect the OCI image cache at the shared
     // `~/.microsandbox/cache` a separately-installed msb uses. Off by
     // default; when unset/falsey we do NOT read or write config.json at all
     // (today's behaviour). db/tls/secrets/sandboxes stay private under
     // MSB_HOME. See doc comment above + README.md.
-    if env_flag_enabled(SHARE_MSB_CACHE_ENV) {
+    let shared_cache = if env_flag_enabled(SHARE_MSB_CACHE_ENV) {
         let cache_dir = resolve_shared_cache_dir()?;
         write_shared_cache_config(&dir, &cache_dir)?;
+        Some(cache_dir)
+    } else {
+        None
+    };
+
+    // Snapshot reindex must run after the shared-cache configuration is
+    // finalized. Its scoped backend also prevents reindex from initializing a
+    // stale process-wide SDK backend for the rest of this process.
+    if preparation == SchemaHomePreparation::SnapshotReindexPending {
+        reindex_adopted_snapshots(&dir, shared_cache.as_deref());
     }
 
     Ok(dir)
@@ -505,6 +968,7 @@ fn verify_patched_marker_with_path_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::{Connection as _, Executor as _, SqliteConnection, sqlite::SqliteConnectOptions};
     use std::os::unix::fs::PermissionsExt;
 
     fn write_fake_msb(dir: &std::path::Path, version_output: &str) -> PathBuf {
@@ -525,6 +989,594 @@ mod tests {
             "[package]\nname = \"agent-vm\"\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn schema_home_paths_are_stable_siblings() {
+        let root = Path::new("/state");
+        let a = SchemaHomePaths::new(root, "m20260606_000001");
+        assert_eq!(a, SchemaHomePaths::new(root, "m20260606_000001"));
+        let b = SchemaHomePaths::new(root, "m20261001_000001");
+        assert_ne!(a.current, b.current);
+        assert_ne!(a.current, a.legacy);
+        assert!(!a.current.starts_with(&a.legacy));
+    }
+
+    #[test]
+    fn compatible_legacy_home_is_adopted_whole() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        std::fs::create_dir_all(paths.legacy.join("cache")).unwrap();
+        std::fs::write(paths.legacy.join("cache/marker"), "kept").unwrap();
+        prepare_schema_msb_home(&paths).unwrap();
+        assert!(paths.current.join("cache/marker").is_file());
+        assert!(!paths.legacy.exists());
+    }
+
+    #[test]
+    fn established_target_wins_over_legacy() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        std::fs::create_dir_all(&paths.current).unwrap();
+        std::fs::create_dir_all(&paths.legacy).unwrap();
+        prepare_schema_msb_home(&paths).unwrap();
+        assert!(paths.legacy.is_dir());
+    }
+
+    #[test]
+    fn fresh_home_is_created_when_legacy_is_absent() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        prepare_schema_msb_home(&paths).unwrap();
+        assert_eq!(
+            home_entry(&paths.current).unwrap(),
+            HomeEntry::RealDirectory
+        );
+    }
+
+    #[test]
+    fn target_file_is_rejected_without_mutating_legacy() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        std::fs::write(&paths.current, "not a directory").unwrap();
+        std::fs::create_dir_all(&paths.legacy).unwrap();
+        let error = prepare_schema_msb_home(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("not a real directory"));
+        assert!(paths.legacy.is_dir());
+    }
+
+    #[test]
+    fn corrupt_legacy_is_retained_and_gets_fresh_home() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        std::fs::create_dir_all(paths.legacy.join("db")).unwrap();
+        std::fs::write(paths.legacy.join("db/msb.db"), "not sqlite").unwrap();
+        prepare_schema_msb_home(&paths).unwrap();
+        assert!(paths.legacy.join("db/msb.db").is_file());
+        assert!(paths.current.is_dir());
+    }
+
+    #[test]
+    fn ahead_legacy_is_retained_and_gets_fresh_home() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        let db = paths.legacy.join("db/msb.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = SqliteConnectOptions::new()
+                .filename(&db)
+                .create_if_missing(true);
+            let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+            connection
+                .execute("CREATE TABLE seaql_migrations (version TEXT)")
+                .await
+                .unwrap();
+            connection
+                .execute("INSERT INTO seaql_migrations VALUES ('m29990101_000001_future_thing')")
+                .await
+                .unwrap();
+            connection.close().await.unwrap();
+        });
+        drop(runtime);
+        prepare_schema_msb_home(&paths).unwrap();
+        assert!(paths.legacy.join("db/msb.db").is_file());
+        assert!(paths.current.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_symlink_is_rejected_without_mutating_legacy() {
+        use std::os::unix::fs::symlink;
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        symlink(state.path().join("somewhere"), &paths.current).unwrap();
+        std::fs::create_dir_all(&paths.legacy).unwrap();
+        assert!(prepare_schema_msb_home(&paths).is_err());
+        assert!(paths.legacy.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_legacy_database_symlink_is_retained() {
+        use std::os::unix::fs::symlink;
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        let external_db = state.path().join("external.db");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = SqliteConnectOptions::new()
+                .filename(&external_db)
+                .create_if_missing(true);
+            let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+            connection
+                .execute("CREATE TABLE seaql_migrations (version TEXT)")
+                .await
+                .unwrap();
+            connection.close().await.unwrap();
+        });
+        drop(runtime);
+        let legacy_db = paths.legacy.join("db/msb.db");
+        std::fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+        symlink(&external_db, &legacy_db).unwrap();
+
+        assert_eq!(
+            prepare_schema_msb_home(&paths).unwrap(),
+            SchemaHomePreparation::ExistingOrFresh
+        );
+        assert!(
+            std::fs::symlink_metadata(&legacy_db)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(paths.current.is_dir());
+    }
+
+    #[test]
+    fn rename_race_accepts_a_target_created_by_another_process() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        std::fs::create_dir_all(&paths.legacy).unwrap();
+
+        let result = prepare_schema_msb_home_with_rename(&paths, |_, target| {
+            std::fs::create_dir_all(target)?;
+            Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+        })
+        .unwrap();
+
+        assert_eq!(result, SchemaHomePreparation::ExistingOrFresh);
+        assert!(paths.current.is_dir());
+        assert!(paths.legacy.is_dir(), "the competing process owns adoption");
+    }
+
+    #[test]
+    fn no_clobber_rename_preserves_an_empty_competing_target() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        std::fs::create_dir_all(paths.legacy.join("cache")).unwrap();
+        std::fs::write(paths.legacy.join("cache/source-marker"), "legacy").unwrap();
+
+        let result = prepare_schema_msb_home_with_rename(&paths, |source, target| {
+            std::fs::create_dir(target)?;
+            std::fs::write(target.join("competing-marker"), "keep")?;
+            rename_no_replace(source, target)
+        })
+        .unwrap();
+
+        assert_eq!(result, SchemaHomePreparation::ExistingOrFresh);
+        assert!(paths.current.join("competing-marker").is_file());
+        assert!(paths.legacy.join("cache/source-marker").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_rename_rejects_a_replaced_legacy_source() {
+        use std::os::unix::fs::symlink;
+
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        std::fs::create_dir_all(&paths.legacy).unwrap();
+        let original = state.path().join("original-legacy");
+        let replacement = state.path().join("replacement");
+        std::fs::create_dir_all(&replacement).unwrap();
+
+        let error = prepare_schema_msb_home_with_rename(&paths, |source, target| {
+            std::fs::rename(source, &original)?;
+            symlink(&replacement, source)?;
+            std::fs::rename(source, target)
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed while being adopted"));
+        assert!(
+            std::fs::symlink_metadata(&paths.current)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(original.is_dir());
+    }
+
+    #[test]
+    fn rejected_replacement_directory_is_never_accepted_on_retry() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        std::fs::create_dir_all(&paths.legacy).unwrap();
+        let inspected = state.path().join("inspected-legacy");
+
+        let error = prepare_schema_msb_home_with_rename(&paths, |source, target| {
+            std::fs::rename(source, &inspected)?;
+            std::fs::create_dir(source)?;
+            std::fs::write(source.join("replacement-marker"), "unvalidated")?;
+            std::fs::rename(source, target)
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed while being adopted"));
+        assert!(paths.current.join("replacement-marker").is_file());
+        assert!(rejected_adoption_marker(&paths.current).unwrap().is_file());
+        let retry = prepare_schema_msb_home(&paths).unwrap_err();
+        assert!(format!("{retry:#}").contains("rejected after a failed adoption validation"));
+        assert!(paths.current.join("replacement-marker").is_file());
+        assert!(inspected.is_dir());
+    }
+
+    #[test]
+    fn rejected_replacement_database_is_never_accepted_on_retry() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        let database = paths.legacy.join("db/msb.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = SqliteConnectOptions::new()
+                .filename(&database)
+                .create_if_missing(true);
+            let connection = SqliteConnection::connect_with(&options).await.unwrap();
+            connection.close().await.unwrap();
+        });
+
+        let error = prepare_schema_msb_home_with_rename(&paths, |source, target| {
+            let db = source.join("db/msb.db");
+            std::fs::remove_file(&db)?;
+            std::fs::write(&db, "replacement database")?;
+            std::fs::rename(source, target)
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("database changed while being adopted"));
+        assert!(paths.current.join("db/msb.db").is_file());
+        assert!(rejected_adoption_marker(&paths.current).unwrap().is_file());
+        assert!(prepare_schema_msb_home(&paths).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_database_parent_symlink_is_retained() {
+        use std::os::unix::fs::symlink;
+
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        let external_db_dir = state.path().join("external-db");
+        std::fs::create_dir_all(&external_db_dir).unwrap();
+        std::fs::write(external_db_dir.join("msb.db"), "not relevant").unwrap();
+        std::fs::create_dir_all(&paths.legacy).unwrap();
+        symlink(&external_db_dir, paths.legacy.join("db")).unwrap();
+
+        assert_eq!(
+            prepare_schema_msb_home(&paths).unwrap(),
+            SchemaHomePreparation::ExistingOrFresh
+        );
+        assert!(
+            std::fs::symlink_metadata(paths.legacy.join("db"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(paths.current.is_dir());
+    }
+
+    #[test]
+    fn pending_snapshot_reindex_survives_a_configuration_failure_for_retry() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        std::fs::create_dir_all(&paths.legacy).unwrap();
+
+        assert_eq!(
+            prepare_schema_msb_home(&paths).unwrap(),
+            SchemaHomePreparation::SnapshotReindexPending
+        );
+        assert!(
+            paths
+                .current
+                .join(SNAPSHOT_REINDEX_PENDING_MARKER)
+                .is_file()
+        );
+        // Simulate `write_shared_cache_config` failing before reindex runs.
+        assert_eq!(
+            prepare_schema_msb_home(&paths).unwrap(),
+            SchemaHomePreparation::SnapshotReindexPending
+        );
+    }
+
+    #[test]
+    fn rename_race_creates_fresh_home_when_another_schema_consumed_legacy() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        let consumed = state.path().join("consumed-by-another-schema");
+        std::fs::create_dir_all(paths.legacy.join("cache")).unwrap();
+        std::fs::write(paths.legacy.join("cache/marker"), "kept by other schema").unwrap();
+
+        let result = prepare_schema_msb_home_with_rename(&paths, |source, _| {
+            std::fs::rename(source, &consumed)?;
+            Err(std::io::Error::other("simulated competing adoption"))
+        })
+        .unwrap();
+
+        assert_eq!(result, SchemaHomePreparation::ExistingOrFresh);
+        assert!(paths.current.is_dir());
+        assert!(consumed.join("cache/marker").is_file());
+        assert!(!paths.legacy.exists());
+    }
+
+    #[test]
+    fn locked_legacy_db_is_retained_after_a_bounded_inspection() {
+        use std::time::{Duration, Instant};
+
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        let db = paths.legacy.join("db/msb.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut lock = runtime.block_on(async {
+            let options = SqliteConnectOptions::new()
+                .filename(&db)
+                .create_if_missing(true);
+            let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+            connection.execute("BEGIN EXCLUSIVE").await.unwrap();
+            connection
+        });
+
+        let started = Instant::now();
+        let outcome = prepare_schema_msb_home(&paths).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "locked inspection must not block startup indefinitely"
+        );
+        assert_eq!(outcome, SchemaHomePreparation::ExistingOrFresh);
+        assert!(paths.legacy.join("db/msb.db").is_file());
+        assert!(paths.current.is_dir());
+
+        runtime.block_on(async {
+            lock.execute("ROLLBACK").await.unwrap();
+            lock.close().await.unwrap();
+        });
+    }
+
+    fn write_snapshot_artifact(parent: &Path, name: &str) -> PathBuf {
+        use std::collections::BTreeMap;
+
+        use microsandbox_image::snapshot::{
+            DEFAULT_UPPER_FILE, ImageRef, MANIFEST_FILENAME, Manifest, SCHEMA_VERSION,
+            SnapshotFormat, UpperLayer,
+        };
+
+        let artifact = parent.join(name);
+        std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::write(artifact.join(DEFAULT_UPPER_FILE), b"snapshot upper").unwrap();
+        let manifest = Manifest {
+            schema: SCHEMA_VERSION,
+            format: SnapshotFormat::Raw,
+            fstype: "ext4".into(),
+            image: ImageRef {
+                reference: "docker.io/library/alpine:3.20".into(),
+                manifest_digest:
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000001".into(),
+            },
+            parent: None,
+            created_at: "2026-05-01T12:00:00Z".into(),
+            labels: BTreeMap::new(),
+            upper: UpperLayer {
+                file: DEFAULT_UPPER_FILE.into(),
+                size_bytes: b"snapshot upper".len() as u64,
+                integrity: None,
+            },
+            source_sandbox: Some("agent-vm-test".into()),
+        };
+        std::fs::write(
+            artifact.join(MANIFEST_FILENAME),
+            manifest.to_canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        artifact
+    }
+
+    #[test]
+    fn adopted_snapshot_reindex_rebases_artifact_paths() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        let legacy_snapshots = paths.legacy.join("snapshots");
+        let artifact = write_snapshot_artifact(&legacy_snapshots, "snapshot-a");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let backend = snapshot_reindex_backend(&paths.legacy, None)
+                .build()
+                .await
+                .unwrap();
+            microsandbox::with_backend(backend, microsandbox::Snapshot::reindex(&legacy_snapshots))
+                .await
+                .unwrap();
+        });
+        assert!(paths.legacy.join("db/msb.db").is_file());
+
+        assert_eq!(
+            prepare_schema_msb_home(&paths).unwrap(),
+            SchemaHomePreparation::SnapshotReindexPending
+        );
+        try_reindex_adopted_snapshots(&paths.current, None).unwrap();
+
+        let current_artifact = paths.current.join("snapshots/snapshot-a");
+        let indexed_path: String = runtime.block_on(async {
+            let options = SqliteConnectOptions::new()
+                .filename(paths.current.join("db/msb.db"))
+                .read_only(true)
+                .create_if_missing(false);
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .unwrap();
+            let indexed_path = sqlx::query_scalar("SELECT artifact_path FROM snapshot_index")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+            indexed_path
+        });
+
+        assert_eq!(artifact, paths.legacy.join("snapshots/snapshot-a"));
+        assert_eq!(indexed_path, current_artifact.display().to_string());
+        assert!(current_artifact.is_dir());
+    }
+
+    #[test]
+    fn partial_snapshot_reindex_retains_marker_until_every_artifact_is_upserted() {
+        let state = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        let legacy_snapshots = paths.legacy.join("snapshots");
+        write_snapshot_artifact(&legacy_snapshots, "snapshot-a");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let backend = snapshot_reindex_backend(&paths.legacy, None)
+                .build()
+                .await
+                .unwrap();
+            microsandbox::with_backend(backend, microsandbox::Snapshot::reindex(&legacy_snapshots))
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            prepare_schema_msb_home(&paths).unwrap(),
+            SchemaHomePreparation::SnapshotReindexPending
+        );
+
+        let database = paths.current.join("db/msb.db");
+        runtime.block_on(async {
+            let options = SqliteConnectOptions::new()
+                .filename(&database)
+                .create_if_missing(false);
+            let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+            connection
+                .execute(
+                    "CREATE TRIGGER reject_snapshot_reindex \
+                     BEFORE INSERT ON snapshot_index \
+                     BEGIN SELECT RAISE(ABORT, 'injected upsert failure'); END",
+                )
+                .await
+                .unwrap();
+            connection.close().await.unwrap();
+        });
+
+        let error = try_reindex_adopted_snapshots(&paths.current, None).unwrap_err();
+        assert!(format!("{error:#}").contains("indexed 0 of 1 required artifacts"));
+        assert!(
+            snapshot_reindex_warning(&paths.current, &error)
+                .contains(SNAPSHOT_REINDEX_RECOVERY_COMMAND)
+        );
+        reindex_adopted_snapshots(&paths.current, None);
+        assert!(
+            paths
+                .current
+                .join(SNAPSHOT_REINDEX_PENDING_MARKER)
+                .is_file()
+        );
+        assert!(paths.current.join("snapshots/snapshot-a").is_dir());
+
+        runtime.block_on(async {
+            let options = SqliteConnectOptions::new()
+                .filename(&database)
+                .create_if_missing(false);
+            let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+            connection
+                .execute("DROP TRIGGER reject_snapshot_reindex")
+                .await
+                .unwrap();
+            connection.close().await.unwrap();
+        });
+        reindex_adopted_snapshots(&paths.current, None);
+        assert!(!paths.current.join(SNAPSHOT_REINDEX_PENDING_MARKER).exists());
+        let indexed: String = runtime.block_on(async {
+            let options = SqliteConnectOptions::new()
+                .filename(&database)
+                .read_only(true)
+                .create_if_missing(false);
+            let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+            let indexed = sqlx::query_scalar("SELECT artifact_path FROM snapshot_index")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+            connection.close().await.unwrap();
+            indexed
+        });
+        assert_eq!(
+            indexed,
+            paths
+                .current
+                .join("snapshots/snapshot-a")
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn failed_snapshot_reindex_retains_artifacts_and_names_recovery_command() {
+        let home = tempfile::tempdir().unwrap();
+        let artifact = home.path().join("snapshots/keep-me");
+        std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::write(artifact.join("artifact"), "do not delete").unwrap();
+        std::fs::create_dir_all(home.path().join("db")).unwrap();
+        std::fs::write(home.path().join("db/msb.db"), "not sqlite").unwrap();
+
+        let error = try_reindex_adopted_snapshots(home.path(), None).unwrap_err();
+        let warning = snapshot_reindex_warning(home.path(), &error);
+        assert!(warning.contains(SNAPSHOT_REINDEX_RECOVERY_COMMAND));
+        assert!(artifact.join("artifact").is_file());
+    }
+
+    #[test]
+    fn adopted_snapshot_reindex_uses_finalized_shared_cache() {
+        let state = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let paths = SchemaHomePaths::new(state.path(), "test");
+        std::fs::create_dir_all(paths.legacy.join("snapshots")).unwrap();
+
+        assert_eq!(
+            prepare_schema_msb_home(&paths).unwrap(),
+            SchemaHomePreparation::SnapshotReindexPending
+        );
+        assert!(
+            !paths.current.join("db/msb.db").exists(),
+            "preparation must defer snapshot reindex until configuration is finalized"
+        );
+
+        let shared_cache = cache.path().join("shared-cache");
+        write_shared_cache_config(&paths.current, &shared_cache).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let backend = snapshot_reindex_backend(&paths.current, Some(&shared_cache))
+                .build()
+                .await
+                .unwrap();
+            assert_eq!(backend.cache_dir(), shared_cache);
+            microsandbox::with_backend(
+                backend,
+                microsandbox::Snapshot::reindex(paths.current.join("snapshots")),
+            )
+            .await
+            .unwrap();
+        });
+        assert!(paths.current.join("db/msb.db").is_file());
     }
 
     #[test]
@@ -832,7 +1884,10 @@ mod tests {
     fn effective_cache_dir_from_errors_without_msb_home_when_not_shared() {
         let err = effective_cache_dir_from(false, None, Path::new("/unused")).unwrap_err();
         let msg = format!("{err:?}");
-        assert!(msg.contains("MSB_HOME"), "expected MSB_HOME mentioned: {msg}");
+        assert!(
+            msg.contains("MSB_HOME"),
+            "expected MSB_HOME mentioned: {msg}"
+        );
     }
 
     #[test]

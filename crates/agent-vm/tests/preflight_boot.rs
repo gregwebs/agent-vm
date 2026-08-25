@@ -184,7 +184,7 @@ impl Harness {
     }
 
     fn msb_home(&self) -> PathBuf {
-        self.state.path().join("msb-home")
+        self.state.path().join("msb-home-m20260606_000001")
     }
 
     fn db_path(&self) -> PathBuf {
@@ -242,7 +242,10 @@ fn ahead_db_blocks_boot_before_any_vm_work() {
         stderr.contains("agent-vm doctor --reset-msb-db"),
         "stderr:\n{stderr}"
     );
-    assert!(stderr.contains("NEWER than this build"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("NEWER than this build"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[test]

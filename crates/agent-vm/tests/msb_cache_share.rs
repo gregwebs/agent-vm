@@ -113,7 +113,7 @@ impl Harness {
     }
 
     fn msb_home(&self) -> PathBuf {
-        self.state.path().join("msb-home")
+        self.state.path().join("msb-home-m20260606_000001")
     }
 
     fn config_json(&self) -> PathBuf {

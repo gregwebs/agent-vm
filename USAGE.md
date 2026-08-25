@@ -40,7 +40,7 @@ clipboard {get,put} [--sys]         exchange a string with the project sandbox
 ```
 
 `agent-vm` keeps its sandbox registry under a private `MSB_HOME`
-(`~/.local/state/agent-vm/msb-home`), so a separately-installed `msb ls` won't
+(`~/.local/state/agent-vm/msb-home-m20260606_000001`, where the suffix is the bundled schema), so a separately-installed `msb ls` won't
 show the sandboxes agent-vm launched — it reads the default
 `~/.microsandbox` instead. `agent-vm msb ls` (and any other `agent-vm msb
 <args...>`) forwards to the bundled `msb` with `MSB_HOME`/`MSB_PATH` already
@@ -129,7 +129,7 @@ for the full contract and design rationale.
 ## Shared microsandbox image cache
 
 By default agent-vm keeps its microsandbox state — including the OCI image
-cache — entirely private under `~/.local/state/agent-vm/msb-home/`, so a
+cache — entirely private under `~/.local/state/agent-vm/msb-home-<schema-id>/`, so a
 separately installed `msb` (Homebrew on macOS; a distro package,
 `cargo install`, or a from-source build on Linux) can never shadow
 agent-vm's KVM-enabled `libkrunfw`. That also means agent-vm and any other
@@ -142,7 +142,7 @@ or pulled twice. Use `AGENT_VM_MSB_CACHE_DIR=<path>` to point at a
 non-default cache location instead.
 
 What stays private: `db/`, `tls/`, `secrets/`, and `sandboxes/` remain under
-`~/.local/state/agent-vm/msb-home/`; only the cache is shared. `libkrunfw` is
+`~/.local/state/agent-vm/msb-home-<schema-id>/`; only the cache is shared. `libkrunfw` is
 unaffected (resolved via `MSB_PATH`, not the cache override), so the
 shadowing protection above is unchanged.
 
@@ -153,21 +153,20 @@ two concurrently against the shared cache with mismatched versions. If
 images misbehave, unset the variable to fall back to the private cache.
 
 **Reverting is a manual step.** The redirect is persisted to
-`~/.local/state/agent-vm/msb-home/config.json`. Unsetting
-`AGENT_VM_SHARE_MSB_CACHE` does **not** by itself restore the private cache —
-agent-vm only writes `config.json` when the flag is on, so a later flag-off
-run leaves the previously written `paths.cache` pointing at the shared
-directory. To fully revert, delete that `config.json` (or remove the
-`paths.cache` key from it).
+`~/.local/state/agent-vm/msb-home-<schema-id>/config.json`. Unsetting
+`AGENT_VM_SHARE_MSB_CACHE` does **not** by itself restore the private cache:
+agent-vm writes `config.json` only when the flag is on, so a later flag-off
+run retains the existing `paths.cache` setting. To fully revert, remove that
+`paths.cache` key (or delete that schema home's `config.json`).
 
 ## Recovering from a forward-migrated microsandbox db
 
 sea-orm migrations in microsandbox are one-way. If a newer, separately
-installed `msb` ever opens agent-vm's private
-`~/.local/state/agent-vm/msb-home/db/msb.db`, it forward-migrates the
-schema — and the older bundled `msb` agent-vm ships can then never open
-that database again. Every subsequent `agent-vm` command that talks to the
-db (`claude`, `codex`, `shell`, ...) fails.
+installed `msb` opens the active schema home's
+`msb-home-<schema-id>/db/msb.db`, it forward-migrates the schema — and the
+older bundled `msb` that agent-vm ships can no longer open that database.
+Every subsequent `agent-vm` command that talks to the db (`claude`, `codex`,
+`shell`, ...) fails.
 
 agent-vm detects this up front — on `shell`/`run` and on `agent-vm msb
 <args...>` — and stops with a message naming the offending migration(s)
@@ -177,8 +176,9 @@ instead of letting the raw sea-orm error through. Recover with:
 agent-vm doctor --reset-msb-db
 ```
 
-This moves `msb-home/db/` (including the `-wal`/`-shm`/lock files) aside to
-a timestamped `db.reset-<epoch-seconds>` sibling — non-destructive, and
+This moves the active `msb-home-<schema-id>/db/` (including the
+`-wal`/`-shm`/lock files) aside to a timestamped `db.reset-<epoch-seconds>`
+sibling — non-destructive, and
 reversible: the command prints the exact `mv` to undo it. It resolves
 `MSB_HOME` the same way `agent-vm` itself does, so it only ever touches
 agent-vm's private state, never a separate `~/.microsandbox` install. If no
@@ -283,3 +283,7 @@ whatever you open, so prefer the narrowest flag that fits.
 - **GitHub 403 from the proxy** — repo isn't in the allow-list.
   Pass `--repo OWNER/NAME` or run from a project with the right
   remote.
+
+## Schema-specific microsandbox homes
+
+Each bundled schema uses a sibling `msb-home-<schema-id>` directory. On the first run after upgrading, agent-vm atomically adopts a compatible old `msb-home` directory (including cache and sandboxes). A newer, corrupt, or unreadable legacy database is retained and a fresh schema home is created instead. Do not start old and new binaries concurrently during this one-time adoption. Separate schema homes can otherwise be used side by side.

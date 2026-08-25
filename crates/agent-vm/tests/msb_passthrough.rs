@@ -185,6 +185,10 @@ impl Harness {
     }
 
     fn msb_home(&self) -> PathBuf {
+        self.state.path().join("msb-home-m20260606_000001")
+    }
+
+    fn legacy_msb_home(&self) -> PathBuf {
         self.state.path().join("msb-home")
     }
 
@@ -246,6 +250,94 @@ fn msb_ls_inherits_msb_home_from_pinned_environment() {
         record.starts_with(&expected),
         "child did not see the pinned MSB_HOME; record:\n{record}\nexpected prefix:\n{expected}"
     );
+}
+
+/// The binary adopts compatible legacy state before dispatching to its msb
+/// child. Image-cache and sandbox markers are deliberately opaque to
+/// agent-vm; whole-home rename is what preserves their backend ownership.
+#[test]
+fn compatible_legacy_adoption_preserves_image_and_sandbox_state_for_child() {
+    let h = Harness::new();
+    let legacy = h.legacy_msb_home();
+    std::fs::create_dir_all(legacy.join("cache/images")).unwrap();
+    std::fs::create_dir_all(legacy.join("sandboxes/stale-sandbox")).unwrap();
+    std::fs::write(
+        legacy.join("cache/images/image-marker"),
+        "image stays available",
+    )
+    .unwrap();
+    std::fs::write(
+        legacy.join("sandboxes/stale-sandbox/overlay-marker"),
+        "sandbox stays discoverable",
+    )
+    .unwrap();
+
+    let out = h.run_msb(&["ls"], &[]);
+
+    assert!(out.status.success(), "stderr:\n{}", stderr_of(&out));
+    assert!(
+        h.read_record()
+            .starts_with(&format!("MSB_HOME={}\n", h.msb_home().display()))
+    );
+    assert!(h.msb_home().join("cache/images/image-marker").is_file());
+    assert!(
+        h.msb_home()
+            .join("sandboxes/stale-sandbox/overlay-marker")
+            .is_file()
+    );
+    assert!(
+        !legacy.exists(),
+        "compatible legacy home must be renamed whole"
+    );
+}
+
+/// A retained forward-migrated legacy database must not be preflighted as the
+/// active home: the child gets a fresh namespace and can still run.
+#[test]
+fn ahead_legacy_is_retained_while_child_uses_a_fresh_schema_home() {
+    let h = Harness::new();
+    let legacy_db = h.legacy_msb_home().join("db/msb.db");
+    seed_sqlite_db(&legacy_db, &[FUTURE_MIGRATION]);
+
+    let out = h.run_msb(&["ls"], &[]);
+
+    assert!(out.status.success(), "stderr:\n{}", stderr_of(&out));
+    assert!(
+        h.read_record()
+            .starts_with(&format!("MSB_HOME={}\n", h.msb_home().display()))
+    );
+    assert!(legacy_db.is_file(), "ahead legacy db must be retained");
+    assert!(h.msb_home().is_dir(), "fresh active home must be created");
+}
+
+/// Shared-cache configuration belongs to the adopted versioned home and does
+/// not move the private DB or sandbox namespaces to the external cache.
+#[test]
+fn adopted_home_writes_shared_cache_config_without_moving_private_state() {
+    let h = Harness::new();
+    let legacy = h.legacy_msb_home();
+    let shared = tempfile::tempdir().unwrap();
+    let shared_cache = shared.path().join("cache");
+    std::fs::create_dir_all(legacy.join("db")).unwrap();
+    std::fs::write(legacy.join("db/private-marker"), "private").unwrap();
+    std::fs::create_dir_all(legacy.join("sandboxes/sandbox")).unwrap();
+
+    let out = h.run_msb(
+        &["ls"],
+        &[
+            ("AGENT_VM_SHARE_MSB_CACHE", "1"),
+            ("AGENT_VM_MSB_CACHE_DIR", shared_cache.to_str().unwrap()),
+        ],
+    );
+
+    assert!(out.status.success(), "stderr:\n{}", stderr_of(&out));
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(h.msb_home().join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["paths"]["cache"], shared_cache.to_str().unwrap());
+    assert!(h.msb_home().join("db/private-marker").is_file());
+    assert!(h.msb_home().join("sandboxes/sandbox").is_dir());
+    assert!(!shared_cache.join("db").exists());
+    assert!(!shared_cache.join("sandboxes").exists());
 }
 
 /// Trailing args — including hyphenated flags — must reach the child

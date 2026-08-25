@@ -12,6 +12,7 @@ mod intercept_hook;
 mod layer;
 mod mount;
 mod msb_cmd;
+mod msb_db;
 mod msb_install;
 mod msb_preflight;
 mod msb_schema;
