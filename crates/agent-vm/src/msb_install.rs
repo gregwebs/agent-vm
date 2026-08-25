@@ -497,23 +497,32 @@ struct FileIdentity {
 }
 
 #[cfg(unix)]
-fn file_identity(path: &Path) -> Result<FileIdentity> {
+fn file_identity_from_metadata(metadata: &std::fs::Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt as _;
 
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("reading metadata for {}", path.display()))?;
-    Ok(FileIdentity {
+    FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
-    })
+    }
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn file_identity(path: &Path) -> Result<FileIdentity> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    Ok(file_identity_from_metadata(&metadata))
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
 struct LegacyAdoptionProof {
     home: FileIdentity,
     db_parent: Option<FileIdentity>,
     db: Option<FileIdentity>,
+    // Keep the inspected database's inode allocated until verification. On
+    // filesystems that immediately reuse unlinked inodes, dev/inode alone is
+    // otherwise vulnerable to a delete-and-recreate ABA replacement.
+    _db_guard: Option<std::fs::File>,
 }
 
 /// Capture the exact directory and database entries that inspection authorized.
@@ -531,15 +540,27 @@ fn capture_legacy_adoption_proof(legacy: &Path) -> Result<LegacyAdoptionProof> {
         ),
     };
     let db_path = db_parent_path.join("msb.db");
-    let db = match std::fs::symlink_metadata(&db_path) {
+    let (db, db_guard) = match std::fs::symlink_metadata(&db_path) {
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
-            Some(file_identity(&db_path)?)
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&db_path)
+                .with_context(|| format!("opening legacy database {}", db_path.display()))?;
+            let identity = file_identity_from_metadata(
+                &file
+                    .metadata()
+                    .with_context(|| format!("reading metadata for {}", db_path.display()))?,
+            );
+            (Some(identity), Some(file))
         }
         Ok(_) => anyhow::bail!(
             "legacy database {} is not a regular file",
             db_path.display()
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("reading metadata for {}", db_path.display()));
@@ -549,6 +570,7 @@ fn capture_legacy_adoption_proof(legacy: &Path) -> Result<LegacyAdoptionProof> {
         home: file_identity(legacy)?,
         db_parent,
         db,
+        _db_guard: db_guard,
     })
 }
 
@@ -1248,7 +1270,8 @@ mod tests {
         assert!(format!("{error:#}").contains("database changed while being adopted"));
         assert!(paths.current.join("db/msb.db").is_file());
         assert!(rejected_adoption_marker(&paths.current).unwrap().is_file());
-        assert!(prepare_schema_msb_home(&paths).is_err());
+        let retry = prepare_schema_msb_home(&paths).unwrap_err();
+        assert!(format!("{retry:#}").contains("rejected after a failed adoption validation"));
     }
 
     #[cfg(unix)]
