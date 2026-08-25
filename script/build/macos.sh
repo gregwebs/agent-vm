@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$script_dir_path" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-RUST_TOOLCHAIN=1.92
+RUST_TOOLCHAIN=1.94
 
 usage() {
     cat <<'EOF'
@@ -82,9 +82,9 @@ preflight() {
         echo "error: could not parse Rust version from: $rust_version" >&2
         exit 1
     fi
-    if ((major < 1 || (major == 1 && minor < 91))); then
-        echo "error: Rust 1.91 or newer is required; found $version" >&2
-        echo "Install the known-good toolchain with 'rustup toolchain install 1.92'." >&2
+    if ((major < 1 || (major == 1 && minor < 94))); then
+        echo "error: Rust 1.94 or newer is required; found $version" >&2
+        echo "Install the known-good toolchain with 'rustup toolchain install 1.94'." >&2
         exit 1
     fi
     if ! run_rust_tool cargo --version >/dev/null; then

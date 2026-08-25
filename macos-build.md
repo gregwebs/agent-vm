@@ -4,7 +4,7 @@ These instructions support Apple Silicon Macs (`arm64`, M1 or newer). Intel macO
 
 ## Prerequisites
 
-Install the Xcode Command Line Tools, rustup with the known-good Rust 1.92 toolchain, and Docker Desktop:
+Install the Xcode Command Line Tools, rustup with the known-good Rust 1.94 toolchain, and Docker Desktop:
 
 ```bash
 xcode-select --install
@@ -12,7 +12,7 @@ brew install rustup
 brew install --cask docker
 rustup-init -y
 source "$HOME/.cargo/env"
-rustup toolchain install 1.92
+rustup toolchain install 1.94
 ```
 
 Start Docker Desktop, initialize the recursive submodules, and check the exact toolchain used by the build:
@@ -20,11 +20,11 @@ Start Docker Desktop, initialize the recursive submodules, and check the exact t
 ```bash
 docker info
 git submodule update --init --recursive
-RUSTUP_AUTO_INSTALL=0 rustup run 1.92 rustc --version
-RUSTUP_AUTO_INSTALL=0 rustup run 1.92 cargo --version
+RUSTUP_AUTO_INSTALL=0 rustup run 1.94 rustc --version
+RUSTUP_AUTO_INSTALL=0 rustup run 1.94 cargo --version
 ```
 
-The guarded checks do not download a missing toolchain. The canonical build selects installed Rust 1.92 locally through rustup; it neither depends on nor changes your global default toolchain.
+The guarded checks do not download a missing toolchain. The canonical build selects installed Rust 1.94 locally through rustup; it neither depends on nor changes your global default toolchain.
 
 The vendored build compiles a Linux guest helper and firmware through Docker. Keep enough Docker and temporary disk space for those outputs and for one staged Docker image archive during local image import.
 
@@ -199,26 +199,26 @@ under `build/` receives `msb-entitlements.plist`. If the repository-local
 firmware output is missing, the same script rebuilds and restores it
 automatically.
 
-### Rust 1.92 or its Cargo component is missing or unusable
+### Rust 1.94 or its Cargo component is missing or unusable
 
-The build uses the installed Rust 1.92 toolchain through rustup with automatic installation disabled. If the toolchain is absent or corrupted, install or repair it without changing the global default:
+The build uses the installed Rust 1.94 toolchain through rustup with automatic installation disabled. If the toolchain is absent or corrupted, install or repair it without changing the global default:
 
 ```bash
-rustup toolchain install 1.92
+rustup toolchain install 1.94
 ```
 
 If the toolchain's compiler works but Cargo is missing or unusable, restore only the Cargo component:
 
 ```bash
-rustup component add cargo --toolchain 1.92
+rustup component add cargo --toolchain 1.94
 ```
 
 On rustup 1.29 for macOS, either bootstrap command can fail during channel synchronization with `invalid peer certificate ... OSStatus -26276`. For that specific failure, retry the applicable command once with rustup's official curl backend:
 
 ```bash
-RUSTUP_USE_CURL=1 rustup toolchain install 1.92
+RUSTUP_USE_CURL=1 rustup toolchain install 1.94
 # Or, for a missing Cargo component:
-RUSTUP_USE_CURL=1 rustup component add cargo --toolchain 1.92
+RUSTUP_USE_CURL=1 rustup component add cargo --toolchain 1.94
 ```
 
 This selects a TLS-verifying HTTPS backend; it does not disable certificate verification. The curl backend is deprecated, so use the variable only for this targeted rustup 1.29 recovery and do not export it permanently. The build script never sets it or downloads a toolchain. This rustup bootstrap failure is separate from the later registry/`agent-vm setup` trust-service failure.

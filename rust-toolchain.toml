@@ -1,0 +1,15 @@
+# Single source of truth for the pinned Rust toolchain. `cargo`/`rustup`
+# auto-select this channel for any invocation rooted here; CI reads it via
+# dtolnay/rust-toolchain's `toolchain: 1.94` input, and script/build/macos.sh
+# keeps its own explicit `rustup run 1.94` (RUST_TOOLCHAIN literal, asserted
+# against this file's channel by script/test/build-workflow.sh) so the build
+# script's "don't touch the caller's global default toolchain" property
+# holds even though this file exists at the repo root.
+#
+# vendor/microsandbox is excluded from this workspace and pins its own
+# toolchain requirements independently (edition 2024, >=1.85) — it still
+# compiles fine under 1.94; see the toolchain-bump commit body for the
+# verification.
+[toolchain]
+channel = "1.94"
+components = ["rustfmt", "clippy"]

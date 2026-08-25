@@ -96,7 +96,14 @@ jobs:
           CROSS: ${{ matrix.cross && '1' || '' }}
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update
+          # Install the pinned version directly (not "stable") so release
+          # artifacts are built with the same toolchain CI and local macOS
+          # builds use. All `cargo`/`rustup target add` calls below run from
+          # the repo root (or a subdirectory of it via --manifest-path,
+          # which doesn't change cwd), so rust-toolchain.toml's directory
+          # override auto-selects 1.94 for them without an explicit
+          # `rustup default`.
+          rustup toolchain install 1.94 --profile minimal --no-self-update
           rustup target add ${{ matrix.cargo_target }}
           if [[ -n "$CROSS" ]]; then
             # Enable the arm64 multiarch repo, then pull the cross
@@ -228,7 +235,14 @@ jobs:
           CROSS: ${{ matrix.cross && '1' || '' }}
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update
+          # Install the pinned version directly (not "stable") so release
+          # artifacts are built with the same toolchain CI and local macOS
+          # builds use. All `cargo`/`rustup target add` calls below run from
+          # the repo root (or a subdirectory of it via --manifest-path,
+          # which doesn't change cwd), so rust-toolchain.toml's directory
+          # override auto-selects 1.94 for them without an explicit
+          # `rustup default`.
+          rustup toolchain install 1.94 --profile minimal --no-self-update
           rustup target add ${{ matrix.cargo_target }}
           if [[ -n "$CROSS" ]]; then
             sudo dpkg --add-architecture arm64

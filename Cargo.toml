@@ -10,6 +10,10 @@ version = "0.1.27"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wirenboard/agent-vm"
+# Kept in lockstep with rust-toolchain.toml's channel by hand (no automated
+# check ties the two together; both are literals a human/agent must update
+# together when bumping the pin).
+rust-version = "1.94"
 
 # wirenboard's libkrun fork: msb_krun_* 0.1.13 with three fixes on top
 # that are required for the userspace split irqchip to work and for the
