@@ -6,15 +6,11 @@
 //! from the migrations it names. It is the highest migration id,
 //! e.g. m20260606_000001.
 //!
-//! No runtime behavior depends on this yet. It exists so #31 can
-//! version-namespace the private MSB_HOME and so a schema-compat
-//! preflight can compare it against an on-disk database.
+//! The runtime uses this identifier to namespace private MSB_HOME state,
+//! while preflight compares it with an on-disk database.
 
 use microsandbox_migration::{Migrator, MigratorTrait};
 
-// Not yet called from any command/boot path (see #31, which will consume
-// this to version-namespace MSB_HOME). Exposed now as a prefactor per #29.
-#[allow(dead_code)]
 pub fn bundled_schema_version() -> String {
     Migrator::get_migration_files()
         .iter()

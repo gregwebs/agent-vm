@@ -78,7 +78,10 @@ fn reset_msb_db_in(msb_home: &Path, ts: &str) -> Result<ResetOutcome> {
     let target = unique_target(msb_home, ts);
     std::fs::rename(&db, &target)
         .with_context(|| format!("moving {} -> {}", db.display(), target.display()))?;
-    Ok(ResetOutcome::Moved { from: db, to: target })
+    Ok(ResetOutcome::Moved {
+        from: db,
+        to: target,
+    })
 }
 
 /// `msb_home/db.reset-<ts>`, disambiguated with `.2`, `.3`, ... if that
@@ -296,14 +299,14 @@ mod tests {
     #[test]
     fn render_moved_mentions_repull_and_paths() {
         let outcome = ResetOutcome::Moved {
-            from: PathBuf::from("/state/msb-home/db"),
-            to: PathBuf::from("/state/msb-home/db.reset-123"),
+            from: PathBuf::from("/state/msb-home-m20260606_000001/db"),
+            to: PathBuf::from("/state/msb-home-m20260606_000001/db.reset-123"),
         };
 
         let text = render(&outcome);
 
-        assert!(text.contains("/state/msb-home/db"));
-        assert!(text.contains("/state/msb-home/db.reset-123"));
+        assert!(text.contains("/state/msb-home-m20260606_000001/db"));
+        assert!(text.contains("/state/msb-home-m20260606_000001/db.reset-123"));
         assert!(text.contains("re-pulled"));
         assert!(text.contains("next"));
         assert!(text.contains("To undo"));
@@ -312,14 +315,14 @@ mod tests {
     #[test]
     fn render_noop_mentions_nothing_moved() {
         let outcome = ResetOutcome::NothingToMove {
-            checked: PathBuf::from("/state/msb-home/db"),
+            checked: PathBuf::from("/state/msb-home-m20260606_000001/db"),
         };
 
         let text = render(&outcome);
 
         assert!(text.contains("No microsandbox db"));
         assert!(text.contains("nothing was moved"));
-        assert!(text.contains("/state/msb-home/db"));
+        assert!(text.contains("/state/msb-home-m20260606_000001/db"));
     }
 
     #[test]

@@ -254,16 +254,16 @@ expect_build_failure() {
     assert_contains "$output" "$expected"
 }
 
-install_import_msb() {
+install_import_agent_vm() {
     local fixture="$1"
     mkdir -p "$fixture/target/macos/bin"
-    cat >"$fixture/target/macos/bin/msb" <<'SH'
+    cat >"$fixture/target/macos/bin/agent-vm" <<'SH'
 #!/bin/bash
 set -euo pipefail
 payload="$(cat)"
-printf 'MSB_HOME=%s args=%s payload=%s\n' "$MSB_HOME" "$*" "$payload" >>"$FAKE_LOG"
+printf 'args=%s payload=%s\n' "$*" "$payload" >>"$FAKE_LOG"
 SH
-    chmod +x "$fixture/target/macos/bin/msb"
+    chmod +x "$fixture/target/macos/bin/agent-vm"
 }
 
 run_import() {
@@ -284,7 +284,7 @@ expect_import_failure() {
     assert_contains "$output" "$expected"
     if [[ -f "$fixture/calls.log" ]]; then
         case "$(cat "$fixture/calls.log")" in
-            *"MSB_HOME="*) fail "failed import reached image load" ;;
+            *"args=msb image load"*) fail "failed import reached image load" ;;
         esac
     fi
 }
@@ -429,53 +429,44 @@ assert_file_contains "$fixture/target/macos/bin/msb" "fake-fresh"
 
 # Import argument defaults, cache placement, and direct streaming.
 check_import() {
-    local name="$1" expected_home="$2" expected_image="$3" expected_tag="$4"
+    local name="$1" expected_image="$2" expected_tag="$3"
     local output expected_agent_vm expected_shell_tag
-    shift 4
+    shift 3
     make_fixture "$name"
-    install_import_msb "$fixture"
+    install_import_agent_vm "$fixture"
     output="$(run_import "$fixture" "$fakebin" "$@")"
     assert_file_contains "$fixture/calls.log" "docker image inspect --format {{.Os}}/{{.Architecture}} $expected_image"
     assert_file_contains "$fixture/calls.log" "docker save $expected_image"
-    assert_file_contains "$fixture/calls.log" "MSB_HOME=$expected_home args=image load --tag $expected_tag payload=fake-archive"
+    assert_file_contains "$fixture/calls.log" "args=msb image load --tag $expected_tag payload=fake-archive"
     printf -v expected_agent_vm '%q' "$fixture/target/macos/bin/agent-vm"
     printf -v expected_shell_tag '%q' "$expected_tag"
     assert_contains "$output" "  $expected_agent_vm shell --image $expected_shell_tag -- uname -m"
     set -- "$fixture"/*.tar
     [[ ! -e "$1" ]] || fail "import created a caller-managed tar"
 }
-check_import import-default "/tmp/state/agent-vm/msb-home" agent-vm-template:latest agent-vm-template:latest env -u AGENT_VM_STATE_DIR XDG_STATE_HOME=/tmp/state
-check_import import-one /tmp/custom/msb-home local:dev local:dev env AGENT_VM_STATE_DIR=/tmp/custom -- local:dev
-check_import import-two /tmp/custom/msb-home source:dev destination:dev env AGENT_VM_STATE_DIR=/tmp/custom -- source:dev destination:dev
-check_import import-empty-agent "$TEST_ROOT/msb-home" image:one image:one env AGENT_VM_STATE_DIR= -- image:one
-check_import import-empty-xdg "$TEST_ROOT/agent-vm/msb-home" image:two image:two env -u AGENT_VM_STATE_DIR XDG_STATE_HOME= -- image:two
-check_import import-empty-home "$TEST_ROOT/.local/state/agent-vm/msb-home" image:three image:three env -u AGENT_VM_STATE_DIR -u XDG_STATE_HOME HOME= -- image:three
-check_import import-relative-agent "$TEST_ROOT/custom-state/msb-home" image:four image:four env AGENT_VM_STATE_DIR=custom-state -- image:four
-check_import import-relative-xdg "$TEST_ROOT/xdg-state/agent-vm/msb-home" image:five image:five env -u AGENT_VM_STATE_DIR XDG_STATE_HOME=xdg-state -- image:five
-check_import import-relative-home "$TEST_ROOT/home/.local/state/agent-vm/msb-home" image:six image:six env -u AGENT_VM_STATE_DIR -u XDG_STATE_HOME HOME=home -- image:six
-check_import "import hint escaping" /tmp/custom/msb-home source:dev "destination tag" env AGENT_VM_STATE_DIR=/tmp/custom -- source:dev "destination tag"
+check_import import-default agent-vm-template:latest agent-vm-template:latest env -u AGENT_VM_STATE_DIR XDG_STATE_HOME=/tmp/state
+check_import import-one local:dev local:dev env AGENT_VM_STATE_DIR=/tmp/custom -- local:dev
+check_import import-two source:dev destination:dev env AGENT_VM_STATE_DIR=/tmp/custom -- source:dev destination:dev
+check_import "import hint escaping" source:dev "destination tag" env AGENT_VM_STATE_DIR=/tmp/custom -- source:dev "destination tag"
 
 # Import failures stop before loading.
 make_fixture import-no-bundle
 expect_import_failure "run './script/build/macos.sh' first" "$fixture" "$fakebin"
 make_fixture import-no-docker
-install_import_msb "$fixture"
+install_import_agent_vm "$fixture"
 mv "$fakebin/docker" "$fakebin/docker.disabled"
 expect_import_failure "docker is required" "$fixture" "$fakebin"
 make_fixture import-daemon
-install_import_msb "$fixture"
+install_import_agent_vm "$fixture"
 expect_import_failure "daemon is unavailable" "$fixture" "$fakebin" env FAKE_DOCKER_DOWN=1
 make_fixture import-missing-image
-install_import_msb "$fixture"
+install_import_agent_vm "$fixture"
 expect_import_failure "was not found" "$fixture" "$fakebin" env FAKE_IMAGE_MISSING=1
 make_fixture import-wrong-platform
-install_import_msb "$fixture"
+install_import_agent_vm "$fixture"
 expect_import_failure "must be linux/arm64" "$fixture" "$fakebin" env FAKE_IMAGE_PLATFORM=linux/amd64
-make_fixture import-no-home
-install_import_msb "$fixture"
-expect_import_failure "HOME is unset" "$fixture" "$fakebin" env -u AGENT_VM_STATE_DIR -u XDG_STATE_HOME -u HOME
 make_fixture import-extra
-install_import_msb "$fixture"
+install_import_agent_vm "$fixture"
 expect_import_failure "Usage:" "$fixture" "$fakebin" -- one two three
 
 # Help requires neither platform nor build tools.

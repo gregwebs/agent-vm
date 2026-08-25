@@ -54,6 +54,10 @@ impl Harness {
     }
 
     fn msb_home(&self) -> PathBuf {
+        self.state.path().join("msb-home-m20260606_000001")
+    }
+
+    fn legacy_msb_home(&self) -> PathBuf {
         self.state.path().join("msb-home")
     }
 
@@ -104,6 +108,30 @@ fn resets_an_existing_db_and_reports_repull() {
         .filter(|name| name.starts_with("db.reset-"))
         .collect();
     assert_eq!(siblings.len(), 1, "expected exactly one db.reset-* sibling");
+}
+
+#[test]
+fn reset_targets_active_schema_db_not_retained_ahead_legacy_db() {
+    let h = Harness::new();
+    let legacy_db = h.legacy_msb_home().join("db/msb.db");
+    let active_db = h.db_dir().join("msb.db");
+    std::fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(active_db.parent().unwrap()).unwrap();
+    std::fs::write(&legacy_db, b"retain this older namespace").unwrap();
+    std::fs::write(&active_db, b"reset this active namespace").unwrap();
+
+    let out = h.run_doctor_reset();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(legacy_db.is_file(), "retained legacy db must not be reset");
+    assert!(
+        !h.db_dir().exists(),
+        "only active schema db should move aside"
+    );
 }
 
 #[test]
