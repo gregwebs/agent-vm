@@ -79,6 +79,28 @@ The in-guest `$HOME` for the current guest user mode:
 Both modes share one symlink mapping,
 `session::GUEST_HOME_LINKS`, so the two provisioning paths can't drift.
 
+## Private MSB_HOME
+
+The private Microsandbox home agent-vm points `msb` at:
+`<state_root>/msb-home` — a single flat directory, shared by every
+agent-vm build on the host under a given `$AGENT_VM_STATE_DIR`, never
+namespaced by schema. Because sea-orm migrations are one-way, two
+builds vendoring different microsandbox schemas sharing this home can
+collide (an older build can't open a DB a newer build already
+forward-migrated); `msb_preflight`'s ahead-of-bundle guard turns that
+into a named, recoverable stop (`agent-vm doctor --reset-msb-db`)
+rather than namespacing it away structurally. See
+`docs/adr/0004-single-shared-msb-home.md`.
+
+_Avoid_: "MSB_HOME" alone when the private-vs-shared distinction
+matters — `MSB_HOME` is the env var; the shared `~/.microsandbox` a
+separately-installed `msb` uses is a different thing agent-vm
+deliberately does not point at (except the opt-in cache share).
+
+_Avoid_: "MSB_HOME" alone when the schema-scoping matters — `MSB_HOME` is the
+env var the schema home is exported under, but the schema home is the
+concept (an env var can point anywhere).
+
 ## Base image
 
 The OCI **guest template** agent-vm boots inside each per-project microVM
