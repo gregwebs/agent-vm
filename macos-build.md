@@ -49,6 +49,52 @@ target/macos/
 
 Re-running `./script/build/macos.sh` is safe. It retains Cargo and Docker incremental output and atomically replaces the verified bundle files without requiring manual copying, signing, or environment setup. The macOS workflow does not require `just`.
 
+## Fast development build
+
+`./script/build/macos.sh` always builds `agent-vm` and `msb` with cargo's
+`release` profile (this project's `[profile.release]` sets `codegen-units =
+16` and `lto = "thin"`), which is the right tradeoff for a bundle you'll
+actually run VMs from, but it makes the inner edit/build/run loop slow while
+iterating on `agent-vm`'s Rust source. For that loop, add `--dev`:
+
+```bash
+./script/build/macos.sh --dev
+```
+
+This builds `agent-vm` and `msb` with cargo's unoptimized `debug` profile
+instead of `--release`, then verifies and publishes the pair the same way as
+the default build (arch check, code signature, and the
+`com.apple.security.hypervisor` / `com.apple.security.cs.disable-library-validation`
+entitlements) to a **separate** bundle directory, `target/macos-dev/`, so it
+never overwrites your verified `target/macos/` release bundle:
+
+```text
+target/macos-dev/
+├── bin/
+│   ├── agent-vm
+│   └── msb
+└── lib/
+    └── libkrunfw.5.dylib
+```
+
+Run it directly, the same way you'd run the release bundle:
+
+```bash
+./target/macos-dev/bin/agent-vm shell --image agent-vm-template:latest -- uname -m
+```
+
+The Docker-built `agentd` and firmware outputs are unaffected by `--dev` and
+are cached exactly as in the default build (see the note below on
+re-running the build), so after the first `--dev` build, editing
+`crates/agent-vm/src/**` and re-running `--dev` only pays for an incremental
+debug-profile `cargo build`, not a fresh Docker build or a release-profile
+compile.
+
+The dev bundle is for local iteration only: it is unstripped, unoptimized,
+and meaningfully larger and slower at runtime than the release bundle.
+Never ship or benchmark from `target/macos-dev/`; use the default
+`./script/build/macos.sh` (no `--dev`) for that.
+
 ## Import and boot a local image without a registry
 
 Build or identify a local native `linux/arm64` Docker image. For example:
