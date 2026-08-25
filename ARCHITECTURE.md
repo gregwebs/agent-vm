@@ -736,7 +736,3 @@ of the just-rotated token.
   outcome is one extra `claude -p` invocation. If this becomes a
   pain point, a `<state>/tokens/.refresh.lock` flock around the host
   CLI invocation is two lines.
-
-### Schema-namespaced private MSB_HOME
-
-`MSB_HOME` is a sibling `msb-home-<schema-id>` namespace, not a shared mutable catalog. A compatible legacy `msb-home` is atomically renamed wholesale; ahead or unreadable legacy state is retained and a fresh home is used. This complements preflight rather than replacing it: an active schema home can still be externally forward-migrated. `MSB_HOME` is set before inspection because SQLx may create a SQLite worker. Shared-cache opt-in redirects only `paths.cache`; databases and sandbox state remain schema-private.

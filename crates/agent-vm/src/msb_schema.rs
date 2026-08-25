@@ -6,8 +6,10 @@
 //! from the migrations it names. It is the highest migration id,
 //! e.g. m20260606_000001.
 //!
-//! The runtime uses this identifier to namespace private MSB_HOME state,
-//! while preflight compares it with an on-disk database.
+//! Used by `msb_preflight`'s ahead-of-bundle guard to compare against an
+//! on-disk database, and named in that guard's block message so a user
+//! (or an agent debugging across worktrees) can see which schema this
+//! particular build expects.
 
 use microsandbox_migration::{Migrator, MigratorTrait};
 

@@ -26,6 +26,26 @@ visible from the main worktree. Push them across with
 `git -C <worktree>/vendor/microsandbox push <main-worktree>/.git/modules/vendor/microsandbox <branch>:<branch>`
 before attempting the submodule merge.
 
+## Isolate `AGENT_VM_STATE_DIR` when building agent-vm across worktrees
+
+`agent-vm`'s private microsandbox home (`MSB_HOME/db/msb.db`) is a
+single flat directory under `$AGENT_VM_STATE_DIR` (default
+`$HOME/.local/state/agent-vm`), shared by *every* `agent-vm` build you
+run on this host — it is not namespaced by which worktree/branch built
+it (see `docs/adr/0004-single-shared-msb-home.md`). sea-orm migrations
+are one-way, so running a build from a worktree vendoring a newer
+microsandbox schema, then switching to one with an older schema, trips
+a fail-fast guard (`msb_preflight.rs`) that blocks every command until
+you run `agent-vm doctor --reset-msb-db` — which re-pulls images on
+next boot.
+
+If you're building and running `agent-vm shell`/`run` from more than
+one worktree in the same session (or expect to), set
+`AGENT_VM_STATE_DIR` to a distinct path per worktree first, e.g.
+`export AGENT_VM_STATE_DIR="$HOME/.local/state/agent-vm-$(basename "$PWD")"`.
+Hitting the guard isn't dangerous (nothing is deleted, the error names
+the fix), just a time cost worth avoiding proactively.
+
 ## Don't relocate build output to `/tmp` or `/dev/shm`
 
 If a build is too big, slow, or runs out of inodes, fix the root

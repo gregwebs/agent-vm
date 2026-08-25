@@ -35,6 +35,7 @@ dependencies = [
  "microsandbox-migration",
  "microsandbox-network",
  "reqwest",
+ "sea-orm",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
