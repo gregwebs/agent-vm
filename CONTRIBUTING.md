@@ -21,6 +21,11 @@ The workflow is directly executable and does not require `just`:
 ./script/build/macos.sh
 ```
 
+While iterating on `agent-vm`'s Rust source, use `./script/build/macos.sh
+--dev` instead for a much faster unoptimized build published to
+`target/macos-dev/` — see [Fast development
+build](macos-build.md#fast-development-build).
+
 On Linux, install the host development packages, build the vendored runtime
 through its supported recipe, and then build agent-vm:
 

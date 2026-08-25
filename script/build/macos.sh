@@ -16,9 +16,17 @@ RUST_TOOLCHAIN=1.92
 
 usage() {
     cat <<'EOF'
-Usage: ./script/build/macos.sh
+Usage: ./script/build/macos.sh [--dev]
 
 Build and verify the Apple Silicon macOS bundle under target/macos.
+
+  --dev  Build agent-vm and msb unoptimized (cargo's debug profile,
+         skipping the release profile's thin-LTO and 16-codegen-unit
+         settings) for a much faster edit/build/run loop. Publishes to
+         target/macos-dev instead, so it never overwrites the
+         optimized target/macos bundle. Not for distribution: the
+         binaries are larger, unstripped, and slower at runtime. See
+         "Fast development build" in macos-build.md.
 EOF
 }
 
@@ -125,15 +133,36 @@ build_agentd() (
     touch build/agentd
 )
 
+msb_build_name() {
+    if [[ "$1" == true ]]; then
+        printf '%s\n' msb-dev
+    else
+        printf '%s\n' msb
+    fi
+}
+
 build_and_sign_msb() {
+    # A bare `local x=()` on macOS's shipped bash 3.2 leaves $x unset rather
+    # than an empty array, which trips `set -u` the moment it's expanded
+    # ("x[@]: unbound variable") -- so cargo's optional --release flag is
+    # threaded through as a scalar, expanded unquoted, instead of an array.
+    local dev="$1" cargo_release_flag=--release cargo_subdir=release msb_name
+
+    if [[ "$dev" == true ]]; then
+        cargo_release_flag=
+        cargo_subdir=debug
+    fi
+    msb_name="$(msb_build_name "$dev")"
+
     (
         cd vendor/microsandbox
+        # shellcheck disable=SC2086
         CARGO_NET_GIT_FETCH_WITH_CLI="${CARGO_NET_GIT_FETCH_WITH_CLI:-true}" \
             CARGO_TARGET_DIR="$REPO_ROOT/vendor/microsandbox/target" \
-            run_rust_tool cargo build --release --no-default-features --features net,ssh -p microsandbox-cli
+            run_rust_tool cargo build $cargo_release_flag --no-default-features --features net,ssh -p microsandbox-cli
         mkdir -p build
-        install -m 0755 target/release/msb build/msb
-        codesign --entitlements msb-entitlements.plist --force -s - build/msb
+        install -m 0755 "target/$cargo_subdir/msb" "build/$msb_name"
+        codesign --entitlements msb-entitlements.plist --force -s - "build/$msb_name"
     )
 }
 
@@ -156,15 +185,19 @@ build_firmware_if_missing() {
 }
 
 build_microsandbox_runtime() {
+    local dev="$1"
     echo "==> Building vendored microsandbox runtime"
     build_agentd
-    build_and_sign_msb
+    build_and_sign_msb "$dev"
     build_firmware_if_missing
 }
 
 require_build_outputs() {
-    test -f vendor/microsandbox/build/msb || {
-        echo "error: vendored build did not produce vendor/microsandbox/build/msb" >&2
+    local dev="$1" msb_name
+    msb_name="$(msb_build_name "$dev")"
+
+    test -f "vendor/microsandbox/build/$msb_name" || {
+        echo "error: vendored build did not produce vendor/microsandbox/build/$msb_name" >&2
         exit 1
     }
     test -f vendor/microsandbox/build/libkrunfw.5.dylib || {
@@ -174,12 +207,22 @@ require_build_outputs() {
 }
 
 build_agent_vm() {
-    echo "==> Building agent-vm"
+    local dev="$1" cargo_release_flag=--release cargo_subdir=release
+
+    if [[ "$dev" == true ]]; then
+        cargo_release_flag=
+        cargo_subdir=debug
+        echo "==> Building agent-vm (dev, unoptimized)"
+    else
+        echo "==> Building agent-vm"
+    fi
+
+    # shellcheck disable=SC2086
     CARGO_NET_GIT_FETCH_WITH_CLI="${CARGO_NET_GIT_FETCH_WITH_CLI:-true}" \
         CARGO_TARGET_DIR="$REPO_ROOT/target" \
-        run_rust_tool cargo build --release -p agent-vm
-    test -f target/release/agent-vm || {
-        echo "error: Cargo did not produce target/release/agent-vm" >&2
+        run_rust_tool cargo build $cargo_release_flag -p agent-vm
+    test -f "target/$cargo_subdir/agent-vm" || {
+        echo "error: Cargo did not produce target/$cargo_subdir/agent-vm" >&2
         exit 1
     }
 }
@@ -226,20 +269,29 @@ verify_msb() {
 }
 
 publish_bundle() {
-    local staged_agent_vm=target/macos/bin/.agent-vm.next
-    local staged_msb=target/macos/bin/.msb.next
-    local staged_firmware=target/macos/lib/.libkrunfw.5.dylib.next
-    local entitlements=target/macos/.msb-entitlements.plist
+    local dev="$1" bundle_dir=target/macos agent_vm_src=target/release/agent-vm
+    local msb_src="vendor/microsandbox/build/msb"
+
+    if [[ "$dev" == true ]]; then
+        bundle_dir=target/macos-dev
+        agent_vm_src=target/debug/agent-vm
+        msb_src="vendor/microsandbox/build/$(msb_build_name true)"
+    fi
+
+    local staged_agent_vm="$bundle_dir/bin/.agent-vm.next"
+    local staged_msb="$bundle_dir/bin/.msb.next"
+    local staged_firmware="$bundle_dir/lib/.libkrunfw.5.dylib.next"
+    local entitlements="$bundle_dir/.msb-entitlements.plist"
     local agent_vm_version msb_version
 
-    mkdir -p target/macos/bin target/macos/lib
+    mkdir -p "$bundle_dir/bin" "$bundle_dir/lib"
     cleanup_staging() {
         rm -f "$staged_agent_vm" "$staged_msb" "$staged_firmware" "$entitlements"
     }
     trap cleanup_staging EXIT
 
-    install -m 0755 target/release/agent-vm "$staged_agent_vm"
-    install -m 0755 vendor/microsandbox/build/msb "$staged_msb"
+    install -m 0755 "$agent_vm_src" "$staged_agent_vm"
+    install -m 0755 "$msb_src" "$staged_msb"
     install -m 0644 vendor/microsandbox/build/libkrunfw.5.dylib "$staged_firmware"
 
     verify_arm64_only "$staged_agent_vm"
@@ -257,40 +309,48 @@ publish_bundle() {
         exit 1
     }
 
-    mv -f "$staged_agent_vm" target/macos/bin/agent-vm
-    mv -f "$staged_msb" target/macos/bin/msb
-    mv -f "$staged_firmware" target/macos/lib/libkrunfw.5.dylib
+    mv -f "$staged_agent_vm" "$bundle_dir/bin/agent-vm"
+    mv -f "$staged_msb" "$bundle_dir/bin/msb"
+    mv -f "$staged_firmware" "$bundle_dir/lib/libkrunfw.5.dylib"
     trap - EXIT
 
-    echo "==> macOS bundle ready"
+    if [[ "$dev" == true ]]; then
+        echo "==> macOS dev bundle ready (unoptimized; not for distribution)"
+    else
+        echo "==> macOS bundle ready"
+    fi
     printf '%s\n' "$agent_vm_version" "$msb_version"
     printf '  %s\n' \
-        target/macos/bin/agent-vm \
-        target/macos/bin/msb \
-        target/macos/lib/libkrunfw.5.dylib
+        "$bundle_dir/bin/agent-vm" \
+        "$bundle_dir/bin/msb" \
+        "$bundle_dir/lib/libkrunfw.5.dylib"
 }
 
 main() {
-    case "${1:-}" in
-        -h | --help)
-            [[ $# -eq 1 ]] || {
+    local dev=false
+
+    while (($#)); do
+        case "$1" in
+            -h | --help)
+                usage
+                return
+                ;;
+            --dev)
+                dev=true
+                shift
+                ;;
+            *)
                 usage >&2
                 exit 2
-            }
-            usage
-            return
-            ;;
-    esac
-    if (($# != 0)); then
-        usage >&2
-        exit 2
-    fi
+                ;;
+        esac
+    done
 
     preflight
-    build_microsandbox_runtime
-    require_build_outputs
-    build_agent_vm
-    publish_bundle
+    build_microsandbox_runtime "$dev"
+    require_build_outputs "$dev"
+    build_agent_vm "$dev"
+    publish_bundle "$dev"
 }
 
 main "$@"

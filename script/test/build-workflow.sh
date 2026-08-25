@@ -85,29 +85,31 @@ else
 fi'
     make_tool "$fakebin/cargo" '
 printf "cargo cwd=%s target=%s args=%s\n" "$PWD" "${CARGO_TARGET_DIR:-}" "$*" >>"$FAKE_LOG"
+subdir=debug
+case "$*" in *"--release"*) subdir=release ;; esac
 case "$*" in
     --version)
         printf "%s\n" "cargo 1.92.0 (fake)"
         ;;
     *"-p microsandbox-cli"*)
-        mkdir -p "$CARGO_TARGET_DIR/release"
-        cat >"$CARGO_TARGET_DIR/release/msb" <<"BIN"
+        mkdir -p "$CARGO_TARGET_DIR/$subdir"
+        cat >"$CARGO_TARGET_DIR/$subdir/msb" <<"BIN"
 #!/bin/bash
 [[ "${1:-}" == --version ]] || exit 40
 if [[ "${FAKE_MSB_VERSION_FAIL:-}" == 1 ]]; then exit 41; fi
 printf "%s\n" "msb fake-fresh"
 BIN
-        chmod +x "$CARGO_TARGET_DIR/release/msb"
+        chmod +x "$CARGO_TARGET_DIR/$subdir/msb"
         ;;
     *"-p agent-vm"*)
-        mkdir -p "$CARGO_TARGET_DIR/release"
-        cat >"$CARGO_TARGET_DIR/release/agent-vm" <<"BIN"
+        mkdir -p "$CARGO_TARGET_DIR/$subdir"
+        cat >"$CARGO_TARGET_DIR/$subdir/agent-vm" <<"BIN"
 #!/bin/bash
 [[ "${1:-}" == --version ]] || exit 40
 if [[ "${FAKE_AGENT_VM_VERSION_FAIL:-}" == 1 ]]; then exit 42; fi
 printf "%s\n" "agent-vm fake-fresh"
 BIN
-        chmod +x "$CARGO_TARGET_DIR/release/agent-vm"
+        chmod +x "$CARGO_TARGET_DIR/$subdir/agent-vm"
         ;;
     *) exit 3 ;;
 esac'
@@ -325,6 +327,22 @@ if [[ -s "$fixture/calls.log" ]]; then
     calls="$(cat "$fixture/calls.log")"
     case "$calls" in *"firmware docker build"*) fail "existing firmware was rebuilt" ;; esac
 fi
+
+# --dev builds unoptimized binaries into a separate bundle dir and never
+# touches the release bundle already published above.
+run_build "$fixture" "$fakebin" -- --dev
+[[ -x "$fixture/target/macos-dev/bin/agent-vm" ]]
+[[ -x "$fixture/target/macos-dev/bin/msb" ]]
+[[ -f "$fixture/target/macos-dev/lib/libkrunfw.5.dylib" ]]
+assert_file_contains "$fixture/target/macos-dev/bin/agent-vm" "fake-fresh"
+assert_file_contains "$fixture/target/macos-dev/bin/msb" "fake-fresh"
+assert_file_contains "$fixture/calls.log" "cargo build --no-default-features --features net,ssh -p microsandbox-cli"
+assert_file_contains "$fixture/calls.log" "cargo build -p agent-vm"
+assert_file_contains "$fixture/calls.log" "codesign --entitlements msb-entitlements.plist --force -s - build/msb-dev"
+[[ -f "$fixture/vendor/microsandbox/build/msb-dev" ]]
+[[ -f "$fixture/vendor/microsandbox/build/msb" ]]
+assert_file_contains "$fixture/target/macos/bin/agent-vm" "fake-fresh"
+assert_file_contains "$fixture/target/macos/bin/msb" "fake-fresh"
 
 # Argument and preflight failures are early and actionable.
 output="$(PATH="$fakebin" "$fixture/script/build/macos.sh" --help)"
