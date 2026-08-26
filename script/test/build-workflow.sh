@@ -5,6 +5,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agent-vm-build-workflow.XXXXXX")"
+# macOS's TMPDIR ends in a trailing slash, so the mktemp template above embeds
+# a doubled slash (".../T//agent-vm-..."). macos.sh derives its own REPO_ROOT
+# via `cd ... && pwd`, which bash normalizes to a single slash -- re-normalize
+# TEST_ROOT the same way so path assertions below compare like with like.
+TEST_ROOT="$(cd "$TEST_ROOT" && pwd)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 fail() {
