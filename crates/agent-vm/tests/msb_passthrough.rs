@@ -7,14 +7,14 @@
 //! `main()` — these tests spawn the actual compiled `agent-vm` binary with
 //! a controlled `HOME` / `AGENT_VM_STATE_DIR` / `MSB_PATH`, exercising the
 //! real `main()` startup path end-to-end: `point_at_msb()`'s `--version`
-//! marker check, `point_at_msb_home()` pinning `MSB_HOME`, the pre-runtime
+//! identity check, `point_at_msb_home()` pinning `MSB_HOME`, the pre-runtime
 //! `Cmd::Msb` short-circuit, and `msb_cmd::run`'s child spawn — all without
 //! needing a real `msb` binary, Hypervisor.framework, or an actual VM boot.
 //!
 //! The fake `msb` is a shell stub (mirrors `write_fake_msb` in
 //! `msb_cache_share.rs` / `msb_install.rs`'s unit tests): it answers a
-//! bare `--version` with the patched-build marker (satisfying
-//! `point_at_msb()`'s preflight check), and for any other invocation
+//! bare `--version` with the official version this agent-vm build vendors
+//! (satisfying `point_at_msb()`'s preflight check), and for any other invocation
 //! records the args it received and its `$MSB_HOME` to `RECORD_FILE`,
 //! prints a distinguishing marker to stdout, and exits with
 //! `$FAKE_MSB_EXIT_CODE` (default 0).
@@ -83,8 +83,9 @@ const FUTURE_MIGRATION: &str = "m29990101_000001_future_thing";
 const BUNDLED_MIGRATION: &str = "m20260305_000001_create_image_tables";
 
 /// Write a fake `msb` that:
-/// - answers a bare `--version` (exactly one arg) with the patched-build
-///   marker, satisfying `point_at_msb()`'s preflight check;
+/// - answers a bare `--version` (exactly one arg) with the official
+///   version this agent-vm build vendors, satisfying `point_at_msb()`'s
+///   preflight check;
 /// - for any other invocation, records the args it received and its
 ///   `$MSB_HOME` to `$RECORD_FILE` (if set), prints a distinguishing
 ///   marker to stdout, and exits with `$FAKE_MSB_EXIT_CODE` (default 0).
@@ -95,7 +96,7 @@ fn write_fake_msb(dir: &Path) -> PathBuf {
         &path,
         r#"#!/bin/sh
 if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
-    echo 'msb 0.4.6+agent-vm.phase4'
+    echo 'msb 0.6.15'
     exit 0
 fi
 if [ -n "$RECORD_FILE" ]; then

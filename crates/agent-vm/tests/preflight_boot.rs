@@ -20,17 +20,14 @@ fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
 }
 
-/// Fake `msb` that only needs to answer `--version` with the patched-build
-/// marker; the preflight guard must bail (ahead case) or fail past it
-/// before any real msb invocation happens on the boot path.
+/// Fake `msb` that only needs to answer `--version` with the official
+/// version this agent-vm build vendors; the preflight guard must bail
+/// (ahead case) or fail past it before any real msb invocation happens
+/// on the boot path.
 fn write_fake_msb(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("msb");
-    std::fs::write(
-        &path,
-        "#!/bin/sh\necho 'msb 0.4.6+agent-vm.phase4'\nexit 0\n",
-    )
-    .unwrap();
+    std::fs::write(&path, "#!/bin/sh\necho 'msb 0.6.15'\nexit 0\n").unwrap();
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();

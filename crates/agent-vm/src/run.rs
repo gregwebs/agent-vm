@@ -307,7 +307,7 @@ fn mkdir_chain(project: &Path) -> Vec<String> {
 }
 
 /// Which entry point to attach inside the sandbox.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Agent {
     Claude,
     Codex,
@@ -631,6 +631,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let mount_home = env::var("HOME").ok().map(PathBuf::from);
 
     let session = ProjectSession::for_cwd()?;
+    // AC#6 (agent-vm issue #40): fail closed, before touching the
+    // filesystem or booting anything, if this sandbox's real agent/control
+    // socket paths would overflow the platform's Unix-domain-socket path
+    // limit. See `msb_install::ensure_socket_paths_fit`'s doc comment.
+    crate::msb_install::ensure_socket_paths_fit(&session.sandbox_name)?;
     session.ensure_dirs()?;
     if !root_mode {
         session
@@ -939,6 +944,12 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     };
     let mut builder = Sandbox::builder(&session.sandbox_name)
         .image(image.as_str())
+        // AC#3 (agent-vm issue #40): explicitly size the writable OCI
+        // upper instead of relying on the SDK default. `root_disk()`
+        // requires an OCI image to already be set, hence chained right
+        // after `.image(...)`; NOT the deprecated `oci_upper_size()`
+        // alias, which just forwards to this same call.
+        .root_disk(crate::defaults::WRITABLE_UPPER_MIB)
         .registry(|r| if is_local_registry { r.insecure() } else { r })
         .pull_policy(PullPolicy::IfMissing)
         .cpus(cpus)
@@ -1082,29 +1093,26 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         );
     }
 
-    // Surface the host HTTP proxy when one is set. Host-side image pulls
-    // already honour it (reqwest auto-detects the env), and guest egress now
-    // tunnels through it via HTTP CONNECT — the microsandbox network stack
-    // reads the same `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY` at boot.
-    // Be loud about it so the operator knows all traffic is routed there.
-    if let Some(proxy) = microsandbox::microsandbox_network::http_proxy::ProxyConfig::from_env() {
-        match (proxy.https_display(), proxy.http_display()) {
-            (Some(s), Some(h)) if s == h => {
-                eprintln!("==> Proxy: routing guest egress + image pulls through {s} (HTTP CONNECT)");
-            }
-            (https, http) => {
-                if let Some(s) = https {
-                    eprintln!("==> Proxy: HTTPS/TLS egress + image pulls via {s} (HTTP CONNECT)");
-                }
-                if let Some(h) = http {
-                    eprintln!("==> Proxy: plain-HTTP egress via {h} (HTTP CONNECT)");
-                }
-            }
-        }
-        if let Some(no_proxy) = proxy.no_proxy_display() {
-            eprintln!("==> Proxy: bypassing (no_proxy) {no_proxy}");
-        }
-    }
+    // Phase 6 (agent-vm issue #40): the fork's guest-egress-via-host-proxy
+    // feature has no baseline equivalent (see `fail_closed.rs`). Fail
+    // closed rather than silently booting with unproxied guest egress
+    // while the operator believes traffic is routed through their proxy.
+    crate::fail_closed::check_no_guest_proxy_env()?;
+
+    // Phase 6: `--auto-publish` and the CIDR/group egress overrides rely
+    // on NetworkBuilder methods (`auto_publish`, `allow_egress_group`,
+    // `allow_egress_cidr`) that don't exist on this baseline. Fail closed
+    // rather than risk mistranslating them onto the new `.policy(..)`
+    // rule grammar without dedicated design/testing (see `fail_closed.rs`).
+    let auto_publish = args.auto_publish;
+    let allow_lan = args.allow_lan;
+    let allow_host = args.allow_host;
+    crate::fail_closed::check_auto_publish_unrequested(auto_publish)?;
+    crate::fail_closed::check_egress_overrides_unrequested(
+        allow_lan,
+        allow_host,
+        allow_egress_cidrs.len(),
+    )?;
 
     // For each provider with a host credential file, register a
     // SecretValue::File secret keyed on the placeholder string the
@@ -1112,42 +1120,33 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // hook target so a 401-then-refresh attempt round-trips through a
     // real host-side rotation (see `intercept_hook`).
     //
-    // allow_host covers both the API endpoint and the OAuth endpoint;
-    // the OAuth host has to be allowed for the placeholder to leave
-    // the VM at all (microsandbox's violation detector would block it
-    // otherwise), even though substitution there is a no-op because
-    // the body's refresh_token is a placeholder, not a header.
+    // Phase 6: the fork's file-backed `SecretValue::File` (re-read on
+    // every connection, so a host-side token rotation propagates without
+    // restarting the sandbox) and its per-route intercept-hook dispatcher
+    // (`NetworkBuilder::intercept()`) do not exist on this baseline —
+    // `SecretBuilder::value()` only takes a static `String`. Rather than
+    // silently baking each file's *current* contents into a static
+    // secret (dropping the rotation guarantee and risking a leaked stale
+    // token on a later refresh), a launch that actually needs credential
+    // injection fails closed. `agent-vm shell --no-git` on a host with
+    // cached credentials is NOT such a launch — Shell never speaks to a
+    // provider/GitHub API on the guest's behalf — so it keeps booting.
+    // See `fail_closed.rs` for the exact criteria.
     let has_creds = creds.anthropic_token_file.is_some()
         || creds.openai_token_file.is_some()
         || creds.gh_token_file.is_some()
         || creds.copilot_token_file.is_some();
-    let auto_publish = args.auto_publish;
-    let allow_lan = args.allow_lan;
-    let allow_host = args.allow_host;
-    let has_egress_overrides = !allow_egress_cidrs.is_empty() || allow_lan || allow_host;
-    if has_creds || !publish_ports.is_empty() || auto_publish || has_egress_overrides {
-        use crate::secrets::*;
-        let anthropic = creds.anthropic_token_file.clone();
-        let openai = creds.openai_token_file.clone();
-        let opencode = creds.opencode_openai_access_token_file.clone();
-        let gh = creds.gh_token_file.clone();
-        let has_gh = gh.is_some();
-        // D1 least-privilege: only wire the Copilot secret (and thus
-        // open Copilot-API egress) when Copilot is the selected agent.
-        // `creds.copilot_token_file` can be `Some` for a claude/codex
-        // session too (gh-fallback capture when `use_github`), but a
-        // non-Copilot launch must not carry a Copilot egress allow-host
-        // or a duplicated gh token in a secret it never uses.
-        let copilot = if want_copilot {
-            creds.copilot_token_file.clone()
-        } else {
-            None
-        };
-        let allowed_repos_for_hook = allowed_repos.clone();
-        let self_path = std::env::current_exe().context("std::env::current_exe")?;
-        let state_dir = session.state_dir.clone();
+    let needs_credential_injection =
+        !args.no_git || crate::fail_closed::agent_requires_credentials(agent);
+    crate::fail_closed::check_credential_injection_unneeded(has_creds, needs_credential_injection)?;
+
+    // Everything that could have needed the fork-only network features
+    // (creds, auto-publish, egress overrides) has already failed closed
+    // above if requested, so the only thing left the network(..) closure
+    // can legitimately do on this baseline is `--publish` port forwarding
+    // (`.port_bind`/`.port_udp_bind` are ordinary baseline APIs).
+    if !publish_ports.is_empty() {
         let publish_ports_for_net = publish_ports.clone();
-        let allow_egress_for_net = allow_egress_cidrs.clone();
         builder = builder.network(move |mut n| {
             n = n.tls(|t| t);
             for p in &publish_ports_for_net {
@@ -1157,161 +1156,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                     PublishProto::Udp => n.port_udp_bind(host_bind, p.host_port, p.guest_port),
                 };
             }
-            if auto_publish {
-                n = n.auto_publish();
-            }
-            if allow_lan {
-                use microsandbox::microsandbox_network::policy::DestinationGroup;
-                n = n.allow_egress_group(DestinationGroup::Private);
-            }
-            if allow_host {
-                use microsandbox::microsandbox_network::policy::DestinationGroup;
-                n = n.allow_egress_group(DestinationGroup::Host);
-            }
-            for cidr in &allow_egress_for_net {
-                n = n.allow_egress_cidr(*cidr);
-            }
-            if !has_creds {
-                return n;
-            }
-            // We only ever substitute into Authorization: Bearer headers.
-            // Explicitly disable basic_auth so the proxy's per-chunk fast
-            // path can short-circuit when the placeholder isn't present
-            // — critical for post-WebSocket-upgrade binary frames where
-            // a UTF-8 lossy round trip would corrupt the bytes.
-            if let Some(file) = anthropic {
-                n = n.secret(|s| {
-                    s.env("MSB_AGENT_VM_ANTHROPIC_UNUSED")
-                        .value(file)
-                        .placeholder(ANTHROPIC_ACCESS_PLACEHOLDER)
-                        .inject_basic_auth(false)
-                        .allow_host(ANTHROPIC_API_HOST)
-                        .allow_host(ANTHROPIC_OAUTH_HOST)
-                        .allow_host(ANTHROPIC_MCP_PROXY_HOST)
-                });
-            }
-            if let Some(file) = openai {
-                n = n.secret(|s| {
-                    s.env("MSB_AGENT_VM_OPENAI_UNUSED")
-                        .value(file)
-                        .placeholder(OPENAI_ACCESS_PLACEHOLDER)
-                        .inject_basic_auth(false)
-                        .allow_host(OPENAI_API_HOST)
-                        .allow_host(OPENAI_CHATGPT_HOST)
-                        .allow_host(OPENAI_OAUTH_HOST)
-                });
-            }
-            // OpenCode sends Authorization: Bearer <synthetic JWT> to
-            // api.openai.com; the proxy swaps the JWT for the real
-            // OpenAI access token (same on-disk file as Codex uses).
-            if let Some(file) = opencode {
-                n = n.secret(|s| {
-                    s.env("MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED")
-                        .value(file)
-                        .placeholder(OPENCODE_OPENAI_ACCESS_PLACEHOLDER)
-                        .inject_basic_auth(false)
-                        .allow_host(OPENAI_API_HOST)
-                        .allow_host(OPENAI_CHATGPT_HOST)
-                });
-            }
-            // Phase 6: gh CLI sends `Authorization: token <token>` (or
-            // Bearer); git uses Basic auth (base64(x-access-token:tok)).
-            // `inject_basic_auth(true)` covers the Basic-auth path. We
-            // accept the perf hit (basic_auth disables the per-chunk
-            // fast path) because GitHub connections aren't WebSocket.
-            //
-            // The per-launch repo allow-list binds api.github.com
-            // (full-buffer hook below) AND the git smart-HTTP hosts
-            // (streaming `rule_streaming` rules below). The smart-
-            // HTTP path uses microsandbox's headers-only dispatch
-            // primitive — the hook decides based on the request
-            // line alone, so multi-MB git push pack data never hits
-            // the 64 KiB intercept buffer.
-            if let Some(file) = gh {
-                n = n.secret(|s| {
-                    s.env("MSB_AGENT_VM_GH_UNUSED")
-                        .value(file)
-                        .placeholder(GH_TOKEN_PLACEHOLDER)
-                        .inject_basic_auth(true)
-                        .allow_host(GITHUB_API_HOST)
-                        .allow_host(GITHUB_HOST)
-                        .allow_host(GITHUB_CODELOAD_HOST)
-                        .allow_host(GITHUB_RAW_HOST)
-                        .allow_host(GITHUB_OBJECTS_HOST)
-                });
-            }
-            // D1: GitHub Copilot CLI sends `Authorization: Bearer
-            // <COPILOT_TOKEN_PLACEHOLDER>` to the Copilot API; the
-            // proxy swaps the placeholder for the real GitHub OAuth
-            // token. Copilot streams responses, so disable basic_auth
-            // to keep the per-chunk fast path (same reasoning as the
-            // Anthropic/OpenAI secrets above — only the bearer header
-            // ever needs substitution here).
-            if let Some(file) = copilot {
-                n = n.secret(|s| {
-                    s.env("MSB_AGENT_VM_COPILOT_UNUSED")
-                        .value(file)
-                        .placeholder(COPILOT_TOKEN_PLACEHOLDER)
-                        .inject_basic_auth(false)
-                        .allow_host(COPILOT_API_HOST)
-                        .allow_host(COPILOT_API_INDIVIDUAL_HOST)
-                });
-            }
-            n.intercept(|i| {
-                let mut hook_argv: Vec<String> = vec![
-                    self_path.to_string_lossy().to_string(),
-                    "_intercept-hook".to_string(),
-                    "--state-dir".to_string(),
-                    state_dir.to_string_lossy().to_string(),
-                ];
-                for repo in &allowed_repos_for_hook {
-                    hook_argv.push("--allowed-repo".to_string());
-                    hook_argv.push(repo.clone());
-                }
-                let mut ix = i
-                    .hook(hook_argv)
-                    // The api.github.com rules buffer the whole request
-                    // so the hook can rule on a GraphQL body, and an
-                    // over-cap request is refused (fail-closed). The
-                    // 64 KiB default is tighter than GitHub's own
-                    // limits — a maximum-length issue comment is 65,536
-                    // characters, and base64 file uploads via the
-                    // contents API inflate 4/3 — so a legal request
-                    // would 413. 2 MiB covers those with room to spare;
-                    // the buffer is per connection and the hook holds
-                    // the request anyway.
-                    .max_request_bytes(2 * 1024 * 1024)
-                    .rule(ANTHROPIC_OAUTH_HOST, "POST", ANTHROPIC_OAUTH_TOKEN_PATH)
-                    .rule(OPENAI_OAUTH_HOST, "POST", OPENAI_OAUTH_TOKEN_PATH);
-                // Phase 6: intercept every method gh CLI uses on
-                // api.github.com so the hook can enforce the repo
-                // allow-list. Path "/" matches everything (prefix
-                // semantics in handler.rs). Only fires when we have
-                // a host gh token; otherwise the hook has nothing to
-                // forward with and there's no risk of a leak.
-                if has_gh {
-                    for method in ["GET", "POST", "PATCH", "PUT", "DELETE"] {
-                        ix = ix.rule(GITHUB_API_HOST, method, "/");
-                    }
-                    // Phase 6 round 2: streaming intercept for the git
-                    // smart-HTTP protocol on github.com. The hook
-                    // decides based on the request line alone (path
-                    // is `/<owner>/<repo>.git/...`); empty stdout =
-                    // passthrough → secret-substitution layer fills
-                    // in the real bearer for legitimate push/clone.
-                    // Non-empty = synthesized 403 for off-allow-list
-                    // repos. Without this the per-launch repo
-                    // allow-list would only bind api.github.com and
-                    // git push could reach anywhere.
-                    for method in ["GET", "POST"] {
-                        ix = ix.rule_streaming(GITHUB_HOST, method, "/");
-                        ix = ix.rule_streaming(GITHUB_CODELOAD_HOST, method, "/");
-                        ix = ix.rule_streaming(GITHUB_RAW_HOST, method, "/");
-                        ix = ix.rule_streaming(GITHUB_OBJECTS_HOST, method, "/");
-                    }
-                }
-                ix
-            })
+            n
         });
     }
 
@@ -1463,40 +1308,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     crate::secrets::sync_chrome_mcp(&session.state_dir, chrome_mcp_enabled)
         .context("synchronizing Chrome MCP configuration")?;
 
-    // Subscribe to the runtime's auto-publish event stream and
-    // surface each mapping to the user. Spawned regardless of
-    // whether auto-publish is enabled — when disabled the runtime
-    // never emits events, so the subscriber just idles. Cheap.
-    if args.auto_publish {
-        eprintln!("==> auto-publish: watching guest LISTEN sockets via /proc/net/tcp{{,6}}");
-        let sb_for_events = sandbox.clone();
-        tokio::spawn(async move {
-            let mut events = sb_for_events.port_events().await;
-            use microsandbox::protocol::network::PortEvent;
-            while let Some(event) = events.recv().await {
-                match event {
-                    PortEvent::Added {
-                        host_bind,
-                        host_port,
-                        guest_port,
-                    } => {
-                        eprintln!(
-                            "==> auto-publish: guest :{guest_port} → host {host_bind}:{host_port}"
-                        );
-                    }
-                    PortEvent::Removed {
-                        host_bind,
-                        host_port,
-                        guest_port,
-                    } => {
-                        eprintln!(
-                            "==> auto-publish: guest :{guest_port} closed (released {host_bind}:{host_port})"
-                        );
-                    }
-                }
-            }
-        });
-    }
+    // Phase 6 (agent-vm issue #40): `--auto-publish` already fails closed
+    // earlier in `launch()` (`fail_closed::check_auto_publish_unrequested`)
+    // because baseline's `NetworkBuilder` has no `auto_publish()` method —
+    // and, correspondingly, no `Sandbox::port_events()`/`PortEvent` stream
+    // to subscribe to. The event-subscriber this block used to spawn here
+    // is therefore dead code on this baseline; removed rather than kept
+    // uncompilable. Re-add once #40's follow-up ports auto-publish.
 
     let inner_cmd = agent.command();
     // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions
@@ -2973,12 +2791,10 @@ async fn seed_pulled_marker_if_absent(image: &str) {
     // seed, and there's correctly nothing newer to flag: the imminent
     // IfMissing pull lands the current image.
     //
-    // Upstream's SDK now routes image lookups through a LocalBackend handle;
-    // open the default one (best-effort — a failure here just skips seeding).
-    let Ok(local) = microsandbox::LocalBackend::new().await else {
-        return;
-    };
-    if let Ok(handle) = microsandbox::Image::get(&local, image).await
+    // Baseline v0.6.15's Image::get resolves the active local backend
+    // internally (crate::backend::default_backend()), so no separate
+    // LocalBackend handle is needed here any more.
+    if let Ok(handle) = microsandbox::Image::get(image).await
         && let Some(digest) = handle.manifest_digest()
     {
         match crate::pulled_marker::write(image, digest) {

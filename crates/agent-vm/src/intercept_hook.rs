@@ -2044,12 +2044,19 @@ mod tests {
         real_token: &str,
     ) -> microsandbox_network::secrets::config::SecretsConfig {
         use microsandbox_network::secrets::config::{
-            HostPattern, SecretEntry, SecretInjection, SecretValue, SecretsConfig,
+            HostPattern, SecretEntry, SecretInjection, SecretsConfig,
         };
         SecretsConfig {
             secrets: vec![SecretEntry {
                 env_var: "GH_TOKEN".into(),
-                value: SecretValue::Static(real_token.into()),
+                // Baseline's `SecretEntry::value` is a plain (zeroized)
+                // `String` — the fork's `SecretValue::File` variant this
+                // test used to construct doesn't exist any more (see
+                // `fail_closed.rs`'s module doc). `source: None` means
+                // "value already carries the material", which is exactly
+                // what a static test fixture needs.
+                value: real_token.to_string().into(),
+                source: None,
                 placeholder: placeholder.into(),
                 allowed_hosts: vec![
                     HostPattern::Exact("github.com".into()),

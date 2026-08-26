@@ -1,9 +1,10 @@
-//! `agent-vm msb <args...>` — forward verbatim to the bundled patched
-//! `msb`, with MSB_PATH / MSB_HOME already pinned in the process env by
-//! main()'s prologue (point_at_msb / point_at_msb_home).
+//! `agent-vm msb <args...>` — forward verbatim to the bundled `msb`
+//! (the official Microsandbox build this agent-vm vendors), with
+//! MSB_PATH / MSB_HOME already pinned in the process env by main()'s
+//! prologue (point_at_msb / point_at_msb_home).
 //!
 //! Pure passthrough: we do not parse or reformat msb's output, and we do
-//! not re-check the patched-binary marker — point_at_msb() already did
+//! not re-check its version identity — point_at_msb() already did
 //! both before dispatch. The child inherits our full environment (so
 //! MSB_HOME points msb at agent-vm's private sandbox registry) and our
 //! stdio. The child's exit status becomes agent-vm's exit status; a child

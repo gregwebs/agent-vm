@@ -100,14 +100,27 @@ pub const COPILOT_TOKEN_PLACEHOLDER: &str = "msb-copilot-placeholder-v2";
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
 // docs stay in lockstep.
 
+// Phase 6 (agent-vm issue #40): run.rs no longer wires these into a
+// credential-substitution secret — that needs the fork's file-backed
+// `SecretValue` + per-route intercept hook, neither of which exists on
+// the clean v0.6.15 baseline (see `fail_closed.rs`), so a launch that
+// would need them fails closed instead. Kept `#[allow(dead_code)]`
+// rather than deleted: they're the exact allow-host set the deferred
+// credential-injection re-port (tracked generically under #40 until a
+// dedicated follow-up exists) will need to reconstruct the same secret
+// entries against baseline's `SecretBuilder`.
+#[allow(dead_code)]
 pub const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 pub const ANTHROPIC_OAUTH_HOST: &str = "platform.claude.com";
 /// Claude Code's MCP relay endpoint. Claude Code's HTTP client sends
 /// the same Anthropic access token here, so the secret substitution
 /// has to allow this destination too — otherwise the placeholder
 /// trips the violation scan and the conn gets dropped, breaking MCP.
+#[allow(dead_code)]
 pub const ANTHROPIC_MCP_PROXY_HOST: &str = "mcp-proxy.anthropic.com";
+#[allow(dead_code)]
 pub const OPENAI_API_HOST: &str = "api.openai.com";
+#[allow(dead_code)]
 pub const OPENAI_CHATGPT_HOST: &str = "chatgpt.com";
 pub const OPENAI_OAUTH_HOST: &str = "auth.openai.com";
 
@@ -123,10 +136,14 @@ pub const GITHUB_OBJECTS_HOST: &str = "objects.githubusercontent.com";
 /// Both are needed: `api.githubcopilot.com` for business/enterprise
 /// seats and `api.individual.githubcopilot.com` for individual ones.
 /// Mirrors the original Bash agent-vm's credential-proxy domains.
+#[allow(dead_code)] // see the Phase 6 note above ANTHROPIC_API_HOST
 pub const COPILOT_API_HOST: &str = "api.githubcopilot.com";
+#[allow(dead_code)] // see the Phase 6 note above ANTHROPIC_API_HOST
 pub const COPILOT_API_INDIVIDUAL_HOST: &str = "api.individual.githubcopilot.com";
 
+#[allow(dead_code)] // see the Phase 6 note above ANTHROPIC_API_HOST
 pub const ANTHROPIC_OAUTH_TOKEN_PATH: &str = "/v1/oauth/token";
+#[allow(dead_code)] // see the Phase 6 note above ANTHROPIC_API_HOST
 pub const OPENAI_OAUTH_TOKEN_PATH: &str = "/oauth/token";
 
 /// Result of [`refresh`]. `*_token_file` paths only exist if the host
@@ -140,6 +157,12 @@ pub const OPENAI_OAUTH_TOKEN_PATH: &str = "/oauth/token";
 pub struct CredsState {
     pub anthropic_token_file: Option<PathBuf>,
     pub openai_token_file: Option<PathBuf>,
+    // Phase 6 (agent-vm issue #40): still captured by `refresh()` (the
+    // guest-side placeholder auth.json is written unconditionally so a
+    // first OpenCode launch doesn't hit its wizard), but no longer read
+    // by run.rs — wiring it into a proxy-substitution secret needs the
+    // same deferred credential-injection re-port as the hosts above.
+    #[allow(dead_code)]
     pub opencode_openai_access_token_file: Option<PathBuf>,
     /// File holding the host's `gh auth token` (a GitHub user OAuth
     /// token). The proxy substitutes `GH_TOKEN_PLACEHOLDER` for this
