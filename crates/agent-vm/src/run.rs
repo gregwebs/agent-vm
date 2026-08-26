@@ -1314,7 +1314,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // and, correspondingly, no `Sandbox::port_events()`/`PortEvent` stream
     // to subscribe to. The event-subscriber this block used to spawn here
     // is therefore dead code on this baseline; removed rather than kept
-    // uncompilable. Re-add once #40's follow-up ports auto-publish.
+    // uncompilable. Re-add once #47's follow-up ports auto-publish.
 
     let inner_cmd = agent.command();
     // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions

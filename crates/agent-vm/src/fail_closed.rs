@@ -17,8 +17,11 @@
 //! safety behavior it promised (e.g. quietly not enforcing the GitHub repo
 //! allow-list) or silently downgrading it (e.g. baking a credential file's
 //! contents into a static secret that never rotates and can leak a stale
-//! token). This module is that fail-closed boundary. See the issue-40
-//! implementation plan's Phase 6 for the option-by-option disposition.
+//! token). This module is that fail-closed boundary, added by agent-vm
+//! issue #40 (see its implementation plan's Phase 6 for the
+//! option-by-option disposition). Porting or dropping each of these
+//! fork-only features on the v0.6.15 baseline is tracked separately in
+//! agent-vm issue #47.
 
 use anyhow::{Result, bail};
 
@@ -31,7 +34,7 @@ use crate::run::Agent;
 fn unsupported_message(option: &str, why: &str) -> String {
     format!(
         "{option} is not supported yet on the clean Microsandbox v0.6.15 baseline: {why}. \
-         Tracked in gregwebs/agent-vm#40; this launch was refused rather than silently \
+         Tracked in gregwebs/agent-vm#47; this launch was refused rather than silently \
          weakening the security behavior {option} implies — rerun without it."
     )
 }
@@ -41,9 +44,11 @@ fn unsupported_message(option: &str, why: &str) -> String {
 /// The fork's guest-egress-via-host-proxy feature (commits `d6b9b117`/
 /// `a05c6b70`) has no baseline equivalent — the baseline SDK carries zero
 /// `http_proxy`/`ProxyConfig` references. Silently ignoring
-/// `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` would boot with guest egress
-/// going *direct* while the operator believes it's proxied, which is
-/// exactly the kind of silent regression AC#5 forbids.
+/// `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (or their equally-common
+/// lowercase `https_proxy`/`http_proxy`/`all_proxy` spellings — the
+/// convention curl, wget, and Python `requests` all honor) would boot with
+/// guest egress going *direct* while the operator believes it's proxied,
+/// which is exactly the kind of silent regression AC#5 forbids.
 pub fn check_no_guest_proxy_env() -> Result<()> {
     check_no_guest_proxy_env_from(|var| std::env::var(var).ok())
 }
@@ -55,14 +60,25 @@ pub fn check_no_guest_proxy_env() -> Result<()> {
 /// (another test could read a value mid-mutation), so tests inject a
 /// closure instead. Mirrors the `msb_home_dir`/`short_macos_msb_home`
 /// split in `msb_install.rs`.
+///
+/// Checks both the uppercase and lowercase spelling of each variable —
+/// `std::env::var` is case-sensitive, and a host or CI job that only
+/// exports the lowercase convention must not silently sail past this
+/// guard.
 fn check_no_guest_proxy_env_from(lookup: impl Fn(&str) -> Option<String>) -> Result<()> {
-    for var in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
-        if lookup(var).is_some_and(|v| !v.is_empty()) {
-            bail!(unsupported_message(
-                &format!("guest egress via the host {var} proxy"),
-                "the microsandbox network stack has no HTTP-CONNECT proxying for guest traffic \
-                 on this baseline",
-            ));
+    for (upper, lower) in [
+        ("HTTPS_PROXY", "https_proxy"),
+        ("HTTP_PROXY", "http_proxy"),
+        ("ALL_PROXY", "all_proxy"),
+    ] {
+        for var in [upper, lower] {
+            if lookup(var).is_some_and(|v| !v.is_empty()) {
+                bail!(unsupported_message(
+                    &format!("guest egress via the host {var} proxy"),
+                    "the microsandbox network stack has no HTTP-CONNECT proxying for guest traffic \
+                     on this baseline",
+                ));
+            }
         }
     }
     Ok(())
@@ -160,7 +176,7 @@ mod tests {
 
     fn issue_reference_present(err: &anyhow::Error) {
         assert!(
-            err.to_string().contains("agent-vm#40"),
+            err.to_string().contains("agent-vm#47"),
             "error should reference the tracking issue: {err}"
         );
     }
@@ -185,6 +201,30 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("HTTPS_PROXY"));
         issue_reference_present(&err);
+    }
+
+    #[test]
+    fn guest_proxy_env_fails_closed_for_lowercase_spelling() {
+        // curl/wget/Python `requests` convention: many hosts and CI jobs
+        // only export the lowercase form.
+        let err = check_no_guest_proxy_env_from(|var| {
+            (var == "https_proxy").then(|| "http://proxy.example:3128".to_string())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("https_proxy"));
+        issue_reference_present(&err);
+    }
+
+    #[test]
+    fn guest_proxy_env_fails_closed_for_all_lowercase_vars() {
+        for var in ["https_proxy", "http_proxy", "all_proxy"] {
+            let target = var;
+            let err = check_no_guest_proxy_env_from(|v| {
+                (v == target).then(|| "http://proxy.example:3128".to_string())
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains(target), "expected {target} in: {err}");
+        }
     }
 
     #[test]

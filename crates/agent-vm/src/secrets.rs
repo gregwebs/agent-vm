@@ -106,9 +106,8 @@ pub const COPILOT_TOKEN_PLACEHOLDER: &str = "msb-copilot-placeholder-v2";
 // the clean v0.6.15 baseline (see `fail_closed.rs`), so a launch that
 // would need them fails closed instead. Kept `#[allow(dead_code)]`
 // rather than deleted: they're the exact allow-host set the deferred
-// credential-injection re-port (tracked generically under #40 until a
-// dedicated follow-up exists) will need to reconstruct the same secret
-// entries against baseline's `SecretBuilder`.
+// credential-injection re-port (tracked in agent-vm#47) will need to
+// reconstruct the same secret entries against baseline's `SecretBuilder`.
 #[allow(dead_code)]
 pub const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 pub const ANTHROPIC_OAUTH_HOST: &str = "platform.claude.com";
