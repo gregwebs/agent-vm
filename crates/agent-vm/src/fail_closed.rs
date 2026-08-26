@@ -45,8 +45,19 @@ fn unsupported_message(option: &str, why: &str) -> String {
 /// going *direct* while the operator believes it's proxied, which is
 /// exactly the kind of silent regression AC#5 forbids.
 pub fn check_no_guest_proxy_env() -> Result<()> {
+    check_no_guest_proxy_env_from(|var| std::env::var(var).ok())
+}
+
+/// Pure core of [`check_no_guest_proxy_env`], taking a lookup function
+/// instead of reading the real process env — `cargo test`'s default
+/// parallel threads make mutating `std::env::set_var`/`remove_var` for
+/// `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` from within a `#[test]` unsafe
+/// (another test could read a value mid-mutation), so tests inject a
+/// closure instead. Mirrors the `msb_home_dir`/`short_macos_msb_home`
+/// split in `msb_install.rs`.
+fn check_no_guest_proxy_env_from(lookup: impl Fn(&str) -> Option<String>) -> Result<()> {
     for var in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
-        if std::env::var(var).is_ok_and(|v| !v.is_empty()) {
+        if lookup(var).is_some_and(|v| !v.is_empty()) {
             bail!(unsupported_message(
                 &format!("guest egress via the host {var} proxy"),
                 "the microsandbox network stack has no HTTP-CONNECT proxying for guest traffic \
@@ -156,23 +167,24 @@ mod tests {
 
     #[test]
     fn guest_proxy_env_unset_passes_when_absent() {
-        for var in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
-            // SAFETY: single-threaded test, no other thread reads/writes
-            // these env vars concurrently.
-            unsafe { std::env::remove_var(var) };
-        }
-        assert!(check_no_guest_proxy_env().is_ok());
+        assert!(check_no_guest_proxy_env_from(|_| None).is_ok());
+    }
+
+    #[test]
+    fn guest_proxy_env_ignores_empty_values() {
+        // An empty-but-set var (e.g. a shell that exports "" rather than
+        // leaving it unset) must not trip the guard.
+        assert!(check_no_guest_proxy_env_from(|_| Some(String::new())).is_ok());
     }
 
     #[test]
     fn guest_proxy_env_fails_closed_when_set() {
-        // SAFETY: see above.
-        unsafe { std::env::set_var("HTTPS_PROXY", "http://proxy.example:3128") };
-        let err = check_no_guest_proxy_env().unwrap_err();
+        let err = check_no_guest_proxy_env_from(|var| {
+            (var == "HTTPS_PROXY").then(|| "http://proxy.example:3128".to_string())
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("HTTPS_PROXY"));
         issue_reference_present(&err);
-        // SAFETY: see above.
-        unsafe { std::env::remove_var("HTTPS_PROXY") };
     }
 
     #[test]
