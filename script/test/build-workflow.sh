@@ -5,6 +5,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agent-vm-build-workflow.XXXXXX")"
+# macOS's TMPDIR ends in a trailing slash, so the mktemp template above embeds
+# a doubled slash (".../T//agent-vm-..."). macos.sh derives its own REPO_ROOT
+# via `cd ... && pwd`, which bash normalizes to a single slash -- re-normalize
+# TEST_ROOT the same way so path assertions below compare like with like.
+TEST_ROOT="$(cd "$TEST_ROOT" && pwd)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 fail() {
@@ -79,9 +84,9 @@ case "${1:-}" in
 esac'
     make_tool "$fakebin/rustc" '
 if [[ "${FAKE_RUSTUP_PINNED:-}" == 1 ]]; then
-    printf "%s\n" "${FAKE_PINNED_RUST_VERSION:-rustc 1.92.0 (fake)}"
+    printf "%s\n" "${FAKE_PINNED_RUST_VERSION:-rustc 1.94.0 (fake)}"
 else
-    printf "%s\n" "${FAKE_ACTIVE_RUST_VERSION:-rustc 1.92.0 (fake)}"
+    printf "%s\n" "${FAKE_ACTIVE_RUST_VERSION:-rustc 1.94.0 (fake)}"
 fi'
     make_tool "$fakebin/cargo" '
 printf "cargo cwd=%s target=%s args=%s\n" "$PWD" "${CARGO_TARGET_DIR:-}" "$*" >>"$FAKE_LOG"
@@ -89,7 +94,7 @@ subdir=debug
 case "$*" in *"--release"*) subdir=release ;; esac
 case "$*" in
     --version)
-        printf "%s\n" "cargo 1.92.0 (fake)"
+        printf "%s\n" "cargo 1.94.0 (fake)"
         ;;
     *"-p microsandbox-cli"*)
         mkdir -p "$CARGO_TARGET_DIR/$subdir"
@@ -119,7 +124,7 @@ if [[ "${RUSTUP_AUTO_INSTALL:-}" != 0 ]]; then
     printf "%s\n" "fake rustup refused an auto-install-capable invocation" >&2
     exit 90
 fi
-if [[ "${1:-}" != run || "${2:-}" != 1.92 ]]; then
+if [[ "${1:-}" != run || "${2:-}" != 1.94 ]]; then
     exit 3
 fi
 shift 2
@@ -130,11 +135,11 @@ case "$tool" in
     *) exit 3 ;;
 esac
 if [[ "${FAKE_RUSTUP_TOOLCHAIN_MISSING:-}" == 1 ]]; then
-    printf "%s\n" "error: toolchain 1.92 is not installed" >&2
+    printf "%s\n" "error: toolchain 1.94 is not installed" >&2
     exit 1
 fi
 if [[ "$tool" == cargo && "${FAKE_RUSTUP_CARGO_MISSING:-}" == 1 ]]; then
-    printf "%s\n" "error: cargo is not installed for toolchain 1.92" >&2
+    printf "%s\n" "error: cargo is not installed for toolchain 1.94" >&2
     exit 1
 fi
 FAKE_RUSTUP_PINNED=1 "$tool" "$@"'
@@ -295,6 +300,17 @@ expect_import_failure() {
 [[ -f "$REPO_ROOT/script/build/macos.sh" ]] || fail "missing script/build/macos.sh"
 [[ -f "$REPO_ROOT/script/build/import-image.sh" ]] || fail "missing script/build/import-image.sh"
 
+# macos.sh's RUST_TOOLCHAIN literal is a deliberate second copy of the pin (it
+# must not auto-select via rust-toolchain.toml, so the build script never
+# depends on or changes the caller's global default toolchain — see its own
+# comment). Assert the two agree so a future bump can't touch one and forget
+# the other.
+toolchain_toml_channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$REPO_ROOT/rust-toolchain.toml")"
+macos_sh_pin="$(sed -n 's/^RUST_TOOLCHAIN=\(.*\)$/\1/p' "$REPO_ROOT/script/build/macos.sh")"
+[[ -n "$toolchain_toml_channel" ]] || fail "could not read channel from rust-toolchain.toml"
+[[ "$macos_sh_pin" == "$toolchain_toml_channel" ]] ||
+    fail "script/build/macos.sh RUST_TOOLCHAIN ($macos_sh_pin) drifted from rust-toolchain.toml channel ($toolchain_toml_channel)"
+
 # A complete fake build works without just, from outside the repository.
 make_fixture success
 if PATH="$fakebin" command -v just >/dev/null 2>&1; then fail "fake PATH unexpectedly contains just"; fi
@@ -315,10 +331,10 @@ assert_file_contains "$fixture/calls.log" "-DABI_VERSION=5"
 assert_file_contains "$fixture/calls.log" "--release -p agent-vm"
 assert_file_contains "$fixture/calls.log" "target=$fixture/vendor/microsandbox/target"
 assert_file_contains "$fixture/calls.log" "target=$fixture/target"
-assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.92 rustc --version"
-assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.92 cargo --version"
-assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.92 cargo build --release --no-default-features --features net,ssh -p microsandbox-cli"
-assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.92 cargo build --release -p agent-vm"
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.94 rustc --version"
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.94 cargo --version"
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.94 cargo build --release --no-default-features --features net,ssh -p microsandbox-cli"
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.94 cargo build --release -p agent-vm"
 
 # A present firmware output is reused on the next build.
 : >"$fixture/calls.log"
@@ -351,23 +367,23 @@ expect_build_failure "Usage:" "$fixture" "$fakebin" -- "extra"
 make_fixture old-active-rust
 run_build "$fixture" "$fakebin" env \
     FAKE_ACTIVE_RUST_VERSION='rustc 1.87.0 (fake)' \
-    FAKE_PINNED_RUST_VERSION='rustc 1.92.0 (fake)'
-assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.92 rustc --version"
-assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.92 cargo --version"
-assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.92 cargo build --release --no-default-features --features net,ssh -p microsandbox-cli"
-assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.92 cargo build --release -p agent-vm"
+    FAKE_PINNED_RUST_VERSION='rustc 1.94.0 (fake)'
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.94 rustc --version"
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.94 cargo --version"
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.94 cargo build --release --no-default-features --features net,ssh -p microsandbox-cli"
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.94 cargo build --release -p agent-vm"
 make_fixture old-pinned-rust
-expect_build_failure "Rust 1.91 or newer is required" "$fixture" "$fakebin" env FAKE_PINNED_RUST_VERSION='rustc 1.90.0 (fake)'
+expect_build_failure "Rust 1.94 or newer is required" "$fixture" "$fakebin" env FAKE_PINNED_RUST_VERSION='rustc 1.90.0 (fake)'
 make_fixture missing-rust-toolchain
 set +e
 output="$(run_build "$fixture" "$fakebin" env FAKE_RUSTUP_TOOLCHAIN_MISSING=1 2>&1)"
 status=$?
 set -e
 [[ $status -ne 0 ]] || fail "build unexpectedly succeeded with missing Rust toolchain"
-assert_contains "$output" "Rust toolchain 1.92 is not installed or usable"
+assert_contains "$output" "Rust toolchain 1.94 is not installed or usable"
 assert_contains "$output" "rustc"
-assert_contains "$output" "rustup toolchain install 1.92"
-assert_contains "$output" "RUSTUP_USE_CURL=1 rustup toolchain install 1.92"
+assert_contains "$output" "rustup toolchain install 1.94"
+assert_contains "$output" "RUSTUP_USE_CURL=1 rustup toolchain install 1.94"
 calls="$(cat "$fixture/calls.log")"
 assert_not_contains "$calls" "docker info"
 assert_not_contains "$calls" "cargo cwd="
@@ -377,10 +393,10 @@ output="$(run_build "$fixture" "$fakebin" env FAKE_RUSTUP_CARGO_MISSING=1 2>&1)"
 status=$?
 set -e
 [[ $status -ne 0 ]] || fail "build unexpectedly succeeded with unusable pinned Cargo"
-assert_contains "$output" "Cargo component for Rust toolchain 1.92 is not installed or usable"
-assert_contains "$output" "rustup component add cargo --toolchain 1.92"
-assert_contains "$output" "RUSTUP_USE_CURL=1 rustup component add cargo --toolchain 1.92"
-assert_not_contains "$output" "rustup toolchain install 1.92"
+assert_contains "$output" "Cargo component for Rust toolchain 1.94 is not installed or usable"
+assert_contains "$output" "rustup component add cargo --toolchain 1.94"
+assert_contains "$output" "RUSTUP_USE_CURL=1 rustup component add cargo --toolchain 1.94"
+assert_not_contains "$output" "rustup toolchain install 1.94"
 calls="$(cat "$fixture/calls.log")"
 assert_not_contains "$calls" "docker info"
 assert_not_contains "$calls" "cargo cwd="

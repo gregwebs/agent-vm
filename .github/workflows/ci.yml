@@ -17,9 +17,10 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable # zizmor: ignore[unpinned-uses] dtolnay/rust-toolchain deliberately maintains `stable`/`beta`/`nightly` as floating branches; pinning to a SHA freezes toolchain resolution and defeats the action's purpose (see its README).
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
+          toolchain: "1.94"
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -59,3 +60,23 @@ jobs:
       - name: Clippy
         continue-on-error: true
         run: cargo clippy -p agent-vm --release -- -D warnings
+
+  # macOS is a first-class supported host (script/build/macos.sh,
+  # macos-build.md) but a full libkrunfw/msb build is too slow for per-PR
+  # CI (it's covered separately in release-npm.yml). This leg proves the
+  # 1.94 pin's own logic — the toolchain-version parsing, floor guard, and
+  # rustup invocation shape — runs correctly on the platform that carries
+  # it, without paying for a real toolchain/VM build: build-workflow.sh
+  # exercises script/build/macos.sh entirely against fake `rustc`/`cargo`/
+  # `rustup` on PATH (see the script's make_fixture), so it needs no Rust
+  # toolchain install step at all.
+  macos-build-script:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Run macOS build script workflow tests
+        run: bash script/test/build-workflow.sh
