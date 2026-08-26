@@ -5,7 +5,7 @@ Sandboxed VMs for AI coding agents — Claude Code, Codex CLI, OpenCode
 [microsandbox](https://github.com/wirenboard/microsandbox).
 
 This package is a thin launcher; the actual native binaries
-(`agent-vm`, the patched `msb`, libkrunfw) ship in the
+(`agent-vm`, `msb`, libkrunfw) ship in the
 platform-specific subpackage installed automatically as an
 `optionalDependency` (e.g. `@wirenboard/agent-vm-linux-x64`).
 

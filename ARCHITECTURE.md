@@ -560,17 +560,28 @@ vendor/microsandbox/  (branch: agent-vm-secret-file)
         └── handler.rs          #   per-connection state machine
 
 crates/agent-vm/src/
-├── msb_install.rs              # discover and validate patched msb; point MSB_PATH at it
+├── msb_install.rs              # discover and validate msb's official-version identity; point MSB_PATH at it
 ├── intercept_hook.rs           # new: `agent-vm _intercept-hook` subprocess
 ├── secrets.rs                  # switched from Static(token) to File(<state>.secrets/{anthropic,openai})
 └── run.rs                      # registers the interceptor with two rules
 ```
 
-### Patched `msb` shipped via `MSB_PATH`
+### `msb` shipped via `MSB_PATH`
 
-At startup, every agent-vm invocation resolves and validates its patched
-`msb` before constructing the async runtime, then sets `MSB_PATH` to that
-binary (the top of microsandbox's resolution ladder). Discovery prefers an
+At startup, every agent-vm invocation resolves and validates its bundled
+`msb`'s version identity before constructing the async runtime, then sets
+`MSB_PATH` to that binary (the top of microsandbox's resolution ladder).
+Since agent-vm issue #40, "validates" means confirming `msb --version`
+reports exactly the official upstream Microsandbox version this agent-vm
+build vendors (`msb_install.rs::verify_official_identity`) — not, as when
+this Phase 4 section was written, a `+agent-vm`-suffixed fork marker; the
+`gw` fork this section otherwise describes was replaced by the clean
+v0.6.15 baseline, and the file-backed `SecretValue`/per-route intercept
+hook the rest of this section walks through are accordingly not wired
+into the boot path today (see `fail_closed.rs` and issue #40's PR). The
+historical description below is kept because `intercept_hook.rs` and
+`secrets.rs` still carry this design, pending a re-port onto baseline's
+equivalent (but differently-shaped) secrets API. Discovery prefers an
 explicit `MSB_PATH`, then an `msb` sibling in an installed bundle, then the
 signed source artifact at `vendor/microsandbox/build/msb`. The user's
 `~/.microsandbox/bin/msb` is never touched, so upstream-installed tooling on
@@ -600,7 +611,7 @@ subsection for *where*) with 0600 perms via atomic-write-then-rename.
 The launcher passes the file path to microsandbox as a
 `SecretValue::File`.
 
-The patched msb's TLS-intercept proxy calls `SecretValue::resolve()`
+msb's TLS-intercept proxy calls `SecretValue::resolve()`
 at *connection-setup* time — every new TCP connection re-reads the
 file. So any host-side rotation (whether triggered by the user's
 external `claude` use or by our interceptor hook below) is visible

@@ -24,10 +24,10 @@ cd ~/your-project
 agent-vm claude           # or codex / opencode / shell
 ```
 
-The npm package bundles a prebuilt `agent-vm` binary, the patched
-`msb`, and libkrunfw. agent-vm finds them via
-`current_exe()`-relative paths, so a user's separate
-`~/.microsandbox/bin/msb` (if any) never shadows the patched build.
+The npm package bundles a prebuilt `agent-vm` binary, `msb`, and
+libkrunfw. agent-vm finds them via `current_exe()`-relative paths, so a
+user's separate `~/.microsandbox/bin/msb` (if any) never shadows the
+bundled build.
 
 ## Subcommands
 
@@ -39,12 +39,15 @@ msb <args...>                       forward to the bundled msb (e.g. msb ls, msb
 clipboard {get,put} [--sys]         exchange a string with the project sandbox
 ```
 
-`agent-vm` keeps its sandbox registry under a private `MSB_HOME`
-(`~/.local/state/agent-vm/msb-home`), so a separately-installed `msb ls` won't
-show the sandboxes agent-vm launched — it reads the default
-`~/.microsandbox` instead. `agent-vm msb ls` (and any other `agent-vm msb
-<args...>`) forwards to the bundled `msb` with `MSB_HOME`/`MSB_PATH` already
-pointed at agent-vm's own state, so it sees the same sandboxes agent-vm does.
+`agent-vm` keeps its sandbox registry under a private `MSB_HOME` —
+`~/.local/state/agent-vm/msb-home` on Linux, `~/.agent-vm-msb` on macOS
+(shortened so per-sandbox Unix-socket paths stay well under macOS's
+104-byte `sun_path` limit; override either with `AGENT_VM_STATE_DIR`) —
+so a separately-installed `msb ls` won't show the sandboxes agent-vm
+launched — it reads the default `~/.microsandbox` instead. `agent-vm msb
+ls` (and any other `agent-vm msb <args...>`) forwards to the bundled
+`msb` with `MSB_HOME`/`MSB_PATH` already pointed at agent-vm's own
+state, so it sees the same sandboxes agent-vm does.
 
 ## Image release cadence
 
@@ -129,7 +132,7 @@ for the full contract and design rationale.
 ## Shared microsandbox image cache
 
 By default agent-vm keeps its microsandbox state — including the OCI image
-cache — entirely private under `~/.local/state/agent-vm/msb-home/`, so a
+cache — entirely private under `MSB_HOME` (see above), so a
 separately installed `msb` (Homebrew on macOS; a distro package,
 `cargo install`, or a from-source build on Linux) can never shadow
 agent-vm's KVM-enabled `libkrunfw`. That also means agent-vm and any other
@@ -142,7 +145,7 @@ or pulled twice. Use `AGENT_VM_MSB_CACHE_DIR=<path>` to point at a
 non-default cache location instead.
 
 What stays private: `db/`, `tls/`, `secrets/`, and `sandboxes/` remain under
-`~/.local/state/agent-vm/msb-home/`; only the cache is shared. `libkrunfw` is
+`MSB_HOME`; only the cache is shared. `libkrunfw` is
 unaffected (resolved via `MSB_PATH`, not the cache override), so the
 shadowing protection above is unchanged.
 
@@ -153,7 +156,7 @@ two concurrently against the shared cache with mismatched versions. If
 images misbehave, unset the variable to fall back to the private cache.
 
 **Reverting is a manual step.** The redirect is persisted to
-`~/.local/state/agent-vm/msb-home/config.json`. Unsetting
+`MSB_HOME/config.json`. Unsetting
 `AGENT_VM_SHARE_MSB_CACHE` does **not** by itself restore the private cache —
 agent-vm only writes `config.json` when the flag is on, so a later flag-off
 run leaves the previously written `paths.cache` pointing at the shared
@@ -163,11 +166,10 @@ directory. To fully revert, delete that `config.json` (or remove the
 ## Recovering from a forward-migrated microsandbox db
 
 sea-orm migrations in microsandbox are one-way. If a newer, separately
-installed `msb` ever opens agent-vm's private
-`~/.local/state/agent-vm/msb-home/db/msb.db`, it forward-migrates the
-schema — and the older bundled `msb` agent-vm ships can then never open
-that database again. Every subsequent `agent-vm` command that talks to the
-db (`claude`, `codex`, `shell`, ...) fails.
+installed `msb` ever opens agent-vm's private `MSB_HOME/db/msb.db`, it
+forward-migrates the schema — and the older bundled `msb` agent-vm ships
+can then never open that database again. Every subsequent `agent-vm`
+command that talks to the db (`claude`, `codex`, `shell`, ...) fails.
 
 agent-vm detects this up front — on `shell`/`run` and on `agent-vm msb
 <args...>` — and stops with a message naming the offending migration(s)
@@ -270,6 +272,17 @@ disjoint groups by design. `--allow-host` is the narrowest way to
 reach a dev server bound to host `127.0.0.1`; `--allow-lan` is the
 broadest. A compromised in-guest process gets full access to
 whatever you open, so prefer the narrowest flag that fits.
+
+**Currently unsupported (agent-vm issue #40):** `--auto-publish`,
+`--allow-egress`, `--allow-lan`, and `--allow-host` each refuse with an
+actionable error naming the flag and this issue instead of booting —
+the Microsandbox v0.6.15 baseline this agent-vm build vendors doesn't
+have the `NetworkBuilder` methods these relied on yet, and re-expressing
+them onto baseline's new rule-based `NetworkPolicy` grammar correctly is
+follow-up work. `--publish` (inbound port forwarding) is unaffected and
+still works. A guest-egress HTTP proxy (`HTTPS_PROXY`/`HTTP_PROXY`/
+`ALL_PROXY` set at launch) fails closed the same way, for the same
+reason.
 
 ## Troubleshooting
 

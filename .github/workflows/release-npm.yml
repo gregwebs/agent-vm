@@ -1,6 +1,6 @@
 name: release-npm
 
-# Build the agent-vm binary + patched msb + bundle libkrunfw for each
+# Build the agent-vm binary + msb + bundle libkrunfw for each
 # supported platform, then publish the main package and per-platform
 # subpackages to npm. Tagged releases only — `v<semver>` (e.g. v1.2.3).
 #

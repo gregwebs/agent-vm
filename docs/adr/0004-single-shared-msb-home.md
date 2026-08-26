@@ -77,6 +77,20 @@ worktree when building/running agent-vm itself, closing the gap that
 made this collision a live risk in the first place (this repo's own
 workflow is worktree-heavy).
 
+## Addendum (agent-vm issue #40 / ADR-0006)
+
+The "the default path is well under the socket-path limit again" claim
+in the Decision above held only for short home directories — as little
+as ~21 bytes of headroom remained under macOS's 104-byte `sun_path` for
+the flat `<state_root>/msb-home` default, not a real margin for every
+user. Issue #40 shortened the macOS default further (`$HOME/.agent-vm-msb`
+instead of `$HOME/.local/state/agent-vm/msb-home`) and added a preflight
+that fails closed — never truncates — on any path, default or
+overridden, that would still overflow. See ADR-0006 for the full
+context. This ADR's core decision (one flat, un-namespaced `MSB_HOME`,
+detect-and-recover via #30/#28 rather than prevent via namespacing) is
+unaffected.
+
 ## Consequences
 
 - End users get a materially better outcome than either the pre-#36
