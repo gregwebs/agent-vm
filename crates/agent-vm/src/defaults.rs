@@ -46,3 +46,14 @@ pub const FIRST_ADVERTISED_CAPABILITIES_IMAGE_API: u32 = 2;
 
 /// Marker written last by the Chrome DevTools tooling layer after its checks pass.
 pub const CHROME_MCP_CAPABILITY_PATH: &str = "/etc/agent-vm-capabilities/chrome-devtools-mcp";
+
+/// Writable OCI-upper capacity for every sandbox, in mebibytes.
+///
+/// v0.6.15 unified the writable overlay for an OCI rootfs into
+/// `SandboxBuilder::root_disk()` (the pre-0.6.0 `oci_upper_size()` alias is
+/// `#[deprecated]` and just forwards to it — see `run.rs`'s boot builder).
+/// Passed explicitly (AC#3 of agent-vm issue #40) rather than relying on the
+/// SDK's own default, so a release can retune capacity by editing this one
+/// constant. 16 GiB preserves the headroom the pre-migration `gw` fork's
+/// hard-coded ext4-overlay-size patch gave every sandbox.
+pub const WRITABLE_UPPER_MIB: u32 = 16 * 1024;

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // Tiny launcher: resolve the platform-specific subpackage, find its
 // `agent-vm` binary, and exec it with our argv. The platform
-// subpackages also bundle the patched `msb` binary and libkrunfw
-// alongside `agent-vm` — agent-vm itself discovers them via
-// `current_exe()`-relative paths, so the launcher only needs to
-// find the main binary.
+// subpackages also bundle the `msb` binary (built from the vendored
+// official Microsandbox release) and libkrunfw alongside `agent-vm` —
+// agent-vm itself discovers them via `current_exe()`-relative paths, so
+// the launcher only needs to find the main binary.
 //
 // Why a JS launcher at all? npm's `bin` field expects a JS or
 // shell entrypoint. We can't put the native binary directly here

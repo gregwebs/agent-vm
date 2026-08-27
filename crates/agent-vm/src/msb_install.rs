@@ -1,12 +1,10 @@
-//! Discover and validate the patched `msb` binary that agent-vm needs.
+//! Discover and validate the `msb` binary that agent-vm needs.
 //!
-//! agent-vm depends on a patched microsandbox CLI (`msb`) — it ships a
-//! `SecretValue::File` variant, the request-interceptor hook with
-//! `dispatch_on_headers`, and a few other agent-vm-only features that
-//! aren't in upstream. To avoid colliding with a user's separate
-//! `~/.microsandbox/bin/msb` install (which would otherwise win on the
-//! SDK's resolution ladder), agent-vm explicitly sets `MSB_PATH` to
-//! its own bundled binary.
+//! agent-vm vendors a specific upstream Microsandbox release as a git
+//! submodule (`vendor/microsandbox`) and bundles the `msb` CLI built from
+//! it. To avoid colliding with a user's separate `~/.microsandbox/bin/msb`
+//! install (which would otherwise win on the SDK's resolution ladder),
+//! agent-vm explicitly sets `MSB_PATH` to its own bundled binary.
 //!
 //! ## Discovery
 //!
@@ -20,11 +18,13 @@
 //!    produced by `script/build/macos.sh` in a source checkout.
 //!
 //! The first existing candidate wins. The resolved binary's
-//! `--version` output MUST contain the `+agent-vm` marker (the
-//! patched build tags itself, e.g. `msb 0.4.6+agent-vm.phase4`) —
-//! otherwise we refuse to run with a clear "your install is stale or
-//! shadowed by an upstream msb" error rather than producing weird
-//! runtime failures inside the sandbox.
+//! `--version` output MUST report exactly the official upstream version
+//! this build vendors (agent-vm issue #40 dropped the pre-0.6.15 `gw`
+//! fork's `+agent-vm` version-suffix convention along with the fork
+//! itself) — a mismatch, in either direction, means the binary at the
+//! resolved path is not the one this `agent-vm` build was compiled
+//! against, so we refuse to run with a clear, actionable error rather
+//! than producing weird runtime failures inside the sandbox.
 
 use std::{
     path::{Path, PathBuf},
@@ -33,11 +33,26 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-/// Marker that the patched `msb --version` must contain. Upstream
-/// builds print `msb <semver>` with no suffix; agent-vm's vendored
-/// build appends `+agent-vm.phase<N>` so we can detect a shadowing
-/// upstream binary.
-const PATCHED_VERSION_MARKER: &str = "+agent-vm";
+/// The upstream Microsandbox version this build vendors, read directly out
+/// of `vendor/microsandbox/Cargo.toml` at COMPILE TIME (`include_str!`) so
+/// it can never drift from the submodule gitlink a given `cargo build`
+/// actually compiled against — a hand-maintained constant left stale after
+/// a gitlink bump is exactly the kind of silent mismatch AC#4 (agent-vm
+/// issue #40) exists to prevent. Panics at first use if the vendored
+/// `Cargo.toml` doesn't have the expected `version = "…"` line, which
+/// would mean the submodule checkout itself is broken — loud and immediate
+/// is correct there, not a runtime fallback.
+fn expected_msb_version() -> &'static str {
+    const VENDORED_CARGO_TOML: &str = include_str!("../../../vendor/microsandbox/Cargo.toml");
+    VENDORED_CARGO_TOML
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("version = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect(
+            "vendor/microsandbox/Cargo.toml must have a top-level `version = \"…\"` line \
+             (workspace.package.version)",
+        )
+}
 
 /// Opt-in switch: when truthy, agent-vm points msb's OCI image cache at the
 /// shared `~/.microsandbox/cache` a separately-installed msb uses (Homebrew
@@ -143,7 +158,7 @@ fn missing_msb_diagnostic(layout: MissingMsbLayout) -> &'static str {
     }
 }
 
-/// Resolve the path to the patched msb that agent-vm should use.
+/// Resolve the path to the official-version msb that agent-vm should use.
 ///
 /// Returns `Ok(Some(path))` on success, `Ok(None)` if no candidate
 /// exists at all, or `Err` only on a present-but-broken candidate
@@ -174,7 +189,7 @@ pub fn resolved_msb_path() -> Result<Option<PathBuf>> {
             "MSB_PATH={} is set but the file does not exist, and no fallback msb \
              was found next to {}.\n\
              Either `unset MSB_PATH` to use the default discovery path, or point \
-             it at a valid patched msb.",
+             it at a valid msb build.",
             p.display(),
             std::env::current_exe()
                 .map(|e| e.display().to_string())
@@ -346,7 +361,35 @@ fn write_shared_cache_config(msb_home: &Path, cache_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The private `MSB_HOME` path agent-vm pins msb at: `state_root()/msb-home`.
+/// macOS-only short `MSB_HOME` root, used in place of
+/// `state_root()/msb-home` when neither `AGENT_VM_STATE_DIR` nor
+/// `XDG_STATE_HOME` is set. See [`msb_home_dir`]'s doc comment for why.
+const SHORT_MACOS_MSB_HOME_DIRNAME: &str = ".agent-vm-msb";
+
+/// The private `MSB_HOME` path agent-vm pins msb at.
+///
+/// Normally `state_root()/msb-home` — but on macOS, when neither
+/// `AGENT_VM_STATE_DIR` nor `XDG_STATE_HOME` is set (i.e. `state_root()`
+/// would fall through to its `$HOME/.local/state/agent-vm` default), this
+/// returns the much shorter `$HOME/.agent-vm-msb` instead (AC#6, agent-vm
+/// issue #40).
+///
+/// Why: v0.6.15's per-sandbox agent/control sockets live at
+/// `<MSB_HOME>/run/sandboxes/<24-hex-char-id>/{agent,control}.sock`
+/// (`vendor/microsandbox/crates/runtime/lib/ipc.rs::sandbox_socket_paths`).
+/// The sandbox *name* itself is SHA-256-hashed to that fixed-length id
+/// before it ever reaches a socket path, so — unlike in the pre-#40 fork
+/// vintage this AC's wording was written against — the long, unbounded
+/// component is NOT the sandbox name; it's the fixed
+/// `/run/sandboxes/<24 hex chars>/control.sock` suffix (83 bytes under the
+/// old default root) plus whatever `$HOME` itself costs. macOS's
+/// `sockaddr_un.sun_path` is only 104 bytes total, so the old default left
+/// as little as ~21 bytes of headroom for `$HOME` — silently overflowing
+/// for any real home directory longer than roughly `/Users/xxxxx`. Under
+/// this short root the same fixed suffix is 66 bytes, leaving ~38 bytes
+/// for `$HOME`, which [`ensure_socket_paths_fit`] then verifies against
+/// the *actual* boot-time sandbox name rather than trusting headroom
+/// alone.
 ///
 /// Side-effect-free (no dir creation, no env mutation) — the single source
 /// of truth for the path itself, shared by [`point_at_msb_home`] (which
@@ -356,9 +399,100 @@ fn write_shared_cache_config(msb_home: &Path, cache_dir: &Path) -> Result<()> {
 /// pure inputs works whether or not `point_at_msb_home()` has run in this
 /// process, and doesn't depend on the setenv-before-runtime invariant.
 pub fn msb_home_dir() -> Result<PathBuf> {
+    if let Some(short) = short_macos_msb_home(
+        cfg!(target_os = "macos"),
+        state_root_overridden(),
+        std::env::var_os("HOME").as_deref(),
+    ) {
+        return Ok(short);
+    }
     Ok(crate::host_paths::state_root()
         .ok_or_else(|| anyhow::anyhow!("could not resolve agent-vm state root ($HOME unset?)"))?
         .join("msb-home"))
+}
+
+/// Pure core of the macOS short-root special case in [`msb_home_dir`].
+///
+/// `None` means "fall through to the normal `state_root()/msb-home`
+/// path" (non-macOS, an explicit override, or `$HOME` unset — the latter
+/// deliberately left to `state_root()`'s own "could not resolve" error
+/// rather than duplicated here). Split out from `msb_home_dir` so tests
+/// can exercise the selection logic with explicit inputs instead of
+/// mutating process-wide `$HOME`/env vars, which `cargo test`'s default
+/// parallel test threads make unsafe to do from within a `#[test]`.
+fn short_macos_msb_home(
+    is_macos: bool,
+    state_root_overridden: bool,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if !is_macos || state_root_overridden {
+        return None;
+    }
+    home.map(|h| PathBuf::from(h).join(SHORT_MACOS_MSB_HOME_DIRNAME))
+}
+
+/// Whether the user explicitly overrode where agent-vm's state lives —
+/// the same two env vars [`crate::host_paths::state_root`] checks before
+/// falling back to its `$HOME/.local/state/agent-vm` default. Mirrored
+/// here (rather than calling `state_root()` and comparing) so
+/// [`msb_home_dir`] can special-case macOS's *default* without silently
+/// overriding a path the user asked for.
+fn state_root_overridden() -> bool {
+    std::env::var_os("AGENT_VM_STATE_DIR").is_some() || std::env::var_os("XDG_STATE_HOME").is_some()
+}
+
+/// Maximum byte length of a Unix-domain socket path this platform can
+/// actually bind, leaving room for the mandatory NUL terminator inside
+/// `sockaddr_un.sun_path` (a fixed-size buffer: 104 bytes on macOS/BSD,
+/// 108 on Linux — the raw buffer size, not the usable string length).
+#[cfg(target_os = "macos")]
+const SUN_PATH_USABLE_LEN: usize = 104 - 1;
+#[cfg(all(unix, not(target_os = "macos")))]
+const SUN_PATH_USABLE_LEN: usize = 108 - 1;
+
+/// Fail closed, before boot, if `sandbox_name`'s real agent/control socket
+/// paths under `msb_home_dir()` would overflow this platform's
+/// `sockaddr_un.sun_path` (AC#6, agent-vm issue #40).
+///
+/// Reuses the runtime's own [`microsandbox_runtime::ipc::sandbox_socket_paths`]
+/// derivation rather than re-implementing the hash/path template, so this
+/// check can't silently drift out of sync with the path the boot actually
+/// binds. The macOS default root ([`msb_home_dir`]) already gives real
+/// home directories generous headroom (see its doc comment) — this is the
+/// defensive backstop for the cases headroom alone can't rule out: an
+/// unusually long `$HOME`, or a user-supplied `AGENT_VM_STATE_DIR` that
+/// re-introduces the same overflow the short default was built to avoid.
+/// Never truncates a path to make it fit; a computed overflow is always a
+/// hard error naming the offending path and the fix (a shorter
+/// `AGENT_VM_STATE_DIR`).
+pub fn ensure_socket_paths_fit(sandbox_name: &str) -> Result<()> {
+    // "run" mirrors `microsandbox_utils::RUN_SUBDIR` / `LocalConfig::run_dir()`
+    // (vendor/microsandbox/sdk/rust/lib/config/mod.rs) — not worth an extra
+    // direct dependency on microsandbox-utils just for this one literal.
+    let run_dir = msb_home_dir()?.join("run");
+    let paths = microsandbox_runtime::ipc::sandbox_socket_paths(&run_dir, sandbox_name);
+    // `control.sock` is always the longer of the two canonical socket
+    // names ("control" > "agent"), so checking it alone covers both.
+    check_socket_path_len(&paths.control, sandbox_name)
+}
+
+/// Pure length check behind [`ensure_socket_paths_fit`], taking an
+/// already-derived socket path instead of deriving one from live env vars
+/// — lets tests supply a contrived long path without needing a real
+/// overlong `$HOME`/`AGENT_VM_STATE_DIR` in the process environment.
+fn check_socket_path_len(socket_path: &Path, sandbox_name: &str) -> Result<()> {
+    let len = socket_path.as_os_str().len();
+    if len > SUN_PATH_USABLE_LEN {
+        bail!(
+            "the control socket path for sandbox {sandbox_name:?} is {len} bytes, exceeding \
+             this platform's {SUN_PATH_USABLE_LEN}-byte Unix-domain-socket path limit:\n  {}\n\
+             Set a shorter AGENT_VM_STATE_DIR (e.g. `export AGENT_VM_STATE_DIR=~/.avm`) and retry \
+             — agent-vm never truncates this path silently, since a truncated path could bind to \
+             the wrong (or another user's) socket.",
+            socket_path.display(),
+        );
+    }
+    Ok(())
 }
 
 /// Point msb at the agent-vm-controlled state dir instead of
@@ -441,7 +575,7 @@ pub fn point_at_msb() -> Result<()> {
         }
     };
 
-    verify_patched_marker(&resolved)?;
+    verify_official_identity(&resolved)?;
 
     // SAFETY: `main()` is a plain `fn main` and calls `point_at_msb`
     // BEFORE constructing the tokio runtime. setenv() is not thread-
@@ -453,16 +587,20 @@ pub fn point_at_msb() -> Result<()> {
     Ok(())
 }
 
-/// Run `<msb> --version` and require its stdout to contain
-/// [`PATCHED_VERSION_MARKER`]. This catches the failure mode where
-/// a vanilla upstream `msb` ends up at our discovered path —
-/// it'd run, but agent-vm's hooks and SecretValue::File would be
-/// silently absent, producing inscrutable runtime errors instead.
-fn verify_patched_marker(msb: &std::path::Path) -> Result<()> {
-    verify_patched_marker_with_path_source(msb, std::env::var_os("MSB_PATH").is_some())
+/// Run `<msb> --version` and require it to report exactly the official
+/// upstream Microsandbox version this build vendors ([`expected_msb_version`]).
+/// This catches two failure modes: a shadowing binary from a *different*
+/// install (a stale reinstall, a `~/.microsandbox/bin/msb` from a
+/// differently-versioned standalone microsandbox install, or — pre-#40 —
+/// this build's own bundled patched fork build) at our discovered path.
+/// Either way it'd run, but potentially behave differently inside the
+/// sandbox than the exact build agent-vm was compiled and tested against,
+/// producing inscrutable runtime errors instead of this upfront check.
+fn verify_official_identity(msb: &std::path::Path) -> Result<()> {
+    verify_official_identity_with_path_source(msb, std::env::var_os("MSB_PATH").is_some())
 }
 
-fn verify_patched_marker_with_path_source(
+fn verify_official_identity_with_path_source(
     msb: &std::path::Path,
     msb_path_is_explicit: bool,
 ) -> Result<()> {
@@ -479,21 +617,31 @@ fn verify_patched_marker_with_path_source(
             stdout.trim()
         );
     }
-    if !stdout.contains(PATCHED_VERSION_MARKER) {
+    let expected = expected_msb_version();
+    // clap's default `--version` output is `"<bin-name> <version>"`
+    // (`msb 0.6.15`); the version is always the last whitespace-separated
+    // token, regardless of what a shadowing binary happens to call itself.
+    let reported = stdout.trim().rsplit(char::is_whitespace).next().unwrap_or("");
+    if reported != expected {
         // Tailor the hint based on whether MSB_PATH is what pointed us
         // at this binary. If the user explicitly set MSB_PATH, "set
         // MSB_PATH explicitly" is the LAST thing they need to hear —
         // they need to unset it.
         let hint = if msb_path_is_explicit {
-            "Your MSB_PATH points at this binary. `unset MSB_PATH` to use the \
-             bundled patched msb, or point MSB_PATH at a patched build."
+            format!(
+                "Your MSB_PATH points at this binary. `unset MSB_PATH` to use the \
+                 bundled official msb, or point MSB_PATH at an msb {expected} build."
+            )
         } else {
             "Reinstall agent-vm (e.g. `npm install -g @wirenboard/agent-vm --force`) \
-             to restore the bundled patched msb."
+             to restore the bundled official msb."
+                .to_string()
         };
         bail!(
-            "{} is the upstream microsandbox binary (no '{PATCHED_VERSION_MARKER}' marker in --version: {:?}).\n\
-             agent-vm needs its own patched build.\n\
+            "{} reports version {reported:?}, but this agent-vm build vendors official \
+             Microsandbox {expected} (--version: {:?}).\n\
+             agent-vm needs the exact msb build it was vendored against — a different \
+             (older, newer, or forked) msb can silently behave differently inside the sandbox.\n\
              {hint}",
             msb.display(),
             stdout.trim(),
@@ -538,29 +686,43 @@ mod tests {
     }
 
     #[test]
-    fn verify_marker_accepts_patched_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = write_fake_msb(dir.path(), "msb 0.4.6+agent-vm.phase4");
-        verify_patched_marker(&p).expect("patched marker should be accepted");
+    fn expected_msb_version_reads_the_vendored_workspace_version() {
+        // Pinned literal, deliberately NOT derived from `expected_msb_version()`
+        // itself — this test exists to catch a `vendor/microsandbox` gitlink
+        // bump that the vendored Cargo.toml's version didn't actually track,
+        // which `include_str!` alone can't catch (it'd just read the new
+        // value). Bump this literal by hand alongside the gitlink.
+        assert_eq!(expected_msb_version(), "0.6.15");
     }
 
     #[test]
-    fn verify_marker_rejects_vanilla_with_branch_specific_hint() {
+    fn verify_identity_accepts_official_version() {
         let dir = tempfile::tempdir().unwrap();
-        let p = write_fake_msb(dir.path(), "msb 0.4.6");
+        let p = write_fake_msb(dir.path(), &format!("msb {}", expected_msb_version()));
+        verify_official_identity(&p).expect("official version should be accepted");
+    }
 
-        let err1 = verify_patched_marker_with_path_source(&p, false).unwrap_err();
+    #[test]
+    fn verify_identity_rejects_wrong_version_with_branch_specific_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        // An older/different version — including the pre-#40 fork's own
+        // `+agent-vm` suffix convention, which must now be rejected too:
+        // this build vendors the exact official version, not "any patched
+        // build that says +agent-vm somewhere".
+        let p = write_fake_msb(dir.path(), "msb 0.5.7+agent-vm.phase4");
+
+        let err1 = verify_official_identity_with_path_source(&p, false).unwrap_err();
         let msg1 = format!("{err1:?}");
         assert!(
-            msg1.contains("upstream microsandbox"),
-            "expected upstream-rejection message; got:\n{msg1}"
+            msg1.contains("reports version"),
+            "expected version-mismatch message; got:\n{msg1}"
         );
         assert!(
             msg1.to_lowercase().contains("reinstall agent-vm"),
             "missing 'reinstall agent-vm' hint when MSB_PATH unset: {msg1}"
         );
 
-        let err2 = verify_patched_marker_with_path_source(&p, true).unwrap_err();
+        let err2 = verify_official_identity_with_path_source(&p, true).unwrap_err();
         let msg2 = format!("{err2:?}");
         assert!(
             msg2.contains("unset MSB_PATH"),
@@ -569,19 +731,27 @@ mod tests {
     }
 
     #[test]
-    fn verify_marker_propagates_exec_failure() {
+    fn verify_identity_rejects_newer_stranger_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_fake_msb(dir.path(), "msb 9.9.9");
+        let err = verify_official_identity(&p).unwrap_err();
+        assert!(format!("{err:?}").contains("reports version"));
+    }
+
+    #[test]
+    fn verify_identity_propagates_exec_failure() {
         // Non-existent path: Command::new(...).output() returns an
         // io::Error before producing a status. We surface it with
         // an "executing" context.
         let bogus = std::path::Path::new("/nonexistent/agent-vm-test-bogus-msb");
-        let err = verify_patched_marker(bogus).unwrap_err();
+        let err = verify_official_identity(bogus).unwrap_err();
         assert!(format!("{err:?}").contains("executing"));
     }
 
     #[test]
     fn resolved_msb_path_honours_env_override() {
         let dir = tempfile::tempdir().unwrap();
-        let p = write_fake_msb(dir.path(), "msb 0.4.6+agent-vm.phase4");
+        let p = write_fake_msb(dir.path(), &format!("msb {}", expected_msb_version()));
         // Avoid mutating the process-wide env in parallel tests:
         // construct the same selection logic locally.
         let env_val: std::ffi::OsString = p.as_os_str().to_owned();
@@ -589,6 +759,83 @@ mod tests {
         let chosen = PathBuf::from(&env_val);
         assert!(chosen.exists());
         assert_eq!(chosen, p);
+    }
+
+    #[test]
+    fn short_macos_msb_home_used_on_macos_default() {
+        let home = std::ffi::OsStr::new("/Users/johnsmith");
+        let chosen = short_macos_msb_home(true, false, Some(home)).expect("macOS default applies");
+        assert_eq!(chosen, PathBuf::from("/Users/johnsmith/.agent-vm-msb"));
+    }
+
+    #[test]
+    fn short_macos_msb_home_falls_through_on_linux() {
+        let home = std::ffi::OsStr::new("/home/johnsmith");
+        assert_eq!(short_macos_msb_home(false, false, Some(home)), None);
+    }
+
+    #[test]
+    fn short_macos_msb_home_falls_through_when_state_root_overridden() {
+        // AGENT_VM_STATE_DIR / XDG_STATE_HOME must keep winning — the
+        // macOS short-root special case only applies to the *default*.
+        let home = std::ffi::OsStr::new("/Users/johnsmith");
+        assert_eq!(short_macos_msb_home(true, true, Some(home)), None);
+    }
+
+    #[test]
+    fn short_macos_msb_home_falls_through_without_home() {
+        assert_eq!(short_macos_msb_home(true, false, None), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn short_root_gives_more_socket_path_headroom_than_old_default() {
+        // The exact regression this AC exists to fix: a realistic macOS
+        // home directory that fits comfortably under the new short root
+        // but would have overflowed sun_path under the old
+        // `~/.local/state/agent-vm/msb-home` default. See
+        // `msb_home_dir`'s doc comment for the byte-budget derivation.
+        //
+        // macOS-only: the fixture's 104-byte control-socket path is chosen
+        // to exceed macOS's stricter 103-byte `SUN_PATH_USABLE_LEN` but
+        // sits comfortably under Linux's more permissive 107-byte limit,
+        // so on Linux it correctly would not overflow — this scenario (and
+        // the short-root special case it justifies) is macOS-specific in
+        // the first place, see `short_macos_msb_home`.
+        let old_default = Path::new("/Users/j.van-der-berg/.local/state/agent-vm/msb-home/run");
+        let short_root = Path::new("/Users/j.van-der-berg/.agent-vm-msb/run");
+        let name = "agent-vm-abcd1234efgh5678-99999";
+
+        let old_paths = microsandbox_runtime::ipc::sandbox_socket_paths(old_default, name);
+        let short_paths = microsandbox_runtime::ipc::sandbox_socket_paths(short_root, name);
+
+        assert!(
+            old_paths.control.as_os_str().len() > SUN_PATH_USABLE_LEN,
+            "test fixture should reproduce the old default's overflow: {} bytes",
+            old_paths.control.as_os_str().len(),
+        );
+        assert!(check_socket_path_len(&short_paths.control, name).is_ok());
+    }
+
+    #[test]
+    fn check_socket_path_len_accepts_a_short_path() {
+        assert!(check_socket_path_len(Path::new("/tmp/short/control.sock"), "s").is_ok());
+    }
+
+    #[test]
+    fn check_socket_path_len_fails_closed_on_overflow_with_actionable_message() {
+        let long = Path::new("/Users/x").join("a".repeat(SUN_PATH_USABLE_LEN)).join("control.sock");
+        let err = check_socket_path_len(&long, "my-sandbox").unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("my-sandbox"), "should name the sandbox: {msg}");
+        assert!(
+            msg.contains("AGENT_VM_STATE_DIR"),
+            "should name the fix: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("truncat") || msg.contains("never truncates"),
+            "must not imply silent truncation: {msg}"
+        );
     }
 
     #[test]

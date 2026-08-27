@@ -46,6 +46,14 @@ one worktree in the same session (or expect to), set
 Hitting the guard isn't dangerous (nothing is deleted, the error names
 the fix), just a time cost worth avoiding proactively.
 
+On macOS, keep the resulting `AGENT_VM_STATE_DIR` short. Unix-domain
+sockets have a ~103-108 byte `sun_path` limit depending on platform,
+and microsandbox binds each sandbox's control/agent socket under this
+root — a long worktree or branch name folded into the path above can
+overflow it. The socket-path preflight added by #40 fails closed with
+a clear error if this happens (it never silently truncates the path);
+the fix is simply to pick a shorter override, e.g. `~/.avm`.
+
 ## Don't relocate build output to `/tmp` or `/dev/shm`
 
 If a build is too big, slow, or runs out of inodes, fix the root

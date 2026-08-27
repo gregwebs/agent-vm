@@ -775,7 +775,10 @@ pub async fn load_derived_image(cache_dir: &Path, tar: &Path, tag: &str) -> Resu
     microsandbox_image::load_archive(
         cache_dir,
         tar,
-        microsandbox_image::ImageLoadOptions { tags: vec![tag.to_string()] },
+        microsandbox_image::ImageLoadOptions {
+            tags: vec![tag.to_string()],
+            ..Default::default()
+        },
     )
     .await
     .with_context(|| format!("loading tooling layer {tag} into the msb cache"))?;

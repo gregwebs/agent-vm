@@ -3,6 +3,7 @@
 mod clipboard;
 mod defaults;
 mod doctor;
+mod fail_closed;
 mod github_graphql;
 mod host_paths;
 mod image_api_version;

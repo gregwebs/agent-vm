@@ -25,6 +25,23 @@ microsandbox-image = { path = "../../vendor/microsandbox/crates/image" }
 # build graph transitively via the microsandbox SDK crate; this just makes
 # Migrator nameable here. No new compilation.
 microsandbox-migration = { path = "../../vendor/microsandbox/crates/migration" }
+# Direct dep because the v0.6.15 baseline SDK no longer re-exports this crate
+# (the 0.5.7 gw fork's sdk/rust/lib/lib.rs did). run.rs/intercept_hook.rs need
+# policy::DestinationGroup and the secrets handler/config types directly to
+# express egress policy and to keep the fail-closed guards for fork-only
+# features (proxy egress, credential intercept, auto-publish) compile-checked.
+# See agent-vm issue #40.
+microsandbox-network = { path = "../../vendor/microsandbox/crates/network" }
+# Direct dep so src/msb_install.rs can reuse the runtime's OWN
+# `ipc::sandbox_socket_paths` derivation (SHA-256-hashed per-sandbox socket
+# dir, not the raw sandbox name) for the macOS Unix-socket-path-limit
+# preflight (AC#6, agent-vm issue #40) — reusing it, instead of
+# re-implementing the hash/path template by hand, keeps the check from
+# silently drifting out of sync with the actual boot path. Already in the
+# build graph transitively via the "net"-enabled SDK; default-features=false
+# only opts this crate itself out of "prebuilt"/"net", which nothing here
+# needs. No new compilation.
+microsandbox-runtime = { path = "../../vendor/microsandbox/crates/runtime", default-features = false }
 # Direct dep only so src/msb_preflight.rs can name Database/Statement/query_all
 # to read applied seaql_migrations without going through the SDK's crashing
 # open path (Migrator::up). Already in the build graph transitively (SDK +
@@ -56,11 +73,7 @@ ipnetwork = "0.21"
 # file under the msb cache dir rather than the system tmp, per AGENTS.md).
 tempfile = "3"
 
-# Integration tests that drive the actual secret-substitution layer
-# end-to-end with the hook's anonymisation logic. Kept out of release
-# deps so production builds don't pull in the entire network stack.
 [dev-dependencies]
-microsandbox-network = { path = "../../vendor/microsandbox/crates/network" }
 # Used only by the msb_preflight / preflight_boot / msb_passthrough tests to
 # CONSTRUCT a valid SQLite fixture DB with a seaql_migrations table (a plain
 # `std::fs::write` of arbitrary bytes, as doctor_reset.rs's fixture does, is

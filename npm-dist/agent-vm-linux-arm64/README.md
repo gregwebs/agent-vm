@@ -1,6 +1,6 @@
 # @wirenboard/agent-vm-linux-arm64
 
-Prebuilt `agent-vm` binary + patched `msb` + libkrunfw for linux/arm64.
+Prebuilt `agent-vm` binary + `msb` + libkrunfw for linux/arm64.
 
 You don't install this directly. The user-facing package is
 [`@wirenboard/agent-vm`](https://www.npmjs.com/package/@wirenboard/agent-vm),

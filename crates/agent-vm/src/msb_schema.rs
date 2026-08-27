@@ -4,7 +4,7 @@
 //! Derived from the compiled-in sea-orm migration set
 //! rather than a hand-maintained constant, so it can never drift
 //! from the migrations it names. It is the highest migration id,
-//! e.g. m20260606_000001.
+//! e.g. m20260824_000001.
 //!
 //! Used by `msb_preflight`'s ahead-of-bundle guard to compare against an
 //! on-disk database, and named in that guard's block message so a user
@@ -63,7 +63,7 @@ pub fn db_ahead_of_bundle(applied_versions: &[String]) -> Option<DbAheadOfBundle
 }
 
 /// Extract the schema-id prefix (m<date>_<seq>) from a full migration
-/// name like m20260606_000001_named_volume_kinds giving m20260606_000001.
+/// name like m20260824_000001_mount_owner_config giving m20260824_000001.
 /// The id is the first two underscore-delimited fields. If a name
 /// somehow has fewer than two underscores, the whole name is returned.
 fn schema_id(name: &str) -> &str {
@@ -92,7 +92,7 @@ mod tests {
     fn identifier_matches_pinned_bundled_schema() {
         assert_eq!(
             bundled_schema_version(),
-            "m20260606_000001",
+            "m20260824_000001",
             "bundled microsandbox schema id changed; if intended, \
              update this pinned value (see #31 for MSB_HOME namespacing)"
         );
@@ -101,8 +101,8 @@ mod tests {
     #[test]
     fn schema_id_extracts_date_seq_prefix() {
         assert_eq!(
-            schema_id("m20260606_000001_named_volume_kinds"),
-            "m20260606_000001"
+            schema_id("m20260824_000001_mount_owner_config"),
+            "m20260824_000001"
         );
         assert_eq!(
             schema_id("m20260305_000001_create_image_tables"),
@@ -117,7 +117,7 @@ mod tests {
         // regardless of how many underscores follow in the description, so
         // a hypothetical next migration whose description itself contains
         // underscores (e.g. m20260606_000002_add_foo_bar_baz) still yields
-        // a clean id distinct from today's pinned m20260606_000001.
+        // a clean id distinct from today's pinned m20260824_000001.
         assert_eq!(
             schema_id("m20260606_000002_add_foo_bar_baz"),
             "m20260606_000002"
