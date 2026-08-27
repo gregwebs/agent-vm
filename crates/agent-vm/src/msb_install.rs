@@ -788,12 +788,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn short_root_gives_more_socket_path_headroom_than_old_default() {
         // The exact regression this AC exists to fix: a realistic macOS
         // home directory that fits comfortably under the new short root
         // but would have overflowed sun_path under the old
         // `~/.local/state/agent-vm/msb-home` default. See
         // `msb_home_dir`'s doc comment for the byte-budget derivation.
+        //
+        // macOS-only: the fixture's 104-byte control-socket path is chosen
+        // to exceed macOS's stricter 103-byte `SUN_PATH_USABLE_LEN` but
+        // sits comfortably under Linux's more permissive 107-byte limit,
+        // so on Linux it correctly would not overflow — this scenario (and
+        // the short-root special case it justifies) is macOS-specific in
+        // the first place, see `short_macos_msb_home`.
         let old_default = Path::new("/Users/j.van-der-berg/.local/state/agent-vm/msb-home/run");
         let short_root = Path::new("/Users/j.van-der-berg/.agent-vm-msb/run");
         let name = "agent-vm-abcd1234efgh5678-99999";
