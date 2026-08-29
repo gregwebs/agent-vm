@@ -190,6 +190,22 @@ The next `agent-vm shell`/`run` finds no `db/` and lets the bundled `msb`
 recreate it fresh at its own schema, re-pulling images on first boot — no
 further action needed.
 
+## Upgrading from an older agent-vm (pre-0.6.15) state
+
+Upgrading agent-vm from a build that vendored an older Microsandbox
+(0.5.7 and earlier) to one vendoring v0.6.15+ needs no manual step: the
+next `agent-vm shell`/`run` forward-migrates `MSB_HOME/db/msb.db`
+automatically, in place, on first boot. Existing images, sandbox
+records, snapshots, and named volumes remain usable afterward, and
+re-running the same or a newer build again is a no-op (see
+`docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md` for how this was
+verified).
+
+If you roll **back** to an older agent-vm build after a newer one has
+already forward-migrated the db, you'll hit the named ahead-guard
+described above — recover the same way, with `agent-vm doctor
+--reset-msb-db`.
+
 ## Guest user / `--root`
 
 By default the in-guest agent runs as **the host user** — the same

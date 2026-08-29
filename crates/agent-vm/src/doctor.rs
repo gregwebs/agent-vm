@@ -49,18 +49,51 @@ enum ResetOutcome {
 }
 
 pub fn run(args: Args) -> Result<()> {
+    let msb_home = crate::msb_install::msb_home_dir()?;
+
     if !args.reset_msb_db {
+        let db_exists = msb_home.join("db").join("msb.db").exists();
+        println!(
+            "{}",
+            describe_home(
+                &msb_home,
+                db_exists,
+                &crate::msb_schema::bundled_schema_version()
+            )
+        );
+        println!();
         println!("==> agent-vm doctor: available operations");
         println!("      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next");
         println!("                       agent-vm shell/run recreates it at the bundled schema");
         return Ok(());
     }
 
-    let msb_home = crate::msb_install::msb_home_dir()?;
     let ts = timestamp_suffix(SystemTime::now());
     let outcome = reset_msb_db_in(&msb_home, &ts)?;
     println!("{}", render(&outcome));
     Ok(())
+}
+
+/// Names the *active* `MSB_HOME` and the schema this build understands, so
+/// `agent-vm doctor` (with no flag) answers "which home and schema am I
+/// acting on" up front — issue #42's AC-5. `MSB_HOME` is deliberately not
+/// schema-namespaced (ADR-0004/0006): this is the detect-and-recover
+/// alternative, not a reintroduction of namespacing. Pure over its inputs
+/// (mirroring `render`/`reset_msb_db_in`'s testable-without-env-or-fs-reads
+/// pattern above) so the wording is unit-tested without needing a real
+/// `MSB_HOME` on disk.
+fn describe_home(msb_home: &Path, db_exists: bool, bundled_schema: &str) -> String {
+    let db_path = msb_home.join("db").join("msb.db");
+    format!(
+        "==> active microsandbox home\n\
+         MSB_HOME: {}\n\
+         db:       {} ({})\n\
+         this build's bundled schema: {}",
+        msb_home.display(),
+        db_path.display(),
+        if db_exists { "exists" } else { "absent" },
+        bundled_schema,
+    )
 }
 
 /// Move `msb_home/db` aside to a unique `db.reset-<ts>` sibling. Pure over
@@ -291,6 +324,24 @@ mod tests {
             b"real-target-bytes",
             "the symlink target's contents must be completely untouched"
         );
+    }
+
+    #[test]
+    fn describe_home_names_home_db_path_and_schema_when_db_exists() {
+        let text = describe_home(Path::new("/state/msb-home"), true, "m20260824_000001");
+
+        assert!(text.contains("/state/msb-home"), "{text}");
+        assert!(text.contains("/state/msb-home/db/msb.db"), "{text}");
+        assert!(text.contains("exists"), "{text}");
+        assert!(text.contains("m20260824_000001"), "{text}");
+    }
+
+    #[test]
+    fn describe_home_reports_absent_db() {
+        let text = describe_home(Path::new("/state/msb-home"), false, "m20260824_000001");
+
+        assert!(text.contains("absent"), "{text}");
+        assert!(!text.contains("exists"), "{text}");
     }
 
     #[test]

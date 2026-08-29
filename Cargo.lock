@@ -37,6 +37,7 @@ dependencies = [
  "microsandbox-runtime",
  "reqwest",
  "sea-orm 1.1.20",
+ "sea-orm-migration",
  "serde_json",
  "sha2 0.10.9",
  "sqlx 0.8.6",

@@ -28,6 +28,37 @@
 //! between worktrees with differently-schema'd builds) to set
 //! `AGENT_VM_STATE_DIR` per build if the collision becomes a recurring
 //! annoyance.
+//!
+//! ## This is the first named stop, not the only one (issue #42)
+//!
+//! This guard is deliberately narrow: it only ever distinguishes "DB is
+//! ahead of this build" from "DB could not be read for some other reason,"
+//! and always fails *open* on the latter (see [`read_applied_migrations`]).
+//! That other-reason bucket includes a DB another process currently holds
+//! locked — this module does not attempt to detect or wait out a lock
+//! itself (there is no separate "locked" test here beyond the generic
+//! missing-table/corrupt-file cases below, which exercise the same
+//! `.ok()?` fail-open branches a lock error would also hit). Probing the
+//! lock explicitly here was considered and rejected: the vendored SDK's own
+//! migration lock is a distinct flock file
+//! (`db/msb.db.migration.lock`, taken in `connect_and_migrate`'s
+//! `acquire_migration_lock`), not a lock on `msb.db` itself, so an
+//! agent-vm-side probe would race the SDK's own lock rather than observe
+//! it, and could produce a false block on a transient, benign contention.
+//!
+//! Two other fail-closed states from issue #42's matrix — **locked**
+//! (`acquire_migration_lock`) and **partial** (`refuse_incomplete_self_downgrade`,
+//! `refuse_if_install_exclusive_held`) — are therefore owned entirely by
+//! the SDK's `connect_and_migrate`
+//! (`vendor/microsandbox/sdk/rust/lib/backend/local/mod.rs:669`), which
+//! this guard runs strictly *before*. When the SDK's own guards fire they
+//! return named errors (`self_downgrade_recovery_required: ...`,
+//! `database schema is newer than this msb binary; ...`, migration-lock
+//! contention) instead of the opaque sea-orm "Migration file ... is
+//! missing" error this module exists to preempt for the **ahead** case —
+//! so this preflight is the first named stop on the boot path, not the
+//! only one. See `docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md` for the
+//! full four-state matrix and which layer owns each.
 
 use std::path::{Path, PathBuf};
 
@@ -201,6 +232,18 @@ mod tests {
         );
     }
 
+    // The next two tests exercise `read_applied_migrations`'s two
+    // `.ok()?` fail-open branches (connect failure, then query failure).
+    // Issue #42's "locked" fail-closed state — another process holding
+    // the SDK's separate migration-lock flock while this guard's plain
+    // `SELECT` runs — lands on the SAME branches: SQLite would return a
+    // "database is locked" error from the query, which is exactly the
+    // "could not read for a reason that is NOT ahead" case these tests
+    // already cover generically (see this module's doc comment). A
+    // dedicated lock simulation would need to hold a real SQLite-level
+    // lock open across the assertion and would only be testing the
+    // default `busy_timeout` retry/give-up behavior already owned by
+    // sqlx/SQLite, not agent-vm logic — these two suffice.
     #[tokio::test]
     async fn db_without_seaql_migrations_table_fails_open() {
         let dir = tempfile::tempdir().unwrap();
