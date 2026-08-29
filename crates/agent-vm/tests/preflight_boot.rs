@@ -240,6 +240,70 @@ fn ahead_db_blocks_boot_before_any_vm_work() {
         "stderr:\n{stderr}"
     );
     assert!(stderr.contains("NEWER than this build"), "stderr:\n{stderr}");
+    // AC-4 (issue #42): the block must be non-destructive -- the ahead db
+    // this test seeded is still exactly there afterwards, not reset or
+    // moved aside. Only `agent-vm doctor --reset-msb-db`, run by an
+    // operator, ever moves it.
+    assert!(
+        h.db_path().exists(),
+        "the ahead-of-bundle db must survive the block untouched"
+    );
+}
+
+/// AC-4 (issue #42): the socket-path guard (`msb_install::ensure_socket_paths_fit`,
+/// issue #40) must fail closed, before any `MSB_HOME/db` is created, when
+/// `AGENT_VM_STATE_DIR` is long enough that this sandbox's real
+/// `control.sock` path would overflow the platform's `sockaddr_un.sun_path`
+/// limit. It runs on the boot path right after `ProjectSession::for_cwd()`
+/// and strictly before `session.ensure_dirs()` (`run.rs::launch`), so no
+/// state directory should exist for it to have touched.
+#[test]
+fn unsafe_state_dir_bails_before_any_db_is_created() {
+    let home = tempfile::tempdir().unwrap();
+    let fake_msb = write_fake_msb(home.path());
+    let cwd = tempfile::tempdir().unwrap();
+    // Long enough to overflow both the 103-byte (macOS) and 107-byte
+    // (Linux) `sun_path` limits regardless of the tempdir's own prefix
+    // length: `<state>/msb-home/run/sandboxes/<24-hex-id>/control.sock`
+    // already costs ~52 bytes past `<state>/msb-home`, so a ~150-byte
+    // `AGENT_VM_STATE_DIR` guarantees overflow on every platform this runs
+    // on. See `msb_install::check_socket_path_len_fails_closed_on_overflow_with_actionable_message`
+    // for the same arithmetic unit-tested directly.
+    let overlong_state_dir = tempfile::tempdir().unwrap().path().join("a".repeat(150));
+    std::fs::create_dir_all(&overlong_state_dir).unwrap();
+
+    let mut cmd = Command::new(agent_vm_bin());
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("AGENT_VM_STATE_DIR", &overlong_state_dir)
+        .env("MSB_PATH", &fake_msb)
+        .current_dir(cwd.path())
+        .arg("shell");
+    let out = run_with_timeout(cmd, Duration::from_secs(15));
+
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit; stderr:\n{}",
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("sun_path") || stderr.contains("Unix-domain-socket path limit"),
+        "stderr must name the overflow condition:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("AGENT_VM_STATE_DIR"),
+        "stderr must point at the fix:\n{stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("truncat") || stderr.contains("never truncates"),
+        "must not imply the overlong path was silently truncated:\n{stderr}"
+    );
+    assert!(
+        !overlong_state_dir.join("msb-home").join("db").exists(),
+        "no MSB_HOME/db may be created before the socket-path guard runs"
+    );
 }
 
 #[test]

@@ -80,3 +80,19 @@ tempfile = "3"
 # not a valid SQLite file and so is insufficient here). Already in the build
 # graph via sea-orm's sqlx-sqlite feature. See issue #30.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+# Used only by tests/msb_migration_0_5_7.rs to drive
+# `microsandbox_migration::Migrator::up` directly (issue #42). That call
+# needs a `sea_orm::DatabaseConnection` of the SAME sea-orm major version
+# `microsandbox-migration` itself compiles against (2.0, via its
+# `sea-orm-migration.workspace = true` dependency inside
+# vendor/microsandbox) -- NOT the 1.1 `sea-orm` this crate already depends
+# on directly for msb_preflight.rs's plain `SELECT` (see that dependency's
+# own comment, issue #30). Two different major versions of the same crate
+# name are distinct Rust types even when both are present in one dependency
+# graph, so `microsandbox_migration::Migrator::up` cannot accept a
+# connection built from the 1.1 dependency. Pinning the same "2.0" range
+# here lets Cargo's resolver reuse the exact sea-orm-migration 2.0.2 (and
+# its re-exported sea_orm 2.0.2) already pulled in transitively by
+# microsandbox-migration, rather than adding a second, incompatible 2.x
+# resolution. Test-only: no runtime/production code needs this.
+sea-orm-migration = { version = "2.0", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
