@@ -1459,6 +1459,27 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             })?;
         let mut stdout = tokio::io::stdout();
         let mut stderr = tokio::io::stderr();
+        // Race the exec event stream against the sandbox's own runtime exit
+        // (issue #41): if the msb VMM child dies mid-session, the relay
+        // socket closing should already end the event stream (`recv()` ->
+        // `None`), but that relies on the SDK's reader loop observing the
+        // socket EOF promptly. This is the belt-and-suspenders backstop —
+        // `sandbox.wait()` resolving first means the exec await can never
+        // hang on a VMM that's already gone, no matter how the event stream
+        // behaves.
+        //
+        // Follow-up fix (verified live, see verifications.md item 3): on a
+        // real VMM kill, the relay socket EOFs essentially instantly, so
+        // `events.recv() -> None` wins this race against `sandbox.wait()`
+        // completing almost every time. If we reported a plain
+        // "stream ended" diagnostic right there, `sandbox.wait()`'s exit
+        // classification — and the `msb-exit.log` post-mortem write it
+        // performs — would never happen, because the future backing this
+        // race would be dropped mid-flight. `next_exec_step` now gives
+        // `runtime_exit` a bounded chance to finish *after* observing the
+        // stream close, so the classification/log-write reliably happens
+        // before we report anything.
+        let mut runtime_exit: RuntimeExit = Box::pin(sandbox.wait());
         // Track whether we actually saw an Exited event. The previous
         // `let mut code = 1` conflated "stream closed without Exited"
         // (infra failure) with "agent exited with 1" (real failure) —
@@ -1466,35 +1487,55 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         // return Err on premature stream close so the launcher
         // bubbles up an actionable error.
         let mut exit_code: Option<i32> = None;
-        while let Some(event) = handle.recv().await {
-            match event {
-                ExecEvent::Stdout(b) => {
+        let mut stream_ended_without_exit = false;
+        loop {
+            match next_exec_step(
+                &mut handle,
+                &mut runtime_exit,
+                STREAM_END_RUNTIME_EXIT_GRACE,
+            )
+            .await
+            {
+                ExecStep::Event(ExecEvent::Stdout(b)) => {
                     stdout.write_all(&b).await.ok();
                     stdout.flush().await.ok();
                 }
-                ExecEvent::Stderr(b) => {
+                ExecStep::Event(ExecEvent::Stderr(b)) => {
                     stderr.write_all(&b).await.ok();
                     stderr.flush().await.ok();
                 }
-                ExecEvent::Exited { code: c } => {
+                ExecStep::Event(ExecEvent::Exited { code: c }) => {
                     exit_code = Some(c);
                     break;
                 }
-                ExecEvent::Failed(payload) => {
+                ExecStep::Event(ExecEvent::Failed(payload)) => {
                     anyhow::bail!(
                         "exec session failed: {payload:?} (full logs: {})",
                         sandbox_log_dir(&session.sandbox_name).display()
                     );
                 }
-                ExecEvent::Started { .. } | ExecEvent::StdinError(_) => {}
+                ExecStep::Event(ExecEvent::Started { .. } | ExecEvent::StdinError(_)) => {}
+                ExecStep::StreamEnded => {
+                    stream_ended_without_exit = true;
+                    break;
+                }
+                ExecStep::RuntimeExited(detail) => {
+                    anyhow::bail!(
+                        "sandbox process exited unexpectedly while the exec stream was still \
+                         open ({detail}); partial output above; see msb-exit.log under {} for \
+                         the VMM's post-mortem record",
+                        sandbox_log_dir(&session.sandbox_name).display()
+                    );
+                }
             }
         }
         match exit_code {
             Some(c) => c,
-            None => anyhow::bail!(
+            None if stream_ended_without_exit => anyhow::bail!(
                 "exec session event stream ended without Exited (agentd disconnect or microsandbox bug; partial output above; full logs: {})",
                 sandbox_log_dir(&session.sandbox_name).display()
             ),
+            None => unreachable!("loop only exits via Exited, StreamEnded, or an Err bail!"),
         }
     };
 
@@ -1519,6 +1560,120 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // any `?`-propagated error path.
 
     Ok(exit)
+}
+
+/// A pending [`Sandbox::wait`] call, boxed so `launch`'s streaming-exec
+/// branch can hold it alongside an `ExecHandle` without threading a generic
+/// parameter through the whole function. Borrows the `Sandbox` for `'a`
+/// rather than requiring `'static`, since `sandbox.wait()` only borrows
+/// `&self`.
+type RuntimeExit<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = microsandbox::MicrosandboxResult<std::process::ExitStatus>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// One step of racing an exec event stream against the sandbox's own
+/// runtime exit — see [`next_exec_step`].
+#[derive(Debug)]
+enum ExecStep {
+    /// The event stream produced an event.
+    Event(microsandbox::sandbox::exec::ExecEvent),
+    /// The event stream ended (channel closed) without an `Exited` event.
+    StreamEnded,
+    /// The sandbox process exited while the event stream was still open.
+    /// Carries a short diagnostic detail (exit status or wait error) for
+    /// the caller to fold into its own error message.
+    RuntimeExited(String),
+}
+
+/// Minimal seam over "the next exec event" so [`next_exec_step`] is
+/// testable against a stub source instead of a real `ExecHandle` (which
+/// requires a booted sandbox). Implemented for `ExecHandle` by delegating
+/// to its inherent `recv` — the trait method is named the same so callers
+/// don't need to think about which one they're using.
+trait ExecEventSource {
+    async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent>;
+}
+
+impl ExecEventSource for microsandbox::sandbox::exec::ExecHandle {
+    async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
+        microsandbox::sandbox::exec::ExecHandle::recv(self).await
+    }
+}
+
+/// How long [`next_exec_step`] waits for the in-flight `runtime_exit`
+/// future to complete after it has already observed the exec stream close,
+/// before giving up and reporting a plain [`ExecStep::StreamEnded`].
+///
+/// On a real VMM kill the relay socket EOFs essentially instantly, so the
+/// stream close is observed first almost every time — `sandbox.wait()`
+/// (which classifies the exit and writes `msb-exit.log`) needs a moment
+/// longer to actually reap the child. `child_reaping.rs`'s
+/// `killed_vmm_child_is_reaped_and_reported_not_blocked` confirmed this
+/// resolves "promptly" against a real sandbox; this budget is comfortably
+/// above that observed latency while staying well short of anything a
+/// human at a CLI would call a hang. If the stream closed for some other
+/// reason and the sandbox process is genuinely still alive, this bound is
+/// what keeps `next_exec_step` from hanging on it.
+const STREAM_END_RUNTIME_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Format a resolved `runtime_exit` result into the short diagnostic detail
+/// carried by [`ExecStep::RuntimeExited`].
+fn describe_runtime_exit(
+    result: microsandbox::MicrosandboxResult<std::process::ExitStatus>,
+) -> String {
+    match result {
+        Ok(status) => format!("exit status: {status:?}"),
+        Err(err) => format!("wait() failed: {err}"),
+    }
+}
+
+/// Await the next exec event, racing it against `runtime_exit`.
+///
+/// This is the testable seam for issue #41's "never block forever on an
+/// exited VMM" requirement: if the sandbox process dies while the exec
+/// stream is still open (rather than the stream itself observing the
+/// closed relay socket and ending on its own), this future resolves with
+/// [`ExecStep::RuntimeExited`] instead of leaving the caller's `recv()`
+/// pending indefinitely. `runtime_exit` must be pinned once by the caller
+/// (via [`RuntimeExit`]) and reused across calls, mirroring the standard
+/// `tokio::pin!`-a-long-lived-future-then-race-it-in-a-loop idiom — each
+/// call here re-polls the *same* future rather than starting a fresh wait.
+///
+/// Follow-up fix: a plain `tokio::select!` between `events.recv()` and
+/// `runtime_exit` has a real-world ordering bug. On an actual VMM kill, the
+/// relay socket's EOF is observed by `events.recv() -> None` before
+/// `sandbox.wait()` (backing `runtime_exit`) gets to complete — which means
+/// `sandbox.wait()`'s exit classification, and the `msb-exit.log`
+/// post-mortem write it performs, would never happen if we reported
+/// `StreamEnded` right there (the still-in-flight `runtime_exit` future
+/// would just be dropped by the caller). So when `events.recv()` resolves
+/// to `None`, this function does *not* immediately report `StreamEnded`:
+/// it first gives the already-in-flight `runtime_exit` future a bounded
+/// ([`STREAM_END_RUNTIME_EXIT_GRACE`]) chance to finish, so the caller
+/// reliably sees the classified [`ExecStep::RuntimeExited`] (and the log
+/// write has reliably happened) instead of racing ahead of it. Only if
+/// `runtime_exit` doesn't resolve within the grace window — i.e. the
+/// stream closed for some reason other than the VMM dying — does this fall
+/// back to `StreamEnded`, so a non-crash stream closure still can't hang.
+async fn next_exec_step(
+    events: &mut impl ExecEventSource,
+    runtime_exit: &mut RuntimeExit<'_>,
+    stream_end_grace: std::time::Duration,
+) -> ExecStep {
+    tokio::select! {
+        event = events.recv() => match event {
+            Some(event) => ExecStep::Event(event),
+            None => match tokio::time::timeout(stream_end_grace, &mut *runtime_exit).await {
+                Ok(result) => ExecStep::RuntimeExited(describe_runtime_exit(result)),
+                Err(_) => ExecStep::StreamEnded,
+            },
+        },
+        result = &mut *runtime_exit => ExecStep::RuntimeExited(describe_runtime_exit(result)),
+    }
 }
 
 /// Best-effort hint at where msb writes a sandbox's per-launch
@@ -2185,6 +2340,180 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(got, None);
+    }
+
+    /// Stub [`ExecEventSource`] backed by an mpsc channel: `send` pushes an
+    /// event, holding the paired `Sender` alive keeps `recv()` pending
+    /// (simulates an exec stream that's still open), and dropping it makes
+    /// `recv()` return `None` (simulates the stream ending).
+    struct StubEvents(tokio::sync::mpsc::Receiver<microsandbox::sandbox::exec::ExecEvent>);
+
+    impl ExecEventSource for StubEvents {
+        async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
+            self.0.recv().await
+        }
+    }
+
+    /// A `RuntimeExit` future that never resolves — models a sandbox process
+    /// that is still running.
+    fn runtime_never_exits<'a>() -> RuntimeExit<'a> {
+        Box::pin(std::future::pending())
+    }
+
+    /// A `RuntimeExit` future that resolves immediately with a real
+    /// `ExitStatus` — models the VMM child having already exited. Spawns a
+    /// trivial OS process rather than fabricating an `ExitStatus`, since the
+    /// type has no public constructor.
+    fn runtime_exited_now<'a>(code: i32) -> RuntimeExit<'a> {
+        Box::pin(async move {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("exit {code}"))
+                .status()
+                .expect("spawn stub exit process");
+            Ok(status)
+        })
+    }
+
+    #[tokio::test]
+    async fn next_exec_step_returns_the_event_when_the_stream_has_one_and_runtime_is_still_alive() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(microsandbox::sandbox::exec::ExecEvent::Exited { code: 0 })
+            .await
+            .unwrap();
+        let mut events = StubEvents(rx);
+        let mut runtime_exit = runtime_never_exits();
+
+        let step = next_exec_step(
+            &mut events,
+            &mut runtime_exit,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(matches!(
+            step,
+            ExecStep::Event(microsandbox::sandbox::exec::ExecEvent::Exited { code: 0 })
+        ));
+    }
+
+    /// The stream closes and the sandbox process is (per `runtime_never_exits`)
+    /// genuinely still alive — i.e. not the issue #41 VMM-kill shape. This
+    /// must still fall back to `StreamEnded` once the bounded grace window
+    /// elapses, rather than hanging on a `runtime_exit` that will never
+    /// resolve.
+    #[tokio::test]
+    async fn next_exec_step_reports_stream_ended_when_the_channel_closes() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+        let mut events = StubEvents(rx);
+        let mut runtime_exit = runtime_never_exits();
+
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_exec_step(
+                &mut events,
+                &mut runtime_exit,
+                std::time::Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect(
+            "next_exec_step hung instead of falling back to StreamEnded after the grace window",
+        );
+
+        assert!(matches!(step, ExecStep::StreamEnded));
+    }
+
+    /// Regression test for the follow-up fix to issue #41: on a real VMM
+    /// kill, the exec stream's EOF (relay socket closing) is observed
+    /// *before* `sandbox.wait()` gets a chance to complete and classify the
+    /// exit — confirmed live against a real sandbox (verifications.md item
+    /// 3: `events.recv() -> None` won this race 2/2 times against an actual
+    /// `kill -KILL` of the VMM). `next_exec_step` must not report
+    /// `StreamEnded` in that shape: it must give the already-in-flight
+    /// `runtime_exit` future a bounded chance to finish so `sandbox.wait()`'s
+    /// classification (and its `msb-exit.log` write) still happens, and
+    /// report `RuntimeExited` instead.
+    #[tokio::test]
+    async fn next_exec_step_awaits_runtime_exit_when_stream_closes_first() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // The stream is already closed by the time next_exec_step is
+        // called — models the relay EOF having already been observed.
+        drop(tx);
+        let mut events = StubEvents(rx);
+        // `runtime_exit` is still in flight and resolves a little *after*
+        // the stream close is observed — models `sandbox.wait()` completing
+        // its reap/classification slightly behind the relay EOF, which is
+        // exactly the ordering that was silently dropped before this fix.
+        let mut runtime_exit: RuntimeExit = Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exit 1")
+                .status()
+                .expect("spawn stub exit process");
+            Ok(status)
+        });
+
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_exec_step(
+                &mut events,
+                &mut runtime_exit,
+                std::time::Duration::from_millis(500),
+            ),
+        )
+        .await
+        .expect("next_exec_step hung waiting on the racing runtime exit");
+
+        match step {
+            ExecStep::RuntimeExited(detail) => {
+                assert!(
+                    detail.contains("exit status"),
+                    "detail should name the exit status: {detail}"
+                );
+            }
+            other => panic!(
+                "expected RuntimeExited (runtime_exit should win once given its bounded grace \
+                 window past the stream close), got {other:?} instead"
+            ),
+        }
+    }
+
+    /// The AC this seam exists for (issue #41): if the sandbox process exits
+    /// while the exec stream is still open and never produces another
+    /// event, `next_exec_step` must resolve with a diagnostic —  not hang
+    /// forever waiting on `recv()`, and not silently report a `0` exit.
+    #[tokio::test]
+    async fn next_exec_step_surfaces_runtime_exit_instead_of_hanging_on_a_silent_stream() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut events = StubEvents(rx);
+        let mut runtime_exit = runtime_exited_now(17);
+
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_exec_step(
+                &mut events,
+                &mut runtime_exit,
+                std::time::Duration::from_millis(500),
+            ),
+        )
+        .await
+        .expect("next_exec_step hung instead of observing the runtime exit");
+
+        match step {
+            ExecStep::RuntimeExited(detail) => {
+                assert!(
+                    detail.contains("exit status"),
+                    "detail should name the exit status: {detail}"
+                );
+            }
+            other => panic!("expected RuntimeExited, got a stream event/close instead: {other:?}"),
+        }
+        // Keep the sender alive for the whole test so a hang would show up
+        // as a real timeout rather than an incidental `StreamEnded`.
+        drop(tx);
     }
 
     #[test]

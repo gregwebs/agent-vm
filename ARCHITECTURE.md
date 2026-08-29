@@ -747,3 +747,115 @@ of the just-rotated token.
   outcome is one extra `claude -p` invocation. If this becomes a
   pain point, a `<state>/tokens/.refresh.lock` flock around the host
   CLI invocation is two lines.
+
+## Phase 5 — Sandbox liveness: heartbeat keep-alive and runtime-exit reporting
+
+A sandbox is a libkrun microVM: the host launcher spawns a hidden `msb
+sandbox …` child process (the VMM), which runs the vendored runtime
+(`vendor/microsandbox/crates/runtime/lib/vm.rs`) and never returns — libkrun
+calls `_exit()` on shutdown. Two independent mechanisms decide whether that
+child is still alive and well, and issue #41 tightened both after a
+long-lived PTY session was reclaimed mid-use.
+
+### Two liveness mechanisms
+
+1. **Heartbeat** (idle / health). The guest agent (`agentd`) writes
+   `/.msb/heartbeat.json` once a second; it appears host-side via virtiofs
+   in the sandbox runtime directory. `HeartbeatReader`
+   (`vendor/microsandbox/crates/runtime/lib/heartbeat.rs`) polls it every
+   second from a monitor task in `vm.rs` to decide idle-vs-active, and —
+   since #41 — whether the agent has gone truly unresponsive.
+2. **Child process supervision.** The SDK owns the VMM child
+   (`vendor/microsandbox/sdk/rust/lib/runtime/handle.rs`'s `ProcessHandle`,
+   spawned by `runtime/spawn.rs`'s `spawn_sandbox`) and is responsible for
+   reaping it and surfacing an unexpected exit instead of letting a
+   host-side `wait()` or exec stream block forever.
+
+### The bug: brief heartbeat staleness looked identical to a dead agent
+
+Under host load or virtiofs write latency, `heartbeat_seq` can stop
+advancing for several seconds even though the guest is healthy and a PTY
+exec session is actively running. Before #41, the only two heartbeat
+outcomes bearing on liveness were "idle" and "not idle" — there was no
+staleness budget at all, so a genuinely wedged `agentd` past boot had no
+way to be caught, and any budget added naively would have killed exactly
+the busy-but-momentarily-quiet sessions the bug report was about.
+
+`HeartbeatReader::check` resolves this with a **two-window confirmation**
+rather than a single deadline:
+
+```
+heartbeat_seq advances every ~1s; STALE budget S = 5s; a hiccup pauses it for ~6s
+time →   0s ......... 5s ......... 10s ......... 15s
+seq      1 2 3 4 5 6 [------ paused ------] 7 8 9 ...
+exec:    RUNNING RUNNING RUNNING RUNNING RUNNING RUNNING (never ends)
+
+stale_for < S              → Active (fresh)
+stale_for in [S, 2S)        → Active (grace: crossed the budget once, not confirmed)
+stale_for >= 2S             → AgentUnresponsive (confirmed: no fresh seq for a full
+                               second window)
+any fresh heartbeat_seq     → resets the grace window immediately
+```
+
+`stale_confirmed_at` records the instant staleness first crosses `S`; only
+once *another* full `S` elapses with no fresh sequence in between does the
+decision flip to `AgentUnresponsive`. A missing heartbeat (never seen at
+all) gets the analogous but much longer `HEARTBEAT_BOOT_GRACE` (180s)
+before being declared unresponsive — this only covers a guest whose relay
+already passed `wait_ready` but whose `agentd` never started writing
+`heartbeat.json`; a guest that never boots the relay at all is still
+reclaimed by the relay's own `wait_ready` timeout, unchanged by this
+monitor. An **active exec session never goes idle**, regardless of
+staleness — busy is healthy.
+
+`AgentUnresponsive` is a distinct decision from `Idle`: it stores
+`EXIT_REASON_AGENT_UNRESPONSIVE`, requests a *bounded* guest shutdown
+(`request_guest_shutdown_with_timeout`, ~1s — deliberately not the normal
+60s idle-shutdown default, since an agent already confirmed unresponsive is
+unlikely to service a graceful shutdown request either) rather than the
+normal graceful path, and triggers host exit either way so a wedged relay
+can never block the sandbox's teardown.
+
+### Child supervision: never block forever on an exited VMM
+
+If the VMM child dies unexpectedly (crash, OOM-kill, `SIGKILL` from
+outside), two things must not happen: the launcher must not block forever
+in `ProcessHandle::wait()` or in an open exec stream's event loop, and the
+diagnostic evidence must not be lost.
+
+- `ProcessHandle::wait()` classifies the exit (`abnormal` = non-zero status
+  or terminated by signal) and — once, guarded by an `exit_logged` flag so
+  repeated `wait()` calls on the same fused `tokio::process::Child::wait()`
+  never duplicate a line — appends a record to `<sandbox log dir>/msb-exit.log`
+  alongside the runtime's own `runtime.log`/`kernel.log`. A clean exit
+  writes nothing; the file is a crash post-mortem, not a lifecycle audit
+  log. `disarm()` (used on the detached-sandbox path) clears the log
+  directory reference first, since a detached handle's eventual `wait()`
+  observes only kernel-reparenting behavior (reaps to `Ok(0)` instantly, or
+  hangs forever) rather than the VMM's real termination — logging that
+  would misrepresent what actually happened.
+- `agent-vm`'s streaming-exec loop (`crates/agent-vm/src/run.rs`,
+  `next_exec_step`) races the exec event stream against
+  `Sandbox::wait()` with `tokio::select!`. In the ordinary case the relay
+  socket closing when the VMM dies already ends the event stream promptly
+  (`recv()` → `None`, already handled as an actionable "stream ended
+  without Exited" error). The race is the belt-and-suspenders backstop for
+  the case where that doesn't happen: if the runtime exits while the
+  stream is still open, the loop reports a diagnostic naming
+  `msb-exit.log` immediately instead of hanging on `recv()`.
+
+### What Phase 5 deliberately doesn't do
+
+- **No proactive polling of `try_wait()` from a timer.** The exec-stream
+  race and the relay's own EOF handling already surface a VMM death
+  promptly for the paths that matter (an open exec session); adding a
+  separate poll loop would duplicate that without covering a new case.
+- **No sea-orm schema change.** `TerminationReason::AgentUnresponsive` and
+  its `EXIT_REASON_AGENT_UNRESPONSIVE` mapping already existed in the
+  v0.6.15 baseline (added for the relay's boot-failure path); #41 reuses
+  both rather than adding new termination-reason variants or migrations.
+- **No stderr-tee task.** An earlier fork implementation (pre-v0.6.15)
+  buffered the VMM's stderr through a tee task so a panic backtrace's tail
+  survived shutdown; the current baseline already redirects stderr
+  directly into `runtime.log` via `Stdio::from(...)`, so there's no
+  separate task to drain or race in `wait()`.
