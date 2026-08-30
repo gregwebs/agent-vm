@@ -2049,12 +2049,12 @@ mod tests {
         SecretsConfig {
             secrets: vec![SecretEntry {
                 env_var: "GH_TOKEN".into(),
-                // Baseline's `SecretEntry::value` is a plain (zeroized)
-                // `String` — the fork's `SecretValue::File` variant this
-                // test used to construct doesn't exist any more (see
-                // `fail_closed.rs`'s module doc). `source: None` means
-                // "value already carries the material", which is exactly
-                // what a static test fixture needs.
+                // Baseline's `SecretEntry` now has a file-backed
+                // `SecretSource` variant too (see `fail_closed.rs`'s module
+                // doc), but agent-vm isn't wired onto it yet — this test
+                // fixture only needs a static value, so `source: None`
+                // ("value already carries the material") is the right
+                // shape for it regardless.
                 value: real_token.to_string().into(),
                 source: None,
                 placeholder: placeholder.into(),

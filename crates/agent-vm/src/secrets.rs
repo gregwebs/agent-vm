@@ -100,14 +100,14 @@ pub const COPILOT_TOKEN_PLACEHOLDER: &str = "msb-copilot-placeholder-v2";
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
 // docs stay in lockstep.
 
-// Phase 6 (agent-vm issue #40): run.rs no longer wires these into a
-// credential-substitution secret — that needs the fork's file-backed
-// `SecretValue` + per-route intercept hook, neither of which exists on
-// the clean v0.6.15 baseline (see `fail_closed.rs`), so a launch that
-// would need them fails closed instead. Kept `#[allow(dead_code)]`
-// rather than deleted: they're the exact allow-host set the deferred
-// credential-injection re-port (tracked in agent-vm#47) will need to
-// reconstruct the same secret entries against baseline's `SecretBuilder`.
+// run.rs no longer wires these into a credential-substitution secret — the
+// baseline (as of issue #47) has the file-backed `SecretSource` + per-route
+// intercept hook this needs, but agent-vm isn't wired onto them yet (see
+// `fail_closed.rs`), so a launch that would need them fails closed instead.
+// Kept `#[allow(dead_code)]` rather than deleted: they're the exact
+// allow-host set the deferred credential-injection re-port (tracked in
+// agent-vm#51) will need to reconstruct the same secret entries against
+// baseline's `SecretEntry`/`SecretSource`.
 #[allow(dead_code)]
 pub const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 pub const ANTHROPIC_OAUTH_HOST: &str = "platform.claude.com";

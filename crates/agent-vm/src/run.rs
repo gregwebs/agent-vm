@@ -508,8 +508,8 @@ pub struct Args {
     /// `--allow-egress 10.100.1.0/24` (CIDR),
     /// `--allow-egress fd00::1/128` (IPv6).
     ///
-    /// The default policy (`NetworkPolicy::public_only`) only
-    /// allows DNS and the `Public` destination group, so RFC1918
+    /// The default policy (`NetworkPolicy::from_profiles([Public])`)
+    /// only allows DNS and the `Public` destination group, so RFC1918
     /// (10/8, 172.16/12, 192.168/16, 100.64/10), loopback, link-
     /// local, and metadata addresses are all denied with
     /// ECONNREFUSED. Use this flag to reach a specific dev box on
@@ -520,12 +520,12 @@ pub struct Args {
 
     /// Allow guest egress to the whole private LAN.
     ///
-    /// Switches the egress policy from `public_only` to `non_local`
-    /// — adds the entire `DestinationGroup::Private` (10/8,
-    /// 172.16/12, 192.168/16, 100.64/10, fc00::/7) to the allow
-    /// list. Coarser than `--allow-egress <CIDR>`; useful for
-    /// "trust everything on my LAN". Loopback, link-local, and
-    /// metadata are still denied.
+    /// Switches the egress policy from `from_profiles([Public])` to
+    /// `from_profiles([Public, Private])` — adds the entire
+    /// `DestinationGroup::Private` (10/8, 172.16/12, 192.168/16,
+    /// 100.64/10, fc00::/7) to the allow list. Coarser than
+    /// `--allow-egress <CIDR>`; useful for "trust everything on my
+    /// LAN". Loopback, link-local, and metadata are still denied.
     ///
     /// Security note: a compromised in-guest process gets full
     /// access to every device on your LAN with this flag. Prefer
@@ -1093,26 +1093,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         );
     }
 
-    // Phase 6 (agent-vm issue #40): the fork's guest-egress-via-host-proxy
-    // feature has no baseline equivalent (see `fail_closed.rs`). Fail
-    // closed rather than silently booting with unproxied guest egress
-    // while the operator believes traffic is routed through their proxy.
-    crate::fail_closed::check_no_guest_proxy_env()?;
+    // The netstack (`HostHttpProxyConnector::from_env()`) auto-installs a
+    // guest-egress HTTP-CONNECT proxy from the operator's own env — nothing
+    // to wire here, just surface positive confirmation at launch time
+    // matching the `==> Egress policy: ...` banners above.
+    if let Some((var, value)) = active_guest_proxy_var() {
+        eprintln!("==> Guest egress routed through host proxy {var}={value} (honoring NO_PROXY)");
+    }
 
-    // Phase 6: `--auto-publish` and the CIDR/group egress overrides rely
-    // on NetworkBuilder methods (`auto_publish`, `allow_egress_group`,
-    // `allow_egress_cidr`) that don't exist on this baseline. Fail closed
-    // rather than risk mistranslating them onto the new `.policy(..)`
-    // rule grammar without dedicated design/testing (see `fail_closed.rs`).
     let auto_publish = args.auto_publish;
     let allow_lan = args.allow_lan;
     let allow_host = args.allow_host;
-    crate::fail_closed::check_auto_publish_unrequested(auto_publish)?;
-    crate::fail_closed::check_egress_overrides_unrequested(
-        allow_lan,
-        allow_host,
-        allow_egress_cidrs.len(),
-    )?;
 
     // For each provider with a host credential file, register a
     // SecretValue::File secret keyed on the placeholder string the
@@ -1120,18 +1111,19 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // hook target so a 401-then-refresh attempt round-trips through a
     // real host-side rotation (see `intercept_hook`).
     //
-    // Phase 6: the fork's file-backed `SecretValue::File` (re-read on
-    // every connection, so a host-side token rotation propagates without
-    // restarting the sandbox) and its per-route intercept-hook dispatcher
-    // (`NetworkBuilder::intercept()`) do not exist on this baseline —
-    // `SecretBuilder::value()` only takes a static `String`. Rather than
-    // silently baking each file's *current* contents into a static
-    // secret (dropping the rotation guarantee and risking a leaked stale
-    // token on a later refresh), a launch that actually needs credential
-    // injection fails closed. `agent-vm shell --no-git` on a host with
-    // cached credentials is NOT such a launch — Shell never speaks to a
-    // provider/GitHub API on the guest's behalf — so it keeps booting.
-    // See `fail_closed.rs` for the exact criteria.
+    // The baseline now has the fork's file-backed `SecretSource` (re-read
+    // on every connection, so a host-side token rotation propagates
+    // without restarting the sandbox) and its per-route intercept-hook
+    // dispatcher (`NetworkBuilder::intercept()`) — but agent-vm's
+    // secrets.rs/intercept_hook.rs aren't wired onto them yet (issue
+    // gregwebs/agent-vm#51). Rather than silently baking each file's
+    // *current* contents into a static secret (dropping the rotation
+    // guarantee and risking a leaked stale token on a later refresh), a
+    // launch that actually needs credential injection fails closed.
+    // `agent-vm shell --no-git` on a host with cached credentials is NOT
+    // such a launch — Shell never speaks to a provider/GitHub API on the
+    // guest's behalf — so it keeps booting. See `fail_closed.rs` for the
+    // exact criteria.
     let has_creds = creds.anthropic_token_file.is_some()
         || creds.openai_token_file.is_some()
         || creds.gh_token_file.is_some()
@@ -1140,21 +1132,33 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         !args.no_git || crate::fail_closed::agent_requires_credentials(agent);
     crate::fail_closed::check_credential_injection_unneeded(has_creds, needs_credential_injection)?;
 
-    // Everything that could have needed the fork-only network features
-    // (creds, auto-publish, egress overrides) has already failed closed
-    // above if requested, so the only thing left the network(..) closure
-    // can legitimately do on this baseline is `--publish` port forwarding
-    // (`.port_bind`/`.port_udp_bind` are ordinary baseline APIs).
-    if !publish_ports.is_empty() {
+    let egress_policy = build_egress_policy(allow_lan, allow_host, &allow_egress_cidrs);
+    if egress_policy.is_some() || !publish_ports.is_empty() || auto_publish {
+        let policy = egress_policy.clone();
         let publish_ports_for_net = publish_ports.clone();
+        // Gate `.tls()` on published ports exactly as before this PR.
+        // `TlsBuilder::new()` defaults `enabled: true`, so calling `.tls()`
+        // unconditionally would switch on MITM interception (and push the
+        // sandbox CA into the guest) for a pure egress-override or
+        // auto-publish launch that needs none of that — an unintended
+        // widening neither feature asked for.
+        let enable_tls = !publish_ports.is_empty();
         builder = builder.network(move |mut n| {
-            n = n.tls(|t| t);
+            if let Some(p) = policy {
+                n = n.policy(p);
+            }
+            if enable_tls {
+                n = n.tls(|t| t);
+            }
             for p in &publish_ports_for_net {
                 let host_bind = p.host_bind;
                 n = match p.protocol {
                     PublishProto::Tcp => n.port_bind(host_bind, p.host_port, p.guest_port),
                     PublishProto::Udp => n.port_udp_bind(host_bind, p.host_port, p.guest_port),
                 };
+            }
+            if auto_publish {
+                n = n.auto_publish();
             }
             n
         });
@@ -1308,13 +1312,36 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     crate::secrets::sync_chrome_mcp(&session.state_dir, chrome_mcp_enabled)
         .context("synchronizing Chrome MCP configuration")?;
 
-    // Phase 6 (agent-vm issue #40): `--auto-publish` already fails closed
-    // earlier in `launch()` (`fail_closed::check_auto_publish_unrequested`)
-    // because baseline's `NetworkBuilder` has no `auto_publish()` method —
-    // and, correspondingly, no `Sandbox::port_events()`/`PortEvent` stream
-    // to subscribe to. The event-subscriber this block used to spawn here
-    // is therefore dead code on this baseline; removed rather than kept
-    // uncompilable. Re-add once #47's follow-up ports auto-publish.
+    // Subscribe to the runtime's auto-publish event stream and surface each
+    // mapping to the user. Only spawned when `--auto-publish` was requested
+    // — `Sandbox::port_events()` allows only one subscriber per
+    // `AgentClient` (a second call overwrites the first), and this is the
+    // sole caller today. The loop ends on its own when `recv()` yields
+    // `None` (sandbox stopped), so nothing further needs to guard the task.
+    if args.auto_publish {
+        eprintln!("==> auto-publish: watching guest LISTEN sockets via /proc/net/tcp{{,6}}");
+        let sb_for_events = sandbox.clone();
+        tokio::spawn(async move {
+            use microsandbox::protocol::network::PortEvent;
+            let mut events = sb_for_events.port_events().await;
+            while let Some(event) = events.recv().await {
+                match event {
+                    PortEvent::Added {
+                        host_bind,
+                        host_port,
+                        guest_port,
+                    } => {
+                        eprintln!(
+                            "==> auto-published guest :{guest_port} -> host {host_bind}:{host_port}"
+                        );
+                    }
+                    PortEvent::Removed { guest_port, .. } => {
+                        eprintln!("==> auto-publish removed :{guest_port}");
+                    }
+                }
+            }
+        });
+    }
 
     let inner_cmd = agent.command();
     // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions
@@ -1928,6 +1955,84 @@ fn parse_allow_egress(raw: &[String]) -> Result<Vec<ipnetwork::IpNetwork>> {
         out.push(cidr);
     }
     Ok(out)
+}
+
+/// Egress policy for the requested overrides, or `None` when none were
+/// requested — leaves the SDK default `NetworkPolicy::from_profiles([Public])`
+/// untouched rather than installing an equivalent-but-distinct policy, so a
+/// plain launch's egress behavior can never silently drift from the SDK
+/// default as that default evolves.
+///
+/// `--allow-lan` adds `NetworkProfile::Private`, `--allow-host` adds
+/// `NetworkProfile::Host`, and each `--allow-egress` CIDR becomes a
+/// `Rule::allow_egress(Destination::Cidr(..))` prepended ahead of the
+/// profile-derived rules. `Public` is always retained.
+fn build_egress_policy(
+    allow_lan: bool,
+    allow_host: bool,
+    allow_egress_cidrs: &[ipnetwork::IpNetwork],
+) -> Option<microsandbox::NetworkPolicy> {
+    if !allow_lan && !allow_host && allow_egress_cidrs.is_empty() {
+        return None;
+    }
+    use microsandbox::NetworkProfile;
+    use microsandbox_network::policy::{Destination, Rule};
+
+    let mut profiles = vec![NetworkProfile::Public];
+    if allow_lan {
+        profiles.push(NetworkProfile::Private);
+    }
+    if allow_host {
+        profiles.push(NetworkProfile::Host);
+    }
+    let mut policy = microsandbox::NetworkPolicy::from_profiles(profiles);
+
+    // Prepend the explicit CIDR allows ahead of the profile-derived group
+    // rules. NOTE: with every rule here an `allow` under the policy's
+    // `default_egress == Deny`, allow-list ORDER is functionally inert today
+    // (the first matching allow wins, and every candidate rule allows) — this
+    // is kept only so a future `deny` rule inserted here would take
+    // precedence over the group rules, not because correctness needs it now.
+    let mut cidr_rules: Vec<Rule> = allow_egress_cidrs
+        .iter()
+        .map(|net| Rule::allow_egress(Destination::Cidr(*net)))
+        .collect();
+    cidr_rules.append(&mut policy.rules);
+    policy.rules = cidr_rules;
+    Some(policy)
+}
+
+/// The first set `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` env var (checking
+/// both the uppercase and the curl/wget/`requests`-convention lowercase
+/// spelling of each), or `None` if none are set. Purely for the launch-time
+/// confirmation banner — the netstack's own `HostHttpProxyConnector::from_env()`
+/// does the real (and independently tested) env parsing and `NO_PROXY`
+/// handling; agent-vm only needs to detect "is one set" for the banner.
+fn active_guest_proxy_var() -> Option<(&'static str, String)> {
+    active_guest_proxy_var_from(|var| std::env::var(var).ok())
+}
+
+/// Pure core of [`active_guest_proxy_var`], taking a lookup function instead
+/// of reading the real process env so tests don't need unsafe
+/// `std::env::set_var`/`remove_var` mutation under `cargo test`'s parallel
+/// threads.
+fn active_guest_proxy_var_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<(&'static str, String)> {
+    for (upper, lower) in [
+        ("HTTPS_PROXY", "https_proxy"),
+        ("HTTP_PROXY", "http_proxy"),
+        ("ALL_PROXY", "all_proxy"),
+    ] {
+        for var in [upper, lower] {
+            if let Some(value) = lookup(var)
+                && !value.is_empty()
+            {
+                return Some((var, value));
+            }
+        }
+    }
+    None
 }
 
 /// Build the GitHub repo allow-list by scanning `project_dir` and
@@ -2986,6 +3091,152 @@ options ndots:2 timeout:1";
         assert!(parse_allow_egress(&["not-an-ip".into()]).is_err());
         assert!(parse_allow_egress(&["10.0.0.1/99".into()]).is_err());
         assert!(parse_allow_egress(&["".into()]).is_err());
+    }
+
+    // ── build_egress_policy ──────────────────────────────────────
+
+    use microsandbox_network::policy::{Action, Destination, DestinationGroup};
+
+    /// The `DestinationGroup`s a profile actually opened for egress —
+    /// i.e. the unrestricted `Rule::allow_egress(Destination::Group(..))`
+    /// rules `from_profiles` emits per requested profile. Excludes the
+    /// single narrow `Rule::allow_dns()` rule every non-empty profile set
+    /// also gets (port 53 only, destination `Group(Host)` regardless of
+    /// whether the `Host` *profile* was requested) — that rule alone must
+    /// never be mistaken for `--allow-host` having opened the Host group.
+    fn group_rule_destinations(policy: &microsandbox::NetworkPolicy) -> Vec<DestinationGroup> {
+        policy
+            .rules
+            .iter()
+            .filter(|r| r.ports.is_empty())
+            .filter_map(|r| match r.destination {
+                Destination::Group(g) => Some(g),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_flags_returns_none() {
+        assert!(build_egress_policy(false, false, &[]).is_none());
+    }
+
+    #[test]
+    fn allow_lan_adds_private_group() {
+        let policy = build_egress_policy(true, false, &[]).expect("Some");
+        assert_eq!(policy.default_egress, Action::Deny);
+        let groups = group_rule_destinations(&policy);
+        assert!(groups.contains(&DestinationGroup::Public));
+        assert!(groups.contains(&DestinationGroup::Private));
+        assert!(!groups.contains(&DestinationGroup::Host));
+    }
+
+    #[test]
+    fn allow_host_adds_host_group() {
+        let policy = build_egress_policy(false, true, &[]).expect("Some");
+        let groups = group_rule_destinations(&policy);
+        assert!(groups.contains(&DestinationGroup::Public));
+        assert!(groups.contains(&DestinationGroup::Host));
+        assert!(!groups.contains(&DestinationGroup::Private));
+    }
+
+    #[test]
+    fn allow_lan_and_host_add_both_groups() {
+        let policy = build_egress_policy(true, true, &[]).expect("Some");
+        let groups = group_rule_destinations(&policy);
+        assert!(groups.contains(&DestinationGroup::Public));
+        assert!(groups.contains(&DestinationGroup::Private));
+        assert!(groups.contains(&DestinationGroup::Host));
+    }
+
+    #[test]
+    fn allow_egress_cidr_prepends_rule() {
+        let cidrs = parse_allow_egress(&["10.0.0.5".into()]).expect("ok");
+        let policy = build_egress_policy(false, false, &cidrs).expect("Some");
+        // The prepended CIDR rule comes before the DNS + group rules
+        // `from_profiles` emits.
+        match &policy.rules[0].destination {
+            Destination::Cidr(net) => assert_eq!(net.prefix(), 32),
+            other => panic!("expected Cidr rule first, got {other:?}"),
+        }
+        // Public + DNS are still present further down the rule list.
+        assert!(group_rule_destinations(&policy).contains(&DestinationGroup::Public));
+    }
+
+    #[test]
+    fn allow_egress_ipv6_cidr() {
+        let cidrs = parse_allow_egress(&["fd00::1/128".into()]).expect("ok");
+        let policy = build_egress_policy(false, false, &cidrs).expect("Some");
+        match &policy.rules[0].destination {
+            Destination::Cidr(net) => assert!(net.is_ipv6()),
+            other => panic!("expected Cidr rule first, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allow_egress_preserves_cli_order() {
+        let cidrs = parse_allow_egress(&["10.0.0.1".into(), "10.0.0.2".into()]).expect("ok");
+        let policy = build_egress_policy(false, false, &cidrs).expect("Some");
+        let cidr_dests: Vec<_> = policy.rules[..2]
+            .iter()
+            .map(|r| match &r.destination {
+                Destination::Cidr(net) => net.ip().to_string(),
+                other => panic!("expected Cidr rule, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(cidr_dests, vec!["10.0.0.1", "10.0.0.2"]);
+    }
+
+    #[test]
+    fn combined_cidr_and_lan() {
+        let cidrs = parse_allow_egress(&["10.0.0.5".into()]).expect("ok");
+        let policy = build_egress_policy(true, false, &cidrs).expect("Some");
+        match &policy.rules[0].destination {
+            Destination::Cidr(_) => {}
+            other => panic!("expected Cidr rule first, got {other:?}"),
+        }
+        let groups = group_rule_destinations(&policy);
+        assert!(groups.contains(&DestinationGroup::Public));
+        assert!(groups.contains(&DestinationGroup::Private));
+    }
+
+    // ── active_guest_proxy_var ───────────────────────────────────
+
+    #[test]
+    fn active_guest_proxy_var_absent_is_none() {
+        assert!(active_guest_proxy_var_from(|_| None).is_none());
+    }
+
+    #[test]
+    fn active_guest_proxy_var_ignores_empty_values() {
+        assert!(active_guest_proxy_var_from(|_| Some(String::new())).is_none());
+    }
+
+    #[test]
+    fn active_guest_proxy_var_detects_uppercase() {
+        let (var, value) = active_guest_proxy_var_from(|v| {
+            (v == "HTTPS_PROXY").then(|| "http://proxy.example:3128".to_string())
+        })
+        .expect("Some");
+        assert_eq!(var, "HTTPS_PROXY");
+        assert_eq!(value, "http://proxy.example:3128");
+    }
+
+    #[test]
+    fn active_guest_proxy_var_detects_lowercase() {
+        let (var, _) = active_guest_proxy_var_from(|v| {
+            (v == "https_proxy").then(|| "http://proxy.example:3128".to_string())
+        })
+        .expect("Some");
+        assert_eq!(var, "https_proxy");
+    }
+
+    #[test]
+    fn active_guest_proxy_var_detects_all_proxy() {
+        let (var, _) =
+            active_guest_proxy_var_from(|v| (v == "ALL_PROXY").then(|| "socks5://x".to_string()))
+                .expect("Some");
+        assert_eq!(var, "ALL_PROXY");
     }
 
     #[test]
