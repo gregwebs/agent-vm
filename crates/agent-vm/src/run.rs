@@ -455,14 +455,10 @@ pub struct Args {
     /// with a warning. Example: `--mount ~/.claude/skills:ro:follow-links`.
     ///
     /// Each `--mount` (including each auto-discovered follow-links target)
-    /// consumes one virtio-fs device. The microsandbox
-    /// runtime enables msb_krun's userspace split irqchip, which on
-    /// x86_64 lifts the per-VM IRQ ceiling from 11 to ~219; aarch64 /
-    /// riscv64 always had >200 GIC/AIA IRQs and are unchanged. Either
-    /// way the practical cap on `--mount` is well into the hundreds
-    /// (shared with rootfs, network, vsock, console, and any
-    /// `--volume` disks — call it ~210 user mounts for the common
-    /// config). You can stop worrying about it for typical workloads.
+    /// consumes one virtio-fs device shared with rootfs, network, vsock,
+    /// console, and `--volume` disks. Capacity depends on the host interrupt
+    /// model and runtime; do not treat a measurement from one platform as a
+    /// portable mount limit.
     #[arg(long = "mount", value_name = "HOST[:GUEST][:ro|:rw|:follow-links]", help_heading = "Mounts & ports")]
     mount: Vec<String>,
 
@@ -906,8 +902,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // microsandbox runtime now enables msb_krun's userspace split irqchip
     // (requires msb_krun >= 0.1.13 — earlier versions' userspace IOAPIC
     // silently dropped IRQs on pin ≥ 32 and underflowed on RTE register
-    // accesses), raising the virtio-mmio IRQ cap from 11 to ~219, so we no
-    // longer need to warn or pre-cap on extra mounts (including
+    // accesses). Device capacity remains host-specific, so this layer does
+    // not impose a guessed portable cap on extra mounts (including
     // follow-links' discovered ones). See the vendored vm.rs `build_vm`
     // for details.
     let (extra_mounts, follow_link_warnings) =

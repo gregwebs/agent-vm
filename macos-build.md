@@ -4,7 +4,7 @@ These instructions support Apple Silicon Macs (`arm64`, M1 or newer). Intel macO
 
 ## Prerequisites
 
-Install the Xcode Command Line Tools, rustup with the known-good Rust 1.94 toolchain, and Docker Desktop:
+Install the Xcode Command Line Tools, rustup with the known-good Rust 1.94 toolchain, and Docker Desktop. Docker remains required for the separate guest-agent and local OCI-image steps; Apple's `container` CLI is additionally supported for the firmware kernel bundle:
 
 ```bash
 xcode-select --install
@@ -26,7 +26,7 @@ RUSTUP_AUTO_INSTALL=0 rustup run 1.94 cargo --version
 
 The guarded checks do not download a missing toolchain. The canonical build selects installed Rust 1.94 locally through rustup; it neither depends on nor changes your global default toolchain.
 
-The vendored build compiles a Linux guest helper and firmware through Docker. Keep enough Docker and temporary disk space for those outputs and for one staged Docker image archive during local image import.
+The vendored build compiles the Linux guest helper through Docker. Its firmware helper accepts `LIBKRUNFW_BUILD_BACKEND=auto|container|docker`: `auto` prefers Apple's `container` CLI, then Docker. Both backends upload a filtered source snapshot to container-native `/work`, build there, and copy only `kernel.c` back. Keep enough container and temporary disk space for those outputs and for one staged Docker image archive during local image import. The helper inherits runtime DNS by default; if Apple's Container runtime cannot resolve Fedora mirrors, explicitly provide the resolver chosen for your network, for example `LIBKRUNFW_BUILD_BACKEND=container LIBKRUNFW_BUILD_DNS=1.1.1.1 ./script/build/macos.sh`. It never selects a public resolver itself; the override accepts one IPv4 address and applies only to the firmware builder.
 
 ## Build the macOS bundle
 
@@ -47,7 +47,7 @@ target/macos/
     └── libkrunfw.5.dylib
 ```
 
-Re-running `./script/build/macos.sh` is safe. It retains Cargo and Docker incremental output and atomically replaces the verified bundle files without requiring manual copying, signing, or environment setup. The macOS workflow does not require `just`.
+Re-running `./script/build/macos.sh` is safe. It retains Cargo and Docker incremental output and atomically replaces the verified bundle files without requiring manual copying, signing, or environment setup. Firmware reuse also requires a clean recursive checkout, a validated dylib, and a matching `vendor/microsandbox/build/libkrunfw.5.dylib.source-sha` value for the nested firmware gitlink; a missing, stale, dirty, invalid, or force-rebuild (`MSB_FORCE_FIRMWARE_REBUILD=1`) case rebuilds into staged files and publishes the dylib before its matching stamp. The stamp guards this local cache only; it is not release provenance. The macOS workflow does not require `just`.
 
 ## Fast development build
 
@@ -83,11 +83,11 @@ Run it directly, the same way you'd run the release bundle:
 ./target/macos-dev/bin/agent-vm shell --image agent-vm-template:latest -- uname -m
 ```
 
-The Docker-built `agentd` and firmware outputs are unaffected by `--dev` and
-are cached exactly as in the default build (see the note below on
-re-running the build), so after the first `--dev` build, editing
+The Docker-built `agentd` and container-built firmware outputs are unaffected
+by `--dev` and are cached exactly as in the default build (see the note below
+on re-running the build), so after the first `--dev` build, editing
 `crates/agent-vm/src/**` and re-running `--dev` only pays for an incremental
-debug-profile `cargo build`, not a fresh Docker build or a release-profile
+debug-profile `cargo build`, not a fresh dependency build or a release-profile
 compile.
 
 The dev bundle is for local iteration only: it is unstripped, unoptimized,
@@ -188,7 +188,9 @@ publishing the bundle. Run runtime smoke tests from a normal Terminal without
 For a complete source rebuild, use the root script:
 
 ```bash
-CARGO_NET_GIT_FETCH_WITH_CLI=true ./script/build/macos.sh
+container system status || container system start
+LIBKRUNFW_BUILD_BACKEND=container MSB_FORCE_FIRMWARE_REBUILD=1 \
+  CARGO_NET_GIT_FETCH_WITH_CLI=true ./script/build/macos.sh
 ```
 
 It drives the pinned vendored agentd, firmware, and `microsandbox-cli` build
@@ -243,9 +245,21 @@ SSL_CERT_FILE=/etc/ssl/cert.pem docker pull fedora:latest
 SSL_CERT_FILE=/etc/ssl/cert.pem ./script/build/macos.sh
 ```
 
-### Kernel extraction fails under Colima
+### Firmware backend is unavailable
 
-Some Colima VirtioFS configurations reject symlinks while extracting the Linux kernel. Use Docker Desktop for the firmware build; its file sharing handles the vendored libkrunfw source layout reliably.
+The firmware helper does not extract Linux on a macOS bind mount, so changing
+VirtioFS implementations is not a supported workaround. Start the selected
+backend instead:
+
+```bash
+container system start
+LIBKRUNFW_BUILD_BACKEND=container ./script/build/macos.sh
+# Docker remains an explicit compatible fallback for the firmware helper.
+LIBKRUNFW_BUILD_BACKEND=docker ./script/build/macos.sh
+```
+
+An explicit selector never falls back to another backend. Docker must still be
+running for the separate agentd image build.
 
 ### Sharing the OCI image cache with a Homebrew `msb`
 

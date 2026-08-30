@@ -220,7 +220,7 @@ serial — adding a bind mount per agent state directory (claude, codex,
 opencode) pushed us over and `RegisterBlockDevice(IrqsExhausted)` at boot
 followed. We later lifted the underlying cap by enabling `msb_krun`'s
 userspace split irqchip (see "Split irqchip and the virtio-IRQ ceiling"
-below; cap is now ~219), but the one-workspace + one-state layout still
+below), but the one-workspace + one-state layout still
 makes sense regardless: one virtio-fs server, one rootfs `patch` entry
 per agent, and a stable on-host layout.
 
@@ -260,13 +260,12 @@ virtio-fs (state) already saturates it on this build, so an extra
 `--mount` would trip `RegisterNetDevice(IrqsExhausted)` at boot.
 
 With split_irqchip enabled, `msb_krun` runs a userspace IOAPIC backed by
-an event-loop thread it spawns automatically. The pin count rises to 219,
-which puts the practical ceiling on `--mount` well into the hundreds. The
-trade-off is one extra worker thread per VM and a slightly hotter IRQ
-delivery path; we accept it because the IRQ headroom is the difference
-between "one or two extra mounts work" and "you can stop worrying about
-the cap." aarch64/riscv64 ignore the knob — their GIC/AIA models already
-expose >200 IRQs.
+an event-loop thread it spawns automatically. Its usable device capacity is
+an observed host-specific property, not a portable mount limit: Linux x86_64
+uses this IOAPIC path, while Apple Silicon uses GIC. The trade-off is one
+extra worker thread per VM and a slightly hotter IRQ delivery path. The
+compatibility harness records conservative platform profiles rather than
+turning an IRQ implementation detail into a universal CLI promise.
 
 The runtime sets `split_irqchip(true)` unconditionally in
 `vendor/microsandbox/crates/runtime/lib/vm.rs`. The user-facing
@@ -286,6 +285,45 @@ The PLAN's Discovered Upstream Issue #3 was originally attributed to
 ceiling but the multi-mount boot failure that finally drove this work
 was a separate, fixable bug inside `msb_krun_devices`'s userspace
 IOAPIC, only ever reached once the split irqchip was turned on.
+
+### Issue #43 runtime proof and platform profiles
+
+`./script/check-runtime-provenance.sh` checks both independent Cargo roots
+(the outer workspace and `vendor/microsandbox`) for the identical official
+crates.io `msb_krun*` 0.1.32 cohort and checksum map. It also checks the
+pinned `vendor/libkrunfw` gitlink, firmware version/ABI, and the x86 source
+configuration contract. This establishes source identity, not an attestation
+that an arbitrary executable came from that source; release provenance remains
+separate work.
+
+The public-CLI compatibility harness is `script/test/msb-krun-compat.sh`.
+It retains process, Docker, fixture, and guest-probe orchestration in shell, while
+`crates/msb-krun-compat-evidence` parses and validates host-side evidence and
+writes its JSON records. The small separate workspace crate keeps that contract
+buildable before the vendored `agentd` and agent-vm runtime dependencies; the
+static Python provenance checker intentionally remains Cargo-independent.
+On Apple Silicon macOS/HVF its device-discovery proof deliberately uses the
+flattened device tree plus guest sysfs and `virtiofs` mountinfo, rather than an
+x86 command-line proxy. A zero-user-bind baseline is compared with each case;
+each added bind must add one `virtio,mmio` FDT node and one bound `virtiofs`
+device, and selected low/boundary/final mounts must read their unique host
+marker and write a unique value back to the host.
+
+The accepted Darwin regression profile is conservative test policy:
+boundary samples 4 and 64, high case 112, and stress case 64. It is not a
+portable mount limit or capacity claim. The measured host booted through 128
+user binds; 256 was the first attempted failure
+(`RegisterFsDevice(IrqsExhausted)`); counts 129--255 were not exhaustively
+tested, so the exact maximum is unmeasured. Darwin's `/proc/cmdline` stayed
+about 202 bytes because arm64 HVF describes virtio-mmio devices in the device
+tree. The pinned firmware's 16 KiB command-line setting and the >2 KiB,
+trailing-`virtio_mmio.device=` acceptance proof are therefore Linux x86_64
+KVM-only.
+
+Linux x86_64 KVM still needs its own live `measure`, reviewed boundary/high/
+cmdline/stress constants, command-line declaration ordering/count proof, and
+split-irqchip/IOAPIC diagnostics. Darwin evidence and orchestration contracts
+do not satisfy any of those KVM items.
 
 ### Interactive attach vs. non-TTY exec
 

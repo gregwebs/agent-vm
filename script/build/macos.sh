@@ -62,7 +62,7 @@ preflight() {
         exit 1
     fi
 
-    for tool in rustup git docker codesign xcode-select file lipo plutil install cc; do
+    for tool in rustup git docker codesign xcode-select file lipo otool plutil install cc; do
         command -v "$tool" >/dev/null 2>&1 || {
             echo "error: required tool '$tool' was not found on PATH" >&2
             exit 1
@@ -166,22 +166,87 @@ build_and_sign_msb() {
     )
 }
 
+firmware_gitlink() {
+    local gitlink
+    gitlink="$(git -C vendor/microsandbox ls-tree HEAD vendor/libkrunfw | awk '{print $3}')"
+    [[ "$gitlink" =~ ^[0-9a-f]{40}$ ]] || {
+        echo "error: could not resolve the nested libkrunfw gitlink; initialize recursive submodules" >&2
+        exit 1
+    }
+    printf '%s\n' "$gitlink"
+}
+
+require_clean_firmware_source() {
+    local firmware_source=vendor/microsandbox/vendor/libkrunfw
+    [[ "$(git -C "$firmware_source" rev-parse HEAD)" == "$(firmware_gitlink)" ]] || {
+        echo "error: nested libkrunfw checkout does not match its gitlink; run git submodule update --init --recursive" >&2
+        exit 1
+    }
+    [[ -z "$(git -C "$firmware_source" status --porcelain --untracked-files=normal)" ]] || {
+        echo "error: nested libkrunfw source is dirty; restore it before building or reusing firmware" >&2
+        exit 1
+    }
+}
+
+firmware_artifact_is_valid() {
+    local path="$1" archs
+
+    file "$path" >&2
+    archs="$(lipo -archs "$path")" || return 1
+    [[ "$archs" == arm64 ]] || return 1
+    otool -L "$path" >/dev/null
+}
+
+require_valid_firmware_artifact() {
+    local path="$1"
+
+    firmware_artifact_is_valid "$path" || {
+        echo "error: $path must be an arm64-only loadable macOS dynamic library" >&2
+        exit 1
+    }
+}
+
 build_firmware_if_missing() {
     local firmware=vendor/microsandbox/build/libkrunfw.5.dylib
-    if [[ -f "$firmware" ]]; then
-        return
+    local stamp="${firmware}.source-sha"
+    local source_firmware=vendor/microsandbox/vendor/libkrunfw/libkrunfw.5.dylib
+    local staged_firmware="${firmware}.next"
+    local staged_stamp="${stamp}.next"
+    local gitlink expected_stamp
+
+    require_clean_firmware_source
+    gitlink="$(firmware_gitlink)"
+    expected_stamp="$gitlink"
+    if [[ "${MSB_FORCE_FIRMWARE_REBUILD:-}" != 1 && -f "$firmware" && -f "$stamp" && "$(cat "$stamp")" == "$expected_stamp" ]]; then
+        if firmware_artifact_is_valid "$firmware" >/dev/null 2>&1; then
+            return
+        fi
+        echo "==> Rebuilding invalid cached vendored firmware"
+    else
+        echo "==> Building vendored firmware from pinned source"
     fi
 
-    echo "==> Restoring missing vendored firmware output"
     (
-        cd vendor/microsandbox/vendor/libkrunfw
-        ./build_in_docker.sh
-        cc -fPIC -DABI_VERSION=5 -shared -o libkrunfw.5.dylib kernel.c
+        # shellcheck disable=SC2329 # This cleanup is invoked by the EXIT trap below.
+        cleanup_firmware_staging() {
+            rm -f "$staged_firmware" "$staged_stamp"
+        }
+        trap cleanup_firmware_staging EXIT
+
+        rm -f "$staged_firmware" "$staged_stamp"
+        (
+            cd vendor/microsandbox/vendor/libkrunfw
+            ./build_in_docker.sh
+            cc -fPIC -DABI_VERSION=5 -shared -o libkrunfw.5.dylib kernel.c
+        )
+        mkdir -p vendor/microsandbox/build
+        install -m 0644 "$source_firmware" "$staged_firmware"
+        require_valid_firmware_artifact "$staged_firmware"
+        printf '%s\n' "$expected_stamp" >"$staged_stamp"
+        mv -f "$staged_firmware" "$firmware"
+        mv -f "$staged_stamp" "$stamp"
+        trap - EXIT
     )
-    mkdir -p vendor/microsandbox/build
-    install -m 0644 \
-        vendor/microsandbox/vendor/libkrunfw/libkrunfw.5.dylib \
-        "$firmware"
 }
 
 build_microsandbox_runtime() {
@@ -204,6 +269,12 @@ require_build_outputs() {
         echo "error: vendored build did not produce vendor/microsandbox/build/libkrunfw.5.dylib" >&2
         exit 1
     }
+    require_clean_firmware_source
+    [[ -f vendor/microsandbox/build/libkrunfw.5.dylib.source-sha && "$(cat vendor/microsandbox/build/libkrunfw.5.dylib.source-sha)" == "$(firmware_gitlink)" ]] || {
+        echo "error: vendored firmware is missing a matching source identity stamp" >&2
+        exit 1
+    }
+    require_valid_firmware_artifact vendor/microsandbox/build/libkrunfw.5.dylib
 }
 
 build_agent_vm() {

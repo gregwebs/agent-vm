@@ -5,9 +5,9 @@
 # major).
 #
 # Submodule and Rust dep updates intentionally NOT enabled here —
-# bumping vendor/microsandbox needs a careful audit (patched msb +
-# libkrunfw kernel-config invariants), and Rust dep bumps are
-# better handled by `cargo update` runs we drive manually.
+# bumping vendor/microsandbox needs a careful audit of the official
+# msb_krun cohort and pinned libkrunfw source/config invariants, and Rust
+# dep bumps are better handled by `cargo update` runs we drive manually.
 
 version: 2
 updates:

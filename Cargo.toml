@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/agent-vm"]
+members = ["crates/agent-vm", "crates/msb-krun-compat-evidence"]
 # microsandbox declares its own workspace under vendor/; keep it separate
 # so Cargo doesn't try to absorb it into ours.
 exclude = ["vendor/microsandbox"]
