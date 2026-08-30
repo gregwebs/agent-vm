@@ -1095,10 +1095,16 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
 
     // The netstack (`HostHttpProxyConnector::from_env()`) auto-installs a
     // guest-egress HTTP-CONNECT proxy from the operator's own env — nothing
-    // to wire here, just surface positive confirmation at launch time
-    // matching the `==> Egress policy: ...` banners above.
+    // to wire here, just surface confirmation at launch time matching the
+    // `==> Egress policy: ...` banners above. Deliberately conditional
+    // wording: the netstack silently falls back to direct egress when the
+    // value isn't a usable `http://` proxy (see `active_guest_proxy_var`),
+    // so this banner must not promise routing agent-vm can't guarantee.
     if let Some((var, value)) = active_guest_proxy_var() {
-        eprintln!("==> Guest egress routed through host proxy {var}={value} (honoring NO_PROXY)");
+        eprintln!(
+            "==> Guest egress proxy: {var}={value} (used when it parses as an \
+             http:// proxy; NO_PROXY honored, otherwise egress goes direct)"
+        );
     }
 
     let auto_publish = args.auto_publish;
@@ -2002,12 +2008,15 @@ fn build_egress_policy(
     Some(policy)
 }
 
-/// The first set `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` env var (checking
-/// both the uppercase and the curl/wget/`requests`-convention lowercase
-/// spelling of each), or `None` if none are set. Purely for the launch-time
-/// confirmation banner — the netstack's own `HostHttpProxyConnector::from_env()`
-/// does the real (and independently tested) env parsing and `NO_PROXY`
-/// handling; agent-vm only needs to detect "is one set" for the banner.
+/// The proxy env var the netstack will actually pick up, plus a
+/// credential-free rendering of its value, or `None` if none is set.
+///
+/// Mirrors `HostHttpProxyConnector::from_env()`'s precedence exactly
+/// (`vendor/microsandbox/crates/network/lib/host_proxy.rs`): the
+/// curl/wget-convention **lowercase** spelling wins over the uppercase one
+/// (`first_environment_value(lowercase, uppercase)`), values are trimmed,
+/// and a whitespace-only value counts as unset. Purely for the launch-time
+/// banner — the netstack does the real parsing and `NO_PROXY` handling.
 fn active_guest_proxy_var() -> Option<(&'static str, String)> {
     active_guest_proxy_var_from(|var| std::env::var(var).ok())
 }
@@ -2024,15 +2033,45 @@ fn active_guest_proxy_var_from(
         ("HTTP_PROXY", "http_proxy"),
         ("ALL_PROXY", "all_proxy"),
     ] {
-        for var in [upper, lower] {
-            if let Some(value) = lookup(var)
-                && !value.is_empty()
-            {
-                return Some((var, value));
+        // Lowercase first, matching the netstack's own preference — the
+        // banner must name the variable the netstack will actually use.
+        for var in [lower, upper] {
+            if let Some(value) = lookup(var) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some((var, redact_proxy_userinfo(value)));
+                }
             }
         }
     }
     None
+}
+
+/// `http://user:pass@proxy:3128/pac` -> `http://proxy:3128/pac`.
+///
+/// A proxy URL's userinfo is a live credential — the netstack turns it into
+/// a Basic `Proxy-Authorization` header (`host_proxy.rs`'s
+/// `basic_authorization`) — and the vendored netstack deliberately logs only
+/// scheme+host+port for exactly that reason (`ProxyEndpoint::display`). A
+/// launch banner must not be the thing that spills it into terminal
+/// scrollback or a CI log.
+fn redact_proxy_userinfo(raw: &str) -> String {
+    let (scheme, rest) = match raw.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, raw),
+    };
+    // Split the authority off first so an '@' inside a path/query can't be
+    // mistaken for userinfo.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = match authority.rsplit_once('@') {
+        Some((_userinfo, host_port)) => host_port,
+        None => authority,
+    };
+    match scheme {
+        Some(scheme) => format!("{scheme}://{authority}{tail}"),
+        None => format!("{authority}{tail}"),
+    }
 }
 
 /// Build the GitHub repo allow-list by scanning `project_dir` and
@@ -3125,6 +3164,9 @@ options ndots:2 timeout:1";
     fn allow_lan_adds_private_group() {
         let policy = build_egress_policy(true, false, &[]).expect("Some");
         assert_eq!(policy.default_egress, Action::Deny);
+        // Installing a policy must not disturb ingress — `--publish`'s
+        // port_bind depends on `default_ingress == Allow`.
+        assert_eq!(policy.default_ingress, Action::Allow);
         let groups = group_rule_destinations(&policy);
         assert!(groups.contains(&DestinationGroup::Public));
         assert!(groups.contains(&DestinationGroup::Private));
@@ -3161,6 +3203,12 @@ options ndots:2 timeout:1";
         }
         // Public + DNS are still present further down the rule list.
         assert!(group_rule_destinations(&policy).contains(&DestinationGroup::Public));
+        // Exactly one ports-bearing rule survives: `Rule::allow_dns()`
+        // (UDP/TCP 53). This also pins `group_rule_destinations`'s filter.
+        assert_eq!(
+            policy.rules.iter().filter(|r| !r.ports.is_empty()).count(),
+            1
+        );
     }
 
     #[test]
@@ -3209,7 +3257,7 @@ options ndots:2 timeout:1";
 
     #[test]
     fn active_guest_proxy_var_ignores_empty_values() {
-        assert!(active_guest_proxy_var_from(|_| Some(String::new())).is_none());
+        assert!(active_guest_proxy_var_from(|_| Some("   ".to_string())).is_none());
     }
 
     #[test]
@@ -3237,6 +3285,61 @@ options ndots:2 timeout:1";
             active_guest_proxy_var_from(|v| (v == "ALL_PROXY").then(|| "socks5://x".to_string()))
                 .expect("Some");
         assert_eq!(var, "ALL_PROXY");
+    }
+
+    #[test]
+    fn active_guest_proxy_var_prefers_lowercase_spelling() {
+        // Matches the netstack's `first_environment_value(lowercase, uppercase)`.
+        let (var, value) = active_guest_proxy_var_from(|v| match v {
+            "https_proxy" => Some("http://lower.example:3128".to_string()),
+            "HTTPS_PROXY" => Some("http://upper.example:3128".to_string()),
+            _ => None,
+        })
+        .expect("Some");
+        assert_eq!(var, "https_proxy");
+        assert_eq!(value, "http://lower.example:3128");
+    }
+
+    #[test]
+    fn active_guest_proxy_var_redacts_embedded_credentials() {
+        let (_, value) = active_guest_proxy_var_from(|v| {
+            (v == "https_proxy").then(|| "http://alice:hunter2@proxy.example:3128".to_string())
+        })
+        .expect("Some");
+        assert_eq!(value, "http://proxy.example:3128");
+        assert!(
+            !value.contains("hunter2"),
+            "credential leaked into banner: {value}"
+        );
+    }
+
+    #[test]
+    fn redact_proxy_userinfo_leaves_credential_free_values_intact() {
+        assert_eq!(
+            redact_proxy_userinfo("http://proxy.example:3128"),
+            "http://proxy.example:3128"
+        );
+        assert_eq!(
+            redact_proxy_userinfo("proxy.example:3128"),
+            "proxy.example:3128"
+        );
+        assert_eq!(
+            redact_proxy_userinfo("http://[::1]:3128"),
+            "http://[::1]:3128"
+        );
+        // An '@' after the authority is path, not userinfo.
+        assert_eq!(
+            redact_proxy_userinfo("http://proxy:3128/a@b"),
+            "http://proxy:3128/a@b"
+        );
+    }
+
+    #[test]
+    fn redact_proxy_userinfo_strips_userinfo_before_ipv6_authority() {
+        assert_eq!(
+            redact_proxy_userinfo("http://u:p@[::1]:3128"),
+            "http://[::1]:3128"
+        );
     }
 
     #[test]
