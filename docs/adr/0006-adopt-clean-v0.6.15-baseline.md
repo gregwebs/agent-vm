@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted.
+Accepted. Superseded in part by ADR-0009 (features 1-3 of the four
+fail-closed here — guest proxy, `--auto-publish`, egress overrides —
+are now ported, not failed-closed; only credential injection remains
+fail-closed, tracked at gregwebs/agent-vm#51).
 
 ## Context
 

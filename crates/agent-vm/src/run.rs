@@ -51,8 +51,7 @@ const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF
 /// OCI config declares no `PATH` (e.g. the image metadata isn't cached yet
 /// on a cold first run, before the pull that happens later in `launch()`).
 /// See [`path_from_config_env`] and [`image_config_path_and_digest`].
-const FALLBACK_GUEST_PATH: &str =
-    "/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin";
+const FALLBACK_GUEST_PATH: &str = "/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin";
 
 /// Pulls the `PATH=` value out of an OCI config `env` vector (`KEY=VALUE`
 /// entries). Returns `None` when absent or empty — either way the caller
@@ -86,7 +85,10 @@ async fn image_config_path_and_digest(image: &str) -> (Option<String>, Option<St
         return (None, None);
     };
     match cache.read_image_metadata_async(&reference).await {
-        Ok(Some(md)) => (path_from_config_env(&md.config.env), Some(md.manifest_digest)),
+        Ok(Some(md)) => (
+            path_from_config_env(&md.config.env),
+            Some(md.manifest_digest),
+        ),
         _ => (None, None),
     }
 }
@@ -103,7 +105,10 @@ fn normalize_layer_flag(flag: Option<PathBuf>) -> Option<PathBuf> {
 /// tooling-layer-build confirmation, for CI/non-interactive callers. Truthy
 /// values match the repo convention (`1|true|yes|on`, see `pull::env_truthy`).
 fn should_auto_confirm(flag: bool, env_val: Option<&str>) -> bool {
-    flag || matches!(env_val, Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+    flag || matches!(
+        env_val,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
 }
 
 /// Interactive y/N confirmation before building a tooling layer (F3 in the
@@ -409,13 +414,23 @@ Environment:
 #[command(after_help = LAUNCH_AFTER_HELP, after_long_help = LAUNCH_AFTER_LONG_HELP)]
 pub struct Args {
     /// Sandbox memory, in GiB.
-    #[arg(long, env = "AGENT_VM_MEMORY_GIB", default_value_t = 2,
-          value_name = "GIB", help_heading = "Sandbox resources")]
+    #[arg(
+        long,
+        env = "AGENT_VM_MEMORY_GIB",
+        default_value_t = 2,
+        value_name = "GIB",
+        help_heading = "Sandbox resources"
+    )]
     memory: u32,
 
     /// vCPU count for the sandbox.
-    #[arg(long, env = "AGENT_VM_CPUS", default_value_t = 2,
-          value_name = "N", help_heading = "Sandbox resources")]
+    #[arg(
+        long,
+        env = "AGENT_VM_CPUS",
+        default_value_t = 2,
+        value_name = "N",
+        help_heading = "Sandbox resources"
+    )]
     cpus: u8,
 
     /// Don't inject host gh/git credentials into the guest.
@@ -423,14 +438,22 @@ pub struct Args {
     /// With this set, no gh auth flows through the proxy and the guest
     /// agent can't `git push` / `gh pr create` etc. Useful for one-off
     /// throwaway sessions on a repo you don't trust the agent with.
-    #[arg(long = "no-git", default_value_t = false, help_heading = "GitHub access")]
+    #[arg(
+        long = "no-git",
+        default_value_t = false,
+        help_heading = "GitHub access"
+    )]
     no_git: bool,
 
     /// Add a repo to the GitHub allow-list (repeatable).
     ///
     /// The cwd's `git remote -v` GitHub entries are always included;
     /// use this to widen the allow-list for cross-repo work.
-    #[arg(long = "repo", value_name = "OWNER/REPO", help_heading = "GitHub access")]
+    #[arg(
+        long = "repo",
+        value_name = "OWNER/REPO",
+        help_heading = "GitHub access"
+    )]
     repo: Vec<String>,
 
     /// Bind an extra host directory into the guest (repeatable).
@@ -459,100 +482,26 @@ pub struct Args {
     /// console, and `--volume` disks. Capacity depends on the host interrupt
     /// model and runtime; do not treat a measurement from one platform as a
     /// portable mount limit.
-    #[arg(long = "mount", value_name = "HOST[:GUEST][:ro|:rw|:follow-links]", help_heading = "Mounts & ports")]
+    #[arg(
+        long = "mount",
+        value_name = "HOST[:GUEST][:ro|:rw|:follow-links]",
+        help_heading = "Mounts & ports"
+    )]
     mount: Vec<String>,
 
-    /// Publish a guest TCP port to the host, docker-style (repeatable).
-    ///
-    /// Format `[HOST_BIND:]HOST_PORT:GUEST_PORT`. HOST_BIND defaults to
-    /// `127.0.0.1` — pass `0.0.0.0:HOST_PORT:GUEST_PORT` to expose on
-    /// every host interface.
-    ///
-    /// The guest service must listen on `0.0.0.0` (or the assigned
-    /// guest IP from `MSB_NET_IPV4`); a bare `127.0.0.1` bind inside
-    /// the guest is not reachable because the smoltcp dial target is
-    /// the guest's assigned VLAN address, not loopback.
-    #[arg(long = "publish", short = 'p', value_name = "[BIND:]HOST_PORT:GUEST_PORT",
-          help_heading = "Mounts & ports")]
-    publish: Vec<String>,
-
-    /// Auto-forward every guest listener onto the host (Lima-style).
-    ///
-    /// The runtime polls `/proc/net/tcp{,6}` inside the guest every ~2s
-    /// and mirrors each detected wildcard (`0.0.0.0`/`[::]`) OR
-    /// loopback (`127.0.0.1`/`[::1]`) TCP LISTEN socket onto a
-    /// host listener at `127.0.0.1:<same port>` (or an ephemeral
-    /// host port if the preferred one is taken). Loopback-only
-    /// guest services are reachable via an in-guest agentd
-    /// forwarder (`eth0_ip:port → 127.0.0.1:port`) — so anything
-    /// listening inside the guest, whether on the wildcard
-    /// interface or just loopback, becomes reachable on host
-    /// `127.0.0.1`. agent-vm prints each new mapping to stderr as
-    /// the runtime emits `PortEvent`s. Off by default.
-    ///
-    /// Security note: with this flag, every TCP service that
-    /// becomes reachable inside the guest is also reachable from
-    /// other processes on the host's loopback. If you don't want
-    /// that, omit `--auto-publish` and use `--publish` to expose
-    /// only the specific ports you mean to share.
-    #[arg(long = "auto-publish", default_value_t = false, help_heading = "Mounts & ports")]
-    auto_publish: bool,
-
-    /// Allow guest egress to one IP or CIDR (repeatable).
-    ///
-    /// Examples: `--allow-egress 10.100.1.75` (single host),
-    /// `--allow-egress 10.100.1.0/24` (CIDR),
-    /// `--allow-egress fd00::1/128` (IPv6).
-    ///
-    /// The default policy (`NetworkPolicy::public_only`) only
-    /// allows DNS and the `Public` destination group, so RFC1918
-    /// (10/8, 172.16/12, 192.168/16, 100.64/10), loopback, link-
-    /// local, and metadata addresses are all denied with
-    /// ECONNREFUSED. Use this flag to reach a specific dev box on
-    /// the same LAN as the host. Use `--allow-lan` instead if you
-    /// want to open the entire Private group at once.
-    #[arg(long = "allow-egress", value_name = "IP|CIDR", help_heading = "Network egress")]
-    allow_egress: Vec<String>,
-
-    /// Allow guest egress to the whole private LAN.
-    ///
-    /// Switches the egress policy from `public_only` to `non_local`
-    /// — adds the entire `DestinationGroup::Private` (10/8,
-    /// 172.16/12, 192.168/16, 100.64/10, fc00::/7) to the allow
-    /// list. Coarser than `--allow-egress <CIDR>`; useful for
-    /// "trust everything on my LAN". Loopback, link-local, and
-    /// metadata are still denied.
-    ///
-    /// Security note: a compromised in-guest process gets full
-    /// access to every device on your LAN with this flag. Prefer
-    /// `--allow-egress <CIDR>` for production-ish uses.
-    #[arg(long = "allow-lan", default_value_t = false, help_heading = "Network egress")]
-    allow_lan: bool,
-
-    /// Allow the guest to reach the host's 127.0.0.1 services.
-    ///
-    /// The smoltcp stack rewrites the per-sandbox gateway IP
-    /// (resolves as `host.microsandbox.internal` inside the guest)
-    /// to host's loopback, so e.g. a dev server bound to
-    /// `127.0.0.1:8080` on the host becomes reachable from the guest
-    /// at `host.microsandbox.internal:8080`. Adds the
-    /// `DestinationGroup::Host` (the gateway IP only) to the allow
-    /// list; loopback, link-local, metadata, and the wider LAN
-    /// remain denied.
-    ///
-    /// Security note: anything bound to the host's loopback —
-    /// including admin UIs, dev DBs, the Docker socket if it's
-    /// listening on a TCP port — becomes reachable from a possibly-
-    /// compromised in-guest process. Use only when you actually need
-    /// it.
-    #[arg(long = "allow-host", default_value_t = false, help_heading = "Network egress")]
-    allow_host: bool,
+    #[command(flatten)]
+    network: crate::network::Args,
 
     /// Override the OCI image reference.
     ///
     /// Default: `ghcr.io/wirenboard/agent-vm-template:latest`. Use a
     /// timestamped tag (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
-    #[arg(long, env = "AGENT_VM_IMAGE_TAG", value_name = "REF", help_heading = "Image")]
+    #[arg(
+        long,
+        env = "AGENT_VM_IMAGE_TAG",
+        value_name = "REF",
+        help_heading = "Image"
+    )]
     image: Option<String>,
 
     /// Check the registry for a newer image at launch (opt-in).
@@ -575,7 +524,12 @@ pub struct Args {
     /// in place of the base — see `docs/adr/0003-project-tooling-layers.md`.
     /// A hash miss (new/changed layer) prompts for confirmation unless
     /// `--yes` / `$AGENT_VM_YES` is set.
-    #[arg(long = "layer", env = "AGENT_VM_LAYER", value_name = "DIR", help_heading = "Image")]
+    #[arg(
+        long = "layer",
+        env = "AGENT_VM_LAYER",
+        value_name = "DIR",
+        help_heading = "Image"
+    )]
     layer: Option<PathBuf>,
 
     /// Assume "yes" to the tooling-layer build confirmation prompt.
@@ -584,7 +538,12 @@ pub struct Args {
     /// hash doesn't already match a previously built/loaded derived image
     /// (a new project, or an edited `.agent-vm/layer/Dockerfile`). Can also
     /// be set persistently with a truthy `AGENT_VM_YES` (1|true|yes|on).
-    #[arg(long = "yes", short = 'y', default_value_t = false, help_heading = "Image")]
+    #[arg(
+        long = "yes",
+        short = 'y',
+        default_value_t = false,
+        help_heading = "Image"
+    )]
     yes: bool,
 
     /// Run the guest as root (uid 0) instead of the default host user.
@@ -672,8 +631,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // confirmation on a miss) and boot it instead of the base. No layer ⇒
     // `image` is left as `base_image`, byte-identical to today.
     let layer_flag = normalize_layer_flag(args.layer.clone());
-    let auto_confirm =
-        should_auto_confirm(args.yes, env::var("AGENT_VM_YES").ok().as_deref());
+    let auto_confirm = should_auto_confirm(args.yes, env::var("AGENT_VM_YES").ok().as_deref());
     if let Some(derived) = resolve_boot_image_with_layer(
         &base_image,
         layer_flag.as_deref(),
@@ -825,9 +783,13 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // gh token written to a copilot secret file it never uses.
     let want_copilot = matches!(agent, Agent::Copilot);
 
-    let creds =
-        crate::secrets::refresh(&session.state_dir, &project_guest_path, use_github, want_copilot)
-            .context("snapshotting host credentials")?;
+    let creds = crate::secrets::refresh(
+        &session.state_dir,
+        &project_guest_path,
+        use_github,
+        want_copilot,
+    )
+    .context("snapshotting host credentials")?;
 
     // D1: when Copilot is the selected agent but no usable token could
     // be captured, fail loudly here. Otherwise the guest would send
@@ -999,13 +961,12 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         });
         extra_mount_mkdirs.extend(mkdir_chain(&em.guest));
     }
-    builder = builder
-        .patch(|mut p| {
-            for parent in extra_mount_mkdirs.drain(..) {
-                p = p.mkdir(parent, None);
-            }
-            p
-        });
+    builder = builder.patch(|mut p| {
+        for parent in extra_mount_mkdirs.drain(..) {
+            p = p.mkdir(parent, None);
+        }
+        p
+    });
     let mut builder = builder
         .patch(|mut p| {
             for parent in patch_builder_steps.drain(..) {
@@ -1052,63 +1013,10 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         })
         .env("CODEX_HOME", "/agent-vm-state/codex");
 
-    // Parse `--publish` into PublishedPort entries up front so we can
-    // wire them into the network builder below (the same place that
-    // sets up secrets/intercept). Done outside the conditional so it
-    // bails early on syntax errors regardless of cred state.
-    let publish_ports = parse_publish_args(&args.publish).context("parsing --publish")?;
-    for p in &publish_ports {
-        eprintln!(
-            "==> Publishing host {}:{}/{} → guest :{}",
-            p.host_bind,
-            p.host_port,
-            match p.protocol {
-                PublishProto::Tcp => "tcp",
-                PublishProto::Udp => "udp",
-            },
-            p.guest_port,
-        );
-    }
-
-    // Parse --allow-egress entries into IpNetwork values. Same
-    // up-front-bail rule as --publish: syntax errors fail before
-    // we boot the sandbox.
-    let allow_egress_cidrs =
-        parse_allow_egress(&args.allow_egress).context("parsing --allow-egress")?;
-    for cidr in &allow_egress_cidrs {
-        eprintln!("==> Egress policy: allowing {cidr}");
-    }
-    if args.allow_lan {
-        eprintln!(
-            "==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable)"
-        );
-    }
-    if args.allow_host {
-        eprintln!(
-            "==> Egress policy: --allow-host enabled (host.microsandbox.internal → host 127.0.0.1 reachable)"
-        );
-    }
-
-    // Phase 6 (agent-vm issue #40): the fork's guest-egress-via-host-proxy
-    // feature has no baseline equivalent (see `fail_closed.rs`). Fail
-    // closed rather than silently booting with unproxied guest egress
-    // while the operator believes traffic is routed through their proxy.
-    crate::fail_closed::check_no_guest_proxy_env()?;
-
-    // Phase 6: `--auto-publish` and the CIDR/group egress overrides rely
-    // on NetworkBuilder methods (`auto_publish`, `allow_egress_group`,
-    // `allow_egress_cidr`) that don't exist on this baseline. Fail closed
-    // rather than risk mistranslating them onto the new `.policy(..)`
-    // rule grammar without dedicated design/testing (see `fail_closed.rs`).
-    let auto_publish = args.auto_publish;
-    let allow_lan = args.allow_lan;
-    let allow_host = args.allow_host;
-    crate::fail_closed::check_auto_publish_unrequested(auto_publish)?;
-    crate::fail_closed::check_egress_overrides_unrequested(
-        allow_lan,
-        allow_host,
-        allow_egress_cidrs.len(),
-    )?;
+    let network_plan = crate::network::Plan::from_args(args.network)?;
+    network_plan
+        .emit_launch_notices()
+        .context("writing launch networking notices")?;
 
     // For each provider with a host credential file, register a
     // SecretValue::File secret keyed on the placeholder string the
@@ -1116,18 +1024,19 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // hook target so a 401-then-refresh attempt round-trips through a
     // real host-side rotation (see `intercept_hook`).
     //
-    // Phase 6: the fork's file-backed `SecretValue::File` (re-read on
-    // every connection, so a host-side token rotation propagates without
-    // restarting the sandbox) and its per-route intercept-hook dispatcher
-    // (`NetworkBuilder::intercept()`) do not exist on this baseline —
-    // `SecretBuilder::value()` only takes a static `String`. Rather than
-    // silently baking each file's *current* contents into a static
-    // secret (dropping the rotation guarantee and risking a leaked stale
-    // token on a later refresh), a launch that actually needs credential
-    // injection fails closed. `agent-vm shell --no-git` on a host with
-    // cached credentials is NOT such a launch — Shell never speaks to a
-    // provider/GitHub API on the guest's behalf — so it keeps booting.
-    // See `fail_closed.rs` for the exact criteria.
+    // The baseline now has the fork's file-backed `SecretSource` (re-read
+    // on every connection, so a host-side token rotation propagates
+    // without restarting the sandbox) and its per-route intercept-hook
+    // dispatcher (`NetworkBuilder::intercept()`) — but agent-vm's
+    // secrets.rs/intercept_hook.rs aren't wired onto them yet (issue
+    // gregwebs/agent-vm#51). Rather than silently baking each file's
+    // *current* contents into a static secret (dropping the rotation
+    // guarantee and risking a leaked stale token on a later refresh), a
+    // launch that actually needs credential injection fails closed.
+    // `agent-vm shell --no-git` on a host with cached credentials is NOT
+    // such a launch — Shell never speaks to a provider/GitHub API on the
+    // guest's behalf — so it keeps booting. See `fail_closed.rs` for the
+    // exact criteria.
     let has_creds = creds.anthropic_token_file.is_some()
         || creds.openai_token_file.is_some()
         || creds.gh_token_file.is_some()
@@ -1136,25 +1045,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         !args.no_git || crate::fail_closed::agent_requires_credentials(agent);
     crate::fail_closed::check_credential_injection_unneeded(has_creds, needs_credential_injection)?;
 
-    // Everything that could have needed the fork-only network features
-    // (creds, auto-publish, egress overrides) has already failed closed
-    // above if requested, so the only thing left the network(..) closure
-    // can legitimately do on this baseline is `--publish` port forwarding
-    // (`.port_bind`/`.port_udp_bind` are ordinary baseline APIs).
-    if !publish_ports.is_empty() {
-        let publish_ports_for_net = publish_ports.clone();
-        builder = builder.network(move |mut n| {
-            n = n.tls(|t| t);
-            for p in &publish_ports_for_net {
-                let host_bind = p.host_bind;
-                n = match p.protocol {
-                    PublishProto::Tcp => n.port_bind(host_bind, p.host_port, p.guest_port),
-                    PublishProto::Udp => n.port_udp_bind(host_bind, p.host_port, p.guest_port),
-                };
-            }
-            n
-        });
-    }
+    builder = network_plan.apply_to(builder);
 
     // Still honour ANTHROPIC_API_KEY / OPENAI_API_KEY if explicitly set
     // by the user — that path stays a simple Bearer header, no
@@ -1304,13 +1195,9 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     crate::secrets::sync_chrome_mcp(&session.state_dir, chrome_mcp_enabled)
         .context("synchronizing Chrome MCP configuration")?;
 
-    // Phase 6 (agent-vm issue #40): `--auto-publish` already fails closed
-    // earlier in `launch()` (`fail_closed::check_auto_publish_unrequested`)
-    // because baseline's `NetworkBuilder` has no `auto_publish()` method —
-    // and, correspondingly, no `Sandbox::port_events()`/`PortEvent` stream
-    // to subscribe to. The event-subscriber this block used to spawn here
-    // is therefore dead code on this baseline; removed rather than kept
-    // uncompilable. Re-add once #47's follow-up ports auto-publish.
+    network_plan
+        .start_event_reporting(&sandbox)
+        .context("starting auto-publish event reporting")?;
 
     let inner_cmd = agent.command();
     // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions
@@ -1388,12 +1275,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // Assemble the in-guest `bash -c` line via `build_agent_shell_line`,
     // which is unit-tested directly. The IPv6-nameserver strip is the
     // `STRIP_IPV6_NAMESERVERS` const (see its doc comment / PLAN.md B3).
-    let shell_line = build_agent_shell_line(
-        &project_guest_path,
-        "",
-        inner_cmd,
-        &inner_args,
-    );
+    let shell_line = build_agent_shell_line(&project_guest_path, "", inner_cmd, &inner_args);
     let cmd = "bash";
     let agent_args: Vec<String> = vec!["-c".into(), shell_line];
 
@@ -1702,7 +1584,9 @@ async fn next_exec_step(
 /// error message rendered far from where the launcher ran is
 /// confusing.
 fn sandbox_log_dir(sandbox_name: &str) -> PathBuf {
-    microsandbox_sandboxes_root().join(sandbox_name).join("logs")
+    microsandbox_sandboxes_root()
+        .join(sandbox_name)
+        .join("logs")
 }
 
 /// `$MSB_HOME/sandboxes` (resolved through the same ladder as
@@ -1787,143 +1671,6 @@ fn pid_alive(pid: u32) -> bool {
     // process exits is small compared to the cost of nuking an
     // unrelated process's sandbox.
     std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
-
-/// One `--publish [HOST_BIND:]HOST_PORT:GUEST_PORT[/proto]` entry, parsed.
-#[derive(Clone, Debug)]
-struct PublishPort {
-    host_bind: std::net::IpAddr,
-    host_port: u16,
-    guest_port: u16,
-    protocol: PublishProto,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PublishProto {
-    Tcp,
-    /// Reserved for when the underlying PortPublisher gains UDP
-    /// support. Parser currently rejects `/udp` so this variant
-    /// is unreachable from user input, but kept so the eventual
-    /// enable change is a single-site edit.
-    #[allow(dead_code)]
-    Udp,
-}
-
-/// Parse `--publish` entries. Accepts docker-style:
-///   `HOST_PORT:GUEST_PORT`                 → 127.0.0.1 bind, TCP
-///   `HOST_IP:HOST_PORT:GUEST_PORT`         → explicit IPv4 bind
-///   `[HOST_IP6]:HOST_PORT:GUEST_PORT`      → explicit IPv6 bind (bracket form)
-///   any of the above + `/tcp` (UDP rejected — not implemented)
-///
-/// The connection enters the smoltcp in-process stack as a dial to
-/// the guest's assigned MSB_NET_IPV4 (or v6) on `GUEST_PORT`, so the
-/// in-guest service has to listen on `0.0.0.0`/`::` (or that exact
-/// guest IP) — a bare `127.0.0.1` bind inside the guest is not
-/// reachable from the publisher.
-///
-/// `/udp` is parsed but REJECTED with a clear error: the underlying
-/// `PortPublisher::spawn_listener_one` short-circuits non-TCP ports
-/// silently, so silently accepting `/udp` would leave the user with
-/// a "published" port that has no listener. When UDP support lands
-/// upstream, drop the rejection here.
-fn parse_publish_args(raw: &[String]) -> Result<Vec<PublishPort>> {
-    use std::net::IpAddr;
-    let mut out = Vec::with_capacity(raw.len());
-    for entry in raw {
-        let (body, proto) = match entry.rsplit_once('/') {
-            Some((b, p)) if matches!(p, "tcp" | "udp" | "TCP" | "UDP") => {
-                (b, p.to_ascii_lowercase())
-            }
-            _ => (entry.as_str(), "tcp".to_string()),
-        };
-        if proto == "udp" {
-            anyhow::bail!(
-                "--publish {entry:?}: UDP is not yet supported by the underlying smoltcp \
-                 PortPublisher; remove `/udp` to publish a TCP port instead"
-            );
-        }
-        let protocol = PublishProto::Tcp;
-
-        // Split off an IPv6 bracketed prefix first (docker convention)
-        // so `[::1]:8080:80` doesn't trip the generic colon split.
-        let (host_bind, rest) = if let Some(after_bracket) = body.strip_prefix('[') {
-            let (v6_str, after) = after_bracket.split_once("]:").ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--publish {entry:?}: bracketed IPv6 must be `[ADDR]:HOST_PORT:GUEST_PORT`"
-                )
-            })?;
-            let addr = v6_str.parse::<std::net::Ipv6Addr>().with_context(|| {
-                format!("--publish {entry:?}: HOST_BIND {v6_str:?} is not an IPv6")
-            })?;
-            (Some(IpAddr::V6(addr)), after)
-        } else {
-            (None, body)
-        };
-
-        let parts: Vec<&str> = rest.split(':').collect();
-        let (host_bind, host_port, guest_port) = match (host_bind, parts.as_slice()) {
-            (Some(bind), [h, g]) => (
-                bind,
-                parse_port(entry, "HOST_PORT", h)?,
-                parse_port(entry, "GUEST_PORT", g)?,
-            ),
-            (None, [h, g]) => (
-                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                parse_port(entry, "HOST_PORT", h)?,
-                parse_port(entry, "GUEST_PORT", g)?,
-            ),
-            (None, [ip, h, g]) => (
-                ip.parse::<IpAddr>().with_context(|| {
-                    format!("--publish {entry:?}: HOST_BIND {ip:?} is not an IP")
-                })?,
-                parse_port(entry, "HOST_PORT", h)?,
-                parse_port(entry, "GUEST_PORT", g)?,
-            ),
-            _ => anyhow::bail!(
-                "--publish {entry:?} must be [HOST_BIND:]HOST_PORT:GUEST_PORT or \
-                 [IPv6_BIND]:HOST_PORT:GUEST_PORT"
-            ),
-        };
-        if host_port == 0 || guest_port == 0 {
-            anyhow::bail!("--publish {entry:?}: port 0 is not allowed");
-        }
-        out.push(PublishPort {
-            host_bind,
-            host_port,
-            guest_port,
-            protocol,
-        });
-    }
-    Ok(out)
-}
-
-fn parse_port(entry: &str, field: &str, s: &str) -> Result<u16> {
-    s.parse::<u16>()
-        .with_context(|| format!("--publish {entry:?}: {field} {s:?} is not a u16"))
-}
-
-/// Parse `--allow-egress` entries. Each entry is an IP literal or
-/// a CIDR (e.g. `10.100.1.75` or `10.100.1.0/24`). A bare IP is
-/// expanded to a /32 (v4) or /128 (v6) CIDR — that matches the
-/// shape the policy builder's `Destination::Cidr` expects.
-fn parse_allow_egress(raw: &[String]) -> Result<Vec<ipnetwork::IpNetwork>> {
-    let mut out = Vec::with_capacity(raw.len());
-    for entry in raw {
-        // Try CIDR first (foo/N); fall back to bare IP.
-        let cidr = if entry.contains('/') {
-            entry
-                .parse::<ipnetwork::IpNetwork>()
-                .with_context(|| format!("--allow-egress {entry:?}: not a valid CIDR"))?
-        } else {
-            let ip: std::net::IpAddr = entry.parse().with_context(|| {
-                format!("--allow-egress {entry:?}: not an IP address or CIDR")
-            })?;
-            // /32 for v4, /128 for v6 — single-host rule.
-            ipnetwork::IpNetwork::from(ip)
-        };
-        out.push(cidr);
-    }
-    Ok(out)
 }
 
 /// Build the GitHub repo allow-list by scanning `project_dir` and
@@ -2078,17 +1825,23 @@ fn parse_gitmodules_github_slugs(dir: &Path) -> Vec<String> {
 fn safe_git_config_flags() -> [&'static str; 12] {
     [
         // Disable repo-local config that runs binaries:
-        "-c", "core.fsmonitor=",
-        "-c", "core.fsmonitorHookVersion=",
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "core.fsmonitorHookVersion=",
         // Editor/pager fall back to cat — nothing we run here
         // needs them but a repo `core.pager = !bad-script` would
         // otherwise fire on output paging.
-        "-c", "core.pager=cat",
-        "-c", "core.editor=:",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "core.editor=:",
         // Trust the dir even if owned by another UID (we only read).
-        "-c", "safe.directory=*",
+        "-c",
+        "safe.directory=*",
         // Don't fetch anything across this invocation.
-        "-c", "protocol.allow=never",
+        "-c",
+        "protocol.allow=never",
     ]
 }
 
@@ -2236,7 +1989,11 @@ mod tests {
 
     #[test]
     fn path_from_config_env_reads_the_path_entry() {
-        let env = vec!["LANG=C.UTF-8".to_string(), "PATH=/opt/agent/.local/bin:/usr/bin".to_string(), "TZ=UTC".to_string()];
+        let env = vec![
+            "LANG=C.UTF-8".to_string(),
+            "PATH=/opt/agent/.local/bin:/usr/bin".to_string(),
+            "TZ=UTC".to_string(),
+        ];
         assert_eq!(
             path_from_config_env(&env),
             Some("/opt/agent/.local/bin:/usr/bin".to_string())
@@ -2581,8 +2338,8 @@ mod tests {
         assert!(!cli.args.update_check);
 
         // `--update-check` parses and flips the field on.
-        let cli = TestCli::try_parse_from(["agent-vm", "--update-check"])
-            .expect("parses --update-check");
+        let cli =
+            TestCli::try_parse_from(["agent-vm", "--update-check"]).expect("parses --update-check");
         assert!(cli.args.update_check);
 
         // The removed `--no-update-check` flag is no longer a recognized
@@ -2599,9 +2356,81 @@ mod tests {
     }
 
     #[test]
+    fn launch_keeps_network_preflight_before_credential_guard_and_boot() {
+        // `launch` has boot-heavy dependencies, so keep this caller-level
+        // characterization at the orchestration boundary. The Plan tests own
+        // the behavior of each lifecycle operation; this test prevents a
+        // future reorder from moving validation/notices past the fail-closed
+        // guard or sandbox construction.
+        // Limit the source characterization to production code. Searching the
+        // complete `include_str!` would let these test literals satisfy their
+        // own assertions if a lifecycle call were removed from `launch`.
+        let production = include_str!("run.rs")
+            .split_once("#[cfg(test)]")
+            .expect("run.rs has a test module")
+            .0;
+        let position = |needle| production.find(needle).expect("launch step is present");
+        let plan = position("let network_plan = crate::network::Plan::from_args(args.network)?;");
+        let notices = position(".emit_launch_notices()");
+        let credential_guard = position("crate::fail_closed::check_credential_injection_unneeded");
+        let apply = position("builder = network_plan.apply_to(builder);");
+        let build = position("let config = builder.build().await");
+        let create = position("Sandbox::create_with_pull_progress(config)");
+        assert!(plan < notices);
+        assert!(notices < credential_guard);
+        assert!(credential_guard < apply);
+        assert!(apply < build);
+        assert!(build < create);
+    }
+
+    #[test]
+    fn flattened_network_args_preserve_values_defaults_and_trailing_agent_args() {
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: Args,
+        }
+        use clap::Parser as _;
+
+        let defaults = TestCli::try_parse_from(["agent-vm"]).expect("default launch args parse");
+        assert!(defaults.args.network.publish.is_empty());
+        assert!(!defaults.args.network.auto_publish);
+        assert!(defaults.args.network.allow_egress.is_empty());
+        assert!(!defaults.args.network.allow_lan);
+        assert!(!defaults.args.network.allow_host);
+
+        let parsed = TestCli::try_parse_from([
+            "agent-vm",
+            "-p",
+            "8080:3000",
+            "--publish",
+            "8081:3001",
+            "--auto-publish",
+            "--allow-egress",
+            "10.0.0.5",
+            "--allow-egress",
+            "fd00::1",
+            "--allow-lan",
+            "--allow-host",
+            "--",
+            "--agent-flag",
+        ])
+        .expect("all network options parse before trailing agent args");
+        assert_eq!(parsed.args.network.publish, ["8080:3000", "8081:3001"]);
+        assert!(parsed.args.network.auto_publish);
+        assert_eq!(parsed.args.network.allow_egress, ["10.0.0.5", "fd00::1"]);
+        assert!(parsed.args.network.allow_lan);
+        assert!(parsed.args.network.allow_host);
+        assert_eq!(parsed.args.agent_args, ["--agent-flag"]);
+    }
+
+    #[test]
     fn shell_escape_handles_simple_and_quoted() {
         assert_eq!(shell_escape("foo"), "'foo'");
-        assert_eq!(shell_escape("--flag=value with spaces"), "'--flag=value with spaces'");
+        assert_eq!(
+            shell_escape("--flag=value with spaces"),
+            "'--flag=value with spaces'"
+        );
         assert_eq!(shell_escape("don't"), "'don'\\''t'");
         assert_eq!(shell_escape(""), "''");
     }
@@ -2621,8 +2450,7 @@ mod tests {
 
     #[test]
     fn build_agent_shell_line_includes_chrome_prelude_and_args() {
-        let line =
-            build_agent_shell_line("/p", "CHROME_CA_STUFF\n", "codex", &["exec".into()]);
+        let line = build_agent_shell_line("/p", "CHROME_CA_STUFF\n", "codex", &["exec".into()]);
         assert!(line.contains("CHROME_CA_STUFF"));
         assert!(line.contains("exec 'codex' 'exec'"));
     }
@@ -2752,7 +2580,10 @@ options ndots:2 timeout:1";
     #[test]
     fn parse_github_slug_rejects_non_github_urls() {
         assert_eq!(parse_github_slug("https://gitlab.com/o/r"), None);
-        assert_eq!(parse_github_slug("https://example.com/github.com/o/r"), None);
+        assert_eq!(
+            parse_github_slug("https://example.com/github.com/o/r"),
+            None
+        );
         assert_eq!(parse_github_slug(""), None);
         assert_eq!(parse_github_slug("not a url"), None);
     }
@@ -2826,15 +2657,16 @@ options ndots:2 timeout:1";
 
     #[test]
     fn guest_always_env_pins_utf8_locale_and_sandbox_flag() {
-        let map: std::collections::HashMap<&str, &str> =
-            GUEST_ALWAYS_ENV.iter().copied().collect();
+        let map: std::collections::HashMap<&str, &str> = GUEST_ALWAYS_ENV.iter().copied().collect();
         // Claude Code's root-guard bypass must stay set.
         assert_eq!(map.get("IS_SANDBOX"), Some(&"1"));
         // A UTF-8 locale must be pinned: without it the guest is C/POSIX,
         // which renders a Cyrillic cwd as `M-P…` escapes and makes the
         // agents' filesystem encoding ASCII (mishandling non-ASCII paths).
         // Removing or non-UTF-8-ing this regresses Cyrillic-path support.
-        let lang = map.get("LANG").expect("guest LANG must be pinned to a UTF-8 locale");
+        let lang = map
+            .get("LANG")
+            .expect("guest LANG must be pinned to a UTF-8 locale");
         assert!(
             lang.to_ascii_lowercase().replace('-', "").contains("utf8"),
             "guest LANG must be a UTF-8 locale, got {lang:?}"
@@ -2866,132 +2698,9 @@ options ndots:2 timeout:1";
 
         // A control character in the path can't be framed for the side
         // channel → defensive /workspace fallback.
-        let (guest, reason) =
-            resolve_project_guest_path(Path::new("/home/a\tb"), "/home/a\tb");
+        let (guest, reason) = resolve_project_guest_path(Path::new("/home/a\tb"), "/home/a\tb");
         assert_eq!(guest, "/workspace");
         assert!(reason.is_some_and(|r| r.contains("control characters")));
-    }
-
-    // ── parse_publish_args ───────────────────────────────────────
-
-    #[test]
-    fn parse_publish_args_two_part_defaults_to_loopback_tcp() {
-        let p = parse_publish_args(&["8080:80".into()]).expect("ok");
-        assert_eq!(p.len(), 1);
-        assert_eq!(
-            p[0].host_bind,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-        );
-        assert_eq!(p[0].host_port, 8080);
-        assert_eq!(p[0].guest_port, 80);
-        assert_eq!(p[0].protocol, PublishProto::Tcp);
-    }
-
-    #[test]
-    fn parse_publish_args_three_part_with_bind() {
-        let p = parse_publish_args(&["0.0.0.0:5000:5000".into()]).expect("ok");
-        assert_eq!(
-            p[0].host_bind,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-        );
-        assert_eq!(p[0].host_port, 5000);
-        assert_eq!(p[0].guest_port, 5000);
-    }
-
-    #[test]
-    fn parse_publish_args_explicit_tcp_suffix() {
-        let p = parse_publish_args(&["8080:80/tcp".into()]).expect("ok");
-        assert_eq!(p[0].protocol, PublishProto::Tcp);
-    }
-
-    /// UDP must be REJECTED with a clear error. Previously the parser
-    /// accepted it, the stderr banner said "Publishing …/udp", and
-    /// `PortPublisher::spawn_listener_one` silently dropped it — user
-    /// got a "successful" publish that actually had no listener.
-    #[test]
-    fn parse_publish_args_rejects_udp() {
-        let err = parse_publish_args(&["53:53/udp".into()])
-            .expect_err("UDP must be rejected until upstream supports it")
-            .to_string();
-        assert!(
-            err.contains("UDP is not yet supported"),
-            "error should mention UDP unsupported, got: {err}"
-        );
-    }
-
-    /// IPv6 host bind must work via the docker-style `[ADDR]:p:p`
-    /// bracket form. Previously the parser split the whole body on
-    /// `:` and IPv6 was unreachable.
-    #[test]
-    fn parse_publish_args_ipv6_bracket_bind() {
-        let p = parse_publish_args(&["[::1]:8080:80".into()]).expect("ok");
-        assert_eq!(p[0].host_bind, std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
-        assert_eq!(p[0].host_port, 8080);
-        assert_eq!(p[0].guest_port, 80);
-    }
-
-    #[test]
-    fn parse_publish_args_ipv6_bracket_wildcard() {
-        let p = parse_publish_args(&["[::]:5000:5000".into()]).expect("ok");
-        assert_eq!(
-            p[0].host_bind,
-            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-        );
-    }
-
-    #[test]
-    fn parse_publish_args_ipv6_bracket_missing_closer_is_rejected() {
-        // `[::1` without `]:` should be a clear error, not a silent
-        // misparse.
-        assert!(parse_publish_args(&["[::1:8080:80".into()]).is_err());
-    }
-
-    // ── parse_allow_egress ───────────────────────────────────────
-
-    #[test]
-    fn parse_allow_egress_accepts_bare_ipv4() {
-        let r = parse_allow_egress(&["10.100.1.75".into()]).expect("ok");
-        assert_eq!(r.len(), 1);
-        // Bare IPv4 → /32 single-host CIDR.
-        assert_eq!(r[0].prefix(), 32);
-        assert_eq!(r[0].network().to_string(), "10.100.1.75");
-    }
-
-    #[test]
-    fn parse_allow_egress_accepts_ipv4_cidr() {
-        let r = parse_allow_egress(&["10.100.1.0/24".into()]).expect("ok");
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].prefix(), 24);
-    }
-
-    #[test]
-    fn parse_allow_egress_accepts_ipv6_cidr() {
-        let r = parse_allow_egress(&["fd00::/64".into()]).expect("ok");
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].prefix(), 64);
-    }
-
-    #[test]
-    fn parse_allow_egress_accepts_bare_ipv6() {
-        let r = parse_allow_egress(&["fd00::1".into()]).expect("ok");
-        assert_eq!(r[0].prefix(), 128);
-    }
-
-    #[test]
-    fn parse_allow_egress_rejects_garbage() {
-        assert!(parse_allow_egress(&["not-an-ip".into()]).is_err());
-        assert!(parse_allow_egress(&["10.0.0.1/99".into()]).is_err());
-        assert!(parse_allow_egress(&["".into()]).is_err());
-    }
-
-    #[test]
-    fn parse_publish_args_rejects_bad_input() {
-        assert!(parse_publish_args(&["80".into()]).is_err());
-        assert!(parse_publish_args(&["a:b".into()]).is_err());
-        assert!(parse_publish_args(&["0:80".into()]).is_err());
-        assert!(parse_publish_args(&["80:0".into()]).is_err());
-        assert!(parse_publish_args(&["999999:80".into()]).is_err());
-        assert!(parse_publish_args(&["1:2:3:4".into()]).is_err());
     }
 
     // ── mkdir_chain ──────────────────────────────────────────────
@@ -3071,17 +2780,17 @@ options ndots:2 timeout:1";
         // If origin happens to be non-github (rare), we still expect
         // the submodule slug.
         assert!(
-            slugs.iter().any(|s| s.eq_ignore_ascii_case("gregwebs/microsandbox")),
+            slugs
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case("gregwebs/microsandbox")),
             "expected gregwebs/microsandbox in scope, got {slugs:?}"
         );
     }
 
     #[test]
     fn parse_gitmodules_returns_empty_when_file_missing() {
-        let tmp = std::env::temp_dir().join(format!(
-            "agent-vm-gitmodules-test-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("agent-vm-gitmodules-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let slugs = parse_gitmodules_github_slugs(&tmp);
         std::fs::remove_dir_all(&tmp).ok();
@@ -3144,9 +2853,7 @@ async fn notify_if_update_available(image: &str) {
             eprintln!(
                 "==> A newer image is available in the registry (cached {cached}, registry {remote})"
             );
-            eprintln!(
-                "==> Run `agent-vm pull` to fetch it. Continuing with the cached image."
-            );
+            eprintln!("==> Run `agent-vm pull` to fetch it. Continuing with the cached image.");
         }
         // UpToDate / NotCached: nothing to say.
         // Ok(Err)/None: registry unreachable etc. — stay quiet.
@@ -3163,7 +2870,10 @@ async fn notify_if_update_available(image: &str) {
 /// Truthy values match the repo convention (`1|true|yes|on`,
 /// see `pull::env_truthy`).
 fn should_check_update(flag: bool, env_val: Option<&str>) -> bool {
-    flag || matches!(env_val, Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+    flag || matches!(
+        env_val,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
 }
 
 /// Wall-clock budget for the launch-path update probe. Bounds the worst
@@ -3171,4 +2881,3 @@ fn should_check_update(flag: bool, env_val: Option<&str>) -> bool {
 /// unreachable registry can't stall boot; matches a single request's
 /// per-request timeout in `image_check`.
 const UPDATE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-

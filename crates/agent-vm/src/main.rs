@@ -16,6 +16,7 @@ mod msb_cmd;
 mod msb_install;
 mod msb_preflight;
 mod msb_schema;
+mod network;
 mod pull;
 mod pull_progress;
 mod pulled_marker;
@@ -167,4 +168,89 @@ fn init_tracing() {
 
 fn exit_with(code: i32) -> Result<()> {
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory as _, Parser as _};
+
+    use super::Cli;
+
+    // Clap indents blank description spacers at this width. Normalize only lines
+    // containing whitespace so fixtures stay clean while still pinning every
+    // meaningful character, indentation, and ordering in both help renderings.
+    fn normalize_help_whitespace_only_lines(help: &str) -> String {
+        help.split_inclusive('\n')
+            .map(|line| {
+                let (content, newline) = line
+                    .strip_suffix('\n')
+                    .map_or((line, ""), |content| (content, "\n"));
+                if content.trim().is_empty() {
+                    newline.to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shell_accepts_network_options_and_keeps_help_stable() {
+        Cli::try_parse_from([
+            "agent-vm",
+            "shell",
+            "-p",
+            "8080:3000",
+            "--publish",
+            "[::1]:8081:3001/tcp",
+            "--auto-publish",
+            "--allow-egress",
+            "10.0.0.5",
+            "--allow-egress",
+            "fd00::1",
+            "--allow-lan",
+            "--allow-host",
+            "--",
+            "--agent-flag",
+        ])
+        .expect("the real shell subcommand accepts all network options");
+
+        let mut command = Cli::command().term_width(100);
+        let mut shell = command
+            .find_subcommand_mut("shell")
+            .expect("shell subcommand is registered")
+            .clone()
+            .bin_name("agent-vm shell")
+            // These fixtures characterize the CLI contract, not ambient process
+            // configuration. Keep the env-variable labels but omit their values
+            // on this test-only clone so parallel tests never need setenv().
+            .mut_args(|arg| arg.hide_env_values(true));
+
+        let mut short_help = Vec::new();
+        shell
+            .clone()
+            .write_help(&mut short_help)
+            .expect("short shell help renders");
+        assert_eq!(
+            normalize_help_whitespace_only_lines(
+                &String::from_utf8(short_help).expect("help is UTF-8"),
+            ),
+            normalize_help_whitespace_only_lines(include_str!(
+                "../tests/fixtures/shell-short-help-columns-100.txt"
+            ))
+        );
+
+        let mut long_help = Vec::new();
+        shell
+            .write_long_help(&mut long_help)
+            .expect("long shell help renders");
+        assert_eq!(
+            normalize_help_whitespace_only_lines(
+                &String::from_utf8(long_help).expect("help is UTF-8"),
+            ),
+            normalize_help_whitespace_only_lines(include_str!(
+                "../tests/fixtures/shell-help-columns-100.txt"
+            ))
+        );
+    }
 }
