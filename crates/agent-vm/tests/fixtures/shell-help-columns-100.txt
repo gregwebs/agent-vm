@@ -17,13 +17,13 @@ Sandbox resources:
       --memory <GIB>
           Sandbox memory, in GiB
 
-          [env: AGENT_VM_MEMORY_GIB=]
+          [env: AGENT_VM_MEMORY_GIB]
           [default: 2]
 
       --cpus <N>
           vCPU count for the sandbox
 
-          [env: AGENT_VM_CPUS=]
+          [env: AGENT_VM_CPUS]
           [default: 2]
 
 GitHub access:
@@ -135,7 +135,7 @@ Image:
           Default: `ghcr.io/wirenboard/agent-vm-template:latest`. Use a timestamped tag
           (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
 
-          [env: AGENT_VM_IMAGE_TAG=agent-vm-template:latest]
+          [env: AGENT_VM_IMAGE_TAG]
 
       --update-check
           Check the registry for a newer image at launch (opt-in).
@@ -155,7 +155,7 @@ Image:
           `docs/adr/0003-project-tooling-layers.md`. A hash miss (new/changed layer) prompts for
           confirmation unless `--yes` / `$AGENT_VM_YES` is set.
 
-          [env: AGENT_VM_LAYER=]
+          [env: AGENT_VM_LAYER]
 
   -y, --yes
           Assume "yes" to the tooling-layer build confirmation prompt.

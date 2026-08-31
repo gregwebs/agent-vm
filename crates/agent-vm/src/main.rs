@@ -220,7 +220,11 @@ mod tests {
             .find_subcommand_mut("shell")
             .expect("shell subcommand is registered")
             .clone()
-            .bin_name("agent-vm shell");
+            .bin_name("agent-vm shell")
+            // These fixtures characterize the CLI contract, not ambient process
+            // configuration. Keep the env-variable labels but omit their values
+            // on this test-only clone so parallel tests never need setenv().
+            .mut_args(|arg| arg.hide_env_values(true));
 
         let mut short_help = Vec::new();
         shell

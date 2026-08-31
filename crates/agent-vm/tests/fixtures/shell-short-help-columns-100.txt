@@ -9,8 +9,8 @@ Options:
   -h, --help  Print help (see more with '--help')
 
 Sandbox resources:
-      --memory <GIB>  Sandbox memory, in GiB [env: AGENT_VM_MEMORY_GIB=] [default: 2]
-      --cpus <N>      vCPU count for the sandbox [env: AGENT_VM_CPUS=] [default: 2]
+      --memory <GIB>  Sandbox memory, in GiB [env: AGENT_VM_MEMORY_GIB] [default: 2]
+      --cpus <N>      vCPU count for the sandbox [env: AGENT_VM_CPUS] [default: 2]
 
 GitHub access:
       --no-git             Don't inject host gh/git credentials into the guest
@@ -30,11 +30,10 @@ Network egress:
       --allow-host              Allow the guest to reach the host's 127.0.0.1 services
 
 Image:
-      --image <REF>   Override the OCI image reference [env:
-                      AGENT_VM_IMAGE_TAG=agent-vm-template:latest]
+      --image <REF>   Override the OCI image reference [env: AGENT_VM_IMAGE_TAG]
       --update-check  Check the registry for a newer image at launch (opt-in)
       --layer <DIR>   Tooling-layer directory (a Dockerfile built FROM the base image) [env:
-                      AGENT_VM_LAYER=]
+                      AGENT_VM_LAYER]
   -y, --yes           Assume "yes" to the tooling-layer build confirmation prompt
 
 Guest user:
