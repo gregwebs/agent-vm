@@ -119,7 +119,7 @@ build_agentd() (
 
     local container_id=
     # Invoked indirectly by the subshell's EXIT trap.
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     cleanup_container() {
         if [[ -n "$container_id" ]]; then
             docker rm "$container_id" >/dev/null 2>&1 || true
@@ -227,7 +227,7 @@ build_firmware_if_missing() {
     fi
 
     (
-        # shellcheck disable=SC2329 # This cleanup is invoked by the EXIT trap below.
+        # shellcheck disable=SC2317,SC2329 # This cleanup is invoked by the EXIT trap below.
         cleanup_firmware_staging() {
             rm -f "$staged_firmware" "$staged_stamp"
         }
