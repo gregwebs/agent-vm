@@ -9,8 +9,8 @@
 //! `integration/v0.6.15-agent-vm` line, which supplies baseline
 //! implementations of the first three (`HostHttpProxyConnector::from_env()`,
 //! `NetworkBuilder::auto_publish()`, and `NetworkPolicy::from_profiles`/
-//! `Rule::allow_egress`) — see `run.rs`'s `launch()` for where they're now
-//! wired in, and `build_egress_policy` for the egress-override translation.
+//! `Rule::allow_egress`) — see `network::Plan` in `network.rs` for their
+//! CLI translation, builder application, and launch reporting.
 //!
 //! Credential injection is the one guard that remains. The baseline now
 //! *has* the building blocks (file-backed `SecretSource` and
@@ -86,7 +86,10 @@ mod tests {
     #[test]
     fn other_agents_require_credentials() {
         for agent in [Agent::Claude, Agent::Codex, Agent::Opencode, Agent::Copilot] {
-            assert!(agent_requires_credentials(agent), "{agent:?} should need credentials");
+            assert!(
+                agent_requires_credentials(agent),
+                "{agent:?} should need credentials"
+            );
         }
     }
 

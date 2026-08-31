@@ -57,8 +57,9 @@ records the resulting gitlink bump in the superproject). The merged tip
 carries both the agentd exit fix / keepalive and `#9`-`#16`'s feature
 ports — supersedes neither line, combines them.
 
-**Wire features 1, 2, and 3 in agent-vm** (`crates/agent-vm/src/run.rs`),
-now that the baseline underneath them exists:
+**Wire features 1, 2, and 3 in agent-vm** through
+`crates/agent-vm/src/network.rs`'s `network::Plan`, while `run.rs` retains
+launch orchestration, now that the baseline underneath them exists:
 
 - **Feature 1 (guest HTTP-CONNECT proxy).** The netstack already
   auto-installs the proxy from the operator's env at
@@ -70,13 +71,12 @@ now that the baseline underneath them exists:
   `NetworkBuilder::auto_publish()` (default `AutoPublishConfig`: 2s
   poll, host-private `127.0.0.1` bind) and re-add the
   `Sandbox::port_events()` subscriber #40 had stubbed out as dead code.
-- **Feature 3 (egress overrides).** A pure `build_egress_policy`
-  function translates `--allow-lan`/`--allow-host`/`--allow-egress` onto
+- **Feature 3 (egress overrides).** `network::Plan` translates
+  `--allow-lan`/`--allow-host`/`--allow-egress` onto
   `NetworkPolicy::from_profiles([..])` plus prepended
-  `Rule::allow_egress(Destination::Cidr(..))` rules, returning `None`
-  (install no `.policy()`, leave the SDK's `from_profiles([Public])`
-  default untouched) when no override flag is passed — no silent
-  widening of the default policy.
+  `Rule::allow_egress(Destination::Cidr(..))` rules, returning no custom
+  policy (leave the SDK's `from_profiles([Public])` default untouched) when
+  no override flag is passed — no silent widening of the default policy.
 
 `.tls()` stays gated on `--publish` ports only (`TlsBuilder::new()`
 defaults `enabled: true`, so calling it unconditionally would switch on
