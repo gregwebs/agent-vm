@@ -29,12 +29,34 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev musl-tools
+          sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev musl-tools shellcheck
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
       # The microsandbox SDK embeds the guest agentd binary. agent-vm builds it
       # from the pinned source (we dropped the upstream prebuilt download), so
       # the static musl agentd must exist at vendor/microsandbox/build/agentd
       # before any `cargo build -p agent-vm`. Mirrors the release-npm workflow.
+      - name: Check runtime source provenance and harness contracts
+        run: |
+          bash vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh
+          ./script/test/runtime-provenance.sh
+          ./script/check-runtime-provenance.sh
+          cargo test --locked -p msb-krun-compat-evidence
+          cargo clippy --locked -p msb-krun-compat-evidence --all-targets -- -D warnings
+          ./script/test/msb-krun-compat-contract.sh
+          bash script/test/build-workflow.sh
+          bash -n vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh \
+            vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh \
+            script/check-runtime-provenance.sh script/test/runtime-provenance.sh \
+            script/test/msb-krun-compat.sh script/test/msb-krun-compat-contract.sh \
+            script/build/macos.sh script/test/build-workflow.sh
+          shellcheck vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh \
+            vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh \
+            script/check-runtime-provenance.sh script/test/runtime-provenance.sh \
+            script/test/msb-krun-compat.sh script/test/msb-krun-compat-contract.sh \
+            script/build/macos.sh script/test/build-workflow.sh
+          "$HOME/go/bin/actionlint"
+
       - name: Build guest agentd
         run: |
           rustup target add x86_64-unknown-linux-musl

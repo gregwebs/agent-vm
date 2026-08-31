@@ -133,8 +133,12 @@ jobs:
             || fail "claude version lookup failed (downloads.claude.ai/claude-code-releases/latest)"
           # Guard against an HTTP-200-but-garbage response (empty body,
           # jq 'null', or an HTML error page) silently becoming a key.
-          [ -n "$codex" ]    && [ "$codex" != null ]    || fail "codex version empty/null"
-          [ -n "$opencode" ] && [ "$opencode" != null ] || fail "opencode version empty/null"
+          if [[ -z "$codex" || "$codex" == null ]]; then
+            fail "codex version empty/null"
+          fi
+          if [[ -z "$opencode" || "$opencode" == null ]]; then
+            fail "opencode version empty/null"
+          fi
           case "$claude" in [0-9]*.[0-9]*.[0-9]*) : ;; *) fail "claude version implausible: '$claude'" ;; esac
           {
             echo "codex=$codex"

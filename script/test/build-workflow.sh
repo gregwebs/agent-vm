@@ -72,7 +72,7 @@ printf '%s\n' 'firmware docker build' >>"$FAKE_LOG"
 SH
     chmod +x "$fixture/vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh"
     ln -s /bin/bash "$fakebin/bash"
-    for tool in mkdir rm mv cp cat chmod touch; do
+    for tool in mkdir rm mv cp cat chmod touch awk; do
         ln -s "$(command -v "$tool")" "$fakebin/$tool"
     done
 
@@ -185,6 +185,15 @@ case "${FAKE_BAD_ARCH_PATH:-}" in
         esac
         ;;
 esac'
+    make_tool "$fakebin/otool" '
+[[ "${1:-}" == -L ]] || exit 2
+if [[ "${FAKE_OTOOL_INVALID:-}" == 1 && "$2" != *.next ]]; then exit 1; fi
+if [[ "${FAKE_OTOOL_INVALID_ONCE:-}" == 1 && "$2" != *.next && ! -e "${FAKE_LOG}.otool-invalid-once" ]]; then
+    touch "${FAKE_LOG}.otool-invalid-once"
+    exit 1
+fi
+printf "%s\n" "$2:"
+'
     make_tool "$fakebin/plutil" '
 key="${2:-}"
 case "$key" in
@@ -208,7 +217,13 @@ done
 [[ -n "$out" ]]
 case "$out" in */*) mkdir -p "${out%/*}" ;; esac
 printf "%s\n" firmware >"$out"'
-    make_tool "$fakebin/git" 'exit 0'
+    make_tool "$fakebin/git" '
+case "${3:-}" in
+    ls-tree) printf "%s\\n" "160000 commit ${FAKE_FIRMWARE_SHA:-c51f0146f9fe836e4fe1bf2c061c70bedfad058c} vendor/libkrunfw" ;;
+    rev-parse) printf "%s\\n" "${FAKE_FIRMWARE_HEAD:-c51f0146f9fe836e4fe1bf2c061c70bedfad058c}" ;;
+    status) [[ "${FAKE_FIRMWARE_DIRTY:-}" != 1 ]] || printf "%s\\n" " M kernel.c" ;;
+    *) exit 3 ;;
+esac'
 
     :
 }
@@ -343,6 +358,39 @@ if [[ -s "$fixture/calls.log" ]]; then
     calls="$(cat "$fixture/calls.log")"
     case "$calls" in *"firmware docker build"*) fail "existing firmware was rebuilt" ;; esac
 fi
+
+# Firmware reuse is tied to the clean nested-source gitlink, not merely a
+# file left in build/. Missing stamps, a changed gitlink, force mode, and an
+# invalid cache all rebuild; a dirty source refuses rather than stamping an
+# artifact whose source identity cannot be claimed.
+[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha")" == c51f0146f9fe836e4fe1bf2c061c70bedfad058c ]]
+rm "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha"
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin"
+assert_file_contains "$fixture/calls.log" "firmware docker build"
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" env MSB_FORCE_FIRMWARE_REBUILD=1
+assert_file_contains "$fixture/calls.log" "firmware docker build"
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" env FAKE_FIRMWARE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa FAKE_FIRMWARE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+assert_file_contains "$fixture/calls.log" "firmware docker build"
+expect_build_failure "nested libkrunfw source is dirty" "$fixture" "$fakebin" env FAKE_FIRMWARE_DIRTY=1
+: >"$fixture/calls.log"
+printf '%s\n' c51f0146f9fe836e4fe1bf2c061c70bedfad058c >"$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha"
+rm -f "$fixture/calls.log.otool-invalid-once"
+run_build "$fixture" "$fakebin" env FAKE_OTOOL_INVALID_ONCE=1
+assert_file_contains "$fixture/calls.log" "firmware docker build"
+
+# A rejected forced-rebuild candidate must not replace or leave a reusable
+# source-stamped firmware cache entry.
+printf published-firmware >"$fixture/vendor/microsandbox/build/libkrunfw.5.dylib"
+printf '%s\n' c51f0146f9fe836e4fe1bf2c061c70bedfad058c >"$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha"
+expect_build_failure "arm64-only loadable macOS dynamic library" "$fixture" "$fakebin" env \
+    MSB_FORCE_FIRMWARE_REBUILD=1 FAKE_BAD_ARCH_PATH=libkrunfw.5.dylib.next
+[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib")" == published-firmware ]]
+[[ "$(cat "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha")" == c51f0146f9fe836e4fe1bf2c061c70bedfad058c ]]
+[[ ! -e "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.next" ]]
+[[ ! -e "$fixture/vendor/microsandbox/build/libkrunfw.5.dylib.source-sha.next" ]]
 
 # --dev builds unoptimized binaries into a separate bundle dir and never
 # touches the release bundle already published above.

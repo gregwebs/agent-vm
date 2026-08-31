@@ -72,7 +72,7 @@ Each launcher accepts:
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
-| `--mount HOST[:GUEST][:ro\|:rw]` | extra bind mount (one virtio-fs each, ~210 mount headroom); append `:ro` for a read-only bind, `:rw` is the default |
+| `--mount HOST[:GUEST][:ro\|:rw]` | extra bind mount (one virtio-fs each); append `:ro` for a read-only bind, `:rw` is the default; capacity is host-specific ([runtime evidence](ARCHITECTURE.md#issue-43-runtime-proof-and-platform-profiles)) |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 | `--layer DIR` | project tooling-layer directory (default `.agent-vm/layer/`) — see [Project tooling layers](#project-tooling-layers) |
 | `--yes` / `-y` | assume "yes" to the tooling-layer build confirmation (CI/non-interactive) |
@@ -302,11 +302,10 @@ reason.
 
 ## Troubleshooting
 
-- **`RegisterNetDevice(IrqsExhausted)` at boot** — the userspace split
-  irqchip raises the cap to ~219 IRQs, so this should only happen with
-  hundreds of `--mount`s or on a host whose KVM lacks
-  `KVM_CAP_SPLIT_IRQCHIP` (pre-Linux 4.7 or some nested-virt /
-  seccomp-restricted setups). Drop a `--mount` to recover.
+- **`RegisterNetDevice(IrqsExhausted)` at boot** — device capacity is host
+  and runtime dependent. Drop a `--mount` to recover. Linux x86_64 uses a
+  split userspace IOAPIC while Apple Silicon uses GIC; do not infer one
+  platform's device limit from another.
 - **`handshake read id_offset: timed out`** — `free -h`; the VM needs
   more memory than is available. Try `--memory 1`.
 - **GitHub 403 from the proxy** — repo isn't in the allow-list.
