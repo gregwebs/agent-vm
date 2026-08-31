@@ -1,0 +1,22 @@
+[package]
+name = "msb-krun-compat-evidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+# This narrow UnicodeData-backed crate recognizes only General_Category=Nd digits,
+# matching Python int() without bringing ICU into production evidence parsing.
+dec_from_char = "0.2.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

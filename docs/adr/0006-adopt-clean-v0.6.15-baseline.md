@@ -113,8 +113,22 @@ overflow.
   `MSB_HOME` locations (`~/.agent-vm-msb` vs.
   `~/.local/state/agent-vm/msb-home`). It remains possible if either
   side sets an explicit `AGENT_VM_STATE_DIR` shared with the other.
-- Linux x86_64 boot (the AC's other required platform) was verified by
-  code review and the full unit/integration test suite, but not by a
-  live VM boot in the sandboxed macOS-only environment this migration
-  was implemented in; a Linux host or CI run is needed before this is
-  fully closed out.
+- Issue #43 statically checks both Cargo resolution roots for the official
+  crates.io `msb_krun*` 0.1.32 cohort, equal checksums, and the pinned
+  firmware source gitlink. This is source identity, not binary/release
+  attestation; signed artifacts and package provenance remain follow-up work.
+- Apple Silicon/HVF is live-verified with the public `msb` compatibility
+  harness. Darwin uses flattened-device-tree and guest-sysfs enumeration plus
+  exact virtiofs mount and bidirectional marker checks: arm64 boot describes
+  virtio-mmio devices through the device tree, so its approximately 202-byte
+  `/proc/cmdline` is diagnostic rather than truncation. The recurring Darwin
+  test policy is boundary 4/64, high 112, and stress 64. It does **not** claim
+  128 as a maximum: 128 was the highest successful tested count, 256 was the
+  first attempted failure (`RegisterFsDevice(IrqsExhausted)`), and 129--255
+  were not exhaustively measured.
+- Linux x86_64 KVM remains outstanding. It needs a real readable/writable
+  `/dev/kvm` run of smoke, measure, reviewed Linux profile selection,
+  boundary, and 100-run stress; the Linux-only >2 KiB/trailing
+  `virtio_mmio.device=` command-line proof; device ordering/final-mount I/O;
+  and split-irqchip/IOAPIC diagnostics. Neither Darwin device-tree evidence
+  nor static checks substitutes for those items.
