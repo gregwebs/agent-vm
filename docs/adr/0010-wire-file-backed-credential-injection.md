@@ -22,7 +22,15 @@ The proxy re-reads its sibling `<project-hash>.secrets/` file for each eligible
 connection and substitutes only on exact hosts. OAuth and GitHub routes are
 intercepted with an HTTP/1.1 hook; unmatched requests on a policed host fail
 closed. OAuth validation repeats exact SNI, method, path, authority, encoding,
-and refresh-placeholder checks before a host CLI can run.
+and refresh-placeholder checks before a host CLI can run. The hook adapter
+crosses one private OAuth-module seam: raw request, SNI, and state directory in;
+a framed response out. That module validates completely before any lock,
+fingerprint, CLI, host-read, or host-write effect. Its bearer representation is
+consumed only by the atomic 0600 host-only token-file writer, after which a
+closed typed public-metadata reply is converted to placeholders. Shared HTTP
+parsing and response framing live separately from OAuth policy. Stdout is the
+interceptor protocol channel, not a logging sink; this explicit safe-reply flow
+resolves CodeQL cleartext-logging alert #5 without suppression or dismissal.
 
 ```
 guest placeholder request

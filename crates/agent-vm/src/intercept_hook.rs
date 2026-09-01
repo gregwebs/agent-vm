@@ -1,46 +1,25 @@
-//! `agent-vm _intercept-hook` — the subprocess microsandbox calls
-//! when an in-VM OAuth refresh attempt matches an intercept rule.
+//! `agent-vm _intercept-hook` is the subprocess adapter for matched OAuth and
+//! scoped GitHub interception rules. It reads one request from stdin, selects the
+//! GitHub policy path or the private OAuth-refresh deep module, and writes one
+//! hook-protocol response to stdout. Stdout is protocol transport, not logging.
 //!
-//! Lifecycle for one matched request:
-//!
-//! 1. msb forks this process, pipes the decrypted HTTP request bytes
-//!    on stdin, sets `MSB_INTERCEPT_SNI` and related env vars.
-//! 2. We figure out which provider the request is for (from the SNI),
-//!    spawn the corresponding host CLI (`claude -p hi --model sonnet`
-//!    or `codex exec --skip-git-repo-check 'Reply OK'`) so the
-//!    host-side credential file gets rotated.
-//! 3. We re-read the rotated host credential file and rewrite the
-//!    per-project token file the proxy reads (so the next non-refresh
-//!    request from the in-VM agent picks up the new bearer).
-//! 4. We synthesize an OAuth refresh response — same shape the
-//!    upstream server would return, but the body's `access_token`
-//!    field is the *placeholder*. The in-VM agent updates its local
-//!    credentials.json to that placeholder, and the next request goes
-//!    through with the placeholder, which the proxy substitutes for
-//!    the now-fresh real token.
-//! 5. We write the response on stdout and exit 0.
-//!
-//! The whole point: the in-VM agent thinks it refreshed normally and
-//! got a new bearer; in reality the host CLI did the refresh and we
-//! lied about which token to use. The placeholder/real swap is what
-//! keeps real tokens out of the VM.
+//! OAuth validation, provider dispatch, locking, host CLI execution, host
+//! credential parsing, bearer installation, and placeholder synthesis are kept
+//! behind `oauth_refresh::handle`. That module completes validation before any
+//! refresh side effect and returns only a response that contains guest-safe data.
 
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::mpsc,
-    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
-use serde::Deserialize;
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
-use crate::host_paths::{atomic_write, host_claude_creds_path, host_codex_auth_path};
 use crate::secrets;
+
+mod http;
+mod oauth_refresh;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -74,10 +53,11 @@ pub async fn run(args: Args) -> Result<()> {
     if args.sni.eq_ignore_ascii_case(secrets::GITHUB_API_HOST) {
         let response = forward_github_api(&request, &args.allowed_repos, &args.state_dir)
             .await
-            .unwrap_or_else(|e| {
-                error_response(502, &format!("agent-vm github forwarder failed: {e}"))
+            .unwrap_or_else(|_| {
+                http::Response::error(502, "agent-vm github forwarder failed")
+                    .expect("fixed response")
             });
-        write_response(&response)?;
+        write_response(response.as_bytes())?;
         return Ok(());
     }
 
@@ -119,20 +99,19 @@ pub async fn run(args: Args) -> Result<()> {
             GithubSmartOutcome::Anonymous => {
                 set_connection_close(&strip_authorization_from_request(&request))
             }
-            GithubSmartOutcome::Deny(msg) => error_response(403, &msg),
+            GithubSmartOutcome::Deny(msg) => http::Response::error(403, &msg)?.as_bytes().to_vec(),
             GithubSmartOutcome::Malformed => {
-                error_response(400, "agent-vm github smart-HTTP filter: malformed request")
+                http::Response::error(400, "agent-vm github smart-HTTP filter: malformed request")?
+                    .as_bytes()
+                    .to_vec()
             }
         };
         write_response(&response)?;
         return Ok(());
     }
 
-    let response = dispatch_oauth_refresh(&request, &args.sni, |provider| match provider {
-        Provider::Anthropic => refresh_anthropic(&args.state_dir),
-        Provider::OpenAi => refresh_openai(&args.state_dir),
-    })?;
-    write_response(&response)?;
+    let response = oauth_refresh::handle(&request, &args.sni, &args.state_dir)?;
+    write_response(response.as_bytes())?;
     Ok(())
 }
 
@@ -161,11 +140,14 @@ async fn forward_github_api(
     request: &[u8],
     allowed_repos: &[String],
     state_dir: &Path,
-) -> Result<Vec<u8>> {
-    let (method, raw_target, headers, body) =
-        parse_http_request(request).context("parsing intercepted github request")?;
+) -> Result<http::Response> {
+    let request = http::Request::parse(request).context("parsing intercepted github request")?;
+    let method = request.method();
+    let raw_target = request.target();
+    let headers = request.headers();
+    let body = request.body().to_vec();
     let target =
-        parse_github_target(&raw_target).context("validating intercepted github request target")?;
+        parse_github_target(raw_target).context("validating intercepted github request target")?;
     let path = target.origin_form;
 
     // `/graphql` carries its repo references in the body, not the
@@ -209,10 +191,10 @@ async fn forward_github_api(
             )
         }
     } else {
-        github_access(&method, &path, allowed_repos)
+        github_access(method, &path, allowed_repos)
     };
     if let GithubAccess::Deny(reason) = &access {
-        return Ok(error_response(403, reason));
+        return http::Response::error(403, reason);
     }
     let real_token = read_gh_token(state_dir).context("reading <state>.secrets/gh")?;
 
@@ -232,7 +214,7 @@ async fn forward_github_api(
         reqwest::Method::from_bytes(method.as_bytes()).context("invalid HTTP method")?;
     let mut req = client.request(method_obj, &url);
     let mut had_authorization = false;
-    for (name, value) in &headers {
+    for (name, value) in headers {
         // Strip hop-by-hop + protocol-level headers; reqwest will
         // re-emit appropriate ones. `Host` is required to point at
         // api.github.com (overrides whatever the guest sent).
@@ -311,20 +293,16 @@ async fn forward_github_api(
         .await
         .context("reading upstream response body")?;
 
-    let mut out = Vec::with_capacity(body_bytes.len() + 1024);
-    let head = format!(
-        "HTTP/1.1 {} {}\r\n",
+    let headers: Vec<_> = out_headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    http::Response::from_parts(
         status.as_u16(),
-        status.canonical_reason().unwrap_or("")
-    );
-    out.extend_from_slice(head.as_bytes());
-    for (k, v) in &out_headers {
-        out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
-    }
-    out.extend_from_slice(format!("Content-Length: {}\r\n", body_bytes.len()).as_bytes());
-    out.extend_from_slice(b"Connection: close\r\n\r\n");
-    out.extend_from_slice(&body_bytes);
-    Ok(out)
+        status.canonical_reason().unwrap_or(""),
+        &headers,
+        &body_bytes,
+    )
 }
 
 struct GithubTarget {
@@ -334,7 +312,7 @@ struct GithubTarget {
 }
 
 fn parse_github_target(target: &str) -> Result<GithubTarget> {
-    if target.contains('\\') || target.contains('#') || contains_escaped_path_escape(target) {
+    if target.contains('\\') || target.contains('#') || http::contains_escaped_path_escape(target) {
         anyhow::bail!("request target contains a forbidden path escape");
     }
     if target.starts_with('/') {
@@ -368,78 +346,6 @@ fn parse_github_target(target: &str) -> Result<GithubTarget> {
         None => path.to_string(),
     };
     Ok(GithubTarget { origin_form })
-}
-
-fn contains_escaped_path_escape(target: &str) -> bool {
-    let bytes = target.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            index += 1;
-            continue;
-        }
-        let Some(encoded) = bytes.get(index + 1..index + 3) else {
-            return true;
-        };
-        let Ok(encoded) = std::str::from_utf8(encoded) else {
-            return true;
-        };
-        let Ok(value) = u8::from_str_radix(encoded, 16) else {
-            return true;
-        };
-        if matches!(value, b'.' | b'/' | b'\\') {
-            return true;
-        }
-        index += 3;
-    }
-    false
-}
-
-/// Parse one complete HTTP/1.1 request. Requests reaching this hook are
-/// untrusted guest input, so malformed framing is rejected rather than guessed.
-fn parse_http_request(req: &[u8]) -> Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
-    let hdr_end = req
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .context("no header/body separator")?;
-    let header_block = std::str::from_utf8(&req[..hdr_end]).context("headers not UTF-8")?;
-    let body = req[hdr_end + 4..].to_vec();
-    let mut lines = header_block.split("\r\n");
-    let request_line = lines.next().context("empty request")?;
-    let mut parts = request_line.split(' ');
-    let method = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .context("no method")?;
-    let target = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .context("no target")?;
-    let version = parts.next().context("no HTTP version")?;
-    if parts.next().is_some() || version != "HTTP/1.1" || method.bytes().any(is_not_token) {
-        anyhow::bail!("request line is not strict HTTP/1.1");
-    }
-    let mut headers = Vec::new();
-    for line in lines {
-        let (name, value) = line.split_once(':').context("malformed header")?;
-        if name.is_empty() || name.bytes().any(is_not_token) {
-            anyhow::bail!("malformed header name");
-        }
-        if value.contains(['\r', '\n']) {
-            anyhow::bail!("malformed header value");
-        }
-        headers.push((
-            name.to_string(),
-            value.trim_matches([' ', '\t']).to_string(),
-        ));
-    }
-    Ok((method.to_string(), target.to_string(), headers, body))
-}
-
-fn is_not_token(byte: u8) -> bool {
-    !matches!(byte, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
-        | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
-        | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
 }
 
 #[cfg(test)]
@@ -599,7 +505,7 @@ fn github_smart_decision(request: &[u8], allowed_repos: &[String]) -> GithubSmar
         None => return GithubSmartOutcome::Malformed,
     };
     let path_no_query = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
-    if path_no_query.contains(['\\', '#']) || contains_escaped_path_escape(path_no_query) {
+    if path_no_query.contains(['\\', '#']) || http::contains_escaped_path_escape(path_no_query) {
         return GithubSmartOutcome::Deny(
             "agent-vm: smart-HTTP path contains a forbidden escape".to_string(),
         );
@@ -795,555 +701,6 @@ fn write_response(bytes: &[u8]) -> Result<()> {
     out.write_all(bytes).context("writing response to stdout")?;
     out.flush().ok();
     Ok(())
-}
-
-/// Public entry point for an Anthropic OAuth-refresh interception.
-///
-/// Thin wrapper that injects the real side effects — spawn the host
-/// `claude` CLI to rotate the host credential file, then read that
-/// file back — and hands the rotated JSON to [`rotate_anthropic`],
-/// which holds the actual rotation logic (token-file rewrite +
-/// placeholder response synthesis). Keeping the side effects out of
-/// `rotate_anthropic` is what makes the rotation path deterministically
-/// testable without a live `claude` session or a real expiring token
-/// (PLAN.md A1).
-fn refresh_anthropic(state_dir: &Path) -> Result<Vec<u8>> {
-    // Single-flight: serialize host-side rotations for this provider so
-    // two racing in-guest refreshes don't each spawn `claude -p`. The
-    // first waiter rotates; the second, on acquiring the lock, finds the
-    // token file freshly rewritten and skips its own host CLI. The lock
-    // is Anthropic-specific so a concurrent OpenAI refresh isn't blocked.
-    let token_path = secrets::anthropic_token_path(state_dir);
-    let before = token_fingerprint(&token_path);
-    let (_flight, acquisition) = RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_ANTHROPIC)?;
-    if should_rotate(before, token_fingerprint(&token_path), acquisition) {
-        trigger_host_refresh("claude", &["-p", "hi", "--model", "sonnet"])?;
-    }
-
-    let host_path = host_claude_creds_path().context("HOME not set")?;
-    let raw = std::fs::read_to_string(&host_path)
-        .with_context(|| format!("reading {}", host_path.display()))?;
-    // Re-wrap with the concrete path so a parse/extract failure in the pure fn
-    // still names which exact host file was bad (the pure fn uses a fixed label).
-    rotate_anthropic(state_dir, &raw)
-        .with_context(|| format!("rotating Anthropic token from {}", host_path.display()))
-}
-
-/// Pure rotation step for Anthropic: parse the (already-rotated) host
-/// `.credentials.json` text, rewrite the per-project token file with
-/// the fresh real bearer, and synthesize the OAuth refresh response
-/// that carries *placeholders* (never the real bearer) back to the
-/// in-VM agent.
-///
-/// Split out from [`refresh_anthropic`] so tests can drive a simulated
-/// rotation by passing the rotated-file contents directly, with no host
-/// CLI spawn and no `$HOME` credential file. Runtime behavior is
-/// identical: `refresh_anthropic` calls this with the bytes it just
-/// read from the real host file.
-fn rotate_anthropic(state_dir: &Path, host_creds_json: &str) -> Result<Vec<u8>> {
-    let json: Value =
-        serde_json::from_str(host_creds_json).context("parsing rotated host .credentials.json")?;
-    let oauth = json
-        .get("claudeAiOauth")
-        .context("rotated host .credentials.json missing claudeAiOauth")?;
-    let new_access = oauth
-        .get("accessToken")
-        .and_then(|v| v.as_str())
-        .context("rotated host claudeAiOauth missing accessToken")?;
-    let expires_at = oauth.get("expiresAt").cloned().unwrap_or(json!(0));
-
-    let token_file = secrets::anthropic_token_path(state_dir);
-    if let Some(parent) = token_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    atomic_write(&token_file, new_access.as_bytes(), 0o600)?;
-
-    // The in-VM Claude writes the refresh response into its local
-    // credentials.json. Returning placeholders in both token fields
-    // means the next API request gets routed through the substitution
-    // path again, where the proxy swaps for the freshly-rotated bearer
-    // it just read from the token file above.
-    let body = json!({
-        "access_token": secrets::ANTHROPIC_ACCESS_PLACEHOLDER,
-        "refresh_token": secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
-        "expires_in": derive_expires_in(&expires_at),
-        "token_type": "Bearer",
-        "scope": oauth.get("scopes").cloned().unwrap_or(json!([])),
-    });
-    Ok(http_200_json(&serde_json::to_vec(&body)?))
-}
-
-/// Public entry point for an OpenAI (Codex/ChatGPT) OAuth-refresh
-/// interception. Thin wrapper mirroring [`refresh_anthropic`]: spawn
-/// the host `codex` CLI to rotate the host auth file, read it back, and
-/// hand the contents to [`rotate_openai`] for the testable rotation
-/// logic.
-fn refresh_openai(state_dir: &Path) -> Result<Vec<u8>> {
-    // Single-flight (see `refresh_anthropic`): serialize host rotations
-    // and skip the `codex exec` if the token file was just rewritten by
-    // the launcher that held the lock before us. OpenAI-specific lock so
-    // an in-flight Anthropic refresh doesn't serialize against this one.
-    let token_path = secrets::openai_token_path(state_dir);
-    let before = token_fingerprint(&token_path);
-    let (_flight, acquisition) = RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_OPENAI)?;
-    if should_rotate(before, token_fingerprint(&token_path), acquisition) {
-        trigger_host_refresh(
-            "codex",
-            &[
-                "exec",
-                "--skip-git-repo-check",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "Reply with OK",
-            ],
-        )?;
-    }
-
-    let host_path = host_codex_auth_path().context("HOME not set")?;
-    let raw = std::fs::read_to_string(&host_path)
-        .with_context(|| format!("reading {}", host_path.display()))?;
-    // Re-wrap with the concrete path so a parse/extract failure in the pure fn
-    // still names which exact host file was bad (the pure fn uses a fixed label).
-    rotate_openai(state_dir, &raw)
-        .with_context(|| format!("rotating OpenAI token from {}", host_path.display()))
-}
-
-/// Pure rotation step for OpenAI: parse the (already-rotated) host
-/// `codex auth.json` text, rewrite the per-project token file with the
-/// fresh real access token, and synthesize the placeholder-carrying
-/// OAuth refresh response. Split out from [`refresh_openai`] for the
-/// same deterministic-testability reason as [`rotate_anthropic`].
-fn rotate_openai(state_dir: &Path, host_auth_json: &str) -> Result<Vec<u8>> {
-    let json: Value =
-        serde_json::from_str(host_auth_json).context("parsing rotated host codex auth.json")?;
-
-    let new_access = json
-        .pointer("/tokens/access_token")
-        .and_then(|v| v.as_str())
-        .or_else(|| json.get("OPENAI_API_KEY").and_then(|v| v.as_str()))
-        .context("rotated host codex auth missing tokens.access_token or OPENAI_API_KEY")?;
-
-    let token_file = secrets::openai_token_path(state_dir);
-    if let Some(parent) = token_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    atomic_write(&token_file, new_access.as_bytes(), 0o600)?;
-
-    let body = json!({
-        "access_token": secrets::OPENAI_ACCESS_PLACEHOLDER,
-        "refresh_token": secrets::OPENAI_REFRESH_PLACEHOLDER,
-        "id_token": secrets::OPENAI_ID_PLACEHOLDER,
-        "expires_in": 3600,
-        "token_type": "Bearer",
-    });
-    Ok(http_200_json(&serde_json::to_vec(&body)?))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TokenFingerprint {
-    Missing,
-    Unreadable,
-    Sha256([u8; 32]),
-}
-
-fn token_fingerprint(path: &Path) -> TokenFingerprint {
-    match std::fs::read(path) {
-        Ok(bytes) => TokenFingerprint::Sha256(Sha256::digest(bytes).into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TokenFingerprint::Missing,
-        Err(_) => TokenFingerprint::Unreadable,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RefreshAcquisition {
-    Acquired { contended: bool },
-    Degraded,
-}
-
-fn should_rotate(
-    before: TokenFingerprint,
-    after: TokenFingerprint,
-    acquisition: RefreshAcquisition,
-) -> bool {
-    !matches!(
-        (before, after, acquisition),
-        (
-            TokenFingerprint::Sha256(before),
-            TokenFingerprint::Sha256(after),
-            RefreshAcquisition::Acquired { contended: true },
-        ) if before != after
-    )
-}
-
-struct RefreshLock {
-    file: Option<std::fs::File>,
-}
-
-impl RefreshLock {
-    fn acquire(state_dir: &Path, lock_name: &str) -> Result<(Self, RefreshAcquisition)> {
-        Self::acquire_with_ceiling(state_dir, lock_name, HOST_REFRESH_TIMEOUT)
-    }
-
-    fn acquire_with_ceiling(
-        state_dir: &Path,
-        lock_name: &str,
-        ceiling: Duration,
-    ) -> Result<(Self, RefreshAcquisition)> {
-        let path = secrets::refresh_lock_path_for(state_dir, lock_name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating secrets dir {}", parent.display()))?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("opening refresh lock {}", path.display()))?;
-        use std::os::unix::io::AsRawFd as _;
-        let fd = file.as_raw_fd();
-        let start = Instant::now();
-        let mut contended = false;
-        loop {
-            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok((
-                    Self { file: Some(file) },
-                    RefreshAcquisition::Acquired { contended },
-                ));
-            }
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EWOULDBLOCK) => {
-                    contended = true;
-                    if start.elapsed() >= ceiling {
-                        tracing::warn!(lock = %path.display(), "refresh lock contended past {}s; proceeding without single-flight", ceiling.as_secs());
-                        return Ok((Self { file: None }, RefreshAcquisition::Degraded));
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                _ => {
-                    return Err(anyhow::Error::new(std::io::Error::last_os_error())
-                        .context(format!("flock(LOCK_EX|LOCK_NB) on {}", path.display())));
-                }
-            }
-        }
-    }
-}
-
-impl Drop for RefreshLock {
-    fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd as _;
-        // Only unlock if we actually acquired it; a timed-out acquire
-        // never took the lock, so issuing LOCK_UN would be wrong (and
-        // could release a lock another fd in this process holds, though
-        // that doesn't happen here).
-        if let Some(file) = &self.file {
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
-}
-
-const HOST_REFRESH_TIMEOUT: Duration = Duration::from_secs(90);
-
-fn trigger_host_refresh(cmd: &str, args: &[&str]) -> Result<()> {
-    trigger_host_refresh_with_timeout(cmd, args, HOST_REFRESH_TIMEOUT)
-}
-
-fn trigger_host_refresh_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Result<()> {
-    let mut command = Command::new(cmd);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawning host {cmd}"))?;
-    let pid = child.id() as libc::pid_t;
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let (drained, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut stderr = stderr;
-        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-        let _ = drained.send(());
-    });
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if start.elapsed() >= timeout => {
-                #[cfg(unix)]
-                unsafe {
-                    if libc::kill(-pid, libc::SIGKILL) == -1 {
-                        return Err(anyhow::Error::new(std::io::Error::last_os_error())
-                            .context(format!("terminating host {cmd} process group")));
-                    }
-                }
-                child
-                    .wait()
-                    .with_context(|| format!("reaping timed-out host {cmd}"))?;
-                let _ = receiver.recv_timeout(Duration::from_millis(100));
-                anyhow::bail!(
-                    "host {cmd} did not return within {} s; terminated",
-                    timeout.as_secs()
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
-    };
-    let _ = receiver.recv_timeout(Duration::from_millis(100));
-    if !status.success() {
-        anyhow::bail!("host {cmd} failed (status {status})");
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Provider {
-    Anthropic,
-    OpenAi,
-}
-#[derive(Debug, PartialEq, Eq)]
-struct OAuthRejection {
-    status: u16,
-    message: String,
-}
-impl OAuthRejection {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: 400,
-            message: message.into(),
-        }
-    }
-    fn forbidden(message: impl Into<String>) -> Self {
-        Self {
-            status: 403,
-            message: message.into(),
-        }
-    }
-}
-
-fn validate_oauth_refresh(
-    request: &[u8],
-    provider_sni: &str,
-) -> std::result::Result<Provider, OAuthRejection> {
-    let provider = if provider_sni.eq_ignore_ascii_case(secrets::ANTHROPIC_OAUTH_HOST) {
-        Provider::Anthropic
-    } else if provider_sni.eq_ignore_ascii_case(secrets::OPENAI_OAUTH_HOST) {
-        Provider::OpenAi
-    } else {
-        return Err(OAuthRejection::forbidden(
-            "OAuth refresh SNI is not allowed",
-        ));
-    };
-    let (method, target, headers, body) = parse_http_request(request)
-        .map_err(|_| OAuthRejection::bad_request("malformed OAuth refresh request"))?;
-    let host = exactly_one_header(&headers, "host")?;
-    if !host.eq_ignore_ascii_case(provider_sni) {
-        return Err(OAuthRejection::forbidden(
-            "OAuth refresh Host does not match SNI",
-        ));
-    }
-    if method != "POST" {
-        return Err(OAuthRejection::forbidden("OAuth refresh requires POST"));
-    }
-    let expected = match provider {
-        Provider::Anthropic => secrets::ANTHROPIC_OAUTH_TOKEN_PATH,
-        Provider::OpenAi => secrets::OPENAI_OAUTH_TOKEN_PATH,
-    };
-    let path = validated_oauth_target(&target, provider_sni)?;
-    if path != expected {
-        return Err(OAuthRejection::forbidden(
-            "OAuth refresh path is not allowed",
-        ));
-    }
-    let content_types: Vec<_> = headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .collect();
-    if content_types.len() != 1
-        || headers.iter().any(|(name, value)| {
-            (name.eq_ignore_ascii_case("transfer-encoding")
-                || name.eq_ignore_ascii_case("content-encoding"))
-                && !value.eq_ignore_ascii_case("identity")
-        })
-    {
-        return Err(OAuthRejection::bad_request(
-            "OAuth refresh has unsupported HTTP encoding",
-        ));
-    }
-    let lengths: Vec<_> = headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .collect();
-    if lengths.len() != 1 || lengths[0].1.parse::<usize>().ok() != Some(body.len()) {
-        return Err(OAuthRejection::bad_request(
-            "OAuth refresh has invalid content length",
-        ));
-    }
-    let content_type = content_types[0].1.split(';').next().unwrap_or("").trim();
-    let (grant_ok, token_ok) = if content_type.eq_ignore_ascii_case("application/json") {
-        #[derive(Deserialize)]
-        struct RefreshBody {
-            grant_type: String,
-            refresh_token: String,
-        }
-        let value: RefreshBody = serde_json::from_slice(&body)
-            .map_err(|_| OAuthRejection::bad_request("OAuth refresh JSON body is invalid"))?;
-        (
-            value.grant_type == "refresh_token",
-            refresh_placeholder_matches(provider, &value.refresh_token),
-        )
-    } else if content_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
-        let values: Vec<_> = url::form_urlencoded::parse(&body).collect();
-        let grants: Vec<_> = values
-            .iter()
-            .filter(|(key, _)| key == "grant_type")
-            .collect();
-        let tokens: Vec<_> = values
-            .iter()
-            .filter(|(key, _)| key == "refresh_token")
-            .collect();
-        (
-            grants.len() == 1 && grants[0].1 == "refresh_token",
-            tokens.len() == 1 && refresh_placeholder_matches(provider, &tokens[0].1),
-        )
-    } else {
-        return Err(OAuthRejection::bad_request(
-            "OAuth refresh content type is not supported",
-        ));
-    };
-    if !grant_ok || !token_ok {
-        return Err(OAuthRejection::forbidden(
-            "OAuth refresh grant or refresh token is not allowed",
-        ));
-    }
-    Ok(provider)
-}
-fn exactly_one_header<'a>(
-    headers: &'a [(String, String)],
-    name: &str,
-) -> std::result::Result<&'a str, OAuthRejection> {
-    let values: Vec<_> = headers
-        .iter()
-        .filter(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
-        .collect();
-    if values.len() != 1 || values[0].is_empty() {
-        return Err(OAuthRejection::bad_request(format!(
-            "OAuth refresh requires exactly one {name} header"
-        )));
-    }
-    Ok(values[0])
-}
-
-fn validated_oauth_target(target: &str, sni: &str) -> std::result::Result<String, OAuthRejection> {
-    if target.starts_with('/') {
-        if target.contains(['?', '#', '\\']) || contains_escaped_path_escape(target) {
-            return Err(OAuthRejection::forbidden(
-                "OAuth refresh target is not exact",
-            ));
-        }
-        return Ok(target.to_string());
-    }
-    let url = url::Url::parse(target)
-        .map_err(|_| OAuthRejection::bad_request("OAuth refresh target is invalid"))?;
-    if !url.scheme().eq_ignore_ascii_case("https")
-        || !url
-            .host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case(sni))
-        || url.port().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(OAuthRejection::forbidden(
-            "OAuth refresh authority does not match SNI",
-        ));
-    }
-    if contains_escaped_path_escape(url.path()) || url.path().contains('\\') {
-        return Err(OAuthRejection::forbidden(
-            "OAuth refresh target is not exact",
-        ));
-    }
-    Ok(url.path().to_string())
-}
-
-fn dispatch_oauth_refresh<F>(request: &[u8], provider_sni: &str, action: F) -> Result<Vec<u8>>
-where
-    F: FnOnce(Provider) -> Result<Vec<u8>>,
-{
-    match validate_oauth_refresh(request, provider_sni) {
-        Ok(provider) => action(provider),
-        Err(rejection) => Ok(error_response(rejection.status, &rejection.message)),
-    }
-}
-fn refresh_placeholder_matches(provider: Provider, token: &str) -> bool {
-    match provider {
-        Provider::Anthropic => token == secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
-        Provider::OpenAi => {
-            token == secrets::OPENAI_REFRESH_PLACEHOLDER
-                || token == secrets::OPENCODE_OPENAI_REFRESH_PLACEHOLDER
-        }
-    }
-}
-
-fn derive_expires_in(expires_at_field: &Value) -> i64 {
-    // claudeAiOauth.expiresAt is ms-since-epoch. We need seconds-until-expiry.
-    let expires_at_ms = expires_at_field.as_i64().unwrap_or(0);
-    if expires_at_ms == 0 {
-        return 3600;
-    }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let diff = (expires_at_ms - now_ms) / 1000;
-    if diff <= 0 { 3600 } else { diff }
-}
-
-fn http_200_json(body: &[u8]) -> Vec<u8> {
-    build_response(200, "OK", body)
-}
-
-/// Synthesized error handed back to the in-guest client.
-///
-/// The body uses `message`, not `error`: go-gh unmarshals only
-/// `message` when it renders an `HTTPError`, so anything under another
-/// key is silently dropped and the user sees a bare status code. The
-/// whole point of denying rather than forwarding anonymously is that
-/// the reason reaches the person reading the terminal.
-fn error_response(code: u16, msg: &str) -> Vec<u8> {
-    let body = format!("{{\"message\":{}}}", json!(msg));
-    build_response(code, "Server Error", body.as_bytes())
-}
-
-fn build_response(code: u16, reason: &str, body: &[u8]) -> Vec<u8> {
-    let head = format!(
-        "HTTP/1.1 {code} {reason}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        body.len()
-    );
-    let mut out = Vec::with_capacity(head.len() + body.len());
-    out.extend_from_slice(head.as_bytes());
-    out.extend_from_slice(body);
-    out
 }
 
 // ─── tests ────────────────────────────────────────────────────────────
@@ -1729,67 +1086,6 @@ mod tests {
         // And the placeholder is NOT in the output at any layer.
         assert!(!out.contains(secrets::GH_TOKEN_PLACEHOLDER));
         assert!(!s.contains(secrets::GH_TOKEN_PLACEHOLDER));
-    }
-
-    // ── parse_http_request ────────────────────────────────────────
-
-    #[test]
-    fn parse_http_request_basic_get_no_body() {
-        let req = b"GET /repos/o/r HTTP/1.1\r\nHost: api.github.com\r\nUser-Agent: gh/2\r\n\r\n";
-        let (method, path, headers, body) = parse_http_request(req).unwrap();
-        assert_eq!(method, "GET");
-        assert_eq!(path, "/repos/o/r");
-        assert!(body.is_empty());
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0], ("Host".into(), "api.github.com".into()));
-        assert_eq!(headers[1], ("User-Agent".into(), "gh/2".into()));
-    }
-
-    #[test]
-    fn parse_http_request_post_with_body() {
-        let req = b"POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"query\":1}";
-        let (method, path, headers, body) = parse_http_request(req).unwrap();
-        assert_eq!(method, "POST");
-        assert_eq!(path, "/graphql");
-        assert_eq!(body, b"{\"query\":1}");
-        assert_eq!(headers.len(), 3);
-    }
-
-    #[test]
-    fn parse_http_request_header_value_with_colons_preserved() {
-        // Authorization values commonly contain `:` — verify the
-        // header split keeps everything after the first `:`.
-        let req = b"GET /x HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz:extra\r\n\r\n";
-        let (_m, _p, headers, _b) = parse_http_request(req).unwrap();
-        let auth = headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("Authorization"));
-        assert_eq!(
-            auth.map(|(_, v)| v.as_str()),
-            Some("Basic dXNlcjpwYXNz:extra")
-        );
-    }
-
-    #[test]
-    fn parse_http_request_errors_on_missing_separator() {
-        // No \r\n\r\n anywhere — can't find header/body boundary.
-        let req = b"GET /x HTTP/1.1\r\nHost: api.github.com\r\n";
-        assert!(parse_http_request(req).is_err());
-    }
-
-    #[test]
-    fn parse_http_request_errors_on_empty_request_line() {
-        let req = b"\r\nHost: api.github.com\r\n\r\n";
-        let err = parse_http_request(req);
-        assert!(err.is_err(), "empty request line must error");
-    }
-
-    #[test]
-    fn parse_http_request_handles_extra_whitespace_in_headers() {
-        // Header values are trimmed of surrounding whitespace.
-        let req = b"GET /x HTTP/1.1\r\nFoo:   bar  \r\n\r\n";
-        let (_m, _p, headers, _b) = parse_http_request(req).unwrap();
-        assert_eq!(headers[0], ("Foo".into(), "bar".into()));
     }
 
     #[test]
@@ -2246,468 +1542,5 @@ mod tests {
             upstream_str.contains(&expected_b64),
             "for allow-listed repo, real token should reach upstream; got:\n{upstream_str}"
         );
-    }
-}
-
-// ─── mid-session token-rotation regression tests (PLAN.md A1) ───────────
-//
-// The OAuth-refresh MITM exists but had never been exercised across a
-// real token-expiry boundary — true e2e needs a long live session and a
-// real expiring token, infeasible in CI / the dev sandbox. Instead we
-// drive the rotation logic deterministically: `refresh_{anthropic,openai}`
-// are thin wrappers that spawn the host CLI and read the rotated host
-// credential file, then delegate to the pure `rotate_{anthropic,openai}`
-// step. These tests call the pure step directly with a simulated rotated
-// host file, then assert the two invariants that matter:
-//
-//   (1) the per-project token file is rewritten to the NEW real bearer
-//       (so the proxy substitutes the fresh token on the next request);
-//   (2) the synthesized HTTP refresh response carries only PLACEHOLDERS
-//       in access_token / refresh_token — never the real bearer — and is
-//       a well-formed HTTP/1.1 200 with the expected headers.
-#[cfg(test)]
-mod rotation_tests {
-    use super::*;
-
-    /// Minimal stdlib temp dir; avoids a dev-dependency. Unique per call
-    /// via pid + a process-global counter, cleaned up on drop.
-    struct TmpDir(PathBuf);
-    impl TmpDir {
-        fn new(tag: &str) -> Self {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static N: AtomicU32 = AtomicU32::new(0);
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            let mut p = std::env::temp_dir();
-            p.push(format!("agentvm-rot-{tag}-{}-{n}", std::process::id()));
-            std::fs::create_dir_all(&p).unwrap();
-            TmpDir(p)
-        }
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// Split a synthesized HTTP/1.1 response into (status_line, headers,
-    /// body). Asserts a single CRLFCRLF separator exists.
-    fn split_http(resp: &[u8]) -> (String, String, String) {
-        let s = std::str::from_utf8(resp).expect("response is UTF-8");
-        let sep = s
-            .find("\r\n\r\n")
-            .expect("response has header/body separator");
-        let head = &s[..sep];
-        let body = &s[sep + 4..];
-        let line_end = head.find("\r\n").unwrap_or(head.len());
-        (
-            head[..line_end].to_string(),
-            head.to_string(),
-            body.to_string(),
-        )
-    }
-
-    // ── Anthropic ─────────────────────────────────────────────────
-
-    const NEW_BEARER_ANTHROPIC: &str =
-        "sk-ant-oat01-ROTATED-NEW-anthropic-bearer-value-do-not-leak";
-
-    fn rotated_anthropic_creds() -> String {
-        json!({
-            "claudeAiOauth": {
-                "accessToken": NEW_BEARER_ANTHROPIC,
-                "refreshToken": "sk-ant-ort01-rotated-refresh",
-                "expiresAt": 9_999_999_999_000i64,
-                "scopes": ["user:inference", "user:profile"],
-            }
-        })
-        .to_string()
-    }
-
-    #[test]
-    fn anthropic_rotation_rewrites_token_file_to_new_bearer() {
-        let tmp = TmpDir::new("anthropic-file");
-        let resp = rotate_anthropic(tmp.path(), &rotated_anthropic_creds())
-            .expect("rotate_anthropic should succeed");
-        assert!(!resp.is_empty(), "response must not be empty");
-
-        // (1) Per-project token file rewritten to the NEW real bearer.
-        let token_file = secrets::anthropic_token_path(tmp.path());
-        let written =
-            std::fs::read_to_string(&token_file).expect("token file should have been written");
-        assert_eq!(
-            written, NEW_BEARER_ANTHROPIC,
-            "anthropic token file must hold the freshly-rotated real bearer"
-        );
-    }
-
-    #[test]
-    fn anthropic_rotation_response_carries_placeholders_not_real_bearer() {
-        let tmp = TmpDir::new("anthropic-resp");
-        let resp = rotate_anthropic(tmp.path(), &rotated_anthropic_creds())
-            .expect("rotate_anthropic should succeed");
-        let (status, headers, body) = split_http(&resp);
-
-        // Well-formed status line + headers.
-        assert_eq!(status, "HTTP/1.1 200 OK", "status line");
-        assert!(
-            headers.contains("Content-Type: application/json"),
-            "Content-Type header present: {headers:?}"
-        );
-        assert!(
-            headers.contains(&format!("Content-Length: {}", body.len())),
-            "Content-Length matches body ({} bytes): {headers:?}",
-            body.len()
-        );
-        assert!(
-            headers.contains("Connection: close"),
-            "Connection: close present: {headers:?}"
-        );
-
-        // (2) The real bearer must NEVER appear anywhere in the response.
-        assert!(
-            !String::from_utf8_lossy(&resp).contains(NEW_BEARER_ANTHROPIC),
-            "real bearer leaked into the refresh response"
-        );
-
-        // Body's token fields are the placeholders, verbatim.
-        let parsed: Value = serde_json::from_str(&body).expect("body is JSON");
-        assert_eq!(
-            parsed["access_token"],
-            secrets::ANTHROPIC_ACCESS_PLACEHOLDER,
-            "access_token must be the placeholder"
-        );
-        assert_eq!(
-            parsed["refresh_token"],
-            secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
-            "refresh_token must be the placeholder"
-        );
-        assert_eq!(parsed["token_type"], "Bearer");
-        // expires_in derived from expiresAt: far-future → positive.
-        assert!(
-            parsed["expires_in"].as_i64().unwrap() > 0,
-            "expires_in should be positive"
-        );
-    }
-
-    // ── OpenAI / Codex ────────────────────────────────────────────
-
-    const NEW_BEARER_OPENAI: &str = "eyJROTATED.openai.access.token.value.do.not.leak";
-
-    fn rotated_openai_auth() -> String {
-        json!({
-            "tokens": {
-                "access_token": NEW_BEARER_OPENAI,
-                "refresh_token": "rotated-openai-refresh",
-                "id_token": "rotated-openai-id",
-            },
-            "OPENAI_API_KEY": null,
-        })
-        .to_string()
-    }
-
-    #[test]
-    fn openai_rotation_rewrites_token_file_to_new_bearer() {
-        let tmp = TmpDir::new("openai-file");
-        let resp = rotate_openai(tmp.path(), &rotated_openai_auth())
-            .expect("rotate_openai should succeed");
-        assert!(!resp.is_empty());
-
-        let token_file = secrets::openai_token_path(tmp.path());
-        let written =
-            std::fs::read_to_string(&token_file).expect("token file should have been written");
-        assert_eq!(
-            written, NEW_BEARER_OPENAI,
-            "openai token file must hold the freshly-rotated real access token"
-        );
-    }
-
-    #[test]
-    fn openai_rotation_response_carries_placeholders_not_real_bearer() {
-        let tmp = TmpDir::new("openai-resp");
-        let resp = rotate_openai(tmp.path(), &rotated_openai_auth())
-            .expect("rotate_openai should succeed");
-        let (status, headers, body) = split_http(&resp);
-
-        assert_eq!(status, "HTTP/1.1 200 OK", "status line");
-        assert!(headers.contains("Content-Type: application/json"));
-        assert!(headers.contains(&format!("Content-Length: {}", body.len())));
-        assert!(headers.contains("Connection: close"));
-
-        assert!(
-            !String::from_utf8_lossy(&resp).contains(NEW_BEARER_OPENAI),
-            "real access token leaked into the refresh response"
-        );
-
-        let parsed: Value = serde_json::from_str(&body).expect("body is JSON");
-        assert_eq!(parsed["access_token"], secrets::OPENAI_ACCESS_PLACEHOLDER);
-        assert_eq!(parsed["refresh_token"], secrets::OPENAI_REFRESH_PLACEHOLDER);
-        assert_eq!(parsed["id_token"], secrets::OPENAI_ID_PLACEHOLDER);
-        assert_eq!(parsed["token_type"], "Bearer");
-    }
-
-    /// The legacy ChatGPT/Codex shape stores the key flat as
-    /// `OPENAI_API_KEY` (no `tokens` object). Rotation must pick it up.
-    #[test]
-    fn openai_rotation_falls_back_to_flat_api_key() {
-        let tmp = TmpDir::new("openai-flat");
-        let auth = json!({ "OPENAI_API_KEY": NEW_BEARER_OPENAI }).to_string();
-        let resp = rotate_openai(tmp.path(), &auth).expect("rotate_openai should succeed");
-
-        let token_file = secrets::openai_token_path(tmp.path());
-        let written = std::fs::read_to_string(&token_file).unwrap();
-        assert_eq!(written, NEW_BEARER_OPENAI);
-        assert!(!String::from_utf8_lossy(&resp).contains(NEW_BEARER_OPENAI));
-    }
-
-    /// Malformed rotated host files surface an error rather than writing
-    /// a garbage token file or a malformed response.
-    #[test]
-    fn rotation_errors_on_malformed_host_file() {
-        let tmp = TmpDir::new("malformed");
-        assert!(rotate_anthropic(tmp.path(), "not json").is_err());
-        assert!(rotate_openai(tmp.path(), "not json").is_err());
-        assert!(
-            rotate_anthropic(tmp.path(), &json!({"claudeAiOauth": {}}).to_string()).is_err(),
-            "missing accessToken must error"
-        );
-        assert!(
-            rotate_openai(tmp.path(), &json!({"tokens": {}}).to_string()).is_err(),
-            "missing access_token must error"
-        );
-    }
-}
-
-#[cfg(test)]
-mod oauth_validation_tests {
-    use super::*;
-
-    fn request(target: &str, content_type: &str, body: &str) -> Vec<u8> {
-        let host = if target.contains(secrets::ANTHROPIC_OAUTH_TOKEN_PATH) {
-            secrets::ANTHROPIC_OAUTH_HOST
-        } else {
-            secrets::OPENAI_OAUTH_HOST
-        };
-        format!("POST {target} HTTP/1.1\r\nHost: {host}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
-    }
-
-    #[test]
-    fn validates_exact_provider_refresh_payloads() {
-        let anth = request(
-            secrets::ANTHROPIC_OAUTH_TOKEN_PATH,
-            "application/json",
-            &format!(
-                r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
-                secrets::ANTHROPIC_REFRESH_PLACEHOLDER
-            ),
-        );
-        assert_eq!(
-            validate_oauth_refresh(&anth, secrets::ANTHROPIC_OAUTH_HOST),
-            Ok(Provider::Anthropic)
-        );
-        let codex = request(
-            secrets::OPENAI_OAUTH_TOKEN_PATH,
-            "application/x-www-form-urlencoded",
-            &format!(
-                "grant_type=refresh_token&refresh_token={}",
-                secrets::OPENAI_REFRESH_PLACEHOLDER
-            ),
-        );
-        assert_eq!(
-            validate_oauth_refresh(&codex, secrets::OPENAI_OAUTH_HOST),
-            Ok(Provider::OpenAi)
-        );
-        let opencode = request(
-            secrets::OPENAI_OAUTH_TOKEN_PATH,
-            "application/json",
-            &format!(
-                r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
-                secrets::OPENCODE_OPENAI_REFRESH_PLACEHOLDER
-            ),
-        );
-        assert_eq!(
-            validate_oauth_refresh(&opencode, secrets::OPENAI_OAUTH_HOST),
-            Ok(Provider::OpenAi)
-        );
-    }
-
-    #[test]
-    fn rejects_path_query_authority_method_encoding_and_ambiguous_bodies() {
-        let body = format!(
-            "grant_type=refresh_token&refresh_token={}",
-            secrets::OPENAI_REFRESH_PLACEHOLDER
-        );
-        for (target, sni) in [
-            ("/oauth/token/near", secrets::OPENAI_OAUTH_HOST),
-            ("/oauth/token?x=1", secrets::OPENAI_OAUTH_HOST),
-            (
-                "https://attacker.invalid/oauth/token",
-                secrets::OPENAI_OAUTH_HOST,
-            ),
-        ] {
-            assert!(
-                validate_oauth_refresh(
-                    &request(target, "application/x-www-form-urlencoded", &body),
-                    sni
-                )
-                .is_err()
-            );
-        }
-        let mut wrong_method = request("/oauth/token", "application/x-www-form-urlencoded", &body);
-        wrong_method.splice(..4, b"GET ".iter().copied());
-        assert!(validate_oauth_refresh(&wrong_method, secrets::OPENAI_OAUTH_HOST).is_err());
-        assert!(
-            validate_oauth_refresh(
-                &request("/oauth/token", "text/plain", &body),
-                secrets::OPENAI_OAUTH_HOST
-            )
-            .is_err()
-        );
-        assert!(
-            validate_oauth_refresh(
-                &request(
-                    "/oauth/token",
-                    "application/x-www-form-urlencoded",
-                    &format!("{body}&refresh_token=other")
-                ),
-                secrets::OPENAI_OAUTH_HOST
-            )
-            .is_err()
-        );
-        assert!(
-            validate_oauth_refresh(
-                &request(
-                    "/oauth/token",
-                    "application/x-www-form-urlencoded",
-                    "grant_type=wrong&refresh_token=x"
-                ),
-                secrets::OPENAI_OAUTH_HOST
-            )
-            .is_err()
-        );
-        assert!(
-            validate_oauth_refresh(
-                &request("/oauth/token", "application/json", "{not json}"),
-                secrets::OPENAI_OAUTH_HOST
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn rejected_oauth_request_never_dispatches_a_refresh_action() {
-        let calls = std::cell::Cell::new(0);
-        let response = dispatch_oauth_refresh(
-            b"GET /oauth/token HTTP/1.1\r\nHost: auth.openai.com\r\n\r\n",
-            secrets::OPENAI_OAUTH_HOST,
-            |_| {
-                calls.set(calls.get() + 1);
-                Ok(Vec::new())
-            },
-        )
-        .expect("rejection is synthesized");
-        assert_eq!(calls.get(), 0);
-        assert!(
-            std::str::from_utf8(&response)
-                .unwrap()
-                .starts_with("HTTP/1.1 403")
-        );
-    }
-
-    #[test]
-    fn oauth_requires_strict_http_framing_host_and_authority() {
-        let body = format!(
-            "grant_type=refresh_token&refresh_token={}",
-            secrets::OPENAI_REFRESH_PLACEHOLDER
-        );
-        for request in [
-            format!(
-                "POST /oauth/token HTTP/1.0\r\nHost: auth.openai.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-            format!(
-                "POST /oauth/token HTTP/1.1 extra\r\nHost: auth.openai.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-            format!(
-                "POST /oauth/token HTTP/1.1\r\nBroken Header\r\nHost: auth.openai.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-            format!(
-                "POST /oauth/token HTTP/1.1\r\nHost: attacker.invalid\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-            format!(
-                "POST https://user@auth.openai.com/oauth/token HTTP/1.1\r\nHost: auth.openai.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-            format!(
-                "POST https://auth.openai.com:444/oauth/token HTTP/1.1\r\nHost: auth.openai.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-        ] {
-            assert!(
-                validate_oauth_refresh(request.as_bytes(), secrets::OPENAI_OAUTH_HOST).is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn host_refresh_runner_is_bounded_and_never_reports_stderr() {
-        trigger_host_refresh_with_timeout("sh", &["-c", "exit 0"], Duration::from_secs(1))
-            .expect("successful fixture");
-        let error = trigger_host_refresh_with_timeout(
-            "sh",
-            &["-c", "echo SECRET_BEARER >&2; exit 9"],
-            Duration::from_secs(1),
-        )
-        .expect_err("non-zero fixture");
-        assert!(!error.to_string().contains("SECRET_BEARER"));
-        let start = Instant::now();
-        let error = trigger_host_refresh_with_timeout(
-            "sh",
-            &["-c", "while :; do echo noisy >&2; done"],
-            Duration::from_millis(50),
-        )
-        .expect_err("timeout fixture");
-        assert!(start.elapsed() < Duration::from_secs(2));
-        assert!(!error.to_string().contains("noisy"));
-        let start = Instant::now();
-        trigger_host_refresh_with_timeout(
-            "sh",
-            &["-c", "(sleep 1 >&2) & exit 0"],
-            Duration::from_secs(1),
-        )
-        .expect("retained stderr descendant cannot block completion");
-        assert!(start.elapsed() < Duration::from_millis(500));
-    }
-
-    #[test]
-    fn rotation_only_skips_a_contended_observed_token_change() {
-        let before = TokenFingerprint::Sha256([1; 32]);
-        let after = TokenFingerprint::Sha256([2; 32]);
-        assert!(!should_rotate(
-            before,
-            after,
-            RefreshAcquisition::Acquired { contended: true }
-        ));
-        assert!(should_rotate(
-            before,
-            after,
-            RefreshAcquisition::Acquired { contended: false }
-        ));
-        assert!(should_rotate(
-            before,
-            before,
-            RefreshAcquisition::Acquired { contended: true }
-        ));
-        assert!(should_rotate(
-            TokenFingerprint::Missing,
-            after,
-            RefreshAcquisition::Acquired { contended: true }
-        ));
-        assert!(should_rotate(before, after, RefreshAcquisition::Degraded));
     }
 }

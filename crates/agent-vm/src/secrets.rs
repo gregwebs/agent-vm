@@ -7,8 +7,8 @@
 //! entries; the microsandbox proxy re-reads the file on every TLS-intercepted
 //! connection so a host-side rotation is picked up on the next request.
 //!
-//! The same token files are rewritten by `intercept_hook` when the
-//! in-VM agent's OAuth refresh attempt fires.
+//! The same token files are rewritten by the hook's private OAuth-refresh
+//! module when an in-VM agent's OAuth refresh attempt fires.
 //!
 //! Placeholders are stable per-version so credentials JSON written by
 //! a prior invocation is still valid for the current one.

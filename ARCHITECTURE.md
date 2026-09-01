@@ -601,7 +601,10 @@ vendor/microsandbox/  (branch: agent-vm-secret-file)
 
 crates/agent-vm/src/
 ├── msb_install.rs              # discover and validate msb's official-version identity; point MSB_PATH at it
-├── intercept_hook.rs           # new: `agent-vm _intercept-hook` subprocess
+├── intercept_hook.rs           # hook adapter/top dispatch and GitHub policy
+│   └── intercept_hook/
+│       ├── http.rs             # shared hook HTTP parsing/response framing
+│       └── oauth_refresh.rs    # private OAuth validation, rotation, and reply module
 ├── secrets.rs                  # switched from Static(token) to File(<state>.secrets/{anthropic,openai})
 └── run.rs                      # registers the interceptor with two rules
 ```
@@ -719,11 +722,14 @@ clap subcommand mode:
 3. Re-reads the rotated host file, rewrites the host-only token file
    (`<state>.secrets/{anthropic,openai}`) so the next non-refresh
    request from the guest gets the new bearer via `SecretSource::File`.
-4. Synthesizes an OAuth refresh-response JSON shaped like what the
-   upstream server would return, but with **placeholder** strings in
-   the `access_token` / `refresh_token` fields. The in-VM agent
-   updates its credentials.json to those placeholders and continues.
-5. Writes the response to stdout, exits 0.
+4. After complete validation, the private OAuth module consumes the bearer
+   into the host-only file and returns only typed public metadata. It then
+   synthesizes an OAuth refresh-response JSON shaped like what the upstream
+   server would return, but with **placeholder** strings in the
+   `access_token` / `refresh_token` fields. The in-VM agent updates its
+   credentials.json to those placeholders and continues.
+5. The adapter writes the response to stdout, which is the interceptor
+   protocol channel rather than logging, then exits 0.
 
 The guest never holds a real token at any layer:
 - `~/.claude/.credentials.json` always contains placeholders (Phase 3).

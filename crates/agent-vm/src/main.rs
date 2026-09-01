@@ -87,8 +87,8 @@ enum Cmd {
     Doctor(doctor::Args),
 
     /// Internal: invoked by msb's interceptor hook for matched OAuth
-    /// refresh requests. Reads the request on stdin, writes an
-    /// HTTP response on stdout. Not meant for direct use.
+    /// and scoped GitHub requests. Reads stdin and writes the protocol
+    /// response on stdout. Not meant for direct use.
     #[command(name = "_intercept-hook", hide = true)]
     InterceptHook(intercept_hook::Args),
 }
