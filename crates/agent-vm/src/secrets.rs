@@ -3,12 +3,12 @@
 //! At launch we snapshot the host's Claude / Codex credential files,
 //! write placeholder credentials into the guest-side state directory,
 //! and return the per-project token-file *paths* to the launcher. The
-//! launcher registers them as microsandbox `SecretValue::File`
-//! entries; the patched msb re-reads the file on every TLS-intercepted
+//! launcher registers them as microsandbox `SecretSource::File`
+//! entries; the microsandbox proxy re-reads the file on every TLS-intercepted
 //! connection so a host-side rotation is picked up on the next request.
 //!
-//! The same token files are rewritten by `intercept_hook` when the
-//! in-VM agent's OAuth refresh attempt fires.
+//! The same token files are rewritten by the hook's private OAuth-refresh
+//! module when an in-VM agent's OAuth refresh attempt fires.
 //!
 //! Placeholders are stable per-version so credentials JSON written by
 //! a prior invocation is still valid for the current one.
@@ -100,26 +100,14 @@ pub const COPILOT_TOKEN_PLACEHOLDER: &str = "msb-copilot-placeholder-v2";
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
 // docs stay in lockstep.
 
-// run.rs no longer wires these into a credential-substitution secret — the
-// baseline (as of issue #47) has the file-backed `SecretSource` + per-route
-// intercept hook this needs, but agent-vm isn't wired onto them yet (see
-// `fail_closed.rs`), so a launch that would need them fails closed instead.
-// Kept `#[allow(dead_code)]` rather than deleted: they're the exact
-// allow-host set the deferred credential-injection re-port (tracked in
-// agent-vm#51) will need to reconstruct the same secret entries against
-// baseline's `SecretEntry`/`SecretSource`.
-#[allow(dead_code)]
 pub const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 pub const ANTHROPIC_OAUTH_HOST: &str = "platform.claude.com";
 /// Claude Code's MCP relay endpoint. Claude Code's HTTP client sends
 /// the same Anthropic access token here, so the secret substitution
 /// has to allow this destination too — otherwise the placeholder
 /// trips the violation scan and the conn gets dropped, breaking MCP.
-#[allow(dead_code)]
 pub const ANTHROPIC_MCP_PROXY_HOST: &str = "mcp-proxy.anthropic.com";
-#[allow(dead_code)]
 pub const OPENAI_API_HOST: &str = "api.openai.com";
-#[allow(dead_code)]
 pub const OPENAI_CHATGPT_HOST: &str = "chatgpt.com";
 pub const OPENAI_OAUTH_HOST: &str = "auth.openai.com";
 
@@ -156,12 +144,10 @@ pub const OPENAI_OAUTH_TOKEN_PATH: &str = "/oauth/token";
 pub struct CredsState {
     pub anthropic_token_file: Option<PathBuf>,
     pub openai_token_file: Option<PathBuf>,
-    // Phase 6 (agent-vm issue #40): still captured by `refresh()` (the
-    // guest-side placeholder auth.json is written unconditionally so a
-    // first OpenCode launch doesn't hit its wizard), but no longer read
-    // by run.rs — wiring it into a proxy-substitution secret needs the
-    // same deferred credential-injection re-port as the hosts above.
-    #[allow(dead_code)]
+    // OpenCode receives a distinct placeholder, but the proxy reads the
+    // same host-only OpenAI bearer file as Codex. `refresh()` also writes
+    // guest placeholder auth.json so the first OpenCode launch skips its
+    // interactive wizard.
     pub opencode_openai_access_token_file: Option<PathBuf>,
     /// File holding the host's `gh auth token` (a GitHub user OAuth
     /// token). The proxy substitutes `GH_TOKEN_PLACEHOLDER` for this
@@ -207,7 +193,7 @@ pub struct HostCredsSnapshot {
 }
 
 /// Host-only directory holding the real access-token files the proxy
-/// re-reads via `SecretValue::File`.
+/// re-reads via `SecretSource::File`.
 ///
 /// **Must live outside `state_dir`.** The launcher bind-mounts
 /// `state_dir` into the guest at `/agent-vm-state` (a single mount, to
@@ -317,7 +303,7 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
 /// Read host credentials, write the token file (atomically, 0600) and
 /// the guest-side placeholder credentials.json. Returns the paths to
 /// the written token files so the launcher can plumb them into
-/// microsandbox's SecretValue::File config.
+/// microsandbox's SecretSource::File config.
 ///
 /// Serialized across concurrent launchers in the same project via an
 /// advisory flock on `<state_dir>/.refresh.lock`. Several files under

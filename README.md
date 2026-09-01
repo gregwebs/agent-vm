@@ -50,4 +50,6 @@ Full flag, subcommand, networking, and troubleshooting reference:
 - [PLAN.md](PLAN.md) — phased roadmap, what's done, what's deferred.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
   the way they do.
+- [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) —
+  file-backed credential-injection and refresh boundary.
 - [CODING_STANDARDS.md](CODING_STANDARDS.md) — repo coding standards.

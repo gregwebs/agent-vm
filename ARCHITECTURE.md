@@ -32,11 +32,13 @@ our crate's manifest noise.
 
 ### Why a git submodule for microsandbox (vs. crates.io, vs. path dep)
 
-- **Phase 3 requires extending microsandbox.** The new `SecretValue::File`
-  variant lives in `microsandbox-network`. A path dep against a sibling
-  checkout works for one developer but not for CI or contributors. A submodule
-  pinned to a branch on our fork (`gregwebs/microsandbox`) makes the
-  checkout self-contained and the upstream diff reviewable.
+- **Credential injection depends on baseline microsandbox primitives.**
+  The current `SecretSource::File` and interception support live in
+  `microsandbox-network`; the old fork used a different `SecretValue`
+  sentinel design. A path dep against a sibling checkout works for one
+  developer but not for CI or contributors. A submodule pinned to a branch
+  on our fork (`gregwebs/microsandbox`) makes the checkout self-contained and
+  the upstream diff reviewable.
 - **`[patch]` against crates.io** also works, but it duplicates the source-of-
   truth pointer (Cargo.lock + patch table) and hides the fact that we are
   shipping a fork. Submodule is more explicit.
@@ -467,7 +469,7 @@ thing as an opaque string and substitute it verbatim — broken for
 
 ### Phase 3 uses `Static` only
 
-`SecretValue::File` is the right primitive for refresh-aware
+`SecretSource::File` is the right primitive for refresh-aware
 substitution, but turning it on end-to-end requires a `msb` daemon
 built from our forked source replacing the prebuilt one at
 `~/.microsandbox/bin/msb`. Phase 3 doesn't ship that distribution
@@ -564,7 +566,7 @@ credential-proxy works.
 
 - **No refresh.** Long sessions will hit a 401 when the captured
   access token expires (typically hours). Phase 4 closes this.
-- **No `~/.microsandbox/bin/msb` replacement.** The `SecretValue::File`
+- **No `~/.microsandbox/bin/msb` replacement.** The `SecretSource::File`
   variant requires a `msb` rebuilt from our fork to actually re-read
   the file. Without that the Static path is what gets exercised, and
   it does work against unpatched `msb` (wire-format compatibility was
@@ -592,14 +594,17 @@ extensions plus an agent-vm subprocess handle it.
 ```
 vendor/microsandbox/  (branch: agent-vm-secret-file)
 └── crates/network/lib/
-    ├── secrets/config.rs       # SecretValue::File (from Phase 3) is now actually used
+    ├── secrets/config.rs       # SecretSource::File is active for per-connection reads
     └── intercept/              # new: per-route request-interceptor hook
         ├── config.rs           #   InterceptConfig (rules + hook command)
         └── handler.rs          #   per-connection state machine
 
 crates/agent-vm/src/
 ├── msb_install.rs              # discover and validate msb's official-version identity; point MSB_PATH at it
-├── intercept_hook.rs           # new: `agent-vm _intercept-hook` subprocess
+├── intercept_hook.rs           # hook adapter/top dispatch and GitHub policy
+│   └── intercept_hook/
+│       ├── http.rs             # shared hook HTTP parsing/response framing
+│       └── oauth_refresh.rs    # private OAuth validation, rotation, and reply module
 ├── secrets.rs                  # switched from Static(token) to File(<state>.secrets/{anthropic,openai})
 └── run.rs                      # registers the interceptor with two rules
 ```
@@ -612,14 +617,11 @@ At startup, every agent-vm invocation resolves and validates its bundled
 Since agent-vm issue #40, "validates" means confirming `msb --version`
 reports exactly the official upstream Microsandbox version this agent-vm
 build vendors (`msb_install.rs::verify_official_identity`) — not, as when
-this Phase 4 section was written, a `+agent-vm`-suffixed fork marker; the
-`gw` fork this section otherwise describes was replaced by the clean
-v0.6.15 baseline, and the file-backed `SecretValue`/per-route intercept
-hook the rest of this section walks through are accordingly not wired
-into the boot path today (see `fail_closed.rs` and issue #40's PR). The
-historical description below is kept because `intercept_hook.rs` and
-`secrets.rs` still carry this design, pending a re-port onto baseline's
-equivalent (but differently-shaped) secrets API. Discovery prefers an
+this Phase 4 section was written, a `+agent-vm`-suffixed fork marker. The
+current baseline wiring uses `SecretSource::File` plus per-route interception
+in the active boot path. The old fork's `SecretValue` sentinel was replaced
+by a durable host-only file reference, so rotated token bytes are never
+serialized into sandbox configuration. Discovery prefers an
 explicit `MSB_PATH`, then an `msb` sibling in an installed bundle, then the
 signed source artifact at `vendor/microsandbox/build/msb`. The user's
 `~/.microsandbox/bin/msb` is never touched, so upstream-installed tooling on
@@ -641,13 +643,13 @@ hangs at VM init — about 30 minutes of debugging into a
 no-VMM-symbols-in-the-binary surprise. Recorded here so the next
 person doesn't redo it.
 
-### `SecretValue::File`
+### `SecretSource::File`
 
 Phase 3's per-launch snapshot becomes a per-launch *file write*. We
 write the host's `accessToken` to a host-only secret file (see next
 subsection for *where*) with 0600 perms via atomic-write-then-rename.
 The launcher passes the file path to microsandbox as a
-`SecretValue::File`.
+`SecretSource::File`.
 
 msb's TLS-intercept proxy calls `SecretValue::resolve()`
 at *connection-setup* time — every new TCP connection re-reads the
@@ -672,7 +674,7 @@ The real access-token files therefore must *not* live under
 by `secrets::{anthropic,openai}_token_path` so the launcher and the
 refresh hook agree on the path without passing it explicitly. The
 microsandbox proxy reads these files on the *host* side via
-`SecretValue::File`, so they never need to be mounted into the guest at
+`SecretSource::File`, so they never need to be mounted into the guest at
 all.
 
 This was a real leak found during Phase 4 end-to-end verification: the
@@ -699,8 +701,9 @@ fills with:
 
 When the in-VM agent posts an OAuth refresh request, the proxy:
 
-1. Buffers the full request (it's tiny — <1 KB — so this is cheap
-   and capped at 64 KiB).
+1. Buffers the full request under the configured 2 MiB cap. Oversized
+   OAuth and GitHub API requests are refused; smart-HTTP dispatches on
+   headers and streams its body after the repository verdict.
 2. Spawns the hook command with the request bytes on stdin and four
    env vars (`MSB_INTERCEPT_SNI/_HOST_RULE/_METHOD/_PATH_PREFIX`).
 3. Reads the hook's stdout as the response and writes it back to the
@@ -710,18 +713,23 @@ When the in-VM agent posts an OAuth refresh request, the proxy:
 The hook (`agent-vm _intercept-hook`) is the same binary in a hidden
 clap subcommand mode:
 
-1. Reads the request from stdin (sanity-checks it's `POST …`).
+1. Reads the request from stdin and strictly validates HTTP/1.1 framing,
+   Host/SNI/authority, exact provider route, encoding, grant, and
+   placeholder before it can start a host command.
 2. Spawns `claude -p hi --model sonnet` (or `codex exec --skip-git-
    repo-check 'Reply OK'`) on the **host** so the host CLI rotates
    `~/.claude/.credentials.json` / `~/.codex/auth.json` the normal way.
 3. Re-reads the rotated host file, rewrites the host-only token file
    (`<state>.secrets/{anthropic,openai}`) so the next non-refresh
-   request from the guest gets the new bearer via `SecretValue::File`.
-4. Synthesizes an OAuth refresh-response JSON shaped like what the
-   upstream server would return, but with **placeholder** strings in
-   the `access_token` / `refresh_token` fields. The in-VM agent
-   updates its credentials.json to those placeholders and continues.
-5. Writes the response to stdout, exits 0.
+   request from the guest gets the new bearer via `SecretSource::File`.
+4. After complete validation, the private OAuth module consumes the bearer
+   into the host-only file and returns only typed public metadata. It then
+   synthesizes an OAuth refresh-response JSON shaped like what the upstream
+   server would return, but with **placeholder** strings in the
+   `access_token` / `refresh_token` fields. The in-VM agent updates its
+   credentials.json to those placeholders and continues.
+5. The adapter writes the response to stdout, which is the interceptor
+   protocol channel rather than logging, then exits 0.
 
 The guest never holds a real token at any layer:
 - `~/.claude/.credentials.json` always contains placeholders (Phase 3).
@@ -774,17 +782,16 @@ of the just-rotated token.
   guest's own refresh attempt at 401-time triggers our hook, which
   triggers the host-side refresh. If the user runs `claude` on the
   host between sessions, the host file is already fresh and the
-  `SecretValue::File` re-read picks it up with no hook involved.
+  `SecretSource::File` re-read picks it up with no hook involved.
   A timer would be belt-and-suspenders.
 - **No msb shipped via `~/.microsandbox/bin/msb`.** The MSB_PATH
   override is per-agent-vm-invocation only; other microsandbox SDK
   consumers on the same host keep using the upstream prebuilt.
-- **No single-flight for concurrent in-guest refreshes.** Two
-  concurrent refresh attempts could each spawn a host `claude -p`.
-  The host CLI's own file lock prevents corruption, so the worst
-  outcome is one extra `claude -p` invocation. If this becomes a
-  pain point, a `<state>/tokens/.refresh.lock` flock around the host
-  CLI invocation is two lines.
+- **Same-project single-flight only.** A provider-specific host-only
+  lock serializes refreshes for one project. A contended waiter skips
+  its CLI only after it observes a changed readable token digest;
+  uncontended and degraded acquisitions rotate. Different projects may
+  still duplicate work and rely on the provider CLI's credential lock.
 
 ## Phase 5 — Sandbox liveness: heartbeat keep-alive and runtime-exit reporting
 

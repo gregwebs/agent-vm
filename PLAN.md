@@ -16,7 +16,7 @@ Working and verified for daily use:
 - **Host-rooted secrets:** real Claude/Codex/OpenCode tokens never enter the
   VM; the microsandbox TLS-intercept proxy substitutes a placeholder for the
   real bearer on the way out. Tokens live host-side outside the guest mount.
-- **OAuth refresh MITM** for Claude + Codex (file-backed `SecretValue::File`
+- **OAuth refresh MITM** for Claude + Codex (file-backed `SecretSource::File`
   + `_intercept-hook`), so an externally-rotated host token is picked up on the
   next request without a relaunch.
 - **gh / git** auth reused from the host with a **per-launch GitHub repo

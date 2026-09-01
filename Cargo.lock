@@ -38,6 +38,7 @@ dependencies = [
  "reqwest",
  "sea-orm 1.1.20",
  "sea-orm-migration",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx 0.8.6",
@@ -45,6 +46,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
