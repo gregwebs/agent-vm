@@ -2,10 +2,8 @@
 
 ## Status
 
-Accepted. Superseded in part by ADR-0009 (features 1-3 of the four
-fail-closed here — guest proxy, `--auto-publish`, egress overrides —
-are now ported, not failed-closed; only credential injection remains
-fail-closed, tracked at gregwebs/agent-vm#51).
+Accepted. Superseded in part by ADR-0009 and ADR-0010: all four
+previously deferred network capabilities are now active.
 
 ## Context
 
@@ -98,12 +96,9 @@ overflow.
   device-workload matrix official `msb_krun` 0.1.32 needs to prove
   itself against (console stress, many-mount IRQ boundaries, firmware
   identity in CI) is issue #43's job, not re-litigated here.
-- Guest-egress-via-proxy, file-backed credential rotation, the
-  per-route GitHub allow-list intercept, and auto-publish are
-  unavailable until a follow-up re-ports them onto baseline's
-  `.policy(NetworkPolicy)`/static-`SecretBuilder` API — tracked
-  generically under issue #40 in the `fail_closed.rs` error messages
-  until a dedicated follow-up issue exists to point at instead.
+- Guest-egress-via-proxy, auto-publish, egress overrides, and credential
+  injection are consumed through the baseline APIs. ADR-0010 records the
+  host-only file-source and request-policy constraints for credentials.
 - A worktree building this baseline's newer sea-orm migration set
   (`m20260824_000001`, was `m20260606_000001`) must not share a
   `msb.db` with a worktree still building the pre-#40 fork (one-way

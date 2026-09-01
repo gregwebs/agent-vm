@@ -28,12 +28,16 @@
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
+use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::host_paths::{atomic_write, host_claude_creds_path, host_codex_auth_path};
 use crate::secrets;
@@ -78,7 +82,7 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     // The git-smart-HTTP hosts (github.com, codeload, raw, objects)
-    // are wired with `rule_streaming` upstream so the hook sees only
+    // are wired with `streaming_rule` upstream so the hook sees only
     // headers, not the (potentially MB-sized) pack body. We decide
     // based on the path alone: in-allow-list → empty stdout
     // (passthrough — proxy streams the rest to upstream with the
@@ -124,23 +128,10 @@ pub async fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
-    if !looks_like_oauth_refresh(&request) {
-        // Forward an opaque server error so the in-VM agent at least
-        // gets a comprehensible failure rather than a hang. We don't
-        // try to proxy the real request — by the time msb spawned us,
-        // it already committed to not connecting upstream.
-        write_response(&error_response(
-            500,
-            "request did not look like an OAuth refresh; agent-vm hook punted",
-        ))?;
-        return Ok(());
-    }
-
-    let response = match args.sni.as_str() {
-        secrets::ANTHROPIC_OAUTH_HOST => refresh_anthropic(&args.state_dir)?,
-        secrets::OPENAI_OAUTH_HOST => refresh_openai(&args.state_dir)?,
-        other => error_response(500, &format!("agent-vm hook has no logic for SNI {other}")),
-    };
+    let response = dispatch_oauth_refresh(&request, &args.sni, |provider| match provider {
+        Provider::Anthropic => refresh_anthropic(&args.state_dir),
+        Provider::OpenAi => refresh_openai(&args.state_dir),
+    })?;
     write_response(&response)?;
     Ok(())
 }
@@ -171,20 +162,16 @@ async fn forward_github_api(
     allowed_repos: &[String],
     state_dir: &Path,
 ) -> Result<Vec<u8>> {
-    let (method, raw_path, headers, body) = parse_http_request(request)
-        .context("parsing intercepted github request")?;
-
-    // RFC 7230 absolute-form (`GET https://api.github.com/repos/x`) is
-    // legal and GitHub accepts it. msb normalises it before matching
-    // rules, but the hook re-derives the upstream URL from this path,
-    // so normalise here too — otherwise we'd concatenate it onto the
-    // host and 502 on a malformed URL instead of applying policy.
-    let path = normalize_origin_form(&raw_path).to_string();
+    let (method, raw_target, headers, body) =
+        parse_http_request(request).context("parsing intercepted github request")?;
+    let target =
+        parse_github_target(&raw_target).context("validating intercepted github request target")?;
+    let path = target.origin_form;
 
     // `/graphql` carries its repo references in the body, not the
     // path — gh CLI does most reads (repo list/view, pr, issue) over
     // GraphQL, so it gets its own body-level allow-list filter. Only
-    // POST is real GraphQL traffic; anything else goes anonymous.
+    // POST with the strict GraphQL envelope can receive authentication.
     let (path_no_query, query_string) = match path.split_once('?') {
         Some((p, q)) => (p, q),
         None => (path.as_str(), ""),
@@ -207,9 +194,7 @@ async fn forward_github_api(
         });
         if method.eq_ignore_ascii_case("POST") && query_string.is_empty() && content_type_is_json {
             match crate::github_graphql::graphql_access(&body, allowed_repos) {
-                crate::github_graphql::GraphqlAccess::Authenticated => {
-                    GithubAccess::Authenticated
-                }
+                crate::github_graphql::GraphqlAccess::Authenticated => GithubAccess::Authenticated,
                 // Deny, not Anonymous. GitHub's GraphQL endpoint has no
                 // anonymous tier: a stripped-Authorization query comes
                 // back `403 API rate limit exceeded for <host IP>`,
@@ -229,15 +214,7 @@ async fn forward_github_api(
     if let GithubAccess::Deny(reason) = &access {
         return Ok(error_response(403, reason));
     }
-    let forward_with_auth = matches!(access, GithubAccess::Authenticated);
-
-    // Only need to read the real token if we're going to forward with
-    // auth. Anonymous requests don't need it.
-    let real_token = if forward_with_auth {
-        read_gh_token(state_dir).context("reading <state>.secrets/gh")?
-    } else {
-        String::new()
-    };
+    let real_token = read_gh_token(state_dir).context("reading <state>.secrets/gh")?;
 
     let url = format!("https://{}{}", secrets::GITHUB_API_HOST, path);
 
@@ -251,8 +228,8 @@ async fn forward_github_api(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building reqwest client")?;
-    let method_obj = reqwest::Method::from_bytes(method.as_bytes())
-        .context("invalid HTTP method")?;
+    let method_obj =
+        reqwest::Method::from_bytes(method.as_bytes()).context("invalid HTTP method")?;
     let mut req = client.request(method_obj, &url);
     let mut had_authorization = false;
     for (name, value) in &headers {
@@ -262,43 +239,47 @@ async fn forward_github_api(
         let lower = name.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
-            "host" | "content-length" | "connection" | "transfer-encoding" | "te" | "keep-alive"
-                | "proxy-authorization" | "proxy-authenticate" | "trailer" | "upgrade"
+            "host"
+                | "content-length"
+                | "connection"
+                | "transfer-encoding"
+                | "te"
+                | "keep-alive"
+                | "proxy-authorization"
+                | "proxy-authenticate"
+                | "trailer"
+                | "upgrade"
         ) {
             continue;
         }
         if lower == "authorization" {
             had_authorization = true;
-            if forward_with_auth {
-                // Substitute the placeholder → real token. Two forms:
-                //   - `token <PLACEHOLDER>` / `Bearer <PLACEHOLDER>` —
-                //     literal substring, handled by `replace`.
-                //   - `Basic base64(x-access-token:<PLACEHOLDER>)` —
-                //     the placeholder is base64-encoded, so a literal
-                //     replace finds nothing. Decode, substitute, re-
-                //     encode.
-                let v = substitute_authorization_header(value, &real_token);
-                req = req.header("Authorization", v);
-            }
-            // Anonymous: do NOT forward an Authorization header.
-            // The guest sent the placeholder; we drop it. GitHub
-            // then sees a third-party request.
+            // Substitute the placeholder → real token. Two forms:
+            //   - `token <PLACEHOLDER>` / `Bearer <PLACEHOLDER>` —
+            //     literal substring, handled by `replace`.
+            //   - `Basic base64(x-access-token:<PLACEHOLDER>)` —
+            //     the placeholder is base64-encoded, so a literal
+            //     replace finds nothing. Decode, substitute, re-
+            //     encode.
+            let v = substitute_authorization_header(value, &real_token);
+            req = req.header("Authorization", v);
             continue;
         }
         req = req.header(name, value);
     }
-    if forward_with_auth && !had_authorization {
-        // Guest sent no Authorization at all but the path is
-        // allow-listed. Inject a Bearer with the real token — the
-        // alternative is sending a silently-anonymous request that
-        // gets 401, masking the agent's intent.
+    if !had_authorization {
+        // An authenticated route with no guest Authorization still gets
+        // the bearer rather than a misleading anonymous upstream 401.
         req = req.header("Authorization", format!("Bearer {real_token}"));
     }
     if !body.is_empty() {
         req = req.body(body);
     }
 
-    let resp = req.send().await.context("upstream send to api.github.com")?;
+    let resp = req
+        .send()
+        .await
+        .context("upstream send to api.github.com")?;
 
     let status = resp.status();
     let mut out_headers: Vec<(String, String)> = Vec::new();
@@ -325,7 +306,10 @@ async fn forward_github_api(
         }
         out_headers.push((k.as_str().to_string(), v.to_str().unwrap_or("").to_string()));
     }
-    let body_bytes = resp.bytes().await.context("reading upstream response body")?;
+    let body_bytes = resp
+        .bytes()
+        .await
+        .context("reading upstream response body")?;
 
     let mut out = Vec::with_capacity(body_bytes.len() + 1024);
     let head = format!(
@@ -343,41 +327,76 @@ async fn forward_github_api(
     Ok(out)
 }
 
-/// Map an absolute-form request target to origin-form. Anything else
-/// is returned unchanged.
-fn normalize_origin_form(target: &str) -> &str {
-    for scheme in ["http://", "https://"] {
-        if target.len() >= scheme.len() && target[..scheme.len()].eq_ignore_ascii_case(scheme) {
-            let rest = &target[scheme.len()..];
-            return match rest.find('/') {
-                Some(slash) => &rest[slash..],
-                None => "/",
-            };
+struct GithubTarget {
+    /// The exact origin-form target whose repository scope was authorized.
+    /// This same string is appended to the fixed upstream authority.
+    origin_form: String,
+}
+
+fn parse_github_target(target: &str) -> Result<GithubTarget> {
+    if target.contains('\\') || target.contains('#') || contains_escaped_path_escape(target) {
+        anyhow::bail!("request target contains a forbidden path escape");
+    }
+    if target.starts_with('/') {
+        if url::Url::parse(&format!("https://{}{}", secrets::GITHUB_API_HOST, target)).is_err() {
+            anyhow::bail!("origin-form request target is invalid");
         }
+        return Ok(GithubTarget {
+            origin_form: target.to_string(),
+        });
     }
-    target
+
+    let url = url::Url::parse(target).context("absolute-form request target is invalid")?;
+    if !url.scheme().eq_ignore_ascii_case("https")
+        || !url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(secrets::GITHUB_API_HOST))
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!("absolute-form request authority does not match api.github.com");
+    }
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    let origin_form = match url.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    Ok(GithubTarget { origin_form })
 }
 
-#[cfg(test)]
-mod origin_form_tests {
-    use super::normalize_origin_form;
-
-    #[test]
-    fn absolute_form_is_reduced_to_the_path() {
-        assert_eq!(
-            normalize_origin_form("https://api.github.com/repos/a/b"),
-            "/repos/a/b"
-        );
-        assert_eq!(normalize_origin_form("HTTPS://api.github.com/x?y=1"), "/x?y=1");
-        assert_eq!(normalize_origin_form("http://api.github.com"), "/");
-        assert_eq!(normalize_origin_form("/repos/a/b"), "/repos/a/b");
+fn contains_escaped_path_escape(target: &str) -> bool {
+    let bytes = target.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        let Some(encoded) = bytes.get(index + 1..index + 3) else {
+            return true;
+        };
+        let Ok(encoded) = std::str::from_utf8(encoded) else {
+            return true;
+        };
+        let Ok(value) = u8::from_str_radix(encoded, 16) else {
+            return true;
+        };
+        if matches!(value, b'.' | b'/' | b'\\') {
+            return true;
+        }
+        index += 3;
     }
+    false
 }
 
-/// Parse buffered HTTP/1.1 request bytes into (method, path, headers,
-/// body). Headers are kept in original case for outbound. Best-effort
-/// — assumes well-formed input from the in-guest CLI tool, errors
-/// fail open to a 502 via the caller.
+/// Parse one complete HTTP/1.1 request. Requests reaching this hook are
+/// untrusted guest input, so malformed framing is rejected rather than guessed.
 fn parse_http_request(req: &[u8]) -> Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
     let hdr_end = req
         .windows(4)
@@ -387,16 +406,72 @@ fn parse_http_request(req: &[u8]) -> Result<(String, String, Vec<(String, String
     let body = req[hdr_end + 4..].to_vec();
     let mut lines = header_block.split("\r\n");
     let request_line = lines.next().context("empty request")?;
-    let mut parts = request_line.split_ascii_whitespace();
-    let method = parts.next().context("no method")?.to_string();
-    let path = parts.next().context("no path")?.to_string();
+    let mut parts = request_line.split(' ');
+    let method = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .context("no method")?;
+    let target = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .context("no target")?;
+    let version = parts.next().context("no HTTP version")?;
+    if parts.next().is_some() || version != "HTTP/1.1" || method.bytes().any(is_not_token) {
+        anyhow::bail!("request line is not strict HTTP/1.1");
+    }
     let mut headers = Vec::new();
     for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
+        let (name, value) = line.split_once(':').context("malformed header")?;
+        if name.is_empty() || name.bytes().any(is_not_token) {
+            anyhow::bail!("malformed header name");
+        }
+        if value.contains(['\r', '\n']) {
+            anyhow::bail!("malformed header value");
+        }
+        headers.push((
+            name.to_string(),
+            value.trim_matches([' ', '\t']).to_string(),
+        ));
+    }
+    Ok((method.to_string(), target.to_string(), headers, body))
+}
+
+fn is_not_token(byte: u8) -> bool {
+    !matches!(byte, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
+        | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn github_target_rejects_normalization_and_authority_ambiguity() {
+        for target in [
+            "/repos/allowed/repo/%2e%2e/victim",
+            "/repos/allowed/repo/%2Fvictim",
+            "/repos/allowed/repo/%5cvictim",
+            "/repos/allowed\\repo",
+            "/repos/allowed/repo#fragment",
+            "/repos/allowed/%zz",
+            "https://attacker.invalid/repos/allowed/repo",
+            "https://user@api.github.com/repos/allowed/repo",
+            "https://api.github.com:444/repos/allowed/repo",
+        ] {
+            assert!(
+                parse_github_target(target).is_err(),
+                "{target} must be rejected"
+            );
         }
     }
-    Ok((method, path, headers, body))
+
+    #[test]
+    fn github_target_authorizes_and_forwards_the_same_origin_form() {
+        let target = parse_github_target("https://api.github.com/repos/allowed/repo?ref=main")
+            .expect("valid absolute-form target");
+        assert_eq!(target.origin_form, "/repos/allowed/repo?ref=main");
+    }
 }
 
 /// Result of a GitHub access-policy decision.
@@ -404,49 +479,25 @@ fn parse_http_request(req: &[u8]) -> Result<(String, String, Vec<(String, String
 /// - `Authenticated` — forward with the user's real token (the proxy
 ///   substitutes `GH_TOKEN_PLACEHOLDER` for the host bearer on the
 ///   wire).
-/// - `Anonymous` — forward WITHOUT the Authorization header. GitHub
-///   then sees a third-party / unauthenticated request and serves
-///   exactly what an external visitor would: public state succeeds,
-///   private state returns 404 / 401, writes get 401.
-/// - `Deny(reason)` — synthesize a 403 with `reason` (used for `..`
-///   path traversal; otherwise the policy never denies outright, it
-///   defers to GitHub's own auth enforcement).
+/// - `Anonymous` — retained only for the smart-HTTP policy, where an
+///   off-list request is deliberately forwarded without Authorization.
+/// - `Deny(reason)` — synthesize a 403 with `reason`. Buffered GitHub
+///   REST requests use this for every route outside the explicit policy.
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 enum GithubAccess {
     Authenticated,
-    Anonymous,
     Deny(String),
 }
 
 /// Policy decision for an api.github.com request.
 ///
-/// **Spec:** "allow-listed repos get my access; everything else gets
-/// the same access a third-party / anonymous account would have."
+/// **Spec:** allow-listed repositories receive host authentication;
+/// off-list, malformed, and unknown REST routes receive a proxy 403.
 ///
-/// Strategy: instead of trying to enumerate which paths are
-/// public-vs-private (which would lag GitHub's API and break on every
-/// surface change), we delegate to GitHub itself by **stripping the
-/// Authorization header** for any request not naming an allow-listed
-/// repo. GitHub then enforces public-vs-private as it does for
-/// unauthenticated traffic.
-///
-/// Path-shape decisions:
-/// - `/repos/<owner>/<repo>/...`: Authenticated iff `<owner>/<repo>`
-///   is in the allow-list; otherwise Anonymous.
-/// - `/user`, `/user/orgs`, `/user/orgs/...`: Authenticated. The
-///   basic identity probe is what `gh auth status` needs; org list
-///   is what `gh repo view org/x` uses.
-/// - `/user/repos`, `/user/keys`, `/user/emails`, `/user/gpg_keys`,
-///   any other `/user/*`: Anonymous (will 401 — matches "third
-///   party can't see this").
-/// - `/rate_limit`, `/meta`, `/markdown`: Authenticated (utility
-///   endpoints, not user-scoped). `/graphql` is handled by the
-///   body-level filter in `github_graphql` before this function is
-///   consulted; here it falls through to Anonymous.
-/// - `/users/<x>`, `/orgs/<x>`, `/notifications`, anything else:
-///   Anonymous (third-party-visible info; private state hidden by
-///   GitHub).
-/// - `..` traversal anywhere: Deny.
+/// The authenticated utility surface is intentionally method-specific:
+/// `GET /user`, `GET /user/orgs[/...]`, `GET /rate_limit`, `GET /meta`,
+/// and `POST /markdown`. In particular, account-wide mutations such as
+/// `PATCH /user` cannot inherit the bearer.
 fn github_access(method: &str, path: &str, allowed: &[String]) -> GithubAccess {
     let p = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
 
@@ -468,61 +519,33 @@ fn github_access(method: &str, path: &str, allowed: &[String]) -> GithubAccess {
         let owner = it.next().unwrap_or("");
         let repo = it.next().unwrap_or("");
         if owner.is_empty() || repo.is_empty() {
-            // Malformed /repos/ path — go anonymous; GitHub returns 404.
-            return GithubAccess::Anonymous;
+            return GithubAccess::Deny("agent-vm: malformed repository route".to_string());
         }
         let slug = format!("{owner}/{repo}");
         if allowed.iter().any(|a| a.eq_ignore_ascii_case(&slug)) {
             return GithubAccess::Authenticated;
         }
-        // Method doesn't matter — third-party reads work for public
-        // repos via Anonymous; writes 401, which is correct.
-        return GithubAccess::Anonymous;
+        return GithubAccess::Deny(format!(
+            "agent-vm: repository {slug} is not on the allow-list"
+        ));
     }
 
     // Identity / org-membership probe: keep auth so gh CLI works.
-    if p == "/user" || p == "/user/orgs" || p.starts_with("/user/orgs/") {
-        return GithubAccess::Authenticated;
-    }
-
-    // All other /user/* paths leak host-user state to the agent if
-    // we forward auth. Strip → GitHub returns 401, which matches the
-    // user's spec ("third party wouldn't have access").
-    if p.starts_with("/user/") {
-        // Reads: GET /user/repos (private repo inventory), /user/keys,
-        // /user/emails, /user/gpg_keys, etc. Writes: POST /user/keys,
-        // DELETE /user/keys/N, etc. All go anonymous → 401.
-        let _ = method;
-        return GithubAccess::Anonymous;
-    }
-
-    // Search and notifications are user-scoped under auth and would
-    // leak private repo inventory / personal state to the agent.
-    // Strip auth so the agent gets exactly what a third party sees:
-    // /search/* → public-only results; /notifications → 401.
-    // Agents needing in-private-repo search can `git grep` inside
-    // the bind-mounted project (works directly on disk).
-    if p == "/notifications"
-        || p.starts_with("/notifications/")
-        || p == "/search"
-        || p.starts_with("/search/")
+    if method.eq_ignore_ascii_case("GET")
+        && (p == "/user" || p == "/user/orgs" || p.starts_with("/user/orgs/"))
     {
-        return GithubAccess::Anonymous;
+        return GithubAccess::Authenticated;
     }
-
-    // Other utility endpoints are not user-scoped and are safe to
-    // forward authenticated (gh tooling uses them). `/graphql` is NOT
-    // here: it names repos in the request *body*, so it has its own
-    // filter (`github_graphql::graphql_access`) — this path-only
-    // policy answers Anonymous for it as defense in depth.
-    if matches!(p, "/rate_limit" | "/meta" | "/markdown") {
+    if method.eq_ignore_ascii_case("GET") && matches!(p, "/rate_limit" | "/meta") {
+        return GithubAccess::Authenticated;
+    }
+    if method.eq_ignore_ascii_case("POST") && p == "/markdown" {
         return GithubAccess::Authenticated;
     }
 
-    // /users/<x>, /orgs/<x>, /repositories (id-based listing),
-    // /licenses, /gitignore/templates, /emojis, /feeds, /events, …
-    // — all third-party-visible read surfaces. Anonymous is fine.
-    GithubAccess::Anonymous
+    GithubAccess::Deny(format!(
+        "agent-vm: GitHub REST route {method} {p} is not permitted"
+    ))
 }
 
 /// Outcome of the smart-HTTP filter pass:
@@ -576,6 +599,11 @@ fn github_smart_decision(request: &[u8], allowed_repos: &[String]) -> GithubSmar
         None => return GithubSmartOutcome::Malformed,
     };
     let path_no_query = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    if path_no_query.contains(['\\', '#']) || contains_escaped_path_escape(path_no_query) {
+        return GithubSmartOutcome::Deny(
+            "agent-vm: smart-HTTP path contains a forbidden escape".to_string(),
+        );
+    }
     let trimmed = path_no_query.trim_start_matches('/');
 
     for seg in trimmed.split('/') {
@@ -728,8 +756,7 @@ fn strip_authorization_from_request(request: &[u8]) -> Vec<u8> {
 
 fn read_gh_token(state_dir: &Path) -> Result<String> {
     let p = secrets::gh_token_path(state_dir);
-    let s = std::fs::read_to_string(&p)
-        .with_context(|| format!("reading {}", p.display()))?;
+    let s = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
     Ok(s.trim().to_string())
 }
 
@@ -745,7 +772,10 @@ fn read_gh_token(state_dir: &Path) -> Result<String> {
 /// recognisable as Basic auth, so non-GitHub callers' headers are
 /// touched as little as possible.
 fn substitute_authorization_header(value: &str, real_token: &str) -> String {
-    if let Some(b64) = value.strip_prefix("Basic ").or_else(|| value.strip_prefix("basic ")) {
+    if let Some(b64) = value
+        .strip_prefix("Basic ")
+        .or_else(|| value.strip_prefix("basic "))
+    {
         use base64::Engine as _;
         if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
             if let Ok(s) = std::str::from_utf8(&decoded) {
@@ -783,8 +813,10 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Vec<u8>> {
     // first waiter rotates; the second, on acquiring the lock, finds the
     // token file freshly rewritten and skips its own host CLI. The lock
     // is Anthropic-specific so a concurrent OpenAI refresh isn't blocked.
-    let _flight = RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_ANTHROPIC)?;
-    if !token_recently_rotated(&secrets::anthropic_token_path(state_dir)) {
+    let token_path = secrets::anthropic_token_path(state_dir);
+    let before = token_fingerprint(&token_path);
+    let (_flight, acquisition) = RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_ANTHROPIC)?;
+    if should_rotate(before, token_fingerprint(&token_path), acquisition) {
         trigger_host_refresh("claude", &["-p", "hi", "--model", "sonnet"])?;
     }
 
@@ -809,8 +841,8 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Vec<u8>> {
 /// identical: `refresh_anthropic` calls this with the bytes it just
 /// read from the real host file.
 fn rotate_anthropic(state_dir: &Path, host_creds_json: &str) -> Result<Vec<u8>> {
-    let json: Value = serde_json::from_str(host_creds_json)
-        .context("parsing rotated host .credentials.json")?;
+    let json: Value =
+        serde_json::from_str(host_creds_json).context("parsing rotated host .credentials.json")?;
     let oauth = json
         .get("claudeAiOauth")
         .context("rotated host .credentials.json missing claudeAiOauth")?;
@@ -851,8 +883,10 @@ fn refresh_openai(state_dir: &Path) -> Result<Vec<u8>> {
     // and skip the `codex exec` if the token file was just rewritten by
     // the launcher that held the lock before us. OpenAI-specific lock so
     // an in-flight Anthropic refresh doesn't serialize against this one.
-    let _flight = RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_OPENAI)?;
-    if !token_recently_rotated(&secrets::openai_token_path(state_dir)) {
+    let token_path = secrets::openai_token_path(state_dir);
+    let before = token_fingerprint(&token_path);
+    let (_flight, acquisition) = RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_OPENAI)?;
+    if should_rotate(before, token_fingerprint(&token_path), acquisition) {
         trigger_host_refresh(
             "codex",
             &[
@@ -904,89 +938,56 @@ fn rotate_openai(state_dir: &Path, host_auth_json: &str) -> Result<Vec<u8>> {
     Ok(http_200_json(&serde_json::to_vec(&body)?))
 }
 
-/// How recently a token file must have been rewritten for the
-/// single-flight waiter to trust it and skip its own host rotation.
-///
-/// Tied to [`HOST_REFRESH_TIMEOUT`]: a host `claude -p` / `codex exec`
-/// is *allowed* to take up to that long, so a fixed 10 s window would
-/// silently no-op in exactly the slow-rotation case the optimization is
-/// meant to help — the holder finishes after, say, 25 s, and the waiter
-/// then sees an mtime older than 10 s and redundantly re-runs the host
-/// CLI even though the token it would read is current. Matching the
-/// window to the rotation budget means a just-completed slow rotation is
-/// still recognized as fresh. This is safe: the file's mtime is only
-/// bumped by an actual successful rotation write, and host access tokens
-/// live far longer than 90 s, so we never serve a stale token. A small
-/// slack is added so a waiter that wakes slightly after the holder
-/// returns still counts the rotation as fresh.
-const REFRESH_FRESHNESS_WINDOW: std::time::Duration =
-    HOST_REFRESH_TIMEOUT.saturating_add(std::time::Duration::from_secs(5));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenFingerprint {
+    Missing,
+    Unreadable,
+    Sha256([u8; 32]),
+}
 
-/// True if `path` exists and was modified within
-/// [`REFRESH_FRESHNESS_WINDOW`]. Used by the second single-flight
-/// waiter to decide it can re-read the just-rotated token file instead
-/// of spawning another host CLI. Any error (missing file, clock skew
-/// making mtime appear in the future) conservatively returns `false`
-/// so we fall back to actually refreshing.
-fn token_recently_rotated(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    let Ok(modified) = meta.modified() else {
-        return false;
-    };
-    match modified.elapsed() {
-        Ok(age) => age <= REFRESH_FRESHNESS_WINDOW,
-        Err(_) => false,
+fn token_fingerprint(path: &Path) -> TokenFingerprint {
+    match std::fs::read(path) {
+        Ok(bytes) => TokenFingerprint::Sha256(Sha256::digest(bytes).into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TokenFingerprint::Missing,
+        Err(_) => TokenFingerprint::Unreadable,
     }
 }
 
-/// Advisory cross-process lock serializing host-side OAuth refreshes
-/// for one provider within a single project. Held for the duration of
-/// one `refresh_anthropic` / `refresh_openai` call so two in-guest
-/// agents (or two launchers) racing the *same* provider's token
-/// rotation don't each spawn a host `claude -p` / `codex exec`.
-///
-/// The lock is keyed per provider (see [`secrets::refresh_lock_path_for`]):
-/// an Anthropic rotation and an OpenAI rotation touch independent host
-/// artifacts, so they hold different lock files and may run
-/// concurrently — only same-provider refreshes serialize.
-///
-/// Uses a non-blocking `flock(LOCK_EX|LOCK_NB)` polled with a deadline
-/// — already available via the `libc` dependency, so no new crate. The
-/// lock is associated with the open file description and released
-/// automatically when the fd is closed on `Drop` (or if the process
-/// dies), so a crashed refresh can't wedge future rotations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefreshAcquisition {
+    Acquired { contended: bool },
+    Degraded,
+}
+
+fn should_rotate(
+    before: TokenFingerprint,
+    after: TokenFingerprint,
+    acquisition: RefreshAcquisition,
+) -> bool {
+    !matches!(
+        (before, after, acquisition),
+        (
+            TokenFingerprint::Sha256(before),
+            TokenFingerprint::Sha256(after),
+            RefreshAcquisition::Acquired { contended: true },
+        ) if before != after
+    )
+}
+
 struct RefreshLock {
-    /// `Some` when we actually hold the flock; `None` when [`acquire`]
-    /// timed out waiting for a wedged-but-live holder and we degraded
-    /// to proceeding without serialization (see [`acquire`]). The fd is
-    /// still kept open in that case so `Drop` is uniform, but no
-    /// `LOCK_UN` is issued.
     file: Option<std::fs::File>,
 }
 
 impl RefreshLock {
-    /// Acquire the per-provider refresh lock named `lock_name` (e.g.
-    /// [`secrets::REFRESH_LOCK_ANTHROPIC`]).
-    ///
-    /// Bounded wait: a live-but-wedged holder must not block a waiter
-    /// indefinitely, which would reintroduce the unbounded stall the
-    /// [`HOST_REFRESH_TIMEOUT`] cap was added to prevent (review #8).
-    /// We poll `LOCK_EX|LOCK_NB` until the ceiling, then degrade to
-    /// proceeding *without* the lock — i.e. the pre-feature behavior of
-    /// just refreshing. That can cost a redundant host CLI spawn in the
-    /// rare wedged-holder case, but keeps the whole refresh path time
-    /// bounded, which matters more.
-    fn acquire(state_dir: &Path, lock_name: &str) -> Result<Self> {
+    fn acquire(state_dir: &Path, lock_name: &str) -> Result<(Self, RefreshAcquisition)> {
         Self::acquire_with_ceiling(state_dir, lock_name, HOST_REFRESH_TIMEOUT)
     }
 
     fn acquire_with_ceiling(
         state_dir: &Path,
         lock_name: &str,
-        ceiling: std::time::Duration,
-    ) -> Result<Self> {
+        ceiling: Duration,
+    ) -> Result<(Self, RefreshAcquisition)> {
         let path = secrets::refresh_lock_path_for(state_dir, lock_name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -1000,38 +1001,28 @@ impl RefreshLock {
             .open(&path)
             .with_context(|| format!("opening refresh lock {}", path.display()))?;
         use std::os::unix::io::AsRawFd as _;
-        use std::time::Instant;
         let fd = file.as_raw_fd();
         let start = Instant::now();
-        // Poll interval is small relative to a host rotation (seconds);
-        // the extra wakeups over a ~90 s ceiling are negligible.
-        let poll = std::time::Duration::from_millis(50);
+        let mut contended = false;
         loop {
-            let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-            if rc == 0 {
-                return Ok(Self { file: Some(file) });
+            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok((
+                    Self { file: Some(file) },
+                    RefreshAcquisition::Acquired { contended },
+                ));
             }
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
+            match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::EINTR) => continue,
-                // Held by someone else — wait and retry until the ceiling.
                 Some(libc::EWOULDBLOCK) => {
+                    contended = true;
                     if start.elapsed() >= ceiling {
-                        // Degrade to no-lock rather than block forever on
-                        // a wedged-but-live holder. `file: None` so Drop
-                        // issues no LOCK_UN we never took.
-                        tracing::warn!(
-                            lock = %path.display(),
-                            "refresh lock contended past {}s; proceeding without single-flight",
-                            ceiling.as_secs(),
-                        );
-                        return Ok(Self { file: None });
+                        tracing::warn!(lock = %path.display(), "refresh lock contended past {}s; proceeding without single-flight", ceiling.as_secs());
+                        return Ok((Self { file: None }, RefreshAcquisition::Degraded));
                     }
-                    std::thread::sleep(poll);
-                    continue;
+                    std::thread::sleep(Duration::from_millis(50));
                 }
                 _ => {
-                    return Err(anyhow::Error::new(err)
+                    return Err(anyhow::Error::new(std::io::Error::last_os_error())
                         .context(format!("flock(LOCK_EX|LOCK_NB) on {}", path.display())));
                 }
             }
@@ -1052,197 +1043,262 @@ impl Drop for RefreshLock {
     }
 }
 
-#[cfg(test)]
-mod refresh_lock_tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn token_recently_rotated_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("anthropic");
-        // Missing file -> not fresh.
-        assert!(!token_recently_rotated(&f));
-        // Just-written file -> fresh.
-        std::fs::write(&f, b"tok").unwrap();
-        assert!(token_recently_rotated(&f));
-    }
-
-    /// Two threads contending the same project lock must run their
-    /// critical sections one at a time. We track the number of holders
-    /// inside the locked region and assert it never exceeds one.
-    #[test]
-    fn contending_threads_serialize() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("proj");
-        std::fs::create_dir_all(&state).unwrap();
-
-        let in_section = Arc::new(AtomicUsize::new(0));
-        let max_concurrent = Arc::new(AtomicUsize::new(0));
-        let acquisitions = Arc::new(AtomicUsize::new(0));
-
-        let spawn = |state: std::path::PathBuf,
-                     in_section: Arc<AtomicUsize>,
-                     max_concurrent: Arc<AtomicUsize>,
-                     acquisitions: Arc<AtomicUsize>| {
-            std::thread::spawn(move || {
-                for _ in 0..20 {
-                    let _guard = RefreshLock::acquire(&state, secrets::REFRESH_LOCK_ANTHROPIC)
-                        .expect("acquire");
-                    acquisitions.fetch_add(1, Ordering::SeqCst);
-                    let now = in_section.fetch_add(1, Ordering::SeqCst) + 1;
-                    // Record the peak observed concurrency.
-                    max_concurrent.fetch_max(now, Ordering::SeqCst);
-                    // Hold briefly to widen the race window.
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    in_section.fetch_sub(1, Ordering::SeqCst);
-                }
-            })
-        };
-
-        let t1 = spawn(
-            state.clone(),
-            in_section.clone(),
-            max_concurrent.clone(),
-            acquisitions.clone(),
-        );
-        let t2 = spawn(
-            state.clone(),
-            in_section.clone(),
-            max_concurrent.clone(),
-            acquisitions.clone(),
-        );
-        t1.join().unwrap();
-        t2.join().unwrap();
-
-        assert_eq!(acquisitions.load(Ordering::SeqCst), 40);
-        assert_eq!(
-            max_concurrent.load(Ordering::SeqCst),
-            1,
-            "flock failed to serialize: two holders entered the critical section at once"
-        );
-    }
-
-    /// Different providers use different lock files, so a holder of the
-    /// Anthropic lock must not block an OpenAI acquire (and vice versa).
-    #[test]
-    fn distinct_providers_do_not_contend() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("proj");
-        std::fs::create_dir_all(&state).unwrap();
-
-        let anthropic = RefreshLock::acquire(&state, secrets::REFRESH_LOCK_ANTHROPIC)
-            .expect("anthropic acquire");
-        // Holding the Anthropic lock, an OpenAI acquire must succeed
-        // immediately (not time out, not degrade) — it's a different file.
-        let openai = RefreshLock::acquire_with_ceiling(
-            &state,
-            secrets::REFRESH_LOCK_OPENAI,
-            std::time::Duration::from_millis(50),
-        )
-        .expect("openai acquire");
-        // Both genuinely hold their locks.
-        assert!(openai.file.is_some(), "openai should hold its own lock");
-        drop(anthropic);
-        drop(openai);
-    }
-
-    /// A live-but-wedged holder must not block a waiter past the
-    /// ceiling: the second acquire returns within the bound and degrades
-    /// to the no-lock state instead of hanging forever.
-    #[test]
-    fn bounded_wait_degrades_when_holder_wedged() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("proj");
-        std::fs::create_dir_all(&state).unwrap();
-
-        // First holder keeps the lock for the whole test.
-        let _held = RefreshLock::acquire(&state, secrets::REFRESH_LOCK_ANTHROPIC)
-            .expect("first acquire");
-
-        let ceiling = std::time::Duration::from_millis(200);
-        let start = std::time::Instant::now();
-        let second = RefreshLock::acquire_with_ceiling(
-            &state,
-            secrets::REFRESH_LOCK_ANTHROPIC,
-            ceiling,
-        )
-        .expect("second acquire returns Ok (degraded)");
-        let waited = start.elapsed();
-
-        // Returned within a small multiple of the ceiling (not blocked
-        // indefinitely), and degraded to no-lock.
-        assert!(
-            waited < ceiling * 4,
-            "acquire blocked {waited:?}, expected ~{ceiling:?}"
-        );
-        assert!(
-            second.file.is_none(),
-            "contended acquire past ceiling must degrade to the no-lock state"
-        );
-    }
-}
-
-/// Bound on how long we'll wait for a host `claude -p` / `codex exec`
-/// to drive a token rotation. A hung host CLI must not keep the in-VM
-/// agent's OAuth refresh waiting indefinitely (review #8). 90 s is
-/// enough for normal claude/codex round-trips and small enough to
-/// surface a problem before the guest agent's own timeout fires.
-///
-/// Shared so the single-flight lock-wait ceiling
-/// ([`RefreshLock::acquire`]) and the freshness window
-/// ([`REFRESH_FRESHNESS_WINDOW`]) stay tied to the actual rotation
-/// budget rather than drifting from it.
-const HOST_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+const HOST_REFRESH_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn trigger_host_refresh(cmd: &str, args: &[&str]) -> Result<()> {
-    use std::time::{Duration, Instant};
-    const TIMEOUT: Duration = HOST_REFRESH_TIMEOUT;
+    trigger_host_refresh_with_timeout(cmd, args, HOST_REFRESH_TIMEOUT)
+}
 
-    let mut child = Command::new(cmd)
+fn trigger_host_refresh_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Result<()> {
+    let mut command = Command::new(cmd);
+    command
         .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawning host {cmd}"))?;
+    let pid = child.id() as libc::pid_t;
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let (drained, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        let _ = drained.send(());
+    });
     let start = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait()? {
-            Some(status) => {
-                let mut stderr = Vec::new();
-                if let Some(mut e) = child.stderr.take() {
-                    use std::io::Read as _;
-                    let _ = e.read_to_end(&mut stderr);
+            Some(status) => break status,
+            None if start.elapsed() >= timeout => {
+                #[cfg(unix)]
+                unsafe {
+                    if libc::kill(-pid, libc::SIGKILL) == -1 {
+                        return Err(anyhow::Error::new(std::io::Error::last_os_error())
+                            .context(format!("terminating host {cmd} process group")));
+                    }
                 }
-                if !status.success() {
-                    anyhow::bail!(
-                        "host {cmd} failed (status {status}): {}",
-                        String::from_utf8_lossy(&stderr)
-                    );
-                }
-                return Ok(());
+                child
+                    .wait()
+                    .with_context(|| format!("reaping timed-out host {cmd}"))?;
+                let _ = receiver.recv_timeout(Duration::from_millis(100));
+                anyhow::bail!(
+                    "host {cmd} did not return within {} s; terminated",
+                    timeout.as_secs()
+                );
             }
-            None => {
-                if start.elapsed() >= TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!(
-                        "host {cmd} did not return within {} s; killed",
-                        TIMEOUT.as_secs()
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let _ = receiver.recv_timeout(Duration::from_millis(100));
+    if !status.success() {
+        anyhow::bail!("host {cmd} failed (status {status})");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provider {
+    Anthropic,
+    OpenAi,
+}
+#[derive(Debug, PartialEq, Eq)]
+struct OAuthRejection {
+    status: u16,
+    message: String,
+}
+impl OAuthRejection {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: 400,
+            message: message.into(),
+        }
+    }
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: 403,
+            message: message.into(),
         }
     }
 }
 
-fn looks_like_oauth_refresh(req: &[u8]) -> bool {
-    std::str::from_utf8(req)
-        .map(|s| s.lines().next().unwrap_or("").starts_with("POST "))
-        .unwrap_or(false)
+fn validate_oauth_refresh(
+    request: &[u8],
+    provider_sni: &str,
+) -> std::result::Result<Provider, OAuthRejection> {
+    let provider = if provider_sni.eq_ignore_ascii_case(secrets::ANTHROPIC_OAUTH_HOST) {
+        Provider::Anthropic
+    } else if provider_sni.eq_ignore_ascii_case(secrets::OPENAI_OAUTH_HOST) {
+        Provider::OpenAi
+    } else {
+        return Err(OAuthRejection::forbidden(
+            "OAuth refresh SNI is not allowed",
+        ));
+    };
+    let (method, target, headers, body) = parse_http_request(request)
+        .map_err(|_| OAuthRejection::bad_request("malformed OAuth refresh request"))?;
+    let host = exactly_one_header(&headers, "host")?;
+    if !host.eq_ignore_ascii_case(provider_sni) {
+        return Err(OAuthRejection::forbidden(
+            "OAuth refresh Host does not match SNI",
+        ));
+    }
+    if method != "POST" {
+        return Err(OAuthRejection::forbidden("OAuth refresh requires POST"));
+    }
+    let expected = match provider {
+        Provider::Anthropic => secrets::ANTHROPIC_OAUTH_TOKEN_PATH,
+        Provider::OpenAi => secrets::OPENAI_OAUTH_TOKEN_PATH,
+    };
+    let path = validated_oauth_target(&target, provider_sni)?;
+    if path != expected {
+        return Err(OAuthRejection::forbidden(
+            "OAuth refresh path is not allowed",
+        ));
+    }
+    let content_types: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .collect();
+    if content_types.len() != 1
+        || headers.iter().any(|(name, value)| {
+            (name.eq_ignore_ascii_case("transfer-encoding")
+                || name.eq_ignore_ascii_case("content-encoding"))
+                && !value.eq_ignore_ascii_case("identity")
+        })
+    {
+        return Err(OAuthRejection::bad_request(
+            "OAuth refresh has unsupported HTTP encoding",
+        ));
+    }
+    let lengths: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .collect();
+    if lengths.len() != 1 || lengths[0].1.parse::<usize>().ok() != Some(body.len()) {
+        return Err(OAuthRejection::bad_request(
+            "OAuth refresh has invalid content length",
+        ));
+    }
+    let content_type = content_types[0].1.split(';').next().unwrap_or("").trim();
+    let (grant_ok, token_ok) = if content_type.eq_ignore_ascii_case("application/json") {
+        #[derive(Deserialize)]
+        struct RefreshBody {
+            grant_type: String,
+            refresh_token: String,
+        }
+        let value: RefreshBody = serde_json::from_slice(&body)
+            .map_err(|_| OAuthRejection::bad_request("OAuth refresh JSON body is invalid"))?;
+        (
+            value.grant_type == "refresh_token",
+            refresh_placeholder_matches(provider, &value.refresh_token),
+        )
+    } else if content_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+        let values: Vec<_> = url::form_urlencoded::parse(&body).collect();
+        let grants: Vec<_> = values
+            .iter()
+            .filter(|(key, _)| key == "grant_type")
+            .collect();
+        let tokens: Vec<_> = values
+            .iter()
+            .filter(|(key, _)| key == "refresh_token")
+            .collect();
+        (
+            grants.len() == 1 && grants[0].1 == "refresh_token",
+            tokens.len() == 1 && refresh_placeholder_matches(provider, &tokens[0].1),
+        )
+    } else {
+        return Err(OAuthRejection::bad_request(
+            "OAuth refresh content type is not supported",
+        ));
+    };
+    if !grant_ok || !token_ok {
+        return Err(OAuthRejection::forbidden(
+            "OAuth refresh grant or refresh token is not allowed",
+        ));
+    }
+    Ok(provider)
+}
+fn exactly_one_header<'a>(
+    headers: &'a [(String, String)],
+    name: &str,
+) -> std::result::Result<&'a str, OAuthRejection> {
+    let values: Vec<_> = headers
+        .iter()
+        .filter(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    if values.len() != 1 || values[0].is_empty() {
+        return Err(OAuthRejection::bad_request(format!(
+            "OAuth refresh requires exactly one {name} header"
+        )));
+    }
+    Ok(values[0])
+}
+
+fn validated_oauth_target(target: &str, sni: &str) -> std::result::Result<String, OAuthRejection> {
+    if target.starts_with('/') {
+        if target.contains(['?', '#', '\\']) || contains_escaped_path_escape(target) {
+            return Err(OAuthRejection::forbidden(
+                "OAuth refresh target is not exact",
+            ));
+        }
+        return Ok(target.to_string());
+    }
+    let url = url::Url::parse(target)
+        .map_err(|_| OAuthRejection::bad_request("OAuth refresh target is invalid"))?;
+    if !url.scheme().eq_ignore_ascii_case("https")
+        || !url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(sni))
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(OAuthRejection::forbidden(
+            "OAuth refresh authority does not match SNI",
+        ));
+    }
+    if contains_escaped_path_escape(url.path()) || url.path().contains('\\') {
+        return Err(OAuthRejection::forbidden(
+            "OAuth refresh target is not exact",
+        ));
+    }
+    Ok(url.path().to_string())
+}
+
+fn dispatch_oauth_refresh<F>(request: &[u8], provider_sni: &str, action: F) -> Result<Vec<u8>>
+where
+    F: FnOnce(Provider) -> Result<Vec<u8>>,
+{
+    match validate_oauth_refresh(request, provider_sni) {
+        Ok(provider) => action(provider),
+        Err(rejection) => Ok(error_response(rejection.status, &rejection.message)),
+    }
+}
+fn refresh_placeholder_matches(provider: Provider, token: &str) -> bool {
+    match provider {
+        Provider::Anthropic => token == secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
+        Provider::OpenAi => {
+            token == secrets::OPENAI_REFRESH_PLACEHOLDER
+                || token == secrets::OPENCODE_OPENAI_REFRESH_PLACEHOLDER
+        }
+    }
 }
 
 fn derive_expires_in(expires_at_field: &Value) -> i64 {
@@ -1335,20 +1391,19 @@ mod tests {
     }
 
     #[test]
-    fn gh_access_other_repo_is_anonymous_any_method() {
-        // The whole point: a non-allow-listed repo gets third-party
-        // access. GitHub itself enforces public/private — public
-        // reads succeed, private 404s, writes 401.
+    fn gh_access_off_list_and_unknown_rest_routes_are_denied() {
         let allowed = al(&["wirenboard/agent-vm"]);
-        for m in ["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE"] {
-            assert_eq!(
-                github_access(m, "/repos/octocat/Hello-World", &allowed),
-                GithubAccess::Anonymous,
-                "{m} on non-allow-listed repo should be Anonymous"
-            );
-            assert_eq!(
-                github_access(m, "/repos/private/something/issues", &allowed),
-                GithubAccess::Anonymous,
+        for (method, path) in [
+            ("GET", "/repos/octocat/Hello-World"),
+            ("POST", "/repos/private/something/issues"),
+            ("GET", "/search/code?q=foo"),
+            ("GET", "/users/octocat"),
+            ("POST", "/graphql"),
+            ("GET", "/repos/"),
+        ] {
+            assert!(
+                matches!(github_access(method, path, &allowed), GithubAccess::Deny(_)),
+                "{method} {path} must receive a proxy denial"
             );
         }
     }
@@ -1367,110 +1422,32 @@ mod tests {
     }
 
     #[test]
-    fn gh_access_user_identity_endpoints_authenticated() {
-        // gh auth status / gh repo view org/x need these.
+    fn gh_access_only_authenticates_safe_utility_methods() {
         let allowed = al(&[]);
-        assert_eq!(github_access("GET", "/user", &allowed), GithubAccess::Authenticated);
-        assert_eq!(
-            github_access("GET", "/user/orgs", &allowed),
-            GithubAccess::Authenticated
-        );
-        assert_eq!(
-            github_access("GET", "/user/orgs/123", &allowed),
-            GithubAccess::Authenticated
-        );
-    }
-
-    #[test]
-    fn gh_access_user_pii_endpoints_are_anonymous() {
-        // Per spec: third party can't see /user/repos (would reveal
-        // private repo inventory), /user/keys (SSH keys),
-        // /user/emails (verified emails), /user/gpg_keys. Stripping
-        // auth → GitHub 401, matching what a third party would get.
-        let allowed = al(&[]);
-        for path in [
-            "/user/repos",
-            "/user/keys",
-            "/user/keys/123",
-            "/user/emails",
-            "/user/gpg_keys",
-            "/user/something-future-we-dont-recognise",
+        for (method, path) in [
+            ("GET", "/user"),
+            ("GET", "/user/orgs"),
+            ("GET", "/user/orgs/123"),
+            ("GET", "/rate_limit"),
+            ("GET", "/meta"),
+            ("POST", "/markdown"),
         ] {
             assert_eq!(
-                github_access("GET", path, &allowed),
-                GithubAccess::Anonymous,
-                "{path} should strip auth"
+                github_access(method, path, &allowed),
+                GithubAccess::Authenticated,
+                "{method} {path} should be authenticated"
             );
-            assert_eq!(github_access("POST", path, &allowed), GithubAccess::Anonymous);
         }
-    }
-
-    #[test]
-    fn gh_access_utility_endpoints_authenticated() {
-        // Non-user-scoped utility surfaces: gh tooling friendly,
-        // safe to forward with auth.
-        let allowed = al(&[]);
-        for path in ["/rate_limit", "/meta", "/markdown"] {
+        for (method, path) in [
+            ("PATCH", "/user"),
+            ("POST", "/user/keys"),
+            ("DELETE", "/user/orgs/123"),
+            ("POST", "/rate_limit"),
+            ("GET", "/markdown"),
+        ] {
             assert!(
-                matches!(github_access("POST", path, &allowed), GithubAccess::Authenticated)
-                    || matches!(github_access("GET", path, &allowed), GithubAccess::Authenticated),
-                "{path} should be Authenticated"
-            );
-        }
-    }
-
-    #[test]
-    fn gh_access_graphql_path_is_anonymous_here() {
-        // /graphql gets its own body-level filter before this
-        // path-only policy runs; if it ever reaches github_access it
-        // must NOT be granted the token on path alone.
-        let allowed = al(&["wirenboard/agent-vm"]);
-        for m in ["GET", "POST"] {
-            assert_eq!(github_access(m, "/graphql", &allowed), GithubAccess::Anonymous);
-        }
-    }
-
-    #[test]
-    fn gh_access_search_and_notifications_are_anonymous() {
-        // Per spec: third-party model. Authenticated search hits
-        // private repos the user has access to → leaks private repo
-        // inventory + code + issues. /notifications is inherently
-        // user-scoped (your own notification feed) — third party
-        // gets 401, which is the right answer.
-        let allowed = al(&["wirenboard/agent-vm"]);
-        for path in [
-            "/search",
-            "/search/code?q=foo+repo:any/repo",
-            "/search/issues?q=is:open",
-            "/search/repositories?q=stars:>1000",
-            "/notifications",
-            "/notifications/threads/123",
-        ] {
-            assert_eq!(
-                github_access("GET", path, &allowed),
-                GithubAccess::Anonymous,
-                "{path} should be Anonymous (third-party access)"
-            );
-        }
-    }
-
-    #[test]
-    fn gh_access_public_lookup_endpoints_are_anonymous() {
-        // Reads of other users / orgs / etc. — third-party
-        // access serves what's public, hides what's private.
-        let allowed = al(&[]);
-        for path in [
-            "/users/octocat",
-            "/users/octocat/repos",
-            "/orgs/github",
-            "/orgs/private-org/members",
-            "/licenses",
-            "/emojis",
-        ] {
-            assert_eq!(
-                github_access("GET", path, &allowed),
-                GithubAccess::Anonymous,
-                "{path} should be Anonymous (third-party access)"
+                matches!(github_access(method, path, &allowed), GithubAccess::Deny(_)),
+                "{method} {path} must not receive host authentication"
             );
         }
     }
@@ -1478,45 +1455,11 @@ mod tests {
     #[test]
     fn gh_access_traversal_is_denied() {
         let allowed = al(&["allowed/repo"]);
-        assert!(matches!(
-            github_access("GET", "/repos/allowed/repo/../../victim/private", &allowed),
-            GithubAccess::Deny(_)
-        ));
-        assert!(matches!(
-            github_access("POST", "/repos/allowed/repo/../../victim/issues", &allowed),
-            GithubAccess::Deny(_)
-        ));
-        assert!(matches!(
-            github_access("GET", "/../etc/passwd", &allowed),
-            GithubAccess::Deny(_)
-        ));
-    }
-
-    #[test]
-    fn gh_access_query_string_stripped_for_path_match() {
-        let allowed = al(&["wirenboard/agent-vm"]);
-        assert_eq!(
-            github_access("GET", "/repos/wirenboard/agent-vm?ref=main", &allowed),
-            GithubAccess::Authenticated,
-        );
-        assert_eq!(
-            github_access("POST", "/repos/octocat/Hello-World/issues?x=y", &allowed),
-            GithubAccess::Anonymous,
-        );
-    }
-
-    #[test]
-    fn gh_access_malformed_repos_path_goes_anonymous() {
-        // The old policy denied these outright; the new policy
-        // defers to GitHub by stripping auth, and GitHub returns
-        // 404 for shapes it doesn't recognise. Safer + simpler.
-        let allowed = al(&["wirenboard/agent-vm"]);
-        for path in ["/repos/", "/repos/owner", "/repos/owner/", "/repos//repo"] {
-            assert_eq!(
-                github_access("POST", path, &allowed),
-                GithubAccess::Anonymous,
-                "{path} should be Anonymous (GitHub returns 404)"
-            );
+        for path in ["/repos/allowed/repo/../../victim/private", "/../etc/passwd"] {
+            assert!(matches!(
+                github_access("GET", path, &allowed),
+                GithubAccess::Deny(_)
+            ));
         }
     }
 
@@ -1594,17 +1537,18 @@ mod tests {
     }
 
     #[test]
-    fn smart_traversal_is_denied() {
+    fn smart_traversal_and_encoded_separators_are_denied() {
         let allowed = al(&["allowed/repo"]);
-        assert!(matches!(
-            github_smart_decision(
-                &req(
-                    "POST /allowed/repo.git/../../victim/private.git/git-receive-pack HTTP/1.1"
-                ),
-                &allowed,
-            ),
-            GithubSmartOutcome::Deny(_),
-        ));
+        for target in [
+            "/allowed/repo.git/../../victim/private.git/git-receive-pack",
+            "/allowed/repo.git/%2e%2e/victim/private.git/git-receive-pack",
+            "/allowed/repo.git/%2Fvictim/private.git/git-receive-pack",
+        ] {
+            assert!(matches!(
+                github_smart_decision(&req(&format!("POST {target} HTTP/1.1")), &allowed),
+                GithubSmartOutcome::Deny(_),
+            ));
+        }
     }
 
     #[test]
@@ -1639,10 +1583,7 @@ mod tests {
         // denied; new policy goes Anonymous and lets GitHub 404.
         let allowed = al(&["x/y"]);
         assert_eq!(
-            github_smart_decision(
-                &req("GET /just-one-segment HTTP/1.1"),
-                &allowed,
-            ),
+            github_smart_decision(&req("GET /just-one-segment HTTP/1.1"), &allowed,),
             GithubSmartOutcome::Anonymous,
         );
     }
@@ -1820,7 +1761,9 @@ mod tests {
         // header split keeps everything after the first `:`.
         let req = b"GET /x HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz:extra\r\n\r\n";
         let (_m, _p, headers, _b) = parse_http_request(req).unwrap();
-        let auth = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Authorization"));
+        let auth = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Authorization"));
         assert_eq!(
             auth.map(|(_, v)| v.as_str()),
             Some("Basic dXNlcjpwYXNz:extra")
@@ -1910,7 +1853,10 @@ mod tests {
                   hello";
         let out = set_connection_close(r);
         let s = std::str::from_utf8(&out).unwrap();
-        assert!(s.contains("\r\n\r\nhello"), "body must follow exactly one \\r\\n\\r\\n; got: {s:?}");
+        assert!(
+            s.contains("\r\n\r\nhello"),
+            "body must follow exactly one \\r\\n\\r\\n; got: {s:?}"
+        );
         assert!(s.ends_with("hello"));
     }
 
@@ -2008,7 +1954,10 @@ mod tests {
         let expected_creds = format!("x-access-token:{real_token}");
         let expected_b64 =
             base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
-        assert!(s.contains(&expected_b64), "auth must reach upstream for allow-listed repo");
+        assert!(
+            s.contains(&expected_b64),
+            "auth must reach upstream for allow-listed repo"
+        );
         // Connection must be close — the connection-reset is the
         // entire point even for the allowed path.
         assert!(
@@ -2049,12 +1998,8 @@ mod tests {
         SecretsConfig {
             secrets: vec![SecretEntry {
                 env_var: "GH_TOKEN".into(),
-                // Baseline's `SecretEntry` now has a file-backed
-                // `SecretSource` variant too (see `fail_closed.rs`'s module
-                // doc), but agent-vm isn't wired onto it yet — this test
-                // fixture only needs a static value, so `source: None`
-                // ("value already carries the material") is the right
-                // shape for it regardless.
+                // This isolated proxy-pipeline fixture uses a synthetic
+                // static bearer; launch configuration uses `SecretSource::File`.
                 value: real_token.to_string().into(),
                 source: None,
                 placeholder: placeholder.into(),
@@ -2062,8 +2007,8 @@ mod tests {
                     HostPattern::Exact("github.com".into()),
                     HostPattern::Exact("api.github.com".into()),
                     HostPattern::Exact("codeload.github.com".into()),
-                    HostPattern::Exact("raw.github.com".into()),
-                    HostPattern::Exact("objects.github.com".into()),
+                    HostPattern::Exact("raw.githubusercontent.com".into()),
+                    HostPattern::Exact("objects.githubusercontent.com".into()),
                 ],
                 injection: SecretInjection {
                     headers: true,
@@ -2122,7 +2067,8 @@ mod tests {
         // (base64-encoded inside the Basic value). If this fails the
         // SecretsHandler isn't doing its job — different bug.
         let expected_creds = format!("x-access-token:{real_token}");
-        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
+        let expected_b64 =
+            base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
         let substituted_str = std::str::from_utf8(substituted_bytes)
             .expect("substituted output should still be UTF-8 for this ASCII request");
         assert!(
@@ -2142,8 +2088,8 @@ mod tests {
 
         // Step 3: stripped bytes are what hits upstream.
         let upstream_bytes = strip_authorization_from_request(substituted_bytes);
-        let upstream_str = std::str::from_utf8(&upstream_bytes)
-            .expect("stripped request should still be UTF-8");
+        let upstream_str =
+            std::str::from_utf8(&upstream_bytes).expect("stripped request should still be UTF-8");
 
         // INVARIANT: real token bytes (raw AND base64) must not be
         // anywhere in what we send upstream.
@@ -2198,7 +2144,9 @@ mod tests {
              Authorization: Basic {b64}\r\n\
              \r\n"
         );
-        let sub1 = handler.substitute(req1.as_bytes()).expect("not a violation");
+        let sub1 = handler
+            .substitute(req1.as_bytes())
+            .expect("not a violation");
         // The hook would run here and strip auth for non-allow-listed.
         // Asserting that part is the other test.
 
@@ -2216,11 +2164,14 @@ mod tests {
              Content-Length: 0\r\n\
              \r\n"
         );
-        let sub2 = handler.substitute(req2.as_bytes()).expect("not a violation");
+        let sub2 = handler
+            .substitute(req2.as_bytes())
+            .expect("not a violation");
         let sub2_str = std::str::from_utf8(&sub2).unwrap();
 
         let expected_creds = format!("x-access-token:{real_token}");
-        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
+        let expected_b64 =
+            base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
 
         // INVARIANT (currently FAILS for keep-alive): if the hook
         // isn't re-engaged for request 2, the substituted bytes
@@ -2272,7 +2223,9 @@ mod tests {
              Authorization: Basic {b64}\r\n\
              \r\n"
         );
-        let substituted = handler.substitute(request.as_bytes()).expect("not a violation");
+        let substituted = handler
+            .substitute(request.as_bytes())
+            .expect("not a violation");
 
         let allowed = vec!["wirenboard/agent-vm".to_string()];
         let decision = github_smart_decision(&substituted, &allowed);
@@ -2287,7 +2240,8 @@ mod tests {
         // is the intended path for legitimate auth on allowed repos.
         let upstream_str = std::str::from_utf8(&substituted).unwrap();
         let expected_creds = format!("x-access-token:{real_token}");
-        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
+        let expected_b64 =
+            base64::engine::general_purpose::STANDARD.encode(expected_creds.as_bytes());
         assert!(
             upstream_str.contains(&expected_b64),
             "for allow-listed repo, real token should reach upstream; got:\n{upstream_str}"
@@ -2342,7 +2296,9 @@ mod rotation_tests {
     /// body). Asserts a single CRLFCRLF separator exists.
     fn split_http(resp: &[u8]) -> (String, String, String) {
         let s = std::str::from_utf8(resp).expect("response is UTF-8");
-        let sep = s.find("\r\n\r\n").expect("response has header/body separator");
+        let sep = s
+            .find("\r\n\r\n")
+            .expect("response has header/body separator");
         let head = &s[..sep];
         let body = &s[sep + 4..];
         let line_end = head.find("\r\n").unwrap_or(head.len());
@@ -2379,8 +2335,8 @@ mod rotation_tests {
 
         // (1) Per-project token file rewritten to the NEW real bearer.
         let token_file = secrets::anthropic_token_path(tmp.path());
-        let written = std::fs::read_to_string(&token_file)
-            .expect("token file should have been written");
+        let written =
+            std::fs::read_to_string(&token_file).expect("token file should have been written");
         assert_eq!(
             written, NEW_BEARER_ANTHROPIC,
             "anthropic token file must hold the freshly-rotated real bearer"
@@ -2419,11 +2375,13 @@ mod rotation_tests {
         // Body's token fields are the placeholders, verbatim.
         let parsed: Value = serde_json::from_str(&body).expect("body is JSON");
         assert_eq!(
-            parsed["access_token"], secrets::ANTHROPIC_ACCESS_PLACEHOLDER,
+            parsed["access_token"],
+            secrets::ANTHROPIC_ACCESS_PLACEHOLDER,
             "access_token must be the placeholder"
         );
         assert_eq!(
-            parsed["refresh_token"], secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
+            parsed["refresh_token"],
+            secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
             "refresh_token must be the placeholder"
         );
         assert_eq!(parsed["token_type"], "Bearer");
@@ -2436,8 +2394,7 @@ mod rotation_tests {
 
     // ── OpenAI / Codex ────────────────────────────────────────────
 
-    const NEW_BEARER_OPENAI: &str =
-        "eyJROTATED.openai.access.token.value.do.not.leak";
+    const NEW_BEARER_OPENAI: &str = "eyJROTATED.openai.access.token.value.do.not.leak";
 
     fn rotated_openai_auth() -> String {
         json!({
@@ -2459,8 +2416,8 @@ mod rotation_tests {
         assert!(!resp.is_empty());
 
         let token_file = secrets::openai_token_path(tmp.path());
-        let written = std::fs::read_to_string(&token_file)
-            .expect("token file should have been written");
+        let written =
+            std::fs::read_to_string(&token_file).expect("token file should have been written");
         assert_eq!(
             written, NEW_BEARER_OPENAI,
             "openai token file must hold the freshly-rotated real access token"
@@ -2520,5 +2477,237 @@ mod rotation_tests {
             rotate_openai(tmp.path(), &json!({"tokens": {}}).to_string()).is_err(),
             "missing access_token must error"
         );
+    }
+}
+
+#[cfg(test)]
+mod oauth_validation_tests {
+    use super::*;
+
+    fn request(target: &str, content_type: &str, body: &str) -> Vec<u8> {
+        let host = if target.contains(secrets::ANTHROPIC_OAUTH_TOKEN_PATH) {
+            secrets::ANTHROPIC_OAUTH_HOST
+        } else {
+            secrets::OPENAI_OAUTH_HOST
+        };
+        format!("POST {target} HTTP/1.1\r\nHost: {host}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
+    }
+
+    #[test]
+    fn validates_exact_provider_refresh_payloads() {
+        let anth = request(
+            secrets::ANTHROPIC_OAUTH_TOKEN_PATH,
+            "application/json",
+            &format!(
+                r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
+                secrets::ANTHROPIC_REFRESH_PLACEHOLDER
+            ),
+        );
+        assert_eq!(
+            validate_oauth_refresh(&anth, secrets::ANTHROPIC_OAUTH_HOST),
+            Ok(Provider::Anthropic)
+        );
+        let codex = request(
+            secrets::OPENAI_OAUTH_TOKEN_PATH,
+            "application/x-www-form-urlencoded",
+            &format!(
+                "grant_type=refresh_token&refresh_token={}",
+                secrets::OPENAI_REFRESH_PLACEHOLDER
+            ),
+        );
+        assert_eq!(
+            validate_oauth_refresh(&codex, secrets::OPENAI_OAUTH_HOST),
+            Ok(Provider::OpenAi)
+        );
+        let opencode = request(
+            secrets::OPENAI_OAUTH_TOKEN_PATH,
+            "application/json",
+            &format!(
+                r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
+                secrets::OPENCODE_OPENAI_REFRESH_PLACEHOLDER
+            ),
+        );
+        assert_eq!(
+            validate_oauth_refresh(&opencode, secrets::OPENAI_OAUTH_HOST),
+            Ok(Provider::OpenAi)
+        );
+    }
+
+    #[test]
+    fn rejects_path_query_authority_method_encoding_and_ambiguous_bodies() {
+        let body = format!(
+            "grant_type=refresh_token&refresh_token={}",
+            secrets::OPENAI_REFRESH_PLACEHOLDER
+        );
+        for (target, sni) in [
+            ("/oauth/token/near", secrets::OPENAI_OAUTH_HOST),
+            ("/oauth/token?x=1", secrets::OPENAI_OAUTH_HOST),
+            (
+                "https://attacker.invalid/oauth/token",
+                secrets::OPENAI_OAUTH_HOST,
+            ),
+        ] {
+            assert!(
+                validate_oauth_refresh(
+                    &request(target, "application/x-www-form-urlencoded", &body),
+                    sni
+                )
+                .is_err()
+            );
+        }
+        let mut wrong_method = request("/oauth/token", "application/x-www-form-urlencoded", &body);
+        wrong_method.splice(..4, b"GET ".iter().copied());
+        assert!(validate_oauth_refresh(&wrong_method, secrets::OPENAI_OAUTH_HOST).is_err());
+        assert!(
+            validate_oauth_refresh(
+                &request("/oauth/token", "text/plain", &body),
+                secrets::OPENAI_OAUTH_HOST
+            )
+            .is_err()
+        );
+        assert!(
+            validate_oauth_refresh(
+                &request(
+                    "/oauth/token",
+                    "application/x-www-form-urlencoded",
+                    &format!("{body}&refresh_token=other")
+                ),
+                secrets::OPENAI_OAUTH_HOST
+            )
+            .is_err()
+        );
+        assert!(
+            validate_oauth_refresh(
+                &request(
+                    "/oauth/token",
+                    "application/x-www-form-urlencoded",
+                    "grant_type=wrong&refresh_token=x"
+                ),
+                secrets::OPENAI_OAUTH_HOST
+            )
+            .is_err()
+        );
+        assert!(
+            validate_oauth_refresh(
+                &request("/oauth/token", "application/json", "{not json}"),
+                secrets::OPENAI_OAUTH_HOST
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejected_oauth_request_never_dispatches_a_refresh_action() {
+        let calls = std::cell::Cell::new(0);
+        let response = dispatch_oauth_refresh(
+            b"GET /oauth/token HTTP/1.1\r\nHost: auth.openai.com\r\n\r\n",
+            secrets::OPENAI_OAUTH_HOST,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(Vec::new())
+            },
+        )
+        .expect("rejection is synthesized");
+        assert_eq!(calls.get(), 0);
+        assert!(
+            std::str::from_utf8(&response)
+                .unwrap()
+                .starts_with("HTTP/1.1 403")
+        );
+    }
+
+    #[test]
+    fn oauth_requires_strict_http_framing_host_and_authority() {
+        let body = format!(
+            "grant_type=refresh_token&refresh_token={}",
+            secrets::OPENAI_REFRESH_PLACEHOLDER
+        );
+        for request in [
+            format!(
+                "POST /oauth/token HTTP/1.0\r\nHost: auth.openai.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+            format!(
+                "POST /oauth/token HTTP/1.1 extra\r\nHost: auth.openai.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+            format!(
+                "POST /oauth/token HTTP/1.1\r\nBroken Header\r\nHost: auth.openai.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+            format!(
+                "POST /oauth/token HTTP/1.1\r\nHost: attacker.invalid\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+            format!(
+                "POST https://user@auth.openai.com/oauth/token HTTP/1.1\r\nHost: auth.openai.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+            format!(
+                "POST https://auth.openai.com:444/oauth/token HTTP/1.1\r\nHost: auth.openai.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        ] {
+            assert!(
+                validate_oauth_refresh(request.as_bytes(), secrets::OPENAI_OAUTH_HOST).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn host_refresh_runner_is_bounded_and_never_reports_stderr() {
+        trigger_host_refresh_with_timeout("sh", &["-c", "exit 0"], Duration::from_secs(1))
+            .expect("successful fixture");
+        let error = trigger_host_refresh_with_timeout(
+            "sh",
+            &["-c", "echo SECRET_BEARER >&2; exit 9"],
+            Duration::from_secs(1),
+        )
+        .expect_err("non-zero fixture");
+        assert!(!error.to_string().contains("SECRET_BEARER"));
+        let start = Instant::now();
+        let error = trigger_host_refresh_with_timeout(
+            "sh",
+            &["-c", "while :; do echo noisy >&2; done"],
+            Duration::from_millis(50),
+        )
+        .expect_err("timeout fixture");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(!error.to_string().contains("noisy"));
+        let start = Instant::now();
+        trigger_host_refresh_with_timeout(
+            "sh",
+            &["-c", "(sleep 1 >&2) & exit 0"],
+            Duration::from_secs(1),
+        )
+        .expect("retained stderr descendant cannot block completion");
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn rotation_only_skips_a_contended_observed_token_change() {
+        let before = TokenFingerprint::Sha256([1; 32]);
+        let after = TokenFingerprint::Sha256([2; 32]);
+        assert!(!should_rotate(
+            before,
+            after,
+            RefreshAcquisition::Acquired { contended: true }
+        ));
+        assert!(should_rotate(
+            before,
+            after,
+            RefreshAcquisition::Acquired { contended: false }
+        ));
+        assert!(should_rotate(
+            before,
+            before,
+            RefreshAcquisition::Acquired { contended: true }
+        ));
+        assert!(should_rotate(
+            TokenFingerprint::Missing,
+            after,
+            RefreshAcquisition::Acquired { contended: true }
+        ));
+        assert!(should_rotate(before, after, RefreshAcquisition::Degraded));
     }
 }

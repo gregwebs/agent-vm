@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted. Feature 4's deferral is superseded by ADR-0010; the other
+historical decisions remain accepted.
 
 ## Context
 
@@ -83,16 +84,9 @@ defaults `enabled: true`, so calling it unconditionally would switch on
 MITM interception for a pure egress-override or auto-publish launch that
 asked for none of that).
 
-**Defer feature 4 (credential injection) to a follow-up
-(gregwebs/agent-vm#51), keep it fail-closed.** The baseline now has the
-building blocks (`SecretSource`'s file-backed variant from `#10`,
-`NetworkBuilder::intercept()` from `#13`), but agent-vm's `secrets.rs`
-and `intercept_hook.rs` are not wired onto them — that rewiring, sized
-as its own PR to preserve the fork's per-connection token-rotation,
-OAuth-refresh, and GitHub REST path-scoping guarantees, is #51's job.
-`fail_closed.rs`'s credential guard stays, repointed from the generic
-"#47 tracks all four" framing to "#51 tracks this one, and the baseline
-mechanism now exists — it's just not wired yet."
+**Feature 4 was deferred to follow-up #51.** ADR-0010 supersedes this
+feature-4 deferral: agent-vm now wires the file-backed secret and
+interceptor primitives with per-connection rotation and GitHub scoping.
 
 **Protocol generation 7 -> 8.** `#16` bumps the msb wire protocol so a
 deployed gen-7 agentd cannot falsely claim auto-publish support. agentd
@@ -126,12 +120,10 @@ defer(4, now tracked at #51).
   consumes it; each of `#9`-`#16` is a separately merged, upstream-tested
   PR.
 - `--auto-publish`, guest-proxy-via-env, and `--allow-lan`/
-  `--allow-host`/`--allow-egress` are now functional rather than
-  fail-closed. `fail_closed.rs` retains only the credential-injection
-  guard.
-- Host-credential injection (Anthropic/OpenAI/GitHub/Copilot token
-  substitution) remains unavailable until gregwebs/agent-vm#51 wires
-  agent-vm onto the baseline's `SecretSource`/`intercept()` APIs.
+  `--allow-host`/`--allow-egress` are functional rather than fail-closed.
+- Feature 4's credential-injection deferral is superseded by ADR-0010,
+  which wires Anthropic/OpenAI/GitHub/Copilot file-backed substitution to
+  the baseline `SecretSource`/`intercept()` APIs.
 - V-P (proxy-env reaches the in-process netstack) and V-AP (auto-publish
   end-to-end, gen-8 embedded agentd) are e2e verifications this PR's
   code review establishes architecturally but could not run live in a

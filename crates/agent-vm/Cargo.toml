@@ -26,11 +26,10 @@ microsandbox-image = { path = "../../vendor/microsandbox/crates/image" }
 # Migrator nameable here. No new compilation.
 microsandbox-migration = { path = "../../vendor/microsandbox/crates/migration" }
 # Direct dep because the v0.6.15 baseline SDK no longer re-exports this crate
-# (the 0.5.7 gw fork's sdk/rust/lib/lib.rs did). run.rs/intercept_hook.rs need
-# policy::DestinationGroup and the secrets handler/config types directly to
-# express egress policy and to keep the fail-closed guards for fork-only
-# features (proxy egress, credential intercept, auto-publish) compile-checked.
-# See agent-vm issue #40.
+# (the 0.5.7 gw fork's sdk/rust/lib/lib.rs did). network.rs uses policy types,
+# while credential_injection.rs and intercept_hook.rs actively configure and
+# test NetworkBuilder, file-backed secrets, and request interception.
+# See agent-vm issues #40 and #51.
 microsandbox-network = { path = "../../vendor/microsandbox/crates/network" }
 # Direct dep so src/msb_install.rs can reuse the runtime's OWN
 # `ipc::sandbox_socket_paths` derivation (SHA-256-hashed per-sandbox socket
@@ -57,7 +56,9 @@ clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 anyhow = "1.0"
 base64 = "0.22"
 sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.18"

@@ -1,9 +1,9 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
 mod clipboard;
+mod credential_injection;
 mod defaults;
 mod doctor;
-mod fail_closed;
 mod github_graphql;
 mod host_paths;
 mod image_api_version;

@@ -255,10 +255,16 @@ on the host, **outside** the bind mount the guest sees. A SHA-256
 snapshot of the three credential files is taken at launch and
 re-checked on exit; unexpected mutations print a warning.
 
-For Claude/Codex, when the in-VM agent's bearer expires the
-hook MITMs the OAuth refresh, runs `claude -p`/`codex exec` on the
-host to rotate, and feeds the new placeholder back to the guest — no
-re-attach required.
+The proxy re-reads each configured host-only token file on every eligible
+connection. For Claude/Codex, an expired bearer triggers an OAuth hook that
+validates the exact request, runs `claude -p`/`codex exec` on the host, and
+returns placeholders only; a failed refresh fails the request closed. GitHub
+credentials are sent only to the per-launch repository allow-list, so off-list
+API calls receive a proxy denial or anonymous smart-HTTP request without the
+host bearer. GraphQL mutations are denied until they have a sound
+repository-scoped authorization design; use an allow-listed REST route where
+available. Copilot has no in-session refresh path: relaunch to recapture an
+expired Copilot token.
 
 ## Project hook
 
@@ -288,17 +294,6 @@ disjoint groups by design. `--allow-host` is the narrowest way to
 reach a dev server bound to host `127.0.0.1`; `--allow-lan` is the
 broadest. A compromised in-guest process gets full access to
 whatever you open, so prefer the narrowest flag that fits.
-
-**Currently unsupported (agent-vm issue #40):** `--auto-publish`,
-`--allow-egress`, `--allow-lan`, and `--allow-host` each refuse with an
-actionable error naming the flag and this issue instead of booting —
-the Microsandbox v0.6.15 baseline this agent-vm build vendors doesn't
-have the `NetworkBuilder` methods these relied on yet, and re-expressing
-them onto baseline's new rule-based `NetworkPolicy` grammar correctly is
-follow-up work. `--publish` (inbound port forwarding) is unaffected and
-still works. A guest-egress HTTP proxy (`HTTPS_PROXY`/`HTTP_PROXY`/
-`ALL_PROXY` set at launch) fails closed the same way, for the same
-reason.
 
 ## Troubleshooting
 

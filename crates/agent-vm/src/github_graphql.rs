@@ -31,12 +31,10 @@
 //!   see [`REPO_YIELDING_FIELDS`], [`ACTOR_YIELDING_FIELDS`] and
 //!   [`COMPOSITE_ALLOWED_FIELDS`] — and anything unrecognised is
 //!   refused.
-//! * `mutation` root fields are not name-restricted (gh needs
-//!   `createPullRequest`, `mergePullRequest`, `addComment`, … and
-//!   their inputs are opaque node IDs we cannot map to a repo), but
-//!   their result subtrees get the same checks — mutation payloads
-//!   carry `viewer: User` and `repository: Repository` fields, so they
-//!   are a read channel too. `subscription` is always anonymous.
+//! * `mutation` and `subscription` operations are denied. Mutation
+//!   inputs use opaque node IDs that cannot be soundly mapped back to an
+//!   allow-listed repository, so authenticating them would let an agent
+//!   mutate an off-list object.
 //!
 //! **Why an allowlist.** The first version of this filter used a
 //! denylist of repo-enumerating field names. Review found nine
@@ -50,12 +48,10 @@
 //! silent leak. The allowlist inverts the failure mode: an omission
 //! makes some query go anonymous, which is visible and recoverable.
 //!
-//! **Residual surface.** Mutation roots are unrestricted, so an agent
-//! that obtains a node ID out of band can write to the object it
-//! names. Reads that would hand out such IDs are filtered, but "we
-//! filter the reads" is not the same claim as "the IDs are
-//! unobtainable" — treat the write surface as "any object whose ID the
-//! agent can guess or acquire elsewhere".
+//! This deliberately reduces compatibility with `gh` workflows that
+//! mutate through GraphQL. REST mutations for an allow-listed repository
+//! remain available; GraphQL mutations require a future sound,
+//! repository-scoped mutation design.
 //!
 //! Anything the parser doesn't understand — malformed JSON, GraphQL
 //! syntax we don't model, variables that aren't plain strings —
@@ -270,14 +266,12 @@ const COMPOSITE_ALLOWED_FIELDS: &[&str] = &[
 /// insufficient for these: `Repository.tempCloneToken` is documented as
 /// a "temporary authentication token for cloning this repository", so
 /// letting it out of an *unscoped* repo subtree hands over clone access
-/// to a repo that is not on the allow-list. `id`/`databaseId` are node
-/// handles, and mutation roots take node IDs.
+/// to a repo that is not on the allow-list.
 const CREDENTIAL_SCALARS: &[&str] = &["tempCloneToken", "tarballUrl", "zipballUrl"];
 
-/// Node handles. Harmless to read back for an object you just created
-/// (gh does, to chain mutations), but harvesting them for a repository
-/// *outside* the allow-list hands the agent exactly what an
-/// unrestricted mutation root takes as input.
+/// Node handles are withheld from an unscoped repository subtree along
+/// with credential scalars. This preserves the conservative read policy
+/// even though GraphQL mutations are currently denied.
 const NODE_ID_SCALARS: &[&str] = &["id", "databaseId"];
 
 /// Cap on selection-set / value nesting. Without it a hostile document
@@ -350,7 +344,10 @@ fn evaluate(body: &[u8], allowed: &[String]) -> GraphqlAccess {
         };
         let ok = match op.kind {
             OpKind::Query => validate_query_root(&op.sel, &ctx, 0),
-            OpKind::Mutation => validate_mutation_root(&op.sel, &ctx),
+            OpKind::Mutation => {
+                ctx.deny("mutations are not permitted without repository-scoped inputs");
+                false
+            }
             OpKind::Subscription => {
                 ctx.deny("subscriptions are not permitted");
                 false
@@ -778,70 +775,6 @@ fn validate_query_root(sel: &[Sel], ctx: &Ctx, depth: usize) -> bool {
                     return false;
                 }
             }
-        }
-    }
-    true
-}
-
-/// One object inside a mutation payload: scalar leaves only.
-///
-/// Node handles are allowed here (gh reads `pullRequest { id }` back to
-/// chain mutations) but credentials are not, and nothing may be
-/// traversed — traversal is what turned every mutation into a read
-/// primitive.
-fn validate_payload_object(sel: &[Sel], ctx: &Ctx) -> bool {
-    if !ctx.spend() || sel.is_empty() {
-        return false;
-    }
-    sel.iter().all(|s| match s {
-        Sel::Field(f) if f.sel.is_empty() => {
-            !CREDENTIAL_SCALARS.contains(&f.name.as_str())
-                || ctx.deny(format!("`{}` is a credential and is not readable", f.name))
-        }
-        Sel::Field(f) => ctx.deny(format!(
-            "mutation payloads may not be traversed; `{}` returns an object",
-            f.name
-        )),
-        Sel::Inline(inner) => validate_payload_object(inner, ctx),
-        Sel::Spread(name) => match ctx.fragments.get(name.as_str()) {
-            Some(frag) => validate_payload_object(frag, ctx),
-            None => ctx.deny(format!("fragment `{name}` is undefined")),
-        },
-    })
-}
-
-/// Mutation roots keep their names (see module docs) but the result
-/// subtrees get the same checks as any other scoped subtree — mutation
-/// payloads carry `viewer: User` and `repository: Repository` fields,
-/// so they are a read channel too.
-fn validate_mutation_root(sel: &[Sel], ctx: &Ctx) -> bool {
-    if sel.is_empty() {
-        return false;
-    }
-    let mut visiting: HashSet<String> = HashSet::new();
-    let _ = &mut visiting;
-    for s in sel {
-        match s {
-            // A mutation root field's own arguments are opaque input
-            // objects. Its *payload* used to get a full generic walk,
-            // which made every mutation a read primitive — `createRef`
-            // returns a `ref` you can walk to `Blob.text`, `updateIssue`
-            // returns the issue's body and comments. The payload is
-            // restricted instead: gh only ever reads scalars back
-            // (`pullRequest { number url }`).
-            Sel::Field(f) => {
-                let payload_ok = f.sel.iter().all(|inner| match inner {
-                    Sel::Field(obj) if !obj.sel.is_empty() => {
-                        validate_payload_object(&obj.sel, ctx)
-                    }
-                    Sel::Field(_) => true,
-                    _ => ctx.deny("mutation payloads may only select scalar results"),
-                });
-                if !payload_ok {
-                    return false;
-                }
-            }
-            _ => return false,
         }
     }
     true
@@ -1577,16 +1510,16 @@ mod tests {
     // ── mutations ─────────────────────────────────────────────────
 
     #[test]
-    fn pr_mutations_are_authenticated() {
-        // gh pr create / merge operate on node IDs obtained through
-        // already-filtered queries; keep them working.
+    fn mutations_are_denied_without_a_repository_scoped_design() {
+        // GraphQL mutation inputs are opaque node IDs, so they cannot be
+        // proved to name an allow-listed repository.
         let create = r#"mutation CreatePullRequest($input: CreatePullRequestInput!) {
             createPullRequest(input: $input) { pullRequest { number url } }
         }"#;
-        assert_eq!(access(create, serde_json::json!({})), AUTH);
+        assert_eq!(access(create, serde_json::json!({})), DENIED);
         let merge = r#"mutation($id: ID!) { mergePullRequest(input: { pullRequestId: $id }) {
             pullRequest { merged } } }"#;
-        assert_eq!(access(merge, serde_json::json!({})), AUTH);
+        assert_eq!(access(merge, serde_json::json!({})), DENIED);
     }
 
     #[test]
@@ -1902,10 +1835,9 @@ mod tests {
         let read_via_issue = r#"mutation($i: UpdateIssueInput!) { updateIssue(input: $i) {
             issue { title comments(first: 100) { nodes { body } } } } }"#;
         assert_eq!(access(read_via_issue, serde_json::json!({})), DENIED);
-        // What gh actually reads back still works.
-        let gh = r#"mutation($i: CreatePullRequestInput!) { createPullRequest(input: $i) {
+        let otherwise_minimal = r#"mutation($i: CreatePullRequestInput!) { createPullRequest(input: $i) {
             pullRequest { id number url } } }"#;
-        assert_eq!(access(gh, serde_json::json!({})), AUTH);
+        assert_eq!(access(otherwise_minimal, serde_json::json!({})), DENIED);
     }
 
     #[test]

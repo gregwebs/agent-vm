@@ -705,7 +705,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // Snapshot host credentials into per-project token files and place
     // placeholder credentials.json files where the in-VM agents will
     // find them. The token files are passed to microsandbox below as
-    // SecretValue::File entries; the proxy re-reads them on every
+    // SecretSource::File entries; the proxy re-reads them on every
     // connection setup, so a host-side rotation propagates without
     // restarting the sandbox.
     //
@@ -1018,34 +1018,20 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .emit_launch_notices()
         .context("writing launch networking notices")?;
 
-    // For each provider with a host credential file, register a
-    // SecretValue::File secret keyed on the placeholder string the
-    // guest will send, then register the OAuth refresh endpoint as a
-    // hook target so a 401-then-refresh attempt round-trips through a
-    // real host-side rotation (see `intercept_hook`).
-    //
-    // The baseline now has the fork's file-backed `SecretSource` (re-read
-    // on every connection, so a host-side token rotation propagates
-    // without restarting the sandbox) and its per-route intercept-hook
-    // dispatcher (`NetworkBuilder::intercept()`) — but agent-vm's
-    // secrets.rs/intercept_hook.rs aren't wired onto them yet (issue
-    // gregwebs/agent-vm#51). Rather than silently baking each file's
-    // *current* contents into a static secret (dropping the rotation
-    // guarantee and risking a leaked stale token on a later refresh), a
-    // launch that actually needs credential injection fails closed.
-    // `agent-vm shell --no-git` on a host with cached credentials is NOT
-    // such a launch — Shell never speaks to a provider/GitHub API on the
-    // guest's behalf — so it keeps booting. See `fail_closed.rs` for the
-    // exact criteria.
-    let has_creds = creds.anthropic_token_file.is_some()
-        || creds.openai_token_file.is_some()
-        || creds.gh_token_file.is_some()
-        || creds.copilot_token_file.is_some();
-    let needs_credential_injection =
-        !args.no_git || crate::fail_closed::agent_requires_credentials(agent);
-    crate::fail_closed::check_credential_injection_unneeded(has_creds, needs_credential_injection)?;
+    let executable =
+        std::env::current_exe().context("resolving agent-vm executable for credential hook")?;
+    let credential_plan = crate::credential_injection::Plan::new(
+        executable,
+        crate::credential_injection::Inputs {
+            creds: &creds,
+            state_dir: &session.state_dir,
+            allowed_repos: &allowed_repos,
+            include_copilot: want_copilot,
+        },
+    )?;
 
     builder = network_plan.apply_to(builder);
+    builder = credential_plan.apply_to(builder);
 
     // Still honour ANTHROPIC_API_KEY / OPENAI_API_KEY if explicitly set
     // by the user — that path stays a simple Bearer header, no
@@ -2356,12 +2342,11 @@ mod tests {
     }
 
     #[test]
-    fn launch_keeps_network_preflight_before_credential_guard_and_boot() {
+    fn launch_applies_base_network_then_credential_network_before_boot() {
         // `launch` has boot-heavy dependencies, so keep this caller-level
         // characterization at the orchestration boundary. The Plan tests own
-        // the behavior of each lifecycle operation; this test prevents a
-        // future reorder from moving validation/notices past the fail-closed
-        // guard or sandbox construction.
+        // behavior; this prevents a future reorder from dropping the
+        // credential overlay or applying it before the base network plan.
         // Limit the source characterization to production code. Searching the
         // complete `include_str!` would let these test literals satisfy their
         // own assertions if a lifecycle call were removed from `launch`.
@@ -2372,14 +2357,14 @@ mod tests {
         let position = |needle| production.find(needle).expect("launch step is present");
         let plan = position("let network_plan = crate::network::Plan::from_args(args.network)?;");
         let notices = position(".emit_launch_notices()");
-        let credential_guard = position("crate::fail_closed::check_credential_injection_unneeded");
-        let apply = position("builder = network_plan.apply_to(builder);");
+        let base_network = position("builder = network_plan.apply_to(builder);");
+        let credential_network = position("builder = credential_plan.apply_to(builder);");
         let build = position("let config = builder.build().await");
         let create = position("Sandbox::create_with_pull_progress(config)");
         assert!(plan < notices);
-        assert!(notices < credential_guard);
-        assert!(credential_guard < apply);
-        assert!(apply < build);
+        assert!(notices < base_network);
+        assert!(base_network < credential_network);
+        assert!(credential_network < build);
         assert!(build < create);
     }
 
