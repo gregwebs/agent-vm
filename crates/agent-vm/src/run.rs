@@ -916,7 +916,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     for volume in user::core_dir_volumes(
         guest_identity
             .as_ref()
-            .map(|gi| (gi.host_home.as_str(), session.guest_home_dir())),
+            .map(|gi| (gi.host_home(), session.guest_home_dir())),
         &project_guest_path,
         &session.project_dir,
         &session.state_dir,
@@ -999,10 +999,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
                 let gi = guest_identity
                     .as_ref()
                     .expect("non-root mode always resolves a guest identity");
-                p = p.append(
-                    "/etc/passwd",
-                    user::passwd_append_line(&gi.username, gi.uid, gi.gid, &gi.host_home),
-                );
+                p = p.append("/etc/passwd", user::passwd_append_line(gi));
                 // See `group_append_line`'s doc comment (user.rs) for why
                 // gids in the system-reserved range are skipped.
                 if let Some(line) = user::group_append_line(gi.gid) {

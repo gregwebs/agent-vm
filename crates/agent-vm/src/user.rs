@@ -8,6 +8,14 @@
 //! implementation detail or a small pure formatter/ordering helper
 //! `launch()` also calls directly (`core_dir_volumes`,
 //! `passwd_append_line`, `group_append_line`, `guest_identity_env`).
+//!
+//! The two host-derived strings mirrored into the guest — username and
+//! `$HOME` — are validated once at the boundary into [`PasswdName`] and
+//! [`GuestHome`], newtypes whose only constructor rejects anything that
+//! could corrupt a `/etc/passwd`/`/etc/group` record (`:`, newline, or
+//! other control characters). [`GuestIdentity`] holds them behind those
+//! types, so [`passwd_append_line`] can format straight from an already-
+//! validated identity instead of re-trusting loose primitives.
 
 use std::{
     env,
@@ -15,18 +23,65 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Safe-for-`/etc/passwd`-field username charset: a leading letter or
 /// underscore, then any run of letters/digits/underscore/hyphen.
 /// Anything else in a resolved username candidate (`:`, space, newline,
 /// non-ASCII, …) would corrupt the appended `/etc/passwd` line, so a
 /// candidate that fails this check is discarded outright by
-/// `choose_guest_username`, never truncated or escaped in place.
+/// `choose_guest_username`, never truncated or escaped in place. Stricter
+/// than [`is_passwd_field_safe`] below: this is a *candidate-selection*
+/// charset for choosing a cosmetic login name, not the weaker framing
+/// invariant that [`PasswdName`]/[`GuestHome`] actually enforce (which
+/// must also admit the non-alphabetic numeric-uid fallback).
 fn is_safe_passwd_username(candidate: &str) -> bool {
     let mut chars = candidate.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A `/etc/passwd`/`/etc/group` *field* is framing-safe iff it contains no
+/// field separator (`:`), no record separator (newline), and no other
+/// control character (C0/C1: NUL, CR, TAB, …). Spaces and non-ASCII are
+/// deliberately allowed — this is weaker than [`is_safe_passwd_username`],
+/// which additionally restricts the charset for *choosing* a cosmetic
+/// login name; this predicate is the framing invariant the account-record
+/// types below actually enforce. `char::is_control()` already covers
+/// newline/CR/TAB/NUL and the Unicode control ranges; no multibyte UTF-8
+/// encoding of a non-control codepoint contains a raw `:` (0x3A) or `\n`
+/// (0x0A) byte, so this char-level check is also byte-safe for the
+/// guest's byte-oriented `getpwent` parser.
+fn is_passwd_field_safe(s: &str) -> bool {
+    !s.chars().any(|c| c == ':' || c.is_control())
+}
+
+/// A username validated framing-safe for `/etc/passwd`/`/etc/group`.
+/// Invariant: non-empty and [`is_passwd_field_safe`]. The inner `String`
+/// is module-private and [`PasswdName::new`] is the only constructor, so
+/// a value of this type is a proof its string cannot corrupt an account
+/// record. Intentionally weaker than [`is_safe_passwd_username`]: that
+/// stricter charset is only for *selecting* a cosmetic login name — the
+/// numeric-uid fallback (e.g. `"502"`) is framing-safe but not a legal
+/// login name (leading digit), and must still be constructible here.
+pub struct PasswdName(String);
+
+impl PasswdName {
+    pub fn new(candidate: String) -> Result<Self> {
+        if !candidate.is_empty() && is_passwd_field_safe(&candidate) {
+            Ok(Self(candidate))
+        } else {
+            bail!(
+                "resolved guest username {candidate:?} is not safe to write to \
+                 /etc/passwd (contains a colon, newline, control character, or \
+                 is empty)"
+            );
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Pure precedence + sanitization core of [`resolve_guest_username`],
@@ -82,33 +137,85 @@ fn passwd_name_for_uid(uid: u32) -> Option<String> {
 /// [`choose_guest_username`] for the precedence/sanitization rules.
 /// Thin, impure entry point: reads `$USER`/`$LOGNAME` and does the NSS
 /// lookup; the actual logic lives in the pure core so it's testable.
-fn resolve_guest_username(uid: u32) -> String {
-    choose_guest_username(
+/// Wraps the result through [`PasswdName::new`]: [`choose_guest_username`]
+/// always yields a non-empty, framing-safe string (including the numeric
+/// fallback), so this never fails in practice — propagated with `?`
+/// rather than `.expect()` for defense-in-depth.
+fn resolve_guest_username(uid: u32) -> Result<PasswdName> {
+    PasswdName::new(choose_guest_username(
         env::var("USER").ok(),
         env::var("LOGNAME").ok(),
         passwd_name_for_uid(uid),
         uid,
-    )
+    ))
 }
 
-/// Host `$HOME`, validated non-empty. Pure core of [`resolve_host_home`]
-/// — takes the already-read env value as a parameter so the empty/unset
-/// guard is unit-testable without mutating process env.
+/// A host `$HOME` validated for mirroring into the guest and rendering
+/// into `/etc/passwd`. Invariants: non-empty, absolute, and
+/// [`is_passwd_field_safe`]. The inner `String` is module-private and
+/// [`GuestHome::new`] is the only constructor, so a value of this type is
+/// a proof its string cannot corrupt an account record. Spaces and
+/// non-ASCII are preserved (ADR-0002: `$HOME` is mirrored verbatim).
+pub struct GuestHome(String);
+
+impl GuestHome {
+    pub fn new(candidate: String) -> Result<Self> {
+        if candidate.is_empty() {
+            bail!(
+                "HOME is empty — required in non-root mode to mirror the \
+                 guest's HOME (pass --root to run as root instead, which \
+                 doesn't need it)"
+            );
+        }
+        // Host-Unix assumption: `Path::is_absolute` uses leading-`/`
+        // semantics on macOS/Linux, matching the Linux guest that consumes
+        // the mirrored string. A relative HOME would also produce a broken
+        // relative bind-mount guest_path in `core_dir_volumes`, so
+        // rejecting it here surfaces that latent bug before boot instead
+        // of at mount time.
+        if !Path::new(&candidate).is_absolute() {
+            bail!(
+                "HOME {candidate:?} is not an absolute path; non-root mode \
+                 mirrors it verbatim into the guest"
+            );
+        }
+        if !is_passwd_field_safe(&candidate) {
+            bail!(
+                "HOME {candidate:?} contains a colon, newline, or control \
+                 character and cannot be safely written to the guest's \
+                 /etc/passwd; use --root or a HOME path without them"
+            );
+        }
+        Ok(Self(candidate))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Host `$HOME`, validated for guest mirroring. Pure core of
+/// [`resolve_host_home`] — takes the already-read env value as a
+/// parameter so the unset/empty/unsafe guards are unit-testable without
+/// mutating process env. Keeps its own unset-specific message (distinct
+/// from [`GuestHome::new`]'s empty/invalid messages) before delegating
+/// the rest of validation to [`GuestHome::new`].
 ///
 /// Deliberately **not** a reuse of `session::state_root`'s own `$HOME`
 /// read (`session.rs:225`): that one is a fallback for the *session
 /// state root* (`~/.local/state/agent-vm`) and has nothing to do with
 /// guest identity mirroring.
-fn host_home_from_env(env_val: Option<String>) -> Result<String> {
-    env_val.filter(|h| !h.is_empty()).context(
+fn host_home_from_env(env_val: Option<String>) -> Result<GuestHome> {
+    let raw = env_val.context(
         "$HOME is not set — required in non-root mode to mirror the guest's \
          HOME (pass --root to run as root instead, which doesn't need it)",
-    )
+    )?;
+    GuestHome::new(raw)
 }
 
 /// Resolve the host's `$HOME`, mirrored verbatim as the non-root guest's
 /// own `$HOME`. Thin wrapper around [`host_home_from_env`].
-fn resolve_host_home() -> Result<String> {
+fn resolve_host_home() -> Result<GuestHome> {
     host_home_from_env(env::var("HOME").ok())
 }
 
@@ -135,11 +242,25 @@ pub struct GuestIdentity {
     /// "uid:gid", formatted once for microsandbox's `.user()` builder calls.
     pub user_spec: String,
     /// Cosmetic — NOT the access-control identity (that's `uid`/`gid`
-    /// above). `whoami`/`$USER`/the shell prompt only.
-    pub username: String,
+    /// above). `whoami`/`$USER`/the shell prompt only. Private: the
+    /// [`PasswdName`] invariant (framing-safe for `/etc/passwd`) must
+    /// survive for the lifetime of this struct, so field access goes
+    /// through [`GuestIdentity::username`].
+    username: PasswdName,
     /// The literal host `$HOME` string, mirrored verbatim as the guest's
-    /// `$HOME`.
-    pub host_home: String,
+    /// `$HOME`. Private for the same reason as `username` — see
+    /// [`GuestIdentity::host_home`].
+    host_home: GuestHome,
+}
+
+impl GuestIdentity {
+    pub fn username(&self) -> &str {
+        self.username.as_str()
+    }
+
+    pub fn host_home(&self) -> &str {
+        self.host_home.as_str()
+    }
 }
 
 /// Resolve the guest's full identity for the given root-mode gate —
@@ -157,15 +278,23 @@ pub fn resolve_guest_identity(root_mode: bool) -> Result<Option<GuestIdentity>> 
         uid,
         gid,
         user_spec: format!("{uid}:{gid}"),
-        username: resolve_guest_username(uid),
+        username: resolve_guest_username(uid)?,
         host_home: resolve_host_home()?,
     }))
 }
 
-/// Format the non-root guest's `/etc/passwd` append line. `username` is
-/// assumed already sanitized — this function does not re-validate it.
-pub fn passwd_append_line(username: &str, uid: u32, gid: u32, host_home: &str) -> String {
-    format!("{username}:x:{uid}:{gid}::{host_home}:/bin/bash\n")
+/// Format the non-root guest's `/etc/passwd` append line from the
+/// already-validated identity. `identity`'s [`PasswdName`]/[`GuestHome`]
+/// fields are the sanitization proof — constructed only through their
+/// validating `new`s — so no re-validation happens here.
+pub fn passwd_append_line(identity: &GuestIdentity) -> String {
+    format!(
+        "{}:x:{}:{}::{}:/bin/bash\n",
+        identity.username(),
+        identity.uid,
+        identity.gid,
+        identity.host_home(),
+    )
 }
 
 /// `/etc/group` append line for the guest's gid, or `None` when the gid
@@ -229,15 +358,34 @@ pub fn core_dir_volumes(
 /// mirrored host `$HOME`), `USER`/`LOGNAME` (the resolved username).
 pub fn guest_identity_env(identity: &GuestIdentity) -> [(&'static str, String); 3] {
     [
-        ("HOME", identity.host_home.clone()),
-        ("USER", identity.username.clone()),
-        ("LOGNAME", identity.username.clone()),
+        ("HOME", identity.host_home().to_string()),
+        ("USER", identity.username().to_string()),
+        ("LOGNAME", identity.username().to_string()),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a `GuestIdentity` straight from already-validated pieces, for
+    /// tests that only care about formatting/env-mirroring, not
+    /// construction. Only possible from inside this module — outside
+    /// `user.rs`, `username`/`host_home` are private and the newtype
+    /// constructors are the only way to produce values for them. That's
+    /// also why no runtime test can construct a `GuestIdentity` with an
+    /// unsafe account-record field: the private-field + validating-`new`
+    /// combination makes it a compile-time impossibility, not just a
+    /// runtime check.
+    fn identity(username: &str, uid: u32, gid: u32, home: &str) -> GuestIdentity {
+        GuestIdentity {
+            uid,
+            gid,
+            user_spec: format!("{uid}:{gid}"),
+            username: PasswdName::new(username.to_string()).unwrap(),
+            host_home: GuestHome::new(home.to_string()).unwrap(),
+        }
+    }
 
     #[test]
     fn root_mode_is_off_by_default_and_opt_in() {
@@ -272,6 +420,56 @@ mod tests {
         assert!(!is_safe_passwd_username("claude user")); // space
         assert!(!is_safe_passwd_username("claude\n")); // newline
         assert!(!is_safe_passwd_username("cläude")); // non-ASCII
+    }
+
+    #[test]
+    fn is_passwd_field_safe_accepts_ordinary_and_non_ascii_rejects_framing_chars() {
+        assert!(is_passwd_field_safe("claude"));
+        assert!(is_passwd_field_safe("502"));
+        assert!(is_passwd_field_safe("/Users/claude"));
+        assert!(is_passwd_field_safe("/Users/cläude")); // non-ASCII allowed
+        assert!(is_passwd_field_safe("/Users/claude person")); // space allowed
+
+        assert!(!is_passwd_field_safe("a:b"));
+        assert!(!is_passwd_field_safe("a\nb"));
+        assert!(!is_passwd_field_safe("a\tb"));
+        assert!(!is_passwd_field_safe("a\rb"));
+        assert!(!is_passwd_field_safe("a\u{0}b"));
+        assert!(!is_passwd_field_safe("a\u{1}b"));
+    }
+
+    #[test]
+    fn passwd_name_new_accepts_safe_names_including_numeric_fallback() {
+        assert_eq!(
+            PasswdName::new("claude".to_string()).unwrap().as_str(),
+            "claude"
+        );
+        // The numeric-uid fallback (leading digit) fails
+        // `is_safe_passwd_username` but must still be constructible here.
+        assert_eq!(PasswdName::new("502".to_string()).unwrap().as_str(), "502");
+    }
+
+    #[test]
+    fn passwd_name_new_rejects_unsafe_or_empty_candidates() {
+        assert!(PasswdName::new("a:b".to_string()).is_err());
+        assert!(PasswdName::new("a\nb".to_string()).is_err());
+        assert!(PasswdName::new(String::new()).is_err());
+    }
+
+    #[test]
+    fn guest_home_new_accepts_valid_absolute_paths_byte_identical() {
+        for home in ["/Users/claude", "/Users/cläude", "/Users/claude person"] {
+            assert_eq!(GuestHome::new(home.to_string()).unwrap().as_str(), home);
+        }
+    }
+
+    #[test]
+    fn guest_home_new_rejects_empty_relative_and_unsafe_candidates() {
+        assert!(GuestHome::new(String::new()).is_err());
+        assert!(GuestHome::new("relative/home".to_string()).is_err());
+        assert!(GuestHome::new("/Users/claude:evil".to_string()).is_err());
+        assert!(GuestHome::new("/Users/claude\nroot:x:0:0::/:/bin/sh".to_string()).is_err());
+        assert!(GuestHome::new("/Users/claude\u{1}".to_string()).is_err());
     }
 
     #[test]
@@ -326,7 +524,9 @@ mod tests {
         assert!(host_home_from_env(None).is_err());
         assert!(host_home_from_env(Some(String::new())).is_err());
         assert_eq!(
-            host_home_from_env(Some("/Users/claude".to_string())).unwrap(),
+            host_home_from_env(Some("/Users/claude".to_string()))
+                .unwrap()
+                .as_str(),
             "/Users/claude"
         );
     }
@@ -334,8 +534,13 @@ mod tests {
     #[test]
     fn passwd_append_line_formats_mirrored_identity() {
         assert_eq!(
-            passwd_append_line("claude", 502, 20, "/Users/claude"),
+            passwd_append_line(&identity("claude", 502, 20, "/Users/claude")),
             "claude:x:502:20::/Users/claude:/bin/bash\n"
+        );
+        // Non-ASCII + space in HOME pass through verbatim.
+        assert_eq!(
+            passwd_append_line(&identity("claude", 502, 20, "/Users/cläude person")),
+            "claude:x:502:20::/Users/cläude person:/bin/bash\n"
         );
     }
 
@@ -348,13 +553,7 @@ mod tests {
 
     #[test]
     fn guest_identity_env_mirrors_host_home_and_username() {
-        let identity = GuestIdentity {
-            uid: 502,
-            gid: 20,
-            user_spec: "502:20".to_string(),
-            username: "claude".to_string(),
-            host_home: "/Users/claude".to_string(),
-        };
+        let identity = identity("claude", 502, 20, "/Users/claude");
         let env = guest_identity_env(&identity);
         assert_eq!(
             env,

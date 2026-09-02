@@ -93,6 +93,12 @@ read — that one is a fallback for the unrelated *session state root*
   silently booting a guest with a broken `$HOME` — previously `$HOME` was
   a hardcoded literal, so it always "worked" regardless of host env.
   `--root` mode is unaffected: it never calls `resolve_host_home`.
+- Verbatim mirroring is now gated by `/etc/passwd`/`/etc/group`
+  framing-safety validation (issue #57, `user::GuestHome`/`PasswdName`): a
+  host `$HOME` that is relative, or that literally contains a colon,
+  newline, or other control character, is unsupported in non-root mode
+  and fails `launch()` before boot instead of corrupting the guest's
+  account records — use `--root` for such a `$HOME`.
 - **Host-uid collision with a base-image passwd entry** is an accepted
   risk: if the host uid ever matched an image user (the optional Chrome DevTools
   layer adds `chrome:9999`; otherwise only root is present), `getpwuid` would return the
