@@ -1,10 +1,15 @@
-# Single source of truth for the pinned Rust toolchain. `cargo`/`rustup`
-# auto-select this channel for any invocation rooted here; CI reads it via
-# dtolnay/rust-toolchain's `toolchain: 1.94` input, and script/build/macos.sh
-# keeps its own explicit `rustup run 1.94` (RUST_TOOLCHAIN literal, asserted
-# against this file's channel by script/test/build-workflow.sh) so the build
-# script's "don't touch the caller's global default toolchain" property
-# holds even though this file exists at the repo root.
+# Canonical pin. This file's [toolchain].channel is the single owner of the
+# Rust version this repo builds with; `cargo`/`rustup` auto-select it for any
+# invocation rooted here. Every other copy of this version -- Cargo.toml's
+# rust-version, CI's dtolnay/rust-toolchain input, the release workflow's
+# explicit installs, script/build/macos.sh's own RUST_TOOLCHAIN literal and
+# floor guard, and macos-build.md's copy-paste commands -- is a duplicated
+# literal that can't simply read this file (see script/check-rust-toolchain.sh's
+# header for why each exists), so it is enforced against this channel by
+# script/check-rust-toolchain.sh. That checker runs in CI (the ubuntu
+# contract step directly, the macOS leg transitively via
+# script/test/build-workflow.sh) and locally in under a second via
+# `./script/check-rust-toolchain.sh`.
 #
 # vendor/microsandbox is excluded from this workspace and pins its own
 # toolchain requirements independently (edition 2024, >=1.85) — it still
