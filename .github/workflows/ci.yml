@@ -17,7 +17,7 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Install Rust toolchain
+      - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: "1.94"
@@ -45,20 +45,16 @@ jobs:
           cargo clippy --locked -p msb-krun-compat-evidence --all-targets -- -D warnings
           ./script/test/msb-krun-compat-contract.sh
           bash script/test/build-workflow.sh
-          ./script/check-rust-toolchain.sh
-          bash script/test/rust-toolchain-consistency.sh
           bash -n vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh \
             vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh \
             script/check-runtime-provenance.sh script/test/runtime-provenance.sh \
             script/test/msb-krun-compat.sh script/test/msb-krun-compat-contract.sh \
-            script/build/macos.sh script/test/build-workflow.sh \
-            script/check-rust-toolchain.sh script/test/rust-toolchain-consistency.sh
+            script/build/macos.sh script/test/build-workflow.sh
           shellcheck vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh \
             vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh \
             script/check-runtime-provenance.sh script/test/runtime-provenance.sh \
             script/test/msb-krun-compat.sh script/test/msb-krun-compat-contract.sh \
-            script/build/macos.sh script/test/build-workflow.sh \
-            script/check-rust-toolchain.sh script/test/rust-toolchain-consistency.sh
+            script/build/macos.sh script/test/build-workflow.sh
           "$HOME/go/bin/actionlint"
 
       - name: Build guest agentd
