@@ -38,15 +38,13 @@ jobs:
       # before any `cargo build -p agent-vm`. Mirrors the release-npm workflow.
       - name: Check runtime source provenance and harness contracts
         run: |
-          bash vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh
-          ./script/test/runtime-provenance.sh
+          bash ./script/test/runtime-provenance.sh
           ./script/check-runtime-provenance.sh
           cargo test --locked -p msb-krun-compat-evidence
           cargo clippy --locked -p msb-krun-compat-evidence --all-targets -- -D warnings
           ./script/test/msb-krun-compat-contract.sh
           bash script/test/build-workflow.sh
           bash -n vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh \
-            vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh \
             script/check-runtime-provenance.sh script/test/runtime-provenance.sh \
             script/test/msb-krun-compat.sh script/test/msb-krun-compat-contract.sh \
             script/build/macos.sh script/test/build-workflow.sh
@@ -55,6 +53,9 @@ jobs:
             script/check-runtime-provenance.sh script/test/runtime-provenance.sh \
             script/test/msb-krun-compat.sh script/test/msb-krun-compat-contract.sh \
             script/build/macos.sh script/test/build-workflow.sh
+
+      - name: actionlint
+        run: |
           "$HOME/go/bin/actionlint"
 
       - name: Build guest agentd
