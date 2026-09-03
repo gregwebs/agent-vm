@@ -212,17 +212,6 @@ pub fn resolved_msb_path() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// True for `1` or `true` (case-insensitive, trimmed). Everything else —
-/// including `0`, `false`, empty, and unset — is false. Kept in lockstep with
-/// the documented values in README.md.
-fn parse_flag(v: &str) -> bool {
-    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true")
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name).map(|v| parse_flag(&v)).unwrap_or(false)
-}
-
 /// Resolve the shared OCI cache directory to redirect `paths.cache` at.
 /// `AGENT_VM_MSB_CACHE_DIR` (non-empty) wins; otherwise `$HOME/.microsandbox/cache`.
 fn resolve_shared_cache_dir_from(
@@ -276,7 +265,7 @@ fn effective_cache_dir_from(
 /// `point_at_msb_home()` has set `MSB_HOME` — see that function's doc
 /// comment for why the two must never drift.
 pub fn effective_cache_dir() -> Result<PathBuf> {
-    let share = env_flag_enabled(SHARE_MSB_CACHE_ENV);
+    let share = crate::env_flag::enabled(SHARE_MSB_CACHE_ENV);
     // Only resolve the shared dir when the flag is on (it may error on a
     // bad env, e.g. no $HOME and no override).
     let shared = if share {
@@ -514,8 +503,9 @@ fn check_socket_path_len(socket_path: &Path, sandbox_name: &str) -> Result<()> {
 ///
 /// ## Opt-in shared OCI image cache
 ///
-/// Set `AGENT_VM_SHARE_MSB_CACHE=1` (or `true`) to redirect only the `cache`
-/// directory (OCI image layers/vmdk/manifests) at the shared
+/// Set `AGENT_VM_SHARE_MSB_CACHE` to a truthy value (parsed by
+/// [`crate::env_flag`]) to redirect only the `cache` directory (OCI image
+/// layers/vmdk/manifests) at the shared
 /// `~/.microsandbox/cache` a separately-installed msb uses — override the
 /// location with `AGENT_VM_MSB_CACHE_DIR=<path>`. Everything else (`db/`,
 /// `tls/`, `secrets/`, `sandboxes/`, and `lib/`/libkrunfw) stays private
@@ -527,7 +517,7 @@ fn check_socket_path_len(socket_path: &Path, sandbox_name: &str) -> Result<()> {
 /// msb reading that file, so agent-vm must never set `MSB_CONFIG_PATH`.
 /// When the flag is unset/falsey, `config.json` is never read or written —
 /// flipping the flag off later does NOT revert an already-written
-/// `config.json`; see README.md for the manual revert step.
+/// `config.json`; see USAGE.md's *Reverting is a manual step*.
 ///
 /// Idempotent. Returns the path that was pinned.
 pub fn point_at_msb_home() -> Result<PathBuf> {
@@ -543,8 +533,9 @@ pub fn point_at_msb_home() -> Result<PathBuf> {
     // `~/.microsandbox/cache` a separately-installed msb uses. Off by
     // default; when unset/falsey we do NOT read or write config.json at all
     // (today's behaviour). db/tls/secrets/sandboxes stay private under
-    // MSB_HOME. See doc comment above + README.md.
-    if env_flag_enabled(SHARE_MSB_CACHE_ENV) {
+    // MSB_HOME. See doc comment above + USAGE.md's *Shared microsandbox
+    // image cache*.
+    if crate::env_flag::enabled(SHARE_MSB_CACHE_ENV) {
         let cache_dir = resolve_shared_cache_dir()?;
         write_shared_cache_config(&dir, &cache_dir)?;
     }
@@ -931,16 +922,6 @@ mod tests {
     }
 
     // --- opt-in shared msb cache ---
-
-    #[test]
-    fn parse_flag_matches_documented_truthy_values_only() {
-        for truthy in ["1", "true", "TRUE", " true "] {
-            assert!(parse_flag(truthy), "expected {truthy:?} to be truthy");
-        }
-        for falsy in ["0", "false", "", "yes", "on", "nope"] {
-            assert!(!parse_flag(falsy), "expected {falsy:?} to be falsy");
-        }
-    }
 
     #[test]
     fn write_shared_cache_config_creates_config_on_empty_home() {

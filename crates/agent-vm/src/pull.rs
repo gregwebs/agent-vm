@@ -107,7 +107,7 @@ pub async fn pull_image(image: &str) -> Result<()> {
 /// registries; bracketed form would need a real parser). Use
 /// `localhost` or `127.0.0.1` instead.
 pub(crate) fn is_plain_http_registry(image_ref: &str) -> bool {
-    if env_truthy("AGENT_VM_INSECURE_REGISTRY") {
+    if crate::env_flag::enabled("AGENT_VM_INSECURE_REGISTRY") {
         return true;
     }
     // First path segment is the registry host (with optional :port).
@@ -120,13 +120,6 @@ pub(crate) fn is_plain_http_registry(image_ref: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0")
         || host.ends_with(".local")
         || host.ends_with(".localhost")
-}
-
-fn env_truthy(name: &str) -> bool {
-    matches!(
-        std::env::var(name).as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-    )
 }
 
 #[cfg(test)]
@@ -151,25 +144,44 @@ mod tests {
         assert!(!is_plain_http_registry("nginx:latest"));
     }
 
-    // Single test exercising the env-var escape hatch — the heuristic
-    // says "secure" for `registry.corp.example` but the env override
-    // wins. Uses a serial-style guard (set + clear) so a parallel test
-    // doesn't observe the var. (cargo test runs tests in parallel by
-    // default — keep the var name unique to this test so it can't
-    // collide with another module setting the same var.)
+    // Single test exercising the env-var escape hatch in both directions —
+    // the heuristic says "secure" for `registry.corp.example` but a truthy
+    // env override wins, while a falsy/unrecognised value must not (the
+    // fail-closed direction, issue #65). Uses a serial-style guard (set +
+    // clear) so a parallel test doesn't observe the var. (cargo test runs
+    // tests in parallel by default — keep the var name unique to this test
+    // so it can't collide with another test setting the same var; that is
+    // why both directions live in one test rather than two.)
     #[test]
     fn env_override_forces_plain_http() {
         // SAFETY: cargo test parallelises but env mutations affect the
-        // whole process; restrict to one assertion + cleanup. The
-        // assertions in the OTHER tests in this module don't touch
-        // AGENT_VM_INSECURE_REGISTRY, so no interference.
+        // whole process; restrict to this test + cleanup after each step.
+        // No other test in the crate touches AGENT_VM_INSECURE_REGISTRY,
+        // so no other assertion can observe this mutation.
         // SAFETY: see rationale above.
         unsafe { std::env::set_var("AGENT_VM_INSECURE_REGISTRY", "1") };
         assert!(is_plain_http_registry("registry.corp.example:5000/x"));
-        assert!(is_plain_http_registry("ghcr.io/wirenboard/agent-vm-template:latest"));
+        assert!(is_plain_http_registry(
+            "ghcr.io/wirenboard/agent-vm-template:latest"
+        ));
         // SAFETY: same.
         unsafe { std::env::remove_var("AGENT_VM_INSECURE_REGISTRY") };
         // After cleanup the heuristic resumes its normal behaviour.
         assert!(!is_plain_http_registry("registry.corp.example:5000/x"));
+
+        // Fail-closed direction: an explicit falsy value (or a typo that
+        // isn't in `env_flag::TRUTHY`) must not be coerced into "insecure"
+        // — the widened accepted set only adds new spellings of an opt-in,
+        // never a new way to opt in by accident.
+        for falsy in ["0", ""] {
+            // SAFETY: same.
+            unsafe { std::env::set_var("AGENT_VM_INSECURE_REGISTRY", falsy) };
+            assert!(
+                !is_plain_http_registry("registry.corp.example:5000/x"),
+                "{falsy:?} must not force plain HTTP"
+            );
+        }
+        // SAFETY: same.
+        unsafe { std::env::remove_var("AGENT_VM_INSECURE_REGISTRY") };
     }
 }

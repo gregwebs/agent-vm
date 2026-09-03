@@ -4,6 +4,7 @@ mod clipboard;
 mod credential_injection;
 mod defaults;
 mod doctor;
+mod env_flag;
 mod github_graphql;
 mod host_paths;
 mod image_api_version;

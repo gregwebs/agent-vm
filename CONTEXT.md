@@ -51,8 +51,10 @@ no more). See `docs/adr/0002-mirror-host-home-and-username.md`.
 ## Root mode
 
 The opt-out, enabled by the `--root` flag or a truthy `AGENT_VM_ROOT` env
-var (same `1|true|yes|on` convention as `AGENT_VM_UPDATE_CHECK`). Runs the
-guest as uid 0 with `HOME=/root` — the pre-non-root-default behavior.
+var (parsed by the shared `env_flag` module — `1|true|yes|on`, trimmed and
+ASCII-case-insensitive, the same parser behind every value-parsing boolean
+`AGENT_VM_*` variable). Runs the guest as uid 0 with `HOME=/root` — the
+pre-non-root-default behavior.
 Required for docker-in-VM (dockerd needs root); when the Chrome DevTools layer is installed, its MCP uses the `sudo -u chrome` path only in this mode.
 
 _Avoid_: "privileged mode" — the microVM boundary applies identically in

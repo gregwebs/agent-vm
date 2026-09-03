@@ -116,10 +116,10 @@ fn resolve_host_home() -> Result<String> {
 /// (host-uid) mode. Enabled by the `--root` flag OR a truthy `AGENT_VM_ROOT`
 /// env var. `env_val` is the raw value of that variable (`None` when
 /// unset), so this stays pure and unit-testable — mirrors `run.rs`'s
-/// `should_check_update` flag-or-truthy-env shape and the same
-/// `1|true|yes|on` truthiness convention (`pull::env_truthy`).
+/// `should_check_update` flag-or-truthy-env shape and the same shared
+/// `env_flag` truthiness convention (`1|true|yes|on`).
 pub fn should_run_root(flag: bool, env_val: Option<&str>) -> bool {
-    flag || matches!(env_val, Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+    flag || env_val.is_some_and(crate::env_flag::is_truthy)
 }
 
 /// The non-root guest's full identity: the numeric access-control uid/gid

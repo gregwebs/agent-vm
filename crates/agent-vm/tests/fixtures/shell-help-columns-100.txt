@@ -199,7 +199,7 @@ Environment:
   AGENT_VM_IMAGE_TAG                    same as --image
   AGENT_VM_ROOT                         same as --root (1|true|yes|on)
   AGENT_VM_UPDATE_CHECK                 check the registry for a newer image (1|true|yes|on)
-  AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls
+  AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls (1|true|yes|on)
   AGENT_VM_STATE_DIR                    override the per-project state dir
   AGENT_VM_PROFILE                      print per-phase boot timings
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
