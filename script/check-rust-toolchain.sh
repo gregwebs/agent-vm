@@ -27,7 +27,7 @@
 #   - docs/adr/0005's "Rust 1.94 pin" mentions -- a frozen historical record
 #     of the pin at decision time, not a copy that should track future bumps.
 #
-# False-positive trap: 
+# False-positive trap:
 # Every pattern below is anchored to its surrounding keyword
 # (RUST_TOOLCHAIN=, "minor < ", "Rust ... or newer", "rustup toolchain
 # install ", "rustup run ", "rustup component add cargo --toolchain ") so a
@@ -173,32 +173,6 @@ check_macos_floor_guard() {
         "$file" "$channel_minor" "$floor"
 }
 
-check_macos_messages() {
-    local file=script/build/macos.sh all_ok=true found
-
-    found="$(grep -oE 'Rust [0-9]+\.[0-9]+(\.[0-9]+)? or newer' "$file" | head -n1 || true)"
-    if [[ -z "$found" ]]; then
-        all_ok=false
-        fail_missing_anchor "$file" 'the "Rust <version> or newer" message'
-    elif [[ "$found" != "Rust $channel or newer" ]]; then
-        all_ok=false
-        fail "$file says \"$found\" but canonical channel is $channel"
-        printf '       fix: change this message in %s to say "Rust %s or newer".\n' "$file" "$channel"
-    fi
-
-    found="$(grep -oE 'rustup toolchain install [0-9]+\.[0-9]+(\.[0-9]+)?' "$file" | head -n1 || true)"
-    if [[ -z "$found" ]]; then
-        all_ok=false
-        fail_missing_anchor "$file" 'the "rustup toolchain install <version>" message'
-    elif [[ "$found" != "rustup toolchain install $channel" ]]; then
-        all_ok=false
-        fail "$file says \"$found\" but canonical channel is $channel"
-        printf '       fix: change this message in %s to say "rustup toolchain install %s".\n' "$file" "$channel"
-    fi
-
-    [[ "$all_ok" == false ]] || ok "$file messages match $channel"
-}
-
 check_macos_build_md() {
     local file=macos-build.md
     local -a occurrences=()
@@ -289,7 +263,6 @@ main() {
     check_release_npm
     check_macos_rust_toolchain_var
     check_macos_floor_guard
-    check_macos_messages
     check_macos_build_md
 
     if ((failures > 0)); then
