@@ -63,7 +63,7 @@ cp Cargo.toml "$tmp/patch.toml"
 printf '\n[patch.crates-io]\nmsb_krun = "0.1.32"\n' >>"$tmp/patch.toml"
 expect_failure 'overrides cohort crate' --root-manifest "$tmp/patch.toml"
 expect_failure 'firmware gitlink mode is' --gitlink-mode 100644
-expect_failure 'firmware gitlink is' --gitlink deadbeef
+expect_failure 'expected gitlink deadbeef' --gitlink deadbeef
 expect_failure 'recursive submodule is not initialized' --firmware-head ''
 expect_failure 'source is dirty' --firmware-dirty
 

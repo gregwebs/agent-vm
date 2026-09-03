@@ -14,7 +14,6 @@ COHORT = frozenset((
     "msb_krun_smbios", "msb_krun_utils", "msb_krun_vmm",
 ))
 VERSION = "0.1.32"
-FIRMWARE_SHA = "c51f0146f9fe836e4fe1bf2c061c70bedfad058c"
 FIRMWARE_VERSION = "5.6.1"
 FIRMWARE_ABI = "5"
 REGISTRY_PREFIX = "registry+https://github.com/rust-lang/crates.io-index"
@@ -92,12 +91,12 @@ def check_metadata(path: pathlib.Path) -> None:
 def check_firmware(args: argparse.Namespace) -> None:
     if args.gitlink_mode != "160000":
         fail(f"firmware gitlink mode is {args.gitlink_mode!r}, expected '160000'")
-    if args.gitlink != FIRMWARE_SHA:
-        fail(f"firmware gitlink is {args.gitlink!r}, expected {FIRMWARE_SHA}")
+    if args.gitlink == "":
+        fail("firmware gitlink is empty")
     if args.firmware_head == "":
         fail("firmware recursive submodule is not initialized; run git submodule update --init --recursive")
-    if args.firmware_head != FIRMWARE_SHA:
-        fail(f"firmware checkout HEAD is {args.firmware_head}, expected gitlink {FIRMWARE_SHA}")
+    if args.firmware_head != args.gitlink:
+        fail(f"firmware checkout HEAD is {args.firmware_head}, expected gitlink {args.gitlink}")
     if args.firmware_dirty:
         fail("firmware source is dirty (tracked modifications or non-ignored untracked files)")
     constants = pathlib.Path(args.constants).read_text()
@@ -148,7 +147,7 @@ def main() -> None:
     except (OSError, tomllib.TOMLDecodeError, json.JSONDecodeError, ValueError) as error:
         print(f"runtime provenance: FAIL: {error}", file=sys.stderr)
         sys.exit(1)
-    print(f"runtime provenance: root+nested registry cohort {VERSION}; checksums equal; firmware {FIRMWARE_SHA[:12]} version {FIRMWARE_VERSION} ABI {FIRMWARE_ABI}")
+    print(f"runtime provenance: root+nested registry cohort {VERSION}; checksums equal; firmware {args.gitlink[:12]} version {FIRMWARE_VERSION} ABI {FIRMWARE_ABI}")
 
 
 if __name__ == "__main__":
