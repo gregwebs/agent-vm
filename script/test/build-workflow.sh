@@ -272,7 +272,7 @@ expect_build_failure() {
     output="$(run_build "$fixture" "$fakebin" "$@" 2>&1)"
     status=$?
     set -e
-    [[ $status -ne 0 ]] || fail "build unexpectedly succeeded: $expected"
+    [[ $status -ne 0 ]] || fail "build unexpectedly succeeded: $expected. output:\n\n$output"
     assert_contains "$output" "$expected"
 }
 

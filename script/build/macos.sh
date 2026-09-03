@@ -84,7 +84,7 @@ preflight() {
     fi
     needed_major="${RUST_TOOLCHAIN%%.*}"
     needed_minor="${RUST_TOOLCHAIN#*.}"
-    if ((major < 1 || (needed_major == 1 && needed_minor < 94))); then
+    if ((major != needed_major)) || ((minor < needed_minor)); then
         echo "error: Rust $RUST_TOOLCHAIN or newer is required; found $version" >&2
         echo "Install the known-good toolchain with 'rustup toolchain install $RUST_TOOLCHAIN'." >&2
         exit 1
