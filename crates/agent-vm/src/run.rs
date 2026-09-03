@@ -108,17 +108,83 @@ fn should_auto_confirm(flag: bool, env_val: Option<&str>) -> bool {
     flag || env_val.is_some_and(crate::env_flag::is_truthy)
 }
 
+/// The user's answer to a y/N question. An enum rather than a `bool` so the
+/// call site reads as a decision instead of a flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Confirmation {
+    Confirmed,
+    Declined,
+}
+
+/// The prompt wording pinned by ADR-0003. A function (not an inline
+/// `format!`) so `prompt_wording_matches_the_adr` renders the *production*
+/// string instead of a copy that could drift from it.
+fn layer_build_question(tag: &str) -> String {
+    format!("Build project tooling layer '{tag}'?")
+}
+
+/// Ask a y/N question and read the answer.
+///
+/// Delivery is checked before input is requested: a failed write or flush
+/// returns and never falls through to `read_line`, so the launcher cannot end
+/// up blocked on a question the user never received (issue #58) — the same
+/// silent-hang failure the non-tty branch of [`confirm_layer_build`] exists to
+/// prevent. Anything other than `y`/`yes` (case- and whitespace-insensitive),
+/// including EOF, declines: the safe direction for a minutes-long network
+/// build.
+///
+/// Generic over the sink so the failure paths are testable without a
+/// terminal. Note that std's `Stderr` — today's only production sink — is
+/// unbuffered and its `flush` cannot fail; the flush arm is the contract for
+/// any future buffered sink, not a reachable production branch.
+fn ask_yes_no(
+    question: &str,
+    output: &mut impl std::io::Write,
+    input: &mut impl std::io::BufRead,
+) -> Result<Confirmation> {
+    // A single `write_all` call, not `write!(output, "{question} [y/N] ")`:
+    // that macro form calls the sink's `write` once per format-string
+    // fragment (the interpolated `question` first, then the literal
+    // `" [y/N] "` segment), so a write failure partway through could
+    // deliver a truncated prompt before returning `Err`. One call keeps
+    // "the prompt" atomic on std's `Stderr` specifically, whose `write_all`
+    // forwards to a single locked call — not a guarantee for every
+    // `impl Write` sink, since `write_all`'s default impl loops over
+    // `write` on short writes.
+    let prompt = format!("{question} [y/N] ");
+    output
+        .write_all(prompt.as_bytes())
+        .with_context(|| format!("writing the {question:?} prompt"))?;
+    output
+        .flush()
+        .with_context(|| format!("flushing the {question:?} prompt"))?;
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .with_context(|| format!("reading the answer to {question:?}"))?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(if answer == "y" || answer == "yes" {
+        Confirmation::Confirmed
+    } else {
+        Confirmation::Declined
+    })
+}
+
 /// Interactive y/N confirmation before building a tooling layer (F3 in the
 /// plan/ADR-0003).
 ///
-/// When `auto` is set (`--yes` / `$AGENT_VM_YES`), always confirms without
-/// prompting. Otherwise, when stdin isn't a terminal, returns an actionable
-/// error rather than hanging on a `read_line` that will never receive
-/// input — a non-interactive caller (CI, a script) needs to pass `--yes`
-/// explicitly, not have the launch appear to hang.
-async fn confirm_layer_build(tag: &str, auto: bool) -> Result<bool> {
+/// `auto` (`--yes` / `$AGENT_VM_YES`) confirms without prompting and without
+/// touching stdin or stderr at all — a CI caller must not depend on a
+/// terminal. Otherwise, when stdin isn't a terminal, this returns an
+/// actionable error rather than hanging on a `read_line` that will never
+/// receive input.
+///
+/// Do not write a test that calls this with `auto = false`: under a developer
+/// shell `cargo test`'s fd 0 *is* a tty, so it would block forever. Test
+/// [`ask_yes_no`] instead.
+fn confirm_layer_build(tag: &str, auto: bool) -> Result<Confirmation> {
     if auto {
-        return Ok(true);
+        return Ok(Confirmation::Confirmed);
     }
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
@@ -126,14 +192,11 @@ async fn confirm_layer_build(tag: &str, auto: bool) -> Result<bool> {
              interactively. Re-run with --yes, or set AGENT_VM_YES=1."
         );
     }
-    eprint!("Build project tooling layer '{tag}'? [y/N] ");
-    std::io::Write::flush(&mut std::io::stderr()).ok();
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .context("reading tooling-layer build confirmation from stdin")?;
-    let answer = line.trim().to_ascii_lowercase();
-    Ok(answer == "y" || answer == "yes")
+    ask_yes_no(
+        &layer_build_question(tag),
+        &mut std::io::stderr(),
+        &mut std::io::stdin().lock(),
+    )
 }
 
 /// If the project declares a tooling layer, build+load it (lazily, hash-
@@ -191,7 +254,7 @@ async fn resolve_boot_image_with_layer(
     //    silently fall back to booting the plain base with a missing
     //    toolchain (F2 in the plan/ADR-0003).
     layer::ensure_docker_buildx()?;
-    if !confirm_layer_build(&id.tag, auto_confirm).await? {
+    if confirm_layer_build(&id.tag, auto_confirm)? == Confirmation::Declined {
         anyhow::bail!(
             "tooling layer {} not built (declined). Re-run and confirm, or pass --yes.",
             id.tag
@@ -1968,6 +2031,8 @@ fn shell_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn path_from_config_env_reads_the_path_entry() {
@@ -2051,6 +2116,267 @@ mod tests {
         // Short form.
         let cli = TestCli::try_parse_from(["agent-vm", "-y"]).expect("parses -y");
         assert!(cli.args.yes);
+    }
+
+    // Test doubles for `ask_yes_no`'s io seam (issue #58). One shared,
+    // ordered event log so "delivery happens before the read" and "no read
+    // after a failed delivery" are asserted directly rather than inferred
+    // from side effects. Test-local duplication of the spirit of
+    // `network.rs`'s `SharedWriter`/`FailingWriter` — deliberate, per
+    // CODING_STANDARDS' DRY note (wait for a third instance).
+    #[derive(Debug, PartialEq, Eq)]
+    enum PromptIo {
+        Wrote(String),
+        Flushed,
+        Read,
+    }
+
+    /// Collapses consecutive `Wrote` entries in `log`, concatenating their
+    /// payloads, so a test can assert "these bytes were delivered, in this
+    /// step order" without pinning how many `write()` calls the sink saw.
+    /// The production sink (`write_all` on std's `Stderr`) makes one call,
+    /// but `ask_yes_no`'s `impl Write` bound makes no such promise for a
+    /// future sink — asserting exact-call-count would couple the test to an
+    /// implementation detail the acceptance criteria don't care about.
+    fn folded_prompt_log(log: &[PromptIo]) -> Vec<PromptIo> {
+        let mut folded: Vec<PromptIo> = Vec::new();
+        for event in log {
+            match (folded.last_mut(), event) {
+                (Some(PromptIo::Wrote(acc)), PromptIo::Wrote(next)) => acc.push_str(next),
+                (_, PromptIo::Wrote(s)) => folded.push(PromptIo::Wrote(s.clone())),
+                (_, PromptIo::Flushed) => folded.push(PromptIo::Flushed),
+                (_, PromptIo::Read) => folded.push(PromptIo::Read),
+            }
+        }
+        folded
+    }
+
+    /// Which io step, if any, fails. `None` is the success path.
+    #[derive(Clone, Copy)]
+    enum Fault {
+        None,
+        Write,
+        Flush,
+    }
+
+    struct ScriptedOutput {
+        log: Rc<RefCell<Vec<PromptIo>>>,
+        fault: Fault,
+    }
+
+    impl std::io::Write for ScriptedOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if matches!(self.fault, Fault::Write) {
+                return Err(std::io::Error::other("broken output"));
+            }
+            self.log
+                .borrow_mut()
+                .push(PromptIo::Wrote(String::from_utf8_lossy(bytes).into_owned()));
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if matches!(self.fault, Fault::Flush) {
+                return Err(std::io::Error::other("broken flush"));
+            }
+            self.log.borrow_mut().push(PromptIo::Flushed);
+            Ok(())
+        }
+    }
+
+    struct ScriptedInput {
+        log: Rc<RefCell<Vec<PromptIo>>>,
+        cursor: std::io::Cursor<Vec<u8>>,
+        fail: bool,
+    }
+
+    impl ScriptedInput {
+        fn from(log: Rc<RefCell<Vec<PromptIo>>>, answer: &str) -> Self {
+            Self {
+                log,
+                cursor: std::io::Cursor::new(answer.as_bytes().to_vec()),
+                fail: false,
+            }
+        }
+
+        fn failing(log: Rc<RefCell<Vec<PromptIo>>>) -> Self {
+            Self {
+                log,
+                cursor: std::io::Cursor::new(Vec::new()),
+                fail: true,
+            }
+        }
+    }
+
+    impl std::io::Read for ScriptedInput {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.cursor, buffer)
+        }
+    }
+
+    impl std::io::BufRead for ScriptedInput {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.log.borrow_mut().push(PromptIo::Read);
+            if self.fail {
+                return Err(std::io::Error::other("broken input"));
+            }
+            std::io::BufRead::fill_buf(&mut self.cursor)
+        }
+
+        fn consume(&mut self, amount: usize) {
+            std::io::BufRead::consume(&mut self.cursor, amount);
+        }
+    }
+
+    #[test]
+    fn prompt_delivery_precedes_the_answer_read() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut input = ScriptedInput::from(log.clone(), "y\n");
+        let answer = ask_yes_no(
+            &layer_build_question("agent-vm-layer:demo-abc123"),
+            &mut output,
+            &mut input,
+        )
+        .expect("scripted success");
+        assert_eq!(answer, Confirmation::Confirmed);
+        assert_eq!(
+            folded_prompt_log(&log.borrow()),
+            vec![
+                PromptIo::Wrote(
+                    "Build project tooling layer 'agent-vm-layer:demo-abc123'? [y/N] ".to_string()
+                ),
+                PromptIo::Flushed,
+                PromptIo::Read,
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_answers_are_case_and_whitespace_insensitive() {
+        for confirmed_answer in ["y\n", "Y\n", "yes\n", " YES \r\n"] {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut output = ScriptedOutput {
+                log: log.clone(),
+                fault: Fault::None,
+            };
+            let mut input = ScriptedInput::from(log.clone(), confirmed_answer);
+            assert_eq!(
+                ask_yes_no(&layer_build_question("t"), &mut output, &mut input)
+                    .expect("scripted success"),
+                Confirmation::Confirmed,
+                "expected {confirmed_answer:?} to confirm"
+            );
+        }
+        for declined_answer in ["n\n", "no\n", "\n", "", "yep\n", "ye s\n"] {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut output = ScriptedOutput {
+                log: log.clone(),
+                fault: Fault::None,
+            };
+            let mut input = ScriptedInput::from(log.clone(), declined_answer);
+            assert_eq!(
+                ask_yes_no(&layer_build_question("t"), &mut output, &mut input)
+                    .expect("scripted success"),
+                Confirmation::Declined,
+                "expected {declined_answer:?} to decline"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_write_failure_is_reported_and_input_is_not_read() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::Write,
+        };
+        let mut input = ScriptedInput::from(log.clone(), "y\n");
+        let error = ask_yes_no(&layer_build_question("t"), &mut output, &mut input)
+            .expect_err("write failure must propagate");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("writing"), "chain: {chain}");
+        assert!(chain.contains("broken output"), "chain: {chain}");
+        assert!(!log.borrow().contains(&PromptIo::Flushed));
+        assert!(!log.borrow().contains(&PromptIo::Read));
+    }
+
+    #[test]
+    fn prompt_flush_failure_is_reported_and_input_is_not_read() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::Flush,
+        };
+        let mut input = ScriptedInput::from(log.clone(), "y\n");
+        let error = ask_yes_no(
+            &layer_build_question("agent-vm-layer:demo-abc123"),
+            &mut output,
+            &mut input,
+        )
+        .expect_err("flush failure must propagate");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("flushing"), "chain: {chain}");
+        assert!(chain.contains("broken flush"), "chain: {chain}");
+        assert_eq!(
+            folded_prompt_log(&log.borrow()),
+            vec![PromptIo::Wrote(
+                "Build project tooling layer 'agent-vm-layer:demo-abc123'? [y/N] ".to_string()
+            )],
+            "write must complete and the read must never happen"
+        );
+    }
+
+    #[test]
+    fn prompt_answer_read_failure_is_reported() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut input = ScriptedInput::failing(log.clone());
+        let error = ask_yes_no(&layer_build_question("t"), &mut output, &mut input)
+            .expect_err("read failure must propagate");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("reading the answer"), "chain: {chain}");
+        assert!(chain.contains("broken input"), "chain: {chain}");
+    }
+
+    #[test]
+    fn prompt_is_skipped_when_pre_approved() {
+        // Safe through the real entry point: the `auto` early return
+        // precedes every io, so this cannot block on a tty even under
+        // `cargo test`'s real fd 0/2.
+        assert_eq!(
+            confirm_layer_build("agent-vm-layer:demo-abc123", true).expect("auto confirms"),
+            Confirmation::Confirmed
+        );
+    }
+
+    #[test]
+    fn prompt_wording_matches_the_adr() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut input = ScriptedInput::from(log.clone(), "\n");
+        ask_yes_no(&layer_build_question("<tag>"), &mut output, &mut input)
+            .expect("scripted success");
+        let rendered = match &log.borrow()[0] {
+            PromptIo::Wrote(text) => text.clone(),
+            other => panic!("expected a Wrote entry first, got {other:?}"),
+        };
+        assert_eq!(rendered, "Build project tooling layer '<tag>'? [y/N] ");
+        let adr = include_str!("../../../docs/adr/0003-project-tooling-layers.md");
+        assert_eq!(
+            adr.matches(rendered.trim_end()).count(),
+            1,
+            "ADR-0003 must state the prompt wording exactly once"
+        );
     }
 
     // `resolve_boot_image_with_layer` is only exercised end-to-end by the
