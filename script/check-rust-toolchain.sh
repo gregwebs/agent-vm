@@ -21,17 +21,14 @@
 #     three anchor commands is checked, not merely their presence.
 #
 # Deliberately NOT enforced (see the implementation plan for issue #59):
-#   - ci.yml's "Install Rust 1.94" step-name label -- cosmetic prose, not a
-#     functional consumer; renaming it away from the version is preferred.
 #   - script/test/build-workflow.sh's fake rustc/cargo/rustup fixtures --
 #     already fail-closed because a stale fixture makes the test's own
 #     assertions fail when it runs; checking them here would be circular.
 #   - docs/adr/0005's "Rust 1.94 pin" mentions -- a frozen historical record
 #     of the pin at decision time, not a copy that should track future bumps.
 #
-# False-positive trap: script/build/macos.sh also contains unrelated
-# version-shaped tokens ("rustup 1.29", "OSStatus -26276") in its rustup
-# recovery hints. Every pattern below is anchored to its surrounding keyword
+# False-positive trap: 
+# Every pattern below is anchored to its surrounding keyword
 # (RUST_TOOLCHAIN=, "minor < ", "Rust ... or newer", "rustup toolchain
 # install ", "rustup run ", "rustup component add cargo --toolchain ") so a
 # blanket version-token scan is never used and these tokens are never

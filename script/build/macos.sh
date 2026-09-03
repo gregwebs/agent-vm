@@ -39,7 +39,7 @@ rust_toolchain_error() {
 
     echo "error: Rust toolchain $RUST_TOOLCHAIN is not installed or usable: failed to run '$tool'" >&2
     echo "Install the complete known-good toolchain with 'rustup toolchain install $RUST_TOOLCHAIN'." >&2
-    echo "If rustup 1.29 fails on macOS with 'OSStatus -26276', retry once with its TLS-verifying curl backend:" >&2
+    echo "If rustup $RUST_TOOLCHAIN fails on macOS with 'OSStatus -26276', retry once with its TLS-verifying curl backend:" >&2
     echo "  RUSTUP_USE_CURL=1 rustup toolchain install $RUST_TOOLCHAIN" >&2
 }
 
@@ -82,9 +82,11 @@ preflight() {
         echo "error: could not parse Rust version from: $rust_version" >&2
         exit 1
     fi
-    if ((major < 1 || (major == 1 && minor < 94))); then
-        echo "error: Rust 1.94 or newer is required; found $version" >&2
-        echo "Install the known-good toolchain with 'rustup toolchain install 1.94'." >&2
+    needed_major="${RUST_TOOLCHAIN%%.*}"
+    needed_minor="${RUST_TOOLCHAIN#*.}"
+    if ((major < 1 || (needed_major == 1 && needed_minor < 94))); then
+        echo "error: Rust $RUST_TOOLCHAIN or newer is required; found $version" >&2
+        echo "Install the known-good toolchain with 'rustup toolchain install $RUST_TOOLCHAIN'." >&2
         exit 1
     fi
     if ! run_rust_tool cargo --version >/dev/null; then
