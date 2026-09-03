@@ -716,19 +716,39 @@ clap subcommand mode:
 1. Reads the request from stdin and strictly validates HTTP/1.1 framing,
    Host/SNI/authority, exact provider route, encoding, grant, and
    placeholder before it can start a host command.
-2. Spawns `claude -p hi --model sonnet` (or `codex exec --skip-git-
-   repo-check 'Reply OK'`) on the **host** so the host CLI rotates
+2. Inspects the host credential file with a fresh clock. A bearer well
+   above the serving floor is re-synced and served with **no host
+   command spawned**; a missing/unreadable/malformed/expired-or-
+   expiring credential never spawns a noninteractive CLI either — it
+   is unavailable outright (`claude login`/`codex login` on the host
+   is what recovers it).
+3. Only a bearer that is due for rotation (parsed, but at or under the
+   provider's serving margin) takes the per-provider host-only lock
+   (bounded, 20 s ceiling), re-reads under the lock, and — unless
+   already above the floor or damped by a fresh 30-second attempt
+   stamp — spawns `claude -p hi --model sonnet` (or `codex exec
+   --skip-git-repo-check 'Reply with OK'`) on the **host**, isolated in
+   an empty 0700 working directory with a cleared, allow-listed
+   environment and no dangerous-bypass flags, so the host CLI rotates
    `~/.claude/.credentials.json` / `~/.codex/auth.json` the normal way.
-3. Re-reads the rotated host file, rewrites the host-only token file
-   (`<state>.secrets/{anthropic,openai}`) so the next non-refresh
-   request from the guest gets the new bearer via `SecretSource::File`.
-4. After complete validation, the private OAuth module consumes the bearer
+4. Regardless of whether the CLI ran, failed, or was skipped, re-reads
+   the host file once more *while still holding the lock* and rewrites
+   the host-only token file (`<state>.secrets/{anthropic,openai}`) so
+   the next non-refresh request from the guest gets the new bearer via
+   `SecretSource::File`. Holding the lock through this install is what
+   stops a launcher from re-capturing a stale host snapshot and
+   overwriting a token this rotation just installed.
+5. After complete validation, the private OAuth module consumes the bearer
    into the host-only file and returns only typed public metadata. It then
    synthesizes an OAuth refresh-response JSON shaped like what the upstream
    server would return, but with **placeholder** strings in the
-   `access_token` / `refresh_token` fields. The in-VM agent updates its
-   credentials.json to those placeholders and continues.
-5. The adapter writes the response to stdout, which is the interceptor
+   `access_token` / `refresh_token` fields. Every expected post-validation
+   failure (unreadable/malformed host state, lock timeout, CLI
+   timeout/nonzero exit, an install that fails) becomes a typed
+   `503 temporarily_unavailable` reply naming the host re-login command —
+   never a raw error or a dropped connection. The in-VM agent updates its
+   credentials.json to the placeholders on success and continues.
+6. The adapter writes the response to stdout, which is the interceptor
    protocol channel rather than logging, then exits 0.
 
 The guest never holds a real token at any layer:
@@ -767,14 +787,30 @@ Response:
   {"access_token":"msb-anthropic-placeholder-a-v2",
    "refresh_token":"msb-anthropic-placeholder-r-v2",
    "expires_in":3499, "token_type":"Bearer",
-   "scope":["user:file_upload","user:inference",…]}
+   "scope":"user:file_upload user:inference"}
 ```
 
 Confirmed on the same nested-VM test host as Phase 3. The hook ran,
 host `claude -p` rotated the host file, the new bearer landed in
 `<state>.secrets/anthropic`, and the synthesized response reached the
 guest. `expires_in: 3499` is the freshly-derived seconds-until-expiry
-of the just-rotated token.
+of the just-rotated token. `scope` is always a single bounded,
+RFC 6749 `scope-token`-filtered, space-joined string (never the host's
+raw JSON shape) and always contains `user:inference`, guaranteed by
+normalization rather than trusted from host data.
+
+### Credential parity hardening (issue #55)
+
+OpenCode static providers are captured from the host OpenCode auth object only
+for OpenCode/shell launches. Guest auth JSON contains provider-specific
+placeholders while sibling 0600 files contain the real keys; each mapping is
+limited to its exact TLS host. Static keys are intentionally relaunch-only.
+
+Guest state is writable by the guest UID, so it is never trusted through a
+joined pathname after launch. Descriptor-relative no-follow opens keep reads,
+create-if-absent defaults, and atomic replacements anchored under the opened
+state root. OAuth operational failures are returned as fail-closed temporary
+unavailability rather than an opaque dropped TLS connection.
 
 ### What Phase 4 deliberately doesn't do
 

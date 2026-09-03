@@ -24,6 +24,8 @@ mod run;
 mod secrets;
 mod session;
 mod setup;
+#[cfg(test)]
+mod test_env;
 mod user;
 
 use anyhow::{Context, Result};

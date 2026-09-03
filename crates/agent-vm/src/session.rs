@@ -115,8 +115,7 @@ impl ProjectSession {
             &self.codex_home(),
             &self.opencode_data(),
         ] {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         Ok(())
     }
@@ -164,8 +163,7 @@ impl ProjectSession {
     pub fn provision_guest_home(&self) -> Result<()> {
         let home = self.guest_home_dir();
         for dir in [&home, &home.join(".local/share"), &home.join(".config")] {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         for (link, target) in guest_home_symlinks(&home) {
             // force_symlink already attributes failures to the specific
@@ -185,9 +183,7 @@ impl ProjectSession {
 fn guest_home_symlinks(home: &Path) -> Vec<(PathBuf, String)> {
     GUEST_HOME_LINKS
         .iter()
-        .map(|(suffix, target_name)| {
-            (home.join(suffix), format!("/agent-vm-state/{target_name}"))
-        })
+        .map(|(suffix, target_name)| (home.join(suffix), format!("/agent-vm-state/{target_name}")))
         .collect()
 }
 
@@ -294,9 +290,12 @@ mod tests {
                 .iter()
                 .any(|(l, t)| l == &home.join(".claude") && t == "/agent-vm-state/claude"),
         );
-        assert!(links.iter().any(|(l, t)| l
-            == &home.join(".local/share/opencode")
-            && t == "/agent-vm-state/opencode"));
+        assert!(
+            links
+                .iter()
+                .any(|(l, t)| l == &home.join(".local/share/opencode")
+                    && t == "/agent-vm-state/opencode")
+        );
         assert!(
             links
                 .iter()

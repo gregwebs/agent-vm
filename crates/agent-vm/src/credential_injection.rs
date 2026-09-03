@@ -24,10 +24,10 @@ pub(crate) struct Plan {
 }
 
 struct FileSecret {
-    env_var: &'static str,
-    placeholder: &'static str,
+    env_var: String,
+    placeholder: String,
     path: PathBuf,
-    hosts: &'static [&'static str],
+    hosts: Vec<&'static str>,
     basic_auth: bool,
 }
 
@@ -57,10 +57,10 @@ impl Plan {
         let mut routes = Vec::new();
         if let Some(path) = &inputs.creds.anthropic_token_file {
             secrets.push(FileSecret {
-                env_var: "MSB_AGENT_VM_ANTHROPIC_UNUSED",
-                placeholder: secrets::ANTHROPIC_ACCESS_PLACEHOLDER,
+                env_var: "MSB_AGENT_VM_ANTHROPIC_UNUSED".into(),
+                placeholder: secrets::ANTHROPIC_ACCESS_PLACEHOLDER.into(),
                 path: path.clone(),
-                hosts: &[
+                hosts: vec![
                     secrets::ANTHROPIC_API_HOST,
                     secrets::ANTHROPIC_OAUTH_HOST,
                     secrets::ANTHROPIC_MCP_PROXY_HOST,
@@ -76,10 +76,10 @@ impl Plan {
         }
         if let Some(path) = &inputs.creds.openai_token_file {
             secrets.push(FileSecret {
-                env_var: "MSB_AGENT_VM_OPENAI_UNUSED",
-                placeholder: secrets::OPENAI_ACCESS_PLACEHOLDER,
+                env_var: "MSB_AGENT_VM_OPENAI_UNUSED".into(),
+                placeholder: secrets::OPENAI_ACCESS_PLACEHOLDER.into(),
                 path: path.clone(),
-                hosts: &[
+                hosts: vec![
                     secrets::OPENAI_API_HOST,
                     secrets::OPENAI_CHATGPT_HOST,
                     secrets::OPENAI_OAUTH_HOST,
@@ -95,19 +95,19 @@ impl Plan {
         }
         if let Some(path) = &inputs.creds.opencode_openai_access_token_file {
             secrets.push(FileSecret {
-                env_var: "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
-                placeholder: secrets::OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
+                env_var: "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED".into(),
+                placeholder: secrets::OPENCODE_OPENAI_ACCESS_PLACEHOLDER.into(),
                 path: path.clone(),
-                hosts: &[secrets::OPENAI_API_HOST, secrets::OPENAI_CHATGPT_HOST],
+                hosts: vec![secrets::OPENAI_API_HOST, secrets::OPENAI_CHATGPT_HOST],
                 basic_auth: false,
             });
         }
         if let Some(path) = &inputs.creds.gh_token_file {
             secrets.push(FileSecret {
-                env_var: "MSB_AGENT_VM_GH_UNUSED",
-                placeholder: secrets::GH_TOKEN_PLACEHOLDER,
+                env_var: "MSB_AGENT_VM_GH_UNUSED".into(),
+                placeholder: secrets::GH_TOKEN_PLACEHOLDER.into(),
                 path: path.clone(),
-                hosts: &[
+                hosts: vec![
                     secrets::GITHUB_API_HOST,
                     secrets::GITHUB_HOST,
                     secrets::GITHUB_CODELOAD_HOST,
@@ -144,13 +144,23 @@ impl Plan {
             && let Some(path) = &inputs.creds.copilot_token_file
         {
             secrets.push(FileSecret {
-                env_var: "MSB_AGENT_VM_COPILOT_UNUSED",
-                placeholder: secrets::COPILOT_TOKEN_PLACEHOLDER,
+                env_var: "MSB_AGENT_VM_COPILOT_UNUSED".into(),
+                placeholder: secrets::COPILOT_TOKEN_PLACEHOLDER.into(),
                 path: path.clone(),
-                hosts: &[
+                hosts: vec![
                     secrets::COPILOT_API_HOST,
                     secrets::COPILOT_API_INDIVIDUAL_HOST,
                 ],
+                basic_auth: false,
+            });
+        }
+
+        for (provider, path) in &inputs.creds.opencode_api_token_files {
+            secrets.push(FileSecret {
+                env_var: provider.env_var(),
+                placeholder: provider.placeholder.into(),
+                path: path.clone(),
+                hosts: vec![provider.host],
                 basic_auth: false,
             });
         }
@@ -186,7 +196,7 @@ impl Plan {
                     .inject_body(false)
                     .require_tls_identity(true);
                 for host in secret.hosts {
-                    builder = builder.allow_host(*host);
+                    builder = builder.allow_host(host);
                 }
                 builder
             });
@@ -347,6 +357,50 @@ mod tests {
                 .filter(|route| route.host == secrets::GITHUB_API_HOST)
                 .all(|route| !route.dispatch_on_headers)
         );
+    }
+
+    #[test]
+    fn opencode_static_rows_have_one_exact_host_and_no_hook_route() {
+        let creds = CredsState {
+            opencode_api_token_files: secrets::OPENCODE_API_PROVIDERS
+                .iter()
+                .map(|provider| (*provider, path(&format!("opencode-{}", provider.id))))
+                .collect(),
+            ..CredsState::default()
+        };
+        let config = network(Plan::new(path("agent-vm"), inputs(&creds, false)).unwrap());
+        assert_eq!(
+            config.secrets.secrets.len(),
+            secrets::OPENCODE_API_PROVIDERS.len()
+        );
+        for provider in secrets::OPENCODE_API_PROVIDERS {
+            let entry = config
+                .secrets
+                .secrets
+                .iter()
+                .find(|entry| entry.placeholder == provider.placeholder)
+                .unwrap();
+            assert_eq!(entry.env_var, provider.env_var());
+            assert!(matches!(
+                &entry.source,
+                Some(SecretSource::File { path: source_path }) if source_path == &path(&format!("opencode-{}", provider.id))
+            ));
+            assert_eq!(entry.allowed_hosts.len(), 1);
+            assert!(
+                matches!(&entry.allowed_hosts[0], HostPattern::Exact(host) if host == provider.host)
+            );
+            assert!(entry.require_tls_identity);
+            assert!(entry.injection.headers);
+            assert!(!entry.injection.basic_auth);
+            assert!(!entry.injection.query_params && !entry.injection.body);
+            assert!(
+                config
+                    .intercept
+                    .rules
+                    .iter()
+                    .all(|route| route.host != provider.host)
+            );
+        }
     }
 
     #[test]

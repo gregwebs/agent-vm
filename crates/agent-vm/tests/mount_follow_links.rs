@@ -116,7 +116,12 @@ impl Harness {
         let state = tempfile::tempdir_in("/tmp").unwrap();
         let project = tempfile::tempdir_in("/tmp").unwrap();
         let fake_msb = write_fake_msb(home.path());
-        Self { home, state, project, fake_msb }
+        Self {
+            home,
+            state,
+            project,
+            fake_msb,
+        }
     }
 
     fn home_path(&self) -> PathBuf {
@@ -201,8 +206,13 @@ fn bind_mounts(config: &serde_json::Value) -> Vec<(String, bool)> {
         .filter(|m| m["type"] == "Bind")
         .map(|m| {
             (
-                m["host"].as_str().expect("Bind mount host must be a string").to_string(),
-                m["options"]["readonly"].as_bool().expect("Bind mount options.readonly must be a bool"),
+                m["host"]
+                    .as_str()
+                    .expect("Bind mount host must be a string")
+                    .to_string(),
+                m["options"]["readonly"]
+                    .as_bool()
+                    .expect("Bind mount options.readonly must be a bool"),
             )
         })
         .collect()
@@ -253,7 +263,10 @@ fn follow_links_discovers_transitive_targets_readonly() {
              walk recursed), got: {mounts:?}"
         )
     });
-    assert!(b_ro, "transitively discovered mount for {b_str} must be read-only");
+    assert!(
+        b_ro,
+        "transitively discovered mount for {b_str} must be read-only"
+    );
 
     // Sanity: the process still failed on the bogus pull, as expected —
     // these assertions are about what happened before that, not this exit.
@@ -272,7 +285,10 @@ fn rw_follow_links_is_a_hard_parse_error_before_boot() {
     assert!(!out.status.success());
     let err = stderr_of(&out);
     assert!(err.contains("conflicting"), "stderr:\n{err}");
-    assert!(err.contains("rw") && err.contains("follow-links"), "stderr:\n{err}");
+    assert!(
+        err.contains("rw") && err.contains("follow-links"),
+        "stderr:\n{err}"
+    );
     assert!(
         !err.contains("[debug] sandbox config JSON"),
         "a parse error must fail before builder.build() runs, stderr:\n{err}"
@@ -324,7 +340,11 @@ fn follow_links_root_mode_enforces_home_guardrail() {
     std::os::unix::fs::symlink(&outside, host_mount.join("escape")).unwrap();
 
     let mount_arg = format!("{}:ro:follow-links", host_mount.display());
-    let out = h.run_shell_opts(&[&mount_arg], /* root */ true, /* set_home */ true);
+    let out = h.run_shell_opts(
+        &[&mount_arg],
+        /* root */ true,
+        /* set_home */ true,
+    );
 
     assert!(!out.status.success());
     let err = stderr_of(&out);
@@ -350,7 +370,11 @@ fn follow_links_root_mode_without_home_is_a_hard_error() {
     std::fs::create_dir_all(&host_mount).unwrap();
     let mount_arg = format!("{}:ro:follow-links", host_mount.display());
 
-    let out = h.run_shell_opts(&[&mount_arg], /* root */ true, /* set_home */ false);
+    let out = h.run_shell_opts(
+        &[&mount_arg],
+        /* root */ true,
+        /* set_home */ false,
+    );
 
     assert!(!out.status.success());
     let err = stderr_of(&out);

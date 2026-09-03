@@ -226,7 +226,10 @@ fn resolve_host_home() -> Result<GuestHome> {
 /// `should_check_update` flag-or-truthy-env shape and the same
 /// `1|true|yes|on` truthiness convention (`pull::env_truthy`).
 pub fn should_run_root(flag: bool, env_val: Option<&str>) -> bool {
-    flag || matches!(env_val, Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+    flag || matches!(
+        env_val,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
 }
 
 /// The non-root guest's full identity: the numeric access-control uid/gid

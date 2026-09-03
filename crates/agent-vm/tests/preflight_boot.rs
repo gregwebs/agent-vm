@@ -239,7 +239,10 @@ fn ahead_db_blocks_boot_before_any_vm_work() {
         stderr.contains("agent-vm doctor --reset-msb-db"),
         "stderr:\n{stderr}"
     );
-    assert!(stderr.contains("NEWER than this build"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("NEWER than this build"),
+        "stderr:\n{stderr}"
+    );
     // AC-4 (issue #42): the block must be non-destructive -- the ahead db
     // this test seeded is still exactly there afterwards, not reset or
     // moved aside. Only `agent-vm doctor --reset-msb-db`, run by an
