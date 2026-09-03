@@ -116,32 +116,22 @@ mod tests {
     }
 
     /// [`enabled`] against the real process environment — the one thing
-    /// [`is_truthy`]'s pure tests cannot cover. Uses a var name unique to
-    /// the whole suite and cleans up afterwards (the same pattern as
-    /// `pull.rs`'s `env_override_forces_plain_http`).
-    ///
-    /// Read this before copying the pattern: a unique name buys *logical*
-    /// isolation only — no sibling test can observe or clobber the value.
-    /// It does not make the mutation sound, because `setenv` rewrites a
-    /// process-wide array while other threads are in `getenv`; that is why
-    /// edition 2024 marks it `unsafe`. Where a function can take its
-    /// lookup as a parameter the repo does that instead (see
-    /// `network.rs`'s `active_guest_proxy_var_from`); [`enabled`] cannot,
-    /// since reading the real environment is its entire job.
+    /// [`is_truthy`]'s pure tests cannot cover. Goes through
+    /// `test_env::guard()` (the crate's shared mutex + restore-on-drop
+    /// helper, see `pull.rs`'s `env_override_forces_plain_http`) rather
+    /// than a bare `unsafe set_var`/`remove_var`: a var name unique to this
+    /// test buys logical isolation only, not soundness — `setenv` rewrites
+    /// a process-wide array while sibling test threads sit in `getenv`.
     #[test]
     fn enabled_reads_the_process_environment() {
         const VAR: &str = "AGENT_VM_TEST_ENV_FLAG_ENABLED";
+        let mut env = crate::test_env::guard();
         assert!(!enabled(VAR), "unset must be false");
-        // SAFETY: VAR is unique to the suite, so no other test's
-        // assertion can observe this mutation. See the caveat above on
-        // why that is isolation rather than soundness.
-        unsafe { std::env::set_var(VAR, "On") };
+        env.set_var(VAR, "On");
         assert!(enabled(VAR));
-        // SAFETY: same.
-        unsafe { std::env::set_var(VAR, "0") };
+        env.set_var(VAR, "0");
         assert!(!enabled(VAR));
-        // SAFETY: same.
-        unsafe { std::env::remove_var(VAR) };
+        env.remove_var(VAR);
         assert!(!enabled(VAR), "must be false again after cleanup");
     }
 
@@ -149,7 +139,8 @@ mod tests {
     /// (matching every pre-#65 call site, all of which used
     /// `std::env::var`, not `var_os`) — that claim had no test. Follows the
     /// same `OsStr::from_bytes` pattern as
-    /// `msb_install::write_shared_cache_config_rejects_non_utf8_cache_path`.
+    /// `msb_install::write_shared_cache_config_rejects_non_utf8_cache_path`,
+    /// through `test_env::guard()` (see `enabled_reads_the_process_environment`).
     #[test]
     fn enabled_treats_non_utf8_value_as_unset() {
         use std::os::unix::ffi::OsStrExt;
@@ -157,15 +148,13 @@ mod tests {
         const VAR: &str = "AGENT_VM_TEST_ENV_FLAG_NON_UTF8";
         // 0x80 is not a valid standalone UTF-8 byte.
         let non_utf8 = std::ffi::OsStr::from_bytes(&[0x6f, 0x6e, 0x80]); // "on" + invalid byte
-        // SAFETY: VAR is unique to the suite; see the caveat on
-        // `enabled_reads_the_process_environment` above.
-        unsafe { std::env::set_var(VAR, non_utf8) };
+        let mut env = crate::test_env::guard();
+        env.set_var(VAR, non_utf8);
         assert!(
             !enabled(VAR),
             "a non-UTF-8 value must read as unset, not truthy"
         );
-        // SAFETY: same.
-        unsafe { std::env::remove_var(VAR) };
+        env.remove_var(VAR);
     }
 
     /// Doc lockstep, written so it cannot pass vacuously: assert both that

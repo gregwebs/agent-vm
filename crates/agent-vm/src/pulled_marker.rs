@@ -22,9 +22,7 @@ use crate::host_paths::{atomic_write, state_root};
 
 pub fn read(image_ref: &str) -> Option<String> {
     let path = marker_path(image_ref)?;
-    fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
+    fs::read_to_string(&path).ok().map(|s| s.trim().to_string())
 }
 
 pub fn write(image_ref: &str, digest: &str) -> Result<()> {
@@ -32,8 +30,7 @@ pub fn write(image_ref: &str, digest: &str) -> Result<()> {
         return Ok(());
     };
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     atomic_write(&path, digest.as_bytes(), 0o644)
 }

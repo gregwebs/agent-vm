@@ -272,7 +272,7 @@ expect_build_failure() {
     output="$(run_build "$fixture" "$fakebin" "$@" 2>&1)"
     status=$?
     set -e
-    [[ $status -ne 0 ]] || fail "build unexpectedly succeeded: $expected"
+    [[ $status -ne 0 ]] || fail "build unexpectedly succeeded: $expected. output:\n\n$output"
     assert_contains "$output" "$expected"
 }
 
@@ -315,16 +315,14 @@ expect_import_failure() {
 [[ -f "$REPO_ROOT/script/build/macos.sh" ]] || fail "missing script/build/macos.sh"
 [[ -f "$REPO_ROOT/script/build/import-image.sh" ]] || fail "missing script/build/import-image.sh"
 
-# macos.sh's RUST_TOOLCHAIN literal is a deliberate second copy of the pin (it
-# must not auto-select via rust-toolchain.toml, so the build script never
-# depends on or changes the caller's global default toolchain — see its own
-# comment). Assert the two agree so a future bump can't touch one and forget
-# the other.
-toolchain_toml_channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$REPO_ROOT/rust-toolchain.toml")"
-macos_sh_pin="$(sed -n 's/^RUST_TOOLCHAIN=\(.*\)$/\1/p' "$REPO_ROOT/script/build/macos.sh")"
-[[ -n "$toolchain_toml_channel" ]] || fail "could not read channel from rust-toolchain.toml"
-[[ "$macos_sh_pin" == "$toolchain_toml_channel" ]] ||
-    fail "script/build/macos.sh RUST_TOOLCHAIN ($macos_sh_pin) drifted from rust-toolchain.toml channel ($toolchain_toml_channel)"
+# All Rust-toolchain pin literals (rust-toolchain.toml, Cargo.toml, ci.yml,
+# release-npm.yml, this script's own RUST_TOOLCHAIN copy, and
+# macos-build.md) are asserted consistent by one shared checker -- see its
+# header for the full consumer list and why the pin is duplicated at all.
+# Running it here, in a macOS-native test, also gives it BSD-sed/BSD-grep
+# coverage: this is the checker's only run on macOS.
+"$REPO_ROOT/script/check-rust-toolchain.sh" ||
+    fail "script/check-rust-toolchain.sh reported a Rust-toolchain pin mismatch (see output above)"
 
 # A complete fake build works without just, from outside the repository.
 make_fixture success

@@ -189,7 +189,12 @@ pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
         let host = host
             .canonicalize()
             .with_context(|| format!("canonicalizing --mount host {host_s:?}"))?;
-        out.push(ExtraMount { host, guest, readonly, follow_links });
+        out.push(ExtraMount {
+            host,
+            guest,
+            readonly,
+            follow_links,
+        });
     }
     Ok(out)
 }
@@ -198,7 +203,11 @@ pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
 /// path and apply `.readonly()` when the mount was parsed `:ro`. Factored
 /// out of the `.volume(...)` closure so the readonly wiring has a boot-free
 /// unit seam (see `extra_mount_ro_propagates_readonly_into_built_volume`).
-pub(crate) fn configure_extra_mount(m: MountBuilder, host: PathBuf, readonly: bool) -> MountBuilder {
+pub(crate) fn configure_extra_mount(
+    m: MountBuilder,
+    host: PathBuf,
+    readonly: bool,
+) -> MountBuilder {
     let m = m.bind(host);
     if readonly { m.readonly() } else { m }
 }
@@ -249,7 +258,10 @@ fn discover_followed_targets(root: &Path, home: &Path) -> Result<(Vec<PathBuf>, 
             Err(e) => {
                 // A permission-denied (or otherwise unreadable) subdir must
                 // not abort the whole launch — warn and move on.
-                warnings.push(format!("skipping unreadable directory {}: {e}", dir.display()));
+                warnings.push(format!(
+                    "skipping unreadable directory {}: {e}",
+                    dir.display()
+                ));
                 continue;
             }
         };
@@ -257,7 +269,10 @@ fn discover_followed_targets(root: &Path, home: &Path) -> Result<(Vec<PathBuf>, 
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    warnings.push(format!("skipping unreadable entry under {}: {e}", dir.display()));
+                    warnings.push(format!(
+                        "skipping unreadable entry under {}: {e}",
+                        dir.display()
+                    ));
                     continue;
                 }
             };
@@ -581,10 +596,7 @@ mod tests {
         let err = parse_extra_mounts(&["/::ro".into()])
             .expect_err("empty middle segment must be rejected")
             .to_string();
-        assert!(
-            !err.contains("unknown mode keyword \"\""),
-            "got: {err}"
-        );
+        assert!(!err.contains("unknown mode keyword \"\""), "got: {err}");
     }
 
     #[test]
@@ -619,10 +631,16 @@ mod tests {
 
         let em_rw = &parse_extra_mounts(&["/:rw".into()]).unwrap()[0];
         assert!(!em_rw.readonly);
-        assert!(!built_readonly(em_rw.host.to_str().unwrap(), em_rw.readonly));
+        assert!(!built_readonly(
+            em_rw.host.to_str().unwrap(),
+            em_rw.readonly
+        ));
 
         let em_def = &parse_extra_mounts(&["/".into()]).unwrap()[0];
-        assert!(!built_readonly(em_def.host.to_str().unwrap(), em_def.readonly));
+        assert!(!built_readonly(
+            em_def.host.to_str().unwrap(),
+            em_def.readonly
+        ));
     }
 
     // ── follow-links: grammar/parse (issue #11) ────────────────────
@@ -636,7 +654,8 @@ mod tests {
 
     #[test]
     fn parse_follow_links_with_ro_ok() {
-        let parsed = parse_extra_mounts(&["/:ro:follow-links".into()]).expect("ok, ro+follow-links coexist");
+        let parsed =
+            parse_extra_mounts(&["/:ro:follow-links".into()]).expect("ok, ro+follow-links coexist");
         assert!(parsed[0].readonly);
         assert!(parsed[0].follow_links);
     }
@@ -648,7 +667,10 @@ mod tests {
                 .expect_err("rw+follow-links must conflict")
                 .to_string();
             assert!(err.contains("conflicting"), "got: {err}");
-            assert!(err.contains("rw") && err.contains("follow-links"), "got: {err}");
+            assert!(
+                err.contains("rw") && err.contains("follow-links"),
+                "got: {err}"
+            );
         }
     }
 
@@ -712,7 +734,10 @@ mod tests {
         targets.sort();
         let mut expected = vec![a, b];
         expected.sort();
-        assert_eq!(targets, expected, "both the direct and transitive target must be discovered");
+        assert_eq!(
+            targets, expected,
+            "both the direct and transitive target must be discovered"
+        );
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     }
 
@@ -735,7 +760,10 @@ mod tests {
         targets.sort();
         let mut expected = vec![a, b];
         expected.sort();
-        assert_eq!(targets, expected, "each real path discovered exactly once despite the cycle");
+        assert_eq!(
+            targets, expected,
+            "each real path discovered exactly once despite the cycle"
+        );
     }
 
     #[test]
@@ -761,7 +789,8 @@ mod tests {
         fs::write(&file, "hi").unwrap();
         symlink(&file, host.join("f")).unwrap();
 
-        let (targets, warnings) = discover_followed_targets(&host, &home_path).expect("ok, not an error");
+        let (targets, warnings) =
+            discover_followed_targets(&host, &home_path).expect("ok, not an error");
         assert!(targets.is_empty());
         assert!(
             warnings.iter().any(|w| w.contains("not a directory")),
@@ -777,7 +806,8 @@ mod tests {
         fs::create_dir_all(&host).unwrap();
         symlink(home_path.join("nonexistent"), host.join("d")).unwrap();
 
-        let (targets, warnings) = discover_followed_targets(&host, &home_path).expect("ok, not an error");
+        let (targets, warnings) =
+            discover_followed_targets(&host, &home_path).expect("ok, not an error");
         assert!(targets.is_empty());
         assert!(
             warnings.iter().any(|w| w.contains("dangling")),
@@ -802,7 +832,10 @@ mod tests {
         let err = discover_followed_targets(&host, &narrow_home)
             .expect_err("target outside $HOME must be a hard error")
             .to_string();
-        assert!(err.contains(&host.join("foo").display().to_string()), "got: {err}");
+        assert!(
+            err.contains(&host.join("foo").display().to_string()),
+            "got: {err}"
+        );
         assert!(err.contains(&outside.display().to_string()), "got: {err}");
     }
 
@@ -865,7 +898,10 @@ mod tests {
             .expect_err("two different hosts claiming the same guest must be a hard error")
             .to_string();
         assert!(err.contains(&target.display().to_string()), "got: {err}");
-        assert!(err.contains(&explicit_host.display().to_string()), "got: {err}");
+        assert!(
+            err.contains(&explicit_host.display().to_string()),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -919,6 +955,9 @@ mod tests {
             .find(|m| m.host == target)
             .expect("discovered target present in expanded list");
         assert!(discovered.readonly);
-        assert!(built_readonly(discovered.host.to_str().unwrap(), discovered.readonly));
+        assert!(built_readonly(
+            discovered.host.to_str().unwrap(),
+            discovered.readonly
+        ));
     }
 }

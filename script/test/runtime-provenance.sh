@@ -7,14 +7,16 @@ cd "$repo_root"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/agent-vm-runtime-provenance.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
+libkrunfw_version=1efc0dfd24f0f7cb4829735d3e5b97d298823afd
+
 base=(python3 script/check-runtime-provenance.py
     --root-lock Cargo.lock --nested-lock vendor/microsandbox/Cargo.lock
     --root-manifest Cargo.toml --nested-manifest vendor/microsandbox/Cargo.toml
     --constants vendor/microsandbox/crates/utils/lib/lib.rs
     --firmware-dir vendor/microsandbox/vendor/libkrunfw
-    --gitlink c51f0146f9fe836e4fe1bf2c061c70bedfad058c
+    --gitlink "$libkrunfw_version"
     --gitlink-mode 160000
-    --firmware-head c51f0146f9fe836e4fe1bf2c061c70bedfad058c)
+    --firmware-head "$libkrunfw_version")
 
 "${base[@]}" >/dev/null
 expect_failure() {
@@ -61,7 +63,7 @@ cp Cargo.toml "$tmp/patch.toml"
 printf '\n[patch.crates-io]\nmsb_krun = "0.1.32"\n' >>"$tmp/patch.toml"
 expect_failure 'overrides cohort crate' --root-manifest "$tmp/patch.toml"
 expect_failure 'firmware gitlink mode is' --gitlink-mode 100644
-expect_failure 'firmware gitlink is' --gitlink deadbeef
+expect_failure 'expected gitlink deadbeef' --gitlink deadbeef
 expect_failure 'recursive submodule is not initialized' --firmware-head ''
 expect_failure 'source is dirty' --firmware-dirty
 

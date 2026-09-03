@@ -111,7 +111,10 @@ fn reset_msb_db_in(msb_home: &Path, ts: &str) -> Result<ResetOutcome> {
     let target = unique_target(msb_home, ts);
     std::fs::rename(&db, &target)
         .with_context(|| format!("moving {} -> {}", db.display(), target.display()))?;
-    Ok(ResetOutcome::Moved { from: db, to: target })
+    Ok(ResetOutcome::Moved {
+        from: db,
+        to: target,
+    })
 }
 
 /// `msb_home/db.reset-<ts>`, disambiguated with `.2`, `.3`, ... if that

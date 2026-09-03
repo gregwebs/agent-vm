@@ -253,9 +253,8 @@ fn effective_cache_dir_from(
     if share {
         return Ok(shared.to_path_buf());
     }
-    let msb_home = msb_home.ok_or_else(|| {
-        anyhow::anyhow!("MSB_HOME unset; point_at_msb_home() not called yet")
-    })?;
+    let msb_home = msb_home
+        .ok_or_else(|| anyhow::anyhow!("MSB_HOME unset; point_at_msb_home() not called yet"))?;
     Ok(PathBuf::from(msb_home).join("cache"))
 }
 
@@ -612,7 +611,11 @@ fn verify_official_identity_with_path_source(
     // clap's default `--version` output is `"<bin-name> <version>"`
     // (`msb 0.6.15`); the version is always the last whitespace-separated
     // token, regardless of what a shadowing binary happens to call itself.
-    let reported = stdout.trim().rsplit(char::is_whitespace).next().unwrap_or("");
+    let reported = stdout
+        .trim()
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or("");
     if reported != expected {
         // Tailor the hint based on whether MSB_PATH is what pointed us
         // at this binary. If the user explicitly set MSB_PATH, "set
@@ -815,7 +818,9 @@ mod tests {
 
     #[test]
     fn check_socket_path_len_fails_closed_on_overflow_with_actionable_message() {
-        let long = Path::new("/Users/x").join("a".repeat(SUN_PATH_USABLE_LEN)).join("control.sock");
+        let long = Path::new("/Users/x")
+            .join("a".repeat(SUN_PATH_USABLE_LEN))
+            .join("control.sock");
         let err = check_socket_path_len(&long, "my-sandbox").unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("my-sandbox"), "should name the sandbox: {msg}");
@@ -1060,7 +1065,10 @@ mod tests {
     fn effective_cache_dir_from_errors_without_msb_home_when_not_shared() {
         let err = effective_cache_dir_from(false, None, Path::new("/unused")).unwrap_err();
         let msg = format!("{err:?}");
-        assert!(msg.contains("MSB_HOME"), "expected MSB_HOME mentioned: {msg}");
+        assert!(
+            msg.contains("MSB_HOME"),
+            "expected MSB_HOME mentioned: {msg}"
+        );
     }
 
     #[test]

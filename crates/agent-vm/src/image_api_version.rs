@@ -22,9 +22,7 @@
 use anyhow::{Context, Result, bail};
 use microsandbox::Sandbox;
 
-use crate::defaults::{
-    IMAGE_API_VERSION_PATH, MAX_SUPPORTED_IMAGE_API, MIN_SUPPORTED_IMAGE_API,
-};
+use crate::defaults::{IMAGE_API_VERSION_PATH, MAX_SUPPORTED_IMAGE_API, MIN_SUPPORTED_IMAGE_API};
 
 /// Read `IMAGE_API_VERSION_PATH` inside `sandbox`, parse the integer,
 /// and require it to be within the supported range. Returns the
@@ -35,11 +33,7 @@ pub async fn check(sandbox: &Sandbox) -> Result<u32> {
     let out = sandbox
         .shell(&format!("cat {}", IMAGE_API_VERSION_PATH))
         .await
-        .with_context(|| {
-            format!(
-                "reading {IMAGE_API_VERSION_PATH} from the guest sandbox"
-            )
-        })?;
+        .with_context(|| format!("reading {IMAGE_API_VERSION_PATH} from the guest sandbox"))?;
 
     let stdout = out.stdout().context("decoding shell output")?;
     let code = out.status().code;

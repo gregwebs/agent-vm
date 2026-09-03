@@ -674,7 +674,11 @@ fn digest_pin_by_string_surgery(base_ref: &str, manifest_digest: &str) -> String
 /// doubling the wait for that case. That's judged acceptable because a
 /// build is confirmed (never automatic) and the error text a user sees is
 /// the same either way, just repeated.
-pub async fn build_derived_oci(id: &LayerIdentity, pinned_base: &str, out_tar: &Path) -> Result<()> {
+pub async fn build_derived_oci(
+    id: &LayerIdentity,
+    pinned_base: &str,
+    out_tar: &Path,
+) -> Result<()> {
     match run_buildx(id, pinned_base, out_tar, "zstd").await {
         Ok(()) => Ok(()),
         Err(zstd_err) => {
@@ -747,11 +751,18 @@ async fn run_buildx(
         .arg("--provenance=false")
         .arg("--sbom=false")
         .arg("--output")
-        .arg(format!("type=oci,dest={out_tar_str},compression={compression}"))
+        .arg(format!(
+            "type=oci,dest={out_tar_str},compression={compression}"
+        ))
         .arg(dir_str)
         .status()
         .await
-        .with_context(|| format!("spawning `docker buildx build` for tooling layer {}", id.tag))?;
+        .with_context(|| {
+            format!(
+                "spawning `docker buildx build` for tooling layer {}",
+                id.tag
+            )
+        })?;
     if !status.success() {
         bail!(
             "`docker buildx build` failed for tooling layer {} ({compression} output, exit {})",
@@ -873,7 +884,10 @@ mod tests {
 
         let before = hash_context(tmp.path(), "sha256:aaaa").unwrap().0;
         let after = hash_context(tmp.path(), "sha256:bbbb").unwrap().0;
-        assert_ne!(before, after, "changing only the base image ID must change the hash");
+        assert_ne!(
+            before, after,
+            "changing only the base image ID must change the hash"
+        );
     }
 
     #[test]
@@ -909,7 +923,10 @@ mod tests {
         let before = must_hash(tmp.path());
         fs::set_permissions(tmp.path().join("a.txt"), fs::Permissions::from_mode(0o640)).unwrap();
         let after = must_hash(tmp.path());
-        assert_eq!(before, after, "chmod 0640 must not change the hash; only the execute bit is tracked");
+        assert_eq!(
+            before, after,
+            "chmod 0640 must not change the hash; only the execute bit is tracked"
+        );
     }
 
     #[test]
@@ -1021,14 +1038,8 @@ mod tests {
         let dir = layer_dir_fixture();
         let cases: &[(&str, &str)] = &[
             ("/work/My Project!", "my-project"),
-            (
-                "/work/abcdefghijklmnopqrstuvwxyz",
-                "abcdefghijklmnopqrst",
-            ),
-            (
-                "/work/abcdefghijklmnopqrs-tuv",
-                "abcdefghijklmnopqrs-",
-            ),
+            ("/work/abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrst"),
+            ("/work/abcdefghijklmnopqrs-tuv", "abcdefghijklmnopqrs-"),
             ("/", "root"),
         ];
         for (project_dir, want_slug) in cases {
@@ -1135,11 +1146,9 @@ mod tests {
 
     #[test]
     fn digest_pinned_base_pins_tagged_ref() {
-        let pinned = digest_pinned_base(
-            "ghcr.io/wirenboard/agent-vm-template:latest",
-            "sha256:abc",
-        )
-        .unwrap();
+        let pinned =
+            digest_pinned_base("ghcr.io/wirenboard/agent-vm-template:latest", "sha256:abc")
+                .unwrap();
         assert_eq!(pinned, "ghcr.io/wirenboard/agent-vm-template@sha256:abc");
     }
 
@@ -1176,10 +1185,7 @@ mod tests {
         let pinned = digest_pinned_base(&base_ref, "sha256:newnew").unwrap();
         // Defines the behavior: the caller's manifest_digest always wins,
         // completely replacing any digest already embedded in base_ref.
-        assert_eq!(
-            pinned,
-            "ghcr.io/wirenboard/agent-vm-template@sha256:newnew"
-        );
+        assert_eq!(pinned, "ghcr.io/wirenboard/agent-vm-template@sha256:newnew");
     }
 
     // --- digest_pin_by_string_surgery() — the Reference-parse-failure fallback ---
@@ -1285,7 +1291,8 @@ mod tests {
     /// network pull can produce one, so this e2e module degrades to a
     /// no-op on a host with no docker at all rather than a false failure.
     fn e2e_pinned_base() -> Option<(String, String)> {
-        let base = std::env::var("AGENT_VM_E2E_BASE_IMAGE").unwrap_or_else(|_| "alpine:latest".to_string());
+        let base = std::env::var("AGENT_VM_E2E_BASE_IMAGE")
+            .unwrap_or_else(|_| "alpine:latest".to_string());
         let inspect = |base: &str| {
             std::process::Command::new("docker")
                 .args(["image", "inspect", base, "--format", "{{.Id}}"])
@@ -1428,7 +1435,11 @@ mod tests {
         load_derived_image(cache_dir.path(), tar.path(), &before.tag)
             .await
             .expect("load_archive");
-        assert!(derived_is_cached(cache_dir.path(), &before.tag).await.unwrap());
+        assert!(
+            derived_is_cached(cache_dir.path(), &before.tag)
+                .await
+                .unwrap()
+        );
 
         write_layer_file(
             layer_dir.path(),
@@ -1440,14 +1451,23 @@ mod tests {
         );
         let after = resolve(layer_dir.path(), Path::new("/tmp/e2e-project"), base_id).unwrap();
 
-        assert_ne!(before.tag, after.tag, "editing the Dockerfile must change the tag");
+        assert_ne!(
+            before.tag, after.tag,
+            "editing the Dockerfile must change the tag"
+        );
         assert!(
-            !derived_is_cached(cache_dir.path(), &after.tag).await.unwrap(),
+            !derived_is_cached(cache_dir.path(), &after.tag)
+                .await
+                .unwrap(),
             "the edited layer's tag must be a fresh cache miss, triggering a rebuild"
         );
         // The old tag is untouched — still resolves from cache. Confirms
         // the hash-as-staleness-check design (no state file to go stale):
         // both identities coexist in the cache independently.
-        assert!(derived_is_cached(cache_dir.path(), &before.tag).await.unwrap());
+        assert!(
+            derived_is_cached(cache_dir.path(), &before.tag)
+                .await
+                .unwrap()
+        );
     }
 }

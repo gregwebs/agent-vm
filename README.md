@@ -6,7 +6,8 @@ booting in ~2 seconds, with:
 - **Host OAuth tokens never enter the VM.** The TLS-intercept proxy in
   [microsandbox](https://github.com/wirenboard/microsandbox) substitutes
   the real bearer for a placeholder on the way out. OAuth refresh is
-  MITM'd so multi-hour sessions survive token rotation.
+  fail-closed; see [USAGE.md](USAGE.md#credentials) for OpenCode static
+  provider support and rotation behavior.
 - **Per-launch GitHub repo allow-list.** Auto-detected from
   `git remote -v`; extend with `--repo OWNER/NAME`. `gh pr create`,
   `git push` etc. are filtered at the proxy — off-list calls get a 403

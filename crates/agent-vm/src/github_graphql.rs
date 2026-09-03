@@ -230,35 +230,114 @@ const CONNECTION_FIELDS: &[&str] = &[
 /// (visible, recoverable) rather than that it leaks (silent).
 const COMPOSITE_ALLOWED_FIELDS: &[&str] = &[
     // connections
-    "nodes", "edges", "node", "pageInfo",
+    "nodes",
+    "edges",
+    "node",
+    "pageInfo",
     // issues / PRs
-    "pullRequests", "pullRequest", "issues", "issue", "issueOrPullRequest",
-    "comments", "reviews", "latestReviews", "latestOpinionatedReviews",
-    "reviewRequests", "reviewThreads", "commits", "files", "closingIssuesReferences",
-    "reactionGroups", "reactions", "labels", "milestone",
-    "milestones", "projectCards", "assignedTo",
+    "pullRequests",
+    "pullRequest",
+    "issues",
+    "issue",
+    "issueOrPullRequest",
+    "comments",
+    "reviews",
+    "latestReviews",
+    "latestOpinionatedReviews",
+    "reviewRequests",
+    "reviewThreads",
+    "commits",
+    "files",
+    "closingIssuesReferences",
+    "reactionGroups",
+    "reactions",
+    "labels",
+    "milestone",
+    "milestones",
+    "projectCards",
+    "assignedTo",
     // refs / git objects
-    "ref", "refs", "defaultBranchRef", "target", "object", "commit", "history",
-    "tree", "entries", "blob", "associatedPullRequests", "statusCheckRollup",
-    "contexts", "checkSuites", "checkRuns", "status", "signature", "tag",
+    "ref",
+    "refs",
+    "defaultBranchRef",
+    "target",
+    "object",
+    "commit",
+    "history",
+    "tree",
+    "entries",
+    "blob",
+    "associatedPullRequests",
+    "statusCheckRollup",
+    "contexts",
+    "checkSuites",
+    "checkRuns",
+    "status",
+    "signature",
+    "tag",
     // repo metadata
-    "languages", "primaryLanguage", "licenseInfo", "repositoryTopics", "topic",
-    "releases", "release", "releaseAssets", "codeOfConduct", "fundingLinks",
-    "discussions", "discussion", "discussionCategories", "branchProtectionRules",
-    "rulesets", "environments", "deployments", "vulnerabilityAlerts",
-    "submodules", "packages",
+    "languages",
+    "primaryLanguage",
+    "licenseInfo",
+    "repositoryTopics",
+    "topic",
+    "releases",
+    "release",
+    "releaseAssets",
+    "codeOfConduct",
+    "fundingLinks",
+    "discussions",
+    "discussion",
+    "discussionCategories",
+    "branchProtectionRules",
+    "rulesets",
+    "environments",
+    "deployments",
+    "vulnerabilityAlerts",
+    "submodules",
+    "packages",
     // PR/issue shapes gh sends that the first cut missed
-    "autoMergeRequest", "baseRef", "branchProtectionRule", "mergeCommit",
-    "potentialMergeCommit", "checkSuite", "workflowRun", "workflow",
-    "checkRunCountsByState", "statusContextCountsByState",
-    "project", "column", "projectItems", "projects", "projectsV2",
-    "fieldValueByName", "latestRelease", "issueType", "subIssues",
-    "subIssuesSummary", "blockedBy", "blocking", "closedByPullRequestsReferences",
-    "issueTemplates", "pullRequestTemplates", "contactLinks", "label",
+    "autoMergeRequest",
+    "baseRef",
+    "branchProtectionRule",
+    "mergeCommit",
+    "potentialMergeCommit",
+    "checkSuite",
+    "workflowRun",
+    "workflow",
+    "checkRunCountsByState",
+    "statusContextCountsByState",
+    "project",
+    "column",
+    "projectItems",
+    "projects",
+    "projectsV2",
+    "fieldValueByName",
+    "latestRelease",
+    "issueType",
+    "subIssues",
+    "subIssuesSummary",
+    "blockedBy",
+    "blocking",
+    "closedByPullRequestsReferences",
+    "issueTemplates",
+    "pullRequestTemplates",
+    "contactLinks",
+    "label",
     // introspection, so the documented `__schema` allowance actually works
-    "types", "fields", "inputFields", "interfaces", "enumValues",
-    "possibleTypes", "ofType", "args", "type", "directives",
-    "queryType", "mutationType", "subscriptionType",
+    "types",
+    "fields",
+    "inputFields",
+    "interfaces",
+    "enumValues",
+    "possibleTypes",
+    "ofType",
+    "args",
+    "type",
+    "directives",
+    "queryType",
+    "mutationType",
+    "subscriptionType",
 ];
 
 /// Scalars that are credentials or capability handles rather than
@@ -596,7 +675,12 @@ fn validate_restricted_subtree(
 
 /// Selection set under an actor-typed field: identity scalars only,
 /// plus connection plumbing so `assignees { nodes { login } }` works.
-fn validate_actor_subtree(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet<String>) -> bool {
+fn validate_actor_subtree(
+    sel: &[Sel],
+    ctx: &Ctx,
+    depth: usize,
+    visiting: &mut HashSet<String>,
+) -> bool {
     if !ctx.spend() || depth > MAX_FRAGMENT_DEPTH || sel.is_empty() {
         return false;
     }
@@ -686,9 +770,7 @@ fn validate_generic(sel: &[Sel], ctx: &Ctx, depth: usize, visiting: &mut HashSet
                     // Scalar leaf: cannot carry an object.
                     continue;
                 }
-                if !COMPOSITE_ALLOWED_FIELDS.contains(&f.name.as_str())
-                    && f.name != "search"
-                {
+                if !COMPOSITE_ALLOWED_FIELDS.contains(&f.name.as_str()) && f.name != "search" {
                     return ctx.deny(format!(
                         "`{}` is not in the set of fields readable inside an allow-listed repository",
                         f.name
@@ -897,8 +979,7 @@ fn lex(src: &str) -> Option<Vec<Tok>> {
             b'-' | b'0'..=b'9' => {
                 let mut j = i + 1;
                 while j < b.len()
-                    && (b[j].is_ascii_digit()
-                        || matches!(b[j], b'.' | b'e' | b'E' | b'+' | b'-'))
+                    && (b[j].is_ascii_digit() || matches!(b[j], b'.' | b'e' | b'E' | b'+' | b'-'))
                 {
                     j += 1;
                 }
@@ -1090,8 +1171,7 @@ impl Parser {
                     // Type: Name with arbitrary [ ] ! nesting.
                     loop {
                         match self.peek()? {
-                            Tok::Name(_) | Tok::Punct('[') | Tok::Punct(']')
-                            | Tok::Punct('!') => {
+                            Tok::Name(_) | Tok::Punct('[') | Tok::Punct(']') | Tok::Punct('!') => {
                                 self.pos += 1;
                             }
                             _ => break,
@@ -1222,27 +1302,23 @@ impl Parser {
             Tok::Var(v) => Some(Val::Var(v.clone())),
             Tok::Num => Some(Val::Other),
             Tok::Name(_) => Some(Val::Other), // enum / true / false / null
-            Tok::Punct('[') => {
-                loop {
-                    if self.peek()? == &Tok::Punct(']') {
-                        self.pos += 1;
-                        return Some(Val::Other);
-                    }
-                    self.value()?;
+            Tok::Punct('[') => loop {
+                if self.peek()? == &Tok::Punct(']') {
+                    self.pos += 1;
+                    return Some(Val::Other);
                 }
-            }
-            Tok::Punct('{') => {
-                loop {
-                    match self.next()? {
-                        Tok::Punct('}') => return Some(Val::Other),
-                        Tok::Name(_) => {
-                            self.expect_punct(':')?;
-                            self.value()?;
-                        }
-                        _ => return None,
+                self.value()?;
+            },
+            Tok::Punct('{') => loop {
+                match self.next()? {
+                    Tok::Punct('}') => return Some(Val::Other),
+                    Tok::Name(_) => {
+                        self.expect_punct(':')?;
+                        self.value()?;
                     }
+                    _ => return None,
                 }
-            }
+            },
             _ => None,
         }
     }
@@ -1343,7 +1419,10 @@ mod tests {
             }
         }"#;
         assert_eq!(
-            access(q, serde_json::json!({"owner": "evgeny-boger", "per_page": 30})),
+            access(
+                q,
+                serde_json::json!({"owner": "evgeny-boger", "per_page": 30})
+            ),
             DENIED
         );
     }
@@ -1377,7 +1456,10 @@ mod tests {
             }
         }"#;
         assert_eq!(
-            access(q, serde_json::json!({"owner": "wirenboard", "repo": "wb-agent-tools", "limit": 30})),
+            access(
+                q,
+                serde_json::json!({"owner": "wirenboard", "repo": "wb-agent-tools", "limit": 30})
+            ),
             AUTH
         );
     }
@@ -1388,7 +1470,10 @@ mod tests {
             repository(owner: $owner, name: $repo) { pullRequests(first: 5) { nodes { title } } }
         }"#;
         assert_eq!(
-            access(q, serde_json::json!({"owner": "wirenboard", "repo": "some-private"})),
+            access(
+                q,
+                serde_json::json!({"owner": "wirenboard", "repo": "some-private"})
+            ),
             DENIED
         );
     }
@@ -1417,14 +1502,14 @@ mod tests {
         // `gh pr status`, …). Equivalent to REST /user, which the
         // path policy forwards authenticated.
         assert_eq!(
-            access("query UserCurrent { viewer { login } }", serde_json::json!({})),
+            access(
+                "query UserCurrent { viewer { login } }",
+                serde_json::json!({})
+            ),
             AUTH
         );
         // Query shorthand form.
-        assert_eq!(
-            access("{ viewer { login } }", serde_json::json!({})),
-            AUTH
-        );
+        assert_eq!(access("{ viewer { login } }", serde_json::json!({})), AUTH);
     }
 
     #[test]
@@ -1441,7 +1526,10 @@ mod tests {
         assert_eq!(access(q, serde_json::json!({})), AUTH);
         // Request variables override defaults — and must be checked.
         assert_eq!(
-            access(q, serde_json::json!({"owner": "wirenboard", "name": "secret-repo"})),
+            access(
+                q,
+                serde_json::json!({"owner": "wirenboard", "name": "secret-repo"})
+            ),
             DENIED
         );
     }
@@ -1462,7 +1550,8 @@ mod tests {
         "#;
         assert_eq!(access(leak, serde_json::json!({})), DENIED);
         // Spread of an undefined fragment: refuse.
-        let undef = r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") { ...nope } }"#;
+        let undef =
+            r#"query { repository(owner: "wirenboard", name: "wb-agent-tools") { ...nope } }"#;
         assert_eq!(access(undef, serde_json::json!({})), DENIED);
     }
 
@@ -1485,7 +1574,10 @@ mod tests {
             nodes { ... on PullRequest { number title repository { nameWithOwner } } }
         } }"#;
         assert_eq!(
-            access(q, serde_json::json!({"q": "repo:wirenboard/wb-agent-tools is:pr is:open"})),
+            access(
+                q,
+                serde_json::json!({"q": "repo:wirenboard/wb-agent-tools is:pr is:open"})
+            ),
             AUTH
         );
         assert_eq!(
@@ -1731,7 +1823,8 @@ mod tests {
 
     #[test]
     fn unicode_escape_requires_four_hex_digits() {
-        let q = r#"query { repository(owner: "wirenboard", name: "\u+041b-agent-tools") { name } }"#;
+        let q =
+            r#"query { repository(owner: "wirenboard", name: "\u+041b-agent-tools") { name } }"#;
         assert_eq!(access(q, serde_json::json!({})), DENIED);
     }
 
@@ -1760,7 +1853,10 @@ mod tests {
         // An unbalanced quote is still refused: we can't tell what
         // GitHub would see.
         assert_eq!(
-            access(q, serde_json::json!({"q": "repo:wirenboard/wb-agent-tools \"oops"})),
+            access(
+                q,
+                serde_json::json!({"q": "repo:wirenboard/wb-agent-tools \"oops"})
+            ),
             DENIED
         );
     }
@@ -1806,7 +1902,13 @@ mod tests {
         // `tempCloneToken` is documented as a clone credential, and
         // node IDs are what mutation roots take. A leaf being "just a
         // scalar" does not make it display data.
-        for field in ["tempCloneToken", "id", "databaseId", "tarballUrl", "zipballUrl"] {
+        for field in [
+            "tempCloneToken",
+            "id",
+            "databaseId",
+            "tarballUrl",
+            "zipballUrl",
+        ] {
             let q = format!(
                 r#"query {{ repository(owner: "wirenboard", name: "wb-agent-tools") {{
                     parent {{ nameWithOwner {field} }} }} }}"#
@@ -1875,8 +1977,14 @@ mod tests {
                 someFutureConnection(first: 1) { nodes { x } } } }"#,
             serde_json::json!({}),
         );
-        assert!(msg.contains("someFutureConnection"), "unhelpful denial: {msg}");
-        assert!(msg.contains("wirenboard/wb-agent-tools"), "denial omits scope: {msg}");
+        assert!(
+            msg.contains("someFutureConnection"),
+            "unhelpful denial: {msg}"
+        );
+        assert!(
+            msg.contains("wirenboard/wb-agent-tools"),
+            "denial omits scope: {msg}"
+        );
 
         let msg = why(
             r#"query { repository(owner: "other", name: "repo") { name } }"#,

@@ -67,7 +67,9 @@ use sea_orm::{ConnectionTrait as _, DatabaseBackend, Statement};
 
 // Resolve MSB_HOME/db/msb.db from the same source of truth boot uses.
 fn private_db_path() -> Result<PathBuf> {
-    Ok(crate::msb_install::msb_home_dir()?.join("db").join("msb.db"))
+    Ok(crate::msb_install::msb_home_dir()?
+        .join("db")
+        .join("msb.db"))
 }
 
 /// Read applied migration names from `seaql_migrations`. `Some(names)`

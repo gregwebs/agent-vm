@@ -45,6 +45,12 @@ On macOS, `./script/build/import-image.sh` loads an existing local
 registry. See [the macOS guide](macos-build.md) for the exact workflow.
 `images/build.sh` remains the separate registry-backed build-and-push option.
 
+The pinned Rust toolchain (`rust-toolchain.toml`) is copied by hand into a
+few other files (Cargo's MSRV, CI, the release workflow, the macOS build
+script, and its docs). After bumping the pin, run
+`./script/check-rust-toolchain.sh` — it's a sub-second local check that
+fails closed with an actionable diagnostic for every copy left stale.
+
 ## Release / version bump
 
 After merging a feature branch, bump the workspace version.
