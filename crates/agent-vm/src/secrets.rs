@@ -990,7 +990,14 @@ pub fn verify_snapshot(before: &HostCredsSnapshot) {
         }
     }
     if !changed.is_empty() {
-        eprintln!(
+        // A `Drop` impl (`SnapshotGuard` in run.rs) has nowhere to propagate
+        // to and must never panic — which `eprintln` does on a stderr write
+        // error, converting a clean launch failure back into an abrupt
+        // exit-101 panic instead (issue #70). This safety-net notice is
+        // best-effort by construction.
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
             "==> host credential file(s) changed during sandbox: {} (expected only on Phase 4 OAuth refresh; investigate if you didn't trigger one)",
             changed.join(", "),
         );

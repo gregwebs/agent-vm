@@ -697,9 +697,27 @@ fn substitute_authorization_header(value: &str, real_token: &str) -> String {
 }
 
 fn write_response(bytes: &[u8]) -> Result<()> {
-    let mut out = std::io::stdout().lock();
+    // Locked here rather than inside the seam so the seam stays
+    // sink-generic and testable.
+    write_response_to(&mut std::io::stdout().lock(), bytes)
+}
+
+/// Deliver the one hook-protocol response.
+///
+/// The flush `Result` is propagated, not discarded: std's `Stdout` is a
+/// `LineWriter`, so `write_all` pushes everything through the last newline
+/// to the fd and buffers the tail — in practice the HTTP body. A dropped
+/// flush therefore loses the body while the hook still exits 0, and the
+/// proxy acts on a truncated verdict (a synthesized 403 reaches the guest
+/// short of its Content-Length; a modified-passthrough payload reaches
+/// upstream truncated) with no diagnostic anywhere. A non-zero exit, by
+/// contrast, fails the connection closed (`run_hook` in the vendored
+/// `intercept/handler.rs`, and its
+/// `hook_exiting_nonzero_fails_closed_without_forwarding` test), which is
+/// the right outcome when the verdict cannot be delivered. Issue #70.
+fn write_response_to(out: &mut impl Write, bytes: &[u8]) -> Result<()> {
     out.write_all(bytes).context("writing response to stdout")?;
-    out.flush().ok();
+    out.flush().context("flushing the response to stdout")?;
     Ok(())
 }
 
@@ -1542,5 +1560,107 @@ mod tests {
             upstream_str.contains(&expected_b64),
             "for allow-listed repo, real token should reach upstream; got:\n{upstream_str}"
         );
+    }
+
+    // Tests for `write_response_to`'s propagated flush (issue #70). A local
+    // recording sink rather than a shared test-support module (D8): this
+    // is intercept_hook's only io test double, and `run.rs`'s `ScriptedOutput`
+    // is a different, non-`Send`-relevant, prompt-flavored double in a
+    // different file.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Step {
+        Wrote(Vec<u8>),
+        Flushed,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Fault {
+        None,
+        Write,
+        Flush,
+    }
+
+    struct RecordingStdout {
+        log: Vec<Step>,
+        fault: Fault,
+    }
+
+    impl RecordingStdout {
+        fn new(fault: Fault) -> Self {
+            Self {
+                log: Vec::new(),
+                fault,
+            }
+        }
+    }
+
+    impl Write for RecordingStdout {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if matches!(self.fault, Fault::Write) {
+                return Err(std::io::Error::other("broken stdout"));
+            }
+            self.log.push(Step::Wrote(bytes.to_vec()));
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if matches!(self.fault, Fault::Flush) {
+                return Err(std::io::Error::other("broken flush"));
+            }
+            self.log.push(Step::Flushed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hook_response_is_written_then_flushed() {
+        let mut out = RecordingStdout::new(Fault::None);
+        write_response_to(&mut out, b"HTTP/1.1 200 OK\r\n\r\nbody").expect("scripted success");
+        assert_eq!(
+            out.log,
+            vec![
+                Step::Wrote(b"HTTP/1.1 200 OK\r\n\r\nbody".to_vec()),
+                Step::Flushed,
+            ],
+            "the flush is not optional"
+        );
+    }
+
+    #[test]
+    fn hook_response_write_failure_is_propagated() {
+        let mut out = RecordingStdout::new(Fault::Write);
+        let error = write_response_to(&mut out, b"HTTP/1.1 200 OK\r\n\r\n")
+            .expect_err("write failure must propagate");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("writing response to stdout"),
+            "chain: {chain}"
+        );
+        assert!(!out.log.contains(&Step::Flushed));
+    }
+
+    /// The truncation this prevents (see `write_response_to`'s doc comment):
+    /// std's `Stdout` is a `LineWriter`, so `write_all` already pushed
+    /// everything through the
+    /// last newline to the fd — for a hook response that's in practice the
+    /// HTTP body sitting in the buffered tail. If the flush's `Result` were
+    /// discarded (as it was before this fix), the body would be silently
+    /// lost while the hook still exited 0. Propagating it here instead
+    /// turns that into a non-zero exit, which the vendored proxy
+    /// (`intercept/handler.rs`'s `run_hook`, covered by its own
+    /// `hook_exiting_nonzero_fails_closed_without_forwarding` test) already
+    /// fails closed on — the correct outcome when the verdict can't be
+    /// delivered.
+    #[test]
+    fn hook_response_flush_failure_is_propagated_so_the_proxy_fails_closed() {
+        let mut out = RecordingStdout::new(Fault::Flush);
+        let error = write_response_to(&mut out, b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            .expect_err("flush failure must propagate");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("flushing the response to stdout"),
+            "chain: {chain}"
+        );
+        assert!(chain.contains("broken flush"), "chain: {chain}");
     }
 }
