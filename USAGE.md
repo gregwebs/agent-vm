@@ -80,8 +80,13 @@ Each launcher accepts:
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
 `agent-vm shell -- -c 'cargo test'`.
 
-Env-var knobs (all opt-in; most accept any value, empty included —
-`AGENT_VM_UPDATE_CHECK` is the exception, see its row):
+Env-var knobs (all opt-in), in three shapes. A row that lists an
+accepted-value set is a boolean switch: its value is parsed — trimmed and
+ASCII-case-insensitive — and only a listed value turns the knob on, so a
+typo leaves it off. A row that stands in for a flag taking an argument
+(`RUST_LOG`, `AGENT_VM_IMAGE_TAG`, `AGENT_VM_MEMORY_GIB`/`AGENT_VM_CPUS`,
+`AGENT_VM_LAYER`) uses its value as-is. Everything else is presence-only:
+any value, empty included, enables it.
 
 | var | what |
 |---|---|
@@ -138,11 +143,15 @@ separately installed `msb` (Homebrew on macOS; a distro package,
 agent-vm's KVM-enabled `libkrunfw`. That also means agent-vm and any other
 `msb` install each store and pull their own copy of every image.
 
-Set `AGENT_VM_SHARE_MSB_CACHE=1` (accepted values: `1` or `true`) to opt into
+Set `AGENT_VM_SHARE_MSB_CACHE` (accepted: `1`/`true`/`yes`/`on`) to opt into
 redirecting only agent-vm's image cache at the shared `~/.microsandbox/cache`
 directory that other `msb` uses, so image layers/vmdk/manifests aren't stored
 or pulled twice. Use `AGENT_VM_MSB_CACHE_DIR=<path>` to point at a
-non-default cache location instead.
+non-default cache location instead. This opt-in is one-way: the first run
+with it set writes `MSB_HOME/config.json`, and unsetting the variable later
+does not revert that write (see *Reverting is a manual step* below). Every
+spelling in the accepted set counts, so a `AGENT_VM_SHARE_MSB_CACHE=yes`
+left over in a shell profile opts you in on the next run.
 
 What stays private: `db/`, `tls/`, `secrets/`, and `sandboxes/` remain under
 `MSB_HOME`; only the cache is shared. `libkrunfw` is

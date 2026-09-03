@@ -103,12 +103,9 @@ fn normalize_layer_flag(flag: Option<PathBuf>) -> Option<PathBuf> {
 /// Mirrors [`should_check_update`]'s flag-or-truthy-env pattern: the
 /// `--yes` flag OR a truthy `AGENT_VM_YES` skips the interactive
 /// tooling-layer-build confirmation, for CI/non-interactive callers. Truthy
-/// values match the repo convention (`1|true|yes|on`, see `pull::env_truthy`).
+/// values match the shared `env_flag` convention (`1|true|yes|on`).
 fn should_auto_confirm(flag: bool, env_val: Option<&str>) -> bool {
-    flag || matches!(
-        env_val,
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-    )
+    flag || env_val.is_some_and(crate::env_flag::is_truthy)
 }
 
 /// Interactive y/N confirmation before building a tooling layer (F3 in the
@@ -403,7 +400,7 @@ Environment:
   AGENT_VM_IMAGE_TAG                    same as --image
   AGENT_VM_ROOT                         same as --root (1|true|yes|on)
   AGENT_VM_UPDATE_CHECK                 check the registry for a newer image (1|true|yes|on)
-  AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls
+  AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls (1|true|yes|on)
   AGENT_VM_STATE_DIR                    override the per-project state dir
   AGENT_VM_PROFILE                      print per-phase boot timings
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
@@ -2027,7 +2024,7 @@ mod tests {
         assert!(!should_auto_confirm(false, Some("0")));
         // Flag opt-in.
         assert!(should_auto_confirm(true, None));
-        // Env opt-in, same truthy set as should_check_update.
+        // Env opt-in, same shared truthy set (`env_flag`) as should_check_update.
         assert!(should_auto_confirm(false, Some("1")));
         assert!(should_auto_confirm(false, Some("true")));
         assert!(should_auto_confirm(false, Some("yes")));
@@ -2290,19 +2287,41 @@ mod tests {
     }
 
     #[test]
-    fn should_check_update_matches_repo_truthy_convention_exactly() {
-        // Uppercase variants in the repo's allowlist (mirrors
-        // pull::env_truthy) are truthy.
-        assert!(should_check_update(false, Some("TRUE")));
-        assert!(should_check_update(false, Some("YES")));
-        assert!(should_check_update(false, Some("ON")));
-        // The allowlist is NOT fully case-insensitive: mixed-case variants
-        // outside the exact literal set are left off by design (consistent
-        // with pull::env_truthy), so e.g. "True" does NOT enable the probe.
-        assert!(!should_check_update(false, Some("True")));
-        assert!(!should_check_update(false, Some("Yes")));
-        assert!(!should_check_update(false, Some("On")));
-        assert!(!should_check_update(false, Some("TrUe")));
+    fn should_check_update_accepts_the_shared_truthy_set() {
+        // Delegates to `env_flag::is_truthy`, which is trimmed and fully
+        // ASCII-case-insensitive — the exact-case exclusion this test used
+        // to assert was an artefact of the pre-#65 copy-paste, not a
+        // decision, so every case variant now enables the probe.
+        for truthy in ["TRUE", "YES", "ON", "True", "Yes", "On", "TrUe", " 1 "] {
+            assert!(
+                should_check_update(false, Some(truthy)),
+                "{truthy:?} should enable the update probe"
+            );
+        }
+        assert!(!should_check_update(false, Some("garbage")));
+    }
+
+    /// Doc/help lockstep: the `Environment:` block's value-parsing rows
+    /// must render the same set `env_flag::TRUTHY` actually accepts, or a
+    /// future change to one and not the other would silently document a
+    /// truthy set the binary doesn't implement (or vice versa).
+    #[test]
+    fn environment_help_block_lists_the_shared_truthy_set() {
+        let rendered = format!("({})", crate::env_flag::TRUTHY.join("|"));
+        for var in [
+            "AGENT_VM_ROOT",
+            "AGENT_VM_UPDATE_CHECK",
+            "AGENT_VM_INSECURE_REGISTRY",
+        ] {
+            let line = LAUNCH_AFTER_LONG_HELP
+                .lines()
+                .find(|line| line.contains(var))
+                .unwrap_or_else(|| panic!("{var} missing from LAUNCH_AFTER_LONG_HELP"));
+            assert!(
+                line.contains(&rendered),
+                "{var}'s help line {line:?} does not list env_flag::TRUTHY ({rendered})"
+            );
+        }
     }
 
     #[test]
@@ -2851,13 +2870,9 @@ async fn notify_if_update_available(image: &str) {
 /// Off by default. Enabled by the `--update-check` flag OR a truthy
 /// `AGENT_VM_UPDATE_CHECK` env var. `env_val` is the raw value of that
 /// variable (`None` when unset), so this stays pure and unit-testable.
-/// Truthy values match the repo convention (`1|true|yes|on`,
-/// see `pull::env_truthy`).
+/// Truthy values match the shared `env_flag` convention (`1|true|yes|on`).
 fn should_check_update(flag: bool, env_val: Option<&str>) -> bool {
-    flag || matches!(
-        env_val,
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-    )
+    flag || env_val.is_some_and(crate::env_flag::is_truthy)
 }
 
 /// Wall-clock budget for the launch-path update probe. Bounds the worst

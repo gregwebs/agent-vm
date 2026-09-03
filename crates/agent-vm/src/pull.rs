@@ -110,7 +110,7 @@ pub async fn pull_image(image: &str) -> Result<()> {
 /// registries; bracketed form would need a real parser). Use
 /// `localhost` or `127.0.0.1` instead.
 pub(crate) fn is_plain_http_registry(image_ref: &str) -> bool {
-    if env_truthy("AGENT_VM_INSECURE_REGISTRY") {
+    if crate::env_flag::enabled("AGENT_VM_INSECURE_REGISTRY") {
         return true;
     }
     // First path segment is the registry host (with optional :port).
@@ -123,13 +123,6 @@ pub(crate) fn is_plain_http_registry(image_ref: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0")
         || host.ends_with(".local")
         || host.ends_with(".localhost")
-}
-
-fn env_truthy(name: &str) -> bool {
-    matches!(
-        std::env::var(name).as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-    )
 }
 
 #[cfg(test)]
@@ -158,12 +151,13 @@ mod tests {
         assert!(!is_plain_http_registry("nginx:latest"));
     }
 
-    // Single test exercising the env-var escape hatch — the heuristic
-    // says "secure" for `registry.corp.example` but the env override
-    // wins. Uses a serial-style guard (set + clear) so a parallel test
-    // doesn't observe the var. (cargo test runs tests in parallel by
-    // default — keep the var name unique to this test so it can't
-    // collide with another module setting the same var.)
+    // Single test exercising the env-var escape hatch in both directions —
+    // the heuristic says "secure" for `registry.corp.example` but a truthy
+    // env override wins, while a falsy/unrecognised value must not (the
+    // fail-closed direction, issue #65). Both directions live in one test
+    // (rather than two) because `test_env::guard()` serializes across the
+    // whole crate on a single mutex — splitting them would just make two
+    // tests take turns for no benefit.
     #[test]
     fn env_override_forces_plain_http() {
         let mut env = crate::test_env::guard();
@@ -175,5 +169,18 @@ mod tests {
         env.remove_var("AGENT_VM_INSECURE_REGISTRY");
         // After cleanup the heuristic resumes its normal behaviour.
         assert!(!is_plain_http_registry("registry.corp.example:5000/x"));
+
+        // Fail-closed direction: an explicit falsy value (or a typo that
+        // isn't in `env_flag::TRUTHY`) must not be coerced into "insecure"
+        // — the widened accepted set only adds new spellings of an opt-in,
+        // never a new way to opt in by accident.
+        for falsy in ["0", ""] {
+            env.set_var("AGENT_VM_INSECURE_REGISTRY", falsy);
+            assert!(
+                !is_plain_http_registry("registry.corp.example:5000/x"),
+                "{falsy:?} must not force plain HTTP"
+            );
+        }
+        env.remove_var("AGENT_VM_INSECURE_REGISTRY");
     }
 }

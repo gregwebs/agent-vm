@@ -186,6 +186,23 @@ fn opt_in_writes_expected_config_and_shares_default_location() {
     );
 }
 
+/// End-to-end proof (issue #65) that the widened `env_flag` truthy set
+/// reaches the real binary through `point_at_msb_home`: `On` was a no-op
+/// before this change (`msb_install`'s old `parse_flag` only accepted
+/// `1`/`true`) and now opts the user in, same as `"1"` above.
+#[test]
+fn opt_in_accepts_the_shared_truthy_set() {
+    let h = Harness::new();
+    h.run_setup(&[("AGENT_VM_SHARE_MSB_CACHE", "On")]);
+
+    let doc = h.read_config_json();
+    let expected_cache = h.home.path().join(".microsandbox").join("cache");
+    assert_eq!(
+        doc["paths"]["cache"],
+        serde_json::Value::String(expected_cache.to_str().unwrap().to_string())
+    );
+}
+
 #[test]
 fn override_env_var_wins_and_default_location_untouched() {
     let h = Harness::new();
