@@ -10,9 +10,9 @@ version = "0.1.28"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wirenboard/agent-vm"
-# Kept in lockstep with rust-toolchain.toml's channel by hand (no automated
-# check ties the two together; both are literals a human/agent must update
-# together when bumping the pin).
+# Kept in exact lockstep with rust-toolchain.toml's channel, which is the
+# canonical pin and owner (see that file's header). script/check-rust-toolchain.sh
+# enforces the two stay equal, in CI and locally.
 rust-version = "1.94"
 
 [profile.release]
