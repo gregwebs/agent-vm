@@ -782,12 +782,14 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // GitHub repo should NOT get Copilot egress opened or a duplicate
     // gh token written to a copilot secret file it never uses.
     let want_copilot = matches!(agent, Agent::Copilot);
+    let want_opencode = matches!(agent, Agent::Opencode | Agent::Shell);
 
     let creds = crate::secrets::refresh(
         &session.state_dir,
         &project_guest_path,
         use_github,
         want_copilot,
+        want_opencode,
     )
     .context("snapshotting host credentials")?;
 

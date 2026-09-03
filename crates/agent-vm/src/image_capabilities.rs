@@ -63,19 +63,37 @@ mod tests {
 
     #[test]
     fn legacy_api_is_available_without_marker() {
-        assert_eq!(chrome_mcp_policy(1, false, false), ChromeMcpDecision::Legacy);
+        assert_eq!(
+            chrome_mcp_policy(1, false, false),
+            ChromeMcpDecision::Legacy
+        );
     }
 
     #[test]
     fn advertised_apis_require_marker() {
-        assert_eq!(chrome_mcp_policy(2, false, false), ChromeMcpDecision::Unavailable);
-        assert_eq!(chrome_mcp_policy(3, false, false), ChromeMcpDecision::Unavailable);
-        assert_eq!(chrome_mcp_policy(2, true, false), ChromeMcpDecision::Advertised);
+        assert_eq!(
+            chrome_mcp_policy(2, false, false),
+            ChromeMcpDecision::Unavailable
+        );
+        assert_eq!(
+            chrome_mcp_policy(3, false, false),
+            ChromeMcpDecision::Unavailable
+        );
+        assert_eq!(
+            chrome_mcp_policy(2, true, false),
+            ChromeMcpDecision::Advertised
+        );
     }
 
     #[test]
     fn opt_out_wins() {
-        assert_eq!(chrome_mcp_policy(1, true, true), ChromeMcpDecision::OptedOut);
-        assert_eq!(chrome_mcp_policy(3, true, true), ChromeMcpDecision::OptedOut);
+        assert_eq!(
+            chrome_mcp_policy(1, true, true),
+            ChromeMcpDecision::OptedOut
+        );
+        assert_eq!(
+            chrome_mcp_policy(3, true, true),
+            ChromeMcpDecision::OptedOut
+        );
     }
 }

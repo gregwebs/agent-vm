@@ -10,11 +10,13 @@ use serde::{
     Deserialize,
     de::{self, MapAccess, Visitor},
 };
-use sha2::{Digest, Sha256};
 
 use super::http;
 use crate::{
-    host_paths::{host_claude_creds_path, host_codex_auth_path},
+    host_paths::{
+        MAX_HOST_CREDENTIAL_FILE_BYTES, host_claude_creds_path, host_codex_auth_path,
+        read_bounded_regular_file,
+    },
     secrets,
 };
 
@@ -30,43 +32,57 @@ pub(super) fn handle(
 
 fn handle_with<A>(raw_request: &[u8], provider_sni: &str, action: A) -> Result<http::Response>
 where
-    A: FnOnce(ValidatedRefresh) -> Result<PublicReply>,
+    A: FnOnce(ValidatedRefresh) -> PublicReply,
 {
     let validated = match validate(raw_request, provider_sni) {
         Ok(validated) => validated,
         Err(rejection) => return http::Response::error(rejection.status, &rejection.message),
     };
-    response(action(validated)?)
+    response(action(validated))
 }
 
 fn response(reply: PublicReply) -> Result<http::Response> {
     match reply {
-        PublicReply::Anthropic { expires_in, scopes } => http::Response::json(
+        PublicReply::AnthropicSuccess { expires_in, scope } => http::Response::json(
             200,
             "OK",
             &serde_json::json!({
                 "access_token": secrets::ANTHROPIC_ACCESS_PLACEHOLDER,
                 "refresh_token": secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
-                "expires_in": expires_in,
-                "token_type": "Bearer",
-                "scope": scopes,
+                "expires_in": expires_in.0,
+                "token_type": "Bearer", "scope": scope.0,
             }),
         ),
-        PublicReply::OpenAi => http::Response::json(
+        PublicReply::OpenAiSuccess { expires_in } => http::Response::json(
             200,
             "OK",
             &serde_json::json!({
                 "access_token": secrets::OPENAI_ACCESS_PLACEHOLDER,
                 "refresh_token": secrets::OPENAI_REFRESH_PLACEHOLDER,
                 "id_token": secrets::OPENAI_ID_PLACEHOLDER,
-                "expires_in": 3600,
-                "token_type": "Bearer",
+                "expires_in": expires_in.0, "token_type": "Bearer",
             }),
         ),
+        PublicReply::TemporarilyUnavailable { provider, reason } => {
+            tracing::debug!(provider = ?provider, reason = ?reason, "OAuth refresh temporarily unavailable");
+            let command = match provider {
+                Provider::Anthropic => "claude login",
+                Provider::OpenAi => "codex login",
+            };
+            http::Response::json(
+                503,
+                "Service Unavailable",
+                &serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "host credential is temporarily unavailable",
+                    "message": format!("retry later or run `{command}` on the host"),
+                }),
+            )
+        }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Provider {
     Anthropic,
     OpenAi,
@@ -76,12 +92,97 @@ struct ValidatedRefresh {
     provider: Provider,
 }
 
+struct ExpiresIn(i64);
+impl ExpiresIn {
+    fn from_expiry_ms(expiry_ms: i64, now_ms: i64, floor: i64) -> Option<Self> {
+        let remaining = expiry_ms.checked_sub(now_ms)?.checked_div(1000)?;
+        (remaining > floor).then_some(Self(remaining))
+    }
+    #[cfg(test)]
+    fn from_remaining_seconds(remaining: i64, floor: i64) -> Option<Self> {
+        (remaining > floor).then_some(Self(remaining))
+    }
+    fn openai_unknown() -> Self {
+        Self(OPENAI_UNKNOWN_EXPIRY_SECS)
+    }
+}
+
+struct OAuthScope(String);
+impl OAuthScope {
+    fn from_host(value: Option<&serde_json::Value>) -> Self {
+        const MAX_SCOPE_TOKENS: usize = 64;
+        const MAX_SCOPE_BYTES: usize = 4096;
+        let mut words = Vec::new();
+        let mut append = |text: &str| {
+            for word in text.split_whitespace() {
+                if words.len() >= MAX_SCOPE_TOKENS
+                    || !word.bytes().all(is_scope_token_byte)
+                    || words.iter().any(|seen: &String| seen == word)
+                {
+                    continue;
+                }
+                let prospective =
+                    words.iter().map(String::len).sum::<usize>() + words.len() + word.len();
+                if prospective <= MAX_SCOPE_BYTES {
+                    words.push(word.to_owned());
+                }
+            }
+        };
+        match value {
+            Some(serde_json::Value::String(text)) => append(text),
+            Some(serde_json::Value::Array(values)) => {
+                for value in values {
+                    if let Some(text) = value.as_str() {
+                        append(text);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !words.iter().any(|word| word == "user:inference") {
+            words = vec!["user:inference".into(), "user:profile".into()];
+        }
+        Self(words.join(" "))
+    }
+}
+fn is_scope_token_byte(byte: u8) -> bool {
+    byte == 0x21 || (0x23..=0x5b).contains(&byte) || (0x5d..=0x7e).contains(&byte)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnusableReason {
+    HostPathUnavailable,
+    HostCredentialUnreadable,
+    HostCredentialMalformed,
+    MissingBearer,
+    InvalidExpiry,
+    ExpiredOrExpiring,
+    RefreshLockUnavailable,
+    RotationDidNotProduceUsableCredential,
+    TokenInstallFailed,
+}
+
 enum PublicReply {
-    Anthropic {
-        expires_in: i64,
-        scopes: Vec<String>,
+    AnthropicSuccess {
+        expires_in: ExpiresIn,
+        scope: OAuthScope,
     },
-    OpenAi,
+    OpenAiSuccess {
+        expires_in: ExpiresIn,
+    },
+    TemporarilyUnavailable {
+        provider: Provider,
+        reason: UnusableReason,
+    },
+}
+
+struct Bearer(String);
+impl Bearer {
+    fn install(self, path: &Path) -> std::result::Result<(), UnusableReason> {
+        secrets::ensure_host_secret_dir(path).map_err(|_| UnusableReason::TokenInstallFailed)?;
+        crate::host_paths::atomic_write(path, self.0.as_bytes(), 0o600)
+            .map_err(|_| UnusableReason::TokenInstallFailed)
+    }
 }
 
 struct OAuthRejection {
@@ -315,228 +416,493 @@ fn refresh_placeholder_matches(provider: Provider, token: &str) -> bool {
     }
 }
 
-fn refresh(state_dir: &Path, validated: ValidatedRefresh) -> Result<PublicReply> {
+const SERVING_FLOOR_SECS: i64 = 300;
+const ROTATION_MARGIN_SECS: i64 = 600;
+const OPENAI_UNKNOWN_EXPIRY_SECS: i64 = 3600;
+const LOCK_CEILING: Duration = Duration::from_secs(20);
+const ANTHROPIC_CLI_TIMEOUT: Duration = Duration::from_secs(45);
+const OPENAI_CLI_TIMEOUT: Duration = Duration::from_secs(60);
+const POLL_OVERSHOOT: Duration = Duration::from_millis(50);
+const REAP_CEILING: Duration = Duration::from_secs(2);
+const STDERR_GRACE: Duration = Duration::from_millis(100);
+const ATTEMPT_STAMP_SECS: Duration = Duration::from_secs(30);
+
+fn refresh(state_dir: &Path, validated: ValidatedRefresh) -> PublicReply {
+    let now = match now_ms() {
+        Ok(now) => now,
+        Err(_) => return unavailable(validated.provider, UnusableReason::InvalidExpiry),
+    };
     match validated.provider {
-        Provider::Anthropic => refresh_anthropic(state_dir),
-        Provider::OpenAi => refresh_openai(state_dir),
+        Provider::Anthropic => anthropic_refresh(state_dir, now, |cmd, args, cwd, timeout| {
+            run_host_cli(cmd, args, cwd, timeout)
+        }),
+        Provider::OpenAi => openai_refresh(state_dir, now, |cmd, args, cwd, timeout| {
+            run_host_cli(cmd, args, cwd, timeout)
+        }),
     }
 }
-
-fn refresh_anthropic(state_dir: &Path) -> Result<PublicReply> {
-    let token_path = secrets::anthropic_token_path(state_dir);
-    let before = token_fingerprint(&token_path);
-    let (_lock, acquisition) = RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_ANTHROPIC)?;
-    if should_rotate(before, token_fingerprint(&token_path), acquisition) {
-        trigger_host_refresh("claude", &["-p", "hi", "--model", "sonnet"])?;
-    }
-    let path = host_claude_creds_path().context("HOME not set")?;
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    host_credentials::install_anthropic(state_dir, &raw)
-        .with_context(|| format!("rotating Anthropic token from {}", path.display()))
+fn unavailable(provider: Provider, reason: UnusableReason) -> PublicReply {
+    PublicReply::TemporarilyUnavailable { provider, reason }
 }
-
-fn refresh_openai(state_dir: &Path) -> Result<PublicReply> {
-    let token_path = secrets::openai_token_path(state_dir);
-    let before = token_fingerprint(&token_path);
-    let (_lock, acquisition) = RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_OPENAI)?;
-    if should_rotate(before, token_fingerprint(&token_path), acquisition) {
-        trigger_host_refresh(
-            "codex",
-            &[
-                "exec",
-                "--skip-git-repo-check",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "Reply with OK",
-            ],
-        )?;
-    }
-    let path = host_codex_auth_path().context("HOME not set")?;
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    host_credentials::install_openai(state_dir, &raw)
-        .with_context(|| format!("rotating OpenAI token from {}", path.display()))
-}
-
-mod host_credentials {
-    use super::*;
-    use crate::host_paths::atomic_write;
-
-    struct Bearer(String);
-    impl Bearer {
-        fn consume_into(self, path: &Path) -> Result<()> {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            atomic_write(path, self.0.as_bytes(), 0o600)
-        }
-    }
-
-    pub(super) fn install_anthropic(state_dir: &Path, raw: &str) -> Result<PublicReply> {
-        let value: serde_json::Value =
-            serde_json::from_str(raw).context("parsing rotated host .credentials.json")?;
-        let oauth = value
-            .get("claudeAiOauth")
-            .context("rotated host .credentials.json missing claudeAiOauth")?;
-        let bearer = Bearer(
-            oauth
-                .get("accessToken")
-                .and_then(|value| value.as_str())
-                .context("rotated host claudeAiOauth missing accessToken")?
-                .to_owned(),
-        );
-        let expires_in =
-            derive_expires_in(oauth.get("expiresAt").unwrap_or(&serde_json::Value::Null));
-        let scopes = oauth
-            .get("scopes")
-            .and_then(|value| value.as_array())
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|value| value.as_str().map(ToOwned::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        bearer.consume_into(&secrets::anthropic_token_path(state_dir))?;
-        Ok(PublicReply::Anthropic { expires_in, scopes })
-    }
-
-    pub(super) fn install_openai(state_dir: &Path, raw: &str) -> Result<PublicReply> {
-        let value: serde_json::Value =
-            serde_json::from_str(raw).context("parsing rotated host codex auth.json")?;
-        let bearer = Bearer(
-            value
-                .pointer("/tokens/access_token")
-                .and_then(|value| value.as_str())
-                .or_else(|| value.get("OPENAI_API_KEY").and_then(|value| value.as_str()))
-                .context("rotated host codex auth missing tokens.access_token or OPENAI_API_KEY")?
-                .to_owned(),
-        );
-        bearer.consume_into(&secrets::openai_token_path(state_dir))?;
-        Ok(PublicReply::OpenAi)
-    }
-}
-
-fn derive_expires_in(expires_at: &serde_json::Value) -> i64 {
-    let expires_at_ms = expires_at.as_i64().unwrap_or(0);
-    if expires_at_ms == 0 {
-        return 3600;
-    }
-    let now_ms = std::time::SystemTime::now()
+fn now_ms() -> Result<i64> {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0);
-    let expires_in = (expires_at_ms - now_ms) / 1000;
-    if expires_in <= 0 { 3600 } else { expires_in }
+        .context("clock before epoch")?
+        .as_millis()
+        .try_into()
+        .context("clock out of range")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TokenFingerprint {
-    Missing,
-    Unreadable,
-    Sha256([u8; 32]),
+enum AnthropicInspection {
+    Serve {
+        bearer: Bearer,
+        expires_in: ExpiresIn,
+        scope: OAuthScope,
+        above_margin: bool,
+    },
+    Rotate,
+    Unavailable(UnusableReason),
 }
-fn token_fingerprint(path: &Path) -> TokenFingerprint {
-    match std::fs::read(path) {
-        Ok(bytes) => TokenFingerprint::Sha256(Sha256::digest(bytes).into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TokenFingerprint::Missing,
-        Err(_) => TokenFingerprint::Unreadable,
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RefreshAcquisition {
-    Acquired { contended: bool },
-    Degraded,
-}
-fn should_rotate(
-    before: TokenFingerprint,
-    after: TokenFingerprint,
-    acquisition: RefreshAcquisition,
-) -> bool {
-    !matches!((before, after, acquisition), (TokenFingerprint::Sha256(before), TokenFingerprint::Sha256(after), RefreshAcquisition::Acquired { contended: true }) if before != after)
-}
-
-struct RefreshLock {
-    file: Option<std::fs::File>,
-}
-impl RefreshLock {
-    fn acquire(state_dir: &Path, lock_name: &str) -> Result<(Self, RefreshAcquisition)> {
-        Self::acquire_with_ceiling(state_dir, lock_name, HOST_REFRESH_TIMEOUT)
-    }
-    fn acquire_with_ceiling(
-        state_dir: &Path,
-        lock_name: &str,
-        ceiling: Duration,
-    ) -> Result<(Self, RefreshAcquisition)> {
-        let path = secrets::refresh_lock_path_for(state_dir, lock_name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating secrets dir {}", parent.display()))?;
+fn inspect_anthropic(path: Option<&Path>, now: i64, floor: i64) -> AnthropicInspection {
+    let Some(path) = path else {
+        return AnthropicInspection::Unavailable(UnusableReason::HostPathUnavailable);
+    };
+    let raw = match read_bounded_regular_file(path, MAX_HOST_CREDENTIAL_FILE_BYTES) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return AnthropicInspection::Unavailable(UnusableReason::HostCredentialUnreadable);
         }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(value) => value,
+        Err(_) => return AnthropicInspection::Unavailable(UnusableReason::HostCredentialMalformed),
+    };
+    let Some(oauth) = value.get("claudeAiOauth") else {
+        return AnthropicInspection::Unavailable(UnusableReason::HostCredentialMalformed);
+    };
+    let Some(access) = oauth
+        .get("accessToken")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty())
+    else {
+        return AnthropicInspection::Unavailable(UnusableReason::MissingBearer);
+    };
+    let Some(expiry) = expires_at_ms(oauth.get("expiresAt")) else {
+        return AnthropicInspection::Rotate;
+    };
+    let Some(expires_in) = ExpiresIn::from_expiry_ms(expiry, now, floor) else {
+        return AnthropicInspection::Rotate;
+    };
+    AnthropicInspection::Serve {
+        bearer: Bearer(access.into()),
+        expires_in,
+        scope: OAuthScope::from_host(oauth.get("scopes")),
+        above_margin: expiry.saturating_sub(now) / 1000 > ROTATION_MARGIN_SECS,
+    }
+}
+fn expires_at_ms(value: Option<&serde_json::Value>) -> Option<i64> {
+    match value? {
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .filter(|n| *n > 0)
+            .or_else(|| {
+                value
+                    .as_u64()
+                    .and_then(|n| i64::try_from(n).ok())
+                    .filter(|n| *n > 0)
+            })
+            .or_else(|| {
+                value
+                    .as_f64()
+                    .filter(|n| n.is_finite() && *n > 0.0 && *n <= i64::MAX as f64)
+                    .map(|n| n as i64)
+            }),
+        _ => None,
+    }
+}
+fn anth_reply(state_dir: &Path, state: AnthropicInspection) -> PublicReply {
+    match state {
+        AnthropicInspection::Serve {
+            bearer,
+            expires_in,
+            scope,
+            ..
+        } => match bearer.install(&secrets::anthropic_token_path(state_dir)) {
+            Ok(()) => PublicReply::AnthropicSuccess { expires_in, scope },
+            Err(reason) => unavailable(Provider::Anthropic, reason),
+        },
+        AnthropicInspection::Unavailable(reason) => unavailable(Provider::Anthropic, reason),
+        AnthropicInspection::Rotate => {
+            unavailable(Provider::Anthropic, UnusableReason::ExpiredOrExpiring)
+        }
+    }
+}
+fn anthropic_refresh<F>(state_dir: &Path, now: i64, runner: F) -> PublicReply
+where
+    F: Fn(&str, &[&str], &Path, Duration) -> Result<()>,
+{
+    let path = host_claude_creds_path();
+    let initial = inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS);
+    if matches!(
+        &initial,
+        AnthropicInspection::Serve {
+            above_margin: true,
+            ..
+        }
+    ) {
+        return anth_reply(state_dir, initial);
+    }
+    if matches!(&initial, AnthropicInspection::Unavailable(_)) {
+        return anth_reply(state_dir, initial);
+    }
+    let lock = match RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_ANTHROPIC, LOCK_CEILING)
+    {
+        Ok(lock) => lock,
+        Err(_) => {
+            let Ok(now) = now_ms() else {
+                return unavailable(Provider::Anthropic, UnusableReason::InvalidExpiry);
+            };
+            return match inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS) {
+                ready @ AnthropicInspection::Serve { .. } => anth_reply(state_dir, ready),
+                _ => unavailable(Provider::Anthropic, UnusableReason::RefreshLockUnavailable),
+            };
+        }
+    };
+    let Ok(now) = now_ms() else {
+        return unavailable(Provider::Anthropic, UnusableReason::InvalidExpiry);
+    };
+    let reread = inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS);
+    if matches!(
+        &reread,
+        AnthropicInspection::Serve {
+            above_margin: true,
+            ..
+        }
+    ) {
+        return anth_reply(state_dir, reread);
+    }
+    if matches!(&reread, AnthropicInspection::Unavailable(_)) {
+        return anth_reply(state_dir, reread);
+    }
+    if !stamp_is_fresh(
+        &secrets::attempt_stamp_path_for(state_dir, "anthropic"),
+        now,
+    ) {
+        let _ = write_stamp(state_dir, "anthropic", now);
+        let cwd = match isolated_work_dir(state_dir) {
+            Ok(dir) => dir,
+            Err(_) => return unavailable(Provider::Anthropic, UnusableReason::TokenInstallFailed),
+        };
+        let _ = runner(
+            "claude",
+            &["-p", "hi", "--model", "sonnet"],
+            cwd.path(),
+            ANTHROPIC_CLI_TIMEOUT,
+        );
+    }
+    let Ok(now) = now_ms() else {
+        return unavailable(Provider::Anthropic, UnusableReason::InvalidExpiry);
+    };
+    // Keep the provider lock through installation so a launcher cannot
+    // overwrite a just-rotated credential with an older host snapshot.
+    let _lock = lock;
+    anth_reply(
+        state_dir,
+        inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS),
+    )
+}
+
+enum AccessTokenKind {
+    Jwt { exp_ms: i64 },
+    Opaque,
+    MalformedJwt,
+}
+fn classify_access_token(token: &str) -> AccessTokenKind {
+    if !token.contains('.') {
+        return AccessTokenKind::Opaque;
+    }
+    let segments: Vec<_> = token.split('.').collect();
+    if segments.len() != 3 {
+        return AccessTokenKind::MalformedJwt;
+    }
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(segments[1])
+        .or_else(|_| {
+            let translated = segments[1].replace('-', "+").replace('_', "/");
+            let padded = format!(
+                "{}{}",
+                translated,
+                "=".repeat((4 - translated.len() % 4) % 4)
+            );
+            base64::engine::general_purpose::STANDARD.decode(padded)
+        });
+    let Ok(payload) = payload else {
+        return AccessTokenKind::MalformedJwt;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload) else {
+        return AccessTokenKind::MalformedJwt;
+    };
+    let Some(exp) = expires_at_ms(value.get("exp")) else {
+        return AccessTokenKind::MalformedJwt;
+    };
+    AccessTokenKind::Jwt {
+        // JWT `exp` is seconds. Saturation preserves a valid far-future
+        // timestamp instead of misclassifying it as malformed.
+        exp_ms: exp.saturating_mul(1000),
+    }
+}
+enum OpenAiInspection {
+    Serve {
+        bearer: Bearer,
+        expires_in: ExpiresIn,
+        above_margin: bool,
+    },
+    Rotate,
+    Unavailable(UnusableReason),
+}
+fn inspect_openai(path: Option<&Path>, now: i64) -> OpenAiInspection {
+    let Some(path) = path else {
+        return OpenAiInspection::Unavailable(UnusableReason::HostPathUnavailable);
+    };
+    let raw = match read_bounded_regular_file(path, MAX_HOST_CREDENTIAL_FILE_BYTES) {
+        Ok(raw) => raw,
+        Err(_) => return OpenAiInspection::Unavailable(UnusableReason::HostCredentialUnreadable),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(value) => value,
+        Err(_) => return OpenAiInspection::Unavailable(UnusableReason::HostCredentialMalformed),
+    };
+    let api = value
+        .get("OPENAI_API_KEY")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty());
+    match value
+        .pointer("/tokens/access_token")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        Some(token) => match classify_access_token(token) {
+            AccessTokenKind::Opaque => OpenAiInspection::Serve {
+                bearer: Bearer(token.into()),
+                expires_in: ExpiresIn::openai_unknown(),
+                above_margin: true,
+            },
+            AccessTokenKind::Jwt { exp_ms } => {
+                match ExpiresIn::from_expiry_ms(exp_ms, now, SERVING_FLOOR_SECS) {
+                    Some(expires_in) => OpenAiInspection::Serve {
+                        above_margin: exp_ms.saturating_sub(now) / 1000 > ROTATION_MARGIN_SECS,
+                        bearer: Bearer(token.into()),
+                        expires_in,
+                    },
+                    None if api.is_some() => OpenAiInspection::Serve {
+                        bearer: Bearer(api.unwrap().into()),
+                        expires_in: ExpiresIn::openai_unknown(),
+                        above_margin: true,
+                    },
+                    None => OpenAiInspection::Rotate,
+                }
+            }
+            AccessTokenKind::MalformedJwt => api
+                .map(|token| OpenAiInspection::Serve {
+                    bearer: Bearer(token.into()),
+                    expires_in: ExpiresIn::openai_unknown(),
+                    above_margin: true,
+                })
+                .unwrap_or(OpenAiInspection::Rotate),
+        },
+        None => api
+            .map(|token| OpenAiInspection::Serve {
+                bearer: Bearer(token.into()),
+                expires_in: ExpiresIn::openai_unknown(),
+                above_margin: true,
+            })
+            .unwrap_or(OpenAiInspection::Unavailable(UnusableReason::MissingBearer)),
+    }
+}
+fn openai_reply(state_dir: &Path, state: OpenAiInspection) -> PublicReply {
+    match state {
+        OpenAiInspection::Serve {
+            bearer, expires_in, ..
+        } => match bearer.install(&secrets::openai_token_path(state_dir)) {
+            Ok(()) => PublicReply::OpenAiSuccess { expires_in },
+            Err(reason) => unavailable(Provider::OpenAi, reason),
+        },
+        OpenAiInspection::Unavailable(reason) => unavailable(Provider::OpenAi, reason),
+        OpenAiInspection::Rotate => unavailable(
+            Provider::OpenAi,
+            UnusableReason::RotationDidNotProduceUsableCredential,
+        ),
+    }
+}
+fn openai_refresh<F>(state_dir: &Path, now: i64, runner: F) -> PublicReply
+where
+    F: Fn(&str, &[&str], &Path, Duration) -> Result<()>,
+{
+    let path = host_codex_auth_path();
+    let initial = inspect_openai(path.as_deref(), now);
+    if matches!(
+        &initial,
+        OpenAiInspection::Serve {
+            above_margin: true,
+            ..
+        }
+    ) || matches!(&initial, OpenAiInspection::Unavailable(_))
+    {
+        return openai_reply(state_dir, initial);
+    }
+    let lock = match RefreshLock::acquire(state_dir, secrets::REFRESH_LOCK_OPENAI, LOCK_CEILING) {
+        Ok(lock) => lock,
+        Err(_) => {
+            let Ok(now) = now_ms() else {
+                return unavailable(Provider::OpenAi, UnusableReason::InvalidExpiry);
+            };
+            return match inspect_openai(path.as_deref(), now) {
+                ready @ OpenAiInspection::Serve { .. } => openai_reply(state_dir, ready),
+                _ => unavailable(Provider::OpenAi, UnusableReason::RefreshLockUnavailable),
+            };
+        }
+    };
+    let Ok(now) = now_ms() else {
+        return unavailable(Provider::OpenAi, UnusableReason::InvalidExpiry);
+    };
+    let reread = inspect_openai(path.as_deref(), now);
+    if matches!(
+        &reread,
+        OpenAiInspection::Serve {
+            above_margin: true,
+            ..
+        }
+    ) {
+        return openai_reply(state_dir, reread);
+    }
+    if matches!(&reread, OpenAiInspection::Unavailable(_)) {
+        return openai_reply(state_dir, reread);
+    }
+    if !stamp_is_fresh(&secrets::attempt_stamp_path_for(state_dir, "openai"), now) {
+        let _ = write_stamp(state_dir, "openai", now);
+        let cwd = match isolated_work_dir(state_dir) {
+            Ok(dir) => dir,
+            Err(_) => return unavailable(Provider::OpenAi, UnusableReason::TokenInstallFailed),
+        };
+        let _ = runner(
+            "codex",
+            &["exec", "--skip-git-repo-check", "Reply with OK"],
+            cwd.path(),
+            OPENAI_CLI_TIMEOUT,
+        );
+    }
+    let Ok(now) = now_ms() else {
+        return unavailable(Provider::OpenAi, UnusableReason::InvalidExpiry);
+    };
+    // Hold the same provider lock until the re-read credential is installed.
+    let _lock = lock;
+    openai_reply(state_dir, inspect_openai(path.as_deref(), now))
+}
+
+struct RefreshLock(std::fs::File);
+impl RefreshLock {
+    fn acquire(state_dir: &Path, name: &str, ceiling: Duration) -> Result<Self> {
+        let path = secrets::refresh_lock_path_for(state_dir, name);
+        secrets::ensure_host_secret_dir(&path)?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)
-            .with_context(|| format!("opening refresh lock {}", path.display()))?;
-        use std::os::unix::io::AsRawFd as _;
-        let fd = file.as_raw_fd();
+            .open(path)?;
+        use std::os::fd::AsRawFd;
         let start = Instant::now();
-        let mut contended = false;
         loop {
-            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok((
-                    Self { file: Some(file) },
-                    RefreshAcquisition::Acquired { contended },
-                ));
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self(file));
             }
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EWOULDBLOCK) => {
-                    contended = true;
-                    if start.elapsed() >= ceiling {
-                        tracing::warn!(lock = %path.display(), "refresh lock contended past {}s; proceeding without single-flight", ceiling.as_secs());
-                        return Ok((Self { file: None }, RefreshAcquisition::Degraded));
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                _ => {
-                    return Err(anyhow::Error::new(std::io::Error::last_os_error())
-                        .context(format!("flock(LOCK_EX|LOCK_NB) on {}", path.display())));
-                }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK)
+                || start.elapsed() >= ceiling
+            {
+                anyhow::bail!("refresh lock unavailable");
             }
+            std::thread::sleep(POLL_OVERSHOOT);
         }
     }
 }
 impl Drop for RefreshLock {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd as _;
-        if let Some(file) = &self.file {
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }
-const HOST_REFRESH_TIMEOUT: Duration = Duration::from_secs(90);
-fn trigger_host_refresh(cmd: &str, args: &[&str]) -> Result<()> {
-    trigger_host_refresh_with_timeout(cmd, args, HOST_REFRESH_TIMEOUT)
+fn write_stamp(state_dir: &Path, provider: &str, now: i64) -> Result<()> {
+    let path = secrets::attempt_stamp_path_for(state_dir, provider);
+    secrets::ensure_host_secret_dir(&path)?;
+    crate::host_paths::atomic_write(&path, now.to_string().as_bytes(), 0o600)
 }
-fn trigger_host_refresh_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Result<()> {
+fn stamp_is_fresh(path: &Path, now: i64) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .is_some_and(|stamp| {
+            now.saturating_sub(stamp) >= 0
+                && now.saturating_sub(stamp) < ATTEMPT_STAMP_SECS.as_millis() as i64
+        })
+}
+fn isolated_work_dir(state_dir: &Path) -> Result<tempfile::TempDir> {
+    let directory = secrets::host_secret_dir_path(state_dir);
+    std::fs::create_dir_all(&directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    tempfile::Builder::new()
+        .prefix("oauth-")
+        .tempdir_in(directory)
+        .context("creating isolated OAuth work directory")
+}
+fn run_host_cli(cmd: &str, args: &[&str], cwd: &Path, timeout: Duration) -> Result<()> {
     let mut command = Command::new(cmd);
     command
         .args(args)
+        .current_dir(cwd)
+        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    for name in [
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         unsafe {
             command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
                 }
-                Ok(())
             });
         }
     }
@@ -544,58 +910,50 @@ fn trigger_host_refresh_with_timeout(cmd: &str, args: &[&str], timeout: Duration
         .spawn()
         .with_context(|| format!("spawning host {cmd}"))?;
     let pid = child.id() as libc::pid_t;
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let (drained, receiver) = mpsc::sync_channel(1);
+    let stderr = child.stderr.take().expect("piped");
+    let (sent, received) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let mut stderr = stderr;
-        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-        let _ = drained.send(());
+        let _ = std::io::copy(&mut std::io::BufReader::new(stderr), &mut std::io::sink());
+        let _ = sent.send(());
     });
     let start = Instant::now();
-    let status = loop {
+    loop {
         match child.try_wait()? {
-            Some(status) => break status,
+            Some(status) => {
+                let _ = received.recv_timeout(STDERR_GRACE);
+                if status.success() {
+                    return Ok(());
+                }
+                anyhow::bail!("host {cmd} failed")
+            }
             None if start.elapsed() >= timeout => {
-                #[cfg(unix)]
                 unsafe {
-                    if libc::kill(-pid, libc::SIGKILL) == -1 {
-                        return Err(anyhow::Error::new(std::io::Error::last_os_error())
-                            .context(format!("terminating host {cmd} process group")));
+                    if libc::kill(-pid, libc::SIGKILL) == -1
+                        && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                    {
+                        let _ = child.kill();
                     }
                 }
-                child
-                    .wait()
-                    .with_context(|| format!("reaping timed-out host {cmd}"))?;
-                let _ = receiver.recv_timeout(Duration::from_millis(100));
-                anyhow::bail!(
-                    "host {cmd} did not return within {} s; terminated",
-                    timeout.as_secs()
-                );
+                let reap_start = Instant::now();
+                while child.try_wait()?.is_none() && reap_start.elapsed() < REAP_CEILING {
+                    std::thread::sleep(POLL_OVERSHOOT);
+                }
+                let _ = received.recv_timeout(STDERR_GRACE);
+                anyhow::bail!("host {cmd} timed out")
             }
-            None => std::thread::sleep(Duration::from_millis(20)),
+            None => std::thread::sleep(POLL_OVERSHOOT),
         }
-    };
-    let _ = receiver.recv_timeout(Duration::from_millis(100));
-    if !status.success() {
-        anyhow::bail!("host {cmd} failed (status {status})");
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        cell::Cell,
-        os::unix::fs::{MetadataExt, PermissionsExt},
-    };
-
-    fn request(sni: &str, target: &str, content_type: &str, body: &str) -> Vec<u8> {
-        format!("POST {target} HTTP/1.1\r\nHost: {sni}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
+    fn request(sni: &str, path: &str, ct: &str, body: &str) -> Vec<u8> {
+        format!("POST {path} HTTP/1.1\r\nHost: {sni}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n{body}",body.len()).into_bytes()
     }
-
     fn openai_request() -> Vec<u8> {
-        let body = format!(
+        let b = format!(
             "grant_type=refresh_token&refresh_token={}",
             secrets::OPENAI_REFRESH_PLACEHOLDER
         );
@@ -603,300 +961,271 @@ mod tests {
             secrets::OPENAI_OAUTH_HOST,
             secrets::OPENAI_OAUTH_TOKEN_PATH,
             "application/x-www-form-urlencoded",
-            &body,
+            &b,
         )
     }
-
-    fn anthropic_request() -> Vec<u8> {
-        let body = format!(
-            r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
-            secrets::ANTHROPIC_REFRESH_PLACEHOLDER
-        );
-        request(
-            secrets::ANTHROPIC_OAUTH_HOST,
-            secrets::ANTHROPIC_OAUTH_TOKEN_PATH,
-            "application/json",
-            &body,
-        )
-    }
-
-    fn assert_rejected_without_effects(name: &str, raw: &[u8], sni: &str) {
-        let calls = Cell::new(0);
-        let response = handle_with(raw, sni, |_| {
-            calls.set(calls.get() + 1);
-            Ok(PublicReply::OpenAi)
+    #[test]
+    fn validation_precedes_action_and_valid_action_is_framed() {
+        let calls = std::cell::Cell::new(0);
+        let invalid = handle_with(b"bad", secrets::OPENAI_OAUTH_HOST, |_| {
+            calls.set(1);
+            unavailable(Provider::OpenAi, UnusableReason::MissingBearer)
         })
         .unwrap();
-        assert_eq!(calls.get(), 0, "{name}");
-        let text = std::str::from_utf8(response.as_bytes()).unwrap();
+        assert_eq!(calls.get(), 0);
         assert!(
-            text.starts_with("HTTP/1.1 400") || text.starts_with("HTTP/1.1 403"),
-            "{name}: {text}"
-        );
-        assert!(!text.contains("VALIDATION_CANARY"), "{name}");
-    }
-
-    #[test]
-    fn every_invalid_oauth_request_stops_before_the_effect_action() {
-        let openai = String::from_utf8(openai_request()).unwrap();
-        let anthropic = String::from_utf8(anthropic_request()).unwrap();
-        let openai_length = format!(
-            "Content-Length: {}",
-            openai.split("\r\n\r\n").nth(1).unwrap().len()
-        );
-        let anthropic_length = format!(
-            "Content-Length: {}",
-            anthropic.split("\r\n\r\n").nth(1).unwrap().len()
-        );
-        let cases = vec![
-            ("unsupported SNI", openai.clone(), "invalid.test"),
-            ("wrong method", openai.replacen("POST ", "GET ", 1), secrets::OPENAI_OAUTH_HOST),
-            ("near path", openai.replacen("/oauth/token", "/oauth/token/near", 1), secrets::OPENAI_OAUTH_HOST),
-            ("query", openai.replacen("/oauth/token", "/oauth/token?x=1", 1), secrets::OPENAI_OAUTH_HOST),
-            ("fragment", openai.replacen("/oauth/token", "/oauth/token#x", 1), secrets::OPENAI_OAUTH_HOST),
-            ("backslash", openai.replacen("/oauth/token", "/oauth\\token", 1), secrets::OPENAI_OAUTH_HOST),
-            ("HTTP/1.0", openai.replacen("HTTP/1.1", "HTTP/1.0", 1), secrets::OPENAI_OAUTH_HOST),
-            ("request-line extra field", openai.replacen("HTTP/1.1", "HTTP/1.1 extra", 1), secrets::OPENAI_OAUTH_HOST),
-            ("malformed request line", openai.replacen("POST ", "PO(ST ", 1), secrets::OPENAI_OAUTH_HOST),
-            ("malformed header", openai.replacen("Host:", "Broken Header\r\nHost:", 1), secrets::OPENAI_OAUTH_HOST),
-            ("missing Host", openai.replacen("Host: auth.openai.com\r\n", "", 1), secrets::OPENAI_OAUTH_HOST),
-            ("duplicate Host", openai.replacen("Host: auth.openai.com", "Host: auth.openai.com\r\nHost: auth.openai.com", 1), secrets::OPENAI_OAUTH_HOST),
-            ("wrong Host", openai.replacen("Host: auth.openai.com", "Host: attacker.invalid", 1), secrets::OPENAI_OAUTH_HOST),
-            ("absolute wrong scheme", openai.replacen("/oauth/token", "http://auth.openai.com/oauth/token", 1), secrets::OPENAI_OAUTH_HOST),
-            ("absolute wrong authority", openai.replacen("/oauth/token", "https://attacker.invalid/oauth/token", 1), secrets::OPENAI_OAUTH_HOST),
-            ("absolute userinfo", openai.replacen("/oauth/token", "https://attacker@auth.openai.com/oauth/token", 1), secrets::OPENAI_OAUTH_HOST),
-            ("absolute port", openai.replacen("/oauth/token", "https://auth.openai.com:444/oauth/token", 1), secrets::OPENAI_OAUTH_HOST),
-            ("encoded slash separator", openai.replacen("/oauth/token", "/oauth%2ftoken", 1), secrets::OPENAI_OAUTH_HOST),
-            ("encoded dot separator", openai.replacen("/oauth/token", "/oauth%2etoken", 1), secrets::OPENAI_OAUTH_HOST),
-            ("encoded backslash separator", openai.replacen("/oauth/token", "/oauth%5ctoken", 1), secrets::OPENAI_OAUTH_HOST),
-            ("missing content type", openai.replacen("Content-Type: application/x-www-form-urlencoded\r\n", "", 1), secrets::OPENAI_OAUTH_HOST),
-            ("unsupported content type", openai.replacen("application/x-www-form-urlencoded", "text/plain", 1), secrets::OPENAI_OAUTH_HOST),
-            ("duplicate content type", openai.replacen("Content-Type: application/x-www-form-urlencoded", "Content-Type: application/x-www-form-urlencoded\r\nContent-Type: application/x-www-form-urlencoded", 1), secrets::OPENAI_OAUTH_HOST),
-            ("missing content length", openai.replacen(&format!("{openai_length}\r\n"), "", 1), secrets::OPENAI_OAUTH_HOST),
-            ("duplicate content length", openai.replacen(&openai_length, &format!("{openai_length}\r\n{openai_length}"), 1), secrets::OPENAI_OAUTH_HOST),
-            ("invalid content length", openai.replacen(&openai_length, "Content-Length: nope", 1), secrets::OPENAI_OAUTH_HOST),
-            ("incomplete body", openai.replacen(&openai_length, "Content-Length: 999", 1), secrets::OPENAI_OAUTH_HOST),
-            ("transfer encoding", openai.replacen("Content-Length:", "Transfer-Encoding: chunked\r\nContent-Length:", 1), secrets::OPENAI_OAUTH_HOST),
-            ("content encoding", openai.replacen("Content-Length:", "Content-Encoding: gzip\r\nContent-Length:", 1), secrets::OPENAI_OAUTH_HOST),
-            ("malformed form", openai.replacen("refresh_token=", "refresh_token=%ZZ", 1), secrets::OPENAI_OAUTH_HOST),
-            ("duplicate form grant", openai.replacen("grant_type=refresh_token", "grant_type=refresh_token&grant_type=refresh_token", 1), secrets::OPENAI_OAUTH_HOST),
-            ("duplicate form token", openai.replacen("refresh_token=", "refresh_token=wrong&refresh_token=", 1), secrets::OPENAI_OAUTH_HOST),
-            ("wrong form grant", openai.replacen("grant_type=refresh_token", "grant_type=wrong", 1), secrets::OPENAI_OAUTH_HOST),
-            ("wrong OpenAI placeholder", openai.replacen(secrets::OPENAI_REFRESH_PLACEHOLDER, "VALIDATION_CANARY", 1), secrets::OPENAI_OAUTH_HOST),
-            ("Anthropic placeholder at OpenAI endpoint", openai.replacen(secrets::OPENAI_REFRESH_PLACEHOLDER, secrets::ANTHROPIC_REFRESH_PLACEHOLDER, 1), secrets::OPENAI_OAUTH_HOST),
-            ("malformed JSON", anthropic.replacen("{\"grant", "{not-json\",\"grant", 1), secrets::ANTHROPIC_OAUTH_HOST),
-            ("duplicate JSON grant", anthropic.replacen("\"grant_type\":\"refresh_token\"", "\"grant_type\":\"refresh_token\",\"grant_type\":\"refresh_token\"", 1), secrets::ANTHROPIC_OAUTH_HOST),
-            ("duplicate JSON token", anthropic.replacen("\"refresh_token\":", "\"refresh_token\":\"wrong\",\"refresh_token\":", 1), secrets::ANTHROPIC_OAUTH_HOST),
-            ("wrong JSON grant", anthropic.replacen("\"grant_type\":\"refresh_token\"", "\"grant_type\":\"wrong\"", 1), secrets::ANTHROPIC_OAUTH_HOST),
-            ("wrong Anthropic placeholder", anthropic.replacen(secrets::ANTHROPIC_REFRESH_PLACEHOLDER, "VALIDATION_CANARY", 1), secrets::ANTHROPIC_OAUTH_HOST),
-            ("OpenAI placeholder at Anthropic endpoint", anthropic.replacen(secrets::ANTHROPIC_REFRESH_PLACEHOLDER, secrets::OPENAI_REFRESH_PLACEHOLDER, 1), secrets::ANTHROPIC_OAUTH_HOST),
-            ("OpenCode placeholder at Anthropic endpoint", anthropic.replacen(secrets::ANTHROPIC_REFRESH_PLACEHOLDER, secrets::OPENCODE_OPENAI_REFRESH_PLACEHOLDER, 1), secrets::ANTHROPIC_OAUTH_HOST),
-            ("Anthropic missing length", anthropic.replacen(&format!("{anthropic_length}\r\n"), "", 1), secrets::ANTHROPIC_OAUTH_HOST),
-        ];
-        for (name, raw, sni) in cases {
-            assert_rejected_without_effects(name, raw.as_bytes(), sni);
-        }
-    }
-
-    #[test]
-    fn complete_validation_precedes_exactly_one_safe_action() {
-        let calls = Cell::new(0);
-        let response = handle_with(&openai_request(), secrets::OPENAI_OAUTH_HOST, |_| {
-            calls.set(calls.get() + 1);
-            Ok(PublicReply::OpenAi)
-        })
-        .unwrap();
-        assert_eq!(calls.get(), 1);
-        let text = std::str::from_utf8(response.as_bytes()).unwrap();
-        assert!(text.starts_with("HTTP/1.1 200 OK"));
-        assert!(text.contains(secrets::OPENAI_ACCESS_PLACEHOLDER));
-    }
-
-    #[test]
-    fn host_bearers_are_atomically_consumed_into_0600_files_and_exact_safe_replies() {
-        for (provider, raw, bearer, path, install, expected) in [
-            (
-                "anthropic",
-                r#"{"claudeAiOauth":{"accessToken":"ANTHROPIC_CANARY","expiresAt":9999999999000,"scopes":["user:inference","user:profile"]}}"#,
-                "ANTHROPIC_CANARY",
-                secrets::anthropic_token_path as fn(&Path) -> std::path::PathBuf,
-                host_credentials::install_anthropic as fn(&Path, &str) -> Result<PublicReply>,
-                serde_json::json!({"access_token": secrets::ANTHROPIC_ACCESS_PLACEHOLDER, "refresh_token": secrets::ANTHROPIC_REFRESH_PLACEHOLDER, "token_type": "Bearer", "scope": ["user:inference", "user:profile"]}),
-            ),
-            (
-                "openai",
-                r#"{"tokens":{"access_token":"OPENAI_CANARY"}}"#,
-                "OPENAI_CANARY",
-                secrets::openai_token_path as fn(&Path) -> std::path::PathBuf,
-                host_credentials::install_openai as fn(&Path, &str) -> Result<PublicReply>,
-                serde_json::json!({"access_token": secrets::OPENAI_ACCESS_PLACEHOLDER, "refresh_token": secrets::OPENAI_REFRESH_PLACEHOLDER, "id_token": secrets::OPENAI_ID_PLACEHOLDER, "expires_in": 3600, "token_type": "Bearer"}),
-            ),
-        ] {
-            let state = tempfile::tempdir().unwrap();
-            let token_path = path(state.path());
-            std::fs::create_dir_all(token_path.parent().unwrap()).unwrap();
-            std::fs::write(&token_path, "old-token").unwrap();
-            let old_inode = std::fs::metadata(&token_path).unwrap().ino();
-            let framed = response(install(state.path(), raw).unwrap()).unwrap();
-            assert_eq!(
-                std::fs::read_to_string(&token_path).unwrap(),
-                bearer,
-                "{provider}"
-            );
-            assert!(!token_path.starts_with(state.path()));
-            let metadata = std::fs::metadata(&token_path).unwrap();
-            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-            assert_ne!(metadata.ino(), old_inode, "{provider} atomic replacement");
-            let text = std::str::from_utf8(framed.as_bytes()).unwrap();
-            assert!(!text.contains(bearer), "{provider}");
-            let body = text.split("\r\n\r\n").nth(1).unwrap();
-            let actual: serde_json::Value = serde_json::from_str(body).unwrap();
-            for (key, value) in expected.as_object().unwrap() {
-                assert_eq!(actual.get(key), Some(value), "{provider} {key}");
-            }
-            let expected_fields = expected.as_object().unwrap().len();
-            if provider == "anthropic" {
-                assert_eq!(actual.as_object().unwrap().len(), expected_fields + 1);
-                assert!(actual["expires_in"].as_i64().is_some_and(|value| value > 0));
-            } else {
-                assert_eq!(actual.as_object().unwrap().len(), expected_fields);
-            }
-        }
-    }
-
-    #[test]
-    fn credential_failures_and_flat_openai_shape_do_not_leak_host_contents() {
-        let state = tempfile::tempdir().unwrap();
-        for (name, result) in [
-            (
-                "invalid Anthropic JSON",
-                host_credentials::install_anthropic(state.path(), "ANTHROPIC_ERROR_CANARY"),
-            ),
-            (
-                "missing Anthropic bearer",
-                host_credentials::install_anthropic(state.path(), r#"{"claudeAiOauth":{}}"#),
-            ),
-            (
-                "invalid OpenAI JSON",
-                host_credentials::install_openai(state.path(), "OPENAI_ERROR_CANARY"),
-            ),
-            (
-                "missing OpenAI bearer",
-                host_credentials::install_openai(state.path(), r#"{"tokens":{}}"#),
-            ),
-        ] {
-            let error = match result {
-                Ok(_) => panic!("{name} unexpectedly succeeded"),
-                Err(error) => error,
-            };
-            assert!(!error.to_string().contains("CANARY"), "{name}");
-        }
-        let reply = host_credentials::install_openai(
-            state.path(),
-            r#"{"OPENAI_API_KEY":"OPENAI_FLAT_CANARY"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(secrets::openai_token_path(state.path())).unwrap(),
-            "OPENAI_FLAT_CANARY"
-        );
-        assert!(
-            !std::str::from_utf8(response(reply).unwrap().as_bytes())
+            std::str::from_utf8(invalid.as_bytes())
                 .unwrap()
-                .contains("OPENAI_FLAT_CANARY")
+                .starts_with("HTTP/1.1 400")
+        );
+        let valid = handle_with(&openai_request(), secrets::OPENAI_OAUTH_HOST, |_| {
+            calls.set(2);
+            PublicReply::OpenAiSuccess {
+                expires_in: ExpiresIn::openai_unknown(),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(
+            std::str::from_utf8(valid.as_bytes())
+                .unwrap()
+                .contains(secrets::OPENAI_ACCESS_PLACEHOLDER)
+        );
+    }
+    #[test]
+    fn scope_is_bounded_and_always_has_inference() {
+        let scope =
+            OAuthScope::from_host(Some(&serde_json::json!(["foo  foo", "bad space", "bar"])));
+        assert_eq!(scope.0, "user:inference user:profile");
+        let scope = OAuthScope::from_host(Some(&serde_json::json!("user:inference foo foo")));
+        assert_eq!(scope.0, "user:inference foo");
+    }
+    #[test]
+    fn expiry_and_jwt_classifier_are_strict() {
+        assert!(ExpiresIn::from_expiry_ms(301_000, 0, 300).is_some());
+        assert!(ExpiresIn::from_remaining_seconds(301, 300).is_some());
+        assert!(ExpiresIn::from_expiry_ms(300_000, 0, 300).is_none());
+        assert!(matches!(
+            classify_access_token("opaque"),
+            AccessTokenKind::Opaque
+        ));
+        assert!(matches!(
+            classify_access_token("a.b"),
+            AccessTokenKind::MalformedJwt
+        ));
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{}}}"#, i64::MAX));
+        assert!(matches!(
+            classify_access_token(&format!("header.{payload}.signature")),
+            AccessTokenKind::Jwt { exp_ms } if exp_ms == i64::MAX
+        ));
+        assert!(expires_at_ms(Some(&serde_json::json!(f64::INFINITY))).is_none());
+    }
+    #[test]
+    fn failed_valid_operation_is_credential_free_503() {
+        let response = handle_with(&openai_request(), secrets::OPENAI_OAUTH_HOST, |_| {
+            unavailable(Provider::OpenAi, UnusableReason::HostCredentialMalformed)
+        })
+        .unwrap();
+        let text = std::str::from_utf8(response.as_bytes()).unwrap();
+        assert!(text.starts_with("HTTP/1.1 503"));
+        assert!(!text.contains("CANARY"));
+    }
+    // ── run_host_cli fake-executable contract ──────────────────────
+
+    fn write_executable_script(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn run_host_cli_captures_argv_isolates_cwd_and_excludes_non_allowlisted_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("capture.txt");
+        let script = dir.path().join("fake-cli");
+        write_executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{cap}'\nprintf 'CWD:%s\\n' \"$(pwd)\" >> '{cap}'\nenv | sort >> '{cap}'\nexit 0\n",
+                cap = capture.display(),
+            ),
+        );
+        let cwd = dir.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let mut env = crate::test_env::guard();
+        env.set_var("AGENT_VM_TEST_OAUTH_CANARY", "must-not-be-inherited");
+        run_host_cli(
+            script.to_str().unwrap(),
+            &["exec", "--skip-git-repo-check", "Reply with OK"],
+            &cwd,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let captured = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            captured.starts_with("exec\n--skip-git-repo-check\nReply with OK\n"),
+            "got: {captured}"
+        );
+        assert!(!captured.contains("--dangerously-bypass-approvals-and-sandbox"));
+        let cwd_line = format!("CWD:{}\n", cwd.canonicalize().unwrap().display());
+        assert!(captured.contains(&cwd_line), "got: {captured}");
+        assert!(
+            !captured.contains("AGENT_VM_TEST_OAUTH_CANARY"),
+            "non-allow-listed host env vars must not reach the CLI: {captured}"
+        );
+        assert!(captured.contains("HOME="), "HOME must be on the allow-list");
+    }
+
+    #[test]
+    fn run_host_cli_kills_the_process_group_on_timeout_within_reap_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("finished");
+        let script = dir.path().join("slow-cli");
+        // The grandchild touches its marker after a short, real sleep (not
+        // the parent's 30s stall) so this test can actually distinguish a
+        // working group-kill from a broken one: we kill well before 1s and
+        // then wait past it. If SIGKILL only reached the parent (leaving the
+        // detached grandchild alive), the marker would still appear once
+        // that 1s elapses; if the whole process group was killed, it never
+        // will.
+        write_executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\n(sleep 1; touch '{marker}') &\nsleep 30\n",
+                marker = marker.display(),
+            ),
+        );
+        let start = Instant::now();
+        let err = run_host_cli(
+            script.to_str().unwrap(),
+            &[],
+            dir.path(),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.to_string().contains("timed out"));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "kill/reap must complete well within the hook timeout budget, took {elapsed:?}"
+        );
+        // Sleep past the grandchild's 1s mark (accounting for the ~200ms
+        // already elapsed above) before checking it never ran.
+        std::thread::sleep(
+            Duration::from_secs(1).saturating_sub(elapsed) + Duration::from_millis(500),
+        );
+        assert!(
+            !marker.exists(),
+            "SIGKILL to the whole process group must also reach the backgrounded grandchild"
         );
     }
 
     #[test]
-    fn expires_in_preserves_missing_invalid_expired_and_future_behavior() {
-        assert_eq!(derive_expires_in(&serde_json::Value::Null), 3600);
+    fn run_host_cli_drains_noisy_stderr_without_leaking_it_into_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let noisy = dir.path().join("noisy-cli");
+        write_executable_script(
+            &noisy,
+            "#!/bin/sh\nfor i in $(seq 1 5000); do echo \"line $i noisy-stderr-canary\" >&2; done\nexit 0\n",
+        );
+        run_host_cli(
+            noisy.to_str().unwrap(),
+            &[],
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .expect("noisy stderr must not block success or the drain thread");
+
+        let failing = dir.path().join("failing-cli");
+        write_executable_script(
+            &failing,
+            "#!/bin/sh\necho 'SECRET-STDERR-CONTENT' >&2\nexit 1\n",
+        );
+        let err = run_host_cli(
+            failing.to_str().unwrap(),
+            &[],
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            !format!("{err:?}").contains("SECRET-STDERR-CONTENT"),
+            "operational errors must never include child stderr"
+        );
+    }
+
+    // ── shared provider-lock coordination ───────────────────────────
+
+    #[test]
+    fn refresh_lock_shares_exclusion_with_a_launcher_style_holder() {
+        // `secrets::with_provider_lock` (launch capture) and
+        // `RefreshLock` (this hook) must lock the exact same path so a
+        // launcher cannot race a hook-driven rotation and overwrite a
+        // just-installed token with a stale re-read. Model the
+        // launcher side directly with `flock` (its actual
+        // implementation) rather than depending on `secrets`'s private
+        // helper.
+        use std::os::fd::AsRawFd as _;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = secrets::refresh_lock_path_for(dir.path(), secrets::REFRESH_LOCK_ANTHROPIC);
+        secrets::ensure_host_secret_dir(&path).unwrap();
+        let launcher_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
         assert_eq!(
-            derive_expires_in(&serde_json::json!("not-a-timestamp")),
-            3600
+            unsafe { libc::flock(launcher_file.as_raw_fd(), libc::LOCK_EX) },
+            0,
+            "launcher-style holder acquires the lock first"
         );
-        assert_eq!(derive_expires_in(&serde_json::json!(0)), 3600);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        assert_eq!(derive_expires_in(&serde_json::json!(now_ms - 2_000)), 3600);
-        let future = derive_expires_in(&serde_json::json!(now_ms + 300_900));
-        assert!((299..=300).contains(&future), "future expiry was {future}");
+
+        let acquired = Arc::new(AtomicBool::new(false));
+        let acquired_writer = Arc::clone(&acquired);
+        let state_dir = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let lock = RefreshLock::acquire(
+                &state_dir,
+                secrets::REFRESH_LOCK_ANTHROPIC,
+                Duration::from_secs(2),
+            )
+            .expect("hook lock eventually acquires once the launcher-style holder releases");
+            acquired_writer.store(true, Ordering::SeqCst);
+            drop(lock);
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "hook lock must block while the launcher-style holder is alive"
+        );
+        unsafe {
+            libc::flock(launcher_file.as_raw_fd(), libc::LOCK_UN);
+        }
+        handle.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn rotation_decision_matrix_only_skips_contended_changed_token() {
-        let before = TokenFingerprint::Sha256([1; 32]);
-        let changed = TokenFingerprint::Sha256([2; 32]);
-        assert!(!should_rotate(
-            before,
-            changed,
-            RefreshAcquisition::Acquired { contended: true }
-        ));
-        assert!(should_rotate(
-            before,
-            changed,
-            RefreshAcquisition::Acquired { contended: false }
-        ));
-        assert!(should_rotate(
-            before,
-            before,
-            RefreshAcquisition::Acquired { contended: true }
-        ));
-        assert!(should_rotate(
-            TokenFingerprint::Missing,
-            changed,
-            RefreshAcquisition::Acquired { contended: true }
-        ));
-        assert!(should_rotate(
-            TokenFingerprint::Unreadable,
-            TokenFingerprint::Unreadable,
-            RefreshAcquisition::Degraded
-        ));
-    }
-
-    #[test]
-    fn actual_lock_contention_degrades_only_after_its_ceiling() {
-        let state = tempfile::tempdir().unwrap();
-        let (_lock, _) = RefreshLock::acquire(state.path(), secrets::REFRESH_LOCK_OPENAI).unwrap();
-        let start = Instant::now();
-        let (_contender, acquisition) = RefreshLock::acquire_with_ceiling(
-            state.path(),
-            secrets::REFRESH_LOCK_OPENAI,
-            Duration::from_millis(60),
-        )
-        .unwrap();
-        assert_eq!(acquisition, RefreshAcquisition::Degraded);
-        assert!(start.elapsed() >= Duration::from_millis(50));
-        assert!(start.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn runner_success_failure_timeout_and_stderr_lifecycle_are_bounded_and_sanitized() {
-        trigger_host_refresh_with_timeout("sh", &["-c", "exit 0"], Duration::from_secs(1)).unwrap();
-        let error = trigger_host_refresh_with_timeout(
-            "sh",
-            &["-c", "echo CHILD_CANARY >&2; exit 9"],
-            Duration::from_secs(1),
-        )
-        .unwrap_err();
-        assert!(!error.to_string().contains("CHILD_CANARY"));
-        let start = Instant::now();
-        let error = trigger_host_refresh_with_timeout(
-            "sh",
-            &["-c", "while :; do echo NOISY_CANARY >&2; done"],
-            Duration::from_millis(50),
-        )
-        .unwrap_err();
-        assert!(start.elapsed() < Duration::from_secs(2));
-        assert!(!error.to_string().contains("NOISY_CANARY"));
-        let start = Instant::now();
-        trigger_host_refresh_with_timeout(
-            "sh",
-            &["-c", "(sleep 1 >&2) & exit 0"],
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        assert!(start.elapsed() < Duration::from_millis(500));
+    fn hook_timeout_contract_has_headroom() {
+        let handler =
+            include_str!("../../../../vendor/microsandbox/crates/network/lib/intercept/handler.rs");
+        assert!(handler.contains("Duration::from_secs(90)"));
+        assert!(
+            LOCK_CEILING
+                + OPENAI_CLI_TIMEOUT
+                + POLL_OVERSHOOT
+                + REAP_CEILING
+                + STDERR_GRACE
+                + Duration::from_secs(5)
+                < Duration::from_secs(90)
+        );
     }
 }

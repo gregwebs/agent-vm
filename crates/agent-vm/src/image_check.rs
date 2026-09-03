@@ -121,7 +121,8 @@ async fn remote_manifest_digest(parsed: &ParsedRef) -> Result<Option<String>> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             // x86_64-host pin; the rewrite is x86_64-only in v1.
-            if os == "linux" && arch == "amd64"
+            if os == "linux"
+                && arch == "amd64"
                 && let Some(d) = entry.get("digest").and_then(|v| v.as_str())
             {
                 return Ok(Some(d.to_string()));
@@ -213,7 +214,9 @@ impl BearerChallenge {
     /// Bearer challenge or has no `realm` (without which we can't fetch
     /// a token).
     fn parse(header: &str) -> Option<Self> {
-        let rest = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer "))?;
+        let rest = header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))?;
         let mut realm = None;
         let mut service = None;
         let mut scope = None;
@@ -310,7 +313,11 @@ impl ParsedRef {
 }
 
 fn short(digest: &str) -> String {
-    digest.trim_start_matches("sha256:").chars().take(12).collect()
+    digest
+        .trim_start_matches("sha256:")
+        .chars()
+        .take(12)
+        .collect()
 }
 
 #[cfg(test)]

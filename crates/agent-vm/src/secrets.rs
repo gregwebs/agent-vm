@@ -20,8 +20,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::host_paths::{
-    atomic_write, host_claude_creds_path, host_codex_auth_path, host_copilot_token_path,
-    host_opencode_auth_path,
+    GuestStateDir, MAX_HOST_CREDENTIAL_FILE_BYTES, atomic_write, host_claude_creds_path,
+    host_codex_auth_path, host_copilot_token_path, host_opencode_auth_path,
+    read_bounded_regular_file,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,6 +97,80 @@ pub const GH_TOKEN_PLACEHOLDER: &str = "msb-gh-placeholder-v2";
 /// agent-vm's `placeholder-copilot-token-injected-by-proxy`.
 pub const COPILOT_TOKEN_PLACEHOLDER: &str = "msb-copilot-placeholder-v2";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpencodeApiProvider {
+    pub id: &'static str,
+    pub placeholder: &'static str,
+    pub host: &'static str,
+}
+
+impl OpencodeApiProvider {
+    pub fn env_var(self) -> String {
+        format!(
+            "MSB_AGENT_VM_OPENCODE_{}_UNUSED",
+            self.id.to_ascii_uppercase().replace('-', "_")
+        )
+    }
+}
+
+pub const OPENCODE_API_PROVIDERS: [OpencodeApiProvider; 7] = [
+    OpencodeApiProvider {
+        id: "zai",
+        placeholder: "msb-zai-placeholder-k-v1",
+        host: "api.z.ai",
+    },
+    OpencodeApiProvider {
+        id: "zai-coding-plan",
+        placeholder: "msb-zai-coding-placeholder-k-v1",
+        host: "api.z.ai",
+    },
+    OpencodeApiProvider {
+        id: "zhipuai",
+        placeholder: "msb-zhipuai-placeholder-k-v1",
+        host: "open.bigmodel.cn",
+    },
+    OpencodeApiProvider {
+        id: "zhipuai-coding-plan",
+        placeholder: "msb-zhipuai-coding-placeholder-k-v1",
+        host: "open.bigmodel.cn",
+    },
+    OpencodeApiProvider {
+        id: "kimi-for-coding",
+        placeholder: "msb-kimi-coding-placeholder-k-v1",
+        host: "api.kimi.com",
+    },
+    OpencodeApiProvider {
+        id: "moonshotai",
+        placeholder: "msb-moonshot-placeholder-k-v1",
+        host: "api.moonshot.ai",
+    },
+    OpencodeApiProvider {
+        id: "moonshotai-cn",
+        placeholder: "msb-moonshot-cn-placeholder-k-v1",
+        host: "api.moonshot.cn",
+    },
+];
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub const ALL_PLACEHOLDERS: &[&str] = &[
+    ANTHROPIC_ACCESS_PLACEHOLDER,
+    ANTHROPIC_REFRESH_PLACEHOLDER,
+    OPENAI_ACCESS_PLACEHOLDER,
+    OPENAI_REFRESH_PLACEHOLDER,
+    OPENAI_ID_PLACEHOLDER,
+    OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
+    OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
+    GH_TOKEN_PLACEHOLDER,
+    COPILOT_TOKEN_PLACEHOLDER,
+    "msb-zai-placeholder-k-v1",
+    "msb-zai-coding-placeholder-k-v1",
+    "msb-zhipuai-placeholder-k-v1",
+    "msb-zhipuai-coding-placeholder-k-v1",
+    "msb-kimi-coding-placeholder-k-v1",
+    "msb-moonshot-placeholder-k-v1",
+    "msb-moonshot-cn-placeholder-k-v1",
+];
+
 // Hostnames the secret-substitution proxy + interceptor key off. Kept
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
 // docs stay in lockstep.
@@ -149,6 +224,7 @@ pub struct CredsState {
     // guest placeholder auth.json so the first OpenCode launch skips its
     // interactive wizard.
     pub opencode_openai_access_token_file: Option<PathBuf>,
+    pub opencode_api_token_files: Vec<(OpencodeApiProvider, PathBuf)>,
     /// File holding the host's `gh auth token` (a GitHub user OAuth
     /// token). The proxy substitutes `GH_TOKEN_PLACEHOLDER` for this
     /// on outbound traffic to GitHub. Only `Some` when the user has
@@ -204,7 +280,7 @@ pub struct HostCredsSnapshot {
 /// microsandbox proxy reads these files on the *host* side, so they
 /// never need to be mounted; we keep them in a sibling `<hash>.secrets/`
 /// directory that is never bind-mounted anywhere.
-fn host_secret_dir(state_dir: &Path) -> PathBuf {
+pub(crate) fn host_secret_dir_path(state_dir: &Path) -> PathBuf {
     let name = state_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -213,18 +289,35 @@ fn host_secret_dir(state_dir: &Path) -> PathBuf {
     parent.join(format!("{name}.secrets"))
 }
 
+pub(crate) fn ensure_host_secret_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("host secret path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn attempt_stamp_path_for(state_dir: &Path, provider: &str) -> PathBuf {
+    host_secret_dir_path(state_dir).join(format!(".refresh.{provider}.stamp"))
+}
+
 /// Per-project location of the token file the proxy re-reads. Lives in
 /// the host-only [`host_secret_dir`], never inside the guest mount.
 pub fn anthropic_token_path(state_dir: &Path) -> PathBuf {
-    host_secret_dir(state_dir).join("anthropic")
+    host_secret_dir_path(state_dir).join("anthropic")
 }
 
 pub fn openai_token_path(state_dir: &Path) -> PathBuf {
-    host_secret_dir(state_dir).join("openai")
+    host_secret_dir_path(state_dir).join("openai")
 }
 
 pub fn gh_token_path(state_dir: &Path) -> PathBuf {
-    host_secret_dir(state_dir).join("gh")
+    host_secret_dir_path(state_dir).join("gh")
 }
 
 /// Per-provider advisory lock file serializing host-side OAuth refreshes
@@ -248,13 +341,42 @@ pub fn gh_token_path(state_dir: &Path) -> PathBuf {
 /// `claude/settings.json`, `opencode-config/opencode.json`), so its
 /// critical section genuinely spans every provider.
 pub fn refresh_lock_path_for(state_dir: &Path, name: &str) -> PathBuf {
-    host_secret_dir(state_dir).join(name)
+    host_secret_dir_path(state_dir).join(name)
 }
 
 /// Lock basename for the Anthropic in-guest refresh single-flight.
 pub const REFRESH_LOCK_ANTHROPIC: &str = ".refresh.anthropic.lock";
 /// Lock basename for the OpenAI in-guest refresh single-flight.
 pub const REFRESH_LOCK_OPENAI: &str = ".refresh.openai.lock";
+
+fn with_provider_lock<T>(
+    state_dir: &Path,
+    name: &str,
+    work: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    use std::os::fd::AsRawFd as _;
+    let path = refresh_lock_path_for(state_dir, name);
+    ensure_host_secret_dir(&path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return Err(anyhow::Error::new(std::io::Error::last_os_error()));
+        }
+    }
+    let result = work();
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+    result
+}
 
 #[cfg(test)]
 mod refresh_lock_tests {
@@ -289,7 +411,7 @@ mod refresh_lock_tests {
 /// Lives in the host-only [`host_secret_dir`], never inside the guest
 /// mount (it holds the real GitHub OAuth token).
 pub fn copilot_token_path(state_dir: &Path) -> PathBuf {
-    host_secret_dir(state_dir).join("copilot")
+    host_secret_dir_path(state_dir).join("copilot")
 }
 
 /// OpenCode reuses the same OpenAI access token file: both Codex and
@@ -305,28 +427,23 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
 /// the written token files so the launcher can plumb them into
 /// microsandbox's SecretSource::File config.
 ///
-/// Serialized across concurrent launchers in the same project via an
-/// advisory flock on `<state_dir>/.refresh.lock`. Several files under
-/// `state_dir` (`claude.json`, `claude/settings.json`,
-/// `opencode-config/opencode.json`) are read-modify-write — without
-/// the lock, two `agent-vm` invocations in the same project would
-/// race: both read the same baseline, both write back their
-/// mutations, the later writer silently clobbers the earlier. Token
-/// files themselves use `atomic_write` (tempfile + rename) so are
-/// fine without the lock, but the lock is cheap and the easier API
-/// is "everything refresh touches is serialized."
+/// Serialized across concurrent launchers by a sibling host-only project
+/// lock. Guest state is writable by the VM, so the lock must never live below
+/// `state_dir`; provider locks additionally serialize launch capture with OAuth
+/// installation for that provider.
 pub fn refresh(
     state_dir: &Path,
     project_guest_path: &str,
     use_github: bool,
     want_copilot: bool,
+    want_opencode: bool,
 ) -> Result<CredsState> {
-    let _lock = ProjectRefreshLock::acquire(state_dir)
-        .context("acquiring per-project refresh lock")?;
+    let _lock =
+        ProjectRefreshLock::acquire(state_dir).context("acquiring per-project refresh lock")?;
     // The token files hold the host's *real* access tokens, so their
     // directory must never be bind-mounted into the guest. Create it
     // 0700 in the host-only sibling location (see `host_secret_dir`).
-    let secret_dir = host_secret_dir(state_dir);
+    let secret_dir = host_secret_dir_path(state_dir);
     std::fs::create_dir_all(&secret_dir)?;
     #[cfg(unix)]
     {
@@ -334,22 +451,32 @@ pub fn refresh(
         std::fs::set_permissions(&secret_dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("chmod 700 {}", secret_dir.display()))?;
     }
-    // Best-effort: an older agent-vm wrote token files to
-    // `state_dir/tokens/`, which is inside the guest bind mount. If a
-    // user upgrades over such a state dir, remove the stale dir so a real
-    // token doesn't linger where the guest can read it.
-    let _ = std::fs::remove_dir_all(state_dir.join("tokens"));
+    let guest = GuestStateDir::open(state_dir)?;
+    for legacy in [Path::new("tokens/anthropic"), Path::new("tokens/openai")] {
+        if let Err(error) = guest.remove_file(legacy) {
+            tracing::warn!(path = %legacy.display(), error = %error, "leaving unsafe legacy guest entry");
+        }
+    }
+    if let Err(error) = guest.remove_empty_dir(Path::new("tokens")) {
+        tracing::warn!(error = %error, "leaving non-empty legacy guest token directory");
+    }
 
     // First-run bypasses, run regardless of whether the user has host
     // credentials for the provider. Without these the in-VM agent
     // blocks on a terminal-style wizard at first launch.
-    write_agent_config_defaults(state_dir, project_guest_path, want_copilot)?;
+    write_agent_config_defaults(&guest, project_guest_path, want_copilot)?;
 
-    let anthropic_token_file = refresh_anthropic(state_dir).unwrap_or_else(|e| {
+    let anthropic_token_file = with_provider_lock(state_dir, REFRESH_LOCK_ANTHROPIC, || {
+        refresh_anthropic(state_dir, &guest)
+    })
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "anthropic credential refresh failed; skipping");
         None
     });
-    let openai_token_file = refresh_openai(state_dir).unwrap_or_else(|e| {
+    let openai_token_file = with_provider_lock(state_dir, REFRESH_LOCK_OPENAI, || {
+        refresh_openai(state_dir, &guest)
+    })
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "openai credential refresh failed; skipping");
         None
     });
@@ -359,16 +486,12 @@ pub fn refresh(
     // proxy substitutes that placeholder for the same real OpenAI
     // access token on outbound traffic. So OpenCode shares the
     // `openai_token_file` with Codex.
-    let opencode_openai_access_token_file = if openai_token_file.is_some() {
-        match refresh_opencode(state_dir) {
-            // Only register the secret when refresh_opencode actually
-            // wrote a placeholder auth.json. `Ok(None)` (host file
-            // missing) means we have nothing to wire up — review
-            // finding #13.
-            Ok(Some(())) => Some(opencode_openai_token_path(state_dir)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(error = %e, "opencode credential refresh failed; skipping");
+    let opencode_oauth = if want_opencode && openai_token_file.is_some() {
+        match opencode_oauth_entry() {
+            Ok(entry) => entry,
+            Err(error) => {
+                // Static OpenCode credentials remain independently usable.
+                tracing::warn!(error = %error, "OpenCode OAuth credential refresh failed; skipping");
                 None
             }
         }
@@ -423,10 +546,31 @@ pub fn refresh(
     // `verify_snapshot`.
     let snapshot = Some(snapshot_host_creds());
 
+    let opencode_refresh = refresh_opencode_with_paths(
+        state_dir,
+        &guest,
+        want_opencode,
+        host_opencode_auth_path().as_deref(),
+        opencode_oauth,
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!(error = %error, "OpenCode credential refresh failed; skipping");
+        OpencodeRefresh::default()
+    });
+    let opencode_openai_access_token_file = opencode_refresh
+        .openai_wired
+        .then(|| opencode_openai_token_path(state_dir));
+    let opencode_api_token_files = opencode_refresh.api_providers;
+    write_opencode_model_default(
+        &guest,
+        opencode_openai_access_token_file.is_some() || opencode_api_token_files.is_empty(),
+    )?;
+
     Ok(CredsState {
         anthropic_token_file,
         openai_token_file,
         opencode_openai_access_token_file,
+        opencode_api_token_files,
         gh_token_file,
         copilot_token_file,
         snapshot,
@@ -495,7 +639,12 @@ fn identity_cache_path() -> Option<PathBuf> {
 /// tampered cache file can't smuggle gitconfig sections into the guest.
 fn read_identity_cache() -> Option<HostGitIdentity> {
     let p = identity_cache_path()?;
-    let age = std::fs::metadata(&p).ok()?.modified().ok()?.elapsed().ok()?;
+    let age = std::fs::metadata(&p)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()?;
     if age > GIT_IDENTITY_CACHE_TTL {
         return None;
     }
@@ -726,8 +875,7 @@ fn refresh_gh(state_dir: &Path) -> Result<Option<PathBuf>> {
         // Most likely "not logged in" — non-fatal.
         return Ok(None);
     }
-    let token = String::from_utf8(out.stdout)
-        .context("`gh auth token` output is not UTF-8")?;
+    let token = String::from_utf8(out.stdout).context("`gh auth token` output is not UTF-8")?;
     let token = token.trim();
     if token.is_empty() {
         return Ok(None);
@@ -773,7 +921,9 @@ fn extract_copilot_token(raw: &str) -> Option<String> {
 fn refresh_copilot(state_dir: &Path, gh_token_file: Option<&Path>) -> Result<Option<PathBuf>> {
     // 1. Device-flow cache from the original Bash agent-vm.
     if let Some(cache) = host_copilot_token_path() {
-        match std::fs::read_to_string(&cache) {
+        match read_bounded_regular_file(&cache, MAX_HOST_CREDENTIAL_FILE_BYTES)
+            .and_then(|raw| String::from_utf8(raw).context("Copilot cache is not UTF-8"))
+        {
             Ok(raw) => {
                 if let Some(token) = extract_copilot_token(&raw) {
                     let token_file = copilot_token_path(state_dir);
@@ -782,15 +932,20 @@ fn refresh_copilot(state_dir: &Path, gh_token_file: Option<&Path>) -> Result<Opt
                 }
                 // Present but unparseable/empty → fall through to gh.
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("reading {}", cache.display())),
+            Err(_error) if !cache.exists() => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", cache.display()));
+            }
         }
     }
 
     // 2. Fall back to the gh token captured this launch.
     if let Some(gh_file) = gh_token_file {
-        let token = std::fs::read_to_string(gh_file)
-            .with_context(|| format!("reading {}", gh_file.display()))?;
+        let token = String::from_utf8(read_bounded_regular_file(
+            gh_file,
+            MAX_HOST_CREDENTIAL_FILE_BYTES,
+        )?)
+        .with_context(|| format!("reading {}", gh_file.display()))?;
         let token = token.trim();
         if !token.is_empty() {
             let token_file = copilot_token_path(state_dir);
@@ -843,7 +998,7 @@ pub fn verify_snapshot(before: &HostCredsSnapshot) {
 }
 
 fn hash_file(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_bounded_regular_file(path, MAX_HOST_CREDENTIAL_FILE_BYTES).ok()?;
     let mut h = Sha256::new();
     h.update(&bytes);
     let digest = h.finalize();
@@ -855,83 +1010,114 @@ fn hash_file(path: &Path) -> Option<String> {
 /// across launches; merges instead of overwrites so user tweaks
 /// survive.
 fn write_agent_config_defaults(
-    state_dir: &Path,
+    guest: &GuestStateDir,
     project_guest_path: &str,
     want_copilot: bool,
 ) -> Result<()> {
-    let claude_dir = state_dir.join("claude");
-    std::fs::create_dir_all(&claude_dir)?;
-    write_default_claude_settings(&claude_dir.join("settings.json"))?;
-    // ~/.claude.json is the per-user onboarding-state file Claude
-    // Code checks for the "first launch" theme picker AND the
-    // per-project "trust this folder?" prompt. It sits at $HOME root
-    // (not inside .claude/), so the symlinked state dir doesn't catch
-    // it — we instead persist it in our state dir and run.rs symlinks
-    // /root/.claude.json → /agent-vm-state/claude.json.
-    write_default_claude_root_state(&state_dir.join("claude.json"), project_guest_path)?;
+    let mut settings = read_guest_json_object(guest, Path::new("claude/settings.json"));
+    settings
+        .entry("theme")
+        .or_insert(Value::String("dark".into()));
+    settings.insert("hasCompletedOnboarding".into(), Value::Bool(true));
+    settings.insert(
+        "skipDangerousModePermissionPrompt".into(),
+        Value::Bool(true),
+    );
+    settings
+        .entry("effortLevel")
+        .or_insert(Value::String("xhigh".into()));
+    guest.atomic_write(
+        Path::new("claude/settings.json"),
+        &serde_json::to_vec(&Value::Object(settings))?,
+        0o644,
+    )?;
 
-    let codex_dir = state_dir.join("codex");
-    std::fs::create_dir_all(&codex_dir)?;
-    write_default_codex_config(&codex_dir.join("config.toml"))?;
+    let mut root = read_guest_json_object(guest, Path::new("claude.json"));
+    root.insert("hasCompletedOnboarding".into(), Value::Bool(true));
+    root.insert("bypassPermissionsModeAccepted".into(), Value::Bool(true));
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}));
+    let projects = projects
+        .as_object_mut()
+        .context("guest claude projects is not an object")?;
+    let project = projects
+        .entry(project_guest_path.to_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    let project = project
+        .as_object_mut()
+        .context("guest claude project is not an object")?;
+    project.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+    project.insert("hasCompletedProjectOnboarding".into(), Value::Bool(true));
+    project
+        .entry("history")
+        .or_insert_with(|| serde_json::json!([]));
+    guest.atomic_write(
+        Path::new("claude.json"),
+        &serde_json::to_vec(&Value::Object(root))?,
+        0o644,
+    )?;
 
-    // OpenCode reads its config from ~/.config/opencode/opencode.json
-    // (XDG config dir, file named opencode.json — NOT the data dir
-    // and NOT config.json). The launcher symlinks
-    // /root/.config/opencode → /agent-vm-state/opencode-config so
-    // this file lands at the right path inside the guest. Without an
-    // explicit `model`, OpenCode defaults to `openai/gpt-5.5-pro`,
-    // which OpenAI rejects for ChatGPT-OAuth accounts with "model
-    // not supported when using Codex with a ChatGPT account." Pin a
-    // ChatGPT-supported model as the default; users can override
-    // per-run via `opencode run --model ...`.
-    let opencode_config_dir = state_dir.join("opencode-config");
-    std::fs::create_dir_all(&opencode_config_dir)?;
-    write_default_opencode_config(&opencode_config_dir.join("opencode.json"))?;
-
-    // D1: GitHub Copilot CLI reads ~/.copilot/config.json. The
-    // launcher symlinks /root/.copilot → /agent-vm-state/copilot so
-    // this file lands at the right path inside the guest. The token
-    // field is a placeholder; the proxy substitutes the real one
-    // outbound (see write_default_copilot_config).
-    //
-    // Only written when the Copilot agent is actually selected
-    // (`want_copilot`). Writing the placeholder `github_token` for a
-    // claude/codex/opencode/shell session would be dead config at best;
-    // worse, paired with the matching `COPILOT_GITHUB_TOKEN` env it would
-    // have the guest emit an unsubstituted bearer if anything in the
-    // session ever hit the Copilot API without a registered secret.
+    let codex = b"sandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\n";
+    let _ = guest.create(Path::new("codex/config.toml"), codex, 0o644)?;
+    let mut opencode = read_guest_json_object(guest, Path::new("opencode-config/opencode.json"));
+    opencode
+        .entry("$schema")
+        .or_insert(Value::String("https://opencode.ai/config.json".into()));
+    opencode
+        .entry("model")
+        .or_insert(Value::String("openai/gpt-5.5".into()));
+    opencode.entry("autoupdate").or_insert(Value::Bool(false));
+    guest.atomic_write(
+        Path::new("opencode-config/opencode.json"),
+        &serde_json::to_vec(&Value::Object(opencode))?,
+        0o644,
+    )?;
     if want_copilot {
-        let copilot_dir = state_dir.join("copilot");
-        std::fs::create_dir_all(&copilot_dir)?;
-        write_default_copilot_config(&copilot_dir.join("config.json"))?;
+        let mut copilot = read_guest_json_object(guest, Path::new("copilot/config.json"));
+        copilot.insert("trusted_folders".into(), serde_json::json!(["/"]));
+        copilot.insert(
+            "github_token".into(),
+            Value::String(COPILOT_TOKEN_PLACEHOLDER.into()),
+        );
+        guest.atomic_write(
+            Path::new("copilot/config.json"),
+            &serde_json::to_vec(&Value::Object(copilot))?,
+            0o600,
+        )?;
     }
-
-    // Persistent per-project bash history. The launcher symlinks
-    // /root/.bash_history → /agent-vm-state/bash_history; touching
-    // the file here ensures the symlink target exists on first
-    // launch (bash refuses to write history if the target's parent
-    // dir is missing — by here state_dir exists, so just ensure
-    // the file does too). Subsequent launches preserve whatever
-    // bash appended on exit.
-    let history_path = state_dir.join("bash_history");
-    if !history_path.exists() {
-        atomic_write(&history_path, b"", 0o600)?;
-    }
-
+    let _ = guest.create(Path::new("bash_history"), b"", 0o600)?;
     Ok(())
 }
 
-fn refresh_anthropic(state_dir: &Path) -> Result<Option<PathBuf>> {
+fn write_opencode_model_default(guest: &GuestStateDir, pin_openai_model: bool) -> Result<()> {
+    let relative = Path::new("opencode-config/opencode.json");
+    let mut config = read_guest_json_object(guest, relative);
+    if pin_openai_model {
+        config
+            .entry("model")
+            .or_insert(Value::String("openai/gpt-5.5".into()));
+    } else if config.get("model").and_then(Value::as_str) == Some("openai/gpt-5.5") {
+        config.remove("model");
+    }
+    guest.atomic_write(
+        relative,
+        &serde_json::to_vec(&Value::Object(config))?,
+        0o644,
+    )
+}
+
+fn refresh_anthropic(state_dir: &Path, guest: &GuestStateDir) -> Result<Option<PathBuf>> {
     let Some(host_path) = host_claude_creds_path() else {
         return Ok(None);
     };
-    let raw = match std::fs::read_to_string(&host_path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", host_path.display())),
-    };
-    let json: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", host_path.display()))?;
+    let raw = String::from_utf8(read_bounded_regular_file(
+        &host_path,
+        MAX_HOST_CREDENTIAL_FILE_BYTES,
+    )?)
+    .with_context(|| format!("reading {}", host_path.display()))?;
+    let json: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", host_path.display()))?;
 
     let oauth = json
         .get("claudeAiOauth")
@@ -944,8 +1130,6 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Option<PathBuf>> {
     let token_file = anthropic_token_path(state_dir);
     atomic_write(&token_file, access_token.as_bytes(), 0o600)?;
 
-    let claude_dir = state_dir.join("claude");
-    std::fs::create_dir_all(&claude_dir)?;
     let placeholder = serde_json::json!({
         "claudeAiOauth": {
             "accessToken": ANTHROPIC_ACCESS_PLACEHOLDER,
@@ -956,11 +1140,14 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Option<PathBuf>> {
             "rateLimitTier": oauth.get("rateLimitTier"),
         }
     });
-    atomic_write(
-        &claude_dir.join(".credentials.json"),
-        serde_json::to_vec(&placeholder)?.as_slice(),
+    if let Err(error) = guest.atomic_write(
+        Path::new("claude/.credentials.json"),
+        &serde_json::to_vec(&placeholder)?,
         0o600,
-    )?;
+    ) {
+        let _ = std::fs::remove_file(&token_file);
+        return Err(error).context("writing Anthropic guest placeholder");
+    }
 
     Ok(Some(token_file))
 }
@@ -975,17 +1162,17 @@ fn refresh_anthropic(state_dir: &Path) -> Result<Option<PathBuf>> {
 ///
 /// Requires that `refresh_openai` has already run (so a host codex
 /// auth file existed and was parseable). Returns `None` if not.
-fn refresh_opencode(state_dir: &Path) -> Result<Option<()>> {
+fn opencode_oauth_entry() -> Result<Option<Value>> {
     let Some(host_path) = host_codex_auth_path() else {
         return Ok(None);
     };
-    let raw = match std::fs::read_to_string(&host_path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", host_path.display())),
-    };
-    let json: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", host_path.display()))?;
+    let raw = String::from_utf8(read_bounded_regular_file(
+        &host_path,
+        MAX_HOST_CREDENTIAL_FILE_BYTES,
+    )?)
+    .with_context(|| format!("reading {}", host_path.display()))?;
+    let json: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", host_path.display()))?;
 
     // account_id: from tokens.account_id directly when present,
     // otherwise pull from the id_token JWT's `chatgpt_account_id`.
@@ -1002,25 +1189,170 @@ fn refresh_opencode(state_dir: &Path) -> Result<Option<()>> {
     // attempts (which would fail against our synthetic JWT).
     let expires_ms: u64 = 9_999_999_999_000;
 
-    let auth = serde_json::json!({
-        "openai": {
-            "type": "oauth",
-            "refresh": OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
-            "access": OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
-            "expires": expires_ms,
-            "accountId": account_id,
+    Ok(Some(serde_json::json!({
+        "type": "oauth",
+        "refresh": OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
+        "access": OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
+        "expires": expires_ms,
+        "accountId": account_id,
+    })))
+}
+
+#[derive(Default)]
+struct OpencodeRefresh {
+    openai_wired: bool,
+    api_providers: Vec<(OpencodeApiProvider, PathBuf)>,
+}
+
+fn opencode_api_token_path(state_dir: &Path, provider: OpencodeApiProvider) -> PathBuf {
+    host_secret_dir_path(state_dir).join(format!("opencode-{}", provider.id))
+}
+
+fn read_guest_json_object(
+    guest: &GuestStateDir,
+    relative: &Path,
+) -> serde_json::Map<String, Value> {
+    match guest.read(relative) {
+        Ok(Some(raw)) => match serde_json::from_slice::<Value>(&raw)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+        {
+            Some(object) => object,
+            None => {
+                tracing::warn!(path = %relative.display(), "guest JSON is not an object; replacing managed entries");
+                serde_json::Map::new()
+            }
+        },
+        Ok(None) => serde_json::Map::new(),
+        Err(error) => {
+            tracing::warn!(path = %relative.display(), error = %error, "guest JSON is unreadable; replacing managed entries");
+            serde_json::Map::new()
         }
-    });
+    }
+}
 
-    let opencode_dir = state_dir.join("opencode");
-    std::fs::create_dir_all(&opencode_dir)?;
-    atomic_write(
-        &opencode_dir.join("auth.json"),
-        serde_json::to_vec(&auth)?.as_slice(),
-        0o600,
-    )?;
+fn refresh_opencode_with_paths(
+    state_dir: &Path,
+    guest: &GuestStateDir,
+    want_opencode: bool,
+    host_opencode_path: Option<&Path>,
+    openai_entry: Option<Value>,
+) -> Result<OpencodeRefresh> {
+    let host_auth = if want_opencode {
+        host_opencode_path
+            .and_then(|path| read_bounded_regular_file(path, MAX_HOST_CREDENTIAL_FILE_BYTES).ok())
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+    } else {
+        None
+    };
+    let mut installed = Vec::new();
+    if let Some(host_auth) = host_auth.and_then(|value| value.as_object().cloned()) {
+        for provider in OPENCODE_API_PROVIDERS {
+            let key = host_auth
+                .get(provider.id)
+                .and_then(Value::as_object)
+                .filter(|entry| {
+                    entry.len() == 2 && entry.get("type").and_then(Value::as_str) == Some("api")
+                })
+                .and_then(|entry| entry.get("key").and_then(Value::as_str))
+                .filter(|key| !key.is_empty());
+            if let Some(key) = key {
+                let path = opencode_api_token_path(state_dir, provider);
+                if ensure_host_secret_dir(&path).is_ok()
+                    && atomic_write(&path, key.as_bytes(), 0o600).is_ok()
+                {
+                    installed.push((provider, path));
+                }
+            }
+        }
+    }
+    let relative = Path::new("opencode/auth.json");
+    let mut auth = read_guest_json_object(guest, relative);
+    // Only remove our own synthetic OpenAI entry. A user-managed `openai`
+    // provider must survive exactly like a user-managed static provider.
+    if auth.get("openai").is_some_and(is_agent_vm_openai_entry) {
+        auth.remove("openai");
+    }
+    let openai_wired = openai_entry.is_some();
+    if let Some(entry) = openai_entry {
+        auth.insert("openai".into(), entry);
+    }
+    for provider in OPENCODE_API_PROVIDERS {
+        let guest_managed = auth
+            .get(provider.id)
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("key"))
+            .and_then(Value::as_str)
+            .is_some_and(|key| {
+                !OPENCODE_API_PROVIDERS
+                    .iter()
+                    .any(|managed| managed.placeholder == key)
+            });
+        if guest_managed {
+            // A real value in guest state is deliberately not ours to replace.
+            // It cannot be paired with a host file, so remove the candidate.
+            let path = opencode_api_token_path(state_dir, provider);
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    provider = provider.id,
+                    "failed to remove unmanaged OpenCode host token"
+                );
+            }
+            installed.retain(|(installed_provider, _)| installed_provider.id != provider.id);
+            continue;
+        }
+        if auth
+            .get(provider.id)
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("key"))
+            .and_then(Value::as_str)
+            .is_some_and(|key| {
+                OPENCODE_API_PROVIDERS
+                    .iter()
+                    .any(|managed| managed.placeholder == key)
+            })
+        {
+            auth.remove(provider.id);
+        }
+        let path = opencode_api_token_path(state_dir, provider);
+        if installed
+            .iter()
+            .any(|(installed_provider, _)| installed_provider.id == provider.id)
+        {
+            auth.insert(
+                provider.id.to_owned(),
+                serde_json::json!({"type":"api", "key": provider.placeholder}),
+            );
+        } else if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                provider = provider.id,
+                "failed to remove stale OpenCode host token"
+            );
+        }
+    }
+    if let Err(error) =
+        guest.atomic_write(relative, &serde_json::to_vec(&Value::Object(auth))?, 0o600)
+    {
+        for (_, path) in &installed {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(error).context("writing placeholder OpenCode auth");
+    }
+    Ok(OpencodeRefresh {
+        openai_wired,
+        api_providers: installed,
+    })
+}
 
-    Ok(Some(()))
+fn is_agent_vm_openai_entry(entry: &Value) -> bool {
+    entry
+        .get("access")
+        .and_then(Value::as_str)
+        .is_some_and(|access| access == OPENCODE_OPENAI_ACCESS_PLACEHOLDER)
 }
 
 /// Decode an OpenAI id_token JWT (alg=RS256, but we don't verify) and
@@ -1028,9 +1360,7 @@ fn refresh_opencode(state_dir: &Path) -> Result<Option<()>> {
 /// `https://api.openai.com/auth` claim. Used as a fallback when the
 /// codex auth.json doesn't carry `tokens.account_id` directly.
 fn decode_id_token_account(json: &Value) -> Option<String> {
-    let id_token = json
-        .pointer("/tokens/id_token")
-        .and_then(|v| v.as_str())?;
+    let id_token = json.pointer("/tokens/id_token").and_then(|v| v.as_str())?;
     let payload_b64 = id_token.split('.').nth(1)?;
     use base64::Engine as _;
     // JWT spec says base64url *without* padding. Use URL_SAFE_NO_PAD
@@ -1055,39 +1385,17 @@ fn decode_id_token_account(json: &Value) -> Option<String> {
         .map(String::from)
 }
 
-fn write_default_claude_settings(path: &Path) -> Result<()> {
-    // Read what's there (if anything), force-set the onboarding-bypass
-    // fields, write back. Merging instead of overwriting means a user
-    // who tweaked some other setting inside the sandbox keeps their
-    // change; force-setting `hasCompletedOnboarding` covers the case
-    // where Claude wrote a partial settings.json mid-wizard.
-    let mut settings: Value = match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let obj = settings.as_object_mut().context("settings.json is not an object")?;
-    obj.entry("theme".to_string())
-        .or_insert(Value::String("dark".into()));
-    obj.insert("hasCompletedOnboarding".into(), Value::Bool(true));
-    obj.insert("skipDangerousModePermissionPrompt".into(), Value::Bool(true));
-    obj.entry("effortLevel".to_string())
-        .or_insert(Value::String("xhigh".into()));
-    atomic_write(path, serde_json::to_vec(&settings)?.as_slice(), 0o644)?;
-    Ok(())
-}
-
-fn refresh_openai(state_dir: &Path) -> Result<Option<PathBuf>> {
+fn refresh_openai(state_dir: &Path, guest: &GuestStateDir) -> Result<Option<PathBuf>> {
     let Some(host_path) = host_codex_auth_path() else {
         return Ok(None);
     };
-    let raw = match std::fs::read_to_string(&host_path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", host_path.display())),
-    };
-    let mut json: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", host_path.display()))?;
+    let raw = String::from_utf8(read_bounded_regular_file(
+        &host_path,
+        MAX_HOST_CREDENTIAL_FILE_BYTES,
+    )?)
+    .with_context(|| format!("reading {}", host_path.display()))?;
+    let mut json: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", host_path.display()))?;
 
     // Either ChatGPT OAuth (`tokens.access_token`) or an API key
     // (`OPENAI_API_KEY`). Both end up as Bearer in outgoing requests.
@@ -1133,13 +1441,14 @@ fn refresh_openai(state_dir: &Path) -> Result<Option<PathBuf>> {
         json["OPENAI_API_KEY"] = Value::String(OPENAI_ACCESS_PLACEHOLDER.into());
     }
 
-    let codex_dir = state_dir.join("codex");
-    std::fs::create_dir_all(&codex_dir)?;
-    atomic_write(
-        &codex_dir.join("auth.json"),
-        serde_json::to_vec(&json)?.as_slice(),
+    if let Err(error) = guest.atomic_write(
+        Path::new("codex/auth.json"),
+        &serde_json::to_vec(&json)?,
         0o600,
-    )?;
+    ) {
+        let _ = std::fs::remove_file(&token_file);
+        return Err(error).context("writing Codex guest placeholder");
+    }
 
     Ok(Some(token_file))
 }
@@ -1148,16 +1457,14 @@ fn refresh_openai(state_dir: &Path) -> Result<Option<PathBuf>> {
 pub fn sync_chrome_mcp(state_dir: &Path, enabled: bool) -> Result<()> {
     let _lock = ProjectRefreshLock::acquire(state_dir)
         .context("acquiring per-project refresh lock for Chrome MCP")?;
-    let path = state_dir.join("claude.json");
-    let mut state: Value = match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).context("parsing claude.json")?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let root = state.as_object_mut().context("~/.claude.json is not an object")?;
+    let guest = GuestStateDir::open(state_dir)?;
+    let relative = Path::new("claude.json");
+    let mut state = Value::Object(read_guest_json_object(&guest, relative));
+    let root = state
+        .as_object_mut()
+        .context("guest claude root is not an object")?;
     sync_chrome_mcp_value(root, enabled);
-    atomic_write(&path, serde_json::to_vec(&state)?.as_slice(), 0o644)
-        .with_context(|| format!("writing {}", path.display()))
+    guest.atomic_write(relative, &serde_json::to_vec(&state)?, 0o644)
 }
 
 fn chrome_mcp_entry() -> Value {
@@ -1170,61 +1477,30 @@ fn chrome_mcp_entry() -> Value {
 
 fn sync_chrome_mcp_value(root: &mut serde_json::Map<String, Value>, enabled: bool) {
     if enabled {
-        let entry = root.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
+        let entry = root
+            .entry("mcpServers")
+            .or_insert_with(|| serde_json::json!({}));
         if !entry.is_object() {
             tracing::warn!("replacing invalid mcpServers value while enabling Chrome MCP");
             *entry = serde_json::json!({});
         }
-        entry.as_object_mut().expect("object set above").insert("chrome-devtools".into(), chrome_mcp_entry());
+        entry
+            .as_object_mut()
+            .expect("object set above")
+            .insert("chrome-devtools".into(), chrome_mcp_entry());
         return;
     }
-    let Some(entry) = root.get_mut("mcpServers") else { return };
+    let Some(entry) = root.get_mut("mcpServers") else {
+        return;
+    };
     let Some(servers) = entry.as_object_mut() else {
         tracing::warn!("leaving non-object mcpServers untouched while disabling Chrome MCP");
         return;
     };
     servers.remove("chrome-devtools");
-    if servers.is_empty() { root.remove("mcpServers"); }
-}
-
-fn write_default_claude_root_state(path: &Path, project_guest_path: &str) -> Result<()> {
-    // Merge-on-existing to preserve user-side updates (project entries
-    // etc.) but force-set the onboarding + per-folder trust flags
-    // every launch.
-    let mut state: Value = match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let obj = state.as_object_mut().context("~/.claude.json is not an object")?;
-    obj.insert("hasCompletedOnboarding".into(), Value::Bool(true));
-    obj.insert("bypassPermissionsModeAccepted".into(), Value::Bool(true));
-
-    // Pre-approve the project folder. Without this the in-VM Claude
-    // shows the "do you trust the files in this folder?" prompt on
-    // first launch in each new project. The keys here mirror what
-    // Claude Code itself writes once a user clicks "yes".
-    let projects = obj
-        .entry("projects".to_string())
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .context("~/.claude.json projects is not an object")?;
-    let project = projects
-        .entry(project_guest_path.to_string())
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .context("~/.claude.json projects.<path> is not an object")?;
-    project.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
-    project.insert(
-        "hasCompletedProjectOnboarding".into(),
-        Value::Bool(true),
-    );
-    project
-        .entry("history".to_string())
-        .or_insert_with(|| serde_json::json!([]));
-
-    atomic_write(path, serde_json::to_vec(&state)?.as_slice(), 0o644)?;
-    Ok(())
+    if servers.is_empty() {
+        root.remove("mcpServers");
+    }
 }
 
 /// Phase 6/9: write the guest's gitconfig and (if `has_gh_token`)
@@ -1258,103 +1534,29 @@ pub fn write_guest_gh_config(
     has_gh_token: bool,
     identity: Option<&HostGitIdentity>,
 ) -> Result<()> {
-    // safe.directory = * is unconditional: the guest IS the security
-    // boundary (microVM), so trusting every path is fine and git
-    // operating on the host-bind-mounted project requires it. Use
-    // wildcard form so any --mount extra also works without
-    // listing every path.
-    let mut gitconfig = String::from(
-        "[safe]\n\
-         \tdirectory = *\n",
-    );
+    let _lock = ProjectRefreshLock::acquire(state_dir)?;
+    let guest = GuestStateDir::open(state_dir)?;
+    let mut gitconfig = String::from("[safe]\n\tdirectory = *\n");
     if let Some(id) = identity {
         gitconfig.push_str(&format!(
-            "[user]\n\tname = {name}\n\temail = {email}\n",
-            name = id.name,
-            email = id.email,
+            "[user]\n\tname = {}\n\temail = {}\n",
+            id.name, id.email
         ));
     }
     if has_gh_token {
-        // git's credential helper for github.com pushes/clones. The
-        // helper is a shell snippet; git invokes it with `get` and
-        // reads `username=`/`password=` lines from stdout.
         gitconfig.push_str(&format!(
-            "[credential \"https://github.com\"]\n\
-             \thelper = \"!f() {{ test \\\"$1\\\" = get && echo username=x-access-token && echo password={tok}; }}; f\"\n\
-             [credential \"https://gist.github.com\"]\n\
-             \thelper = \"!f() {{ test \\\"$1\\\" = get && echo username=x-access-token && echo password={tok}; }}; f\"\n\
-             [url \"https://github.com/\"]\n\
-             \tinsteadOf = git@github.com:\n",
-            tok = GH_TOKEN_PLACEHOLDER,
-        ));
+            "[credential \"https://github.com\"]\n\thelper = \"!f() {{ test \\\"$1\\\" = get && echo username=x-access-token && echo password={}; }}; f\"\n[credential \"https://gist.github.com\"]\n\thelper = \"!f() {{ test \\\"$1\\\" = get && echo username=x-access-token && echo password={}; }}; f\"\n[url \"https://github.com/\"]\n\tinsteadOf = git@github.com:\n", GH_TOKEN_PLACEHOLDER, GH_TOKEN_PLACEHOLDER));
     }
-    atomic_write(&state_dir.join("gitconfig"), gitconfig.as_bytes(), 0o600)?;
-
+    guest.atomic_write(Path::new("gitconfig"), gitconfig.as_bytes(), 0o600)?;
     if has_gh_token {
-        // The `user:` field in gh's hosts.yml is a local *login*
-        // annotation (shows up in `gh auth status`); use the real
-        // login if we have one, otherwise fall back to a literal
-        // that won't be confused for a real user.
         let gh_user = identity
             .and_then(|id| id.gh_login.as_deref())
             .unwrap_or("agent-vm");
-        let gh_dir = state_dir.join("gh-config");
-        std::fs::create_dir_all(&gh_dir)?;
-        let hosts_yml = format!(
-            "github.com:\n\
-             \\x20\\x20user: {gh_user}\n\
-             \\x20\\x20oauth_token: {tok}\n\
-             \\x20\\x20git_protocol: https\n",
-            gh_user = gh_user,
-            tok = GH_TOKEN_PLACEHOLDER,
-        )
-        .replace("\\x20", " ");
-        atomic_write(&gh_dir.join("hosts.yml"), hosts_yml.as_bytes(), 0o600)?;
+        let hosts = format!(
+            "github.com:\n  user: {gh_user}\n  oauth_token: {GH_TOKEN_PLACEHOLDER}\n  git_protocol: https\n"
+        );
+        guest.atomic_write(Path::new("gh-config/hosts.yml"), hosts.as_bytes(), 0o600)?;
     }
-    Ok(())
-}
-
-fn write_default_codex_config(path: &Path) -> Result<()> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    let mut f = match std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o644)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
-    };
-    let body = "sandbox_mode = \"danger-full-access\"\n\
-                approval_policy = \"never\"\n";
-    f.write_all(body.as_bytes())?;
-    Ok(())
-}
-
-/// Write a minimal OpenCode config that pins the default model to one
-/// the ChatGPT-OAuth flow accepts. Merge-on-existing so the user's own
-/// settings (model overrides, MCP servers, etc.) survive across
-/// launches; only fields we manage are force-set.
-fn write_default_opencode_config(path: &Path) -> Result<()> {
-    let mut config: Value = match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let obj = config
-        .as_object_mut()
-        .context("opencode config.json is not an object")?;
-    obj.entry("$schema".to_string())
-        .or_insert(Value::String("https://opencode.ai/config.json".into()));
-    // ChatGPT-OAuth doesn't accept gpt-5.5-pro (OpenCode's built-in
-    // default); pin a model that does. Use `entry().or_insert` so a
-    // user who set `model` to something else doesn't get clobbered.
-    obj.entry("model".to_string())
-        .or_insert(Value::String("openai/gpt-5.5".into()));
-    obj.entry("autoupdate".to_string())
-        .or_insert(Value::Bool(false));
-    atomic_write(path, serde_json::to_vec(&config)?.as_slice(), 0o644)?;
     Ok(())
 }
 
@@ -1372,44 +1574,9 @@ fn write_default_opencode_config(path: &Path) -> Result<()> {
 ///
 /// Merge-on-existing so a user's own settings survive across launches;
 /// only the fields we manage are force-set.
-fn write_default_copilot_config(path: &Path) -> Result<()> {
-    let mut config: Value = match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({})),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let obj = config
-        .as_object_mut()
-        .context("copilot config.json is not an object")?;
-    // Trust everything — the VM itself is the security boundary.
-    obj.insert(
-        "trusted_folders".into(),
-        Value::Array(vec![Value::String("/".into())]),
-    );
-    // Placeholder token; the proxy swaps it for the real one outbound.
-    obj.insert(
-        "github_token".into(),
-        Value::String(COPILOT_TOKEN_PLACEHOLDER.into()),
-    );
-    atomic_write(path, serde_json::to_vec(&config)?.as_slice(), 0o600)?;
-    Ok(())
-}
-
-/// Advisory exclusive flock on `<state_dir>/.refresh.lock`. Held for
-/// the duration of [`refresh`] so two concurrent `agent-vm` launchers
-/// in the same project don't interleave reads/writes of the shared
-/// per-project state files (`claude.json`, `claude/settings.json`,
-/// `opencode-config/opencode.json` — each is a read-modify-write that
-/// would otherwise lose one launcher's mutation).
-///
-/// Implemented on top of `flock(2)` (Unix-only). The lock auto-releases
-/// when the fd closes — Drop performs an explicit `LOCK_UN` first for
-/// clarity, but isn't strictly required for correctness.
-///
-/// Why a separate lockfile (`.refresh.lock`) and not flock'ing the
-/// state files directly: those files don't exist on first launch (we
-/// create them inside the locked section), and flock requires an open
-/// fd. A dedicated always-present lockfile avoids that chicken-and-egg.
+/// Host-only project lock used for guest-state read-modify-write transactions.
+/// It is a sibling of the guest mount so a guest cannot delete or replace the
+/// synchronization point.
 struct ProjectRefreshLock {
     file: std::fs::File,
 }
@@ -1417,12 +1584,15 @@ struct ProjectRefreshLock {
 impl ProjectRefreshLock {
     fn acquire(state_dir: &Path) -> Result<Self> {
         use std::os::unix::io::AsRawFd;
-        // Caller created state_dir already (run.rs's session.ensure_dirs);
-        // belt-and-braces in case `refresh` is invoked from somewhere
-        // that doesn't.
-        std::fs::create_dir_all(state_dir)
-            .with_context(|| format!("creating {}", state_dir.display()))?;
-        let lock_path = state_dir.join(".refresh.lock");
+        let secret_dir = host_secret_dir_path(state_dir);
+        std::fs::create_dir_all(&secret_dir)
+            .with_context(|| format!("creating {}", secret_dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&secret_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let lock_path = secret_dir.join(".refresh.project.lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -1466,6 +1636,8 @@ impl Drop for ProjectRefreshLock {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     /// Security invariant: the real-token files must never live under
@@ -1473,6 +1645,128 @@ mod tests {
     /// guest at `/agent-vm-state`. A token file under that path would be
     /// readable by the in-VM agent (`cat /agent-vm-state/tokens/...`),
     /// defeating the whole "real tokens never enter the VM" design.
+    #[test]
+    fn all_placeholders_are_unique_and_non_overlapping() {
+        for (index, placeholder) in ALL_PLACEHOLDERS.iter().enumerate() {
+            assert!(!placeholder.is_empty());
+            for other in ALL_PLACEHOLDERS.iter().skip(index + 1) {
+                assert_ne!(placeholder, other);
+                assert!(!placeholder.contains(other));
+                assert!(!other.contains(placeholder));
+            }
+        }
+        assert_eq!(OPENCODE_API_PROVIDERS.len(), 7);
+    }
+
+    #[test]
+    fn opencode_static_capture_keeps_canaries_host_only_and_reconciles() {
+        let state = tempfile::tempdir().unwrap();
+        let host = tempfile::NamedTempFile::new().unwrap();
+        let mut entries = serde_json::Map::new();
+        for provider in OPENCODE_API_PROVIDERS {
+            entries.insert(
+                provider.id.into(),
+                serde_json::json!({"type":"api", "key":format!("CANARY_{}", provider.id)}),
+            );
+        }
+        entries.insert(
+            "openrouter".into(),
+            serde_json::json!({"type":"api", "key":"guest-managed"}),
+        );
+        std::fs::write(
+            host.path(),
+            serde_json::to_vec(&Value::Object(entries)).unwrap(),
+        )
+        .unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        guest
+            .atomic_write(
+                Path::new("opencode/auth.json"),
+                br#"{"openrouter":{"type":"api","key":"guest-managed"}}"#,
+                0o600,
+            )
+            .unwrap();
+        let installed =
+            refresh_opencode_with_paths(state.path(), &guest, true, Some(host.path()), None)
+                .unwrap()
+                .api_providers;
+        assert_eq!(installed.len(), OPENCODE_API_PROVIDERS.len());
+        let guest_auth: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("opencode/auth.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(guest_auth["openrouter"]["key"], "guest-managed");
+        let guest_text = guest_auth.to_string();
+        for provider in OPENCODE_API_PROVIDERS {
+            let path = opencode_api_token_path(state.path(), provider);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("CANARY_{}", provider.id)
+            );
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(guest_auth[provider.id]["key"], provider.placeholder);
+            assert!(!guest_text.contains("CANARY_"));
+        }
+        let absent =
+            refresh_opencode_with_paths(state.path(), &guest, false, Some(host.path()), None)
+                .unwrap()
+                .api_providers;
+        assert!(absent.is_empty());
+        for provider in OPENCODE_API_PROVIDERS {
+            assert!(!opencode_api_token_path(state.path(), provider).exists());
+        }
+    }
+
+    #[test]
+    fn opencode_merge_preserves_known_guest_provider_and_unknown_entries() {
+        let state = tempfile::tempdir().unwrap();
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            host.path(),
+            br#"{"zai":{"type":"api","key":"HOST_CANARY"}}"#,
+        )
+        .unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        guest
+            .atomic_write(
+                Path::new("opencode/auth.json"),
+                br#"{"zai":{"type":"api","key":"guest-managed"},"unknown":{"key":"keep"}}"#,
+                0o600,
+            )
+            .unwrap();
+        let result = refresh_opencode_with_paths(
+            state.path(),
+            &guest,
+            true,
+            Some(host.path()),
+            Some(serde_json::json!({
+                "type": "oauth",
+                "access": OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
+            })),
+        )
+        .unwrap();
+        assert!(result.api_providers.is_empty());
+        assert!(result.openai_wired);
+        assert!(!opencode_api_token_path(state.path(), OPENCODE_API_PROVIDERS[0]).exists());
+        let auth: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("opencode/auth.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(auth["zai"]["key"], "guest-managed");
+        assert_eq!(auth["unknown"]["key"], "keep");
+        assert_eq!(auth["openai"]["access"], OPENCODE_OPENAI_ACCESS_PLACEHOLDER);
+        assert!(!auth.to_string().contains("HOST_CANARY"));
+    }
+
     #[test]
     fn token_files_live_outside_the_guest_mount() {
         let state_dir = Path::new("/home/u/.local/state/agent-vm/abc123");
@@ -1514,7 +1808,7 @@ mod tests {
             .create(true)
             .write(true)
             .truncate(false)
-            .open(dir.path().join(".refresh.lock"))
+            .open(host_secret_dir_path(dir.path()).join(".refresh.project.lock"))
             .expect("open second handle");
         let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         let err = std::io::Error::last_os_error();
@@ -1544,7 +1838,7 @@ mod tests {
             "/tmp/agent-vm-state",
         ] {
             let sdp = Path::new(sd);
-            let secret = host_secret_dir(sdp);
+            let secret = host_secret_dir_path(sdp);
             assert!(
                 !secret.starts_with(sdp.canonicalize().unwrap_or(sdp.to_path_buf())),
                 "{} must not be inside {}",
@@ -1567,7 +1861,7 @@ mod tests {
     fn copilot_token_not_captured_without_use_github_or_want_copilot() {
         let dir = tempfile::tempdir().unwrap();
         let sd = dir.path();
-        let creds = super::refresh(sd, "/workspace/p", false, false).unwrap();
+        let creds = super::refresh(sd, "/workspace/p", false, false, false).unwrap();
         assert!(
             creds.copilot_token_file.is_none(),
             "copilot token captured despite use_github=false and want_copilot=false"
@@ -1636,7 +1930,8 @@ mod tests {
         let path = tmpdir.join("known");
         let mut f = std::fs::File::create(&path).unwrap();
         // Capital T is the famous one (`d7a8fbb...`).
-        f.write_all(b"The quick brown fox jumps over the lazy dog").unwrap();
+        f.write_all(b"The quick brown fox jumps over the lazy dog")
+            .unwrap();
         drop(f);
         let h = hash_file(&path).unwrap();
         assert_eq!(
@@ -1648,7 +1943,10 @@ mod tests {
 
     // ── decode_id_token_account ───────────────────────────────────
 
-    fn make_jwt(payload_json: &str, alphabet: base64::engine::general_purpose::GeneralPurpose) -> String {
+    fn make_jwt(
+        payload_json: &str,
+        alphabet: base64::engine::general_purpose::GeneralPurpose,
+    ) -> String {
         use base64::Engine as _;
         // Header doesn't matter; payload is what we test.
         let header = alphabet.encode(b"{\"alg\":\"none\",\"typ\":\"JWT\"}");
@@ -1664,10 +1962,7 @@ mod tests {
         let payload = r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"abc-123"}}"#;
         let jwt = make_jwt(payload, base64::engine::general_purpose::URL_SAFE_NO_PAD);
         let json = serde_json::json!({"tokens": {"id_token": jwt}});
-        assert_eq!(
-            decode_id_token_account(&json).as_deref(),
-            Some("abc-123"),
-        );
+        assert_eq!(decode_id_token_account(&json).as_deref(), Some("abc-123"),);
     }
 
     #[test]
@@ -1680,10 +1975,7 @@ mod tests {
         let payload = r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct?+/"}}"#;
         let jwt = make_jwt(payload, base64::engine::general_purpose::STANDARD);
         let json = serde_json::json!({"tokens": {"id_token": jwt}});
-        assert_eq!(
-            decode_id_token_account(&json).as_deref(),
-            Some("acct?+/"),
-        );
+        assert_eq!(decode_id_token_account(&json).as_deref(), Some("acct?+/"),);
     }
 
     #[test]
@@ -1707,62 +1999,201 @@ mod tests {
         assert_eq!(decode_id_token_account(&json), None);
     }
 
-    // ── write_default_opencode_config merge semantics ─────────────
+    // ── write_opencode_model_default pin/retire/preserve semantics ──
+    //
+    // Exercises the real production entry point (through
+    // `GuestStateDir`), not a parallel plain-filesystem implementation:
+    // the previous version of these tests called a `#[cfg(test)]`-only
+    // `write_default_opencode_config` helper that duplicated (and had
+    // drifted from) `write_opencode_model_default`'s actual pin/retire
+    // rule, so passing tests proved nothing about production behavior.
 
-    #[test]
-    fn opencode_config_first_write_creates_with_defaults() {
-        let tmpdir = std::env::temp_dir().join(format!(
-            "agent-vm-oc-cfg-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+    fn opencode_model_value(guest: &GuestStateDir) -> Value {
+        serde_json::from_slice(
+            &guest
+                .read(Path::new("opencode-config/opencode.json"))
                 .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&tmpdir).unwrap();
-        let path = tmpdir.join("opencode.json");
-
-        write_default_opencode_config(&path).unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let v: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(v["model"], "openai/gpt-5.5");
-        assert_eq!(v["$schema"], "https://opencode.ai/config.json");
-        assert_eq!(v["autoupdate"], false);
-
-        std::fs::remove_dir_all(&tmpdir).ok();
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     #[test]
-    fn opencode_config_preserves_user_model_override() {
-        // A user who sets model = "openai/gpt-5-turbo" must not have
-        // it clobbered on a subsequent launch.
-        let tmpdir = std::env::temp_dir().join(format!(
-            "agent-vm-oc-cfg-merge-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&tmpdir).unwrap();
-        let path = tmpdir.join("opencode.json");
+    fn opencode_model_default_pins_when_requested_on_first_write() {
+        let state = tempfile::tempdir().unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        write_opencode_model_default(&guest, true).unwrap();
+        assert_eq!(opencode_model_value(&guest)["model"], "openai/gpt-5.5");
+    }
 
-        std::fs::write(
-            &path,
-            r#"{"model": "openai/gpt-5-turbo", "extra": "user-data"}"#,
+    #[test]
+    fn opencode_model_default_preserves_user_override_while_pinning() {
+        let state = tempfile::tempdir().unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        guest
+            .atomic_write(
+                Path::new("opencode-config/opencode.json"),
+                br#"{"model":"openai/gpt-5-turbo","extra":"user-data"}"#,
+                0o644,
+            )
+            .unwrap();
+        write_opencode_model_default(&guest, true).unwrap();
+        let config = opencode_model_value(&guest);
+        assert_eq!(
+            config["model"], "openai/gpt-5-turbo",
+            "user override survived"
+        );
+        assert_eq!(config["extra"], "user-data", "user-set field preserved");
+    }
+
+    #[test]
+    fn opencode_model_default_retires_only_the_exact_stale_pin() {
+        let state = tempfile::tempdir().unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        guest
+            .atomic_write(
+                Path::new("opencode-config/opencode.json"),
+                br#"{"model":"openai/gpt-5.5"}"#,
+                0o644,
+            )
+            .unwrap();
+        // Static GLM/Kimi keys are the only OpenCode credential wired
+        // this launch: pin_openai_model=false must retire the stale
+        // agent-vm default so OpenCode's own default takes over.
+        write_opencode_model_default(&guest, false).unwrap();
+        assert!(opencode_model_value(&guest).get("model").is_none());
+    }
+
+    #[test]
+    fn opencode_model_default_preserves_non_stale_value_when_not_pinning() {
+        let state = tempfile::tempdir().unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        guest
+            .atomic_write(
+                Path::new("opencode-config/opencode.json"),
+                br#"{"model":"anthropic/claude"}"#,
+                0o644,
+            )
+            .unwrap();
+        write_opencode_model_default(&guest, false).unwrap();
+        assert_eq!(opencode_model_value(&guest)["model"], "anthropic/claude");
+    }
+
+    // ── OpenCode reconciliation edge cases (code review follow-up) ──
+
+    #[test]
+    fn opencode_malformed_host_json_does_not_disable_independent_openai_leg() {
+        let state = tempfile::tempdir().unwrap();
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"not valid json {{{").unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        let result = refresh_opencode_with_paths(
+            state.path(),
+            &guest,
+            true,
+            Some(host.path()),
+            Some(serde_json::json!({
+                "type": "oauth",
+                "access": OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
+            })),
         )
         .unwrap();
+        assert!(
+            result.api_providers.is_empty(),
+            "malformed host JSON must not yield any static provider"
+        );
+        assert!(
+            result.openai_wired,
+            "the independently-supplied OpenAI OAuth leg must survive malformed static host JSON"
+        );
+        let auth: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("opencode/auth.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(auth["openai"]["access"], OPENCODE_OPENAI_ACCESS_PLACEHOLDER);
+    }
 
-        write_default_opencode_config(&path).unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let v: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(v["model"], "openai/gpt-5-turbo", "user override survived");
-        assert_eq!(v["extra"], "user-data", "user-set field preserved");
-        // Our defaults still filled in where the user didn't set them.
-        assert_eq!(v["$schema"], "https://opencode.ai/config.json");
-        assert_eq!(v["autoupdate"], false);
+    #[test]
+    fn opencode_partial_host_write_failure_yields_consistent_successful_subset() {
+        let state = tempfile::tempdir().unwrap();
+        let host = tempfile::NamedTempFile::new().unwrap();
+        let mut entries = serde_json::Map::new();
+        for provider in OPENCODE_API_PROVIDERS {
+            entries.insert(
+                provider.id.into(),
+                serde_json::json!({"type":"api", "key":format!("CANARY_{}", provider.id)}),
+            );
+        }
+        std::fs::write(
+            host.path(),
+            serde_json::to_vec(&Value::Object(entries)).unwrap(),
+        )
+        .unwrap();
+        // Pre-occupy one provider's host token path with a directory so
+        // the final `renameat` onto it fails (EISDIR/ENOTDIR) while every
+        // other provider's independent write still succeeds.
+        let failing = OPENCODE_API_PROVIDERS[0];
+        std::fs::create_dir_all(opencode_api_token_path(state.path(), failing)).unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        let result =
+            refresh_opencode_with_paths(state.path(), &guest, true, Some(host.path()), None)
+                .unwrap();
+        assert_eq!(result.api_providers.len(), OPENCODE_API_PROVIDERS.len() - 1);
+        assert!(!result.api_providers.iter().any(|(p, _)| p.id == failing.id));
+        let auth: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("opencode/auth.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            auth.get(failing.id).is_none(),
+            "a provider whose host write failed must not get a guest placeholder"
+        );
+        for provider in OPENCODE_API_PROVIDERS
+            .iter()
+            .filter(|provider| provider.id != failing.id)
+        {
+            assert_eq!(auth[provider.id]["key"], provider.placeholder);
+        }
+    }
 
-        std::fs::remove_dir_all(&tmpdir).ok();
+    #[test]
+    fn opencode_final_guest_merge_failure_registers_no_providers_and_cleans_up_host_files() {
+        let state = tempfile::tempdir().unwrap();
+        let host = tempfile::NamedTempFile::new().unwrap();
+        let mut entries = serde_json::Map::new();
+        for provider in OPENCODE_API_PROVIDERS {
+            entries.insert(
+                provider.id.into(),
+                serde_json::json!({"type":"api", "key":format!("CANARY_{}", provider.id)}),
+            );
+        }
+        std::fs::write(
+            host.path(),
+            serde_json::to_vec(&Value::Object(entries)).unwrap(),
+        )
+        .unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        // Occupy the "opencode" parent as a regular file so the final
+        // merge write to "opencode/auth.json" fails closed.
+        guest
+            .create(Path::new("opencode"), b"not-a-directory", 0o600)
+            .unwrap();
+        let result =
+            refresh_opencode_with_paths(state.path(), &guest, true, Some(host.path()), None);
+        assert!(result.is_err());
+        for provider in OPENCODE_API_PROVIDERS {
+            assert!(
+                !opencode_api_token_path(state.path(), provider).exists(),
+                "host token for {} must be removed best-effort after guest merge failure",
+                provider.id
+            );
+        }
     }
 
     // ── sync_chrome_mcp ──────────────────────────────────────────
@@ -1770,13 +2201,31 @@ mod tests {
     #[test]
     fn sync_chrome_mcp_adds_exact_owned_entry_and_preserves_user_state() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("claude.json"), r#"{"other":true,"mcpServers":{"user":{"command":"mine"}}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("claude.json"),
+            r#"{"other":true,"mcpServers":{"user":{"command":"mine"}}}"#,
+        )
+        .unwrap();
         sync_chrome_mcp(dir.path(), true).unwrap();
-        let state: Value = serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap()).unwrap();
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap())
+                .unwrap();
         let chrome = &state["mcpServers"]["chrome-devtools"];
         assert_eq!(chrome["command"], "/usr/local/bin/agent-vm-chrome-mcp");
-        assert_eq!(chrome["args"], serde_json::json!(["npx", "-y", "chrome-devtools-mcp@1.0.1", "--headless=true", "--isolated=true"]));
-        assert_eq!(chrome["env"]["CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"], "1");
+        assert_eq!(
+            chrome["args"],
+            serde_json::json!([
+                "npx",
+                "-y",
+                "chrome-devtools-mcp@1.0.1",
+                "--headless=true",
+                "--isolated=true"
+            ])
+        );
+        assert_eq!(
+            chrome["env"]["CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"],
+            "1"
+        );
         assert_eq!(state["mcpServers"]["user"]["command"], "mine");
         assert_eq!(state["other"], true);
     }
@@ -1790,7 +2239,9 @@ mod tests {
         )
         .unwrap();
         sync_chrome_mcp(dir.path(), false).unwrap();
-        let state: Value = serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap()).unwrap();
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap())
+                .unwrap();
         assert!(state["mcpServers"].get("chrome-devtools").is_none());
         assert_eq!(state["mcpServers"]["user"]["command"], "mine");
         assert_eq!(state["other"], true);
@@ -1800,10 +2251,19 @@ mod tests {
     fn disabling_preserves_non_object_user_value() {
         for value in ["null", "\"text\"", "[]", "1", "true"] {
             let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join("claude.json"), format!(r#"{{"mcpServers":{value}}}"#)).unwrap();
+            std::fs::write(
+                dir.path().join("claude.json"),
+                format!(r#"{{"mcpServers":{value}}}"#),
+            )
+            .unwrap();
             sync_chrome_mcp(dir.path(), false).unwrap();
-            let state: Value = serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap()).unwrap();
-            assert_eq!(state["mcpServers"], serde_json::from_str::<Value>(value).unwrap());
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                state["mcpServers"],
+                serde_json::from_str::<Value>(value).unwrap()
+            );
         }
     }
 
@@ -1811,9 +2271,15 @@ mod tests {
     fn enabling_replaces_invalid_mcp_servers_value() {
         for value in ["null", "\"text\"", "[]", "1", "true"] {
             let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join("claude.json"), format!(r#"{{"mcpServers":{value}}}"#)).unwrap();
+            std::fs::write(
+                dir.path().join("claude.json"),
+                format!(r#"{{"mcpServers":{value}}}"#),
+            )
+            .unwrap();
             sync_chrome_mcp(dir.path(), true).unwrap();
-            let state: Value = serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap()).unwrap();
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("claude.json")).unwrap())
+                    .unwrap();
             assert!(state["mcpServers"]["chrome-devtools"].is_object());
         }
     }
@@ -1985,7 +2451,10 @@ mod tests {
         // must still work.
         let payload = br#"{"login":"big","id":18446744073709551610,"name":null,"email":null}"#;
         let id = parse_gh_user_json(payload).expect("parse");
-        assert_eq!(id.email, "18446744073709551610+big@users.noreply.github.com");
+        assert_eq!(
+            id.email,
+            "18446744073709551610+big@users.noreply.github.com"
+        );
     }
 
     #[test]

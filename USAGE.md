@@ -246,7 +246,8 @@ telemetry.
 Reads from the host:
 
 - `~/.claude/.credentials.json` (Claude)
-- `~/.codex/auth.json` (Codex, OpenCode)
+- `~/.codex/auth.json` (Codex, OpenCode OAuth)
+- `~/.local/share/opencode/auth.json` (OpenCode static API providers)
 - `gh auth token` (git/gh)
 
 The guest gets placeholder strings; the proxy substitutes on the wire.
@@ -255,10 +256,17 @@ on the host, **outside** the bind mount the guest sees. A SHA-256
 snapshot of the three credential files is taken at launch and
 re-checked on exit; unexpected mutations print a warning.
 
+OpenCode and `shell` launches also capture the supported static OpenCode IDs:
+`zai`, `zai-coding-plan`, `zhipuai`, `zhipuai-coding-plan`, `kimi-for-coding`,
+`moonshotai`, and `moonshotai-cn`. Each is stored in its own 0600 sibling file
+and substitutes only on its exact provider host; static keys refresh on
+relaunch, not during a running session.
+
 The proxy re-reads each configured host-only token file on every eligible
 connection. For Claude/Codex, an expired bearer triggers an OAuth hook that
 validates the exact request, runs `claude -p`/`codex exec` on the host, and
-returns placeholders only; a failed refresh fails the request closed. GitHub
+returns placeholders only; an unavailable or failed refresh returns a
+credential-free temporary-unavailable response rather than exposing a token. GitHub
 credentials are sent only to the per-launch repository allow-list, so off-list
 API calls receive a proxy denial or anonymous smart-HTTP request without the
 host bearer. GraphQL mutations are denied until they have a sound

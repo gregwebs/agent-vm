@@ -116,7 +116,11 @@ impl PullProgressDisplay {
                 self.header
                     .set_message(format!("{:<12} {}...", "Resolving", self.reference));
             }
-            PullProgress::Resolved { layer_count, reference, .. } => {
+            PullProgress::Resolved {
+                layer_count,
+                reference,
+                ..
+            } => {
                 if self.reference.is_empty() {
                     self.reference = reference.to_string();
                 }

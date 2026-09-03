@@ -70,7 +70,10 @@ pub async fn pull_image(image: &str) -> Result<()> {
     // a logging helper makes panics inside the render task (e.g. a
     // ProgressStyle template typo) visible instead of swallowed by
     // `JoinHandle::await.ok()`.
-    let result = task.await.context("pull task join").and_then(|inner| inner.context("pulling image"));
+    let result = task
+        .await
+        .context("pull task join")
+        .and_then(|inner| inner.context("pulling image"));
     crate::pull_progress::await_render(render).await;
     let sandbox = result?;
     sandbox.stop_and_wait().await.ok();
@@ -135,7 +138,9 @@ mod tests {
 
     #[test]
     fn local_registries_are_plain_http() {
-        assert!(is_plain_http_registry("localhost:5000/agent-vm-template:latest"));
+        assert!(is_plain_http_registry(
+            "localhost:5000/agent-vm-template:latest"
+        ));
         assert!(is_plain_http_registry("127.0.0.1:5000/x"));
         assert!(is_plain_http_registry("0.0.0.0:8080/x"));
         assert!(is_plain_http_registry("dev.local/x"));
@@ -144,7 +149,9 @@ mod tests {
 
     #[test]
     fn public_registries_are_not_plain_http() {
-        assert!(!is_plain_http_registry("ghcr.io/wirenboard/agent-vm-template:latest"));
+        assert!(!is_plain_http_registry(
+            "ghcr.io/wirenboard/agent-vm-template:latest"
+        ));
         assert!(!is_plain_http_registry("docker.io/library/debian:13"));
         assert!(!is_plain_http_registry("registry.example.com/x"));
         // Docker Hub short form has no `/` in the registry part.
@@ -159,16 +166,13 @@ mod tests {
     // collide with another module setting the same var.)
     #[test]
     fn env_override_forces_plain_http() {
-        // SAFETY: cargo test parallelises but env mutations affect the
-        // whole process; restrict to one assertion + cleanup. The
-        // assertions in the OTHER tests in this module don't touch
-        // AGENT_VM_INSECURE_REGISTRY, so no interference.
-        // SAFETY: see rationale above.
-        unsafe { std::env::set_var("AGENT_VM_INSECURE_REGISTRY", "1") };
+        let mut env = crate::test_env::guard();
+        env.set_var("AGENT_VM_INSECURE_REGISTRY", "1");
         assert!(is_plain_http_registry("registry.corp.example:5000/x"));
-        assert!(is_plain_http_registry("ghcr.io/wirenboard/agent-vm-template:latest"));
-        // SAFETY: same.
-        unsafe { std::env::remove_var("AGENT_VM_INSECURE_REGISTRY") };
+        assert!(is_plain_http_registry(
+            "ghcr.io/wirenboard/agent-vm-template:latest"
+        ));
+        env.remove_var("AGENT_VM_INSECURE_REGISTRY");
         // After cleanup the heuristic resumes its normal behaviour.
         assert!(!is_plain_http_registry("registry.corp.example:5000/x"));
     }
