@@ -170,6 +170,97 @@ fn ask_yes_no(
     })
 }
 
+/// stderr sink for `launch()`'s `==> …` progress notices.
+///
+/// Exists because `eprintln` panics from inside `std::io::_eprint`
+/// ("failed printing to stderr") when the write fails — a real outcome for
+/// `agent-vm … 2>&1 | head` (EPIPE) or a full disk — aborting the launcher
+/// with exit 101 and no context instead of reaching the error boundary in
+/// `main()` (issue #70). Generic over the sink so the failure path is
+/// testable without a broken pipe, following `network.rs`'s
+/// `emit_launch_notices_to` precedent.
+struct LaunchNotices<W> {
+    sink: W,
+}
+
+impl LaunchNotices<std::io::Stderr> {
+    /// The production sink is the `Stderr` *handle*, not a `.lock()` guard:
+    /// `StderrLock<'a>` borrows for `'a` and is `!Send`, so it can neither
+    /// be a long-lived field here nor cross into the spawned update-banner
+    /// task. (Deadlock is not the concern — std's stderr lock is
+    /// reentrant-per-thread.) Each `emit` is a single `write_all`, which
+    /// takes the lock once, so nothing is lost by not holding it.
+    fn to_stderr() -> Self {
+        Self::new(std::io::stderr())
+    }
+}
+
+impl<W: std::io::Write> LaunchNotices<W> {
+    fn new(sink: W) -> Self {
+        Self { sink }
+    }
+
+    /// Deliver one notice line.
+    ///
+    /// One `write_all` of the fully rendered line rather than `writeln!`,
+    /// which writes once per format-string fragment and could deliver half a
+    /// notice before failing. No flush: std's `Stderr` is unbuffered, so
+    /// there is nothing to flush and neither `eprintln` nor
+    /// `emit_launch_notices_to` does — adding one would change
+    /// success-path behavior.
+    fn emit(&mut self, message: impl std::fmt::Display) -> Result<()> {
+        let mut line = message.to_string();
+        line.push('\n');
+        self.sink
+            .write_all(line.as_bytes())
+            .with_context(|| format!("writing the launch notice {:?}", line.trim_end()))
+    }
+}
+
+/// `==> agent-vm-<hash>-<pid> in /home/dev/proj (state: /…/state/<hash>)`
+fn launch_banner(session: &ProjectSession) -> String {
+    format!(
+        "==> {} in {} (state: {})",
+        session.sandbox_name,
+        session.project_dir.display(),
+        session.state_dir.display(),
+    )
+}
+
+/// `==> GitHub repo scope (2): a/b, c/d` or
+/// `==> GitHub repo scope: <none> (no api.github.com access)`
+fn repo_scope_notice(allowed: &[String]) -> String {
+    if allowed.is_empty() {
+        "==> GitHub repo scope: <none> (no api.github.com access)".to_string()
+    } else {
+        format!(
+            "==> GitHub repo scope ({}): {}",
+            allowed.len(),
+            allowed.join(", "),
+        )
+    }
+}
+
+/// `==> Git author identity: Ada <ada@x> (gh:ada)` /
+/// `==> Git author identity: Ada <ada@x>` /
+/// `==> Git author identity: <none> (gh not logged in and …)`
+fn git_identity_notice(identity: Option<&crate::secrets::HostGitIdentity>) -> String {
+    match identity {
+        Some(id) => format!(
+            "==> Git author identity: {} <{}>{}",
+            id.name,
+            id.email,
+            id.gh_login
+                .as_deref()
+                .map(|l| format!(" (gh:{l})"))
+                .unwrap_or_default(),
+        ),
+        None => "==> Git author identity: <none> (gh not logged in and no host gitconfig \
+                  user.name/email; in-VM `git commit` will refuse until you set one)"
+            .to_string(),
+    }
+}
+
 /// Interactive y/N confirmation before building a tooling layer (F3 in the
 /// plan/ADR-0003).
 ///
@@ -210,11 +301,12 @@ fn confirm_layer_build(tag: &str, auto: bool) -> Result<Confirmation> {
 /// without the surrounding ~150 lines of mount/credential/network setup
 /// interleaved with it, and so each step (cache hit, confirm, build, load)
 /// is a single `?`-propagated call a reader can follow in order.
-async fn resolve_boot_image_with_layer(
+async fn resolve_boot_image_with_layer<W: std::io::Write>(
     base_image: &str,
     layer_flag: Option<&Path>,
     project_dir: &Path,
     auto_confirm: bool,
+    notices: &mut LaunchNotices<W>,
 ) -> Result<Option<String>> {
     let Some(layer_dir) = layer::resolve_layer_dir(layer_flag, project_dir)? else {
         return Ok(None);
@@ -226,7 +318,9 @@ async fn resolve_boot_image_with_layer(
     //    base if it isn't cached yet (F4).
     let (_path, mut base_digest) = image_config_path_and_digest(base_image).await;
     if base_digest.is_none() {
-        eprintln!("==> Tooling layer present; pulling base {base_image} first…");
+        notices.emit(format!(
+            "==> Tooling layer present; pulling base {base_image} first…"
+        ))?;
         crate::pull::pull_image(base_image)
             .await
             .context("pulling base image to build the tooling layer FROM")?;
@@ -245,7 +339,7 @@ async fn resolve_boot_image_with_layer(
     //    no prompt — this is the common-case fast path on every launch
     //    after the first.
     if layer::derived_is_cached(&cache_dir, &id.tag).await? {
-        eprintln!("==> Reusing cached tooling layer {}", id.tag);
+        notices.emit(format!("==> Reusing cached tooling layer {}", id.tag))?;
         return Ok(Some(id.tag));
     }
 
@@ -268,14 +362,14 @@ async fn resolve_boot_image_with_layer(
         .suffix(".tar")
         .tempfile_in(&cache_dir)
         .context("creating tooling-layer OCI archive tempfile")?;
-    eprintln!("==> Building tooling layer {} …", id.tag);
+    notices.emit(format!("==> Building tooling layer {} …", id.tag))?;
     layer::build_derived_oci(&id, &pinned_base, tar.path())
         .await
         .with_context(|| format!("building tooling layer {}", id.tag))?;
     layer::load_derived_image(&cache_dir, tar.path(), &id.tag)
         .await
         .with_context(|| format!("loading tooling layer {} into the msb cache", id.tag))?;
-    eprintln!("==> Tooling layer {} ready", id.tag);
+    notices.emit(format!("==> Tooling layer {} ready", id.tag))?;
     Ok(Some(id.tag))
 }
 
@@ -661,12 +755,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // this same project before we boot. See
     // `reap_stale_project_sandboxes` for the full rationale.
     reap_stale_project_sandboxes(&session.project_hash).await;
-    eprintln!(
-        "==> {} in {} (state: {})",
-        session.sandbox_name,
-        session.project_dir.display(),
-        session.state_dir.display(),
-    );
+    let mut notices = LaunchNotices::to_stderr();
+    notices.emit(launch_banner(&session))?;
     let _ = &session.project_hash;
 
     // `base_image` stays a separate binding from `image` for the lifetime of
@@ -697,6 +787,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         layer_flag.as_deref(),
         &session.project_dir,
         auto_confirm,
+        &mut notices,
     )
     .await?
     {
@@ -731,7 +822,9 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let (project_guest_path, remap_reason) =
         resolve_project_guest_path(&session.project_dir, host_path);
     if let Some(reason) = remap_reason {
-        eprintln!("==> Project path {host_path} {reason}; mounting at /workspace instead");
+        notices.emit(format!(
+            "==> Project path {host_path} {reason}; mounting at /workspace instead"
+        ))?;
     }
     let mut patch_builder_steps = mkdir_chain(Path::new(&project_guest_path));
     // PullPolicy::IfMissing keeps the slow part (pull + materialize) off
@@ -758,7 +851,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         let img = base_image.clone();
         tokio::spawn(async move {
             seed_pulled_marker_if_absent(&img).await;
-            notify_if_update_available(&img).await;
+            // Detached task: there is no launch error boundary to reach
+            // from here (the launch may finish first), and an undeliverable
+            // *informational* banner must not kill an otherwise-healthy
+            // launch. Handle it here — the task is its own top level —
+            // instead of discarding the Result. The trace itself also goes
+            // to stderr, so on a fully broken stderr this is silent; that
+            // is the accepted floor for a background banner (issue #70).
+            let mut notices = LaunchNotices::to_stderr();
+            if let Err(error) = notify_if_update_available(&img, &mut notices).await {
+                tracing::debug!(error = %format!("{error:#}"), "update banner not delivered");
+            }
         });
     }
 
@@ -810,11 +913,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             parsed_mounts.iter().map(|m| m.host.as_path()),
         ));
     } else if !args.repo.is_empty() {
-        eprintln!(
+        notices.emit(format!(
             "==> --no-git skips cwd remote auto-detection, but --repo overrides are kept ({} entr{})",
             args.repo.len(),
             if args.repo.len() == 1 { "y" } else { "ies" },
-        );
+        ))?;
     }
     for r in &args.repo {
         let r = r.trim().to_string();
@@ -823,15 +926,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         }
     }
     let use_github = !allowed_repos.is_empty();
-    if use_github {
-        eprintln!(
-            "==> GitHub repo scope ({}): {}",
-            allowed_repos.len(),
-            allowed_repos.join(", "),
-        );
-    } else {
-        eprintln!("==> GitHub repo scope: <none> (no api.github.com access)");
-    }
+    notices.emit(repo_scope_notice(&allowed_repos))?;
 
     // D1: the Copilot API is reached with a GitHub OAuth token, but
     // unlike the gh CLI / repo-push path it is not repo-scoped — so
@@ -894,22 +989,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // `[user]` section is omitted and git will refuse to commit
     // until the user sets one — preferable to mis-attribution.
     let host_identity = crate::secrets::discover_host_git_identity();
-    if let Some(id) = &host_identity {
-        eprintln!(
-            "==> Git author identity: {} <{}>{}",
-            id.name,
-            id.email,
-            id.gh_login
-                .as_deref()
-                .map(|l| format!(" (gh:{l})"))
-                .unwrap_or_default(),
-        );
-    } else {
-        eprintln!(
-            "==> Git author identity: <none> (gh not logged in and no host gitconfig user.name/email; \
-             in-VM `git commit` will refuse until you set one)"
-        );
-    }
+    notices.emit(git_identity_notice(host_identity.as_ref()))?;
     crate::secrets::write_guest_gh_config(
         &session.state_dir,
         creds.gh_token_file.is_some(),
@@ -934,7 +1014,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         mount::expand_follow_links(parsed_mounts, mount_home.as_deref())
             .context("expanding --mount follow-links")?;
     for w in &follow_link_warnings {
-        eprintln!("==> {w}");
+        notices.emit(format!("==> {w}"))?;
     }
     // Belt-and-suspenders: `parse_extra_mounts` already canonicalize()s
     // every explicit HOST (which fails on a missing path), and every
@@ -1005,12 +1085,12 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // (same dance as the project bind above).
     let mut extra_mount_mkdirs: Vec<String> = Vec::new();
     for em in &extra_mounts {
-        eprintln!(
+        notices.emit(format!(
             "==> Mounting {} -> {}{}",
             em.host.display(),
             em.guest.display(),
             if em.readonly { " (read-only)" } else { "" }
-        );
+        ))?;
         let host = em.host.clone();
         let readonly = em.readonly;
         let guest_str = em
@@ -1176,16 +1256,16 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     }
 
     let profile = env::var("AGENT_VM_PROFILE").is_ok();
-    eprintln!(
+    notices.emit(format!(
         "==> Booting sandbox from {image} ({memory_mib} MiB, {cpus} vCPU; first run pulls layers, otherwise ~3s)"
-    );
+    ))?;
     let t_create = Instant::now();
     let config = builder.build().await.context("preparing sandbox config")?;
     if env::var("AGENT_VM_DEBUG_CONFIG").is_ok() {
-        eprintln!(
+        notices.emit(format!(
             "[debug] sandbox config JSON: {}",
             serde_json::to_string_pretty(&config).unwrap_or_default()
-        );
+        ))?;
     }
     let (progress, task) = Sandbox::create_with_pull_progress(config);
     let render_task = tokio::spawn(crate::pull_progress::render(progress));
@@ -1199,7 +1279,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     crate::pull_progress::await_render(render_task).await;
     let sandbox = result?;
     if profile {
-        eprintln!("[profile] create: {:?}", t_create.elapsed());
+        notices.emit(format!("[profile] create: {:?}", t_create.elapsed()))?;
     }
     // When the project path isn't cmdline-safe we handed libkrun the `/`
     // workdir placeholder, so create-time validation only confirmed that
@@ -1326,7 +1406,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
 
     let t_run = Instant::now();
     let exit = if std::io::stdin().is_terminal() {
-        eprintln!("==> Attaching to {inner_cmd}");
+        notices.emit(format!("==> Attaching to {inner_cmd}"))?;
         // Pin the agent's cwd to the real project path via the exec request
         // (vsock, byte-safe), NOT libkrun's `KRUN_WORKDIR` — which may be the
         // ASCII `/` placeholder for a non-ASCII project. `attach()` alone
@@ -1362,7 +1442,9 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         // commands (codex exec can take >30s for a single response) and
         // lets us inspect partial output when the user Ctrl-Cs or the
         // shell times out.
-        eprintln!("==> Running {inner_cmd} in sandbox (no TTY; streaming output)");
+        notices.emit(format!(
+            "==> Running {inner_cmd} in sandbox (no TTY; streaming output)"
+        ))?;
         use microsandbox::sandbox::exec::ExecEvent;
         use tokio::io::AsyncWriteExt as _;
         let mut handle = sandbox
@@ -1463,19 +1545,19 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     };
 
     if profile {
-        eprintln!("[profile] run:    {:?}", t_run.elapsed());
+        notices.emit(format!("[profile] run:    {:?}", t_run.elapsed()))?;
     }
 
-    eprintln!("==> Stopping sandbox");
+    notices.emit("==> Stopping sandbox")?;
     let t_stop = Instant::now();
     sandbox.stop_and_wait().await.ok();
     if profile {
-        eprintln!("[profile] stop:   {:?}", t_stop.elapsed());
+        notices.emit(format!("[profile] stop:   {:?}", t_stop.elapsed()))?;
     }
     let t_remove = Instant::now();
     Sandbox::remove(&session.sandbox_name).await.ok();
     if profile {
-        eprintln!("[profile] remove: {:?}", t_remove.elapsed());
+        notices.emit(format!("[profile] remove: {:?}", t_remove.elapsed()))?;
     }
 
     // Phase 5 safety net (host-cred mutation check) runs via the
@@ -2118,12 +2200,13 @@ mod tests {
         assert!(cli.args.yes);
     }
 
-    // Test doubles for `ask_yes_no`'s io seam (issue #58). One shared,
-    // ordered event log so "delivery happens before the read" and "no read
-    // after a failed delivery" are asserted directly rather than inferred
-    // from side effects. Test-local duplication of the spirit of
-    // `network.rs`'s `SharedWriter`/`FailingWriter` — deliberate, per
-    // CODING_STANDARDS' DRY note (wait for a third instance).
+    // Test doubles for `ask_yes_no`'s io seam (issue #58), now shared by
+    // `LaunchNotices::emit`'s tests too (issue #70). One shared, ordered
+    // event log so "delivery happens before the read" and "no read after a
+    // failed delivery" are asserted directly rather than inferred from side
+    // effects. Test-local duplication of the spirit of `network.rs`'s
+    // `SharedWriter`/`FailingWriter` — deliberate, per CODING_STANDARDS'
+    // DRY note (wait for a third instance).
     #[derive(Debug, PartialEq, Eq)]
     enum PromptIo {
         Wrote(String),
@@ -2379,6 +2462,172 @@ mod tests {
         );
     }
 
+    // Tests for `LaunchNotices::emit` (issue #70), reusing the `ask_yes_no`
+    // io test doubles above (D8: no new test-support module for a second
+    // consumer in the same file).
+
+    #[test]
+    fn notice_is_delivered_as_one_write_without_a_flush() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut notices = LaunchNotices::new(output);
+        notices.emit("==> hello").expect("scripted success");
+        assert_eq!(
+            folded_prompt_log(&log.borrow()),
+            vec![PromptIo::Wrote("==> hello\n".to_string())],
+            "one atomic write, no flush"
+        );
+    }
+
+    #[test]
+    fn notice_write_failure_is_propagated_with_the_line_in_context() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::Write,
+        };
+        let mut notices = LaunchNotices::new(output);
+        let error = notices
+            .emit("==> hello")
+            .expect_err("write failure must propagate");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("writing the launch notice \"==> hello\""),
+            "chain: {chain}"
+        );
+        assert!(chain.contains("broken output"), "chain: {chain}");
+    }
+
+    #[test]
+    fn notice_launch_banner_names_sandbox_project_and_state_dir() {
+        let session = ProjectSession {
+            project_dir: PathBuf::from("/home/dev/proj"),
+            project_hash: "abc".to_string(),
+            state_dir: PathBuf::from("/state/abc"),
+            sandbox_name: "agent-vm-abc-42".to_string(),
+        };
+        assert_eq!(
+            launch_banner(&session),
+            "==> agent-vm-abc-42 in /home/dev/proj (state: /state/abc)"
+        );
+    }
+
+    #[test]
+    fn notice_repo_scope_lists_allowed_repos_or_reports_none() {
+        assert_eq!(
+            repo_scope_notice(&[]),
+            "==> GitHub repo scope: <none> (no api.github.com access)"
+        );
+        assert_eq!(
+            repo_scope_notice(&["a/b".to_string(), "c/d".to_string()]),
+            "==> GitHub repo scope (2): a/b, c/d"
+        );
+    }
+
+    #[test]
+    fn notice_git_identity_renders_login_suffix_or_none() {
+        assert_eq!(
+            git_identity_notice(Some(&crate::secrets::HostGitIdentity {
+                name: "Ada".to_string(),
+                email: "ada@x".to_string(),
+                gh_login: Some("ada".to_string()),
+            })),
+            "==> Git author identity: Ada <ada@x> (gh:ada)"
+        );
+        assert_eq!(
+            git_identity_notice(Some(&crate::secrets::HostGitIdentity {
+                name: "Ada".to_string(),
+                email: "ada@x".to_string(),
+                gh_login: None,
+            })),
+            "==> Git author identity: Ada <ada@x>"
+        );
+        assert_eq!(
+            git_identity_notice(None),
+            "==> Git author identity: <none> (gh not logged in and no host gitconfig \
+             user.name/email; in-VM `git commit` will refuse until you set one)"
+        );
+    }
+
+    /// Head+tail source guard (D10): the launch path must contain no
+    /// panicking `eprintln!`/`eprint!`/`println!`/`print!` call. `mod tests`
+    /// opens at `#[cfg(test)]` and closes with the only column-0 `}` inside
+    /// it (everything nested is indented), so locating that span isolates
+    /// the test module from the production code that follows it in this
+    /// file (`seed_pulled_marker_if_absent`, `notify_if_update_available`,
+    /// etc. — see issue #70's plan D10; a prefix-only scan would miss
+    /// these). Unlike an earlier version of this test, the scan below walks
+    /// `src.lines().enumerate()` once directly — real 1-based line numbers
+    /// throughout — and skips lines inside the test module's span, rather
+    /// than concatenating head+tail into a separate buffer and reporting
+    /// `line_no + 1` against *that* buffer's line numbers (which put every
+    /// tail hit ~1245 lines too low, landing inside `mod tests`; issue #70
+    /// code review finding F1).
+    ///
+    /// This split point is positional, not structural: if a future test
+    /// literal inside `mod tests` ever introduces its own column-0 `}`, the
+    /// `\n}\n` search below would match that line instead, shrinking the
+    /// test module's computed span and leaving an in-test `eprintln!` in
+    /// the scanned "production" text. That fails *loudly* (the guard then
+    /// trips on the in-test call), not silently, so this fragility is safe
+    /// to leave undefended.
+    #[test]
+    fn notice_production_launch_path_uses_no_panicking_print_macros() {
+        let src = include_str!("run.rs");
+        let cfg_test_offset = src.find("#[cfg(test)]").expect("run.rs has a test module");
+        let after_cfg_test = &src[cfg_test_offset..];
+        let close_offset_in_after = after_cfg_test.find("\n}\n").expect("test module is closed");
+        // Byte offset of the `}` that closes `mod tests` (skip the leading
+        // '\n' of the "\n}\n" match).
+        let test_module_close_brace_offset = cfg_test_offset + close_offset_in_after + 1;
+        let tail_start_offset = cfg_test_offset + close_offset_in_after + "\n}\n".len();
+        let tail = &src[tail_start_offset..];
+        assert!(
+            !tail.contains("#[cfg(test)]"),
+            "this guard assumes a single test module in run.rs"
+        );
+
+        fn line_number_at(src: &str, byte_offset: usize) -> usize {
+            src[..byte_offset].matches('\n').count() + 1
+        }
+        // The test module's span, in real 1-based line numbers: from
+        // `#[cfg(test)]` through the `}` that closes `mod tests`, inclusive.
+        let test_module_start_line = line_number_at(src, cfg_test_offset);
+        let test_module_end_line = line_number_at(src, test_module_close_brace_offset);
+
+        // "eprintln!(" contains "println!(" and "eprint!(" contains
+        // "print!(" (but "eprintln!(" does not contain "print!("), so all
+        // four needles are checked, with "eprint" reported first when a
+        // line matches more than one.
+        for (idx, line) in src.lines().enumerate() {
+            let line_no = idx + 1;
+            if line_no >= test_module_start_line && line_no <= test_module_end_line {
+                continue;
+            }
+            let hit = if line.contains("eprintln!(") {
+                Some("eprintln!(")
+            } else if line.contains("eprint!(") {
+                Some("eprint!(")
+            } else if line.contains("println!(") {
+                Some("println!(")
+            } else if line.contains("print!(") {
+                Some("print!(")
+            } else {
+                None
+            };
+            assert!(
+                hit.is_none(),
+                "production run.rs:{} uses {} — route it through LaunchNotices \
+                 instead (issue #70). line: {line:?}",
+                line_no,
+                hit.unwrap_or_default(),
+            );
+        }
+    }
+
     // `resolve_boot_image_with_layer` is only exercised end-to-end by the
     // opt-in docker+registry e2e paths (see layer.rs's `#[ignore]`d
     // `e2e_*` tests and the manual verification recorded for issue #13),
@@ -2392,15 +2641,26 @@ mod tests {
     #[tokio::test]
     async fn resolve_boot_image_with_layer_returns_none_for_a_project_with_no_layer() {
         let project = tempfile::tempdir().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut notices = LaunchNotices::new(output);
         let got = resolve_boot_image_with_layer(
             "ghcr.io/wirenboard/agent-vm-template:latest",
             None,
             project.path(),
             false,
+            &mut notices,
         )
         .await
         .unwrap();
         assert_eq!(got, None);
+        assert!(
+            log.borrow().is_empty(),
+            "the no-layer fast path must stay silent"
+        );
     }
 
     /// Stub [`ExecEventSource`] backed by an mpsc channel: `send` pushes an
@@ -3167,7 +3427,10 @@ async fn seed_pulled_marker_if_absent(image: &str) {
     }
 }
 
-async fn notify_if_update_available(image: &str) {
+async fn notify_if_update_available<W: std::io::Write>(
+    image: &str,
+    notices: &mut LaunchNotices<W>,
+) -> Result<()> {
     use crate::image_check::{UpdateState, check_for_update};
     // The probe does up to three sequential registry round-trips for a
     // token-auth registry (manifest GET → 401 → token → authed GET),
@@ -3179,16 +3442,18 @@ async fn notify_if_update_available(image: &str) {
     let probe = tokio::time::timeout(UPDATE_PROBE_BUDGET, check_for_update(image));
     match probe.await {
         Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) => {
-            eprintln!(
+            notices.emit(format!(
                 "==> A newer image is available in the registry (cached {cached}, registry {remote})"
-            );
-            eprintln!("==> Run `agent-vm pull` to fetch it. Continuing with the cached image.");
+            ))?;
+            notices
+                .emit("==> Run `agent-vm pull` to fetch it. Continuing with the cached image.")?;
         }
         // UpToDate / NotCached: nothing to say.
         // Ok(Err)/None: registry unreachable etc. — stay quiet.
         // Err(Elapsed): probe exceeded the budget — stay quiet.
         _ => {}
     }
+    Ok(())
 }
 
 /// Whether to run the launch-time registry update probe.

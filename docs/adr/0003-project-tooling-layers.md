@@ -91,7 +91,10 @@ explicit, not implicit:
 - A **stderr write error** while delivering the prompt (broken pipe, out
   of disk) fails the launch with that io error in context, instead of
   aborting the process from inside `eprint!`; the answer is never read
-  after a failed delivery (issue #58). Two limits are deliberate: the
+  after a failed delivery (issue #58) — and the layer's own progress
+  notices (`==> Tooling layer present; pulling base …`, `==> Building
+  tooling layer …`, etc.) share this same failure handling rather than
+  panicking independently (issue #70). Two limits are deliberate: the
   Rust runtime reopens a closed std fd onto `/dev/null` before `main`
   runs, so under `2>&-` the prompt write *succeeds* into `/dev/null` and
   the failure is undetectable — it is not a failure at all; and a prompt
