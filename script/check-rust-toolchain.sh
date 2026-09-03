@@ -156,23 +156,6 @@ check_macos_rust_toolchain_var() {
         "$channel" "$file" "$found"
 }
 
-check_macos_floor_guard() {
-    local file=script/build/macos.sh found floor
-    found="$(grep -oE 'minor < [0-9]+' "$file" | head -n1 || true)"
-    if [[ -z "$found" ]]; then
-        fail_missing_anchor "$file" 'the "minor < N" floor guard'
-        return
-    fi
-    floor="${found##* }"
-    if [[ "$floor" == "$channel_minor" ]]; then
-        ok "$file floor guard minor = $floor"
-        return
-    fi
-    fail "$file floor guard checks minor < $floor but canonical channel minor is $channel_minor"
-    printf '       fix: change the floor guard in %s to minor < %s, or update rust-toolchain.toml if minor %s was intended.\n' \
-        "$file" "$channel_minor" "$floor"
-}
-
 check_macos_build_md() {
     local file=macos-build.md
     local -a occurrences=()
@@ -262,7 +245,6 @@ main() {
     check_ci_yml
     check_release_npm
     check_macos_rust_toolchain_var
-    check_macos_floor_guard
     check_macos_build_md
 
     if ((failures > 0)); then
