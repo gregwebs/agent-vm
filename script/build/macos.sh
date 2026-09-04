@@ -34,6 +34,21 @@ run_rust_tool() {
     RUSTUP_AUTO_INSTALL=0 rustup run "$RUST_TOOLCHAIN" "$@"
 }
 
+# Prints wall-clock time for one build stage to stderr without altering its
+# output or exit status. Temporary instrumentation for diagnosing where
+# ./script/build/macos.sh spends time on a no-op rerun; not meant to stay
+# long-term once the slow stage is identified.
+stage() {
+    local name="$1" start end elapsed
+    shift
+    start="$(date +%s)"
+    echo "==> [timing] start: $name" >&2
+    "$@"
+    end="$(date +%s)"
+    elapsed=$((end - start))
+    echo "==> [timing] done: $name (${elapsed}s)" >&2
+}
+
 rust_toolchain_error() {
     local tool="$1"
 
@@ -119,10 +134,11 @@ build_agentd() (
     cd vendor/microsandbox
     mkdir -p build
 
-    local container_id=
+    local container_id= staged=build/.agentd.next
     # Invoked indirectly by the subshell's EXIT trap.
     # shellcheck disable=SC2317,SC2329
     cleanup_container() {
+        rm -f "$staged"
         if [[ -n "$container_id" ]]; then
             docker rm "$container_id" >/dev/null 2>&1 || true
         fi
@@ -131,8 +147,20 @@ build_agentd() (
 
     docker build -f Dockerfile.agentd -t microsandbox-agentd-build .
     container_id="$(docker create microsandbox-agentd-build /dev/null)"
-    docker cp "$container_id:/agentd" build/agentd
-    touch build/agentd
+    docker cp "$container_id:/agentd" "$staged"
+
+    # microsandbox-filesystem's build.rs declares
+    # `cargo:rerun-if-changed=build/agentd`, so bumping this file's mtime on
+    # every invocation -- even a full Docker layer-cache hit -- forces a full
+    # rebuild of microsandbox-filesystem/runtime/sdk/cli (and, transitively,
+    # agent-vm) on every run regardless of whether anything changed. Only
+    # replace build/agentd, and thus only touch its mtime, when the built
+    # binary's content actually differs.
+    if [[ -f build/agentd ]] && cmp -s "$staged" build/agentd; then
+        rm -f "$staged"
+    else
+        mv -f "$staged" build/agentd
+    fi
 )
 
 msb_build_name() {
@@ -238,7 +266,13 @@ build_firmware_if_missing() {
         rm -f "$staged_firmware" "$staged_stamp"
         (
             cd vendor/microsandbox/vendor/libkrunfw
-            ./build_in_docker.sh
+            export LIBKRUNFW_BUILD_BACKEND=docker
+	    #if which container >/dev/null ; then
+	    #    echo "==> Building with container"
+	    #    export LIBKRUNFW_BUILD_BACKEND=container
+	    #    export LIBKRUNFW_BUILD_DNS=1.1.1.1
+	    #fi
+	    ./build_in_docker.sh
             cc -fPIC -DABI_VERSION=5 -shared -o libkrunfw.5.dylib kernel.c
         )
         mkdir -p vendor/microsandbox/build
@@ -254,9 +288,9 @@ build_firmware_if_missing() {
 build_microsandbox_runtime() {
     local dev="$1"
     echo "==> Building vendored microsandbox runtime"
-    build_agentd
-    build_and_sign_msb "$dev"
-    build_firmware_if_missing
+    stage build_agentd build_agentd
+    stage build_and_sign_msb build_and_sign_msb "$dev"
+    stage build_firmware_if_missing build_firmware_if_missing
 }
 
 require_build_outputs() {
@@ -419,11 +453,16 @@ main() {
         esac
     done
 
-    preflight
-    build_microsandbox_runtime "$dev"
-    require_build_outputs "$dev"
-    build_agent_vm "$dev"
-    publish_bundle "$dev"
+    local script_start
+    script_start="$(date +%s)"
+
+    stage preflight preflight
+    stage build_microsandbox_runtime build_microsandbox_runtime "$dev"
+    stage require_build_outputs require_build_outputs "$dev"
+    stage build_agent_vm build_agent_vm "$dev"
+    stage publish_bundle publish_bundle "$dev"
+
+    echo "==> [timing] total: $(( $(date +%s) - script_start ))s" >&2
 }
 
 main "$@"
