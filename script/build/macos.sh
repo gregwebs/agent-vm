@@ -134,7 +134,7 @@ build_agentd() (
     cd vendor/microsandbox
     mkdir -p build
 
-    local container_id= staged=build/.agentd.next
+    local container_id='' staged=build/.agentd.next
     # Invoked indirectly by the subshell's EXIT trap.
     # shellcheck disable=SC2317,SC2329
     cleanup_container() {
@@ -392,6 +392,8 @@ publish_bundle() {
     local agent_vm_version msb_version
 
     mkdir -p "$bundle_dir/bin" "$bundle_dir/lib"
+    # Invoked indirectly by the trap below.
+    # shellcheck disable=SC2317,SC2329
     cleanup_staging() {
         rm -f "$staged_agent_vm" "$staged_msb" "$staged_firmware" "$entitlements"
     }
