@@ -72,7 +72,7 @@ printf '%s\n' 'firmware docker build' >>"$FAKE_LOG"
 SH
     chmod +x "$fixture/vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh"
     ln -s /bin/bash "$fakebin/bash"
-    for tool in mkdir rm mv cp cat chmod touch awk; do
+    for tool in mkdir rm mv cp cat chmod touch awk date cmp; do
         ln -s "$(command -v "$tool")" "$fakebin/$tool"
     done
 
@@ -150,8 +150,8 @@ case "${1:-}" in
     build) exit 0 ;;
     create) printf "%s\n" fake-container ;;
     cp)
-        mkdir -p "${2%/*}"
-        printf "%s\n" agentd >"$2"
+        mkdir -p "${3%/*}"
+        printf "%s\n" agentd >"$3"
         ;;
     rm) exit 0 ;;
     image)
@@ -335,7 +335,7 @@ assert_mode 755 "$fixture/target/macos/bin/agent-vm"
 assert_mode 755 "$fixture/target/macos/bin/msb"
 assert_mode 644 "$fixture/target/macos/lib/libkrunfw.5.dylib"
 assert_file_contains "$fixture/calls.log" "docker build -f Dockerfile.agentd -t microsandbox-agentd-build ."
-assert_file_contains "$fixture/calls.log" "docker cp fake-container:/agentd build/agentd"
+assert_file_contains "$fixture/calls.log" "docker cp fake-container:/agentd build/.agentd.next"
 assert_file_contains "$fixture/calls.log" "docker rm fake-container"
 assert_file_contains "$fixture/calls.log" "--release --no-default-features --features net,ssh -p microsandbox-cli"
 assert_file_contains "$fixture/calls.log" "codesign --entitlements msb-entitlements.plist --force -s - build/msb"
