@@ -473,6 +473,7 @@ pub fn refresh(
         tracing::warn!(error = %e, "anthropic credential refresh failed; skipping");
         None
     });
+    clear_stale_anthropic_placeholder(&guest, anthropic_token_file.is_some());
     let openai_token_file = with_provider_lock(state_dir, REFRESH_LOCK_OPENAI, || {
         refresh_openai(state_dir, &guest)
     })
@@ -1112,6 +1113,30 @@ fn write_opencode_model_default(guest: &GuestStateDir, pin_openai_model: bool) -
         &serde_json::to_vec(&Value::Object(config))?,
         0o644,
     )
+}
+
+/// Drop a guest Claude placeholder left over from an earlier, successful
+/// launch when *this* launch captured nothing.
+///
+/// The guest state dir persists across launches, but the proxy's
+/// substitution entry does not: it is rebuilt per launch from
+/// [`CredsState`]. So a stale placeholder plus a failed capture means the
+/// guest sends `Bearer msb-anthropic-placeholder-a-v2` verbatim — the
+/// in-VM agent looks signed in until every request 401s, and the obvious
+/// next move (`/login` in the guest) is itself refused by the OAuth hook.
+/// Removing it makes the guest *visibly* signed out and lets
+/// `run::launch` fail with an actionable message instead.
+///
+/// Best-effort: a removal failure is logged, not fatal — the launch is
+/// about to bail for a Claude launch anyway, and a codex/opencode launch
+/// should not be blocked by a stray Claude file.
+fn clear_stale_anthropic_placeholder(guest: &GuestStateDir, captured: bool) {
+    if captured {
+        return;
+    }
+    if let Err(error) = guest.remove_file(Path::new("claude/.credentials.json")) {
+        tracing::warn!(error = %error, "leaving stale Anthropic guest placeholder");
+    }
 }
 
 fn refresh_anthropic(state_dir: &Path, guest: &GuestStateDir) -> Result<Option<PathBuf>> {
@@ -2023,6 +2048,43 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_failed_capture_removes_the_stale_guest_claude_placeholder() {
+        let state = tempfile::tempdir().unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        let relative = Path::new("claude/.credentials.json");
+        guest
+            .atomic_write(relative, br#"{"claudeAiOauth":{}}"#, 0o600)
+            .unwrap();
+
+        clear_stale_anthropic_placeholder(&guest, false);
+
+        assert!(
+            !state.path().join(relative).exists(),
+            "a placeholder nothing will substitute must not be left behind"
+        );
+        // Idempotent: a launch with no placeholder to begin with is fine.
+        clear_stale_anthropic_placeholder(&guest, false);
+    }
+
+    #[test]
+    fn a_successful_capture_leaves_the_guest_placeholder_in_place() {
+        let state = tempfile::tempdir().unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        let relative = Path::new("claude/.credentials.json");
+        guest
+            .atomic_write(
+                relative,
+                br#"{"claudeAiOauth":{"accessToken":"ph"}}"#,
+                0o600,
+            )
+            .unwrap();
+
+        clear_stale_anthropic_placeholder(&guest, true);
+
+        assert!(state.path().join(relative).exists());
     }
 
     #[test]

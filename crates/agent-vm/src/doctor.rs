@@ -62,6 +62,8 @@ pub fn run(args: Args) -> Result<()> {
             )
         );
         println!();
+        println!("{}", describe_credentials(&gather_credentials()));
+        println!();
         println!("==> agent-vm doctor: available operations");
         println!("      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next");
         println!("                       agent-vm shell/run recreates it at the bundled schema");
@@ -94,6 +96,248 @@ fn describe_home(msb_home: &Path, db_exists: bool, bundled_schema: &str) -> Stri
         if db_exists { "exists" } else { "absent" },
         bundled_schema,
     )
+}
+
+/// What `doctor` found for one host credential source. `Present` carries
+/// an optional expiry (epoch ms) because only the Claude file exposes one
+/// in a shape we already parse elsewhere.
+#[derive(Debug, PartialEq, Eq)]
+enum HostCred {
+    Missing,
+    Unreadable { why: String },
+    Present { expires_at_ms: Option<i64> },
+}
+
+/// One rendered row plus the per-project follow-through. Kept as data so
+/// [`describe_credentials`] is pure and unit-testable without a real
+/// `$HOME` or state dir, matching [`describe_home`]'s pattern.
+#[derive(Debug, PartialEq, Eq)]
+struct CredReport {
+    /// `(agent label, host path as shown, what we found)`.
+    hosts: Vec<(&'static str, String, HostCred)>,
+    /// The project `doctor` was run in, and whether its per-project
+    /// host-only token files exist. `None` when the cwd can't be resolved.
+    project: Option<ProjectCreds>,
+    /// `now` in epoch ms, for rendering "expires in ...".
+    now_ms: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ProjectCreds {
+    dir: String,
+    state_dir: String,
+    /// Providers with a real token captured under `<hash>.secrets/`.
+    captured: Vec<&'static str>,
+    /// Whether the guest still holds a Claude placeholder cred file.
+    guest_claude_placeholder: bool,
+}
+
+/// Read every host credential source agent-vm knows about, plus the
+/// per-project capture state for the cwd. Never prints or returns token
+/// bytes — only presence, parseability, and the Claude expiry, which is
+/// exactly what a user debugging "the in-VM agent is signed out" needs.
+fn gather_credentials() -> CredReport {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let hosts = vec![
+        (
+            "claude",
+            crate::host_paths::host_claude_creds_path(),
+            true, // parse claudeAiOauth.expiresAt
+        ),
+        ("codex", crate::host_paths::host_codex_auth_path(), false),
+        (
+            "opencode",
+            crate::host_paths::host_opencode_auth_path(),
+            false,
+        ),
+        (
+            "copilot",
+            crate::host_paths::host_copilot_token_path(),
+            false,
+        ),
+    ]
+    .into_iter()
+    .map(|(label, path, want_expiry)| {
+        let shown = path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<no $HOME>".to_string());
+        let state = match &path {
+            None => HostCred::Unreadable {
+                why: "no $HOME".into(),
+            },
+            Some(p) => inspect_host_cred(p, want_expiry),
+        };
+        (label, shown, state)
+    })
+    .collect();
+
+    CredReport {
+        hosts,
+        project: gather_project_creds(),
+        now_ms,
+    }
+}
+
+fn inspect_host_cred(path: &Path, want_expiry: bool) -> HostCred {
+    if std::fs::symlink_metadata(path).is_err() {
+        return HostCred::Missing;
+    }
+    let bytes = match crate::host_paths::read_bounded_regular_file(
+        path,
+        crate::host_paths::MAX_HOST_CREDENTIAL_FILE_BYTES,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return HostCred::Unreadable {
+                why: format!("{error:#}"),
+            };
+        }
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(json) => json,
+        Err(error) => {
+            return HostCred::Unreadable {
+                why: format!("not valid JSON: {error}"),
+            };
+        }
+    };
+    if !want_expiry {
+        return HostCred::Present {
+            expires_at_ms: None,
+        };
+    }
+    // Same shape `secrets::refresh_anthropic` requires; report the
+    // *absence* of it as unreadable so "file exists but agent-vm can't
+    // use it" never renders as a healthy row.
+    let Some(oauth) = json.get("claudeAiOauth") else {
+        return HostCred::Unreadable {
+            why: "missing claudeAiOauth (API-key-only login?)".into(),
+        };
+    };
+    if oauth.get("accessToken").and_then(|v| v.as_str()).is_none() {
+        return HostCred::Unreadable {
+            why: "claudeAiOauth has no accessToken".into(),
+        };
+    }
+    HostCred::Present {
+        expires_at_ms: oauth.get("expiresAt").and_then(serde_json::Value::as_i64),
+    }
+}
+
+fn gather_project_creds() -> Option<ProjectCreds> {
+    let session = crate::session::ProjectSession::for_cwd().ok()?;
+    let captured = [
+        (
+            "claude",
+            crate::secrets::anthropic_token_path(&session.state_dir),
+        ),
+        (
+            "codex",
+            crate::secrets::openai_token_path(&session.state_dir),
+        ),
+        ("gh", crate::secrets::gh_token_path(&session.state_dir)),
+        (
+            "copilot",
+            crate::secrets::copilot_token_path(&session.state_dir),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, path)| path.exists())
+    .map(|(label, _)| label)
+    .collect();
+    Some(ProjectCreds {
+        dir: session.project_dir.display().to_string(),
+        state_dir: session.state_dir.display().to_string(),
+        captured,
+        guest_claude_placeholder: session.state_dir.join("claude/.credentials.json").exists(),
+    })
+}
+
+/// Render the credential report. Pure over its input so the wording is
+/// unit-tested without touching `$HOME` or the filesystem.
+fn describe_credentials(report: &CredReport) -> String {
+    let mut out = String::from("==> host agent credentials\n");
+    let width = report
+        .hosts
+        .iter()
+        .map(|(label, _, _)| label.len())
+        .max()
+        .unwrap_or(0);
+    for (label, path, state) in &report.hosts {
+        let detail = match state {
+            HostCred::Missing => "absent".to_string(),
+            HostCred::Unreadable { why } => format!("UNUSABLE - {why}"),
+            HostCred::Present {
+                expires_at_ms: None,
+            } => "ok".to_string(),
+            HostCred::Present {
+                expires_at_ms: Some(exp),
+            } => format!("ok ({})", describe_expiry(*exp, report.now_ms)),
+        };
+        out.push_str(&format!(
+            "{label:<width$}  {path}\n{:width$}  {detail}\n",
+            ""
+        ));
+    }
+
+    match &report.project {
+        None => out.push_str("\n==> this project: <cwd could not be resolved>\n"),
+        Some(project) => {
+            out.push_str(&format!(
+                "\n==> this project\ndir:      {}\nstate:    {}\ncaptured: {}\nguest Claude cred file: {}\n",
+                project.dir,
+                project.state_dir,
+                if project.captured.is_empty() {
+                    "<none> (nothing to substitute on the wire)".to_string()
+                } else {
+                    project.captured.join(", ")
+                },
+                if project.guest_claude_placeholder {
+                    "placeholder present"
+                } else {
+                    "absent"
+                },
+            ));
+        }
+    }
+
+    out.push_str(
+        "\nThe guest never receives a real token: it gets a placeholder that the\n\
+         TLS proxy swaps for the host token on the way out. So sign in ON THE HOST\n\
+         (`claude login`, `codex login`, `gh auth login`) - running `/login` inside\n\
+         the VM cannot work and fails with an OAuth 400.",
+    );
+    out
+}
+
+/// `expires in 3h22m` / `EXPIRED 15m ago`. Minute resolution is enough to
+/// answer "is my host login stale?", which is the only question this row
+/// exists to settle.
+fn describe_expiry(expires_at_ms: i64, now_ms: i64) -> String {
+    let delta_secs = (expires_at_ms - now_ms) / 1000;
+    let (verb, mut secs) = if delta_secs >= 0 {
+        ("expires in", delta_secs)
+    } else {
+        ("EXPIRED", -delta_secs)
+    };
+    let hours = secs / 3600;
+    secs %= 3600;
+    let minutes = secs / 60;
+    let span = if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else {
+        format!("{minutes}m")
+    };
+    if delta_secs >= 0 {
+        format!("{verb} {span}")
+    } else {
+        format!("{verb} {span} ago")
+    }
 }
 
 /// Move `msb_home/db` aside to a unique `db.reset-<ts>` sibling. Pure over
@@ -395,5 +639,115 @@ mod tests {
 
         let cli = TestCli::try_parse_from(["t"]).unwrap();
         assert!(!cli.args.reset_msb_db);
+    }
+
+    const HOUR_MS: i64 = 3_600_000;
+
+    #[test]
+    fn a_claude_file_without_claudeaioauth_reads_as_unusable_not_ok() {
+        // The exact shape `secrets::refresh_anthropic` rejects. Rendering
+        // this as "ok" would send the user hunting anywhere but the file
+        // that is actually the problem.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        write_file(&path, br#"{"someOtherLogin":{"accessToken":"x"}}"#);
+
+        assert_eq!(
+            inspect_host_cred(&path, true),
+            HostCred::Unreadable {
+                why: "missing claudeAiOauth (API-key-only login?)".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_well_formed_claude_file_reports_its_expiry_and_absent_stays_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        write_file(
+            &path,
+            br#"{"claudeAiOauth":{"accessToken":"tok","expiresAt":42}}"#,
+        );
+
+        assert_eq!(
+            inspect_host_cred(&path, true),
+            HostCred::Present {
+                expires_at_ms: Some(42)
+            }
+        );
+        assert_eq!(
+            inspect_host_cred(&dir.path().join("nope.json"), true),
+            HostCred::Missing
+        );
+    }
+
+    #[test]
+    fn expiry_renders_both_directions() {
+        assert_eq!(describe_expiry(3 * HOUR_MS, 0), "expires in 3h00m");
+        assert_eq!(
+            describe_expiry(3 * HOUR_MS + 22 * 60_000, 0),
+            "expires in 3h22m"
+        );
+        assert_eq!(describe_expiry(15 * 60_000, 0), "expires in 15m");
+        assert_eq!(describe_expiry(0, 15 * 60_000), "EXPIRED 15m ago");
+    }
+
+    fn report(hosts: Vec<(&'static str, String, HostCred)>) -> CredReport {
+        CredReport {
+            hosts,
+            project: Some(ProjectCreds {
+                dir: "/p".into(),
+                state_dir: "/s/abc".into(),
+                captured: vec!["claude"],
+                guest_claude_placeholder: true,
+            }),
+            now_ms: 0,
+        }
+    }
+
+    #[test]
+    fn render_flags_an_unusable_host_credential_and_always_names_the_host_login() {
+        let text = describe_credentials(&report(vec![
+            (
+                "claude",
+                "/h/.claude/.credentials.json".into(),
+                HostCred::Unreadable {
+                    why: "not valid JSON: x".into(),
+                },
+            ),
+            ("codex", "/h/.codex/auth.json".into(), HostCred::Missing),
+        ]));
+
+        assert!(text.contains("UNUSABLE - not valid JSON: x"), "{text}");
+        assert!(text.contains("absent"), "{text}");
+        // The whole point of the section: point at the host, and say why
+        // the obvious in-VM workaround is not one.
+        assert!(text.contains("claude login"), "{text}");
+        assert!(
+            text.contains("cannot work and fails with an OAuth 400"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_calls_out_a_project_with_nothing_captured() {
+        let mut r = report(vec![(
+            "claude",
+            "/h/.claude/.credentials.json".into(),
+            HostCred::Present {
+                expires_at_ms: Some(HOUR_MS),
+            },
+        )]);
+        r.project.as_mut().unwrap().captured.clear();
+        r.project.as_mut().unwrap().guest_claude_placeholder = false;
+
+        let text = describe_credentials(&r);
+
+        assert!(text.contains("ok (expires in 1h00m)"), "{text}");
+        assert!(
+            text.contains("<none> (nothing to substitute on the wire)"),
+            "{text}"
+        );
+        assert!(text.contains("guest Claude cred file: absent"), "{text}");
     }
 }
