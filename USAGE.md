@@ -77,7 +77,7 @@ Each launcher accepts:
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
-| `--mount HOST[:GUEST][:MODE]...` | extra bind mount (one virtio-fs each). Modes: `:rw` (default), `:ro` read-only, `:follow-links` also bind the real directories that symlinks under `HOST` resolve to (implies `:ro`, so it combines with it). Capacity is host-specific ([runtime evidence](ARCHITECTURE.md#issue-43-runtime-proof-and-platform-profiles)); design notes in [Extra mounts](ARCHITECTURE.md#extra-mounts-ro-rw-follow-links) |
+| `--mount HOST[:GUEST][:MODE]...` | extra bind mount (one virtio-fs each). Modes: `:rw` (default), `:ro` read-only, `:follow-links` also bind the real directories that symlinks under `HOST` resolve to (implies `:ro`, so it combines with it). Capacity is host-specific ([runtime evidence](ARCHITECTURE.md#runtime-provenance-and-platform-profiles)); design notes in [Extra mounts](ARCHITECTURE.md#extra-mounts-ro-rw-follow-links) |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 | `--layer DIR` | project tooling-layer directory (default `.agent-vm/layer/`) — see [Project tooling layers](#project-tooling-layers) |
 | `--yes` / `-y` | assume "yes" to the tooling-layer build confirmation (CI/non-interactive) |

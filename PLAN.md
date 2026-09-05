@@ -23,9 +23,9 @@ only an index, so the roadmap below has a fixed starting point.
 
 | Capability | How to use it | Why it works that way |
 |---|---|---|
-| Agents `claude` / `codex` / `opencode` / `copilot` / `shell`, per-project microVM, project bind-mounted at its host path | [Subcommands](USAGE.md#subcommands) | [Phase 2](ARCHITECTURE.md#phase-2--launcher-mvp) |
-| Host-rooted secrets — real tokens never enter the VM, fail-closed on a missed capture | [Credentials](USAGE.md#credentials) | [Phase 3](ARCHITECTURE.md#phase-3--host-rooted-secrets), [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
-| OAuth refresh MITM for Claude + Codex, single-flighted per provider | [Credentials](USAGE.md#credentials) | [Phase 4](ARCHITECTURE.md#phase-4--oauth-refresh-file-backed-secrets--interceptor-hook) |
+| Agents `claude` / `codex` / `opencode` / `copilot` / `shell`, per-project microVM, project bind-mounted at its host path | [Subcommands](USAGE.md#subcommands) | [Sandboxes and sessions](ARCHITECTURE.md#sandboxes-and-sessions) |
+| Host-rooted secrets — real tokens never enter the VM, fail-closed on a missed capture | [Credentials](USAGE.md#credentials) | [Credentials](ARCHITECTURE.md#credentials), [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
+| OAuth refresh MITM for Claude + Codex, single-flighted per provider | [Credentials](USAGE.md#credentials) | [OAuth refresh MITM](ARCHITECTURE.md#the-oauth-refresh-mitm) |
 | gh / git auth reused from the host, per-launch GitHub repo allow-list | [Credentials](USAGE.md#credentials) | [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
 | Host-credential security snapshot (SHA-256 at launch, re-checked on exit) | [Credentials](USAGE.md#credentials) | [Security snapshot](ARCHITECTURE.md#host-credential-security-snapshot) |
 | Network egress: `--publish` / `--auto-publish` / `--allow-egress` / `--allow-lan` / `--allow-host` | [Ports & egress](USAGE.md#ports--egress) | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
@@ -36,12 +36,12 @@ only an index, so the roadmap below has a fixed starting point.
 | Clipboard exchange | [Clipboard](USAGE.md#clipboard) | [Clipboard exchange](ARCHITECTURE.md#clipboard-exchange) |
 | `agent-vm-ccusage` — token/cost across host *and* sandbox sessions | [Token usage](USAGE.md#token-usage-across-host-and-sandbox) | [`agent-vm-ccusage`](ARCHITECTURE.md#agent-vm-ccusage) |
 | `agent-vm msb <args…>` passthrough and `agent-vm doctor` | [Checking what agent-vm can see](USAGE.md#checking-what-agent-vm-can-see) | [State operations](ARCHITECTURE.md#state-operations-msb-passthrough-and-doctor) |
-| Image distribution: `setup`, `pull`, opt-in update check, image-API-version lock | [Image release cadence](USAGE.md#image-release-cadence) | [Phase 1](ARCHITECTURE.md#phase-1--base-oci-image) |
+| Image distribution: `setup`, `pull`, opt-in update check, image-API-version lock | [Image release cadence](USAGE.md#image-release-cadence) | [The base image](ARCHITECTURE.md#the-base-image) |
 | Opt-in shared OCI image cache | [Shared microsandbox image cache](USAGE.md#shared-microsandbox-image-cache) | [Shared OCI image cache](ARCHITECTURE.md#shared-oci-image-cache-opt-in) |
-| Official crates.io `msb_krun` 0.1.32 runtime (no fork), provenance-checked | — | [ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md), [runtime proof](ARCHITECTURE.md#issue-43-runtime-proof-and-platform-profiles) |
+| Official crates.io `msb_krun` 0.1.32 runtime (no fork), provenance-checked | — | [ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md), [runtime proof](ARCHITECTURE.md#runtime-provenance-and-platform-profiles) |
 | microsandbox v0.6.15 + one-way state migration + forward-migration preflight | [Recovering from a forward-migrated db](USAGE.md#recovering-from-a-forward-migrated-microsandbox-db), [Upgrading older state](USAGE.md#upgrading-from-an-older-agent-vm-pre-0615-state) | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md), [ADR-0004](docs/adr/0004-single-shared-msb-home.md) |
-| Sandbox liveness: heartbeat keep-alive, runtime-exit reporting | — | [Phase 5](ARCHITECTURE.md#phase-5--sandbox-liveness-heartbeat-keep-alive-and-runtime-exit-reporting), [ADR-0007](docs/adr/0007-heartbeat-keep-alive-and-runtime-exit-reporting.md) |
-| macOS / Apple Silicon as a build and run host | [Requirements](USAGE.md#requirements), [macos-build.md](macos-build.md) | [runtime proof](ARCHITECTURE.md#issue-43-runtime-proof-and-platform-profiles) |
+| Sandbox liveness: idle detection, runtime-exit handling | — | [Sandbox liveness](ARCHITECTURE.md#sandbox-liveness-idle-detection-and-runtime-exits), [ADR-0007](docs/adr/0007-heartbeat-keep-alive-and-runtime-exit-reporting.md) |
+| macOS / Apple Silicon as a build and run host | [Requirements](USAGE.md#requirements), [macos-build.md](macos-build.md) | [runtime proof](ARCHITECTURE.md#runtime-provenance-and-platform-profiles) |
 
 Two things about that list matter to the roadmap rather than to a user:
 
