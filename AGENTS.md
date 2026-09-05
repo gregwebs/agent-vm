@@ -3,9 +3,9 @@
 Things that aren't obvious from the code and that I keep forgetting to
 tell you. Read once, then act on them silently.
 
-> The post-merge workspace version bump lives in
-> [CONTRIBUTING.md](CONTRIBUTING.md#release--version-bump) — do it after
-> every merge into `rewrite-microsandbox`.
+> The workspace version bump lives in
+> [CONTRIBUTING.md](CONTRIBUTING.md#release--version-bump) — do it in the
+> feature branch, before the PR lands on `main`.
 
 ## Submodule merges go first
 

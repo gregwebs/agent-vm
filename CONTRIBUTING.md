@@ -9,7 +9,7 @@ the end-user reference.
 Clone the repository and its recursive submodules:
 
 ```bash
-git clone -b rewrite-microsandbox https://github.com/wirenboard/agent-vm
+git clone https://github.com/gregwebs/agent-vm
 cd agent-vm
 git submodule update --init --recursive
 ```
@@ -53,25 +53,25 @@ fails closed with an actionable diagnostic for every copy left stale.
 
 ## Release / version bump
 
-After merging a feature branch, bump the workspace version.
+Every feature PR bumps the workspace version.
 
-Every merge into `rewrite-microsandbox` ships with a
-`workspace.package.version` bump in the root `Cargo.toml` and a
-follow-up `vX.Y.Z: bump for <feature>` commit. Skipping this leaves
-the next release boundary ambiguous and means downstream
-`agent-vm --version` lies about what's in the binary.
-
-Convention (look at `git log --oneline | grep "^[a-f0-9]* v"`):
+Bump `workspace.package.version` in the root `Cargo.toml` **in the
+feature branch itself**, so the PR that lands the change also lands its
+version. Skipping this leaves the next release boundary ambiguous and
+means downstream `agent-vm --version` lies about what's in the binary.
 
 ```
-git merge --no-ff <feature-branch>     # produces "Merge ...: ..."
 $EDITOR Cargo.toml                     # version = "0.1.N+1"
-git commit -am "v0.1.N+1: bump for <one-line feature>"
+cargo build                            # refreshes Cargo.lock
+git commit -am "..."                   # lock alongside the bump
 ```
 
-`Cargo.lock` will need refreshing — run a build after the bump to
-update it, then commit the lock alongside the version bump if it
-moved (it always does).
+`Cargo.lock` always moves with the version, so commit it alongside.
+
+(Older history used a separate post-merge `vX.Y.Z: bump for <feature>`
+commit on the retired `rewrite-microsandbox` branch — that's what
+`git log --oneline | grep "^[a-f0-9]* v"` is showing you. PRs now squash
+onto `main` and carry the bump inside.)
 
 ## Coding standards & conventions
 

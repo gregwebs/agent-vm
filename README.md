@@ -1,6 +1,7 @@
 # agent-vm
 
-Run Claude Code / Codex / OpenCode inside a per-project libkrun microVM,
+Run Claude Code / Codex / OpenCode / Copilot inside a per-project libkrun
+microVM,
 booting in ~2 seconds, with:
 
 - **Host OAuth tokens never enter the VM.** The TLS-intercept proxy in
@@ -19,7 +20,7 @@ booting in ~2 seconds, with:
 
 This is the Rust rewrite of the original Bash
 [`wirenboard/agent-vm`](https://github.com/wirenboard/agent-vm) on
-top of microsandbox. Living on `rewrite-microsandbox` until v1.
+top of microsandbox, and it is what lives on `main`.
 
 ## Requirements
 

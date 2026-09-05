@@ -32,9 +32,12 @@ bundled build.
 ## Subcommands
 
 ```
-claude | codex | opencode | shell   launch an agent in a per-project sandbox
+claude | codex | opencode | copilot | shell
+                                    launch an agent in a per-project sandbox
 pull                                refresh the cached image
 setup                               pull base image + verify boot
+doctor                              report host credentials + microsandbox state
+                                    (--reset-msb-db recovers a forward-migrated db)
 msb <args...>                       forward to the bundled msb (e.g. msb ls, msb status)
 clipboard {get,put} [--sys]         exchange a string with the project sandbox
 ```
@@ -62,6 +65,8 @@ The agent-vm binary and the image are version-locked through an
 (`/etc/agent-vm-image-version` inside the image). Mismatch → clean
 error at launch instead of mysterious in-VM failures.
 
+## Launch flags
+
 Each launcher accepts:
 
 | flag | what |
@@ -72,7 +77,7 @@ Each launcher accepts:
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
-| `--mount HOST[:GUEST][:ro\|:rw]` | extra bind mount (one virtio-fs each); append `:ro` for a read-only bind, `:rw` is the default; capacity is host-specific ([runtime evidence](ARCHITECTURE.md#issue-43-runtime-proof-and-platform-profiles)) |
+| `--mount HOST[:GUEST][:MODE]...` | extra bind mount (one virtio-fs each). Modes: `:rw` (default), `:ro` read-only, `:follow-links` also bind the real directories that symlinks under `HOST` resolve to (implies `:ro`, so it combines with it). Capacity is host-specific ([runtime evidence](ARCHITECTURE.md#runtime-provenance-and-platform-profiles)); design notes in [Extra mounts](ARCHITECTURE.md#extra-mounts-ro-rw-follow-links) |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 | `--layer DIR` | project tooling-layer directory (default `.agent-vm/layer/`) — see [Project tooling layers](#project-tooling-layers) |
 | `--yes` / `-y` | assume "yes" to the tooling-layer build confirmation (CI/non-interactive) |
@@ -315,6 +320,44 @@ If the project root contains an executable `.agent-vm.runtime.sh`,
 the launcher sources it inside the guest before exec'ing the agent.
 Use for `npm install`, env exports, dev-server startup. Non-zero
 exit aborts the launch.
+
+## Clipboard
+
+Move a string across the VM boundary without a shared shell:
+
+```
+agent-vm clipboard put "some text"    # or: ... | agent-vm clipboard put
+agent-vm clipboard get
+```
+
+Run both from the project directory — the clipboard is per-project. It is a
+plain file, `clipboard.txt` in the project's state dir, bind-mounted into the
+guest at `/agent-vm-state/clipboard.txt`, so the in-VM agent can read and
+write that path directly with no special tooling.
+
+`--sys` / `-s` also exchanges with the host's system clipboard (`xclip`,
+`wl-copy`/`wl-paste`, or `pbcopy`/`pbpaste`, whichever is on `PATH`). Without
+it the command is pure stdin/stdout and works headless.
+
+## Token usage across host and sandbox
+
+`ccusage` only sees the session history under `~/.claude`, so it misses
+everything an agent did inside a sandbox. `bin/agent-vm-ccusage` unions the
+host history with every per-project agent-vm session directory and reports
+them together:
+
+```
+bin/agent-vm-ccusage            # extra args are forwarded to ccusage
+```
+
+It runs `npx -y ccusage@latest`, so it needs Node and network on first use;
+nothing has to be installed up front.
+
+It finds the per-project directories under the same state root the launcher
+uses (`AGENT_VM_STATE_DIR`, else `$XDG_STATE_HOME/agent-vm`, else
+`~/.local/state/agent-vm`). A directory whose path contains a comma is skipped
+with a warning — `CLAUDE_CONFIG_DIR` is comma-separated with no way to escape
+one.
 
 ## Ports & egress
 
