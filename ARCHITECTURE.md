@@ -940,3 +940,154 @@ diagnostic evidence must not be lost.
   survived shutdown; the current baseline already redirects stderr
   directly into `runtime.log` via `Stdio::from(...)`, so there's no
   separate task to drain or race in `wait()`.
+
+## Beyond the phases
+
+The Phase 0–5 sections above are a chronological record: each landed as one
+milestone and its rationale was written at the time. Work after Phase 5 is no
+longer phased — it arrives as individual features, and its decisions live in
+`docs/adr/`. This section is the index for that, plus the rationale for the
+capabilities that are too small to justify an ADR and have no phase to belong
+to.
+
+### Decision record index
+
+| Decision | Where |
+|---|---|
+| Non-root guest via a native user | [ADR-0001](docs/adr/0001-non-root-guest-via-native-user.md), and [Guest user](#guest-user-non-root-by-default----root) above |
+| Mirroring the host `$HOME` and username into the guest | [ADR-0002](docs/adr/0002-mirror-host-home-and-username.md) |
+| Project tooling layers (`--layer`) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
+| One shared `MSB_HOME`, not schema-namespaced | [ADR-0004](docs/adr/0004-single-shared-msb-home.md) |
+| Deferring the sea-orm / sqlx major bump | [ADR-0005](docs/adr/0005-defer-sea-orm-sqlx-major-bump.md) |
+| Adopting a clean microsandbox v0.6.15 baseline (dropping the fork) | [ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md) |
+| Heartbeat keep-alive and runtime-exit reporting | [ADR-0007](docs/adr/0007-heartbeat-keep-alive-and-runtime-exit-reporting.md), and [Phase 5](#phase-5--sandbox-liveness-heartbeat-keep-alive-and-runtime-exit-reporting) above |
+| Migrating 0.5.7 state to v0.6.15 | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md) |
+| Adopting `origin/main`'s network features | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
+| Wiring file-backed credential injection | [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
+
+### Extra mounts: `ro`, `rw`, `follow-links`
+
+`--mount HOST[:GUEST][:MODE]...` (`mount.rs`) grew two things past the
+Phase 2 "one workspace mount, one state mount" baseline.
+
+**Modes are a suffix list, not a flag.** `ro`/`rw` could have been separate
+flags (`--mount-ro`), but a mount already has two positional fields and the
+mode belongs to *that* mount, not to the launch. `rw` is the default and is
+accepted only so a `--mount` line can say what it means.
+
+**`ro` and `follow-links` deliberately coexist.** `follow-links` *implies*
+read-only, so they are not mutually exclusive — which is why the conflict
+policy lives in one table in `mount.rs` rather than being spread across
+per-pair checks that would have to encode the exception.
+
+**`follow-links` binds the real directories, not the links.** virtio-fs
+passes a symlink through as a symlink; a link pointing outside the bind is
+dangling in the guest. The walk resolves links under `HOST` transitively and
+appends one read-only bind per discovered target directory, with a depth cap
+on *link-follow chains* specifically (not on ordinary directory nesting, which
+is unbounded and fine). Discovered binds carry `follow_links: false` so the
+walk cannot re-expand its own output.
+
+**Targets are bound at their literal guest path (#77).** A discovered target
+is reachable in the guest by the path the link text implies, which is not
+always its canonicalized host path — canonicalization resolves symlinks
+*before* applying a following `..`, so the two answers part company exactly
+there. Binding at the canonical path would leave the guest resolving a link to
+a path nothing is mounted at. Rejected alternative: rewriting the link text
+inside the guest — that mutates the user's project.
+
+The capacity ceiling on all of this is per-host and per-runtime; see
+[Issue #43 runtime proof and platform profiles](#issue-43-runtime-proof-and-platform-profiles).
+
+### Clipboard exchange
+
+`agent-vm clipboard {get,put}` (`clipboard.rs`) moves a string across the VM
+boundary through a per-project `<state>/clipboard.txt`, bind-mounted into the
+guest at `/agent-vm-state/clipboard.txt`.
+
+**Why a file and not a channel.** The guest agent already has the state mount;
+a file needs no new device, no port, no protocol, and no guest-side agent-vm
+binary — the agent just reads and writes a path. A vsock or HTTP channel would
+add a second control plane for a feature whose whole job is "hand over some
+text".
+
+**Why the host system clipboard is opt-in (`--sys`).** Reaching X11/Wayland/
+macOS pasteboard means shelling out to whichever of `xclip` / `wl-copy` /
+`wl-paste` / `pbcopy` / `pbpaste` exists. That is a host-environment
+dependency, so it stays behind a flag; without it the command is pure stdio and
+works headless.
+
+### State operations: `msb` passthrough and `doctor`
+
+Two subcommands exist because agent-vm's microsandbox state is *private* — a
+separately-installed `msb` reads `~/.microsandbox` and cannot see the sandboxes
+agent-vm launched (see [ADR-0004](docs/adr/0004-single-shared-msb-home.md)).
+
+**`agent-vm msb <args…>` is a verbatim passthrough** (`msb_cmd.rs`), not a
+curated subset: it execs the pinned bundled binary with `MSB_PATH`/`MSB_HOME`
+already set, inherits stdio and the environment, and maps the child's exit
+status through (signal death → `128+signo`, so it can never read as success).
+Deliberately *not* parsed or reformatted — re-exposing a chosen subset would
+mean tracking msb's CLI forever, and the whole point is that `ls`, `ps`,
+`stop`, `exec`, `logs` and everything else work as documented upstream. Note
+`disable_help_flag`, so `--help` reaches msb instead of clap.
+
+**`agent-vm doctor` is the operator surface** (`doctor.rs`) for two questions
+the launcher can't answer mid-failure: *what credentials does the host
+actually have* (present / absent / unusable, Claude token expiry, and which
+reached this project — never token bytes), and *is the private db recoverable*.
+
+`--reset-msb-db` moves `MSB_HOME/db` aside to a timestamped sibling rather than
+deleting it: reversible by construction, and the undo `mv` is printed. msb owns
+that directory outright — no agent-vm code creates, opens, or writes it — so it
+recreates it at the bundled schema on next boot and re-pulls images. This
+closes the loop with `msb_preflight.rs`, which detects the forward-migrated db
+up front on both the boot path and the passthrough and names this command in
+its error.
+
+### Host-credential security snapshot
+
+At launch, `snapshot_host_creds` SHA-256s the three host credential files;
+`verify_snapshot` re-hashes them on exit through a `SnapshotGuard` `Drop` and
+prints one line naming any that changed (`secrets.rs`).
+
+**Non-fatal by design.** The OAuth refresh hook legitimately rewrites these
+files mid-session, so a change is not proof of tampering — the value is that an
+*unexpected* change becomes visible. Failing the launch on a legitimate refresh
+would be worse than the warning.
+
+**The `Drop` impl must never panic.** It has nowhere to propagate an error, and
+`eprintln!` panics on a stderr write failure — which would turn a clean launch
+failure into an abrupt exit-101 (issue #70). The notice is therefore
+best-effort `writeln!` with the result discarded.
+
+Scope today is those three files only; extending it to project integrity
+(`.git/hooks`, build files) is tracked as PLAN item A2.
+
+### Shared OCI image cache (opt-in)
+
+`AGENT_VM_SHARE_MSB_CACHE` points msb's image cache at the
+`~/.microsandbox/cache` a separately-installed msb uses (Homebrew, a distro
+package, `cargo install`), instead of agent-vm's private `MSB_HOME/cache`;
+`AGENT_VM_MSB_CACHE_DIR` overrides the location for a non-default layout
+(`msb_install.rs`).
+
+**Off by default, and a strict boolean.** Sharing a cache couples agent-vm's
+image state to a binary it does not version-check, so it is a deliberate
+choice, not a default. The value is parsed through the strict `env_flag`
+parser, so a typo fails closed to "private cache" rather than silently
+enabling sharing.
+
+### `agent-vm-ccusage`
+
+`bin/agent-vm-ccusage` unions the host's `~/.claude` session history with every
+per-project agent-vm session dir under the state root, then hands the combined
+list to `ccusage` via `CLAUDE_CONFIG_DIR`, so token/cost reporting covers host
+*and* sandbox sessions in one summary.
+
+It resolves the state root by the same precedence the Rust launcher uses
+(`AGENT_VM_STATE_DIR` → `XDG_STATE_HOME` → `~/.local/state`), and it *skips*
+any directory whose path contains a comma: `CLAUDE_CONFIG_DIR` is
+comma-separated with no escape mechanism, so such a path would silently
+mis-tokenize into two wrong directories. Skipping with a warning beats merging
+directories the user never asked for.

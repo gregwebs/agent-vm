@@ -14,60 +14,46 @@ rather than cited by line, since the file is not here to cite.
 
 ## Where the rewrite stands today
 
-Working and verified for daily use:
+Everything below is working and verified for daily use. This file does not
+describe these features — that is what the other two docs are for, and
+duplicating them here is how this section went stale before. **How to use it**
+lives in [USAGE.md](USAGE.md); **why it is built that way** lives in
+[ARCHITECTURE.md](ARCHITECTURE.md) and [docs/adr/](docs/adr/). This table is
+only an index, so the roadmap below has a fixed starting point.
 
-- **Agents:** `claude`, `codex`, `opencode`, `copilot`, `shell` (per-project
-  microVM, ~1.5 s launch, project bind-mounted at its host path).
-- **Host-rooted secrets:** real Claude/Codex/OpenCode/Copilot tokens never
-  enter the VM; the microsandbox TLS-intercept proxy substitutes a placeholder
-  for the real bearer on the way out. Tokens live host-side outside the guest
-  mount. A failed host capture fails the launch closed rather than booting a
-  signed-out agent.
-- **OAuth refresh MITM** for Claude + Codex (file-backed `SecretSource::File`
-  + `_intercept-hook`), so an externally-rotated host token is picked up on the
-  next request without a relaunch. Same-provider refreshes are single-flighted
-  under a host-only `flock` plus an attempt-damping stamp
-  (`intercept_hook/oauth_refresh.rs`, `secrets.rs:343-350`). Copilot is the
-  exception — it has no in-session refresh path (see A5).
-- **gh / git** auth reused from the host with a **per-launch GitHub repo
-  allow-list** enforced at the proxy (off-list push → clean 403). GraphQL
-  mutations are denied outright (see A6).
-- **Security snapshot** of the three credential files (SHA-256 at launch,
-  re-checked on exit).
-- **DX:** `--mount` with `ro` / `rw` / `follow-links` modes (`mount.rs`),
-  `clipboard get/put`, `agent-vm-ccusage`, `agent-vm msb <args…>` passthrough,
-  `agent-vm doctor` (host credential presence, Claude token expiry,
-  `--reset-msb-db` recovery).
-- **Project tooling layers:** `--layer` builds a Dockerfile `FROM` the base
-  image and boots the derived image registry-lessly (ADR-0003). Chrome
-  DevTools MCP ships as one such layer (with the MITM CA trusted in its NSS
-  DB); `examples/layers/` carries it and a wirenboard-cpp example.
-- **Non-root guest by default:** the guest agent runs as the invoking host
-  uid/gid with the host username and `$HOME` mirrored in; `--root` restores
-  the legacy root guest (ADR-0001, ADR-0002).
-- **Image + distribution:** `setup` (Docker build + boot-verify), `pull` +
-  an **opt-in** update banner (`--update-check` / `AGENT_VM_UPDATE_CHECK`,
-  off by default so a normal launch makes no registry contact),
-  image-API-version lock, auto-install of the runtime.
-- **Official runtime, no fork:** the vendored runtime is the stock crates.io
-  `msb_krun*` 0.1.32 cohort — the 25-commit fork and the `[patch.crates-io]`
-  libkrun override were dropped in the v0.6.15 cutover (ADR-0006) and source
-  identity is machine-checked by `script/check-runtime-provenance.sh`.
-- **microsandbox v0.6.15**, with a safe one-way migration from 0.5.7 state
-  (ADR-0008), a fail-fast preflight for a forward-migrated `msb.db`
-  (`msb_preflight.rs`), and heartbeat keep-alive / runtime-exit reporting
-  (ADR-0007).
-- **macOS / Apple Silicon** is a first-class host: `script/build/macos.sh`
-  (plus a `--dev` fast path), `script/build/import-image.sh` for registry-less
-  image load, and an HVF device-discovery evidence harness
-  (`crates/msb-krun-compat-evidence`).
-- **Network egress** flags `--publish` / `--auto-publish` / `--allow-egress` /
-  `--allow-lan` / `--allow-host` — this **already exceeds** the original, which
-  had no per-launch egress controls.
+| Capability | How to use it | Why it works that way |
+|---|---|---|
+| Agents `claude` / `codex` / `opencode` / `copilot` / `shell`, per-project microVM, project bind-mounted at its host path | [Subcommands](USAGE.md#subcommands) | [Phase 2](ARCHITECTURE.md#phase-2--launcher-mvp) |
+| Host-rooted secrets — real tokens never enter the VM, fail-closed on a missed capture | [Credentials](USAGE.md#credentials) | [Phase 3](ARCHITECTURE.md#phase-3--host-rooted-secrets), [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
+| OAuth refresh MITM for Claude + Codex, single-flighted per provider | [Credentials](USAGE.md#credentials) | [Phase 4](ARCHITECTURE.md#phase-4--oauth-refresh-file-backed-secrets--interceptor-hook) |
+| gh / git auth reused from the host, per-launch GitHub repo allow-list | [Credentials](USAGE.md#credentials) | [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
+| Host-credential security snapshot (SHA-256 at launch, re-checked on exit) | [Credentials](USAGE.md#credentials) | [Security snapshot](ARCHITECTURE.md#host-credential-security-snapshot) |
+| Network egress: `--publish` / `--auto-publish` / `--allow-egress` / `--allow-lan` / `--allow-host` | [Ports & egress](USAGE.md#ports--egress) | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
+| Extra mounts with `ro` / `rw` / `follow-links` | [Launch flags](USAGE.md#launch-flags) | [Extra mounts](ARCHITECTURE.md#extra-mounts-ro-rw-follow-links) |
+| Non-root guest by default, `--root` to opt out | [Guest user](USAGE.md#guest-user----root) | [ADR-0001](docs/adr/0001-non-root-guest-via-native-user.md), [ADR-0002](docs/adr/0002-mirror-host-home-and-username.md) |
+| Project tooling layers (`--layer`), incl. the Chrome DevTools MCP layer | [Project tooling layers](USAGE.md#project-tooling-layers), [Chrome DevTools MCP](USAGE.md#chrome-devtools-mcp) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
+| Project hook (`.agent-vm.runtime.sh`) | [Project hook](USAGE.md#project-hook) | — |
+| Clipboard exchange | [Clipboard](USAGE.md#clipboard) | [Clipboard exchange](ARCHITECTURE.md#clipboard-exchange) |
+| `agent-vm-ccusage` — token/cost across host *and* sandbox sessions | [Token usage](USAGE.md#token-usage-across-host-and-sandbox) | [`agent-vm-ccusage`](ARCHITECTURE.md#agent-vm-ccusage) |
+| `agent-vm msb <args…>` passthrough and `agent-vm doctor` | [Checking what agent-vm can see](USAGE.md#checking-what-agent-vm-can-see) | [State operations](ARCHITECTURE.md#state-operations-msb-passthrough-and-doctor) |
+| Image distribution: `setup`, `pull`, opt-in update check, image-API-version lock | [Image release cadence](USAGE.md#image-release-cadence) | [Phase 1](ARCHITECTURE.md#phase-1--base-oci-image) |
+| Opt-in shared OCI image cache | [Shared microsandbox image cache](USAGE.md#shared-microsandbox-image-cache) | [Shared OCI image cache](ARCHITECTURE.md#shared-oci-image-cache-opt-in) |
+| Official crates.io `msb_krun` 0.1.32 runtime (no fork), provenance-checked | — | [ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md), [runtime proof](ARCHITECTURE.md#issue-43-runtime-proof-and-platform-profiles) |
+| microsandbox v0.6.15 + one-way state migration + forward-migration preflight | [Recovering from a forward-migrated db](USAGE.md#recovering-from-a-forward-migrated-microsandbox-db), [Upgrading older state](USAGE.md#upgrading-from-an-older-agent-vm-pre-0615-state) | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md), [ADR-0004](docs/adr/0004-single-shared-msb-home.md) |
+| Sandbox liveness: heartbeat keep-alive, runtime-exit reporting | — | [Phase 5](ARCHITECTURE.md#phase-5--sandbox-liveness-heartbeat-keep-alive-and-runtime-exit-reporting), [ADR-0007](docs/adr/0007-heartbeat-keep-alive-and-runtime-exit-reporting.md) |
+| macOS / Apple Silicon as a build and run host | [Requirements](USAGE.md#requirements), [macos-build.md](macos-build.md) | [runtime proof](ARCHITECTURE.md#issue-43-runtime-proof-and-platform-profiles) |
 
-Both the original and the rewrite are **fresh-VM-per-launch**; the rewrite is
-*not* missing any persistent-VM lifecycle the original had (see C1 — that's a
-new capability, not a regression).
+Two things about that list matter to the roadmap rather than to a user:
+
+- **Network egress already exceeds the original**, which had no per-launch
+  egress controls at all.
+- Both the original and the rewrite are **fresh-VM-per-launch**. The rewrite is
+  *not* missing a persistent-VM lifecycle the original had — see C1, which is a
+  new capability, not a regression.
+
+Two carve-outs inside the credential story are tracked as open items, not
+documented as finished behaviour: Copilot has no in-session refresh (A5) and
+GitHub GraphQL mutations are denied (A4).
 
 ## A. In-scope work to finish
 
