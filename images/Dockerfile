@@ -6,9 +6,7 @@
 # Contents: Debian 13 slim + the four AI coding agents (Claude
 # Code, OpenCode, Codex, GitHub Copilot), the docker engine
 # (docker.io + containerd + runc + fuse-overlayfs), network/diagnostic
-# CLIs, codestyle-pinned Python linters (black/isort/pylint matching
-# `wirenboard/codestyle`), and a clone of `wirenboard/codestyle`
-# at /opt/wirenboard/codestyle. The WB C/C++ build-essentials
+# CLIs. The WB C/C++ build-essentials
 # family and armhf/arm64 cross toolchains live as an opt-in example
 # tooling layer at examples/layers/wirenboard-cpp/ instead of in
 # this base image — see docs/adr/0003-project-tooling-layers.md.
@@ -34,7 +32,7 @@
 FROM debian:13-slim
 
 LABEL org.opencontainers.image.title="agent-vm guest template"
-LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + GitHub Copilot + diag tooling (ssh/ping/etc.) + codestyle-pinned Python linters + /opt/wirenboard/codestyle. Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
+LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + GitHub Copilot + diag tooling (ssh/ping/etc.). Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
 
 # LANG=C.UTF-8: debian:slim ships with NO locale set, leaving the guest in
 # C/POSIX — which renders a non-ASCII (e.g. Cyrillic) cwd as `M-P…` meta-
@@ -200,66 +198,6 @@ RUN apt-get update \
  && printf '%s\n' '{' '  "storage-driver": "fuse-overlayfs"' '}' \
         > /etc/docker/daemon.json
 
-# Python lint/format toolchain — pinned to the versions in
-# `wirenboard/codestyle/python/config/requirements.txt`. Pinning
-# matters: codestyle ships a `pyproject.toml` that engineers copy
-# into projects, and a black/isort/pylint version skew between
-# image and project re-formats files differently → noisy diffs.
-#
-# `--break-system-packages` because Debian 13 enforces PEP 668 and
-# we WANT these system-wide so any in-VM tool finds them. The
-# microVM rootfs is throwaway, so there's no system Python we can
-# accidentally damage. `--no-cache-dir` shaves ~40 MB off the
-# layer (the pip download cache is dead weight in an image).
-#
-# Versions sourced from
-# `codestyle/python/config/requirements.txt` (master). `attrs==23.1.0`
-# is per the workaround in `codestyle/python/local/linux-devenv.sh`
-# (newer attrs breaks the pinned pylint). `j2cli` is in
-# wb-mqtt-serial's Build-Depends and is a one-line install here.
-RUN pip3 install --no-cache-dir --break-system-packages \
-        black==24.2.0 \
-        isort==5.13.2 \
-        pylint==3.3.9 \
-        pytest-cov==2.10.1 \
-        attrs==23.1.0 \
-        j2cli
-
-# Shallow-clone `wirenboard/codestyle` so the per-project
-# devenv scripts work without each project re-cloning it.
-#
-# The script `cpp/local/linux-devenv.sh` and its Python sibling
-# both expect to be invoked from inside a project as
-# `bash ../codestyle/{cpp,python}/local/linux-devenv.sh`, i.e.
-# with codestyle as a sibling directory. Having it at a known
-# path inside the image lets a project hook (`.agent-vm.runtime.sh`)
-# symlink/copy it into place at launch instead of cloning over
-# the proxy on every cold start.
-#
-# `CODESTYLE_REF` build-arg (default `master`) lets a reproducible
-# build pin to a specific ref — `git clone --branch` accepts a
-# branch or tag name. The hourly CI cron just builds from master,
-# matching the previous behavior.
-#
-# Hard-fails by default: if GitHub is unreachable the resulting
-# image is missing the devenv path that several WB workflows rely
-# on, and we'd rather not silently ship that. Source-checkout dev
-# builds that set `AGENT_INSTALL_SOFT_FAIL=1` (see images/build.sh,
-# auto-set on TLS-intercept hosts) downgrade to a warning.
-#
-# `AGENT_INSTALL_SOFT_FAIL` is also consumed by the three agent
-# installers + the zellij download below + the sanity check below;
-# declared here at first use so a single toggle covers everything
-# that might legitimately fail in a dev sandbox but must succeed in
-# CI.
-ARG CODESTYLE_REF=master
-ARG AGENT_INSTALL_SOFT_FAIL=
-RUN git clone --depth=1 --branch "${CODESTYLE_REF}" \
-        https://github.com/wirenboard/codestyle.git \
-        /opt/wirenboard/codestyle \
- || { msg="==> wirenboard/codestyle clone FAILED (ref=${CODESTYLE_REF}) — re-clone in-VM with: git clone https://github.com/wirenboard/codestyle.git /opt/wirenboard/codestyle"; \
-      if [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then echo "$msg (soft-fail mode)"; else echo "$msg" >&2; exit 1; fi; }
-
 # zellij is shipped beside tmux because Debian 13 does not package it. The
 # statically linked musl release asset keeps working if the Debian base moves.
 # This dedicated layer stays below the agent installers so their hourly
@@ -292,6 +230,7 @@ RUN --mount=type=bind,source=install-zellij.sh,target=/tmp/install-zellij.sh,ro 
 # `images/build.sh` builds leave the defaults empty and get normal
 # Docker layer-cache behaviour.
 
+ARG AGENT_INSTALL_SOFT_FAIL=
 # Shared helper for the three agent installer RUNs below. Downloads
 # the upstream `install.sh`, runs it under the requested shell, and
 # emits a uniform soft-fail or hard-fail diagnostic depending on
@@ -497,7 +436,7 @@ RUN npm install -g @github/copilot && copilot --version
 # Agent CLIs (claude/opencode/codex) are HARD-required unless
 # `AGENT_INSTALL_SOFT_FAIL` is set, in which case they're SOFT
 # (missing → warning, not failure) — matches the policy on the
-# installer RUNs above. /opt/wirenboard/codestyle and zellij follow
+# installer RUNs above. zellij follows
 # the same policy (their RUNs above also honor AGENT_INSTALL_SOFT_FAIL,
 # scoped to the network fetch only — see the zellij RUN's comment for
 # why a checksum mismatch is never soft-failable even though a
@@ -508,9 +447,6 @@ RUN set -e \
  && docker --version >/dev/null \
  && containerd --version >/dev/null \
  && runc --version >/dev/null \
- && black --version >/dev/null \
- && isort --version >/dev/null \
- && pylint --version >/dev/null \
  && ssh -V >/dev/null 2>&1 \
  && sshpass -V >/dev/null 2>&1 \
  && ping -V >/dev/null 2>&1 \
@@ -520,13 +456,6 @@ RUN set -e \
           echo "  zellij: MISSING (soft-fail mode)"; \
       else \
           echo "  zellij: MISSING — hard sanity failure" >&2; exit 1; \
-      fi; } \
- && { if [ -d /opt/wirenboard/codestyle ]; then \
-          echo "  codestyle clone: OK"; \
-      elif [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then \
-          echo "  codestyle clone: MISSING (soft-fail mode)"; \
-      else \
-          echo "  codestyle clone: MISSING — hard sanity failure" >&2; exit 1; \
       fi; } \
  && echo "== agent CLIs ==" \
  && for bin in claude opencode codex copilot; do \
