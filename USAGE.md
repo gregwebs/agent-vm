@@ -32,9 +32,12 @@ bundled build.
 ## Subcommands
 
 ```
-claude | codex | opencode | shell   launch an agent in a per-project sandbox
+claude | codex | opencode | copilot | shell
+                                    launch an agent in a per-project sandbox
 pull                                refresh the cached image
 setup                               pull base image + verify boot
+doctor                              report host credentials + microsandbox state
+                                    (--reset-msb-db recovers a forward-migrated db)
 msb <args...>                       forward to the bundled msb (e.g. msb ls, msb status)
 clipboard {get,put} [--sys]         exchange a string with the project sandbox
 ```
