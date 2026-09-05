@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted.
+Accepted, but **not present in the pinned `vendor/microsandbox`** — the
+submodule merge that carried it was dropped by a later gitlink bump. The
+shipped behaviour is idle-only heartbeat with boot failure owned by the
+relay's `wait_ready`, and nothing writes `msb-exit.log`. See
+[issue #86](https://github.com/gregwebs/agent-vm/issues/86); do not treat the
+decision below as a description of current code.
 
 ## Context
 

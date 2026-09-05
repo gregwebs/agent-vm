@@ -294,7 +294,9 @@ A sandbox is a libkrun microVM: the launcher spawns a hidden `msb sandbox …`
 child (the VMM) which runs the vendored runtime and never returns — libkrun
 calls `_exit()` on shutdown. Three separate things decide when that ends, and
 the division of labour between them is the whole design.
-Background: [ADR-0007](docs/adr/0007-heartbeat-keep-alive-and-runtime-exit-reporting.md).
+Background: [ADR-0007](docs/adr/0007-heartbeat-keep-alive-and-runtime-exit-reporting.md)
+— but note that ADR proposes a staleness-budget design that is *not* what
+ships; see [issue #86](https://github.com/gregwebs/agent-vm/issues/86).
 
 **The heartbeat monitor only answers "is this sandbox idle?"** `agentd` writes
 `/.msb/heartbeat.json` once a second and it appears host-side via virtiofs;
