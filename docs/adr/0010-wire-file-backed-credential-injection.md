@@ -65,6 +65,20 @@ reduces compatibility for `gh` mutation workflows. Copilot receives file-backed
 substitution only for a selected Copilot launch.
 It has no in-session OAuth refresh path; relaunch recaptures its token.
 
+A failed host capture is fail-closed on the launch path, not a warning.
+The guest state directory outlives a launch but the proxy's substitution
+entries are rebuilt from `CredsState` on every launch, so a placeholder
+credential file surviving from an earlier successful launch would be sent
+verbatim as the bearer — the in-VM agent appears signed in until every
+request 401s, and `/login` inside the guest is refused by the OAuth
+validation above, surfacing only as `status code 400`. `secrets::refresh`
+therefore removes the guest Claude placeholder whenever no Anthropic
+token was captured, and a Claude launch with no captured token aborts
+before boot naming the host `claude login`. Copilot already had this
+guard; Claude did not. Each launch also prints which providers were
+captured, and `agent-vm doctor` reports host credential presence,
+usability, and Claude token expiry without printing token bytes.
+
 ## Consequences
 
 Credential files are never mounted into the guest and token bytes are not

@@ -172,6 +172,19 @@ run leaves the previously written `paths.cache` pointing at the shared
 directory. To fully revert, delete that `config.json` (or remove the
 `paths.cache` key from it).
 
+## Checking what agent-vm can see
+
+```
+agent-vm doctor
+```
+
+Prints the active `MSB_HOME` and bundled schema, then every host
+credential source agent-vm reads — present / absent / unusable, plus how
+long the Claude token has left — and which of them were captured for the
+project you run it in. It never prints token bytes. This is the first
+thing to run when an in-VM agent comes up signed out. See
+[Credentials](#credentials).
+
 ## Recovering from a forward-migrated microsandbox db
 
 sea-orm migrations in microsandbox are one-way. If a newer, separately
@@ -251,6 +264,19 @@ database rather than using an insecure certificate flag, and disables MCP
 telemetry.
 
 ## Credentials
+
+**Sign in on the host, never inside the VM.** The guest only ever holds
+placeholder tokens; the proxy swaps in the real host token on the way
+out. So `claude login` / `codex login` / `gh auth login` are host
+commands. Running `/login` *inside* the guest cannot work — the OAuth
+hook accepts only a refresh grant carrying the placeholder refresh
+token, so an authorization-code exchange is rejected and Claude Code
+reports a bare `OAuth error: Request failed with status code 400`.
+A Claude launch with no usable host credential now fails before boot
+rather than starting a signed-out agent.
+
+Run `agent-vm doctor` to see what was found on the host, when the Claude
+token expires, and which credentials reached the current project.
 
 Reads from the host:
 

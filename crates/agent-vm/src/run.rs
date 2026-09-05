@@ -241,6 +241,46 @@ fn repo_scope_notice(allowed: &[String]) -> String {
     }
 }
 
+/// `==> Agent credentials: claude, codex, gh` /
+/// `==> Agent credentials: <none> (no host logins found)`
+///
+/// Names the providers whose host credential was captured into
+/// `<hash>.secrets/` and registered for proxy substitution. Without this
+/// the only signal that a capture failed is a `tracing::warn!` buried in
+/// the boot output, and the resulting symptom — an in-VM agent that comes
+/// up signed out — points nowhere near the host login that fixes it.
+/// Order is fixed (not `CredsState` field order) so the line is stable
+/// across launches. OpenCode's static provider keys are summarised as a
+/// count because there are seven of them.
+fn creds_notice(creds: &crate::secrets::CredsState) -> String {
+    let mut found: Vec<String> = Vec::new();
+    for (present, label) in [
+        (creds.anthropic_token_file.is_some(), "claude"),
+        (creds.openai_token_file.is_some(), "codex"),
+        (
+            creds.opencode_openai_access_token_file.is_some(),
+            "opencode",
+        ),
+        (creds.gh_token_file.is_some(), "gh"),
+        (creds.copilot_token_file.is_some(), "copilot"),
+    ] {
+        if present {
+            found.push(label.to_string());
+        }
+    }
+    if !creds.opencode_api_token_files.is_empty() {
+        found.push(format!(
+            "opencode-api x{}",
+            creds.opencode_api_token_files.len()
+        ));
+    }
+    if found.is_empty() {
+        "==> Agent credentials: <none> (no host logins found)".to_string()
+    } else {
+        format!("==> Agent credentials: {}", found.join(", "))
+    }
+}
+
 /// `==> Git author identity: Ada <ada@x> (gh:ada)` /
 /// `==> Git author identity: Ada <ada@x>` /
 /// `==> Git author identity: <none> (gh not logged in and …)`
@@ -961,6 +1001,27 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
              and retry, or pick another agent."
         );
     }
+
+    // Same reasoning for Claude, which had no equivalent guard: a failed
+    // capture was only a `tracing::warn!` and the launch continued, so
+    // the in-VM Claude Code came up signed out. The natural next move —
+    // `/login` inside the guest — cannot work either: the guest only
+    // ever holds placeholders, and `intercept_hook::oauth_refresh`
+    // accepts `grant_type=refresh_token` with the placeholder refresh
+    // token *only*, so an authorization-code exchange is rejected and
+    // Claude Code surfaces a bare "OAuth error ... status code 400".
+    // Fail here instead, naming the one action that actually fixes it.
+    if matches!(agent, Agent::Claude) && creds.anthropic_token_file.is_none() {
+        anyhow::bail!(
+            "no usable Claude credential found on the host at \
+             ~/.claude/.credentials.json. Sign in *on the host* with \
+             `claude login`, then retry — you cannot `/login` from inside \
+             the VM, which only ever sees placeholder tokens. Run \
+             `agent-vm doctor` to see what was found."
+        );
+    }
+
+    notices.emit(creds_notice(&creds))?;
 
     // RAII guard so the Phase-5 host-cred mutation check runs on
     // *every* exit path from launch() — including `?` propagation
@@ -2549,6 +2610,27 @@ mod tests {
             git_identity_notice(None),
             "==> Git author identity: <none> (gh not logged in and no host gitconfig \
              user.name/email; in-VM `git commit` will refuse until you set one)"
+        );
+    }
+
+    #[test]
+    fn notice_creds_lists_captured_providers_or_reports_none() {
+        use crate::secrets::CredsState;
+        use std::path::PathBuf;
+
+        assert_eq!(
+            creds_notice(&CredsState::default()),
+            "==> Agent credentials: <none> (no host logins found)"
+        );
+        // Order is the fixed display order, not the order the fields were
+        // populated in, so the line reads the same launch to launch.
+        assert_eq!(
+            creds_notice(&CredsState {
+                gh_token_file: Some(PathBuf::from("/s/gh")),
+                anthropic_token_file: Some(PathBuf::from("/s/anthropic")),
+                ..CredsState::default()
+            }),
+            "==> Agent credentials: claude, gh"
         );
     }
 
