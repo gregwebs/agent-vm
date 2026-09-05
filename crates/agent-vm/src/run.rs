@@ -1237,10 +1237,10 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // by the user — that path stays a simple Bearer header, no
     // placeholder substitution involved.
     for var in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
-        if let Ok(val) = env::var(var) {
-            if !val.is_empty() {
-                builder = builder.env(var, val);
-            }
+        if let Ok(val) = env::var(var)
+            && !val.is_empty()
+        {
+            builder = builder.env(var, val);
         }
     }
     // The image's PATH was set inside the Dockerfile, but it lives in the
@@ -1865,6 +1865,7 @@ fn pid_alive(pid: u32) -> bool {
 /// each `extra_mount_dir` for:
 ///   * every `git remote -v` URL that points at github.com,
 ///   * every github.com URL listed in that dir's `.gitmodules`.
+///
 /// Matches main-branch claude-vm.sh:1463-1514 — without this,
 /// `git push` from inside a submodule (or a mounted sibling repo)
 /// would hit api.github.com anonymous and 401.
@@ -1882,10 +1883,10 @@ fn detect_github_repos<'a>(
     // project dir (or a symlink to it) doesn't re-run the same scan.
     let project_canon = project_dir.canonicalize().ok();
     for dir in extra_mount_dirs {
-        if let (Some(pc), Ok(mc)) = (project_canon.as_ref(), dir.canonicalize()) {
-            if &mc == pc {
-                continue;
-            }
+        if let (Some(pc), Ok(mc)) = (project_canon.as_ref(), dir.canonicalize())
+            && &mc == pc
+        {
+            continue;
         }
         scan_dir_for_github_slugs(dir, &mut slugs);
     }
@@ -1950,10 +1951,10 @@ fn parse_dir_remote_github_slugs(dir: &Path) -> Vec<String> {
             Some(u) => u,
             None => continue,
         };
-        if let Some(slug) = parse_github_slug(url) {
-            if !slugs.iter().any(|s| s.eq_ignore_ascii_case(&slug)) {
-                slugs.push(slug);
-            }
+        if let Some(slug) = parse_github_slug(url)
+            && !slugs.iter().any(|s| s.eq_ignore_ascii_case(&slug))
+        {
+            slugs.push(slug);
         }
     }
     slugs
@@ -3522,18 +3523,15 @@ async fn notify_if_update_available<W: std::io::Write>(
     // request's worth of wait. The banner is best-effort — on timeout we
     // simply stay quiet and continue with the cached image.
     let probe = tokio::time::timeout(UPDATE_PROBE_BUDGET, check_for_update(image));
-    match probe.await {
-        Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) => {
-            notices.emit(format!(
-                "==> A newer image is available in the registry (cached {cached}, registry {remote})"
-            ))?;
-            notices
-                .emit("==> Run `agent-vm pull` to fetch it. Continuing with the cached image.")?;
-        }
-        // UpToDate / NotCached: nothing to say.
-        // Ok(Err)/None: registry unreachable etc. — stay quiet.
-        // Err(Elapsed): probe exceeded the budget — stay quiet.
-        _ => {}
+    // Every other outcome is deliberately silent:
+    //   UpToDate / NotCached: nothing to say.
+    //   Ok(Err)/None: registry unreachable etc. — stay quiet.
+    //   Err(Elapsed): probe exceeded the budget — stay quiet.
+    if let Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) = probe.await {
+        notices.emit(format!(
+            "==> A newer image is available in the registry (cached {cached}, registry {remote})"
+        ))?;
+        notices.emit("==> Run `agent-vm pull` to fetch it. Continuing with the cached image.")?;
     }
     Ok(())
 }

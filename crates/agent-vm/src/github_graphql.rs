@@ -1169,13 +1169,10 @@ impl Parser {
                     let name = name.clone();
                     self.expect_punct(':')?;
                     // Type: Name with arbitrary [ ] ! nesting.
-                    loop {
-                        match self.peek()? {
-                            Tok::Name(_) | Tok::Punct('[') | Tok::Punct(']') | Tok::Punct('!') => {
-                                self.pos += 1;
-                            }
-                            _ => break,
-                        }
+                    while let Tok::Name(_) | Tok::Punct('[') | Tok::Punct(']') | Tok::Punct('!') =
+                        self.peek()?
+                    {
+                        self.pos += 1;
                     }
                     if self.peek() == Some(&Tok::Punct('=')) {
                         self.pos += 1;
