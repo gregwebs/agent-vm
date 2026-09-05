@@ -149,13 +149,39 @@ sources the project hook before exec. The refresh single-flight, the
 
 ## C. Improvements beyond the original (optional, product call)
 
-- **C1 — Detached / persistent-VM fast launch.** Neither the original nor the
-  rewrite has this. Boot once per project, attach per invocation: ~1.5 s →
-  ~10–50 ms. Pulls in lifecycle subcommands (`ps` / `stop` / `restart`),
-  attach-if-exists reuse, idle-timeout cleanup, and an in-VM-state-persistence
-  policy call. Nothing exists yet — `crates/agent-vm/src/main.rs:57-97` is the
-  complete subcommand list, and the closest thing is the read-only
-  `agent-vm msb ls|status` passthrough. Effort: L.
+- **C1 — Detached / persistent-VM fast launch.** Boot once per project, attach
+  per invocation: ~1.5 s → ~10–50 ms.
+
+  **The lifecycle primitives already exist and are already reachable.** `msb`
+  ships `create` / `start` / `stop` / `restart` / `ps` / `exec` / `ssh` /
+  `snapshot` / `logs`
+  (`vendor/microsandbox/crates/cli/lib/commands/`), and `agent-vm msb <args…>`
+  forwards *verbatim* with `MSB_PATH`/`MSB_HOME` pinned at agent-vm's private
+  registry (`msb_cmd.rs` — it is a pure passthrough, not a read-only subset).
+  So C1 is not "add `ps`/`stop`/`restart`"; those are one `agent-vm msb` away
+  today.
+
+  What's missing is on the agent-vm side, and the launcher is currently
+  designed *against* reuse:
+
+  - **Nothing survives to attach to.** The sandbox is named
+    `agent-vm-{project_hash}-{pid}` (`session.rs:99`) — PID-scoped on purpose,
+    so concurrent launches in one project can't collide. A name that changes
+    every launch cannot be re-attached.
+  - **The launcher tears it down.** `launch` ends with `stop_and_wait()` +
+    `Sandbox::remove` (`run.rs:1620-1626`), and `reap_stale_project_sandboxes`
+    (`run.rs:1825`) garbage-collects anything a crashed launcher left behind.
+  - **No attach-if-exists / idle-timeout path** in `run.rs` at all.
+  - **The hard part is config, not plumbing.** The network plan, the
+    credential-injection overlay, and the per-launch GitHub repo allow-list are
+    built from the cwd and applied at *builder* time
+    (`run.rs:1223-1240`), before `Sandbox::create`. A reused VM would silently
+    inherit the previous launch's allow-list and egress policy unless they are
+    re-applied or the launch is refused — that is a security property, not a
+    convenience, and it is what makes this L rather than M.
+
+  Also needs an in-VM-state-persistence policy call (what survives between
+  attaches). Effort: L.
 
 ## D. Original-only features — decisions made
 
