@@ -75,7 +75,10 @@ pub(crate) struct ExtraMount {
     /// True iff `follow-links` was among the parsed modes. Consumed by
     /// [`expand_follow_links`], which walks `host` on the host side and
     /// appends one read-only `ExtraMount` per discovered symlink-target
-    /// directory. Mounts appended by that walk carry `follow_links: false`
+    /// directory — plus, when a link's raw target text names that directory
+    /// through a symlinked parent, a second mount of the same host
+    /// directory at that *literal* path (see [`literal_guest_path`]).
+    /// Mounts appended by that walk carry `follow_links: false`
     /// (the walk does not recurse into a discovered target's own targets
     /// beyond what it already resolved transitively).
     pub(crate) follow_links: bool,
@@ -215,18 +218,225 @@ pub(crate) fn configure_extra_mount(
 /// Depth cap on symlink-*follow* chains specifically — NOT on plain
 /// directory nesting under `HOST` or a discovered target (see the
 /// `link_depth` bookkeeping in [`discover_followed_targets`], which only
-/// increments when a symlink is followed). Termination is already
-/// guaranteed by the canonicalized `visited` set (finitely many distinct
-/// real paths), so this cap is belt-and-suspenders against pathological
-/// symlink chains; 40 is deep enough for any real skill farm while still
-/// bounding a runaway chain.
+/// increments when a symlink is followed). The `visited` set stops the
+/// walk revisiting a host/guest pair, which alone bounds every layout
+/// whose guest paths come from a finite set — but a literal alias derives
+/// a *new* guest path from link text, so a pathological chain of relative
+/// links could keep minting pairs. This cap is what bounds that; 40 is
+/// deep enough for any real skill farm while still stopping a runaway.
 const MAX_LINK_DEPTH: usize = 40;
 
+/// A directory in both the worlds the follow-links walk straddles: where
+/// it really lives on the host, and the path the guest reaches it by.
+///
+/// The two coincide for an ordinary mirror bind. They diverge inside a
+/// *literal alias* — a second bind of one host directory at the path some
+/// link's raw text names (see [`literal_guest_path`]) — and the walk has
+/// to carry both, because a relative symlink found inside that directory
+/// resolves against whichever path the guest entered by, not against the
+/// host's canonical one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BindPath {
+    host: PathBuf,
+    guest: PathBuf,
+}
+
+impl BindPath {
+    /// One host directory bound at its own real path — the ordinary case.
+    fn mirrored(path: PathBuf) -> BindPath {
+        BindPath {
+            host: path.clone(),
+            guest: path,
+        }
+    }
+
+    /// Descend into `name` on both sides at once.
+    fn join(&self, name: &std::ffi::OsStr) -> BindPath {
+        BindPath {
+            host: self.host.join(name),
+            guest: self.guest.join(name),
+        }
+    }
+}
+
+impl From<BindPath> for ExtraMount {
+    /// Every bind the walk discovers is read-only (`follow-links` implies
+    /// `ro`) and carries `follow_links: false` — the walk that produced it
+    /// already resolved transitively, so it must not be re-expanded.
+    fn from(p: BindPath) -> ExtraMount {
+        ExtraMount {
+            host: p.host,
+            guest: p.guest,
+            readonly: true,
+            follow_links: false,
+        }
+    }
+}
+
+/// Join a symlink's raw target text against the directory holding the link
+/// and fold `.`/`..` *lexically*, i.e. as pure string surgery with no
+/// filesystem lookups.
+///
+/// Folding this way models a kernel's resolution only while no `..`
+/// crosses a symlinked component — the kernel expands a symlink *before*
+/// applying the `..` that follows it, so the two answers part company
+/// exactly there. [`literal_guest_path`] is what detects that divergence;
+/// this function's contract is only the string operation. `None` when the
+/// link has no parent or a `..` escapes above the root.
+fn lexical_link_path(link: &Path, raw_target: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let joined = if raw_target.is_absolute() {
+        raw_target.to_path_buf()
+    } else {
+        link.parent()?.join(raw_target)
+    };
+    let mut out = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    Some(out)
+}
+
+/// What [`literal_guest_path`] concluded about one symlink's raw target
+/// text. `Declined` is not a failure — the walk carries on and surfaces
+/// the warning — which is why this is an enum and not a `Result`.
+enum LiteralPath {
+    /// The mirror bind at the canonical path already covers this link:
+    /// the guest resolves the text to exactly the directory the host did.
+    AlreadyCovered,
+    /// The guest resolves the text to this path instead, so the same host
+    /// directory needs a second bind here.
+    MirrorAt(PathBuf),
+    /// Cannot be mirrored safely; carries the warning to surface.
+    Declined(String),
+}
+
+/// One `Declined` warning, phrased alike for every reason: name the
+/// symlink, give the reason, state what it costs the user.
+fn declined(link: &Path, reason: String) -> String {
+    format!(
+        "not mirroring symlink {} — {reason}; it may not resolve inside the sandbox",
+        link.display()
+    )
+}
+
+/// Where the guest will look when it resolves the symlink `link`, given
+/// that the host resolves it to `canonical`.
+///
+/// The guest sees the link verbatim through an enclosing bind, so its
+/// `readlink()` returns the raw target text and the guest kernel resolves
+/// *that*, starting from `link.guest`'s parent. The host's canonicalized
+/// answer names the same directory only when every component of the text
+/// is already a real directory the guest can walk. When an intermediate
+/// component is itself a symlink, the guest never reaches the canonical
+/// path at all:
+///
+/// ```text
+/// ~/.claude/skills/implement -> ~/code/conf/.agents/skills/implement   (raw text)
+/// ~/code/conf/.agents/skills -> ../skills                              (parent link)
+/// canonical                   = ~/code/conf/skills/implement
+/// ```
+///
+/// Binding only `~/code/conf/skills/implement` leaves the guest looking up
+/// `~/code/conf/.agents/…`, which nothing is mounted at. A second bind of
+/// the same real directory at the literal path closes the gap: agentd
+/// creates a mount point's missing ancestors before binding it, so the
+/// `.agents/skills` directories come into being on the way. (Ancestors
+/// that would land inside an already-read-only bind cannot be created;
+/// that surfaces as a boot error rather than as silent breakage.)
+///
+/// [`LiteralPath::Declined`] covers text we will not mirror:
+/// - text whose `..` cannot be folded without consulting the filesystem,
+///   because a `..` crosses a symlinked component. The kernel expands the
+///   symlink first, so no single mount point reproduces its answer and
+///   the honest move is to warn rather than bind somewhere merely
+///   plausible. Detected by folding on the host side, where the result
+///   can be checked against `canonical`.
+/// - a mount point outside `home`, which would let a link inside `$HOME`
+///   place a bind anywhere in the guest's filesystem.
+fn literal_guest_path(link: &BindPath, canonical: &Path, home: &Path) -> LiteralPath {
+    let raw = match fs::read_link(&link.host) {
+        Ok(r) => r,
+        Err(e) => {
+            return LiteralPath::Declined(declined(
+                &link.host,
+                format!("its target text could not be read: {e}"),
+            ));
+        }
+    };
+    // The same fold applied twice: on the host side purely so the result
+    // can be checked against `canonical`, on the guest side for the answer
+    // we actually want. Agreement on the host therefore transfers to the
+    // guest, which is what lets an alias deep inside the walk be trusted.
+    let (Some(on_host), Some(on_guest)) = (
+        lexical_link_path(&link.host, &raw),
+        lexical_link_path(&link.guest, &raw),
+    ) else {
+        return LiteralPath::Declined(declined(
+            &link.host,
+            format!(
+                "its target {} folds above the filesystem root",
+                raw.display()
+            ),
+        ));
+    };
+    if on_guest == canonical {
+        return LiteralPath::AlreadyCovered;
+    }
+    if on_host.canonicalize().ok().as_deref() != Some(canonical) {
+        return LiteralPath::Declined(declined(
+            &link.host,
+            format!(
+                "its target text does not name {} on the host",
+                canonical.display()
+            ),
+        ));
+    }
+    if !on_guest.starts_with(home) {
+        return LiteralPath::Declined(declined(
+            &link.host,
+            format!(
+                "the guest would look it up at {}, outside your $HOME ({})",
+                on_guest.display(),
+                home.display()
+            ),
+        ));
+    }
+    LiteralPath::MirrorAt(on_guest)
+}
+
 /// Walk `root` (already canonicalized) on the host side and return the
-/// distinct canonicalized *directory* targets reachable by following the
-/// symlinks it transitively contains, plus warnings for anything skipped
-/// along the way (symlink-to-file, dangling symlink, unreadable
-/// subdirectory, depth-cap hit).
+/// binds needed to make the symlinks it transitively contains resolve
+/// inside the guest, plus warnings for anything skipped along the way
+/// (symlink-to-file, dangling symlink, unreadable subdirectory, depth-cap
+/// hit, un-mirrorable literal path).
+///
+/// Every canonicalized *directory* target gets a mirror bind at its own
+/// real path, and a target whose link text reaches it through a symlinked
+/// parent gets a second bind at that literal path as well — the guest
+/// resolves link text, not canonical paths (see [`literal_guest_path`]).
+/// A target bound at such an alias is then walked *again* under that
+/// alias, because a relative symlink inside it resolves against the path
+/// the guest entered by. Entries are distinct by guest path.
+///
+/// `root` carries both sides for the same reason: the mount it came from
+/// may name a guest path that differs from the host directory — either
+/// explicitly (`--mount HOST:GUEST:follow-links`) or, far more commonly,
+/// because `HOST` was itself a symlink and `parse_extra_mounts`
+/// canonicalized it while leaving `GUEST` as typed. A relative link
+/// directly under such a root resolves against the guest side, so that is
+/// what the walk has to track.
 ///
 /// Returning warnings as data instead of `eprintln!`ing them keeps this
 /// function side-effect-free so tests can assert on the warning text, not
@@ -238,29 +448,33 @@ const MAX_LINK_DEPTH: usize = 40;
 /// `home` is the invoking user's already-canonicalized `$HOME`. A resolved
 /// directory target outside it is a hard error naming both the symlink and
 /// the target (safety guardrail — see issue #9/#11).
-fn discover_followed_targets(root: &Path, home: &Path) -> Result<(Vec<PathBuf>, Vec<String>)> {
-    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let mut out: Vec<PathBuf> = Vec::new();
+fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPath>, Vec<String>)> {
+    let mut visited: std::collections::HashSet<BindPath> = std::collections::HashSet::new();
+    let mut out: Vec<BindPath> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
-    // (directory to scan, symlink-follow depth so far).
-    let mut worklist: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    // (directory to scan — host side, plus the guest path it is reached
+    // by — and the symlink-follow depth so far).
+    let mut worklist: Vec<(BindPath, usize)> = vec![(root.clone(), 0)];
 
     while let Some((dir, link_depth)) = worklist.pop() {
-        // Canonicalized visited-set: two symlinks resolving to the same
-        // real path (or a symlink back to an already-walked ancestor)
-        // collapse to one entry here, which is what actually terminates
-        // cycles — the depth cap above is a secondary bound.
+        // Keyed on the host/guest pair, not the host path alone: one real
+        // directory reached by two different guest paths has to be walked
+        // twice, since a relative symlink inside it resolves against the
+        // path the guest entered by. Two symlinks resolving to the same
+        // pair (or a symlink back to an already-walked ancestor) collapse
+        // to one entry here, which is what actually terminates cycles —
+        // the depth cap above is a secondary bound.
         if !visited.insert(dir.clone()) {
             continue;
         }
-        let entries = match fs::read_dir(&dir) {
+        let entries = match fs::read_dir(&dir.host) {
             Ok(e) => e,
             Err(e) => {
                 // A permission-denied (or otherwise unreadable) subdir must
                 // not abort the whole launch — warn and move on.
                 warnings.push(format!(
                     "skipping unreadable directory {}: {e}",
-                    dir.display()
+                    dir.host.display()
                 ));
                 continue;
             }
@@ -271,18 +485,18 @@ fn discover_followed_targets(root: &Path, home: &Path) -> Result<(Vec<PathBuf>, 
                 Err(e) => {
                     warnings.push(format!(
                         "skipping unreadable entry under {}: {e}",
-                        dir.display()
+                        dir.host.display()
                     ));
                     continue;
                 }
             };
-            let path = entry.path();
+            let path = dir.join(&entry.file_name());
             // lstat (no follow) so we can tell "is a symlink" from "is a
             // real dir/file" without resolving anything yet.
-            let meta = match fs::symlink_metadata(&path) {
+            let meta = match fs::symlink_metadata(&path.host) {
                 Ok(m) => m,
                 Err(e) => {
-                    warnings.push(format!("skipping {}: {e}", path.display()));
+                    warnings.push(format!("skipping {}: {e}", path.host.display()));
                     continue;
                 }
             };
@@ -302,14 +516,14 @@ fn discover_followed_targets(root: &Path, home: &Path) -> Result<(Vec<PathBuf>, 
                 warnings.push(format!(
                     "skipping symlink {} — exceeded max follow depth ({MAX_LINK_DEPTH}); \
                      possible pathological symlink chain",
-                    path.display()
+                    path.host.display()
                 ));
                 continue;
             }
-            let target = match path.canonicalize() {
+            let target = match path.host.canonicalize() {
                 Ok(t) => t,
                 Err(_) => {
-                    warnings.push(format!("skipping dangling symlink {}", path.display()));
+                    warnings.push(format!("skipping dangling symlink {}", path.host.display()));
                     continue;
                 }
             };
@@ -318,7 +532,7 @@ fn discover_followed_targets(root: &Path, home: &Path) -> Result<(Vec<PathBuf>, 
                 Err(e) => {
                     warnings.push(format!(
                         "skipping symlink {} -> {}: {e}",
-                        path.display(),
+                        path.host.display(),
                         target.display()
                     ));
                     continue;
@@ -327,7 +541,7 @@ fn discover_followed_targets(root: &Path, home: &Path) -> Result<(Vec<PathBuf>, 
             if !target_meta.is_dir() {
                 warnings.push(format!(
                     "skipping symlink {} -> {} (not a directory)",
-                    path.display(),
+                    path.host.display(),
                     target.display()
                 ));
                 continue;
@@ -336,20 +550,42 @@ fn discover_followed_targets(root: &Path, home: &Path) -> Result<(Vec<PathBuf>, 
                 anyhow::bail!(
                     "--mount follow-links: symlink {} resolves to {}, which is outside your \
                      $HOME ({}); refusing to mount it",
-                    path.display(),
+                    path.host.display(),
                     target.display(),
                     home.display()
                 );
             }
-            // Dedup within this walk. Note this does not special-case a
-            // target that lands *inside* `root` or another already-
-            // discovered target (see `expand_follow_links` doc) — that's
-            // a redundant-but-harmless extra bind at its own real path,
-            // not a correctness issue.
-            if !out.contains(&target) {
-                out.push(target.clone());
+            // Dedup within this walk on the guest path — the one thing
+            // that has to be unique, since it is the mount point. Note
+            // this does not special-case a target that lands *inside*
+            // `root` or another already-discovered target (see
+            // `expand_follow_links` doc) — that's a redundant-but-harmless
+            // extra bind at its own real path, not a correctness issue.
+            let mut push_unique_guest = |b: BindPath| {
+                if !out.iter().any(|d| d.guest == b.guest) {
+                    out.push(b);
+                }
+            };
+            let mirror = BindPath::mirrored(target.clone());
+            push_unique_guest(mirror.clone());
+            worklist.push((mirror, link_depth + 1));
+            // …and again at the path the guest's own `readlink()` will
+            // name, when a symlinked parent makes that differ. The alias
+            // is walked too: a relative symlink inside `target` resolves
+            // against whichever of the two paths the guest came in by, so
+            // the alias needs its own pass to discover its own aliases.
+            match literal_guest_path(&path, &target, home) {
+                LiteralPath::AlreadyCovered => {}
+                LiteralPath::MirrorAt(guest) => {
+                    let alias = BindPath {
+                        host: target,
+                        guest,
+                    };
+                    push_unique_guest(alias.clone());
+                    worklist.push((alias, link_depth + 1));
+                }
+                LiteralPath::Declined(w) => warnings.push(w),
             }
-            worklist.push((target, link_depth + 1));
         }
     }
     Ok((out, warnings))
@@ -365,6 +601,11 @@ fn discover_followed_targets(root: &Path, home: &Path) -> Result<(Vec<PathBuf>, 
 ///
 /// Returns the finalized mount list plus every warning collected while
 /// discovering targets, for the caller to print (see `launch()`).
+///
+/// Each walk is rooted at the entry's host *and* guest path, so relative
+/// link text under a root whose two sides differ — a remapped
+/// `--mount HOST:GUEST`, or a `HOST` that was itself a symlink — resolves
+/// the way the guest will resolve it.
 pub(crate) fn expand_follow_links(
     mounts: Vec<ExtraMount>,
     home: Option<&Path>,
@@ -382,26 +623,25 @@ pub(crate) fn expand_follow_links(
 
     let mut warnings = Vec::new();
     let mut expanded = mounts;
-    let mut discovered_targets: Vec<PathBuf> = Vec::new();
+    let mut discovered_targets: Vec<BindPath> = Vec::new();
     for m in &expanded {
         if !m.follow_links {
             continue;
         }
-        let (targets, mut w) = discover_followed_targets(&m.host, &home_canon)?;
+        let root = BindPath {
+            host: m.host.clone(),
+            guest: m.guest.clone(),
+        };
+        let (targets, mut w) = discover_followed_targets(&root, &home_canon)?;
         warnings.append(&mut w);
         discovered_targets.extend(targets);
     }
-    for target in discovered_targets {
-        // The original follow-links mount (the HOST bind itself) stays in
-        // the list unchanged; this appends one read-only mount per
-        // distinct discovered real target, at its own real path.
-        expanded.push(ExtraMount {
-            host: target.clone(),
-            guest: target,
-            readonly: true,
-            follow_links: false,
-        });
-    }
+    // The original follow-links mount (the HOST bind itself) stays in the
+    // list unchanged; this appends one read-only mount per distinct
+    // discovered guest path — the target's own real path, plus the literal
+    // path a symlinked parent makes the guest look up (see
+    // `literal_guest_path`).
+    expanded.extend(discovered_targets.into_iter().map(ExtraMount::from));
 
     // Finalize across the whole resulting list: dedup a guest path that
     // repeats with the *same* host (two symlinks resolving to the same
@@ -702,6 +942,20 @@ mod tests {
         p.canonicalize().expect("canonicalize")
     }
 
+    /// Walk a root whose two sides coincide — the shape almost every
+    /// discovery test wants. Tests about a root that was itself a symlink
+    /// call `discover_followed_targets` with an explicit [`BindPath`].
+    fn walk(host: &Path, home: &Path) -> Result<(Vec<BindPath>, Vec<String>)> {
+        discover_followed_targets(&BindPath::mirrored(host.to_path_buf()), home)
+    }
+
+    /// The real host directories a walk found. Most discovery tests only
+    /// care about that set; the ones about literal guest paths assert on
+    /// [`BindPath::guest`] directly instead.
+    fn hosts(found: &[BindPath]) -> Vec<PathBuf> {
+        found.iter().map(|d| d.host.clone()).collect()
+    }
+
     #[test]
     fn discover_direct_dir_symlink() {
         let home = tempfile::tempdir().unwrap();
@@ -712,8 +966,8 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         symlink(&outside, host.join("foo")).unwrap();
 
-        let (targets, warnings) = discover_followed_targets(&host, &home_path).expect("ok");
-        assert_eq!(targets, vec![outside]);
+        let (found, warnings) = walk(&host, &home_path).expect("ok");
+        assert_eq!(hosts(&found), vec![outside]);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     }
 
@@ -730,7 +984,8 @@ mod tests {
         symlink(&a, host.join("foo")).unwrap();
         symlink(&b, a.join("bar")).unwrap();
 
-        let (mut targets, warnings) = discover_followed_targets(&host, &home_path).expect("ok");
+        let (found, warnings) = walk(&host, &home_path).expect("ok");
+        let mut targets = hosts(&found);
         targets.sort();
         let mut expected = vec![a, b];
         expected.sort();
@@ -739,6 +994,216 @@ mod tests {
             "both the direct and transitive target must be discovered"
         );
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    // ── lexical_link_path: properties ───────────────────────────────
+
+    proptest::proptest! {
+        /// Whatever text a symlink holds, a folded path is usable as a
+        /// mount point: absolute, and free of the `.`/`..` components a
+        /// bind target cannot carry. Folding is also a fixed point, which
+        /// is the property that makes it safe to fold the same raw text
+        /// against two different directories (host and guest) and trust
+        /// that agreement on one transfers to the other.
+        #[test]
+        fn lexical_link_path_folds_to_a_clean_absolute_fixed_point(
+            link_segs in proptest::collection::vec("[a-z]{1,4}", 1..5),
+            raw_segs in proptest::collection::vec("[a-z]{1,4}|\\.|\\.\\.", 0..6),
+            raw_is_absolute in proptest::bool::ANY,
+        ) {
+            use proptest::prop_assert;
+            use std::path::Component;
+
+            let link = link_segs.iter().fold(PathBuf::from("/"), |a, s| a.join(s));
+            let base = if raw_is_absolute { PathBuf::from("/") } else { PathBuf::new() };
+            let raw = raw_segs.iter().fold(base, |a, s| a.join(s));
+
+            if let Some(folded) = lexical_link_path(&link, &raw) {
+                prop_assert!(folded.is_absolute(), "{folded:?}");
+                prop_assert!(
+                    folded
+                        .components()
+                        .all(|c| matches!(c, Component::RootDir | Component::Normal(_))),
+                    "{folded:?} still carries . or .. components"
+                );
+                prop_assert!(
+                    lexical_link_path(&link, &folded).as_ref() == Some(&folded),
+                    "folding {folded:?} again changed it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discover_binds_literal_path_through_a_symlinked_parent() {
+        // The `~/.claude/skills` shape: the link's raw target text runs
+        // through `.agents/skills`, which is itself a symlink, so the
+        // canonical path the host resolves to is NOT the path the guest
+        // will look up.
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        let conf = home_path.join("conf");
+        let real = conf.join("skills").join("implement");
+        let literal = conf.join(".agents").join("skills").join("implement");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(conf.join(".agents")).unwrap();
+        symlink("../skills", conf.join(".agents").join("skills")).unwrap();
+        symlink(&literal, host.join("implement")).unwrap();
+
+        let (found, warnings) = walk(&host, &home_path).expect("ok");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(
+            found.iter().any(|d| d.host == real && d.guest == real),
+            "the canonical target must still be bound at its own path, got: {found:?}"
+        );
+        assert!(
+            found.iter().any(|d| d.host == real && d.guest == literal),
+            "the same real directory must ALSO be bound at the literal path the \
+             guest's readlink() names, got: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_binds_relative_link_nested_inside_a_literal_alias() {
+        // The same defect one level down: `implement` is reached through a
+        // symlinked parent (so it gets an alias bind), and inside it a
+        // *relative* link points out to a sibling. Entering via the alias,
+        // the guest resolves `../shared` against the alias's parent — a
+        // path the canonical binds never cover.
+        //
+        //   HOST/implement            -> $HOME/conf/.agents/skills/implement
+        //   $HOME/conf/.agents/skills -> ../skills
+        //   $HOME/conf/skills/implement/ref -> ../shared
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        let conf = home_path.join("conf");
+        let implement = conf.join("skills").join("implement");
+        let shared = conf.join("skills").join("shared");
+        let alias_skills = conf.join(".agents").join("skills");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&implement).unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(conf.join(".agents")).unwrap();
+        symlink("../skills", &alias_skills).unwrap();
+        symlink(alias_skills.join("implement"), host.join("implement")).unwrap();
+        symlink("../shared", implement.join("ref")).unwrap();
+
+        let (found, warnings) = walk(&host, &home_path).expect("ok");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(
+            found
+                .iter()
+                .any(|d| d.host == shared && d.guest == alias_skills.join("shared")),
+            "the sibling must be bound where the guest resolves `../shared` from \
+             inside the alias ({}), got: {found:?}",
+            alias_skills.join("shared").display()
+        );
+    }
+
+    #[test]
+    fn discover_resolves_relative_links_against_a_root_whose_guest_path_differs() {
+        // The shape of the user's own invocation: `--mount ~/.claude/skills`
+        // where `~/.claude/skills` is itself a symlink, so
+        // `parse_extra_mounts` canonicalizes the host while the guest keeps
+        // the path as typed. A relative link directly under that root
+        // resolves against the *guest* side, one directory level away from
+        // where the host resolves it.
+        //
+        //   root  host = $HOME/deep/realskills   guest = $HOME/skills
+        //   $HOME/deep/realskills/foo -> ../shared
+        //   host resolves  -> $HOME/deep/shared
+        //   guest resolves -> $HOME/shared
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let real = home_path.join("deep").join("realskills");
+        let shared = home_path.join("deep").join("shared");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        symlink("../shared", real.join("foo")).unwrap();
+
+        let root = BindPath {
+            host: real.clone(),
+            guest: home_path.join("skills"),
+        };
+        let (found, warnings) = discover_followed_targets(&root, &home_path).expect("ok");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(
+            found
+                .iter()
+                .any(|d| d.host == shared && d.guest == home_path.join("shared")),
+            "the target must be bound where the guest resolves `../shared` from the \
+             root's guest path ({}), got: {found:?}",
+            home_path.join("shared").display()
+        );
+    }
+
+    #[test]
+    fn discover_skips_literal_path_that_disagrees_with_host_resolution() {
+        // Raw target `…/p/q/../target` where `p/q` is itself a symlink:
+        // the kernel resolves `q` first, so `..` climbs out of `r`, not
+        // out of `p`. Folding `..` lexically would name `…/p/target`,
+        // which is a different (here: nonexistent) place — so we must
+        // skip it with a warning rather than bind the directory there.
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let host = home_path.join("host");
+        let target = home_path.join("target");
+        let r = home_path.join("r");
+        let p = home_path.join("p");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&r).unwrap();
+        fs::create_dir_all(&p).unwrap();
+        symlink("../r", p.join("q")).unwrap();
+        symlink(p.join("q").join("..").join("target"), host.join("x")).unwrap();
+
+        let (found, warnings) = walk(&host, &home_path).expect("ok");
+        assert_eq!(
+            hosts(&found),
+            vec![target.clone()],
+            "the canonical target is still discovered"
+        );
+        assert!(
+            found.iter().all(|d| d.guest == target),
+            "no bind at the lexically-folded path, got: {found:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("does not name")),
+            "expected a warning that the literal path names something else, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn discover_skips_literal_path_outside_home() {
+        // Canonical target is inside `$HOME` (so the hard guardrail is
+        // happy), but the literal path the guest would look up is not —
+        // binding there would let a link inside `$HOME` place a mount
+        // anywhere in the guest.
+        let root = tempfile::tempdir().unwrap();
+        let root_path = canon(root.path());
+        let home_path = root_path.join("h");
+        let host = home_path.join("host");
+        let real = home_path.join("real");
+        let outside = root_path.join("outside");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink("../h/real", outside.join("skills")).unwrap();
+        symlink(outside.join("skills"), host.join("x")).unwrap();
+
+        let (found, warnings) = walk(&host, &home_path).expect("ok");
+        assert_eq!(hosts(&found), vec![real.clone()]);
+        assert!(
+            found.iter().all(|d| d.guest == real),
+            "no bind at the outside-$HOME literal path, got: {found:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("outside your $HOME")),
+            "expected an outside-$HOME warning for the literal path, got: {warnings:?}"
+        );
     }
 
     #[test]
@@ -755,8 +1220,8 @@ mod tests {
         symlink(&b, a.join("x")).unwrap();
         symlink(&a, b.join("y")).unwrap();
 
-        let (mut targets, _warnings) =
-            discover_followed_targets(&host, &home_path).expect("must terminate, not hang");
+        let (found, _warnings) = walk(&host, &home_path).expect("must terminate, not hang");
+        let mut targets = hosts(&found);
         targets.sort();
         let mut expected = vec![a, b];
         expected.sort();
@@ -774,9 +1239,8 @@ mod tests {
         fs::create_dir_all(&host).unwrap();
         symlink(&host, host.join("loop")).unwrap();
 
-        let (targets, _warnings) =
-            discover_followed_targets(&host, &home_path).expect("must terminate, not hang");
-        assert_eq!(targets, vec![host]);
+        let (found, _warnings) = walk(&host, &home_path).expect("must terminate, not hang");
+        assert_eq!(hosts(&found), vec![host]);
     }
 
     #[test]
@@ -789,9 +1253,8 @@ mod tests {
         fs::write(&file, "hi").unwrap();
         symlink(&file, host.join("f")).unwrap();
 
-        let (targets, warnings) =
-            discover_followed_targets(&host, &home_path).expect("ok, not an error");
-        assert!(targets.is_empty());
+        let (found, warnings) = walk(&host, &home_path).expect("ok, not an error");
+        assert!(found.is_empty());
         assert!(
             warnings.iter().any(|w| w.contains("not a directory")),
             "expected a 'not a directory' warning, got: {warnings:?}"
@@ -806,9 +1269,8 @@ mod tests {
         fs::create_dir_all(&host).unwrap();
         symlink(home_path.join("nonexistent"), host.join("d")).unwrap();
 
-        let (targets, warnings) =
-            discover_followed_targets(&host, &home_path).expect("ok, not an error");
-        assert!(targets.is_empty());
+        let (found, warnings) = walk(&host, &home_path).expect("ok, not an error");
+        assert!(found.is_empty());
         assert!(
             warnings.iter().any(|w| w.contains("dangling")),
             "expected a dangling-symlink warning, got: {warnings:?}"
@@ -829,7 +1291,7 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         symlink(&outside, host.join("foo")).unwrap();
 
-        let err = discover_followed_targets(&host, &narrow_home)
+        let err = walk(&host, &narrow_home)
             .expect_err("target outside $HOME must be a hard error")
             .to_string();
         assert!(
@@ -837,6 +1299,46 @@ mod tests {
             "got: {err}"
         );
         assert!(err.contains(&outside.display().to_string()), "got: {err}");
+    }
+
+    #[test]
+    fn expand_roots_the_walk_at_the_mounts_guest_path_not_just_its_host() {
+        // Wiring test for the seam above `discover_followed_targets`: an
+        // `ExtraMount` whose guest path differs from its host — which is
+        // what `--mount ~/.claude/skills:follow-links` produces whenever
+        // that path is itself a symlink — must have BOTH sides handed to
+        // the walk, or relative link text is resolved against the wrong
+        // directory and the discovered bind lands where the guest never
+        // looks.
+        let home = tempfile::tempdir().unwrap();
+        let home_path = canon(home.path());
+        let real = home_path.join("deep").join("realskills");
+        let shared = home_path.join("deep").join("shared");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        symlink("../shared", real.join("foo")).unwrap();
+
+        let mounts = vec![ExtraMount {
+            host: real,
+            guest: home_path.join("skills"),
+            readonly: true,
+            follow_links: true,
+        }];
+        let (expanded, warnings) = expand_follow_links(mounts, Some(&home_path)).expect("ok");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let want_guest = home_path.join("shared");
+        assert!(
+            expanded
+                .iter()
+                .any(|m| m.host == shared && m.guest == want_guest && m.readonly),
+            "expected {} bound read-only at {}, got: {:?}",
+            shared.display(),
+            want_guest.display(),
+            expanded
+                .iter()
+                .map(|m| (&m.host, &m.guest))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

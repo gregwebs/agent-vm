@@ -665,7 +665,12 @@ pub struct Args {
     /// outside `HOST` (e.g. a skills directory full of `foo -> /elsewhere`
     /// links) resolve correctly in the guest — an ordinary bind mount only
     /// exposes the `HOST` subtree, so the guest's `readlink()` would name a
-    /// path nothing is mounted at. `follow-links` implies `:ro` (bare
+    /// path nothing is mounted at. When a link's raw target text reaches
+    /// that directory *through a symlinked parent* (e.g.
+    /// `skills/x -> ~/conf/.agents/skills/x` where `.agents/skills` is
+    /// itself a link to `../skills`), the guest's `readlink()` names the
+    /// pre-resolution path, so the same real directory is bound a second
+    /// time at that literal path too. `follow-links` implies `:ro` (bare
     /// `--mount ~/ref:follow-links` behaves as `ro`); combining it with
     /// `:rw` is a parse error. A resolved target outside your `$HOME` is a
     /// hard error; a symlink to a file, or a dangling symlink, is skipped
@@ -673,9 +678,11 @@ pub struct Args {
     ///
     /// Each `--mount` (including each auto-discovered follow-links target)
     /// consumes one virtio-fs device shared with rootfs, network, vsock,
-    /// console, and `--volume` disks. Capacity depends on the host interrupt
-    /// model and runtime; do not treat a measurement from one platform as a
-    /// portable mount limit.
+    /// console, and `--volume` disks. A `follow-links` symlink can cost two
+    /// — the target's own path plus the literal path described above — so
+    /// budget up to 2x the symlink count, not 1x. Capacity depends on the
+    /// host interrupt model and runtime; do not treat a measurement from
+    /// one platform as a portable mount limit.
     #[arg(
         long = "mount",
         value_name = "HOST[:GUEST][:ro|:rw|:follow-links]",

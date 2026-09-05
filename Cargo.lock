@@ -36,6 +36,7 @@ dependencies = [
  "microsandbox-migration",
  "microsandbox-network",
  "microsandbox-runtime",
+ "proptest",
  "reqwest",
  "rustix",
  "sea-orm 1.1.20",
