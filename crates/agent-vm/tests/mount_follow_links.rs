@@ -194,11 +194,11 @@ fn debug_config_json(stderr: &str) -> serde_json::Value {
 }
 
 /// The `Bind` mounts in a dumped `SandboxConfig`'s `mounts` array, as
-/// `(host, readonly)` pairs. See `VolumeMount`'s hand-written `Serialize`
-/// impl in vendor/microsandbox (packages/microsandbox-types/rust/lib/
-/// domain.rs) — confirmed to emit `host` and `options.readonly` by field
-/// name for `Bind` mounts.
-fn bind_mounts(config: &serde_json::Value) -> Vec<(String, bool)> {
+/// `(host, guest, readonly)` triples. See `VolumeMount`'s hand-written
+/// `Serialize` impl in vendor/microsandbox (packages/microsandbox-types/
+/// rust/lib/domain.rs) — confirmed to emit `host`, `guest` and
+/// `options.readonly` by field name for `Bind` mounts.
+fn bind_mounts(config: &serde_json::Value) -> Vec<(String, String, bool)> {
     config["mounts"]
         .as_array()
         .expect("config.mounts must be an array")
@@ -209,6 +209,10 @@ fn bind_mounts(config: &serde_json::Value) -> Vec<(String, bool)> {
                 m["host"]
                     .as_str()
                     .expect("Bind mount host must be a string")
+                    .to_string(),
+                m["guest"]
+                    .as_str()
+                    .expect("Bind mount guest must be a string")
                     .to_string(),
                 m["options"]["readonly"]
                     .as_bool()
@@ -248,16 +252,16 @@ fn follow_links_discovers_transitive_targets_readonly() {
     let b_str = b.to_str().unwrap();
     let host_mount_str = host_mount.to_str().unwrap();
 
-    let find = |needle: &str| mounts.iter().find(|(h, _)| h == needle);
+    let find = |needle: &str| mounts.iter().find(|(h, _, _)| h == needle);
     assert!(
         find(host_mount_str).is_some(),
         "expected the HOST bind itself among the mounts, got: {mounts:?}"
     );
-    let (_, a_ro) = find(a_str).unwrap_or_else(|| {
+    let (_, _, a_ro) = find(a_str).unwrap_or_else(|| {
         panic!("expected the direct discovered target {a_str} among the mounts, got: {mounts:?}")
     });
     assert!(a_ro, "discovered mount for {a_str} must be read-only");
-    let (_, b_ro) = find(b_str).unwrap_or_else(|| {
+    let (_, _, b_ro) = find(b_str).unwrap_or_else(|| {
         panic!(
             "expected the transitively discovered target {b_str} among the mounts (proves the \
              walk recursed), got: {mounts:?}"
@@ -270,6 +274,113 @@ fn follow_links_discovers_transitive_targets_readonly() {
 
     // Sanity: the process still failed on the bogus pull, as expected —
     // these assertions are about what happened before that, not this exit.
+    assert!(!out.status.success());
+}
+
+#[test]
+fn follow_links_binds_target_at_the_literal_path_the_guest_will_readlink() {
+    let h = Harness::new();
+    let home = h.home_path();
+
+    // The layout a real `~/.claude/skills` farm has, and the one plain
+    // canonicalization gets wrong:
+    //
+    //   HOST/implement          -> $HOME/conf/.agents/skills/implement  (raw text)
+    //   $HOME/conf/.agents/skills -> ../skills                          (parent link)
+    //
+    // The guest reads `HOST/implement` through the HOST bind, so its
+    // `readlink()` yields the raw text — the `.agents/…` path — while the
+    // host canonicalizes that to `$HOME/conf/skills/implement`. Binding
+    // only the canonical path leaves the link dangling in the guest.
+    let host_mount = home.join("skills");
+    let conf = home.join("conf");
+    let real_skills = conf.join("skills");
+    let real_implement = real_skills.join("implement");
+    let literal_implement = conf.join(".agents").join("skills").join("implement");
+    std::fs::create_dir_all(&host_mount).unwrap();
+    std::fs::create_dir_all(&real_implement).unwrap();
+    std::fs::create_dir_all(conf.join(".agents")).unwrap();
+    std::fs::write(real_implement.join("SKILL.md"), "skill").unwrap();
+    std::os::unix::fs::symlink("../skills", conf.join(".agents").join("skills")).unwrap();
+    std::os::unix::fs::symlink(&literal_implement, host_mount.join("implement")).unwrap();
+
+    let mount_arg = format!("{}:ro:follow-links", host_mount.display());
+    let out = h.run_shell(&[&mount_arg]);
+
+    let err = stderr_of(&out);
+    let mounts = bind_mounts(&debug_config_json(&err));
+
+    let real_str = real_implement.to_str().unwrap();
+    let literal_str = literal_implement.to_str().unwrap();
+    assert!(
+        mounts
+            .iter()
+            .any(|(host, guest, ro)| host == real_str && guest == real_str && *ro),
+        "expected the canonical target {real_str} bound read-only at its own path, \
+         got: {mounts:?}"
+    );
+    assert!(
+        mounts
+            .iter()
+            .any(|(host, guest, ro)| host == real_str && guest == literal_str && *ro),
+        "expected {real_str} ALSO bound read-only at {literal_str} — the path the \
+         guest's own readlink() names — got: {mounts:?}"
+    );
+
+    assert!(!out.status.success());
+}
+
+#[test]
+fn follow_links_handles_a_host_that_is_itself_a_symlink() {
+    let h = Harness::new();
+    let home = h.home_path();
+
+    // The exact shape of `--mount ~/.claude/skills:follow-links` when
+    // `~/.claude/skills` is a symlink: `parse_extra_mounts` canonicalizes
+    // the HOST but leaves GUEST as typed, so the two sides of the root
+    // differ. A *relative* link under it then resolves one directory
+    // level away from where the host resolves it.
+    //
+    //   $HOME/skills             -> deep/realskills
+    //   $HOME/deep/realskills/foo -> ../shared
+    //   host resolves  -> $HOME/deep/shared
+    //   guest resolves -> $HOME/shared
+    let real = home.join("deep").join("realskills");
+    let shared = home.join("deep").join("shared");
+    let host_arg = home.join("skills");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("marker.txt"), "shared").unwrap();
+    std::os::unix::fs::symlink("deep/realskills", &host_arg).unwrap();
+    std::os::unix::fs::symlink("../shared", real.join("foo")).unwrap();
+
+    let mount_arg = format!("{}:ro:follow-links", host_arg.display());
+    let out = h.run_shell(&[&mount_arg]);
+
+    let err = stderr_of(&out);
+    let mounts = bind_mounts(&debug_config_json(&err));
+
+    let real_str = real.to_str().unwrap();
+    let host_arg_str = host_arg.to_str().unwrap();
+    assert!(
+        mounts
+            .iter()
+            .any(|(host, guest, _)| host == real_str && guest == host_arg_str),
+        "the HOST bind should carry the canonicalized host {real_str} at the guest \
+         path as typed {host_arg_str}, got: {mounts:?}"
+    );
+
+    let shared_str = shared.to_str().unwrap();
+    let want_guest = home.join("shared");
+    let want_guest_str = want_guest.to_str().unwrap();
+    assert!(
+        mounts
+            .iter()
+            .any(|(host, guest, ro)| host == shared_str && guest == want_guest_str && *ro),
+        "expected {shared_str} bound read-only at {want_guest_str} — where the guest \
+         resolves `../shared` from the root's guest path — got: {mounts:?}"
+    );
+
     assert!(!out.status.success());
 }
 

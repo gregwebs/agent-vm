@@ -77,6 +77,13 @@ getrandom = "0.4"
 tempfile = "3"
 
 [dev-dependencies]
+# Property tests for `mount::lexical_link_path` (pure string surgery over
+# symlink target text -- the one total function in that module, so the
+# obvious quickcheck candidate per CODING_STANDARDS "Use property based
+# testing"). Version "1" matches what msb-krun-compat-evidence already
+# declares, so the resolver reuses the proptest 1.11 already in the graph
+# rather than adding a second resolution.
+proptest = "1"
 # Used only by the msb_preflight / preflight_boot / msb_passthrough tests to
 # CONSTRUCT a valid SQLite fixture DB with a seaql_migrations table (a plain
 # `std::fs::write` of arbitrary bytes, as doctor_reset.rs's fixture does, is
