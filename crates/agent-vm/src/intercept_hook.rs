@@ -683,14 +683,13 @@ fn substitute_authorization_header(value: &str, real_token: &str) -> String {
         .or_else(|| value.strip_prefix("basic "))
     {
         use base64::Engine as _;
-        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
-            if let Ok(s) = std::str::from_utf8(&decoded) {
-                if s.contains(secrets::GH_TOKEN_PLACEHOLDER) {
-                    let sub = s.replace(secrets::GH_TOKEN_PLACEHOLDER, real_token);
-                    let re = base64::engine::general_purpose::STANDARD.encode(sub.as_bytes());
-                    return format!("Basic {re}");
-                }
-            }
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim())
+            && let Ok(s) = std::str::from_utf8(&decoded)
+            && s.contains(secrets::GH_TOKEN_PLACEHOLDER)
+        {
+            let sub = s.replace(secrets::GH_TOKEN_PLACEHOLDER, real_token);
+            let re = base64::engine::general_purpose::STANDARD.encode(sub.as_bytes());
+            return format!("Basic {re}");
         }
     }
     value.replace(secrets::GH_TOKEN_PLACEHOLDER, real_token)

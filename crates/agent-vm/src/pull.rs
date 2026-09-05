@@ -82,10 +82,10 @@ pub async fn pull_image(image: &str) -> Result<()> {
     // Only after a successful pull do we record what we landed. If
     // anything above failed, the marker is unchanged and the next
     // launch's banner still flags this image as needing an update.
-    if let Some(digest) = crate::image_check::fetch_remote_digest(image).await {
-        if let Err(e) = crate::pulled_marker::write(image, &digest) {
-            eprintln!("warn: failed to record pulled digest: {e}");
-        }
+    if let Some(digest) = crate::image_check::fetch_remote_digest(image).await
+        && let Err(e) = crate::pulled_marker::write(image, &digest)
+    {
+        eprintln!("warn: failed to record pulled digest: {e}");
     }
 
     Ok(())
