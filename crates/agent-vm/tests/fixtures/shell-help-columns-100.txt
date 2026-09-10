@@ -149,25 +149,13 @@ Image:
           run `agent-vm pull` to fetch an update. Can also be enabled persistently with a truthy
           `AGENT_VM_UPDATE_CHECK` (1|true|yes|on).
 
-      --layer <DIR>
-          Tooling-layer directory (a Dockerfile built FROM the base image).
-
-          Precedence: this flag, then $AGENT_VM_LAYER, then the default `.agent-vm/layer/` in the
-          project. An explicitly-pointed-at dir missing a Dockerfile is an error; the default dir
-          simply being absent means "no layer". When a layer is declared, the derived image (base +
-          layer) is built, loaded registry-lessly, and booted in place of the base — see
-          `docs/adr/0003-project-tooling-layers.md`. A hash miss (new/changed layer) prompts for
-          confirmation unless `--yes` / `$AGENT_VM_YES` is set.
-
-          [env: AGENT_VM_LAYER]
-
   -y, --yes
           Assume "yes" to the tooling-layer build confirmation prompt.
 
-          Needed for CI/non-interactive launches whenever the tooling-layer hash doesn't already
-          match a previously built/loaded derived image (a new project, or an edited
-          `.agent-vm/layer/Dockerfile`). Can also be set persistently with a truthy `AGENT_VM_YES`
-          (1|true|yes|on).
+          Needed for CI/non-interactive launches whenever a chain step's hash doesn't already match
+          a previously built/loaded derived image (a new project, or an edited
+          `.agent-vm/layers/*/Dockerfile`). Can also be set persistently with a truthy
+          `AGENT_VM_YES` (1|true|yes|on).
 
 Guest user:
       --root

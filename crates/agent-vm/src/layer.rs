@@ -1,21 +1,32 @@
-//! Turn a project's tooling layer directory into the identity of the derived
-//! image, then build, registry-lessly load, and report on that derived
-//! image.
+//! Compose a project's ordered chain of tooling layers into the identity of
+//! the final derived image, then build, registry-lessly load, and report on
+//! that derived image.
 //!
-//! Identity is a content hash rather than a recorded state file: the tag
-//! itself is the staleness check, so there is nothing to forget to write and
-//! nothing that can disagree with the image store. See
-//! `docs/adr/0003-project-tooling-layers.md` for the full design.
+//! A project declares its chain under `.agent-vm/layers/`; each immediate
+//! subdirectory is one step, built `FROM` the previous step (the base image
+//! for step 0). Only the final step is registry-lessly ingested — the
+//! intermediates live in docker's own local image store and are pinned for
+//! the next step by their tag.
+//!
+//! Identity is a content hash rather than a recorded state file: each step's
+//! hash covers the previous step's hash (a Merkle chain anchored on the base
+//! image's manifest digest), so the tag itself is the staleness check — there
+//! is nothing to forget to write and nothing that can disagree with the image
+//! store. See `docs/adr/0003-project-tooling-layers.md` for the full design,
+//! including the amendment recording this chain and why it hashes against the
+//! previous step's content hash rather than its docker image id.
 //!
 //! Ported from `claude-contained`'s `internal/layer/{hash,layer}.go` and
 //! `internal/host/sanitize.go` — see those files for the original Go
-//! implementation this mirrors.
+//! implementation this mirrors (single-layer only; the chain is native to
+//! this port).
 //!
-//! The module splits into two sections: identity (pure, no I/O beyond
-//! reading the layer directory to hash it) and build & load (the only
+//! The module splits into three sections: identity (pure, no I/O beyond
+//! reading a layer directory to hash it), chain composition (pure planning
+//! plus the effectful [`ChainRuntime`] seam), and build & load (the only
 //! I/O/process-spawning code here — `docker buildx build` plus a
 //! registry-less `microsandbox_image::load_archive` ingest). `run.rs`
-//! orchestrates calling both from `launch()`.
+//! orchestrates calling into all three from `launch()`.
 
 use std::{
     fs,
@@ -50,18 +61,40 @@ const SCHEME_TAG: &[u8] = b"agent-vm-layer\x00v1\x00";
 /// shorter — a collision here means silently running the wrong toolchain.
 const HASH_LEN: usize = 32;
 
-/// Default tooling-layer directory, relative to the project root.
-const DEFAULT_LAYER_SUBDIR: &str = ".agent-vm/layer";
+/// The tooling-layer chain directory, relative to the project root. Its
+/// immediate subdirectories are the chain, in lexicographic order. This is
+/// the only place a chain can live — there is no flag or env override.
+const LAYERS_SUBDIR: &str = ".agent-vm/layers";
 
-/// Env var carrying an explicit layer directory override. Read by clap
-/// (`env = "AGENT_VM_LAYER"` on the `--layer` flag in `run.rs`), not by this
-/// module directly — see [`resolve_layer_dir`].
-#[allow(dead_code)] // documents the wiring; the literal lives in run.rs's clap attribute
-const LAYER_ENV: &str = "AGENT_VM_LAYER";
+/// The removed single-layer path. Retained solely to detect an un-migrated
+/// checkout and fail with a useful message (see [`resolve_layer_dirs`]);
+/// nothing reads a layer from here.
+const LEGACY_LAYER_SUBDIR: &str = ".agent-vm/layer";
 
 /// Mirrors `claude-contained`'s `maxFolderNameLen` (`cut -c1-20` in the
 /// original bash `sanitize_foldername`).
 const MAX_SLUG_LEN: usize = 20;
+
+/// A step's place in the chain. Display/orchestration metadata only — it is
+/// deliberately not part of the hash (see [`resolve`]'s doc comment): the
+/// chain's transitivity already comes from feeding each step's content hash
+/// in as the next step's `base_image_id`, so hashing the position too would
+/// only fragment the cache (step 0 of a one-step chain and step 0 of a
+/// two-step chain, over identical inputs, must share a tag) and would break
+/// the free-migration property (a bare directory's tag must match what a
+/// one-step chain produces for the same contents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainPosition {
+    pub index: usize,
+    pub total: usize,
+}
+
+impl ChainPosition {
+    /// 1-based, for humans: "step 2/3".
+    pub fn human(self) -> String {
+        format!("{}/{}", self.index + 1, self.total)
+    }
+}
 
 /// Everything a caller needs about a resolved, hashed layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +113,8 @@ pub struct LayerIdentity {
     /// Total bytes read while hashing file contents (not directory/symlink
     /// entries, which don't stream file bytes).
     pub hashed_bytes: u64,
+    /// This step's place in the chain. Not hashed — see [`ChainPosition`].
+    pub position: ChainPosition,
 }
 
 /// Entry kinds. `Other` covers fifos, sockets and devices, which contribute
@@ -361,7 +396,12 @@ fn hash_context(dir: &Path, base_image_id: &str) -> Result<(String, usize, u64)>
 /// byte-identical layers on the same base build twice — buys per-project
 /// cleanup: `docker image ls agent-vm-layer` stays a readable handle instead
 /// of a bare content address.
-pub fn resolve(dir: &Path, project_dir: &Path, base_image_id: &str) -> Result<LayerIdentity> {
+pub fn resolve(
+    dir: &Path,
+    project_dir: &Path,
+    base_image_id: &str,
+    position: ChainPosition,
+) -> Result<LayerIdentity> {
     let (digest, count, hashed_bytes) = hash_context(dir, base_image_id)?;
     let hash = digest[..HASH_LEN].to_string();
 
@@ -381,6 +421,7 @@ pub fn resolve(dir: &Path, project_dir: &Path, base_image_id: &str) -> Result<La
         hash,
         file_count: count,
         hashed_bytes,
+        position,
     })
 }
 
@@ -489,67 +530,299 @@ fn basename(path: &Path) -> String {
     String::from_utf8_lossy(&trimmed[start..]).into_owned()
 }
 
-/// Resolves the project's tooling-layer directory, applying precedence and
-/// the fail-closed missing-`Dockerfile` rule.
+/// The project's tooling-layer chain, in build order. Empty means "no layer
+/// declared", which the caller turns into "boot the base unchanged".
 ///
-/// `flag` is the *pre-resolved* explicit source: the caller (`run.rs`) folds
-/// `$AGENT_VM_LAYER` into the clap flag's value via `env = "AGENT_VM_LAYER"`
-/// before calling this, and filters an explicitly-set-but-empty value to
-/// `None` first (`AGENT_VM_LAYER=""` must resolve as "unset", not as an
-/// explicit empty-path layer dir) — so this function does not read the
-/// environment itself and an env-sourced value is indistinguishable from a
-/// `--layer`-sourced one, which is the desired behavior.
+/// There is no precedence to apply and no override to honour: the chain is
+/// always `<project_dir>/.agent-vm/layers/*/`. `--layer` / `$AGENT_VM_LAYER`
+/// were removed with this change (issue #79) — a project's tooling layout is
+/// a property of the project, not of an invocation, and a single-directory
+/// override cannot express a whole chain anyway.
 ///
-/// Precedence, once resolved to a single optional path by the caller:
+/// Resolution rules, checked in this order:
 ///
-/// - `flag` explicit (whether from `--layer` or `$AGENT_VM_LAYER`): the
-///   directory must exist and contain a `Dockerfile`, or this is a hard
-///   error naming which one is missing.
-/// - otherwise, the default `project_dir/.agent-vm/layer`: absent means "no
-///   layer" (`Ok(None)`); present without a `Dockerfile` is still a hard
-///   error — a present default layer dir is a declared layer, and a missing
-///   Dockerfile in it is a mistake, not "no layer".
-pub fn resolve_layer_dir(flag: Option<&Path>, project_dir: &Path) -> Result<Option<PathBuf>> {
-    match flag {
-        Some(dir) => {
-            if !dir.is_dir() {
-                bail!(
-                    "--layer {} does not exist or is not a directory",
-                    dir.display()
-                );
-            }
-            let dockerfile = dir.join("Dockerfile");
-            if !dockerfile.is_file() {
-                bail!(
-                    "--layer {} has no Dockerfile (expected {})",
-                    dir.display(),
-                    dockerfile.display()
-                );
-            }
-            Ok(Some(dir.to_path_buf()))
-        }
-        None => {
-            let dir = project_dir.join(DEFAULT_LAYER_SUBDIR);
-            if !dir.exists() {
-                return Ok(None);
-            }
-            if !dir.is_dir() {
-                bail!(
-                    "default tooling-layer path {} exists but is not a directory",
-                    dir.display()
-                );
-            }
-            let dockerfile = dir.join("Dockerfile");
-            if !dockerfile.is_file() {
-                bail!(
-                    "tooling-layer directory {} has no Dockerfile (expected {})",
-                    dir.display(),
-                    dockerfile.display()
-                );
-            }
-            Ok(Some(dir))
+/// - [`LEGACY_LAYER_SUBDIR`] (`.agent-vm/layer/`, singular) exists in any
+///   form — checked first, unconditionally, whether or not
+///   [`LAYERS_SUBDIR`] also exists — is a hard error naming the path and the
+///   migration to run. This is a migration guardrail, not backwards
+///   compatibility: nothing about the old layout still works. The
+///   alternative (silently ignoring it) would let an un-migrated checkout
+///   boot looking healthy while missing the toolchain the user believes they
+///   declared — exactly the failure this module exists to prevent. The
+///   suggested `git mv` is safe to run without invalidating anything already
+///   built: the hash covers the directory's *contents*, not its path (see
+///   `canonical_stream`), so migrating is a pure rename.
+/// - [`LAYERS_SUBDIR`] absent ⇒ `Ok(vec![])`, "no layer".
+/// - [`LAYERS_SUBDIR`] present as a file (the predictable
+///   rename-without-nesting mistake) ⇒ a hard error pointing at a numbered
+///   subdirectory, distinct from the legacy-directory error above.
+/// - [`LAYERS_SUBDIR`] present as a directory with no subdirectories ⇒ a
+///   hard error ("declares no layer steps") — the same fail-closed stance:
+///   silently booting the base here looks healthy but is missing the
+///   toolchain.
+/// - Otherwise, its immediate subdirectories, byte-lexicographically sorted
+///   by file name (`fs::read_dir` order is arbitrary, so this sort is
+///   mandatory — `10-a` < `20-b` < `30-c` falls out of byte order). Each
+///   must hold a `Dockerfile` ([`require_step_dir`]). Non-directory entries
+///   (`README.md`, `.gitkeep`) are ignored — they are not steps.
+pub fn resolve_layer_dirs(project_dir: &Path) -> Result<Vec<PathBuf>> {
+    let legacy = project_dir.join(LEGACY_LAYER_SUBDIR);
+    if legacy.exists() {
+        bail!(
+            "{} is no longer supported (agent-vm now composes an ordered chain \
+             of layers). Move it under {}/ as a numbered step, e.g.\n  \
+             git mv {} {}/10-tools\n\
+             Your already-built image is not invalidated by the move: the layer \
+             hash covers the directory's contents, not its path.",
+            legacy.display(),
+            project_dir.join(LAYERS_SUBDIR).display(),
+            legacy.display(),
+            project_dir.join(LAYERS_SUBDIR).display(),
+        );
+    }
+
+    let layers_dir = project_dir.join(LAYERS_SUBDIR);
+    if !layers_dir.exists() {
+        return Ok(vec![]);
+    }
+    if !layers_dir.is_dir() {
+        bail!(
+            "{} exists but is not a directory; each layer step belongs in its own \
+             numbered subdirectory, e.g. {}/10-tools/Dockerfile",
+            layers_dir.display(),
+            layers_dir.display(),
+        );
+    }
+
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    for entry in fs::read_dir(&layers_dir).with_context(|| {
+        format!(
+            "reading tooling-layer chain directory {}",
+            layers_dir.display()
+        )
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "reading tooling-layer chain directory {}",
+                layers_dir.display()
+            )
+        })?;
+        if entry
+            .file_type()
+            .with_context(|| format!("reading {}", entry.path().display()))?
+            .is_dir()
+        {
+            names.push(entry.file_name());
+        } else if entry.file_name() == "Dockerfile" {
+            bail!(
+                "{} has a Dockerfile directly inside it; each layer step needs its own \
+                 numbered subdirectory, e.g. {}/10-tools/Dockerfile",
+                layers_dir.display(),
+                layers_dir.display(),
+            );
         }
     }
+    if names.is_empty() {
+        bail!(
+            "{} declares no layer steps (no subdirectories found)",
+            layers_dir.display()
+        );
+    }
+    names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+    let dirs: Vec<PathBuf> = names
+        .into_iter()
+        .map(|name| layers_dir.join(name))
+        .collect();
+    for dir in &dirs {
+        require_step_dir(dir)?;
+    }
+    Ok(dirs)
+}
+
+/// A step directory must be a directory and hold a `Dockerfile`. Errors name
+/// the step directory, which is what the user can act on.
+fn require_step_dir(dir: &Path) -> Result<()> {
+    let dockerfile = dir.join("Dockerfile");
+    if !dockerfile.is_file() {
+        bail!(
+            "tooling-layer step {} has no Dockerfile (expected {})",
+            dir.display(),
+            dockerfile.display()
+        );
+    }
+    Ok(())
+}
+
+// --- chain composition ---
+//
+// `plan_chain` is pure: no process spawned, no network, no cache read — just
+// the layer directories and the base digest. Every step's tag is therefore
+// known before anything is built, which is what lets the cache check, the
+// prompt, and the build set all be decided up front. `ChainRuntime` is the
+// narrow effectful seam `execute_chain` drives; `run.rs` implements it
+// against real docker + the msb cache, and tests implement it with a
+// recording fake — following the `ExecEventSource` precedent elsewhere in
+// this crate (private AFIT trait, `&mut self`, no `async-trait`).
+
+/// The whole chain's identities, in build order.
+///
+/// Step 0 is anchored on the base image's *manifest* digest; every later
+/// step on its predecessor's *content hash* — never a docker-assigned image
+/// id. Both are content addresses that move whenever what they name moves,
+/// which is all the hash needs, and keeping it a pure hash is what makes the
+/// whole chain computable without spawning a process.
+///
+/// Chaining on the previous step's content hash rather than its resolved
+/// docker image id (as an earlier draft of this design, and the originating
+/// issue, proposed) is a deliberate choice, not an oversight: image-id
+/// chaining would put `docker image inspect` on the cache-hit path of every
+/// launch (the final tag would not otherwise be computable), and `docker
+/// image inspect` exits non-zero both when an image is absent *and* when the
+/// daemon is unreachable — so an already-ingested chain would read as "not
+/// cached" and hard-fail whenever docker simply wasn't running. Image ids are
+/// also not stable across `docker image prune` or reproducible across
+/// machines, while a content hash is both. See
+/// `docs/adr/0003-project-tooling-layers.md`'s chain amendment for the full
+/// writeup.
+pub fn plan_chain(
+    dirs: &[PathBuf],
+    project_dir: &Path,
+    base_manifest_digest: &str,
+) -> Result<Vec<LayerIdentity>> {
+    let total = dirs.len();
+    if total == 0 {
+        bail!("plan_chain called with an empty chain");
+    }
+    let mut plan = Vec::with_capacity(total);
+    let mut base_id = base_manifest_digest.to_string();
+    for (index, dir) in dirs.iter().enumerate() {
+        let id = resolve(dir, project_dir, &base_id, ChainPosition { index, total })?;
+        base_id = id.hash.clone();
+        plan.push(id);
+    }
+    Ok(plan)
+}
+
+/// One row of the confirmation prompt.
+pub struct PlannedStep {
+    pub position: ChainPosition,
+    pub dir: PathBuf,
+    /// Always known — the chain is pure, so every tag is computed before
+    /// anything is built.
+    pub tag: String,
+    /// `false` means already cached — shown to the user as "(cached)".
+    pub pending: bool,
+}
+
+/// Every effect executing a chain performs. `run.rs` implements it against
+/// real docker + the msb cache; tests implement it with a recording fake.
+pub trait ChainRuntime {
+    fn notice(&mut self, message: &str) -> Result<()>;
+
+    /// Ask once for the whole chain. The implementation runs the
+    /// `docker buildx` preflight *before* asking, so a broken docker
+    /// install surfaces as one clear error instead of wasting the user's
+    /// answer — that ordering is today's single-layer behavior and the
+    /// reason this is one method rather than two.
+    fn confirm_build(&mut self, plan: &[PlannedStep]) -> Result<()>;
+
+    /// `docker image inspect <tag> --format '{{.Id}}'`; `Ok(None)` means
+    /// absent.
+    async fn intermediate_image_id(&mut self, tag: &str) -> Result<Option<String>>;
+
+    /// `layer::derived_is_cached` against the msb cache.
+    async fn final_is_cached(&mut self, tag: &str) -> Result<bool>;
+
+    /// buildx `--output type=docker`, into docker's own image store.
+    async fn build_intermediate(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()>;
+
+    /// buildx `--output type=oci` + `load_archive` into the msb cache.
+    async fn build_and_load_final(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()>;
+}
+
+/// Executes `plan`, returning the final derived tag to boot.
+///
+/// Traced for `total ∈ {1,2,3}` while writing this: with `total == 1` the
+/// backward walk below never runs (its range is empty), so a one-step chain
+/// takes exactly one `build_and_load_final` off `pinned_base_ref` — byte-
+/// identical to the pre-chain single-layer behavior. With `total == 2` and
+/// step 0 already in docker's store, the walk finds it, `build_from` becomes
+/// 1, and only the final step builds `FROM` `plan[0].tag`. With `total == 3`
+/// and nothing cached, both intermediates build in order before the final.
+pub async fn execute_chain<R: ChainRuntime>(
+    plan: &[LayerIdentity],
+    pinned_base_ref: &str,
+    rt: &mut R,
+) -> Result<String> {
+    let total = plan.len();
+    let final_id = plan
+        .last()
+        .context("execute_chain called with an empty chain")?;
+
+    // 1. The common case, and the only path a cache-hit launch takes: the
+    //    final tag is already ingested. No prompt, no docker process at all
+    //    — not even an `inspect` (see plan_chain's doc comment).
+    if rt.final_is_cached(&final_id.tag).await? {
+        rt.notice(&format!(
+            "==> Reusing cached tooling layer {}",
+            final_id.tag
+        ))?;
+        return Ok(final_id.tag.clone());
+    }
+
+    // 2. Decide where to start building. Walk *backwards* from the last
+    //    intermediate: the first one already in docker's store is a usable
+    //    FROM for the step above it, so nothing below it needs rebuilding.
+    //    Presence of `tag_i` is sufficient — the tag embeds H_i, which
+    //    covers every step beneath it, so an image under that tag was
+    //    necessarily built from the right predecessor.
+    let mut build_from = 0;
+    for i in (0..total.saturating_sub(1)).rev() {
+        if rt.intermediate_image_id(&plan[i].tag).await?.is_some() {
+            build_from = i + 1;
+            break;
+        }
+    }
+
+    // 3. One prompt for the whole chain, listing every step with its real
+    //    tag and whether it will be built.
+    let steps: Vec<PlannedStep> = plan
+        .iter()
+        .enumerate()
+        .map(|(i, id)| PlannedStep {
+            position: id.position,
+            dir: id.dir.clone(),
+            tag: id.tag.clone(),
+            pending: i >= build_from,
+        })
+        .collect();
+    rt.confirm_build(&steps)?;
+
+    // 4. Build forward. Any failure propagates and aborts the launch; the
+    //    msb cache is untouched until the final step succeeds, so a
+    //    partially-composed chain can never boot (ADR-0003's hard-fail
+    //    rule).
+    let mut from_ref = if build_from == 0 {
+        pinned_base_ref.to_string()
+    } else {
+        plan[build_from - 1].tag.clone()
+    };
+    for id in &plan[build_from..] {
+        rt.notice(&format!(
+            "==> Building tooling layer step {} ({}) …",
+            id.position.human(),
+            id.dir.display()
+        ))?;
+        if id.position.index + 1 == total {
+            rt.build_and_load_final(id, &from_ref).await?; // ONLY here
+        } else {
+            rt.build_intermediate(id, &from_ref).await?;
+            from_ref = id.tag.clone();
+        }
+    }
+    rt.notice(&format!("==> Tooling layer {} ready", final_id.tag))?;
+    Ok(final_id.tag.clone())
 }
 
 // --- build & load ---
@@ -679,14 +952,18 @@ pub async fn build_derived_oci(
     pinned_base: &str,
     out_tar: &Path,
 ) -> Result<()> {
-    match run_buildx(id, pinned_base, out_tar, "zstd").await {
+    let oci = |compression: &'static str| BuildxOutput::Oci {
+        out_tar,
+        compression,
+    };
+    match run_buildx(id, pinned_base, oci("zstd")).await {
         Ok(()) => Ok(()),
         Err(zstd_err) => {
             eprintln!(
                 "==> docker buildx build (zstd output) failed for {}; retrying with gzip output: {zstd_err}",
                 id.tag
             );
-            run_buildx(id, pinned_base, out_tar, "gzip").await.with_context(|| {
+            run_buildx(id, pinned_base, oci("gzip")).await.with_context(|| {
                 format!(
                     "building tooling layer {} (gzip retry also failed; zstd attempt failed with: {zstd_err})",
                     id.tag
@@ -694,6 +971,96 @@ pub async fn build_derived_oci(
             })
         }
     }
+}
+
+/// Builds an *intermediate* chain step with `--output type=docker`, landing
+/// it in docker's own local image store (equivalent to `--load -t <tag>`) so
+/// the next step's `FROM <tag>` can find it there — never registry-pulled,
+/// see `docs/adr/0003-project-tooling-layers.md`'s chain amendment. Unlike
+/// [`build_derived_oci`], this takes no `compression=` (the docker exporter
+/// has no such option) and so has no zstd/gzip retry.
+///
+/// After the build, asserts `docker image inspect id.tag` actually resolves.
+/// Its absence overwhelmingly means the active buildx builder uses the
+/// `docker-container` driver rather than `docker` — that driver's isolated
+/// buildkit container cannot see a previous build's `--load` output, so a
+/// later `FROM <tag>` falls through to a Docker Hub pull of a tag that does
+/// not exist there. `.github/workflows/chrome-layer-contract.yml` already
+/// pins `driver: docker` for exactly this reason. Checked as a post-build
+/// assertion (not by parsing `docker buildx inspect` up front) because that
+/// is a second output format to track, can false-positive on multi-node
+/// builders, and the post-hoc check cannot be wrong.
+pub async fn build_derived_docker(id: &LayerIdentity, from_ref: &str) -> Result<()> {
+    run_buildx(id, from_ref, BuildxOutput::Docker)
+        .await
+        .with_context(|| format!("building intermediate tooling layer {}", id.tag))?;
+    if docker_image_id(&id.tag).await?.is_none() {
+        let driver = buildx_driver().unwrap_or_else(|| "<unknown>".to_string());
+        bail!(
+            "tooling layer step {} ({}) built, but its image did not appear in docker's \
+             local image store. agent-vm chains layer steps through that store, which \
+             requires the default `docker` buildx driver (this host's builder uses driver \
+             `{driver}`). Run `docker buildx use default`, or create a builder with \
+             `docker buildx create --driver docker --use`.",
+            id.position.human(),
+            id.dir.display(),
+        );
+    }
+    Ok(())
+}
+
+/// Only on the [`build_derived_docker`] failure path: the current builder's
+/// driver, best-effort, for the error message. Never fails a build on its
+/// own — a `None` just means the error message says "<unknown>" instead of
+/// naming the driver.
+fn buildx_driver() -> Option<String> {
+    let output = std::process::Command::new("docker")
+        .args(["buildx", "inspect"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Driver:"))
+        .map(|driver| driver.trim().to_string())
+}
+
+/// Trims and validates `docker image inspect --format '{{.Id}}'` output.
+/// Split out from the process call so the trailing-newline and empty-output
+/// cases are unit-testable without docker.
+fn parse_image_id(stdout: &str) -> Result<String> {
+    let id = stdout.trim();
+    if id.is_empty() {
+        bail!("`docker image inspect` produced empty output");
+    }
+    Ok(id.to_string())
+}
+
+/// The resolved image id of `tag` in docker's local image store, or `None`
+/// when absent (`docker image inspect` exits 1). A *spawn* failure is an
+/// error, not `None` — "docker is broken" must not read as "not cached",
+/// which would make [`execute_chain`]'s cache-hit path indistinguishable
+/// from a genuinely broken docker install.
+pub async fn docker_image_id(tag: &str) -> Result<Option<String>> {
+    let output = tokio::process::Command::new("docker")
+        .args(["image", "inspect", tag, "--format", "{{.Id}}"])
+        .output()
+        .await
+        .with_context(|| format!("spawning `docker image inspect {tag}`"))?;
+    if !output.status.success() {
+        // Exit 1 covers both "no such image" and "daemon unreachable" —
+        // indistinguishable from the exit code alone. That ambiguity is
+        // exactly why content-hash chaining keeps this call off the
+        // cache-hit path entirely (see plan_chain's doc comment): a stopped
+        // daemon must never read as "chain not cached".
+        return Ok(None);
+    }
+    let id = parse_image_id(&String::from_utf8_lossy(&output.stdout))
+        .with_context(|| format!("parsing `docker image inspect {tag}` output"))?;
+    Ok(Some(id))
 }
 
 /// The `docker buildx --platform` value for the host we are running on.
@@ -722,15 +1089,25 @@ fn host_oci_platform() -> String {
     format!("linux/{arch}")
 }
 
-async fn run_buildx(
-    id: &LayerIdentity,
-    pinned_base: &str,
-    out_tar: &Path,
-    compression: &str,
-) -> Result<()> {
-    let out_tar_str = out_tar
-        .to_str()
-        .context("tooling-layer OCI archive path is not valid UTF-8")?;
+/// Which exporter [`run_buildx`] targets. The two variants differ in three
+/// deliberate ways, each commented at its point of asymmetry below:
+/// whether a `-t` tag is passed (docker's local store needs one to be
+/// addressable by the next step; an OCI archive does not), whether
+/// `--provenance=false --sbom=false` apply, and the shape of the `--output`
+/// value itself.
+enum BuildxOutput<'a> {
+    /// `--output type=oci,dest=<out_tar>,compression=<compression>`. Final
+    /// step only.
+    Oci {
+        out_tar: &'a Path,
+        compression: &'a str,
+    },
+    /// `-t <tag> --output type=docker`, into docker's local image store.
+    /// Intermediate steps only.
+    Docker,
+}
+
+async fn run_buildx(id: &LayerIdentity, from_ref: &str, output: BuildxOutput<'_>) -> Result<()> {
     let dockerfile_str = id
         .dockerfile
         .to_str()
@@ -739,33 +1116,62 @@ async fn run_buildx(
         .dir
         .to_str()
         .context("tooling-layer directory path is not valid UTF-8")?;
-    let status = tokio::process::Command::new("docker")
-        .arg("buildx")
+
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.arg("buildx")
         .arg("build")
         .arg("--build-arg")
-        .arg(format!("BASE_IMAGE={pinned_base}"))
+        .arg(format!("BASE_IMAGE={from_ref}"))
         .arg("-f")
         .arg(dockerfile_str)
         .arg("--platform")
-        .arg(host_oci_platform())
-        .arg("--provenance=false")
-        .arg("--sbom=false")
-        .arg("--output")
-        .arg(format!(
-            "type=oci,dest={out_tar_str},compression={compression}"
-        ))
-        .arg(dir_str)
-        .status()
-        .await
-        .with_context(|| {
-            format!(
-                "spawning `docker buildx build` for tooling layer {}",
-                id.tag
-            )
-        })?;
+        .arg(host_oci_platform());
+
+    let output_desc = match output {
+        BuildxOutput::Oci {
+            out_tar,
+            compression,
+        } => {
+            let out_tar_str = out_tar
+                .to_str()
+                .context("tooling-layer OCI archive path is not valid UTF-8")?;
+            // `--provenance=false --sbom=false` is OCI-only: it suppresses
+            // the attestation manifests that would otherwise turn the
+            // archive into a multi-image index — see F7 in
+            // `docs/adr/0003-project-tooling-layers.md`. The docker exporter
+            // carries no attestations, so the flags would be meaningless
+            // there and buildx may warn about them.
+            cmd.arg("--provenance=false").arg("--sbom=false");
+            cmd.arg("--output").arg(format!(
+                "type=oci,dest={out_tar_str},compression={compression}"
+            ));
+            format!("{compression} output")
+        }
+        BuildxOutput::Docker => {
+            // `-t` is what makes the image addressable by tag in docker's
+            // own store for the next step's `FROM`; an OCI archive has no
+            // such addressability need. No `compression=` here — the
+            // docker exporter takes no such argument, so intermediates get
+            // no zstd/gzip retry (that retry exists only for the OCI
+            // archive path; see build_derived_oci).
+            cmd.arg("-t")
+                .arg(&id.tag)
+                .arg("--output")
+                .arg("type=docker");
+            "docker output".to_string()
+        }
+    };
+    cmd.arg(dir_str);
+
+    let status = cmd.status().await.with_context(|| {
+        format!(
+            "spawning `docker buildx build` for tooling layer {}",
+            id.tag
+        )
+    })?;
     if !status.success() {
         bail!(
-            "`docker buildx build` failed for tooling layer {} ({compression} output, exit {})",
+            "`docker buildx build` failed for tooling layer {} ({output_desc}, exit {})",
             id.tag,
             status
                 .code()
@@ -1020,10 +1426,25 @@ mod tests {
         tmp
     }
 
+    /// The position a single-step (non-chain) caller uses. Test-only: the
+    /// only production caller of `resolve` is `plan_chain`, which always has
+    /// a real `{index, total}` to hand it, so a production
+    /// `ChainPosition::single()` would sit unused behind a `dead_code`
+    /// allow. Kept in test code instead.
+    fn first_of_one() -> ChainPosition {
+        ChainPosition { index: 0, total: 1 }
+    }
+
     #[test]
     fn resolve_names_the_derived_image() {
         let dir = layer_dir_fixture();
-        let id = resolve(dir.path(), Path::new("/work/my-app"), TEST_BASE_ID).unwrap();
+        let id = resolve(
+            dir.path(),
+            Path::new("/work/my-app"),
+            TEST_BASE_ID,
+            first_of_one(),
+        )
+        .unwrap();
 
         assert_eq!(id.hash.len(), HASH_LEN);
         assert_eq!(id.tag, format!("{REPO}:my-app-{}", id.hash));
@@ -1043,7 +1464,13 @@ mod tests {
             ("/", "root"),
         ];
         for (project_dir, want_slug) in cases {
-            let id = resolve(dir.path(), Path::new(project_dir), TEST_BASE_ID).unwrap();
+            let id = resolve(
+                dir.path(),
+                Path::new(project_dir),
+                TEST_BASE_ID,
+                first_of_one(),
+            )
+            .unwrap();
             assert_eq!(
                 id.tag,
                 format!("{REPO}:{want_slug}-{}", id.hash),
@@ -1055,17 +1482,64 @@ mod tests {
     #[test]
     fn resolve_passes_the_project_path_whole() {
         let dir = layer_dir_fixture();
-        let with_slash = resolve(dir.path(), Path::new("/work/my-app/"), TEST_BASE_ID).unwrap();
-        let without_slash = resolve(dir.path(), Path::new("/work/my-app"), TEST_BASE_ID).unwrap();
+        let with_slash = resolve(
+            dir.path(),
+            Path::new("/work/my-app/"),
+            TEST_BASE_ID,
+            first_of_one(),
+        )
+        .unwrap();
+        let without_slash = resolve(
+            dir.path(),
+            Path::new("/work/my-app"),
+            TEST_BASE_ID,
+            first_of_one(),
+        )
+        .unwrap();
         assert_eq!(with_slash.tag, without_slash.tag);
     }
 
     #[test]
     fn resolve_hash_ignores_the_project_directory() {
         let dir = layer_dir_fixture();
-        let a = resolve(dir.path(), Path::new("/work/alpha"), TEST_BASE_ID).unwrap();
-        let b = resolve(dir.path(), Path::new("/work/beta"), TEST_BASE_ID).unwrap();
+        let a = resolve(
+            dir.path(),
+            Path::new("/work/alpha"),
+            TEST_BASE_ID,
+            first_of_one(),
+        )
+        .unwrap();
+        let b = resolve(
+            dir.path(),
+            Path::new("/work/beta"),
+            TEST_BASE_ID,
+            first_of_one(),
+        )
+        .unwrap();
         assert_eq!(a.hash, b.hash);
+    }
+
+    #[test]
+    fn chain_position_does_not_change_the_hash() {
+        let dir = layer_dir_fixture();
+        let at_0_of_1 = resolve(
+            dir.path(),
+            Path::new("/work/my-app"),
+            TEST_BASE_ID,
+            first_of_one(),
+        )
+        .unwrap();
+        let at_1_of_3 = resolve(
+            dir.path(),
+            Path::new("/work/my-app"),
+            TEST_BASE_ID,
+            ChainPosition { index: 1, total: 3 },
+        )
+        .unwrap();
+        assert_eq!(
+            at_0_of_1.tag, at_1_of_3.tag,
+            "the chain position must not participate in the hash (D3)"
+        );
     }
 
     // --- slug() sanitization ---
@@ -1099,47 +1573,576 @@ mod tests {
         assert_eq!(slug(Path::new("")), "root");
     }
 
-    // --- resolve_layer_dir() precedence & errors ---
+    // --- resolve_layer_dirs() ---
 
-    #[test]
-    fn explicit_dir_with_dockerfile_resolves() {
-        let dir = layer_dir_fixture();
-        let project = tempfile::tempdir().unwrap();
-        let got = resolve_layer_dir(Some(dir.path()), project.path()).unwrap();
-        assert_eq!(got, Some(dir.path().to_path_buf()));
+    /// Creates `<project>/.agent-vm/layers/<name>/Dockerfile`.
+    fn write_step(project: &Path, name: &str, dockerfile: &str) -> PathBuf {
+        let dir = project.join(LAYERS_SUBDIR).join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Dockerfile"), dockerfile).unwrap();
+        dir
     }
 
     #[test]
-    fn explicit_dir_without_dockerfile_errors() {
-        let dir = tempfile::tempdir().unwrap();
+    fn resolve_layer_dirs_orders_steps_lexicographically() {
         let project = tempfile::tempdir().unwrap();
-        let err = resolve_layer_dir(Some(dir.path()), project.path()).unwrap_err();
-        assert!(format!("{err:?}").contains("Dockerfile"));
+        // Created out of order: readdir order is arbitrary, so this is the
+        // real guard on the sort.
+        write_step(project.path(), "20-b", "FROM scratch\n");
+        write_step(project.path(), "05-z", "FROM scratch\n");
+        write_step(project.path(), "10-a", "FROM scratch\n");
+
+        let got = resolve_layer_dirs(project.path()).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                project.path().join(LAYERS_SUBDIR).join("05-z"),
+                project.path().join(LAYERS_SUBDIR).join("10-a"),
+                project.path().join(LAYERS_SUBDIR).join("20-b"),
+            ]
+        );
     }
 
     #[test]
-    fn default_dir_absent_resolves_to_none() {
+    fn resolve_layer_dirs_absent_resolves_to_an_empty_chain() {
         let project = tempfile::tempdir().unwrap();
-        let got = resolve_layer_dir(None, project.path()).unwrap();
-        assert_eq!(got, None);
+        assert_eq!(
+            resolve_layer_dirs(project.path()).unwrap(),
+            Vec::<PathBuf>::new()
+        );
     }
 
     #[test]
-    fn default_dir_present_without_dockerfile_errors() {
+    fn resolve_layer_dirs_legacy_singular_dir_is_a_migration_error() {
         let project = tempfile::tempdir().unwrap();
-        fs::create_dir_all(project.path().join(DEFAULT_LAYER_SUBDIR)).unwrap();
-        let err = resolve_layer_dir(None, project.path()).unwrap_err();
-        assert!(format!("{err:?}").contains("Dockerfile"));
+        let legacy = project.path().join(LEGACY_LAYER_SUBDIR);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("Dockerfile"), "FROM scratch\n").unwrap();
+
+        let err = resolve_layer_dirs(project.path()).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains(&legacy.display().to_string()), "{msg}");
+        assert!(msg.contains(LAYERS_SUBDIR), "{msg}");
     }
 
     #[test]
-    fn default_dir_present_with_dockerfile_resolves() {
+    fn resolve_layer_dirs_legacy_dir_errors_even_when_layers_also_exists() {
         let project = tempfile::tempdir().unwrap();
-        let layer_dir = project.path().join(DEFAULT_LAYER_SUBDIR);
-        fs::create_dir_all(&layer_dir).unwrap();
-        fs::write(layer_dir.join("Dockerfile"), "FROM scratch\n").unwrap();
-        let got = resolve_layer_dir(None, project.path()).unwrap();
-        assert_eq!(got, Some(layer_dir));
+        let legacy = project.path().join(LEGACY_LAYER_SUBDIR);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("Dockerfile"), "FROM scratch\n").unwrap();
+        write_step(project.path(), "10-a", "FROM scratch\n");
+
+        let err = resolve_layer_dirs(project.path()).unwrap_err();
+        assert!(
+            format!("{err:?}").contains(&legacy.display().to_string()),
+            "the legacy check must run first and unconditionally"
+        );
+    }
+
+    #[test]
+    fn resolve_layer_dirs_step_without_dockerfile_errors() {
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().join(LAYERS_SUBDIR).join("10-a");
+        fs::create_dir_all(&dir).unwrap();
+
+        let err = resolve_layer_dirs(project.path()).unwrap_err();
+        assert!(format!("{err:?}").contains(&dir.display().to_string()));
+    }
+
+    #[test]
+    fn resolve_layer_dirs_empty_layers_dir_errors() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join(LAYERS_SUBDIR)).unwrap();
+
+        let err = resolve_layer_dirs(project.path()).unwrap_err();
+        assert!(format!("{err:?}").contains("no layer steps"));
+    }
+
+    #[test]
+    fn resolve_layer_dirs_dockerfile_directly_in_layers_dir_errors() {
+        let project = tempfile::tempdir().unwrap();
+        let layers_dir = project.path().join(LAYERS_SUBDIR);
+        fs::create_dir_all(&layers_dir).unwrap();
+        fs::write(layers_dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+
+        let err = resolve_layer_dirs(project.path()).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("numbered subdirectory"), "{msg}");
+        assert!(
+            !msg.contains("no longer supported"),
+            "must be a distinct message from the legacy-directory error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_layer_dirs_ignores_non_directory_entries() {
+        let project = tempfile::tempdir().unwrap();
+        write_step(project.path(), "10-a", "FROM scratch\n");
+        fs::write(project.path().join(LAYERS_SUBDIR).join("README.md"), "hi").unwrap();
+
+        let got = resolve_layer_dirs(project.path()).unwrap();
+        assert_eq!(got, vec![project.path().join(LAYERS_SUBDIR).join("10-a")]);
+    }
+
+    #[test]
+    fn resolve_layer_dirs_single_step_chain_resolves() {
+        let project = tempfile::tempdir().unwrap();
+        let dir = write_step(project.path(), "10-a", "FROM scratch\n");
+        assert_eq!(resolve_layer_dirs(project.path()).unwrap(), vec![dir]);
+    }
+
+    // --- plan_chain() ---
+
+    #[test]
+    fn plan_chain_orders_identities_and_positions() {
+        let project = tempfile::tempdir().unwrap();
+        let a = write_step(project.path(), "10-a", "FROM scratch\nRUN true\n");
+        let b = write_step(project.path(), "20-b", "FROM scratch\nRUN false\n");
+        let dirs = vec![a.clone(), b.clone()];
+
+        let plan = plan_chain(&dirs, project.path(), TEST_BASE_ID).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].dir, a);
+        assert_eq!(plan[0].position, ChainPosition { index: 0, total: 2 });
+        assert_eq!(plan[1].dir, b);
+        assert_eq!(plan[1].position, ChainPosition { index: 1, total: 2 });
+    }
+
+    #[test]
+    fn plan_chain_hashes_each_step_against_its_predecessors_hash() {
+        let project = tempfile::tempdir().unwrap();
+        let a = write_step(project.path(), "10-a", "FROM scratch\nRUN true\n");
+        let b = write_step(project.path(), "20-b", "FROM scratch\nRUN false\n");
+        let dirs = vec![a.clone(), b.clone()];
+
+        let plan = plan_chain(&dirs, project.path(), TEST_BASE_ID).unwrap();
+        let step1_alone = resolve(
+            &b,
+            project.path(),
+            &plan[0].hash,
+            ChainPosition { index: 1, total: 2 },
+        )
+        .unwrap();
+        assert_eq!(plan[1].tag, step1_alone.tag);
+    }
+
+    #[test]
+    fn editing_an_early_step_changes_every_later_tag() {
+        let project = tempfile::tempdir().unwrap();
+        let a = write_step(project.path(), "10-a", "FROM scratch\nRUN a\n");
+        let b = write_step(project.path(), "20-b", "FROM scratch\nRUN b\n");
+        let c = write_step(project.path(), "30-c", "FROM scratch\nRUN c\n");
+        let dirs = vec![a.clone(), b, c];
+
+        let before = plan_chain(&dirs, project.path(), TEST_BASE_ID).unwrap();
+        fs::write(a.join("Dockerfile"), "FROM scratch\nRUN a-edited\n").unwrap();
+        let after = plan_chain(&dirs, project.path(), TEST_BASE_ID).unwrap();
+
+        for i in 0..3 {
+            assert_ne!(before[i].tag, after[i].tag, "step {i} tag must change");
+        }
+    }
+
+    #[test]
+    fn editing_the_last_step_changes_only_its_own_tag() {
+        let project = tempfile::tempdir().unwrap();
+        let a = write_step(project.path(), "10-a", "FROM scratch\nRUN a\n");
+        let b = write_step(project.path(), "20-b", "FROM scratch\nRUN b\n");
+        let c = write_step(project.path(), "30-c", "FROM scratch\nRUN c\n");
+        let dirs = vec![a, b, c.clone()];
+
+        let before = plan_chain(&dirs, project.path(), TEST_BASE_ID).unwrap();
+        fs::write(c.join("Dockerfile"), "FROM scratch\nRUN c-edited\n").unwrap();
+        let after = plan_chain(&dirs, project.path(), TEST_BASE_ID).unwrap();
+
+        assert_eq!(before[0].tag, after[0].tag);
+        assert_eq!(before[1].tag, after[1].tag);
+        assert_ne!(before[2].tag, after[2].tag);
+    }
+
+    #[test]
+    fn plan_chain_is_stable_across_repeated_calls() {
+        let project = tempfile::tempdir().unwrap();
+        let a = write_step(project.path(), "10-a", "FROM scratch\n");
+        let b = write_step(project.path(), "20-b", "FROM scratch\n");
+        let dirs = vec![a, b];
+
+        let first = plan_chain(&dirs, project.path(), TEST_BASE_ID).unwrap();
+        let second = plan_chain(&dirs, project.path(), TEST_BASE_ID).unwrap();
+        assert_eq!(
+            first.iter().map(|i| &i.tag).collect::<Vec<_>>(),
+            second.iter().map(|i| &i.tag).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn plan_chain_of_one_matches_a_bare_resolve() {
+        // The migration-is-free guard: a one-step chain's tag must be
+        // exactly what the pre-chain implementation produced for the same
+        // directory contents, so moving `.agent-vm/layer/` under
+        // `.agent-vm/layers/` invalidates nobody's already-built image.
+        let project = tempfile::tempdir().unwrap();
+        let dir = write_step(project.path(), "10-a", "FROM scratch\n");
+
+        let via_chain = plan_chain(&[dir.clone()], project.path(), TEST_BASE_ID).unwrap();
+        let via_bare_resolve = resolve(&dir, project.path(), TEST_BASE_ID, first_of_one()).unwrap();
+        assert_eq!(via_chain[0].tag, via_bare_resolve.tag);
+    }
+
+    // --- parse_image_id() ---
+
+    #[test]
+    fn parse_image_id_trims_the_trailing_newline() {
+        assert_eq!(parse_image_id("sha256:abc123\n").unwrap(), "sha256:abc123");
+    }
+
+    #[test]
+    fn parse_image_id_rejects_empty_output() {
+        assert!(parse_image_id("").is_err());
+        assert!(parse_image_id("\n").is_err());
+    }
+
+    // --- execute_chain() against a recording fake ---
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Event {
+        Notice(String),
+        ConfirmBuild(Vec<(String, bool)>), // (tag, pending) per step
+        InspectIntermediate(String),
+        CheckFinal(String),
+        BuildIntermediate { tag: String, from: String },
+        BuildAndLoadFinal { tag: String, from: String },
+    }
+
+    struct FakeRuntime {
+        log: Vec<Event>,
+        docker_store: std::collections::HashSet<String>, // intermediate tags "already built"
+        msb_cache: std::collections::HashSet<String>,    // final tags "already ingested"
+        fail_at: Option<usize>,                          // step index whose build returns Err
+        declined: bool,
+    }
+
+    impl FakeRuntime {
+        fn new() -> Self {
+            Self {
+                log: Vec::new(),
+                docker_store: std::collections::HashSet::new(),
+                msb_cache: std::collections::HashSet::new(),
+                fail_at: None,
+                declined: false,
+            }
+        }
+    }
+
+    impl ChainRuntime for FakeRuntime {
+        fn notice(&mut self, message: &str) -> Result<()> {
+            self.log.push(Event::Notice(message.to_string()));
+            Ok(())
+        }
+
+        fn confirm_build(&mut self, plan: &[PlannedStep]) -> Result<()> {
+            self.log.push(Event::ConfirmBuild(
+                plan.iter().map(|s| (s.tag.clone(), s.pending)).collect(),
+            ));
+            if self.declined {
+                bail!("declined");
+            }
+            Ok(())
+        }
+
+        async fn intermediate_image_id(&mut self, tag: &str) -> Result<Option<String>> {
+            self.log.push(Event::InspectIntermediate(tag.to_string()));
+            Ok(self
+                .docker_store
+                .contains(tag)
+                .then(|| format!("sha256:{tag}")))
+        }
+
+        async fn final_is_cached(&mut self, tag: &str) -> Result<bool> {
+            self.log.push(Event::CheckFinal(tag.to_string()));
+            Ok(self.msb_cache.contains(tag))
+        }
+
+        async fn build_intermediate(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()> {
+            self.log.push(Event::BuildIntermediate {
+                tag: id.tag.clone(),
+                from: from_ref.to_string(),
+            });
+            if self.fail_at == Some(id.position.index) {
+                bail!("build failed at step {}", id.position.index);
+            }
+            self.docker_store.insert(id.tag.clone());
+            Ok(())
+        }
+
+        async fn build_and_load_final(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()> {
+            self.log.push(Event::BuildAndLoadFinal {
+                tag: id.tag.clone(),
+                from: from_ref.to_string(),
+            });
+            if self.fail_at == Some(id.position.index) {
+                bail!("build failed at step {}", id.position.index);
+            }
+            self.msb_cache.insert(id.tag.clone());
+            Ok(())
+        }
+    }
+
+    /// A 3-step chain plan with distinct tags, cheap to build repeatedly per
+    /// test without touching disk — `execute_chain` never reads the
+    /// filesystem itself, only the already-resolved `LayerIdentity`s.
+    fn fake_plan(n: usize) -> Vec<LayerIdentity> {
+        (0..n)
+            .map(|i| LayerIdentity {
+                dir: PathBuf::from(format!("/proj/.agent-vm/layers/{i}")),
+                dockerfile: PathBuf::from(format!("/proj/.agent-vm/layers/{i}/Dockerfile")),
+                tag: format!("agent-vm-layer:proj-tag{i}"),
+                hash: format!("hash{i}"),
+                file_count: 1,
+                hashed_bytes: 1,
+                position: ChainPosition { index: i, total: n },
+            })
+            .collect()
+    }
+
+    const PINNED_BASE: &str = "ghcr.io/example/base@sha256:base";
+
+    #[tokio::test]
+    async fn chain_builds_every_step_in_order_and_loads_only_the_last() {
+        let plan = fake_plan(3);
+        let mut rt = FakeRuntime::new();
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        let intermediates: Vec<&str> = rt
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Event::BuildIntermediate { tag, .. } => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            intermediates,
+            vec!["agent-vm-layer:proj-tag0", "agent-vm-layer:proj-tag1"]
+        );
+
+        let finals: Vec<&str> = rt
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Event::BuildAndLoadFinal { tag, .. } => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finals, vec!["agent-vm-layer:proj-tag2"]);
+    }
+
+    #[tokio::test]
+    async fn chain_from_ref_is_the_pinned_base_then_the_previous_tag() {
+        let plan = fake_plan(3);
+        let mut rt = FakeRuntime::new();
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        let froms: Vec<&str> = rt
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Event::BuildIntermediate { from, .. } => Some(from.as_str()),
+                Event::BuildAndLoadFinal { from, .. } => Some(from.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            froms,
+            vec![
+                PINNED_BASE,
+                "agent-vm-layer:proj-tag0",
+                "agent-vm-layer:proj-tag1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fully_cached_chain_spawns_nothing_and_never_confirms() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        rt.msb_cache.insert(plan[1].tag.clone());
+
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        assert_eq!(
+            rt.log,
+            vec![
+                Event::CheckFinal(plan[1].tag.clone()),
+                Event::Notice(format!("==> Reusing cached tooling layer {}", plan[1].tag)),
+            ],
+            "a cache-hit launch must touch nothing else — no inspect, no confirm, no build"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_prefix_is_not_rebuilt() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        rt.docker_store.insert(plan[0].tag.clone());
+
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        assert!(
+            !rt.log
+                .iter()
+                .any(|e| matches!(e, Event::BuildIntermediate { .. })),
+            "step 0 must not rebuild: {:?}",
+            rt.log
+        );
+        let final_build = rt
+            .log
+            .iter()
+            .find_map(|e| match e {
+                Event::BuildAndLoadFinal { from, .. } => Some(from.clone()),
+                _ => None,
+            })
+            .expect("final step must build");
+        assert_eq!(final_build, plan[0].tag);
+    }
+
+    #[tokio::test]
+    async fn the_backward_walk_stops_at_the_highest_cached_intermediate() {
+        let plan = fake_plan(4);
+        let mut rt = FakeRuntime::new();
+        rt.docker_store.insert(plan[2].tag.clone());
+
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        let inspected: Vec<&str> = rt
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Event::InspectIntermediate(tag) => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inspected,
+            vec![plan[2].tag.as_str()],
+            "the walk must stop at the first (highest-index) cached intermediate it finds \
+             and never inspect below it"
+        );
+        assert!(
+            rt.log.iter().any(
+                |e| matches!(e, Event::BuildAndLoadFinal { from, .. } if from == &plan[2].tag)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_step_aborts_the_chain_and_never_loads() {
+        for fail_at in [0usize, 1, 2] {
+            let plan = fake_plan(3);
+            let mut rt = FakeRuntime::new();
+            rt.fail_at = Some(fail_at);
+
+            let result = execute_chain(&plan, PINNED_BASE, &mut rt).await;
+            assert!(result.is_err(), "fail_at={fail_at}");
+            assert!(
+                !rt.log
+                    .iter()
+                    .any(|e| matches!(e, Event::BuildAndLoadFinal { .. })
+                        && rt.msb_cache.contains(&plan[2].tag)),
+                "fail_at={fail_at}: a failed final build must not leave the msb cache populated"
+            );
+            assert!(
+                rt.msb_cache.is_empty(),
+                "fail_at={fail_at}: nothing may be ingested when any step fails"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_whole_chain_is_confirmed_by_a_single_prompt() {
+        let plan = fake_plan(3);
+        let mut rt = FakeRuntime::new();
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        let confirms: Vec<&Vec<(String, bool)>> = rt
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Event::ConfirmBuild(steps) => Some(steps),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(confirms.len(), 1, "exactly one prompt for the whole chain");
+        assert_eq!(
+            confirms[0],
+            &vec![
+                (plan[0].tag.clone(), true),
+                (plan[1].tag.clone(), true),
+                (plan[2].tag.clone(), true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_precedes_every_build() {
+        let plan = fake_plan(3);
+        let mut rt = FakeRuntime::new();
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        let confirm_idx = rt
+            .log
+            .iter()
+            .position(|e| matches!(e, Event::ConfirmBuild(_)))
+            .unwrap();
+        for (i, event) in rt.log.iter().enumerate() {
+            if matches!(
+                event,
+                Event::BuildIntermediate { .. } | Event::BuildAndLoadFinal { .. }
+            ) {
+                assert!(
+                    i > confirm_idx,
+                    "build at index {i} precedes confirm at {confirm_idx}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declined_chain_builds_nothing() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        rt.declined = true;
+
+        assert!(execute_chain(&plan, PINNED_BASE, &mut rt).await.is_err());
+        assert!(!rt.log.iter().any(|e| matches!(
+            e,
+            Event::BuildIntermediate { .. } | Event::BuildAndLoadFinal { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_single_step_chain_uses_the_pinned_base_and_never_inspects() {
+        let plan = fake_plan(1);
+        let mut rt = FakeRuntime::new();
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        assert!(!rt.log.iter().any(|e| matches!(
+            e,
+            Event::InspectIntermediate(_) | Event::BuildIntermediate { .. }
+        )));
+        assert_eq!(
+            rt.log
+                .iter()
+                .filter(|e| matches!(e, Event::BuildAndLoadFinal { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            rt.log
+                .iter()
+                .any(|e| matches!(e, Event::BuildAndLoadFinal { from, .. } if from == PINNED_BASE))
+        );
     }
 
     // --- digest_pinned_base() ---
@@ -1271,7 +2274,9 @@ mod tests {
     // `AGENT_VM_E2E_BASE_IMAGE=<ref>` to point at a locally cached image
     // instead (e.g. the real `agent-vm-template:latest`) on a host where
     // outbound registry access is restricted. Run explicitly:
-    // `cargo test -p agent-vm --lib layer::tests::e2e -- --ignored`.
+    // `cargo test -p agent-vm --bin agent-vm layer::tests::e2e -- --ignored`
+    // (there is no `--lib` target: `crates/agent-vm/Cargo.toml` declares only
+    // `[[bin]]`).
     //
     // This exercises the novel, riskiest part of this ticket for real —
     // `docker buildx build --output type=oci` with a digest-pinned
@@ -1342,6 +2347,7 @@ mod tests {
             layer_dir.path(),
             Path::new("/tmp/e2e-project"),
             "sha256:e2e0000000000000000000000000000000000000000000000000000000000",
+            first_of_one(),
         )
         .unwrap();
 
@@ -1425,7 +2431,13 @@ mod tests {
             0o644,
         );
         let base_id = "sha256:e2e0000000000000000000000000000000000000000000000000000000000";
-        let before = resolve(layer_dir.path(), Path::new("/tmp/e2e-project"), base_id).unwrap();
+        let before = resolve(
+            layer_dir.path(),
+            Path::new("/tmp/e2e-project"),
+            base_id,
+            first_of_one(),
+        )
+        .unwrap();
 
         let cache_dir = tempfile::tempdir().unwrap();
         let tar = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
@@ -1449,7 +2461,13 @@ mod tests {
             ),
             0o644,
         );
-        let after = resolve(layer_dir.path(), Path::new("/tmp/e2e-project"), base_id).unwrap();
+        let after = resolve(
+            layer_dir.path(),
+            Path::new("/tmp/e2e-project"),
+            base_id,
+            first_of_one(),
+        )
+        .unwrap();
 
         assert_ne!(
             before.tag, after.tag,
