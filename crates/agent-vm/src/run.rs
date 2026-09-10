@@ -2439,6 +2439,47 @@ mod tests {
         assert!(cli.args.yes);
     }
 
+    #[test]
+    fn layer_flag_is_repeatable_and_keeps_order() {
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: Args,
+        }
+        use clap::Parser as _;
+
+        let cli = TestCli::try_parse_from(["agent-vm"]).expect("parses with no flags");
+        assert!(cli.args.layer.is_empty());
+
+        let cli = TestCli::try_parse_from(["agent-vm", "--layer", "b", "--layer", "a"])
+            .expect("--layer is repeatable");
+        assert_eq!(
+            cli.args.layer,
+            vec![PathBuf::from("b"), PathBuf::from("a")],
+            "command-line order must survive, since resolve_layer_chain appends flags in that order"
+        );
+    }
+
+    #[test]
+    fn layer_flag_has_no_env_binding() {
+        // Pins "flag-only": $AGENT_VM_LAYER must not silently satisfy
+        // --layer, since it's rejected outright by reject_removed_layer_env.
+        // Introspects clap's Arg rather than setenv() + parse, per the ADR
+        // amendment's "flag-only" contract.
+        use clap::CommandFactory as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: Args,
+        }
+        let command = TestCli::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "layer")
+            .expect("--layer is a registered arg");
+        assert!(arg.get_env().is_none(), "{arg:?}");
+    }
+
     // Test doubles for `ask_yes_no`'s io seam (issue #58), now shared by
     // `LaunchNotices::emit`'s tests too (issue #70). One shared, ordered
     // event log so "delivery happens before the read" and "no read after a

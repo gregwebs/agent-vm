@@ -2716,6 +2716,148 @@ mod tests {
         );
     }
 
+    /// Like [`fake_plan`], but the caller picks each step's origin — for the
+    /// amendment's A6 tests, where whether a step is a project step or a
+    /// `--layer` step is the point.
+    fn fake_plan_with_origins(origins: &[LayerOrigin]) -> Vec<ChainStep> {
+        let n = origins.len();
+        origins
+            .iter()
+            .enumerate()
+            .map(|(i, &origin)| {
+                let label = match origin {
+                    LayerOrigin::Project => format!(".agent-vm/layers/{i}"),
+                    LayerOrigin::Flag => format!("--layer flag-{i}"),
+                };
+                ChainStep {
+                    id: LayerIdentity {
+                        dir: PathBuf::from(format!("/proj/{i}")),
+                        dockerfile: PathBuf::from(format!("/proj/{i}/Dockerfile")),
+                        tag: format!("agent-vm-layer:proj-tag{i}"),
+                        hash: format!("hash{i}"),
+                        file_count: 1,
+                        hashed_bytes: 1,
+                        position: ChainPosition { index: i, total: n },
+                    },
+                    origin,
+                    label,
+                }
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn adding_a_flag_layer_reexports_only_the_last_project_step() {
+        // Amendment A6: the project's own last step was only ever ingested
+        // as an OCI archive (never landed in docker's local image store), so
+        // appending a --layer after it must re-export that step once — the
+        // backward walk sees it as "not cached" from docker's point of view
+        // and the confirmation prompt must show it as pending, not cached.
+        use LayerOrigin::{Flag, Project};
+        let plan = fake_plan_with_origins(&[Project, Project, Flag]);
+        let mut rt = FakeRuntime::new();
+        rt.docker_store.insert(plan[0].id.tag.clone());
+        // plan[1] (the project's last step) is deliberately absent from
+        // docker_store: it was built with --output type=oci and only lives
+        // in the msb cache, which this fake never populates for it.
+
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        let confirm = rt
+            .log
+            .iter()
+            .find_map(|e| match e {
+                Event::ConfirmBuild(steps) => Some(steps),
+                _ => None,
+            })
+            .expect("one confirmation");
+        assert_eq!(
+            confirm,
+            &vec![
+                (plan[0].id.tag.clone(), false),
+                (plan[1].id.tag.clone(), true),
+                (plan[2].id.tag.clone(), true),
+            ],
+            "step 0 cached; the project's last step and the flag step both pending"
+        );
+
+        let built: Vec<&str> = rt
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Event::BuildIntermediate { tag, .. } => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(built, vec![plan[1].id.tag.as_str()]);
+        assert!(
+            rt.log.iter().any(
+                |e| matches!(e, Event::BuildAndLoadFinal { tag, .. } if tag == &plan[2].id.tag)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_flag_again_is_a_pure_cache_hit() {
+        // Once the project's own chain (without any --layer) has its final
+        // tag ingested, launching without the flag again touches nothing —
+        // the project's tag never left the msb cache regardless of what was
+        // appended to it on some other launch.
+        use LayerOrigin::Project;
+        let plan = fake_plan_with_origins(&[Project, Project]);
+        let mut rt = FakeRuntime::new();
+        rt.msb_cache.insert(plan[1].id.tag.clone());
+
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        assert_eq!(
+            rt.log,
+            vec![
+                Event::CheckFinal(plan[1].id.tag.clone()),
+                Event::Notice(format!(
+                    "==> Reusing cached tooling layer {}",
+                    plan[1].id.tag
+                )),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_flag_layer_aborts_and_never_loads() {
+        use LayerOrigin::{Flag, Project};
+        let plan = fake_plan_with_origins(&[Project, Flag]);
+        let mut rt = FakeRuntime::new();
+        rt.fail_at = Some(1); // the flag step
+
+        let result = execute_chain(&plan, PINNED_BASE, &mut rt).await;
+        assert!(result.is_err());
+        assert!(rt.msb_cache.is_empty(), "nothing may be ingested");
+    }
+
+    #[tokio::test]
+    async fn notices_use_step_labels() {
+        use LayerOrigin::{Flag, Project};
+        let plan = fake_plan_with_origins(&[Project, Flag]);
+        let mut rt = FakeRuntime::new();
+
+        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+
+        let building_final = rt
+            .log
+            .iter()
+            .find_map(|e| match e {
+                Event::Notice(msg) if msg.contains("Building") && msg.contains("2/2") => {
+                    Some(msg.clone())
+                }
+                _ => None,
+            })
+            .expect("a building notice for the flag step");
+        assert!(
+            building_final.contains("--layer flag-1"),
+            "{building_final}"
+        );
+    }
+
     // --- digest_pinned_base() ---
 
     #[test]
