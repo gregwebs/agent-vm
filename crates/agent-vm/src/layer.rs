@@ -1785,7 +1785,8 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let dir = write_step(project.path(), "10-a", "FROM scratch\n");
 
-        let via_chain = plan_chain(&[dir.clone()], project.path(), TEST_BASE_ID).unwrap();
+        let via_chain =
+            plan_chain(std::slice::from_ref(&dir), project.path(), TEST_BASE_ID).unwrap();
         let via_bare_resolve = resolve(&dir, project.path(), TEST_BASE_ID, first_of_one()).unwrap();
         assert_eq!(via_chain[0].tag, via_bare_resolve.tag);
     }
