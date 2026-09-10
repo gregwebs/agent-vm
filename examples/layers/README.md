@@ -1,31 +1,31 @@
 # Example tooling layers
 
-A **tooling layer** is a project-owned `.agent-vm/layer/Dockerfile` (plus its
-build context) that adds project-specific tools on top of the agent-vm base
-image — compilers, cross-toolchains, anything the base doesn't carry. See
-`docs/adr/0003-project-tooling-layers.md` and the "Tooling layer" / "Derived
-image" entries in `CONTEXT.md` for the full mechanism.
+A **tooling layer** is a project-owned `Dockerfile` (plus its build context)
+that adds project-specific tools on top of the previous step in the
+project's **layer chain** — compilers, cross-toolchains, anything the base
+doesn't carry. A project's chain lives under `.agent-vm/layers/`, one
+numbered subdirectory per step, built in order. See
+`docs/adr/0003-project-tooling-layers.md` and the "Tooling layer" / "Layer
+chain" / "Derived image" entries in `CONTEXT.md` for the full mechanism.
 
 The directories under `examples/layers/` are worked examples, not activated
-by default. To use one in your project:
+by default. To use one in your project, copy it into place as a numbered
+step:
 
 ```sh
-cp -r examples/layers/wirenboard-cpp .agent-vm/layer
+cp -r examples/layers/wirenboard-cpp .agent-vm/layers/10-wirenboard-cpp
 ```
 
-or point at it directly without copying:
+Copying into `.agent-vm/layers/` is the only way to use an example — there
+is no `--layer` flag or `$AGENT_VM_LAYER` to point at a directory directly;
+the chain is always read from the project's own `.agent-vm/layers/`.
 
-```sh
-agent-vm shell --layer examples/layers/wirenboard-cpp
-# or
-export AGENT_VM_LAYER=examples/layers/wirenboard-cpp
-```
-
-The first launch after a layer is declared (or edited) prompts to build it:
-`Build project tooling layer '<tag>'? [y/N]`. Pass `--yes` (or set
-`AGENT_VM_YES=1`) for non-interactive/CI use. A later launch with an
-unchanged layer reuses the already-built derived image with no rebuild and
-no prompt.
+The first launch after a chain is declared (or a step is edited) prompts to
+build it: `Build project tooling layer '<tag>'? [y/N]` for a single-step
+chain, or a multi-line prompt listing every step for a longer one. Pass
+`--yes` (or set `AGENT_VM_YES=1`) for non-interactive/CI use. A later launch
+with an unchanged chain reuses the already-built derived image with no
+rebuild and no prompt.
 
 ## Writing your own layer
 
@@ -46,4 +46,30 @@ additive (or don't set it at all), install tools world-readable
 
 ## Chrome DevTools
 
-Copy `examples/layers/chrome-devtools` to `.agent-vm/layer`, or run `agent-vm claude --layer examples/layers/chrome-devtools --yes`. It installs Chromium and the Chrome DevTools MCP integration. Root guests use the dedicated `chrome` account; non-root guests run Chromium as their guest user. The layer pre-warms the npm cache for root mode only: arbitrary non-root guest homes remain persistent but download on first use. A project has one layer directory, so compose recipes (including the capability marker) when it needs Chrome plus another example.
+Copy `examples/layers/chrome-devtools` to `.agent-vm/layers/10-chrome-devtools`
+(or any numbered step) and run `agent-vm claude --yes`. It installs Chromium
+and the Chrome DevTools MCP integration. Root guests use the dedicated
+`chrome` account; non-root guests run Chromium as their guest user. The
+layer pre-warms the npm cache for root mode only: arbitrary non-root guest
+homes remain persistent but download on first use.
+
+## Composing several layers
+
+A project chain can combine `chrome-devtools` with its own toolchain — the
+motivating case for the chain in the first place. Copy both examples into
+numbered steps, choosing the order that matches what each depends on
+(neither of these two depends on the other, so either order works):
+
+```sh
+cp -r examples/layers/wirenboard-cpp   .agent-vm/layers/10-wirenboard-cpp
+cp -r examples/layers/chrome-devtools  .agent-vm/layers/20-chrome-devtools
+```
+
+The `NN-` numbering is what fixes the build order — steps are sorted
+byte-lexicographically by directory name, so `10-` always builds before
+`20-`. Number with gaps (`10`, `20`, `30`, ...) so a step can be inserted
+later without renaming its neighbors. Each step's `Dockerfile` must still
+start `ARG BASE_IMAGE=...` / `FROM ${BASE_IMAGE}` — the launcher rewrites
+`BASE_IMAGE` per step (the base image for the first step, the previous
+step's built image for every step after it), so a step's own Dockerfile
+never names a fixed base or its neighbors directly.

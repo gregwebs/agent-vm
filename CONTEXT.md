@@ -116,32 +116,52 @@ Resolved via `--image` / `AGENT_VM_IMAGE_TAG` / `defaults::DEFAULT_IMAGE_REF`
 
 ## Tooling layer
 
-A project-owned `.agent-vm/layer/Dockerfile` (plus its build context — the
-rest of that directory) that adds project-specific tools `FROM` the base
-image: compilers, cross-toolchains, anything the base doesn't carry.
-Resolution precedence, applied by `layer::resolve_layer_dir`: `--layer` /
-`$AGENT_VM_LAYER` / the default `.agent-vm/layer/` under the project root. An
-explicitly-pointed-at directory missing a `Dockerfile` is a hard error; the
-*default* directory simply being absent means "no layer" (`Ok(None)`). See
+A project-owned `Dockerfile` (plus its build context — the rest of that
+directory) that adds project-specific tools `FROM` the previous step in the
+chain: compilers, cross-toolchains, anything the base doesn't carry. A
+single tooling layer is one step of a "layer chain" (see below); resolved by
+`layer::resolve_layer_dirs`. There is no flag or env override — the chain is
+always `.agent-vm/layers/*/` under the project root. See
 `docs/adr/0003-project-tooling-layers.md`.
+
+## Layer chain
+
+The project's tooling layers, in build order: the immediate subdirectories
+of `.agent-vm/layers/`, sorted byte-lexicographically by directory name
+(`10-toolchain` before `20-chrome`). Each step builds `FROM` the previous
+step (the base image for step 0); only the **final** step is ingested into
+the msb cache — intermediates live in docker's own local image store,
+pinned for the next step by tag. `layer::plan_chain` computes the whole
+chain's identities up front (pure, no I/O beyond hashing); `layer::execute_chain`
+drives the build. A leftover singular `.agent-vm/layer/` (the pre-chain,
+one-layer-only layout) is a hard migration error naming the path, not a
+supported alias. See `docs/adr/0003-project-tooling-layers.md`.
 
 ## Derived image
 
-Base image + tooling layer, built with `docker buildx build`, tagged
-`agent-vm-layer:<project-slug>-<hash>`, and booted in place of the base
-whenever the project declares a layer. Ingested **registry-lessly** — via
-`microsandbox_image::load_archive`, never a `registry:2` push — so booting a
-derived image makes no registry contact. See
-`docs/adr/0003-project-tooling-layers.md`.
+Base image + the **whole layer chain**, built one `docker buildx build` per
+chain step, tagged `agent-vm-layer:<project-slug>-<hash>`, and booted in
+place of the base whenever the project declares a chain. Only the final
+step's image is the derived image proper — intermediate steps are build-time
+scaffolding in docker's own image store, never booted and never ingested.
+Ingested **registry-lessly** — via `microsandbox_image::load_archive`, never
+a `registry:2` push — so booting a derived image makes no registry contact.
+See `docs/adr/0003-project-tooling-layers.md`.
 
 ## Layer identity / hash
 
-The content hash `layer::resolve` computes over the base image's resolved
-manifest digest plus the whole tooling-layer directory tree (git-mode-
-normalized: only the execute bit is tracked, so checkout umask can't move
-the hash). The tag *is* the staleness check — there is no separate state
-file recording "what was last built" to fall out of sync with the image
-store. A hash hit reuses the already-ingested derived image with no rebuild
-and no confirmation prompt; a hash miss (new project, or an edited
-Dockerfile/layer file) prompts to build unless `--yes` / `$AGENT_VM_YES` is
-set. See `docs/adr/0003-project-tooling-layers.md`.
+The content hash `layer::resolve` computes over a step's `base_image_id`
+plus that step's whole tooling-layer directory tree (git-mode-normalized:
+only the execute bit is tracked, so checkout umask can't move the hash).
+For chain step 0, `base_image_id` is the base image's resolved manifest
+digest; for every step after it, `base_image_id` is the *previous step's*
+content hash — never a docker-assigned image id (see the ADR's chain
+amendment for why). That makes the hash transitive: each step's hash
+covers everything beneath it, so editing an early step invalidates every
+step above it, and the whole chain's tags are computable without spawning a
+process. The tag *is* the staleness check — there is no separate state file
+recording "what was last built" to fall out of sync with the image store. A
+hash hit reuses the already-ingested derived image with no rebuild and no
+confirmation prompt; a hash miss (new project, or an edited
+Dockerfile/layer file) prompts to build the whole chain unless `--yes` /
+`$AGENT_VM_YES` is set. See `docs/adr/0003-project-tooling-layers.md`.

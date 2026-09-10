@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted.
+Accepted. The single-layer decision is superseded by ordered layer chains
+(issue #79) — see "Amendment: ordered layer chains" below, which also
+records the removal of `--layer` / `$AGENT_VM_LAYER`. Every other decision
+here (registry-less ingest, digest-pinned base, hash-as-staleness-check,
+hard-fail, the Dockerfile contract) is unchanged and now applies per chain
+step.
 
 ## Context
 
@@ -180,11 +185,16 @@ launcher-enforced invariant.
 
 ### The layer Dockerfile contract
 
-A `.agent-vm/layer/Dockerfile` MUST:
+Each chain step's `Dockerfile` (`.agent-vm/layers/<NN-name>/Dockerfile`)
+MUST:
 
 - Start `ARG BASE_IMAGE=<default>` then `FROM ${BASE_IMAGE}` — the launcher
-  overrides `BASE_IMAGE` via `--build-arg` to the digest-pinned base; a
-  Dockerfile that hardcodes `FROM ghcr.io/...` instead breaks the pin.
+  overrides `BASE_IMAGE` via `--build-arg`, to the digest-pinned base for
+  step 0 and to the previous step's tag for every step after it (see the
+  chain amendment below). This requirement is now doubly load-bearing: it is
+  how steps chain, not only how the base is pinned. A Dockerfile that
+  hardcodes `FROM ghcr.io/...` or `FROM <some other tag>` instead breaks
+  both.
 - Not touch `/etc/agent-vm-image-version` — that's the image-API-version
   contract check (`defaults::IMAGE_API_VERSION_PATH`), unrelated to tooling.
 - Keep `ENV PATH` **additive** — retain
@@ -216,6 +226,143 @@ unsafe. Accepted rather than de-duplicated with an extra lock file: rare in
 practice (two concurrent first-launches of the same project), and the
 existing per-image flock already prevents a torn cache write.
 
+### Amendment: ordered layer chains (issue #79)
+
+This ADR originally supported exactly one project tooling layer. That
+blocked both per-tool layers and the ordinary case of combining a shipped
+example layer (e.g. `examples/layers/chrome-devtools/`) with a project's own
+toolchain. A project now declares an **ordered chain** of layers, each built
+`FROM` the previous one, with only the final step registry-lessly ingested.
+
+**Location.** `.agent-vm/layers/` is now the *only* location a chain can
+live. Its immediate subdirectories are the chain, in byte-lexicographic
+order by directory name (`10-toolchain` before `20-chrome`); each must hold
+a `Dockerfile`. `layer::resolve_layer_dirs` replaces `layer::resolve_layer_dir`.
+
+**`--layer` and `$AGENT_VM_LAYER` are removed. There is no override.** A
+chain expresses something a single-directory override cannot (a whole
+ordered sequence of steps), and a project's tooling layout is a property of
+the project's checkout, not of an invocation — so there is nothing left for
+a flag to usefully override.
+
+**No compatibility with the singular `.agent-vm/layer/`.** A leftover
+`.agent-vm/layer/` — in any form, whether or not `.agent-vm/layers/` also
+exists — is a hard error naming the path and the `git mv` to run, not a
+deprecated alias. This is a deliberate migration guardrail, not backwards
+compatibility: nothing about the old layout still works, and the error path
+runs no build logic. The alternative (silently ignoring the leftover
+directory) would let an un-migrated checkout boot looking healthy while
+missing the toolchain the user believes they declared — precisely the
+failure this whole design exists to prevent. The migration itself is a pure
+rename with no rebuild cost: `canonical_stream` hashes a layer directory's
+*contents* relative to that directory, and the tag's project slug comes from
+the project directory, not the layer's location, so neither can see where
+the directory lives on disk. A user running `git mv .agent-vm/layer
+.agent-vm/layers/10-tools` keeps the exact same tag and their already-built
+image is still a cache hit.
+
+**Transitive identity by content hash, not docker image id.** Each step's
+`base_image_id` (fed to `layer::resolve`) is step 0's msb-resolved *manifest
+digest*, and every later step's is its *predecessor's content hash*
+(`LayerIdentity::hash`) — never a docker-assigned image id, even though an
+earlier draft of this design (and the originating issue) proposed exactly
+that. Image-id chaining has three concrete defects that rule it out:
+
+1. It puts docker on the cache-hit path of every launch. With image-id
+   chaining, the final tag is not computable without walking the chain
+   (`docker image inspect` once per intermediate) — even on a pure cache
+   hit. Worse, `docker image inspect` exits non-zero both when an image is
+   absent **and** when the daemon is unreachable, so an already-ingested
+   chain would read as "not cached" and hard-fail whenever docker simply
+   isn't running.
+2. Docker config ids are not stable across `docker image prune` — a prune
+   changes step 0's rebuilt id, which cascades into every later hash moving,
+   which moves the final tag and forces a full re-ingest (the expensive
+   EROFS+fsmeta+VMDK half) for a project not one byte of which changed.
+3. Docker config ids are not reproducible across machines — two developers
+   on the same commit would compute different final tags, exactly the
+   failure `git_mode` already exists to prevent one level down.
+
+Content-hash chaining has none of these problems: every step's tag is a pure
+function of the checkout plus the base manifest digest, computable before
+anything is built, stable across `docker image prune`, and identical on
+every machine on the same commit. `SCHEME_TAG` is deliberately **not**
+bumped for this change — chaining is additive to the hash's inputs
+(`base_image_id` now sometimes carries a predecessor's hash rather than
+always a base digest), not a change to the enumeration rules `SCHEME_TAG`
+versions.
+
+**`FROM` takes the previous step's tag, not its image id.** Verified live
+(colima's docker, buildx v0.36.1, driver `docker`):
+
+```
+$ docker buildx build -t b --build-arg BASE_IMAGE="sha256:2544a6f5…" --output type=docker ./b
+ERROR: failed to solve: sha256:2544a6f5…: failed to resolve source metadata for
+docker.io/library/sha256:2544a6f5…: pull access denied, repository does not
+exist or may require authorization
+```
+
+BuildKit parses a bare `sha256:<id>` as a *repository name*, not an image id
+— `FROM sha256:<id>` cannot work through buildx. Passing the tag works and
+chains correctly:
+
+```
+$ docker buildx build -t spike-a --output type=docker ./a          # loads into the store
+$ docker buildx build -t spike-b --build-arg BASE_IMAGE="spike-a" --output type=docker ./b
+$ docker run --rm spike-b ls /marker-a /marker-b                   # both exist
+```
+
+This is sound precisely because the registry-tag-race reasoning that
+motivates this ADR's digest-pinned base (a *moving registry tag* can be
+re-resolved independently by docker against a registry, racing what msb
+cached) does not transfer to an intermediate chain tag:
+`agent-vm-layer:<slug>-<hash>` is a local name in a repository agent-vm
+owns, never pulled from a registry, whose text already embeds the content
+hash of everything beneath it. Its only failure mode is a human manually
+retagging it, out of scope in the same way hand-editing the msb cache is —
+there is deliberately no re-assert-by-image-id step after an intermediate
+build, since there is no expected id to compare a step found already present
+in the store against.
+
+**Two ingest paths, not one.** `digest_pinned_base` applies to step 0 only.
+Intermediate steps (`0..n-1`) build with `--output type=docker`, landing in
+docker's own local image store (`docker image inspect <tag>` is the
+staleness check); only the **final** step emits an OCI archive and goes
+through `load_archive` into the msb cache. Intermediates never boot and the
+EROFS+fsmeta+VMDK materialization is the expensive half of ingest, so
+ingesting them would be pure waste.
+
+This requires the default `docker` buildx driver — `.github/workflows/chrome-layer-contract.yml`
+already pins `driver: docker` (not the `docker-container` default) for the
+same reason: only the `docker` driver's builds land in a store every later
+build can see with a plain `FROM <tag>`. Under `docker-container`, an
+isolated buildkit container can't see a previous build's `--load` output, so
+the next step's `FROM <tag>` falls through to a Docker Hub pull of a tag
+that does not exist there. Detected by post-build assertion
+(`docker image inspect <tag>` after an intermediate build) rather than
+parsing `docker buildx inspect` up front — a second output format to track,
+which can false-positive on multi-node builders, when the post-hoc check
+cannot be wrong.
+
+**One prompt for the whole chain.** Rather than one confirmation per step,
+`execute_chain` asks once, listing every step, its tag, and whether it's
+pending or already cached. The hard-fail rule is unchanged and now matters
+more: any step failing aborts the launch, and the msb cache is untouched
+until the final step succeeds, so a partially-composed chain can never boot.
+
+**Accepted consequence: growing a one-step chain rebuilds step 0 once.** A
+project running a one-step chain (`.agent-vm/layers/10-a/` alone) that later
+adds `20-b/` will rebuild step 0 once. Its image was produced with
+`--output type=oci` (an archive), which does not populate docker's image
+store, so `docker image inspect` misses even though the tag is unchanged and
+still ingested in the msb cache. buildx's own build cache usually makes this
+cheap. Rejected alternative: build *every* step with `type=docker`, then
+`docker save` the final image into `load_archive` (which auto-detects
+docker-archive as well as OCI layout) — rejected because it reverses three
+of this ADR's own decisions at once (OCI layout over `docker save`, zstd for
+blob dedup, `--provenance=false --sbom=false`) to save a one-time cost on an
+uncommon transition.
+
 ## Consequences
 
 - **F5 — fsmeta/VMDK evicted while metadata survives.** If something ever
@@ -243,7 +390,7 @@ existing per-image flock already prevents a torn cache write.
   `run.rs` keeps `base_image` as a binding separate from the (possibly
   reassigned) `image` for exactly this reason.
 - Non-layer projects are unaffected: `resolve_boot_image_with_layer` returns
-  `Ok(None)` when `.agent-vm/layer/` isn't declared, and `launch()` boots
+  `Ok(None)` when `.agent-vm/layers/` isn't declared, and `launch()` boots
   `base_image` exactly as it did before this ADR.
 - **Cross-arch correctness (resolved in this PR, after a live `aarch64`
   reproduction).** An earlier revision hardcoded `--platform linux/amd64`

@@ -1,6 +1,7 @@
 # examples/layers/wirenboard-cpp — WB C/C++ + armhf/arm64 cross toolchain
-# tooling layer. Copy this directory to your project's .agent-vm/layer/
-# (or point `agent-vm --layer <path>` at it) to build it FROM the base image.
+# tooling layer. Copy this directory to a numbered step under your project's
+# .agent-vm/layers/ (e.g. .agent-vm/layers/10-wirenboard-cpp) to build it FROM
+# the base image (or the previous chain step, if you compose it with another).
 # See docs/adr/0003-project-tooling-layers.md for the layer contract.
 
 # Launcher overrides BASE_IMAGE with the digest-pinned base at build time
