@@ -480,12 +480,13 @@ impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
     }
 }
 
-/// If the project declares a tooling-layer chain, build+load it (lazily,
-/// hash-cached per step, with one confirmation for the whole chain on a
-/// miss — see ADR-0003) and return the final derived tag to boot instead of
-/// `base_image`. Returns `Ok(None)` when there is no chain declared, so
-/// `launch()` boots `base_image` unchanged — a non-layer project's behavior
-/// is byte-identical to before tooling layers existed.
+/// If the project declares a tooling-layer chain and/or `layer_flags` is
+/// non-empty, build+load the composed chain (lazily, hash-cached per step,
+/// with one confirmation for the whole chain on a miss — see ADR-0003) and
+/// return the final derived tag to boot instead of `base_image`. Returns
+/// `Ok(None)` when neither source declares anything, so `launch()` boots
+/// `base_image` unchanged — a non-layer project's behavior is byte-identical
+/// to before tooling layers existed.
 ///
 /// Extracted out of `launch()` so the orchestration reads top-to-bottom
 /// without the surrounding ~150 lines of mount/credential/network setup

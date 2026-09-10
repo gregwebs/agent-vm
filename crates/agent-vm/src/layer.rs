@@ -4,7 +4,10 @@
 //!
 //! A project declares its chain under `.agent-vm/layers/`; each immediate
 //! subdirectory is one step, built `FROM` the previous step (the base image
-//! for step 0). Only the final step is registry-lessly ingested — the
+//! for step 0). A repeatable `--layer DIR` flag appends more steps after
+//! those, in command-line order — never prepends, and never overrides them
+//! — so a project's own steps keep their tags whether or not any flag is
+//! passed. Only the final step is registry-lessly ingested — the
 //! intermediates live in docker's own local image store and are pinned for
 //! the next step by their tag.
 //!
