@@ -148,20 +148,26 @@ fn layer_build_question(tag: &str) -> String {
 }
 
 /// The multi-step prompt wording — a fn, like its single-step sibling, so a
-/// test renders production text rather than a copy that can drift.
+/// test renders production text rather than a copy that can drift. Each
+/// step's label (`.agent-vm/layers/10-toolchain` for a project step,
+/// `--layer <as typed>` for a flag step — see [`layer::ChainDir::label`]) is
+/// padded to the widest one so tags align even when a `--layer` label runs
+/// long.
 ///
 /// ```text
-/// Build project tooling layer chain (2 steps)?
-///   1/2  .agent-vm/layers/10-toolchain  agent-vm-layer:my-app-1a2b3c…
-///   2/2  .agent-vm/layers/20-chrome     agent-vm-layer:my-app-9f8e7d…  (cached)
+/// Build project tooling layer chain (3 steps)?
+///   1/3  .agent-vm/layers/10-toolchain            agent-vm-layer:my-app-1a2b3c…
+///   2/3  .agent-vm/layers/20-chrome               agent-vm-layer:my-app-9f8e7d…  (cached)
+///   3/3  --layer examples/layers/chrome-devtools  agent-vm-layer:my-app-9f8e7d…
 /// ```
 fn layer_chain_build_question(steps: &[layer::PlannedStep]) -> String {
+    let label_width = steps.iter().map(|s| s.label.len()).max().unwrap_or(0);
     let mut question = format!("Build project tooling layer chain ({} steps)?", steps.len());
     for step in steps {
         question.push_str(&format!(
-            "\n  {}  {}  {}",
+            "\n  {}  {:label_width$}  {}",
             step.position.human(),
-            step.dir.display(),
+            step.label,
             step.tag,
         ));
         if !step.pending {
@@ -487,11 +493,12 @@ impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
 /// single `?`-propagated call a reader can follow in order.
 async fn resolve_boot_image_with_layer<W: std::io::Write>(
     base_image: &str,
+    layer_flags: &[PathBuf],
     project_dir: &Path,
     auto_confirm: bool,
     notices: &mut LaunchNotices<W>,
 ) -> Result<Option<String>> {
-    let layer_dirs = layer::resolve_layer_dirs(project_dir)?;
+    let layer_dirs = layer::resolve_layer_chain(project_dir, layer_flags)?;
     if layer_dirs.is_empty() {
         return Ok(None);
     }
@@ -839,6 +846,25 @@ pub struct Args {
     #[arg(long = "update-check", default_value_t = false, help_heading = "Image")]
     update_check: bool,
 
+    /// Append a tooling layer to this launch's chain (repeatable).
+    ///
+    /// Each DIR is one layer directory holding a Dockerfile that starts
+    /// `ARG BASE_IMAGE` / `FROM ${BASE_IMAGE}`. Flag layers are appended
+    /// after the project's own `.agent-vm/layers/*` steps, in the order
+    /// given, so the project's steps keep their cached images; it works with
+    /// no `.agent-vm/layers/` at all. Relative paths resolve against the
+    /// project directory (the current directory) — unlike `--mount`, which
+    /// requires absolute paths, because trying a checked-in example by
+    /// relative path is the point. There is deliberately no environment
+    /// variable; the removed `AGENT_VM_LAYER` is rejected if set.
+    #[arg(
+        long = "layer",
+        value_name = "DIR",
+        action = clap::ArgAction::Append,
+        help_heading = "Image"
+    )]
+    layer: Vec<PathBuf>,
+
     /// Assume "yes" to the tooling-layer build confirmation prompt.
     ///
     /// Needed for CI/non-interactive launches whenever a chain step's hash
@@ -936,14 +962,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let cpus = args.cpus;
 
     // Tooling-layer resolution (issue #13, extended to an ordered chain by
-    // #79): if the project declares `.agent-vm/layers/*/Dockerfile`
-    // subdirectories, build+load the composed derived image now (lazily,
-    // hash-cached per step, with one confirmation for the whole chain on a
-    // miss) and boot it instead of the base. No chain declared ⇒ `image` is
-    // left as `base_image`, byte-identical to today.
+    // #79, then to an additive repeatable `--layer` by amendment A1): if the
+    // project declares `.agent-vm/layers/*/Dockerfile` subdirectories and/or
+    // `--layer DIR` is given (appended after the project's own steps),
+    // build+load the composed derived image now (lazily, hash-cached per
+    // step, with one confirmation for the whole chain on a miss) and boot it
+    // instead of the base. Neither source declared ⇒ `image` is left as
+    // `base_image`, byte-identical to today.
     let auto_confirm = should_auto_confirm(args.yes, env::var("AGENT_VM_YES").ok().as_deref());
     if let Some(derived) = resolve_boot_image_with_layer(
         &base_image,
+        &args.layer,
         &session.project_dir,
         auto_confirm,
         &mut notices,
@@ -2367,7 +2396,8 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("AGENT_VM_LAYER"), "{msg}");
         assert!(
-            !msg.contains("--layer \u{fffd}") && !msg.lines().any(|l| l.trim().starts_with("--layer ")),
+            !msg.contains("--layer \u{fffd}")
+                && !msg.lines().any(|l| l.trim().starts_with("--layer ")),
             "a lossy value must not be offered as a copy-pasteable --layer line: {msg}"
         );
     }
@@ -2880,6 +2910,7 @@ mod tests {
         let mut notices = LaunchNotices::new(output);
         let got = resolve_boot_image_with_layer(
             "ghcr.io/wirenboard/agent-vm-template:latest",
+            &[],
             project.path(),
             false,
             &mut notices,
@@ -2911,6 +2942,7 @@ mod tests {
         let mut notices = LaunchNotices::new(output);
         let err = resolve_boot_image_with_layer(
             "ghcr.io/wirenboard/agent-vm-template:latest",
+            &[],
             project.path(),
             false,
             &mut notices,
@@ -2929,13 +2961,15 @@ mod tests {
         let steps = vec![
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 0, total: 2 },
-                dir: PathBuf::from(".agent-vm/layers/10-a"),
+                origin: layer::LayerOrigin::Project,
+                label: ".agent-vm/layers/10-a".to_string(),
                 tag: "agent-vm-layer:proj-aaa".to_string(),
                 pending: true,
             },
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 1, total: 2 },
-                dir: PathBuf::from(".agent-vm/layers/20-b"),
+                origin: layer::LayerOrigin::Project,
+                label: ".agent-vm/layers/20-b".to_string(),
                 tag: "agent-vm-layer:proj-bbb".to_string(),
                 pending: true,
             },
@@ -2955,13 +2989,15 @@ mod tests {
         let steps = vec![
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 0, total: 2 },
-                dir: PathBuf::from(".agent-vm/layers/10-a"),
+                origin: layer::LayerOrigin::Project,
+                label: ".agent-vm/layers/10-a".to_string(),
                 tag: "agent-vm-layer:proj-aaa".to_string(),
                 pending: false,
             },
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 1, total: 2 },
-                dir: PathBuf::from(".agent-vm/layers/20-b"),
+                origin: layer::LayerOrigin::Project,
+                label: ".agent-vm/layers/20-b".to_string(),
                 tag: "agent-vm-layer:proj-bbb".to_string(),
                 pending: true,
             },
@@ -2974,10 +3010,47 @@ mod tests {
     }
 
     #[test]
+    fn layer_chain_build_question_marks_flag_layers() {
+        let steps = vec![
+            layer::PlannedStep {
+                position: layer::ChainPosition { index: 0, total: 2 },
+                origin: layer::LayerOrigin::Project,
+                label: ".agent-vm/layers/10-a".to_string(),
+                tag: "agent-vm-layer:proj-aaa".to_string(),
+                pending: true,
+            },
+            layer::PlannedStep {
+                position: layer::ChainPosition { index: 1, total: 2 },
+                origin: layer::LayerOrigin::Flag,
+                label: "--layer examples/layers/chrome-devtools".to_string(),
+                tag: "agent-vm-layer:proj-bbb".to_string(),
+                pending: true,
+            },
+        ];
+        assert_eq!(steps[0].origin, layer::LayerOrigin::Project);
+        assert_eq!(steps[1].origin, layer::LayerOrigin::Flag);
+        let question = layer_chain_build_question(&steps);
+        let flag_line = question
+            .lines()
+            .find(|l| l.contains("examples/layers/chrome-devtools"))
+            .unwrap();
+        assert!(
+            flag_line.contains("--layer examples/layers/chrome-devtools"),
+            "{flag_line}"
+        );
+        // Columns still align: both label cells are padded to the same width.
+        let project_line = question.lines().find(|l| l.contains("10-a")).unwrap();
+        let project_label_col = project_line.find(".agent-vm").unwrap();
+        let flag_label_col = flag_line.find("--layer").unwrap();
+        assert_eq!(project_label_col, flag_label_col, "{question}");
+    }
+
+    #[test]
     fn layer_declined_error_names_the_chain() {
         let one = vec![layer::PlannedStep {
             position: layer::ChainPosition { index: 0, total: 1 },
-            dir: PathBuf::from(".agent-vm/layers/10-a"),
+            origin: layer::LayerOrigin::Project,
+            label: ".agent-vm/layers/10-a".to_string(),
             tag: "agent-vm-layer:proj-aaa".to_string(),
             pending: true,
         }];
@@ -2990,13 +3063,15 @@ mod tests {
         let two = vec![
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 0, total: 2 },
-                dir: PathBuf::from(".agent-vm/layers/10-a"),
+                origin: layer::LayerOrigin::Project,
+                label: ".agent-vm/layers/10-a".to_string(),
                 tag: "agent-vm-layer:proj-aaa".to_string(),
                 pending: true,
             },
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 1, total: 2 },
-                dir: PathBuf::from(".agent-vm/layers/20-b"),
+                origin: layer::LayerOrigin::Project,
+                label: ".agent-vm/layers/20-b".to_string(),
                 tag: "agent-vm-layer:proj-bbb".to_string(),
                 pending: true,
             },
