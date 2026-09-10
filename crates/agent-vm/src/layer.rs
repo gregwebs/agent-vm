@@ -2296,7 +2296,13 @@ mod tests {
     /// Returns `None` — skip, don't fail — when neither a local copy nor a
     /// network pull can produce one, so this e2e module degrades to a
     /// no-op on a host with no docker at all rather than a false failure.
-    fn e2e_pinned_base() -> Option<(String, String)> {
+    ///
+    /// The returned "digest" is actually `docker image inspect`'s resolved
+    /// image id, not a registry manifest digest — a pre-existing
+    /// simplification of this e2e harness (there is no registry in play
+    /// here to ask for a manifest digest), reused as-is for the chain e2e
+    /// test below rather than fixed as part of this ticket.
+    fn e2e_pinned_base() -> Option<(String, String, String)> {
         let base = std::env::var("AGENT_VM_E2E_BASE_IMAGE")
             .unwrap_or_else(|_| "alpine:latest".to_string());
         let inspect = |base: &str| {
@@ -2316,7 +2322,7 @@ mod tests {
             pulled.then(|| inspect(&base)).flatten()
         })?;
         let pinned = digest_pinned_base(&base, &digest).ok()?;
-        Some((base, pinned))
+        Some((base, digest, pinned))
     }
 
     #[tokio::test]
@@ -2326,7 +2332,7 @@ mod tests {
             eprintln!("skipping: `docker buildx` not available on PATH");
             return;
         }
-        let Some((base, pinned_base)) = e2e_pinned_base() else {
+        let Some((base, _digest, pinned_base)) = e2e_pinned_base() else {
             eprintln!("skipping: no base image available locally or via network pull");
             return;
         };
@@ -2419,7 +2425,7 @@ mod tests {
             eprintln!("skipping: `docker buildx` not available on PATH");
             return;
         }
-        let Some((base, pinned_base)) = e2e_pinned_base() else {
+        let Some((base, _digest, pinned_base)) = e2e_pinned_base() else {
             eprintln!("skipping: no base image available locally or via network pull");
             return;
         };
@@ -2487,6 +2493,205 @@ mod tests {
             derived_is_cached(cache_dir.path(), &before.tag)
                 .await
                 .unwrap()
+        );
+    }
+
+    // --- e2e: the chain, and ADR-0003's fsmeta/VMDK guard ---
+
+    /// A minimal, real [`ChainRuntime`]: notices go to stderr, confirmation
+    /// always proceeds (there is no interactive prompt to script in a
+    /// test), and every other method is the real production function
+    /// against real docker + the msb cache. `run.rs`'s `LaunchChainRuntime`
+    /// is the production wiring; this is its crate-internal twin so
+    /// `plan_chain` + `execute_chain` can be exercised end-to-end here
+    /// without dragging in `run.rs`'s launch machinery.
+    struct E2eChainRuntime {
+        cache_dir: PathBuf,
+    }
+
+    impl ChainRuntime for E2eChainRuntime {
+        fn notice(&mut self, message: &str) -> Result<()> {
+            eprintln!("{message}");
+            Ok(())
+        }
+
+        fn confirm_build(&mut self, _plan: &[PlannedStep]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn intermediate_image_id(&mut self, tag: &str) -> Result<Option<String>> {
+            docker_image_id(tag).await
+        }
+
+        async fn final_is_cached(&mut self, tag: &str) -> Result<bool> {
+            derived_is_cached(&self.cache_dir, tag).await
+        }
+
+        async fn build_intermediate(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()> {
+            build_derived_docker(id, from_ref).await
+        }
+
+        async fn build_and_load_final(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()> {
+            let tar = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+            build_derived_oci(id, from_ref, tar.path()).await?;
+            load_derived_image(&self.cache_dir, tar.path(), &id.tag).await?;
+            Ok(())
+        }
+    }
+
+    /// Issue AC 1: `.agent-vm/layers/{10-a,20-b}/` builds both layers in
+    /// order and loads only the final image. (Booting it is out of scope
+    /// for this crate-internal module — see the file-level e2e note above —
+    /// but everything up to "ready to boot" runs for real here: two live
+    /// `docker buildx build`s chained through docker's own image store, then
+    /// a real `load_archive` ingest.)
+    ///
+    /// Each step's marker is an `ENV`, not a `RUN ln -s` file, specifically
+    /// so this test can prove both steps composed by reading the *ingested
+    /// image's config* (mirroring the PATH-merge assertion in the round-trip
+    /// test above) without needing a VM boot to `ls` a symlink.
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_two_step_chain_builds_in_order_and_ingests_only_the_final_image() {
+        if ensure_docker_buildx().is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some((base, digest, _pinned)) = e2e_pinned_base() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+
+        let project = tempfile::tempdir().unwrap();
+        write_step(
+            project.path(),
+            "10-a",
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nENV MARKER_A=present\n"),
+        );
+        write_step(
+            project.path(),
+            "20-b",
+            // FROM the *previous step's tag*, per D5/D4: this step's build
+            // context never names the base image directly.
+            "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nENV MARKER_B=present\n",
+        );
+        let dirs = resolve_layer_dirs(project.path()).unwrap();
+        assert_eq!(dirs.len(), 2);
+
+        let plan = plan_chain(&dirs, project.path(), &digest).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut rt = E2eChainRuntime {
+            cache_dir: cache_dir.path().to_path_buf(),
+        };
+        let pinned_base = digest_pinned_base(&base, &digest).unwrap();
+        let final_tag = execute_chain(&plan, &pinned_base, &mut rt)
+            .await
+            .expect("chain execution");
+
+        assert_eq!(final_tag, plan[1].tag);
+        assert!(
+            derived_is_cached(cache_dir.path(), &plan[1].tag)
+                .await
+                .unwrap(),
+            "the final step must be ingested into the msb cache"
+        );
+        assert!(
+            !derived_is_cached(cache_dir.path(), &plan[0].tag)
+                .await
+                .unwrap(),
+            "an intermediate step must never be ingested — only docker's own image store"
+        );
+        assert!(
+            docker_image_id(&plan[0].tag).await.unwrap().is_some(),
+            "the intermediate step must land in docker's local image store"
+        );
+
+        let reference: microsandbox_image::Reference = plan[1].tag.parse().unwrap();
+        let cache = microsandbox_image::GlobalCache::new_async(cache_dir.path())
+            .await
+            .unwrap();
+        let metadata = cache
+            .read_image_metadata_async(&reference)
+            .await
+            .unwrap()
+            .expect("metadata must be present after the chain ingests the final image");
+        assert!(
+            metadata.config.env.iter().any(|e| e == "MARKER_A=present"),
+            "step 0's ENV must survive into the final image — proof step 1 was built \
+             FROM step 0's tag, not straight from the base"
+        );
+        assert!(
+            metadata.config.env.iter().any(|e| e == "MARKER_B=present"),
+            "step 1's own ENV must also be present"
+        );
+    }
+
+    /// The named ADR-0003 guard (issue AC 9). `derived_is_cached`'s own
+    /// check (exercised by the round-trip test above, via
+    /// `is_vmdk_materialized`) says nothing about the fsmeta EROFS image —
+    /// the metadata-only merged view `load_archive` also materializes and
+    /// ADR-0003's Consequences section calls out by name ("stages blobs
+    /// AND materializes per-layer EROFS + fsmeta + VMDK offline"). Without
+    /// fsmeta, a boot would fail even though `derived_is_cached` still read
+    /// "cached". `GlobalCache::is_fsmeta_materialized` is the public
+    /// accessor the vendored `microsandbox_image` crate exposes for this
+    /// (`vendor/microsandbox/crates/image/lib/cache/store.rs`).
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_load_archive_materializes_fsmeta_and_vmdk() {
+        if ensure_docker_buildx().is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some((base, _digest, pinned_base)) = e2e_pinned_base() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+
+        let layer_dir = tempfile::tempdir().unwrap();
+        write_layer_file(
+            layer_dir.path(),
+            "Dockerfile",
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\n"),
+            0o644,
+        );
+        let id = resolve(
+            layer_dir.path(),
+            Path::new("/tmp/e2e-fsmeta-project"),
+            "sha256:e2efsmeta000000000000000000000000000000000000000000000000000",
+            first_of_one(),
+        )
+        .unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let tar = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+        build_derived_oci(&id, &pinned_base, tar.path())
+            .await
+            .expect("docker buildx build");
+        load_derived_image(cache_dir.path(), tar.path(), &id.tag)
+            .await
+            .expect("load_archive");
+
+        let reference: microsandbox_image::Reference = id.tag.parse().unwrap();
+        let cache = microsandbox_image::GlobalCache::new_async(cache_dir.path())
+            .await
+            .unwrap();
+        let metadata = cache
+            .read_image_metadata_async(&reference)
+            .await
+            .unwrap()
+            .expect("metadata must be present after load_archive");
+        let manifest_digest: microsandbox_image::Digest = metadata.manifest_digest.parse().unwrap();
+
+        assert!(
+            cache.is_fsmeta_materialized(&manifest_digest),
+            "load_archive must materialize the fsmeta EROFS image, not just the VMDK \
+             (ADR-0003 Consequences)"
+        );
+        assert!(
+            cache.is_vmdk_materialized(&manifest_digest),
+            "companion assertion, so this one test names both halves of ADR-0003's \
+             invariant together"
         );
     }
 }
