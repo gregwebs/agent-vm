@@ -3338,6 +3338,103 @@ mod tests {
         );
     }
 
+    /// Amendment A1/A6's one genuinely new real-docker behavior: a project
+    /// step that was already built and ingested as a **final** step (OCI
+    /// archive, never landed in docker's local image store) must be
+    /// rebuildable as an **intermediate** (`--output type=docker`) under
+    /// the exact same tag once a `--layer` is appended after it — content-
+    /// hash chaining is prefix-stable, so the tag doesn't move even though
+    /// the *kind* of build that produces it does.
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_a_final_step_can_be_rebuilt_as_an_intermediate_under_the_same_tag() {
+        if ensure_docker_buildx().is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some((base, digest, _pinned)) = e2e_pinned_base() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+
+        let project = tempfile::tempdir().unwrap();
+        write_step(
+            project.path(),
+            "10-a",
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nENV MARKER_A=present\n"),
+        );
+        let flag_dir = tempfile::tempdir().unwrap();
+        write_layer_file(
+            flag_dir.path(),
+            "Dockerfile",
+            "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nENV MARKER_X=present\n",
+            0o644,
+        );
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let pinned_base = digest_pinned_base(&base, &digest).unwrap();
+
+        // First launch: just the project's one-step chain. Built and
+        // ingested as a final step (OCI archive) — never lands in docker's
+        // local image store.
+        let solo_dirs = resolve_layer_chain(project.path(), &[]).unwrap();
+        let solo_plan = plan_chain(&solo_dirs, project.path(), &digest).unwrap();
+        let solo_tag = solo_plan[0].id.tag.clone();
+        let mut rt = E2eChainRuntime {
+            cache_dir: cache_dir.path().to_path_buf(),
+        };
+        execute_chain(&solo_plan, &pinned_base, &mut rt)
+            .await
+            .expect("first chain execution");
+        assert!(
+            derived_is_cached(cache_dir.path(), &solo_tag)
+                .await
+                .unwrap(),
+            "the solo project step must be ingested as a final step"
+        );
+        assert!(
+            docker_image_id(&solo_tag).await.unwrap().is_none(),
+            "a step ingested only as a final (OCI) build must not be in docker's own store"
+        );
+
+        // Second launch: append a --layer after it. execute_chain's
+        // backward walk must not find `solo_tag` in docker's store, so it
+        // rebuilds step 0 as an intermediate under the *same* tag before
+        // building the flag step as the new final.
+        let chain_with_flag =
+            resolve_layer_chain(project.path(), &[flag_dir.path().to_path_buf()]).unwrap();
+        let plan_with_flag = plan_chain(&chain_with_flag, project.path(), &digest).unwrap();
+        assert_eq!(
+            plan_with_flag[0].id.tag, solo_tag,
+            "prefix-stability: the project's step must keep the exact same tag"
+        );
+        let mut rt2 = E2eChainRuntime {
+            cache_dir: cache_dir.path().to_path_buf(),
+        };
+        let final_tag = execute_chain(&plan_with_flag, &pinned_base, &mut rt2)
+            .await
+            .expect("second chain execution");
+
+        assert_eq!(final_tag, plan_with_flag[1].id.tag);
+        assert!(
+            docker_image_id(&solo_tag).await.unwrap().is_some(),
+            "step 0 must now also exist in docker's local image store, re-built as an \
+             intermediate under its unchanged tag"
+        );
+
+        let reference: microsandbox_image::Reference = final_tag.parse().unwrap();
+        let cache = microsandbox_image::GlobalCache::new_async(cache_dir.path())
+            .await
+            .unwrap();
+        let metadata = cache
+            .read_image_metadata_async(&reference)
+            .await
+            .unwrap()
+            .expect("metadata must be present after the second chain's ingest");
+        assert!(metadata.config.env.iter().any(|e| e == "MARKER_A=present"));
+        assert!(metadata.config.env.iter().any(|e| e == "MARKER_X=present"));
+    }
+
     /// The named ADR-0003 guard (issue AC 9). `derived_is_cached`'s own
     /// check (exercised by the round-trip test above, via
     /// `is_vmdk_materialized`) says nothing about the fsmeta EROFS image —
