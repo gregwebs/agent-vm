@@ -2564,22 +2564,11 @@ mod tests {
     }
 
     #[test]
-    fn prompt_is_skipped_when_pre_approved() {
-        // Safe through the real entry point: the `auto` early return
-        // precedes every io, so this cannot block on a tty even under
-        // `cargo test`'s real fd 0/2.
-        assert_eq!(
-            confirm_layer_build("tooling layer agent-vm-layer:demo-abc123", "unused", true)
-                .expect("auto confirms"),
-            Confirmation::Confirmed
-        );
-    }
-
-    #[test]
     fn confirm_layer_build_auto_confirms_without_touching_stdin_or_stderr() {
-        // `auto = true` returns before both `is_terminal()` and
-        // `ask_yes_no`, so this is safe under a real tty/fd-0 test runner —
-        // no scripted io double is needed because none is ever touched.
+        // Safe through the real entry point: the `auto` early return
+        // precedes both `is_terminal()` and `ask_yes_no`, so this cannot
+        // block on a tty even under `cargo test`'s real fd 0/2 — no scripted
+        // io double is needed because none is ever touched.
         assert_eq!(
             confirm_layer_build("subject", "question", true).expect("auto confirms"),
             Confirmation::Confirmed
