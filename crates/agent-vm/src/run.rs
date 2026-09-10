@@ -93,6 +93,35 @@ async fn image_config_path_and_digest(image: &str) -> (Option<String>, Option<St
     }
 }
 
+/// `$AGENT_VM_LAYER` was removed in issue #79: it used to *replace* the
+/// project's layer directory, and a chain has no single directory to
+/// replace. Any value, even an empty one, means a configuration somewhere
+/// still references it, and silently ignoring it would boot without the
+/// toolchain the user expects — the exact failure the layer design exists to
+/// prevent (the likeliest source of an empty value is `AGENT_VM_LAYER=
+/// "$LAYER_DIR"` with `LAYER_DIR` unset, which is exactly that silent-boot
+/// case). Only unset is OK. Pure over the value so tests never need
+/// `setenv()`.
+///
+/// Read with `env::var_os` at the call site, not `var`, so a non-UTF-8 value
+/// still trips this guard instead of reading as "unset". `OsStr` has no
+/// `Display`, so the value is interpolated with `{:?}`, and the
+/// copy-pasteable `--layer <value>` line is only emitted when the value is
+/// non-empty valid UTF-8 — a lossy value would make that line wrong.
+fn reject_removed_layer_env(value: Option<&std::ffi::OsStr>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let how = match value.to_str() {
+        Some(s) if !s.is_empty() => format!("Pass the layer on the command line instead:\n  --layer {s}\n(repeatable; flag layers are appended after the project's .agent-vm/layers/*),"),
+        _ => "Pass the directory with --layer DIR instead (repeatable; flag layers are appended after the project's .agent-vm/layers/*),".to_string(),
+    };
+    anyhow::bail!(
+        "AGENT_VM_LAYER is set ({value:?}) but is no longer supported. {how} or move it into \
+         the project as .agent-vm/layers/NN-name/. Then unset AGENT_VM_LAYER."
+    );
+}
+
 /// Mirrors [`should_check_update`]'s flag-or-truthy-env pattern: the
 /// `--yes` flag OR a truthy `AGENT_VM_YES` skips the interactive
 /// tooling-layer-build confirmation, for CI/non-interactive callers. Truthy
@@ -846,6 +875,13 @@ pub struct Args {
 }
 
 pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
+    // First statement, deliberately: a still-set $AGENT_VM_LAYER is rejected
+    // before anything else runs — state dirs, guest HOME provisioning, stale
+    // sandbox reaping, or the msb-db preflight below — because the hazard is
+    // "no project layers + env var set ⇒ silent base boot", and none of that
+    // setup should happen on the way to a launch that's about to be rejected.
+    reject_removed_layer_env(env::var_os("AGENT_VM_LAYER").as_deref())?;
+
     // Fail fast if the private msb.db was forward-migrated by a newer
     // microsandbox than this build understands, instead of letting the SDK
     // surface sea-orm's opaque "Migration file ... is missing" error on
@@ -2296,6 +2332,44 @@ mod tests {
     fn path_from_config_env_ignores_non_path_keys_containing_path_substring() {
         let env = vec!["XPATH=/should-not-match".to_string()];
         assert_eq!(path_from_config_env(&env), None);
+    }
+
+    #[test]
+    fn reject_removed_layer_env_accepts_unset() {
+        assert!(reject_removed_layer_env(None).is_ok());
+    }
+
+    #[test]
+    fn reject_removed_layer_env_rejects_an_empty_value() {
+        let err = reject_removed_layer_env(Some(std::ffi::OsStr::new(""))).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("AGENT_VM_LAYER"), "{msg}");
+        assert!(
+            !msg.contains("--layer \"\"") && !msg.lines().any(|l| l.trim() == "--layer"),
+            "an empty value has nothing to suggest as a copy-pasteable --layer line: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_removed_layer_env_rejects_a_set_value() {
+        let err = reject_removed_layer_env(Some(std::ffi::OsStr::new("x"))).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("AGENT_VM_LAYER"), "{msg}");
+        assert!(msg.contains('x'), "{msg}");
+        assert!(msg.contains("--layer x"), "{msg}");
+    }
+
+    #[test]
+    fn reject_removed_layer_env_rejects_non_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let value = std::ffi::OsStr::from_bytes(b"\xff");
+        let err = reject_removed_layer_env(Some(value)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("AGENT_VM_LAYER"), "{msg}");
+        assert!(
+            !msg.contains("--layer \u{fffd}") && !msg.lines().any(|l| l.trim().starts_with("--layer ")),
+            "a lossy value must not be offered as a copy-pasteable --layer line: {msg}"
+        );
     }
 
     #[test]
