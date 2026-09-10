@@ -402,10 +402,10 @@ user session depends on them. `--no-verify` skips it for Dockerfile iteration;
 `--image` / `AGENT_VM_IMAGE_TAG` points at an alternative tag without touching
 `build.sh`.
 
-Project tooling layers (`.agent-vm/layers/*/`) are an ordered chain, each
-step's Dockerfile built `FROM` the previous one; only the final image is
-booted, ingested registry-lessly. See
-[ADR-0003](docs/adr/0003-project-tooling-layers.md).
+Project tooling layers (`.agent-vm/layers/*/`, plus any `--layer DIR`
+appended after them) are an ordered chain, each step's Dockerfile built
+`FROM` the previous one; only the final image is booted, ingested
+registry-lessly. See [ADR-0003](docs/adr/0003-project-tooling-layers.md).
 
 ## Credentials
 

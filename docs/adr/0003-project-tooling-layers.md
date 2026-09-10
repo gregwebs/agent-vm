@@ -4,10 +4,13 @@
 
 Accepted. The single-layer decision is superseded by ordered layer chains
 (issue #79) — see "Amendment: ordered layer chains" below, which also
-records the removal of `--layer` / `$AGENT_VM_LAYER`. Every other decision
-here (registry-less ingest, digest-pinned base, hash-as-staleness-check,
-hard-fail, the Dockerfile contract) is unchanged and now applies per chain
-step.
+records the removal of `--layer` / `$AGENT_VM_LAYER`. A follow-on amendment,
+"Amendment: `--layer` returns, additive and repeatable", redefines `--layer`
+as a repeatable flag appended after the project's own chain and records that
+`$AGENT_VM_LAYER` stays removed and is now rejected outright if set. Every
+other decision here (registry-less ingest, digest-pinned base,
+hash-as-staleness-check, hard-fail, the Dockerfile contract) is unchanged and
+now applies per chain step.
 
 ## Context
 
@@ -237,13 +240,19 @@ toolchain. A project now declares an **ordered chain** of layers, each built
 **Location.** `.agent-vm/layers/` is now the *only* location a chain can
 live. Its immediate subdirectories are the chain, in byte-lexicographic
 order by directory name (`10-toolchain` before `20-chrome`); each must hold
-a `Dockerfile`. `layer::resolve_layer_dirs` replaces `layer::resolve_layer_dir`.
+a `Dockerfile`. `layer::resolve_layer_dirs` replaces `layer::resolve_layer_dir`
+(itself later renamed `layer::resolve_layer_chain` by the follow-on amendment
+below, which also takes back part of this paragraph's claim).
 
-**`--layer` and `$AGENT_VM_LAYER` are removed. There is no override.** A
-chain expresses something a single-directory override cannot (a whole
-ordered sequence of steps), and a project's tooling layout is a property of
-the project's checkout, not of an invocation — so there is nothing left for
-a flag to usefully override.
+**`--layer` and `$AGENT_VM_LAYER` are removed. There is no override.**
+*(Superseded in part — see "Amendment: `--layer` returns, additive and
+repeatable" below: `--layer` comes back as a repeatable, additive flag;
+`$AGENT_VM_LAYER` stays removed.)* A chain expresses something a
+single-directory *override* cannot (a whole ordered sequence of steps), and
+a project's tooling layout is a property of the project's checkout, not of
+an invocation — so there is nothing left for a flag to usefully *override*.
+There is, however, still room for a flag to *add* to the chain, which is
+exactly what the follow-on amendment does.
 
 **No compatibility with the singular `.agent-vm/layer/`.** A leftover
 `.agent-vm/layer/` — in any form, whether or not `.agent-vm/layers/` also
@@ -362,6 +371,87 @@ docker-archive as well as OCI layout) — rejected because it reverses three
 of this ADR's own decisions at once (OCI layout over `docker save`, zstd for
 blob dedup, `--provenance=false --sbom=false`) to save a one-time cost on an
 uncommon transition.
+
+### Amendment: `--layer` returns, additive and repeatable (issue #79, follow-on)
+
+The previous amendment removed `--layer` / `$AGENT_VM_LAYER` outright,
+reasoning that a chain has no single directory left for a flag to override.
+After reviewing that, the user asked whether a flag could instead *add* a
+layer not under `.agent-vm/layers/` — appended to whatever is already there,
+repeatable — and approved doing so. So `--layer` comes back, but redefined:
+
+- **`--layer DIR` is repeatable and additive**, never an override. Its
+  directories are appended *after* `.agent-vm/layers/*`, in command-line
+  order: `chain = .agent-vm/layers/*/ (sorted) ++ --layer DIR ... (as given)`.
+  It works with no `.agent-vm/layers/` at all — the chain is then just the
+  flag layers, restoring the "try a checked-in example" workflow
+  (`agent-vm shell --layer examples/layers/chrome-devtools --yes`).
+- **Still no environment variable.** The removed `$AGENT_VM_LAYER` stays
+  removed as an input; any presence — including an empty value — is now a
+  hard error pointing at `--layer`, raised as the first statement of
+  `launch()`, before any state-dir provisioning or the msb-db preflight.
+  Silently ignoring it would boot without the toolchain the user expects,
+  which is exactly the failure this whole design exists to prevent.
+- **Still no compatibility with `.agent-vm/layer/`** (singular). The legacy
+  migration-guardrail error runs first and unconditionally, exactly as
+  before; a `--layer` cannot reach the legacy directory by a side door,
+  because the guardrail fires on the directory's mere presence, independent
+  of any flag.
+
+**Why append, not prepend.** Content-hash chaining is prefix-stable: step
+`i`'s hash depends only on steps `0..i`, so appending after the project's own
+steps leaves every one of their tags untouched — a project's chain stays a
+pure cache hit whether or not any `--layer` is passed. Prepending would shift
+every project step onto a new predecessor hash and invalidate the whole
+chain every time a flag was added or removed.
+
+**Provenance stays out of the hash.** A resolved chain step now carries
+*where* it came from (a project subdirectory or a `--layer` value, plus the
+human-facing label used in prompts and errors) alongside the identity
+`layer::resolve` computes, not inside it — `resolve` and `LayerIdentity` are
+completely unchanged by this amendment. That is what makes **try-then-adopt**
+free: `agent-vm shell --layer examples/layers/chrome-devtools --yes` in a
+project with no layers, followed by copying that same directory into
+`.agent-vm/layers/20-chrome-devtools/`, produces the identical tag at the
+same chain position — the adopted layer is a cache hit, not a rebuild.
+
+**Validation.** Each `--layer` value is checked, in this fixed order (so the
+right problem is always reported first): non-empty; exists and is a
+directory (relative paths resolve against the project directory, the one
+deliberate divergence from `--mount`'s absolute-only rule, because trying a
+checked-in example by relative path is the point); not the project directory
+or an ancestor of it (`plan_chain` hashes and would upload a step's whole
+tree on every launch — pointing that at the project root would mean the
+entire checkout); holds a `Dockerfile` (with a hint when the named directory
+instead holds subdirectories that are themselves layers, e.g. `--layer
+examples/layers`). Then the combined chain (project steps plus flag steps)
+is checked for duplicates by canonical path, which also catches a flag
+naming an already-declared project step and symlink aliasing.
+
+**Accepted consequence: the first `--layer` re-exports the project's last
+step.** This generalizes the single-step-chain consequence above. A project
+chain's final step is built with `--output type=oci` and never lands in
+docker's local image store; the first time a `--layer` is appended after it,
+`execute_chain`'s backward walk finds that step absent from the store and
+rebuilds it as an intermediate under its *unchanged* tag before building the
+new final step. Correctness is unaffected (the tag is prefix-stable, so the
+rebuild reproduces identical content); the cost is a one-time re-export,
+usually fast off buildx's own build cache. Dropping the flag again afterward
+is a pure cache hit, because the project's own final tag never left the msb
+cache. Verified live (`e2e_a_final_step_can_be_rebuilt_as_an_intermediate_under_the_same_tag`):
+build a one-step project chain (ingested, absent from docker's store), then
+append a `--layer`; step 0 rebuilds under its original tag and lands in
+docker's store, the flag step becomes the new final, and both steps' markers
+are present in the ingested image.
+
+Deferred as a follow-up, not part of this amendment: a live spike (buildx
+v0.36.1, `docker` driver) confirmed that a single build can emit **both**
+`--output type=docker` and `--output type=oci` exporters at once, which would
+let every final build also land in docker's store and eliminate this
+consequence entirely (and the equivalent one above). Not done here because it
+changes the final-build path this amendment does not otherwise touch, needs
+buildx ≥ 0.13, and the existing zstd→gzip retry logic would need to cover a
+second exporter.
 
 ## Consequences
 

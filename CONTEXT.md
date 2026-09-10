@@ -120,22 +120,26 @@ A project-owned `Dockerfile` (plus its build context — the rest of that
 directory) that adds project-specific tools `FROM` the previous step in the
 chain: compilers, cross-toolchains, anything the base doesn't carry. A
 single tooling layer is one step of a "layer chain" (see below); resolved by
-`layer::resolve_layer_dirs`. There is no flag or env override — the chain is
-always `.agent-vm/layers/*/` under the project root. See
+`layer::resolve_layer_chain`. There is no environment-variable override —
+`$AGENT_VM_LAYER` is rejected outright if set — but there is composition: the
+chain is the project's own `.agent-vm/layers/*/` steps, then any `--layer
+DIR` values (repeatable, appended after, never prepended). See
 `docs/adr/0003-project-tooling-layers.md`.
 
 ## Layer chain
 
-The project's tooling layers, in build order: the immediate subdirectories
-of `.agent-vm/layers/`, sorted byte-lexicographically by directory name
-(`10-toolchain` before `20-chrome`). Each step builds `FROM` the previous
-step (the base image for step 0); only the **final** step is ingested into
-the msb cache — intermediates live in docker's own local image store,
-pinned for the next step by tag. `layer::plan_chain` computes the whole
-chain's identities up front (pure, no I/O beyond hashing); `layer::execute_chain`
-drives the build. A leftover singular `.agent-vm/layer/` (the pre-chain,
-one-layer-only layout) is a hard migration error naming the path, not a
-supported alias. See `docs/adr/0003-project-tooling-layers.md`.
+The project's tooling layers plus any `--layer` flags, in build order: the
+immediate subdirectories of `.agent-vm/layers/`, sorted byte-lexicographically
+by directory name (`10-toolchain` before `20-chrome`), then each `--layer DIR`
+in command-line order. Each step builds `FROM` the previous step (the base
+image for step 0); only the **final** step is ingested into the msb cache —
+intermediates live in docker's own local image store, pinned for the next
+step by tag. `layer::plan_chain` computes the whole chain's identities up
+front (pure, no I/O beyond hashing); `layer::execute_chain` drives the build.
+A leftover singular `.agent-vm/layer/` (the pre-chain, one-layer-only layout)
+is a hard migration error naming the path, not a supported alias, and a
+`--layer` cannot reach it either — the check runs first and unconditionally.
+See `docs/adr/0003-project-tooling-layers.md`.
 
 ## Derived image
 

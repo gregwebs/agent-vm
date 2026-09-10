@@ -79,6 +79,7 @@ Each launcher accepts:
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
 | `--mount HOST[:GUEST][:MODE]...` | extra bind mount (one virtio-fs each). Modes: `:rw` (default), `:ro` read-only, `:follow-links` also bind the real directories that symlinks under `HOST` resolve to (implies `:ro`, so it combines with it). Capacity is host-specific ([runtime evidence](ARCHITECTURE.md#runtime-provenance-and-platform-profiles)); design notes in [Extra mounts](ARCHITECTURE.md#extra-mounts-ro-rw-follow-links) |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
+| `--layer DIR` | append a tooling layer after the project's own `.agent-vm/layers/*` (repeatable, command-line order; relative to the project dir) — see [Project tooling layers](#project-tooling-layers) |
 | `--yes` / `-y` | assume "yes" to the tooling-layer chain build confirmation (CI/non-interactive) — see [Project tooling layers](#project-tooling-layers) |
 
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
@@ -104,6 +105,9 @@ included, enables it.
 | `AGENT_VM_ROOT` | same as `--root` (accepted: `1`/`true`/`yes`/`on`) |
 | `AGENT_VM_YES` | same as `--yes` (accepted: `1`/`true`/`yes`/`on`) |
 
+`AGENT_VM_LAYER` was removed; if set, launches fail with a pointer to
+`--layer`.
+
 ## Project tooling layers
 
 A project can add tools on top of the base image — compilers,
@@ -119,8 +123,39 @@ step), in byte-lexicographic order by directory name:
 
 A single-step chain (just `.agent-vm/layers/10-tools/`) is the common case
 and is not a special case — it behaves exactly like the single layer this
-feature originally shipped as. There is no `--layer` flag or `$AGENT_VM_LAYER`
-override: the chain is always read from `.agent-vm/layers/` in the project.
+feature originally shipped as.
+
+`--layer DIR` (repeatable) **appends** more steps after the project's own
+`.agent-vm/layers/*` chain, in the order given on the command line:
+
+```
+agent-vm shell --layer ../shared/debug-tools --layer examples/layers/chrome-devtools
+```
+
+It appends rather than prepends because content-hash chaining is
+*prefix-stable*: a step's hash depends only on the steps before it, so
+appending never moves any project step's tag — a project's own chain stays a
+pure cache hit whether or not a `--layer` is passed that launch. `--layer`
+also works with **no** `.agent-vm/layers/` at all, which is how you try a
+checked-in example without copying it into the project first:
+
+```
+agent-vm shell --layer examples/layers/chrome-devtools --yes
+```
+
+Relative `--layer` paths resolve against the project directory (unlike
+`--mount`, which requires absolute paths — trying an example by relative path
+is the point). There is deliberately no environment variable for `--layer`;
+see the `AGENT_VM_LAYER` note above. The first time a `--layer` is appended
+after a project chain whose last step was already built, that last step gets
+rebuilt once (re-exported into docker's local image store, since it was
+built as a final/OCI step and never landed there) — this is expected, not a
+bug, and buildx's own build cache usually makes it fast; dropping the flag
+again afterward is a pure cache hit, because the project's own tag never left
+the msb cache. Trying a layer via `--layer` and then adopting it into the
+project (copying it under `.agent-vm/layers/`) costs nothing either: the hash
+covers the directory's contents and position in the chain, never how it was
+named on the command line, so the adopted layer is a cache hit too.
 
 When a chain is declared, `agent-vm claude`/`codex`/`opencode`/`copilot`/`shell`
 builds each step with `docker buildx build`, chaining every step `FROM` the
@@ -144,12 +179,15 @@ every step's hash is already cached, one confirmation for the whole chain:
 Build project tooling layer 'agent-vm-layer:my-app-1a2b3c...'? [y/N]
 ```
 
-for a single-step chain, or for a multi-step chain:
+for a single-step chain, or for a multi-step chain (`--layer` steps are
+labeled with their flag, as typed, so it's clear which came from the project
+and which from the command line):
 
 ```
-Build project tooling layer chain (2 steps)?
-  1/2  .agent-vm/layers/10-toolchain  agent-vm-layer:my-app-1a2b3c…
-  2/2  .agent-vm/layers/20-chrome     agent-vm-layer:my-app-9f8e7d…
+Build project tooling layer chain (3 steps)?
+  1/3  .agent-vm/layers/10-toolchain            agent-vm-layer:my-app-1a2b3c…
+  2/3  .agent-vm/layers/20-lint                 agent-vm-layer:my-app-9f8e7d…
+  3/3  --layer examples/layers/chrome-devtools  agent-vm-layer:my-app-2c1d9e…
  [y/N]
 ```
 
@@ -302,8 +340,11 @@ for the full design rationale.
 
 The base image does not include Chromium. Select the marker-bearing
 [`chrome-devtools` tooling layer](examples/layers/chrome-devtools/) to install
-it and have the launcher add its owned `mcpServers.chrome-devtools` entry.
-Removing the layer removes that stale owned entry while preserving other MCPs.
+it and have the launcher add its owned `mcpServers.chrome-devtools` entry —
+either copy it into the project as a numbered step
+(`.agent-vm/layers/NN-chrome-devtools/`) or try it without copying via
+`agent-vm claude --layer examples/layers/chrome-devtools --yes`. Removing the
+layer removes that stale owned entry while preserving other MCPs.
 `AGENT_VM_NO_CHROME_MCP=1` removes the automatic entry but leaves Chromium
 available for manual use. The wrapper preserves Chromium's nested sandbox:
 non-root guests run it directly and root guests switch only to the dedicated
