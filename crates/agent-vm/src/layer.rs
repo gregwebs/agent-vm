@@ -609,9 +609,13 @@ pub struct ChainDir {
 ///      own toolchain, the same looks-healthy-but-missing-it failure.
 ///    - otherwise, its immediate subdirectories, byte-lexicographically
 ///      sorted by file name (`fs::read_dir` order is arbitrary, so this sort
-///      is mandatory — `10-a` < `20-b` < `30-c` falls out of byte order).
-///      Each must hold a `Dockerfile` ([`require_step_dir`]). Non-directory
-///      entries (`README.md`, `.gitkeep`) are ignored — they are not steps.
+///      is mandatory — `10-a` < `20-b` < `30-c` falls out of byte order). A
+///      symlink to a directory counts as a step too (a natural way to adopt
+///      an example without copying it); a dangling symlink is a hard error
+///      naming the entry, since a declared step must never silently vanish.
+///      Each must hold a `Dockerfile` ([`require_step_dir`]). Every other
+///      non-directory entry (`README.md`, `.gitkeep`) is ignored — it is not
+///      a step.
 /// 3. Flag steps, in command-line order. For each, checks run in this fixed
 ///    order — the ancestor check must precede the `Dockerfile` check, or
 ///    `--layer ..` would report "no Dockerfile" instead of the real problem:
@@ -680,12 +684,24 @@ fn resolve_project_steps(project_dir: &Path) -> Result<Vec<ChainDir>> {
                 layers_dir.display()
             )
         })?;
-        if entry
+        let file_type = entry
             .file_type()
-            .with_context(|| format!("reading {}", entry.path().display()))?
-            .is_dir()
-        {
+            .with_context(|| format!("reading {}", entry.path().display()))?;
+        // `DirEntry::file_type` does not follow symlinks (it's an lstat), so
+        // a symlinked step (a natural way to adopt an example without
+        // copying it) would otherwise fall through to "ignored" and vanish
+        // from the chain silently — exactly the missing-toolchain-but-looks-
+        // healthy failure this module exists to prevent. A dangling symlink
+        // must not silently vanish either: it was declared as a step, so an
+        // unreachable target is an error, not a no-op.
+        if file_type.is_dir() || (file_type.is_symlink() && entry.path().is_dir()) {
             names.push(entry.file_name());
+        } else if file_type.is_symlink() && !entry.path().exists() {
+            bail!(
+                "{} is a symlink to a path that does not exist; each layer step must resolve to \
+                 a real directory",
+                entry.path().display()
+            );
         } else if entry.file_name() == "Dockerfile" {
             bail!(
                 "{} has a Dockerfile directly inside it; each layer step needs its own \
@@ -1914,6 +1930,65 @@ mod tests {
         assert_eq!(
             dirs_of(&resolve_layer_chain(project.path(), &[]).unwrap()),
             vec![dir]
+        );
+    }
+
+    #[test]
+    fn resolve_layer_dirs_follows_a_symlinked_step() {
+        let project = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::write(target.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let layers_dir = project.path().join(LAYERS_SUBDIR);
+        fs::create_dir_all(&layers_dir).unwrap();
+        let link = layers_dir.join("20-x");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+
+        let chain = resolve_layer_chain(project.path(), &[]).unwrap();
+        assert_eq!(
+            chain.len(),
+            1,
+            "a symlinked step must not be silently dropped"
+        );
+        assert_eq!(
+            chain[0].dir, link,
+            "a symlinked project step displays at its own (uncanonicalised) path"
+        );
+        assert_eq!(chain[0].label, format!("{LAYERS_SUBDIR}/20-x"));
+    }
+
+    #[test]
+    fn resolve_layer_dirs_dangling_symlink_step_errors() {
+        let project = tempfile::tempdir().unwrap();
+        let layers_dir = project.path().join(LAYERS_SUBDIR);
+        fs::create_dir_all(&layers_dir).unwrap();
+        let link = layers_dir.join("20-x");
+        std::os::unix::fs::symlink("nothing-is-here", &link).unwrap();
+
+        let err = resolve_layer_chain(project.path(), &[]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(&link.display().to_string()),
+            "must name the dangling entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_layer_dirs_symlinked_step_hashes_like_the_real_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let real_dir = write_step(project.path(), "10-a", "FROM scratch\n");
+
+        let target = tempfile::tempdir().unwrap();
+        fs::write(target.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let linked_dir = project.path().join(LAYERS_SUBDIR).join("20-x");
+        std::os::unix::fs::symlink(target.path(), &linked_dir).unwrap();
+
+        let real_identity =
+            resolve(&real_dir, project.path(), TEST_BASE_ID, first_of_one()).unwrap();
+        let linked_identity =
+            resolve(&linked_dir, project.path(), TEST_BASE_ID, first_of_one()).unwrap();
+        assert_eq!(
+            real_identity.tag, linked_identity.tag,
+            "a symlinked step must hash identically to the same contents on disk"
         );
     }
 
