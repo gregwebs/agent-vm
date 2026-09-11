@@ -38,6 +38,20 @@ fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
 }
 
+/// Base directory for harness `$HOME`/project dirs that is on the real
+/// workspace filesystem rather than a host path under a guest tmpfs prefix.
+///
+/// `run::guest_path_is_safe` remaps any project below `/tmp` (and the other
+/// `TMPFS_GUEST_PREFIXES`) to `/workspace`. On macOS `tempdir_in("/tmp")`
+/// canonicalizes to `/private/tmp`, which escapes that prefix, but on Linux
+/// `/tmp` is a real directory, so a `/tmp` project is remapped and its guest
+/// path stops equalling its host path. Cargo creates `CARGO_TARGET_TMPDIR`
+/// (`<target>/tmp`) before running integration tests, so dirs created there
+/// keep host and guest paths identical on both platforms.
+fn harness_tmpdir() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+}
+
 /// Write a fake `msb` that always reports the official version this
 /// agent-vm build vendors, satisfying `point_at_msb`'s `--version` check
 /// regardless of subcommand or args. Mirrors `msb_cache_share.rs`'s
@@ -141,11 +155,14 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        // The relay socket lives below the state directory. macOS's default
-        // temporary root is long enough to exceed Unix's socket-path limit.
-        let home = tempfile::tempdir_in("/tmp").unwrap();
+        // The relay socket lives below the state directory, so keep that one
+        // under `/tmp` to stay within Unix's socket-path limit. `$HOME` and
+        // the project dir live on the workspace filesystem instead: a project
+        // under `/tmp` is remapped to `/workspace` on Linux, breaking tests
+        // that reason about the project's guest path.
+        let home = tempfile::tempdir_in(harness_tmpdir()).unwrap();
         let state = tempfile::tempdir_in("/tmp").unwrap();
-        let project = tempfile::tempdir_in("/tmp").unwrap();
+        let project = tempfile::tempdir_in(harness_tmpdir()).unwrap();
         let fake_msb = write_fake_msb(home.path());
         Self {
             home,
