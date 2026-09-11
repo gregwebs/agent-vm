@@ -629,7 +629,11 @@ pub struct ChainDir {
 ///    symlink aliasing.
 pub fn resolve_layer_chain(project_dir: &Path, flag_dirs: &[PathBuf]) -> Result<Vec<ChainDir>> {
     let legacy = project_dir.join(LEGACY_LAYER_SUBDIR);
-    if legacy.exists() {
+    // symlink_metadata (lstat), not exists() (which follows symlinks and
+    // reports false for a dangling one): "exists in any form" must also
+    // catch a leftover `.agent-vm/layer` symlink whose target is gone, or a
+    // half-migrated checkout would silently slip past this guardrail.
+    if fs::symlink_metadata(&legacy).is_ok() {
         bail!(
             "{} is no longer supported (agent-vm now composes an ordered chain \
              of layers). Move it under {}/ as a numbered step, e.g.\n  \
@@ -1281,7 +1285,11 @@ pub async fn docker_image_id(tag: &str) -> Result<Option<String>> {
         .args(["image", "inspect", tag, "--format", "{{.Id}}"])
         .output()
         .await
-        .with_context(|| format!("spawning `docker image inspect {tag}`"))?;
+        .with_context(|| {
+            format!(
+                "spawning `docker image inspect {tag}` failed; is docker installed and on PATH?"
+            )
+        })?;
     if !output.status.success() {
         // Exit 1 covers both "no such image" and "daemon unreachable" —
         // indistinguishable from the exit code alone. That ambiguity is
@@ -1805,7 +1813,7 @@ mod tests {
         assert_eq!(slug(Path::new("")), "root");
     }
 
-    // --- resolve_layer_dirs() ---
+    // --- resolve_layer_chain() — project steps only ---
 
     /// Creates `<project>/.agent-vm/layers/<name>/Dockerfile`.
     fn write_step(project: &Path, name: &str, dockerfile: &str) -> PathBuf {
@@ -1861,6 +1869,23 @@ mod tests {
         let msg = format!("{err:?}");
         assert!(msg.contains(&legacy.display().to_string()), "{msg}");
         assert!(msg.contains(LAYERS_SUBDIR), "{msg}");
+    }
+
+    #[test]
+    fn resolve_layer_dirs_legacy_dangling_symlink_is_a_migration_error() {
+        let project = tempfile::tempdir().unwrap();
+        let legacy = project.path().join(LEGACY_LAYER_SUBDIR);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("nothing-is-here", &legacy).unwrap();
+        assert!(
+            !legacy.exists(),
+            "sanity: exists() must report false for a dangling symlink, which is exactly why \
+             the guardrail cannot use it"
+        );
+
+        let err = resolve_layer_chain(project.path(), &[]).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains(&legacy.display().to_string()), "{msg}");
     }
 
     #[test]
@@ -2144,10 +2169,18 @@ mod tests {
         fs::write(flag.path().join("Dockerfile"), "FROM scratch\n").unwrap();
         let dotted = flag.path().join(".");
 
-        let err =
-            resolve_layer_chain(project.path(), &[flag.path().to_path_buf(), dotted]).unwrap_err();
+        let err = resolve_layer_chain(project.path(), &[flag.path().to_path_buf(), dotted.clone()])
+            .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains(&flag.path().display().to_string()), "{msg}");
+        assert!(msg.contains("same layer directory"), "{msg}");
+        assert!(
+            msg.contains(&format!("--layer {}", flag.path().display())),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!("--layer {}", dotted.display())),
+            "{msg}"
+        );
     }
 
     #[test]

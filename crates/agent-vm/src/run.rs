@@ -161,7 +161,14 @@ fn layer_build_question(tag: &str) -> String {
 ///   3/3  --layer examples/layers/chrome-devtools  agent-vm-layer:my-app-9f8e7d…
 /// ```
 fn layer_chain_build_question(steps: &[layer::PlannedStep]) -> String {
-    let label_width = steps.iter().map(|s| s.label.len()).max().unwrap_or(0);
+    // chars(), not len(): len() counts bytes, so a non-ASCII label (a
+    // `--layer` path with a multi-byte character in it) would pad by the
+    // wrong amount and misalign the tag column `{:label_width$}` targets.
+    let label_width = steps
+        .iter()
+        .map(|s| s.label.chars().count())
+        .max()
+        .unwrap_or(0);
     let mut question = format!("Build project tooling layer chain ({} steps)?", steps.len());
     for step in steps {
         question.push_str(&format!(
@@ -2935,7 +2942,7 @@ mod tests {
     // opt-in docker+registry e2e paths (see layer.rs's `#[ignore]`d
     // `e2e_*` tests and the manual verification recorded for issue #13/#79),
     // but its "no chain declared" short circuit is pure and network-free:
-    // `layer::resolve_layer_dirs` returns an empty chain on a missing
+    // `layer::resolve_layer_chain` returns an empty chain on a missing
     // `.agent-vm/layers/` before this function's first `.await`, so this
     // is safe to pin as an ordinary fast unit test. It locks in the
     // guarantee that a non-layer project's boot path is byte-identical to
@@ -3085,6 +3092,12 @@ mod tests {
         let project_label_col = project_line.find(".agent-vm").unwrap();
         let flag_label_col = flag_line.find("--layer").unwrap();
         assert_eq!(project_label_col, flag_label_col, "{question}");
+        // The tag column must align too — the label-column check above only
+        // proves the padding starts at the same place, not that it's wide
+        // enough to push the *tag* into alignment as well.
+        let project_tag_col = project_line.find("agent-vm-layer:").unwrap();
+        let flag_tag_col = flag_line.find("agent-vm-layer:").unwrap();
+        assert_eq!(project_tag_col, flag_tag_col, "{question}");
     }
 
     #[test]
