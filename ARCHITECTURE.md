@@ -36,7 +36,7 @@ crates/agent-vm/src/
 │       └── oauth_refresh.rs#   OAuth validation, rotation, single-flight
 ├── network.rs              # egress policy and published ports
 ├── mount.rs                # --mount grammar and volume wiring
-├── layer.rs                # project tooling layers (--layer)
+├── layer.rs                # project tooling layers (.agent-vm/layers/, plus --layer)
 ├── msb_install.rs          # locate + version-verify the bundled msb; MSB_HOME
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
 ├── doctor.rs               # operator diagnostics and db recovery
@@ -402,9 +402,10 @@ user session depends on them. `--no-verify` skips it for Dockerfile iteration;
 `--image` / `AGENT_VM_IMAGE_TAG` points at an alternative tag without touching
 `build.sh`.
 
-Project tooling layers (`--layer`) build a Dockerfile `FROM` the base image and
-boot the derived image registry-lessly; see
-[ADR-0003](docs/adr/0003-project-tooling-layers.md).
+Project tooling layers (`.agent-vm/layers/*/`, plus any `--layer DIR`
+appended after them) are an ordered chain, each step's Dockerfile built
+`FROM` the previous one; only the final image is booted, ingested
+registry-lessly. See [ADR-0003](docs/adr/0003-project-tooling-layers.md).
 
 ## Credentials
 
@@ -734,7 +735,7 @@ directories the user never asked for.
 |---|---|
 | Non-root guest via a native user | [ADR-0001](docs/adr/0001-non-root-guest-via-native-user.md) |
 | Mirroring the host `$HOME` and username into the guest | [ADR-0002](docs/adr/0002-mirror-host-home-and-username.md) |
-| Project tooling layers (`--layer`) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
+| Project tooling layers (`.agent-vm/layers/`, plus any `--layer DIR`) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
 | One shared `MSB_HOME`, not schema-namespaced | [ADR-0004](docs/adr/0004-single-shared-msb-home.md) |
 | Deferring the sea-orm / sqlx major bump | [ADR-0005](docs/adr/0005-defer-sea-orm-sqlx-major-bump.md) |
 | Adopting a clean microsandbox v0.6.15 baseline (dropping the fork) | [ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md) |

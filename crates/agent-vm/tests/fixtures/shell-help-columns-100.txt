@@ -150,24 +150,23 @@ Image:
           `AGENT_VM_UPDATE_CHECK` (1|true|yes|on).
 
       --layer <DIR>
-          Tooling-layer directory (a Dockerfile built FROM the base image).
+          Append a tooling layer to this launch's chain (repeatable).
 
-          Precedence: this flag, then $AGENT_VM_LAYER, then the default `.agent-vm/layer/` in the
-          project. An explicitly-pointed-at dir missing a Dockerfile is an error; the default dir
-          simply being absent means "no layer". When a layer is declared, the derived image (base +
-          layer) is built, loaded registry-lessly, and booted in place of the base — see
-          `docs/adr/0003-project-tooling-layers.md`. A hash miss (new/changed layer) prompts for
-          confirmation unless `--yes` / `$AGENT_VM_YES` is set.
-
-          [env: AGENT_VM_LAYER]
+          Each DIR is one layer directory holding a Dockerfile that starts `ARG BASE_IMAGE` / `FROM
+          ${BASE_IMAGE}`. Flag layers are appended after the project's own `.agent-vm/layers/*`
+          steps, in the order given, so the project's steps keep their cached images; it works with
+          no `.agent-vm/layers/` at all. Relative paths resolve against the project directory (the
+          current directory) — unlike `--mount`, which requires absolute paths, because trying a
+          checked-in example by relative path is the point. There is deliberately no environment
+          variable; the removed `AGENT_VM_LAYER` is rejected if set.
 
   -y, --yes
           Assume "yes" to the tooling-layer build confirmation prompt.
 
-          Needed for CI/non-interactive launches whenever the tooling-layer hash doesn't already
-          match a previously built/loaded derived image (a new project, or an edited
-          `.agent-vm/layer/Dockerfile`). Can also be set persistently with a truthy `AGENT_VM_YES`
-          (1|true|yes|on).
+          Needed for CI/non-interactive launches whenever a chain step's hash doesn't already match
+          a previously built/loaded derived image (a new project, or an edited
+          `.agent-vm/layers/*/Dockerfile`). Can also be set persistently with a truthy
+          `AGENT_VM_YES` (1|true|yes|on).
 
 Guest user:
       --root

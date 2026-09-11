@@ -93,11 +93,33 @@ async fn image_config_path_and_digest(image: &str) -> (Option<String>, Option<St
     }
 }
 
-/// `AGENT_VM_LAYER=""` (clap's `env` does not filter empty values) must
-/// resolve as "unset", not as an explicit empty-path layer dir that would
-/// hard-error `resolve_layer_dir` on a missing Dockerfile.
-fn normalize_layer_flag(flag: Option<PathBuf>) -> Option<PathBuf> {
-    flag.filter(|p| !p.as_os_str().is_empty())
+/// `$AGENT_VM_LAYER` was removed in issue #79: it used to *replace* the
+/// project's layer directory, and a chain has no single directory to
+/// replace. Any value, even an empty one, means a configuration somewhere
+/// still references it, and silently ignoring it would boot without the
+/// toolchain the user expects — the exact failure the layer design exists to
+/// prevent (the likeliest source of an empty value is `AGENT_VM_LAYER=
+/// "$LAYER_DIR"` with `LAYER_DIR` unset, which is exactly that silent-boot
+/// case). Only unset is OK. Pure over the value so tests never need
+/// `setenv()`.
+///
+/// Read with `env::var_os` at the call site, not `var`, so a non-UTF-8 value
+/// still trips this guard instead of reading as "unset". `OsStr` has no
+/// `Display`, so the value is interpolated with `{:?}`, and the
+/// copy-pasteable `--layer <value>` line is only emitted when the value is
+/// non-empty valid UTF-8 — a lossy value would make that line wrong.
+fn reject_removed_layer_env(value: Option<&std::ffi::OsStr>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let how = match value.to_str() {
+        Some(s) if !s.is_empty() => format!("Pass the layer on the command line instead:\n  --layer {s}\n(repeatable; flag layers are appended after the project's .agent-vm/layers/*),"),
+        _ => "Pass the directory with --layer DIR instead (repeatable; flag layers are appended after the project's .agent-vm/layers/*),".to_string(),
+    };
+    anyhow::bail!(
+        "AGENT_VM_LAYER is set ({value:?}) but is no longer supported. {how} or move it into \
+         the project as .agent-vm/layers/NN-name/. Then unset AGENT_VM_LAYER."
+    );
 }
 
 /// Mirrors [`should_check_update`]'s flag-or-truthy-env pattern: the
@@ -116,11 +138,66 @@ enum Confirmation {
     Declined,
 }
 
-/// The prompt wording pinned by ADR-0003. A function (not an inline
-/// `format!`) so `prompt_wording_matches_the_adr` renders the *production*
-/// string instead of a copy that could drift from it.
+/// The single-step prompt wording pinned by ADR-0003. A function (not an
+/// inline `format!`) so `prompt_wording_matches_the_adr` renders the
+/// *production* string instead of a copy that could drift from it. Used
+/// as-is for a one-step chain, so that common case stays byte-identical to
+/// the pre-chain single-layer prompt.
 fn layer_build_question(tag: &str) -> String {
     format!("Build project tooling layer '{tag}'?")
+}
+
+/// The multi-step prompt wording — a fn, like its single-step sibling, so a
+/// test renders production text rather than a copy that can drift. Each
+/// step's label (`.agent-vm/layers/10-toolchain` for a project step,
+/// `--layer <as typed>` for a flag step — see [`layer::ChainDir::label`]) is
+/// padded to the widest one so tags align even when a `--layer` label runs
+/// long.
+///
+/// ```text
+/// Build project tooling layer chain (3 steps)?
+///   1/3  .agent-vm/layers/10-toolchain            agent-vm-layer:my-app-1a2b3c…
+///   2/3  .agent-vm/layers/20-chrome               agent-vm-layer:my-app-9f8e7d…  (cached)
+///   3/3  --layer examples/layers/chrome-devtools  agent-vm-layer:my-app-9f8e7d…
+/// ```
+fn layer_chain_build_question(steps: &[layer::PlannedStep]) -> String {
+    // chars(), not len(): len() counts bytes, so a non-ASCII label (a
+    // `--layer` path with a multi-byte character in it) would pad by the
+    // wrong amount and misalign the tag column `{:label_width$}` targets.
+    let label_width = steps
+        .iter()
+        .map(|s| s.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut question = format!("Build project tooling layer chain ({} steps)?", steps.len());
+    for step in steps {
+        question.push_str(&format!(
+            "\n  {}  {:label_width$}  {}",
+            step.position.human(),
+            step.label,
+            step.tag,
+        ));
+        if !step.pending {
+            question.push_str("  (cached)");
+        }
+    }
+    question
+}
+
+/// The decline error. Also a fn, for the same reason as
+/// [`layer_chain_build_question`]. The one-step case matches the pre-chain
+/// wording exactly.
+fn layer_declined_error(steps: &[layer::PlannedStep]) -> String {
+    match steps {
+        [only] => format!(
+            "tooling layer {} not built (declined). Re-run and confirm, or pass --yes.",
+            only.tag
+        ),
+        _ => format!(
+            "tooling layer chain ({} steps) not built (declined). Re-run and confirm, or pass --yes.",
+            steps.len()
+        ),
+    }
 }
 
 /// Ask a y/N question and read the answer.
@@ -301,8 +378,14 @@ fn git_identity_notice(identity: Option<&crate::secrets::HostGitIdentity>) -> St
     }
 }
 
-/// Interactive y/N confirmation before building a tooling layer (F3 in the
-/// plan/ADR-0003).
+/// Interactive y/N confirmation before building a tooling layer chain (F3 in
+/// the plan/ADR-0003).
+///
+/// `subject` names the thing in the non-TTY error (e.g. `"tooling layer
+/// <tag>"` or `"tooling layer chain (2 steps)"`); `question` is what's
+/// actually asked. Splitting them out of a single `tag` parameter is what
+/// lets one function serve both the one-step and multi-step wording without
+/// either caller building the other's error text by hand.
 ///
 /// `auto` (`--yes` / `$AGENT_VM_YES`) confirms without prompting and without
 /// touching stdin or stderr at all — a CI caller must not depend on a
@@ -313,47 +396,123 @@ fn git_identity_notice(identity: Option<&crate::secrets::HostGitIdentity>) -> St
 /// Do not write a test that calls this with `auto = false`: under a developer
 /// shell `cargo test`'s fd 0 *is* a tty, so it would block forever. Test
 /// [`ask_yes_no`] instead.
-fn confirm_layer_build(tag: &str, auto: bool) -> Result<Confirmation> {
+fn confirm_layer_build(subject: &str, question: &str, auto: bool) -> Result<Confirmation> {
     if auto {
         return Ok(Confirmation::Confirmed);
     }
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
-            "tooling layer {tag} needs to be built, but stdin is not a terminal to confirm \
+            "{subject} needs to be built, but stdin is not a terminal to confirm \
              interactively. Re-run with --yes, or set AGENT_VM_YES=1."
         );
     }
     ask_yes_no(
-        &layer_build_question(tag),
+        question,
         &mut std::io::stderr(),
         &mut std::io::stdin().lock(),
     )
 }
 
-/// If the project declares a tooling layer, build+load it (lazily, hash-
-/// cached, with confirmation on a miss — see ADR-0003) and return the
-/// derived tag to boot instead of `base_image`. Returns `Ok(None)` when
-/// there is no layer, so `launch()` boots `base_image` unchanged — a
-/// non-layer project's behavior is byte-identical to before this function
-/// existed.
+/// [`layer::ChainRuntime`] wired to real docker + the msb cache. `run.rs`'s
+/// only implementation of the seam; tests use a recording fake
+/// (`layer.rs`'s `FakeRuntime`) instead.
+struct LaunchChainRuntime<'a, W: std::io::Write> {
+    notices: &'a mut LaunchNotices<W>,
+    cache_dir: PathBuf,
+    auto_confirm: bool,
+}
+
+impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
+    fn notice(&mut self, message: &str) -> Result<()> {
+        self.notices.emit(message)
+    }
+
+    fn confirm_build(&mut self, plan: &[layer::PlannedStep]) -> Result<()> {
+        // The buildx preflight runs *before* asking, so a broken docker
+        // install surfaces as one clear error instead of wasting the user's
+        // answer to a question that can't be honored anyway.
+        layer::ensure_docker_buildx()?;
+        let (subject, question) = match plan {
+            [only] => (
+                format!("tooling layer {}", only.tag),
+                layer_build_question(&only.tag),
+            ),
+            _ => (
+                format!("tooling layer chain ({} steps)", plan.len()),
+                layer_chain_build_question(plan),
+            ),
+        };
+        if confirm_layer_build(&subject, &question, self.auto_confirm)? == Confirmation::Declined {
+            anyhow::bail!(layer_declined_error(plan));
+        }
+        Ok(())
+    }
+
+    async fn intermediate_image_id(&mut self, tag: &str) -> Result<Option<String>> {
+        layer::docker_image_id(tag).await
+    }
+
+    async fn final_is_cached(&mut self, tag: &str) -> Result<bool> {
+        layer::derived_is_cached(&self.cache_dir, tag).await
+    }
+
+    async fn build_intermediate(
+        &mut self,
+        id: &layer::LayerIdentity,
+        from_ref: &str,
+    ) -> Result<()> {
+        layer::build_derived_docker(id, from_ref).await
+    }
+
+    async fn build_and_load_final(
+        &mut self,
+        id: &layer::LayerIdentity,
+        from_ref: &str,
+    ) -> Result<()> {
+        // Under `cache_dir`, not the system tmp (AGENTS.md) — RAII-cleaned
+        // via NamedTempFile's Drop regardless of how build/load below
+        // returns.
+        let tar = tempfile::Builder::new()
+            .prefix("agent-vm-layer-")
+            .suffix(".tar")
+            .tempfile_in(&self.cache_dir)
+            .context("creating tooling-layer OCI archive tempfile")?;
+        layer::build_derived_oci(id, from_ref, tar.path())
+            .await
+            .with_context(|| format!("building tooling layer {}", id.tag))?;
+        layer::load_derived_image(&self.cache_dir, tar.path(), &id.tag)
+            .await
+            .with_context(|| format!("loading tooling layer {} into the msb cache", id.tag))?;
+        Ok(())
+    }
+}
+
+/// If the project declares a tooling-layer chain and/or `layer_flags` is
+/// non-empty, build+load the composed chain (lazily, hash-cached per step,
+/// with one confirmation for the whole chain on a miss — see ADR-0003) and
+/// return the final derived tag to boot instead of `base_image`. Returns
+/// `Ok(None)` when neither source declares anything, so `launch()` boots
+/// `base_image` unchanged — a non-layer project's behavior is byte-identical
+/// to before tooling layers existed.
 ///
 /// Extracted out of `launch()` so the orchestration reads top-to-bottom
 /// without the surrounding ~150 lines of mount/credential/network setup
-/// interleaved with it, and so each step (cache hit, confirm, build, load)
-/// is a single `?`-propagated call a reader can follow in order.
+/// interleaved with it, and so each step (resolve, plan, execute) is a
+/// single `?`-propagated call a reader can follow in order.
 async fn resolve_boot_image_with_layer<W: std::io::Write>(
     base_image: &str,
-    layer_flag: Option<&Path>,
+    layer_flags: &[PathBuf],
     project_dir: &Path,
     auto_confirm: bool,
     notices: &mut LaunchNotices<W>,
 ) -> Result<Option<String>> {
-    let Some(layer_dir) = layer::resolve_layer_dir(layer_flag, project_dir)? else {
+    let layer_dirs = layer::resolve_layer_chain(project_dir, layer_flags)?;
+    if layer_dirs.is_empty() {
         return Ok(None);
-    };
+    }
 
     // 1. Ensure the base is cached and get its manifest digest — needed
-    //    both for the #12 content hash and to digest-pin docker's FROM
+    //    both for step 0's content hash and to digest-pin docker's FROM
     //    (ADR-0003). Reuse the existing best-effort reader; only pull the
     //    base if it isn't cached yet (F4).
     let (_path, mut base_digest) = image_config_path_and_digest(base_image).await;
@@ -370,47 +529,27 @@ async fn resolve_boot_image_with_layer<W: std::io::Write>(
         "could not resolve base image digest after pull; cannot build a reproducible tooling layer",
     )?;
 
-    // 2. Identity: content hash over the base digest + the layer directory
-    //    tree. The tag IS the staleness check (see layer.rs's module doc).
-    let id = layer::resolve(&layer_dir, project_dir, &base_digest)?;
+    // 2. Plan the whole chain — pure, no I/O beyond hashing each step's
+    //    directory tree. Every tag is known up front (see layer.rs's
+    //    plan_chain doc comment), which is what lets execute_chain decide
+    //    the cache check, the prompt, and the build set without spawning a
+    //    process on a pure cache hit.
+    let plan = layer::plan_chain(&layer_dirs, project_dir, &base_digest)?;
+    let pinned_base = layer::digest_pinned_base(base_image, &base_digest)?;
     let cache_dir = crate::msb_install::effective_cache_dir()?;
 
-    // 3. Hash hit ⇒ reuse the already-ingested derived image. No rebuild,
-    //    no prompt — this is the common-case fast path on every launch
-    //    after the first.
-    if layer::derived_is_cached(&cache_dir, &id.tag).await? {
-        notices.emit(format!("==> Reusing cached tooling layer {}", id.tag))?;
-        return Ok(Some(id.tag));
-    }
-
-    // 4. Hash miss (new project or an edited layer) ⇒ confirm, build, load.
-    //    Any failure past this point is a hard fail — launch() must never
+    // 3. Execute: cache-hit fast path, or confirm-then-build-forward. Any
+    //    failure past this point is a hard fail — launch() must never
     //    silently fall back to booting the plain base with a missing
-    //    toolchain (F2 in the plan/ADR-0003).
-    layer::ensure_docker_buildx()?;
-    if confirm_layer_build(&id.tag, auto_confirm)? == Confirmation::Declined {
-        anyhow::bail!(
-            "tooling layer {} not built (declined). Re-run and confirm, or pass --yes.",
-            id.tag
-        );
-    }
-    let pinned_base = layer::digest_pinned_base(base_image, &base_digest)?;
-    // Under `cache_dir`, not the system tmp (AGENTS.md) — RAII-cleaned via
-    // NamedTempFile's Drop regardless of how build/load below returns.
-    let tar = tempfile::Builder::new()
-        .prefix("agent-vm-layer-")
-        .suffix(".tar")
-        .tempfile_in(&cache_dir)
-        .context("creating tooling-layer OCI archive tempfile")?;
-    notices.emit(format!("==> Building tooling layer {} …", id.tag))?;
-    layer::build_derived_oci(&id, &pinned_base, tar.path())
-        .await
-        .with_context(|| format!("building tooling layer {}", id.tag))?;
-    layer::load_derived_image(&cache_dir, tar.path(), &id.tag)
-        .await
-        .with_context(|| format!("loading tooling layer {} into the msb cache", id.tag))?;
-    notices.emit(format!("==> Tooling layer {} ready", id.tag))?;
-    Ok(Some(id.tag))
+    //    toolchain (F2 in the plan/ADR-0003; a partially-composed chain
+    //    must never boot).
+    let mut rt = LaunchChainRuntime {
+        notices,
+        cache_dir,
+        auto_confirm,
+    };
+    let tag = layer::execute_chain(&plan, &pinned_base, &mut rt).await?;
+    Ok(Some(tag))
 }
 
 fn guest_path_is_safe(project: &Path) -> bool {
@@ -715,30 +854,31 @@ pub struct Args {
     #[arg(long = "update-check", default_value_t = false, help_heading = "Image")]
     update_check: bool,
 
-    /// Tooling-layer directory (a Dockerfile built FROM the base image).
+    /// Append a tooling layer to this launch's chain (repeatable).
     ///
-    /// Precedence: this flag, then $AGENT_VM_LAYER, then the default
-    /// `.agent-vm/layer/` in the project. An explicitly-pointed-at dir
-    /// missing a Dockerfile is an error; the default dir simply being
-    /// absent means "no layer". When a layer is declared, the derived
-    /// image (base + layer) is built, loaded registry-lessly, and booted
-    /// in place of the base — see `docs/adr/0003-project-tooling-layers.md`.
-    /// A hash miss (new/changed layer) prompts for confirmation unless
-    /// `--yes` / `$AGENT_VM_YES` is set.
+    /// Each DIR is one layer directory holding a Dockerfile that starts
+    /// `ARG BASE_IMAGE` / `FROM ${BASE_IMAGE}`. Flag layers are appended
+    /// after the project's own `.agent-vm/layers/*` steps, in the order
+    /// given, so the project's steps keep their cached images; it works with
+    /// no `.agent-vm/layers/` at all. Relative paths resolve against the
+    /// project directory (the current directory) — unlike `--mount`, which
+    /// requires absolute paths, because trying a checked-in example by
+    /// relative path is the point. There is deliberately no environment
+    /// variable; the removed `AGENT_VM_LAYER` is rejected if set.
     #[arg(
         long = "layer",
-        env = "AGENT_VM_LAYER",
         value_name = "DIR",
+        action = clap::ArgAction::Append,
         help_heading = "Image"
     )]
-    layer: Option<PathBuf>,
+    layer: Vec<PathBuf>,
 
     /// Assume "yes" to the tooling-layer build confirmation prompt.
     ///
-    /// Needed for CI/non-interactive launches whenever the tooling-layer
-    /// hash doesn't already match a previously built/loaded derived image
-    /// (a new project, or an edited `.agent-vm/layer/Dockerfile`). Can also
-    /// be set persistently with a truthy `AGENT_VM_YES` (1|true|yes|on).
+    /// Needed for CI/non-interactive launches whenever a chain step's hash
+    /// doesn't already match a previously built/loaded derived image (a new
+    /// project, or an edited `.agent-vm/layers/*/Dockerfile`). Can also be
+    /// set persistently with a truthy `AGENT_VM_YES` (1|true|yes|on).
     #[arg(
         long = "yes",
         short = 'y',
@@ -769,6 +909,13 @@ pub struct Args {
 }
 
 pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
+    // First statement, deliberately: a still-set $AGENT_VM_LAYER is rejected
+    // before anything else runs — state dirs, guest HOME provisioning, stale
+    // sandbox reaping, or the msb-db preflight below — because the hazard is
+    // "no project layers + env var set ⇒ silent base boot", and none of that
+    // setup should happen on the way to a launch that's about to be rejected.
+    reject_removed_layer_env(env::var_os("AGENT_VM_LAYER").as_deref())?;
+
     // Fail fast if the private msb.db was forward-migrated by a newer
     // microsandbox than this build understands, instead of letting the SDK
     // surface sea-orm's opaque "Migration file ... is missing" error on
@@ -822,16 +969,18 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .context("--memory in GiB overflows u32 MiB")?;
     let cpus = args.cpus;
 
-    // Tooling-layer resolution (issue #13, on top of #12's identity-only
-    // plumbing): if the project declares `.agent-vm/layer/Dockerfile`,
-    // build+load the derived image now (lazily, hash-cached, with
-    // confirmation on a miss) and boot it instead of the base. No layer ⇒
-    // `image` is left as `base_image`, byte-identical to today.
-    let layer_flag = normalize_layer_flag(args.layer.clone());
+    // Tooling-layer resolution (issue #13, extended to an ordered chain by
+    // #79, then to an additive repeatable `--layer` by amendment A1): if the
+    // project declares `.agent-vm/layers/*/Dockerfile` subdirectories and/or
+    // `--layer DIR` is given (appended after the project's own steps),
+    // build+load the composed derived image now (lazily, hash-cached per
+    // step, with one confirmation for the whole chain on a miss) and boot it
+    // instead of the base. Neither source declared ⇒ `image` is left as
+    // `base_image`, byte-identical to today.
     let auto_confirm = should_auto_confirm(args.yes, env::var("AGENT_VM_YES").ok().as_deref());
     if let Some(derived) = resolve_boot_image_with_layer(
         &base_image,
-        layer_flag.as_deref(),
+        &args.layer,
         &session.project_dir,
         auto_confirm,
         &mut notices,
@@ -2223,13 +2372,42 @@ mod tests {
     }
 
     #[test]
-    fn normalize_layer_flag_treats_empty_as_unset() {
-        assert_eq!(normalize_layer_flag(Some(PathBuf::from(""))), None);
-        assert_eq!(
-            normalize_layer_flag(Some(PathBuf::from("/a/b"))),
-            Some(PathBuf::from("/a/b"))
+    fn reject_removed_layer_env_accepts_unset() {
+        assert!(reject_removed_layer_env(None).is_ok());
+    }
+
+    #[test]
+    fn reject_removed_layer_env_rejects_an_empty_value() {
+        let err = reject_removed_layer_env(Some(std::ffi::OsStr::new(""))).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("AGENT_VM_LAYER"), "{msg}");
+        assert!(
+            !msg.contains("--layer \"\"") && !msg.lines().any(|l| l.trim() == "--layer"),
+            "an empty value has nothing to suggest as a copy-pasteable --layer line: {msg}"
         );
-        assert_eq!(normalize_layer_flag(None), None);
+    }
+
+    #[test]
+    fn reject_removed_layer_env_rejects_a_set_value() {
+        let err = reject_removed_layer_env(Some(std::ffi::OsStr::new("x"))).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("AGENT_VM_LAYER"), "{msg}");
+        assert!(msg.contains('x'), "{msg}");
+        assert!(msg.contains("--layer x"), "{msg}");
+    }
+
+    #[test]
+    fn reject_removed_layer_env_rejects_non_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let value = std::ffi::OsStr::from_bytes(b"\xff");
+        let err = reject_removed_layer_env(Some(value)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("AGENT_VM_LAYER"), "{msg}");
+        assert!(
+            !msg.contains("--layer \u{fffd}")
+                && !msg.lines().any(|l| l.trim().starts_with("--layer ")),
+            "a lossy value must not be offered as a copy-pasteable --layer line: {msg}"
+        );
     }
 
     #[test]
@@ -2267,6 +2445,47 @@ mod tests {
         // Short form.
         let cli = TestCli::try_parse_from(["agent-vm", "-y"]).expect("parses -y");
         assert!(cli.args.yes);
+    }
+
+    #[test]
+    fn layer_flag_is_repeatable_and_keeps_order() {
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: Args,
+        }
+        use clap::Parser as _;
+
+        let cli = TestCli::try_parse_from(["agent-vm"]).expect("parses with no flags");
+        assert!(cli.args.layer.is_empty());
+
+        let cli = TestCli::try_parse_from(["agent-vm", "--layer", "b", "--layer", "a"])
+            .expect("--layer is repeatable");
+        assert_eq!(
+            cli.args.layer,
+            vec![PathBuf::from("b"), PathBuf::from("a")],
+            "command-line order must survive, since resolve_layer_chain appends flags in that order"
+        );
+    }
+
+    #[test]
+    fn layer_flag_has_no_env_binding() {
+        // Pins "flag-only": $AGENT_VM_LAYER must not silently satisfy
+        // --layer, since it's rejected outright by reject_removed_layer_env.
+        // Introspects clap's Arg rather than setenv() + parse, per the ADR
+        // amendment's "flag-only" contract.
+        use clap::CommandFactory as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: Args,
+        }
+        let command = TestCli::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "layer")
+            .expect("--layer is a registered arg");
+        assert!(arg.get_env().is_none(), "{arg:?}");
     }
 
     // Test doubles for `ask_yes_no`'s io seam (issue #58), now shared by
@@ -2498,12 +2717,13 @@ mod tests {
     }
 
     #[test]
-    fn prompt_is_skipped_when_pre_approved() {
+    fn confirm_layer_build_auto_confirms_without_touching_stdin_or_stderr() {
         // Safe through the real entry point: the `auto` early return
-        // precedes every io, so this cannot block on a tty even under
-        // `cargo test`'s real fd 0/2.
+        // precedes both `is_terminal()` and `ask_yes_no`, so this cannot
+        // block on a tty even under `cargo test`'s real fd 0/2 — no scripted
+        // io double is needed because none is ever touched.
         assert_eq!(
-            confirm_layer_build("agent-vm-layer:demo-abc123", true).expect("auto confirms"),
+            confirm_layer_build("subject", "question", true).expect("auto confirms"),
             Confirmation::Confirmed
         );
     }
@@ -2720,14 +2940,14 @@ mod tests {
 
     // `resolve_boot_image_with_layer` is only exercised end-to-end by the
     // opt-in docker+registry e2e paths (see layer.rs's `#[ignore]`d
-    // `e2e_*` tests and the manual verification recorded for issue #13),
-    // but its "no layer declared" short circuit is pure and network-free:
-    // `layer::resolve_layer_dir` returns `Ok(None)` on a missing
-    // `.agent-vm/layer/` before this function's first `.await`, so this
+    // `e2e_*` tests and the manual verification recorded for issue #13/#79),
+    // but its "no chain declared" short circuit is pure and network-free:
+    // `layer::resolve_layer_chain` returns an empty chain on a missing
+    // `.agent-vm/layers/` before this function's first `.await`, so this
     // is safe to pin as an ordinary fast unit test. It locks in the
     // guarantee that a non-layer project's boot path is byte-identical to
-    // before this ticket: no base-digest read, no docker, no msb-cache
-    // touch, `image` stays the base unchanged.
+    // before tooling layers existed: no base-digest read, no docker, no
+    // msb-cache touch, `image` stays the base unchanged.
     #[tokio::test]
     async fn resolve_boot_image_with_layer_returns_none_for_a_project_with_no_layer() {
         let project = tempfile::tempdir().unwrap();
@@ -2739,7 +2959,7 @@ mod tests {
         let mut notices = LaunchNotices::new(output);
         let got = resolve_boot_image_with_layer(
             "ghcr.io/wirenboard/agent-vm-template:latest",
-            None,
+            &[],
             project.path(),
             false,
             &mut notices,
@@ -2751,6 +2971,158 @@ mod tests {
             log.borrow().is_empty(),
             "the no-layer fast path must stay silent"
         );
+    }
+
+    /// New for #79: a leftover singular `.agent-vm/layer/` must fail before
+    /// any `.await` on docker/msb — the migration guardrail (D2) applies
+    /// uniformly, whether or not a chain is *also* declared.
+    #[tokio::test]
+    async fn resolve_boot_image_with_layer_errors_on_a_legacy_layer_dir() {
+        let project = tempfile::tempdir().unwrap();
+        let legacy = project.path().join(".agent-vm/layer");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("Dockerfile"), "FROM scratch\n").unwrap();
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut notices = LaunchNotices::new(output);
+        let err = resolve_boot_image_with_layer(
+            "ghcr.io/wirenboard/agent-vm-template:latest",
+            &[],
+            project.path(),
+            false,
+            &mut notices,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:?}").contains(".agent-vm/layer"));
+        assert!(
+            log.borrow().is_empty(),
+            "the legacy-directory error must fire before any notice is emitted"
+        );
+    }
+
+    #[test]
+    fn layer_chain_build_question_lists_every_step() {
+        let steps = vec![
+            layer::PlannedStep {
+                position: layer::ChainPosition { index: 0, total: 2 },
+                label: ".agent-vm/layers/10-a".to_string(),
+                tag: "agent-vm-layer:proj-aaa".to_string(),
+                pending: true,
+            },
+            layer::PlannedStep {
+                position: layer::ChainPosition { index: 1, total: 2 },
+                label: ".agent-vm/layers/20-b".to_string(),
+                tag: "agent-vm-layer:proj-bbb".to_string(),
+                pending: true,
+            },
+        ];
+        let question = layer_chain_build_question(&steps);
+        assert!(question.starts_with("Build project tooling layer chain (2 steps)?"));
+        assert!(question.contains("1/2"));
+        assert!(question.contains(".agent-vm/layers/10-a"));
+        assert!(question.contains("agent-vm-layer:proj-aaa"));
+        assert!(question.contains("2/2"));
+        assert!(question.contains(".agent-vm/layers/20-b"));
+        assert!(question.contains("agent-vm-layer:proj-bbb"));
+    }
+
+    #[test]
+    fn layer_chain_question_marks_cached_steps() {
+        let steps = vec![
+            layer::PlannedStep {
+                position: layer::ChainPosition { index: 0, total: 2 },
+                label: ".agent-vm/layers/10-a".to_string(),
+                tag: "agent-vm-layer:proj-aaa".to_string(),
+                pending: false,
+            },
+            layer::PlannedStep {
+                position: layer::ChainPosition { index: 1, total: 2 },
+                label: ".agent-vm/layers/20-b".to_string(),
+                tag: "agent-vm-layer:proj-bbb".to_string(),
+                pending: true,
+            },
+        ];
+        let question = layer_chain_build_question(&steps);
+        let cached_line = question.lines().find(|l| l.contains("10-a")).unwrap();
+        let pending_line = question.lines().find(|l| l.contains("20-b")).unwrap();
+        assert!(cached_line.contains("(cached)"), "{cached_line}");
+        assert!(!pending_line.contains("(cached)"), "{pending_line}");
+    }
+
+    #[test]
+    fn layer_chain_build_question_marks_flag_layers() {
+        let steps = vec![
+            layer::PlannedStep {
+                position: layer::ChainPosition { index: 0, total: 2 },
+                label: ".agent-vm/layers/10-a".to_string(),
+                tag: "agent-vm-layer:proj-aaa".to_string(),
+                pending: true,
+            },
+            layer::PlannedStep {
+                position: layer::ChainPosition { index: 1, total: 2 },
+                label: "--layer examples/layers/chrome-devtools".to_string(),
+                tag: "agent-vm-layer:proj-bbb".to_string(),
+                pending: true,
+            },
+        ];
+        let question = layer_chain_build_question(&steps);
+        let flag_line = question
+            .lines()
+            .find(|l| l.contains("examples/layers/chrome-devtools"))
+            .unwrap();
+        assert!(
+            flag_line.contains("--layer examples/layers/chrome-devtools"),
+            "{flag_line}"
+        );
+        // Columns still align: both label cells are padded to the same width.
+        let project_line = question.lines().find(|l| l.contains("10-a")).unwrap();
+        let project_label_col = project_line.find(".agent-vm").unwrap();
+        let flag_label_col = flag_line.find("--layer").unwrap();
+        assert_eq!(project_label_col, flag_label_col, "{question}");
+        // The tag column must align too — the label-column check above only
+        // proves the padding starts at the same place, not that it's wide
+        // enough to push the *tag* into alignment as well.
+        let project_tag_col = project_line.find("agent-vm-layer:").unwrap();
+        let flag_tag_col = flag_line.find("agent-vm-layer:").unwrap();
+        assert_eq!(project_tag_col, flag_tag_col, "{question}");
+    }
+
+    #[test]
+    fn layer_declined_error_names_the_chain() {
+        let one = vec![layer::PlannedStep {
+            position: layer::ChainPosition { index: 0, total: 1 },
+            label: ".agent-vm/layers/10-a".to_string(),
+            tag: "agent-vm-layer:proj-aaa".to_string(),
+            pending: true,
+        }];
+        assert_eq!(
+            layer_declined_error(&one),
+            "tooling layer agent-vm-layer:proj-aaa not built (declined). \
+             Re-run and confirm, or pass --yes."
+        );
+
+        let two = vec![
+            layer::PlannedStep {
+                position: layer::ChainPosition { index: 0, total: 2 },
+                label: ".agent-vm/layers/10-a".to_string(),
+                tag: "agent-vm-layer:proj-aaa".to_string(),
+                pending: true,
+            },
+            layer::PlannedStep {
+                position: layer::ChainPosition { index: 1, total: 2 },
+                label: ".agent-vm/layers/20-b".to_string(),
+                tag: "agent-vm-layer:proj-bbb".to_string(),
+                pending: true,
+            },
+        ];
+        let msg = layer_declined_error(&two);
+        assert!(msg.contains("2 steps"), "{msg}");
+        assert!(msg.contains("--yes"), "{msg}");
     }
 
     /// Stub [`ExecEventSource`] backed by an mpsc channel: `send` pushes an

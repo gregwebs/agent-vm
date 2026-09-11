@@ -32,8 +32,7 @@ Network egress:
 Image:
       --image <REF>   Override the OCI image reference [env: AGENT_VM_IMAGE_TAG]
       --update-check  Check the registry for a newer image at launch (opt-in)
-      --layer <DIR>   Tooling-layer directory (a Dockerfile built FROM the base image) [env:
-                      AGENT_VM_LAYER]
+      --layer <DIR>   Append a tooling layer to this launch's chain (repeatable)
   -y, --yes           Assume "yes" to the tooling-layer build confirmation prompt
 
 Guest user:
