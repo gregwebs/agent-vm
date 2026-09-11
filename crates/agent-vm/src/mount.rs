@@ -2437,31 +2437,77 @@ const FORK_MAX_LINK_DEPTH: usize = 40;
 // The copy engine deliberately exposes only test-only checkpoints.  They let
 // tests swap a just-classified pathname before its descriptor is opened,
 // proving that O_NOFOLLOW/fstat rather than timing protects the traversal.
+//
+// The callback is scoped to the canonical root being copied so it can only
+// fire for the copy its test armed it for. Cargo runs unit tests in parallel,
+// so an unscoped process-global hook would run inside a stranger's copy and
+// mutate that other test's tree.
 #[cfg(test)]
-static COPY_CHECKPOINT: std::sync::Mutex<Option<Box<dyn Fn(&Path) + Send>>> =
+static COPY_CHECKPOINT: std::sync::Mutex<Option<(PathBuf, Box<dyn Fn(&Path) + Send>)>> =
     std::sync::Mutex::new(None);
 
-// The descriptor-swap and lock-wait regressions install process-global fault
-// hooks. Serialize only those tests; production has no such shared state.
+#[cfg(test)]
+thread_local! {
+    // The canonical root of the copy running on this thread. The armed
+    // callback's scope is compared against it, so a hook fires only for its
+    // own copy even while parallel tests copy other trees.
+    static COPY_CHECKPOINT_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct CopyCheckpointScope;
+
+#[cfg(test)]
+impl CopyCheckpointScope {
+    fn enter(source: &Path) -> Self {
+        COPY_CHECKPOINT_ROOT.with(|root| *root.borrow_mut() = Some(source.to_path_buf()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for CopyCheckpointScope {
+    fn drop(&mut self) {
+        COPY_CHECKPOINT_ROOT.with(|root| *root.borrow_mut() = None);
+    }
+}
+
+// Only one callback can be armed at a time, so tests that arm/clear it
+// serialize on this lock. Scoping (above) handles the other direction: a
+// parallel test that copies must not fire an armed callback at all.
 #[cfg(test)]
 static COPY_CHECKPOINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-fn set_copy_checkpoint(callback: Option<Box<dyn Fn(&Path) + Send>>) {
+fn set_copy_checkpoint(source: &Path, callback: Box<dyn Fn(&Path) + Send>) {
+    let scope = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
     *COPY_CHECKPOINT
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = callback;
+        .unwrap_or_else(|poison| poison.into_inner()) = Some((scope, callback));
+}
+
+#[cfg(test)]
+fn clear_copy_checkpoint() {
+    *COPY_CHECKPOINT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
 }
 
 #[cfg(test)]
 fn copy_checkpoint(path: &Path) {
-    if let Some(callback) = COPY_CHECKPOINT
+    let root = COPY_CHECKPOINT_ROOT.with(|root| root.borrow().clone());
+    let guard = COPY_CHECKPOINT
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .as_ref()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let (Some(root), Some((scope, callback))) = (root.as_ref(), guard.as_ref())
+        && scope == root
     {
         callback(path);
     }
+    drop(guard);
     // A child-only pause lets the transaction test kill an actual
     // initializer mid-copy. This is compiled only into the test binary.
     if std::env::var_os("AGENT_VM_FORK_KILL_CHECKPOINT")
@@ -2976,6 +3022,8 @@ fn copy_root(
     let source = source
         .canonicalize()
         .with_context(|| format!("resolving fork root {}", source.display()))?;
+    #[cfg(test)]
+    let _checkpoint_scope = CopyCheckpointScope::enter(&source);
     copy_checkpoint(&source);
     let fd = rfs::open(
         &source,
@@ -3846,17 +3894,20 @@ mod prepare_tests {
         let (resume_tx, resume_rx) = mpsc::channel();
         let paused = Arc::new(AtomicBool::new(false));
         let checkpoint_paused = Arc::clone(&paused);
-        set_copy_checkpoint(Some(Box::new(move |path| {
-            // `waiter-stage-marker` is reached after copy_root has opened the root through
-            // its pinned descriptor, so renaming the declaration path cannot
-            // disrupt the first initializer's already-staged traversal.
-            if path == Path::new("waiter-stage-marker")
-                && !checkpoint_paused.swap(true, Ordering::SeqCst)
-            {
-                staged_tx.send(()).unwrap();
-                resume_rx.recv().unwrap();
-            }
-        })));
+        set_copy_checkpoint(
+            &source,
+            Box::new(move |path| {
+                // `waiter-stage-marker` is reached after copy_root has opened the root through
+                // its pinned descriptor, so renaming the declaration path cannot
+                // disrupt the first initializer's already-staged traversal.
+                if path == Path::new("waiter-stage-marker")
+                    && !checkpoint_paused.swap(true, Ordering::SeqCst)
+                {
+                    staged_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }
+            }),
+        );
 
         let first_store = store.path().to_path_buf();
         let first_request = request.clone();
@@ -3893,7 +3944,7 @@ mod prepare_tests {
         resume_tx.send(()).unwrap();
         let first_plan = first.join().unwrap();
         assert!(second.wait().unwrap().success(), "waiter must reuse READY");
-        set_copy_checkpoint(None);
+        clear_copy_checkpoint();
 
         let fork_path = match &first_plan.volumes[0].source {
             PreparedVolumeSource::WritableBind(path) => path.clone(),
@@ -4075,21 +4126,24 @@ mod prepare_tests {
             let external = external.clone();
             let swapping_link = victim == "link";
             let swapped_at_checkpoint = std::sync::Arc::clone(&swapped);
-            set_copy_checkpoint(Some(Box::new(move |seen| {
-                let root_checkpoint =
-                    swap == root_source && seen == root_source.canonicalize().unwrap();
-                if root_checkpoint || seen == checkpoint {
-                    swapped_at_checkpoint.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let replacement = swap.with_extension("swapped");
-                    // A rename makes the check/open window deterministic.
-                    fs::rename(&swap, &replacement).unwrap();
-                    if swapping_link {
-                        fs::hard_link(&external, &swap).unwrap();
-                    } else {
-                        symlink(&external, &swap).unwrap();
+            set_copy_checkpoint(
+                &source,
+                Box::new(move |seen| {
+                    let root_checkpoint =
+                        swap == root_source && seen == root_source.canonicalize().unwrap();
+                    if root_checkpoint || seen == checkpoint {
+                        swapped_at_checkpoint.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let replacement = swap.with_extension("swapped");
+                        // A rename makes the check/open window deterministic.
+                        fs::rename(&swap, &replacement).unwrap();
+                        if swapping_link {
+                            fs::hard_link(&external, &swap).unwrap();
+                        } else {
+                            symlink(&external, &swap).unwrap();
+                        }
                     }
-                }
-            })));
+                }),
+            );
             let store = tempfile::tempdir().unwrap();
             let request = format!("{}:/guest:fork", source.display());
             assert!(
@@ -4100,7 +4154,7 @@ mod prepare_tests {
                 .is_err(),
                 "swap at {victim} was accepted"
             );
-            set_copy_checkpoint(None);
+            clear_copy_checkpoint();
             assert!(
                 swapped.load(std::sync::atomic::Ordering::SeqCst),
                 "checkpoint at {victim} did not run"
