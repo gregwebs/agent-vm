@@ -116,9 +116,11 @@ Resolved via `--image` / `AGENT_VM_IMAGE_TAG` / `defaults::DEFAULT_IMAGE_REF`
 
 ## Tooling layer
 
-A project-owned `Dockerfile` (plus its build context — the rest of that
-directory) that adds project-specific tools `FROM` the previous step in the
-chain: compilers, cross-toolchains, anything the base doesn't carry. A
+A `Dockerfile` (plus its build context — the rest of that directory) that
+adds project-specific tools `FROM` the previous step in the chain:
+compilers, cross-toolchains, anything the base doesn't carry. Not
+necessarily project-owned: a step is either a `.agent-vm/layers/` subdirectory
+of the project, or a `--layer DIR` directory anywhere else on disk. A
 single tooling layer is one step of a "layer chain" (see below); resolved by
 `layer::resolve_layer_chain`. There is no environment-variable override —
 `$AGENT_VM_LAYER` is rejected outright if set — but there is composition: the

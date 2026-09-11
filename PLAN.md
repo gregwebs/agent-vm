@@ -31,7 +31,7 @@ only an index, so the roadmap below has a fixed starting point.
 | Network egress: `--publish` / `--auto-publish` / `--allow-egress` / `--allow-lan` / `--allow-host` | [Ports & egress](USAGE.md#ports--egress) | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
 | Extra mounts with `ro` / `rw` / `follow-links` | [Launch flags](USAGE.md#launch-flags) | [Extra mounts](ARCHITECTURE.md#extra-mounts-ro-rw-follow-links) |
 | Non-root guest by default, `--root` to opt out | [Guest user](USAGE.md#guest-user----root) | [ADR-0001](docs/adr/0001-non-root-guest-via-native-user.md), [ADR-0002](docs/adr/0002-mirror-host-home-and-username.md) |
-| Project tooling layers (`.agent-vm/layers/`, an ordered chain), incl. the Chrome DevTools MCP layer | [Project tooling layers](USAGE.md#project-tooling-layers), [Chrome DevTools MCP](USAGE.md#chrome-devtools-mcp) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
+| Project tooling layers (`.agent-vm/layers/*`, plus any `--layer DIR`, an ordered chain), incl. the Chrome DevTools MCP layer | [Project tooling layers](USAGE.md#project-tooling-layers), [Chrome DevTools MCP](USAGE.md#chrome-devtools-mcp) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
 | Project hook (`.agent-vm.runtime.sh`) | [Project hook](USAGE.md#project-hook) | — |
 | Clipboard exchange | [Clipboard](USAGE.md#clipboard) | [Clipboard exchange](ARCHITECTURE.md#clipboard-exchange) |
 | `agent-vm-ccusage` — token/cost across host *and* sandbox sessions | [Token usage](USAGE.md#token-usage-across-host-and-sandbox) | [`agent-vm-ccusage`](ARCHITECTURE.md#agent-vm-ccusage) |

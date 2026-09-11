@@ -154,7 +154,7 @@ bug, and buildx's own build cache usually makes it fast; dropping the flag
 again afterward is a pure cache hit, because the project's own tag never left
 the msb cache. Trying a layer via `--layer` and then adopting it into the
 project (copying it under `.agent-vm/layers/`) costs nothing either: the hash
-covers the directory's contents and position in the chain, never how it was
+covers the directory's contents and every step before it, never how it was
 named on the command line, so the adopted layer is a cache hit too.
 
 When a chain is declared, `agent-vm claude`/`codex`/`opencode`/`copilot`/`shell`

@@ -480,8 +480,8 @@ second exporter.
   `run.rs` keeps `base_image` as a binding separate from the (possibly
   reassigned) `image` for exactly this reason.
 - Non-layer projects are unaffected: `resolve_boot_image_with_layer` returns
-  `Ok(None)` when `.agent-vm/layers/` isn't declared, and `launch()` boots
-  `base_image` exactly as it did before this ADR.
+  `Ok(None)` when `.agent-vm/layers/` isn't declared and no `--layer` is
+  given, and `launch()` boots `base_image` exactly as it did before this ADR.
 - **Cross-arch correctness (resolved in this PR, after a live `aarch64`
   reproduction).** An earlier revision hardcoded `--platform linux/amd64`
   as the originating plan specified; a real `docker buildx build` +
