@@ -3010,14 +3010,12 @@ mod tests {
         let steps = vec![
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 0, total: 2 },
-                origin: layer::LayerOrigin::Project,
                 label: ".agent-vm/layers/10-a".to_string(),
                 tag: "agent-vm-layer:proj-aaa".to_string(),
                 pending: true,
             },
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 1, total: 2 },
-                origin: layer::LayerOrigin::Project,
                 label: ".agent-vm/layers/20-b".to_string(),
                 tag: "agent-vm-layer:proj-bbb".to_string(),
                 pending: true,
@@ -3038,14 +3036,12 @@ mod tests {
         let steps = vec![
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 0, total: 2 },
-                origin: layer::LayerOrigin::Project,
                 label: ".agent-vm/layers/10-a".to_string(),
                 tag: "agent-vm-layer:proj-aaa".to_string(),
                 pending: false,
             },
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 1, total: 2 },
-                origin: layer::LayerOrigin::Project,
                 label: ".agent-vm/layers/20-b".to_string(),
                 tag: "agent-vm-layer:proj-bbb".to_string(),
                 pending: true,
@@ -3063,21 +3059,17 @@ mod tests {
         let steps = vec![
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 0, total: 2 },
-                origin: layer::LayerOrigin::Project,
                 label: ".agent-vm/layers/10-a".to_string(),
                 tag: "agent-vm-layer:proj-aaa".to_string(),
                 pending: true,
             },
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 1, total: 2 },
-                origin: layer::LayerOrigin::Flag,
                 label: "--layer examples/layers/chrome-devtools".to_string(),
                 tag: "agent-vm-layer:proj-bbb".to_string(),
                 pending: true,
             },
         ];
-        assert_eq!(steps[0].origin, layer::LayerOrigin::Project);
-        assert_eq!(steps[1].origin, layer::LayerOrigin::Flag);
         let question = layer_chain_build_question(&steps);
         let flag_line = question
             .lines()
@@ -3104,7 +3096,6 @@ mod tests {
     fn layer_declined_error_names_the_chain() {
         let one = vec![layer::PlannedStep {
             position: layer::ChainPosition { index: 0, total: 1 },
-            origin: layer::LayerOrigin::Project,
             label: ".agent-vm/layers/10-a".to_string(),
             tag: "agent-vm-layer:proj-aaa".to_string(),
             pending: true,
@@ -3118,14 +3109,12 @@ mod tests {
         let two = vec![
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 0, total: 2 },
-                origin: layer::LayerOrigin::Project,
                 label: ".agent-vm/layers/10-a".to_string(),
                 tag: "agent-vm-layer:proj-aaa".to_string(),
                 pending: true,
             },
             layer::PlannedStep {
                 position: layer::ChainPosition { index: 1, total: 2 },
-                origin: layer::LayerOrigin::Project,
                 label: ".agent-vm/layers/20-b".to_string(),
                 tag: "agent-vm-layer:proj-bbb".to_string(),
                 pending: true,

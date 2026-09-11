@@ -405,11 +405,12 @@ pure cache hit whether or not any `--layer` is passed. Prepending would shift
 every project step onto a new predecessor hash and invalidate the whole
 chain every time a flag was added or removed.
 
-**Provenance stays out of the hash.** A resolved chain step now carries
-*where* it came from (a project subdirectory or a `--layer` value, plus the
-human-facing label used in prompts and errors) alongside the identity
-`layer::resolve` computes, not inside it — `resolve` and `LayerIdentity` are
-completely unchanged by this amendment. That is what makes **try-then-adopt**
+**Provenance stays out of the hash.** A resolved chain step carries its
+human-facing label used in prompts and errors — `.agent-vm/layers/10-a` for a
+project step, `--layer <as typed>` for a flag step — alongside the identity
+`layer::resolve` computes, not inside it, and nothing else about where it
+came from. `resolve` and `LayerIdentity` are completely unchanged by this
+amendment. That is what makes **try-then-adopt**
 free: `agent-vm shell --layer examples/layers/chrome-devtools --yes` in a
 project with no layers, followed by copying that same directory into
 `.agent-vm/layers/20-chrome-devtools/`, produces the identical tag at the

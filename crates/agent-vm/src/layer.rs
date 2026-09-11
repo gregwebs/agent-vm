@@ -535,19 +535,6 @@ fn basename(path: &Path) -> String {
     String::from_utf8_lossy(&trimmed[start..]).into_owned()
 }
 
-/// Where a chain step was declared. Display/orchestration metadata only —
-/// deliberately NOT hashed, exactly like [`ChainPosition`]: `resolve`'s
-/// hash covers a step's build context and its predecessor, never how the
-/// step was named on the command line. That is also what makes
-/// try-then-adopt free (see `docs/adr/0003-project-tooling-layers.md`'s
-/// amendment): `--layer examples/layers/x` and a copy of the same contents
-/// at `.agent-vm/layers/10-x` must hash identically at the same position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayerOrigin {
-    Project,
-    Flag,
-}
-
 /// One resolved chain-step directory, before hashing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainDir {
@@ -557,10 +544,17 @@ pub struct ChainDir {
     /// step it is the canonicalised absolute path (symlinks resolved, so
     /// dedup can see through them).
     pub dir: PathBuf,
-    pub origin: LayerOrigin,
     /// What humans see in the prompt, notices and errors: `.agent-vm/layers/10-a`
     /// for a project step, or `--layer examples/layers/chrome-devtools` (the
-    /// flag value exactly as typed) for a flag step.
+    /// flag value exactly as typed) for a flag step. This is the *only*
+    /// record of where a step was declared — display/orchestration metadata
+    /// only, deliberately NOT hashed, exactly like [`ChainPosition`]:
+    /// `resolve`'s hash covers a step's build context and its predecessor,
+    /// never how the step was named on the command line. That is also what
+    /// makes try-then-adopt free (see
+    /// `docs/adr/0003-project-tooling-layers.md`'s amendment): `--layer
+    /// examples/layers/x` and a copy of the same contents at
+    /// `.agent-vm/layers/10-x` must hash identically at the same position.
     pub label: String,
 }
 
@@ -729,7 +723,6 @@ fn resolve_project_steps(project_dir: &Path) -> Result<Vec<ChainDir>> {
         require_step_dir(&dir, &format!("tooling-layer step {}", dir.display()))?;
         steps.push(ChainDir {
             dir,
-            origin: LayerOrigin::Project,
             label: format!("{LAYERS_SUBDIR}/{}", name.to_string_lossy()),
         });
     }
@@ -787,7 +780,6 @@ fn resolve_flag_steps(canonical_project: &Path, flag_dirs: &[PathBuf]) -> Result
 
         steps.push(ChainDir {
             dir: canonical_flag,
-            origin: LayerOrigin::Flag,
             label: format!("--layer {as_typed}"),
         });
     }
@@ -881,10 +873,10 @@ fn require_step_dir(dir: &Path, what: &str) -> Result<()> {
 /// `docs/adr/0003-project-tooling-layers.md`'s chain amendment for the full
 /// writeup.
 ///
-/// `origin` and `label` (see [`ChainDir`]) never reach [`resolve`] and never
-/// enter the hash, by construction: `resolve` and [`LayerIdentity`] are
-/// untouched by this amendment, and this function only attaches provenance
-/// to the identity it already computed. That is what keeps try-then-adopt
+/// `label` (see [`ChainDir`]) never reaches [`resolve`] and never enters the
+/// hash, by construction: `resolve` and [`LayerIdentity`] are untouched by
+/// this amendment, and this function only attaches the human-facing label to
+/// the identity it already computed. That is what keeps try-then-adopt
 /// free — a `--layer` step and a project step over the same directory
 /// contents at the same chain position hash identically.
 pub fn plan_chain(
@@ -908,35 +900,25 @@ pub fn plan_chain(
         base_id = id.hash.clone();
         plan.push(ChainStep {
             id,
-            origin: step.origin,
             label: step.label.clone(),
         });
     }
     Ok(plan)
 }
 
-/// A hashed chain step: the identity [`resolve`] computed, plus where it
-/// came from. Kept separate from [`LayerIdentity`] rather than folded into
-/// it — see [`plan_chain`]'s doc comment — so provenance cannot reach the
-/// hash by construction.
+/// A hashed chain step: the identity [`resolve`] computed, plus its
+/// human-facing label. Kept separate from [`LayerIdentity`] rather than
+/// folded into it — see [`plan_chain`]'s doc comment — so the label cannot
+/// reach the hash by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainStep {
     pub id: LayerIdentity,
-    pub origin: LayerOrigin,
     pub label: String,
 }
 
 /// One row of the confirmation prompt.
 pub struct PlannedStep {
     pub position: ChainPosition,
-    /// Kept for symmetry with `ChainDir`/`ChainStep`'s provenance and for a
-    /// future per-origin consumer; today `layer_chain_build_question`
-    /// distinguishes origins through `label`'s text alone (a `--layer`
-    /// label always carries that literal prefix), so nothing in production
-    /// reads this field yet. Exercised directly by
-    /// `layer_chain_build_question_marks_flag_layers`.
-    #[allow(dead_code)]
-    pub origin: LayerOrigin,
     /// `.agent-vm/layers/10-a`, or `--layer <as typed>` — see [`ChainDir::label`].
     pub label: String,
     /// Always known — the chain is pure, so every tag is computed before
@@ -1027,7 +1009,6 @@ pub async fn execute_chain<R: ChainRuntime>(
         .enumerate()
         .map(|(i, step)| PlannedStep {
             position: step.id.position,
-            origin: step.origin,
             label: step.label.clone(),
             tag: step.id.tag.clone(),
             pending: i >= build_from,
@@ -2059,7 +2040,7 @@ mod tests {
 
         let chain = resolve_layer_chain(project.path(), &[flag.path().to_path_buf()]).unwrap();
         assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].origin, LayerOrigin::Flag);
+        assert!(chain[0].label.starts_with("--layer "), "{}", chain[0].label);
         assert_eq!(chain[0].dir, flag.path().canonicalize().unwrap());
     }
 
@@ -2265,11 +2246,7 @@ mod tests {
     /// chain directly rather than going through `resolve_layer_chain`.
     fn project_chain_dir(dir: PathBuf) -> ChainDir {
         let label = dir.file_name().unwrap().to_string_lossy().into_owned();
-        ChainDir {
-            dir,
-            origin: LayerOrigin::Project,
-            label,
-        }
+        ChainDir { dir, label }
     }
 
     #[test]
@@ -2443,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn origin_and_label_reach_the_chain_step() {
+    fn label_reaches_the_chain_step() {
         let project = tempfile::tempdir().unwrap();
         write_step(project.path(), "10-a", "FROM scratch\n");
         let flag = tempfile::tempdir().unwrap();
@@ -2452,9 +2429,7 @@ mod tests {
         let chain = resolve_layer_chain(project.path(), &[flag.path().to_path_buf()]).unwrap();
         let plan = plan_chain(&chain, project.path(), TEST_BASE_ID).unwrap();
 
-        assert_eq!(plan[0].origin, LayerOrigin::Project);
         assert_eq!(plan[0].label, chain[0].label);
-        assert_eq!(plan[1].origin, LayerOrigin::Flag);
         assert_eq!(plan[1].label, chain[1].label);
 
         let bare = resolve(
@@ -2581,7 +2556,6 @@ mod tests {
                     hashed_bytes: 1,
                     position: ChainPosition { index: i, total: n },
                 },
-                origin: LayerOrigin::Project,
                 label: format!(".agent-vm/layers/{i}"),
             })
             .collect()
@@ -2827,32 +2801,26 @@ mod tests {
         );
     }
 
-    /// Like [`fake_plan`], but the caller picks each step's origin — for the
-    /// amendment's A6 tests, where whether a step is a project step or a
-    /// `--layer` step is the point.
-    fn fake_plan_with_origins(origins: &[LayerOrigin]) -> Vec<ChainStep> {
-        let n = origins.len();
-        origins
+    /// Like [`fake_plan`], but the caller picks each step's label directly —
+    /// for the amendment's A6 tests, where whether a step is a project step
+    /// or a `--layer` step (distinguished purely by label text, per D3/A2:
+    /// nothing else carries that fact) is the point.
+    fn fake_plan_with_origins(labels: &[&str]) -> Vec<ChainStep> {
+        let n = labels.len();
+        labels
             .iter()
             .enumerate()
-            .map(|(i, &origin)| {
-                let label = match origin {
-                    LayerOrigin::Project => format!(".agent-vm/layers/{i}"),
-                    LayerOrigin::Flag => format!("--layer flag-{i}"),
-                };
-                ChainStep {
-                    id: LayerIdentity {
-                        dir: PathBuf::from(format!("/proj/{i}")),
-                        dockerfile: PathBuf::from(format!("/proj/{i}/Dockerfile")),
-                        tag: format!("agent-vm-layer:proj-tag{i}"),
-                        hash: format!("hash{i}"),
-                        file_count: 1,
-                        hashed_bytes: 1,
-                        position: ChainPosition { index: i, total: n },
-                    },
-                    origin,
-                    label,
-                }
+            .map(|(i, &label)| ChainStep {
+                id: LayerIdentity {
+                    dir: PathBuf::from(format!("/proj/{i}")),
+                    dockerfile: PathBuf::from(format!("/proj/{i}/Dockerfile")),
+                    tag: format!("agent-vm-layer:proj-tag{i}"),
+                    hash: format!("hash{i}"),
+                    file_count: 1,
+                    hashed_bytes: 1,
+                    position: ChainPosition { index: i, total: n },
+                },
+                label: label.to_string(),
             })
             .collect()
     }
@@ -2864,8 +2832,8 @@ mod tests {
         // appending a --layer after it must re-export that step once — the
         // backward walk sees it as "not cached" from docker's point of view
         // and the confirmation prompt must show it as pending, not cached.
-        use LayerOrigin::{Flag, Project};
-        let plan = fake_plan_with_origins(&[Project, Project, Flag]);
+        let plan =
+            fake_plan_with_origins(&[".agent-vm/layers/0", ".agent-vm/layers/1", "--layer flag-2"]);
         let mut rt = FakeRuntime::new();
         rt.docker_store.insert(plan[0].id.tag.clone());
         // plan[1] (the project's last step) is deliberately absent from
@@ -2914,8 +2882,7 @@ mod tests {
         // tag ingested, launching without the flag again touches nothing —
         // the project's tag never left the msb cache regardless of what was
         // appended to it on some other launch.
-        use LayerOrigin::Project;
-        let plan = fake_plan_with_origins(&[Project, Project]);
+        let plan = fake_plan_with_origins(&[".agent-vm/layers/0", ".agent-vm/layers/1"]);
         let mut rt = FakeRuntime::new();
         rt.msb_cache.insert(plan[1].id.tag.clone());
 
@@ -2935,8 +2902,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_flag_layer_aborts_and_never_loads() {
-        use LayerOrigin::{Flag, Project};
-        let plan = fake_plan_with_origins(&[Project, Flag]);
+        let plan = fake_plan_with_origins(&[".agent-vm/layers/0", "--layer flag-1"]);
         let mut rt = FakeRuntime::new();
         rt.fail_at = Some(1); // the flag step
 
@@ -2947,8 +2913,7 @@ mod tests {
 
     #[tokio::test]
     async fn notices_use_step_labels() {
-        use LayerOrigin::{Flag, Project};
-        let plan = fake_plan_with_origins(&[Project, Flag]);
+        let plan = fake_plan_with_origins(&[".agent-vm/layers/0", "--layer flag-1"]);
         let mut rt = FakeRuntime::new();
 
         execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
