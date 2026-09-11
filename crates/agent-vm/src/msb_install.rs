@@ -519,14 +519,20 @@ fn check_socket_path_len(socket_path: &Path, sandbox_name: &str) -> Result<()> {
 /// `config.json`; see USAGE.md's *Reverting is a manual step*.
 ///
 /// Idempotent. Returns the path that was pinned.
-pub fn point_at_msb_home() -> Result<PathBuf> {
+/// Set the process-wide MSB_HOME before Tokio starts, without creating it.
+/// Launch calls [`ensure_msb_home`] only after mount preflight succeeds.
+pub fn configure_msb_home() -> Result<PathBuf> {
     let dir = msb_home_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating MSB_HOME at {}", dir.display()))?;
-    // SAFETY: like [`point_at_msb`], called before the tokio runtime
-    // spins up. setenv() is not thread-safe; this ordering invariant
-    // is the only thing that makes the call sound.
+    // SAFETY: called before the tokio runtime spins up. setenv() is not
+    // thread-safe, so filesystem creation is intentionally split out.
     unsafe { std::env::set_var("MSB_HOME", &dir) };
+    Ok(dir)
+}
+
+/// Create/configure a previously selected MSB_HOME after launch preflight.
+pub fn ensure_msb_home(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating MSB_HOME at {}", dir.display()))?;
 
     // Opt-in only: redirect the OCI image cache at the shared
     // `~/.microsandbox/cache` a separately-installed msb uses. Off by
@@ -536,10 +542,10 @@ pub fn point_at_msb_home() -> Result<PathBuf> {
     // image cache*.
     if crate::env_flag::enabled(SHARE_MSB_CACHE_ENV) {
         let cache_dir = resolve_shared_cache_dir()?;
-        write_shared_cache_config(&dir, &cache_dir)?;
+        write_shared_cache_config(dir, &cache_dir)?;
     }
 
-    Ok(dir)
+    Ok(())
 }
 
 /// Resolve and pin the patched `msb` binary for this process.

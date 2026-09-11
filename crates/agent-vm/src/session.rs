@@ -120,6 +120,13 @@ impl ProjectSession {
         Ok(())
     }
 
+    /// Host-managed fork state, deliberately a sibling of the guest-visible
+    /// state directory so locks and manifests can never be mounted in a VM.
+    pub fn mount_store_dir(&self) -> PathBuf {
+        self.state_dir
+            .with_file_name(format!("{}.mounts", self.project_hash))
+    }
+
     pub fn claude_home(&self) -> PathBuf {
         self.state_dir.join("claude")
     }
@@ -321,6 +328,30 @@ mod tests {
             state_dir: root.join("state"),
             sandbox_name: "agent-vm-test".into(),
         }
+    }
+
+    #[test]
+    fn mount_store_is_a_private_sibling_of_project_state() {
+        let session = throwaway_session();
+        let store = session.mount_store_dir();
+        assert_eq!(store, session.project_dir.join("deadbeef0000.mounts"));
+        assert_eq!(store.parent(), session.state_dir.parent());
+        assert!(!store.starts_with(&session.state_dir));
+
+        let same_project = ProjectSession {
+            project_dir: session.project_dir.clone(),
+            project_hash: session.project_hash.clone(),
+            state_dir: session.state_dir.clone(),
+            sandbox_name: "other".into(),
+        };
+        assert_eq!(same_project.mount_store_dir(), store);
+        let different_project = ProjectSession {
+            project_dir: session.project_dir.clone(),
+            project_hash: "otherhash000".into(),
+            state_dir: session.project_dir.join("other-state"),
+            sandbox_name: "other".into(),
+        };
+        assert_ne!(different_project.mount_store_dir(), store);
     }
 
     #[test]

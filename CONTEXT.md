@@ -171,3 +171,9 @@ hash hit reuses the already-ingested derived image with no rebuild and no
 confirmation prompt; a hash miss (new project, or an edited
 Dockerfile/layer file) prompts to build the whole chain unless `--yes` /
 `$AGENT_VM_YES` is set. See `docs/adr/0003-project-tooling-layers.md`.
+
+## Forked mount
+
+A writable, project-scoped persistent mount initialized once from a host file or directory. After initialization, the fork and source are independent: changes do not propagate in either direction.
+
+_Avoid_: "bind mount", which remains connected to the host path; "copy-on-write mount", which implies lazy shared backing storage.

@@ -77,10 +77,30 @@ Each launcher accepts:
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
-| `--mount HOST[:GUEST][:MODE]...` | extra bind mount (one virtio-fs each). Modes: `:rw` (default), `:ro` read-only, `:follow-links` also bind the real directories that symlinks under `HOST` resolve to (implies `:ro`, so it combines with it). Capacity is host-specific ([runtime evidence](ARCHITECTURE.md#runtime-provenance-and-platform-profiles)); design notes in [Extra mounts](ARCHITECTURE.md#extra-mounts-ro-rw-follow-links) |
+| `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Modes: `:rw` (default), `:ro`, `:fork`, `:follow-links`, and repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). Capacity is host-specific. |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 | `--layer DIR` | append a tooling layer after the project's own `.agent-vm/layers/*` (repeatable, command-line order; relative to the project dir) — see [Project tooling layers](#project-tooling-layers) |
 | `--yes` / `-y` | assume "yes" to the tooling-layer chain build confirmation (CI/non-interactive) — see [Project tooling layers](#project-tooling-layers) |
+
+### Extra and forked mounts
+
+`--mount /host/path:/guest/path:fork` creates a writable project-scoped copy on
+first launch. Later launches bind that stored copy, never synchronize with `/host/path`,
+and print the exact reset directory. `:fork:follow-links` materializes link targets into
+that copy; without it nested link text is preserved. `fork` conflicts with `ro` and `rw`.
+
+Repeat `:exclude=REL` on any mode, for example
+`--mount /host:/guest:fork:exclude=credentials.json:exclude=cache`. `REL` is a nonempty
+normal relative path: it cannot contain `:`, control characters, `.`, `..`, empty
+components, or an absolute path. Live exclusions require an existing regular file or
+directory below a directory source; they become readonly opaque masks. Fork initialization
+omits excluded entries, so a guest can later create its own content there. A single-file
+fork cannot carry exclusions.
+
+Forks consume the full initial-copy disk cost. Their source is not an atomic snapshot if
+it changes while copying. To reset/reseed, stop every launch using the fork, remove the
+printed fork directory, and launch the identical declaration again. Changing the source
+spelling, normalized guest path, follow policy, or exclusions creates a distinct fork.
 
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
 `agent-vm shell -- -c 'cargo test'`.

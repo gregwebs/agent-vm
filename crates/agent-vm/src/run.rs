@@ -722,7 +722,18 @@ Examples (claude shown; codex/opencode/shell take the same options):
   agent-vm claude --mount ~/ref:ro            read-only extra mount
   agent-vm claude --mount ~/.claude/skills:ro:follow-links
                                                follow symlinks in a skills dir
+  agent-vm shell --mount ~/config:/config:fork:exclude=credentials.json
+                                               seed an independent writable config copy
   agent-vm claude --repo owner/other-repo     widen the GitHub allow-list
+
+Fork mounts:
+  `:fork` copies its source once into project-scoped persistent state; later launches reuse that
+  copy, so source and fork changes never synchronize in either direction. `:fork:follow-links`
+  materializes symlink targets in the copy; without it, symlinks are preserved. Repeat
+  `:exclude=REL` to omit paths while seeding (or make them readonly opaque masks on live binds).
+  Forks use disk space for the full initial copy in the host-managed project mount store beside
+  `/agent-vm-state`. To reset/reseed, stop users of the fork, remove the exact directory printed at
+  launch, then launch the same declaration again.
 
 Networking (deny-by-default; flags compose):
   --publish        host  → guest   open an inbound port to a guest service
@@ -789,13 +800,27 @@ pub struct Args {
     )]
     repo: Vec<String>,
 
-    /// Bind an extra host directory into the guest (repeatable).
+    /// Bind an extra host directory into the guest, or seed a persistent fork (repeatable).
     ///
-    /// Format `HOST[:GUEST][:ro|:rw|:follow-links]`; `GUEST` defaults to
-    /// `HOST` (mirror at the same absolute path). Append `:ro` for a
-    /// read-only bind or `:rw` for read-write (the default). `GUEST`, if
-    /// given, must be an absolute path (start with `/`); a trailing token
-    /// that isn't a path is parsed as a mode keyword, e.g. `--mount ~/ref:ro`.
+    /// Format `HOST[:GUEST][:ro|:rw|:fork|:follow-links|:exclude=REL]`; `GUEST` defaults to
+    /// `HOST` (mirror at the same absolute path). Append `:ro` for a read-only bind or `:rw` for
+    /// read-write (the default). `GUEST`, if given, must be an absolute path (start with `/`); a
+    /// trailing token that isn't a path is parsed as a mode keyword, e.g. `--mount ~/ref:ro`.
+    ///
+    /// `:fork` copies a file or directory once into project-scoped persistent state. Later launches
+    /// reuse that stored copy without synchronizing either direction: source changes do not reach
+    /// the fork, and guest changes do not reach the source. Forks consume disk space for the full
+    /// initial copy in the host-managed project mount store beside `/agent-vm-state`. To reset or
+    /// reseed one, stop its users, remove the exact fork directory printed at launch, then relaunch
+    /// the same declaration. `:fork` conflicts with `:ro` and `:rw`. Example: `--mount
+    /// ~/config:/config:fork:exclude=credentials.json`.
+    ///
+    /// Repeat `:exclude=REL` on any valid mount mode. On live binds it creates a readonly opaque
+    /// mask; on a fork it omits that path only from initial seeding, so the guest can later create
+    /// fork-owned content there.
+    ///
+    /// For `:fork`, symlinks are preserved by default. `:fork:follow-links` instead materializes
+    /// their targets in the project-owned copy, never as a continuing live bind.
     ///
     /// `:follow-links` additionally walks `HOST` on the host side and, for
     /// every symlink it transitively contains that resolves to a directory,
@@ -824,7 +849,7 @@ pub struct Args {
     /// one platform as a portable mount limit.
     #[arg(
         long = "mount",
-        value_name = "HOST[:GUEST][:ro|:rw|:follow-links]",
+        value_name = "HOST[:GUEST][:ro|:rw|:fork|:follow-links|:exclude=REL]",
         help_heading = "Mounts & ports"
     )]
     mount: Vec<String>,
@@ -916,13 +941,6 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // setup should happen on the way to a launch that's about to be rejected.
     reject_removed_layer_env(env::var_os("AGENT_VM_LAYER").as_deref())?;
 
-    // Fail fast if the private msb.db was forward-migrated by a newer
-    // microsandbox than this build understands, instead of letting the SDK
-    // surface sea-orm's opaque "Migration file ... is missing" error on
-    // the first DB open (reap_stale_project_sandboxes below, then the
-    // Sandbox builder). See src/msb_preflight.rs and issue #30.
-    crate::msb_preflight::ensure_db_not_ahead().await?;
-
     // Resolve root vs. non-root guest mode up front — it gates dir
     // provisioning, the rootfs patch block, and the guest env/exec wiring
     // further down, so it has to be known before any of that runs.
@@ -938,6 +956,42 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // filesystem or booting anything, if this sandbox's real agent/control
     // socket paths would overflow the platform's Unix-domain-socket path
     // limit. See `msb_install::ensure_socket_paths_fit`'s doc comment.
+    // Mount preparation is deliberately before every launch-side effect.
+    // A rejected topology must not provision session state, reap a sandbox,
+    // emit a banner, build tooling, refresh credentials, or configure msb.
+    let host_path = session
+        .project_dir
+        .to_str()
+        .context("project path contains non-UTF-8 bytes; not supported")?;
+    let (project_guest_path, remap_reason) =
+        resolve_project_guest_path(&session.project_dir, host_path);
+    let core_volumes = user::core_dir_volumes(
+        guest_identity
+            .as_ref()
+            .map(|gi| (gi.host_home(), session.guest_home_dir())),
+        &project_guest_path,
+        &session.project_dir,
+        &session.state_dir,
+    );
+    let mount_plan = mount::prepare(
+        mount::parse_extra_mounts(&args.mount).context("parsing --mount")?,
+        &mount::MountContext {
+            mount_store: session.mount_store_dir(),
+            host_home: mount_home.clone(),
+            core_guest_mounts: core_volumes
+                .iter()
+                .map(|volume| PathBuf::from(&volume.guest_path))
+                .collect(),
+        },
+    )
+    .context("preparing --mount")?;
+
+    // These checks open/create Microsandbox state, so they must remain after
+    // the side-effect-free mount rejection boundary.
+    crate::msb_install::ensure_msb_home(&crate::msb_install::msb_home_dir()?)?;
+    // Fail fast if the private msb.db was forward-migrated by a newer build.
+    // See src/msb_preflight.rs and issue #30.
+    crate::msb_preflight::ensure_db_not_ahead().await?;
     crate::msb_install::ensure_socket_paths_fit(&session.sandbox_name)?;
     session.ensure_dirs()?;
     if !root_mode {
@@ -1011,12 +1065,6 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // prefix's .codex/packages (/opt/agent/.codex/packages in the
     // image; /root/.codex/packages under --root), which a symlink
     // would shadow.
-    let host_path = session
-        .project_dir
-        .to_str()
-        .context("project path contains non-UTF-8 bytes; not supported")?;
-    let (project_guest_path, remap_reason) =
-        resolve_project_guest_path(&session.project_dir, host_path);
     if let Some(reason) = remap_reason {
         notices.emit(format!(
             "==> Project path {host_path} {reason}; mounting at /workspace instead"
@@ -1085,11 +1133,11 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // happen to contain git checkouts must not silently widen
     // api.github.com access to remotes the user never asked for. Only the
     // explicit `--mount` entries are scanned for repos.
-    let parsed_mounts = mount::parse_extra_mounts(&args.mount).context("parsing --mount")?;
-    for em in &parsed_mounts {
-        if !em.host.exists() {
-            anyhow::bail!("--mount host path {:?} does not exist", em.host);
-        }
+    // Parse and prepare once.  In particular, preparation validates the
+    // complete mount plan before it creates fork state, scans repositories,
+    // snapshots credentials, or hands anything to the sandbox builder.
+    for notice in &mount_plan.notices {
+        notices.emit(notice)?;
     }
 
     // Phase 6: build the per-launch GitHub repo allow-list from the
@@ -1106,7 +1154,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     if !args.no_git {
         allowed_repos.extend(detect_github_repos(
             &session.project_dir,
-            parsed_mounts.iter().map(|m| m.host.as_path()),
+            mount_plan.repo_scan_roots.iter(),
         ));
     } else if !args.repo.is_empty() {
         notices.emit(format!(
@@ -1214,35 +1262,8 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     )
     .context("writing guest gh/git config")?;
 
-    // Phase 7 / issue #11: expand the parsed `--mount HOST[:GUEST]` extras —
-    // appending one read-only mount per symlink-target directory that any
-    // `:follow-links` entry's walk discovered, deduping repeats, and
-    // rejecting guest-path collisions (see `mount::expand_follow_links`).
-    // Reuses `parsed_mounts` from above rather than re-parsing `args.mount`
-    // (that used to be a duplicate `parse_extra_mounts` call here). The
-    // microsandbox runtime now enables msb_krun's userspace split irqchip
-    // (requires msb_krun >= 0.1.13 — earlier versions' userspace IOAPIC
-    // silently dropped IRQs on pin ≥ 32 and underflowed on RTE register
-    // accesses). Device capacity remains host-specific, so this layer does
-    // not impose a guessed portable cap on extra mounts (including
-    // follow-links' discovered ones). See the vendored vm.rs `build_vm`
-    // for details.
-    let (extra_mounts, follow_link_warnings) =
-        mount::expand_follow_links(parsed_mounts, mount_home.as_deref())
-            .context("expanding --mount follow-links")?;
-    for w in &follow_link_warnings {
-        notices.emit(format!("==> {w}"))?;
-    }
-    // Belt-and-suspenders: `parse_extra_mounts` already canonicalize()s
-    // every explicit HOST (which fails on a missing path), and every
-    // discovered mount's host is a path `canonicalize()` just succeeded
-    // on inside the follow-links walk — so this should never trip. Kept
-    // as a cheap final guard rather than the real existence check.
-    for em in &extra_mounts {
-        if !em.host.exists() {
-            anyhow::bail!("--mount host path {:?} does not exist", em.host);
-        }
-    }
+    // `mount_plan` is closed: launch translates its typed instructions but
+    // never reclassifies a source or makes another mount-policy decision.
 
     let is_local_registry = crate::pull::is_plain_http_registry(&image);
     // `.workdir()` becomes libkrun's `KRUN_WORKDIR`, which rides the
@@ -1272,14 +1293,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .cpus(cpus)
         .memory(memory_mib)
         .workdir(krun_workdir);
-    for volume in user::core_dir_volumes(
-        guest_identity
-            .as_ref()
-            .map(|gi| (gi.host_home(), session.guest_home_dir())),
-        &project_guest_path,
-        &session.project_dir,
-        &session.state_dir,
-    ) {
+    for volume in core_volumes {
         builder = builder.volume(volume.guest_path, |m| m.bind(volume.host_path));
     }
     // MSB_USER on the *sandbox* builder (independent of the per-exec
@@ -1296,35 +1310,57 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     if let Some(gi) = &guest_identity {
         builder = builder.user(gi.user_spec.clone());
     }
-    // Phase 7: extra `--mount HOST[:GUEST]` binds. Each gets its own
-    // .volume() — and we also have to mkdir the guest path in the
-    // patch builder so microsandbox's workdir/rootfs validation passes
-    // (same dance as the project bind above).
+    // Prepared mount instructions carry the already-classified node kind;
+    // file leaves get only their parents patched so agentd can safely create
+    // the target without writing through a readonly parent.
     let mut extra_mount_mkdirs: Vec<String> = Vec::new();
-    for em in &extra_mounts {
-        notices.emit(format!(
-            "==> Mounting {} -> {}{}",
-            em.host.display(),
-            em.guest.display(),
-            if em.readonly { " (read-only)" } else { "" }
-        ))?;
-        let host = em.host.clone();
-        let readonly = em.readonly;
-        let guest_str = em
-            .guest
+    for volume in &mount_plan.volumes {
+        let guest = volume.guest.clone();
+        let guest_str = guest
             .to_str()
             .context("--mount guest path must be UTF-8")?
-            .to_string();
-        builder = builder.volume(guest_str.clone(), move |m| {
-            mount::configure_extra_mount(m, host, readonly)
-        });
-        extra_mount_mkdirs.extend(mkdir_chain(&em.guest));
-    }
-    builder = builder.patch(|mut p| {
-        for parent in extra_mount_mkdirs.drain(..) {
-            p = p.mkdir(parent, None);
+            .to_owned();
+        match &volume.source {
+            mount::PreparedVolumeSource::WritableBind(host) => {
+                notices.emit(format!(
+                    "==> Mounting {} -> {}",
+                    host.display(),
+                    guest.display()
+                ))?;
+                let host = host.clone();
+                builder = builder.volume(guest_str, move |m| m.bind(host));
+            }
+            mount::PreparedVolumeSource::ReadOnlyBind(host) => {
+                notices.emit(format!(
+                    "==> Mounting {} -> {} (read-only)",
+                    host.display(),
+                    guest.display()
+                ))?;
+                let host = host.clone();
+                builder = builder.volume(guest_str, move |m| m.bind(host).readonly());
+            }
+            mount::PreparedVolumeSource::OpaqueFile => {
+                unreachable!("prepare materializes file masks before launch")
+            }
+            mount::PreparedVolumeSource::OpaqueDirectory => {
+                notices.emit(format!("==> Masking {} (read-only)", guest.display()))?;
+                builder = builder.volume(guest_str, |m| m.tmpfs().readonly());
+            }
         }
-        p
+        match volume.node_kind {
+            mount::PreparedNodeKind::Directory => extra_mount_mkdirs.extend(mkdir_chain(&guest)),
+            mount::PreparedNodeKind::File => {
+                if let Some(parent) = guest.parent() {
+                    extra_mount_mkdirs.extend(mkdir_chain(parent));
+                }
+            }
+        }
+    }
+    builder = builder.patch(|mut patch| {
+        for parent in extra_mount_mkdirs.drain(..) {
+            patch = patch.mkdir(parent, None);
+        }
+        patch
     });
     let mut builder = builder
         .patch(|mut p| {
@@ -2030,23 +2066,48 @@ fn pid_alive(pid: u32) -> bool {
 /// just contribute nothing — caller passes `--repo` to widen.
 fn detect_github_repos<'a>(
     project_dir: &Path,
-    extra_mount_dirs: impl IntoIterator<Item = &'a Path>,
+    extra_mount_roots: impl IntoIterator<Item = &'a mount::RepoScanRoot>,
 ) -> Vec<String> {
     let mut slugs: Vec<String> = Vec::new();
     scan_dir_for_github_slugs(project_dir, &mut slugs);
-
-    // Dedup against the project dir so a mount that *is* the
-    // project dir (or a symlink to it) doesn't re-run the same scan.
     let project_canon = project_dir.canonicalize().ok();
-    for dir in extra_mount_dirs {
-        if let (Some(pc), Ok(mc)) = (project_canon.as_ref(), dir.canonicalize())
-            && &mc == pc
+    for root in extra_mount_roots {
+        if let (Some(project), Ok(mounted)) = (project_canon.as_ref(), root.host.canonicalize())
+            && &mounted == project
         {
             continue;
         }
-        scan_dir_for_github_slugs(dir, &mut slugs);
+        scan_dir_for_github_slugs_with_exclusions(&root.host, &root.exclusions, &mut slugs);
     }
     slugs
+}
+
+fn metadata_hidden(exclusions: &[PathBuf], path: &Path) -> bool {
+    exclusions.iter().any(|excluded| {
+        // The scan must not read a metadata path that is hidden itself, lies
+        // below an excluded metadata directory, or has an excluded child
+        // that the scanner necessarily reads (notably `.git/config` for
+        // `git -C … remote -v`). Metadata siblings remain independently
+        // visible: hiding `.git` does not hide a visible `.gitmodules`.
+        path == excluded || path.starts_with(excluded) || excluded.starts_with(path)
+    })
+}
+
+fn scan_dir_for_github_slugs_with_exclusions(
+    dir: &Path,
+    exclusions: &[PathBuf],
+    out: &mut Vec<String>,
+) {
+    if !metadata_hidden(exclusions, Path::new(".git")) {
+        for slug in parse_dir_remote_github_slugs(dir) {
+            push_slug_unique(out, slug);
+        }
+    }
+    if !metadata_hidden(exclusions, Path::new(".gitmodules")) {
+        for slug in parse_gitmodules_github_slugs(dir) {
+            push_slug_unique(out, slug);
+        }
+    }
 }
 
 /// Scan one directory: top-level remotes + one level of submodule
@@ -2054,12 +2115,7 @@ fn detect_github_repos<'a>(
 /// claude-vm.sh; recursing into each submodule's `.gitmodules`
 /// would balloon scope and add little value in practice).
 fn scan_dir_for_github_slugs(dir: &Path, out: &mut Vec<String>) {
-    for slug in parse_dir_remote_github_slugs(dir) {
-        push_slug_unique(out, slug);
-    }
-    for slug in parse_gitmodules_github_slugs(dir) {
-        push_slug_unique(out, slug);
-    }
+    scan_dir_for_github_slugs_with_exclusions(dir, &[], out);
 }
 
 fn push_slug_unique(out: &mut Vec<String>, slug: String) {
@@ -3836,6 +3892,66 @@ options ndots:2 timeout:1";
                 .any(|s| s.eq_ignore_ascii_case("gregwebs/microsandbox")),
             "expected gregwebs/microsandbox in scope, got {slugs:?}"
         );
+    }
+
+    #[test]
+    fn github_scan_respects_hidden_git_and_gitmodules_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/visible.git",
+            ])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        std::fs::write(
+            root.path().join(".gitmodules"),
+            "[submodule \"hidden\"]\n path = hidden\n url = https://github.com/example/submodule.git\n",
+        )
+        .unwrap();
+        let root_scan = mount::RepoScanRoot {
+            host: root.path().to_path_buf(),
+            exclusions: Vec::new(),
+        };
+        let visible = detect_github_repos(project.path(), [&root_scan]);
+        assert!(visible.iter().any(|slug| slug == "example/visible"));
+        assert!(visible.iter().any(|slug| slug == "example/submodule"));
+        let hidden_git = mount::RepoScanRoot {
+            host: root.path().to_path_buf(),
+            exclusions: vec![PathBuf::from(".git")],
+        };
+        let slugs = detect_github_repos(project.path(), [&hidden_git]);
+        assert!(!slugs.iter().any(|slug| slug == "example/visible"));
+        assert!(slugs.iter().any(|slug| slug == "example/submodule"));
+        let hidden_config = mount::RepoScanRoot {
+            host: root.path().to_path_buf(),
+            exclusions: vec![PathBuf::from(".git/config")],
+        };
+        let slugs = detect_github_repos(project.path(), [&hidden_config]);
+        assert!(
+            !slugs.iter().any(|slug| slug == "example/visible"),
+            "an excluded .git/config must prevent git from reading its remote: {slugs:?}"
+        );
+        assert!(
+            slugs.iter().any(|slug| slug == "example/submodule"),
+            "a visible .gitmodules remains independently scannable: {slugs:?}"
+        );
+        let hidden_modules = mount::RepoScanRoot {
+            host: root.path().to_path_buf(),
+            exclusions: vec![PathBuf::from(".gitmodules")],
+        };
+        let slugs = detect_github_repos(project.path(), [&hidden_modules]);
+        assert!(slugs.iter().any(|slug| slug == "example/visible"));
+        assert!(!slugs.iter().any(|slug| slug == "example/submodule"));
     }
 
     #[test]

@@ -138,7 +138,34 @@ wrote. Non-root links are therefore materialized host-side by
 `ProjectSession::provision_guest_home`, dangling on the host and resolving once
 mounted. Both paths draw from the same `session::GUEST_HOME_LINKS` table.
 
-### Extra mounts: `ro`, `rw`, `follow-links`
+### Extra and forked mounts: `ro`, `rw`, `fork`, `follow-links`
+
+`fork` is an eager, project-scoped copy rather than a live bind. `mount::prepare`
+owns parsing, source classification, state publication, mask construction, and collision
+validation; `run` receives only typed prepared volumes. That boundary matters: a READY
+fork is selected before any source access, and launch does not accidentally re-stat a
+path after policy has been decided.
+
+```text
+live bind                         fork state
+HOST ── bind ──> /guest           ABSENT --lock--> COPYING --rename--> READY
+  └─ excluded file ─ mask ─> /guest/file             staging              data
+  └─ excluded directory ─ tmpfs ─> /guest/dir
+```
+
+A versioned, length-delimited SHA-256 identity contains the source spelling, normalized
+guest path, follow policy, and normalized exclusions. The store is a sibling of the
+guest-visible state directory: `&lt;project-hash&gt;.mounts/{locks,staging,forks}`. A per-fork
+exclusive lock serializes initializers; only a complete `manifest.json` plus `data` is
+renamed into `forks/`. Staging is never mounted. A malformed committed entry is a hard
+error with its reset path, never an automatic reseed. This is process-crash atomicity,
+not a power-loss durability or concurrently-mutating-source snapshot promise.
+
+Live exclusions are readonly opaque masks (a file bind for files and readonly tmpfs for
+directories); a plan rejects a mount that would pierce one. Fork exclusions are omitted
+before traversal. Default fork traversal preserves nested link text; `fork:follow-links`
+materializes link targets into owned data, so it never creates a continuing external bind.
+See [ADR-0013](docs/adr/0013-add-forked-mounts.md) for lifecycle and reset details.
 
 `--mount HOST[:GUEST][:MODE]...` (`mount.rs`).
 
@@ -743,6 +770,7 @@ directories the user never asked for.
 | Migrating 0.5.7 state to v0.6.15 | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md) |
 | Adopting `origin/main`'s network features | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
 | Wiring file-backed credential injection | [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
+| Forked mounts and opaque exclusions | [ADR-0013](docs/adr/0013-add-forked-mounts.md) |
 
 ## Deliberate non-goals
 

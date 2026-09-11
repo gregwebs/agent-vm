@@ -41,13 +41,28 @@ GitHub access:
           allow-list for cross-repo work.
 
 Mounts & ports:
-      --mount <HOST[:GUEST][:ro|:rw|:follow-links]>
-          Bind an extra host directory into the guest (repeatable).
+      --mount <HOST[:GUEST][:ro|:rw|:fork|:follow-links|:exclude=REL]>
+          Bind an extra host directory into the guest, or seed a persistent fork (repeatable).
 
-          Format `HOST[:GUEST][:ro|:rw|:follow-links]`; `GUEST` defaults to `HOST` (mirror at the
-          same absolute path). Append `:ro` for a read-only bind or `:rw` for read-write (the
-          default). `GUEST`, if given, must be an absolute path (start with `/`); a trailing token
-          that isn't a path is parsed as a mode keyword, e.g. `--mount ~/ref:ro`.
+          Format `HOST[:GUEST][:ro|:rw|:fork|:follow-links|:exclude=REL]`; `GUEST` defaults to
+          `HOST` (mirror at the same absolute path). Append `:ro` for a read-only bind or `:rw` for
+          read-write (the default). `GUEST`, if given, must be an absolute path (start with `/`); a
+          trailing token that isn't a path is parsed as a mode keyword, e.g. `--mount ~/ref:ro`.
+
+          `:fork` copies a file or directory once into project-scoped persistent state. Later
+          launches reuse that stored copy without synchronizing either direction: source changes do
+          not reach the fork, and guest changes do not reach the source. Forks consume disk space
+          for the full initial copy in the host-managed project mount store beside
+          `/agent-vm-state`. To reset or reseed one, stop its users, remove the exact fork directory
+          printed at launch, then relaunch the same declaration. `:fork` conflicts with `:ro` and
+          `:rw`. Example: `--mount ~/config:/config:fork:exclude=credentials.json`.
+
+          Repeat `:exclude=REL` on any valid mount mode. On live binds it creates a readonly opaque
+          mask; on a fork it omits that path only from initial seeding, so the guest can later
+          create fork-owned content there.
+
+          For `:fork`, symlinks are preserved by default. `:fork:follow-links` instead materializes
+          their targets in the project-owned copy, never as a continuing live bind.
 
           `:follow-links` additionally walks `HOST` on the host side and, for every symlink it
           transitively contains that resolves to a directory, bind-mounts that *real* directory into
@@ -188,7 +203,18 @@ Examples (claude shown; codex/opencode/shell take the same options):
   agent-vm claude --mount ~/ref:ro            read-only extra mount
   agent-vm claude --mount ~/.claude/skills:ro:follow-links
                                                follow symlinks in a skills dir
+  agent-vm shell --mount ~/config:/config:fork:exclude=credentials.json
+                                               seed an independent writable config copy
   agent-vm claude --repo owner/other-repo     widen the GitHub allow-list
+
+Fork mounts:
+  `:fork` copies its source once into project-scoped persistent state; later launches reuse that
+  copy, so source and fork changes never synchronize in either direction. `:fork:follow-links`
+  materializes symlink targets in the copy; without it, symlinks are preserved. Repeat
+  `:exclude=REL` to omit paths while seeding (or make them readonly opaque masks on live binds).
+  Forks use disk space for the full initial copy in the host-managed project mount store beside
+  `/agent-vm-state`. To reset/reseed, stop users of the fork, remove the exact directory printed at
+  launch, then launch the same declaration again.
 
 Networking (deny-by-default; flags compose):
   --publish        host  → guest   open an inbound port to a guest service
