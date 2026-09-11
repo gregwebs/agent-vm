@@ -97,6 +97,37 @@ fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+fn state_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn visit(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+            let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+            if metadata.is_dir() {
+                out.push((relative.clone(), b"directory".to_vec()));
+                visit(root, &entry.path(), out);
+            } else if metadata.file_type().is_symlink() {
+                use std::os::unix::ffi::OsStrExt;
+                out.push((
+                    relative,
+                    std::fs::read_link(entry.path())
+                        .unwrap()
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec(),
+                ));
+            } else {
+                out.push((relative, std::fs::read(entry.path()).unwrap()));
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries.sort();
+    entries
+}
+
 /// One isolated `$HOME` + `AGENT_VM_STATE_DIR` + project dir (cwd) + fake
 /// `MSB_PATH`, plus a helper to invoke `agent-vm shell --mount ... --image
 /// <bogus>` with a fully-controlled environment (no inherited vars beyond
@@ -128,6 +159,10 @@ impl Harness {
         self.home.path().canonicalize().unwrap()
     }
 
+    fn project_path(&self) -> PathBuf {
+        self.project.path().canonicalize().unwrap()
+    }
+
     /// Run `agent-vm shell --mount <m> [--mount <m>...] --image <bogus>`
     /// with `HOME`/`AGENT_VM_STATE_DIR`/cwd pinned to this harness's
     /// tempdirs, `MSB_PATH` pinned to the fake patched msb, and
@@ -135,7 +170,15 @@ impl Harness {
     /// `SandboxConfig` JSON to stderr right before the (expected-to-fail)
     /// pull.
     fn run_shell(&self, mounts: &[&str]) -> Output {
-        self.run_shell_opts(mounts, false, true)
+        self.run_shell_at_state(mounts, &self.state.path().canonicalize().unwrap())
+    }
+
+    fn run_shell_at_state(&self, mounts: &[&str], state: &Path) -> Output {
+        self.run_shell_opts_from_state(mounts, false, true, self.project.path(), state)
+    }
+
+    fn run_shell_from(&self, mounts: &[&str], project: &Path) -> Output {
+        self.run_shell_opts_from(mounts, false, true, project)
     }
 
     /// Like `run_shell`, but additionally lets a test pass `--root` and/or
@@ -153,16 +196,40 @@ impl Harness {
     /// the env var, independent of `guest_identity` — is actually wired
     /// into `launch()` rather than silently no-op'ing under `--root`.
     fn run_shell_opts(&self, mounts: &[&str], root: bool, set_home: bool) -> Output {
+        self.run_shell_opts_from(mounts, root, set_home, self.project.path())
+    }
+
+    fn run_shell_opts_from(
+        &self,
+        mounts: &[&str],
+        root: bool,
+        set_home: bool,
+        project: &Path,
+    ) -> Output {
+        self.run_shell_opts_from_state(
+            mounts,
+            root,
+            set_home,
+            project,
+            &self.state.path().canonicalize().unwrap(),
+        )
+    }
+
+    fn run_shell_opts_from_state(
+        &self,
+        mounts: &[&str],
+        root: bool,
+        set_home: bool,
+        project: &Path,
+        state: &Path,
+    ) -> Output {
         let mut cmd = Command::new(agent_vm_bin());
         cmd.env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env(
-                "AGENT_VM_STATE_DIR",
-                self.state.path().canonicalize().unwrap(),
-            )
+            .env("AGENT_VM_STATE_DIR", state)
             .env("MSB_PATH", &self.fake_msb)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
-            .current_dir(self.project.path())
+            .current_dir(project)
             .arg("shell");
         if set_home {
             cmd.env("HOME", self.home.path());
@@ -223,6 +290,286 @@ fn bind_mounts(config: &serde_json::Value) -> Vec<(String, String, bool)> {
             )
         })
         .collect()
+}
+
+#[test]
+fn absent_state_root_supports_directory_fork_seed_and_reuse() {
+    let h = Harness::new();
+    let state_parent = tempfile::tempdir_in("/tmp").unwrap();
+    let state = state_parent
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("absent/state-root");
+    let source = h.home.path().join("directory-source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("seed"), "seed").unwrap();
+    let mount = format!("{}:/guest:fork", source.display());
+
+    let seeded = h.run_shell_at_state(&[&mount], &state);
+    let seeded_stderr = stderr_of(&seeded);
+    assert!(
+        seeded_stderr.contains("Initialized fork"),
+        "{seeded_stderr}"
+    );
+    assert!(
+        seeded_stderr.contains("[debug] sandbox config JSON:"),
+        "{seeded_stderr}"
+    );
+
+    let reused = h.run_shell_at_state(&[&mount], &state);
+    let reused_stderr = stderr_of(&reused);
+    assert!(reused_stderr.contains("Reusing fork"), "{reused_stderr}");
+    assert!(
+        reused_stderr.contains("[debug] sandbox config JSON:"),
+        "{reused_stderr}"
+    );
+}
+
+#[test]
+fn ready_file_fork_with_explicit_child_is_rejected_before_launch_effects_in_either_order() {
+    for fork_first in [false, true] {
+        let h = Harness::new();
+        let source = h.home.path().join("source-file");
+        let child = h.home.path().join("child-directory");
+        std::fs::write(&source, "seed").unwrap();
+        std::fs::create_dir(&child).unwrap();
+        let fork = format!("{}:/guest/file:fork", source.display());
+
+        // First launch seeds the file fork. The deliberately bogus image
+        // fails only after builder configuration, so this proves the seed is
+        // committed before the second launch's side-effect-free rejection.
+        let seeded = h.run_shell(&[&fork]);
+        assert!(stderr_of(&seeded).contains("Initialized fork"));
+        std::fs::remove_file(&source).unwrap();
+
+        let child_mount = format!("{}:/guest/file/child:ro", child.display());
+        let mounts = if fork_first {
+            vec![fork.as_str(), child_mount.as_str()]
+        } else {
+            vec![child_mount.as_str(), fork.as_str()]
+        };
+        let before = state_tree(h.state.path());
+        let rejected = h.run_shell(&mounts);
+        assert!(!rejected.status.success());
+        let stderr = stderr_of(&rejected);
+        assert!(stderr.contains("below file mount"), "{stderr}");
+        assert!(
+            !stderr.contains("[debug] sandbox config JSON:")
+                && !stderr.contains("Initialized fork")
+                && !stderr.contains("Reusing fork")
+                && !stderr.contains("==> Mounting")
+                && !stderr.contains("==> Masking"),
+            "a rejected complete plan must not emit notices or builder output: {stderr}"
+        );
+        assert_eq!(
+            state_tree(h.state.path()),
+            before,
+            "a rejected complete plan must not mutate state"
+        );
+    }
+}
+
+#[test]
+fn absent_state_root_supports_file_fork() {
+    let h = Harness::new();
+    let state_parent = tempfile::tempdir_in("/tmp").unwrap();
+    let state = state_parent
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("absent/state-root");
+    let source = h.home.path().join("file-source");
+    std::fs::write(&source, "seed").unwrap();
+    let mount = format!("{}:/guest-file:fork", source.display());
+
+    let output = h.run_shell_at_state(&[&mount], &state);
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("Initialized fork"), "{stderr}");
+    assert!(stderr.contains("[debug] sandbox config JSON:"), "{stderr}");
+}
+
+#[test]
+fn absent_state_root_supports_live_file_and_directory_exclusions() {
+    let h = Harness::new();
+    let state_parent = tempfile::tempdir_in("/tmp").unwrap();
+    let state = state_parent
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("absent/state-root");
+    let source = h.home.path().join("live-source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("hidden-file"), "secret").unwrap();
+    std::fs::create_dir(source.join("hidden-directory")).unwrap();
+    let mount = format!(
+        "{}:/guest:ro:exclude=hidden-file:exclude=hidden-directory",
+        source.display()
+    );
+
+    let output = h.run_shell_at_state(&[&mount], &state);
+    let stderr = stderr_of(&output);
+    let mounts = bind_mounts(&debug_config_json(&stderr));
+    assert!(
+        mounts
+            .iter()
+            .any(|(_, guest, readonly)| guest == "/guest/hidden-file" && *readonly),
+        "expected a readonly file mask, got: {mounts:?}"
+    );
+    assert!(stderr.contains("[debug] sandbox config JSON:"), "{stderr}");
+    assert!(
+        state.exists(),
+        "valid masks must create their required store hierarchy"
+    );
+}
+
+#[test]
+fn file_fork_above_core_fails_before_mount_or_launch_side_effects() {
+    let h = Harness::new();
+    let state_parent = tempfile::tempdir_in("/tmp").unwrap();
+    let state = state_parent
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("absent/state-root");
+    let source = h.home.path().join("source-file");
+    std::fs::write(&source, "seed").unwrap();
+    let project = h.project_path();
+    let guest = project.parent().unwrap();
+    let mount = format!("{}:{}:fork", source.display(), guest.display());
+
+    let output = h.run_shell_at_state(&[&mount], &state);
+    assert!(!output.status.success());
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("below file mount"), "{stderr}");
+    assert!(
+        !stderr.contains("[debug] sandbox config JSON:")
+            && !stderr.contains("Initialized fork")
+            && !stderr.contains("Reusing fork")
+            && !stderr.contains("==> Mounting"),
+        "a rejected topology must not emit builder or mount side effects: {stderr}"
+    );
+    assert!(
+        !state.exists(),
+        "a rejected topology must not create even an absent state root"
+    );
+}
+
+#[test]
+fn exact_core_explicit_collision_fails_before_launch_side_effects() {
+    let h = Harness::new();
+    let source = h.home.path().join("fork-source");
+    std::fs::create_dir(&source).unwrap();
+    let project = h.project_path();
+    let mount = format!("{}:{}:fork", source.display(), project.display());
+
+    let output = h.run_shell(&[&mount]);
+    assert!(!output.status.success());
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("collides with an agent-vm core mount"),
+        "{stderr}"
+    );
+    assert_no_launch_side_effects(&h, &stderr);
+}
+
+#[test]
+fn exact_core_followed_collision_fails_before_launch_side_effects() {
+    let h = Harness::new();
+    let home = h.home_path();
+    let project = home.join("project");
+    let source = home.join("follow-source");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&source).unwrap();
+    std::os::unix::fs::symlink(&project, source.join("project-alias")).unwrap();
+    let mount = format!("{}:/guest:ro:follow-links", source.display());
+
+    let output = h.run_shell_from(&[&mount], &project);
+    assert!(!output.status.success());
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("mount plan collides with an agent-vm core mount"),
+        "{stderr}"
+    );
+    assert_no_launch_side_effects(&h, &stderr);
+}
+
+fn assert_no_launch_side_effects(harness: &Harness, stderr: &str) {
+    assert!(
+        !stderr.contains("[debug] sandbox config JSON:")
+            && !stderr.contains("Initialized fork")
+            && !stderr.contains("Reusing fork")
+            && !stderr.contains("==> Mounting")
+            && !stderr.contains("==> Masking"),
+        "a rejected topology must not emit builder or mount notices: {stderr}"
+    );
+    let state_entries = std::fs::read_dir(harness.state.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert!(
+        state_entries.is_empty(),
+        "a rejected topology must not create session, fork, mask, credential, or builder state: {state_entries:?}"
+    );
+}
+
+#[test]
+fn conflicting_declarations_fail_before_mount_or_launch_side_effects_in_either_order() {
+    // `launch` calls mount::prepare before notices, repository scanning,
+    // credential refresh, or builder wiring. Exercise that ordering through
+    // the process boundary rather than inferring it from the unit seam.
+    for fork_first in [true, false] {
+        let h = Harness::new();
+        let fork_source = h.home.path().join("fork-source");
+        let live_source = h.home.path().join("live-source");
+        std::fs::create_dir(&fork_source).unwrap();
+        std::fs::create_dir(&live_source).unwrap();
+        let fork = format!("{}:/collision:fork", fork_source.display());
+        let live = format!("{}:/collision:ro", live_source.display());
+        let mounts = if fork_first {
+            vec![fork.as_str(), live.as_str()]
+        } else {
+            vec![live.as_str(), fork.as_str()]
+        };
+
+        let output = h.run_shell(&mounts);
+        assert!(!output.status.success());
+        let stderr = stderr_of(&output);
+        assert!(
+            stderr.contains("claimed by different declarations"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("[debug] sandbox config JSON:"),
+            "a rejected mount plan must not reach builder wiring: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Initialized fork")
+                && !stderr.contains("Reusing fork")
+                && !stderr.contains("Masking "),
+            "a rejected mount plan must not emit mount notices: {stderr}"
+        );
+        assert!(
+            std::fs::read_dir(h.state.path())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".mounts")),
+            "a rejected plan must not create a fork/mask store"
+        );
+        assert!(
+            std::fs::read_dir(h.state.path())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".secrets")),
+            "a rejected plan must not refresh credentials"
+        );
+    }
 }
 
 #[test]
@@ -388,191 +735,6 @@ fn follow_links_handles_a_host_that_is_itself_a_symlink() {
 }
 
 #[test]
-fn follow_links_masks_file_directory_and_nested_aliases_at_every_guest_path() {
-    let h = Harness::new();
-    let home = h.home_path();
-    let source = home.join("source");
-    let target = source.join("target");
-    let nested_target = source.join("nested-target");
-    std::fs::create_dir(&source).unwrap();
-    std::fs::create_dir(&target).unwrap();
-    std::fs::create_dir(&nested_target).unwrap();
-    std::fs::write(target.join("secret-file"), "secret").unwrap();
-    std::fs::create_dir(target.join("secret-directory")).unwrap();
-    std::fs::write(nested_target.join("nested-secret"), "secret").unwrap();
-    std::os::unix::fs::symlink("target", source.join("alias")).unwrap();
-    std::os::unix::fs::symlink("../nested-target", target.join("nested-alias")).unwrap();
-
-    let mount = format!(
-        "{}:/guest:ro:follow-links:exclude=alias/secret-file:exclude=alias/secret-directory:exclude=alias/nested-alias/nested-secret",
-        source.display()
-    );
-    let out = h.run_shell(&[&mount]);
-    let config = debug_config_json(&stderr_of(&out));
-    let guests = config["mounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|mount| mount["guest"].as_str())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let expected = vec![
-        "/guest/alias/secret-file".to_owned(),
-        "/guest/alias/secret-directory".to_owned(),
-        "/guest/alias/nested-alias/nested-secret".to_owned(),
-        target.join("secret-file").display().to_string(),
-        target.join("secret-directory").display().to_string(),
-        nested_target.join("nested-secret").display().to_string(),
-    ];
-
-    for guest in expected {
-        assert!(
-            guests.contains(&guest),
-            "missing opaque mask at {guest}: {guests:?}"
-        );
-    }
-    assert!(!out.status.success());
-}
-
-#[test]
-fn absent_projected_child_does_not_reject_file_or_directory_overlay_in_either_order() {
-    for directory in [false, true] {
-        for root_first in [false, true] {
-            let h = Harness::new();
-            let source = h.home_path().join("source");
-            std::fs::create_dir(&source).unwrap();
-            std::fs::write(source.join("hidden"), "hidden").unwrap();
-            let overlay_source = h.home_path().join("overlay");
-            if directory {
-                std::fs::create_dir(&overlay_source).unwrap();
-            } else {
-                std::fs::write(&overlay_source, "overlay").unwrap();
-            }
-
-            let masked_root = format!("{}:/guest:rw:exclude=hidden", source.display());
-            let overlay = format!("{}:/guest/new:rw", overlay_source.display());
-            let declarations = if root_first {
-                vec![masked_root.as_str(), overlay.as_str()]
-            } else {
-                vec![overlay.as_str(), masked_root.as_str()]
-            };
-            let out = h.run_shell(&declarations);
-            let stderr = stderr_of(&out);
-            assert!(
-                !stderr.contains("resolving mount /guest/new through mount /guest"),
-                "an absent projected child must not reject preparation: {stderr}"
-            );
-            let config = debug_config_json(&stderr);
-            let guests = config["mounts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|mount| mount["guest"].as_str())
-                .collect::<Vec<_>>();
-            assert!(guests.contains(&"/guest/new"));
-            assert!(guests.contains(&"/guest/hidden"));
-        }
-    }
-}
-
-#[test]
-fn composed_mount_alias_overlay_is_rejected_before_builder_or_state_side_effects() {
-    for directory in [false, true] {
-        for order in [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ] {
-            let h = Harness::new();
-            let root = h.home_path().join("root");
-            std::fs::create_dir(&root).unwrap();
-            let hidden = root.join("m-hidden");
-            if directory {
-                std::fs::create_dir(&hidden).unwrap();
-            } else {
-                std::fs::write(&hidden, "hidden").unwrap();
-            }
-            std::os::unix::fs::symlink("a-new/secret", root.join("z-alias")).unwrap();
-
-            let supplied_child = h.home_path().join("supplied-a-new");
-            std::fs::create_dir(&supplied_child).unwrap();
-            std::os::unix::fs::symlink("../m-hidden", supplied_child.join("secret")).unwrap();
-
-            let declarations = [
-                format!("{}:/guest:rw:exclude=m-hidden", root.display()),
-                format!("{}:/guest/a-new:rw", supplied_child.display()),
-                format!("{}:/guest/z-alias:rw", hidden.display()),
-            ];
-            let declarations = order
-                .iter()
-                .map(|&index| declarations[index].as_str())
-                .collect::<Vec<_>>();
-            let out = h.run_shell(&declarations);
-            let stderr = stderr_of(&out);
-
-            assert!(!out.status.success());
-            assert!(stderr.contains("pierce opaque mask"), "stderr:\n{stderr}");
-            assert!(
-                !stderr.contains("[debug] sandbox config JSON"),
-                "the composed alias collision must reject before builder wiring, stderr:\n{stderr}"
-            );
-            assert!(
-                std::fs::read_dir(h.state.path()).unwrap().next().is_none(),
-                "rejection must not create state (directory={directory}, order={order:?})"
-            );
-        }
-    }
-}
-
-#[test]
-fn in_tree_symlink_alias_overlay_is_rejected_before_builder_in_either_order() {
-    for directory in [false, true] {
-        for root_first in [false, true] {
-            let h = Harness::new();
-            let source = h.home_path().join("source");
-            let deep = source.join("deep/nested");
-            std::fs::create_dir_all(&deep).unwrap();
-            let secret = deep.join("secret");
-            if directory {
-                std::fs::create_dir(&secret).unwrap();
-            } else {
-                std::fs::write(&secret, "secret").unwrap();
-            }
-            std::fs::create_dir(source.join("b")).unwrap();
-            std::os::unix::fs::symlink("b", source.join("a")).unwrap();
-            std::os::unix::fs::symlink("../deep/nested", source.join("b/c")).unwrap();
-
-            let root = format!(
-                "{}:/guest:ro:follow-links:exclude=a/c/secret",
-                source.display()
-            );
-            let overlay = format!("{}:/guest/deep/nested/secret:ro", secret.display());
-            let declarations = if root_first {
-                vec![root.as_str(), overlay.as_str()]
-            } else {
-                vec![overlay.as_str(), root.as_str()]
-            };
-            let out = h.run_shell(&declarations);
-            let stderr = stderr_of(&out);
-
-            assert!(!out.status.success());
-            assert!(stderr.contains("pierce opaque mask"), "stderr:\n{stderr}");
-            assert!(
-                !stderr.contains("[debug] sandbox config JSON"),
-                "the physical-alias collision must reject before builder wiring, stderr:\n{stderr}"
-            );
-            assert!(
-                std::fs::read_dir(h.state.path()).unwrap().next().is_none(),
-                "rejection must not create state (directory={directory}, root_first={root_first})"
-            );
-        }
-    }
-}
-
-#[test]
 fn rw_follow_links_is_a_hard_parse_error_before_boot() {
     let h = Harness::new();
     let host_mount = h.project.path().join("m");
@@ -682,5 +844,138 @@ fn follow_links_root_mode_without_home_is_a_hard_error() {
     assert!(
         !err.contains("[debug] sandbox config JSON"),
         "the guardrail must fail before builder.build() runs, stderr:\n{err}"
+    );
+}
+
+#[test]
+fn ready_directory_fork_reuses_committed_anchor_for_nested_exclusion_in_either_order() {
+    for child_follow_links in [false, true] {
+        for fork_first in [false, true] {
+            let h = Harness::new();
+            let source = h.home_path().join("fork-source");
+            let child = h.home_path().join("child-source");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&child).unwrap();
+            std::fs::write(child.join("secret"), "host secret").unwrap();
+            if child_follow_links {
+                std::fs::create_dir(child.join("linked")).unwrap();
+                std::os::unix::fs::symlink("linked", child.join("alias")).unwrap();
+            }
+            // The fork preserves this nested link. On reuse, physical alias
+            // validation must project the mask through committed `data`, not the
+            // deleted declaration root.
+            std::os::unix::fs::symlink(&child, source.join("child")).unwrap();
+            let fork = format!("{}:/fork:fork", source.display());
+
+            let seeded = h.run_shell(&[&fork]);
+            let seeded_binds = bind_mounts(&debug_config_json(&stderr_of(&seeded)));
+            let committed = seeded_binds
+                .iter()
+                .find(|(_, guest, _)| guest == "/fork")
+                .map(|(host, _, _)| PathBuf::from(host))
+                .expect("seeded fork bind");
+            std::fs::remove_file(source.join("child")).unwrap();
+            std::fs::remove_dir(&source).unwrap();
+
+            let child_mount = format!(
+                "{}:/fork/child:ro{}:exclude=secret",
+                child.display(),
+                if child_follow_links {
+                    ":follow-links"
+                } else {
+                    ""
+                },
+            );
+            let mounts = if fork_first {
+                vec![fork.as_str(), child_mount.as_str()]
+            } else {
+                vec![child_mount.as_str(), fork.as_str()]
+            };
+            let reused = h.run_shell(&mounts);
+            let stderr = stderr_of(&reused);
+            assert!(stderr.contains("Reusing fork"), "{stderr}");
+            let config = debug_config_json(&stderr);
+            let binds = bind_mounts(&config);
+            assert!(
+                binds.iter().any(|(host, guest, readonly)| {
+                    PathBuf::from(host) == committed && guest == "/fork" && !readonly
+                }),
+                "expected committed fork bind, got: {binds:?}"
+            );
+            assert!(
+                binds.iter().any(|(host, guest, readonly)| {
+                    host == &child.display().to_string() && guest == "/fork/child" && *readonly
+                }),
+                "expected child bind, got: {binds:?}"
+            );
+            assert!(
+                binds.iter().any(|(host, guest, readonly)| {
+                    host.ends_with(".mounts/.mask-file")
+                        && guest == "/fork/child/secret"
+                        && *readonly
+                }),
+                "expected readonly opaque file mask, got: {config}"
+            );
+            if child_follow_links {
+                assert!(
+                    binds.iter().any(|(host, guest, readonly)| {
+                        host == &child.join("linked").display().to_string()
+                            && guest == &child.join("linked").display().to_string()
+                            && *readonly
+                    }),
+                    "expected followed child bind, got: {binds:?}"
+                );
+            }
+            assert!(
+                !source.exists(),
+                "the deleted declaration source must not be needed after READY reuse"
+            );
+        }
+    }
+}
+
+#[test]
+fn fork_debug_config_uses_committed_data_not_source_and_reuses_it() {
+    let h = Harness::new();
+    let source = h.home_path().join("fork-source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("visible"), "seed").unwrap();
+    std::fs::write(source.join("hidden"), "secret").unwrap();
+    let mount = format!("{}:/fork:fork:exclude=hidden", source.display());
+
+    let first = h.run_shell(&[&mount]);
+    let first_config = debug_config_json(&stderr_of(&first));
+    let first_binds = bind_mounts(&first_config);
+    let (_, _, readonly) = first_binds
+        .iter()
+        .find(|(_, guest, _)| guest == "/fork")
+        .unwrap_or_else(|| panic!("missing fork bind: {first_binds:?}"));
+    assert!(!readonly);
+    let (host, _, _) = first_binds
+        .iter()
+        .find(|(_, guest, _)| guest == "/fork")
+        .unwrap();
+    assert_ne!(host, &source.display().to_string());
+    let committed = PathBuf::from(host);
+    assert_eq!(
+        std::fs::read_to_string(committed.join("visible")).unwrap(),
+        "seed"
+    );
+    assert!(!committed.join("hidden").exists());
+
+    std::fs::write(source.join("visible"), "host-change").unwrap();
+    std::fs::write(committed.join("visible"), "fork-change").unwrap();
+    std::fs::remove_dir_all(&source).unwrap();
+    let second = h.run_shell(&[&mount]);
+    let second_config = debug_config_json(&stderr_of(&second));
+    let second_binds = bind_mounts(&second_config);
+    let (reused, _, _) = second_binds
+        .iter()
+        .find(|(_, guest, _)| guest == "/fork")
+        .unwrap();
+    assert_eq!(reused, host);
+    assert_eq!(
+        std::fs::read_to_string(committed.join("visible")).unwrap(),
+        "fork-change"
     );
 }

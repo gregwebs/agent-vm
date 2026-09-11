@@ -106,7 +106,7 @@ fn main() -> Result<()> {
     // contexts where the bundled msb may not be available
     // (e.g. inside the guest VM), so skip the check there too.
     //
-    // CRITICAL: `point_at_msb()` / `point_at_msb_home()` mutate the
+    // CRITICAL: `point_at_msb()` / `configure_msb_home()` mutate the
     // process environment via `unsafe { std::env::set_var(...) }`.
     // setenv() is not thread-safe under POSIX. We MUST run them
     // before the tokio multi-thread runtime spawns workers (which
@@ -115,12 +115,20 @@ fn main() -> Result<()> {
     let needs_msb_setup = !matches!(cli.cmd, Cmd::InterceptHook(_) | Cmd::Clipboard(_));
     if needs_msb_setup {
         msb_install::point_at_msb()?;
-        // Reroute msb's writable state off `~/.microsandbox/` and into
+        // Select a rerouted msb state location off `~/.microsandbox/` and into
         // agent-vm's own state dir. msb still finds `libkrunfw.so.*`
         // via MSB_PATH → sibling `../lib/` (the bundle layout), so no
         // copy/sync into MSB_HOME is needed — only the writable state
         // (db, sandboxes, cache, tls/CA, logs) lives here.
-        msb_install::point_at_msb_home()?;
+        let msb_home = msb_install::configure_msb_home()?;
+        // Launch defers state creation until `run::launch` has rejected an
+        // invalid mount topology. Other commands do not have that boundary.
+        if !matches!(
+            cli.cmd,
+            Cmd::Claude(_) | Cmd::Codex(_) | Cmd::Opencode(_) | Cmd::Copilot(_) | Cmd::Shell(_)
+        ) {
+            msb_install::ensure_msb_home(&msb_home)?;
+        }
     }
     // `msb_cmd::run` is fully synchronous (just spawns a child and waits);
     // dispatch it before paying for a tokio runtime we'd otherwise spin up
