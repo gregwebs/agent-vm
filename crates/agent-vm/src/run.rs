@@ -3004,7 +3004,7 @@ mod tests {
     }
 
     // `resolve_boot_image_with_layer` is only exercised end-to-end by the
-    // opt-in docker+registry e2e paths (see layer.rs's `#[ignore]`d
+    // opt-in docker+registry e2e paths (see `layer.rs`'s and `layer/contract.rs`'s `#[ignore]`d
     // `e2e_*` tests and the manual verification recorded for issue #13/#79),
     // but its "no chain declared" short circuit is pure and network-free:
     // `layer::resolve_layer_chain` returns an empty chain on a missing
