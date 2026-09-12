@@ -111,8 +111,21 @@ in-VM coding agents (Claude Code, Codex CLI, OpenCode). "Base image" and
 "guest template" name the same thing; use "base image" in code and docs that
 also talk about tooling layers, since it is the base a layer builds `FROM`.
 Resolved via `--image` / `AGENT_VM_IMAGE_TAG` / `defaults::DEFAULT_IMAGE_REF`
-(`run.rs`'s `base_image` binding). See
-`docs/adr/0003-project-tooling-layers.md`.
+(`run.rs`'s `base_image` binding). msb's resolved per-platform **manifest
+digest** is authoritative: it is step 0's hash input and what boot resolves,
+even when Docker needs a separate build-time name for the same base (see
+**Base link**). See `docs/adr/0003-project-tooling-layers.md`.
+
+## Base link
+
+The Docker-local name `agent-vm-base:<manifest-digest-hex>` for an msb-cached
+base image — what buildx's step-0 `FROM` resolves, created by
+`script/build/import-image.sh` at import time (or, for a registry base, by a
+build-time `docker pull <repo>@<digest>` + `docker tag`). It is the *bridge*
+between the two image stores, not a second identity: the manifest digest stays
+step 0's hash input, and the link is never consulted on a cache-hit launch
+(which spawns no Docker process). See
+`docs/adr/0003-project-tooling-layers.md`'s issue-#98 amendment.
 
 ## Tooling layer
 
@@ -161,8 +174,9 @@ plus that step's whole tooling-layer directory tree (git-mode-normalized:
 only the execute bit is tracked, so checkout umask can't move the hash).
 For chain step 0, `base_image_id` is the base image's resolved manifest
 digest; for every step after it, `base_image_id` is the *previous step's*
-content hash — never a docker-assigned image id (see the ADR's chain
-amendment for why). That makes the hash transitive: each step's hash
+content hash — never a docker-assigned image id (see the ADR's *chain*
+amendment) or the **Base link** tag (see the ADR's issue-#98 amendment).
+That makes the hash transitive: each step's hash
 covers everything beneath it, so editing an early step invalidates every
 step above it, and the whole chain's tags are computable without spawning a
 process. The tag *is* the staleness check — there is no separate state file

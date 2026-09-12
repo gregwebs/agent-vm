@@ -119,6 +119,15 @@ To use a different cache tag, pass both the Docker source and destination tag:
 ./script/build/import-image.sh my-local-image:dev agent-vm-template:dev
 ```
 
+A project with tooling layers (`.agent-vm/layers/*/`) also needs its base
+addressed *inside Docker*, under the same reference the launcher builds step 0
+`FROM`. `import-image.sh` now creates that Docker **base link**
+(`agent-vm-base:<msb-manifest-digest-hex>`) automatically at import time —
+reading the digest back from the freshly loaded destination and tagging the
+Docker **source** image (so the renamed form above works too). This is why the
+import step is not optional for a layered project: without the link, the first
+build hard-fails and tells you to rerun this script.
+
 The script accepts zero to two positional arguments. The Docker source defaults to `agent-vm-template:latest`, and the destination tag defaults to the source. It verifies the Docker image is exactly `linux/arm64`, resolves agent-vm's state directory, and pipes `docker save` into `msb image load`. It does not run a registry or create a caller-managed tar archive. `msb` currently stages stdin in a temporary file before ingesting it, so temporary free space roughly equal to the Docker archive is still required.
 
 Cache references are exact. Importing `agent-vm-template:latest` does not populate `ghcr.io/wirenboard/agent-vm-template:latest`.

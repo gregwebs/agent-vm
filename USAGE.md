@@ -183,7 +183,11 @@ previous one's tag, loads **only the final step's** result into the
 microsandbox image cache **registry-lessly** (no `registry:2` sidecar, no
 registry contact at boot), and boots that derived image instead of the base.
 Intermediate steps live in docker's own local image store, never booted and
-never ingested into the msb cache.
+never ingested into the msb cache. Step 0 resolves its base through the
+Docker-local base link `agent-vm-base:<msb-manifest-digest-hex>` (created at
+import time by `./script/build/import-image.sh`; for a registry base, the
+first build instead pulls the exact digest and creates the link itself) — this
+resolution happens **only on an actual build**, never on a cached launch.
 
 Each step's identity is a content hash that transitively covers every step
 beneath it, so the tag itself is the staleness check — there is no separate

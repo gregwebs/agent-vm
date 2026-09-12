@@ -7,10 +7,13 @@ Accepted. The single-layer decision is superseded by ordered layer chains
 records the removal of `--layer` / `$AGENT_VM_LAYER`. A follow-on amendment,
 "Amendment: `--layer` returns, additive and repeatable", redefines `--layer`
 as a repeatable flag appended after the project's own chain and records that
-`$AGENT_VM_LAYER` stays removed and is now rejected outright if set. Every
-other decision here (registry-less ingest, digest-pinned base,
-hash-as-staleness-check, hard-fail, the Dockerfile contract) is unchanged and
-now applies per chain step.
+`$AGENT_VM_LAYER` stays removed and is now rejected outright if set. A third
+amendment, "Amendment: msb-owned base with a Docker base link (issue #98)",
+supersedes only the way the base is *addressed by Docker* — the historical
+direct digest-pinned `BASE_IMAGE` cannot name an archive-imported base. Every
+other decision here (registry-less ingest, hash-as-staleness-check, hard-fail,
+the Dockerfile contract) is unchanged and now applies per chain step; msb's
+per-platform manifest digest remains the identity anchor for step 0's hash.
 
 ## Context
 
@@ -192,9 +195,12 @@ Each chain step's `Dockerfile` (`.agent-vm/layers/<NN-name>/Dockerfile`)
 MUST:
 
 - Start `ARG BASE_IMAGE=<default>` then `FROM ${BASE_IMAGE}` — the launcher
-  overrides `BASE_IMAGE` via `--build-arg`, to the digest-pinned base for
-  step 0 and to the previous step's tag for every step after it (see the
-  chain amendment below). This requirement is now doubly load-bearing: it is
+  overrides `BASE_IMAGE` via `--build-arg`, to the **base link**
+  (`agent-vm-base:<msb-manifest-digest-hex>`, a local Docker name — not the
+  digest-pinned registry ref this section originally described; see the
+  issue-#98 amendment below) for step 0, and to the previous step's tag for
+  every step after it (see the chain amendment below). This requirement is
+  now doubly load-bearing: it is
   how steps chain, not only how the base is pinned. A Dockerfile that
   hardcodes `FROM ghcr.io/...` or `FROM <some other tag>` instead breaks
   both.
@@ -453,6 +459,94 @@ consequence entirely (and the equivalent one above). Not done here because it
 changes the final-build path this amendment does not otherwise touch, needs
 buildx ≥ 0.13, and the existing zstd→gzip retry logic would need to cover a
 second exporter.
+
+### Amendment: msb-owned base with a Docker base link (issue #98)
+
+This ADR's "Digest-pinned `BASE_IMAGE`" decision assumed the base always
+arrives from a registry, where msb's per-platform manifest digest is directly
+pullable as `<repo>@<digest>`. That assumption breaks on the documented Apple
+Silicon path: `script/build/import-image.sh` loads a local `docker save`
+archive into msb, and msb *synthesizes* a manifest digest by re-serializing
+the manifest itself. That digest is valid inside msb but exists in neither a
+registry nor Docker's content-addressed namespace, so passing it straight to
+buildx's `FROM` fails with "failed to resolve source metadata … pull access
+denied". Pre-existing since issue #13; every layered project hit it.
+
+**The split: msb owns base identity and launch; Docker executes builds.**
+
+- **msb keeps the base identity unchanged.** The value fed to
+  `layer::plan_chain` as step 0's `base_image_id` is still msb's resolved
+  per-platform manifest digest — the same input as before, so no derived-image
+  tag moves. The launch path stays **msb-only**: read base metadata → compute the
+  chain hash → msb cache check → boot. A **cache-hit launch spawns no Docker
+  process at all**, not even an `inspect`.
+- **Docker gets a local bridge name, only at build time.** Step 0 builds
+  `FROM agent-vm-base:<manifest-digest-hex>` — a Docker-local tag in a
+  repository agent-vm owns. The link means "Docker's image under this tag is
+  the same base whose manifest identity msb records"; it is *not* a second
+  identity and never enters `plan_chain`'s hash input. `digest_pinned_base`
+  is retained, repurposed to form the exact registry pull reference below.
+- **`import-image.sh` creates the link at import time.** After `docker save |
+  msb image load`, it reads the loaded destination's top-level manifest
+  digest back (`msb image inspect --format json`, extracted structurally with
+  `plutil` so the nested `config.digest` can't be mistaken for it) and runs
+  `docker tag <source-image> agent-vm-base:<hex>`. Import is the one moment
+  Docker's source image and msb's cached copy are known to be identical bytes
+  — which is also why the renamed form
+  (`import-image.sh my-local:dev agent-vm-template:dev`) links the *source*,
+  not the destination.
+- **Build-time resolution is lazy and ordered.** `execute_chain` calls
+  `ChainRuntime::pin_base(base_ref, digest)` only when step 0 actually builds
+  (after the final-cache check, the backward intermediate search, and the
+  single chain confirmation):
+
+  ```text
+  cache-hit launch:   base metadata → chain hash → final msb cache hit → boot
+                      Docker calls: ZERO
+
+  build miss, step 0: plan_chain(..., msb-digest)          # identity is msb's
+                      pin_base(base_ref, msb-digest):
+                        agent-vm-base:<hex> present?  → use it
+                        else docker pull <repo>@<digest>; docker tag → link
+                        else hard-fail naming the ref + import-image.sh
+                      buildx … --build-arg BASE_IMAGE=agent-vm-base:<hex>
+  ```
+
+**Accepted consequences.**
+
+- **No multi-arch re-tag.** msb's per-platform manifest digest stays the hash
+  input, so existing derived-image tags never move.
+- **`import-image.sh` gains a Docker `tag` side effect** (and its fake-based
+  tests cover it). Docker's source and msb's cache are linked at import time;
+  a base that reached msb by some *other* offline route has no link and no
+  pullable digest and **hard-fails**, naming the ref and
+  `./script/build/import-image.sh` rather than booting the plain base.
+- **A registry base's first build does one explicit `docker pull` + `docker
+  tag`.** Later builds reuse the link; a cache-hit launch never gets here.
+- **An existing `agent-vm-base:<hex>` link is trusted with no revalidation.**
+  `pin_docker_base` / `pin_docker_base_with_runner` short-circuits on the
+  presence probe, so a link left by an earlier import of *different* content
+  under a colliding hex — or a manual retag — is used as-is. This is the one
+  place the design can build `FROM` the wrong bytes. No revalidation probe
+  was added: it would put an extra addressing/content call on a build path the
+  design keeps deliberately lean, and import time is the *only* moment the
+  two stores are known to hold identical bytes, so the link is established
+  there (and re-established by rerunning the idempotent import).
+- **Registry-less ingest and Docker-local intermediates are unchanged**: only
+  the final step is ingested into msb; intermediates still live in docker's
+  store.
+- **Rejected: a persisted digest state file, or a Docker probe on the launch
+  path.** Either can silently disagree with the image store — exactly the
+  drift the hash-as-staleness-check design exists to prevent — and a probe
+  would put Docker back on every cache hit.
+- **Deferred: an explicit base-architecture guard.** Under containerd a
+  multi-arch tag's identity is the *index* digest while `docker image inspect`
+  reports whatever platform the tag currently resolves to, so a naive guard
+  false-fails; genuine mismatches already hard-fail through buildx.
+
+The older "Digest-pinned `BASE_IMAGE`" section above is retained as historical
+context; its `<repo>@<digest>` reference now lives only inside `pin_base` as
+the exact pull used to establish the link, not as buildx's step-0 `FROM`.
 
 ## Consequences
 
