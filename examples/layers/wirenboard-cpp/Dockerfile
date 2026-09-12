@@ -5,9 +5,12 @@
 # — or point `agent-vm --layer <path>` at it directly, no copy needed.
 # See docs/adr/0003-project-tooling-layers.md for the layer contract.
 
-# Launcher overrides BASE_IMAGE with the digest-pinned base at build time
-# (layer::digest_pinned_base). The default keeps a bare `docker build` of this
-# directory working for smoke-testing.
+# Launcher overrides BASE_IMAGE at build time with a digest-derived Docker
+# base link (`agent-vm-base:<msb-manifest-digest-hex>`) for step 0, or with the
+# previous chain step's tag for later steps. The link does not replace msb's
+# digest as this layer's identity — that digest is still the hash input. The
+# default keeps a bare `docker build` of this directory working for
+# smoke-testing.
 ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
 FROM ${BASE_IMAGE}
 

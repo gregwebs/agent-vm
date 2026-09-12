@@ -78,7 +78,18 @@ async fn image_config_path_and_digest(image: &str) -> (Option<String>, Option<St
     let Ok(cache_dir) = crate::msb_install::effective_cache_dir() else {
         return (None, None);
     };
-    let Ok(cache) = microsandbox_image::GlobalCache::new_async(&cache_dir).await else {
+    image_config_path_and_digest_in(&cache_dir, image).await
+}
+
+/// The cache-explicit body of [`image_config_path_and_digest`], split out so
+/// the resolver can read metadata from an explicit cache (a test's tempdir)
+/// instead of the configured msb home — see
+/// `resolve_boot_image_with_layer`'s `cache_dir_override`.
+async fn image_config_path_and_digest_in(
+    cache_dir: &Path,
+    image: &str,
+) -> (Option<String>, Option<String>) {
+    let Ok(cache) = microsandbox_image::GlobalCache::new_async(cache_dir).await else {
         return (None, None);
     };
     let Ok(reference) = image.parse::<microsandbox_image::Reference>() else {
@@ -427,11 +438,11 @@ impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
         self.notices.emit(message)
     }
 
-    fn confirm_build(&mut self, plan: &[layer::PlannedStep]) -> Result<()> {
+    async fn confirm_build(&mut self, plan: &[layer::PlannedStep]) -> Result<()> {
         // The buildx preflight runs *before* asking, so a broken docker
         // install surfaces as one clear error instead of wasting the user's
         // answer to a question that can't be honored anyway.
-        layer::ensure_docker_buildx()?;
+        layer::ensure_docker_buildx().await?;
         let (subject, question) = match plan {
             [only] => (
                 format!("tooling layer {}", only.tag),
@@ -450,6 +461,10 @@ impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
 
     async fn intermediate_image_id(&mut self, tag: &str) -> Result<Option<String>> {
         layer::docker_image_id(tag).await
+    }
+
+    async fn pin_base(&mut self, base: layer::BaseImage<'_>) -> Result<String> {
+        layer::pin_docker_base(base).await
     }
 
     async fn final_is_cached(&mut self, tag: &str) -> Result<bool> {
@@ -505,25 +520,46 @@ async fn resolve_boot_image_with_layer<W: std::io::Write>(
     project_dir: &Path,
     auto_confirm: bool,
     notices: &mut LaunchNotices<W>,
+    cache_dir_override: Option<&Path>,
 ) -> Result<Option<String>> {
     let layer_dirs = layer::resolve_layer_chain(project_dir, layer_flags)?;
     if layer_dirs.is_empty() {
         return Ok(None);
     }
 
-    // 1. Ensure the base is cached and get its manifest digest — needed
-    //    both for step 0's content hash and to digest-pin docker's FROM
-    //    (ADR-0003). Reuse the existing best-effort reader; only pull the
-    //    base if it isn't cached yet (F4).
-    let (_path, mut base_digest) = image_config_path_and_digest(base_image).await;
+    // The cache that owns the base metadata and receives the final ingest.
+    // A test overrides it with a tempdir; production uses the configured msb
+    // home for both reads and writes so they can never disagree.
+    let cache_dir = match cache_dir_override {
+        Some(dir) => dir.to_path_buf(),
+        None => crate::msb_install::effective_cache_dir()?,
+    };
+
+    // 1. Read the base's manifest digest from the selected cache — it is the
+    //    sole input anchoring step 0's content hash (ADR-0003). The base is
+    //    pulled only on the production path and only if it isn't cached yet
+    //    (F4). An override cache is *preloaded-only*: a miss there is a test
+    //    setup defect, and failing here (before any `pull_image`) guarantees
+    //    an ignored-test mistake can never mutate the user's configured
+    //    cache. (The base's Docker-local link is established later, lazily,
+    //    by `execute_chain` — never here.)
+    let (_path, mut base_digest) = image_config_path_and_digest_in(&cache_dir, base_image).await;
     if base_digest.is_none() {
+        if cache_dir_override.is_some() {
+            anyhow::bail!(
+                "test seam: base image {base_image} is not preloaded in the override cache {}",
+                cache_dir.display()
+            );
+        }
         notices.emit(format!(
             "==> Tooling layer present; pulling base {base_image} first…"
         ))?;
         crate::pull::pull_image(base_image)
             .await
             .context("pulling base image to build the tooling layer FROM")?;
-        base_digest = image_config_path_and_digest(base_image).await.1;
+        base_digest = image_config_path_and_digest_in(&cache_dir, base_image)
+            .await
+            .1;
     }
     let base_digest = base_digest.context(
         "could not resolve base image digest after pull; cannot build a reproducible tooling layer",
@@ -533,10 +569,10 @@ async fn resolve_boot_image_with_layer<W: std::io::Write>(
     //    directory tree. Every tag is known up front (see layer.rs's
     //    plan_chain doc comment), which is what lets execute_chain decide
     //    the cache check, the prompt, and the build set without spawning a
-    //    process on a pure cache hit.
+    //    process on a pure cache hit. `base_image` and `base_digest` stay
+    //    separate: the digest anchors the hash, the ref is only what
+    //    `pin_base` may pull to establish the Docker base link.
     let plan = layer::plan_chain(&layer_dirs, project_dir, &base_digest)?;
-    let pinned_base = layer::digest_pinned_base(base_image, &base_digest)?;
-    let cache_dir = crate::msb_install::effective_cache_dir()?;
 
     // 3. Execute: cache-hit fast path, or confirm-then-build-forward. Any
     //    failure past this point is a hard fail — launch() must never
@@ -548,7 +584,15 @@ async fn resolve_boot_image_with_layer<W: std::io::Write>(
         cache_dir,
         auto_confirm,
     };
-    let tag = layer::execute_chain(&plan, &pinned_base, &mut rt).await?;
+    let tag = layer::execute_chain(
+        &plan,
+        layer::BaseImage {
+            reference: base_image,
+            manifest_digest: &base_digest,
+        },
+        &mut rt,
+    )
+    .await?;
     Ok(Some(tag))
 }
 
@@ -1038,6 +1082,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         &session.project_dir,
         auto_confirm,
         &mut notices,
+        None,
     )
     .await?
     {
@@ -2387,6 +2432,7 @@ fn shell_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layer::test_support::{DockerTagGuard, docker_tag_exists, e2e_nonce};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -3019,6 +3065,7 @@ mod tests {
             project.path(),
             false,
             &mut notices,
+            None,
         )
         .await
         .unwrap();
@@ -3051,6 +3098,7 @@ mod tests {
             project.path(),
             false,
             &mut notices,
+            None,
         )
         .await
         .unwrap_err();
@@ -3059,6 +3107,208 @@ mod tests {
             log.borrow().is_empty(),
             "the legacy-directory error must fire before any notice is emitted"
         );
+    }
+
+    /// A declared chain whose base is absent from an explicit override cache
+    /// must fail at the preload guard — before the pull path, confirmation,
+    /// base pinning, or any build/load. This locks in that the override is
+    /// preloaded-only: a missing ignored-test fixture can never fall through
+    /// to `pull_image` against the user's configured msb home.
+    #[tokio::test]
+    async fn resolve_boot_image_with_layer_override_missing_base_fails_before_pulling() {
+        let project = tempfile::tempdir().unwrap();
+        let layer = project.path().join(".agent-vm/layers/10-a");
+        std::fs::create_dir_all(&layer).unwrap();
+        std::fs::write(
+            layer.join("Dockerfile"),
+            "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n",
+        )
+        .unwrap();
+
+        let override_cache = tempfile::tempdir().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut notices = LaunchNotices::new(output);
+        let err = resolve_boot_image_with_layer(
+            "ghcr.io/wirenboard/agent-vm-template:latest",
+            &[],
+            project.path(),
+            true,
+            &mut notices,
+            Some(override_cache.path()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("not preloaded in the override cache"),
+            "{err:?}"
+        );
+        assert!(
+            log.borrow().is_empty(),
+            "the preload guard must fire before any notice (no pull banner, no confirm)"
+        );
+    }
+
+    // --- issue #98: real resolver regression through an imported base link ---
+
+    /// The full issue-#98 path through the real resolver: a base imported as
+    /// a `docker save` archive into an isolated temp cache (so msb
+    /// synthesizes its manifest digest), linked into Docker as
+    /// `agent-vm-base:<hex>` exactly as `import-image.sh` does, then a
+    /// one-step project layer built FROM that link and ingested back into the
+    /// temp cache. Needs docker/buildx and a host-platform parent image;
+    /// skipped otherwise. Never touches the configured msb home (the override
+    /// is preloaded-only and receives the final ingest).
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a local single-platform base image"]
+    async fn resolve_boot_image_with_layer_builds_an_imported_base_through_its_docker_link() {
+        if layer::ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+
+        let parent = std::env::var("AGENT_VM_E2E_BASE_IMAGE")
+            .unwrap_or_else(|_| "alpine:latest".to_string());
+        if !docker_tag_exists(&parent)
+            && !std::process::Command::new("docker")
+                .args(["pull", "-q", &parent])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        }
+
+        let nonce = e2e_nonce();
+        let source = format!("agent-vm-e2e-base:{nonce}");
+        if docker_tag_exists(&source) {
+            eprintln!("skipping: disposable source tag {source} already exists");
+            return;
+        }
+
+        // Build a uniquely marked disposable child so its bytes — and hence
+        // the archive-imported msb manifest digest — are unique per run.
+        let ctx = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ctx.path().join("Dockerfile"),
+            format!("ARG PARENT={parent}\nFROM ${{PARENT}}\nLABEL agent-vm-e2e-nonce={nonce}\n"),
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("docker")
+                .args([
+                    "build",
+                    "--build-arg",
+                    &format!("PARENT={parent}"),
+                    "-t",
+                    &source,
+                    ctx.path().to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success(),
+            "disposable child build must succeed"
+        );
+
+        let mut guard = DockerTagGuard::default();
+        guard.own(&source);
+
+        // Save the disposable source and load it as an archive into an
+        // isolated temp cache under a unique local base ref — this is the
+        // exact archive-import path whose synthesized digest breaks #98.
+        let archive = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+        assert!(
+            std::process::Command::new("docker")
+                .args(["save", &source, "-o", archive.path().to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success(),
+            "docker save must succeed"
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let local_base_ref = format!("agent-vm-e2e-local:{nonce}");
+        microsandbox_image::load_archive(
+            cache.path(),
+            archive.path(),
+            microsandbox_image::ImageLoadOptions {
+                tags: vec![local_base_ref.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("load_archive into the temp cache");
+
+        // Read msb's synthesized manifest digest back and create the Docker
+        // base link from the *source* image, mirroring import-image.sh.
+        let reference: microsandbox_image::Reference = local_base_ref.parse().unwrap();
+        let cache_handle = microsandbox_image::GlobalCache::new_async(cache.path())
+            .await
+            .unwrap();
+        let metadata = cache_handle
+            .read_image_metadata_async(&reference)
+            .await
+            .unwrap()
+            .expect("imported base metadata must be present");
+        let digest = metadata.manifest_digest;
+        let link = layer::docker_base_tag(&digest).expect("valid sha256 manifest digest");
+        if docker_tag_exists(&link) {
+            eprintln!("skipping: base link {link} already exists");
+            return;
+        }
+        assert!(
+            std::process::Command::new("docker")
+                .args(["tag", &source, &link])
+                .status()
+                .unwrap()
+                .success(),
+            "docker tag must succeed"
+        );
+        guard.own(&link);
+
+        // A one-step project layer using the normal BASE_IMAGE contract.
+        let project = tempfile::tempdir().unwrap();
+        let step = project.path().join(".agent-vm/layers/10-a");
+        std::fs::create_dir_all(&step).unwrap();
+        std::fs::write(
+            step.join("Dockerfile"),
+            "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nENV MARKER_E2E=present\n",
+        )
+        .unwrap();
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut notices = LaunchNotices::new(output);
+        let got = resolve_boot_image_with_layer(
+            &local_base_ref,
+            &[],
+            project.path(),
+            true,
+            &mut notices,
+            Some(cache.path()),
+        )
+        .await
+        .expect("resolution through an imported base link")
+        .expect("a derived tag");
+
+        // The returned tag must equal a plan computed with the *msb manifest
+        // digest* — pinning the link did not move step 0's hash input.
+        let dirs = layer::resolve_layer_chain(project.path(), &[]).unwrap();
+        let plan = layer::plan_chain(&dirs, project.path(), &digest).unwrap();
+        assert_eq!(got, plan[0].id.tag);
+        assert!(
+            layer::derived_is_cached(cache.path(), &got).await.unwrap(),
+            "the derived image must be materialized in the temp cache"
+        );
+        // `guard` (and the temp cache/archive/project tempdirs) drop here,
+        // removing only the disposable source/link tags this test created.
+        drop(guard);
     }
 
     #[test]

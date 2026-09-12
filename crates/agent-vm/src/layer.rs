@@ -24,6 +24,14 @@
 //! implementation this mirrors (single-layer only; the chain is native to
 //! this port).
 //!
+//! Step 0's *identity* is the base image's msb manifest digest (the hash
+//! anchor); Docker's step-0 `FROM` is a separate, build-only **base link**,
+//! `agent-vm-base:<manifest-digest-hex>`, established lazily by
+//! [`pin_docker_base`] only when step 0 actually builds. That split is what
+//! lets a base imported from a `docker save` archive (whose msb-synthesized
+//! digest no registry or Docker store can resolve) still be built `FROM` —
+//! see `docs/adr/0003-project-tooling-layers.md`'s issue-#98 amendment.
+//!
 //! The module splits into three sections: identity (pure, no I/O beyond
 //! reading a layer directory to hash it), chain composition (pure planning
 //! plus the effectful [`ChainRuntime`] seam), and build & load (the only
@@ -49,6 +57,14 @@ use sha2::{Digest, Sha256};
 /// listing (`docker image ls` equivalent) stays a readable per-project
 /// cleanup handle.
 const REPO: &str = "agent-vm-layer";
+
+/// The Docker-local repository under which an msb-owned base is linked for
+/// buildx's step-0 `FROM` (`agent-vm-base:<manifest-digest-hex>`). This is a
+/// *build-time name*, not a second identity: msb's per-platform manifest
+/// digest stays the layer hash's step-0 anchor, and the link never
+/// participates in the hash. See [`docker_base_tag`] and ADR-0003's
+/// "msb-owned base with a Docker base link" amendment (issue #98).
+const BASE_REPO: &str = "agent-vm-base";
 
 /// Version tag for these enumeration rules. Exists so a future change to
 /// them deliberately invalidates every derived image instead of silently
@@ -928,6 +944,22 @@ pub struct PlannedStep {
     pub pending: bool,
 }
 
+/// The two strings that always travel together as an msb-cached base's
+/// identity for a build: the user-facing `reference` (what `docker pull` and
+/// error text name) and the `manifest_digest` msb recorded, which anchors
+/// step 0's layer hash. Bundling them makes the pair a single value so a call
+/// site can't transpose the ref and the digest — they are the data clump
+/// `CODING_STANDARDS.md`'s "don't use the same type multiple times in a row"
+/// rule targets (issue-#98 review T3). `Copy`: both fields are borrows.
+#[derive(Clone, Copy)]
+pub struct BaseImage<'a> {
+    /// The base ref as the user/config names it (a tag, or a `repo@digest`).
+    pub reference: &'a str,
+    /// msb's manifest digest: the untouched step-0 hash anchor and the source
+    /// of the `agent-vm-base:<hex>` link name.
+    pub manifest_digest: &'a str,
+}
+
 /// Every effect executing a chain performs. `run.rs` implements it against
 /// real docker + the msb cache; tests implement it with a recording fake.
 pub trait ChainRuntime {
@@ -938,11 +970,18 @@ pub trait ChainRuntime {
     /// install surfaces as one clear error instead of wasting the user's
     /// answer — that ordering is today's single-layer behavior and the
     /// reason this is one method rather than two.
-    fn confirm_build(&mut self, plan: &[PlannedStep]) -> Result<()>;
+    async fn confirm_build(&mut self, plan: &[PlannedStep]) -> Result<()>;
 
     /// `docker image inspect <tag> --format '{{.Id}}'`; `Ok(None)` means
     /// absent.
     async fn intermediate_image_id(&mut self, tag: &str) -> Result<Option<String>>;
+
+    /// Establish (or reuse) the Docker-local base link for an msb-cached
+    /// base, returning the `agent-vm-base:<digest-hex>` tag buildx's step-0
+    /// `FROM` should use. Called **only** when step 0 actually builds, so a
+    /// cache-hit launch spawns no Docker process; the real adapter delegates
+    /// to [`pin_docker_base`].
+    async fn pin_base(&mut self, base: BaseImage<'_>) -> Result<String>;
 
     /// `layer::derived_is_cached` against the msb cache.
     async fn final_is_cached(&mut self, tag: &str) -> Result<bool>;
@@ -958,14 +997,15 @@ pub trait ChainRuntime {
 ///
 /// Traced for `total ∈ {1,2,3}` while writing this: with `total == 1` the
 /// backward walk below never runs (its range is empty), so a one-step chain
-/// takes exactly one `build_and_load_final` off `pinned_base_ref` — byte-
-/// identical to the pre-chain single-layer behavior. With `total == 2` and
+/// takes exactly one `build_and_load_final` off the base link `pin_base`
+/// returns — byte-identical to the pre-chain single-layer behavior. With
+/// `total == 2` and
 /// step 0 already in docker's store, the walk finds it, `build_from` becomes
 /// 1, and only the final step builds `FROM` `plan[0].tag`. With `total == 3`
 /// and nothing cached, both intermediates build in order before the final.
 pub async fn execute_chain<R: ChainRuntime>(
     plan: &[ChainStep],
-    pinned_base_ref: &str,
+    base: BaseImage<'_>,
     rt: &mut R,
 ) -> Result<String> {
     let total = plan.len();
@@ -1014,14 +1054,18 @@ pub async fn execute_chain<R: ChainRuntime>(
             pending: i >= build_from,
         })
         .collect();
-    rt.confirm_build(&steps)?;
+    rt.confirm_build(&steps).await?;
 
     // 4. Build forward. Any failure propagates and aborts the launch; the
     //    msb cache is untouched until the final step succeeds, so a
     //    partially-composed chain can never boot (ADR-0003's hard-fail
     //    rule).
+    // The base link is established lazily, only when step 0 is the first
+    // step that actually builds. A final cache hit, a declined prompt, or a
+    // cached intermediate above step 0 must not spawn the pin's Docker
+    // process — that placement is what keeps cache-hit launches Docker-free.
     let mut from_ref = if build_from == 0 {
-        pinned_base_ref.to_string()
+        rt.pin_base(base).await?
     } else {
         plan[build_from - 1].id.tag.clone()
     };
@@ -1087,29 +1131,87 @@ pub async fn derived_is_cached(cache_dir: &Path, tag: &str) -> Result<bool> {
 /// prompts to build a tooling layer, so a missing/broken docker install
 /// surfaces as one clear, actionable error instead of a confusing failure
 /// partway through a build the user just confirmed.
-pub fn ensure_docker_buildx() -> Result<()> {
-    let status = std::process::Command::new("docker")
-        .args(["buildx", "version"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("running `docker buildx version` failed; is docker installed and on PATH?")?;
+pub async fn ensure_docker_buildx() -> Result<()> {
+    docker_status(&["buildx", "version"], false).await.context(
+        "install Docker Buildx (https://docs.docker.com/build/architecture/#buildx) \
+             to build project tooling layers",
+    )
+}
+
+/// Run a `docker` subcommand, turning a *spawn* failure (docker missing) and a
+/// non-zero exit into one actionable error that names the exact command. The
+/// pin's `pull`/`tag` and the buildx preflight were three copies of this
+/// spawn/context/status shape (issue-#98 review T8). `inherit_output` keeps
+/// Docker's own progress and auth/network diagnostics visible for `pull` and
+/// `tag`; the preflight silences the version banner.
+async fn docker_status(args: &[&str], inherit_output: bool) -> Result<()> {
+    let rendered = format!("docker {}", args.join(" "));
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.args(args);
+    if !inherit_output {
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
+    let status = cmd.status().await.with_context(|| {
+        format!("running `{rendered}` failed; is docker installed and on PATH?")
+    })?;
     if !status.success() {
-        bail!(
-            "`docker buildx version` exited non-zero; install Docker Buildx \
-             (https://docs.docker.com/build/architecture/#buildx) to build project tooling layers"
-        );
+        bail!("`{rendered}` exited with {status}");
     }
     Ok(())
 }
 
-/// Pins the base reference to `<registry>/<repository>@<manifest_digest>` so
-/// docker's own `FROM` pull resolves to exactly the base image msb already
-/// cached & hashed (see `docs/adr/0003-project-tooling-layers.md`'s
-/// "Digest-pinned BASE_IMAGE" decision) — without this, docker independently
-/// re-resolves `FROM ghcr.io/.../agent-vm-template:latest` against the
-/// registry, which can race a moving `:latest` tag and silently build FROM a
-/// different image than the one the layer hash covers.
+/// The Docker-local name [`pin_docker_base`] establishes for an msb-cached
+/// base: `agent-vm-base:<manifest-digest-hex>` (no algorithm prefix after
+/// the colon, matching a Docker tag's grammar). This is the value buildx
+/// receives as step 0's `BASE_IMAGE` — a local name Docker can resolve,
+/// unlike msb's manifest digest for a base imported from a `docker save`
+/// archive (msb reserializes that manifest, so the synthesized digest exists
+/// in neither a registry nor Docker's content-addressed namespace; see
+/// ADR-0003's issue-#98 amendment).
+///
+/// Validates strictly rather than trusting `Digest`'s own parser: only a
+/// `sha256` algorithm with exactly 64 lowercase ASCII hex characters is
+/// accepted, so the interpolated value can never smuggle a Docker-grammar
+/// metacharacter or an uppercase/short encoding into the produced tag.
+pub fn docker_base_tag(manifest_digest: &str) -> Result<String> {
+    let digest: microsandbox_image::Digest = manifest_digest
+        .parse()
+        .with_context(|| format!("parsing base manifest digest {manifest_digest}"))?;
+    if digest.algorithm() != "sha256" {
+        bail!(
+            "base manifest digest {manifest_digest} uses unsupported algorithm {:?}; only \
+             sha256 is supported",
+            digest.algorithm()
+        );
+    }
+    let hex = digest.hex();
+    if hex.len() != 64 {
+        bail!(
+            "base manifest digest {manifest_digest} has {} hex characters; a sha256 digest \
+             must have exactly 64",
+            hex.len()
+        );
+    }
+    if !hex
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        bail!("base manifest digest {manifest_digest} must be lowercase ASCII hexadecimal");
+    }
+    Ok(format!("{BASE_REPO}:{hex}"))
+}
+
+/// The immutable registry reference used to *establish* a Docker base link
+/// ([`pin_docker_base`]): `<registry>/<repository>@<manifest_digest>`.
+///
+/// This is no longer buildx's step-0 `FROM` value (that is the local
+/// [`docker_base_tag`] link); its job now is to name the exact digest
+/// `docker pull` may fetch for a registry-origin base, so Docker resolves the
+/// same manifest msb cached & hashed rather than independently re-resolving a
+/// moving tag (`FROM ghcr.io/.../agent-vm-template:latest`) that could race
+/// the registry and silently build FROM a different base than the one the
+/// layer hash covers.
 ///
 /// Any existing tag or digest on `base_ref` is discarded — `manifest_digest`
 /// always wins, so a caller can't accidentally pin the *previous* digest
@@ -1147,6 +1249,121 @@ fn digest_pin_by_string_surgery(base_ref: &str, manifest_digest: &str) -> String
     format!("{repo}@{manifest_digest}")
 }
 
+/// Establishes the Docker-local base link for an msb-cached base and returns
+/// it, in the approved resolution order (see ADR-0003's issue-#98
+/// amendment):
+///
+/// 1. an existing `agent-vm-base:<digest-hex>` tag is trusted as-is;
+/// 2. otherwise `docker pull <repo>@<digest>` (registry bases — msb's digest
+///    is the platform-manifest digest, directly pullable) followed by
+///    `docker tag` of the pulled ref under the link;
+/// 3. otherwise a hard error naming the base and telling the user to rerun
+///    `./script/build/import-image.sh` (a base that reached msb from a
+///    `docker save` archive has no pullable registry digest).
+///
+/// This is invoked lazily — only when a chain step 0 actually builds — so a
+/// cache-hit launch spawns no Docker process at all. Never falls back to a
+/// moving tag: a failed exact pull is a hard error, not a `docker pull
+/// <tag>`. The command protocol lives here so `run.rs` never learns it.
+pub async fn pin_docker_base(base: BaseImage<'_>) -> Result<String> {
+    pin_docker_base_with_runner(base, &ProductionPinRunner).await
+}
+
+/// The three Docker effects [`pin_docker_base`] performs, as a private seam
+/// so the existing-link → exact-pull → tag ordering, its status handling,
+/// and its actionable error text are unit-testable without a Docker daemon.
+/// A spawn failure is an `Err`; a non-zero exit is surfaced as `Ok(false)`
+/// (probe) or an `Err` (pull/tag, which cannot proceed).
+trait PinCommandRunner {
+    /// `docker image inspect <tag>` presence probe: `Ok(true)` when the tag
+    /// resolves locally. Exit 1 (absent — or daemon unreachable,
+    /// indistinguishable from the exit code) is `Ok(false)`.
+    async fn link_present(&self, tag: &str) -> Result<bool>;
+
+    /// `docker pull <reference>`, with inherited output so authentication
+    /// and network diagnostics stay visible. `Ok(())` only on a zero exit.
+    async fn pull(&self, reference: &str) -> Result<()>;
+
+    /// `docker tag <from> <to>`. `Ok(())` only on a zero exit.
+    async fn tag(&self, from: &str, to: &str) -> Result<()>;
+}
+
+/// The production [`PinCommandRunner`]: real `docker` subprocesses. Pull/tag
+/// inherit stdio so a user watching a build sees Docker's own progress (and
+/// can tell a network/auth failure from a link problem).
+struct ProductionPinRunner;
+
+impl PinCommandRunner for ProductionPinRunner {
+    async fn link_present(&self, tag: &str) -> Result<bool> {
+        Ok(docker_image_id(tag).await?.is_some())
+    }
+
+    async fn pull(&self, reference: &str) -> Result<()> {
+        docker_status(&["pull", reference], true).await
+    }
+
+    async fn tag(&self, from: &str, to: &str) -> Result<()> {
+        docker_status(&["tag", from, to], true).await
+    }
+}
+
+/// The injectable body of [`pin_docker_base`]. Every effect — including the
+/// initial link probe — crosses `runner`, so tests observe the exact
+/// protocol and can script spawn failures, exit statuses, and probe output.
+async fn pin_docker_base_with_runner<R: PinCommandRunner>(
+    base: BaseImage<'_>,
+    runner: &R,
+) -> Result<String> {
+    let linked_tag = docker_base_tag(base.manifest_digest)?;
+
+    if runner
+        .link_present(&linked_tag)
+        .await
+        .with_context(|| format!("probing for an existing Docker base link {linked_tag}"))?
+    {
+        return Ok(linked_tag);
+    }
+
+    let pull_ref = digest_pinned_base(base.reference, base.manifest_digest)?;
+    runner
+        .pull(&pull_ref)
+        .await
+        .with_context(|| pin_failure(base, &pull_ref, PinPhase::Pull, &linked_tag))?;
+    runner
+        .tag(&pull_ref, &linked_tag)
+        .await
+        .with_context(|| pin_failure(base, &pull_ref, PinPhase::Tag, &linked_tag))?;
+    Ok(linked_tag)
+}
+
+/// Which of the pin's two Docker effects failed, so [`pin_failure`] can name
+/// the right command. An enum rather than the previous `&str` (matched as
+/// `_ => tag`) so an unexpected value can't silently fall through to the tag
+/// message in an error path (issue-#98 review T4).
+#[derive(Clone, Copy)]
+enum PinPhase {
+    Pull,
+    Tag,
+}
+
+/// The actionable hard-fail text for a failed pull/tag while establishing a
+/// base link. Names the original base ref, the exact pull ref attempted, and
+/// which phase failed; points a `docker save`-imported base at the command
+/// that creates the link at import time.
+fn pin_failure(base: BaseImage<'_>, pull_ref: &str, phase: PinPhase, linked_tag: &str) -> String {
+    let (verb, command) = match phase {
+        PinPhase::Pull => ("pull", format!("docker pull {pull_ref}")),
+        PinPhase::Tag => ("tag", format!("docker tag {pull_ref} {linked_tag}")),
+    };
+    format!(
+        "failed to {verb} the tooling-layer base into Docker: `{command}` did not succeed. \
+         Base {} could not be linked as {linked_tag}. If this base was imported into \
+         the msb cache from a local Docker image, rerun `./script/build/import-image.sh` to \
+         create the Docker base link; otherwise ensure {pull_ref} is pullable.",
+        base.reference
+    )
+}
+
 /// Runs `docker buildx build` producing an OCI archive at `out_tar`
 /// containing exactly one image (`--provenance=false --sbom=false`
 /// suppresses the attestation manifests that would otherwise turn the
@@ -1164,23 +1381,19 @@ fn digest_pin_by_string_surgery(base_ref: &str, manifest_digest: &str) -> String
 /// doubling the wait for that case. That's judged acceptable because a
 /// build is confirmed (never automatic) and the error text a user sees is
 /// the same either way, just repeated.
-pub async fn build_derived_oci(
-    id: &LayerIdentity,
-    pinned_base: &str,
-    out_tar: &Path,
-) -> Result<()> {
+pub async fn build_derived_oci(id: &LayerIdentity, from_ref: &str, out_tar: &Path) -> Result<()> {
     let oci = |compression: &'static str| BuildxOutput::Oci {
         out_tar,
         compression,
     };
-    match run_buildx(id, pinned_base, oci("zstd")).await {
+    match run_buildx(id, from_ref, oci("zstd")).await {
         Ok(()) => Ok(()),
         Err(zstd_err) => {
             eprintln!(
                 "==> docker buildx build (zstd output) failed for {}; retrying with gzip output: {zstd_err}",
                 id.tag
             );
-            run_buildx(id, pinned_base, oci("gzip")).await.with_context(|| {
+            run_buildx(id, from_ref, oci("gzip")).await.with_context(|| {
                 format!(
                     "building tooling layer {} (gzip retry also failed; zstd attempt failed with: {zstd_err})",
                     id.tag
@@ -1299,8 +1512,11 @@ pub async fn docker_image_id(tag: &str) -> Result<Option<String>> {
 /// image and the load/boot platform in lockstep on every supported host
 /// (see ADR-0003 and README "Requirements": Linux/KVM x86_64 and Apple
 /// Silicon are both first-class). The host arch is also exactly the platform
-/// msb resolved and cached for the base image, so docker's digest-pinned
-/// `FROM` pull selects the same base manifest the layer hash covers.
+/// msb resolved and cached for the base image, so the local
+/// `agent-vm-base:<hex>` link buildx's step-0 `FROM` resolves points at the
+/// same-platform base manifest the layer hash covers (before issue #98 the
+/// `FROM` was a digest-pinned registry pull; it is now a local link, but the
+/// platform-matching argument is unchanged).
 fn host_oci_platform() -> String {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
@@ -1438,8 +1654,87 @@ mod hex {
     }
 }
 
+/// Shared, Docker-dependent helpers for the crate's `#[cfg(test)]` suites.
+///
+/// The `layer` e2e harness and the `run` resolver regression both need
+/// these. They live here (rather than a file of their own) so the fix adds
+/// no new module to the crate, and they are shared so the load-bearing one —
+/// the RAII [`DockerTagGuard`] — has exactly one implementation: it is what
+/// keeps a live test from deleting a user's Docker tags, and a bug fixed in
+/// one copy would silently persist in the other (issue-#98 review T2).
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Best-effort synchronous `docker image inspect` presence check, used by
+    /// the live fixtures to detect a tag collision *before* mutating
+    /// anything. A tag that can't be inspected (absent, or no daemon) reads
+    /// as absent; the fixtures then skip rather than risk overwriting an
+    /// unowned tag.
+    pub fn docker_tag_exists(tag: &str) -> bool {
+        std::process::Command::new("docker")
+            .args(["image", "inspect", tag])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// `docker image inspect <tag> --format '{{.Id}}'`, synchronously, for a
+    /// live fixture's synthetic digest derivation.
+    pub fn docker_image_id_sync(tag: &str) -> Option<String> {
+        let out = std::process::Command::new("docker")
+            .args(["image", "inspect", tag, "--format", "{{.Id}}"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!id.is_empty()).then_some(id)
+    }
+
+    /// A process-unique, Docker-tag-safe nonce for disposable live-test tags.
+    pub fn e2e_nonce() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{}{nanos}", std::process::id())
+    }
+
+    /// RAII cleanup for Docker tags a live fixture created. Only tags a
+    /// fixture actually observed absent→present are added with
+    /// [`own`](Self::own); `Drop` removes exactly those — never a
+    /// caller-supplied parent, a pre-existing tag, or one this process never
+    /// proved it created. Running on `Drop` means it fires on early `return`
+    /// and on panic alike.
+    #[derive(Default)]
+    pub struct DockerTagGuard {
+        owned: Vec<String>,
+    }
+
+    impl DockerTagGuard {
+        /// Take ownership of `tag` so `Drop` removes it. Call only *after*
+        /// observing the tag become present under this test's control.
+        pub fn own(&mut self, tag: &str) {
+            self.owned.push(tag.to_string());
+        }
+    }
+
+    impl Drop for DockerTagGuard {
+        fn drop(&mut self) {
+            for tag in &self.owned {
+                let _ = std::process::Command::new("docker")
+                    .args(["rmi", "-f", tag])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{DockerTagGuard, docker_image_id_sync, docker_tag_exists, e2e_nonce};
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2463,6 +2758,7 @@ mod tests {
         ConfirmBuild(Vec<(String, bool)>), // (tag, pending) per step
         InspectIntermediate(String),
         CheckFinal(String),
+        PinBase { base_ref: String, digest: String },
         BuildIntermediate { tag: String, from: String },
         BuildAndLoadFinal { tag: String, from: String },
     }
@@ -2473,6 +2769,7 @@ mod tests {
         msb_cache: std::collections::HashSet<String>,    // final tags "already ingested"
         fail_at: Option<usize>,                          // step index whose build returns Err
         declined: bool,
+        pin_fails: bool, // pin_base returns Err
     }
 
     impl FakeRuntime {
@@ -2483,6 +2780,7 @@ mod tests {
                 msb_cache: std::collections::HashSet::new(),
                 fail_at: None,
                 declined: false,
+                pin_fails: false,
             }
         }
     }
@@ -2493,7 +2791,7 @@ mod tests {
             Ok(())
         }
 
-        fn confirm_build(&mut self, plan: &[PlannedStep]) -> Result<()> {
+        async fn confirm_build(&mut self, plan: &[PlannedStep]) -> Result<()> {
             self.log.push(Event::ConfirmBuild(
                 plan.iter().map(|s| (s.tag.clone(), s.pending)).collect(),
             ));
@@ -2514,6 +2812,17 @@ mod tests {
         async fn final_is_cached(&mut self, tag: &str) -> Result<bool> {
             self.log.push(Event::CheckFinal(tag.to_string()));
             Ok(self.msb_cache.contains(tag))
+        }
+
+        async fn pin_base(&mut self, base: BaseImage<'_>) -> Result<String> {
+            self.log.push(Event::PinBase {
+                base_ref: base.reference.to_string(),
+                digest: base.manifest_digest.to_string(),
+            });
+            if self.pin_fails {
+                bail!("pin_base failed");
+            }
+            Ok(LINKED_BASE.to_string())
         }
 
         async fn build_intermediate(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()> {
@@ -2561,13 +2870,33 @@ mod tests {
             .collect()
     }
 
-    const PINNED_BASE: &str = "ghcr.io/example/base@sha256:base";
+    /// A base ref and the msb manifest digest that anchors step 0's hash.
+    /// Distinct strings so a test can't accidentally pass the digest where a
+    /// ref belongs (or vice versa).
+    const BASE_REF: &str = "ghcr.io/example/base:latest";
+    const BASE_DIGEST: &str = "sha256:base";
+    /// The pair bundled for the `execute_chain`/`pin_base` call sites.
+    const BASE: BaseImage<'static> = BaseImage {
+        reference: BASE_REF,
+        manifest_digest: BASE_DIGEST,
+    };
+    /// Build a [`BaseImage`] for the injected-runner tests, where the digest
+    /// is computed per test.
+    fn base_image<'a>(reference: &'a str, manifest_digest: &'a str) -> BaseImage<'a> {
+        BaseImage {
+            reference,
+            manifest_digest,
+        }
+    }
+    /// What `FakeRuntime::pin_base` returns deterministically — stands in for
+    /// the real `agent-vm-base:<digest-hex>` link.
+    const LINKED_BASE: &str = "agent-vm-base:base";
 
     #[tokio::test]
     async fn chain_builds_every_step_in_order_and_loads_only_the_last() {
         let plan = fake_plan(3);
         let mut rt = FakeRuntime::new();
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         let intermediates: Vec<&str> = rt
             .log
@@ -2594,10 +2923,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chain_from_ref_is_the_pinned_base_then_the_previous_tag() {
+    async fn chain_from_ref_is_the_linked_base_then_the_previous_tag() {
         let plan = fake_plan(3);
         let mut rt = FakeRuntime::new();
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         let froms: Vec<&str> = rt
             .log
@@ -2611,7 +2940,7 @@ mod tests {
         assert_eq!(
             froms,
             vec![
-                PINNED_BASE,
+                LINKED_BASE,
                 "agent-vm-layer:proj-tag0",
                 "agent-vm-layer:proj-tag1"
             ]
@@ -2624,7 +2953,7 @@ mod tests {
         let mut rt = FakeRuntime::new();
         rt.msb_cache.insert(plan[1].id.tag.clone());
 
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         assert_eq!(
             rt.log,
@@ -2645,7 +2974,7 @@ mod tests {
         let mut rt = FakeRuntime::new();
         rt.docker_store.insert(plan[0].id.tag.clone());
 
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         assert!(
             !rt.log
@@ -2671,7 +3000,7 @@ mod tests {
         let mut rt = FakeRuntime::new();
         rt.docker_store.insert(plan[2].id.tag.clone());
 
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         let inspected: Vec<&str> = rt
             .log
@@ -2699,7 +3028,7 @@ mod tests {
             let mut rt = FakeRuntime::new();
             rt.fail_at = Some(fail_at);
 
-            let result = execute_chain(&plan, PINNED_BASE, &mut rt).await;
+            let result = execute_chain(&plan, BASE, &mut rt).await;
             assert!(result.is_err(), "fail_at={fail_at}");
             assert!(
                 !rt.log
@@ -2719,7 +3048,7 @@ mod tests {
     async fn the_whole_chain_is_confirmed_by_a_single_prompt() {
         let plan = fake_plan(3);
         let mut rt = FakeRuntime::new();
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         let confirms: Vec<&Vec<(String, bool)>> = rt
             .log
@@ -2744,7 +3073,7 @@ mod tests {
     async fn confirm_precedes_every_build() {
         let plan = fake_plan(3);
         let mut rt = FakeRuntime::new();
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         let confirm_idx = rt
             .log
@@ -2770,7 +3099,7 @@ mod tests {
         let mut rt = FakeRuntime::new();
         rt.declined = true;
 
-        assert!(execute_chain(&plan, PINNED_BASE, &mut rt).await.is_err());
+        assert!(execute_chain(&plan, BASE, &mut rt).await.is_err());
         assert!(!rt.log.iter().any(|e| matches!(
             e,
             Event::BuildIntermediate { .. } | Event::BuildAndLoadFinal { .. }
@@ -2778,10 +3107,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_single_step_chain_uses_the_pinned_base_and_never_inspects() {
+    async fn a_single_step_chain_uses_the_linked_base_and_never_inspects() {
         let plan = fake_plan(1);
         let mut rt = FakeRuntime::new();
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         assert!(!rt.log.iter().any(|e| matches!(
             e,
@@ -2797,7 +3126,15 @@ mod tests {
         assert!(
             rt.log
                 .iter()
-                .any(|e| matches!(e, Event::BuildAndLoadFinal { from, .. } if from == PINNED_BASE))
+                .any(|e| matches!(e, Event::BuildAndLoadFinal { from, .. } if from == LINKED_BASE))
+        );
+        assert_eq!(
+            rt.log
+                .iter()
+                .filter(|e| matches!(e, Event::PinBase { .. }))
+                .count(),
+            1,
+            "a one-step chain pins the base exactly once"
         );
     }
 
@@ -2840,7 +3177,7 @@ mod tests {
         // docker_store: it was built with --output type=oci and only lives
         // in the msb cache, which this fake never populates for it.
 
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         let confirm = rt
             .log
@@ -2886,7 +3223,7 @@ mod tests {
         let mut rt = FakeRuntime::new();
         rt.msb_cache.insert(plan[1].id.tag.clone());
 
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         assert_eq!(
             rt.log,
@@ -2906,7 +3243,7 @@ mod tests {
         let mut rt = FakeRuntime::new();
         rt.fail_at = Some(1); // the flag step
 
-        let result = execute_chain(&plan, PINNED_BASE, &mut rt).await;
+        let result = execute_chain(&plan, BASE, &mut rt).await;
         assert!(result.is_err());
         assert!(rt.msb_cache.is_empty(), "nothing may be ingested");
     }
@@ -2916,7 +3253,7 @@ mod tests {
         let plan = fake_plan_with_origins(&[".agent-vm/layers/0", "--layer flag-1"]);
         let mut rt = FakeRuntime::new();
 
-        execute_chain(&plan, PINNED_BASE, &mut rt).await.unwrap();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
         let building_final = rt
             .log
@@ -2932,6 +3269,87 @@ mod tests {
             building_final.contains("--layer flag-1"),
             "{building_final}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_all_miss_chain_pins_once_after_confirm_before_the_first_build() {
+        let plan = fake_plan(3);
+        let mut rt = FakeRuntime::new();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
+
+        let pins: Vec<usize> = rt
+            .log
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| matches!(e, Event::PinBase { .. }).then_some(i))
+            .collect();
+        assert_eq!(pins.len(), 1, "exactly one pin for an all-miss chain");
+        let confirm_idx = rt
+            .log
+            .iter()
+            .position(|e| matches!(e, Event::ConfirmBuild(_)))
+            .unwrap();
+        let first_build_idx = rt
+            .log
+            .iter()
+            .position(|e| matches!(e, Event::BuildIntermediate { .. }))
+            .unwrap();
+        assert!(
+            confirm_idx < pins[0] && pins[0] < first_build_idx,
+            "pin must follow confirmation and precede the first build: {:?}",
+            rt.log
+        );
+        assert!(
+            rt.log.iter().any(|e| matches!(
+                e,
+                Event::PinBase { base_ref, digest }
+                    if base_ref == BASE_REF && digest == BASE_DIGEST
+            )),
+            "the pin must receive the separate base ref and msb digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_final_cache_hit_never_pins() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        rt.msb_cache.insert(plan[1].id.tag.clone());
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
+        assert!(!rt.log.iter().any(|e| matches!(e, Event::PinBase { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_cached_intermediate_skips_pinning() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        rt.docker_store.insert(plan[0].id.tag.clone());
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
+        assert!(
+            !rt.log.iter().any(|e| matches!(e, Event::PinBase { .. })),
+            "a cached intermediate above step 0 must not pin the base"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declined_chain_never_pins() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        rt.declined = true;
+        assert!(execute_chain(&plan, BASE, &mut rt).await.is_err());
+        assert!(!rt.log.iter().any(|e| matches!(e, Event::PinBase { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_pin_failure_aborts_before_any_build_or_load() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        rt.pin_fails = true;
+        assert!(execute_chain(&plan, BASE, &mut rt).await.is_err());
+        assert!(!rt.log.iter().any(|e| matches!(
+            e,
+            Event::BuildIntermediate { .. } | Event::BuildAndLoadFinal { .. }
+        )));
+        assert!(rt.msb_cache.is_empty());
     }
 
     // --- digest_pinned_base() ---
@@ -3053,6 +3471,249 @@ mod tests {
         assert!(format!("{err:?}").contains("parsing derived image tag"));
     }
 
+    // --- docker_base_tag() ---
+
+    fn sha256_hex(c: char) -> String {
+        format!("sha256:{}", c.to_string().repeat(64))
+    }
+
+    #[test]
+    fn docker_base_tag_maps_a_full_sha256_digest_to_its_hex_tag() {
+        let digest = sha256_hex('a');
+        assert_eq!(
+            docker_base_tag(&digest).unwrap(),
+            format!("agent-vm-base:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            docker_base_tag(&digest).unwrap(),
+            docker_base_tag(&digest).unwrap()
+        );
+    }
+
+    #[test]
+    fn docker_base_tag_rejects_malformed_digests() {
+        // (input, the reason fragment `docker_base_tag` must report). Asserting
+        // the *reason* per row — not merely that the input appears somewhere
+        // in the error — keeps every row meaningful: for the empty input a
+        // `contains(bad)` check is vacuously true and would prove nothing.
+        let cases: Vec<(String, &str)> = vec![
+            (String::new(), "parsing base manifest digest"), // empty
+            ("sha256".to_string(), "parsing base manifest digest"), // no colon
+            ("sha256:".to_string(), "parsing base manifest digest"), // empty encoded value
+            ("sha256:abc".to_string(), "exactly 64"),        // short
+            (format!("sha256:{}", "a".repeat(65)), "exactly 64"), // overlong
+            (
+                format!("sha256:{}", "A".repeat(64)),
+                "lowercase ASCII hexadecimal",
+            ), // uppercase
+            (
+                format!("sha256:{}", "g".repeat(64)),
+                "lowercase ASCII hexadecimal",
+            ), // non-hex
+            (
+                format!("sha512:{}", "a".repeat(64)),
+                "unsupported algorithm",
+            ), // wrong algorithm
+            (
+                format!("sha256+b64u:{}", "a".repeat(64)),
+                "unsupported algorithm",
+            ), // extension
+        ];
+        for (bad, reason) in &cases {
+            let err = docker_base_tag(bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected {bad:?} to be rejected"));
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains(reason),
+                "for {bad:?}, expected {reason:?}: {msg}"
+            );
+        }
+    }
+
+    // --- BASE_REPO / shell literal tie ---
+
+    #[test]
+    fn base_repo_constant_matches_the_import_script_literal() {
+        // `script/build/import-image.sh` mints the link from a bare
+        // `agent-vm-base:<hex>` literal (a shell script can't import a Rust
+        // const) and `script/test/build-workflow.sh` asserts it. A typo on
+        // either side would produce tags no build ever looks for, so tie the
+        // shell literal back to `BASE_REPO` here (issue-#98 review T6).
+        let script = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../script/build/import-image.sh"
+        ))
+        .expect("read script/build/import-image.sh");
+        let needle = format!("{BASE_REPO}:${{digest#sha256:}}");
+        assert!(
+            script.contains(&needle),
+            "import-image.sh must form the link exactly as `{needle}` so it matches \
+             layer::BASE_REPO; the Rust-side constant and the shell literal are the two \
+             halves of one name"
+        );
+    }
+
+    // --- pin_docker_base() — the injected-runner protocol ---
+
+    /// A scripted [`PinCommandRunner`]: records typed inspect/pull/tag
+    /// requests and returns configured probe results / failures. Interior
+    /// mutability (single-threaded tests) so the seam can stay `&self`.
+    #[derive(Default)]
+    struct RecordingRunner {
+        log: std::cell::RefCell<Vec<String>>,
+        link_present: bool,
+        fail_inspect: bool,
+        fail_pull: bool,
+        fail_tag: bool,
+    }
+
+    impl RecordingRunner {
+        fn calls(&self) -> Vec<String> {
+            self.log.borrow().clone()
+        }
+        fn record(&self, call: String) {
+            self.log.borrow_mut().push(call);
+        }
+    }
+
+    impl PinCommandRunner for RecordingRunner {
+        async fn link_present(&self, tag: &str) -> Result<bool> {
+            self.record(format!("inspect {tag}"));
+            if self.fail_inspect {
+                bail!("inspect spawn failed");
+            }
+            Ok(self.link_present)
+        }
+        async fn pull(&self, reference: &str) -> Result<()> {
+            self.record(format!("pull {reference}"));
+            if self.fail_pull {
+                bail!("pull exited 1");
+            }
+            Ok(())
+        }
+        async fn tag(&self, from: &str, to: &str) -> Result<()> {
+            self.record(format!("tag {from} {to}"));
+            if self.fail_tag {
+                bail!("tag exited 1");
+            }
+            Ok(())
+        }
+    }
+
+    const PIN_BASE_REF: &str = "ghcr.io/example/base:latest";
+
+    fn pin_hex(c: char) -> String {
+        format!("sha256:{}", c.to_string().repeat(64))
+    }
+
+    #[tokio::test]
+    async fn pin_uses_an_existing_link_without_pulling_or_tagging() {
+        let digest = pin_hex('b');
+        let link = format!("agent-vm-base:{}", "b".repeat(64));
+        let runner = RecordingRunner {
+            link_present: true,
+            ..Default::default()
+        };
+        let got = pin_docker_base_with_runner(base_image(PIN_BASE_REF, &digest), &runner)
+            .await
+            .unwrap();
+        assert_eq!(got, link);
+        assert_eq!(runner.calls(), vec![format!("inspect {link}")]);
+    }
+
+    #[tokio::test]
+    async fn pin_pulls_the_exact_digest_then_tags_when_the_link_is_absent() {
+        let digest = pin_hex('c');
+        let link = format!("agent-vm-base:{}", "c".repeat(64));
+        let pull_ref = format!("ghcr.io/example/base@{digest}");
+        let runner = RecordingRunner::default();
+        let got = pin_docker_base_with_runner(base_image(PIN_BASE_REF, &digest), &runner)
+            .await
+            .unwrap();
+        assert_eq!(got, link);
+        assert_eq!(
+            runner.calls(),
+            vec![
+                format!("inspect {link}"),
+                format!("pull {pull_ref}"),
+                format!("tag {pull_ref} {link}"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_aborts_at_a_failed_probe_without_pulling() {
+        let digest = pin_hex('d');
+        let runner = RecordingRunner {
+            fail_inspect: true,
+            ..Default::default()
+        };
+        let err = pin_docker_base_with_runner(base_image(PIN_BASE_REF, &digest), &runner)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("probing for an existing Docker base link"));
+        assert_eq!(
+            runner
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("pull "))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_aborts_at_a_failed_pull_before_tagging() {
+        let digest = pin_hex('e');
+        let pull_ref = format!("ghcr.io/example/base@{digest}");
+        let runner = RecordingRunner {
+            fail_pull: true,
+            ..Default::default()
+        };
+        let err = pin_docker_base_with_runner(base_image(PIN_BASE_REF, &digest), &runner)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains(PIN_BASE_REF), "{msg}");
+        assert!(msg.contains(&pull_ref), "{msg}");
+        assert!(msg.contains("failed to pull"), "{msg}");
+        assert!(msg.contains("./script/build/import-image.sh"), "{msg}");
+        assert_eq!(
+            runner
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("tag "))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_aborts_at_a_failed_tag() {
+        let digest = pin_hex('f');
+        let pull_ref = format!("ghcr.io/example/base@{digest}");
+        let link = format!("agent-vm-base:{}", "f".repeat(64));
+        let runner = RecordingRunner {
+            fail_tag: true,
+            ..Default::default()
+        };
+        let err = pin_docker_base_with_runner(base_image(PIN_BASE_REF, &digest), &runner)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains(PIN_BASE_REF), "{msg}");
+        assert!(msg.contains(&pull_ref), "{msg}");
+        assert!(msg.contains("failed to tag"), "{msg}");
+        assert!(msg.contains(&link), "{msg}");
+        assert!(msg.contains("./script/build/import-image.sh"), "{msg}");
+        // The pull did run (tag follows it), but nothing after the tag does.
+        assert_eq!(
+            runner.calls().last().unwrap(),
+            &format!("tag {pull_ref} {link}")
+        );
+    }
+
     // --- e2e: real docker buildx build + registry-less load ---
     //
     // `#[ignore]`d: needs a working `docker buildx` on PATH, plus a base
@@ -3068,9 +3729,10 @@ mod tests {
     // `[[bin]]`).
     //
     // This exercises the novel, riskiest part of this ticket for real —
-    // `docker buildx build --output type=oci` with a digest-pinned
-    // `BASE_IMAGE` (mirrors [`digest_pinned_base`]) producing an archive
-    // that `microsandbox_image::load_archive` then ingests registry-lessly,
+    // `docker buildx build --output type=oci` with an msb-digest-identified
+    // base (`plan_chain` hashing the manifest digest) whose `FROM` is the
+    // Docker-local `agent-vm-base:<hex>` link ([`pin_docker_base`]) producing
+    // an archive that `microsandbox_image::load_archive` then ingests registry-lessly,
     // with no `registry:2` sidecar involved — without needing the full
     // `agent-vm` CLI/session/mount machinery or an actual VM boot (which
     // this test deliberately does not attempt; see
@@ -3078,52 +3740,114 @@ mod tests {
     // live VM boot needs Hypervisor.framework/KVM this dev sandbox may not
     // have).
 
-    /// Resolves the e2e base image's local content digest (pulling it once
-    /// if it isn't already present and the pull succeeds), and pins it via
-    /// the same [`digest_pinned_base`] production code path `run.rs` uses.
-    /// Returns `None` — skip, don't fail — when neither a local copy nor a
-    /// network pull can produce one, so this e2e module degrades to a
-    /// no-op on a host with no docker at all rather than a false failure.
-    ///
-    /// The returned "digest" is actually `docker image inspect`'s resolved
-    /// image id, not a registry manifest digest — a pre-existing
-    /// simplification of this e2e harness (there is no registry in play
-    /// here to ask for a manifest digest), reused as-is for the chain e2e
-    /// test below rather than fixed as part of this ticket.
-    fn e2e_pinned_base() -> Option<(String, String, String)> {
-        let base = std::env::var("AGENT_VM_E2E_BASE_IMAGE")
+    /// A disposable base for the e2e build/load/chain tests: a uniquely
+    /// marked child of `AGENT_VM_E2E_BASE_IMAGE` (default `alpine:latest`)
+    /// whose Docker image id stands in for msb's manifest digest, linked
+    /// into Docker as `agent-vm-base:<hex>` exactly as `import-image.sh`
+    /// does at import time. Owning the guard keeps both the disposable
+    /// source tag and the link alive through the test and removes only those
+    /// on every exit. Returns `None` — skip, don't fail — when a parent
+    /// can't be resolved, or when a nonce collision would require
+    /// overwriting a pre-existing tag.
+    struct E2eBase {
+        /// The disposable source tag the marked child image was built under.
+        source: String,
+        /// The synthetic msb manifest digest (the child's Docker image id,
+        /// which is `sha256:<64 lowercase hex>`).
+        digest: String,
+        /// `agent-vm-base:<digest-hex>` — what buildx's step-0 `FROM` uses.
+        link: String,
+        _guard: DockerTagGuard,
+    }
+
+    fn e2e_base_fixture() -> Option<E2eBase> {
+        let parent = std::env::var("AGENT_VM_E2E_BASE_IMAGE")
             .unwrap_or_else(|_| "alpine:latest".to_string());
-        let inspect = |base: &str| {
-            std::process::Command::new("docker")
-                .args(["image", "inspect", base, "--format", "{{.Id}}"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        };
-        let digest = inspect(&base).or_else(|| {
+        if !docker_tag_exists(&parent) {
             let pulled = std::process::Command::new("docker")
-                .args(["pull", "-q", &base])
+                .args(["pull", "-q", &parent])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
-            pulled.then(|| inspect(&base)).flatten()
-        })?;
-        let pinned = digest_pinned_base(&base, &digest).ok()?;
-        Some((base, digest, pinned))
+            if !pulled {
+                return None;
+            }
+        }
+
+        let nonce = e2e_nonce();
+        let source = format!("agent-vm-e2e-base:{nonce}");
+        if docker_tag_exists(&source) {
+            eprintln!("skipping: disposable source tag {source} already exists");
+            return None;
+        }
+
+        let ctx = tempfile::tempdir().ok()?;
+        fs::write(
+            ctx.path().join("Dockerfile"),
+            format!(
+                "ARG PARENT={parent}\nFROM ${{PARENT}}\n\
+                 LABEL agent-vm-e2e-nonce={nonce}\n"
+            ),
+        )
+        .ok()?;
+        let built = std::process::Command::new("docker")
+            .args([
+                "build",
+                "--build-arg",
+                &format!("PARENT={parent}"),
+                "-t",
+                &source,
+                ctx.path().to_str()?,
+            ])
+            .status()
+            .ok()?
+            .success();
+        if !built {
+            return None;
+        }
+
+        let mut guard = DockerTagGuard::default();
+        guard.own(&source);
+
+        let digest = docker_image_id_sync(&source)?;
+        let link = docker_base_tag(&digest).ok()?;
+        if docker_tag_exists(&link) {
+            eprintln!("skipping: base link {link} already exists");
+            return None; // guard drops the disposable source
+        }
+        let tagged = std::process::Command::new("docker")
+            .args(["tag", &source, &link])
+            .status()
+            .ok()?
+            .success();
+        if !tagged {
+            return None;
+        }
+        guard.own(&link);
+
+        Some(E2eBase {
+            source,
+            digest,
+            link,
+            _guard: guard,
+        })
     }
 
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_build_and_load_round_trip_through_derived_is_cached() {
-        if ensure_docker_buildx().is_err() {
+        if ensure_docker_buildx().await.is_err() {
             eprintln!("skipping: `docker buildx` not available on PATH");
             return;
         }
-        let Some((base, _digest, pinned_base)) = e2e_pinned_base() else {
+        let Some(fixture) = e2e_base_fixture() else {
             eprintln!("skipping: no base image available locally or via network pull");
             return;
         };
+        // The fixture's pre-created `agent-vm-base:<hex>` link is what
+        // buildx's step-0 `FROM` resolves, mirroring an imported base.
+        let base = fixture.link.clone();
+        let pinned_base = fixture.link.clone();
         eprintln!("e2e base: {base} pinned to {pinned_base}");
 
         let layer_dir = tempfile::tempdir().unwrap();
@@ -3209,14 +3933,18 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_editing_the_layer_is_a_fresh_cache_miss() {
-        if ensure_docker_buildx().is_err() {
+        if ensure_docker_buildx().await.is_err() {
             eprintln!("skipping: `docker buildx` not available on PATH");
             return;
         }
-        let Some((base, _digest, pinned_base)) = e2e_pinned_base() else {
+        let Some(fixture) = e2e_base_fixture() else {
             eprintln!("skipping: no base image available locally or via network pull");
             return;
         };
+        // The fixture's pre-created `agent-vm-base:<hex>` link is what
+        // buildx's step-0 `FROM` resolves, mirroring an imported base.
+        let base = fixture.link.clone();
+        let pinned_base = fixture.link.clone();
 
         let layer_dir = tempfile::tempdir().unwrap();
         write_layer_file(
@@ -3303,7 +4031,7 @@ mod tests {
             Ok(())
         }
 
-        fn confirm_build(&mut self, _plan: &[PlannedStep]) -> Result<()> {
+        async fn confirm_build(&mut self, _plan: &[PlannedStep]) -> Result<()> {
             Ok(())
         }
 
@@ -3313,6 +4041,10 @@ mod tests {
 
         async fn final_is_cached(&mut self, tag: &str) -> Result<bool> {
             derived_is_cached(&self.cache_dir, tag).await
+        }
+
+        async fn pin_base(&mut self, base: BaseImage<'_>) -> Result<String> {
+            pin_docker_base(base).await
         }
 
         async fn build_intermediate(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()> {
@@ -3341,14 +4073,18 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_two_step_chain_builds_in_order_and_ingests_only_the_final_image() {
-        if ensure_docker_buildx().is_err() {
+        if ensure_docker_buildx().await.is_err() {
             eprintln!("skipping: `docker buildx` not available on PATH");
             return;
         }
-        let Some((base, digest, _pinned)) = e2e_pinned_base() else {
+        let Some(fixture) = e2e_base_fixture() else {
             eprintln!("skipping: no base image available locally or via network pull");
             return;
         };
+        // The fixture's pre-created `agent-vm-base:<hex>` link is what
+        // buildx's step-0 `FROM` resolves, mirroring an imported base.
+        let base = fixture.link.clone();
+        let digest = fixture.digest.clone();
 
         let project = tempfile::tempdir().unwrap();
         write_step(
@@ -3371,8 +4107,7 @@ mod tests {
         let mut rt = E2eChainRuntime {
             cache_dir: cache_dir.path().to_path_buf(),
         };
-        let pinned_base = digest_pinned_base(&base, &digest).unwrap();
-        let final_tag = execute_chain(&plan, &pinned_base, &mut rt)
+        let final_tag = execute_chain(&plan, base_image(&fixture.source, &digest), &mut rt)
             .await
             .expect("chain execution");
 
@@ -3424,14 +4159,18 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_a_final_step_can_be_rebuilt_as_an_intermediate_under_the_same_tag() {
-        if ensure_docker_buildx().is_err() {
+        if ensure_docker_buildx().await.is_err() {
             eprintln!("skipping: `docker buildx` not available on PATH");
             return;
         }
-        let Some((base, digest, _pinned)) = e2e_pinned_base() else {
+        let Some(fixture) = e2e_base_fixture() else {
             eprintln!("skipping: no base image available locally or via network pull");
             return;
         };
+        // The fixture's pre-created `agent-vm-base:<hex>` link is what
+        // buildx's step-0 `FROM` resolves, mirroring an imported base.
+        let base = fixture.link.clone();
+        let digest = fixture.digest.clone();
 
         let project = tempfile::tempdir().unwrap();
         write_step(
@@ -3448,7 +4187,6 @@ mod tests {
         );
 
         let cache_dir = tempfile::tempdir().unwrap();
-        let pinned_base = digest_pinned_base(&base, &digest).unwrap();
 
         // First launch: just the project's one-step chain. Built and
         // ingested as a final step (OCI archive) — never lands in docker's
@@ -3459,7 +4197,7 @@ mod tests {
         let mut rt = E2eChainRuntime {
             cache_dir: cache_dir.path().to_path_buf(),
         };
-        execute_chain(&solo_plan, &pinned_base, &mut rt)
+        execute_chain(&solo_plan, base_image(&fixture.source, &digest), &mut rt)
             .await
             .expect("first chain execution");
         assert!(
@@ -3487,9 +4225,13 @@ mod tests {
         let mut rt2 = E2eChainRuntime {
             cache_dir: cache_dir.path().to_path_buf(),
         };
-        let final_tag = execute_chain(&plan_with_flag, &pinned_base, &mut rt2)
-            .await
-            .expect("second chain execution");
+        let final_tag = execute_chain(
+            &plan_with_flag,
+            base_image(&fixture.source, &digest),
+            &mut rt2,
+        )
+        .await
+        .expect("second chain execution");
 
         assert_eq!(final_tag, plan_with_flag[1].id.tag);
         assert!(
@@ -3524,14 +4266,18 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_load_archive_materializes_fsmeta_and_vmdk() {
-        if ensure_docker_buildx().is_err() {
+        if ensure_docker_buildx().await.is_err() {
             eprintln!("skipping: `docker buildx` not available on PATH");
             return;
         }
-        let Some((base, _digest, pinned_base)) = e2e_pinned_base() else {
+        let Some(fixture) = e2e_base_fixture() else {
             eprintln!("skipping: no base image available locally or via network pull");
             return;
         };
+        // The fixture's pre-created `agent-vm-base:<hex>` link is what
+        // buildx's step-0 `FROM` resolves, mirroring an imported base.
+        let base = fixture.link.clone();
+        let pinned_base = fixture.link.clone();
 
         let layer_dir = tempfile::tempdir().unwrap();
         write_layer_file(
@@ -3577,6 +4323,67 @@ mod tests {
             cache.is_vmdk_materialized(&manifest_digest),
             "companion assertion, so this one test names both halves of ADR-0003's \
              invariant together"
+        );
+    }
+
+    /// Opt-in live coverage of [`pin_docker_base`]'s absent-link registry
+    /// branch: an exact `<repo>@sha256:<64 lowercase hex>` reference is
+    /// pulled and tagged as the base link, then both names resolve. Skipped
+    /// unless `AGENT_VM_E2E_REGISTRY_BASE` is set, so normal tests stay
+    /// network-free; skips rather than overwriting/removing any pre-existing
+    /// exact ref or link. Pull/tag failure *text* and ordering remain the
+    /// deterministic job of the injected-runner unit tests above.
+    #[tokio::test]
+    #[ignore = "needs docker + network: set AGENT_VM_E2E_REGISTRY_BASE=<repo>@sha256:<64 hex>"]
+    async fn e2e_pin_docker_base_pulls_an_exact_registry_digest() {
+        let Some(supplied) = std::env::var("AGENT_VM_E2E_REGISTRY_BASE").ok() else {
+            eprintln!(
+                "skipping: set AGENT_VM_E2E_REGISTRY_BASE=<repo>@sha256:<64 hex> to run this \
+                 opt-in test"
+            );
+            return;
+        };
+        let Some((repo, digest)) = supplied.split_once('@') else {
+            eprintln!("skipping: AGENT_VM_E2E_REGISTRY_BASE must be <repo>@sha256:<hex>");
+            return;
+        };
+        if repo.is_empty() {
+            eprintln!("skipping: empty repository in AGENT_VM_E2E_REGISTRY_BASE");
+            return;
+        }
+        let Ok(link) = docker_base_tag(digest) else {
+            eprintln!(
+                "skipping: AGENT_VM_E2E_REGISTRY_BASE digest is not sha256:<64 lowercase hex>"
+            );
+            return;
+        };
+        let pull_ref = format!("{repo}@{digest}");
+        if docker_tag_exists(&pull_ref) || docker_tag_exists(&link) {
+            eprintln!("skipping: {pull_ref} or {link} already exists locally");
+            return;
+        }
+
+        let mut guard = DockerTagGuard::default();
+        let result = pin_docker_base(base_image(repo, digest)).await;
+        // Claim each name only after observing its absent→present
+        // transition — including on an error return, so a successful pull
+        // followed by a failed tag cannot leak the pulled exact ref.
+        if docker_tag_exists(&pull_ref) {
+            guard.own(&pull_ref);
+        }
+        if docker_tag_exists(&link) {
+            guard.own(&link);
+        }
+
+        let got = result.expect("pin_docker_base");
+        assert_eq!(got, link);
+        assert!(
+            docker_tag_exists(&pull_ref),
+            "the exact pulled ref must be resolvable after a successful pin"
+        );
+        assert!(
+            docker_tag_exists(&link),
+            "the digest-derived base link must be resolvable after a successful pin"
         );
     }
 }

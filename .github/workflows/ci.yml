@@ -47,12 +47,14 @@ jobs:
           bash -n vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh \
             script/check-runtime-provenance.sh script/test/runtime-provenance.sh \
             script/test/msb-krun-compat.sh script/test/msb-krun-compat-contract.sh \
-            script/build/macos.sh script/test/build-workflow.sh
+            script/build/macos.sh script/test/build-workflow.sh \
+            script/test/fixtures/fake-plutil.sh
           shellcheck vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh \
             vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh \
             script/check-runtime-provenance.sh script/test/runtime-provenance.sh \
             script/test/msb-krun-compat.sh script/test/msb-krun-compat-contract.sh \
-            script/build/macos.sh script/test/build-workflow.sh
+            script/build/macos.sh script/test/build-workflow.sh \
+            script/test/fixtures/fake-plutil.sh
 
       - name: actionlint
         run: |

@@ -57,7 +57,7 @@ resolve_msb_home() {
 }
 
 main() {
-    local image tag platform msb_home
+    local image tag platform msb_home inspect_json digest base_link
 
     case "${1:-}" in
         -h | --help)
@@ -89,6 +89,15 @@ main() {
         echo "error: Docker is installed but its daemon is unavailable; start Docker Desktop" >&2
         exit 1
     }
+    # `plutil` reads the loaded image's top-level manifest digest out of the
+    # msb inspect JSON below (a structured root-key extract, because the JSON
+    # also carries a nested config.digest). It is a macOS system binary; fail
+    # here with a clear message rather than misreporting its absence later as
+    # "could not extract its manifest digest".
+    command -v plutil >/dev/null 2>&1 || {
+        echo "error: plutil is required to extract the imported image's manifest digest; it ships with macOS" >&2
+        exit 1
+    }
 
     platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" || {
         echo "error: local Docker image '$image' was not found" >&2
@@ -107,6 +116,38 @@ main() {
         target/macos/bin/msb image load --tag "$tag"
 
     echo "==> Imported $tag"
+
+    # Link the base into Docker under its msb manifest digest so a project
+    # tooling-layer build can resolve step 0's FROM locally (issue #98).
+    # Import time is the one moment Docker's source image and msb's cached
+    # copy are guaranteed to be the same bytes. The digest is read back
+    # structurally with plutil: real inspect output also carries a nested
+    # config.digest, so a regex/textual extraction could pick the wrong value
+    # (the root manifest digest is the layer-hash anchor).
+    inspect_json="$(MSB_HOME="$msb_home" \
+        target/macos/bin/msb image inspect --format json "$tag")" || {
+        echo "error: imported $tag into msb, but 'msb image inspect' failed; the Docker base link was not created. Rerun to retry." >&2
+        exit 1
+    }
+    digest="$(printf '%s' "$inspect_json" | \
+        plutil -extract digest raw -expect string -o - -)" || {
+        echo "error: imported $tag into msb, but could not extract its manifest digest from inspect output; the Docker base link was not created. Rerun to retry." >&2
+        exit 1
+    }
+    if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "error: msb reported a malformed manifest digest for $tag ('$digest'); expected sha256:<64 lowercase hex>. The Docker base link was not created." >&2
+        exit 1
+    fi
+    # The Docker-local repository below must match `layer::BASE_REPO` in
+    # `crates/agent-vm/src/layer.rs` (a Rust const a shell script can't
+    # import); `layer::tests::base_repo_constant_matches_the_import_script_literal`
+    # guards the tie. See issue #98's ADR-0003 amendment.
+    base_link="agent-vm-base:${digest#sha256:}"
+    docker tag "$image" "$base_link" || {
+        echo "error: imported $tag into msb, but 'docker tag $image $base_link' failed; the Docker base link is missing. Rerun to retry." >&2
+        exit 1
+    }
+    echo "==> Linked $image into Docker as $base_link (tooling-layer base)"
     printf 'Verify offline with:\n  %q shell --image %q -- uname -m\n' \
         "$REPO_ROOT/target/macos/bin/agent-vm" "$tag"
     echo "Note: msb stages the incoming archive in temporary storage, so keep roughly one archive's worth of disk free."

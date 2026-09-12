@@ -163,6 +163,9 @@ case "${1:-}" in
         [[ "${FAKE_SAVE_FAIL:-}" != 1 ]] || exit 29
         printf "%s" fake-archive
         ;;
+    tag)
+        [[ "${FAKE_TAG_FAIL:-}" != 1 ]] || exit 1
+        ;;
     *) exit 3 ;;
 esac'
     make_tool "$fakebin/codesign" '
@@ -194,15 +197,12 @@ if [[ "${FAKE_OTOOL_INVALID_ONCE:-}" == 1 && "$2" != *.next && ! -e "${FAKE_LOG}
 fi
 printf "%s\n" "$2:"
 '
-    make_tool "$fakebin/plutil" '
-key="${2:-}"
-case "$key" in
-    *hypervisor*) value="${FAKE_HYPERVISOR_ENTITLEMENT:-true}" ;;
-    *disable-library-validation*) value="${FAKE_LIBRARY_ENTITLEMENT:-true}" ;;
-    *) exit 3 ;;
-esac
-[[ "$value" != missing ]] || exit 1
-printf "%s\n" "$value"'
+    # Shared fake `plutil` (root-key digest extraction for import-image.sh,
+    # entitlement queries for macos.sh). Checked in as a fixture rather than
+    # an inline heredoc so shellcheck analyzes it; see
+    # script/test/fixtures/fake-plutil.sh for the portability contract.
+    cp "$REPO_ROOT/script/test/fixtures/fake-plutil.sh" "$fakebin/plutil"
+    chmod +x "$fakebin/plutil"
     make_tool "$fakebin/install" '
 mode=; if [[ "${1:-}" == -m ]]; then mode="$2"; shift 2; fi
 /bin/cp "$1" "$2"
@@ -276,12 +276,36 @@ expect_build_failure() {
     assert_contains "$output" "$expected"
 }
 
+# The two fixture digests, defined once here and exported so the fake `msb`
+# below (which emits them) and every assertion that names them read the same
+# values -- one source of truth (issue-#98 review T10). The nested
+# `config.digest` (config_hex) is emitted *before*, and differs from, the
+# top-level manifest digest (manifest_hex) so a textual extraction would
+# select the wrong one; only a structured root-key extract gets manifest_hex.
+config_hex="$(printf '1%.0s' {1..64})"
+manifest_hex="$(printf '2%.0s' {1..64})"
+export config_hex manifest_hex
+
 install_import_msb() {
     local fixture="$1"
     mkdir -p "$fixture/target/macos/bin"
     cat >"$fixture/target/macos/bin/msb" <<'SH'
 #!/bin/bash
 set -euo pipefail
+if [[ "${1:-}" == image && "${2:-}" == inspect ]]; then
+    printf 'MSB_HOME=%s args=%s\n' "$MSB_HOME" "$*" >>"$FAKE_LOG"
+    [[ "${FAKE_MSB_INSPECT_FAIL:-}" != 1 ]] || exit 1
+    if [[ -n "${FAKE_MSB_INSPECT_JSON:-}" ]]; then
+        printf '%s\n' "$FAKE_MSB_INSPECT_JSON"
+    else
+        # Nested config.digest is emitted *first* and differs from the
+        # top-level manifest digest, so a textual extraction that grabs the
+        # first sha256 picks the wrong value.
+        printf '{"config":{"digest":"sha256:%s"},"digest":"sha256:%s"}\n' \
+            "$config_hex" "$manifest_hex"
+    fi
+    exit 0
+fi
 payload="$(cat)"
 printf 'MSB_HOME=%s args=%s payload=%s\n' "$MSB_HOME" "$*" "$payload" >>"$FAKE_LOG"
 SH
@@ -306,9 +330,26 @@ expect_import_failure() {
     assert_contains "$output" "$expected"
     if [[ -f "$fixture/calls.log" ]]; then
         case "$(cat "$fixture/calls.log")" in
-            *"MSB_HOME="*) fail "failed import reached image load" ;;
+            *"args=image load"*) fail "failed import reached image load" ;;
         esac
     fi
+}
+
+# A failure *after* the msb load completed (bad inspect output, extraction,
+# or Docker tagging). The import has already succeeded into the cache, so the
+# load must be seen, and the completion notice must not claim a link.
+expect_import_late_failure() {
+    local expected="$1" fixture="$2" fakebin="$3"
+    shift 3
+    local output status
+    set +e
+    output="$(run_import "$fixture" "$fakebin" "$@" 2>&1)"
+    status=$?
+    set -e
+    [[ $status -ne 0 ]] || fail "import unexpectedly succeeded: $expected"
+    assert_contains "$output" "$expected"
+    assert_file_contains "$fixture/calls.log" "args=image load"
+    assert_not_contains "$output" "==> Linked"
 }
 
 # Public scripts must exist before the fake contract can run.
@@ -507,17 +548,32 @@ run_build "$fixture" "$fakebin" env CARGO_TARGET_DIR="$TEST_ROOT/alternate-targe
 assert_file_contains "$fixture/target/macos/bin/agent-vm" "fake-fresh"
 assert_file_contains "$fixture/target/macos/bin/msb" "fake-fresh"
 
-# Import argument defaults, cache placement, and direct streaming.
+# Import argument defaults, cache placement, and direct streaming. The fake
+# msb emits a nested config.digest *distinct from and before* the top-level
+# manifest digest, so these assertions prove the structured root-key
+# extraction selects the manifest digest (the layer-hash anchor).
 check_import() {
     local name="$1" expected_home="$2" expected_image="$3" expected_tag="$4"
-    local output expected_agent_vm expected_shell_tag
+    local output expected_agent_vm expected_shell_tag calls
     shift 4
     make_fixture "$name"
     install_import_msb "$fixture"
     output="$(run_import "$fixture" "$fakebin" "$@")"
+    calls="$(cat "$fixture/calls.log")"
     assert_file_contains "$fixture/calls.log" "docker image inspect --format {{.Os}}/{{.Architecture}} $expected_image"
     assert_file_contains "$fixture/calls.log" "docker save $expected_image"
     assert_file_contains "$fixture/calls.log" "MSB_HOME=$expected_home args=image load --tag $expected_tag payload=fake-archive"
+    assert_file_contains "$fixture/calls.log" "MSB_HOME=$expected_home args=image inspect --format json $expected_tag"
+    assert_file_contains "$fixture/calls.log" "plutil extract digest input="
+    # Docker tags the *source* image (which, for a renamed import, differs
+    # from the msb destination) as the base link. The nested config digest
+    # must never be used.
+    # `agent-vm-base` must match `layer::BASE_REPO` in
+    # `crates/agent-vm/src/layer.rs`; the Rust test
+    # `base_repo_constant_matches_the_import_script_literal` guards that tie.
+    assert_file_contains "$fixture/calls.log" "docker tag $expected_image agent-vm-base:$manifest_hex"
+    assert_not_contains "$calls" "agent-vm-base:$config_hex"
+    assert_contains "$output" "agent-vm-base:$manifest_hex"
     printf -v expected_agent_vm '%q' "$fixture/target/macos/bin/agent-vm"
     printf -v expected_shell_tag '%q' "$expected_tag"
     assert_contains "$output" "  $expected_agent_vm shell --image $expected_shell_tag -- uname -m"
@@ -557,6 +613,36 @@ expect_import_failure "HOME is unset" "$fixture" "$fakebin" env -u AGENT_VM_STAT
 make_fixture import-extra
 install_import_msb "$fixture"
 expect_import_failure "Usage:" "$fixture" "$fakebin" -- one two three
+
+# Import failures *after* the msb load completed: the import stays intact in
+# the cache, the Docker base link is not created, and the script exits
+# non-zero. The nested config digest must never be substituted for a bad or
+# missing top-level digest.
+make_fixture import-inspect-fail
+install_import_msb "$fixture"
+expect_import_late_failure "msb image inspect' failed" "$fixture" "$fakebin" env FAKE_MSB_INSPECT_FAIL=1
+make_fixture import-malformed-digest
+install_import_msb "$fixture"
+expect_import_late_failure "malformed manifest digest" "$fixture" "$fakebin" env "FAKE_MSB_INSPECT_JSON={\"config\":{\"digest\":\"sha256:$config_hex\"},\"digest\":\"sha256:abc\"}"
+make_fixture import-uppercase-digest
+install_import_msb "$fixture"
+uppercase_hex="$(printf 'A%.0s' {1..64})"
+expect_import_late_failure "malformed manifest digest" "$fixture" "$fakebin" env "FAKE_MSB_INSPECT_JSON={\"digest\":\"sha256:$uppercase_hex\"}"
+make_fixture import-missing-digest
+install_import_msb "$fixture"
+expect_import_late_failure "could not extract its manifest digest" "$fixture" "$fakebin" env "FAKE_MSB_INSPECT_JSON={\"config\":{\"digest\":\"sha256:$config_hex\"}}"
+make_fixture import-wrongtype-digest
+install_import_msb "$fixture"
+expect_import_late_failure "could not extract its manifest digest" "$fixture" "$fakebin" env 'FAKE_MSB_INSPECT_JSON={"digest":123}'
+make_fixture import-badjson-digest
+install_import_msb "$fixture"
+expect_import_late_failure "could not extract its manifest digest" "$fixture" "$fakebin" env 'FAKE_MSB_INSPECT_JSON=not json'
+make_fixture import-plutil-fail
+install_import_msb "$fixture"
+expect_import_late_failure "could not extract its manifest digest" "$fixture" "$fakebin" env FAKE_PLUTIL_FAIL=1
+make_fixture import-tag-fail
+install_import_msb "$fixture"
+expect_import_late_failure "docker tag" "$fixture" "$fakebin" env FAKE_TAG_FAIL=1
 
 # Help requires neither platform nor build tools.
 make_fixture help
