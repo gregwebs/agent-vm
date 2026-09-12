@@ -731,6 +731,36 @@ child present locally) is a named hard error naming the link and
 `./script/build/import-image.sh`, never a silently skipped C4a — that state is
 precisely what C4a exists to catch.
 
+### Amendment: the contract's e2e proof moves in-tree (issue #102)
+
+The "The layer image contract" narrative above says the checks are "pure
+policy: facts in, violation out" and leaves the suite that proves them in
+`layer.rs`. Issue #102 moved that suite — the eight `#[ignore]`d,
+`#[cfg(test)]`-only tests that build a real derived image over the fixture's
+base link and check C1–C4 against the facts both producers report — into
+`crates/agent-vm/src/layer/contract.rs`, directly beneath the policy it
+proves, promoting the fixtures it shares with `layer`'s own e2e harness into
+`layer::test_support`.
+
+**The qualification, made explicit.** "Pure policy" is a claim about the
+checks that **ship**, and it stays true: `contract.rs` is a production module
+with no I/O of its own. The moved suite sits inside `mod tests`, compiled only
+under `cfg(test)`, so a `--release` build carries the checks without it. The
+suite *does* drive real Docker, which is why the module doc and the sentence
+above now name the `#[cfg(test)]`-only half rather than leaving "pure policy"
+unqualified beside a Docker-driving file.
+
+**No clause, grade or enforcement point changes.** C1–C8, the
+enforced/documented split, the enforcement points and every decision D1–D9 are
+exactly as the issue-#97 amendment left them; the moved tests *assert* the
+contract, they do not redefine it. `layer::execute_chain` and the two fact
+producers are unchanged, and no production line moved.
+
+**Accepted consequence.** The file a reader opens to audit the contract now
+also carries eight Docker-requiring tests. They stay `#[ignore]`d and never run
+in CI; their duplicated skip preamble and `#[ignore]` literal are recorded as a
+follow-up (issue #107), not addressed here.
+
 ## Consequences
 
 - **F5 — fsmeta/VMDK evicted while metadata survives.** If something ever

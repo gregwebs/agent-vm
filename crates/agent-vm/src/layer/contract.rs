@@ -2,12 +2,18 @@
 //! must satisfy, and the pure checks that enforce C1–C4 against a built
 //! image's OCI config.
 //!
-//! Split out of `layer.rs` because it is 100% policy — facts in, violation
-//! out — with no I/O of its own. `layer.rs` owns the two producers that turn
-//! a `docker image inspect` document or an msb cache record into
-//! [`ImageFacts`]. See `docs/adr/0003-project-tooling-layers.md`, "The layer
-//! image contract", for the normative text (all eight clauses, which four
-//! are enforced, and where).
+//! Split out of `layer.rs` because its **checks** are 100% policy — facts in,
+//! violation out, no I/O of their own. (The `#[ignore]`d e2e suite below *does*
+//! drive real Docker; the constraint is on the code that ships.) `layer.rs`
+//! still owns the two producers that turn a `docker image inspect` document or
+//! an msb cache record into [`ImageFacts`]. See
+//! `docs/adr/0003-project-tooling-layers.md`, "The layer image contract", for
+//! the normative text (all eight clauses, which four are enforced, and where).
+//!
+//! This module owns both halves of the contract — the pure clause checks above
+//! and the live end-to-end suite below, which proves them against real
+//! `docker buildx` output and the msb cache. Run recipe and its rationale:
+//! see the *real docker buildx build* e2e section header in `layer.rs`.
 //!
 //! Only clauses C1–C4 are represented here: they are the four whose
 //! violations are visible in the image *config* and *manifest* — both tiny
@@ -727,6 +733,21 @@ mod tests {
     use super::*;
     use crate::layer::{ChainPosition, LayerIdentity};
     use std::path::{Path, PathBuf};
+
+    // Fixtures shared with `layer`'s own e2e harness, promoted into
+    // `layer::test_support` by issue #102.
+    use crate::layer::test_support::{
+        DockerTagGuard, E2eBase, docker_tag_exists, e2e_base_fixture, e2e_nonce, first_of_one,
+        write_layer_file,
+    };
+    // The engine the contract's live proof drives. These are `layer`'s own items;
+    // a child module may name its ancestor's private ones (`host_oci_platform`),
+    // which is why none of them needed a visibility change for this move.
+    use crate::layer::{
+        build_derived_docker, build_derived_oci, derived_is_cached, discard_derived_image,
+        docker_image_facts, ensure_docker_buildx, final_image_facts, host_oci_platform,
+        load_derived_image, resolve,
+    };
 
     /// The platform `check` supplies as "this host" for the check tests.
     /// Deliberately not `host_oci_platform()`: the check is pure, and pinning
@@ -1510,5 +1531,457 @@ mod tests {
     fn path_from_config_env_ignores_non_path_keys_containing_path_substring() {
         let env = vec!["XPATH=/should-not-match".to_string()];
         assert_eq!(path_from_config_env(&env), None);
+    }
+
+    // --- e2e: the layer image contract against real docker + the msb cache ---
+    // Ignore attribute values must be literals, so the repeated reasons stay
+    // at their call sites to deliberately retain direct test registration.
+    //
+    // Moved here from `layer.rs` by issue #102; the fixtures these tests share
+    // with `layer`'s own e2e harness live in `layer::test_support`.
+    //
+    // These eight tests are the live proof of the clauses in
+    // `docs/adr/0003-project-tooling-layers.md`: seven build a real derived
+    // image over the fixture's base link and check the contract against the
+    // facts the two producers actually report — the tripwire for the design's
+    // riskiest assumptions (BuildKit preserving the base's diff ids; docker's
+    // store and the msb cache agreeing on them). The eighth builds its own
+    // foreign base, proving C4a is not a tautology.
+
+    /// Build `dockerfile` (a one-step layer over the fixture's base link) with
+    /// `--output type=oci`, ingest it into a fresh temp cache, and return the
+    /// step, that cache dir, the ingested image's facts and the base link's
+    /// facts. The caller keeps the returned `TempDir` alive.
+    async fn e2e_ingest_one_step(
+        fixture: &E2eBase,
+        dockerfile: &str,
+        extra_files: &[(&str, &str)],
+    ) -> (ChainStep, tempfile::TempDir, ImageFacts, ImageFacts) {
+        let base = fixture.link.clone();
+        let layer_dir = tempfile::tempdir().unwrap();
+        write_layer_file(layer_dir.path(), "Dockerfile", dockerfile, 0o644);
+        for (rel, content) in extra_files {
+            write_layer_file(layer_dir.path(), rel, content, 0o755);
+        }
+        let id = resolve(
+            layer_dir.path(),
+            Path::new("/tmp/e2e-contract-project"),
+            &fixture.digest,
+            first_of_one(),
+        )
+        .unwrap();
+        let step = ChainStep {
+            id,
+            label: ".agent-vm/layers/10-a".to_string(),
+        };
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        // Under the cache dir, not the system tmp (AGENTS.md) — a full OCI
+        // tar can be hundreds of MB.
+        let tar = tempfile::Builder::new()
+            .suffix(".tar")
+            .tempfile_in(cache_dir.path())
+            .unwrap();
+        build_derived_oci(&step.id, &base, tar.path())
+            .await
+            .expect("docker buildx build");
+        let metadata = load_derived_image(cache_dir.path(), tar.path(), &step.id.tag)
+            .await
+            .expect("load_archive");
+        let built = ImageFacts::from_cached_metadata(&metadata).unwrap();
+        let base_facts = docker_image_facts(&base)
+            .await
+            .unwrap()
+            .expect("the fixture's base link must be inspectable");
+        (step, cache_dir, built, base_facts)
+    }
+
+    /// The distinct stderr messages below are the observable run-versus-skip
+    /// contract, so each precondition keeps its own wording. Split in two
+    /// because the foreign-base test needs the buildx check without the
+    /// ordinary host-base fixture.
+    async fn e2e_buildx_or_skip() -> bool {
+        if ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return false;
+        }
+        true
+    }
+
+    /// Return the owned fixture, not just its link: its guard must survive
+    /// until the caller exits, including early returns and unwinding.
+    async fn e2e_fixture_or_skip() -> Option<E2eBase> {
+        if !e2e_buildx_or_skip().await {
+            return None;
+        }
+        let Some(fixture) = e2e_base_fixture() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return None;
+        };
+        Some(fixture)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_a_built_layers_diff_ids_extend_its_base() {
+        let Some(fixture) = e2e_fixture_or_skip().await else {
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, _cache, built, base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!(
+                "ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\n\
+                 RUN ln -s /bin/true /usr/local/bin/marker-tool\n\
+                 ENV PATH=/usr/local/bin:$PATH\n"
+            ),
+            &[],
+        )
+        .await;
+
+        assert!(
+            base_facts.diff_ids.len() < built.diff_ids.len(),
+            "the layer must add at least one layer: base {:?}, built {:?}",
+            base_facts.diff_ids,
+            built.diff_ids
+        );
+        assert_eq!(
+            built.diff_ids[..base_facts.diff_ids.len()],
+            base_facts.diff_ids[..],
+            "the built image's diff ids must extend the base's as a prefix — the \
+             assumption C1's image half rests on"
+        );
+        check_built_image(
+            &step,
+            StepRole::Final,
+            BuiltOn {
+                predecessor: &base_facts,
+                built: &built,
+            },
+            &host_oci_platform(),
+        )
+        .expect("C1 must pass for a layer built FROM the base link");
+    }
+
+    /// BuildKit is free to rebase layers for `COPY --link`; if this ever
+    /// stops preserving the base's diff ids, that is a design change (see the
+    /// plan's F1), never something to paper over with a carve-out.
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_copy_link_still_extends_its_base() {
+        let Some(fixture) = e2e_fixture_or_skip().await else {
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, _cache, built, base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!(
+                "ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\n\
+                 COPY --link --chmod=0755 hello.sh /usr/local/bin/hello.sh\n"
+            ),
+            &[("hello.sh", "#!/bin/sh\necho hi\n")],
+        )
+        .await;
+
+        assert_eq!(
+            built.diff_ids[..base_facts.diff_ids.len()],
+            base_facts.diff_ids[..],
+            "COPY --link must still leave the base's diff ids as a prefix: base {:?}, built {:?}",
+            base_facts.diff_ids,
+            built.diff_ids
+        );
+        check_built_image(
+            &step,
+            StepRole::Final,
+            BuiltOn {
+                predecessor: &base_facts,
+                built: &built,
+            },
+            &host_oci_platform(),
+        )
+        .expect("C1 must pass for a COPY --link layer built FROM the base link");
+    }
+
+    /// The cross-store comparability C1's final-step check depends on: the
+    /// docker exporter and the OCI exporter must report the same diff ids for
+    /// the same Dockerfile (they legitimately differ in the *compressed* blob
+    /// digests, which is why only diff ids are compared).
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_facts_agree_between_dockers_store_and_the_msb_cache() {
+        let Some(fixture) = e2e_fixture_or_skip().await else {
+            return;
+        };
+        let base = fixture.link.clone();
+
+        let layer_dir = tempfile::tempdir().unwrap();
+        write_layer_file(
+            layer_dir.path(),
+            "Dockerfile",
+            &format!(
+                "ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\n\
+                 RUN ln -s /bin/true /usr/local/bin/marker-tool\n"
+            ),
+            0o644,
+        );
+        let id = resolve(
+            layer_dir.path(),
+            Path::new("/tmp/e2e-contract-same-image"),
+            &fixture.digest,
+            first_of_one(),
+        )
+        .unwrap();
+        if docker_tag_exists(&id.tag) {
+            eprintln!("skipping: {} already exists locally", id.tag);
+            return;
+        }
+
+        // docker-exporter build first, so its tag can be cleaned up.
+        let docker_facts = build_derived_docker(&id, &base)
+            .await
+            .expect("docker-exporter build");
+        let mut guard = DockerTagGuard::default();
+        guard.own(&id.tag);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let tar = tempfile::Builder::new()
+            .suffix(".tar")
+            .tempfile_in(cache_dir.path())
+            .unwrap();
+        build_derived_oci(&id, &base, tar.path())
+            .await
+            .expect("oci-exporter build");
+        let metadata = load_derived_image(cache_dir.path(), tar.path(), &id.tag)
+            .await
+            .expect("load_archive");
+        let cache_facts = ImageFacts::from_cached_metadata(&metadata).unwrap();
+
+        assert_eq!(
+            docker_facts.diff_ids, cache_facts.diff_ids,
+            "docker's store and the msb cache must report the same diff ids"
+        );
+        assert_eq!(docker_facts, cache_facts);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_a_path_replacing_layer_is_rejected() {
+        let Some(fixture) = e2e_fixture_or_skip().await else {
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, _cache, built, base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nENV PATH=/only/mine\n"),
+            &[],
+        )
+        .await;
+
+        let err = check_built_image(
+            &step,
+            StepRole::Final,
+            BuiltOn {
+                predecessor: &base_facts,
+                built: &built,
+            },
+            &host_oci_platform(),
+        )
+        .expect_err("replacing PATH must violate C2 against real facts");
+        assert_eq!(err.clause, Clause::PathIsAdditive);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_a_non_root_final_layer_is_rejected() {
+        let Some(fixture) = e2e_fixture_or_skip().await else {
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, _cache, built, base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nUSER 9999\n"),
+            &[],
+        )
+        .await;
+
+        let err = check_built_image(
+            &step,
+            StepRole::Final,
+            BuiltOn {
+                predecessor: &base_facts,
+                built: &built,
+            },
+            &host_oci_platform(),
+        )
+        .expect_err("a non-root final must violate C3 against real facts");
+        assert_eq!(err.clause, Clause::EndsAsRoot);
+        // The identical image passes as an intermediate (decision D5).
+        check_built_image(
+            &step,
+            StepRole::Intermediate,
+            BuiltOn {
+                predecessor: &base_facts,
+                built: &built,
+            },
+            &host_oci_platform(),
+        )
+        .expect("a mid-chain USER is legitimate");
+    }
+
+    /// D7's rollback, and a live guard on the vendored
+    /// `delete_image_metadata_async`: after the discard the tag reads as
+    /// uncached, so the next launch rebuilds and re-checks instead of booting
+    /// the violating artifact.
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_discard_derived_image_makes_a_loaded_tag_uncached() {
+        let Some(fixture) = e2e_fixture_or_skip().await else {
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, cache_dir, _built, _base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nENV MARKER=present\n"),
+            &[],
+        )
+        .await;
+
+        assert!(
+            derived_is_cached(cache_dir.path(), &step.id.tag)
+                .await
+                .unwrap(),
+            "the ingest must leave the tag cached"
+        );
+        discard_derived_image(cache_dir.path(), &step.id.tag)
+            .await
+            .expect("discard_derived_image");
+        assert!(
+            !derived_is_cached(cache_dir.path(), &step.id.tag)
+                .await
+                .unwrap(),
+            "after the discard the tag must read as uncached, so the next launch \
+             rebuilds and re-checks the contract"
+        );
+    }
+
+    /// MAJOR-3's fix: an image agent-vm ingested but could **not evaluate**
+    /// must be discarded, not left "cached" for the next launch to boot with
+    /// zero clauses checked. The metadata here claims a platform-less config,
+    /// which `from_cached_metadata` rejects.
+    ///
+    /// The intermediate half of the same fix is not separately tested:
+    /// forcing a malformed `docker image inspect` needs a fake docker binary.
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_an_unevaluatable_final_is_not_left_ingested() {
+        let Some(fixture) = e2e_fixture_or_skip().await else {
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, cache_dir, _built, _base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nENV MARKER=present\n"),
+            &[],
+        )
+        .await;
+        assert!(
+            derived_is_cached(cache_dir.path(), &step.id.tag)
+                .await
+                .unwrap(),
+            "the ingest must leave the tag cached"
+        );
+
+        use microsandbox_image::{CachedImageMetadata, CachedLayerMetadata, ImageConfig};
+        let unevaluatable = CachedImageMetadata {
+            manifest_digest: "sha256:manifest".to_string(),
+            config_digest: "sha256:config".to_string(),
+            raw_manifest_json: "{}".to_string(),
+            raw_config_json: "{}".to_string(),
+            config: ImageConfig::default(),
+            layers: vec![CachedLayerMetadata {
+                digest: "sha256:compressed".to_string(),
+                media_type: None,
+                size_bytes: None,
+                diff_id: "sha256:layer".to_string(),
+            }],
+        };
+        let err = final_image_facts(cache_dir.path(), &step.id.tag, &unevaluatable).await;
+        assert!(err.is_err(), "a platform-less config must not evaluate");
+        assert!(
+            !derived_is_cached(cache_dir.path(), &step.id.tag)
+                .await
+                .unwrap(),
+            "an unevaluatable final must be discarded, or the next launch boots it \
+             with no clause checked"
+        );
+    }
+
+    /// C4a's falsifiability: a base link that really is a foreign-platform
+    /// image must be rejected. This is the test the reviewer said could not be
+    /// written without changing the check — the proof C4 is not a tautology.
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_a_foreign_base_link_is_rejected_by_c4() {
+        if !e2e_buildx_or_skip().await {
+            return;
+        }
+        let foreign = if host_oci_platform() == "linux/amd64" {
+            "linux/arm64"
+        } else {
+            "linux/amd64"
+        };
+
+        let link = format!("agent-vm-base:e2e-foreign-{}", e2e_nonce());
+        if docker_tag_exists(&link) {
+            eprintln!("skipping: {link} already exists locally");
+            return;
+        }
+
+        // Build a genuinely foreign-platform image. A `FROM`-only Dockerfile
+        // has no `RUN` to emulate, so buildx can still export the target
+        // platform's rootfs. A plain `docker pull --platform <foreign>`
+        // would *not* do: with the classic image store it leaves an existing
+        // host-platform tag in place (`Image is up to date`) and the link
+        // would inspect as the host platform, silently voiding the test.
+        let ctx = tempfile::tempdir().unwrap();
+        write_layer_file(
+            ctx.path(),
+            "Dockerfile",
+            "FROM debian:13-slim\nLABEL agent-vm-e2e-foreign-platform=1\n",
+            0o644,
+        );
+        // Offline is not a failure of the check: skip, and never report the
+        // skip as a pass (the reviewer's explicit warning).
+        let built = std::process::Command::new("docker")
+            .args(["buildx", "build", "--platform", foreign, "-t", &link])
+            .args(["--output", "type=docker", ctx.path().to_str().unwrap()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !built {
+            eprintln!(
+                "skipping: could not build a {foreign} image (no network, or no \
+                 cross-platform support on this builder)"
+            );
+            return;
+        }
+        let mut guard = DockerTagGuard::default();
+        guard.own(&link);
+
+        let base = docker_image_facts(&link)
+            .await
+            .unwrap()
+            .expect("the foreign base link must be inspectable");
+        assert_eq!(
+            base.platform, foreign,
+            "buildx must have produced a {foreign} image under the link"
+        );
+
+        let step = chain_step(0, 1);
+        let err = check_base_image(&step, &base, &host_oci_platform())
+            .expect_err("a foreign base link must violate C4a");
+        assert_eq!(err.clause, Clause::TargetsHostPlatform);
     }
 }
