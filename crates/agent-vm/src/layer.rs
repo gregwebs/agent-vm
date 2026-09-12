@@ -53,6 +53,15 @@ use anyhow::{Context, Result, bail};
 // fully-qualified at its two call sites instead of importing it here.
 use sha2::{Digest, Sha256};
 
+/// The layer image contract (issue #97): the clauses every built chain step
+/// must satisfy, and the pure checks that enforce C1–C4 against a built
+/// image's OCI config. Split out of this file because it is pure policy —
+/// facts in, violation out — with no I/O of its own; `layer.rs` owns the two
+/// producers that turn a docker inspect or an msb cache record into
+/// [`contract::ImageFacts`]. See `docs/adr/0003-project-tooling-layers.md`,
+/// "The layer image contract".
+pub mod contract;
+
 /// The derived images' repository name, separate from the base image's so a
 /// listing (`docker image ls` equivalent) stays a readable per-project
 /// cleanup handle.
@@ -965,6 +974,13 @@ pub struct BaseImage<'a> {
 pub trait ChainRuntime {
     fn notice(&mut self, message: &str) -> Result<()>;
 
+    /// C1's fast half for a step that is *about to be built*: read its
+    /// Dockerfile and lint the text. Behind the seam because it is I/O; called
+    /// after the cache checks and before `confirm_build`, so a hardcoded `FROM`
+    /// never costs the user an answered prompt, and a cache-hit launch never
+    /// reads a Dockerfile it is not going to build.
+    fn lint_step(&mut self, step: &ChainStep) -> Result<()>;
+
     /// Ask once for the whole chain. The implementation runs the
     /// `docker buildx` preflight *before* asking, so a broken docker
     /// install surfaces as one clear error instead of wasting the user's
@@ -972,9 +988,16 @@ pub trait ChainRuntime {
     /// reason this is one method rather than two.
     async fn confirm_build(&mut self, plan: &[PlannedStep]) -> Result<()>;
 
-    /// `docker image inspect <tag> --format '{{.Id}}'`; `Ok(None)` means
-    /// absent.
-    async fn intermediate_image_id(&mut self, tag: &str) -> Result<Option<String>>;
+    /// `docker image inspect <tag> --format '{{json .}}'`; `Ok(None)` means
+    /// absent. Answers both "is this intermediate already built?" (the
+    /// backward walk) and "what does the image agent-vm is about to build
+    /// FROM actually contain?" (contract clauses C1/C2) from one process.
+    ///
+    /// This is the facts *reader*, not a presence probe: an image whose facts
+    /// cannot be read must not be silently trusted as a contract predecessor.
+    /// See [`docker_image_present`] for the exit-code-only probe the base-link
+    /// pin uses.
+    async fn image_facts(&mut self, tag: &str) -> Result<Option<contract::ImageFacts>>;
 
     /// Establish (or reuse) the Docker-local base link for an msb-cached
     /// base, returning the `agent-vm-base:<digest-hex>` tag buildx's step-0
@@ -986,11 +1009,27 @@ pub trait ChainRuntime {
     /// `layer::derived_is_cached` against the msb cache.
     async fn final_is_cached(&mut self, tag: &str) -> Result<bool>;
 
-    /// buildx `--output type=docker`, into docker's own image store.
-    async fn build_intermediate(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()>;
+    /// buildx `--output type=docker`, into docker's own image store, returning
+    /// the built image's facts for the layer image contract.
+    async fn build_intermediate(
+        &mut self,
+        id: &LayerIdentity,
+        from_ref: &str,
+    ) -> Result<contract::ImageFacts>;
 
-    /// buildx `--output type=oci` + `load_archive` into the msb cache.
-    async fn build_and_load_final(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()>;
+    /// buildx `--output type=oci` + `load_archive` into the msb cache,
+    /// returning the ingested image's facts (what will actually boot).
+    async fn build_and_load_final(
+        &mut self,
+        id: &LayerIdentity,
+        from_ref: &str,
+    ) -> Result<contract::ImageFacts>;
+
+    /// Throw away the image a step just produced, after it failed the
+    /// contract, so the next launch rebuilds and re-checks instead of finding
+    /// the violating artifact cached. Best effort by contract: its error is
+    /// appended to the violation, never replaces it.
+    async fn discard_step(&mut self, step: &ChainStep, role: contract::StepRole) -> Result<()>;
 }
 
 /// Executes `plan`, returning the final derived tag to boot.
@@ -1034,12 +1073,29 @@ pub async fn execute_chain<R: ChainRuntime>(
     //    ingested, that step's image is not in docker's store — it was built
     //    with `--output type=oci` — so the walk lands on it as `build_from`
     //    and it is re-exported once; see the ADR amendment's A6.)
+    //
+    //    The walk now also *keeps* the facts of the intermediate it stops at:
+    //    that image is what the first rebuilt step will be built FROM, so it
+    //    is the predecessor the contract's C1/C2 compare against — fetched by
+    //    the same `docker image inspect` the walk already ran. The walk keeps
+    //    the *validating* parse (unlike `docker_image_present`): an image it
+    //    cannot read as facts must not be silently trusted as a predecessor.
     let mut build_from = 0;
+    let mut predecessor: Option<contract::ImageFacts> = None;
     for i in (0..total.saturating_sub(1)).rev() {
-        if rt.intermediate_image_id(&plan[i].id.tag).await?.is_some() {
+        if let Some(facts) = rt.image_facts(&plan[i].id.tag).await? {
             build_from = i + 1;
+            predecessor = Some(facts);
             break;
         }
+    }
+
+    // 2b. C1's fast half, for exactly the steps that will be built: before
+    //     the prompt (so a hardcoded FROM never costs an answered prompt or a
+    //     multi-minute build) and after the cache checks (so an already-built
+    //     chain is grandfathered — decision D1).
+    for step in &plan[build_from..] {
+        rt.lint_step(step)?;
     }
 
     // 3. One prompt for the whole chain, listing every step with its real
@@ -1064,26 +1120,164 @@ pub async fn execute_chain<R: ChainRuntime>(
     // step that actually builds. A final cache hit, a declined prompt, or a
     // cached intermediate above step 0 must not spawn the pin's Docker
     // process — that placement is what keeps cache-hit launches Docker-free.
-    let mut from_ref = if build_from == 0 {
-        rt.pin_base(base).await?
-    } else {
-        plan[build_from - 1].id.tag.clone()
+    //
+    // `pin_base` is followed by one inspect of the link, which is the
+    // predecessor step 0's C1/C2 compare against (decision D9: C1 asks "did
+    // this step build on what agent-vm told it to build on?", and the link is
+    // literally the ref buildx resolved). It is the only process this ticket
+    // adds, and only on a build that starts at step 0.
+    let host_platform = host_oci_platform();
+    let mut from_ref = match &predecessor {
+        Some(_) => plan[build_from - 1].id.tag.clone(),
+        None => rt.pin_base(base).await?,
     };
+    // Reached only when step 0 actually builds: a cache-hit launch returned
+    // at section 1, and a chain with any cached intermediate takes the `Some`
+    // arm. `with_context` here is anyhow's `Option` impl, turning the absent
+    // link into a named error rather than a skipped C1 check.
+    let mut predecessor = match predecessor {
+        Some(facts) => facts,
+        None => rt
+            .image_facts(&from_ref)
+            .await
+            .with_context(|| {
+                format!(
+                    "inspecting the Docker base link {from_ref}; agent-vm cannot determine the \
+                     platform of the image every layer is built on. Re-run \
+                     ./script/build/import-image.sh"
+                )
+            })?
+            .with_context(|| {
+                format!(
+                    "the Docker base link {from_ref} was established but cannot be inspected; \
+                     re-run ./script/build/import-image.sh"
+                )
+            })?,
+    };
+
+    // C4a: the base link is the only image in this chain agent-vm did not
+    // build itself, so its platform is the chain's only real platform fact
+    // (every built image's config restates agent-vm's own `--platform`). Only
+    // when step 0 builds: above a cached prefix the predecessor is an
+    // agent-vm-built intermediate whose stamp proves nothing, and any change
+    // of base moves every step's tag (plan_chain anchors step 0's hash on the
+    // base manifest digest), so a new base always re-runs this.
+    if build_from == 0
+        && let Err(violation) = contract::check_base_image(&plan[0], &predecessor, &host_platform)
+    {
+        // Nothing has been built yet, so there is nothing to discard.
+        return Err(anyhow::Error::new(ChainViolation::new(violation)));
+    }
+
     for step in &plan[build_from..] {
         rt.notice(&format!(
             "==> Building tooling layer step {} ({}) …",
             step.id.position.human(),
             step.label,
         ))?;
-        if step.id.position.index + 1 == total {
-            rt.build_and_load_final(&step.id, &from_ref).await?; // ONLY here
+        let role = if step.id.position.index + 1 == total {
+            contract::StepRole::Final
         } else {
-            rt.build_intermediate(&step.id, &from_ref).await?;
+            contract::StepRole::Intermediate
+        };
+        let built = match role {
+            contract::StepRole::Final => rt.build_and_load_final(&step.id, &from_ref).await?,
+            contract::StepRole::Intermediate => rt.build_intermediate(&step.id, &from_ref).await?,
+        };
+        if let Err(violation) = contract::check_built_image(
+            step,
+            role,
+            contract::BuiltOn {
+                predecessor: &predecessor,
+                built: &built,
+            },
+            &host_platform,
+        ) {
+            return Err(discard_then_report(rt, step, role, violation).await);
+        }
+        if role == contract::StepRole::Intermediate {
             from_ref = step.id.tag.clone();
+            predecessor = built;
         }
     }
     rt.notice(&format!("==> Tooling layer {} ready", final_step.id.tag))?;
     Ok(final_step.id.tag.clone())
+}
+
+/// A contract violation as it reaches `launch()`: the [`contract::Violation`]
+/// itself, plus the best-effort rollback's own failure when the violating
+/// image could not be discarded.
+///
+/// A wrapper rather than `anyhow!(string)` so the clause survives to the top
+/// of the call stack — tests and any future caller branch on
+/// `err.downcast_ref::<ChainViolation>()`, not on message substrings
+/// (CODING_STANDARDS.md, "make invalid states unrepresentable"; the seam
+/// `contract.rs`'s module doc already promises). A wrapper rather than
+/// `.context(note)` so the violation stays the *top-level* message: the clause
+/// is what the user must act on, and a failed `docker image rm` must never
+/// outrank it.
+#[derive(Debug)]
+pub struct ChainViolation {
+    pub violation: contract::Violation,
+    pub discard_error: Option<anyhow::Error>,
+}
+
+impl ChainViolation {
+    /// A violation with no rollback attempted (nothing was built yet).
+    pub fn new(violation: contract::Violation) -> Self {
+        Self {
+            violation,
+            discard_error: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ChainViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.violation)?;
+        if let Some(err) = &self.discard_error {
+            write!(f, "\n\n{}", discard_failure_note(err))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ChainViolation {
+    // Deliberately no `source()`: this `Display` already renders the violation
+    // verbatim, and anyhow renders a root error's causes *after* the top-level
+    // message — so returning the violation here would print the clause twice
+    // (main terminates with `{:?}`). The violation is reachable through
+    // `self.violation` and, at the call stack's top, through
+    // `downcast_ref::<ChainViolation>()`.
+}
+
+/// The sentence appended when a best-effort discard fails. One definition so
+/// the violation path, the unevaluatable-final path and the
+/// unevaluatable-intermediate path phrase the same failure the same way.
+fn discard_failure_note(err: &anyhow::Error) -> String {
+    format!(
+        "The violating image could not be discarded ({err:#}); remove it by hand if the next \
+         launch reports it as cached."
+    )
+}
+
+/// Roll back the image a violating step produced, then report the violation.
+///
+/// The violation is what the user must act on, so a failure to discard is
+/// carried alongside it (as [`ChainViolation::discard_error`], rendered after
+/// it) rather than replacing it — losing the clause because `docker image rm`
+/// failed would be strictly worse than leaving a stale tag behind.
+async fn discard_then_report<R: ChainRuntime>(
+    rt: &mut R,
+    step: &ChainStep,
+    role: contract::StepRole,
+    violation: contract::Violation,
+) -> anyhow::Error {
+    let discard_error = rt.discard_step(step, role).await.err();
+    anyhow::Error::new(ChainViolation {
+        violation,
+        discard_error,
+    })
 }
 
 // --- build & load ---
@@ -1295,7 +1489,7 @@ struct ProductionPinRunner;
 
 impl PinCommandRunner for ProductionPinRunner {
     async fn link_present(&self, tag: &str) -> Result<bool> {
-        Ok(docker_image_id(tag).await?.is_some())
+        docker_image_present(tag).await
     }
 
     async fn pull(&self, reference: &str) -> Result<()> {
@@ -1410,9 +1604,10 @@ pub async fn build_derived_oci(id: &LayerIdentity, from_ref: &str, out_tar: &Pat
 /// [`build_derived_oci`], this takes no `compression=` (the docker exporter
 /// has no such option) and so has no zstd/gzip retry.
 ///
-/// After the build, asserts `docker image inspect id.tag` actually resolves.
-/// Its absence overwhelmingly means the active buildx builder uses the
-/// `docker-container` driver rather than `docker` — that driver's isolated
+/// After the build, asserts `docker image inspect id.tag` actually resolves
+/// and returns that image's [`contract::ImageFacts`] for the layer image
+/// contract. The absence overwhelmingly means the active buildx builder uses
+/// the `docker-container` driver rather than `docker` — that driver's isolated
 /// buildkit container cannot see a previous build's `--load` output, so a
 /// later `FROM <tag>` falls through to a Docker Hub pull of a tag that does
 /// not exist there. `.github/workflows/chrome-layer-contract.yml` already
@@ -1420,23 +1615,47 @@ pub async fn build_derived_oci(id: &LayerIdentity, from_ref: &str, out_tar: &Pat
 /// assertion (not by parsing `docker buildx inspect` up front) because that
 /// is a second output format to track, can false-positive on multi-node
 /// builders, and the post-hoc check cannot be wrong.
-pub async fn build_derived_docker(id: &LayerIdentity, from_ref: &str) -> Result<()> {
+pub async fn build_derived_docker(
+    id: &LayerIdentity,
+    from_ref: &str,
+) -> Result<contract::ImageFacts> {
     run_buildx(id, from_ref, BuildxOutput::Docker)
         .await
         .with_context(|| format!("building intermediate tooling layer {}", id.tag))?;
-    if docker_image_id(&id.tag).await?.is_none() {
-        let driver = buildx_driver().unwrap_or_else(|| "<unknown>".to_string());
-        bail!(
-            "tooling layer step {} ({}) built, but its image did not appear in docker's \
-             local image store. agent-vm chains layer steps through that store, which \
-             requires the default `docker` buildx driver (this host's builder uses driver \
-             `{driver}`). Run `docker buildx use default`, or create a builder with \
-             `docker buildx create --driver docker --use`.",
-            id.position.human(),
-            id.dir.display(),
-        );
-    }
-    Ok(())
+    let facts = match docker_image_facts(&id.tag).await {
+        Ok(Some(facts)) => facts,
+        Ok(None) => {
+            let driver = buildx_driver().unwrap_or_else(|| "<unknown>".to_string());
+            bail!(
+                "tooling layer step {} ({}) built, but its image did not appear in docker's \
+                 local image store. agent-vm chains layer steps through that store, which \
+                 requires the default `docker` buildx driver (this host's builder uses driver \
+                 `{driver}`). Run `docker buildx use default`, or create a builder with \
+                 `docker buildx create --driver docker --use`.",
+                id.position.human(),
+                id.dir.display(),
+            );
+        }
+        Err(err) => {
+            // The tag may exist but be unreadable. An image agent-vm tagged but
+            // could not evaluate would otherwise be *trusted as a predecessor*
+            // by the next launch's backward walk (which keeps the validating
+            // parse), booting with a clause unchecked and permanently — the
+            // D7 hole the review found, for intermediates. Best-effort discard,
+            // like every discard: its failure is appended, never replaces the
+            // error. The intermediate half is not separately tested (forcing a
+            // malformed `docker image inspect` needs a fake docker binary).
+            let err = err.context(format!(
+                "reading the layer image contract facts of intermediate tooling layer {}",
+                id.tag
+            ));
+            return Err(match discard_intermediate_image(&id.tag).await {
+                Ok(()) => err,
+                Err(discard_err) => err.context(discard_failure_note(&discard_err)),
+            });
+        }
+    };
+    Ok(facts)
 }
 
 /// Only on the [`build_derived_docker`] failure path: the current builder's
@@ -1458,25 +1677,26 @@ fn buildx_driver() -> Option<String> {
         .map(|driver| driver.trim().to_string())
 }
 
-/// Trims and validates `docker image inspect --format '{{.Id}}'` output.
-/// Split out from the process call so the trailing-newline and empty-output
-/// cases are unit-testable without docker.
-fn parse_image_id(stdout: &str) -> Result<String> {
-    let id = stdout.trim();
-    if id.is_empty() {
-        bail!("`docker image inspect` produced empty output");
-    }
-    Ok(id.to_string())
-}
-
-/// The resolved image id of `tag` in docker's local image store, or `None`
-/// when absent (`docker image inspect` exits 1). A *spawn* failure is an
-/// error, not `None` — "docker is broken" must not read as "not cached",
+/// The [`contract::ImageFacts`] of `tag` in docker's local image store, or
+/// `None` when absent (`docker image inspect` exits 1). A *spawn* failure is
+/// an error, not `None` — "docker is broken" must not read as "not cached",
 /// which would make [`execute_chain`]'s cache-hit path indistinguishable
 /// from a genuinely broken docker install.
-pub async fn docker_image_id(tag: &str) -> Result<Option<String>> {
+///
+/// One `--format '{{json .}}'` call replaces the previous `{{.Id}}` one: the
+/// presence answer the chain's backward walk needs and the facts the contract
+/// needs come from the same process, so enforcement costs no extra docker
+/// invocation. `contract::ImageFacts::from_docker_inspect` validates the
+/// document (a malformed/renamed one is a named error, never a silent empty
+/// fact set).
+///
+/// This is the facts *reader*, not a presence probe: both the backward walk
+/// and [`build_derived_docker`] consume the result as a contract predecessor,
+/// and an image whose facts cannot be read must not be silently trusted as
+/// one. For a pure "is it there?" question use [`docker_image_present`].
+pub async fn docker_image_facts(tag: &str) -> Result<Option<contract::ImageFacts>> {
     let output = tokio::process::Command::new("docker")
-        .args(["image", "inspect", tag, "--format", "{{.Id}}"])
+        .args(["image", "inspect", tag, "--format", "{{json .}}"])
         .output()
         .await
         .with_context(|| {
@@ -1492,9 +1712,33 @@ pub async fn docker_image_id(tag: &str) -> Result<Option<String>> {
         // daemon must never read as "chain not cached".
         return Ok(None);
     }
-    let id = parse_image_id(&String::from_utf8_lossy(&output.stdout))
+    let facts = contract::ImageFacts::from_docker_inspect(&String::from_utf8_lossy(&output.stdout))
         .with_context(|| format!("parsing `docker image inspect {tag}` output"))?;
-    Ok(Some(id))
+    Ok(Some(facts))
+}
+
+/// Whether `tag` resolves in docker's local image store. Exit-code only — the
+/// document is never parsed.
+///
+/// Deliberately *not* [`docker_image_facts`]: a probe must answer "is it
+/// there?" for any image, including one whose inspect document the contract's
+/// parser would reject (a multi-arch index with no host-platform child, a
+/// `FROM scratch` stage). The base-link pin asks only this question, and with
+/// no escape hatch (D2) a false trip there is unrecoverable. A *spawn* failure
+/// is an error, not `false`.
+pub async fn docker_image_present(tag: &str) -> Result<bool> {
+    let status = tokio::process::Command::new("docker")
+        .args(["image", "inspect", tag, "--format", "{{.Id}}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "spawning `docker image inspect {tag}` failed; is docker installed and on PATH?"
+            )
+        })?;
+    Ok(status.success())
 }
 
 /// The `docker buildx --platform` value for the host we are running on.
@@ -1625,8 +1869,17 @@ async fn run_buildx(id: &LayerIdentity, from_ref: &str, output: BuildxOutput<'_>
 /// `docs/adr/0003-project-tooling-layers.md`) — after this returns
 /// successfully, a boot of `tag` with `PullPolicy::IfMissing` resolves
 /// entirely from cache, with no registry contact.
-pub async fn load_derived_image(cache_dir: &Path, tar: &Path, tag: &str) -> Result<()> {
-    microsandbox_image::load_archive(
+///
+/// Returns the metadata `load_archive` recorded for `tag` — the same record
+/// [`derived_is_cached`] reads back and the one boot resolves — so the caller
+/// can check the layer image contract against exactly what will boot, without
+/// a second cache read or a tar parse (decision D8).
+pub async fn load_derived_image(
+    cache_dir: &Path,
+    tar: &Path,
+    tag: &str,
+) -> Result<microsandbox_image::CachedImageMetadata> {
+    let loaded = microsandbox_image::load_archive(
         cache_dir,
         tar,
         microsandbox_image::ImageLoadOptions {
@@ -1635,8 +1888,145 @@ pub async fn load_derived_image(cache_dir: &Path, tar: &Path, tag: &str) -> Resu
         },
     )
     .await
-    .with_context(|| format!("loading tooling layer {tag} into the msb cache"))?;
+    .map_err(|err| {
+        // Deliberately string-matching a vendored error message: a miss only
+        // costs the hint, never correctness. This is the one contract
+        // violation (C4) whose final-step symptom precedes our own check —
+        // `load_archive` picks the manifest for the *host* platform, so a
+        // wrong-platform archive fails here before [`super::contract`] can
+        // see it.
+        let hint = if err
+            .to_string()
+            .contains("no image manifests for the host platform")
+        {
+            format!(
+                ". This usually means the step violates the layer image contract, clause {} ({}): \
+                 the archive carries no manifest for {}, the host platform. See {}",
+                contract::Clause::TargetsHostPlatform.id(),
+                contract::Clause::TargetsHostPlatform.title(),
+                host_oci_platform(),
+                contract::ADR,
+            )
+        } else {
+            String::new()
+        };
+        anyhow::Error::new(err).context(format!(
+            "loading tooling layer {tag} into the msb cache{hint}"
+        ))
+    })?;
+
+    // `load_archive` returns every image in the archive, not one; its
+    // `options.tags` is applied to the archive's *first* image, so the
+    // by-reference lookup is the precise form and the first entry is the
+    // documented fallback.
+    let image = loaded
+        .iter()
+        .find(|img| img.reference == tag)
+        .or_else(|| loaded.first())
+        .with_context(|| format!("load_archive ingested no image for {tag}"))?;
+    Ok(image.metadata.clone())
+}
+
+/// The contract facts of a just-ingested final image — discarding the image
+/// when its record cannot be read.
+///
+/// D7's rollback covers the violation case; this covers the strictly worse
+/// one. An image agent-vm ingested but could not evaluate would otherwise be
+/// found "already cached" by the next launch ([`derived_is_cached`]), which
+/// short-circuits before any check and boots it with **no** clause verified —
+/// permanently, because nothing re-evaluates it and its hash has not moved.
+/// Best effort, like every discard: a failed discard is appended to the error,
+/// never replaces it.
+pub async fn final_image_facts(
+    cache_dir: &Path,
+    tag: &str,
+    metadata: &microsandbox_image::CachedImageMetadata,
+) -> Result<contract::ImageFacts> {
+    match contract::ImageFacts::from_cached_metadata(metadata) {
+        Ok(facts) => Ok(facts),
+        Err(err) => {
+            let err = err.context(format!(
+                "reading the layer image contract facts of the ingested tooling layer {tag}"
+            ));
+            Err(match discard_derived_image(cache_dir, tag).await {
+                Ok(()) => err,
+                Err(discard_err) => err.context(discard_failure_note(&discard_err)),
+            })
+        }
+    }
+}
+
+/// Delete the msb cache's metadata record for `tag`, so a derived image that
+/// failed the layer image contract is not found "already ingested" on the
+/// next launch (which would skip the check and boot it). The materialized
+/// EROFS/fsmeta/VMDK artifacts are content-addressed and are left for normal
+/// GC — [`derived_is_cached`] answers `false` without the metadata record,
+/// which is the only thing the launch path consults.
+///
+/// `GlobalCache::delete_image_metadata_async` removes exactly one file,
+/// `<cache>/manifests/<sha256(reference-string)>.json`, and is idempotent
+/// (`NotFound` is `Ok`). That file *is* the tag in the msb cache: `load_archive`
+/// writes only this record, boot's cache resolution starts from
+/// `read_image_metadata_async(reference)`, and agent-vm never routes derived
+/// tags through the SDK's image DB — so after a discard the next launch
+/// rebuilds and re-checks, failing again deterministically until the
+/// Dockerfile is fixed.
+pub async fn discard_derived_image(cache_dir: &Path, tag: &str) -> Result<()> {
+    let reference: microsandbox_image::Reference = tag
+        .parse()
+        .with_context(|| format!("parsing derived image tag {tag}"))?;
+    let cache = microsandbox_image::GlobalCache::new_async(cache_dir)
+        .await
+        .with_context(|| format!("opening image cache at {}", cache_dir.display()))?;
+    cache
+        .delete_image_metadata_async(&reference)
+        .await
+        .with_context(|| format!("discarding cached tooling layer {tag}"))?;
     Ok(())
+}
+
+/// `docker image rm <tag>` for an intermediate that failed the contract, for
+/// the same reason as [`discard_derived_image`]: the backward walk would
+/// otherwise find it in docker's store on the next launch and *trust* it as a
+/// predecessor, so a violation in an intermediate would escape after its first
+/// (failed) launch. No `--force`: the tag is one agent-vm itself created
+/// seconds earlier in a repository it owns, and an untagging is all that is
+/// needed.
+pub async fn discard_intermediate_image(tag: &str) -> Result<()> {
+    docker_status(&["image", "rm", tag], false)
+        .await
+        .with_context(|| format!("discarding intermediate tooling layer {tag}"))
+}
+
+/// The Dockerfile-text lint for a step about to be built (C1's fast half).
+///
+/// The `read_to_string` + [`contract::lint_step_dockerfile`] pair lives here so
+/// the production adapter (`run.rs`'s `LaunchChainRuntime`) and the e2e twin
+/// (`layer.rs`'s `E2eChainRuntime`) share exactly one body — the two had
+/// drifted into byte-identical copies. The read stays *outside*
+/// `execute_chain` so the chain orchestration remains free of filesystem I/O
+/// and its fake-runtime tests keep working on synthetic plans with no
+/// directories on disk.
+pub fn lint_step_file(step: &ChainStep) -> Result<()> {
+    let text = std::fs::read_to_string(&step.id.dockerfile)
+        .with_context(|| format!("reading {}", step.id.dockerfile.display()))?;
+    contract::lint_step_dockerfile(step, &text)?;
+    Ok(())
+}
+
+/// Throw away the image a step produced: [`discard_derived_image`] for the
+/// final (msb cache), [`discard_intermediate_image`] for an intermediate
+/// (docker's store). One home for the [`contract::StepRole`] switch so the
+/// production adapter and the e2e twin cannot disagree about it.
+pub async fn discard_step_image(
+    cache_dir: &Path,
+    step: &ChainStep,
+    role: contract::StepRole,
+) -> Result<()> {
+    match role {
+        contract::StepRole::Final => discard_derived_image(cache_dir, &step.id.tag).await,
+        contract::StepRole::Intermediate => discard_intermediate_image(&step.id.tag).await,
+    }
 }
 
 // hex encode/decode without a new dependency: sha2 already gives us
@@ -2737,39 +3127,53 @@ mod tests {
         assert_eq!(plan[1].id, bare);
     }
 
-    // --- parse_image_id() ---
-
-    #[test]
-    fn parse_image_id_trims_the_trailing_newline() {
-        assert_eq!(parse_image_id("sha256:abc123\n").unwrap(), "sha256:abc123");
-    }
-
-    #[test]
-    fn parse_image_id_rejects_empty_output() {
-        assert!(parse_image_id("").is_err());
-        assert!(parse_image_id("\n").is_err());
-    }
-
     // --- execute_chain() against a recording fake ---
 
     #[derive(Debug, PartialEq, Eq)]
     enum Event {
         Notice(String),
+        LintStep(String),                  // step tag
         ConfirmBuild(Vec<(String, bool)>), // (tag, pending) per step
-        InspectIntermediate(String),
+        ImageFacts(String),                // tag
         CheckFinal(String),
         PinBase { base_ref: String, digest: String },
         BuildIntermediate { tag: String, from: String },
         BuildAndLoadFinal { tag: String, from: String },
+        DiscardStep(String, contract::StepRole), // tag, role
     }
 
     struct FakeRuntime {
         log: Vec<Event>,
         docker_store: std::collections::HashSet<String>, // intermediate tags "already built"
         msb_cache: std::collections::HashSet<String>,    // final tags "already ingested"
-        fail_at: Option<usize>,                          // step index whose build returns Err
+        /// Known images' contract facts, keyed by tag: the base link by
+        /// default, plus every intermediate a build produces and every tag a
+        /// test marks pre-built. `image_facts` answers only from here, so a
+        /// tag absent from this map reads as "not present in docker's store"
+        /// — the same thing `Ok(None)` means in production.
+        facts: std::collections::HashMap<String, contract::ImageFacts>,
+        fail_at: Option<usize>, // step index whose build returns Err
         declined: bool,
         pin_fails: bool, // pin_base returns Err
+        lint_fails_at: Option<usize>,
+        violate_at: Option<usize>,
+        discard_fails: bool,
+    }
+
+    /// The fake base link's facts: three layers, a realistic agent `PATH`, no
+    /// `USER`, and the host platform (so C4 passes by default).
+    fn base_facts() -> contract::ImageFacts {
+        contract::ImageFacts {
+            diff_ids: ["a", "b", "c"]
+                .iter()
+                .map(|l| format!("sha256:base-{l}"))
+                .collect(),
+            env: vec![
+                "PATH=/opt/agent/.local/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin".to_string(),
+            ],
+            user: None,
+            platform: host_oci_platform(),
+        }
     }
 
     impl FakeRuntime {
@@ -2778,16 +3182,55 @@ mod tests {
                 log: Vec::new(),
                 docker_store: std::collections::HashSet::new(),
                 msb_cache: std::collections::HashSet::new(),
+                facts: std::collections::HashMap::from([(LINKED_BASE.to_string(), base_facts())]),
                 fail_at: None,
                 declined: false,
                 pin_fails: false,
+                lint_fails_at: None,
+                violate_at: None,
+                discard_fails: false,
             }
+        }
+
+        /// Mark `tag` as an already-built intermediate: present in docker's
+        /// store with facts the contract can compare against.
+        fn prebuild_intermediate(&mut self, tag: &str) {
+            let mut facts = base_facts();
+            facts.diff_ids.push(format!("sha256:prebuilt-{tag}"));
+            self.docker_store.insert(tag.to_string());
+            self.facts.insert(tag.to_string(), facts);
+        }
+
+        /// What a build of `id` produces: the predecessor's facts plus one new
+        /// layer. `violate_at` makes that step produce a C1 violation instead
+        /// (an unrelated layer list) — the one violation every build path can
+        /// synthesize without a real docker.
+        fn built_facts(&self, id: &LayerIdentity, from_ref: &str) -> contract::ImageFacts {
+            let mut facts = self.facts.get(from_ref).cloned().unwrap_or_else(base_facts);
+            if self.violate_at == Some(id.position.index) {
+                facts.diff_ids = vec!["sha256:not-built-on-the-predecessor".to_string()];
+                return facts;
+            }
+            facts.diff_ids.push(format!("sha256:built-{}", id.tag));
+            facts
         }
     }
 
     impl ChainRuntime for FakeRuntime {
         fn notice(&mut self, message: &str) -> Result<()> {
             self.log.push(Event::Notice(message.to_string()));
+            Ok(())
+        }
+
+        fn lint_step(&mut self, step: &ChainStep) -> Result<()> {
+            self.log.push(Event::LintStep(step.id.tag.clone()));
+            if self.lint_fails_at == Some(step.id.position.index) {
+                return Err(
+                    contract::lint_step_dockerfile(step, "FROM debian:bookworm\n")
+                        .expect_err("a hardcoded FROM must fail the lint")
+                        .into(),
+                );
+            }
             Ok(())
         }
 
@@ -2801,12 +3244,9 @@ mod tests {
             Ok(())
         }
 
-        async fn intermediate_image_id(&mut self, tag: &str) -> Result<Option<String>> {
-            self.log.push(Event::InspectIntermediate(tag.to_string()));
-            Ok(self
-                .docker_store
-                .contains(tag)
-                .then(|| format!("sha256:{tag}")))
+        async fn image_facts(&mut self, tag: &str) -> Result<Option<contract::ImageFacts>> {
+            self.log.push(Event::ImageFacts(tag.to_string()));
+            Ok(self.facts.get(tag).cloned())
         }
 
         async fn final_is_cached(&mut self, tag: &str) -> Result<bool> {
@@ -2825,7 +3265,11 @@ mod tests {
             Ok(LINKED_BASE.to_string())
         }
 
-        async fn build_intermediate(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()> {
+        async fn build_intermediate(
+            &mut self,
+            id: &LayerIdentity,
+            from_ref: &str,
+        ) -> Result<contract::ImageFacts> {
             self.log.push(Event::BuildIntermediate {
                 tag: id.tag.clone(),
                 from: from_ref.to_string(),
@@ -2833,11 +3277,17 @@ mod tests {
             if self.fail_at == Some(id.position.index) {
                 bail!("build failed at step {}", id.position.index);
             }
+            let facts = self.built_facts(id, from_ref);
             self.docker_store.insert(id.tag.clone());
-            Ok(())
+            self.facts.insert(id.tag.clone(), facts.clone());
+            Ok(facts)
         }
 
-        async fn build_and_load_final(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()> {
+        async fn build_and_load_final(
+            &mut self,
+            id: &LayerIdentity,
+            from_ref: &str,
+        ) -> Result<contract::ImageFacts> {
             self.log.push(Event::BuildAndLoadFinal {
                 tag: id.tag.clone(),
                 from: from_ref.to_string(),
@@ -2845,7 +3295,25 @@ mod tests {
             if self.fail_at == Some(id.position.index) {
                 bail!("build failed at step {}", id.position.index);
             }
+            let facts = self.built_facts(id, from_ref);
             self.msb_cache.insert(id.tag.clone());
+            self.facts.insert(id.tag.clone(), facts.clone());
+            Ok(facts)
+        }
+
+        async fn discard_step(&mut self, step: &ChainStep, role: contract::StepRole) -> Result<()> {
+            self.log.push(Event::DiscardStep(step.id.tag.clone(), role));
+            if self.discard_fails {
+                bail!("docker image rm failed");
+            }
+            match role {
+                contract::StepRole::Intermediate => {
+                    self.docker_store.remove(&step.id.tag);
+                }
+                contract::StepRole::Final => {
+                    self.msb_cache.remove(&step.id.tag);
+                }
+            }
             Ok(())
         }
     }
@@ -2964,15 +3432,20 @@ mod tests {
                     plan[1].id.tag
                 )),
             ],
-            "a cache-hit launch must touch nothing else — no inspect, no confirm, no build"
+            "a cache-hit launch must touch nothing else — no lint, no inspect, no confirm, \
+             no build, no discard"
         );
+        assert!(!rt.log.iter().any(|e| matches!(
+            e,
+            Event::LintStep(_) | Event::ImageFacts(_) | Event::DiscardStep(_, _)
+        )));
     }
 
     #[tokio::test]
     async fn a_cached_prefix_is_not_rebuilt() {
         let plan = fake_plan(2);
         let mut rt = FakeRuntime::new();
-        rt.docker_store.insert(plan[0].id.tag.clone());
+        rt.prebuild_intermediate(&plan[0].id.tag);
 
         execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
@@ -2998,7 +3471,7 @@ mod tests {
     async fn the_backward_walk_stops_at_the_highest_cached_intermediate() {
         let plan = fake_plan(4);
         let mut rt = FakeRuntime::new();
-        rt.docker_store.insert(plan[2].id.tag.clone());
+        rt.prebuild_intermediate(&plan[2].id.tag);
 
         execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
@@ -3006,7 +3479,7 @@ mod tests {
             .log
             .iter()
             .filter_map(|e| match e {
-                Event::InspectIntermediate(tag) => Some(tag.as_str()),
+                Event::ImageFacts(tag) => Some(tag.as_str()),
                 _ => None,
             })
             .collect();
@@ -3107,15 +3580,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_single_step_chain_uses_the_linked_base_and_never_inspects() {
+    async fn a_single_step_chain_uses_the_linked_base_and_inspects_only_the_link() {
         let plan = fake_plan(1);
         let mut rt = FakeRuntime::new();
         execute_chain(&plan, BASE, &mut rt).await.unwrap();
 
-        assert!(!rt.log.iter().any(|e| matches!(
-            e,
-            Event::InspectIntermediate(_) | Event::BuildIntermediate { .. }
-        )));
+        assert!(
+            !rt.log
+                .iter()
+                .any(|e| matches!(e, Event::BuildIntermediate { .. }))
+        );
+        // The base link is inspected exactly once (decision D9): it is step
+        // 0's contract predecessor. No intermediate is ever inspected because
+        // this chain has none.
+        let inspected: Vec<&str> = rt
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Event::ImageFacts(tag) => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inspected, vec![LINKED_BASE]);
         assert_eq!(
             rt.log
                 .iter()
@@ -3172,7 +3658,7 @@ mod tests {
         let plan =
             fake_plan_with_origins(&[".agent-vm/layers/0", ".agent-vm/layers/1", "--layer flag-2"]);
         let mut rt = FakeRuntime::new();
-        rt.docker_store.insert(plan[0].id.tag.clone());
+        rt.prebuild_intermediate(&plan[0].id.tag);
         // plan[1] (the project's last step) is deliberately absent from
         // docker_store: it was built with --output type=oci and only lives
         // in the msb cache, which this fake never populates for it.
@@ -3322,7 +3808,7 @@ mod tests {
     async fn a_cached_intermediate_skips_pinning() {
         let plan = fake_plan(2);
         let mut rt = FakeRuntime::new();
-        rt.docker_store.insert(plan[0].id.tag.clone());
+        rt.prebuild_intermediate(&plan[0].id.tag);
         execute_chain(&plan, BASE, &mut rt).await.unwrap();
         assert!(
             !rt.log.iter().any(|e| matches!(e, Event::PinBase { .. })),
@@ -3350,6 +3836,366 @@ mod tests {
             Event::BuildIntermediate { .. } | Event::BuildAndLoadFinal { .. }
         )));
         assert!(rt.msb_cache.is_empty());
+    }
+
+    // --- the layer image contract's placement inside execute_chain ---
+    // These are the chain tests from issue #97's plan (tests 31–39); 31 lives
+    // in `fully_cached_chain_spawns_nothing_and_never_confirms` above and 40
+    // is "every pre-existing test still passes".
+
+    #[tokio::test]
+    async fn the_lint_runs_for_the_built_steps_only_and_before_the_prompt() {
+        let plan = fake_plan(4);
+        let mut rt = FakeRuntime::new();
+        rt.prebuild_intermediate(&plan[1].id.tag); // cached prefix: steps 0,1
+
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
+
+        let lints: Vec<&str> = rt
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Event::LintStep(tag) => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lints,
+            vec![plan[2].id.tag.as_str(), plan[3].id.tag.as_str()],
+            "exactly the steps that will build, in order"
+        );
+
+        let confirm_idx = rt
+            .log
+            .iter()
+            .position(|e| matches!(e, Event::ConfirmBuild(_)))
+            .unwrap();
+        let last_lint_idx = rt
+            .log
+            .iter()
+            .rposition(|e| matches!(e, Event::LintStep(_)))
+            .unwrap();
+        let first_build_idx = rt
+            .log
+            .iter()
+            .position(|e| matches!(e, Event::BuildIntermediate { .. }))
+            .unwrap();
+        assert!(
+            last_lint_idx < confirm_idx && confirm_idx < first_build_idx,
+            "lint must precede the prompt, which precedes the builds: {:?}",
+            rt.log
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lint_failure_aborts_before_the_prompt_and_any_build() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        rt.lint_fails_at = Some(1);
+
+        let err = format!(
+            "{:#}",
+            execute_chain(&plan, BASE, &mut rt).await.unwrap_err()
+        );
+        assert!(err.contains("C1"), "{err}");
+        assert!(
+            !rt.log.iter().any(|e| matches!(
+                e,
+                Event::ConfirmBuild(_)
+                    | Event::BuildIntermediate { .. }
+                    | Event::BuildAndLoadFinal { .. }
+                    | Event::DiscardStep(_, _)
+            )),
+            "a hardcoded FROM must cost no prompt, build or discard: {:?}",
+            rt.log
+        );
+        assert!(rt.msb_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_violating_intermediate_aborts_the_chain_and_is_discarded() {
+        let plan = fake_plan(3);
+        let mut rt = FakeRuntime::new();
+        rt.violate_at = Some(1);
+
+        let err = execute_chain(&plan, BASE, &mut rt).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ChainViolation>()
+                .expect("a contract failure must reach the call stack typed")
+                .violation
+                .clause,
+            contract::Clause::BuildsOnPredecessor
+        );
+        let err = format!("{err:#}");
+        assert!(err.contains("clause C1"), "{err}");
+        assert!(
+            !rt.log
+                .iter()
+                .any(|e| matches!(e, Event::BuildAndLoadFinal { .. })),
+            "a violating intermediate must abort before the final builds"
+        );
+        let discards: Vec<(&str, contract::StepRole)> = rt
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                Event::DiscardStep(tag, role) => Some((tag.as_str(), *role)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            discards,
+            vec![(plan[1].id.tag.as_str(), contract::StepRole::Intermediate)]
+        );
+        assert!(
+            !rt.docker_store.contains(&plan[1].id.tag),
+            "the violating intermediate must be removed so the walk cannot trust it"
+        );
+        assert!(rt.msb_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_violating_final_is_discarded_from_the_msb_cache() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        rt.violate_at = Some(1);
+
+        let err = execute_chain(&plan, BASE, &mut rt).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ChainViolation>()
+                .expect("typed")
+                .violation
+                .clause,
+            contract::Clause::BuildsOnPredecessor
+        );
+        let err = format!("{err:#}");
+        assert!(err.contains("clause C1"), "{err}");
+        assert_eq!(
+            rt.log
+                .iter()
+                .filter(|e| matches!(e, Event::DiscardStep(_, contract::StepRole::Final)))
+                .count(),
+            1
+        );
+        assert!(
+            !rt.msb_cache.contains(&plan[1].id.tag),
+            "the violating final must not remain ingested, or the next launch boots it from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discard_failure_does_not_mask_the_violation() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        rt.violate_at = Some(1);
+        rt.discard_fails = true;
+
+        let err = execute_chain(&plan, BASE, &mut rt).await.unwrap_err();
+        let chain = err.downcast_ref::<ChainViolation>().expect("typed");
+        assert_eq!(
+            chain.violation.clause,
+            contract::Clause::BuildsOnPredecessor
+        );
+        assert!(
+            chain.discard_error.is_some(),
+            "the discard failure must be carried"
+        );
+        let err = format!("{err:#}");
+        assert!(err.contains("clause C1"), "{err}");
+        assert!(err.contains("could not be discarded"), "{err}");
+        assert!(err.contains("docker image rm failed"), "{err}");
+    }
+
+    /// The non-host platform, for tests that need a base link built for the
+    /// other architecture.
+    fn foreign_platform() -> String {
+        if host_oci_platform() == "linux/amd64" {
+            "linux/arm64"
+        } else {
+            "linux/amd64"
+        }
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_foreign_base_link_fails_c4_before_any_build() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        let mut foreign = base_facts();
+        foreign.platform = foreign_platform();
+        rt.facts.insert(LINKED_BASE.to_string(), foreign);
+
+        let err = execute_chain(&plan, BASE, &mut rt).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ChainViolation>()
+                .expect("typed")
+                .violation
+                .clause,
+            contract::Clause::TargetsHostPlatform
+        );
+        assert!(
+            rt.log.iter().any(|e| matches!(e, Event::PinBase { .. })),
+            "the pin still runs before the link's facts are read: {:?}",
+            rt.log
+        );
+        assert_eq!(
+            rt.log
+                .iter()
+                .filter(|e| matches!(e, Event::ImageFacts(tag) if tag == LINKED_BASE))
+                .count(),
+            1,
+            "the link is inspected exactly once: {:?}",
+            rt.log
+        );
+        assert!(
+            !rt.log.iter().any(|e| matches!(
+                e,
+                Event::BuildIntermediate { .. }
+                    | Event::BuildAndLoadFinal { .. }
+                    | Event::DiscardStep(_, _)
+            )),
+            "a foreign base link must abort before anything is built or discarded: {:?}",
+            rt.log
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_prefix_does_not_recheck_the_base_link_platform() {
+        // The documented scope of C4a: above a cached prefix, step 0 does not
+        // build, so the (possibly foreign) base link is not re-checked. This is
+        // the accepted grandfathering hole, not an oversight — C4a runs
+        // whenever the base actually changes, because that moves every tag.
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        let mut foreign = base_facts();
+        foreign.platform = foreign_platform();
+        rt.facts.insert(LINKED_BASE.to_string(), foreign);
+        rt.prebuild_intermediate(&plan[0].id.tag);
+
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
+
+        assert!(
+            !rt.log.iter().any(|e| matches!(e, Event::PinBase { .. })),
+            "a cached prefix must not pin, and so must not re-check C4a: {:?}",
+            rt.log
+        );
+        assert!(
+            rt.log
+                .iter()
+                .any(|e| matches!(e, Event::BuildAndLoadFinal { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_base_link_is_inspected_once_after_pinning_and_before_the_first_build() {
+        let plan = fake_plan(3);
+        let mut rt = FakeRuntime::new();
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
+
+        assert_eq!(
+            rt.log
+                .iter()
+                .filter(|e| matches!(e, Event::ImageFacts(tag) if tag == LINKED_BASE))
+                .count(),
+            1,
+            "the base link is inspected exactly once: {:?}",
+            rt.log
+        );
+        let pin_idx = rt
+            .log
+            .iter()
+            .position(|e| matches!(e, Event::PinBase { .. }))
+            .unwrap();
+        let inspect_idx = rt
+            .log
+            .iter()
+            .position(|e| matches!(e, Event::ImageFacts(tag) if tag == LINKED_BASE))
+            .unwrap();
+        let first_build_idx = rt
+            .log
+            .iter()
+            .position(|e| matches!(e, Event::BuildIntermediate { .. }))
+            .unwrap();
+        assert!(
+            pin_idx < inspect_idx && inspect_idx < first_build_idx,
+            "pin, then inspect the link, then build: {:?}",
+            rt.log
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_prefix_is_the_contract_predecessor_of_the_first_rebuilt_step() {
+        let plan = fake_plan(3);
+        let mut rt = FakeRuntime::new();
+        // A cached intermediate whose facts are distinctive: its PATH
+        // contains a directory the *base link* does not, so comparing the
+        // rebuilt step against the base instead of against this prefix would
+        // fail C2.
+        rt.docker_store.insert(plan[1].id.tag.clone());
+        rt.facts.insert(
+            plan[1].id.tag.clone(),
+            contract::ImageFacts {
+                diff_ids: vec!["sha256:cached-prefix".to_string()],
+                env: vec!["PATH=/cached-prefix:/usr/bin".to_string()],
+                user: None,
+                platform: host_oci_platform(),
+            },
+        );
+
+        execute_chain(&plan, BASE, &mut rt).await.unwrap();
+
+        assert!(
+            !rt.log.iter().any(|e| matches!(e, Event::PinBase { .. })),
+            "a cached prefix must not pin the base"
+        );
+        let built = &rt.facts[&plan[2].id.tag];
+        contract::check_built_image(
+            &plan[2],
+            contract::StepRole::Final,
+            contract::BuiltOn {
+                predecessor: &rt.facts[&plan[1].id.tag],
+                built,
+            },
+            &host_oci_platform(),
+        )
+        .expect("the rebuilt step satisfies the contract against the cached prefix");
+        // Non-vacuity: the same built image WOULD have failed had the check
+        // used the base link's facts, so the assertion above really does pin
+        // which predecessor was compared against.
+        assert!(
+            contract::check_built_image(
+                &plan[2],
+                contract::StepRole::Final,
+                contract::BuiltOn {
+                    predecessor: &base_facts(),
+                    built,
+                },
+                &host_oci_platform(),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vanished_base_link_fails_before_any_build_naming_the_import_script() {
+        let plan = fake_plan(2);
+        let mut rt = FakeRuntime::new();
+        // `pin_base` still "succeeds", but the link it named cannot be
+        // inspected — the base was removed between the two calls.
+        rt.facts.clear();
+
+        let err = format!(
+            "{:#}",
+            execute_chain(&plan, BASE, &mut rt).await.unwrap_err()
+        );
+        assert!(err.contains("import-image.sh"), "{err}");
+        assert!(
+            !rt.log.iter().any(|e| matches!(
+                e,
+                Event::BuildIntermediate { .. } | Event::BuildAndLoadFinal { .. }
+            )),
+            "a missing link must never fall through to a skipped C1 check: {:?}",
+            rt.log
+        );
     }
 
     // --- digest_pinned_base() ---
@@ -4031,12 +4877,16 @@ mod tests {
             Ok(())
         }
 
+        fn lint_step(&mut self, step: &ChainStep) -> Result<()> {
+            lint_step_file(step)
+        }
+
         async fn confirm_build(&mut self, _plan: &[PlannedStep]) -> Result<()> {
             Ok(())
         }
 
-        async fn intermediate_image_id(&mut self, tag: &str) -> Result<Option<String>> {
-            docker_image_id(tag).await
+        async fn image_facts(&mut self, tag: &str) -> Result<Option<contract::ImageFacts>> {
+            docker_image_facts(tag).await
         }
 
         async fn final_is_cached(&mut self, tag: &str) -> Result<bool> {
@@ -4047,15 +4897,31 @@ mod tests {
             pin_docker_base(base).await
         }
 
-        async fn build_intermediate(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()> {
+        async fn build_intermediate(
+            &mut self,
+            id: &LayerIdentity,
+            from_ref: &str,
+        ) -> Result<contract::ImageFacts> {
             build_derived_docker(id, from_ref).await
         }
 
-        async fn build_and_load_final(&mut self, id: &LayerIdentity, from_ref: &str) -> Result<()> {
+        async fn build_and_load_final(
+            &mut self,
+            id: &LayerIdentity,
+            from_ref: &str,
+        ) -> Result<contract::ImageFacts> {
             let tar = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
             build_derived_oci(id, from_ref, tar.path()).await?;
-            load_derived_image(&self.cache_dir, tar.path(), &id.tag).await?;
-            Ok(())
+            let metadata = load_derived_image(&self.cache_dir, tar.path(), &id.tag).await?;
+            // Route through `final_image_facts`, like the production adapter
+            // (`run.rs`): an ingested-but-unevaluatable image must be
+            // discarded here too, or the twin would silently exercise
+            // different behaviour from production (MAJOR-3 / NEW-1).
+            final_image_facts(&self.cache_dir, &id.tag, &metadata).await
+        }
+
+        async fn discard_step(&mut self, step: &ChainStep, role: contract::StepRole) -> Result<()> {
+            discard_step_image(&self.cache_dir, step, role).await
         }
     }
 
@@ -4125,7 +4991,7 @@ mod tests {
             "an intermediate step must never be ingested — only docker's own image store"
         );
         assert!(
-            docker_image_id(&plan[0].id.tag).await.unwrap().is_some(),
+            docker_image_facts(&plan[0].id.tag).await.unwrap().is_some(),
             "the intermediate step must land in docker's local image store"
         );
 
@@ -4207,7 +5073,7 @@ mod tests {
             "the solo project step must be ingested as a final step"
         );
         assert!(
-            docker_image_id(&solo_tag).await.unwrap().is_none(),
+            docker_image_facts(&solo_tag).await.unwrap().is_none(),
             "a step ingested only as a final (OCI) build must not be in docker's own store"
         );
 
@@ -4235,7 +5101,7 @@ mod tests {
 
         assert_eq!(final_tag, plan_with_flag[1].id.tag);
         assert!(
-            docker_image_id(&solo_tag).await.unwrap().is_some(),
+            docker_image_facts(&solo_tag).await.unwrap().is_some(),
             "step 0 must now also exist in docker's local image store, re-built as an \
              intermediate under its unchanged tag"
         );
@@ -4385,5 +5251,466 @@ mod tests {
             docker_tag_exists(&link),
             "the digest-derived base link must be resolvable after a successful pin"
         );
+    }
+
+    // --- e2e: the layer image contract against real docker + the msb cache ---
+    //
+    // These are the plan's tests 41–46. Each builds a real derived image over
+    // the fixture's base link and checks the contract against the facts the
+    // two producers actually report — the tripwire for the design's riskiest
+    // assumptions (BuildKit preserving the base's diff ids; docker's store and
+    // the msb cache agreeing on them).
+
+    /// Build `dockerfile` (a one-step layer over the fixture's base link) with
+    /// `--output type=oci`, ingest it into a fresh temp cache, and return the
+    /// step, that cache dir, the ingested image's facts and the base link's
+    /// facts. The caller keeps the returned `TempDir` alive.
+    async fn e2e_ingest_one_step(
+        fixture: &E2eBase,
+        dockerfile: &str,
+        extra_files: &[(&str, &str)],
+    ) -> (
+        ChainStep,
+        tempfile::TempDir,
+        contract::ImageFacts,
+        contract::ImageFacts,
+    ) {
+        let base = fixture.link.clone();
+        let layer_dir = tempfile::tempdir().unwrap();
+        write_layer_file(layer_dir.path(), "Dockerfile", dockerfile, 0o644);
+        for (rel, content) in extra_files {
+            write_layer_file(layer_dir.path(), rel, content, 0o755);
+        }
+        let id = resolve(
+            layer_dir.path(),
+            Path::new("/tmp/e2e-contract-project"),
+            &fixture.digest,
+            first_of_one(),
+        )
+        .unwrap();
+        let step = ChainStep {
+            id,
+            label: ".agent-vm/layers/10-a".to_string(),
+        };
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        // Under the cache dir, not the system tmp (AGENTS.md) — a full OCI
+        // tar can be hundreds of MB.
+        let tar = tempfile::Builder::new()
+            .suffix(".tar")
+            .tempfile_in(cache_dir.path())
+            .unwrap();
+        build_derived_oci(&step.id, &base, tar.path())
+            .await
+            .expect("docker buildx build");
+        let metadata = load_derived_image(cache_dir.path(), tar.path(), &step.id.tag)
+            .await
+            .expect("load_archive");
+        let built = contract::ImageFacts::from_cached_metadata(&metadata).unwrap();
+        let base_facts = docker_image_facts(&base)
+            .await
+            .unwrap()
+            .expect("the fixture's base link must be inspectable");
+        (step, cache_dir, built, base_facts)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_a_built_layers_diff_ids_extend_its_base() {
+        if ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some(fixture) = e2e_base_fixture() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, _cache, built, base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!(
+                "ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\n\
+                 RUN ln -s /bin/true /usr/local/bin/marker-tool\n\
+                 ENV PATH=/usr/local/bin:$PATH\n"
+            ),
+            &[],
+        )
+        .await;
+
+        assert!(
+            base_facts.diff_ids.len() < built.diff_ids.len(),
+            "the layer must add at least one layer: base {:?}, built {:?}",
+            base_facts.diff_ids,
+            built.diff_ids
+        );
+        assert_eq!(
+            built.diff_ids[..base_facts.diff_ids.len()],
+            base_facts.diff_ids[..],
+            "the built image's diff ids must extend the base's as a prefix — the \
+             assumption C1's image half rests on"
+        );
+        contract::check_built_image(
+            &step,
+            contract::StepRole::Final,
+            contract::BuiltOn {
+                predecessor: &base_facts,
+                built: &built,
+            },
+            &host_oci_platform(),
+        )
+        .expect("C1 must pass for a layer built FROM the base link");
+    }
+
+    /// BuildKit is free to rebase layers for `COPY --link`; if this ever
+    /// stops preserving the base's diff ids, that is a design change (see the
+    /// plan's F1), never something to paper over with a carve-out.
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_copy_link_still_extends_its_base() {
+        if ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some(fixture) = e2e_base_fixture() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, _cache, built, base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!(
+                "ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\n\
+                 COPY --link --chmod=0755 hello.sh /usr/local/bin/hello.sh\n"
+            ),
+            &[("hello.sh", "#!/bin/sh\necho hi\n")],
+        )
+        .await;
+
+        assert_eq!(
+            built.diff_ids[..base_facts.diff_ids.len()],
+            base_facts.diff_ids[..],
+            "COPY --link must still leave the base's diff ids as a prefix: base {:?}, built {:?}",
+            base_facts.diff_ids,
+            built.diff_ids
+        );
+        contract::check_built_image(
+            &step,
+            contract::StepRole::Final,
+            contract::BuiltOn {
+                predecessor: &base_facts,
+                built: &built,
+            },
+            &host_oci_platform(),
+        )
+        .expect("C1 must pass for a COPY --link layer built FROM the base link");
+    }
+
+    /// The cross-store comparability C1's final-step check depends on: the
+    /// docker exporter and the OCI exporter must report the same diff ids for
+    /// the same Dockerfile (they legitimately differ in the *compressed* blob
+    /// digests, which is why only diff ids are compared).
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_facts_agree_between_dockers_store_and_the_msb_cache() {
+        if ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some(fixture) = e2e_base_fixture() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+        let base = fixture.link.clone();
+
+        let layer_dir = tempfile::tempdir().unwrap();
+        write_layer_file(
+            layer_dir.path(),
+            "Dockerfile",
+            &format!(
+                "ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\n\
+                 RUN ln -s /bin/true /usr/local/bin/marker-tool\n"
+            ),
+            0o644,
+        );
+        let id = resolve(
+            layer_dir.path(),
+            Path::new("/tmp/e2e-contract-same-image"),
+            &fixture.digest,
+            first_of_one(),
+        )
+        .unwrap();
+        if docker_tag_exists(&id.tag) {
+            eprintln!("skipping: {} already exists locally", id.tag);
+            return;
+        }
+
+        // docker-exporter build first, so its tag can be cleaned up.
+        let docker_facts = build_derived_docker(&id, &base)
+            .await
+            .expect("docker-exporter build");
+        let mut guard = DockerTagGuard::default();
+        guard.own(&id.tag);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let tar = tempfile::Builder::new()
+            .suffix(".tar")
+            .tempfile_in(cache_dir.path())
+            .unwrap();
+        build_derived_oci(&id, &base, tar.path())
+            .await
+            .expect("oci-exporter build");
+        let metadata = load_derived_image(cache_dir.path(), tar.path(), &id.tag)
+            .await
+            .expect("load_archive");
+        let cache_facts = contract::ImageFacts::from_cached_metadata(&metadata).unwrap();
+
+        assert_eq!(
+            docker_facts.diff_ids, cache_facts.diff_ids,
+            "docker's store and the msb cache must report the same diff ids"
+        );
+        assert_eq!(docker_facts, cache_facts);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_a_path_replacing_layer_is_rejected() {
+        if ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some(fixture) = e2e_base_fixture() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, _cache, built, base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nENV PATH=/only/mine\n"),
+            &[],
+        )
+        .await;
+
+        let err = contract::check_built_image(
+            &step,
+            contract::StepRole::Final,
+            contract::BuiltOn {
+                predecessor: &base_facts,
+                built: &built,
+            },
+            &host_oci_platform(),
+        )
+        .expect_err("replacing PATH must violate C2 against real facts");
+        assert_eq!(err.clause, contract::Clause::PathIsAdditive);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_a_non_root_final_layer_is_rejected() {
+        if ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some(fixture) = e2e_base_fixture() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, _cache, built, base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nUSER 9999\n"),
+            &[],
+        )
+        .await;
+
+        let err = contract::check_built_image(
+            &step,
+            contract::StepRole::Final,
+            contract::BuiltOn {
+                predecessor: &base_facts,
+                built: &built,
+            },
+            &host_oci_platform(),
+        )
+        .expect_err("a non-root final must violate C3 against real facts");
+        assert_eq!(err.clause, contract::Clause::EndsAsRoot);
+        // The identical image passes as an intermediate (decision D5).
+        contract::check_built_image(
+            &step,
+            contract::StepRole::Intermediate,
+            contract::BuiltOn {
+                predecessor: &base_facts,
+                built: &built,
+            },
+            &host_oci_platform(),
+        )
+        .expect("a mid-chain USER is legitimate");
+    }
+
+    /// D7's rollback, and a live guard on the vendored
+    /// `delete_image_metadata_async`: after the discard the tag reads as
+    /// uncached, so the next launch rebuilds and re-checks instead of booting
+    /// the violating artifact.
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_discard_derived_image_makes_a_loaded_tag_uncached() {
+        if ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some(fixture) = e2e_base_fixture() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, cache_dir, _built, _base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nENV MARKER=present\n"),
+            &[],
+        )
+        .await;
+
+        assert!(
+            derived_is_cached(cache_dir.path(), &step.id.tag)
+                .await
+                .unwrap(),
+            "the ingest must leave the tag cached"
+        );
+        discard_derived_image(cache_dir.path(), &step.id.tag)
+            .await
+            .expect("discard_derived_image");
+        assert!(
+            !derived_is_cached(cache_dir.path(), &step.id.tag)
+                .await
+                .unwrap(),
+            "after the discard the tag must read as uncached, so the next launch \
+             rebuilds and re-checks the contract"
+        );
+    }
+
+    /// MAJOR-3's fix: an image agent-vm ingested but could **not evaluate**
+    /// must be discarded, not left "cached" for the next launch to boot with
+    /// zero clauses checked. The metadata here claims a platform-less config,
+    /// which `from_cached_metadata` rejects.
+    ///
+    /// The intermediate half of the same fix is not separately tested:
+    /// forcing a malformed `docker image inspect` needs a fake docker binary.
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_an_unevaluatable_final_is_not_left_ingested() {
+        if ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let Some(fixture) = e2e_base_fixture() else {
+            eprintln!("skipping: no base image available locally or via network pull");
+            return;
+        };
+        let base = fixture.link.clone();
+        let (step, cache_dir, _built, _base_facts) = e2e_ingest_one_step(
+            &fixture,
+            &format!("ARG BASE_IMAGE={base}\nFROM ${{BASE_IMAGE}}\nENV MARKER=present\n"),
+            &[],
+        )
+        .await;
+        assert!(
+            derived_is_cached(cache_dir.path(), &step.id.tag)
+                .await
+                .unwrap(),
+            "the ingest must leave the tag cached"
+        );
+
+        use microsandbox_image::{CachedImageMetadata, CachedLayerMetadata, ImageConfig};
+        let unevaluatable = CachedImageMetadata {
+            manifest_digest: "sha256:manifest".to_string(),
+            config_digest: "sha256:config".to_string(),
+            raw_manifest_json: "{}".to_string(),
+            raw_config_json: "{}".to_string(),
+            config: ImageConfig::default(),
+            layers: vec![CachedLayerMetadata {
+                digest: "sha256:compressed".to_string(),
+                media_type: None,
+                size_bytes: None,
+                diff_id: "sha256:layer".to_string(),
+            }],
+        };
+        let err = final_image_facts(cache_dir.path(), &step.id.tag, &unevaluatable).await;
+        assert!(err.is_err(), "a platform-less config must not evaluate");
+        assert!(
+            !derived_is_cached(cache_dir.path(), &step.id.tag)
+                .await
+                .unwrap(),
+            "an unevaluatable final must be discarded, or the next launch boots it \
+             with no clause checked"
+        );
+    }
+
+    /// C4a's falsifiability: a base link that really is a foreign-platform
+    /// image must be rejected. This is the test the reviewer said could not be
+    /// written without changing the check — the proof C4 is not a tautology.
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_a_foreign_base_link_is_rejected_by_c4() {
+        if ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let foreign = if host_oci_platform() == "linux/amd64" {
+            "linux/arm64"
+        } else {
+            "linux/amd64"
+        };
+
+        let link = format!("agent-vm-base:e2e-foreign-{}", e2e_nonce());
+        if docker_tag_exists(&link) {
+            eprintln!("skipping: {link} already exists locally");
+            return;
+        }
+
+        // Build a genuinely foreign-platform image. A `FROM`-only Dockerfile
+        // has no `RUN` to emulate, so buildx can still export the target
+        // platform's rootfs. A plain `docker pull --platform <foreign>`
+        // would *not* do: with the classic image store it leaves an existing
+        // host-platform tag in place (`Image is up to date`) and the link
+        // would inspect as the host platform, silently voiding the test.
+        let ctx = tempfile::tempdir().unwrap();
+        write_layer_file(
+            ctx.path(),
+            "Dockerfile",
+            "FROM debian:13-slim\nLABEL agent-vm-e2e-foreign-platform=1\n",
+            0o644,
+        );
+        // Offline is not a failure of the check: skip, and never report the
+        // skip as a pass (the reviewer's explicit warning).
+        let built = std::process::Command::new("docker")
+            .args(["buildx", "build", "--platform", foreign, "-t", &link])
+            .args(["--output", "type=docker", ctx.path().to_str().unwrap()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !built {
+            eprintln!(
+                "skipping: could not build a {foreign} image (no network, or no \
+                 cross-platform support on this builder)"
+            );
+            return;
+        }
+        let mut guard = DockerTagGuard::default();
+        guard.own(&link);
+
+        let base = docker_image_facts(&link)
+            .await
+            .unwrap()
+            .expect("the foreign base link must be inspectable");
+        assert_eq!(
+            base.platform, foreign,
+            "buildx must have produced a {foreign} image under the link"
+        );
+
+        let step = fake_plan(1).remove(0);
+        let err = contract::check_base_image(&step, &base, &host_oci_platform())
+            .expect_err("a foreign base link must violate C4a");
+        assert_eq!(err.clause, contract::Clause::TargetsHostPlatform);
     }
 }

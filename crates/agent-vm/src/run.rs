@@ -50,21 +50,9 @@ const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF
 /// `images/Dockerfile`'s `ENV PATH=…`. Used only when the booted image's own
 /// OCI config declares no `PATH` (e.g. the image metadata isn't cached yet
 /// on a cold first run, before the pull that happens later in `launch()`).
-/// See [`path_from_config_env`] and [`image_config_path_and_digest`].
+/// See [`layer::contract::path_from_config_env`] and
+/// [`image_config_path_and_digest`].
 const FALLBACK_GUEST_PATH: &str = "/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin";
-
-/// Pulls the `PATH=` value out of an OCI config `env` vector (`KEY=VALUE`
-/// entries). Returns `None` when absent or empty — either way the caller
-/// falls back to [`FALLBACK_GUEST_PATH`]. The *last* `PATH=` entry wins,
-/// matching how a shell applies successive assignments (an image config can
-/// legally list `PATH` more than once across base+derived `ENV` layers).
-fn path_from_config_env(env: &[String]) -> Option<String> {
-    env.iter()
-        .filter_map(|e| e.strip_prefix("PATH="))
-        .next_back()
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
-}
 
 /// Best-effort read of the booted image's config `PATH`, plus the base
 /// image's manifest digest (fed to the tooling-layer hash in `layer.rs`).
@@ -97,7 +85,7 @@ async fn image_config_path_and_digest_in(
     };
     match cache.read_image_metadata_async(&reference).await {
         Ok(Some(md)) => (
-            path_from_config_env(&md.config.env),
+            layer::contract::path_from_config_env(&md.config.env),
             Some(md.manifest_digest),
         ),
         _ => (None, None),
@@ -438,6 +426,10 @@ impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
         self.notices.emit(message)
     }
 
+    fn lint_step(&mut self, step: &layer::ChainStep) -> Result<()> {
+        layer::lint_step_file(step)
+    }
+
     async fn confirm_build(&mut self, plan: &[layer::PlannedStep]) -> Result<()> {
         // The buildx preflight runs *before* asking, so a broken docker
         // install surfaces as one clear error instead of wasting the user's
@@ -459,8 +451,8 @@ impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
         Ok(())
     }
 
-    async fn intermediate_image_id(&mut self, tag: &str) -> Result<Option<String>> {
-        layer::docker_image_id(tag).await
+    async fn image_facts(&mut self, tag: &str) -> Result<Option<layer::contract::ImageFacts>> {
+        layer::docker_image_facts(tag).await
     }
 
     async fn pin_base(&mut self, base: layer::BaseImage<'_>) -> Result<String> {
@@ -475,7 +467,7 @@ impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
         &mut self,
         id: &layer::LayerIdentity,
         from_ref: &str,
-    ) -> Result<()> {
+    ) -> Result<layer::contract::ImageFacts> {
         layer::build_derived_docker(id, from_ref).await
     }
 
@@ -483,7 +475,7 @@ impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
         &mut self,
         id: &layer::LayerIdentity,
         from_ref: &str,
-    ) -> Result<()> {
+    ) -> Result<layer::contract::ImageFacts> {
         // Under `cache_dir`, not the system tmp (AGENTS.md) — RAII-cleaned
         // via NamedTempFile's Drop regardless of how build/load below
         // returns.
@@ -495,10 +487,18 @@ impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
         layer::build_derived_oci(id, from_ref, tar.path())
             .await
             .with_context(|| format!("building tooling layer {}", id.tag))?;
-        layer::load_derived_image(&self.cache_dir, tar.path(), &id.tag)
+        let metadata = layer::load_derived_image(&self.cache_dir, tar.path(), &id.tag)
             .await
             .with_context(|| format!("loading tooling layer {} into the msb cache", id.tag))?;
-        Ok(())
+        layer::final_image_facts(&self.cache_dir, &id.tag, &metadata).await
+    }
+
+    async fn discard_step(
+        &mut self,
+        step: &layer::ChainStep,
+        role: layer::contract::StepRole,
+    ) -> Result<()> {
+        layer::discard_step_image(&self.cache_dir, step, role).await
     }
 }
 
@@ -2435,43 +2435,6 @@ mod tests {
     use crate::layer::test_support::{DockerTagGuard, docker_tag_exists, e2e_nonce};
     use std::cell::RefCell;
     use std::rc::Rc;
-
-    #[test]
-    fn path_from_config_env_reads_the_path_entry() {
-        let env = vec![
-            "LANG=C.UTF-8".to_string(),
-            "PATH=/opt/agent/.local/bin:/usr/bin".to_string(),
-            "TZ=UTC".to_string(),
-        ];
-        assert_eq!(
-            path_from_config_env(&env),
-            Some("/opt/agent/.local/bin:/usr/bin".to_string())
-        );
-    }
-
-    #[test]
-    fn path_from_config_env_absent_is_none() {
-        let env = vec!["LANG=C.UTF-8".to_string()];
-        assert_eq!(path_from_config_env(&env), None);
-    }
-
-    #[test]
-    fn path_from_config_env_empty_value_is_none() {
-        let env = vec!["PATH=".to_string()];
-        assert_eq!(path_from_config_env(&env), None);
-    }
-
-    #[test]
-    fn path_from_config_env_last_entry_wins() {
-        let env = vec!["PATH=/first".to_string(), "PATH=/second".to_string()];
-        assert_eq!(path_from_config_env(&env), Some("/second".to_string()));
-    }
-
-    #[test]
-    fn path_from_config_env_ignores_non_path_keys_containing_path_substring() {
-        let env = vec!["XPATH=/should-not-match".to_string()];
-        assert_eq!(path_from_config_env(&env), None);
-    }
 
     #[test]
     fn reject_removed_layer_env_accepts_unset() {

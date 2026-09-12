@@ -220,11 +220,38 @@ CI/non-interactive launches. A failure in any step is a hard stop: agent-vm
 never boots the base, or a partially-built chain, in place of a step that
 failed.
 
-Each step's Dockerfile must follow a small contract (start
-`ARG BASE_IMAGE=...` / `FROM ${BASE_IMAGE}`, keep `ENV PATH` additive,
-install world-readable tools; the launcher builds for the host's own
-architecture, `linux/amd64` on x86_64 and `linux/arm64` on Apple Silicon)
-— see
+Each step's **built image** must satisfy the **layer image contract** — eight
+clauses, four enforced at build time. The normative text is
+[`docs/adr/0003-project-tooling-layers.md`](docs/adr/0003-project-tooling-layers.md)
+("The layer image contract").
+
+What agent-vm rejects, and how to fix it:
+
+1. **C1** — build `FROM ${BASE_IMAGE}`: declare a global `ARG BASE_IMAGE=...` before the first `FROM`.
+2. **C2** — keep `PATH` additive: never remove a directory the previous step had.
+3. **C3** — end the last step as root: no trailing `USER <someone-else>`.
+4. **C4** — don't pin `--platform` on your final `FROM`; agent-vm also refuses to build on a base image of the wrong platform.
+
+The other four clauses (C5–C8: not touching agent-vm's own files, keeping
+`/bin/bash` and `/etc/passwd`/`/etc/group` appendable, installing tools
+readable by any uid, advertising a capability only when it works) are
+documented-only — see the ADR. A `RUN` that installs foreign-architecture
+binaries **is not detected**: it fails at run time with `Exec format error`.
+
+A violation is a hard failure that aborts the launch, with no opt-out, and
+the offending image is discarded so the next launch rebuilds and re-checks it
+instead of booting it from cache:
+
+```text
+Error: tooling layer step 1/1 (.agent-vm/layers/10-a) violates the layer image contract, clause C3 (ends as root): the built image's config sets User="chrome", so a --root launch would run every command as that user instead of root
+Fix: end the Dockerfile with `USER root`
+See docs/adr/0003-project-tooling-layers.md, "The layer image contract".
+```
+
+The four enforced clauses apply only to images **built after** this version:
+agent-vm does not revalidate an already-cached image (a pre-upgrade artifact, or
+one whose discard after a violation failed), so it keeps booting until a step
+is edited and its hash moves. See
 [`docs/adr/0003-project-tooling-layers.md`](docs/adr/0003-project-tooling-layers.md)
 for the full contract and design rationale, including why chaining hashes
 against each step's content hash rather than a docker image id, and why
