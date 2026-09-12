@@ -13,10 +13,8 @@ use serde::{
 
 use super::http;
 use crate::{
-    host_paths::{
-        MAX_HOST_CREDENTIAL_FILE_BYTES, host_claude_creds_path, host_codex_auth_path,
-        read_bounded_regular_file,
-    },
+    credential_provider::{self, CredentialProvider, OAuthRotation},
+    host_paths::{MAX_HOST_CREDENTIAL_FILE_BYTES, read_bounded_regular_file},
     secrets,
 };
 
@@ -65,10 +63,7 @@ fn response(reply: PublicReply) -> Result<http::Response> {
         ),
         PublicReply::TemporarilyUnavailable { provider, reason } => {
             tracing::debug!(provider = ?provider, reason = ?reason, "OAuth refresh temporarily unavailable");
-            let command = match provider {
-                Provider::Anthropic => "claude login",
-                Provider::OpenAi => "codex login",
-            };
+            let command = provider.rotation().host_login_hint;
             http::Response::json(
                 503,
                 "Service Unavailable",
@@ -82,14 +77,47 @@ fn response(reply: PublicReply) -> Result<http::Response> {
     }
 }
 
+/// The providers whose access tokens agent-vm can rotate on the host by
+/// re-running the vendor CLI. A strict subset of
+/// [`crate::credential_provider::CredentialProvider`]; kept as its own enum so
+/// `refresh()`'s match stays exhaustive without `unreachable!()` arms for the
+/// two providers that have no rotation (a runtime panic path in the
+/// security-sensitive interception hook would be worse than a compile-time
+/// guarantee). Every string it needs is sourced from the shared provider
+/// table; `rotatable_providers_are_exactly_the_oauth_ones` guards the subset
+/// relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Provider {
+enum RotatableProvider {
     Anthropic,
     OpenAi,
 }
 
+impl RotatableProvider {
+    fn credential(self) -> CredentialProvider {
+        match self {
+            RotatableProvider::Anthropic => CredentialProvider::Anthropic,
+            RotatableProvider::OpenAi => CredentialProvider::OpenAi,
+        }
+    }
+
+    /// The shared rotation facts (SNI host, token path, accepted refresh
+    /// placeholders, host login hint) from the provider table.
+    fn rotation(self) -> &'static OAuthRotation {
+        credential_provider::oauth_rotation(self.credential())
+            .expect("rotatable providers always carry OAuthRotation facts")
+    }
+
+    /// Match the request's SNI/Host against the shared table, case-insensitively
+    /// (matching the hook's historical behaviour).
+    fn from_sni(sni: &str) -> Option<Self> {
+        [RotatableProvider::Anthropic, RotatableProvider::OpenAi]
+            .into_iter()
+            .find(|provider| sni.eq_ignore_ascii_case(provider.rotation().sni_host))
+    }
+}
+
 struct ValidatedRefresh {
-    provider: Provider,
+    provider: RotatableProvider,
 }
 
 struct ExpiresIn(i64);
@@ -171,7 +199,7 @@ enum PublicReply {
         expires_in: ExpiresIn,
     },
     TemporarilyUnavailable {
-        provider: Provider,
+        provider: RotatableProvider,
         reason: UnusableReason,
     },
 }
@@ -208,7 +236,8 @@ fn validate(
     raw_request: &[u8],
     provider_sni: &str,
 ) -> std::result::Result<ValidatedRefresh, OAuthRejection> {
-    let provider = provider_for_sni(provider_sni)?;
+    let provider = RotatableProvider::from_sni(provider_sni)
+        .ok_or_else(|| OAuthRejection::forbidden("OAuth refresh SNI is not allowed"))?;
     let request = http::Request::parse(raw_request)
         .map_err(|_| OAuthRejection::bad_request("malformed OAuth refresh request"))?;
     let host = exactly_one_header(&request, "host")?;
@@ -220,10 +249,7 @@ fn validate(
     if request.method() != "POST" {
         return Err(OAuthRejection::forbidden("OAuth refresh requires POST"));
     }
-    let expected_path = match provider {
-        Provider::Anthropic => secrets::ANTHROPIC_OAUTH_TOKEN_PATH,
-        Provider::OpenAi => secrets::OPENAI_OAUTH_TOKEN_PATH,
-    };
+    let expected_path = provider.rotation().token_path;
     if validated_target(request.target(), provider_sni)? != expected_path {
         return Err(OAuthRejection::forbidden(
             "OAuth refresh path is not allowed",
@@ -281,18 +307,6 @@ fn validate(
         ));
     }
     Ok(ValidatedRefresh { provider })
-}
-
-fn provider_for_sni(sni: &str) -> std::result::Result<Provider, OAuthRejection> {
-    if sni.eq_ignore_ascii_case(secrets::ANTHROPIC_OAUTH_HOST) {
-        Ok(Provider::Anthropic)
-    } else if sni.eq_ignore_ascii_case(secrets::OPENAI_OAUTH_HOST) {
-        Ok(Provider::OpenAi)
-    } else {
-        Err(OAuthRejection::forbidden(
-            "OAuth refresh SNI is not allowed",
-        ))
-    }
 }
 
 fn exactly_one_header<'a>(
@@ -406,14 +420,11 @@ impl<'de> Deserialize<'de> for JsonRefresh {
     }
 }
 
-fn refresh_placeholder_matches(provider: Provider, token: &str) -> bool {
-    match provider {
-        Provider::Anthropic => token == secrets::ANTHROPIC_REFRESH_PLACEHOLDER,
-        Provider::OpenAi => {
-            token == secrets::OPENAI_REFRESH_PLACEHOLDER
-                || token == secrets::OPENCODE_OPENAI_REFRESH_PLACEHOLDER
-        }
-    }
+fn refresh_placeholder_matches(provider: RotatableProvider, token: &str) -> bool {
+    provider
+        .rotation()
+        .accepted_refresh_placeholders
+        .contains(&token)
 }
 
 const SERVING_FLOOR_SECS: i64 = 300;
@@ -433,15 +444,17 @@ fn refresh(state_dir: &Path, validated: ValidatedRefresh) -> PublicReply {
         Err(_) => return unavailable(validated.provider, UnusableReason::InvalidExpiry),
     };
     match validated.provider {
-        Provider::Anthropic => anthropic_refresh(state_dir, now, |cmd, args, cwd, timeout| {
-            run_host_cli(cmd, args, cwd, timeout)
-        }),
-        Provider::OpenAi => openai_refresh(state_dir, now, |cmd, args, cwd, timeout| {
+        RotatableProvider::Anthropic => {
+            anthropic_refresh(state_dir, now, |cmd, args, cwd, timeout| {
+                run_host_cli(cmd, args, cwd, timeout)
+            })
+        }
+        RotatableProvider::OpenAi => openai_refresh(state_dir, now, |cmd, args, cwd, timeout| {
             run_host_cli(cmd, args, cwd, timeout)
         }),
     }
 }
-fn unavailable(provider: Provider, reason: UnusableReason) -> PublicReply {
+fn unavailable(provider: RotatableProvider, reason: UnusableReason) -> PublicReply {
     PublicReply::TemporarilyUnavailable { provider, reason }
 }
 fn now_ms() -> Result<i64> {
@@ -529,19 +542,24 @@ fn anth_reply(state_dir: &Path, state: AnthropicInspection) -> PublicReply {
             ..
         } => match bearer.install(&secrets::anthropic_token_path(state_dir)) {
             Ok(()) => PublicReply::AnthropicSuccess { expires_in, scope },
-            Err(reason) => unavailable(Provider::Anthropic, reason),
+            Err(reason) => unavailable(RotatableProvider::Anthropic, reason),
         },
-        AnthropicInspection::Unavailable(reason) => unavailable(Provider::Anthropic, reason),
-        AnthropicInspection::Rotate => {
-            unavailable(Provider::Anthropic, UnusableReason::ExpiredOrExpiring)
+        AnthropicInspection::Unavailable(reason) => {
+            unavailable(RotatableProvider::Anthropic, reason)
         }
+        AnthropicInspection::Rotate => unavailable(
+            RotatableProvider::Anthropic,
+            UnusableReason::ExpiredOrExpiring,
+        ),
     }
 }
 fn anthropic_refresh<F>(state_dir: &Path, now: i64, runner: F) -> PublicReply
 where
     F: Fn(&str, &[&str], &Path, Duration) -> Result<()>,
 {
-    let path = host_claude_creds_path();
+    let path = RotatableProvider::Anthropic
+        .credential()
+        .host_credential_path();
     let initial = inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS);
     if matches!(
         &initial,
@@ -560,16 +578,19 @@ where
         Ok(lock) => lock,
         Err(_) => {
             let Ok(now) = now_ms() else {
-                return unavailable(Provider::Anthropic, UnusableReason::InvalidExpiry);
+                return unavailable(RotatableProvider::Anthropic, UnusableReason::InvalidExpiry);
             };
             return match inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS) {
                 ready @ AnthropicInspection::Serve { .. } => anth_reply(state_dir, ready),
-                _ => unavailable(Provider::Anthropic, UnusableReason::RefreshLockUnavailable),
+                _ => unavailable(
+                    RotatableProvider::Anthropic,
+                    UnusableReason::RefreshLockUnavailable,
+                ),
             };
         }
     };
     let Ok(now) = now_ms() else {
-        return unavailable(Provider::Anthropic, UnusableReason::InvalidExpiry);
+        return unavailable(RotatableProvider::Anthropic, UnusableReason::InvalidExpiry);
     };
     let reread = inspect_anthropic(path.as_deref(), now, SERVING_FLOOR_SECS);
     if matches!(
@@ -591,7 +612,12 @@ where
         let _ = write_stamp(state_dir, "anthropic", now);
         let cwd = match isolated_work_dir(state_dir) {
             Ok(dir) => dir,
-            Err(_) => return unavailable(Provider::Anthropic, UnusableReason::TokenInstallFailed),
+            Err(_) => {
+                return unavailable(
+                    RotatableProvider::Anthropic,
+                    UnusableReason::TokenInstallFailed,
+                );
+            }
         };
         let _ = runner(
             "claude",
@@ -601,7 +627,7 @@ where
         );
     }
     let Ok(now) = now_ms() else {
-        return unavailable(Provider::Anthropic, UnusableReason::InvalidExpiry);
+        return unavailable(RotatableProvider::Anthropic, UnusableReason::InvalidExpiry);
     };
     // Keep the provider lock through installation so a launcher cannot
     // overwrite a just-rotated credential with an older host snapshot.
@@ -726,11 +752,11 @@ fn openai_reply(state_dir: &Path, state: OpenAiInspection) -> PublicReply {
             bearer, expires_in, ..
         } => match bearer.install(&secrets::openai_token_path(state_dir)) {
             Ok(()) => PublicReply::OpenAiSuccess { expires_in },
-            Err(reason) => unavailable(Provider::OpenAi, reason),
+            Err(reason) => unavailable(RotatableProvider::OpenAi, reason),
         },
-        OpenAiInspection::Unavailable(reason) => unavailable(Provider::OpenAi, reason),
+        OpenAiInspection::Unavailable(reason) => unavailable(RotatableProvider::OpenAi, reason),
         OpenAiInspection::Rotate => unavailable(
-            Provider::OpenAi,
+            RotatableProvider::OpenAi,
             UnusableReason::RotationDidNotProduceUsableCredential,
         ),
     }
@@ -739,7 +765,9 @@ fn openai_refresh<F>(state_dir: &Path, now: i64, runner: F) -> PublicReply
 where
     F: Fn(&str, &[&str], &Path, Duration) -> Result<()>,
 {
-    let path = host_codex_auth_path();
+    let path = RotatableProvider::OpenAi
+        .credential()
+        .host_credential_path();
     let initial = inspect_openai(path.as_deref(), now);
     if matches!(
         &initial,
@@ -755,16 +783,19 @@ where
         Ok(lock) => lock,
         Err(_) => {
             let Ok(now) = now_ms() else {
-                return unavailable(Provider::OpenAi, UnusableReason::InvalidExpiry);
+                return unavailable(RotatableProvider::OpenAi, UnusableReason::InvalidExpiry);
             };
             return match inspect_openai(path.as_deref(), now) {
                 ready @ OpenAiInspection::Serve { .. } => openai_reply(state_dir, ready),
-                _ => unavailable(Provider::OpenAi, UnusableReason::RefreshLockUnavailable),
+                _ => unavailable(
+                    RotatableProvider::OpenAi,
+                    UnusableReason::RefreshLockUnavailable,
+                ),
             };
         }
     };
     let Ok(now) = now_ms() else {
-        return unavailable(Provider::OpenAi, UnusableReason::InvalidExpiry);
+        return unavailable(RotatableProvider::OpenAi, UnusableReason::InvalidExpiry);
     };
     let reread = inspect_openai(path.as_deref(), now);
     if matches!(
@@ -783,7 +814,12 @@ where
         let _ = write_stamp(state_dir, "openai", now);
         let cwd = match isolated_work_dir(state_dir) {
             Ok(dir) => dir,
-            Err(_) => return unavailable(Provider::OpenAi, UnusableReason::TokenInstallFailed),
+            Err(_) => {
+                return unavailable(
+                    RotatableProvider::OpenAi,
+                    UnusableReason::TokenInstallFailed,
+                );
+            }
         };
         let _ = runner(
             "codex",
@@ -793,7 +829,7 @@ where
         );
     }
     let Ok(now) = now_ms() else {
-        return unavailable(Provider::OpenAi, UnusableReason::InvalidExpiry);
+        return unavailable(RotatableProvider::OpenAi, UnusableReason::InvalidExpiry);
     };
     // Hold the same provider lock until the re-read credential is installed.
     let _lock = lock;
@@ -949,6 +985,66 @@ fn run_host_cli(cmd: &str, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// V8: the rotatable set is exactly the providers carrying OAuth-rotation
+    /// facts, `from_sni` round-trips each SNI (case-insensitively), and an
+    /// unknown SNI is rejected. Guards the two enums against drifting apart.
+    #[test]
+    fn rotatable_providers_are_exactly_the_oauth_ones() {
+        let rotatable: Vec<CredentialProvider> = CredentialProvider::ALL
+            .into_iter()
+            .filter(|p| credential_provider::oauth_rotation(*p).is_some())
+            .collect();
+        assert_eq!(
+            rotatable,
+            vec![CredentialProvider::Anthropic, CredentialProvider::OpenAi]
+        );
+        for provider in [RotatableProvider::Anthropic, RotatableProvider::OpenAi] {
+            let sni = provider.rotation().sni_host;
+            assert_eq!(RotatableProvider::from_sni(sni), Some(provider));
+            assert_eq!(
+                RotatableProvider::from_sni(&sni.to_ascii_uppercase()),
+                Some(provider)
+            );
+        }
+        assert_eq!(RotatableProvider::from_sni("evil.example.com"), None);
+        assert_eq!(RotatableProvider::from_sni(""), None);
+        // The two SNIs are distinct: a request can only map to one provider.
+        assert_ne!(
+            RotatableProvider::Anthropic.rotation().sni_host,
+            RotatableProvider::OpenAi.rotation().sni_host
+        );
+    }
+
+    /// V9: OpenAI accepts both its own and OpenCode's refresh placeholder;
+    /// Anthropic accepts neither the OpenAI nor the OpenCode one. This gates
+    /// which refresh requests the hook will serve.
+    #[test]
+    fn openai_rotation_accepts_opencode_refresh_placeholder() {
+        let openai = RotatableProvider::OpenAi;
+        assert!(refresh_placeholder_matches(
+            openai,
+            secrets::OPENAI_REFRESH_PLACEHOLDER
+        ));
+        assert!(refresh_placeholder_matches(
+            openai,
+            secrets::OPENCODE_OPENAI_REFRESH_PLACEHOLDER
+        ));
+        let anthropic = RotatableProvider::Anthropic;
+        assert!(refresh_placeholder_matches(
+            anthropic,
+            secrets::ANTHROPIC_REFRESH_PLACEHOLDER
+        ));
+        assert!(!refresh_placeholder_matches(
+            anthropic,
+            secrets::OPENCODE_OPENAI_REFRESH_PLACEHOLDER
+        ));
+        assert!(!refresh_placeholder_matches(
+            anthropic,
+            secrets::OPENAI_REFRESH_PLACEHOLDER
+        ));
+    }
+
     fn request(sni: &str, path: &str, ct: &str, body: &str) -> Vec<u8> {
         format!("POST {path} HTTP/1.1\r\nHost: {sni}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n{body}",body.len()).into_bytes()
     }
@@ -969,7 +1065,7 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let invalid = handle_with(b"bad", secrets::OPENAI_OAUTH_HOST, |_| {
             calls.set(1);
-            unavailable(Provider::OpenAi, UnusableReason::MissingBearer)
+            unavailable(RotatableProvider::OpenAi, UnusableReason::MissingBearer)
         })
         .unwrap();
         assert_eq!(calls.get(), 0);
@@ -1025,7 +1121,10 @@ mod tests {
     #[test]
     fn failed_valid_operation_is_credential_free_503() {
         let response = handle_with(&openai_request(), secrets::OPENAI_OAUTH_HOST, |_| {
-            unavailable(Provider::OpenAi, UnusableReason::HostCredentialMalformed)
+            unavailable(
+                RotatableProvider::OpenAi,
+                UnusableReason::HostCredentialMalformed,
+            )
         })
         .unwrap();
         let text = std::str::from_utf8(response.as_bytes()).unwrap();

@@ -19,10 +19,9 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::credential_provider::{self, CredentialProvider, ProviderSet};
 use crate::host_paths::{
-    GuestStateDir, MAX_HOST_CREDENTIAL_FILE_BYTES, atomic_write, host_claude_creds_path,
-    host_codex_auth_path, host_copilot_token_path, host_opencode_auth_path,
-    read_bounded_regular_file,
+    GuestStateDir, MAX_HOST_CREDENTIAL_FILE_BYTES, atomic_write, read_bounded_regular_file,
 };
 
 // ---------------------------------------------------------------------------
@@ -239,10 +238,10 @@ pub struct CredsState {
     /// login with the Copilot scope works against the Copilot API).
     ///
     /// `Some` whenever a usable token was found and either the Copilot
-    /// agent is being launched (`want_copilot`) or GitHub egress is
-    /// already enabled for another agent (`use_github`). Crucially this
-    /// is NOT gated on `--no-git` for a Copilot launch: the Copilot API
-    /// is not repo-scoped, so `agent-vm copilot` must work even in a
+    /// provider is selected or GitHub egress is already enabled for
+    /// another tool (`CaptureScope::WhenSelectedOrGithubEgress`). Crucially
+    /// this is NOT gated on `--no-git` for a Copilot launch: the Copilot
+    /// API is not repo-scoped, so `agent-vm copilot` must work even in a
     /// non-GitHub project.
     ///
     /// **Known limitation (no in-session refresh):** unlike the
@@ -255,6 +254,29 @@ pub struct CredsState {
     /// impact is low; re-launch to recover.
     pub copilot_token_file: Option<PathBuf>,
     pub snapshot: Option<HostCredsSnapshot>,
+}
+
+impl CredsState {
+    /// The host-only file the proxy re-reads for `provider`, if this launch
+    /// captured one. `gh_token_file` is deliberately absent: GitHub egress is
+    /// orthogonal to the tool (see `--no-git`), so it is not a provider.
+    ///
+    /// The mapping is intentionally not uniform:
+    /// - `OpencodeStatic` maps to `opencode_openai_access_token_file`, **not**
+    ///   `openai_token_file`. They share the same on-disk file, but the OpenCode
+    ///   one is only `Some` when OpenCode wiring actually succeeded; mapping it
+    ///   to `openai_token_file` would register the OpenCode placeholder for
+    ///   launches that never wired OpenCode.
+    /// - `opencode_api_token_files` (the BYO-API-key rows) is a `Vec`, a
+    ///   different concept, and is deliberately unreachable through here.
+    pub fn token_file(&self, provider: CredentialProvider) -> Option<&Path> {
+        match provider {
+            CredentialProvider::Anthropic => self.anthropic_token_file.as_deref(),
+            CredentialProvider::OpenAi => self.openai_token_file.as_deref(),
+            CredentialProvider::OpencodeStatic => self.opencode_openai_access_token_file.as_deref(),
+            CredentialProvider::Copilot => self.copilot_token_file.as_deref(),
+        }
+    }
 }
 
 /// SHA-256 of each host credential file at launcher start. Compared
@@ -422,6 +444,15 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
     openai_token_path(state_dir)
 }
 
+/// What this launch wants captured. Replaces three positional `bool`s
+/// (CODING_STANDARDS: don't put same-typed args in a row).
+#[derive(Debug, Clone, Copy)]
+pub struct CredentialSelection {
+    pub providers: ProviderSet,
+    /// Driven by `--no-git` / detected repos, orthogonal to the tool.
+    pub github_egress: bool,
+}
+
 /// Read host credentials, write the token file (atomically, 0600) and
 /// the guest-side placeholder credentials.json. Returns the paths to
 /// the written token files so the launcher can plumb them into
@@ -434,10 +465,20 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
 pub fn refresh(
     state_dir: &Path,
     project_guest_path: &str,
-    use_github: bool,
-    want_copilot: bool,
-    want_opencode: bool,
+    selection: &CredentialSelection,
 ) -> Result<CredsState> {
+    // The capture gate for each provider is the legacy asymmetry spelled out
+    // in `credential_provider`'s table. Deriving it from the table keeps the
+    // "why" local: Anthropic/OpenAI capture unconditionally (Always), while
+    // OpenCode-static follows the selection and Copilot follows the selection
+    // *or* GitHub egress.
+    let captures = |provider: CredentialProvider| {
+        credential_provider::capture_scope(provider).applies(
+            provider,
+            selection.providers,
+            selection.github_egress,
+        )
+    };
     let _lock =
         ProjectRefreshLock::acquire(state_dir).context("acquiring per-project refresh lock")?;
     // The token files hold the host's *real* access tokens, so their
@@ -463,8 +504,11 @@ pub fn refresh(
 
     // First-run bypasses, run regardless of whether the user has host
     // credentials for the provider. Without these the in-VM agent
-    // blocks on a terminal-style wizard at first launch.
-    write_agent_config_defaults(&guest, project_guest_path, want_copilot)?;
+    // blocks on a terminal-style wizard at first launch. The `Always` scope
+    // in the provider table keeps claude/codex/opencode configs flowing on
+    // every launch, not just the selected tool's.
+    let bypass_ctx = credential_provider::BypassContext { project_guest_path };
+    credential_provider::write_bypass_configs(&guest, &bypass_ctx, selection.providers)?;
 
     let anthropic_token_file = with_provider_lock(state_dir, REFRESH_LOCK_ANTHROPIC, || {
         refresh_anthropic(state_dir, &guest)
@@ -487,6 +531,7 @@ pub fn refresh(
     // proxy substitutes that placeholder for the same real OpenAI
     // access token on outbound traffic. So OpenCode shares the
     // `openai_token_file` with Codex.
+    let want_opencode = captures(CredentialProvider::OpencodeStatic);
     let opencode_oauth = if want_opencode && openai_token_file.is_some() {
         match opencode_oauth_entry() {
             Ok(entry) => entry,
@@ -501,10 +546,10 @@ pub fn refresh(
     };
 
     // Phase 6: capture the user's `gh auth token` (if any and not
-    // suppressed via `--no-git`). The launcher passes
-    // `--no-git`/use_github=false when the user opted out or when no
-    // GitHub remote was found and no `--repo` overrides were given.
-    let gh_token_file = if use_github {
+    // suppressed via `--no-git`). The launcher sets `github_egress=false`
+    // when the user opted out or when no GitHub remote was found and no
+    // `--repo` overrides were given.
+    let gh_token_file = if selection.github_egress {
         refresh_gh(state_dir).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "gh credential capture failed; skipping");
             None
@@ -519,20 +564,21 @@ pub fn refresh(
     // `gh auth token` we just captured (a gh login carries the
     // Copilot scope for users with a Copilot seat).
     //
-    // Unlike the gh capture, this is NOT gated on `use_github`. The
+    // Unlike the gh capture, this is NOT gated on `github_egress`. The
     // Copilot API is reached with a GitHub OAuth token, but it is not
     // repo-scoped the way `api.github.com` push is — so the reason to
     // run `agent-vm copilot` (GitHub-backed AI) must not be switched off
     // just because the project has no detected GitHub remote or the user
-    // passed `--no-git`. We capture the token whenever the Copilot agent
-    // is the one being launched (`want_copilot`), or when GitHub egress
-    // is already enabled for another agent (`use_github`) so an existing
-    // gh login still flows through. When `want_copilot && !use_github`
-    // there is no gh fallback token, so capture succeeds only via the
-    // device-flow cache; the caller surfaces a clear error if nothing
-    // was obtained rather than letting the guest send an unsubstituted
-    // placeholder bearer.
-    let copilot_token_file = if use_github || want_copilot {
+    // passed `--no-git`. `captures(Copilot)` is the
+    // `WhenSelectedOrGithubEgress` scope: the token is captured whenever
+    // the Copilot provider is selected, or when GitHub egress is already
+    // enabled for another tool so an existing gh login still flows
+    // through. When Copilot is selected without GitHub egress there is no
+    // gh fallback token, so capture succeeds only via the device-flow
+    // cache; the caller surfaces a clear error if nothing was obtained
+    // rather than letting the guest send an unsubstituted placeholder
+    // bearer.
+    let copilot_token_file = if captures(CredentialProvider::Copilot) {
         refresh_copilot(state_dir, gh_token_file.as_deref()).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "copilot credential capture failed; skipping");
             None
@@ -551,7 +597,9 @@ pub fn refresh(
         state_dir,
         &guest,
         want_opencode,
-        host_opencode_auth_path().as_deref(),
+        CredentialProvider::OpencodeStatic
+            .host_credential_path()
+            .as_deref(),
         opencode_oauth,
     )
     .unwrap_or_else(|error| {
@@ -921,7 +969,7 @@ fn extract_copilot_token(raw: &str) -> Option<String> {
 /// original's "could not obtain Copilot token" warning.
 fn refresh_copilot(state_dir: &Path, gh_token_file: Option<&Path>) -> Result<Option<PathBuf>> {
     // 1. Device-flow cache from the original Bash agent-vm.
-    if let Some(cache) = host_copilot_token_path() {
+    if let Some(cache) = CredentialProvider::Copilot.host_credential_path() {
         match read_bounded_regular_file(&cache, MAX_HOST_CREDENTIAL_FILE_BYTES)
             .and_then(|raw| String::from_utf8(raw).context("Copilot cache is not UTF-8"))
         {
@@ -963,9 +1011,15 @@ fn refresh_copilot(state_dir: &Path, gh_token_file: Option<&Path>) -> Result<Opt
 /// hash become anchors for [`verify_snapshot`].
 pub fn snapshot_host_creds() -> HostCredsSnapshot {
     HostCredsSnapshot {
-        claude: host_claude_creds_path().and_then(|p| hash_file(&p).map(|h| (p, h))),
-        codex: host_codex_auth_path().and_then(|p| hash_file(&p).map(|h| (p, h))),
-        opencode: host_opencode_auth_path().and_then(|p| hash_file(&p).map(|h| (p, h))),
+        claude: CredentialProvider::Anthropic
+            .host_credential_path()
+            .and_then(|p| hash_file(&p).map(|h| (p, h))),
+        codex: CredentialProvider::OpenAi
+            .host_credential_path()
+            .and_then(|p| hash_file(&p).map(|h| (p, h))),
+        opencode: CredentialProvider::OpencodeStatic
+            .host_credential_path()
+            .and_then(|p| hash_file(&p).map(|h| (p, h))),
     }
 }
 
@@ -1013,91 +1067,13 @@ fn hash_file(path: &Path) -> Option<String> {
     Some(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Drop the per-agent bypass files (Claude's onboarding flags + Codex's
-/// trust/approval settings) into the per-project state dir. Idempotent
-/// across launches; merges instead of overwrites so user tweaks
-/// survive.
-fn write_agent_config_defaults(
-    guest: &GuestStateDir,
-    project_guest_path: &str,
-    want_copilot: bool,
-) -> Result<()> {
-    let mut settings = read_guest_json_object(guest, Path::new("claude/settings.json"));
-    settings
-        .entry("theme")
-        .or_insert(Value::String("dark".into()));
-    settings.insert("hasCompletedOnboarding".into(), Value::Bool(true));
-    settings.insert(
-        "skipDangerousModePermissionPrompt".into(),
-        Value::Bool(true),
-    );
-    settings
-        .entry("effortLevel")
-        .or_insert(Value::String("xhigh".into()));
-    guest.atomic_write(
-        Path::new("claude/settings.json"),
-        &serde_json::to_vec(&Value::Object(settings))?,
-        0o644,
-    )?;
-
-    let mut root = read_guest_json_object(guest, Path::new("claude.json"));
-    root.insert("hasCompletedOnboarding".into(), Value::Bool(true));
-    root.insert("bypassPermissionsModeAccepted".into(), Value::Bool(true));
-    let projects = root
-        .entry("projects")
-        .or_insert_with(|| serde_json::json!({}));
-    let projects = projects
-        .as_object_mut()
-        .context("guest claude projects is not an object")?;
-    let project = projects
-        .entry(project_guest_path.to_owned())
-        .or_insert_with(|| serde_json::json!({}));
-    let project = project
-        .as_object_mut()
-        .context("guest claude project is not an object")?;
-    project.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
-    project.insert("hasCompletedProjectOnboarding".into(), Value::Bool(true));
-    project
-        .entry("history")
-        .or_insert_with(|| serde_json::json!([]));
-    guest.atomic_write(
-        Path::new("claude.json"),
-        &serde_json::to_vec(&Value::Object(root))?,
-        0o644,
-    )?;
-
-    let codex = b"sandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\n";
-    let _ = guest.create(Path::new("codex/config.toml"), codex, 0o644)?;
-    let mut opencode = read_guest_json_object(guest, Path::new("opencode-config/opencode.json"));
-    opencode
-        .entry("$schema")
-        .or_insert(Value::String("https://opencode.ai/config.json".into()));
-    opencode
-        .entry("model")
-        .or_insert(Value::String("openai/gpt-5.5".into()));
-    opencode.entry("autoupdate").or_insert(Value::Bool(false));
-    guest.atomic_write(
-        Path::new("opencode-config/opencode.json"),
-        &serde_json::to_vec(&Value::Object(opencode))?,
-        0o644,
-    )?;
-    if want_copilot {
-        let mut copilot = read_guest_json_object(guest, Path::new("copilot/config.json"));
-        copilot.insert("trusted_folders".into(), serde_json::json!(["/"]));
-        copilot.insert(
-            "github_token".into(),
-            Value::String(COPILOT_TOKEN_PLACEHOLDER.into()),
-        );
-        guest.atomic_write(
-            Path::new("copilot/config.json"),
-            &serde_json::to_vec(&Value::Object(copilot))?,
-            0o600,
-        )?;
-    }
-    let _ = guest.create(Path::new("bash_history"), b"", 0o600)?;
-    Ok(())
-}
-
+// The first-run bypass writers now live in `credential_provider`
+// (`write_bypass_configs`), keyed by provider. `write_opencode_model_default`
+// below is deliberately **not** one of them: both touch
+// `opencode-config/opencode.json`, but this one runs *after* capture and
+// removes the `model` key when the launch ended up wired to a non-OpenAI
+// OpenCode provider, whereas the bypass writer seeds it *before* capture.
+// Do not merge them.
 fn write_opencode_model_default(guest: &GuestStateDir, pin_openai_model: bool) -> Result<()> {
     let relative = Path::new("opencode-config/opencode.json");
     let mut config = read_guest_json_object(guest, relative);
@@ -1140,7 +1116,7 @@ fn clear_stale_anthropic_placeholder(guest: &GuestStateDir, captured: bool) {
 }
 
 fn refresh_anthropic(state_dir: &Path, guest: &GuestStateDir) -> Result<Option<PathBuf>> {
-    let Some(host_path) = host_claude_creds_path() else {
+    let Some(host_path) = CredentialProvider::Anthropic.host_credential_path() else {
         return Ok(None);
     };
     let raw = String::from_utf8(read_bounded_regular_file(
@@ -1195,7 +1171,7 @@ fn refresh_anthropic(state_dir: &Path, guest: &GuestStateDir) -> Result<Option<P
 /// Requires that `refresh_openai` has already run (so a host codex
 /// auth file existed and was parseable). Returns `None` if not.
 fn opencode_oauth_entry() -> Result<Option<Value>> {
-    let Some(host_path) = host_codex_auth_path() else {
+    let Some(host_path) = CredentialProvider::OpenAi.host_credential_path() else {
         return Ok(None);
     };
     let raw = String::from_utf8(read_bounded_regular_file(
@@ -1240,7 +1216,11 @@ fn opencode_api_token_path(state_dir: &Path, provider: OpencodeApiProvider) -> P
     host_secret_dir_path(state_dir).join(format!("opencode-{}", provider.id))
 }
 
-fn read_guest_json_object(
+/// Read a guest JSON state file into an object map, logging and replacing it
+/// with an empty map when absent, unreadable, or not a JSON object. Generic
+/// guest-state handling, not provider knowledge — shared with
+/// [`crate::credential_provider`]'s bypass writers.
+pub(crate) fn read_guest_json_object(
     guest: &GuestStateDir,
     relative: &Path,
 ) -> serde_json::Map<String, Value> {
@@ -1418,7 +1398,7 @@ fn decode_id_token_account(json: &Value) -> Option<String> {
 }
 
 fn refresh_openai(state_dir: &Path, guest: &GuestStateDir) -> Result<Option<PathBuf>> {
-    let Some(host_path) = host_codex_auth_path() else {
+    let Some(host_path) = CredentialProvider::OpenAi.host_credential_path() else {
         return Ok(None);
     };
     let raw = String::from_utf8(read_bounded_regular_file(
@@ -1880,23 +1860,36 @@ mod tests {
         }
     }
 
+    /// Build a [`CredentialSelection`] for tests.
+    fn selection(providers: ProviderSet, github_egress: bool) -> CredentialSelection {
+        CredentialSelection {
+            providers,
+            github_egress,
+        }
+    }
+
     /// D1 regression guard for the per-agent Copilot gating (review
-    /// finding #5). With neither GitHub egress (`use_github=false`) nor
-    /// the Copilot agent selected (`want_copilot=false`), `refresh` must
-    /// not capture a Copilot token — both capture conditions are off, so
-    /// `copilot_token_file` is `None` by construction, independent of any
-    /// host/`$HOME`/gh state (this combination skips both `refresh_gh`
-    /// and `refresh_copilot`). Also re-asserts the security-critical
-    /// property that the copilot token *path* lives *outside* the
-    /// guest-bind-mounted state dir, same as the other token files.
+    /// finding #5). With neither GitHub egress nor the Copilot provider
+    /// selected, `refresh` must not capture a Copilot token — both capture
+    /// conditions are off, so `copilot_token_file` is `None` by
+    /// construction, independent of any host/`$HOME`/gh state (this
+    /// combination skips both `refresh_gh` and `refresh_copilot`). Also
+    /// re-asserts the security-critical property that the copilot token
+    /// *path* lives *outside* the guest-bind-mounted state dir, same as the
+    /// other token files.
     #[test]
     fn copilot_token_not_captured_without_use_github_or_want_copilot() {
         let dir = tempfile::tempdir().unwrap();
         let sd = dir.path();
-        let creds = super::refresh(sd, "/workspace/p", false, false, false).unwrap();
+        let creds = super::refresh(
+            sd,
+            "/workspace/p",
+            &selection(ProviderSet::default(), false),
+        )
+        .unwrap();
         assert!(
             creds.copilot_token_file.is_none(),
-            "copilot token captured despite use_github=false and want_copilot=false"
+            "copilot token captured despite no GitHub egress and no Copilot provider"
         );
         // Independent of capture: the path the proxy would re-read must
         // never be under the guest mount (threat-model invariant).
@@ -1908,6 +1901,58 @@ mod tests {
             sd.display(),
         );
         assert_eq!(cp.parent().unwrap().parent(), sd.parent());
+    }
+
+    /// V7: the copilot capture gate is the disjunction
+    /// `github_egress || providers.contains(Copilot)`, not the provider alone.
+    /// Override `$HOME` to a temp dir holding a device-flow cache so capture
+    /// is deterministic without a logged-in `gh`.
+    #[test]
+    fn copilot_capture_follows_use_github_or_want_copilot_disjunction() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".cache/claude-vm")).unwrap();
+        std::fs::write(
+            home.path().join(".cache/claude-vm/copilot-token.json"),
+            br#"{"access_token":"gho_canary_copilot"}"#,
+        )
+        .unwrap();
+        env.set_var("HOME", home.path());
+        let state = tempfile::tempdir().unwrap();
+
+        // github_egress=true, Copilot not selected → captured via GitHub egress.
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &selection(ProviderSet::default(), true),
+        )
+        .unwrap();
+        assert!(
+            creds.copilot_token_file.is_some(),
+            "copilot must be captured when GitHub egress is enabled"
+        );
+        // Copilot selected, github_egress=false → still captured via the
+        // provider. This is the arm that makes `agent-vm copilot --no-git` (or
+        // `agent-vm copilot` in a non-GitHub project) work at all — the one
+        // the D1 note exists to defend.
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &selection(ProviderSet::new([CredentialProvider::Copilot]), false),
+        )
+        .unwrap();
+        assert!(
+            creds.copilot_token_file.is_some(),
+            "copilot must be captured when the Copilot provider is selected even without GitHub egress"
+        );
+        // Neither condition → not captured.
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &selection(ProviderSet::default(), false),
+        )
+        .unwrap();
+        assert!(creds.copilot_token_file.is_none());
     }
 
     /// **Placeholder distinctness**. If one placeholder were a

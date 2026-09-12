@@ -79,7 +79,8 @@ The in-guest `$HOME` for the current guest user mode:
   `run.rs`'s `.patch()` block, unchanged.
 
 Both modes share one symlink mapping,
-`session::GUEST_HOME_LINKS`, so the two provisioning paths can't drift.
+`credential_provider::guest_home_links()`, so the two provisioning paths can't
+drift (see **Credential provider** → **Guest home link**).
 
 ## Private MSB_HOME
 
@@ -102,6 +103,56 @@ deliberately does not point at (except the opt-in cache share).
 _Avoid_: "MSB_HOME" alone when the schema-scoping matters — `MSB_HOME` is the
 env var the schema home is exported under, but the schema home is the
 concept (an env var can point anywhere).
+
+## Credential provider
+
+A **compiled-in credential subsystem** a launched tool can depend on. The four
+variants are `Anthropic`, `OpenAi`, `OpencodeStatic` and `Copilot`
+(`crates/agent-vm/src/credential_provider.rs`). A provider owns everything
+needed to be signed in: the host credential file it captures, its
+placeholders, its eager state dir, its guest-HOME links, its first-run bypass
+config, its guest env, and its proxy secret/routes — plus, for
+`Anthropic`/`OpenAi`, the OAuth-rotation facts (SNI host, token path, accepted
+refresh placeholders, host login hint) the interception hook reads.
+
+Which tool needs which provider is a **code** fact today and becomes
+**configuration** in #80/#82, where the config name is `anthropic` / `openai`
+/ `opencode-static` / `copilot` (`CredentialProvider::config_name`). A
+**Tool** (#82's term) is a resolved command carrying a provider set; do not
+call a provider a "tool" or "agent".
+
+The legacy gating is **asymmetric**: `Anthropic`/`OpenAi` capture runs on
+*every* launch regardless of the selected tool, and the claude/codex/opencode
+bypass configs are written unconditionally (`Scope::Always`). This is
+preserved behaviour, not a design goal — narrowing it belongs to #82, which is
+why each cell is an explicit `Scope`/`CaptureScope` field rather than an
+inference from the selected set. `Copilot` is the one provider the proxy only
+registers when it is selected.
+
+**GitHub egress is not a provider.** The `gh` token is gated by `--no-git` /
+detected repos, orthogonal to the launched tool, so it has no
+`CredentialProvider` variant; `credential_injection` keeps its own block and
+splices it into the proxy's fixed `WIRE_ORDER`.
+
+_Avoid_ the `doctor_label` (`claude` / `codex` / `opencode` / `copilot`) as the
+provider's name: the label names the host CLI that owns the file (retained so
+`agent-vm doctor` output stays byte-identical), while the config name for
+OpenCode is `opencode-static`. A user copying `opencode` out of `agent-vm
+doctor` into `credentials = [...]` is rejected by #80's validator.
+
+_Not the same as_ `OpencodeApiProvider`: that is a *dynamic*,
+user-populated BYO-API-key row inside OpenCode's `auth.json`, not a
+compiled-in subsystem.
+
+### Guest home link
+
+A `(home_relative, state_relative)` pair mapping a guest `$HOME` dotfile to an
+entry under the per-project state dir (`credential_provider::HomeLink`).
+Provider-owned links come first, in `CredentialProvider::ALL` order, then the
+`GENERIC_HOME_LINKS` that no provider owns (`.gitconfig`, `.config/gh`,
+`.bash_history`). Both guest-user modes consume the single
+`credential_provider::guest_home_links()` list, so root mode's `.patch()`
+symlinks and non-root mode's host-side provisioning cannot drift (ADR-0002).
 
 ## Base image
 

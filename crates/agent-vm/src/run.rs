@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
+use crate::credential_provider::{self, CredentialProvider, ProviderSet};
 use crate::layer;
 use crate::mount;
 use crate::session::ProjectSession;
@@ -719,7 +720,8 @@ impl Agent {
     /// this, two concurrent `agent-vm shell` invocations in the same
     /// project would have the later-exiting shell wholesale clobber
     /// the earlier shell's commands (the symlink target is the same
-    /// host file — `.bash_history` in [`crate::session::GUEST_HOME_LINKS`],
+    /// host file — `.bash_history` in
+    /// [`crate::credential_provider::guest_home_links`],
     /// wired up per guest-user mode by the `.patch()` block in `launch()`
     /// (root mode) or [`crate::session::ProjectSession::provision_guest_home`]
     /// (non-root mode)).
@@ -736,6 +738,23 @@ impl Agent {
             // passed it; the filter in `launch` handles that.
             Agent::Copilot => &["--allow-all-tools"],
             Agent::Codex | Agent::Opencode => &[],
+        }
+    }
+
+    /// The credential subsystems this tool depends on. This is the seam #82
+    /// replaces: a resolved tool will carry this set from config instead of
+    /// deriving it from a compile-time variant.
+    fn credential_providers(self) -> ProviderSet {
+        use CredentialProvider::*;
+        match self {
+            Agent::Claude => ProviderSet::new([Anthropic]),
+            Agent::Codex => ProviderSet::new([OpenAi]),
+            Agent::Opencode => ProviderSet::new([OpenAi, OpencodeStatic]),
+            Agent::Copilot => ProviderSet::new([Copilot]),
+            // `shell` matches `opencode`'s set: the run path grouped
+            // `Opencode | Shell` before #81, and #78's default config table
+            // records the same pairing.
+            Agent::Shell => ProviderSet::new([OpenAi, OpencodeStatic]),
         }
     }
 }
@@ -1217,57 +1236,50 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     let use_github = !allowed_repos.is_empty();
     notices.emit(repo_scope_notice(&allowed_repos))?;
 
+    // The credential subsystems this tool depends on. `github_egress`
+    // (`use_github`, driven by `--no-git` / detected repos) stays orthogonal
+    // to the tool.
+    let providers = agent.credential_providers();
+
     // D1: the Copilot API is reached with a GitHub OAuth token, but
     // unlike the gh CLI / repo-push path it is not repo-scoped — so
-    // Copilot's token capture and egress must follow the *selected
-    // agent*, not `use_github`. A user running `agent-vm copilot` in a
-    // non-GitHub project (or with `--no-git`) still expects Copilot to
-    // work; conversely a claude/codex/opencode/shell session in a
-    // GitHub repo should NOT get Copilot egress opened or a duplicate
-    // gh token written to a copilot secret file it never uses.
-    let want_copilot = matches!(agent, Agent::Copilot);
-    let want_opencode = matches!(agent, Agent::Opencode | Agent::Shell);
-
+    // Copilot's token capture and egress must follow the *selected tool's
+    // provider set*, not `use_github`. A user running `agent-vm copilot` in
+    // a non-GitHub project (or with `--no-git`) still expects Copilot to
+    // work; conversely a claude/codex/opencode/shell session in a GitHub
+    // repo should NOT get Copilot egress opened or a duplicate gh token
+    // written to a copilot secret file it never uses. `secrets::refresh`
+    // models this as `CaptureScope::WhenSelectedOrGithubEgress`.
     let creds = crate::secrets::refresh(
         &session.state_dir,
         &project_guest_path,
-        use_github,
-        want_copilot,
-        want_opencode,
+        &crate::secrets::CredentialSelection {
+            providers,
+            github_egress: use_github,
+        },
     )
     .context("snapshotting host credentials")?;
 
-    // D1: when Copilot is the selected agent but no usable token could
-    // be captured, fail loudly here. Otherwise the guest would send
-    // `Authorization: Bearer msb-copilot-placeholder-v2` to the Copilot
-    // API with no registered substitution entry — the proxy drops the
-    // connection (violation scan) or GitHub returns a confusing 401.
-    if want_copilot && creds.copilot_token_file.is_none() {
-        anyhow::bail!(
-            "no GitHub Copilot token found on the host. Sign in on the host \
-             (e.g. `gh auth login` with a Copilot seat, or run the Copilot \
-             device-flow login that writes ~/.cache/claude-vm/copilot-token.json) \
-             and retry, or pick another agent."
-        );
-    }
-
-    // Same reasoning for Claude, which had no equivalent guard: a failed
-    // capture was only a `tracing::warn!` and the launch continued, so
-    // the in-VM Claude Code came up signed out. The natural next move —
-    // `/login` inside the guest — cannot work either: the guest only
-    // ever holds placeholders, and `intercept_hook::oauth_refresh`
-    // accepts `grant_type=refresh_token` with the placeholder refresh
-    // token *only*, so an authorization-code exchange is rejected and
-    // Claude Code surfaces a bare "OAuth error ... status code 400".
-    // Fail here instead, naming the one action that actually fixes it.
-    if matches!(agent, Agent::Claude) && creds.anthropic_token_file.is_none() {
-        anyhow::bail!(
-            "no usable Claude credential found on the host at \
-             ~/.claude/.credentials.json. Sign in *on the host* with \
-             `claude login`, then retry — you cannot `/login` from inside \
-             the VM, which only ever sees placeholder tokens. Run \
-             `agent-vm doctor` to see what was found."
-        );
+    // When a selected provider produced no usable credential, fail loudly
+    // here rather than letting the guest send an unsubstituted placeholder
+    // bearer (the proxy drops it as a violation, or the vendor returns a
+    // confusing 401). Only Anthropic and Copilot carry a message; no default
+    // tool selects both, so at most one fires. Iteration is in
+    // `CredentialProvider::ALL` order, so the error stays deterministic.
+    //
+    // Anthropic: a failed capture used to be only a `tracing::warn!` and the
+    // launch continued, so the in-VM Claude Code came up signed out. The
+    // natural next move — `/login` inside the guest — cannot work either: the
+    // guest only ever holds placeholders, and `intercept_hook::oauth_refresh`
+    // accepts `grant_type=refresh_token` with the placeholder refresh token
+    // *only*, so an authorization-code exchange is rejected and Claude Code
+    // surfaces a bare "OAuth error ... status code 400".
+    for provider in providers.iter() {
+        if creds.token_file(provider).is_none()
+            && let Some(message) = credential_provider::missing_credential_error(provider)
+        {
+            anyhow::bail!("{message}");
+        }
     }
 
     notices.emit(creds_notice(&creds))?;
@@ -1407,48 +1419,60 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         }
         patch
     });
-    let mut builder = builder
-        .patch(|mut p| {
-            for parent in patch_builder_steps.drain(..) {
-                p = p.mkdir(parent, None);
+    let mut builder = builder.patch(|mut p| {
+        for parent in patch_builder_steps.drain(..) {
+            p = p.mkdir(parent, None);
+        }
+        if root_mode {
+            // Root mode: the dotfile symlinks live at un-shadowed
+            // rootfs paths (/root/...), so baking them via `.patch()`
+            // is correct — nothing mounts over /root at runtime.
+            p = p
+                .mkdir("/root/.local", None)
+                .mkdir("/root/.local/share", None)
+                .mkdir("/root/.config", None);
+            for link in credential_provider::guest_home_links() {
+                p = p.symlink(
+                    format!("/agent-vm-state/{}", link.state_relative),
+                    format!("/root/{}", link.home_relative),
+                    true,
+                );
             }
-            if root_mode {
-                // Root mode: the dotfile symlinks live at un-shadowed
-                // rootfs paths (/root/...), so baking them via `.patch()`
-                // is correct — nothing mounts over /root at runtime.
-                p = p
-                    .mkdir("/root/.local", None)
-                    .mkdir("/root/.local/share", None)
-                    .mkdir("/root/.config", None);
-                for (suffix, target_name) in crate::session::GUEST_HOME_LINKS {
-                    p = p.symlink(
-                        format!("/agent-vm-state/{target_name}"),
-                        format!("/root/{suffix}"),
-                        true,
-                    );
-                }
-                p
-            } else {
-                // Non-root mode: the HOME dir + its dotfile symlinks are
-                // instead provisioned host-side (ProjectSession::
-                // provision_guest_home, called above) because
-                // /agent-vm-state is a *runtime* bind mount that shadows
-                // whatever a `.patch()` bakes at that path. /etc/passwd and
-                // /etc/group are real rootfs, unaffected by that bind, so
-                // appending the guest's identity here is correct.
-                let gi = guest_identity
-                    .as_ref()
-                    .expect("non-root mode always resolves a guest identity");
-                p = p.append("/etc/passwd", user::passwd_append_line(gi));
-                // See `group_append_line`'s doc comment (user.rs) for why
-                // gids in the system-reserved range are skipped.
-                if let Some(line) = user::group_append_line(gi.gid) {
-                    p = p.append("/etc/group", line);
-                }
-                p
+            p
+        } else {
+            // Non-root mode: the HOME dir + its dotfile symlinks are
+            // instead provisioned host-side (ProjectSession::
+            // provision_guest_home, called above) because
+            // /agent-vm-state is a *runtime* bind mount that shadows
+            // whatever a `.patch()` bakes at that path. /etc/passwd and
+            // /etc/group are real rootfs, unaffected by that bind, so
+            // appending the guest's identity here is correct.
+            let gi = guest_identity
+                .as_ref()
+                .expect("non-root mode always resolves a guest identity");
+            p = p.append("/etc/passwd", user::passwd_append_line(gi));
+            // See `group_append_line`'s doc comment (user.rs) for why
+            // gids in the system-reserved range are skipped.
+            if let Some(line) = user::group_append_line(gi.gid) {
+                p = p.append("/etc/group", line);
             }
-        })
-        .env("CODEX_HOME", "/agent-vm-state/codex");
+            p
+        }
+    });
+
+    // Guest env, slot 1 of 2 (`credential_provider::GUEST_ENV_SLOTS`): the
+    // *generic* pairs (`GENERIC_GUEST_ENV`, e.g. `CODEX_HOME`). Published here
+    // — right after the root-mode `.patch()` — because `SandboxBuilder::env`
+    // appends to a `Vec<EnvVar>` (serialized as a JSON *array*), and that is
+    // where the pre-#81 config put `CODEX_HOME`. Slot 2 (the provider-owned
+    // pairs) is published after `GUEST_ALWAYS_ENV` below, matching its
+    // historical position; see `credential_provider::GuestEnvSlot` for why the
+    // two slots are kept separate.
+    for (key, value) in
+        credential_provider::guest_env_slot(credential_provider::GuestEnvSlot::Generic, providers)
+    {
+        builder = builder.env(key, value);
+    }
 
     let network_plan = crate::network::Plan::from_args(args.network)?;
     network_plan
@@ -1463,7 +1487,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
             creds: &creds,
             state_dir: &session.state_dir,
             allowed_repos: &allowed_repos,
-            include_copilot: want_copilot,
+            providers,
         },
     )?;
 
@@ -1531,26 +1555,17 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         builder = builder.env(*key, *value);
     }
 
-    // D1: GitHub Copilot CLI reads its token from COPILOT_GITHUB_TOKEN.
-    // Hand it the placeholder; the credential proxy substitutes the real
-    // GitHub OAuth token for it on the wire to the Copilot API. We set
-    // it via env (not just ~/.copilot/config.json) because attach()'s
-    // execve never sources /etc/profile.d, unlike the original Bash
-    // agent-vm.
-    //
-    // Only set when Copilot is the selected agent. Exporting the
-    // placeholder for a claude/codex/opencode/shell session would have
-    // the guest emit `Authorization: Bearer msb-copilot-placeholder-v2`
-    // to the Copilot API with no registered substitution entry (the
-    // copilot secret is gated on the same condition above), which the
-    // proxy drops as a violation or GitHub rejects with a 401. By here,
-    // a Copilot launch is guaranteed to have a captured token (we bailed
-    // earlier otherwise), so the placeholder always resolves.
-    if want_copilot {
-        builder = builder.env(
-            "COPILOT_GITHUB_TOKEN",
-            crate::secrets::COPILOT_TOKEN_PLACEHOLDER,
-        );
+    // Guest env, slot 2 of 2: the *provider-owned* pairs. Today only Copilot
+    // contributes one — `COPILOT_GITHUB_TOKEN`, and only when Copilot is
+    // selected. Published last, after `GUEST_ALWAYS_ENV`, matching the pre-#81
+    // config; the security rationale for the pair (and for gating it on the
+    // selected provider) lives on `CredentialProvider::Copilot`'s spec and on
+    // `credential_provider::proxy_requires_selection`.
+    for (key, value) in credential_provider::guest_env_slot(
+        credential_provider::GuestEnvSlot::ProviderOwned,
+        providers,
+    ) {
+        builder = builder.env(key, value);
     }
 
     let profile = env::var("AGENT_VM_PROFILE").is_ok();
@@ -2435,6 +2450,44 @@ mod tests {
     use crate::layer::test_support::{DockerTagGuard, docker_tag_exists, e2e_nonce};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// V1: the agent → provider-set mapping matches the legacy `matches!`
+    /// gating for every variant. The expressions are re-written inline here
+    /// (from the pre-refactor source), not re-derived from the new method.
+    #[test]
+    fn agent_provider_sets_match_legacy_gating() {
+        for agent in [
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Opencode,
+            Agent::Copilot,
+            Agent::Shell,
+        ] {
+            let providers = agent.credential_providers();
+            assert_eq!(
+                providers.contains(CredentialProvider::Copilot),
+                matches!(agent, Agent::Copilot),
+                "copilot gating changed for {agent:?}"
+            );
+            assert_eq!(
+                providers.contains(CredentialProvider::OpencodeStatic),
+                matches!(agent, Agent::Opencode | Agent::Shell),
+                "opencode-static gating changed for {agent:?}"
+            );
+            assert_eq!(
+                providers.contains(CredentialProvider::Anthropic),
+                matches!(agent, Agent::Claude),
+                "anthropic gating changed for {agent:?}"
+            );
+            // OpenAI is the only provider not gated on the tool by name;
+            // every tool that talks to OpenAI derives it from its pairing.
+            assert_eq!(
+                providers.contains(CredentialProvider::OpenAi),
+                matches!(agent, Agent::Codex | Agent::Opencode | Agent::Shell),
+                "openai gating changed for {agent:?}"
+            );
+        }
+    }
 
     #[test]
     fn reject_removed_layer_env_accepts_unset() {

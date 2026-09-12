@@ -2,6 +2,7 @@
 
 mod clipboard;
 mod credential_injection;
+mod credential_provider;
 mod defaults;
 mod doctor;
 mod env_flag;

@@ -7,7 +7,8 @@
 //! `.local/share/opencode`) so session history survives across runs —
 //! `$HOME` is `/root` in `--root` mode; in the non-root default it's the
 //! *mirrored host* `$HOME` path (e.g. `/Users/claude`), bind-mounted from
-//! this host-owned `<state_dir>/home` (see [`GUEST_HOME_LINKS`],
+//! this host-owned `<state_dir>/home` (see
+//! [`crate::credential_provider::guest_home_links`],
 //! [`ProjectSession::provision_guest_home`], `user.rs`'s `core_dir_volumes`,
 //! and `docs/adr/0002-mirror-host-home-and-username.md`).
 //!
@@ -28,45 +29,6 @@ use std::{
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-
-/// `(dotfile path relative to $HOME, target name relative to
-/// `/agent-vm-state`)` pairs for every agent's persisted dotfile. Shared
-/// source-of-truth for both guest-user modes so they can't drift:
-///
-/// - root mode wires these up as `/root/<suffix> -> /agent-vm-state/<target>`
-///   rootfs symlinks baked by `run.rs`'s `.patch()` block (un-shadowed
-///   rootfs, so `.patch()` is the right place).
-/// - non-root mode wires the *same* mapping up host-side via
-///   [`ProjectSession::provision_guest_home`], because non-root's HOME lives
-///   under the `/agent-vm-state` runtime bind mount, which shadows anything
-///   `.patch()` bakes at that path.
-///
-/// Codex is deliberately absent: it locates its config via the
-/// `CODEX_HOME` env var (set unconditionally in `run.rs`), not a dotfile
-/// symlink.
-pub const GUEST_HOME_LINKS: &[(&str, &str)] = &[
-    (".claude", "claude"),
-    // Onboarding-state file lives at $HOME root, not in .claude/. Without
-    // persistence the in-VM Claude re-runs the theme picker every launch.
-    (".claude.json", "claude.json"),
-    (".local/share/opencode", "opencode"),
-    // OpenCode reads its config from $XDG_CONFIG_HOME/opencode/
-    // (=~/.config/opencode/), file opencode.json. Distinct from the data
-    // dir above — wired separately.
-    (".config/opencode", "opencode-config"),
-    // D1: GitHub Copilot CLI reads/writes ~/.copilot/ (config.json with
-    // trusted_folders + the placeholder token, plus its session state).
-    (".copilot", "copilot"),
-    // gh/git config: secrets::write_guest_gh_config writes both into
-    // state_dir; these symlinks expose them at the standard paths. The
-    // gh-config link dangles when no gh token was captured — nothing
-    // references it in that case.
-    (".gitconfig", "gitconfig"),
-    (".config/gh", "gh-config"),
-    // Persistent per-project bash history. secrets::refresh touches
-    // `<state>/bash_history` so the symlink target exists on first launch.
-    (".bash_history", "bash_history"),
-];
 
 /// Everything Phase 2 needs to know about a project invocation.
 pub struct ProjectSession {
@@ -108,14 +70,16 @@ impl ProjectSession {
     /// Create the state subdirectories that will be bind-mounted into the
     /// guest. Called before sandbox creation so virtiofs has somewhere real to
     /// point at.
+    ///
+    /// `state_dir` itself is created **first** (it is not one of the provider
+    /// dirs `eager_state_dirs` returns); dropping that would break first-launch
+    /// provisioning for a brand-new project.
     pub fn ensure_dirs(&self) -> Result<()> {
-        for dir in [
-            &self.state_dir,
-            &self.claude_home(),
-            &self.codex_home(),
-            &self.opencode_data(),
-        ] {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&self.state_dir)
+            .with_context(|| format!("creating {}", self.state_dir.display()))?;
+        for name in crate::credential_provider::eager_state_dirs() {
+            let dir = self.state_dir.join(name);
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         Ok(())
     }
@@ -125,18 +89,6 @@ impl ProjectSession {
     pub fn mount_store_dir(&self) -> PathBuf {
         self.state_dir
             .with_file_name(format!("{}.mounts", self.project_hash))
-    }
-
-    pub fn claude_home(&self) -> PathBuf {
-        self.state_dir.join("claude")
-    }
-
-    pub fn codex_home(&self) -> PathBuf {
-        self.state_dir.join("codex")
-    }
-
-    pub fn opencode_data(&self) -> PathBuf {
-        self.state_dir.join("opencode")
     }
 
     /// Host-absolute HOME for the non-root guest — `<state_dir>/home`. This
@@ -183,14 +135,19 @@ impl ProjectSession {
     }
 }
 
-/// Pure mapping from [`GUEST_HOME_LINKS`] to `(host link path, guest target
-/// string)` pairs rooted at `home`. Split out from
-/// [`ProjectSession::provision_guest_home`] so the link→target mapping is
+/// Pure mapping from [`crate::credential_provider::guest_home_links`] to
+/// `(host link path, guest target string)` pairs rooted at `home`. Split out
+/// from [`ProjectSession::provision_guest_home`] so the link→target mapping is
 /// unit-testable without touching the filesystem.
 fn guest_home_symlinks(home: &Path) -> Vec<(PathBuf, String)> {
-    GUEST_HOME_LINKS
+    crate::credential_provider::guest_home_links()
         .iter()
-        .map(|(suffix, target_name)| (home.join(suffix), format!("/agent-vm-state/{target_name}")))
+        .map(|link| {
+            (
+                home.join(link.home_relative),
+                format!("/agent-vm-state/{}", link.state_relative),
+            )
+        })
         .collect()
 }
 
@@ -285,13 +242,42 @@ mod tests {
         assert_eq!(a.sandbox_name, b.sandbox_name);
     }
 
+    // ── characterization goldens captured on the pre-refactor tree ──
+    //
+    // These pin today's behaviour so the credential-provider extraction
+    // (#81) is provably zero-behaviour-change. The golden literals below
+    // were transcribed from the unrefactored source, not from the new
+    // module — if the extraction changes any of them, that is a
+    // regression, not a test to update.
+
+    /// V12: `ensure_dirs` eagerly creates the state root plus exactly the
+    /// three per-tool subdirectories; a dropped one breaks first-launch
+    /// provisioning (virtiofs has nowhere real to point at). The golden dir
+    /// list itself is asserted in `credential_provider`.
+    #[test]
+    fn ensure_dirs_creates_state_root_and_legacy_subdirs() {
+        let session = throwaway_session();
+        session.ensure_dirs().expect("ensure_dirs");
+        assert!(session.state_dir.is_dir(), "state root must be created");
+        for sub in ["claude", "codex", "opencode"] {
+            assert!(
+                session.state_dir.join(sub).is_dir(),
+                "ensure_dirs must create state_dir/{sub}"
+            );
+        }
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
     // ── non-root guest HOME provisioning ───────────────────────────
 
     #[test]
     fn guest_home_symlinks_map_matches_guest_home_links() {
         let home = Path::new("/state/home");
         let links = guest_home_symlinks(home);
-        assert_eq!(links.len(), GUEST_HOME_LINKS.len());
+        assert_eq!(
+            links.len(),
+            crate::credential_provider::guest_home_links().len()
+        );
         assert!(
             links
                 .iter()
