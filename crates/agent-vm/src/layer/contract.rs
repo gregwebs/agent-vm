@@ -1534,16 +1534,19 @@ mod tests {
     }
 
     // --- e2e: the layer image contract against real docker + the msb cache ---
+    // Ignore attribute values must be literals, so the repeated reasons stay
+    // at their call sites to deliberately retain direct test registration.
     //
     // Moved here from `layer.rs` by issue #102; the fixtures these tests share
     // with `layer`'s own e2e harness live in `layer::test_support`.
     //
     // These eight tests are the live proof of the clauses in
-    // `docs/adr/0003-project-tooling-layers.md`: each builds a real derived
-    // image over the fixture's base link and checks the contract against the
+    // `docs/adr/0003-project-tooling-layers.md`: seven build a real derived
+    // image over the fixture's base link and check the contract against the
     // facts the two producers actually report — the tripwire for the design's
     // riskiest assumptions (BuildKit preserving the base's diff ids; docker's
-    // store and the msb cache agreeing on them).
+    // store and the msb cache agreeing on them). The eighth builds its own
+    // foreign base, proving C4a is not a tautology.
 
     /// Build `dockerfile` (a one-step layer over the fixture's base link) with
     /// `--output type=oci`, ingest it into a fresh temp cache, and return the
@@ -1593,15 +1596,35 @@ mod tests {
         (step, cache_dir, built, base_facts)
     }
 
-    #[tokio::test]
-    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
-    async fn e2e_a_built_layers_diff_ids_extend_its_base() {
+    /// The distinct stderr messages below are the observable run-versus-skip
+    /// contract, so each precondition keeps its own wording. Split in two
+    /// because the foreign-base test needs the buildx check without the
+    /// ordinary host-base fixture.
+    async fn e2e_buildx_or_skip() -> bool {
         if ensure_docker_buildx().await.is_err() {
             eprintln!("skipping: `docker buildx` not available on PATH");
-            return;
+            return false;
+        }
+        true
+    }
+
+    /// Return the owned fixture, not just its link: its guard must survive
+    /// until the caller exits, including early returns and unwinding.
+    async fn e2e_fixture_or_skip() -> Option<E2eBase> {
+        if !e2e_buildx_or_skip().await {
+            return None;
         }
         let Some(fixture) = e2e_base_fixture() else {
             eprintln!("skipping: no base image available locally or via network pull");
+            return None;
+        };
+        Some(fixture)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
+    async fn e2e_a_built_layers_diff_ids_extend_its_base() {
+        let Some(fixture) = e2e_fixture_or_skip().await else {
             return;
         };
         let base = fixture.link.clone();
@@ -1646,12 +1669,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_copy_link_still_extends_its_base() {
-        if ensure_docker_buildx().await.is_err() {
-            eprintln!("skipping: `docker buildx` not available on PATH");
-            return;
-        }
-        let Some(fixture) = e2e_base_fixture() else {
-            eprintln!("skipping: no base image available locally or via network pull");
+        let Some(fixture) = e2e_fixture_or_skip().await else {
             return;
         };
         let base = fixture.link.clone();
@@ -1691,12 +1709,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_facts_agree_between_dockers_store_and_the_msb_cache() {
-        if ensure_docker_buildx().await.is_err() {
-            eprintln!("skipping: `docker buildx` not available on PATH");
-            return;
-        }
-        let Some(fixture) = e2e_base_fixture() else {
-            eprintln!("skipping: no base image available locally or via network pull");
+        let Some(fixture) = e2e_fixture_or_skip().await else {
             return;
         };
         let base = fixture.link.clone();
@@ -1753,12 +1766,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_a_path_replacing_layer_is_rejected() {
-        if ensure_docker_buildx().await.is_err() {
-            eprintln!("skipping: `docker buildx` not available on PATH");
-            return;
-        }
-        let Some(fixture) = e2e_base_fixture() else {
-            eprintln!("skipping: no base image available locally or via network pull");
+        let Some(fixture) = e2e_fixture_or_skip().await else {
             return;
         };
         let base = fixture.link.clone();
@@ -1785,12 +1793,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_a_non_root_final_layer_is_rejected() {
-        if ensure_docker_buildx().await.is_err() {
-            eprintln!("skipping: `docker buildx` not available on PATH");
-            return;
-        }
-        let Some(fixture) = e2e_base_fixture() else {
-            eprintln!("skipping: no base image available locally or via network pull");
+        let Some(fixture) = e2e_fixture_or_skip().await else {
             return;
         };
         let base = fixture.link.clone();
@@ -1832,12 +1835,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_discard_derived_image_makes_a_loaded_tag_uncached() {
-        if ensure_docker_buildx().await.is_err() {
-            eprintln!("skipping: `docker buildx` not available on PATH");
-            return;
-        }
-        let Some(fixture) = e2e_base_fixture() else {
-            eprintln!("skipping: no base image available locally or via network pull");
+        let Some(fixture) = e2e_fixture_or_skip().await else {
             return;
         };
         let base = fixture.link.clone();
@@ -1876,12 +1874,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_an_unevaluatable_final_is_not_left_ingested() {
-        if ensure_docker_buildx().await.is_err() {
-            eprintln!("skipping: `docker buildx` not available on PATH");
-            return;
-        }
-        let Some(fixture) = e2e_base_fixture() else {
-            eprintln!("skipping: no base image available locally or via network pull");
+        let Some(fixture) = e2e_fixture_or_skip().await else {
             return;
         };
         let base = fixture.link.clone();
@@ -1929,8 +1922,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs docker buildx + a resolvable base image; run with `cargo test ... -- --ignored`"]
     async fn e2e_a_foreign_base_link_is_rejected_by_c4() {
-        if ensure_docker_buildx().await.is_err() {
-            eprintln!("skipping: `docker buildx` not available on PATH");
+        if !e2e_buildx_or_skip().await {
             return;
         }
         let foreign = if host_oci_platform() == "linux/amd64" {
