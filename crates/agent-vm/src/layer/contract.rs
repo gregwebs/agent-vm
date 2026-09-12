@@ -12,8 +12,8 @@
 //!
 //! This module owns both halves of the contract — the pure clause checks above
 //! and the live end-to-end suite below, which proves them against real
-//! `docker buildx` output and the msb cache (run it with
-//! `cargo test -p agent-vm --bin agent-vm -- e2e_ --ignored --test-threads=1`).
+//! `docker buildx` output and the msb cache. Run recipe and its rationale:
+//! see the *real docker buildx build* e2e section header in `layer.rs`.
 //!
 //! Only clauses C1–C4 are represented here: they are the four whose
 //! violations are visible in the image *config* and *manifest* — both tiny
@@ -1538,11 +1538,12 @@ mod tests {
     // Moved here from `layer.rs` by issue #102; the fixtures these tests share
     // with `layer`'s own e2e harness live in `layer::test_support`.
     //
-    // These are the plan's tests 41–46. Each builds a real derived image over
-    // the fixture's base link and checks the contract against the facts the
-    // two producers actually report — the tripwire for the design's riskiest
-    // assumptions (BuildKit preserving the base's diff ids; docker's store and
-    // the msb cache agreeing on them).
+    // These eight tests are the live proof of the clauses in
+    // `docs/adr/0003-project-tooling-layers.md`: each builds a real derived
+    // image over the fixture's base link and checks the contract against the
+    // facts the two producers actually report — the tripwire for the design's
+    // riskiest assumptions (BuildKit preserving the base's diff ids; docker's
+    // store and the msb cache agreeing on them).
 
     /// Build `dockerfile` (a one-step layer over the fixture's base link) with
     /// `--output type=oci`, ingest it into a fresh temp cache, and return the

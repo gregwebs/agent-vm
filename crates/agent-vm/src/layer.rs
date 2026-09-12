@@ -4676,6 +4676,14 @@ mod tests {
     //  `e2e_` is not a substring of any other test name in this target. There is no
     //  `--lib` target: `crates/agent-vm/Cargo.toml` declares only `[[bin]]`).
     //
+    // `--test-threads=1` is prudence, not a correctness requirement: each
+    // test drives a real `docker buildx` build, so serialising avoids buildx
+    // cache contention and interleaved build logs; and execution order cannot
+    // matter either way, because the fixtures are nonce-scoped. The fixture's
+    // uniqueness guards are check-then-act, not atomic, so serialising also
+    // closes the narrow window where two tests draw the same nonce and the
+    // loser's guard `docker rmi -f`s a tag the winner still holds.
+    //
     // The C1–C4 contract e2e tests moved to `layer/contract.rs` (issue #102);
     // this section keeps the six build/load/chain tests.
     //
