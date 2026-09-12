@@ -299,7 +299,9 @@ Caveat: only enable this when the other `msb`'s version is close to the
 vendored fork's — the on-disk cache format (erofs/vmdk/manifest schema) is
 not guaranteed compatible across microsandbox versions. Avoid running the
 two concurrently against the shared cache with mismatched versions. If
-images misbehave, unset the variable to fall back to the private cache.
+images misbehave, unset the variable **and** remove the persisted redirect
+as described in *Reverting is a manual step* below — unsetting the variable
+alone does not fall back to the private cache.
 
 **Reverting is a manual step.** The redirect is persisted to
 `MSB_HOME/config.json`. Unsetting
