@@ -748,9 +748,6 @@ mod tests {
         docker_image_facts, ensure_docker_buildx, final_image_facts, host_oci_platform,
         load_derived_image, resolve,
     };
-    // Commit A only (see D3): lets the moved bodies keep their `contract::` prefixes so the
-    // move is provably byte-identical. Commit B drops this line with the prefixes.
-    use crate::layer::contract;
 
     /// The platform `check` supplies as "this host" for the check tests.
     /// Deliberately not `host_oci_platform()`: the check is pure, and pinning
@@ -1555,12 +1552,7 @@ mod tests {
         fixture: &E2eBase,
         dockerfile: &str,
         extra_files: &[(&str, &str)],
-    ) -> (
-        ChainStep,
-        tempfile::TempDir,
-        contract::ImageFacts,
-        contract::ImageFacts,
-    ) {
+    ) -> (ChainStep, tempfile::TempDir, ImageFacts, ImageFacts) {
         let base = fixture.link.clone();
         let layer_dir = tempfile::tempdir().unwrap();
         write_layer_file(layer_dir.path(), "Dockerfile", dockerfile, 0o644);
@@ -1592,7 +1584,7 @@ mod tests {
         let metadata = load_derived_image(cache_dir.path(), tar.path(), &step.id.tag)
             .await
             .expect("load_archive");
-        let built = contract::ImageFacts::from_cached_metadata(&metadata).unwrap();
+        let built = ImageFacts::from_cached_metadata(&metadata).unwrap();
         let base_facts = docker_image_facts(&base)
             .await
             .unwrap()
@@ -1635,10 +1627,10 @@ mod tests {
             "the built image's diff ids must extend the base's as a prefix — the \
              assumption C1's image half rests on"
         );
-        contract::check_built_image(
+        check_built_image(
             &step,
-            contract::StepRole::Final,
-            contract::BuiltOn {
+            StepRole::Final,
+            BuiltOn {
                 predecessor: &base_facts,
                 built: &built,
             },
@@ -1679,10 +1671,10 @@ mod tests {
             base_facts.diff_ids,
             built.diff_ids
         );
-        contract::check_built_image(
+        check_built_image(
             &step,
-            contract::StepRole::Final,
-            contract::BuiltOn {
+            StepRole::Final,
+            BuiltOn {
                 predecessor: &base_facts,
                 built: &built,
             },
@@ -1748,7 +1740,7 @@ mod tests {
         let metadata = load_derived_image(cache_dir.path(), tar.path(), &id.tag)
             .await
             .expect("load_archive");
-        let cache_facts = contract::ImageFacts::from_cached_metadata(&metadata).unwrap();
+        let cache_facts = ImageFacts::from_cached_metadata(&metadata).unwrap();
 
         assert_eq!(
             docker_facts.diff_ids, cache_facts.diff_ids,
@@ -1776,17 +1768,17 @@ mod tests {
         )
         .await;
 
-        let err = contract::check_built_image(
+        let err = check_built_image(
             &step,
-            contract::StepRole::Final,
-            contract::BuiltOn {
+            StepRole::Final,
+            BuiltOn {
                 predecessor: &base_facts,
                 built: &built,
             },
             &host_oci_platform(),
         )
         .expect_err("replacing PATH must violate C2 against real facts");
-        assert_eq!(err.clause, contract::Clause::PathIsAdditive);
+        assert_eq!(err.clause, Clause::PathIsAdditive);
     }
 
     #[tokio::test]
@@ -1808,22 +1800,22 @@ mod tests {
         )
         .await;
 
-        let err = contract::check_built_image(
+        let err = check_built_image(
             &step,
-            contract::StepRole::Final,
-            contract::BuiltOn {
+            StepRole::Final,
+            BuiltOn {
                 predecessor: &base_facts,
                 built: &built,
             },
             &host_oci_platform(),
         )
         .expect_err("a non-root final must violate C3 against real facts");
-        assert_eq!(err.clause, contract::Clause::EndsAsRoot);
+        assert_eq!(err.clause, Clause::EndsAsRoot);
         // The identical image passes as an intermediate (decision D5).
-        contract::check_built_image(
+        check_built_image(
             &step,
-            contract::StepRole::Intermediate,
-            contract::BuiltOn {
+            StepRole::Intermediate,
+            BuiltOn {
                 predecessor: &base_facts,
                 built: &built,
             },
@@ -1995,8 +1987,8 @@ mod tests {
         );
 
         let step = chain_step(0, 1);
-        let err = contract::check_base_image(&step, &base, &host_oci_platform())
+        let err = check_base_image(&step, &base, &host_oci_platform())
             .expect_err("a foreign base link must violate C4a");
-        assert_eq!(err.clause, contract::Clause::TargetsHostPlatform);
+        assert_eq!(err.clause, Clause::TargetsHostPlatform);
     }
 }
