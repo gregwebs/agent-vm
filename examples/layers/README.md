@@ -38,13 +38,30 @@ rebuild and no prompt.
 
 ## Writing your own layer
 
-Follow the layer Dockerfile contract in
-`docs/adr/0003-project-tooling-layers.md` ("The layer Dockerfile contract"):
-start with `ARG BASE_IMAGE=...` / `FROM ${BASE_IMAGE}`, keep `ENV PATH`
-additive (or don't set it at all), install tools world-readable
-(`a+rX`, not under a `0700` home), stay glibc/arch-portable, and leave
-`/etc/agent-vm-image-version`, `/bin/bash`, `/etc/passwd`/`/etc/group`, and
-`ENTRYPOINT`/`CMD` untouched.
+The **layer image contract** is normative in
+`docs/adr/0003-project-tooling-layers.md` ("The layer image contract"). Every
+step needs these two lines:
+
+```dockerfile
+ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
+FROM ${BASE_IMAGE}
+```
+
+Four clauses are **enforced at build time** (a violation is a hard error):
+C1 build on the previous step; C2 keep `PATH` additive (never drop a
+directory the previous step had); C3 end the chain's last step as root
+(`USER root`, or no trailing `USER` at all); C4 don't pin `--platform` on
+your final `FROM`.
+
+C5–C8 are documented-only — see the ADR for all eight. Keep `/bin/bash` and
+`/etc/passwd`/`/etc/group` appendable, install tools world-readable (`a+rX`),
+don't touch `/etc/agent-vm-image-version` or `/opt/agent/**`, and write
+`/etc/agent-vm-capabilities/<name>` only after your own build-time checks
+pass. Two conventions: expose environment through `ENV` (not an `env.d`-style
+file the base does not read), and leave `ENTRYPOINT`/`CMD` inert — agentd
+execs the agent directly. Both shipped examples satisfy all eight; the C1
+lint half is kept true by
+`layer::contract::tests::shipped_example_layers_pass_the_dockerfile_lint`.
 
 ## Index
 

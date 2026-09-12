@@ -138,7 +138,8 @@ single tooling layer is one step of a "layer chain" (see below); resolved by
 `layer::resolve_layer_chain`. There is no environment-variable override —
 `$AGENT_VM_LAYER` is rejected outright if set — but there is composition: the
 chain is the project's own `.agent-vm/layers/*/` steps, then any `--layer
-DIR` values (repeatable, appended after, never prepended). See
+DIR` values (repeatable, appended after, never prepended). Every step's
+built image must satisfy the **Layer image contract**. See
 `docs/adr/0003-project-tooling-layers.md`.
 
 ## Layer chain
@@ -165,7 +166,9 @@ step's image is the derived image proper — intermediate steps are build-time
 scaffolding in docker's own image store, never booted and never ingested.
 Ingested **registry-lessly** — via `microsandbox_image::load_archive`, never
 a `registry:2` push — so booting a derived image makes no registry contact.
-See `docs/adr/0003-project-tooling-layers.md`.
+Only the final derived image boots, so only it is subject to the **Layer
+image contract**'s clause C3 ("ends as root"); C1/C2/C4 apply to every built
+step. See `docs/adr/0003-project-tooling-layers.md`.
 
 ## Layer identity / hash
 
@@ -185,6 +188,25 @@ hash hit reuses the already-ingested derived image with no rebuild and no
 confirmation prompt; a hash miss (new project, or an edited
 Dockerfile/layer file) prompts to build the whole chain unless `--yes` /
 `$AGENT_VM_YES` is set. See `docs/adr/0003-project-tooling-layers.md`.
+
+## Layer image contract
+
+The eight clauses every **chain step**'s image must satisfy. Four are
+enforced at build time against the *built image's* OCI config: C1 (builds on
+its predecessor), C2 (keeps `PATH` additive), C3 (ends as root, final step
+only), C4 (targets the host platform — its base-image and `--platform`
+halves; see the ADR for what C4 does not cover). Four are documented-only,
+because they would need every built layer decompressed: C5 (doesn't touch
+agent-vm's own files), C6 (keeps `/bin/bash` and `/etc/passwd`/`/etc/group`
+appendable), C7 (installs tools readable by any uid), C8 (advertises a
+capability only when it works). A violation is a **hard error** (no opt-out),
+and the offending image is discarded (best-effort; a failed discard is
+reported alongside) so the next launch rebuilds and re-checks. The checks
+live in `crates/agent-vm/src/layer/contract.rs`; the ADR is canonical (the
+clauses, the grandfathering hole, what C4 omits).
+
+_Avoid_: "Dockerfile contract" — only a layer's *final* stage is exported, so
+`FROM ${BASE_IMAGE}` matters there; the checks are on built images.
 
 ## Forked mount
 
