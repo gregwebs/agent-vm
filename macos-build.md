@@ -192,6 +192,36 @@ The script verifies the signature and both required entitlements before
 publishing the bundle. Run runtime smoke tests from a normal Terminal without
 `sudo` or a sandbox wrapper.
 
+### Boot fails with `Not authorized` against `index.docker.io`
+
+```text
+Error: creating sandbox
+Caused by:
+    image error: registry error: Not authorized: url https://index.docker.io/v2/library/agent-vm-template/manifests/latest
+```
+
+This is **not** a registry-credentials problem, and there is nothing to log in
+to. `index.docker.io/v2/library/...` means the requested reference was
+**unqualified**, so `msb` resolved it against Docker Hub instead of GHCR — where
+no image of that name exists, so the lookup is reported as unauthorized. Check
+both `--image` and the `AGENT_VM_IMAGE_TAG` environment variable, because a
+value exported from a shell profile overrides what you pass on the command
+line:
+
+- an unqualified `agent-vm-template:latest` resolves to
+  `index.docker.io/library/agent-vm-template` — **not** to the local image cache
+  and **not** to `ghcr.io/wirenboard/agent-vm-template`
+- use the fully qualified `ghcr.io/wirenboard/agent-vm-template:latest`, or an
+  imported local tag — see [Import and boot a local image without a
+  registry](#import-and-boot-a-local-image-without-a-registry)
+
+A `Not authorized` here can also mean the image is simply absent from whichever
+cache `msb` is configured to use, which is expected when the shared-cache opt-in
+points at a cache that does not have it — see [Sharing the OCI image cache with
+a Homebrew `msb`](#sharing-the-oci-image-cache-with-a-homebrew-msb) and, in
+`USAGE.md`, *Reverting is a manual step*. In both cases the error text points at
+the registry, not at the actual cause.
+
 ### Supported source rebuild
 
 For a complete source rebuild, use the root script:
