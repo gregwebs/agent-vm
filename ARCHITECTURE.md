@@ -136,7 +136,8 @@ but is invisible for the non-root default, whose `HOME` lives under
 `/agent-vm-state` — a *runtime* bind mount that shadows whatever the patch
 wrote. Non-root links are therefore materialized host-side by
 `ProjectSession::provision_guest_home`, dangling on the host and resolving once
-mounted. Both paths draw from the same `session::GUEST_HOME_LINKS` table.
+mounted. Both paths draw from the same `credential_provider::guest_home_links()`
+table.
 
 ### Extra and forked mounts: `ro`, `rw`, `fork`, `follow-links`
 

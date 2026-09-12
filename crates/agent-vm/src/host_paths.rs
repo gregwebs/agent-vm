@@ -33,22 +33,6 @@ pub fn state_root() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".local/state/agent-vm"))
 }
 
-pub fn host_claude_creds_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".claude/.credentials.json"))
-}
-
-pub fn host_codex_auth_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".codex/auth.json"))
-}
-
-pub fn host_opencode_auth_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/share/opencode/auth.json"))
-}
-
-pub fn host_copilot_token_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache/claude-vm/copilot-token.json"))
-}
-
 /// Reads a regular host credential file without allowing a FIFO or oversized
 /// file to consume a launcher or validated interception request.
 pub(crate) fn read_bounded_regular_file(path: &Path, max: u64) -> Result<Vec<u8>> {

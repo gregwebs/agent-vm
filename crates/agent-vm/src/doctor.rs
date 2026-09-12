@@ -142,39 +142,29 @@ fn gather_credentials() -> CredReport {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    let hosts = vec![
-        (
-            "claude",
-            crate::host_paths::host_claude_creds_path(),
-            true, // parse claudeAiOauth.expiresAt
-        ),
-        ("codex", crate::host_paths::host_codex_auth_path(), false),
-        (
-            "opencode",
-            crate::host_paths::host_opencode_auth_path(),
-            false,
-        ),
-        (
-            "copilot",
-            crate::host_paths::host_copilot_token_path(),
-            false,
-        ),
-    ]
-    .into_iter()
-    .map(|(label, path, want_expiry)| {
-        let shown = path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<no $HOME>".to_string());
-        let state = match &path {
-            None => HostCred::Unreadable {
-                why: "no $HOME".into(),
-            },
-            Some(p) => inspect_host_cred(p, want_expiry),
-        };
-        (label, shown, state)
-    })
-    .collect();
+    // The host credential table is the provider table: `doctor_label`
+    // (`claude`/`codex`/`opencode`/`copilot`) and `doctor_parses_expiry` are
+    // retained verbatim so this output stays byte-identical, and `ALL` order
+    // is the historical claude, codex, opencode, copilot order.
+    let hosts = crate::credential_provider::CredentialProvider::ALL
+        .into_iter()
+        .map(|provider| {
+            let label = provider.doctor_label();
+            let want_expiry = provider.doctor_parses_expiry();
+            let path = provider.host_credential_path();
+            let shown = path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<no $HOME>".to_string());
+            let state = match &path {
+                None => HostCred::Unreadable {
+                    why: "no $HOME".into(),
+                },
+                Some(p) => inspect_host_cred(p, want_expiry),
+            };
+            (label, shown, state)
+        })
+        .collect();
 
     CredReport {
         hosts,

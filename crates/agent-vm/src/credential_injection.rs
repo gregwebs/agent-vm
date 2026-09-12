@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use microsandbox::sandbox::SandboxBuilder;
 use microsandbox_network::builder::NetworkBuilder;
 
+use crate::credential_provider::{self, CredentialProvider, ProviderSet};
 use crate::secrets::{self, CredsState};
 
 const MAX_BUFFERED_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -14,8 +15,29 @@ pub(crate) struct Inputs<'a> {
     pub creds: &'a CredsState,
     pub state_dir: &'a Path,
     pub allowed_repos: &'a [String],
-    pub include_copilot: bool,
+    pub providers: ProviderSet,
 }
+
+/// Registration order for the substituting proxy's secrets. Explicit because
+/// GitHub is *not* a [`CredentialProvider`] (it is gated by `--no-git`, not by
+/// the launched tool) yet has always been registered between the OpenCode and
+/// Copilot entries. Reordering is believed harmless —
+/// `secrets::placeholders_are_pairwise_distinct` proves no placeholder is a
+/// substring of another, so substitution cannot pick the wrong secret — but
+/// this is a prefactor, so the wire order stays byte-identical and is asserted
+/// by `proxy_plan_matches_legacy_for_each_agent`.
+enum WireSlot {
+    Provider(CredentialProvider),
+    GithubEgress,
+}
+
+const WIRE_ORDER: [WireSlot; 5] = [
+    WireSlot::Provider(CredentialProvider::Anthropic),
+    WireSlot::Provider(CredentialProvider::OpenAi),
+    WireSlot::Provider(CredentialProvider::OpencodeStatic),
+    WireSlot::GithubEgress,
+    WireSlot::Provider(CredentialProvider::Copilot),
+];
 
 pub(crate) struct Plan {
     secrets: Vec<FileSecret>,
@@ -55,104 +77,80 @@ impl Plan {
 
         let mut secrets = Vec::new();
         let mut routes = Vec::new();
-        if let Some(path) = &inputs.creds.anthropic_token_file {
-            secrets.push(FileSecret {
-                env_var: "MSB_AGENT_VM_ANTHROPIC_UNUSED".into(),
-                placeholder: secrets::ANTHROPIC_ACCESS_PLACEHOLDER.into(),
-                path: path.clone(),
-                hosts: vec![
-                    secrets::ANTHROPIC_API_HOST,
-                    secrets::ANTHROPIC_OAUTH_HOST,
-                    secrets::ANTHROPIC_MCP_PROXY_HOST,
-                ],
-                basic_auth: false,
-            });
-            routes.push(Route {
-                host: secrets::ANTHROPIC_OAUTH_HOST,
-                method: "POST",
-                path: secrets::ANTHROPIC_OAUTH_TOKEN_PATH,
-                dispatch_on_headers: false,
-            });
-        }
-        if let Some(path) = &inputs.creds.openai_token_file {
-            secrets.push(FileSecret {
-                env_var: "MSB_AGENT_VM_OPENAI_UNUSED".into(),
-                placeholder: secrets::OPENAI_ACCESS_PLACEHOLDER.into(),
-                path: path.clone(),
-                hosts: vec![
-                    secrets::OPENAI_API_HOST,
-                    secrets::OPENAI_CHATGPT_HOST,
-                    secrets::OPENAI_OAUTH_HOST,
-                ],
-                basic_auth: false,
-            });
-            routes.push(Route {
-                host: secrets::OPENAI_OAUTH_HOST,
-                method: "POST",
-                path: secrets::OPENAI_OAUTH_TOKEN_PATH,
-                dispatch_on_headers: false,
-            });
-        }
-        if let Some(path) = &inputs.creds.opencode_openai_access_token_file {
-            secrets.push(FileSecret {
-                env_var: "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED".into(),
-                placeholder: secrets::OPENCODE_OPENAI_ACCESS_PLACEHOLDER.into(),
-                path: path.clone(),
-                hosts: vec![secrets::OPENAI_API_HOST, secrets::OPENAI_CHATGPT_HOST],
-                basic_auth: false,
-            });
-        }
-        if let Some(path) = &inputs.creds.gh_token_file {
-            secrets.push(FileSecret {
-                env_var: "MSB_AGENT_VM_GH_UNUSED".into(),
-                placeholder: secrets::GH_TOKEN_PLACEHOLDER.into(),
-                path: path.clone(),
-                hosts: vec![
-                    secrets::GITHUB_API_HOST,
-                    secrets::GITHUB_HOST,
-                    secrets::GITHUB_CODELOAD_HOST,
-                    secrets::GITHUB_RAW_HOST,
-                    secrets::GITHUB_OBJECTS_HOST,
-                ],
-                basic_auth: true,
-            });
-            for method in API_METHODS {
-                routes.push(Route {
-                    host: secrets::GITHUB_API_HOST,
-                    method,
-                    path: "/",
-                    dispatch_on_headers: false,
-                });
-            }
-            for host in [
-                secrets::GITHUB_HOST,
-                secrets::GITHUB_CODELOAD_HOST,
-                secrets::GITHUB_RAW_HOST,
-                secrets::GITHUB_OBJECTS_HOST,
-            ] {
-                for method in SMART_HTTP_METHODS {
-                    routes.push(Route {
-                        host,
-                        method,
-                        path: "/",
-                        dispatch_on_headers: true,
+        for slot in WIRE_ORDER {
+            match slot {
+                WireSlot::Provider(provider) => {
+                    if credential_provider::proxy_requires_selection(provider)
+                        && !inputs.providers.contains(provider)
+                    {
+                        continue;
+                    }
+                    let (Some(spec), Some(path)) = (
+                        credential_provider::proxy_secret(provider),
+                        inputs.creds.token_file(provider),
+                    ) else {
+                        continue;
+                    };
+                    secrets.push(FileSecret {
+                        env_var: spec.env_var.into(),
+                        placeholder: spec.placeholder.into(),
+                        path: path.to_path_buf(),
+                        hosts: spec.hosts.to_vec(),
+                        basic_auth: spec.basic_auth,
                     });
+                    if let Some((host, path)) = spec.oauth_token_route {
+                        routes.push(Route {
+                            host,
+                            method: "POST",
+                            path,
+                            dispatch_on_headers: false,
+                        });
+                    }
+                }
+                WireSlot::GithubEgress => {
+                    // GitHub is not a `CredentialProvider`: its capture is
+                    // gated by `--no-git`, not by the launched tool. Keep its
+                    // own block (with its route allow-list) as before.
+                    if let Some(path) = &inputs.creds.gh_token_file {
+                        secrets.push(FileSecret {
+                            env_var: "MSB_AGENT_VM_GH_UNUSED".into(),
+                            placeholder: secrets::GH_TOKEN_PLACEHOLDER.into(),
+                            path: path.clone(),
+                            hosts: vec![
+                                secrets::GITHUB_API_HOST,
+                                secrets::GITHUB_HOST,
+                                secrets::GITHUB_CODELOAD_HOST,
+                                secrets::GITHUB_RAW_HOST,
+                                secrets::GITHUB_OBJECTS_HOST,
+                            ],
+                            basic_auth: true,
+                        });
+                        for method in API_METHODS {
+                            routes.push(Route {
+                                host: secrets::GITHUB_API_HOST,
+                                method,
+                                path: "/",
+                                dispatch_on_headers: false,
+                            });
+                        }
+                        for host in [
+                            secrets::GITHUB_HOST,
+                            secrets::GITHUB_CODELOAD_HOST,
+                            secrets::GITHUB_RAW_HOST,
+                            secrets::GITHUB_OBJECTS_HOST,
+                        ] {
+                            for method in SMART_HTTP_METHODS {
+                                routes.push(Route {
+                                    host,
+                                    method,
+                                    path: "/",
+                                    dispatch_on_headers: true,
+                                });
+                            }
+                        }
+                    }
                 }
             }
-        }
-        if inputs.include_copilot
-            && let Some(path) = &inputs.creds.copilot_token_file
-        {
-            secrets.push(FileSecret {
-                env_var: "MSB_AGENT_VM_COPILOT_UNUSED".into(),
-                placeholder: secrets::COPILOT_TOKEN_PLACEHOLDER.into(),
-                path: path.clone(),
-                hosts: vec![
-                    secrets::COPILOT_API_HOST,
-                    secrets::COPILOT_API_INDIVIDUAL_HOST,
-                ],
-                basic_auth: false,
-            });
         }
 
         for (provider, path) in &inputs.creds.opencode_api_token_files {
@@ -241,13 +239,18 @@ mod tests {
     fn path(name: &str) -> PathBuf {
         PathBuf::from(format!("/host/{name}"))
     }
-    fn inputs(creds: &CredsState, include_copilot: bool) -> Inputs<'_> {
+    fn inputs(creds: &CredsState, providers: ProviderSet) -> Inputs<'_> {
         Inputs {
             creds,
             state_dir: Path::new("/state/project"),
             allowed_repos: &[],
-            include_copilot,
+            providers,
         }
+    }
+
+    /// Select every compiled-in provider (the "all secrets present" case).
+    fn all() -> ProviderSet {
+        ProviderSet::new(CredentialProvider::ALL)
     }
     fn network(plan: Plan) -> microsandbox_network::config::NetworkConfig {
         plan.configure_network(NetworkBuilder::new())
@@ -255,9 +258,146 @@ mod tests {
             .unwrap()
     }
 
+    /// V6: the emitted secret registration order, captured on the
+    /// pre-refactor tree. Today it is `anthropic, openai, opencode-openai,
+    /// gh, copilot` then the static OpenCode rows. A prefactor must keep
+    /// this byte-identical (the `WIRE_ORDER` splice exists for exactly
+    /// this reason).
+    #[test]
+    fn proxy_plan_matches_legacy_order() {
+        let creds = CredsState {
+            anthropic_token_file: Some(path("anthropic")),
+            openai_token_file: Some(path("openai")),
+            opencode_openai_access_token_file: Some(path("openai")),
+            gh_token_file: Some(path("gh")),
+            copilot_token_file: Some(path("copilot")),
+            ..CredsState::default()
+        };
+        let config = network(Plan::new(path("agent-vm"), inputs(&creds, all())).unwrap());
+        let order: Vec<String> = config
+            .secrets
+            .secrets
+            .iter()
+            .map(|entry| entry.env_var.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+                "MSB_AGENT_VM_OPENAI_UNUSED",
+                "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
+                "MSB_AGENT_VM_GH_UNUSED",
+                "MSB_AGENT_VM_COPILOT_UNUSED",
+            ]
+        );
+    }
+
+    /// V6: per-tool secret order. With every token file present, the
+    /// *legacy asymmetry* shows: anthropic/openai/opencode-openai/gh are
+    /// registered for **every** tool (only Copilot requires selection). The
+    /// order is fixed by `WIRE_ORDER`, with `gh` spliced between the OpenCode
+    /// and Copilot entries.
+    #[test]
+    fn proxy_plan_matches_legacy_for_each_agent() {
+        let creds = CredsState {
+            anthropic_token_file: Some(path("anthropic")),
+            openai_token_file: Some(path("openai")),
+            opencode_openai_access_token_file: Some(path("openai")),
+            gh_token_file: Some(path("gh")),
+            copilot_token_file: Some(path("copilot")),
+            ..CredsState::default()
+        };
+        let base = [
+            "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+            "MSB_AGENT_VM_OPENAI_UNUSED",
+            "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
+            "MSB_AGENT_VM_GH_UNUSED",
+        ];
+        let opencode = ProviderSet::new([
+            CredentialProvider::OpenAi,
+            CredentialProvider::OpencodeStatic,
+        ]);
+        let cases: [(&str, ProviderSet, &[&str]); 5] = [
+            (
+                "claude",
+                ProviderSet::new([CredentialProvider::Anthropic]),
+                &base,
+            ),
+            (
+                "codex",
+                ProviderSet::new([CredentialProvider::OpenAi]),
+                &base,
+            ),
+            ("opencode", opencode, &base),
+            ("shell", opencode, &base),
+            (
+                "copilot",
+                ProviderSet::new([CredentialProvider::Copilot]),
+                &[
+                    "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+                    "MSB_AGENT_VM_OPENAI_UNUSED",
+                    "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
+                    "MSB_AGENT_VM_GH_UNUSED",
+                    "MSB_AGENT_VM_COPILOT_UNUSED",
+                ],
+            ),
+        ];
+        for (name, providers, expected) in cases {
+            let config = network(Plan::new(path("agent-vm"), inputs(&creds, providers)).unwrap());
+            let order: Vec<String> = config
+                .secrets
+                .secrets
+                .iter()
+                .map(|entry| entry.env_var.clone())
+                .collect();
+            assert_eq!(order, expected, "secret order changed for {name}");
+        }
+        // A non-copilot tool must never register the copilot placeholder.
+        for (name, providers, _) in &cases[..4] {
+            let config = network(Plan::new(path("agent-vm"), inputs(&creds, *providers)).unwrap());
+            assert!(
+                config
+                    .secrets
+                    .secrets
+                    .iter()
+                    .all(|entry| entry.placeholder != secrets::COPILOT_TOKEN_PLACEHOLDER),
+                "copilot leaked into a {name} launch"
+            );
+        }
+    }
+
+    /// V14: the hand-written `WIRE_ORDER` array covers every provider exactly
+    /// once plus one GitHub slot. A fifth provider that is added to the enum
+    /// but forgotten here then fails a test instead of silently vanishing
+    /// from the proxy.
+    #[test]
+    fn wire_order_covers_every_provider_exactly_once() {
+        let mut providers = Vec::new();
+        let mut github = 0;
+        for slot in WIRE_ORDER {
+            match slot {
+                WireSlot::Provider(provider) => providers.push(provider),
+                WireSlot::GithubEgress => github += 1,
+            }
+        }
+        assert_eq!(github, 1, "GithubEgress must appear exactly once");
+        for provider in CredentialProvider::ALL {
+            assert_eq!(
+                providers.iter().filter(|p| **p == provider).count(),
+                1,
+                "{provider:?} must appear exactly once in WIRE_ORDER"
+            );
+        }
+        assert_eq!(providers.len(), CredentialProvider::ALL.len());
+    }
+
     #[test]
     fn no_credentials_leave_network_unmodified() {
-        let plan = Plan::new(path("agent-vm"), inputs(&CredsState::default(), false)).unwrap();
+        let plan = Plan::new(
+            path("agent-vm"),
+            inputs(&CredsState::default(), ProviderSet::default()),
+        )
+        .unwrap();
         let config = network(plan);
         assert!(config.secrets.secrets.is_empty());
         assert!(!config.intercept.is_active());
@@ -285,7 +425,7 @@ mod tests {
                     creds: &creds,
                     state_dir: Path::new("/state/project"),
                     allowed_repos: &allowed_repos,
-                    include_copilot: true,
+                    providers: all(),
                 },
             )
             .unwrap(),
@@ -368,7 +508,8 @@ mod tests {
                 .collect(),
             ..CredsState::default()
         };
-        let config = network(Plan::new(path("agent-vm"), inputs(&creds, false)).unwrap());
+        let config =
+            network(Plan::new(path("agent-vm"), inputs(&creds, ProviderSet::default())).unwrap());
         assert_eq!(
             config.secrets.secrets.len(),
             secrets::OPENCODE_API_PROVIDERS.len()
@@ -410,7 +551,8 @@ mod tests {
             copilot_token_file: Some(path("copilot")),
             ..CredsState::default()
         };
-        let without = network(Plan::new(path("agent-vm"), inputs(&creds, false)).unwrap());
+        let without =
+            network(Plan::new(path("agent-vm"), inputs(&creds, ProviderSet::default())).unwrap());
         assert_eq!(without.secrets.secrets.len(), 1);
         assert_eq!(
             without.secrets.secrets[0].placeholder,
@@ -423,7 +565,7 @@ mod tests {
                 .iter()
                 .all(|route| route.host != secrets::GITHUB_API_HOST)
         );
-        let with = network(Plan::new(path("agent-vm"), inputs(&creds, true)).unwrap());
+        let with = network(Plan::new(path("agent-vm"), inputs(&creds, all())).unwrap());
         assert!(
             with.secrets
                 .secrets
@@ -439,7 +581,8 @@ mod tests {
             opencode_openai_access_token_file: Some(path("openai")),
             ..CredsState::default()
         };
-        let config = network(Plan::new(path("agent-vm"), inputs(&creds, false)).unwrap());
+        let config =
+            network(Plan::new(path("agent-vm"), inputs(&creds, ProviderSet::default())).unwrap());
         assert_eq!(config.secrets.secrets.len(), 2);
         assert!(
             config
@@ -461,7 +604,7 @@ mod tests {
             copilot_token_file: Some(path("copilot")),
             ..CredsState::default()
         };
-        let config = network(Plan::new(path("agent-vm"), inputs(&creds, true)).unwrap());
+        let config = network(Plan::new(path("agent-vm"), inputs(&creds, all())).unwrap());
         let expected = [
             (
                 "MSB_AGENT_VM_ANTHROPIC_UNUSED",
@@ -601,7 +744,9 @@ mod tests {
                 Some(secrets::GITHUB_API_HOST),
             ),
         ] {
-            let config = network(Plan::new(path("agent-vm"), inputs(&creds, false)).unwrap());
+            let config = network(
+                Plan::new(path("agent-vm"), inputs(&creds, ProviderSet::default())).unwrap(),
+            );
             assert_eq!(config.secrets.secrets.len(), 1);
             assert_eq!(config.secrets.secrets[0].placeholder, expected_placeholder);
             if let Some(host) = expected_route_host {
@@ -630,7 +775,7 @@ mod tests {
             .policy(base_policy.clone())
             .port(8080, 3000)
             .auto_publish();
-        let config = Plan::new(path("agent-vm"), inputs(&creds, false))
+        let config = Plan::new(path("agent-vm"), inputs(&creds, ProviderSet::default()))
             .unwrap()
             .configure_network(base)
             .build()
