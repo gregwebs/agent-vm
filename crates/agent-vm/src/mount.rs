@@ -2442,9 +2442,14 @@ const FORK_MAX_LINK_DEPTH: usize = 40;
 // fire for the copy its test armed it for. Cargo runs unit tests in parallel,
 // so an unscoped process-global hook would run inside a stranger's copy and
 // mutate that other test's tree.
+//
+// The tuple is `(scope, callback)`; the alias keeps it readable and out of
+// clippy's `type_complexity` lint, which `--all-targets` now gates on.
 #[cfg(test)]
-static COPY_CHECKPOINT: std::sync::Mutex<Option<(PathBuf, Box<dyn Fn(&Path) + Send>)>> =
-    std::sync::Mutex::new(None);
+type CopyCheckpoint = (PathBuf, Box<dyn Fn(&Path) + Send>);
+
+#[cfg(test)]
+static COPY_CHECKPOINT: std::sync::Mutex<Option<CopyCheckpoint>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 thread_local! {
@@ -3228,7 +3233,7 @@ mod prepare_tests {
         let store = tempfile::tempdir().unwrap();
         let request = format!("{spelling}:/guest:fork");
         let seeded = prepare(
-            parse_extra_mounts(&[request.clone()]).unwrap(),
+            parse_extra_mounts(std::slice::from_ref(&request)).unwrap(),
             &context(store.path()),
         )
         .unwrap();
@@ -3708,7 +3713,7 @@ mod prepare_tests {
             let guest = PathBuf::from("/guest/file");
             let fork = format!("{}:{}:fork", source.display(), guest.display());
             prepare(
-                parse_extra_mounts(&[fork.clone()]).unwrap(),
+                parse_extra_mounts(std::slice::from_ref(&fork)).unwrap(),
                 &context(store.path()),
             )
             .expect("first launch seeds the file fork");
@@ -3746,7 +3751,7 @@ mod prepare_tests {
                 followed_guest.display()
             );
             prepare(
-                parse_extra_mounts(&[followed_fork.clone()]).unwrap(),
+                parse_extra_mounts(std::slice::from_ref(&followed_fork)).unwrap(),
                 &context(store.path()),
             )
             .expect("first launch seeds the followed file fork");
@@ -3810,7 +3815,7 @@ mod prepare_tests {
             let store = tempfile::tempdir().unwrap();
             let fork = format!("{}:/guest/directory:fork", source.display());
             prepare(
-                parse_extra_mounts(&[fork.clone()]).unwrap(),
+                parse_extra_mounts(std::slice::from_ref(&fork)).unwrap(),
                 &context(store.path()),
             )
             .expect("first launch seeds the directory fork");
@@ -4178,7 +4183,7 @@ mod prepare_tests {
         let store = tempfile::tempdir().unwrap();
         let request = format!("{}:/guest:fork:follow-links", source.display());
         let error = prepare(
-            parse_extra_mounts(&[request.clone()]).unwrap(),
+            parse_extra_mounts(std::slice::from_ref(&request)).unwrap(),
             &context(store.path()),
         )
         .unwrap_err()
@@ -4533,7 +4538,7 @@ mod prepare_tests {
         let store = tempfile::tempdir().unwrap();
         let request = format!("{}:/guest:fork", declaration.display());
         let seeded = prepare(
-            parse_extra_mounts(&[request.clone()]).unwrap(),
+            parse_extra_mounts(std::slice::from_ref(&request)).unwrap(),
             &context(store.path()),
         )
         .unwrap();

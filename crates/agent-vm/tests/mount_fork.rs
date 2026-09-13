@@ -915,7 +915,7 @@ fn ready_directory_fork_reuses_committed_anchor_for_nested_exclusion_in_either_o
             let binds = bind_mounts(&config);
             assert!(
                 binds.iter().any(|(host, guest, readonly)| {
-                    PathBuf::from(host) == committed && guest == "/fork" && !readonly
+                    *host == committed && guest == "/fork" && !readonly
                 }),
                 "expected committed fork bind, got: {binds:?}"
             );
