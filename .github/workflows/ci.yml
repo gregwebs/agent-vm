@@ -82,9 +82,12 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all -- --check
 
+      # Gating lint. `--all-targets` covers the integration tests and both
+      # workspace members, so a lint regression in test-only code fails the
+      # build too. Unlike the format check above, this step is deliberately not
+      # `continue-on-error`: it is clean as of this commit and must stay clean.
       - name: Clippy
-        continue-on-error: true
-        run: cargo clippy -p agent-vm --release -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   # macOS is a first-class supported host (script/build/macos.sh,
   # macos-build.md) but a full libkrunfw/msb build is too slow for per-PR

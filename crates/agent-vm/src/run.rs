@@ -2444,6 +2444,88 @@ fn shell_escape(s: &str) -> String {
     out
 }
 
+/// Seed the pulled-digest marker from microsandbox's cache when we have
+/// no record yet, so the update banner has a baseline to diff against on
+/// this very launch.
+///
+/// The marker (what the banner compares to the registry) was historically
+/// written *only* by `agent-vm pull`. A user who acquired the image via a
+/// launch's `IfMissing` auto-pull — or via an older agent-vm that never
+/// wrote it — had no baseline, so the banner could never fire. Here, if
+/// the image is already cached and unmarked, we record its per-platform
+/// manifest digest. Then a stale cache trips the banner on the next probe
+/// (i.e. immediately, since the call below seeds before we probe).
+///
+/// Safe on the launch path: `IfMissing` never re-pulls, so `Image::get`'s
+/// digest is accurate (the re-pull staleness that makes pull.rs avoid
+/// `Image::get` — see pulled_marker.rs — can't apply here). Verified
+/// empirically that `Image::get(...).manifest_digest()` is the same
+/// per-platform digest `image_check::fetch_remote_digest` returns, so the
+/// comparison is apples-to-apples. Only ever *seed* — never overwrite an
+/// existing marker, which is the authoritative record of our last pull.
+async fn seed_pulled_marker_if_absent(image: &str) {
+    if crate::pulled_marker::read(image).is_some() {
+        return;
+    }
+    // Not cached yet (genuine first run) → Image::get errors → nothing to
+    // seed, and there's correctly nothing newer to flag: the imminent
+    // IfMissing pull lands the current image.
+    //
+    // Baseline v0.6.15's Image::get resolves the active local backend
+    // internally (crate::backend::default_backend()), so no separate
+    // LocalBackend handle is needed here any more.
+    if let Ok(handle) = microsandbox::Image::get(image).await
+        && let Some(digest) = handle.manifest_digest()
+    {
+        match crate::pulled_marker::write(image, digest) {
+            Ok(()) => tracing::debug!(image, digest, "seeded pulled-digest baseline from cache"),
+            Err(e) => tracing::warn!(error = %e, "failed to seed pulled-digest marker"),
+        }
+    }
+}
+
+async fn notify_if_update_available<W: std::io::Write>(
+    image: &str,
+    notices: &mut LaunchNotices<W>,
+) -> Result<()> {
+    use crate::image_check::{UpdateState, check_for_update};
+    // The probe does up to three sequential registry round-trips for a
+    // token-auth registry (manifest GET → 401 → token → authed GET),
+    // each carrying its own 5s per-request timeout. This runs inline on
+    // the launch hot path before boot, so cap the whole thing: a slow or
+    // flaky registry must never delay launch by more than a single
+    // request's worth of wait. The banner is best-effort — on timeout we
+    // simply stay quiet and continue with the cached image.
+    let probe = tokio::time::timeout(UPDATE_PROBE_BUDGET, check_for_update(image));
+    // Every other outcome is deliberately silent:
+    //   UpToDate / NotCached: nothing to say.
+    //   Ok(Err)/None: registry unreachable etc. — stay quiet.
+    //   Err(Elapsed): probe exceeded the budget — stay quiet.
+    if let Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) = probe.await {
+        notices.emit(format!(
+            "==> A newer image is available in the registry (cached {cached}, registry {remote})"
+        ))?;
+        notices.emit("==> Run `agent-vm pull` to fetch it. Continuing with the cached image.")?;
+    }
+    Ok(())
+}
+
+/// Whether to run the launch-time registry update probe.
+///
+/// Off by default. Enabled by the `--update-check` flag OR a truthy
+/// `AGENT_VM_UPDATE_CHECK` env var. `env_val` is the raw value of that
+/// variable (`None` when unset), so this stays pure and unit-testable.
+/// Truthy values match the shared `env_flag` convention (`1|true|yes|on`).
+fn should_check_update(flag: bool, env_val: Option<&str>) -> bool {
+    flag || env_val.is_some_and(crate::env_flag::is_truthy)
+}
+
+/// Wall-clock budget for the launch-path update probe. Bounds the worst
+/// case across all of the probe's registry round-trips so a slow or
+/// unreachable registry can't stall boot; matches a single request's
+/// per-request timeout in `image_check`.
+const UPDATE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4231,85 +4313,3 @@ options ndots:2 timeout:1";
         assert!(slugs.is_empty(), "no .gitmodules → no slugs, got {slugs:?}");
     }
 }
-
-/// Seed the pulled-digest marker from microsandbox's cache when we have
-/// no record yet, so the update banner has a baseline to diff against on
-/// this very launch.
-///
-/// The marker (what the banner compares to the registry) was historically
-/// written *only* by `agent-vm pull`. A user who acquired the image via a
-/// launch's `IfMissing` auto-pull — or via an older agent-vm that never
-/// wrote it — had no baseline, so the banner could never fire. Here, if
-/// the image is already cached and unmarked, we record its per-platform
-/// manifest digest. Then a stale cache trips the banner on the next probe
-/// (i.e. immediately, since the call below seeds before we probe).
-///
-/// Safe on the launch path: `IfMissing` never re-pulls, so `Image::get`'s
-/// digest is accurate (the re-pull staleness that makes pull.rs avoid
-/// `Image::get` — see pulled_marker.rs — can't apply here). Verified
-/// empirically that `Image::get(...).manifest_digest()` is the same
-/// per-platform digest `image_check::fetch_remote_digest` returns, so the
-/// comparison is apples-to-apples. Only ever *seed* — never overwrite an
-/// existing marker, which is the authoritative record of our last pull.
-async fn seed_pulled_marker_if_absent(image: &str) {
-    if crate::pulled_marker::read(image).is_some() {
-        return;
-    }
-    // Not cached yet (genuine first run) → Image::get errors → nothing to
-    // seed, and there's correctly nothing newer to flag: the imminent
-    // IfMissing pull lands the current image.
-    //
-    // Baseline v0.6.15's Image::get resolves the active local backend
-    // internally (crate::backend::default_backend()), so no separate
-    // LocalBackend handle is needed here any more.
-    if let Ok(handle) = microsandbox::Image::get(image).await
-        && let Some(digest) = handle.manifest_digest()
-    {
-        match crate::pulled_marker::write(image, digest) {
-            Ok(()) => tracing::debug!(image, digest, "seeded pulled-digest baseline from cache"),
-            Err(e) => tracing::warn!(error = %e, "failed to seed pulled-digest marker"),
-        }
-    }
-}
-
-async fn notify_if_update_available<W: std::io::Write>(
-    image: &str,
-    notices: &mut LaunchNotices<W>,
-) -> Result<()> {
-    use crate::image_check::{UpdateState, check_for_update};
-    // The probe does up to three sequential registry round-trips for a
-    // token-auth registry (manifest GET → 401 → token → authed GET),
-    // each carrying its own 5s per-request timeout. This runs inline on
-    // the launch hot path before boot, so cap the whole thing: a slow or
-    // flaky registry must never delay launch by more than a single
-    // request's worth of wait. The banner is best-effort — on timeout we
-    // simply stay quiet and continue with the cached image.
-    let probe = tokio::time::timeout(UPDATE_PROBE_BUDGET, check_for_update(image));
-    // Every other outcome is deliberately silent:
-    //   UpToDate / NotCached: nothing to say.
-    //   Ok(Err)/None: registry unreachable etc. — stay quiet.
-    //   Err(Elapsed): probe exceeded the budget — stay quiet.
-    if let Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) = probe.await {
-        notices.emit(format!(
-            "==> A newer image is available in the registry (cached {cached}, registry {remote})"
-        ))?;
-        notices.emit("==> Run `agent-vm pull` to fetch it. Continuing with the cached image.")?;
-    }
-    Ok(())
-}
-
-/// Whether to run the launch-time registry update probe.
-///
-/// Off by default. Enabled by the `--update-check` flag OR a truthy
-/// `AGENT_VM_UPDATE_CHECK` env var. `env_val` is the raw value of that
-/// variable (`None` when unset), so this stays pure and unit-testable.
-/// Truthy values match the shared `env_flag` convention (`1|true|yes|on`).
-fn should_check_update(flag: bool, env_val: Option<&str>) -> bool {
-    flag || env_val.is_some_and(crate::env_flag::is_truthy)
-}
-
-/// Wall-clock budget for the launch-path update probe. Bounds the worst
-/// case across all of the probe's registry round-trips so a slow or
-/// unreachable registry can't stall boot; matches a single request's
-/// per-request timeout in `image_check`.
-const UPDATE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

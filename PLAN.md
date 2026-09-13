@@ -110,9 +110,10 @@ sources the project hook before exec. The refresh single-flight, the
   scripts, runs `actionlint`, and exercises `script/build/macos.sh` against
   fixture toolchains — but nothing boots a VM. Add: build the image, run
   `agent-vm setup --no-verify`, then `agent-vm shell -- -c 'echo ok'`, green on
-  at least linux-amd64. While in there, decide whether `cargo fmt` and
-  `cargo clippy -- -D warnings` should stop being `continue-on-error: true`
-  (`ci.yml:79-85`) — today both are advisory, so a lint regression merges green.
+  at least linux-amd64. The clippy half of the "while in there" decision is
+  settled: `cargo clippy --locked --workspace --all-targets -- -D warnings` is
+  now a gating step, not advisory, so a lint regression fails CI. `cargo fmt`
+  remains `continue-on-error: true`.
 - **B2 — Finish cross-arch packaging.** Per-platform npm packaging now exists
   (`npm-dist/agent-vm-linux-x64`, `npm-dist/agent-vm-linux-arm64`, dispatched
   from `npm-dist/agent-vm/bin/agent-vm.js`), so the old "bundles one
