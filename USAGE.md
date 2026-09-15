@@ -77,30 +77,63 @@ Each launcher accepts:
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
-| `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Modes: `:rw` (default), `:ro`, `:fork`, `:follow-links`, and repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). Capacity is host-specific. |
+| `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). Capacity is host-specific. |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 | `--layer DIR` | append a tooling layer after the project's own `.agent-vm/layers/*` (repeatable, command-line order; relative to the project dir) — see [Project tooling layers](#project-tooling-layers) |
 | `--yes` / `-y` | assume "yes" to the tooling-layer chain build confirmation (CI/non-interactive) — see [Project tooling layers](#project-tooling-layers) |
 
 ### Extra and forked mounts
 
-`--mount /host/path:/guest/path:fork` creates a writable project-scoped copy on
-first launch. Later launches bind that stored copy, never synchronize with `/host/path`,
-and print the exact reset directory. `:fork:follow-links` materializes link targets into
-that copy; without it nested link text is preserved. `fork` conflicts with `ro` and `rw`.
+`--mount` accepts `HOST[:GUEST][:MODE]...`. `GUEST` defaults to `HOST` (a
+mirror at the same absolute path). Valid mode tokens are `ro`, `rw`, `fork`,
+`follow-links`, and `exclude=REL`; contradictory tokens (`ro`+`rw`,
+`rw`+`follow-links`, `fork`+`ro`, `fork`+`rw`) are parse errors.
 
-Repeat `:exclude=REL` on any mode, for example
-`--mount /host:/guest:fork:exclude=credentials.json:exclude=cache`. `REL` is a nonempty
-normal relative path: it cannot contain `:`, control characters, `.`, `..`, empty
-components, or an absolute path. Live exclusions require an existing regular file or
-directory below a directory source; they become readonly opaque masks. Fork initialization
-omits excluded entries, so a guest can later create its own content there. A single-file
-fork cannot carry exclusions.
+| declaration | source and behavior |
+|---|---|
+| `HOST[:GUEST]`, `:rw` | directory, live writable bind |
+| `:ro` | directory or regular file, read-only bind |
+| `:follow-links`, `:ro:follow-links` | read-only discovery of resolved directory targets (unchanged; see below) |
+| `:fork` | directory root copied once into project state; nested link text preserved |
+| `:fork:follow-links` | directory root copied once; symlink targets materialized into the copy |
+| `:exclude=REL` | only with `:fork`; repeatable, normalized seed omissions |
 
-Forks consume the full initial-copy disk cost. Their source is not an atomic snapshot if
-it changes while copying. To reset/reseed, stop every launch using the fork, remove the
-printed fork directory, and launch the identical declaration again. Changing the source
-spelling, normalized guest path, follow policy, or exclusions creates a distinct fork.
+A live bind is a directory, or a regular file with `:ro`. A bare file mount
+defaults to writable and is rejected, as is `:rw` on a file; the error names
+the source and suggests `:ro` or forking the containing directory. `:fork`
+copies a **directory** only: a file fork root is rejected, and a file cannot
+be `:fork`ed. There is no writable single-file mount.
+
+`:fork` creates a writable project-scoped copy on first launch. Later launches
+bind that stored copy, never synchronize with `HOST`, and print the exact reset
+directory. `:fork:follow-links` materializes link targets into that copy;
+without it nested link text is preserved. `fork` conflicts with `ro` and `rw`.
+
+Repeat `:exclude=REL`, for example
+`--mount /host:/guest:fork:exclude=credentials.json:exclude=cache`. `REL` is a
+nonempty normal relative path: it cannot contain `:`, control characters, `.`,
+`..`, empty components, or an absolute path. Exclusions are **fork-only** — on
+any live bind they are a parse error (`:exclude is only supported on :fork
+mounts`). Fork initialization omits excluded entries, so a guest can later
+create its own content there; an explicit child mount at an omitted path is
+allowed, including a read-only file bind. Normal mount policies still apply:
+file children must be read-only. Exclusions are not a persistent guest access
+restriction.
+
+Forks consume the full initial-copy disk cost. Their source is not an atomic
+snapshot if it changes while copying. To reset/reseed, stop every launch using
+the fork, remove the printed fork directory, and launch the identical
+declaration again. Changing the source spelling, normalized guest path, follow
+policy, or exclusions creates a distinct fork. A v2 fork whose manifest `kind`
+is `file` (from an older build) fails closed: the error names the exact
+directory to remove, and nothing is reseeded, migrated, or deleted
+automatically.
+
+`follow-links` (unchanged) walks `HOST` on the host and bind-mounts each
+resolved directory target at its real absolute path, so links that leave
+`HOST` resolve in the guest. A resolved target outside `$HOME` is a hard
+error; a symlink to a file or a dangling symlink is skipped with a warning.
+`follow-links` implies `:ro`.
 
 Trailing args go to the agent: `agent-vm claude -p "say hi"`,
 `agent-vm shell -- -c 'cargo test'`.

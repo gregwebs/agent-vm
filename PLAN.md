@@ -29,7 +29,7 @@ only an index, so the roadmap below has a fixed starting point.
 | gh / git auth reused from the host, per-launch GitHub repo allow-list | [Credentials](USAGE.md#credentials) | [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
 | Host-credential security snapshot (SHA-256 at launch, re-checked on exit) | [Credentials](USAGE.md#credentials) | [Security snapshot](ARCHITECTURE.md#host-credential-security-snapshot) |
 | Network egress: `--publish` / `--auto-publish` / `--allow-egress` / `--allow-lan` / `--allow-host` | [Ports & egress](USAGE.md#ports--egress) | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
-| Extra mounts with `ro` / `rw` / `fork` / `follow-links` and opaque exclusions | [Extra and forked mounts](USAGE.md#extra-and-forked-mounts) | [Extra and forked mounts](ARCHITECTURE.md#extra-and-forked-mounts-ro-rw-fork-follow-links) |
+| Extra mounts with `ro` / `rw` / `fork` / `follow-links`; directory forks with seed exclusions; read-only file binds | [Extra and forked mounts](USAGE.md#extra-and-forked-mounts) | [Extra and forked mounts](ARCHITECTURE.md#extra-and-forked-mounts-ro-rw-fork-follow-links) |
 | Non-root guest by default, `--root` to opt out | [Guest user](USAGE.md#guest-user----root) | [ADR-0001](docs/adr/0001-non-root-guest-via-native-user.md), [ADR-0002](docs/adr/0002-mirror-host-home-and-username.md) |
 | Project tooling layers (`.agent-vm/layers/*`, plus any `--layer DIR`, an ordered chain), incl. the Chrome DevTools MCP layer | [Project tooling layers](USAGE.md#project-tooling-layers), [Chrome DevTools MCP](USAGE.md#chrome-devtools-mcp) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
 | Project hook (`.agent-vm.runtime.sh`) | [Project hook](USAGE.md#project-hook) | — |
