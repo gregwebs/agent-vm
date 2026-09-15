@@ -261,6 +261,6 @@ _Avoid_: "Dockerfile contract" — only a layer's *final* stage is exported, so
 
 ## Forked mount
 
-A writable, project-scoped persistent mount initialized once from a host file or directory. After initialization, the fork and source are independent: changes do not propagate in either direction.
+A writable, project-scoped persistent mount initialized once from a host **directory**. After initialization, the fork and source are independent: changes do not propagate in either direction. A fork can optionally omit entries while seeding (`:fork:exclude=REL`); omissions are seed-only and are not a persistent guest access restriction. Files are never forked — a regular file is mounted read-only instead.
 
 _Avoid_: "bind mount", which remains connected to the host path; "copy-on-write mount", which implies lazy shared backing storage.

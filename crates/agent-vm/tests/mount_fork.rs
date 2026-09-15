@@ -1,5 +1,6 @@
-//! Boot-free integration test for `--mount HOST:ro:follow-links` (issue #11,
-//! sub-issue of #9).
+//! Boot-free integration test for the narrowed `--mount` contract (issue
+//! #113): directory `:fork` seeds, read-only file binds, fork-only seed
+//! exclusions, plus the retained `:ro:follow-links` discovery from #11.
 //!
 //! Modeled on `tests/msb_cache_share.rs`, but that harness drives
 //! `agent-vm setup --no-verify`, which never enters `launch()` — the
@@ -309,6 +310,39 @@ fn bind_mounts(config: &serde_json::Value) -> Vec<(String, String, bool)> {
         .collect()
 }
 
+/// The top-level `follow_root_symlinks` flag of the bind mounted at `guest`.
+/// It is a sibling of `options`, not nested under it — the per-mount root
+/// follow opt-in (issue #113).
+fn bind_follow_root(config: &serde_json::Value, guest: &str) -> bool {
+    config["mounts"]
+        .as_array()
+        .expect("config.mounts must be an array")
+        .iter()
+        .find(|m| m["type"] == "Bind" && m["guest"] == guest)
+        .and_then(|m| m["follow_root_symlinks"].as_bool())
+        .unwrap_or_else(|| panic!("no Bind at {guest} with follow_root_symlinks in {config}"))
+}
+
+/// Every notice a rejected preparation could conceivably have emitted. Used
+/// by the rejection tests so a leaked builder/banner/repo-scope effect fails
+/// the test instead of passing on a missing specific string.
+fn assert_no_notices(stderr: &str) {
+    for notice in [
+        "[debug] sandbox config JSON:",
+        "==> agent-vm-",
+        "GitHub repo scope",
+        "Initialized fork",
+        "Reusing fork",
+        "==> Mounting",
+        "==> Masking",
+    ] {
+        assert!(
+            !stderr.contains(notice),
+            "a rejected plan must not emit {notice:?}: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn absent_state_root_supports_directory_fork_seed_and_reuse() {
     let h = Harness::new();
@@ -344,41 +378,28 @@ fn absent_state_root_supports_directory_fork_seed_and_reuse() {
 }
 
 #[test]
-fn ready_file_fork_with_explicit_child_is_rejected_before_launch_effects_in_either_order() {
-    for fork_first in [false, true] {
+fn live_readonly_file_parent_with_explicit_child_is_rejected_before_launch_effects_in_either_order()
+{
+    for file_first in [false, true] {
         let h = Harness::new();
-        let source = h.home.path().join("source-file");
+        let file = h.home.path().join("parent-file");
         let child = h.home.path().join("child-directory");
-        std::fs::write(&source, "seed").unwrap();
+        std::fs::write(&file, "content").unwrap();
         std::fs::create_dir(&child).unwrap();
-        let fork = format!("{}:/guest/file:fork", source.display());
-
-        // First launch seeds the file fork. The deliberately bogus image
-        // fails only after builder configuration, so this proves the seed is
-        // committed before the second launch's side-effect-free rejection.
-        let seeded = h.run_shell(&[&fork]);
-        assert!(stderr_of(&seeded).contains("Initialized fork"));
-        std::fs::remove_file(&source).unwrap();
-
+        let file_mount = format!("{}:/guest/file:ro", file.display());
         let child_mount = format!("{}:/guest/file/child:ro", child.display());
-        let mounts = if fork_first {
-            vec![fork.as_str(), child_mount.as_str()]
+
+        let mounts = if file_first {
+            vec![file_mount.as_str(), child_mount.as_str()]
         } else {
-            vec![child_mount.as_str(), fork.as_str()]
+            vec![child_mount.as_str(), file_mount.as_str()]
         };
         let before = state_tree(h.state.path());
         let rejected = h.run_shell(&mounts);
         assert!(!rejected.status.success());
         let stderr = stderr_of(&rejected);
         assert!(stderr.contains("below file mount"), "{stderr}");
-        assert!(
-            !stderr.contains("[debug] sandbox config JSON:")
-                && !stderr.contains("Initialized fork")
-                && !stderr.contains("Reusing fork")
-                && !stderr.contains("==> Mounting")
-                && !stderr.contains("==> Masking"),
-            "a rejected complete plan must not emit notices or builder output: {stderr}"
-        );
+        assert_no_notices(&stderr);
         assert_eq!(
             state_tree(h.state.path()),
             before,
@@ -388,60 +409,89 @@ fn ready_file_fork_with_explicit_child_is_rejected_before_launch_effects_in_eith
 }
 
 #[test]
-fn absent_state_root_supports_file_fork() {
+fn absent_state_root_rejects_file_fork_roots_without_effects() {
+    use std::os::unix::fs::symlink;
     let h = Harness::new();
-    let state_parent = tempfile::tempdir_in("/tmp").unwrap();
-    let state = state_parent
-        .path()
-        .canonicalize()
-        .unwrap()
-        .join("absent/state-root");
     let source = h.home.path().join("file-source");
     std::fs::write(&source, "seed").unwrap();
-    let mount = format!("{}:/guest-file:fork", source.display());
+    let symlinked = h.home.path().join("symlinked-file-source");
+    symlink(&source, &symlinked).unwrap();
 
-    let output = h.run_shell_at_state(&[&mount], &state);
-    let stderr = stderr_of(&output);
-    assert!(stderr.contains("Initialized fork"), "{stderr}");
-    assert!(stderr.contains("[debug] sandbox config JSON:"), "{stderr}");
+    // Plain, excluded, follow-links, and symlink-to-file fork roots all
+    // reject with the directory-only diagnostic and no launch/store effects.
+    for raw in [
+        format!("{}:/guest-file:fork", source.display()),
+        format!("{}:/guest-file:fork:exclude=x", source.display()),
+        format!("{}:/guest-file:fork:follow-links", source.display()),
+        format!("{}:/guest-file:fork", symlinked.display()),
+    ] {
+        let state_parent = tempfile::tempdir_in("/tmp").unwrap();
+        let state = state_parent
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("absent/state-root");
+        let output = h.run_shell_at_state(&[&raw], &state);
+        assert!(!output.status.success());
+        let stderr = stderr_of(&output);
+        assert!(
+            stderr.contains("a :fork source must be a directory"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("bind the file read-only with :ro"),
+            "{stderr}"
+        );
+        assert_no_notices(&stderr);
+        assert!(
+            !state.exists(),
+            "a rejected fork must not create the state root"
+        );
+    }
 }
 
 #[test]
-fn absent_state_root_supports_live_file_and_directory_exclusions() {
+fn absent_state_root_rejects_live_exclusions_before_source_lookup() {
     let h = Harness::new();
-    let state_parent = tempfile::tempdir_in("/tmp").unwrap();
-    let state = state_parent
-        .path()
-        .canonicalize()
-        .unwrap()
-        .join("absent/state-root");
     let source = h.home.path().join("live-source");
     std::fs::create_dir(&source).unwrap();
-    std::fs::write(source.join("hidden-file"), "secret").unwrap();
-    std::fs::create_dir(source.join("hidden-directory")).unwrap();
-    let mount = format!(
-        "{}:/guest:ro:exclude=hidden-file:exclude=hidden-directory",
-        source.display()
-    );
 
-    let output = h.run_shell_at_state(&[&mount], &state);
-    let stderr = stderr_of(&output);
-    let mounts = bind_mounts(&debug_config_json(&stderr));
-    assert!(
-        mounts
-            .iter()
-            .any(|(_, guest, readonly)| guest == "/guest/hidden-file" && *readonly),
-        "expected a readonly file mask, got: {mounts:?}"
-    );
-    assert!(stderr.contains("[debug] sandbox config JSON:"), "{stderr}");
-    assert!(
-        state.exists(),
-        "valid masks must create their required store hierarchy"
-    );
+    // Every live-bind exclusion form rejects at parse, including a
+    // nonexistent source (no filesystem lookup) and reordered suffixes.
+    for raw in [
+        format!("{}:/guest:ro:exclude=x", source.display()),
+        format!("{}:/guest:rw:exclude=x", source.display()),
+        format!("{}:/guest:exclude=x", source.display()),
+        format!("{}:/guest:follow-links:exclude=x", source.display()),
+        format!("{}:/guest:exclude=x:ro", source.display()),
+        format!(
+            "{}:/guest:ro:exclude=x",
+            h.home.path().join("missing").display()
+        ),
+    ] {
+        let state_parent = tempfile::tempdir_in("/tmp").unwrap();
+        let state = state_parent
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("absent/state-root");
+        let output = h.run_shell_at_state(&[&raw], &state);
+        assert!(!output.status.success());
+        let stderr = stderr_of(&output);
+        assert!(
+            stderr.contains(":exclude is only supported on :fork mounts"),
+            "{raw}: {stderr}"
+        );
+        assert_no_notices(&stderr);
+        assert!(
+            !state.exists(),
+            "a parse rejection must not create the state root"
+        );
+    }
 }
 
 #[test]
-fn file_fork_above_core_fails_before_mount_or_launch_side_effects() {
+fn file_ro_above_core_fails_before_mount_or_launch_side_effects() {
     let h = Harness::new();
     let state_parent = tempfile::tempdir_in("/tmp").unwrap();
     let state = state_parent
@@ -453,19 +503,13 @@ fn file_fork_above_core_fails_before_mount_or_launch_side_effects() {
     std::fs::write(&source, "seed").unwrap();
     let project = h.project_path();
     let guest = project.parent().unwrap();
-    let mount = format!("{}:{}:fork", source.display(), guest.display());
+    let mount = format!("{}:{}:ro", source.display(), guest.display());
 
     let output = h.run_shell_at_state(&[&mount], &state);
     assert!(!output.status.success());
     let stderr = stderr_of(&output);
     assert!(stderr.contains("below file mount"), "{stderr}");
-    assert!(
-        !stderr.contains("[debug] sandbox config JSON:")
-            && !stderr.contains("Initialized fork")
-            && !stderr.contains("Reusing fork")
-            && !stderr.contains("==> Mounting"),
-        "a rejected topology must not emit builder or mount side effects: {stderr}"
-    );
+    assert_no_notices(&stderr);
     assert!(
         !state.exists(),
         "a rejected topology must not create even an absent state root"
@@ -512,21 +556,14 @@ fn exact_core_followed_collision_fails_before_launch_side_effects() {
 }
 
 fn assert_no_launch_side_effects(harness: &Harness, stderr: &str) {
-    assert!(
-        !stderr.contains("[debug] sandbox config JSON:")
-            && !stderr.contains("Initialized fork")
-            && !stderr.contains("Reusing fork")
-            && !stderr.contains("==> Mounting")
-            && !stderr.contains("==> Masking"),
-        "a rejected topology must not emit builder or mount notices: {stderr}"
-    );
+    assert_no_notices(stderr);
     let state_entries = std::fs::read_dir(harness.state.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
     assert!(
         state_entries.is_empty(),
-        "a rejected topology must not create session, fork, mask, credential, or builder state: {state_entries:?}"
+        "a rejected topology must not create session, fork, credential, or builder state: {state_entries:?}"
     );
 }
 
@@ -865,7 +902,7 @@ fn follow_links_root_mode_without_home_is_a_hard_error() {
 }
 
 #[test]
-fn ready_directory_fork_reuses_committed_anchor_for_nested_exclusion_in_either_order() {
+fn ready_directory_fork_reuses_committed_anchor_for_nested_bind_in_either_order() {
     for child_follow_links in [false, true] {
         for fork_first in [false, true] {
             let h = Harness::new();
@@ -878,9 +915,9 @@ fn ready_directory_fork_reuses_committed_anchor_for_nested_exclusion_in_either_o
                 std::fs::create_dir(child.join("linked")).unwrap();
                 std::os::unix::fs::symlink("linked", child.join("alias")).unwrap();
             }
-            // The fork preserves this nested link. On reuse, physical alias
-            // validation must project the mask through committed `data`, not the
-            // deleted declaration root.
+            // The fork preserves this nested link. On reuse, the committed
+            // `data` directory is still the fork's anchor even after the
+            // declaration source is gone.
             std::os::unix::fs::symlink(&child, source.join("child")).unwrap();
             let fork = format!("{}:/fork:fork", source.display());
 
@@ -895,7 +932,7 @@ fn ready_directory_fork_reuses_committed_anchor_for_nested_exclusion_in_either_o
             std::fs::remove_dir(&source).unwrap();
 
             let child_mount = format!(
-                "{}:/fork/child:ro{}:exclude=secret",
+                "{}:/fork/child:ro{}",
                 child.display(),
                 if child_follow_links {
                     ":follow-links"
@@ -926,12 +963,10 @@ fn ready_directory_fork_reuses_committed_anchor_for_nested_exclusion_in_either_o
                 "expected child bind, got: {binds:?}"
             );
             assert!(
-                binds.iter().any(|(host, guest, readonly)| {
-                    host.ends_with(".mounts/.mask-file")
-                        && guest == "/fork/child/secret"
-                        && *readonly
-                }),
-                "expected readonly opaque file mask, got: {config}"
+                !binds
+                    .iter()
+                    .any(|(_, guest, _)| guest == "/fork/child/secret"),
+                "no exclusion mask may be projected now that masks are removed: {binds:?}"
             );
             if child_follow_links {
                 assert!(
@@ -952,13 +987,55 @@ fn ready_directory_fork_reuses_committed_anchor_for_nested_exclusion_in_either_o
 }
 
 #[test]
+fn fork_seed_omission_does_not_block_later_explicit_child_mount() {
+    // A seed omission removes content only during seeding; it is not a
+    // persistent guest access restriction. An explicit child mount at the
+    // omitted path is accepted and appears in the config.
+    for file_child in [false, true] {
+        let h = Harness::new();
+        let source = h.home.path().join("fork-source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("omitted"), "secret").unwrap();
+        std::fs::create_dir(source.join("kept")).unwrap();
+        let explicit = h.home.path().join("explicit-child");
+        if file_child {
+            std::fs::write(&explicit, "overlay").unwrap();
+        } else {
+            std::fs::create_dir(&explicit).unwrap();
+        }
+        let fork = format!("{}:/fork:fork:exclude=omitted", source.display());
+
+        let seeded = h.run_shell(&[&fork]);
+        assert!(stderr_of(&seeded).contains("Initialized fork"));
+
+        let child_mount = format!("{}:/fork/omitted:ro", explicit.display());
+        let reused = h.run_shell(&[&fork, &child_mount]);
+        let stderr = stderr_of(&reused);
+        let binds = bind_mounts(&debug_config_json(&stderr));
+        assert!(
+            binds.iter().any(|(host, guest, readonly)| {
+                host == &explicit.display().to_string() && guest == "/fork/omitted" && *readonly
+            }),
+            "expected the explicit child bind at the omitted seed path (file={file_child}), got: {binds:?}"
+        );
+    }
+}
+
+#[test]
 fn fork_debug_config_uses_committed_data_not_source_and_reuses_it() {
     let h = Harness::new();
     let source = h.home_path().join("fork-source");
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("visible"), "seed").unwrap();
     std::fs::write(source.join("hidden"), "secret").unwrap();
-    let mount = format!("{}:/fork:fork:exclude=hidden", source.display());
+    std::fs::create_dir(source.join("hidden-dir")).unwrap();
+    std::fs::write(source.join("hidden-dir/inside"), "secret").unwrap();
+    std::fs::create_dir(source.join("nested")).unwrap();
+    std::fs::write(source.join("nested/item"), "nested").unwrap();
+    let mount = format!(
+        "{}:/fork:fork:exclude=hidden:exclude=hidden-dir",
+        source.display()
+    );
 
     let first = h.run_shell(&[&mount]);
     let first_config = debug_config_json(&stderr_of(&first));
@@ -978,7 +1055,21 @@ fn fork_debug_config_uses_committed_data_not_source_and_reuses_it() {
         std::fs::read_to_string(committed.join("visible")).unwrap(),
         "seed"
     );
+    // Excluded file and directory subtree are physically absent from `data`.
     assert!(!committed.join("hidden").exists());
+    assert!(!committed.join("hidden-dir").exists());
+    // Nested regular files still copy.
+    assert_eq!(
+        std::fs::read_to_string(committed.join("nested/item")).unwrap(),
+        "nested"
+    );
+    // No mask file or extra volume appears at an excluded guest path.
+    assert!(
+        !first_binds
+            .iter()
+            .any(|(_, guest, _)| guest.starts_with("/fork/hidden")),
+        "no extra volumes may appear at excluded guest paths: {first_binds:?}"
+    );
 
     std::fs::write(source.join("visible"), "host-change").unwrap();
     std::fs::write(committed.join("visible"), "fork-change").unwrap();
@@ -995,4 +1086,268 @@ fn fork_debug_config_uses_committed_data_not_source_and_reuses_it() {
         std::fs::read_to_string(committed.join("visible")).unwrap(),
         "fork-change"
     );
+}
+
+#[test]
+fn file_writable_mounts_reject_before_launch_effects() {
+    use std::os::unix::fs::symlink;
+    let h = Harness::new();
+    let file = h.home.path().join("plain-file");
+    std::fs::write(&file, "content").unwrap();
+    let linked = h.home.path().join("linked-file");
+    symlink(&file, &linked).unwrap();
+
+    for raw in [
+        format!("{}:/guest/file", file.display()),
+        format!("{}:/guest/file:rw", file.display()),
+        format!("{}:/guest/file", linked.display()),
+    ] {
+        let output = h.run_shell(&[&raw]);
+        assert!(!output.status.success());
+        let stderr = stderr_of(&output);
+        assert!(
+            stderr.contains("can only be mounted read-only"),
+            "{raw}: {stderr}"
+        );
+        assert!(stderr.contains(":ro"), "{raw}: {stderr}");
+        assert_no_notices(&stderr);
+        assert_no_launch_side_effects(&h, &stderr);
+    }
+
+    // A valid unseeded directory fork alongside each invalid file mount (both
+    // argv orders) must not create any fork store.
+    for file_first in [false, true] {
+        let h = Harness::new();
+        let fork_source = h.home.path().join("fork-source");
+        std::fs::create_dir(&fork_source).unwrap();
+        let fork = format!("{}:/fork:fork", fork_source.display());
+        let bad = format!("{}:/guest/file:rw", file.display());
+        let mounts = if file_first {
+            vec![bad.as_str(), fork.as_str()]
+        } else {
+            vec![fork.as_str(), bad.as_str()]
+        };
+        let before = state_tree(h.state.path());
+        let output = h.run_shell(&mounts);
+        assert!(!output.status.success());
+        let stderr = stderr_of(&output);
+        assert!(stderr.contains("can only be mounted read-only"), "{stderr}");
+        assert_no_notices(&stderr);
+        assert_eq!(state_tree(h.state.path()), before);
+    }
+}
+
+#[test]
+fn readonly_file_bind_emits_readonly_and_root_follow() {
+    use std::os::unix::fs::symlink;
+    let h = Harness::new();
+    let home = h.home_path();
+    let file = home.join("plain-file");
+    std::fs::write(&file, "content").unwrap();
+    let linked = home.join("linked-file");
+    symlink(&file, &linked).unwrap();
+    // A file reached through a symlinked ancestor directory.
+    let ancestor_dir = home.join("real-ancestor");
+    std::fs::create_dir(&ancestor_dir).unwrap();
+    std::fs::write(ancestor_dir.join("inner-file"), "inner").unwrap();
+    let ancestor_link = home.join("ancestor-link");
+    symlink(&ancestor_dir, &ancestor_link).unwrap();
+
+    let cases = [
+        (file.clone(), "/guest/plain"),
+        (linked.clone(), "/guest/linked"),
+        (ancestor_link.join("inner-file"), "/guest/ancestor"),
+    ];
+    for (source, guest) in cases {
+        let raw = format!("{}:{guest}:ro", source.display());
+        let output = h.run_shell(&[&raw]);
+        let stderr = stderr_of(&output);
+        let config = debug_config_json(&stderr);
+        let binds = bind_mounts(&config);
+        let (host, bound_guest, readonly) = binds
+            .iter()
+            .find(|(_, g, _)| g == guest)
+            .unwrap_or_else(|| panic!("{raw}: missing bind: {binds:?}"));
+        assert_eq!(bound_guest, guest);
+        assert!(*readonly, "{raw}: file ro bind must be readonly");
+        assert_eq!(
+            PathBuf::from(host).canonicalize().unwrap(),
+            source.canonicalize().unwrap(),
+            "{raw}: host must resolve to the real file"
+        );
+        assert!(
+            bind_follow_root(&config, guest),
+            "{raw}: user binds must opt into root follow"
+        );
+    }
+    // Source bytes unchanged by preparation.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "content");
+    assert_eq!(
+        std::fs::read_to_string(ancestor_dir.join("inner-file")).unwrap(),
+        "inner"
+    );
+}
+
+#[test]
+fn legacy_ready_file_fork_fails_closed_without_mutation() {
+    let h = Harness::new();
+    let source = h.home.path().join("fork-source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("seed"), "seed").unwrap();
+    let mount = format!("{}:/fork:fork", source.display());
+
+    // Seed a legitimate v2 directory fork, then locate the final entry from
+    // the config bind host's parent.
+    let seeded = h.run_shell(&[&mount]);
+    let binds = bind_mounts(&debug_config_json(&stderr_of(&seeded)));
+    let (host, _, _) = binds.iter().find(|(_, g, _)| g == "/fork").unwrap();
+    let data = PathBuf::from(host);
+    let final_dir = data.parent().unwrap().to_path_buf();
+    let manifest_path = final_dir.join("manifest.json");
+
+    // Replace `data` with a valuable regular file and patch only the
+    // manifest kind to `file`.
+    std::fs::remove_dir_all(&data).unwrap();
+    std::fs::write(&data, "valuable bytes").unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["kind"] = serde_json::Value::String("file".into());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let before = state_tree(h.state.path());
+
+    // Source removed too, to prove the reset-path failure does not depend on
+    // the original source.
+    std::fs::remove_dir_all(&source).unwrap();
+    let output = h.run_shell(&[&mount]);
+    assert!(!output.status.success());
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains(&final_dir.display().to_string()),
+        "error must name the exact final directory: {stderr}"
+    );
+    assert!(stderr.contains("remove it to reset"), "{stderr}");
+    assert_no_notices(&stderr);
+    assert_eq!(
+        state_tree(h.state.path()),
+        before,
+        "a legacy file fork must be retained unchanged"
+    );
+    assert_eq!(std::fs::read_to_string(&data).unwrap(), "valuable bytes");
+}
+
+#[test]
+fn core_sources_are_canonical_and_keep_root_follow_default() {
+    let h = Harness::new();
+    // Point state through a symlinked ancestor plus an absent nested child;
+    // HOME is provisioned as a non-root guest HOME.
+    let real_state_parent = tempfile::tempdir_in("/tmp").unwrap();
+    let real_state_parent = real_state_parent.path().canonicalize().unwrap();
+    let link_parent = tempfile::tempdir_in("/tmp").unwrap();
+    let link = link_parent.path().join("state-link");
+    std::os::unix::fs::symlink(&real_state_parent, &link).unwrap();
+    let state = link.join("absent-root");
+    let canonical_state = real_state_parent.join("absent-root");
+
+    let output = h.run_shell_at_state(&[], &state);
+    let stderr = stderr_of(&output);
+    let config = debug_config_json(&stderr);
+    let binds = bind_mounts(&config);
+
+    // Every core bind's host is canonicalized (no symlinked ancestor).
+    for (host, guest, _) in &binds {
+        let host_path = PathBuf::from(host);
+        assert_eq!(
+            host_path.canonicalize().unwrap(),
+            host_path,
+            "core bind {guest} host {host} must already be canonical"
+        );
+    }
+    // The state bind resolves under the canonical state root, not the
+    // symlinked spelling, and guest HOME's source is <state_dir>/home.
+    assert!(
+        binds
+            .iter()
+            .any(|(host, guest, _)| guest == "/agent-vm-state"
+                && PathBuf::from(host).starts_with(&canonical_state)),
+        "expected the state bind under canonical state root {}, got {binds:?}",
+        canonical_state.display()
+    );
+    assert!(
+        !binds
+            .iter()
+            .any(|(host, _, _)| PathBuf::from(host).starts_with(&link)),
+        "no core host may retain the symlinked ancestor spelling: {binds:?}"
+    );
+    // Core binds keep root follow default false.
+    for (_, guest, _) in &binds {
+        assert!(
+            !bind_follow_root(&config, guest),
+            "core bind {guest} must NOT opt into root follow"
+        );
+    }
+    // Guest destinations are unchanged. (The serialized `mounts` array is
+    // not insertion-ordered, so HOME-before-project is asserted at the
+    // `core_dir_volumes` unit seam, not by array position here.)
+    let home_guest = h.home.path().to_str().unwrap();
+    let project_guest = h.project_path();
+    let project_guest = project_guest.to_str().unwrap();
+    let guest_paths: Vec<&str> = config["mounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["type"] == "Bind")
+        .map(|m| m["guest"].as_str().unwrap())
+        .collect();
+    assert!(guest_paths.contains(&home_guest), "{guest_paths:?}");
+    assert!(guest_paths.contains(&project_guest), "{guest_paths:?}");
+
+    // A bad file mount with the same initially-absent symlinked state spelling
+    // must reject without creating it.
+    let bad_state = link.join("bad-root");
+    let file = h.home.path().join("plain-file");
+    std::fs::write(&file, "content").unwrap();
+    let bad = h.run_shell_at_state(&[&format!("{}:/guest/file", file.display())], &bad_state);
+    assert!(!bad.status.success());
+    assert_no_notices(&stderr_of(&bad));
+    assert!(!bad_state.exists() && !real_state_parent.join("bad-root").exists());
+}
+
+#[test]
+fn mount_mode_matrix_sets_readonly_and_root_follow() {
+    let h = Harness::new();
+    let home = h.home_path();
+    let dir = home.join("mode-dir");
+    std::fs::create_dir(&dir).unwrap();
+    let source = home.join("mode-fork-source");
+    std::fs::create_dir(&source).unwrap();
+
+    for (raw, want_readonly) in [
+        (format!("{}:/guest/ro:ro", dir.display()), true),
+        (format!("{}:/guest/rw:rw", dir.display()), false),
+        (format!("{}:/guest/bare", dir.display()), false),
+        (format!("{}:/guest/fork:fork", source.display()), false),
+        (
+            format!("{}:/guest/follow:ro:follow-links", dir.display()),
+            true,
+        ),
+    ] {
+        let output = h.run_shell(&[&raw]);
+        let stderr = stderr_of(&output);
+        let config = debug_config_json(&stderr);
+        let binds = bind_mounts(&config);
+        let guest = raw.split(':').nth(1).unwrap();
+        let (_, _, readonly) = binds
+            .iter()
+            .find(|(_, g, _)| g == guest)
+            .unwrap_or_else(|| panic!("{raw}: missing bind: {binds:?}"));
+        assert_eq!(*readonly, want_readonly, "{raw}");
+        assert!(
+            bind_follow_root(&config, guest),
+            "{raw}: user binds follow root"
+        );
+    }
 }
