@@ -1,15 +1,24 @@
 # The five tools agent-vm ships a definition for, used only when BOTH the
 # user and project config files declare zero tools (see src/config.rs).
 #
-# This is the single shipped source of the fallback catalog: it is embedded
+# This is the single shipped source of the launch-verb catalog: it is embedded
 # at compile time with `include_str!` and parsed through exactly the same
 # raw-to-validated path as a user's file. `agent-vm doctor` never writes it
-# out; there is no starter-config writer (#80's non-goals).
+# out; there is no starter-config writer (#80's non-goals). The built-in
+# `shell` fallback (when a config omits the name) is this file's `shell` entry,
+# re-parsed — there is no second definition.
 #
-# Order matters. The declaration order below is the order `agent-vm doctor`
-# previews and the order #84 will compose tooling layers in. The image build
-# keeps the same cache-motivated ordering (codex first, then opencode, then
-# claude) — see images/Dockerfile's "Layer order is deliberate" comment.
+# Order matters. The declaration order below is the order `agent-vm --help`
+# and `agent-vm doctor` show the verbs, and the order #84 will compose tooling
+# layers in. The image build keeps the same cache-motivated ordering (codex
+# first, then opencode, then claude) — see images/Dockerfile's "Layer order is
+# deliberate" comment.
+#
+# `args` holds the flags prepended before the user's own args (`run::inner_argv`
+# drops any the user already passed). The microVM is the security boundary, so
+# the in-VM agent's "are you sure?" prompts add no protection and break
+# agent-mode flows — that is why claude gets `--dangerously-skip-permissions`
+# and copilot `--allow-all-tools`.
 #
 # `codex` and `opencode` carry NO default argv on purpose. Their non-interactive
 # "bypass" configuration is persisted as files by provider code
@@ -50,9 +59,22 @@ credentials = ["copilot"]
 persist = []
 
 # `shell` is bash, not an agent, and has no tooling layer.
+#
+# `-O histappend` makes the interactive bash *append* its in-memory history to
+# the shared bind-mounted `~/.bash_history` on exit instead of overwriting it.
+# Without it, two concurrent `agent-vm shell` invocations in the same project
+# would have the later-exiting shell wholesale clobber the earlier shell's
+# commands (the symlink target is the same host file; see
+# credential_provider::guest_home_links and ADR-0002).
+#
+# `interactive_shell = true` makes `run::inner_argv` join the user's trailing
+# args into a single `bash -c` command line instead of appending them as
+# separate argv entries, so `agent-vm shell ls -l` runs `ls -l` rather than
+# PATH-searching for a script named `ls`.
 [[tools]]
 name = "shell"
 command = "bash"
 args = ["-O", "histappend"]
 credentials = ["openai", "opencode-static"]
 persist = []
+interactive_shell = true

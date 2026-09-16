@@ -16,7 +16,8 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
-use crate::credential_provider::{self, CredentialProvider, ProviderSet};
+use crate::config::Tool;
+use crate::credential_provider;
 use crate::layer;
 use crate::mount;
 use crate::session::ProjectSession;
@@ -689,107 +690,57 @@ fn mkdir_chain(project: &Path) -> Vec<String> {
     out
 }
 
-/// Which entry point to attach inside the sandbox.
-#[derive(Clone, Copy, Debug)]
-pub enum Agent {
-    Claude,
-    Codex,
-    Opencode,
-    Copilot,
-    Shell,
+/// Footer shown under `-h` (the short summary). A few high-value examples
+/// plus a pointer to `--help`. Printed verbatim by clap, so this is exactly
+/// what the user sees. One [`Args`] backs every launch verb, so the examples
+/// are rendered with the verb actually being helped — a hard-coded tool name
+/// would be wrong for a user who configured a different one (and naming a
+/// specific tool is an explicit acceptance criterion of #82).
+pub(crate) fn launch_after_help(name: &str) -> String {
+    format!(
+        "\
+Examples:
+  agent-vm {name}                  launch in the current project
+  agent-vm {name} -p 8080:3000     publish guest :3000 to host 127.0.0.1:8080
+  agent-vm {name} -- --some-flag   forward args to the tool (after --)
+
+Trailing args go to the tool. Run with --help for networking, security, and env details."
+    )
 }
 
-impl Agent {
-    fn command(self) -> &'static str {
-        match self {
-            Agent::Claude => "claude",
-            Agent::Codex => "codex",
-            Agent::Opencode => "opencode",
-            Agent::Copilot => "copilot",
-            Agent::Shell => "bash",
-        }
-    }
+/// Spaces between `{name}` and an example description in the literal lines of
+/// [`launch_after_long_help`]; the continuation indent is built from it so it
+/// tracks the interpolated verb.
+const EXAMPLE_DESCRIPTION_PAD: usize = 29;
 
-    /// Flags we always pass before the user's own args. The microVM is
-    /// the security boundary, so the in-VM agent's "are you sure?"
-    /// prompts add no protection and break agent-mode flows.
-    ///
-    /// `Agent::Shell` carries `-O histappend` so the interactive bash
-    /// *appends* its in-memory history to the shared bind-mounted
-    /// `~/.bash_history` on exit instead of overwriting it. Without
-    /// this, two concurrent `agent-vm shell` invocations in the same
-    /// project would have the later-exiting shell wholesale clobber
-    /// the earlier shell's commands (the symlink target is the same
-    /// host file — `.bash_history` in
-    /// [`crate::credential_provider::guest_home_links`],
-    /// wired up per guest-user mode by the `.patch()` block in `launch()`
-    /// (root mode) or [`crate::session::ProjectSession::provision_guest_home`]
-    /// (non-root mode)).
-    fn default_args(self) -> &'static [&'static str] {
-        match self {
-            Agent::Claude => &["--dangerously-skip-permissions"],
-            Agent::Shell => &["-O", "histappend"],
-            // Copilot CLI's `--allow-all-tools` disables its in-VM
-            // "may I run this?" confirmations. The microVM is the
-            // security boundary, so the extra prompts add no
-            // protection and break non-interactive / agent-mode
-            // flows — same reasoning as `--dangerously-skip-permissions`
-            // for Claude. Drop it (`-> &[]`) if the user already
-            // passed it; the filter in `launch` handles that.
-            Agent::Copilot => &["--allow-all-tools"],
-            Agent::Codex | Agent::Opencode => &[],
-        }
-    }
-
-    /// The credential subsystems this tool depends on. This is the seam #82
-    /// replaces: a resolved tool will carry this set from config instead of
-    /// deriving it from a compile-time variant.
-    fn credential_providers(self) -> ProviderSet {
-        use CredentialProvider::*;
-        match self {
-            Agent::Claude => ProviderSet::new([Anthropic]),
-            Agent::Codex => ProviderSet::new([OpenAi]),
-            Agent::Opencode => ProviderSet::new([OpenAi, OpencodeStatic]),
-            Agent::Copilot => ProviderSet::new([Copilot]),
-            // `shell` matches `opencode`'s set: the run path grouped
-            // `Opencode | Shell` before #81, and #78's default config table
-            // records the same pairing.
-            Agent::Shell => ProviderSet::new([OpenAi, OpencodeStatic]),
-        }
-    }
-}
-
-// Footer shown under `-h` (the short summary). A few high-value
-// examples plus a pointer to `--help`. Printed verbatim by clap, so
-// this is exactly what the user sees. One `Args` backs all five launch
-// verbs (claude/codex/opencode/copilot/shell), so this footer can't vary
-// per verb — the examples use `claude` and the header says so.
-const LAUNCH_AFTER_HELP: &str = "\
-Examples (claude shown; codex/opencode/shell take the same options):
-  agent-vm claude                  launch Claude Code in the current project
-  agent-vm shell                   open a bash shell instead
-  agent-vm claude -p 8080:3000     publish guest :3000 to host 127.0.0.1:8080
-  agent-vm claude -- --model opus  forward args to the agent (after --)
-
-Trailing args go to the agent. Run with --help for networking, security, and env details.";
-
-// Fuller footer shown under `--help`. Same single-`Args` constraint:
-// claude/codex/opencode/copilot/shell all share this.
-const LAUNCH_AFTER_LONG_HELP: &str = "\
-Examples (claude shown; codex/opencode/shell take the same options):
-  agent-vm claude                             launch in the current project
-  agent-vm shell                              open a bash shell instead
-  agent-vm shell -- cargo test                run one command, then exit
-  agent-vm claude -- --model opus --resume    forward args to the agent
-  agent-vm claude --memory 8 --cpus 4         a bigger sandbox
-  agent-vm claude --mount ~/ref:ro            read-only extra mount
-  agent-vm claude --mount /etc/hosts:/host-hosts:ro
-                                               read-only single-file bind
-  agent-vm claude --mount ~/.claude/skills:ro:follow-links
-                                               follow symlinks in a skills dir
-  agent-vm shell --mount ~/config:/config:fork:exclude=credentials.json
-                                               seed an independent writable config copy
-  agent-vm claude --repo owner/other-repo     widen the GitHub allow-list
+/// Fuller footer shown under `--help`. Same single-[`Args`] constraint: every
+/// launch verb shares it, so the verb is interpolated and no shipped tool is
+/// named anywhere in the literal text.
+///
+/// The example descriptions form a column after `  agent-vm <verb>` plus
+/// [`EXAMPLE_DESCRIPTION_PAD`]. Since the verb is interpolated into every
+/// example line, that column moves with the verb's length — so a wrapped
+/// example's continuation must indent to the *same* column rather than a
+/// hard-coded value (which only lined up for one verb length).
+pub(crate) fn launch_after_long_help(name: &str) -> String {
+    // `  agent-vm ` + the verb + the pad the literal example lines use.
+    let continuation_indent = "  agent-vm ".len() + name.chars().count() + EXAMPLE_DESCRIPTION_PAD;
+    let continuation = " ".repeat(continuation_indent);
+    format!(
+        "\
+Examples:
+  agent-vm {name}                             launch in the current project
+  agent-vm {name} -- <command>                run one command, then exit
+  agent-vm {name} -- --model opus --resume    forward args to the tool
+  agent-vm {name} --memory 8 --cpus 4         a bigger sandbox
+  agent-vm {name} --mount ~/ref:ro            read-only extra mount
+  agent-vm {name} --mount /etc/hosts:/host-hosts:ro
+{continuation}read-only single-file bind
+  agent-vm {name} --mount ~/skills:ro:follow-links
+{continuation}follow symlinks in a skills dir
+  agent-vm {name} --mount ~/config:/config:fork:exclude=credentials.json
+{continuation}seed an independent writable copy
+  agent-vm {name} --repo owner/other-repo     widen the GitHub allow-list
 
 Fork mounts:
   `:fork` copies its source directory once into project-scoped persistent state; later launches
@@ -818,10 +769,11 @@ Environment:
   AGENT_VM_PROFILE                      print per-phase boot timings
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
   AGENT_VM_NO_CHROME_MCP                disable Chrome MCP auto-configuration for Chrome-capable images
-  RUST_LOG                              tracing filter (e.g. agent_vm=debug)";
+  RUST_LOG                              tracing filter (e.g. agent_vm=debug)"
+    )
+}
 
 #[derive(ClapArgs)]
-#[command(after_help = LAUNCH_AFTER_HELP, after_long_help = LAUNCH_AFTER_LONG_HELP)]
 pub struct Args {
     /// Sandbox memory, in GiB.
     #[arg(
@@ -906,7 +858,7 @@ pub struct Args {
     /// `--mount ~/ref:follow-links` behaves as `ro`); combining it with
     /// `:rw` is a parse error. A resolved target outside your `$HOME` is a
     /// hard error; a symlink to a file, or a dangling symlink, is skipped
-    /// with a warning. Example: `--mount ~/.claude/skills:ro:follow-links`.
+    /// with a warning. Example: `--mount ~/.agents/skills:ro:follow-links`.
     ///
     /// Each `--mount` (including each auto-discovered follow-links target)
     /// consumes one virtio-fs device shared with rootfs, network, vsock,
@@ -998,10 +950,14 @@ pub struct Args {
     /// Forwarded verbatim to the in-sandbox agent command. Use `--` if
     /// any argument starts with `-` to keep clap from claiming it.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-    agent_args: Vec<String>,
+    pub(crate) agent_args: Vec<String>,
 }
 
-pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
+/// Take the resolved [`Tool`] rather than destructured fields: #83 needs
+/// `persist` and #84 needs `layer` from the same value, and three same-typed
+/// `&str`/`&[String]` parameters would violate `CODING_STANDARDS.md`'s
+/// "don't take several same-typed args in a row".
+pub(crate) async fn launch(tool: &Tool, args: Args) -> Result<i32> {
     // First statement, deliberately: a still-set $AGENT_VM_LAYER is rejected
     // before anything else runs — state dirs, guest HOME provisioning, stale
     // sandbox reaping, or the msb-db preflight below — because the hazard is
@@ -1259,7 +1215,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // The credential subsystems this tool depends on. `github_egress`
     // (`use_github`, driven by `--no-git` / detected repos) stays orthogonal
     // to the tool.
-    let providers = agent.credential_providers();
+    let providers = tool.credential_providers();
 
     // D1: the Copilot API is reached with a GitHub OAuth token, but
     // unlike the gh CLI / repo-push path it is not repo-scoped — so
@@ -1589,12 +1545,29 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         "==> Booting sandbox from {image} ({memory_mib} MiB, {cpus} vCPU; first run pulls layers, otherwise ~3s)"
     ))?;
     let t_create = Instant::now();
+    // The resolved guest command line is computed here (rather than at its use
+    // site below) purely so this debug line and the sandbox-config dump stay
+    // adjacent; it depends only on the tool and the user's args, not on the
+    // sandbox. The guest command line travels over the exec request *after*
+    // boot, so it is absent from the `SandboxConfig` dump below — this line is
+    // the only observable form of it. The user's own args can appear here, the
+    // same exposure class as the dump, behind the same opt-in flag.
+    let inner_cmd = tool.command();
+    let inner_argv = inner_argv(tool, args.agent_args);
     let config = builder.build().await.context("preparing sandbox config")?;
     if env::var("AGENT_VM_DEBUG_CONFIG").is_ok() {
         notices.emit(format!(
             "[debug] sandbox config JSON: {}",
             serde_json::to_string_pretty(&config).unwrap_or_default()
         ))?;
+        // No trailing space when the argv is empty (codex/opencode), so the
+        // line is exactly the guest command line an integration test asserts.
+        let guest_command = if inner_argv.is_empty() {
+            inner_cmd.to_string()
+        } else {
+            format!("{inner_cmd} {}", inner_argv.join(" "))
+        };
+        notices.emit(format!("[debug] guest command: {guest_command}"))?;
     }
     let (progress, task) = Sandbox::create_with_pull_progress(config);
     let render_task = tokio::spawn(crate::pull_progress::render(progress));
@@ -1653,35 +1626,6 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
         .start_event_reporting(&sandbox)
         .context("starting auto-publish event reporting")?;
 
-    let inner_cmd = agent.command();
-    // Prepend agent-vm's default flags (e.g. --dangerously-skip-permissions
-    // for Claude) unless the user already provided them.
-    let mut inner_args: Vec<String> = agent
-        .default_args()
-        .iter()
-        .filter(|d| !args.agent_args.iter().any(|u| u == *d))
-        .map(|s| s.to_string())
-        .collect();
-    if matches!(agent, Agent::Shell) && !args.agent_args.is_empty() {
-        // `agent-vm shell foo bar` runs `foo bar` as a command. Without
-        // `-c`, bash treats the first non-option positional as a script
-        // filename and PATH-searches for it, so `agent-vm shell ls` lands
-        // on `/usr/bin/ls` and prints "cannot execute binary file" the
-        // moment bash hits the ELF magic. Joining the user's args into a
-        // single `-c` command line (each arg shell-escaped so quoting is
-        // preserved across the boundary) is the standard fix.
-        let cmd = args
-            .agent_args
-            .iter()
-            .map(|a| shell_escape(a))
-            .collect::<Vec<_>>()
-            .join(" ");
-        inner_args.push("-c".into());
-        inner_args.push(cmd);
-    } else {
-        inner_args.extend(args.agent_args);
-    }
-
     // Wrap the agent invocation in a tiny bash prelude that:
     //
     // 1. Strips IPv6 nameservers from /etc/resolv.conf before exec'ing
@@ -1729,7 +1673,7 @@ pub async fn launch(agent: Agent, args: Args) -> Result<i32> {
     // Assemble the in-guest `bash -c` line via `build_agent_shell_line`,
     // which is unit-tested directly. The IPv6-nameserver strip is the
     // `STRIP_IPV6_NAMESERVERS` const (see its doc comment / PLAN.md B3).
-    let shell_line = build_agent_shell_line(&project_guest_path, "", inner_cmd, &inner_args);
+    let shell_line = build_agent_shell_line(&project_guest_path, "", inner_cmd, &inner_argv);
     let cmd = "bash";
     let agent_args: Vec<String> = vec!["-c".into(), shell_line];
 
@@ -2388,6 +2332,48 @@ const STRIP_IPV6_NAMESERVERS: &str =
 const SEED_CLAUDE_PLUGINS: &str =
     "[ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh || true";
 
+/// The guest command line: the tool's default argv (minus any flag the user
+/// already passed), then the user's own args — or, for an interactive shell, a
+/// single `-c` with those args joined and escaped.
+///
+/// Pure and string-only so the five default tools' guest command lines are
+/// unit-tested without booting, mirroring [`build_agent_shell_line`] below.
+/// This is the *only* oracle for "identical to `main`": the guest command
+/// line travels over the exec request after boot and never appears in the
+/// `SandboxConfig` an integration test can observe (see the
+/// `[debug] guest command:` line in `launch`).
+///
+/// The `argv` values' "why" lives beside them in `default-tools.toml`; the
+/// filter here is the one rule that belongs to the launch path rather than the
+/// catalogue: a default flag the user already passed is not duplicated.
+pub(crate) fn inner_argv(tool: &Tool, agent_args: Vec<String>) -> Vec<String> {
+    let mut inner_args: Vec<String> = tool
+        .argv()
+        .iter()
+        .filter(|default| !agent_args.iter().any(|user| user == *default))
+        .map(|argument| argument.to_string())
+        .collect();
+    if tool.is_interactive_shell() && !agent_args.is_empty() {
+        // `agent-vm shell foo bar` runs `foo bar` as a command. Without `-c`,
+        // bash treats the first non-option positional as a script filename and
+        // PATH-searches for it, so `agent-vm shell ls` lands on `/usr/bin/ls`
+        // and prints "cannot execute binary file" the moment bash hits the ELF
+        // magic. Joining the user's args into a single `-c` command line (each
+        // arg shell-escaped so quoting is preserved across the boundary) is
+        // the standard fix.
+        let cmd = agent_args
+            .iter()
+            .map(|a| shell_escape(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        inner_args.push("-c".into());
+        inner_args.push(cmd);
+    } else {
+        inner_args.extend(agent_args);
+    }
+    inner_args
+}
+
 /// Build the `bash -c` line that runs inside the guest: the prelude
 /// (IPv6-nameserver strip, stdin redirect, optional chrome-CA install,
 /// optional project runtime hook) followed by `exec`'ing the chosen
@@ -2529,63 +2515,101 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    /// V1: the agent → provider-set mapping matches the legacy `matches!`
-    /// gating for every variant. The expressions are re-written inline here
-    /// (from the pre-refactor source), not re-derived from the new method.
-    #[test]
-    fn agent_provider_sets_match_legacy_gating() {
-        for agent in [
-            Agent::Claude,
-            Agent::Codex,
-            Agent::Opencode,
-            Agent::Copilot,
-            Agent::Shell,
-        ] {
-            let providers = agent.credential_providers();
-            assert_eq!(
-                providers.contains(CredentialProvider::Copilot),
-                matches!(agent, Agent::Copilot),
-                "copilot gating changed for {agent:?}"
-            );
-            assert_eq!(
-                providers.contains(CredentialProvider::OpencodeStatic),
-                matches!(agent, Agent::Opencode | Agent::Shell),
-                "opencode-static gating changed for {agent:?}"
-            );
-            assert_eq!(
-                providers.contains(CredentialProvider::Anthropic),
-                matches!(agent, Agent::Claude),
-                "anthropic gating changed for {agent:?}"
-            );
-            // OpenAI is the only provider not gated on the tool by name;
-            // every tool that talks to OpenAI derives it from its pairing.
-            assert_eq!(
-                providers.contains(CredentialProvider::OpenAi),
-                matches!(agent, Agent::Codex | Agent::Opencode | Agent::Shell),
-                "openai gating changed for {agent:?}"
-            );
-        }
+    /// The five compiled-in `default-tools.toml` tools, for the argv tests
+    /// below. Parsed via the same validated path as user input.
+    fn default_catalog() -> crate::config::LaunchCatalog {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::load(&crate::config::ConfigPaths {
+            user: Some(dir.path().join("no-user-config.toml")),
+            project: dir.path().join("no-project-config.toml"),
+        })
+        .expect("the embedded default catalog parses")
+        .into_launch_catalog()
+        .expect("the default catalog resolves")
     }
 
-    /// R3 legacy oracle: the exact guest command and default argv every
-    /// variant must keep. These literals are written independently of the
-    /// config defaults (`default-tools.toml`), so drifting either source
-    /// trips its own test: dropping Claude's `--dangerously-skip-permissions`
-    /// from the config fails `config::tests`; dropping it here fails this
-    /// test. Nothing derives one from the other (#80 keeps launch off config).
+    fn tool<'a>(catalog: &'a crate::config::LaunchCatalog, name: &str) -> &'a Tool {
+        catalog
+            .as_slice()
+            .iter()
+            .find(|tool| tool.name() == name)
+            .unwrap()
+    }
+
+    /// **T2.** Differential characterization of [`inner_argv`] against the
+    /// pre-#82 `run::launch` behaviour (`matches!(agent, Agent::Shell)` plus
+    /// the "filter a default the user already passed" rule), transcribed by
+    /// hand from `bb299d1` and covering both sides of the interactive-shell
+    /// boundary. This is the unit-level oracle for "identical to `main`".
     #[test]
-    fn agent_command_and_default_argv_match_legacy_literals() {
-        let cases: [(Agent, &str, &[&str]); 5] = [
-            (Agent::Claude, "claude", &["--dangerously-skip-permissions"]),
-            (Agent::Codex, "codex", &[]),
-            (Agent::Opencode, "opencode", &[]),
-            (Agent::Copilot, "copilot", &["--allow-all-tools"]),
-            (Agent::Shell, "bash", &["-O", "histappend"]),
-        ];
-        for (agent, command, argv) in cases {
-            assert_eq!(agent.command(), command, "{agent:?}");
-            assert_eq!(agent.default_args(), argv, "{agent:?}");
+    fn inner_argv_matches_the_legacy_launch_behaviour() {
+        let catalog = default_catalog();
+        let args = |argv: &[&str]| argv.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // No user args: exactly command + default argv.
+        for (name, expected) in [
+            ("codex", vec![]),
+            ("opencode", vec![]),
+            ("claude", vec!["--dangerously-skip-permissions"]),
+            ("copilot", vec!["--allow-all-tools"]),
+            ("shell", vec!["-O", "histappend"]),
+        ] {
+            assert_eq!(
+                inner_argv(tool(&catalog, name), vec![]),
+                args(&expected),
+                "{name}: no user args"
+            );
         }
+
+        // A non-shell tool appends the user's args verbatim.
+        assert_eq!(
+            inner_argv(tool(&catalog, "claude"), args(&["--model", "opus"])),
+            args(&["--dangerously-skip-permissions", "--model", "opus"]),
+        );
+
+        // The asymmetric pair: the same user args on either side of the
+        // `is_interactive_shell` boundary. Each shell arg is single-quoted, so
+        // the joined `-c` line is `'ls' '-l'` (the pre-#82 behaviour).
+        assert_eq!(
+            inner_argv(tool(&catalog, "shell"), args(&["ls", "-l"])),
+            args(&["-O", "histappend", "-c", "'ls' '-l'"]),
+        );
+        assert_eq!(
+            inner_argv(tool(&catalog, "copilot"), args(&["ls", "-l"])),
+            args(&["--allow-all-tools", "ls", "-l"]),
+        );
+
+        // A default flag the user already passed appears once, not twice.
+        assert_eq!(
+            inner_argv(
+                tool(&catalog, "claude"),
+                args(&["--dangerously-skip-permissions"]),
+            ),
+            args(&["--dangerously-skip-permissions"]),
+        );
+
+        // A shell with no user args does NOT join a `-c`.
+        assert_eq!(
+            inner_argv(tool(&catalog, "shell"), vec![]),
+            args(&["-O", "histappend"]),
+        );
+    }
+
+    /// The interactive-shell `-c` join shell-escapes each argument, so a
+    /// quoted user command survives the boundary (the pre-#82 behaviour).
+    #[test]
+    fn inner_argv_shell_join_escapes_each_argument() {
+        let catalog = default_catalog();
+        let argv: Vec<String> = vec!["echo".into(), "a b".into(), "it's".into()];
+        assert_eq!(
+            inner_argv(tool(&catalog, "shell"), argv),
+            vec![
+                "-O".to_string(),
+                "histappend".to_string(),
+                "-c".to_string(),
+                "'echo' 'a b' 'it'\\''s'".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3778,15 +3802,16 @@ mod tests {
     #[test]
     fn environment_help_block_lists_the_shared_truthy_set() {
         let rendered = format!("({})", crate::env_flag::TRUTHY.join("|"));
+        let long_help = launch_after_long_help("shell");
         for var in [
             "AGENT_VM_ROOT",
             "AGENT_VM_UPDATE_CHECK",
             "AGENT_VM_INSECURE_REGISTRY",
         ] {
-            let line = LAUNCH_AFTER_LONG_HELP
+            let line = long_help
                 .lines()
                 .find(|line| line.contains(var))
-                .unwrap_or_else(|| panic!("{var} missing from LAUNCH_AFTER_LONG_HELP"));
+                .unwrap_or_else(|| panic!("{var} missing from launch_after_long_help"));
             assert!(
                 line.contains(&rendered),
                 "{var}'s help line {line:?} does not list env_flag::TRUTHY ({rendered})"

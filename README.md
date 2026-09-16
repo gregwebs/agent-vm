@@ -36,8 +36,12 @@ npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm <cmd>
 agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
 
 cd ~/your-project
-agent-vm claude           # or codex / opencode / shell
+agent-vm claude           # a configured launch verb; see `agent-vm --help`
 ```
+
+The launch verbs come from your tool configuration (two tiers, user-wins), so
+`agent-vm --help` lists exactly the tools you have configured; `agent-vm doctor`
+shows which config files were found and what they resolved to.
 
 Full flag, subcommand, networking, and troubleshooting reference:
 **[USAGE.md](USAGE.md)**.

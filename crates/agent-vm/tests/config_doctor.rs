@@ -188,10 +188,8 @@ fn reports_defaults_and_preserves_the_pre_existing_sections() {
     assert_success(&out);
     let stdout = stdout_of(&out);
 
-    assert!(
-        stdout.contains("==> tool configuration (diagnostic only; launches unchanged)"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("==> tool configuration"), "{stdout}");
+    assert!(!stdout.contains("diagnostic only"), "{stdout}");
     assert!(
         stdout.contains(&format!("{} (absent)", h.user_config().display())),
         "{stdout}"
@@ -249,7 +247,7 @@ fn found_empty_tier_is_distinct_from_absent_and_still_uses_defaults() {
 }
 
 #[test]
-fn a_user_only_catalog_does_not_add_defaults_or_shell() {
+fn a_user_only_catalog_adds_the_shell_fallback_but_no_defaults() {
     let h = Harness::new();
     h.write_user(ONE_TOOL);
 
@@ -259,8 +257,12 @@ fn a_user_only_catalog_does_not_add_defaults_or_shell() {
 
     assert!(stdout.contains("resolved: declared tools"), "{stdout}");
     assert!(stdout.contains("1. solo"), "{stdout}");
+    // No default agent is added...
     assert!(!stdout.contains("1. codex"), "{stdout}");
-    assert!(!stdout.contains("5. shell"), "{stdout}");
+    assert!(!stdout.contains("codex ->"), "{stdout}");
+    // ...but the built-in `shell` fallback is, and it is labelled.
+    assert!(stdout.contains("2. shell"), "{stdout}");
+    assert!(stdout.contains("`shell` was not declared"), "{stdout}");
 }
 
 #[test]
