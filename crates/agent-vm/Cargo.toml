@@ -58,6 +58,11 @@ base64 = "0.22"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# Parses the user/project tool-config TOML (#80) and the compiled-in
+# `default-tools.toml`. Only the parser + serde features are wanted — no
+# `preserve_order` (key order is never load-bearing; tool order comes from
+# the `[[tools]]` array, not a map). See src/config.rs.
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

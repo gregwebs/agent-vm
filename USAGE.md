@@ -37,6 +37,7 @@ claude | codex | opencode | copilot | shell
 pull                                refresh the cached image
 setup                               pull base image + verify boot
 doctor                              report host credentials + microsandbox state
+                                    + the diagnostic tool-config preview
                                     (--reset-msb-db recovers a forward-migrated db)
 msb <args...>                       forward to the bundled msb (e.g. msb ls, msb status)
 clipboard {get,put} [--sys]         exchange a string with the project sandbox
@@ -356,6 +357,111 @@ long the Claude token has left — and which of them were captured for the
 project you run it in. It never prints token bytes. This is the first
 thing to run when an in-VM agent comes up signed out. See
 [Credentials](#credentials).
+
+It also prints a read-only [tool configuration](#tool-configuration-diagnostic-preview)
+preview. That preview is **diagnostic only**: it changes no launch behavior.
+
+## Tool configuration (diagnostic preview)
+
+`agent-vm doctor` parses and resolves two tool-config files and prints the
+result. **Nothing else in this release reads them.** No CLI verb, launch
+argument, credential, tooling layer, or persistence path is affected yet —
+the config is there so you can see and validate what a future release will
+consume, and to catch mistakes early. In particular the preview never
+executes a declared command, builds or checks a layer, or creates a persist
+path. Paths and tool names in this section are escaped: any byte outside
+printable ASCII (including every non-ASCII byte and control characters)
+renders as `\xNN`, so a config file or directory name cannot inject terminal
+escapes.
+
+### Where the files live
+
+| Tier | Path |
+|---|---|
+| user | `$HOME/.config/agent-vm/config.toml` |
+| project | `<project root>/.agent-vm/config.toml` (`<project root>` is the canonical current directory) |
+
+Both are optional (an absent file is reported as `absent`; a present but
+empty one as `found, 0 tools`). `$XDG_CONFIG_HOME` and any config-path
+override are deliberately **not** honored in this release.
+
+### Schema
+
+```toml
+[[tools]]
+name = "mytool"                      # required; see "Names" below
+command = "mytool"                   # required; the guest command name
+args = ["--flag"]                    # optional; default argv (array of strings)
+layer = { builtin = "codex" }        # optional; EXACTLY one of builtin/path
+credentials = ["openai"]             # optional; credential provider names
+persist = [".cache/mytool"]          # optional; guest-HOME-relative paths
+```
+
+- `name` — required; a single command-name token: nonempty, no
+  whitespace/control characters, no `/` (a name is not a path), not an
+  all-dots spelling (`.`/`..`), no leading `-`, and not one of the reserved
+  subcommands `setup`, `pull`, `msb`, `clipboard`, `doctor`,
+  `_intercept-hook`. Names are case-sensitive. The five launch verbs
+  (`claude`, `codex`, `opencode`, `copilot`, `shell`) are **not** reserved —
+  naming a tool `claude` is normal.
+- `command` — required, nonempty, NUL-free. It is a single command name; it
+  is never executed by `doctor`.
+- `args` — optional, an array of strings. `doctor` shows only the argument
+  **count**, never the values, so a secret accidentally placed here is not
+  echoed. Args are not shell-split or expanded.
+- `layer` — optional; a table with **exactly one** of `builtin` (one of
+  `codex`, `opencode`, `claude`, `copilot`) or `path` (a declared path). A
+  layer is metadata only in this release: it is **not** resolved, checked
+  for existence, or built.
+- `credentials` — optional; provider **config names**, which differ from
+  the `agent-vm doctor` row labels. Valid: `anthropic`, `openai`,
+  `opencode-static`, `copilot`. Note `opencode` (the doctor label) is **not**
+  a valid name — use `opencode-static`.
+- `persist` — optional; guest-HOME-relative paths to preserve across runs.
+  Absolute paths, any `..` component, NUL, and root-equivalent spellings
+  (`.`/`./`/empty) are rejected; harmless `.`/`//`/trailing-`/` spellings are
+  normalized. No path is ever created by `doctor`.
+
+Unknown keys, wrong types, malformed TOML, unknown `layer.builtin`, unknown
+provider names, duplicate tool names within one file, duplicate normalized
+persist entries within one tool, and two tools claiming the same normalized
+persist path are all **hard errors** — there is no silent fallback to the
+defaults.
+
+### Merge order and defaults
+
+The user file is authoritative for any tool name it contains; the project
+file may add whole tool definitions the user did not write. This is a union
+of whole definitions, **not** a field-by-field overlay: a repo cannot fill in
+an omitted `persist`, `layer`, or `credentials` on a user-defined tool.
+Resolved order is user declarations first, then project-only declarations.
+When a project declaration of an existing name differs, `doctor` warns once
+and the user definition wins, e.g.:
+
+```text
+warning: tool "claude" in /home/alice/.config/agent-vm/config.toml overrides
+         /work/repo/.agent-vm/config.toml; differing fields: command, args
+```
+
+Only when **both** files declare zero tools (missing, empty, or `tools = []`)
+does the compiled-in fallback apply: the five defaults
+`codex`, `opencode`, `claude`, `copilot`, `shell`, in that order. They are
+defined once in
+[`crates/agent-vm/src/default-tools.toml`](crates/agent-vm/src/default-tools.toml),
+embedded into the binary (never written to disk). A configured catalog that
+omits `shell` keeps omitting it in the preview; the CLI fallback is a later
+change.
+
+### Errors and recovery
+
+A broken config makes ordinary `agent-vm doctor` exit nonzero. The failure
+is rendered inside the `==> tool configuration` section, naming the file and
+declaration (or a line/column for syntax errors), so the sections above it —
+state, credentials, and the operations list — still print: a repo-supplied
+config cannot hide them. Diagnostics never echo argument or command values,
+and control characters in paths and names are escaped as `\xNN`. `agent-vm
+doctor --reset-msb-db` **never reads config**, so a broken config can never
+block recovering a forward-migrated db.
 
 ## Recovering from a forward-migrated microsandbox db
 

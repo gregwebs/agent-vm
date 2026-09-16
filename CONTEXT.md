@@ -154,6 +154,37 @@ Provider-owned links come first, in `CredentialProvider::ALL` order, then the
 `credential_provider::guest_home_links()` list, so root mode's `.patch()`
 symlinks and non-root mode's host-side provisioning cannot drift (ADR-0002).
 
+## Tool
+
+A validated **declarative tool definition** (`config::Tool`): a guest
+`command`, its default `argv`, an optional **tooling layer**, a list of
+**credential providers**, extra guest-HOME-relative `persist` paths, and the
+**tool config tier** it came from. A tool is **data**, not a credential
+provider and not a command to execute on the host.
+
+In this release config names *parse* — `agent-vm doctor` resolves and previews
+the catalog — but no launch path reads it; selecting a tool at runtime is #82.
+Until then the five hard-coded launch verbs remain the runtime tools, and these
+two meanings coexist: the *configured* tool (a catalog entry, possibly
+`codex`-shaped) and the *launched* tool (a clap subcommand). #82 collapses them.
+
+_Avoid_: calling a **credential provider** a "tool" or "agent".
+
+### Tool config tier
+
+One of the two ordered, optional config files resolved by `config::load`: the
+**user** tier (`$HOME/.config/agent-vm/config.toml`) or the **project** tier
+(`<cwd>/.agent-vm/config.toml`). Each tier is parsed and validated
+independently before merging, retains whether it was `absent`, `found` (with a
+declared-tool count), or — for the user tier only — unavailable because
+`$HOME` is unset. Only when both tiers declare **zero** tools do the
+compiled-in defaults (embedded from `default-tools.toml`) apply.
+
+Their merge is a **union of whole definitions**, not a field overlay: the user
+tier is authoritative for every name it declares, the project tier may only
+add names the user did not write, and a differing project declaration yields a
+`config::ConfigConflict` warning rendered by `doctor` (user definition wins).
+
 ## Base image
 
 The OCI **guest template** agent-vm boots inside each per-project microVM

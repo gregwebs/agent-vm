@@ -81,17 +81,13 @@ impl CredentialProvider {
     }
 
     /// Stable name used in `credentials = [...]` (#80) and diagnostics.
-    ///
-    /// Forward-looking on purpose: #81 ships no config parser, but the
-    /// parse/print pair belongs with the enum and lets #80 consume this
-    /// module without editing it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Consumed by `config::validate_credentials` on the config parse path;
+    /// the inverse below is used by tests and future config printing.
     pub fn config_name(self) -> &'static str {
         self.spec().config_name
     }
 
     /// Inverse of [`Self::config_name`]. Unknown names are rejected.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_config_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|p| p.config_name() == name)
     }

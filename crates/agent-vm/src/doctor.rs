@@ -1,5 +1,16 @@
 //! `agent-vm doctor` — diagnostic / maintenance operations for agent-vm's
-//! private microsandbox state.
+//! private microsandbox state, and a read-only preview of the resolved tool
+//! configuration (see [`crate::config`]).
+//!
+//! ## Ordinary run
+//!
+//! With no flag, doctor prints the active `MSB_HOME`/schema, the host
+//! credential sources, and the diagnostic tool-configuration preview. The
+//! config preview is explicitly diagnostic only: nothing on any launch path
+//! consumes config yet (#82/#84 own that). A broken config still exits
+//! nonzero, but its failure is reported *inside* the config section so it
+//! never suppresses the sections above it — and never blocks recovery
+//! (below).
 //!
 //! ## `--reset-msb-db`
 //!
@@ -29,6 +40,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 
+use crate::config::{ConfigReport, TierReport, TierStatus, Tool, ToolLayer, ToolOrigin};
+
 #[derive(ClapArgs)]
 pub struct Args {
     /// Move MSB_HOME/db aside (non-destructive) so the next agent-vm
@@ -52,6 +65,16 @@ pub fn run(args: Args) -> Result<()> {
     let msb_home = crate::msb_install::msb_home_dir()?;
 
     if !args.reset_msb_db {
+        // Discover and load the read-only tool configuration, but hold the
+        // result as data instead of `?`-propagating it: a repo-supplied config
+        // must not blank out the state/credential sections `doctor` exists to
+        // show. A load failure is rendered as the `==> tool configuration`
+        // section's own body, and the trailing `config.map(|_| ())?` still
+        // exits nonzero. The reset branch deliberately never reads config: a
+        // broken TOML must not block recovering a forward-migrated db.
+        let config =
+            crate::config::ConfigPaths::discover().and_then(|paths| crate::config::load(&paths));
+
         let db_exists = msb_home.join("db").join("msb.db").exists();
         println!(
             "{}",
@@ -64,9 +87,15 @@ pub fn run(args: Args) -> Result<()> {
         println!();
         println!("{}", describe_credentials(&gather_credentials()));
         println!();
+        match &config {
+            Ok(report) => println!("{}", describe_config(report)),
+            Err(error) => println!("==> tool configuration\nerror: {error:#}"),
+        }
+        println!();
         println!("==> agent-vm doctor: available operations");
         println!("      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next");
         println!("                       agent-vm shell/run recreates it at the bundled schema");
+        config.map(|_| ())?;
         return Ok(());
     }
 
@@ -303,6 +332,97 @@ fn describe_credentials(report: &CredReport) -> String {
          the VM cannot work and fails with an OAuth 400.",
     );
     out
+}
+
+/// Render the read-only tool-configuration preview. Pure over its input so
+/// the wording is unit-tested without a real filesystem, mirroring
+/// [`describe_home`]/[`describe_credentials`].
+///
+/// This section is **diagnostic only**: it never claims that a layer chain or
+/// any launch behavior was built, and it shows argument *counts* rather than
+/// values (a user may have mistakenly put a secret in `args`). Untrusted
+/// names/paths are escaped so a config file cannot inject terminal controls.
+fn describe_config(report: &ConfigReport) -> String {
+    let mut out = String::from("==> tool configuration (diagnostic only; launches unchanged)\n");
+    out.push_str(&format!(
+        "user:    {}\nproject: {}\n",
+        describe_tier(report.user()),
+        describe_tier(report.project()),
+    ));
+    out.push_str(if report.uses_defaults() {
+        "resolved: built-in defaults; declaration / future tool-layer order\n"
+    } else {
+        "resolved: declared tools; declaration / future tool-layer order\n"
+    });
+    for (index, tool) in report.resolved().as_slice().iter().enumerate() {
+        out.push_str(&format!("  {}. {}\n", index + 1, describe_tool(tool)));
+    }
+    for conflict in report.conflicts() {
+        let fields = conflict
+            .fields()
+            .iter()
+            .map(|field| field.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "warning: tool {} in {} overrides\n         {}; differing fields: {}\n",
+            crate::config::quoted_str(conflict.tool()),
+            crate::config::escape_path(conflict.user_file()),
+            crate::config::escape_path(conflict.project_file()),
+            fields,
+        ));
+    }
+    // Drop the final newline: the caller adds one via `writeln!`.
+    out.truncate(out.trim_end_matches('\n').len());
+    out
+}
+
+fn describe_tier(tier: &TierReport) -> String {
+    match tier.status() {
+        TierStatus::UnavailableHome => "<no HOME; user tier unavailable>".to_string(),
+        TierStatus::Absent => format!(
+            "{} (absent)",
+            tier.path()
+                .map_or("<unknown>".to_string(), crate::config::escape_path)
+        ),
+        TierStatus::Found { declared_tools } => format!(
+            "{} (found, {declared_tools} tool{})",
+            tier.path()
+                .map_or("<unknown>".to_string(), crate::config::escape_path),
+            if *declared_tools == 1 { "" } else { "s" },
+        ),
+    }
+}
+
+fn describe_tool(tool: &Tool) -> String {
+    let layer = match tool.layer() {
+        None => "none".to_string(),
+        Some(ToolLayer::Builtin(builtin)) => format!("builtin:{}", builtin.as_str()),
+        Some(ToolLayer::Path(path)) => {
+            format!("path:{}", crate::config::escape_path(path.as_path()))
+        }
+    };
+    let credentials = if tool.credentials().is_empty() {
+        "none".to_string()
+    } else {
+        tool.credentials()
+            .iter()
+            .map(|provider| provider.config_name())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let source = match tool.origin() {
+        ToolOrigin::BuiltIn => "built-in".to_string(),
+        ToolOrigin::User(file) => format!("user:{}", crate::config::escape_path(file)),
+        ToolOrigin::Project(file) => format!("project:{}", crate::config::escape_path(file)),
+    };
+    format!(
+        "{} -> \"{}\"; args={}; layer={layer}; credentials={credentials}; persist={}; source={source}",
+        crate::config::escape_str(tool.name()),
+        crate::config::escape_str(tool.command()),
+        tool.arg_count(),
+        tool.persist_count(),
+    )
 }
 
 /// `expires in 3h22m` / `EXPIRED 15m ago`. Minute resolution is enough to
@@ -739,5 +859,126 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("guest Claude cred file: absent"), "{text}");
+    }
+
+    // -- tool-configuration preview ---------------------------------------
+
+    /// Build a report by loading real files: config construction is private,
+    /// and a real `load` keeps the renderer test free of a duplicate schema.
+    fn config_report(user: Option<&Path>, project: &Path) -> crate::config::ConfigReport {
+        crate::config::load(&crate::config::ConfigPaths {
+            user: user.map(Path::to_path_buf),
+            project: project.to_path_buf(),
+        })
+        .expect("fixture config should load")
+    }
+
+    #[test]
+    fn describe_config_lists_defaults_in_order_and_shows_argument_counts_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = config_report(None, &dir.path().join("absent.toml"));
+
+        let text = describe_config(&report);
+
+        assert!(
+            text.contains("diagnostic only; launches unchanged"),
+            "{text}"
+        );
+        assert!(text.contains("<no HOME; user tier unavailable>"), "{text}");
+        assert!(text.contains("built-in defaults"), "{text}");
+
+        let codex = text.find("1. codex").expect("codex row");
+        let opencode = text.find("2. opencode").expect("opencode row");
+        let claude = text.find("3. claude").expect("claude row");
+        assert!(codex < opencode && opencode < claude, "{text}");
+
+        assert!(
+            text.contains(
+                "shell -> \"bash\"; args=2; layer=none; credentials=openai,opencode-static; persist=0; source=built-in"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("claude -> \"claude\"; args=1;"), "{text}");
+        assert!(text.contains("codex -> \"codex\"; args=0;"), "{text}");
+    }
+
+    #[test]
+    fn describe_config_distinguishes_a_found_empty_tier_from_an_absent_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(&user, "").unwrap();
+        let report = config_report(Some(&user), &dir.path().join("absent.toml"));
+
+        let text = describe_config(&report);
+        assert!(text.contains("(found, 0 tools)"), "{text}");
+        assert!(text.contains("(absent)"), "{text}");
+    }
+
+    #[test]
+    fn describe_config_names_differing_fields_but_never_argument_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        std::fs::write(
+            &user,
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"--token=SENTINEL\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"other\"]\n",
+        )
+        .unwrap();
+        let report = config_report(Some(&user), &project);
+
+        let text = describe_config(&report);
+        assert!(text.contains("overrides"), "{text}");
+        assert!(text.contains("tool \"t\" in"), "{text}");
+        assert!(text.contains("differing fields: args"), "{text}");
+        assert!(!text.contains("SENTINEL"), "argument value leaked: {text}");
+    }
+
+    #[test]
+    fn describe_config_escapes_control_bytes_in_a_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let evil = dir.path().join("user\x1b[31m\nname");
+        std::fs::create_dir_all(&evil).unwrap();
+        let user = evil.join("config.toml");
+        std::fs::write(&user, "").unwrap();
+        let report = config_report(Some(&user), &dir.path().join("absent.toml"));
+
+        let text = describe_config(&report);
+        assert!(!text.contains('\x1b'), "raw ESC leaked: {text:?}");
+        assert!(text.contains("\\x1b"), "ESC should be escaped: {text:?}");
+        assert!(
+            text.contains("\\x0a"),
+            "newline should be escaped: {text:?}"
+        );
+    }
+
+    /// A *resolved row* is not only paths: `command` and `layer.path` accept
+    /// every byte except NUL, so they too can carry terminal controls. Both
+    /// are escaped the same way; this pins the renderer that a hostile project
+    /// config cannot inject an ANSI escape or split the report with a newline.
+    #[test]
+    fn describe_config_escapes_control_bytes_in_a_command_and_layer_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "[[tools]]\nname = \"t\"\ncommand = \"evil\\u001b[31m\\nred\"\n\
+             layer = { path = \"layers/\\u001b[32m\\ngrn\" }\n",
+        )
+        .unwrap();
+        let report = config_report(Some(&user), &dir.path().join("absent.toml"));
+
+        let text = describe_config(&report);
+        assert!(!text.contains('\x1b'), "raw ESC leaked: {text:?}");
+        assert!(
+            !text.contains("red\n"),
+            "raw newline from the command leaked: {text:?}"
+        );
+        assert!(text.contains("evil\\x1b[31m\\x0ared"), "{text}");
+        assert!(text.contains("layers/\\x1b[32m\\x0agrn"), "{text}");
     }
 }

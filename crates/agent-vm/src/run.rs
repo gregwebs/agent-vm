@@ -2567,6 +2567,27 @@ mod tests {
         }
     }
 
+    /// R3 legacy oracle: the exact guest command and default argv every
+    /// variant must keep. These literals are written independently of the
+    /// config defaults (`default-tools.toml`), so drifting either source
+    /// trips its own test: dropping Claude's `--dangerously-skip-permissions`
+    /// from the config fails `config::tests`; dropping it here fails this
+    /// test. Nothing derives one from the other (#80 keeps launch off config).
+    #[test]
+    fn agent_command_and_default_argv_match_legacy_literals() {
+        let cases: [(Agent, &str, &[&str]); 5] = [
+            (Agent::Claude, "claude", &["--dangerously-skip-permissions"]),
+            (Agent::Codex, "codex", &[]),
+            (Agent::Opencode, "opencode", &[]),
+            (Agent::Copilot, "copilot", &["--allow-all-tools"]),
+            (Agent::Shell, "bash", &["-O", "histappend"]),
+        ];
+        for (agent, command, argv) in cases {
+            assert_eq!(agent.command(), command, "{agent:?}");
+            assert_eq!(agent.default_args(), argv, "{agent:?}");
+        }
+    }
+
     #[test]
     fn reject_removed_layer_env_accepts_unset() {
         assert!(reject_removed_layer_env(None).is_ok());
