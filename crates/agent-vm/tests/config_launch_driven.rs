@@ -32,7 +32,17 @@
 //! - the non-root guest identity (`runtime.user`, `USER`/`LOGNAME`, the
 //!   `/etc/passwd` append) is tokenized, and the `Mkdir` patches — a
 //!   mechanical function of the project path's ancestors, which differ by
-//!   platform (macOS canonicalizes `/tmp` → `/private/tmp`) — are dropped.
+//!   platform (macOS canonicalizes `/tmp` → `/private/tmp`) — are dropped;
+//! - the project's **guest** location — `runtime.workdir` and the project bind
+//!   mount's `guest` — collapses to one `$PROJECT_GUEST` token, and the
+//!   `/etc/group` append is dropped. Both are decided by *pre-existing* launch
+//!   code from the host environment, never by the tool: `run.rs` mirrors the
+//!   project at its real path unless it sits under a guest tmpfs (`/tmp`,
+//!   `/run`, …), where it falls back to `/workspace` — which is true on the
+//!   Linux CI runner (its real `/tmp` is a guest tmpfs) but not here (macOS
+//!   `/tmp` is `/private/tmp`, so the path is mirrored); and `user.rs` appends
+//!   an `/etc/group` line only when the host gid is ≥ 1000 (a macOS developer
+//!   gid is not). See [`normalize_host_environment`].
 //!
 //! Everything else — every network rule, proxy secret, and the captured state
 //! files under the project state dir — is pinned byte-for-byte. The state-dir
@@ -59,6 +69,10 @@ const GUEST_CMD_MARKER: &str = "[debug] guest command: ";
 
 /// The five shipped default tools, in `default-tools.toml` order.
 const DEFAULT_TOOLS: [&str; 5] = ["codex", "opencode", "claude", "copilot", "shell"];
+
+/// The tool-independent guest `PATH` every default tool launches with. Pinned
+/// both by the goldens and by [`assert_tool_dependent_content`].
+const PATH_VALUE: &str = "/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin";
 
 /// The resolved guest command line each default tool must produce with no user
 /// args (`command` + `argv`). Transcribed by hand from `run::Agent`'s
@@ -188,6 +202,21 @@ impl Harness {
         }
     }
 
+    /// A harness whose *cwd* carries a control character (a TAB).
+    ///
+    /// `run::resolve_project_guest_path` refuses to mirror a control-character
+    /// path and falls back to `/workspace` — the same guest shape the Linux CI
+    /// runner produces for an ordinary path, because its real `/tmp` is a guest
+    /// tmpfs. This is how the mount/workdir normalization is exercised on this
+    /// macOS host, where an ordinary temp path is mirrored at its real path.
+    fn with_control_char_project() -> Self {
+        let mut harness = Self::new();
+        let project_root = harness.project_root.join("proj\twith-control-char");
+        std::fs::create_dir_all(&project_root).unwrap();
+        harness.project_root = project_root;
+        harness
+    }
+
     fn user_config(&self) -> PathBuf {
         self.home_root.join(".config/agent-vm/config.toml")
     }
@@ -230,11 +259,11 @@ impl Harness {
         self.launch(tool, &[])
     }
 
-    /// Replace every location-dependent token so a golden is reproducible.
-    fn normalize(&self, state_dir: &Path, text: &str) -> String {
-        // Longest path first: `state_dir` is `state_root/<hash>`, so it must
-        // be replaced before its `state_root` prefix.
-        let replacements = [
+    /// The location-dependent host paths to tokenize, longest first
+    /// (`state_dir` is `state_root/<hash>`, so it must be replaced before its
+    /// `state_root` prefix).
+    fn location_tokens(&self, state_dir: &Path) -> [(String, &'static str); 5] {
+        [
             (state_dir.to_string_lossy().into_owned(), "$STATE_DIR"),
             (
                 self.state_root.to_string_lossy().into_owned(),
@@ -246,20 +275,30 @@ impl Harness {
                 agent_vm_bin().to_string_lossy().into_owned(),
                 "$AGENT_VM_BIN",
             ),
-        ];
+        ]
+    }
+
+    /// Replace every location-dependent token so a golden is reproducible.
+    fn normalize(&self, state_dir: &Path, text: &str) -> String {
         let mut out = text.to_string();
-        for (from, to) in replacements {
+        for (from, to) in self.location_tokens(state_dir) {
             out = out.replace(&from, to);
         }
         out
     }
 
     fn normalize_json(&self, state_dir: &Path, value: &serde_json::Value) -> String {
-        // Normalize the paths *before* sorting, or the sort key would itself be
-        // a raw temp path and the ordering would stay run-dependent below.
-        let text = self.normalize(state_dir, &serde_json::to_string_pretty(value).unwrap());
-        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // Tokenize the paths *structurally, before sorting*, so the sort key is
+        // not itself a raw temp path. Structural (rather than text) replacement
+        // matters for a project path containing a character JSON escapes — e.g.
+        // `Harness::with_control_char_project`'s TAB, which the serialized JSON
+        // spells `\t` — where a text substitution would silently miss.
+        let mut value = value.clone();
+        for (from, to) in self.location_tokens(state_dir) {
+            replace_in_strings(&mut value, &from, to);
+        }
         normalize_host_identity(&mut value);
+        normalize_host_environment(&mut value);
         // Drop the `Mkdir` patches: they are a mechanical function of the
         // project path's ancestors, which differ by platform (macOS
         // canonicalizes `/tmp` -> `/private/tmp`, Linux does not). They are not
@@ -280,6 +319,30 @@ impl Harness {
             mounts.sort_by_key(|mount| serde_json::to_string(mount).unwrap());
         }
         serde_json::to_string_pretty(&value).unwrap()
+    }
+}
+
+/// Replace `from` with `to` in every JSON *string value*, recursively. Used to
+/// tokenize host paths on the parsed value so a path JSON escapes is still
+/// tokenized.
+fn replace_in_strings(value: &mut serde_json::Value, from: &str, to: &str) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.contains(from) {
+                *text = text.replace(from, to);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                replace_in_strings(item, from, to);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for field in fields.values_mut() {
+                replace_in_strings(field, from, to);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -327,6 +390,67 @@ fn normalize_host_identity(value: &mut serde_json::Value) {
                     serde_json::json!("$GUEST_USER:x:$GUEST_UID:$GUEST_GID::$HOME:/bin/bash\n");
             }
         }
+    }
+}
+
+/// Collapse the two host-environment-dependent project-guest shapes to one
+/// token, and drop the host-gid-dependent `/etc/group` append.
+///
+/// **Why this is host-dependent, and why it is not tool-dependent.** The guest
+/// location of the project is chosen by `run::resolve_project_guest_path` (run.rs)
+/// purely from the host path: a project under a guest tmpfs (`/tmp`, `/run`,
+/// `/dev/shm`, `/var/run` — `TMPFS_GUEST_PREFIXES`) falls back to `/workspace`,
+/// while any other path is mirrored verbatim. The harness's project dir lives
+/// under the platform temp root, so on the Linux CI runner it *is* under `/tmp`
+/// and falls back, whereas on macOS `/tmp` canonicalizes to `/private/tmp` (no
+/// longer a listed prefix) and is mirrored. `user::group_append_line` emits the
+/// `/etc/group` append only when the guest gid is ≥ 1000 — derived from the
+/// *host* account, so the append's very presence differs between a macOS
+/// developer (staff=20, none) and the Linux runner (gid ≥ 1000, one). Both the
+/// `/workspace` fallback logic and the gid-range rule predate #82 and are pinned
+/// by `run.rs`/`user.rs` tests; neither is decided by the launched tool.
+///
+/// Narrow by construction: it rewrites only `runtime.workdir`, the project
+/// bind mount's `guest`, and `/etc/group` appends — every other field (the
+/// `CODEX_HOME`/`PATH` env, the secret set and its placeholder/allowlist shape,
+/// the intercept `hook`, the mount set) is left untouched. See
+/// `host_environment_normalization_collapses_only_the_three_host_dependent_fields`.
+fn normalize_host_environment(value: &mut serde_json::Value) {
+    /// The project's guest path, whether mirrored at the host path
+    /// (`$PROJECT`) or remapped to `/workspace`.
+    const GUEST_TOKEN: &str = "$PROJECT_GUEST";
+    const MIRRORED: &str = "$PROJECT";
+    const FALLBACK: &str = "/workspace";
+
+    if let Some(workdir) = value
+        .get_mut("runtime")
+        .and_then(|runtime| runtime.get_mut("workdir"))
+        && matches!(workdir.as_str(), Some(MIRRORED | FALLBACK))
+    {
+        *workdir = serde_json::json!(GUEST_TOKEN);
+    }
+    if let Some(mounts) = value.get_mut("mounts").and_then(|m| m.as_array_mut()) {
+        for mount in mounts {
+            // The project bind is the one whose host is the (tokenized) project
+            // path; the state and state-home mounts have other hosts.
+            if mount.get("host").and_then(|host| host.as_str()) != Some(MIRRORED) {
+                continue;
+            }
+            if let Some(guest) = mount.get_mut("guest")
+                && matches!(guest.as_str(), Some(MIRRORED | FALLBACK))
+            {
+                *guest = serde_json::json!(GUEST_TOKEN);
+            }
+        }
+    }
+    if let Some(patches) = value.get_mut("patches").and_then(|p| p.as_array_mut()) {
+        patches.retain(|patch| {
+            patch
+                .get("Append")
+                .and_then(|append| append.get("path"))
+                .and_then(|path| path.as_str())
+                != Some("/etc/group")
+        });
     }
 }
 
@@ -435,6 +559,133 @@ fn observation(harness: &Harness, out: &Output) -> String {
     lines.join("\n")
 }
 
+/// Just the normalized `SandboxConfig` (the JSON half of [`observation`]), as a
+/// value, so a test can assert the tool-dependent subset directly.
+fn normalized_config(harness: &Harness, out: &Output) -> serde_json::Value {
+    let stderr = stderr_of(out);
+    let state = state_dir(&stderr);
+    let mut config = debug_config_json(&stderr);
+    config["name"] = serde_json::json!("agent-vm-normalized");
+    serde_json::from_str(&harness.normalize_json(&state, &config)).unwrap()
+}
+
+/// Assert the tool-dependent content the goldens pin *directly*, so a future
+/// widening of the normalizer cannot quietly stop pinning it. Every field here
+/// is decided by the launched tool (or is a constant of the launch contract),
+/// never by the host environment.
+fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
+    // The mount *set* is fixed; only its runtime order is run-dependent.
+    let mounts: std::collections::BTreeSet<(&str, &str)> = config["mounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|mount| {
+            (
+                mount["host"].as_str().unwrap(),
+                mount["guest"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let expected_mounts: std::collections::BTreeSet<(&str, &str)> = [
+        ("$PROJECT", "$PROJECT_GUEST"),
+        ("$STATE_DIR", "/agent-vm-state"),
+        ("$STATE_DIR/home", "$HOME"),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(mounts, expected_mounts, "mount set changed for {tool}");
+
+    // The intercept hook argv is tool-independent but security-relevant.
+    assert_eq!(
+        config["network"]["intercept"]["hook"],
+        serde_json::json!([
+            "$AGENT_VM_BIN",
+            "_intercept-hook",
+            "--state-dir",
+            "$STATE_DIR"
+        ]),
+        "intercept hook argv changed for {tool}"
+    );
+
+    let env: Vec<(&str, &str)> = config["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["key"].as_str().unwrap(),
+                entry["value"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let env_of = |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+    assert_eq!(
+        env_of("PATH"),
+        Some(PATH_VALUE),
+        "PATH env changed for {tool}"
+    );
+    assert_eq!(
+        env_of("CODEX_HOME"),
+        Some("/agent-vm-state/codex"),
+        "CODEX_HOME env changed for {tool}"
+    );
+
+    // The credential secret set is tool-dependent; each secret's placeholder and
+    // allowlist shape is pinned.
+    let secrets = config["network"]["secrets"]["secrets"].as_array().unwrap();
+    let env_vars: Vec<&str> = secrets
+        .iter()
+        .map(|secret| secret["env_var"].as_str().unwrap())
+        .collect();
+    let expected_env_vars: &[&str] = match tool {
+        "opencode" | "shell" => &[
+            "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+            "MSB_AGENT_VM_OPENAI_UNUSED",
+            "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
+        ],
+        "copilot" => &[
+            "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+            "MSB_AGENT_VM_OPENAI_UNUSED",
+            "MSB_AGENT_VM_COPILOT_UNUSED",
+        ],
+        _ => &[
+            "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+            "MSB_AGENT_VM_OPENAI_UNUSED",
+        ],
+    };
+    assert_eq!(env_vars, expected_env_vars, "secret set changed for {tool}");
+    for secret in secrets {
+        assert!(
+            !secret["placeholder"].as_str().unwrap().is_empty(),
+            "{tool}: empty secret placeholder"
+        );
+        assert!(
+            !secret["allowed_hosts"].as_array().unwrap().is_empty(),
+            "{tool}: empty secret allowlist"
+        );
+        assert!(
+            secret["source"]["path"]
+                .as_str()
+                .unwrap()
+                .starts_with("$STATE_DIR.secrets/"),
+            "{tool}: secret source path is not tokenized"
+        );
+    }
+    if tool == "copilot" {
+        assert_eq!(
+            env_of("COPILOT_GITHUB_TOKEN"),
+            Some("msb-copilot-placeholder-v2"),
+            "copilot token env changed"
+        );
+    } else {
+        assert_eq!(
+            env_of("COPILOT_GITHUB_TOKEN"),
+            None,
+            "COPILOT_GITHUB_TOKEN must only be set for copilot"
+        );
+    }
+}
+
 fn golden_path(tool: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/config-launch")
@@ -467,6 +718,64 @@ fn assert_matches_golden(tool: &str, actual: &str) {
 fn default_tools_launch_identically_to_main() {
     for tool in DEFAULT_TOOLS {
         let harness = Harness::new();
+        let out = harness.launch_default(tool);
+        // Pin the tool-dependent subset directly as well as via the golden, so
+        // a future widening of the normalizer cannot stop pinning it.
+        assert_tool_dependent_content(tool, &normalized_config(&harness, &out));
+        assert_matches_golden(tool, &observation(&harness, &out));
+    }
+}
+
+/// The normalization must stay narrow: it may collapse exactly the three
+/// host-environment-dependent fields, and nothing else. This is the guard that
+/// the golden has not degraded into a lossy blob — a change to any
+/// tool-dependent field still fails [`default_tools_launch_identically_to_main`].
+#[test]
+fn host_environment_normalization_collapses_only_the_three_host_dependent_fields() {
+    // The same launch observed on a mirroring host (top) and a `/workspace`
+    // fallback host (bottom): only `runtime.workdir`, the project mount's
+    // `guest`, and the `/etc/group` append differ.
+    let mirrored = serde_json::json!({
+        "runtime": { "workdir": "$PROJECT" },
+        "mounts": [ { "host": "$PROJECT", "guest": "$PROJECT" } ],
+        "patches": [ { "Append": { "path": "/etc/passwd", "content": "p" } } ],
+        "env": [ { "key": "PATH", "value": PATH_VALUE } ],
+    });
+    let fallback = serde_json::json!({
+        "runtime": { "workdir": "/workspace" },
+        "mounts": [ { "host": "$PROJECT", "guest": "/workspace" } ],
+        "patches": [
+            { "Append": { "path": "/etc/passwd", "content": "p" } },
+            { "Append": { "path": "/etc/group", "content": "agent:x:1001:" } },
+        ],
+        "env": [ { "key": "PATH", "value": PATH_VALUE } ],
+    });
+    let mut a = mirrored.clone();
+    let mut b = fallback.clone();
+    normalize_host_environment(&mut a);
+    normalize_host_environment(&mut b);
+    assert_eq!(a, b, "the two host shapes must normalize identically");
+    assert_eq!(a["runtime"]["workdir"], serde_json::json!("$PROJECT_GUEST"));
+
+    // A difference in a tool-dependent field must survive normalization.
+    let mut changed = fallback.clone();
+    changed["env"][0]["value"] = serde_json::json!("/somewhere/else");
+    normalize_host_environment(&mut changed);
+    assert_ne!(
+        changed, b,
+        "a tool-dependent change must not be normalized away"
+    );
+}
+
+/// Drive the `/workspace` fallback shape (via a control-character project path,
+/// see [`Harness::with_control_char_project`]) through the same golden. On this
+/// macOS host the ordinary harness mirrors the project; this pins that the
+/// fallback shape normalizes to the *same* observation, which is what makes the
+/// fixtures portable to the Linux CI runner.
+#[test]
+fn a_workspace_fallback_project_normalizes_like_the_mirrored_golden() {
+    for tool in DEFAULT_TOOLS {
+        let harness = Harness::with_control_char_project();
         let out = harness.launch_default(tool);
         assert_matches_golden(tool, &observation(&harness, &out));
     }
