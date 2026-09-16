@@ -200,7 +200,8 @@ A load failure is **deferred**, not fatal at startup (#82): the CLI is
 built from the loaded catalog, but a broken config is carried as data so
 `doctor` (and the in-guest `clipboard`/`_intercept-hook`) keep working, a
 launch verb reports the config error rather than clap's "unrecognized
-subcommand", and `--help` still lists the built-ins.
+subcommand" (a verb near a built-in gets a did-you-mean hint *appended* to
+that error, never in place of it), and `--help` still lists the built-ins.
 
 ## Base image
 

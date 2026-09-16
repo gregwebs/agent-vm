@@ -708,10 +708,24 @@ Trailing args go to the tool. Run with --help for networking, security, and env 
     )
 }
 
+/// Spaces between `{name}` and an example description in the literal lines of
+/// [`launch_after_long_help`]; the continuation indent is built from it so it
+/// tracks the interpolated verb.
+const EXAMPLE_DESCRIPTION_PAD: usize = 29;
+
 /// Fuller footer shown under `--help`. Same single-[`Args`] constraint: every
 /// launch verb shares it, so the verb is interpolated and no shipped tool is
 /// named anywhere in the literal text.
+///
+/// The example descriptions form a column after `  agent-vm <verb>` plus
+/// [`EXAMPLE_DESCRIPTION_PAD`]. Since the verb is interpolated into every
+/// example line, that column moves with the verb's length — so a wrapped
+/// example's continuation must indent to the *same* column rather than a
+/// hard-coded value (which only lined up for one verb length).
 pub(crate) fn launch_after_long_help(name: &str) -> String {
+    // `  agent-vm ` + the verb + the pad the literal example lines use.
+    let continuation_indent = "  agent-vm ".len() + name.chars().count() + EXAMPLE_DESCRIPTION_PAD;
+    let continuation = " ".repeat(continuation_indent);
     format!(
         "\
 Examples:
@@ -721,11 +735,11 @@ Examples:
   agent-vm {name} --memory 8 --cpus 4         a bigger sandbox
   agent-vm {name} --mount ~/ref:ro            read-only extra mount
   agent-vm {name} --mount /etc/hosts:/host-hosts:ro
-                                               read-only single-file bind
+{continuation}read-only single-file bind
   agent-vm {name} --mount ~/skills:ro:follow-links
-                                               follow symlinks in a skills dir
+{continuation}follow symlinks in a skills dir
   agent-vm {name} --mount ~/config:/config:fork:exclude=credentials.json
-                                               seed an independent writable config copy
+{continuation}seed an independent writable copy
   agent-vm {name} --repo owner/other-repo     widen the GitHub allow-list
 
 Fork mounts:

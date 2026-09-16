@@ -204,11 +204,11 @@ Examples:
   agent-vm shell --memory 8 --cpus 4         a bigger sandbox
   agent-vm shell --mount ~/ref:ro            read-only extra mount
   agent-vm shell --mount /etc/hosts:/host-hosts:ro
-                                               read-only single-file bind
+                                             read-only single-file bind
   agent-vm shell --mount ~/skills:ro:follow-links
-                                               follow symlinks in a skills dir
+                                             follow symlinks in a skills dir
   agent-vm shell --mount ~/config:/config:fork:exclude=credentials.json
-                                               seed an independent writable config copy
+                                             seed an independent writable copy
   agent-vm shell --repo owner/other-repo     widen the GitHub allow-list
 
 Fork mounts:

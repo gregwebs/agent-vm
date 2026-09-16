@@ -126,6 +126,14 @@ pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "help",
 ];
 
+/// The outcome of loading the tool config, as data. One value rather than a
+/// `LaunchCatalog` plus a parallel `Option<Error>`, so the catalog and the
+/// deferred error cannot disagree about which state the process is in.
+pub(crate) enum Catalog {
+    Ready(LaunchCatalog),
+    Broken(anyhow::Error),
+}
+
 /// Build the full command (built-ins + one subcommand per catalog entry) and
 /// parse `argv`.
 ///
@@ -140,66 +148,76 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let (catalog, config_error) = match config {
-        Ok(report) => (Some(report.into_launch_catalog()?), None),
-        Err(error) => (None, Some(error)),
+    let catalog = match config {
+        Ok(report) => Catalog::Ready(report.into_launch_catalog()?),
+        Err(error) => Catalog::Broken(error),
     };
-    // Kept so the misspelling carve-out below can re-parse against the
-    // built-ins alone, where clap's parser (not the derive) renders its
-    // did-you-mean suggestion.
-    let argv: Vec<OsString> = argv.into_iter().map(Into::into).collect();
 
-    let matches = match build_command(catalog.as_ref()).try_get_matches_from(argv.clone()) {
+    let matches = match build_command(&catalog).try_get_matches_from(argv) {
         Ok(matches) => matches,
-        // Help and version are not failures: clap's own `exit()` writes them
-        // to stdout with status 0. Propagating them as `anyhow::Error` through
-        // main's `?` would print help to *stderr* with status 2.
-        Err(error) => error.exit(),
+        Err(error) => {
+            // On the broken path `allow_external_subcommands` absorbs every
+            // unknown verb, so the only `InvalidSubcommand` clap can raise is
+            // its synthesized `help <x>` validating `x` against the tool-less
+            // command. Report the config error there — never clap's
+            // "unrecognized subcommand" — with a did-you-mean hint when
+            // useful.
+            if error.kind() == clap::error::ErrorKind::InvalidSubcommand
+                && let Catalog::Broken(config_error) = &catalog
+            {
+                return Err(config_error_with_hint(
+                    config_error,
+                    invalid_subcommand(&error).as_deref().unwrap_or_default(),
+                ));
+            }
+            // Help and version are not failures: clap's own `exit()` writes
+            // them to stdout with status 0. Propagating them as
+            // `anyhow::Error` through main's `?` would print help to *stderr*
+            // with status 2.
+            error.exit()
+        }
     };
 
-    match matches.subcommand() {
-        Some((name, sub)) => match catalog.and_then(|catalog| catalog.take(name)) {
-            Some(tool) => Ok(Dispatch::Launch {
-                tool,
-                args: Box::new(run::Args::from_arg_matches(sub)?),
-            }),
-            // Not a tool. The catalog is authoritative (checked first) so a
-            // future built-in added without updating `RESERVED_TOOL_NAMES`
-            // fails a test rather than silently shadowing a user's tool.
-            None => match Cli::from_arg_matches(&matches) {
-                Ok(cli) => Ok(Dispatch::Builtin(cli.cmd)),
-                // Broken-config path only (external subcommands are off
-                // otherwise). A near-miss on a built-in is a typo in the
-                // verb, so let clap say so — `agent-vm doctro` must not report
-                // a config error when `doctor` is what we're telling the user
-                // to run. Re-parsing against the built-ins alone (external
-                // subcommands off) is what makes clap render its did-you-mean.
-                Err(_) if near_builtin(name) => {
-                    let error = Cli::command()
-                        .try_get_matches_from(argv)
-                        .expect_err("a near-builtin verb does not match a built-in");
-                    error.exit()
-                }
-                Err(_) => {
-                    Err(config_error.unwrap_or_else(|| anyhow!("unrecognized subcommand {name:?}")))
-                }
-            },
-        },
+    match (matches.subcommand(), catalog) {
         // Unreachable in practice: clap returns
         // `DisplayHelpOnMissingArgumentOrSubcommand` for a bare `agent-vm`
         // even with external subcommands enabled, so `error.exit()` above has
         // already handled it. Kept as an explicit error rather than a panic.
-        None => Err(anyhow!("no subcommand")),
+        (None, _) => Err(anyhow!("no subcommand")),
+        // The catalog is authoritative (checked first) so a future built-in
+        // added without updating `RESERVED_TOOL_NAMES` fails a test rather
+        // than silently shadowing a user's tool.
+        (Some((name, sub)), Catalog::Ready(catalog)) => match catalog.into_tool(name) {
+            Some(tool) => Ok(Dispatch::Launch {
+                tool,
+                args: Box::new(run::Args::from_arg_matches(sub)?),
+            }),
+            // Not a tool, so a fixed built-in: the two name sets are disjoint
+            // (`RESERVED_TOOL_NAMES`, asserted by a test) and external
+            // subcommands are off on this path, so clap could not have accepted
+            // anything else.
+            None => Ok(Dispatch::Builtin(Cli::from_arg_matches(&matches)?.cmd)),
+        },
+        (Some((name, _)), Catalog::Broken(config_error)) => {
+            // A registered built-in still works; anything else is an unknown
+            // verb clap accepted as an external subcommand, and carries the
+            // config error.
+            match Cli::from_arg_matches(&matches) {
+                Ok(cli) => Ok(Dispatch::Builtin(cli.cmd)),
+                Err(_) => Err(config_error_with_hint(&config_error, name)),
+            }
+        }
     }
 }
 
-/// The clap command for a given catalog. `None` is the broken-config shape.
-/// Pure over its inputs so the help fixtures are pinned without touching
-/// `$HOME` or the cwd.
-pub(crate) fn build_command(catalog: Option<&LaunchCatalog>) -> clap::Command {
+/// The clap command for a given catalog: `Ready` registers one subcommand per
+/// tool, `Broken` registers none and lets unknown verbs reach the deferred
+/// config error. Pure over its inputs so the help fixtures are pinned without
+/// touching `$HOME` or the cwd.
+pub(crate) fn build_command(catalog: &Catalog) -> clap::Command {
     let mut command = Cli::command();
     match catalog {
-        Some(catalog) => {
+        Catalog::Ready(catalog) => {
             for tool in catalog.as_slice() {
                 command = command.subcommand(launch_subcommand(tool));
             }
@@ -208,13 +226,51 @@ pub(crate) fn build_command(catalog: Option<&LaunchCatalog>) -> clap::Command {
         // config error rather than clap's "unrecognized subcommand", which
         // would send the user hunting for a typo in the verb instead of in
         // their TOML.
-        None => {
+        Catalog::Broken(_) => {
             command = command
                 .allow_external_subcommands(true)
                 .after_help(format!("{TOP_AFTER_HELP}\n\n{CONFIG_BROKEN_NOTE}"));
         }
     }
     command
+}
+
+/// Format the deferred config error as the primary message, appending clap's
+/// did-you-mean as a hint when `verb` is a near-miss on a built-in. A broken
+/// config must never be replaced by "unrecognized subcommand" (issue #82's
+/// acceptance criterion), but a verb typo still deserves the pointer clap
+/// would give — *after* the real error, not instead of it.
+fn config_error_with_hint(config_error: &anyhow::Error, verb: &str) -> anyhow::Error {
+    match nearest_builtin(verb) {
+        Some(builtin) => {
+            anyhow!("{config_error:#}\n\ntip: a similar subcommand exists: '{builtin}'")
+        }
+        None => anyhow!("{config_error:#}"),
+    }
+}
+
+/// The verb clap rejected in an `InvalidSubcommand` error. clap always sets
+/// this context alongside that kind; `None` is a defensive fallback.
+fn invalid_subcommand(error: &clap::Error) -> Option<String> {
+    match error.get(clap::error::ContextKind::InvalidSubcommand) {
+        Some(clap::error::ContextValue::String(name)) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The built-in `verb` is a near-miss on — within edit distance 2, closest
+/// first — or `None` when it is not near any. `help` is excluded: it is
+/// clap-synthesized, and including it makes real launch verbs false-positive
+/// ("shell" is edit distance 2 from "help"), which would append a misleading
+/// hint to an otherwise valid tool name.
+fn nearest_builtin(verb: &str) -> Option<&'static str> {
+    BUILTIN_SUBCOMMANDS
+        .iter()
+        .filter(|builtin| **builtin != "help")
+        .map(|builtin| (*builtin, edit_distance(verb, builtin)))
+        .filter(|(_, distance)| *distance <= 2)
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(builtin, _)| builtin)
 }
 
 /// One launch subcommand, backed by the shared [`run::Args`]. `tool.name()` is
@@ -226,22 +282,6 @@ fn launch_subcommand(tool: &Tool) -> clap::Command {
         .about(format!("Launch {} in a per-project sandbox", tool.name()))
         .after_help(run::launch_after_help(tool.name()))
         .after_long_help(run::launch_after_long_help(tool.name()))
-}
-
-/// True when `name` is within edit distance 2 of a built-in subcommand. Used
-/// only on the broken-config path: a near-miss is a verb typo, so clap's own
-/// did-you-mean is the honest message, not the config error.
-fn near_builtin(name: &str) -> bool {
-    // `help` is deliberately excluded. It is clap-synthesized, and including it
-    // makes real launch verbs false-positive: "shell" is edit-distance 2 from
-    // "help", so `agent-vm shell` under a broken config would show clap's
-    // "unrecognized subcommand" instead of the config error — violating the
-    // acceptance criterion that a broken config never degrades that way. A
-    // typo of `help` is rare enough to fall through to the config error.
-    BUILTIN_SUBCOMMANDS
-        .iter()
-        .filter(|builtin| **builtin != "help")
-        .any(|builtin| edit_distance(name, builtin) <= 2)
 }
 
 /// Levenshtein distance. Small inputs (subcommand names) so the simple
@@ -309,7 +349,7 @@ mod tests {
     #[test]
     fn default_catalog_registers_builtins_then_tools_in_order() {
         let catalog = default_catalog();
-        let mut command = build_command(Some(&catalog));
+        let mut command = build_command(&Catalog::Ready(catalog));
         // `build()` runs clap's `_check_help_and_version`, which is what
         // registers the synthesized `help` subcommand — so the names below are
         // the full `BUILTIN_SUBCOMMANDS` set, in registration order: fixed
@@ -352,7 +392,7 @@ mod tests {
             "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n",
         );
         let catalog = report.into_launch_catalog().unwrap();
-        let command = build_command(Some(&catalog));
+        let command = build_command(&Catalog::Ready(catalog));
         assert!(command.find_subcommand("claude").is_some());
         assert!(command.find_subcommand("shell").is_some());
         for absent in ["codex", "opencode", "copilot"] {
@@ -419,21 +459,81 @@ mod tests {
         )
         .into_launch_catalog()
         .unwrap();
-        let error = build_command(Some(&catalog))
+        let error = build_command(&Catalog::Ready(catalog))
             .try_get_matches_from(["agent-vm", "codex"])
             .expect_err("codex is not registered");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
+    // -- T10b: a broken config never degrades into clap's unrecognized ------
+
+    #[test]
+    fn a_broken_config_reports_its_error_and_hints_at_a_near_builtin_verb() {
+        // A misspelled built-in keeps clap's helpfulness, but as a hint after
+        // the config error — never as clap's "unrecognized subcommand".
+        let result = parse_from(
+            ["agent-vm", "doctro"],
+            Err(anyhow!("config: broken on purpose")),
+        );
+        let text = format!("{:#}", result.err().expect("`doctro` must fail"));
+        assert!(text.contains("config: broken on purpose"), "{text}");
+        assert!(
+            text.contains("tip: a similar subcommand exists: 'doctor'"),
+            "{text}"
+        );
+        assert!(!text.contains("unrecognized subcommand"), "{text}");
+
+        // A plausible *tool* name within distance 2 of a built-in (`docker` /
+        // `doctor`) is not special-cased away: the config error stays primary.
+        let result = parse_from(
+            ["agent-vm", "docker"],
+            Err(anyhow!("config: broken on purpose")),
+        );
+        let text = format!("{:#}", result.err().expect("`docker` must fail"));
+        assert!(text.contains("config: broken on purpose"), "{text}");
+        assert!(text.contains("'doctor'"), "{text}");
+        assert!(!text.contains("unrecognized subcommand"), "{text}");
+
+        // A verb far from every built-in gets the config error and no hint.
+        let result = parse_from(
+            ["agent-vm", "claude"],
+            Err(anyhow!("config: broken on purpose")),
+        );
+        let text = format!("{:#}", result.err().expect("`claude` must fail"));
+        assert!(text.contains("config: broken on purpose"), "{text}");
+        assert!(!text.contains("tip:"), "{text}");
+        assert!(!text.contains("unrecognized subcommand"), "{text}");
+    }
+
+    /// clap's synthesized `help <verb>` validates its positional *before*
+    /// `parse_from`'s dispatch, so on the broken path it is the only
+    /// `InvalidSubcommand` clap raises. It must still report the config error.
+    #[test]
+    fn help_for_an_unknown_verb_under_a_broken_config_reports_the_config_error() {
+        let result = parse_from(
+            ["agent-vm", "help", "claude"],
+            Err(anyhow!("config: broken on purpose")),
+        );
+        let text = format!("{:#}", result.err().expect("`help claude` must fail"));
+        assert!(text.contains("config: broken on purpose"), "{text}");
+        assert!(!text.contains("unrecognized subcommand"), "{text}");
+    }
+
     // -- T11: the near-builtin predicate ----------------------------------
 
     #[test]
-    fn near_builtin_detects_typos_and_rejects_real_verbs() {
-        for near in ["doctro", "doctr", "setp", "clipbord"] {
-            assert!(near_builtin(near), "{near} should be near a built-in");
-        }
+    fn nearest_builtin_detects_typos_and_rejects_real_verbs() {
+        assert_eq!(nearest_builtin("doctro"), Some("doctor"));
+        assert_eq!(nearest_builtin("doctr"), Some("doctor"));
+        assert_eq!(nearest_builtin("setp"), Some("setup"));
+        assert_eq!(nearest_builtin("clipbord"), Some("clipboard"));
+        // A plausible tool name colliding with a built-in still yields a hint.
+        assert_eq!(nearest_builtin("docker"), Some("doctor"));
+        assert_eq!(nearest_builtin("mcp"), Some("msb"));
+        // Real launch verbs, and `shell` in particular — which is distance 2
+        // from the excluded `help` — do not get a hint.
         for far in ["claude", "mytool", "codex", "shell"] {
-            assert!(!near_builtin(far), "{far} should not be near a built-in");
+            assert_eq!(nearest_builtin(far), None, "{far} should not be near");
         }
     }
 
@@ -460,7 +560,7 @@ mod tests {
 
     #[test]
     fn shell_accepts_network_options_and_keeps_help_stable() {
-        let command = build_command(Some(&default_catalog())).term_width(100);
+        let command = build_command(&Catalog::Ready(default_catalog())).term_width(100);
         command
             .clone()
             .try_get_matches_from([
@@ -567,7 +667,7 @@ mod tests {
 
     #[test]
     fn broken_config_help_lists_builtins_and_points_at_doctor() {
-        let command = build_command(None);
+        let command = build_command(&Catalog::Broken(anyhow!("broken on purpose")));
         let mut help = Vec::new();
         command
             .clone()

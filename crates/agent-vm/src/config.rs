@@ -224,9 +224,11 @@ impl LaunchCatalog {
         self.shell_fallback_added
     }
 
-    /// Move one tool out by name for dispatch. Order-preserving so a catalog
-    /// that outlives one `take` still lists the remaining tools in order.
-    pub(crate) fn take(mut self, name: &str) -> Option<Tool> {
+    /// Consume the catalog, returning the tool named `name` for dispatch (the
+    /// remaining tools are dropped). `remove` rather than `swap_remove` keeps
+    /// the surviving order stable, though nothing observes it once `self` is
+    /// consumed.
+    pub(crate) fn into_tool(mut self, name: &str) -> Option<Tool> {
         let index = self.tools.iter().position(|tool| tool.name() == name)?;
         Some(self.tools.remove(index))
     }
@@ -1598,16 +1600,16 @@ mod tests {
         assert_eq!(catalog.as_slice().len(), 2);
     }
 
-    /// `take` moves exactly the named tool, order-preserving.
+    /// `into_tool` moves exactly the named tool out, consuming the catalog.
     #[test]
-    fn launch_catalog_take_moves_the_named_tool() {
+    fn launch_catalog_into_tool_returns_the_named_tool() {
         let fixture = Fixture::new();
         fixture.user(&one_tool("solo"));
         let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
-        let solo = catalog.take("solo").expect("solo is in the catalog");
+        let solo = catalog.into_tool("solo").expect("solo is in the catalog");
         assert_eq!(solo.name(), "solo");
         let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
-        assert!(catalog.take("absent").is_none());
+        assert!(catalog.into_tool("absent").is_none());
     }
 
     // -- interactive_shell ------------------------------------------------

@@ -16,7 +16,7 @@
     "max_memory_mib": 2048
   },
   "runtime": {
-    "workdir": "$PROJECT_GUEST",
+    "workdir": "$PROJECT",
     "shell": "/bin/sh",
     "scripts": {},
     "entrypoint": null,
@@ -63,7 +63,7 @@
     {
       "type": "Bind",
       "host": "$PROJECT",
-      "guest": "$PROJECT_GUEST",
+      "guest": "$PROJECT",
       "options": {
         "readonly": false,
         "noexec": false,

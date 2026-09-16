@@ -78,9 +78,11 @@ pub fn run(args: Args) -> Result<()> {
         // TOML must not block recovering a forward-migrated db.
         let config =
             crate::config::ConfigPaths::discover().and_then(|paths| crate::config::load(&paths));
-        // Extract the failure (rendered below) so the report can still own its
-        // `ConfigReport` and build the launch catalog from it.
-        let config_failure = config.as_ref().err().map(|error| anyhow!("{error:#}"));
+        // A load failure *and* a catalog-build failure (the embedded defaults
+        // failing to resolve `shell`) both fail the run; either is rendered in
+        // the section. `describe_config` returns the latter so `doctor` cannot
+        // print an error and still exit 0.
+        let load_failure = config.as_ref().err().map(|error| anyhow!("{error:#}"));
 
         let db_exists = msb_home.join("db").join("msb.db").exists();
         println!(
@@ -94,10 +96,17 @@ pub fn run(args: Args) -> Result<()> {
         println!();
         println!("{}", describe_credentials(&gather_credentials()));
         println!();
-        match config {
-            Ok(report) => println!("{}", describe_config(report)),
-            Err(error) => println!("==> tool configuration\nerror: {error:#}"),
-        }
+        let config_failure = match config {
+            Ok(report) => {
+                let (section, catalog_failure) = describe_config(report);
+                println!("{section}");
+                catalog_failure
+            }
+            Err(error) => {
+                println!("==> tool configuration\nerror: {error:#}");
+                load_failure
+            }
+        };
         println!();
         println!("==> agent-vm doctor: available operations");
         println!("      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next");
@@ -346,15 +355,17 @@ fn describe_credentials(report: &CredReport) -> String {
 /// Render the tool-configuration section. Consumes its input so it can build
 /// the owned [`crate::config::LaunchCatalog`] (the merge result plus the
 /// built-in `shell` fallback) that `--help` also renders — the two therefore
-/// cannot disagree about the verb list. Pure over its input so the wording is
-/// unit-tested without a real filesystem, mirroring
+/// cannot disagree about the verb list. Returns the section text plus the
+/// catalog-build failure, if any, so the caller can fail the exit code rather
+/// than print an error and still report success. Pure over its input so the
+/// wording is unit-tested without a real filesystem, mirroring
 /// [`describe_home`]/[`describe_credentials`].
 ///
 /// The verb list is authoritative; the *layer chain* is still metadata only
 /// (#84 owns building it), and it shows argument *counts* rather than values
 /// (a user may have mistakenly put a secret in `args`). Untrusted names/paths
 /// are escaped so a config file cannot inject terminal controls.
-fn describe_config(report: ConfigReport) -> String {
+fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>) {
     // Everything that needs a borrow is rendered before `report` is consumed
     // by `into_launch_catalog`.
     let tiers = format!(
@@ -372,7 +383,7 @@ fn describe_config(report: ConfigReport) -> String {
     let mut out = String::from("==> tool configuration\n");
     out.push_str(&tiers);
     out.push_str(resolved_label);
-    match report.into_launch_catalog() {
+    let failure = match report.into_launch_catalog() {
         Ok(catalog) => {
             for (index, tool) in catalog.as_slice().iter().enumerate() {
                 out.push_str(&format!("  {}. {}\n", index + 1, describe_tool(tool)));
@@ -383,15 +394,19 @@ fn describe_config(report: ConfigReport) -> String {
                      still have a way into the guest.\n",
                 );
             }
+            None
         }
         // Only reachable if the embedded defaults are internally broken — a
         // programming error, not a config the user can fix.
-        Err(error) => out.push_str(&format!("error: {error:#}\n")),
-    }
+        Err(error) => {
+            out.push_str(&format!("error: {error:#}\n"));
+            Some(error)
+        }
+    };
     out.push_str(&conflicts);
     // Drop the final newline: the caller adds one via `writeln!`.
     out.truncate(out.trim_end_matches('\n').len());
-    out
+    (out, failure)
 }
 
 /// The `warning:` blocks for cross-tier shadows, in project declaration order.
@@ -923,7 +938,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let report = config_report(None, &dir.path().join("absent.toml"));
 
-        let text = describe_config(report);
+        let (text, _) = describe_config(report);
 
         // The verb list is authoritative now; the header must not claim it is
         // "diagnostic only" (the pre-#82 wording), and the default catalog
@@ -956,7 +971,7 @@ mod tests {
         std::fs::write(&user, "").unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let text = describe_config(report);
+        let (text, _) = describe_config(report);
         assert!(text.contains("(found, 0 tools)"), "{text}");
         assert!(text.contains("(absent)"), "{text}");
         // The default catalog declares `shell`, so the fallback does not fire.
@@ -972,7 +987,7 @@ mod tests {
         std::fs::write(&user, "[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n").unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let text = describe_config(report);
+        let (text, _) = describe_config(report);
         assert!(text.contains("1. solo"), "{text}");
         assert!(text.contains("2. shell"), "{text}");
         assert!(text.contains("`shell` was not declared"), "{text}");
@@ -995,7 +1010,7 @@ mod tests {
         .unwrap();
         let report = config_report(Some(&user), &project);
 
-        let text = describe_config(report);
+        let (text, _) = describe_config(report);
         assert!(text.contains("overrides"), "{text}");
         assert!(text.contains("tool \"t\" in"), "{text}");
         assert!(text.contains("differing fields: args"), "{text}");
@@ -1011,7 +1026,7 @@ mod tests {
         std::fs::write(&user, "").unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let text = describe_config(report);
+        let (text, _) = describe_config(report);
         assert!(!text.contains('\x1b'), "raw ESC leaked: {text:?}");
         assert!(text.contains("\\x1b"), "ESC should be escaped: {text:?}");
         assert!(
@@ -1036,7 +1051,7 @@ mod tests {
         .unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let text = describe_config(report);
+        let (text, _) = describe_config(report);
         assert!(!text.contains('\x1b'), "raw ESC leaked: {text:?}");
         assert!(
             !text.contains("red\n"),
