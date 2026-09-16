@@ -142,31 +142,62 @@ table.
 ### Extra and forked mounts: `ro`, `rw`, `fork`, `follow-links`
 
 `fork` is an eager, project-scoped copy rather than a live bind. `mount::prepare`
-owns parsing, source classification, state publication, mask construction, and collision
-validation; `run` receives only typed prepared volumes. That boundary matters: a READY
-fork is selected before any source access, and launch does not accidentally re-stat a
-path after policy has been decided.
+owns parsing, READY-first policy and topology validation, host-side copying, and
+publication; `run` receives only typed prepared volumes and does not re-stat or
+reinterpret them. That deep single interface matters: a READY fork is selected
+before any source access, every deterministic policy/topology rejection happens
+before the first state mutation, and launch never reclassifies a path after
+policy has been decided.
 
 ```text
-live bind                         fork state
-HOST ── bind ──> /guest           ABSENT --lock--> COPYING --rename--> READY
-  └─ excluded file ─ mask ─> /guest/file             staging              data
-  └─ excluded directory ─ tmpfs ─> /guest/dir
+source directory
+  └─ host-side staging (no-follow descriptors, exclusions skipped)
+       └─ atomic rename -> READY data
+            └─ ordinary writable directory bind -> /guest
+
+live ro/rw directory and file-ro paths ── ordinary binds ──> /guest
 ```
 
-A versioned, length-delimited SHA-256 identity contains the source spelling, normalized
-guest path, follow policy, and normalized exclusions. The store is a sibling of the
-guest-visible state directory: `&lt;project-hash&gt;.mounts/{locks,staging,forks}`. A per-fork
-exclusive lock serializes initializers; only a complete `manifest.json` plus `data` is
-renamed into `forks/`. Staging is never mounted. A malformed committed entry is a hard
-error with its reset path, never an automatic reseed. This is process-crash atomicity,
-not a power-loss durability or concurrently-mutating-source snapshot promise.
+Forks are directory-only (issue #113): a file fork root is rejected with a
+directory-only diagnostic, and a regular file can only be a read-only bind. The
+copy engine still copies nested regular files and, under `fork:follow-links`,
+materializes followed file targets — only the root is constrained. The root is
+opened with `O_DIRECTORY` at the descriptor actually copied from, so a root that
+was a directory at policy time but is later swapped for a file or symlink fails
+closed instead of publishing a file-root fork.
 
-Live exclusions are readonly opaque masks (a file bind for files and readonly tmpfs for
-directories); a plan rejects a mount that would pierce one. Fork exclusions are omitted
-before traversal. Default fork traversal preserves nested link text; `fork:follow-links`
-materializes link targets into owned data, so it never creates a continuing external bind.
-See [ADR-0013](docs/adr/0013-add-forked-mounts.md) for lifecycle and reset details.
+A versioned, length-delimited SHA-256 identity contains the source spelling,
+normalized guest path, follow policy, and normalized exclusions. The store is a
+sibling of the guest-visible state directory: `&lt;project-hash&gt;.mounts/{locks,staging,forks}`.
+A per-fork exclusive lock serializes initializers; only a complete
+`manifest.json` plus `data` is renamed into `forks/`. Staging is never mounted.
+A malformed committed entry is a hard error with its reset path, never an
+automatic reseed; a legacy v2 `kind: "file"` entry is an actionable unsupported
+fork that names the exact directory to remove. This is process-crash atomicity,
+not a power-loss durability or concurrently-mutating-source snapshot promise;
+copy errors or a killed initializer can leave retryable staging.
+
+Fork exclusions (`:exclude=REL`, fork-only) are omitted before traversal; they
+are not a persistent guest access restriction, and an explicit child mount can
+still populate an omitted path. Default fork traversal preserves nested link
+text; `fork:follow-links` materializes link targets into owned data, so it never
+creates a continuing external bind. See [ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md)
+for the narrowed policy and [ADR-0013](docs/adr/0013-add-forked-mounts.md) for the
+retained lifecycle and reset details.
+
+Live binds are ordinary mounts, each opting into per-bind root follow so a
+user's symlinked source spelling resolves once. Core volumes (HOME, project,
+state) keep root follow at its default `false` and are canonicalized only after
+provisioning, once their sources exist; a fresh state root is still valid. The
+dependency is pinned to microsandbox `main` (`f948475c`), which provides
+`follow_root_symlinks` and a no-follow-root default; the descriptor-pinned
+`nofollow`/ACL hardening is deferred to
+[gregwebs/agent-vm#114](https://github.com/gregwebs/agent-vm/issues/114).
+
+GitHub repo discovery scans the prepared roots' committed physical content:
+forks contribute `data`, never the original source, and no logical exclusion
+filter is applied. An excluded `.git`/`.gitmodules` is simply absent from the
+copy, so it cannot contribute slugs.
 
 `--mount HOST[:GUEST][:MODE]...` (`mount.rs`).
 
@@ -771,7 +802,8 @@ directories the user never asked for.
 | Migrating 0.5.7 state to v0.6.15 | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md) |
 | Adopting `origin/main`'s network features | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
 | Wiring file-backed credential injection | [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
-| Forked mounts and opaque exclusions | [ADR-0013](docs/adr/0013-add-forked-mounts.md) |
+| Forked mounts and opaque exclusions (superseded for file forks and live exclusions) | [ADR-0013](docs/adr/0013-add-forked-mounts.md) |
+| Narrowing fork mounts to directories; files read-only | [ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md) |
 
 ## Deliberate non-goals
 

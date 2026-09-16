@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted. Superseded by [ADR-0014](0014-narrow-fork-mounts-to-directories.md) for file-root forks and live exclusions; the identity, store, locking, publication, and fail-closed recovery decisions remain applicable.
 
 ## Context
 

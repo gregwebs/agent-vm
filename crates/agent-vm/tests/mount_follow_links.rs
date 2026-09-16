@@ -1,5 +1,5 @@
 //! Boot-free integration test for `--mount HOST:ro:follow-links` (issue #11,
-//! sub-issue of #9).
+//! sub-issue of #9), retained under the narrowed #113 mount contract.
 //!
 //! Modeled on `tests/msb_cache_share.rs`, but that harness drives
 //! `agent-vm setup --no-verify`, which never enters `launch()` — the
@@ -225,6 +225,17 @@ fn bind_mounts(config: &serde_json::Value) -> Vec<(String, String, bool)> {
         .collect()
 }
 
+/// The top-level `follow_root_symlinks` flag of the bind mounted at `guest`.
+fn bind_follow_root(config: &serde_json::Value, guest: &str) -> bool {
+    config["mounts"]
+        .as_array()
+        .expect("config.mounts must be an array")
+        .iter()
+        .find(|m| m["type"] == "Bind" && m["guest"] == guest)
+        .and_then(|m| m["follow_root_symlinks"].as_bool())
+        .unwrap_or_else(|| panic!("no Bind at {guest} with follow_root_symlinks in {config}"))
+}
+
 #[test]
 fn follow_links_discovers_transitive_targets_readonly() {
     let h = Harness::new();
@@ -259,6 +270,17 @@ fn follow_links_discovers_transitive_targets_readonly() {
     assert!(
         find(host_mount_str).is_some(),
         "expected the HOST bind itself among the mounts, got: {mounts:?}"
+    );
+    // User-plan binds (including discovered followed targets) opt into
+    // per-bind root follow; this is agent-vm's wiring, not a guest-runtime
+    // visibility guarantee.
+    assert!(
+        bind_follow_root(&config, host_mount_str),
+        "the user root bind must opt into root follow: {mounts:?}"
+    );
+    assert!(
+        bind_follow_root(&config, a_str),
+        "discovered target {a_str} must opt into root follow: {mounts:?}"
     );
     let (_, _, a_ro) = find(a_str).unwrap_or_else(|| {
         panic!("expected the direct discovered target {a_str} among the mounts, got: {mounts:?}")
@@ -388,188 +410,107 @@ fn follow_links_handles_a_host_that_is_itself_a_symlink() {
 }
 
 #[test]
-fn follow_links_masks_file_directory_and_nested_aliases_at_every_guest_path() {
-    let h = Harness::new();
-    let home = h.home_path();
-    let source = home.join("source");
-    let target = source.join("target");
-    let nested_target = source.join("nested-target");
-    std::fs::create_dir(&source).unwrap();
-    std::fs::create_dir(&target).unwrap();
-    std::fs::create_dir(&nested_target).unwrap();
-    std::fs::write(target.join("secret-file"), "secret").unwrap();
-    std::fs::create_dir(target.join("secret-directory")).unwrap();
-    std::fs::write(nested_target.join("nested-secret"), "secret").unwrap();
-    std::os::unix::fs::symlink("target", source.join("alias")).unwrap();
-    std::os::unix::fs::symlink("../nested-target", target.join("nested-alias")).unwrap();
-
-    let mount = format!(
-        "{}:/guest:ro:follow-links:exclude=alias/secret-file:exclude=alias/secret-directory:exclude=alias/nested-alias/nested-secret",
-        source.display()
-    );
-    let out = h.run_shell(&[&mount]);
-    let config = debug_config_json(&stderr_of(&out));
-    let guests = config["mounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|mount| mount["guest"].as_str())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let expected = vec![
-        "/guest/alias/secret-file".to_owned(),
-        "/guest/alias/secret-directory".to_owned(),
-        "/guest/alias/nested-alias/nested-secret".to_owned(),
-        target.join("secret-file").display().to_string(),
-        target.join("secret-directory").display().to_string(),
-        nested_target.join("nested-secret").display().to_string(),
-    ];
-
-    for guest in expected {
+fn follow_links_with_exclusions_rejects_at_parse() {
+    // Every live follow-links + exclude form rejects at parse, before source
+    // lookup or any builder/state side effect.
+    for template in [
+        "{source}:/guest:ro:follow-links:exclude=alias/secret",
+        "{source}:/guest:follow-links:exclude=alias/secret:ro",
+        "/no/such/source:/guest:ro:follow-links:exclude=alias/secret",
+    ] {
+        let h = Harness::new();
+        let source = h.home_path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let raw = template.replace("{source}", &source.display().to_string());
+        let out = h.run_shell(&[&raw]);
+        assert!(!out.status.success(), "{raw}");
+        let stderr = stderr_of(&out);
         assert!(
-            guests.contains(&guest),
-            "missing opaque mask at {guest}: {guests:?}"
+            stderr.contains(":exclude is only supported on :fork mounts"),
+            "{raw}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("[debug] sandbox config JSON")
+                && !stderr.contains("==> agent-vm-")
+                && !stderr.contains("GitHub repo scope")
+                && !stderr.contains("==> Mounting")
+                && !stderr.contains("==> Masking"),
+            "{raw}: a parse rejection must not emit notices: {stderr}"
+        );
+        assert!(
+            std::fs::read_dir(h.state.path()).unwrap().next().is_none(),
+            "{raw}: a parse rejection must not create state"
         );
     }
-    assert!(!out.status.success());
 }
 
 #[test]
-fn absent_projected_child_does_not_reject_file_or_directory_overlay_in_either_order() {
-    for directory in [false, true] {
+fn ordinary_overlay_in_either_order_reaches_config() {
+    // Root `:rw` without exclusions plus a child mount: file child is `:ro`,
+    // directory child is `:rw`. Both orders reach the builder config.
+    for file_child in [false, true] {
         for root_first in [false, true] {
             let h = Harness::new();
             let source = h.home_path().join("source");
             std::fs::create_dir(&source).unwrap();
-            std::fs::write(source.join("hidden"), "hidden").unwrap();
             let overlay_source = h.home_path().join("overlay");
-            if directory {
-                std::fs::create_dir(&overlay_source).unwrap();
-            } else {
+            if file_child {
                 std::fs::write(&overlay_source, "overlay").unwrap();
-            }
-
-            let masked_root = format!("{}:/guest:rw:exclude=hidden", source.display());
-            let overlay = format!("{}:/guest/new:rw", overlay_source.display());
-            let declarations = if root_first {
-                vec![masked_root.as_str(), overlay.as_str()]
             } else {
-                vec![overlay.as_str(), masked_root.as_str()]
+                std::fs::create_dir(&overlay_source).unwrap();
+            }
+            let root = format!("{}:/guest:rw", source.display());
+            let child = if file_child {
+                format!("{}:/guest/new:ro", overlay_source.display())
+            } else {
+                format!("{}:/guest/new:rw", overlay_source.display())
+            };
+            let declarations = if root_first {
+                vec![root.as_str(), child.as_str()]
+            } else {
+                vec![child.as_str(), root.as_str()]
             };
             let out = h.run_shell(&declarations);
-            let stderr = stderr_of(&out);
+            let config = debug_config_json(&stderr_of(&out));
+            let binds = bind_mounts(&config);
             assert!(
-                !stderr.contains("resolving mount /guest/new through mount /guest"),
-                "an absent projected child must not reject preparation: {stderr}"
+                binds.iter().any(|(_, guest, _)| guest == "/guest"),
+                "root bind missing: {binds:?}"
             );
-            let config = debug_config_json(&stderr);
-            let guests = config["mounts"]
-                .as_array()
-                .unwrap()
+            let (_, _, child_readonly) = binds
                 .iter()
-                .filter_map(|mount| mount["guest"].as_str())
-                .collect::<Vec<_>>();
-            assert!(guests.contains(&"/guest/new"));
-            assert!(guests.contains(&"/guest/hidden"));
-        }
-    }
-}
-
-#[test]
-fn composed_mount_alias_overlay_is_rejected_before_builder_or_state_side_effects() {
-    for directory in [false, true] {
-        for order in [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ] {
-            let h = Harness::new();
-            let root = h.home_path().join("root");
-            std::fs::create_dir(&root).unwrap();
-            let hidden = root.join("m-hidden");
-            if directory {
-                std::fs::create_dir(&hidden).unwrap();
-            } else {
-                std::fs::write(&hidden, "hidden").unwrap();
-            }
-            std::os::unix::fs::symlink("a-new/secret", root.join("z-alias")).unwrap();
-
-            let supplied_child = h.home_path().join("supplied-a-new");
-            std::fs::create_dir(&supplied_child).unwrap();
-            std::os::unix::fs::symlink("../m-hidden", supplied_child.join("secret")).unwrap();
-
-            let declarations = [
-                format!("{}:/guest:rw:exclude=m-hidden", root.display()),
-                format!("{}:/guest/a-new:rw", supplied_child.display()),
-                format!("{}:/guest/z-alias:rw", hidden.display()),
-            ];
-            let declarations = order
-                .iter()
-                .map(|&index| declarations[index].as_str())
-                .collect::<Vec<_>>();
-            let out = h.run_shell(&declarations);
-            let stderr = stderr_of(&out);
-
-            assert!(!out.status.success());
-            assert!(stderr.contains("pierce opaque mask"), "stderr:\n{stderr}");
-            assert!(
-                !stderr.contains("[debug] sandbox config JSON"),
-                "the composed alias collision must reject before builder wiring, stderr:\n{stderr}"
-            );
-            assert!(
-                std::fs::read_dir(h.state.path()).unwrap().next().is_none(),
-                "rejection must not create state (directory={directory}, order={order:?})"
+                .find(|(_, guest, _)| guest == "/guest/new")
+                .unwrap_or_else(|| panic!("child bind missing: {binds:?}"));
+            assert_eq!(
+                *child_readonly, file_child,
+                "file child is :ro; dir child :rw"
             );
         }
     }
 }
 
 #[test]
-fn in_tree_symlink_alias_overlay_is_rejected_before_builder_in_either_order() {
-    for directory in [false, true] {
-        for root_first in [false, true] {
-            let h = Harness::new();
-            let source = h.home_path().join("source");
-            let deep = source.join("deep/nested");
-            std::fs::create_dir_all(&deep).unwrap();
-            let secret = deep.join("secret");
-            if directory {
-                std::fs::create_dir(&secret).unwrap();
-            } else {
-                std::fs::write(&secret, "secret").unwrap();
-            }
-            std::fs::create_dir(source.join("b")).unwrap();
-            std::os::unix::fs::symlink("b", source.join("a")).unwrap();
-            std::os::unix::fs::symlink("../deep/nested", source.join("b/c")).unwrap();
+fn follow_links_accepts_valid_discovery_without_exclusions() {
+    // Retained discovery still works after the narrowed contract.
+    let h = Harness::new();
+    let home = h.home_path();
+    let host_mount = home.join("skills");
+    let target = home.join("dev-target");
+    std::fs::create_dir_all(&host_mount).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("marker.txt"), "t").unwrap();
+    std::os::unix::fs::symlink(&target, host_mount.join("link")).unwrap();
 
-            let root = format!(
-                "{}:/guest:ro:follow-links:exclude=a/c/secret",
-                source.display()
-            );
-            let overlay = format!("{}:/guest/deep/nested/secret:ro", secret.display());
-            let declarations = if root_first {
-                vec![root.as_str(), overlay.as_str()]
-            } else {
-                vec![overlay.as_str(), root.as_str()]
-            };
-            let out = h.run_shell(&declarations);
-            let stderr = stderr_of(&out);
-
-            assert!(!out.status.success());
-            assert!(stderr.contains("pierce opaque mask"), "stderr:\n{stderr}");
-            assert!(
-                !stderr.contains("[debug] sandbox config JSON"),
-                "the physical-alias collision must reject before builder wiring, stderr:\n{stderr}"
-            );
-            assert!(
-                std::fs::read_dir(h.state.path()).unwrap().next().is_none(),
-                "rejection must not create state (directory={directory}, root_first={root_first})"
-            );
-        }
-    }
+    let mount_arg = format!("{}:ro:follow-links", host_mount.display());
+    let out = h.run_shell(&[&mount_arg]);
+    let config = debug_config_json(&stderr_of(&out));
+    let mounts = bind_mounts(&config);
+    let target_str = target.to_str().unwrap();
+    assert!(
+        mounts.iter().any(|(host, _, ro)| host == target_str && *ro),
+        "expected discovered target {target_str}: {mounts:?}"
+    );
+    assert!(bind_follow_root(&config, target_str));
 }
 
 #[test]

@@ -87,7 +87,8 @@ pub(crate) struct ExtraMount {
     pub(crate) host: PathBuf,
     pub(crate) guest: PathBuf,
     pub(crate) policy: MountPolicy,
-    /// Normalized relative entries omitted from a fork or hidden in a bind.
+    /// Normalized relative entries omitted from a `:fork` seed. Empty for
+    /// every live bind: `:exclude` is fork-only (issue #113).
     pub(crate) exclusions: Vec<PathBuf>,
 }
 
@@ -251,6 +252,16 @@ pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
         } else {
             MountPolicy::BindReadWrite
         };
+        // `:exclude` omits entries from a fork seed. On a live bind there is
+        // no seed to omit from, and the old opaque-mask substitute is removed
+        // (issue #113), so reject the declaration here — after normalization
+        // and mode-conflict precedence, but before any source I/O.
+        if !exclusions.is_empty() && !matches!(policy, MountPolicy::Fork { .. }) {
+            anyhow::bail!(
+                "--mount {entry}: :exclude is only supported on :fork mounts;\n\
+                 live binds cannot hide nested paths."
+            );
+        }
         out.push(ExtraMount {
             source_spelling: host_s,
             host,
@@ -343,10 +354,8 @@ impl BindPath {
 }
 
 impl From<BindPath> for ExtraMount {
-    /// Every bind the walk discovers is read-only and retains the follow
-    /// marker so mask planning knows projected exclusions may be resolved
-    /// only through this safe alias. It is appended after discovery, so the
-    /// marker cannot trigger another discovery pass.
+    /// Discovered binds retain their read-only follow policy. They are
+    /// appended after discovery, so the marker cannot trigger another pass.
     fn from(p: BindPath) -> ExtraMount {
         ExtraMount {
             source_spelling: p.host.display().to_string(),
@@ -988,13 +997,67 @@ mod tests {
 
     #[test]
     fn parse_fork_and_normalizes_exclusions() {
-        let parsed = parse_extra_mounts(&["/:/guest:fork:exclude=cache:exclude=cache/a".into()])
-            .expect("fork syntax");
-        assert!(parsed[0].is_fork());
-        assert!(!parsed[0].is_readonly());
-        assert_eq!(parsed[0].exclusions, vec![PathBuf::from("cache")]);
-        assert!(parse_extra_mounts(&["/:fork:ro".into()]).is_err());
-        assert!(parse_extra_mounts(&["/:fork:exclude=../escape".into()]).is_err());
+        // Both fork policies accept exclusions, regardless of suffix order.
+        for entry in [
+            "/:/guest:fork:exclude=cache:exclude=cache/a",
+            "/:exclude=cache:exclude=cache/a:fork",
+            "/:/guest:exclude=cache:fork",
+        ] {
+            let parsed = parse_extra_mounts(&[entry.into()]).expect("fork syntax");
+            assert!(parsed[0].is_fork(), "{entry}");
+            assert!(!parsed[0].is_readonly(), "{entry}");
+            // Ancestor collapse keeps only `cache`.
+            assert_eq!(
+                parsed[0].exclusions,
+                vec![PathBuf::from("cache")],
+                "{entry}"
+            );
+        }
+        // Duplicate and sibling entries dedup/sort without swallowing siblings.
+        let parsed =
+            parse_extra_mounts(&["/:fork:exclude=b:exclude=a:exclude=b:exclude=a/b".into()])
+                .unwrap();
+        assert_eq!(
+            parsed[0].exclusions,
+            vec![PathBuf::from("a"), PathBuf::from("b")]
+        );
+        // A nonexistent source never reaches the filesystem at parse time.
+        assert!(parse_extra_mounts(&["/no/such/source:fork:exclude=x".into()]).is_ok());
+        // Mode conflicts still win over exclusion validity.
+        assert!(parse_extra_mounts(&["/:fork:rw:exclude=x".into()]).is_err());
+        assert!(parse_extra_mounts(&["/:rw:follow-links:exclude=x".into()]).is_err());
+        // Invalid REL values are rejected with the normalization error.
+        for bad in [
+            "exclude=",
+            "exclude=/abs",
+            "exclude=..",
+            "exclude=a/../b",
+            "exclude=.",
+        ] {
+            let error = parse_extra_mounts(&[format!("/:fork:{bad}")]).unwrap_err();
+            assert!(error.to_string().contains("exclude"), "{bad}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn parse_extra_mounts_rejects_live_exclusions_before_any_io() {
+        // `:exclude` is fork-only. Every live-bind form rejects at parse,
+        // including a nonexistent source (proving no filesystem lookup), and
+        // regardless of where the suffix lands.
+        for entry in [
+            "/no/such/source:exclude=x",
+            "/no/such/source:rw:exclude=x",
+            "/no/such/source:ro:exclude=x",
+            "/no/such/source:follow-links:exclude=x",
+            "/no/such/source:exclude=x:ro",
+            "/no/such/source:/guest:ro:exclude=x",
+        ] {
+            let error = parse_extra_mounts(&[entry.into()]).unwrap_err().to_string();
+            assert!(
+                error.contains(":exclude is only supported on :fork mounts"),
+                "{entry}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1653,10 +1716,6 @@ mod tests {
 pub(crate) enum PreparedVolumeSource {
     WritableBind(PathBuf),
     ReadOnlyBind(PathBuf),
-    /// A file mask before the complete plan is accepted. It is materialized
-    /// into the shared readonly mask source only after collision validation.
-    OpaqueFile,
-    OpaqueDirectory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1669,7 +1728,6 @@ pub(crate) enum PreparedNodeKind {
 pub(crate) enum VolumeRole {
     Explicit,
     Followed,
-    Mask,
 }
 
 #[derive(Clone, Debug)]
@@ -1683,7 +1741,6 @@ pub(crate) struct PreparedVolume {
 #[derive(Clone, Debug)]
 pub(crate) struct RepoScanRoot {
     pub(crate) host: PathBuf,
-    pub(crate) exclusions: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -1773,44 +1830,51 @@ pub(crate) fn prepare(
         unique.push(request);
     }
 
-    // Fork source access belongs exclusively to the locked transaction: a
-    // concurrent waiter must be able to reuse READY after the source moves.
-    // A fork whose root is still uninitialized can be a file, so reject the
-    // one topology that would make a core mount pierce such a file before any
-    // store/lock side effect. READY forks are validated without source I/O.
+    // Every fork is validated READY-first here, before any live-bind
+    // discovery or state mutation. A READY entry is reused from its
+    // committed `data` without reading the original source; an
+    // uninitialized fork whose root is a file (or a symlink to one) is
+    // rejected before discovery/transaction. A missing source is left for
+    // the locked transaction, so a waiter can still reuse a fork another
+    // initializer publishes while it waits.
+    let known_fork_kinds = preflight_forks(&mut unique, &context.mount_store)?;
+
+    // Live binds are the only sources that can contribute followed links, so
+    // discovery runs after fork preflight and never over a fork.
     let explicit_count = unique.len();
     let (mut expanded, warnings) =
         expand_follow_links(unique.clone(), context.host_home.as_deref())?;
-    // Only topology candidates need a source-kind preflight. In particular,
-    // exclusions alone must not touch the source before the per-fork lock:
-    // another initializer may publish READY while this process waits.
-    let known_fork_kinds = preflight_forks(
-        &mut unique,
-        &context.mount_store,
-        &expanded,
-        &context.core_guest_mounts,
-    )?;
     sync_fork_representations(&unique, &mut expanded)?;
 
     let mut volumes = Vec::new();
     for (index, mount) in expanded.iter().enumerate() {
         let explicit = index < explicit_count;
-        // An uninitialized fork deliberately has no source classification at
-        // this point. `prepare_forks` performs that work after taking the
-        // per-fork lock and rechecking READY. Its provisional directory kind
-        // is replaced with the committed kind below before launch sees it.
+        // Only a missing source remains unclassified after preflight. Its
+        // provisional directory kind permits a waiter to reach the locked
+        // READY recheck without requiring the original source to survive.
         let kind = if mount.is_fork() {
             known_fork_kinds
                 .get(&mount.guest)
                 .copied()
-                // An uninitialized fork with no topology-sensitive child can
-                // remain provisional until its locked transaction resolves it.
+                // An uninitialized fork is always directory-or-rejected; the
+                // locked transaction rechecks before it publishes.
                 .unwrap_or(PreparedNodeKind::Directory)
         } else {
             let metadata = fs::symlink_metadata(&mount.host)
                 .with_context(|| format!("validating --mount source {}", mount.host.display()))?;
             node_kind(&metadata, &mount.host)?
         };
+        // A regular file cannot be a writable bind: the runtime's writable
+        // file staging is intentionally unreachable from agent-vm (issue
+        // #113). Reject here, after canonicalization, so a symlink-to-file
+        // root is caught too.
+        if kind == PreparedNodeKind::File && !mount.is_readonly() {
+            anyhow::bail!(
+                "--mount {}: a file can only be mounted read-only.\n\
+                 Use :ro, or :fork its containing directory for a writable copy.",
+                mount.source_spelling
+            );
+        }
         let source = if mount.is_readonly() {
             PreparedVolumeSource::ReadOnlyBind(mount.host.clone())
         } else {
@@ -1826,14 +1890,12 @@ pub(crate) fn prepare(
                 VolumeRole::Followed
             },
         });
-        if !mount.is_fork() {
-            add_masks(&mut volumes, mount)?;
-        }
     }
     validate_plan(&mut volumes, &context.core_guest_mounts)?;
 
-    // Only a validated complete set of core, explicit, followed, and mask
-    // claims may publish any host-managed state.
+    // Only a validated complete set of core, explicit, and followed claims
+    // may publish any host-managed state. The first state mutation happens
+    // inside `prepare_forks`; everything above is rejection or classification.
     let mut notices = prepare_forks(&mut unique, &context.mount_store, &known_fork_kinds)?;
     sync_fork_representations(&unique, &mut expanded)?;
     notices.extend(warnings.into_iter().map(|warning| format!("==> {warning}")));
@@ -1856,28 +1918,16 @@ pub(crate) fn prepare(
             .with_context(|| format!("validating committed fork {}", mount.host.display()))?;
         volume.node_kind = node_kind(&metadata, &mount.host)?;
     }
-    // File-mask publication is deliberately last: every collision has been
-    // checked, and the shared source is unnecessary for directory-only masks.
-    for volume in &mut volumes {
-        if volume.source == PreparedVolumeSource::OpaqueFile {
-            volume.source = PreparedVolumeSource::ReadOnlyBind(mask_file(&context.mount_store)?);
-        }
-    }
 
+    // The prepared explicit declarations in order: live binds carry their
+    // canonical source (after `expand_follow_links`), and forks carry their
+    // committed `data` (after `sync_fork_representations`), never the original
+    // source. Followed aliases are not scanned as separate roots.
     let repo_scan_roots = expanded
         .iter()
         .take(explicit_count)
-        .enumerate()
-        .map(|(index, mount)| {
-            let explicit = &unique[index];
-            RepoScanRoot {
-                host: explicit.host.clone(),
-                exclusions: if explicit.is_fork() {
-                    Vec::new()
-                } else {
-                    mount.exclusions.clone()
-                },
-            }
+        .map(|mount| RepoScanRoot {
+            host: mount.host.clone(),
         })
         .collect();
     Ok(PreparedMountPlan {
@@ -1887,59 +1937,48 @@ pub(crate) fn prepare(
     })
 }
 
-/// Validate only committed forks without creating their store or inspecting
-/// an uninitialized source. Source classification/copying happens under the
-/// transaction lock in `prepare_forks`.
+/// Validate every fork without creating its store or inspecting an
+/// uninitialized source beyond its kind. READY is checked first, so a fork
+/// stays reusable after its original source disappears or changes type.
 fn preflight_forks(
     mounts: &mut [ExtraMount],
     mount_store: &Path,
-    expanded: &[ExtraMount],
-    core: &[PathBuf],
 ) -> Result<std::collections::HashMap<PathBuf, PreparedNodeKind>> {
     let mut kinds = std::collections::HashMap::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
         let id = fork_id(mount);
         let final_dir = mount_store.join("forks").join(&id);
-        let kind = if final_dir_exists(&final_dir)? {
+        if final_dir_exists(&final_dir)? {
             let kind = validate_ready(&final_dir, mount, &id)?;
-            // `expanded` still contains the declaration spelling, so complete
-            // plan validation obtains this committed kind from the preflight
-            // map rather than restatting the source or using a provisional
-            // directory kind. This must happen before any reuse notice or
-            // other launch effect.
-            kinds.insert(mount.guest.clone(), kind);
+            // READY wins over whatever the original source now is; the
+            // committed copy is the mount source from here on.
             mount.host = final_dir.join("data");
-            kind
-        } else {
-            // A source kind affects validation only when another claim could
-            // be below this fork, or an exclusion needs a directory root.
-            // A vanished source is deliberately deferred: it may be a waiter
-            // racing an initializer which will publish READY under the lock.
-            let has_descendant = expanded
-                .iter()
-                .any(|claim| claim.guest != mount.guest && claim.guest.starts_with(&mount.guest))
-                || core
-                    .iter()
-                    .any(|claim| claim != &mount.guest && claim.starts_with(&mount.guest));
-            if !has_descendant && mount.exclusions.is_empty() {
-                continue;
-            }
-            let Some(kind) = try_fork_source_kind(&mount.host)? else {
-                continue;
-            };
-            if has_descendant {
-                kinds.insert(mount.guest.clone(), kind);
-            }
-            kind
-        };
-        if !mount.exclusions.is_empty() && kind == PreparedNodeKind::File {
-            anyhow::bail!(
-                "--mount exclusions require a directory source: {}",
-                mount.source_spelling
-            );
+            kinds.insert(mount.guest.clone(), kind);
+            continue;
         }
+        // Uninitialized: reject a file root now, before discovery or any
+        // store/lock side effect. A vanished source is deliberately deferred:
+        // a concurrent initializer may publish READY while this waiter blocks
+        // on the per-fork lock (see the process tests).
+        let Some(kind) = try_fork_source_kind(&mount.host)? else {
+            continue;
+        };
+        require_fork_directory(kind, &mount.source_spelling)?;
+        kinds.insert(mount.guest.clone(), kind);
     }
     Ok(kinds)
+}
+
+/// A `:fork` root is always a directory (issue #113). Shared between the
+/// preflight classification and the locked recheck so both emit one message.
+fn require_fork_directory(kind: PreparedNodeKind, source: &str) -> Result<()> {
+    if kind != PreparedNodeKind::Directory {
+        anyhow::bail!(
+            "--mount {source}: a :fork source must be a directory.\n\
+             Fork the containing directory, or bind the file read-only with :ro."
+        );
+    }
+    Ok(())
 }
 
 fn try_fork_source_kind(source: &Path) -> Result<Option<PreparedNodeKind>> {
@@ -1963,7 +2002,7 @@ fn fork_source_kind(source: &Path) -> Result<PreparedNodeKind> {
 
 /// Keep the follow-link-expanded representation aligned with the declaration
 /// that owns fork transaction state. A READY preflight replaces only
-/// `unique`; every later consumer (volumes, alias validation, and repository
+/// `unique`; every later consumer (volumes and repository
 /// scanning) must therefore use this committed path rather than the original
 /// declaration source.
 fn sync_fork_representations(unique: &[ExtraMount], expanded: &mut [ExtraMount]) -> Result<()> {
@@ -2007,118 +2046,9 @@ fn node_kind(metadata: &fs::Metadata, path: &Path) -> Result<PreparedNodeKind> {
     }
 }
 
-fn add_masks(volumes: &mut Vec<PreparedVolume>, mount: &ExtraMount) -> Result<()> {
-    if mount.exclusions.is_empty() {
-        return Ok(());
-    }
-    if !fs::symlink_metadata(&mount.host)?.is_dir() {
-        anyhow::bail!(
-            "--mount exclusions require a directory source: {}",
-            mount.host.display()
-        );
-    }
-    for relative in &mount.exclusions {
-        let kind = match resolve_live_exclusion(&mount.host, relative) {
-            Ok(kind) => kind,
-            Err(error) if mount.follows_links() && is_symlink_ancestor_error(&error) => {
-                // This declaration's root bind still exposes the object at
-                // its logical guest alias. Follow-link discovery adds masks
-                // for canonical and literal target binds, but they do not
-                // hide `/guest/alias/...` through the original root bind.
-                // The final leaf remains no-follow; only the directory-link
-                // ancestor is resolved, as it is for the guest alias.
-                resolve_followed_alias_exclusion(&mount.host, relative)?
-            }
-            Err(error) => return Err(error),
-        };
-        let guest = mount.guest.join(relative);
-        let source = match kind {
-            PreparedNodeKind::Directory => PreparedVolumeSource::OpaqueDirectory,
-            PreparedNodeKind::File => PreparedVolumeSource::OpaqueFile,
-        };
-        volumes.push(PreparedVolume {
-            guest,
-            source,
-            node_kind: kind,
-            role: VolumeRole::Mask,
-        });
-    }
-    Ok(())
-}
-
-const SYMLINK_ANCESTOR_ERROR: &str = "excluded path has a symlink ancestor";
-
-fn is_symlink_ancestor_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains(SYMLINK_ANCESTOR_ERROR))
-}
-
-/// Walk every ancestor without following it. The final path is opened only
-/// after its parent descriptor is pinned; special leaves cannot be mounted.
-fn resolve_live_exclusion(root: &Path, relative: &Path) -> Result<PreparedNodeKind> {
-    use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags};
-    let mut dir = rfs::open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .with_context(|| format!("opening mount root {}", root.display()))?;
-    let parts: Vec<_> = relative.components().collect();
-    for (index, component) in parts.iter().enumerate() {
-        let std::path::Component::Normal(name) = component else {
-            anyhow::bail!("invalid exclusion {}", relative.display());
-        };
-        let stat = rfs::statat(&dir, *name, AtFlags::SYMLINK_NOFOLLOW).with_context(|| {
-            format!("validating excluded path {}", root.join(relative).display())
-        })?;
-        let ty = FileType::from_raw_mode(stat.st_mode);
-        if index + 1 == parts.len() {
-            return match ty {
-                FileType::RegularFile => Ok(PreparedNodeKind::File),
-                FileType::Directory => Ok(PreparedNodeKind::Directory),
-                _ => anyhow::bail!(
-                    "excluded path {} must be a regular file or directory",
-                    root.join(relative).display()
-                ),
-            };
-        }
-        if ty == FileType::Symlink {
-            anyhow::bail!(
-                "{SYMLINK_ANCESTOR_ERROR}: {}",
-                root.join(relative).display()
-            );
-        }
-        if ty != FileType::Directory {
-            anyhow::bail!(
-                "excluded path {} has a non-directory ancestor",
-                root.join(relative).display()
-            );
-        }
-        dir = rfs::openat(
-            &dir,
-            *name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-    }
-    unreachable!("validated exclusion is nonempty")
-}
-
-/// Classify an exclusion reached through a directory symlink in a
-/// `follow-links` root. The caller has already rejected a symlink leaf with
-/// descriptor-relative resolution; this fallback is only for the logical
-/// guest alias that necessarily resolves the discovered directory link.
-fn resolve_followed_alias_exclusion(root: &Path, relative: &Path) -> Result<PreparedNodeKind> {
-    let path = root.join(relative);
-    let metadata = fs::symlink_metadata(&path)
-        .with_context(|| format!("validating excluded path {}", path.display()))?;
-    node_kind(&metadata, &path)
-}
-
 fn validate_plan(volumes: &mut Vec<PreparedVolume>, core: &[PathBuf]) -> Result<()> {
-    // Exact duplicate generated masks are harmless. Anything else with the
-    // same guest path is ambiguous and rejected before builder side effects.
+    // Identical claims are harmless; distinct claims at the same guest path
+    // are ambiguous and must fail before builder side effects.
     let mut unique = Vec::new();
     for volume in volumes.drain(..) {
         if unique
@@ -2138,21 +2068,8 @@ fn validate_plan(volumes: &mut Vec<PreparedVolume>, core: &[PathBuf]) -> Result<
         }
         unique.push(volume);
     }
-    validate_physical_mask_aliases(&unique)?;
 
     for volume in &unique {
-        for mask in unique
-            .iter()
-            .filter(|candidate| candidate.role == VolumeRole::Mask)
-        {
-            if volume.role != VolumeRole::Mask && volume.guest.starts_with(&mask.guest) {
-                anyhow::bail!(
-                    "mount at {} would pierce opaque mask {}",
-                    volume.guest.display(),
-                    mask.guest.display()
-                );
-            }
-        }
         for file in unique
             .iter()
             .filter(|candidate| candidate.node_kind == PreparedNodeKind::File)
@@ -2171,258 +2088,17 @@ fn validate_plan(volumes: &mut Vec<PreparedVolume>, core: &[PathBuf]) -> Result<
                 volume.guest.display()
             );
         }
-        if core.iter().any(|path| path.starts_with(&volume.guest)) {
-            if volume.role == VolumeRole::Mask {
-                anyhow::bail!(
-                    "core mount would pierce opaque mask {}",
-                    volume.guest.display()
-                );
-            }
-            if volume.node_kind == PreparedNodeKind::File
-                && core
-                    .iter()
-                    .any(|path| path != &volume.guest && path.starts_with(&volume.guest))
-            {
-                anyhow::bail!("core mount is below file mount {}", volume.guest.display());
-            }
+        if core.iter().any(|path| path.starts_with(&volume.guest))
+            && volume.node_kind == PreparedNodeKind::File
+            && core
+                .iter()
+                .any(|path| path != &volume.guest && path.starts_with(&volume.guest))
+        {
+            anyhow::bail!("core mount is below file mount {}", volume.guest.display());
         }
     }
     *volumes = unique;
     Ok(())
-}
-
-/// Reject an overlay that reaches an opaque mask through a symlink path in
-/// an in-tree directory bind. Lexical guest paths are insufficient here:
-/// `/guest/a/c/secret` and `/guest/deep/nested/secret` can name the same
-/// object when `a -> b` and `b/c -> ../deep/nested`. Microsandbox applies the
-/// later direct overlay after the mask, which would reveal the hidden object.
-///
-/// Project both guest paths through each directory bind that contains them,
-/// then compare their resolved host locations. This is planning-only path
-/// resolution: no mount-store, notice, builder, or source mutation occurs
-/// before a collision is rejected. Repeating it for every directory anchor
-/// also covers nested and transitive in-tree link chains.
-fn validate_physical_mask_aliases(volumes: &[PreparedVolume]) -> Result<()> {
-    validate_composed_mask_aliases(volumes)?;
-
-    for mask in volumes
-        .iter()
-        .filter(|volume| volume.role == VolumeRole::Mask)
-    {
-        for anchor in volumes.iter().filter(|volume| {
-            volume.role != VolumeRole::Mask && volume.node_kind == PreparedNodeKind::Directory
-        }) {
-            let Some(mask_path) = project_guest_path(anchor, &mask.guest) else {
-                continue;
-            };
-            let mask_path = mask_path.with_context(|| {
-                format!(
-                    "resolving opaque mask {} through mount {}",
-                    mask.guest.display(),
-                    anchor.guest.display()
-                )
-            })?;
-
-            for overlay in volumes
-                .iter()
-                .filter(|volume| volume.role != VolumeRole::Mask)
-            {
-                if overlay.guest == anchor.guest {
-                    continue;
-                }
-                let Some(overlay_path) = project_guest_path(anchor, &overlay.guest) else {
-                    continue;
-                };
-                let overlay_path = match overlay_path {
-                    Ok(path) => path,
-                    // The overlay mount itself can create this guest child.
-                    // Until the child exists in the containing bind, it has
-                    // no existing physical object that could alias a mask.
-                    Err(error) if caused_by_not_found(&error) => continue,
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "resolving mount {} through mount {}",
-                                overlay.guest.display(),
-                                anchor.guest.display()
-                            )
-                        });
-                    }
-                };
-                let pierces_mask = match mask.node_kind {
-                    PreparedNodeKind::File => overlay_path == mask_path,
-                    PreparedNodeKind::Directory => overlay_path.starts_with(&mask_path),
-                };
-                if pierces_mask {
-                    anyhow::bail!(
-                        "mount at {} would pierce opaque mask {} through in-tree symlink aliases",
-                        overlay.guest.display(),
-                        mask.guest.display()
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Resolve each non-mask claim through the complete prepared graph, excluding
-/// that claim itself. A mount can supply a child that was absent in an
-/// enclosing bind, and a symlink in that child can then lead back to an
-/// opaque mask. Resolving only the enclosing host root misses this composed
-/// route and lets a later overlay replace the mask.
-fn validate_composed_mask_aliases(volumes: &[PreparedVolume]) -> Result<()> {
-    for mask in volumes
-        .iter()
-        .filter(|volume| volume.role == VolumeRole::Mask)
-    {
-        for claim in volumes
-            .iter()
-            .filter(|volume| volume.role != VolumeRole::Mask)
-        {
-            let resolved = match resolve_guest_path_through_plan(volumes, &claim.guest, claim) {
-                Ok(path) => path,
-                // A mount may create a child absent from every containing
-                // lower bind. With no object to resolve, it cannot alias a
-                // mask at preparation time.
-                Err(error) if caused_by_not_found(&error) => continue,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "resolving mount {} through the prepared mount graph",
-                            claim.guest.display()
-                        )
-                    });
-                }
-            };
-            let pierces_mask = match mask.node_kind {
-                PreparedNodeKind::File => resolved == mask.guest,
-                PreparedNodeKind::Directory => resolved.starts_with(&mask.guest),
-            };
-            if pierces_mask {
-                anyhow::bail!(
-                    "mount at {} would pierce opaque mask {} through composed mount aliases",
-                    claim.guest.display(),
-                    mask.guest.display()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Resolve a guest pathname with the same mount selection and symlink
-/// substitution order the guest uses. `ignored` is the prospective overlay:
-/// it must not hide the lower alias route we are validating.
-fn resolve_guest_path_through_plan(
-    volumes: &[PreparedVolume],
-    guest: &Path,
-    ignored: &PreparedVolume,
-) -> Result<PathBuf> {
-    use std::collections::VecDeque;
-
-    let mut pending = guest
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(component) => Some(component.to_os_string()),
-            _ => None,
-        })
-        .collect::<VecDeque<_>>();
-    let mut resolved = PathBuf::from("/");
-    let mut link_depth = 0;
-
-    while let Some(component) = pending.pop_front() {
-        let candidate = resolved.join(&component);
-        let Some(anchor) = volumes
-            .iter()
-            .filter(|volume| {
-                !std::ptr::eq(*volume, ignored)
-                    && volume.role != VolumeRole::Mask
-                    && volume.node_kind == PreparedNodeKind::Directory
-                    && candidate.starts_with(&volume.guest)
-            })
-            .max_by_key(|volume| volume.guest.components().count())
-        else {
-            resolved = candidate;
-            continue;
-        };
-        let (PreparedVolumeSource::WritableBind(host) | PreparedVolumeSource::ReadOnlyBind(host)) =
-            &anchor.source
-        else {
-            resolved = candidate;
-            continue;
-        };
-        let host_path = host.join(candidate.strip_prefix(&anchor.guest).unwrap());
-        let metadata = fs::symlink_metadata(&host_path)?;
-        if !metadata.file_type().is_symlink() {
-            resolved = candidate;
-            continue;
-        }
-        link_depth += 1;
-        if link_depth > MAX_LINK_DEPTH {
-            anyhow::bail!(
-                "resolving mount {} exceeded maximum symlink depth",
-                guest.display()
-            );
-        }
-        let target = fs::read_link(&host_path)?;
-        let replacement = if target.is_absolute() {
-            target
-        } else {
-            candidate.parent().unwrap_or(Path::new("/")).join(target)
-        };
-        let replacement = normalize_guest_link_target(&replacement)?;
-        pending = replacement
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(component) => Some(component.to_os_string()),
-                _ => None,
-            })
-            .chain(pending)
-            .collect();
-        resolved = PathBuf::from("/");
-    }
-    Ok(resolved)
-}
-
-fn normalize_guest_link_target(path: &Path) -> Result<PathBuf> {
-    let mut normalized = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir | std::path::Component::CurDir => {}
-            std::path::Component::Normal(component) => normalized.push(component),
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    anyhow::bail!("symlink target {} escapes the guest root", path.display());
-                }
-            }
-            std::path::Component::Prefix(_) => {
-                anyhow::bail!("symlink target {} is not a Unix guest path", path.display())
-            }
-        }
-    }
-    Ok(normalized)
-}
-
-/// Resolve `guest` as the guest kernel does below one directory bind.
-/// `None` means the guest path is outside that bind. Callers retain a missing
-/// projected child as a distinct case because a later overlay creates it.
-fn caused_by_not_found(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    })
-}
-
-fn project_guest_path(anchor: &PreparedVolume, guest: &Path) -> Option<Result<PathBuf>> {
-    let relative = guest.strip_prefix(&anchor.guest).ok()?;
-    let (PreparedVolumeSource::WritableBind(host) | PreparedVolumeSource::ReadOnlyBind(host)) =
-        &anchor.source
-    else {
-        return None;
-    };
-    Some(host.join(relative).canonicalize().map_err(Into::into))
 }
 
 fn same_volume(a: &PreparedVolume, b: &PreparedVolume) -> bool {
@@ -2573,17 +2249,12 @@ pub(crate) fn prepare_forks(
         // The root kind is source-dependent, so resolve it only after the
         // waiter has acquired the transaction lock and rechecked READY.
         let source_kind = fork_source_kind(&mount.host)?;
+        require_fork_directory(source_kind, &mount.source_spelling)?;
         if let Some(expected) = expected_kinds.get(&mount.guest)
             && *expected != source_kind
         {
             anyhow::bail!(
                 "fork root kind changed while preparing {}; retry the launch",
-                mount.source_spelling
-            );
-        }
-        if !mount.exclusions.is_empty() && source_kind == PreparedNodeKind::File {
-            anyhow::bail!(
-                "--mount exclusions require a directory source: {}",
                 mount.source_spelling
             );
         }
@@ -2872,108 +2543,19 @@ fn validate_ready(dir: &Path, mount: &ExtraMount, id: &str) -> Result<PreparedNo
     if data.file_type().is_symlink() {
         anyhow::bail!("{}", reset());
     }
+    // Only directory forks are published now (issue #113). A legacy
+    // `kind: "file"` entry (or any other/unknown kind) is a hard, actionable
+    // stop that names the exact final directory: never reseed, migrate,
+    // truncate, rename, delete, or bypass it.
     match (manifest.kind.as_str(), data.is_file(), data.is_dir()) {
-        ("file", true, false) => Ok(PreparedNodeKind::File),
         ("directory", false, true) => Ok(PreparedNodeKind::Directory),
+        ("file", true, false) => anyhow::bail!(
+            "unsupported file fork {} (this build mounts directory forks only); \
+             remove it to reset",
+            dir.display()
+        ),
         _ => anyhow::bail!("{}", reset()),
     }
-}
-
-const MASK_STAGE_PREFIX: &str = ".mask-file.stage-";
-
-/// Remove only orphaned files created by this publisher. The staging
-/// directory also holds fork transactions, so prefix lookalikes and every
-/// unrelated name stay untouched. Both lookup and unlink are relative to a
-/// pinned no-follow descriptor: a staged symlink is rejected rather than
-/// traversed or removed.
-fn clean_stale_mask_staging(staging: &Path) -> Result<()> {
-    use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags};
-
-    let staging_dir = rfs::open(
-        staging,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .with_context(|| format!("opening mask staging directory {}", staging.display()))?;
-    for entry in rfs::Dir::read_from(&staging_dir)? {
-        let entry = entry?;
-        let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
-        let Some(suffix) = name.as_bytes().strip_prefix(MASK_STAGE_PREFIX.as_bytes()) else {
-            continue;
-        };
-        // `tempfile` appends a six-character ASCII alphanumeric suffix. A
-        // reserved-prefix entry outside that grammar may not be ours.
-        if suffix.len() < 6 || !suffix.iter().all(u8::is_ascii_alphanumeric) {
-            anyhow::bail!(
-                "unsafe stale mask staging entry {}/{}",
-                staging.display(),
-                name.to_string_lossy()
-            );
-        }
-        let stat = rfs::statat(&staging_dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
-        let mode = stat.st_mode as u32 & 0o7777;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-            || stat.st_size != 0
-            // A publisher can die before or after fchmod. No other mode is
-            // produced by our exclusive tempfile publication protocol.
-            || !matches!(mode, 0o600 | 0o444)
-        {
-            anyhow::bail!(
-                "unsafe stale mask staging entry {}/{}",
-                staging.display(),
-                name.to_string_lossy()
-            );
-        }
-        rfs::unlinkat(&staging_dir, name, AtFlags::empty()).with_context(|| {
-            format!(
-                "removing stale mask staging entry {}/{}",
-                staging.display(),
-                name.to_string_lossy()
-            )
-        })?;
-    }
-    Ok(())
-}
-
-/// Create the shared readonly mask exactly once. Existing entries are never
-/// repaired: corruption is a stop, not an opportunity to truncate a file a
-/// prior VM may still have mounted.
-fn mask_file(store: &Path) -> Result<PathBuf> {
-    ensure_store(store)?;
-    let final_path = store.join(".mask-file");
-    let lock = open_regular_lock(&store.join("locks/.mask-file.lock"))?;
-    lock_exclusive(&lock)?;
-    clean_stale_mask_staging(&store.join("staging"))?;
-    match fs::symlink_metadata(&final_path) {
-        Ok(metadata) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_file()
-                    || metadata.len() != 0
-                    || metadata.permissions().mode() & 0o7777 != 0o444
-                {
-                    anyhow::bail!(
-                        "corrupt mask file {}; remove the mount store to reset",
-                        final_path.display()
-                    );
-                }
-            }
-            return Ok(final_path);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let staged = tempfile::Builder::new()
-        .prefix(MASK_STAGE_PREFIX)
-        .tempfile_in(store.join("staging"))?;
-    staged
-        .as_file()
-        .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o444))?;
-    std::fs::hard_link(staged.path(), &final_path)
-        .with_context(|| format!("publishing {}", final_path.display()))?;
-    Ok(final_path)
 }
 
 fn is_excluded(relative: &Path, exclusions: &[PathBuf]) -> bool {
@@ -3014,27 +2596,37 @@ fn merge_exclusions(existing: &mut Vec<PathBuf>, additions: Vec<PathBuf>) {
     }
     *existing = collapsed;
 }
-/// Copy a root via verified descriptors.  Nested links are never followed in
-/// the default policy, so a swap cannot turn an untrusted leaf into a read of
-/// an external target. Explicit follow mode is deliberately opt-in.
+/// Copy a directory root via verified descriptors. Nested links are never
+/// followed in the default policy, so a swap cannot turn an untrusted leaf
+/// into a read of an external target. Explicit follow mode is deliberately
+/// opt-in. Nested regular files are still copied by [`copy_opened`]; only the
+/// root is directory-only (issue #113).
 fn copy_root(
     source: &Path,
     destination: &Path,
     exclusions: &[PathBuf],
     follow: bool,
 ) -> Result<PreparedNodeKind> {
-    use rustix::fs::{self as rfs, Mode, OFlags};
+    use rustix::fs::{self as rfs, FileType, Mode, OFlags};
     let source = source
         .canonicalize()
         .with_context(|| format!("resolving fork root {}", source.display()))?;
     #[cfg(test)]
     let _checkpoint_scope = CopyCheckpointScope::enter(&source);
     copy_checkpoint(&source);
+    // `O_DIRECTORY` is the load-bearing enforcement: a root that was a
+    // directory at preflight but is now a file or a symlink to one fails
+    // here, at the descriptor actually copied from, rather than silently
+    // publishing a file-root fork.
     let fd = rfs::open(
         &source,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
-    )?;
+    )
+    .with_context(|| format!("opening fork root {}", source.display()))?;
+    if FileType::from_raw_mode(rfs::fstat(&fd)?.st_mode) != FileType::Directory {
+        anyhow::bail!("fork root {} must be a directory", source.display());
+    }
     copy_opened(
         &fd,
         destination,
@@ -3043,7 +2635,8 @@ fn copy_root(
         follow,
         0,
         &mut Vec::new(),
-    )
+    )?;
+    Ok(PreparedNodeKind::Directory)
 }
 fn copy_opened(
     fd: &rustix::fd::OwnedFd,
@@ -3256,7 +2849,110 @@ mod prepare_tests {
     }
 
     #[test]
-    fn mask_collision_is_rejected_before_fork_store_creation() {
+    fn rejection_precedence_fork_source_then_canonicalization_then_file_rw() {
+        // A bad fork root is rejected in preflight, before live-bind
+        // canonicalization: the fork-source error wins over a missing live
+        // source in the same argv.
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        fs::write(&file, "x").unwrap();
+        let missing = root.path().join("missing");
+        let store = tempfile::tempdir().unwrap();
+        let error = prepare(
+            parse_extra_mounts(&[
+                format!("{}:/fork:fork", file.display()),
+                format!("{}:/live:ro", missing.display()),
+            ])
+            .unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("a :fork source must be a directory"),
+            "{error}"
+        );
+
+        // A missing live source is reported during canonicalization, before
+        // the file-rw rejection in live-volume assembly.
+        let file2 = root.path().join("file2");
+        fs::write(&file2, "x").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let error = prepare(
+            parse_extra_mounts(&[
+                format!("{}:/file:rw", file2.display()),
+                format!("{}:/missing:ro", missing.display()),
+            ])
+            .unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("canonicalizing --mount host"), "{error}");
+    }
+
+    #[test]
+    fn legacy_ready_file_kind_fails_closed_without_mutation() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("seed"), "seed").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let request = format!("{}:/guest:fork", source.path().display());
+        let plan = prepare(
+            parse_extra_mounts(std::slice::from_ref(&request)).unwrap(),
+            &context(store.path()),
+        )
+        .unwrap();
+        let data = match &plan.volumes[0].source {
+            PreparedVolumeSource::WritableBind(path) => path.clone(),
+            _ => panic!("fork is writable"),
+        };
+        let final_dir = data.parent().unwrap().to_path_buf();
+        let manifest_path = final_dir.join("manifest.json");
+
+        // Negative controls: `kind: directory` paired with non-directory data,
+        // and a legacy `kind: file` with a valuable regular file.
+        for (kind, make_file) in [("directory", true), ("file", true), ("file", false)] {
+            if make_file {
+                fs::remove_dir_all(&data)
+                    .or_else(|_| fs::remove_file(&data))
+                    .unwrap();
+                fs::write(&data, "valuable bytes").unwrap();
+            }
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            manifest["kind"] = serde_json::Value::String(kind.into());
+            fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let before = store_tree(store.path());
+
+            // The original source is removed to prove the failure does not
+            // depend on it.
+            fs::remove_dir_all(source.path()).ok();
+            let error = prepare(
+                parse_extra_mounts(std::slice::from_ref(&request)).unwrap(),
+                &context(store.path()),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&final_dir.display().to_string()),
+                "error must name the exact final directory: {error}"
+            );
+            assert!(error.contains("reset"), "{error}");
+            assert_eq!(
+                store_tree(store.path()),
+                before,
+                "a legacy/bad manifest must be retained unchanged (kind={kind})"
+            );
+            if make_file {
+                assert_eq!(fs::read_to_string(&data).unwrap(), "valuable bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn exact_core_fork_collision_is_rejected_before_fork_store_creation() {
+        // An explicit fork and a core mount at the same guest path is an exact
+        // collision; the fork identity is otherwise valid.
         let source = tempfile::tempdir().unwrap();
         fs::write(source.path().join("hidden"), "secret").unwrap();
         let store = tempfile::tempdir().unwrap();
@@ -3285,7 +2981,7 @@ mod prepare_tests {
         assert!(error.to_string().contains("core mount"), "{error:#}");
         assert!(
             fs::read_dir(store.path()).unwrap().next().is_none(),
-            "an exact explicit/core collision must not create fork or mask state"
+            "an exact explicit/core collision must not create fork state"
         );
     }
 
@@ -3323,60 +3019,101 @@ mod prepare_tests {
             assert!(error.to_string().contains("core mount"), "{error:#}");
             assert!(
                 fs::read_dir(store.path()).unwrap().next().is_none(),
-                "an exact followed/core collision must not create fork or mask state (fork_first={fork_first})"
+                "an exact followed/core collision must not create fork state (fork_first={fork_first})"
             );
         }
     }
 
     #[test]
-    fn validation_failure_has_no_fork_or_mask_side_effects_in_either_order() {
+    fn file_rw_rejection_precedes_fork_store_creation_in_either_order() {
         let fork_source = tempfile::tempdir().unwrap();
-        fs::write(fork_source.path().join("seed"), "seed").unwrap();
-        let live_source = tempfile::tempdir().unwrap();
-        fs::write(live_source.path().join("hidden"), "hidden").unwrap();
+        fs::create_dir(fork_source.path().join("seed")).unwrap();
+        let file_source = tempfile::tempdir().unwrap();
+        let file = file_source.path().join("plain-file");
+        fs::write(&file, "content").unwrap();
 
         for declarations in [
             vec![
                 format!("{}:/fork:fork", fork_source.path().display()),
-                format!("{}:/live:ro:exclude=hidden", live_source.path().display()),
+                format!("{}:/live/file", file.display()),
             ],
             vec![
-                format!("{}:/live:ro:exclude=hidden", live_source.path().display()),
+                format!("{}:/live/file", file.display()),
                 format!("{}:/fork:fork", fork_source.path().display()),
             ],
         ] {
-            let store = tempfile::tempdir().unwrap();
-            let mut context = context(store.path());
-            // This core claim would be mounted below the generated opaque
-            // mask, so complete-plan validation must reject it before fork
-            // state or the shared file mask can be published.
-            context
-                .core_guest_mounts
-                .push(PathBuf::from("/live/hidden"));
-            assert!(prepare(parse_extra_mounts(&declarations).unwrap(), &context).is_err());
+            // An absent mount-store path must stay absent: the file-rw
+            // rejection is a policy error, not a fork transaction.
+            let store = file_source.path().join("absent-store");
+            let error =
+                prepare(parse_extra_mounts(&declarations).unwrap(), &context(&store)).unwrap_err();
             assert!(
-                fs::read_dir(store.path()).unwrap().next().is_none(),
-                "failed preparation must leave the mount store untouched"
+                error.to_string().contains("can only be mounted read-only"),
+                "{error:#}"
             );
+            assert!(!store.exists(), "rejection must not create the mount store");
         }
     }
 
     #[test]
-    fn fork_file_exclusions_fail_before_store_creation_and_do_not_poison_retry() {
+    fn file_ro_parent_topology_rejection_is_side_effect_free_in_either_order() {
+        let fork_source = tempfile::tempdir().unwrap();
+        fs::create_dir(fork_source.path().join("seed")).unwrap();
+        let file_source = tempfile::tempdir().unwrap();
+        let file = file_source.path().join("plain-file");
+        fs::write(&file, "content").unwrap();
+        let child_source = tempfile::tempdir().unwrap();
+
+        for declarations in [
+            vec![
+                format!("{}:/fork:fork", fork_source.path().display()),
+                format!("{}:/live/file:ro", file.display()),
+                format!("{}:/live/file/child:ro", child_source.path().display()),
+            ],
+            vec![
+                format!("{}:/live/file/child:ro", child_source.path().display()),
+                format!("{}:/live/file:ro", file.display()),
+                format!("{}:/fork:fork", fork_source.path().display()),
+            ],
+        ] {
+            let store = file_source.path().join("absent-store");
+            assert!(!store.exists());
+            let error =
+                prepare(parse_extra_mounts(&declarations).unwrap(), &context(&store)).unwrap_err();
+            assert!(error.to_string().contains("below file mount"), "{error:#}");
+            assert!(!store.exists(), "rejection must be side-effect free");
+        }
+    }
+
+    #[test]
+    fn file_fork_roots_reject_before_store_creation_and_retry_after_becoming_directory() {
         let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source-file");
+        let source = root.path().join("source");
         fs::write(&source, "seed").unwrap();
         let store = tempfile::tempdir().unwrap();
-        let excluded = format!("{}:/guest:fork:exclude=hidden", source.display());
-        let error = prepare(
-            parse_extra_mounts(&[excluded]).unwrap(),
-            &context(store.path()),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("directory source"), "{error}");
-        assert!(fs::read_dir(store.path()).unwrap().next().is_none());
 
+        // Plain, excluded, and follow-links file forks all reject before the
+        // store exists; the old plain-file fork success path is gone.
+        for request in [
+            format!("{}:/guest:fork", source.display()),
+            format!("{}:/guest:fork:exclude=hidden", source.display()),
+            format!("{}:/guest:fork:follow-links", source.display()),
+        ] {
+            let error = prepare(
+                parse_extra_mounts(&[request]).unwrap(),
+                &context(store.path()),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("must be a directory"), "{error}");
+            assert!(fs::read_dir(store.path()).unwrap().next().is_none());
+        }
+
+        // Turning the same spelling into a directory makes the same identity
+        // resolvable on retry (the file rejection did not poison it).
+        fs::remove_file(&source).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("visible"), "seed").unwrap();
         let valid = format!("{}:/guest:fork", source.display());
         assert!(
             prepare(
@@ -3388,420 +3125,143 @@ mod prepare_tests {
     }
 
     #[test]
-    fn composed_mount_alias_overlay_cannot_pierce_opaque_mask_in_any_order() {
+    fn first_use_fork_kind_validates_core_explicit_and_followed_descendants() {
         use std::os::unix::fs::symlink;
 
-        for directory in [false, true] {
-            for order in [
-                [0, 1, 2],
-                [0, 2, 1],
-                [1, 0, 2],
-                [1, 2, 0],
-                [2, 0, 1],
-                [2, 1, 0],
-            ] {
-                // The root's `z-alias` initially points into a child that
-                // does not exist there. A second mount supplies that child,
-                // whose link then resolves back to the root's masked leaf.
-                let root = tempfile::tempdir().unwrap();
-                let source = root.path().join("root");
-                fs::create_dir(&source).unwrap();
-                let hidden = source.join("m-hidden");
-                if directory {
-                    fs::create_dir(&hidden).unwrap();
+        // A directory fork keeps accepting descendant claims (explicit,
+        // followed, and core) in either declaration order.
+        for fork_first in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source");
+            fs::create_dir(&source).unwrap();
+            let child = root.path().join("child");
+            fs::create_dir(&child).unwrap();
+            let live = root.path().join("live");
+            fs::create_dir(&live).unwrap();
+            symlink(&child, live.join("followed-child")).unwrap();
+            let fork = format!("{}:{}:fork", source.display(), root.path().display());
+            let explicit = format!("{}:{}:ro", child.display(), child.display());
+            let followed = format!("{}:ro:follow-links", live.display());
+
+            for child_claim in [&explicit, &followed] {
+                let declarations = if fork_first {
+                    vec![fork.clone(), child_claim.to_string()]
                 } else {
-                    fs::write(&hidden, "hidden").unwrap();
-                }
-                symlink("a-new/secret", source.join("z-alias")).unwrap();
-
-                let supplied_child = root.path().join("supplied-a-new");
-                fs::create_dir(&supplied_child).unwrap();
-                symlink("../m-hidden", supplied_child.join("secret")).unwrap();
-
-                let declarations = [
-                    format!("{}:/guest:rw:exclude=m-hidden", source.display()),
-                    format!("{}:/guest/a-new:rw", supplied_child.display()),
-                    format!("{}:/guest/z-alias:rw", hidden.display()),
-                ];
-                let declarations = order
-                    .iter()
-                    .map(|&index| declarations[index].clone())
-                    .collect::<Vec<_>>();
-                let store = tempfile::tempdir().unwrap();
-                let error = prepare(
-                    parse_extra_mounts(&declarations).unwrap(),
-                    &context(store.path()),
-                )
-                .expect_err("a composed mount alias must not pierce an opaque mask")
-                .to_string();
-                assert!(error.contains("pierce opaque mask"), "{error}");
-                assert!(
-                    fs::read_dir(store.path()).unwrap().next().is_none(),
-                    "rejection must precede mask publication (directory={directory}, order={order:?})"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn absent_projected_child_cannot_alias_mask_in_either_declaration_order() {
-        for directory in [false, true] {
-            for root_first in [false, true] {
-                let root = tempfile::tempdir().unwrap();
-                let source = root.path().join("source");
-                fs::create_dir(&source).unwrap();
-                fs::write(source.join("hidden"), "hidden").unwrap();
-
-                let overlay_source = root.path().join("overlay");
-                if directory {
-                    fs::create_dir(&overlay_source).unwrap();
-                } else {
-                    fs::write(&overlay_source, "overlay").unwrap();
-                }
-
-                let masked_root = format!("{}:/guest:rw:exclude=hidden", source.display());
-                let overlay = format!("{}:/guest/new:rw", overlay_source.display());
-                let declarations = if root_first {
-                    vec![masked_root, overlay]
-                } else {
-                    vec![overlay, masked_root]
+                    vec![child_claim.to_string(), fork.clone()]
                 };
                 let store = tempfile::tempdir().unwrap();
-                let plan = prepare(
-                    parse_extra_mounts(&declarations).unwrap(),
-                    &context(store.path()),
-                )
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "an absent projected child cannot alias an existing mask (directory={directory}, root_first={root_first}): {error:#}"
-                    )
-                });
-                assert!(
-                    plan.volumes
-                        .iter()
-                        .any(|volume| volume.guest == Path::new("/guest/new"))
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn in_tree_symlink_alias_overlay_cannot_pierce_opaque_mask_in_either_order() {
-        use std::os::unix::fs::symlink;
-
-        for directory in [false, true] {
-            for root_first in [false, true] {
-                // `/guest/a/c/secret` resolves through `a -> b` and
-                // `b/c -> ../deep/nested` to `/guest/deep/nested/secret`.
-                let home = tempfile::tempdir().unwrap();
-                let source = home.path().join("source");
-                let deep = source.join("deep/nested");
-                fs::create_dir_all(&deep).unwrap();
-                let secret = deep.join("secret");
-                if directory {
-                    fs::create_dir(&secret).unwrap();
-                } else {
-                    fs::write(&secret, "secret").unwrap();
-                }
-                fs::create_dir(source.join("b")).unwrap();
-                symlink("b", source.join("a")).unwrap();
-                symlink("../deep/nested", source.join("b/c")).unwrap();
-
-                let root = format!(
-                    "{}:/guest:ro:follow-links:exclude=a/c/secret",
-                    source.display()
-                );
-                let overlay = format!("{}:/guest/deep/nested/secret:ro", secret.display());
-                let declarations = if root_first {
-                    vec![root, overlay]
-                } else {
-                    vec![overlay, root]
-                };
-                let store = tempfile::tempdir().unwrap();
-                let error = prepare(
+                let result = prepare(
                     parse_extra_mounts(&declarations).unwrap(),
                     &MountContext {
                         mount_store: store.path().to_path_buf(),
-                        host_home: Some(home.path().to_path_buf()),
-                        core_guest_mounts: Vec::new(),
+                        host_home: Some(root.path().to_path_buf()),
+                        core_guest_mounts: vec![root.path().join("core-child")],
                     },
-                )
-                .expect_err("a physical alias overlay must not pierce an opaque mask")
-                .to_string();
-                assert!(error.contains("pierce opaque mask"), "{error}");
+                );
                 assert!(
-                    fs::read_dir(store.path()).unwrap().next().is_none(),
-                    "rejection must not publish a mask (directory={directory}, root_first={root_first})"
+                    result.is_ok(),
+                    "directory fork must allow child: {result:?}"
                 );
             }
         }
-    }
 
-    #[test]
-    fn followed_aliases_receive_projected_file_and_directory_masks() {
-        use std::os::unix::fs::symlink;
-
-        let home = tempfile::tempdir().unwrap();
-        let source = home.path().join("source");
-        let first_target = source.join("target");
-        let second_target = source.join("nested-target");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&first_target).unwrap();
-        fs::create_dir(&second_target).unwrap();
-        fs::write(first_target.join("secret-file"), "secret").unwrap();
-        fs::create_dir(first_target.join("secret-directory")).unwrap();
-        fs::write(second_target.join("nested-secret"), "secret").unwrap();
-        symlink("target", source.join("alias")).unwrap();
-        symlink("../nested-target", first_target.join("nested-alias")).unwrap();
-
-        let request = format!(
-            "{}:/guest:ro:follow-links:exclude=alias/secret-file:exclude=alias/secret-directory:exclude=alias/nested-alias/nested-secret",
-            source.display()
-        );
+        // A file fork root is rejected with the directory-only diagnostic,
+        // never a `below file mount` topology error, even with descendants.
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source-file");
+        fs::write(&source, "seed").unwrap();
+        let child = root.path().join("child");
+        fs::create_dir(&child).unwrap();
         let store = tempfile::tempdir().unwrap();
-        let plan = prepare(
-            parse_extra_mounts(&[request]).unwrap(),
-            &MountContext {
-                mount_store: store.path().to_path_buf(),
-                host_home: Some(home.path().to_path_buf()),
-                core_guest_mounts: Vec::new(),
-            },
-        )
-        .unwrap();
-        let masks = plan
-            .volumes
-            .iter()
-            .filter(|volume| volume.role == VolumeRole::Mask)
-            .map(|volume| volume.guest.clone())
-            .collect::<Vec<_>>();
-        let first_target = first_target.canonicalize().unwrap();
-        let second_target = second_target.canonicalize().unwrap();
-        assert!(masks.contains(&first_target.join("secret-file")));
-        assert!(masks.contains(&first_target.join("secret-directory")));
-        assert!(masks.contains(&second_target.join("nested-secret")));
-        // The root bind still exposes the target through its in-tree link,
-        // so masking only the followed canonical/literal aliases would let
-        // `/guest/alias/secret-file` pierce the exclusion.
-        assert!(masks.contains(&PathBuf::from("/guest/alias/secret-file")));
-        assert!(masks.contains(&PathBuf::from("/guest/alias/secret-directory")));
-        assert!(masks.contains(&PathBuf::from("/guest/alias/nested-alias/nested-secret")));
-    }
-
-    #[test]
-    fn exclusions_survive_deduplicated_canonical_and_literal_followed_aliases() {
-        use std::os::unix::fs::symlink;
-
-        // Make one followed target reachable through both its canonical and
-        // literal guest paths, then declare those paths explicitly too. The
-        // explicit declarations used to win expand_follow_links' dedup and
-        // discard the exclusion projected from `implement`.
-        let home = tempfile::tempdir().unwrap();
-        let home_path = home.path().canonicalize().unwrap();
-        let source = home_path.join("source");
-        let conf = home_path.join("conf");
-        let target = conf.join("skills").join("implement");
-        let literal = conf.join(".agents").join("skills").join("implement");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        fs::create_dir_all(conf.join(".agents")).unwrap();
-        fs::write(target.join("secret"), "secret").unwrap();
-        symlink("../skills", conf.join(".agents").join("skills")).unwrap();
-        symlink(&literal, source.join("implement")).unwrap();
-
-        let store = tempfile::tempdir().unwrap();
-        let plan = prepare(
+        let error = prepare(
             parse_extra_mounts(&[
-                format!(
-                    "{}:ro:follow-links:exclude=implement/secret",
-                    source.display()
-                ),
-                format!("{}:{}:ro", target.display(), target.display()),
-                format!("{}:{}:ro", target.display(), literal.display()),
+                format!("{}:/guest:fork", source.display()),
+                format!("{}:/guest/child:ro", child.display()),
             ])
             .unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("a :fork source must be a directory"),
+            "{error}"
+        );
+        assert!(fs::read_dir(store.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn readonly_file_bind_rejects_explicit_followed_and_core_descendants() {
+        use std::os::unix::fs::symlink;
+
+        // Explicit child below a read-only file bind, both orders.
+        for file_first in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let file = root.path().join("plain-file");
+            fs::write(&file, "content").unwrap();
+            let child_source = root.path().join("explicit-child");
+            fs::create_dir(&child_source).unwrap();
+            let file_mount = format!("{}:/guest/file:ro", file.display());
+            let child = format!("{}:/guest/file/child:ro", child_source.display());
+            let declarations = if file_first {
+                vec![file_mount.clone(), child]
+            } else {
+                vec![child, file_mount.clone()]
+            };
+            let store = tempfile::tempdir().unwrap();
+            let error = prepare(
+                parse_extra_mounts(&declarations).unwrap(),
+                &context(store.path()),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("below file mount"), "{error:#}");
+            assert!(fs::read_dir(store.path()).unwrap().next().is_none());
+        }
+
+        // A followed target whose discovered guest path is below the file
+        // bind is rejected. The file is mounted at the guest spelling of a
+        // real directory `D`; the live root is elsewhere and links into `D`.
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let file = home_path.join("plain-file");
+        fs::write(&file, "content").unwrap();
+        let live = home_path.join("live");
+        let d = home_path.join("d");
+        let sub = d.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir(&live).unwrap();
+        symlink(&sub, live.join("link")).unwrap();
+        let file_mount = format!("{}:{}:ro", file.display(), d.display());
+        let followed = format!("{}:ro:follow-links", live.display());
+        let store = tempfile::tempdir().unwrap();
+        let error = prepare(
+            parse_extra_mounts(&[file_mount, followed]).unwrap(),
             &MountContext {
                 mount_store: store.path().to_path_buf(),
                 host_home: Some(home_path.clone()),
                 core_guest_mounts: Vec::new(),
             },
         )
-        .unwrap();
-        let masks = plan
-            .volumes
-            .iter()
-            .filter(|volume| volume.role == VolumeRole::Mask)
-            .map(|volume| volume.guest.clone())
-            .collect::<Vec<_>>();
-        assert!(masks.contains(&target.join("secret")), "{masks:?}");
-        assert!(masks.contains(&literal.join("secret")), "{masks:?}");
-    }
+        .unwrap_err();
+        assert!(error.to_string().contains("below file mount"), "{error:#}");
+        assert!(fs::read_dir(store.path()).unwrap().next().is_none());
 
-    #[test]
-    fn corrupt_mask_is_never_repaired() {
+        // Core child below a read-only file bind.
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("plain-file");
+        fs::write(&file, "content").unwrap();
         let store = tempfile::tempdir().unwrap();
-        ensure_store(store.path()).unwrap();
-        fs::write(store.path().join(".mask-file"), "not empty").unwrap();
-        assert!(mask_file(store.path()).is_err());
-        assert_eq!(
-            fs::read_to_string(store.path().join(".mask-file")).unwrap(),
-            "not empty"
-        );
-    }
-
-    #[test]
-    fn first_use_fork_kind_validates_core_explicit_and_followed_descendants() {
-        use std::os::unix::fs::symlink;
-
-        for directory in [false, true] {
-            for fork_first in [false, true] {
-                let root = tempfile::tempdir().unwrap();
-                let source = root.path().join("source");
-                if directory {
-                    fs::create_dir(&source).unwrap();
-                } else {
-                    fs::write(&source, "seed").unwrap();
-                }
-                let child = root.path().join("child");
-                fs::create_dir(&child).unwrap();
-                let live = root.path().join("live");
-                fs::create_dir(&live).unwrap();
-                symlink(&child, live.join("followed-child")).unwrap();
-                let fork = format!("{}:{}:fork", source.display(), root.path().display());
-                let explicit = format!("{}:{}:ro", child.display(), child.display());
-                let followed = format!("{}:ro:follow-links", live.display());
-
-                for child_claim in [&explicit, &followed] {
-                    let declarations = if fork_first {
-                        vec![fork.clone(), child_claim.to_string()]
-                    } else {
-                        vec![child_claim.to_string(), fork.clone()]
-                    };
-                    let store = tempfile::tempdir().unwrap();
-                    let result = prepare(
-                        parse_extra_mounts(&declarations).unwrap(),
-                        &MountContext {
-                            mount_store: store.path().to_path_buf(),
-                            host_home: Some(root.path().to_path_buf()),
-                            core_guest_mounts: vec![root.path().join("core-child")],
-                        },
-                    );
-                    if directory {
-                        assert!(
-                            result.is_ok(),
-                            "directory fork must allow child: {result:?}"
-                        );
-                    } else {
-                        assert!(result.is_err(), "file fork must reject child topology");
-                        assert!(fs::read_dir(store.path()).unwrap().next().is_none());
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn ready_file_fork_rejects_descendants_during_side_effect_free_complete_plan_validation() {
-        use std::os::unix::fs::symlink;
-
-        for fork_first in [false, true] {
-            // First launch seeds a file fork. The second launch reuses it
-            // after the declaration source is gone and adds an explicit child.
-            let root = tempfile::tempdir().unwrap();
-            let source = root.path().join("source-file");
-            fs::write(&source, "seed").unwrap();
-            let store = tempfile::tempdir().unwrap();
-            let guest = PathBuf::from("/guest/file");
-            let fork = format!("{}:{}:fork", source.display(), guest.display());
-            prepare(
-                parse_extra_mounts(std::slice::from_ref(&fork)).unwrap(),
-                &context(store.path()),
-            )
-            .expect("first launch seeds the file fork");
-            fs::remove_file(&source).unwrap();
-
-            let child = root.path().join("child");
-            fs::create_dir(&child).unwrap();
-            let explicit = format!("{}:{}/child:ro", child.display(), guest.display());
-            let declarations = if fork_first {
-                vec![fork.clone(), explicit]
-            } else {
-                vec![explicit, fork.clone()]
-            };
-            let before = store_tree(store.path());
-            let error = prepare(
-                parse_extra_mounts(&declarations).unwrap(),
-                &context(store.path()),
-            )
-            .expect_err("an explicit child cannot be mounted below a READY file fork");
-            assert!(error.to_string().contains("below file mount"), "{error:#}");
-            assert_eq!(
-                store_tree(store.path()),
-                before,
-                "rejected plan must not mutate READY state"
-            );
-
-            // A followed target is also a complete-plan claim. Its canonical
-            // guest path is under this READY file fork's guest path.
-            let followed_source = root.path().join("followed-source-file");
-            fs::write(&followed_source, "seed").unwrap();
-            let followed_guest = root.path().canonicalize().unwrap();
-            let followed_fork = format!(
-                "{}:{}:fork",
-                followed_source.display(),
-                followed_guest.display()
-            );
-            prepare(
-                parse_extra_mounts(std::slice::from_ref(&followed_fork)).unwrap(),
-                &context(store.path()),
-            )
-            .expect("first launch seeds the followed file fork");
-            fs::remove_file(&followed_source).unwrap();
-            let live = root.path().join("live");
-            let followed_child = root.path().join("followed-child");
-            fs::create_dir(&live).unwrap();
-            fs::create_dir(&followed_child).unwrap();
-            symlink(&followed_child, live.join("child")).unwrap();
-            let followed = format!("{}:ro:follow-links", live.display());
-            let declarations = if fork_first {
-                vec![followed_fork.clone(), followed]
-            } else {
-                vec![followed, followed_fork.clone()]
-            };
-            let before = store_tree(store.path());
-            let error = prepare(
-                parse_extra_mounts(&declarations).unwrap(),
-                &MountContext {
-                    mount_store: store.path().to_path_buf(),
-                    host_home: Some(root.path().to_path_buf()),
-                    core_guest_mounts: Vec::new(),
-                },
-            )
-            .expect_err("a followed child cannot be mounted below a READY file fork");
-            assert!(error.to_string().contains("below file mount"), "{error:#}");
-            assert_eq!(
-                store_tree(store.path()),
-                before,
-                "rejected plan must not mutate READY state"
-            );
-
-            // Core claims are validated in the same side-effect-free pass.
-            let before = store_tree(store.path());
-            let error = prepare(
-                parse_extra_mounts(&[fork]).unwrap(),
-                &MountContext {
-                    mount_store: store.path().to_path_buf(),
-                    host_home: Some(root.path().to_path_buf()),
-                    core_guest_mounts: vec![guest.join("core-child")],
-                },
-            )
-            .expect_err("a core child cannot be mounted below a READY file fork");
-            assert!(error.to_string().contains("below file mount"), "{error:#}");
-            assert_eq!(
-                store_tree(store.path()),
-                before,
-                "rejected plan must not mutate READY state"
-            );
-        }
+        let mut mount_context = context(store.path());
+        mount_context
+            .core_guest_mounts
+            .push(PathBuf::from("/guest/file/core-child"));
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/guest/file:ro", file.display())]).unwrap(),
+            &mount_context,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("below file mount"), "{error:#}");
+        assert!(fs::read_dir(store.path()).unwrap().next().is_none());
     }
 
     #[test]
@@ -3836,7 +3296,7 @@ mod prepare_tests {
     }
 
     #[test]
-    fn file_fork_below_core_is_rejected_before_store_or_launch_work() {
+    fn file_ro_below_core_is_rejected_before_store_or_launch_work() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source-file");
         fs::write(&source, "seed").unwrap();
@@ -3847,10 +3307,10 @@ mod prepare_tests {
             .push(PathBuf::from("/tmp/project"));
 
         let error = prepare(
-            parse_extra_mounts(&[format!("{}:/tmp:fork", source.display())]).unwrap(),
+            parse_extra_mounts(&[format!("{}:/tmp:ro", source.display())]).unwrap(),
             &mount_context,
         )
-        .expect_err("a core directory below a file fork cannot be mounted");
+        .expect_err("a core directory below a read-only file bind cannot be mounted");
         assert!(error.to_string().contains("below file mount"), "{error:#}");
         assert!(
             fs::read_dir(store.path()).unwrap().next().is_none(),
@@ -4101,24 +3561,35 @@ mod prepare_tests {
             .unwrap_or_else(|poison| poison.into_inner());
         use std::os::unix::fs::symlink;
 
-        for victim in ["root", "file", "directory", "link"] {
+        // The root case starts as a real directory and is swapped for both a
+        // symlink-to-external-directory and a regular file: this is exactly
+        // what `copy_root`'s `O_DIRECTORY` descriptor open must reject. Nested
+        // file/directory/link swaps stay as they were.
+        for (victim, root_replacement) in [
+            ("root", "symlink"),
+            ("root", "file"),
+            ("file", "symlink"),
+            ("directory", "symlink"),
+            ("link", "symlink"),
+        ] {
             let swapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let root = tempfile::tempdir().unwrap();
             let source = root.path().join("source");
-            let external = root.path().join("external");
+            let external_file = root.path().join("external-file");
+            let external_dir = root.path().join("external-dir");
             fs::create_dir(&source).unwrap();
-            fs::write(&external, "outside").unwrap();
+            fs::write(source.join("kept"), "inside").unwrap();
+            fs::write(&external_file, "outside").unwrap();
+            fs::create_dir(&external_dir).unwrap();
+            fs::write(external_dir.join("outside"), "outside").unwrap();
             match victim {
-                "root" => {
-                    fs::remove_dir(&source).unwrap();
-                    fs::write(&source, "inside").unwrap();
-                }
+                "root" => {}
                 "file" => fs::write(source.join("file"), "inside").unwrap(),
                 "directory" => {
                     fs::create_dir(source.join("directory")).unwrap();
                     fs::write(source.join("directory/item"), "inside").unwrap();
                 }
-                "link" => symlink(&external, source.join("link")).unwrap(),
+                "link" => symlink(&external_file, source.join("link")).unwrap(),
                 _ => unreachable!(),
             }
             let swap = if victim == "root" {
@@ -4128,8 +3599,10 @@ mod prepare_tests {
             };
             let root_source = source.clone();
             let checkpoint = PathBuf::from(victim);
-            let external = external.clone();
+            let external_file_capture = external_file.clone();
+            let external_dir_capture = external_dir.clone();
             let swapping_link = victim == "link";
+            let root_replacement_kind = root_replacement.to_string();
             let swapped_at_checkpoint = std::sync::Arc::clone(&swapped);
             set_copy_checkpoint(
                 &source,
@@ -4142,9 +3615,13 @@ mod prepare_tests {
                         // A rename makes the check/open window deterministic.
                         fs::rename(&swap, &replacement).unwrap();
                         if swapping_link {
-                            fs::hard_link(&external, &swap).unwrap();
+                            fs::hard_link(&external_file_capture, &swap).unwrap();
+                        } else if root_checkpoint && root_replacement_kind == "file" {
+                            fs::write(&swap, "swapped").unwrap();
+                        } else if root_checkpoint {
+                            symlink(&external_dir_capture, &swap).unwrap();
                         } else {
-                            symlink(&external, &swap).unwrap();
+                            symlink(&external_file_capture, &swap).unwrap();
                         }
                     }
                 }),
@@ -4157,18 +3634,23 @@ mod prepare_tests {
                     &context(store.path())
                 )
                 .is_err(),
-                "swap at {victim} was accepted"
+                "swap at {victim}/{root_replacement} was accepted"
             );
             clear_copy_checkpoint();
             assert!(
                 swapped.load(std::sync::atomic::Ordering::SeqCst),
-                "checkpoint at {victim} did not run"
+                "checkpoint at {victim}/{root_replacement} did not run"
             );
             assert!(
                 fs::read_dir(store.path().join("forks"))
                     .unwrap()
                     .next()
                     .is_none()
+            );
+            assert_eq!(
+                fs::read_to_string(external_dir.join("outside")).unwrap(),
+                "outside",
+                "external content must not be mutated"
             );
         }
     }
@@ -4311,218 +3793,6 @@ mod prepare_tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("remove it to reset"), "{error}");
-    }
-
-    #[test]
-    fn mask_file_rejects_every_special_permission_bit() {
-        use std::os::unix::fs::PermissionsExt;
-
-        for special_bits in 1..=0o7 {
-            let store = tempfile::tempdir().unwrap();
-            ensure_store(store.path()).unwrap();
-            let final_path = store.path().join(".mask-file");
-            fs::write(&final_path, "").unwrap();
-            let mode = 0o444 | (special_bits << 9);
-            fs::set_permissions(&final_path, fs::Permissions::from_mode(mode)).unwrap();
-
-            let error = mask_file(store.path())
-                .expect_err("special permission bits make a mask file corrupt")
-                .to_string();
-            assert!(error.contains("corrupt mask file"), "{error}");
-            assert_eq!(
-                fs::metadata(&final_path).unwrap().permissions().mode() & 0o7777,
-                mode,
-                "corrupt mask state must never be repaired"
-            );
-        }
-    }
-
-    #[test]
-    fn mask_file_cleans_interrupted_stages_before_reuse_and_publication() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let store = tempfile::tempdir().unwrap();
-        ensure_store(store.path()).unwrap();
-        let staging = store.path().join("staging");
-        let stale = staging.join(".mask-file.stage-crashed1");
-        fs::write(&stale, "").unwrap();
-        fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
-        let unrelated = staging.join("unrelated-fork-stage");
-        fs::write(&unrelated, "leave me alone").unwrap();
-
-        let published = mask_file(store.path()).unwrap();
-        assert_eq!(published, store.path().join(".mask-file"));
-        assert!(!stale.exists(), "a process-left mask stage must be retried");
-        assert!(unrelated.exists(), "unrelated staging must be preserved");
-
-        let stale_after_ready = staging.join(".mask-file.stage-crashed2");
-        fs::write(&stale_after_ready, "").unwrap();
-        fs::set_permissions(&stale_after_ready, fs::Permissions::from_mode(0o444)).unwrap();
-        assert_eq!(mask_file(store.path()).unwrap(), published);
-        assert!(
-            !stale_after_ready.exists(),
-            "READY reuse must also clean an interrupted publisher's stage"
-        );
-    }
-
-    #[test]
-    fn mask_file_retries_a_stage_left_by_an_interrupted_process() {
-        if let Some(store) = std::env::var_os("AGENT_VM_INTERRUPTED_MASK_STORE") {
-            let staging = PathBuf::from(store).join("staging");
-            let stage = staging.join(".mask-file.stage-interrupted1");
-            fs::write(&stage, "").unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(stage, fs::Permissions::from_mode(0o600)).unwrap();
-            // Simulate a publisher dying after exclusive creation but before
-            // fchmod/link. The parent must reclaim this exact on-disk state.
-            std::process::exit(91);
-        }
-
-        let store = tempfile::tempdir().unwrap();
-        ensure_store(store.path()).unwrap();
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "mount::prepare_tests::mask_file_retries_a_stage_left_by_an_interrupted_process",
-                "--nocapture",
-            ])
-            .env("AGENT_VM_INTERRUPTED_MASK_STORE", store.path())
-            .status()
-            .unwrap();
-        assert_eq!(status.code(), Some(91));
-
-        let published = mask_file(store.path()).unwrap();
-        assert!(published.is_file());
-        assert!(
-            fs::read_dir(store.path().join("staging"))
-                .unwrap()
-                .next()
-                .is_none(),
-            "the next publisher must remove only its recognized stale stage"
-        );
-    }
-
-    #[test]
-    fn mask_file_rejects_unsafe_mask_stages_without_following_them() {
-        use std::ffi::CString;
-        use std::os::unix::{
-            ffi::OsStrExt,
-            fs::{PermissionsExt, symlink},
-        };
-
-        for kind in [
-            "symlink",
-            "fifo",
-            "directory",
-            "wrong-mode",
-            "malformed-name",
-        ] {
-            let store = tempfile::tempdir().unwrap();
-            ensure_store(store.path()).unwrap();
-            let staging = store.path().join("staging");
-            let stage = staging.join(match kind {
-                "malformed-name" => ".mask-file.stage-",
-                _ => ".mask-file.stage-unsafe1",
-            });
-            match kind {
-                "symlink" => {
-                    let target = store.path().join("target");
-                    fs::write(&target, "must not be followed").unwrap();
-                    symlink(&target, &stage).unwrap();
-                }
-                "fifo" => {
-                    let stage = CString::new(stage.as_os_str().as_bytes()).unwrap();
-                    assert_eq!(unsafe { libc::mkfifo(stage.as_ptr(), 0o600) }, 0);
-                }
-                "directory" => fs::create_dir(&stage).unwrap(),
-                "wrong-mode" => {
-                    fs::write(&stage, "").unwrap();
-                    fs::set_permissions(&stage, fs::Permissions::from_mode(0o644)).unwrap();
-                }
-                "malformed-name" => fs::write(&stage, "").unwrap(),
-                _ => unreachable!(),
-            }
-
-            assert!(mask_file(store.path()).is_err(), "{kind}");
-            assert!(stage.exists(), "unsafe stage must not be removed: {kind}");
-            assert!(
-                !store.path().join(".mask-file").exists(),
-                "unsafe staging must prevent publication: {kind}"
-            );
-        }
-    }
-
-    #[test]
-    fn concurrent_mask_publishers_from_separate_processes_share_one_final() {
-        if let Some(store) = std::env::var_os("AGENT_VM_MASK_PUBLISHER_STORE") {
-            mask_file(Path::new(&store)).unwrap();
-            return;
-        }
-
-        let store = tempfile::tempdir().unwrap();
-        let children = (0..2)
-            .map(|_| {
-                std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "mount::prepare_tests::concurrent_mask_publishers_from_separate_processes_share_one_final",
-                        "--nocapture",
-                    ])
-                    .env("AGENT_VM_MASK_PUBLISHER_STORE", store.path())
-                    .spawn()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        for mut child in children {
-            assert!(child.wait().unwrap().success());
-        }
-        let final_path = store.path().join(".mask-file");
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(&final_path).unwrap();
-        assert_eq!(metadata.len(), 0);
-        assert_eq!(metadata.permissions().mode() & 0o7777, 0o444);
-        assert!(
-            fs::read_dir(store.path().join("staging"))
-                .unwrap()
-                .next()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn mask_publication_is_atomic_and_rejects_all_corrupt_final_kinds() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-        for kind in ["symlink", "directory", "nonempty", "mode"] {
-            let store = tempfile::tempdir().unwrap();
-            ensure_store(store.path()).unwrap();
-            let final_path = store.path().join(".mask-file");
-            match kind {
-                "symlink" => symlink("elsewhere", &final_path).unwrap(),
-                "directory" => fs::create_dir(&final_path).unwrap(),
-                "nonempty" => fs::write(&final_path, "x").unwrap(),
-                "mode" => {
-                    fs::write(&final_path, "").unwrap();
-                    fs::set_permissions(&final_path, fs::Permissions::from_mode(0o600)).unwrap();
-                }
-                _ => unreachable!(),
-            }
-            assert!(mask_file(store.path()).is_err(), "{kind}");
-        }
-        let store = tempfile::tempdir().unwrap();
-        let workers: Vec<_> = (0..2)
-            .map(|_| {
-                let path = store.path().to_path_buf();
-                std::thread::spawn(move || mask_file(&path).unwrap())
-            })
-            .collect();
-        let paths: Vec<_> = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
-            .collect();
-        assert_eq!(paths[0], paths[1]);
-        let metadata = fs::metadata(&paths[0]).unwrap();
-        assert_eq!(metadata.len(), 0);
-        assert_eq!(metadata.permissions().mode() & 0o7777, 0o444);
     }
 
     #[test]
