@@ -40,6 +40,7 @@ crates/agent-vm/src/
 ├── msb_install.rs          # locate + version-verify the bundled msb; MSB_HOME
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
 ├── doctor.rs               # operator diagnostics and db recovery
+├── config.rs               # read-only tool config parse/merge/validate (doctor preview)
 └── …                       # clipboard, pull, setup, user, env_flag, …
 
 images/                     # the base OCI image and its build script
@@ -62,6 +63,34 @@ A launch is one pass, and the ordering is load-bearing:
 6. The agent runs, attached to a PTY or through a streaming exec.
 7. Teardown stops the sandbox, removes it, and re-checks the credential
    snapshot.
+
+### Tool configuration is diagnostic only (not in the launch path)
+
+`config.rs` reads two ordered **catalogs** — `$HOME/.config/agent-vm/config.toml`
+and `<cwd>/.agent-vm/config.toml` — validates each strictly, and resolves a
+whole-definition union (user definitions win; the project may only add names
+the user did not write). When both declare zero tools it falls back to the
+five compiled-in defaults embedded from `default-tools.toml`. The only
+consumer today is ordinary `agent-vm doctor`, which renders a preview:
+
+```
+user file --------> parse + validate --+
+                                       +--> ordered union --> persist
+project file -----> parse + validate --+    + conflicts       ownership
+                                                          |
+                                                   ResolvedTools
+                                                          |
+                                            doctor preview (read-only)
+```
+
+There is deliberately **no arrow from this module to launch**, credential
+capture, Docker, layers, or guest state. Layer paths are declarative metadata
+that is never resolved or built, and config warnings are never logged —
+doctor renders them explicitly. `doctor --reset-msb-db` never reads config, so
+a broken file cannot block db recovery. Runtime consumption (selecting a tool,
+narrowing credential gating, building layers from config) belongs to #82/#83/#84.
+See [USAGE](USAGE.md#tool-configuration-diagnostic-preview) for the schema and
+rules and [CONTEXT](CONTEXT.md) for the vocabulary.
 
 ### Why a git submodule for microsandbox
 

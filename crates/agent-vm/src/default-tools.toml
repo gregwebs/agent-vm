@@ -1,0 +1,58 @@
+# The five tools agent-vm ships a definition for, used only when BOTH the
+# user and project config files declare zero tools (see src/config.rs).
+#
+# This is the single shipped source of the fallback catalog: it is embedded
+# at compile time with `include_str!` and parsed through exactly the same
+# raw-to-validated path as a user's file. `agent-vm doctor` never writes it
+# out; there is no starter-config writer (#80's non-goals).
+#
+# Order matters. The declaration order below is the order `agent-vm doctor`
+# previews and the order #84 will compose tooling layers in. The image build
+# keeps the same cache-motivated ordering (codex first, then opencode, then
+# claude) — see images/Dockerfile's "Layer order is deliberate" comment.
+#
+# `codex` and `opencode` carry NO default argv on purpose. Their non-interactive
+# "bypass" configuration is persisted as files by provider code
+# (credential_provider::write_openai_bypass / write_opencode_bypass,
+# src/credential_provider.rs), not by a missing `--yolo`-style flag. Do not
+# "fix" the empty `args` below by inventing one.
+
+[[tools]]
+name = "codex"
+command = "codex"
+args = []
+layer = { builtin = "codex" }
+credentials = ["openai"]
+persist = []
+
+[[tools]]
+name = "opencode"
+command = "opencode"
+args = []
+layer = { builtin = "opencode" }
+credentials = ["openai", "opencode-static"]
+persist = []
+
+[[tools]]
+name = "claude"
+command = "claude"
+args = ["--dangerously-skip-permissions"]
+layer = { builtin = "claude" }
+credentials = ["anthropic"]
+persist = []
+
+[[tools]]
+name = "copilot"
+command = "copilot"
+args = ["--allow-all-tools"]
+layer = { builtin = "copilot" }
+credentials = ["copilot"]
+persist = []
+
+# `shell` is bash, not an agent, and has no tooling layer.
+[[tools]]
+name = "shell"
+command = "bash"
+args = ["-O", "histappend"]
+credentials = ["openai", "opencode-static"]
+persist = []
