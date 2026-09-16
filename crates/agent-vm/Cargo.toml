@@ -52,7 +52,13 @@ tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "time"] }
 # `wrap_help` makes clap detect the terminal width and wrap long help
 # text to it; without it the multi-paragraph `--help` prose renders as
 # unbroken one-line-per-paragraph walls.
-clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+#
+# `string` lets `Command`/`Arg` names be owned `String`s. Required since
+# #82: launch subcommands are generated from the resolved tool catalog at
+# runtime, so their names are not `&'static str`. Without it,
+# `Command::new(tool.name().to_owned())` fails with `E0277` (and a
+# `&*name` workaround with `E0521`, since `Str` wants `'static`).
+clap = { version = "4.5", features = ["derive", "env", "string", "wrap_help"] }
 anyhow = "1.0"
 base64 = "0.22"
 sha2 = "0.10"

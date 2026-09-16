@@ -1,4 +1,4 @@
-Open a bash shell in a per-project sandbox
+Launch shell in a per-project sandbox
 
 Usage: agent-vm shell [OPTIONS] [AGENT_ARGS]...
 
@@ -79,7 +79,7 @@ Mounts & ports:
           second time at that literal path too. `follow-links` implies `:ro` (bare `--mount
           ~/ref:follow-links` behaves as `ro`); combining it with `:rw` is a parse error. A resolved
           target outside your `$HOME` is a hard error; a symlink to a file, or a dangling symlink,
-          is skipped with a warning. Example: `--mount ~/.claude/skills:ro:follow-links`.
+          is skipped with a warning. Example: `--mount ~/.agents/skills:ro:follow-links`.
 
           Each `--mount` (including each auto-discovered follow-links target) consumes one virtio-fs
           device shared with rootfs, network, vsock, console, and `--volume` disks. A `follow-links`
@@ -197,20 +197,19 @@ Guest user:
           to the project/state bind mounts (see CONTEXT.md "Guest user"). Can also be enabled
           persistently with a truthy `AGENT_VM_ROOT` (1|true|yes|on).
 
-Examples (claude shown; codex/opencode/shell take the same options):
-  agent-vm claude                             launch in the current project
-  agent-vm shell                              open a bash shell instead
-  agent-vm shell -- cargo test                run one command, then exit
-  agent-vm claude -- --model opus --resume    forward args to the agent
-  agent-vm claude --memory 8 --cpus 4         a bigger sandbox
-  agent-vm claude --mount ~/ref:ro            read-only extra mount
-  agent-vm claude --mount /etc/hosts:/host-hosts:ro
+Examples:
+  agent-vm shell                             launch in the current project
+  agent-vm shell -- <command>                run one command, then exit
+  agent-vm shell -- --model opus --resume    forward args to the tool
+  agent-vm shell --memory 8 --cpus 4         a bigger sandbox
+  agent-vm shell --mount ~/ref:ro            read-only extra mount
+  agent-vm shell --mount /etc/hosts:/host-hosts:ro
                                                read-only single-file bind
-  agent-vm claude --mount ~/.claude/skills:ro:follow-links
+  agent-vm shell --mount ~/skills:ro:follow-links
                                                follow symlinks in a skills dir
   agent-vm shell --mount ~/config:/config:fork:exclude=credentials.json
                                                seed an independent writable config copy
-  agent-vm claude --repo owner/other-repo     widen the GitHub allow-list
+  agent-vm shell --repo owner/other-repo     widen the GitHub allow-list
 
 Fork mounts:
   `:fork` copies its source directory once into project-scoped persistent state; later launches

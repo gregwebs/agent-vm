@@ -5,9 +5,11 @@
 //! ## Ordinary run
 //!
 //! With no flag, doctor prints the active `MSB_HOME`/schema, the host
-//! credential sources, and the diagnostic tool-configuration preview. The
-//! config preview is explicitly diagnostic only: nothing on any launch path
-//! consumes config yet (#82/#84 own that). A broken config still exits
+//! credential sources, and the resolved tool configuration. The **verb list**
+//! this section renders is authoritative — it is the same [`crate::cli`]
+//! catalog `--help` shows. The *layer chain* is still metadata only (#84 owns
+//! building it), and argument *values* are still hidden (only their count is
+//! shown, so a secret in `args` is never echoed). A broken config still exits
 //! nonzero, but its failure is reported *inside* the config section so it
 //! never suppresses the sections above it — and never blocks recovery
 //! (below).
@@ -37,10 +39,12 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Args as ClapArgs;
 
-use crate::config::{ConfigReport, TierReport, TierStatus, Tool, ToolLayer, ToolOrigin};
+use crate::config::{
+    ConfigConflict, ConfigReport, TierReport, TierStatus, Tool, ToolLayer, ToolOrigin,
+};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -69,11 +73,14 @@ pub fn run(args: Args) -> Result<()> {
         // result as data instead of `?`-propagating it: a repo-supplied config
         // must not blank out the state/credential sections `doctor` exists to
         // show. A load failure is rendered as the `==> tool configuration`
-        // section's own body, and the trailing `config.map(|_| ())?` still
-        // exits nonzero. The reset branch deliberately never reads config: a
-        // broken TOML must not block recovering a forward-migrated db.
+        // section's own body, and the trailing `return Err(...)` still exits
+        // nonzero. The reset branch deliberately never reads config: a broken
+        // TOML must not block recovering a forward-migrated db.
         let config =
             crate::config::ConfigPaths::discover().and_then(|paths| crate::config::load(&paths));
+        // Extract the failure (rendered below) so the report can still own its
+        // `ConfigReport` and build the launch catalog from it.
+        let config_failure = config.as_ref().err().map(|error| anyhow!("{error:#}"));
 
         let db_exists = msb_home.join("db").join("msb.db").exists();
         println!(
@@ -87,7 +94,7 @@ pub fn run(args: Args) -> Result<()> {
         println!();
         println!("{}", describe_credentials(&gather_credentials()));
         println!();
-        match &config {
+        match config {
             Ok(report) => println!("{}", describe_config(report)),
             Err(error) => println!("==> tool configuration\nerror: {error:#}"),
         }
@@ -95,7 +102,9 @@ pub fn run(args: Args) -> Result<()> {
         println!("==> agent-vm doctor: available operations");
         println!("      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next");
         println!("                       agent-vm shell/run recreates it at the bundled schema");
-        config.map(|_| ())?;
+        if let Some(error) = config_failure {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -334,30 +343,61 @@ fn describe_credentials(report: &CredReport) -> String {
     out
 }
 
-/// Render the read-only tool-configuration preview. Pure over its input so
-/// the wording is unit-tested without a real filesystem, mirroring
+/// Render the tool-configuration section. Consumes its input so it can build
+/// the owned [`crate::config::LaunchCatalog`] (the merge result plus the
+/// built-in `shell` fallback) that `--help` also renders — the two therefore
+/// cannot disagree about the verb list. Pure over its input so the wording is
+/// unit-tested without a real filesystem, mirroring
 /// [`describe_home`]/[`describe_credentials`].
 ///
-/// This section is **diagnostic only**: it never claims that a layer chain or
-/// any launch behavior was built, and it shows argument *counts* rather than
-/// values (a user may have mistakenly put a secret in `args`). Untrusted
-/// names/paths are escaped so a config file cannot inject terminal controls.
-fn describe_config(report: &ConfigReport) -> String {
-    let mut out = String::from("==> tool configuration (diagnostic only; launches unchanged)\n");
-    out.push_str(&format!(
+/// The verb list is authoritative; the *layer chain* is still metadata only
+/// (#84 owns building it), and it shows argument *counts* rather than values
+/// (a user may have mistakenly put a secret in `args`). Untrusted names/paths
+/// are escaped so a config file cannot inject terminal controls.
+fn describe_config(report: ConfigReport) -> String {
+    // Everything that needs a borrow is rendered before `report` is consumed
+    // by `into_launch_catalog`.
+    let tiers = format!(
         "user:    {}\nproject: {}\n",
         describe_tier(report.user()),
         describe_tier(report.project()),
-    ));
-    out.push_str(if report.uses_defaults() {
-        "resolved: built-in defaults; declaration / future tool-layer order\n"
+    );
+    let resolved_label = if report.uses_defaults() {
+        "resolved: built-in defaults; launch-verb / future tool-layer order\n"
     } else {
-        "resolved: declared tools; declaration / future tool-layer order\n"
-    });
-    for (index, tool) in report.resolved().as_slice().iter().enumerate() {
-        out.push_str(&format!("  {}. {}\n", index + 1, describe_tool(tool)));
+        "resolved: declared tools; launch-verb / future tool-layer order\n"
+    };
+    let conflicts = render_conflicts(report.conflicts());
+
+    let mut out = String::from("==> tool configuration\n");
+    out.push_str(&tiers);
+    out.push_str(resolved_label);
+    match report.into_launch_catalog() {
+        Ok(catalog) => {
+            for (index, tool) in catalog.as_slice().iter().enumerate() {
+                out.push_str(&format!("  {}. {}\n", index + 1, describe_tool(tool)));
+            }
+            if catalog.shell_fallback_added() {
+                out.push_str(
+                    "note: `shell` was not declared; the built-in fallback is registered so you\n\
+                     still have a way into the guest.\n",
+                );
+            }
+        }
+        // Only reachable if the embedded defaults are internally broken — a
+        // programming error, not a config the user can fix.
+        Err(error) => out.push_str(&format!("error: {error:#}\n")),
     }
-    for conflict in report.conflicts() {
+    out.push_str(&conflicts);
+    // Drop the final newline: the caller adds one via `writeln!`.
+    out.truncate(out.trim_end_matches('\n').len());
+    out
+}
+
+/// The `warning:` blocks for cross-tier shadows, in project declaration order.
+fn render_conflicts(conflicts: &[ConfigConflict]) -> String {
+    let mut out = String::new();
+    for conflict in conflicts {
         let fields = conflict
             .fields()
             .iter()
@@ -372,8 +412,6 @@ fn describe_config(report: &ConfigReport) -> String {
             fields,
         ));
     }
-    // Drop the final newline: the caller adds one via `writeln!`.
-    out.truncate(out.trim_end_matches('\n').len());
     out
 }
 
@@ -416,8 +454,15 @@ fn describe_tool(tool: &Tool) -> String {
         ToolOrigin::User(file) => format!("user:{}", crate::config::escape_path(file)),
         ToolOrigin::Project(file) => format!("project:{}", crate::config::escape_path(file)),
     };
+    // Only surfaced when true, so the default-config rows for the four agents
+    // are byte-identical to before (`interactive_shell` is `shell`-only).
+    let interactive_shell = if tool.is_interactive_shell() {
+        "; interactive_shell=true"
+    } else {
+        ""
+    };
     format!(
-        "{} -> \"{}\"; args={}; layer={layer}; credentials={credentials}; persist={}; source={source}",
+        "{} -> \"{}\"; args={}; layer={layer}; credentials={credentials}; persist={}; source={source}{interactive_shell}",
         crate::config::escape_str(tool.name()),
         crate::config::escape_str(tool.command()),
         tool.arg_count(),
@@ -878,12 +923,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let report = config_report(None, &dir.path().join("absent.toml"));
 
-        let text = describe_config(&report);
+        let text = describe_config(report);
 
-        assert!(
-            text.contains("diagnostic only; launches unchanged"),
-            "{text}"
-        );
+        // The verb list is authoritative now; the header must not claim it is
+        // "diagnostic only" (the pre-#82 wording), and the default catalog
+        // declares `shell`, so no fallback note appears.
+        assert!(text.starts_with("==> tool configuration\n"), "{text}");
+        assert!(!text.contains("diagnostic only"), "{text}");
+        assert!(!text.contains("was not declared"), "{text}");
         assert!(text.contains("<no HOME; user tier unavailable>"), "{text}");
         assert!(text.contains("built-in defaults"), "{text}");
 
@@ -894,7 +941,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "shell -> \"bash\"; args=2; layer=none; credentials=openai,opencode-static; persist=0; source=built-in"
+                "shell -> \"bash\"; args=2; layer=none; credentials=openai,opencode-static; persist=0; source=built-in; interactive_shell=true"
             ),
             "{text}"
         );
@@ -909,9 +956,26 @@ mod tests {
         std::fs::write(&user, "").unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let text = describe_config(&report);
+        let text = describe_config(report);
         assert!(text.contains("(found, 0 tools)"), "{text}");
         assert!(text.contains("(absent)"), "{text}");
+        // The default catalog declares `shell`, so the fallback does not fire.
+        assert!(!text.contains("was not declared"), "{text}");
+    }
+
+    /// A one-tool catalog gains the built-in `shell` fallback row and the note
+    /// that explains it, so `doctor`'s numbering matches `--help`.
+    #[test]
+    fn describe_config_labels_the_shell_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(&user, "[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n").unwrap();
+        let report = config_report(Some(&user), &dir.path().join("absent.toml"));
+
+        let text = describe_config(report);
+        assert!(text.contains("1. solo"), "{text}");
+        assert!(text.contains("2. shell"), "{text}");
+        assert!(text.contains("`shell` was not declared"), "{text}");
     }
 
     #[test]
@@ -931,7 +995,7 @@ mod tests {
         .unwrap();
         let report = config_report(Some(&user), &project);
 
-        let text = describe_config(&report);
+        let text = describe_config(report);
         assert!(text.contains("overrides"), "{text}");
         assert!(text.contains("tool \"t\" in"), "{text}");
         assert!(text.contains("differing fields: args"), "{text}");
@@ -947,7 +1011,7 @@ mod tests {
         std::fs::write(&user, "").unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let text = describe_config(&report);
+        let text = describe_config(report);
         assert!(!text.contains('\x1b'), "raw ESC leaked: {text:?}");
         assert!(text.contains("\\x1b"), "ESC should be escaped: {text:?}");
         assert!(
@@ -972,7 +1036,7 @@ mod tests {
         .unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let text = describe_config(&report);
+        let text = describe_config(report);
         assert!(!text.contains('\x1b'), "raw ESC leaked: {text:?}");
         assert!(
             !text.contains("red\n"),

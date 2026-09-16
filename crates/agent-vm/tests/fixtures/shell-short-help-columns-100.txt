@@ -1,4 +1,4 @@
-Open a bash shell in a per-project sandbox
+Launch shell in a per-project sandbox
 
 Usage: agent-vm shell [OPTIONS] [AGENT_ARGS]...
 
@@ -38,10 +38,9 @@ Image:
 Guest user:
       --root  Run the guest as root (uid 0) instead of the default host user
 
-Examples (claude shown; codex/opencode/shell take the same options):
-  agent-vm claude                  launch Claude Code in the current project
-  agent-vm shell                   open a bash shell instead
-  agent-vm claude -p 8080:3000     publish guest :3000 to host 127.0.0.1:8080
-  agent-vm claude -- --model opus  forward args to the agent (after --)
+Examples:
+  agent-vm shell                  launch in the current project
+  agent-vm shell -p 8080:3000     publish guest :3000 to host 127.0.0.1:8080
+  agent-vm shell -- --some-flag   forward args to the tool (after --)
 
-Trailing args go to the agent. Run with --help for networking, security, and env details.
+Trailing args go to the tool. Run with --help for networking, security, and env details.

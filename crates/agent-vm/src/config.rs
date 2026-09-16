@@ -59,13 +59,15 @@
 //!   *entire* reason chain of a reused reader before returning a fresh error
 //!   with no raw source attached.
 //!
-//! # Not yet wired to launch
+//! # Consumed by launch
 //!
-//! Nothing on any launch path reads config. Layer paths are metadata only —
-//! they are compared as declared values and never resolved, checked for
-//! existence, or built. Relative-path anchoring and persisted-path overlap
-//! safety belong to their consuming tickets (#83/#84); #82 owns the ADR and
-//! the actual launch consumption.
+//! [`ConfigReport::into_launch_catalog`] is what `cli` (to register
+//! subcommands) and `doctor` (to render them) both start from: the resolved
+//! merge result plus the built-in `shell` fallback (see [`LaunchCatalog`]).
+//! Layer paths are still metadata only — they are compared as declared values
+//! and never resolved, checked for existence, or built. Relative-path
+//! anchoring and persisted-path overlap safety belong to their consuming
+//! tickets (#83/#84).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -77,7 +79,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
-use crate::credential_provider::CredentialProvider;
+use crate::credential_provider::{CredentialProvider, ProviderSet};
 
 /// Ceiling on a config file read. A project config is possibly untrusted
 /// input, so a huge or special file must not be able to hang or exhaust
@@ -88,17 +90,21 @@ const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 const USER_CONFIG_RELATIVE: &str = ".config/agent-vm/config.toml";
 const PROJECT_CONFIG_RELATIVE: &str = ".agent-vm/config.toml";
 
-/// Subcommands `agent-vm` reserves for itself (see `main.rs`'s `Cmd`). A tool
-/// named after one would be unreachable through the CLI. The five launch
-/// verbs are deliberately **not** reserved: a tool named `claude` is the
-/// normal case and a clap-level collision is #82's concern.
-const RESERVED_TOOL_NAMES: &[&str] = &[
+/// Subcommands `agent-vm` reserves for itself. A tool named after one would be
+/// unreachable through the CLI, so it is rejected at validation. The launch
+/// verbs **are** the tools (a tool named `claude` is the normal case), so the
+/// reserved set is exactly the fixed built-ins plus clap's synthesized
+/// `help`. `cli::BUILTIN_SUBCOMMANDS` must stay a superset of this list.
+pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     "setup",
     "pull",
     "msb",
     "clipboard",
     "doctor",
     "_intercept-hook",
+    // clap synthesizes a `help` subcommand unconditionally. A second one
+    // panics in debug builds and silently shadows clap's in release.
+    "help",
 ];
 
 /// The compiled-in fallback catalog (see the file's own header for the order
@@ -151,6 +157,10 @@ impl ConfigReport {
         &self.project
     }
 
+    /// The pure merge result, without the launch fallback. Test-only: launch
+    /// and `doctor` both consume [`ConfigReport::into_launch_catalog`] so their
+    /// verb lists cannot disagree.
+    #[cfg(test)]
     pub(crate) fn resolved(&self) -> &ResolvedTools {
         &self.resolved
     }
@@ -166,6 +176,75 @@ impl ConfigReport {
     pub(crate) fn conflicts(&self) -> &[ConfigConflict] {
         &self.conflicts
     }
+
+    /// The catalog a launch actually offers: the merge result, plus the
+    /// built-in `shell` appended when no declared tool claims that name.
+    /// Consumed by both `cli::build_command` and `doctor`, so `--help` and
+    /// `agent-vm doctor` cannot disagree about the verb list.
+    ///
+    /// Deliberately *not* folded into [`ResolvedTools`]: that type means "the
+    /// merge result", and the fallback is not a declaration.
+    pub(crate) fn into_launch_catalog(self) -> Result<LaunchCatalog> {
+        let ConfigReport { resolved, .. } = self;
+        let mut tools = resolved.0;
+        let shell_fallback_added = !tools.iter().any(|tool| tool.name() == SHELL_FALLBACK_NAME);
+        if shell_fallback_added {
+            tools.push(builtin_shell()?);
+        }
+        Ok(LaunchCatalog {
+            tools,
+            shell_fallback_added,
+        })
+    }
+}
+
+/// The name the built-in `shell` fallback claims. A config that declares
+/// `shell` (even as a typo like `shel`) suppresses the fallback for `shell`
+/// only when it declares exactly this name.
+const SHELL_FALLBACK_NAME: &str = "shell";
+
+/// The verbs a launch actually offers, in chain order: the resolved merge
+/// result, plus the built-in `shell` appended when no declared tool claims
+/// that name. A config that omits `shell` — or typos it — must never leave the
+/// user without a way into the guest to debug that config.
+#[derive(Debug)]
+pub(crate) struct LaunchCatalog {
+    tools: Vec<Tool>,
+    shell_fallback_added: bool,
+}
+
+impl LaunchCatalog {
+    pub(crate) fn as_slice(&self) -> &[Tool] {
+        &self.tools
+    }
+
+    /// True when the built-in `shell` was appended because no declared tool
+    /// claimed the name; `doctor` labels the row from this.
+    pub(crate) fn shell_fallback_added(&self) -> bool {
+        self.shell_fallback_added
+    }
+
+    /// Move one tool out by name for dispatch. Order-preserving so a catalog
+    /// that outlives one `take` still lists the remaining tools in order.
+    pub(crate) fn take(mut self, name: &str) -> Option<Tool> {
+        let index = self.tools.iter().position(|tool| tool.name() == name)?;
+        Some(self.tools.remove(index))
+    }
+}
+
+/// The shipped `shell` definition, re-parsed from `default-tools.toml` so
+/// there is exactly one source of it. A missing entry is a programming error
+/// (guarded by a test over [`default_tools`]), so it is a hard error rather
+/// than a silent skip.
+fn builtin_shell() -> Result<Tool> {
+    default_tools()?
+        .into_iter()
+        .find(|tool| tool.name() == SHELL_FALLBACK_NAME)
+        .ok_or_else(|| {
+            anyhow!(
+                "config: the built-in defaults have no `{SHELL_FALLBACK_NAME}` tool; this is a bug"
+            )
+        })
 }
 
 /// The resolved tool catalog, in composition order. The inner value has no
@@ -174,6 +253,10 @@ impl ConfigReport {
 pub(crate) struct ResolvedTools(Vec<Tool>);
 
 impl ResolvedTools {
+    /// The pure merge result, without the launch fallback. Used by the merge
+    /// tests and proptests; launch/doctor go through
+    /// [`ConfigReport::into_launch_catalog`] instead.
+    #[cfg(test)]
     pub(crate) fn as_slice(&self) -> &[Tool] {
         &self.0
     }
@@ -229,6 +312,7 @@ pub(crate) struct Tool {
     layer: Option<ToolLayer>,
     credentials: Vec<CredentialProvider>,
     persist: Vec<PersistPath>,
+    interactive_shell: bool,
     origin: ToolOrigin,
 }
 
@@ -244,9 +328,32 @@ impl Tool {
 
     /// Count only. Argument *values* are never surfaced to callers, so a
     /// user who mistakenly put a secret in `args` cannot leak it through
-    /// `doctor`. Issue #82 will consume `argv` directly on the launch path.
+    /// `doctor`. Launch reads [`Self::argv`] instead; diagnostics must not.
     pub(crate) fn arg_count(&self) -> usize {
         self.argv.len()
+    }
+
+    /// The tool's default argv, prepended to the user's own args by
+    /// `run::launch`. Distinct from [`Self::arg_count`], which exists so
+    /// `doctor` can report a tool without echoing a value a user mistook for
+    /// a credential (#80): launch needs the values, diagnostics must not.
+    pub(crate) fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    /// The credential subsystems this tool depends on, as the bitset
+    /// `run::launch` threads into `secrets::refresh`.
+    pub(crate) fn credential_providers(&self) -> ProviderSet {
+        ProviderSet::new(self.credentials.iter().copied())
+    }
+
+    /// True when the user's trailing args must be joined into a single bash
+    /// `-c` command line instead of appended as separate `argv` entries (see
+    /// `run::inner_argv`). A first-class config field rather than a
+    /// `command == "bash"` check, which would silently misbehave for a
+    /// user-declared `zsh`, `/bin/bash`, or `sh`.
+    pub(crate) fn is_interactive_shell(&self) -> bool {
+        self.interactive_shell
     }
 
     pub(crate) fn layer(&self) -> Option<&ToolLayer> {
@@ -274,6 +381,7 @@ impl Tool {
             && self.layer == other.layer
             && self.credentials == other.credentials
             && self.persist == other.persist
+            && self.interactive_shell == other.interactive_shell
     }
 
     /// The differing fields, in the fixed schema order the warning renders.
@@ -293,6 +401,10 @@ impl Tool {
         }
         if self.persist != other.persist {
             fields.push(ToolField::Persist);
+        }
+        // Appended last so the fixed-order warnings keep their ordering.
+        if self.interactive_shell != other.interactive_shell {
+            fields.push(ToolField::InteractiveShell);
         }
         fields
     }
@@ -391,6 +503,9 @@ pub(crate) enum ToolField {
     Layer,
     Credentials,
     Persist,
+    // Appended last: `each_differing_field_is_reported_individually_in_fixed_order`
+    // and the multi-field ordering test depend on this sequence.
+    InteractiveShell,
 }
 
 impl ToolField {
@@ -401,6 +516,7 @@ impl ToolField {
             ToolField::Layer => "layer",
             ToolField::Credentials => "credentials",
             ToolField::Persist => "persist",
+            ToolField::InteractiveShell => "interactive_shell",
         }
     }
 }
@@ -672,6 +788,8 @@ struct RawTool {
     credentials: Vec<String>,
     #[serde(default)]
     persist: Vec<String>,
+    #[serde(default)]
+    interactive_shell: bool,
 }
 
 /// A small optional-fields struct plus exhaustive validation produces a
@@ -716,6 +834,7 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
             layer,
             credentials,
             persist,
+            interactive_shell: tool.interactive_shell,
             origin: kind.origin(file),
         });
     }
@@ -1301,6 +1420,232 @@ mod tests {
         assert_eq!(tools[0].name(), "solo");
     }
 
+    // -- the legacy `run::Agent` characterization table -------------------
+
+    /// **T1.** The compiled-in defaults, transcribed *verbatim* from
+    /// `run::Agent`'s `command()`/`default_args()`/`credential_providers()` and
+    /// `matches!(agent, Agent::Shell)` as of `bb299d1` (the pre-#82 `main`).
+    /// This is the only thing between a typo in `default-tools.toml` and a
+    /// silently wrong default launch. The provider column also re-states
+    /// #81's asymmetry (`copilot ⇔ Copilot`, `opencode|shell ⇔
+    /// OpencodeStatic`, `claude ⇔ Anthropic`, `codex|opencode|shell ⇔
+    /// OpenAi`).
+    #[test]
+    fn default_tools_match_the_legacy_agent_table() {
+        use CredentialProvider::*;
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            &'a [&'a str],
+            &'a [CredentialProvider],
+            bool,
+        );
+        let tools = default_tools().unwrap();
+        let cases: [Case; 5] = [
+            ("codex", "codex", &[], &[OpenAi], false),
+            (
+                "opencode",
+                "opencode",
+                &[],
+                &[OpenAi, OpencodeStatic],
+                false,
+            ),
+            (
+                "claude",
+                "claude",
+                &["--dangerously-skip-permissions"],
+                &[Anthropic],
+                false,
+            ),
+            (
+                "copilot",
+                "copilot",
+                &["--allow-all-tools"],
+                &[Copilot],
+                false,
+            ),
+            (
+                "shell",
+                "bash",
+                &["-O", "histappend"],
+                &[OpenAi, OpencodeStatic],
+                true,
+            ),
+        ];
+        assert_eq!(tools.len(), cases.len());
+        for (tool, (name, command, argv, providers, interactive_shell)) in tools.iter().zip(cases) {
+            assert_eq!(tool.name(), name);
+            assert_eq!(tool.command(), command, "{name}");
+            let expected_argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            assert_eq!(tool.argv(), expected_argv.as_slice(), "{name}");
+            let expected: Vec<CredentialProvider> = providers.to_vec();
+            let actual: Vec<CredentialProvider> = tool.credential_providers().iter().collect();
+            // `iter()` yields in `CredentialProvider::ALL` order, so compare
+            // as a set to keep the table's per-tool intent, not its spelling.
+            for provider in expected {
+                assert!(
+                    tool.credential_providers().contains(provider),
+                    "{name} must select {provider:?}"
+                );
+            }
+            assert_eq!(actual.len(), providers.len(), "{name}");
+            assert_eq!(tool.is_interactive_shell(), interactive_shell, "{name}");
+        }
+    }
+
+    /// Every default selects a provider its legacy variant gated on, and no
+    /// extra one. Re-stated as an exact set so a silently added or dropped
+    /// provider trips here rather than only in the launch integration test.
+    #[test]
+    fn default_tools_provider_sets_are_exactly_the_legacy_asymmetry() {
+        use CredentialProvider::*;
+        for tool in default_tools().unwrap() {
+            let set = tool.credential_providers();
+            let name = tool.name();
+            assert_eq!(
+                set.contains(Copilot),
+                name == "copilot",
+                "copilot gating changed for {name}"
+            );
+            assert_eq!(
+                set.contains(OpencodeStatic),
+                name == "opencode" || name == "shell",
+                "opencode-static gating changed for {name}"
+            );
+            assert_eq!(
+                set.contains(Anthropic),
+                name == "claude",
+                "anthropic gating changed for {name}"
+            );
+            assert_eq!(
+                set.contains(OpenAi),
+                name == "codex" || name == "opencode" || name == "shell",
+                "openai gating changed for {name}"
+            );
+        }
+    }
+
+    /// **T3.** `help` is reserved: clap synthesizes it unconditionally, so a
+    /// tool of that name would panic in debug and shadow clap's in release.
+    #[test]
+    fn the_name_help_is_rejected_as_reserved() {
+        let fixture = Fixture::new();
+        fixture.user(&one_tool("help"));
+        let error = fixture.load().unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("reserved"), "{rendered}");
+    }
+
+    // -- LaunchCatalog (the shell fallback) -------------------------------
+
+    /// **T4a.** A config declaring one non-shell tool gets the built-in
+    /// `shell` appended, with built-in provenance, and the flag set.
+    #[test]
+    fn a_one_tool_catalog_gains_the_builtin_shell_fallback() {
+        let fixture = Fixture::new();
+        fixture.user(&one_tool("solo"));
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        let names: Vec<&str> = catalog.as_slice().iter().map(Tool::name).collect();
+        assert_eq!(names, ["solo", "shell"]);
+        assert!(catalog.shell_fallback_added());
+        let shell = catalog
+            .as_slice()
+            .iter()
+            .find(|tool| tool.name() == "shell")
+            .unwrap();
+        assert_eq!(shell.origin(), &ToolOrigin::BuiltIn);
+        assert_eq!(shell.command(), "bash");
+        assert!(shell.is_interactive_shell());
+    }
+
+    /// **T4b.** A config that *declares* `shell` (here as `zsh`) keeps its
+    /// own definition and suppresses the fallback.
+    #[test]
+    fn a_declared_shell_suppresses_the_fallback() {
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"shell\"\ncommand = \"zsh\"\n");
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert!(!catalog.shell_fallback_added());
+        assert_eq!(catalog.as_slice().len(), 1);
+        assert_eq!(catalog.as_slice()[0].name(), "shell");
+        assert_eq!(catalog.as_slice()[0].command(), "zsh");
+    }
+
+    /// **T4c/T4d.** The default path (both tiers empty, or `tools = []`) does
+    /// not double-append `shell`. This goes through `load`'s both-empty
+    /// branch, not the fallback.
+    #[test]
+    fn the_default_catalog_does_not_append_a_second_shell() {
+        for (user, project) in [("", ""), ("tools = []\n", "")] {
+            let fixture = Fixture::new();
+            fixture.user(user).project(project);
+            let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+            assert!(!catalog.shell_fallback_added());
+            let names: Vec<&str> = catalog.as_slice().iter().map(Tool::name).collect();
+            assert_eq!(names, ["codex", "opencode", "claude", "copilot", "shell"]);
+        }
+    }
+
+    /// **T4e.** `ResolvedTools` is the pure merge result and is untouched by
+    /// the fallback: one declared tool, even after a catalog is built.
+    #[test]
+    fn the_fallback_never_leaks_into_resolved_tools() {
+        let fixture = Fixture::new();
+        fixture.user(&one_tool("solo"));
+        let report = fixture.load().unwrap();
+        assert_eq!(report.resolved().as_slice().len(), 1);
+        let catalog = report.into_launch_catalog().unwrap();
+        assert_eq!(catalog.as_slice().len(), 2);
+    }
+
+    /// `take` moves exactly the named tool, order-preserving.
+    #[test]
+    fn launch_catalog_take_moves_the_named_tool() {
+        let fixture = Fixture::new();
+        fixture.user(&one_tool("solo"));
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        let solo = catalog.take("solo").expect("solo is in the catalog");
+        assert_eq!(solo.name(), "solo");
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert!(catalog.take("absent").is_none());
+    }
+
+    // -- interactive_shell ------------------------------------------------
+
+    /// **T5.** `interactive_shell` round-trips, defaults to false, and
+    /// participates in the conflict machinery, ordered last.
+    #[test]
+    fn interactive_shell_round_trips_defaults_false_and_orders_last() {
+        let omitted = Fixture::new();
+        omitted.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\n");
+        let explicit_false = Fixture::new();
+        explicit_false
+            .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ninteractive_shell = false\n");
+        let a = omitted.load().unwrap();
+        let b = explicit_false.load().unwrap();
+        assert!(!a.resolved().as_slice()[0].is_interactive_shell());
+        assert!(a.resolved().as_slice()[0].same_definition(&b.resolved().as_slice()[0]));
+        assert!(a.conflicts().is_empty());
+
+        // A differing interactive_shell is a conflict, and is reported *last*
+        // in the fixed field order even alongside another differing field.
+        let base = "[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"a\"]\ncredentials = [\"openai\"]\n";
+        let fixture = Fixture::new();
+        fixture.user(base).project(
+            &format!("{base}interactive_shell = true\n")
+                .replace("command = \"t\"", "command = \"t2\""),
+        );
+        let report = fixture.load().unwrap();
+        assert_eq!(report.conflicts().len(), 1);
+        assert_eq!(
+            report.conflicts()[0].fields(),
+            &[ToolField::Command, ToolField::InteractiveShell]
+        );
+        assert_eq!(ToolField::InteractiveShell.as_str(), "interactive_shell");
+        // The user's definition (interactive_shell = false) wins.
+        assert!(!report.resolved().as_slice()[0].is_interactive_shell());
+    }
+
     #[test]
     fn omitted_and_explicit_empty_optional_lists_are_equivalent() {
         let omitted = Fixture::new();
@@ -1572,13 +1917,14 @@ mod tests {
 
     #[test]
     fn each_differing_field_is_reported_individually_in_fixed_order() {
-        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\nlayer = { builtin = \"codex\" }\ncredentials = [\"openai\"]\npersist = [\"p\"]\n";
+        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\nlayer = { builtin = \"codex\" }\ncredentials = [\"openai\"]\npersist = [\"p\"]\ninteractive_shell = false\n";
         let cases = [
             ("command = \"other\"", ToolField::Command),
             ("args = [\"b\"]", ToolField::Args),
             ("layer = { builtin = \"claude\" }", ToolField::Layer),
             ("credentials = [\"anthropic\"]", ToolField::Credentials),
             ("persist = [\"q\"]", ToolField::Persist),
+            ("interactive_shell = true", ToolField::InteractiveShell),
         ];
         for (mutated, expected) in cases {
             let project_body = base.replace(
@@ -1588,6 +1934,7 @@ mod tests {
                     ToolField::Layer => "layer = { builtin = \"codex\" }",
                     ToolField::Credentials => "credentials = [\"openai\"]",
                     ToolField::Persist => "persist = [\"p\"]",
+                    ToolField::InteractiveShell => "interactive_shell = false",
                 },
                 mutated,
             );

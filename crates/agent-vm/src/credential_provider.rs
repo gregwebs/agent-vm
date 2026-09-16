@@ -30,8 +30,10 @@
 //! | missing-credential hard bail | yes | no | no | yes |
 //!
 //! `Always` is a *preserved legacy behaviour*, not a design goal. Narrowing it
-//! is a behaviour change and belongs to #82, which is why it is spelled out in
-//! [`Scope`] rather than hard-coded.
+//! is a behaviour change tracked in
+//! [agent-vm #118](https://github.com/gregwebs/agent-vm/issues/118) (#82 kept
+//! it intact to meet its identical-behaviour criterion), which is why it is
+//! spelled out in [`Scope`] rather than hard-coded.
 //!
 //! # Names
 //!
@@ -177,8 +179,9 @@ pub const GENERIC_HOME_LINKS: &[HomeLink] = &[
 
 /// Guest env that is not owned by any provider. `CODEX_HOME` lives here
 /// because it names codex-the-tool's config dir, not a credential
-/// subsystem; #82 moves it onto the resolved tool, where it belongs.
-// TODO(#82): move `CODEX_HOME` onto the resolved tool (a config field), not a
+/// subsystem; moving it onto the resolved tool where it belongs is
+/// [agent-vm #119](https://github.com/gregwebs/agent-vm/issues/119).
+// TODO(#119): move `CODEX_HOME` onto the resolved tool (a config field), not a
 // generic const.
 pub const GENERIC_GUEST_ENV: &[(&str, &str)] = &[("CODEX_HOME", "/agent-vm-state/codex")];
 
@@ -428,9 +431,10 @@ fn write_copilot_bypass(guest: &GuestStateDir) -> Result<()> {
 
 /// Whether a facet applies on every launch or only when the launched tool
 /// declared the provider. Today most facets are `Always` — that is a
-/// *preserved legacy behaviour*, not a design goal; #82+ may narrow them
-/// deliberately, which is exactly why it is spelled out here.
-// TODO(#82): narrow the `Always` scopes deliberately — each is a *preserved*
+/// *preserved legacy behaviour*, not a design goal;
+/// [agent-vm #118](https://github.com/gregwebs/agent-vm/issues/118) narrows
+/// them deliberately, which is exactly why it is spelled out here.
+// TODO(#118): narrow the `Always` scopes deliberately — each is a *preserved*
 // legacy behaviour, not a design goal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scope {

@@ -21,7 +21,7 @@ npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm <cmd>
 agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
 
 cd ~/your-project
-agent-vm claude           # or codex / opencode / shell
+agent-vm claude           # a configured launch verb; see `agent-vm --help`
 ```
 
 The npm package bundles a prebuilt `agent-vm` binary, `msb`, and
@@ -32,16 +32,24 @@ bundled build.
 ## Subcommands
 
 ```
-claude | codex | opencode | copilot | shell
-                                    launch an agent in a per-project sandbox
+<tool>                              launch a configured tool in a per-project sandbox
+                                    (the verbs come from your tool configuration;
+                                    run `agent-vm --help` for the exact list)
 pull                                refresh the cached image
 setup                               pull base image + verify boot
 doctor                              report host credentials + microsandbox state
-                                    + the diagnostic tool-config preview
+                                    + the resolved tool configuration
                                     (--reset-msb-db recovers a forward-migrated db)
 msb <args...>                       forward to the bundled msb (e.g. msb ls, msb status)
 clipboard {get,put} [--sys]         exchange a string with the project sandbox
 ```
+
+The launch verbs are generated from your tool configuration (see *Tool
+configuration* below). With no config files you get the five shipped defaults
+`codex`, `opencode`, `claude`, `copilot`, `shell`; if your config declares only
+`claude`, then only `agent-vm claude` (plus the built-ins and a `shell`
+fallback) exists. `agent-vm --help` and `agent-vm doctor` always show the same
+list, in the same order.
 
 `agent-vm` keeps its sandbox registry under a private `MSB_HOME` —
 `~/.local/state/agent-vm/msb-home` on Linux, `~/.agent-vm-msb` on macOS
@@ -211,7 +219,7 @@ project (copying it under `.agent-vm/layers/`) costs nothing either: the hash
 covers the directory's contents and every step before it, never how it was
 named on the command line, so the adopted layer is a cache hit too.
 
-When a chain is declared, `agent-vm claude`/`codex`/`opencode`/`copilot`/`shell`
+When a chain is declared, any launch verb
 builds each step with `docker buildx build`, chaining every step `FROM` the
 previous one's tag, loads **only the final step's** result into the
 microsandbox image cache **registry-lessly** (no `registry:2` sidecar, no
@@ -358,21 +366,20 @@ project you run it in. It never prints token bytes. This is the first
 thing to run when an in-VM agent comes up signed out. See
 [Credentials](#credentials).
 
-It also prints a read-only [tool configuration](#tool-configuration-diagnostic-preview)
-preview. That preview is **diagnostic only**: it changes no launch behavior.
+It also prints the resolved [tool configuration](#tool-configuration) — the same
+verb list `agent-vm --help` shows.
 
-## Tool configuration (diagnostic preview)
+## Tool configuration
 
-`agent-vm doctor` parses and resolves two tool-config files and prints the
-result. **Nothing else in this release reads them.** No CLI verb, launch
-argument, credential, tooling layer, or persistence path is affected yet —
-the config is there so you can see and validate what a future release will
-consume, and to catch mistakes early. In particular the preview never
-executes a declared command, builds or checks a layer, or creates a persist
-path. Paths and tool names in this section are escaped: any byte outside
-printable ASCII (including every non-ASCII byte and control characters)
-renders as `\xNN`, so a config file or directory name cannot inject terminal
-escapes.
+The launch verbs are generated from a tool configuration resolved on every
+invocation. `agent-vm doctor` prints exactly what was resolved (and `agent-vm
+--help` shows the same verb list, in the same order). The design rationale is
+in [ADR-0015](docs/adr/0015-config-driven-tools.md).
+
+> Running `agent-vm` in a directory means trusting that directory's
+> `.agent-vm/` — a project config can declare and (where a tool needs them)
+> wire up arbitrary commands and credentials. See ADR-0015's trust-model
+> section.
 
 ### Where the files live
 
@@ -383,36 +390,37 @@ escapes.
 
 Both are optional (an absent file is reported as `absent`; a present but
 empty one as `found, 0 tools`). `$XDG_CONFIG_HOME` and any config-path
-override are deliberately **not** honored in this release.
+override are deliberately **not** honored.
 
 ### Schema
 
 ```toml
 [[tools]]
-name = "mytool"                      # required; see "Names" below
+name = "mytool"                      # required; the `agent-vm <name>` verb
 command = "mytool"                   # required; the guest command name
 args = ["--flag"]                    # optional; default argv (array of strings)
 layer = { builtin = "codex" }        # optional; EXACTLY one of builtin/path
 credentials = ["openai"]             # optional; credential provider names
 persist = [".cache/mytool"]          # optional; guest-HOME-relative paths
+interactive_shell = false            # optional; join trailing args into `-c`
 ```
 
 - `name` — required; a single command-name token: nonempty, no
   whitespace/control characters, no `/` (a name is not a path), not an
   all-dots spelling (`.`/`..`), no leading `-`, and not one of the reserved
   subcommands `setup`, `pull`, `msb`, `clipboard`, `doctor`,
-  `_intercept-hook`. Names are case-sensitive. The five launch verbs
-  (`claude`, `codex`, `opencode`, `copilot`, `shell`) are **not** reserved —
-  naming a tool `claude` is normal.
-- `command` — required, nonempty, NUL-free. It is a single command name; it
-  is never executed by `doctor`.
-- `args` — optional, an array of strings. `doctor` shows only the argument
+  `_intercept-hook`, `help`. Names are case-sensitive. Naming a tool `claude`
+  is normal — that is the point.
+- `command` — required, nonempty, NUL-free. The guest command name; it is
+  never executed by `doctor`.
+- `args` — optional, the default argv prepended to the user's own args unless
+  the user already passed the same flag. `doctor` shows only the argument
   **count**, never the values, so a secret accidentally placed here is not
   echoed. Args are not shell-split or expanded.
 - `layer` — optional; a table with **exactly one** of `builtin` (one of
   `codex`, `opencode`, `claude`, `copilot`) or `path` (a declared path). A
   layer is metadata only in this release: it is **not** resolved, checked
-  for existence, or built.
+  for existence, or built (see [#84](https://github.com/gregwebs/agent-vm/issues/84)).
 - `credentials` — optional; provider **config names**, which differ from
   the `agent-vm doctor` row labels. Valid: `anthropic`, `openai`,
   `opencode-static`, `copilot`. Note `opencode` (the doctor label) is **not**
@@ -420,7 +428,12 @@ persist = [".cache/mytool"]          # optional; guest-HOME-relative paths
 - `persist` — optional; guest-HOME-relative paths to preserve across runs.
   Absolute paths, any `..` component, NUL, and root-equivalent spellings
   (`.`/`./`/empty) are rejected; harmless `.`/`//`/trailing-`/` spellings are
-  normalized. No path is ever created by `doctor`.
+  normalized. Metadata only in this release (see
+  [#83](https://github.com/gregwebs/agent-vm/issues/83)).
+- `interactive_shell` — optional boolean, default `false`. When true, the
+  user's trailing args are joined (and shell-escaped) into a single `bash -c`
+  command line instead of being appended as separate argv entries. The shipped
+  `shell` tool sets it.
 
 Unknown keys, wrong types, malformed TOML, unknown `layer.builtin`, unknown
 provider names, duplicate tool names within one file, duplicate normalized
@@ -434,34 +447,45 @@ The user file is authoritative for any tool name it contains; the project
 file may add whole tool definitions the user did not write. This is a union
 of whole definitions, **not** a field-by-field overlay: a repo cannot fill in
 an omitted `persist`, `layer`, or `credentials` on a user-defined tool.
-Resolved order is user declarations first, then project-only declarations.
-When a project declaration of an existing name differs, `doctor` warns once
-and the user definition wins, e.g.:
+Resolved order is user declarations first, then project-only declarations (the
+order `--help` and `doctor` both use). When a project declaration of an
+existing name differs, `doctor` warns once and the user definition wins, e.g.:
 
 ```text
 warning: tool "claude" in /home/alice/.config/agent-vm/config.toml overrides
          /work/repo/.agent-vm/config.toml; differing fields: command, args
 ```
 
+### The `shell` fallback
+
+When the resolved catalog declares no tool named `shell`, the built-in `shell`
+(from [`crates/agent-vm/src/default-tools.toml`](crates/agent-vm/src/default-tools.toml))
+is appended, so a config that omits — or typos — `shell` never leaves you
+without a way into the guest. It is **conditional**: a config that *declares*
+`shell` (even as `zsh`) keeps its own definition, and the fallback does not
+fire on an unparseable config (see *Errors and recovery*). `doctor` labels the
+row with a note when the fallback is in use.
+
 Only when **both** files declare zero tools (missing, empty, or `tools = []`)
-does the compiled-in fallback apply: the five defaults
-`codex`, `opencode`, `claude`, `copilot`, `shell`, in that order. They are
-defined once in
+does the compiled-in defaults list apply: `codex`, `opencode`, `claude`,
+`copilot`, `shell`, in that order. They are defined once in
 [`crates/agent-vm/src/default-tools.toml`](crates/agent-vm/src/default-tools.toml),
-embedded into the binary (never written to disk). A configured catalog that
-omits `shell` keeps omitting it in the preview; the CLI fallback is a later
-change.
+embedded into the binary (never written to disk). **`codex` and `opencode`
+have empty `args` on purpose** — their non-interactive configuration is
+persisted as files, not a flag; do not add one.
 
 ### Errors and recovery
 
-A broken config makes ordinary `agent-vm doctor` exit nonzero. The failure
-is rendered inside the `==> tool configuration` section, naming the file and
-declaration (or a line/column for syntax errors), so the sections above it —
-state, credentials, and the operations list — still print: a repo-supplied
-config cannot hide them. Diagnostics never echo argument or command values,
-and control characters in paths and names are escaped as `\xNN`. `agent-vm
-doctor --reset-msb-db` **never reads config**, so a broken config can never
-block recovering a forward-migrated db.
+A config parse/validation error fails any launch verb with *that* error — never
+clap's "unrecognized subcommand". Ordinary `agent-vm doctor` still exits
+nonzero, but the failure is rendered inside the `==> tool configuration`
+section, naming the file and declaration (or a line/column for syntax errors),
+so the sections above it — state, credentials, and the operations list — still
+print: a repo-supplied config cannot hide them. `agent-vm --help` still exits 0
+and lists the built-ins with a note pointing at `agent-vm doctor`. Diagnostics
+never echo argument or command values, and control characters in paths and
+names are escaped as `\xNN`. `agent-vm doctor --reset-msb-db` **never reads
+config**, so a broken config can never block recovering a forward-migrated db.
 
 ## Recovering from a forward-migrated microsandbox db
 

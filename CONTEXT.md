@@ -115,19 +115,22 @@ config, its guest env, and its proxy secret/routes — plus, for
 `Anthropic`/`OpenAi`, the OAuth-rotation facts (SNI host, token path, accepted
 refresh placeholders, host login hint) the interception hook reads.
 
-Which tool needs which provider is a **code** fact today and becomes
-**configuration** in #80/#82, where the config name is `anthropic` / `openai`
-/ `opencode-static` / `copilot` (`CredentialProvider::config_name`). A
-**Tool** (#82's term) is a resolved command carrying a provider set; do not
-call a provider a "tool" or "agent".
+Which tool needs which provider **is configuration** (#80/#82): a tool names
+its providers in config (`anthropic` / `openai` / `opencode-static` /
+`copilot`, `CredentialProvider::config_name`), and `Tool::credential_providers`
+turns that into the `ProviderSet` launch threads through. A **Tool** (#82's
+term) is a resolved command carrying a provider set; do not call a provider a
+"tool" or "agent".
 
 The legacy gating is **asymmetric**: `Anthropic`/`OpenAi` capture runs on
 *every* launch regardless of the selected tool, and the claude/codex/opencode
 bypass configs are written unconditionally (`Scope::Always`). This is
-preserved behaviour, not a design goal — narrowing it belongs to #82, which is
-why each cell is an explicit `Scope`/`CaptureScope` field rather than an
-inference from the selected set. `Copilot` is the one provider the proxy only
-registers when it is selected.
+preserved behaviour, not a design goal — narrowing it is
+[agent-vm #118](https://github.com/gregwebs/agent-vm/issues/118), *not* #82
+(doing it in #82 would break its own identical-behaviour criterion). Each cell
+is an explicit `Scope`/`CaptureScope` field rather than an inference from the
+selected set precisely so that narrowing is a contained change. `Copilot` is
+the one provider the proxy only registers when it is selected.
 
 **GitHub egress is not a provider.** The `gh` token is gated by `--no-git` /
 detected repos, orthogonal to the launched tool, so it has no
@@ -158,15 +161,23 @@ symlinks and non-root mode's host-side provisioning cannot drift (ADR-0002).
 
 A validated **declarative tool definition** (`config::Tool`): a guest
 `command`, its default `argv`, an optional **tooling layer**, a list of
-**credential providers**, extra guest-HOME-relative `persist` paths, and the
-**tool config tier** it came from. A tool is **data**, not a credential
-provider and not a command to execute on the host.
+**credential providers**, extra guest-HOME-relative `persist` paths, an
+`interactive_shell` flag, and the **tool config tier** it came from. A tool is
+**data**, not a credential provider and not a command to execute on the host.
 
-In this release config names *parse* — `agent-vm doctor` resolves and previews
-the catalog — but no launch path reads it; selecting a tool at runtime is #82.
-Until then the five hard-coded launch verbs remain the runtime tools, and these
-two meanings coexist: the *configured* tool (a catalog entry, possibly
-`codex`-shaped) and the *launched* tool (a clap subcommand). #82 collapses them.
+A tool *is* the launch verb: `agent-vm <name>` works because the resolved
+configuration declares a tool named `<name>`, and the CLI builds its
+subcommands from that catalog (#82). `layer` and `persist` remain metadata
+until #84/#83. `interactive_shell` selects the bash `-c` argument-joining the
+shipped `shell` tool uses.
+
+### Launch catalog
+
+The verbs a launch actually offers (`config::LaunchCatalog`): the resolved
+merge result, plus the built-in `shell` appended when no declared tool claims
+that name. Both `agent-vm --help` and `agent-vm doctor` render it, so their
+verb lists and order cannot disagree. Distinct from `ResolvedTools`, which is
+the pure merge result and never contains the fallback.
 
 _Avoid_: calling a **credential provider** a "tool" or "agent".
 
@@ -184,6 +195,12 @@ Their merge is a **union of whole definitions**, not a field overlay: the user
 tier is authoritative for every name it declares, the project tier may only
 add names the user did not write, and a differing project declaration yields a
 `config::ConfigConflict` warning rendered by `doctor` (user definition wins).
+
+A load failure is **deferred**, not fatal at startup (#82): the CLI is
+built from the loaded catalog, but a broken config is carried as data so
+`doctor` (and the in-guest `clipboard`/`_intercept-hook`) keep working, a
+launch verb reports the config error rather than clap's "unrecognized
+subcommand", and `--help` still lists the built-ins.
 
 ## Base image
 
