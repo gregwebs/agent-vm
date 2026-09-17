@@ -476,8 +476,16 @@ fn describe_tool(tool: &Tool) -> String {
     } else {
         ""
     };
+    // Count only (never the values — see `Tool::guest_env`), and only when
+    // nonzero so the rows of tools that declare no env stay unchanged.
+    let env_count = tool.env_count();
+    let env = if env_count == 0 {
+        String::new()
+    } else {
+        format!("; env={env_count}")
+    };
     format!(
-        "{} -> \"{}\"; args={}; layer={layer}; credentials={credentials}; persist={}; source={source}{interactive_shell}",
+        "{} -> \"{}\"; args={}; layer={layer}; credentials={credentials}; persist={}; source={source}{interactive_shell}{env}",
         crate::config::escape_str(tool.name()),
         crate::config::escape_str(tool.command()),
         tool.arg_count(),
@@ -956,12 +964,50 @@ mod tests {
 
         assert!(
             text.contains(
-                "shell -> \"bash\"; args=2; layer=none; credentials=openai,opencode-static; persist=0; source=built-in; interactive_shell=true"
+                "shell -> \"bash\"; args=2; layer=none; credentials=openai,opencode-static; persist=0; source=built-in; interactive_shell=true; env=1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "codex -> \"codex\"; args=0; layer=builtin:codex; credentials=openai; persist=0; source=built-in; env=1"
             ),
             "{text}"
         );
         assert!(text.contains("claude -> \"claude\"; args=1;"), "{text}");
-        assert!(text.contains("codex -> \"codex\"; args=0;"), "{text}");
+        // `claude` declares no `env`, so its row must stay byte-identical —
+        // no `; env=0` suffix. V7 (D6/D7).
+        assert!(
+            !text.contains(
+                "claude -> \"claude\"; args=1; layer=builtin:claude; credentials=anthropic; persist=0; source=built-in; env"
+            ),
+            "{text}"
+        );
+    }
+
+    /// **V7 (D6).** An `env` *value* is never rendered — only its count is —
+    /// so a credential a user pasted into `env` cannot leak through `doctor`.
+    /// The suffix renders only when nonzero, and goes after `interactive_shell`.
+    #[test]
+    fn describe_tool_shows_only_the_env_count_never_a_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "[[tools]]\nname = \"secret\"\ncommand = \"secret\"\nenv = { TOKEN = \"sk-secret\" }\n",
+        )
+        .unwrap();
+        let report = config_report(Some(&user), &dir.path().join("absent.toml"));
+
+        let (text, _) = describe_config(report);
+        assert!(
+            text.contains(
+                "secret -> \"secret\"; args=0; layer=none; credentials=none; persist=0; source=user:"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("; env=1"), "{text}");
+        assert!(!text.contains("sk-secret"), "env value leaked: {text}");
     }
 
     #[test]

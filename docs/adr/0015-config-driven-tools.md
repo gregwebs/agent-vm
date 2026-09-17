@@ -39,6 +39,7 @@ Running `agent-vm` in a directory means trusting that directory's `.agent-vm/`. 
 - **A tool's `layer` is metadata until [#84](https://github.com/gregwebs/agent-vm/issues/84)**, and `persist` until [#83](https://github.com/gregwebs/agent-vm/issues/83). This ADR does not build or resolve either.
 - **The verb list is the merge result, in chain order**, matching what `doctor` numbers. The fallback `shell` row is labelled so the user knows it was not declared.
 - **`ToolName` is validated** (no whitespace/control characters, no leading `-`, no `/`, not reserved), so it is safe to interpolate into help. A tool's `command` is **not** equally validated and is therefore never rendered in help.
+- **A tool also carries its own guest `env`.** [#119](https://github.com/gregwebs/agent-vm/issues/119) moved `CODEX_HOME` off `credential_provider::GENERIC_GUEST_ENV` onto a tool `env` field; the generic slot and `GuestEnvSlot` are gone. The precedence rule that makes a user-declarable `env` safe is [ADR-0016](0016-tool-declared-guest-env.md).
 
 ## Alternatives
 

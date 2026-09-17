@@ -402,6 +402,7 @@ args = ["--flag"]                    # optional; default argv (array of strings)
 layer = { builtin = "codex" }        # optional; EXACTLY one of builtin/path
 credentials = ["openai"]             # optional; credential provider names
 persist = [".cache/mytool"]          # optional; guest-HOME-relative paths
+env = { VAR = "value" }              # optional; guest env pairs for this tool
 interactive_shell = false            # optional; join trailing args into `-c`
 ```
 
@@ -430,6 +431,21 @@ interactive_shell = false            # optional; join trailing args into `-c`
   (`.`/`./`/empty) are rejected; harmless `.`/`//`/trailing-`/` spellings are
   normalized. Metadata only in this release (see
   [#83](https://github.com/gregwebs/agent-vm/issues/83)).
+- `env` — optional; a table of guest environment variables set for this tool
+  only. Keys must be nonempty and contain no `=`, NUL, whitespace or control
+  characters, and must not start with `MSB_` (reserved by microsandbox).
+  `HOME`, `USER` and `LOGNAME` are **rejected**: agent-vm owns the guest
+  identity environment, and it publishes those three only in the default
+  non-root mode — under `--root` a tool declaration would win outright and
+  would break the guest's credential symlinks, so the declaration is refused
+  in every mode rather than being honoured in one of them. Values are literal
+  strings: no `$VAR` expansion, no shell splitting — the same rule as `args`.
+  `doctor` shows only the **count**, never the values, so `doctor` never echoes
+  a secret accidentally placed here. The opt-in `AGENT_VM_DEBUG_CONFIG` dump
+  still shows values, the same exposure class as `args`. These pairs are
+  published into the guest **before** agent-vm's own environment, and the guest
+  applies them last-wins, so declaring `PATH`, `IS_SANDBOX` or `LANG` has no
+  effect — agent-vm always overrides them.
 - `interactive_shell` — optional boolean, default `false`. When true, the
   user's trailing args are joined (and shell-escaped) into a single `bash -c`
   command line instead of being appended as separate argv entries. The shipped
@@ -438,8 +454,10 @@ interactive_shell = false            # optional; join trailing args into `-c`
 Unknown keys, wrong types, malformed TOML, unknown `layer.builtin`, unknown
 provider names, duplicate tool names within one file, duplicate normalized
 persist entries within one tool, and two tools claiming the same normalized
-persist path are all **hard errors** — there is no silent fallback to the
-defaults.
+persist path are all **hard errors** — as are invalid `env` entries: a key
+that is empty, or contains `=`/NUL/whitespace/control characters, or starts
+with `MSB_`, or is `HOME`/`USER`/`LOGNAME`, and an `env` **value** containing
+NUL. There is no silent fallback to the defaults.
 
 ### Merge order and defaults
 
@@ -473,6 +491,22 @@ does the compiled-in defaults list apply: `codex`, `opencode`, `claude`,
 embedded into the binary (never written to disk). **`codex` and `opencode`
 have empty `args` on purpose** — their non-interactive configuration is
 persisted as files, not a flag; do not add one.
+
+`codex` and `shell` are the only shipped tools that declare `env`: both set
+`CODEX_HOME=/agent-vm-state/codex`. Codex is the one agent with no
+`~/<dotfile>` symlink into the project state dir (its install prefix holds
+`packages/`, so a `~/.codex` symlink would shadow the binary itself), and
+`shell` already provisions the same OpenAI credential into that state dir, so
+dropping the pointer would leave a fully-provisioned, unreachable credential.
+The other three agents never read `CODEX_HOME`. See
+[ADR-0016](docs/adr/0016-tool-declared-guest-env.md).
+
+**Upgrading:** `CODEX_HOME` used to be set on *every* launch. It is now
+declared by the shipped `codex` and `shell` tools. If you declare your own
+`codex` or `shell` tool in `~/.config/agent-vm/config.toml` or
+`.agent-vm/config.toml`, your definition wins wholesale and does **not**
+inherit the shipped `env` — add `env = { CODEX_HOME = "/agent-vm-state/codex" }`
+to it, or codex will start in the guest as signed out.
 
 ### Errors and recovery
 

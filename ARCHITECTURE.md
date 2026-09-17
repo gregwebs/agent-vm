@@ -150,7 +150,10 @@ separate mounts:
 - `$HOME/.local/share/opencode → /agent-vm-state/opencode`
 - Codex instead gets `CODEX_HOME=/agent-vm-state/codex`, because
   `<install-prefix>/.codex/packages/…` contains the codex binary itself and a
-  symlink there would shadow it.
+  symlink there would shadow it. That variable is declared by the `codex` (and
+  `shell`) tool's own config `env`, not set on every launch
+  ([agent-vm #119](https://github.com/gregwebs/agent-vm/issues/119),
+  [ADR-0016](docs/adr/0016-tool-declared-guest-env.md)).
 
 This shape originally fell out of a hard virtio-IRQ ceiling (below). The
 ceiling is lifted and the shape stayed, because it is better on its own terms:

@@ -3,9 +3,9 @@
 //!
 //! A **tool declaration** (`[[tools]]` in a config file) is *data*: a guest
 //! command, its default argv, an optional tooling layer, the credential
-//! providers it needs, and extra guest-HOME-relative paths to persist. This
-//! module never executes a command, creates guest state, builds a layer, or
-//! captures a credential.
+//! providers it needs, extra guest-HOME-relative paths to persist, and guest
+//! env pairs. This module never executes a command, creates guest state,
+//! builds a layer, or captures a credential.
 //!
 //! # Two ordered catalogs, not an overlay
 //!
@@ -70,7 +70,7 @@
 //! tickets (#83/#84).
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -315,6 +315,11 @@ pub(crate) struct Tool {
     credentials: Vec<CredentialProvider>,
     persist: Vec<PersistPath>,
     interactive_shell: bool,
+    /// This tool's own guest env, key-sorted. Keys are validated at
+    /// construction ([`validate_env`]); values are arbitrary and may be
+    /// secrets, so the field is private and `doctor` only ever sees
+    /// [`Self::env_count`] — the same rule as `argv`.
+    env: BTreeMap<String, String>,
     origin: ToolOrigin,
 }
 
@@ -370,6 +375,25 @@ impl Tool {
         self.persist.len()
     }
 
+    /// This tool's own guest environment, sorted by key (a `BTreeMap`
+    /// contract, which is why nothing tests declaration-order insensitivity).
+    /// Published by `run::launch` *before* the launcher's own env, so a
+    /// declaration colliding with `PATH`/`IS_SANDBOX`/`LANG` is overridden
+    /// rather than honoured; the guest applies the pairs last-wins.
+    /// `HOME`/`USER`/`LOGNAME` cannot appear here at all — [`validate_env`]
+    /// rejects them, because the launcher publishes them only in non-root
+    /// mode and position would not protect them under `--root`. See
+    /// ADR-0016.
+    pub(crate) fn guest_env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
+    /// Count only, for the same reason as [`Self::arg_count`]: a value may be
+    /// a credential a user pasted here by mistake.
+    pub(crate) fn env_count(&self) -> usize {
+        self.env.len()
+    }
+
     pub(crate) fn origin(&self) -> &ToolOrigin {
         &self.origin
     }
@@ -384,6 +408,7 @@ impl Tool {
             && self.credentials == other.credentials
             && self.persist == other.persist
             && self.interactive_shell == other.interactive_shell
+            && self.env == other.env
     }
 
     /// The differing fields, in the fixed schema order the warning renders.
@@ -407,6 +432,10 @@ impl Tool {
         // Appended last so the fixed-order warnings keep their ordering.
         if self.interactive_shell != other.interactive_shell {
             fields.push(ToolField::InteractiveShell);
+        }
+        // Appended last for the same reason as `interactive_shell` above.
+        if self.env != other.env {
+            fields.push(ToolField::Env);
         }
         fields
     }
@@ -508,6 +537,7 @@ pub(crate) enum ToolField {
     // Appended last: `each_differing_field_is_reported_individually_in_fixed_order`
     // and the multi-field ordering test depend on this sequence.
     InteractiveShell,
+    Env,
 }
 
 impl ToolField {
@@ -519,6 +549,7 @@ impl ToolField {
             ToolField::Credentials => "credentials",
             ToolField::Persist => "persist",
             ToolField::InteractiveShell => "interactive_shell",
+            ToolField::Env => "env",
         }
     }
 }
@@ -792,6 +823,8 @@ struct RawTool {
     persist: Vec<String>,
     #[serde(default)]
     interactive_shell: bool,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 /// A small optional-fields struct plus exhaustive validation produces a
@@ -828,6 +861,7 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
         let layer = validate_layer(tool.layer, file, index, &name)?;
         let credentials = validate_credentials(tool.credentials, file, index, &name)?;
         let persist = validate_persist(tool.persist, file, index, &name)?;
+        let env = validate_env(tool.env, file, index, &name)?;
 
         tools.push(Tool {
             name,
@@ -837,6 +871,7 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
             credentials,
             persist,
             interactive_shell: tool.interactive_shell,
+            env,
             origin: kind.origin(file),
         });
     }
@@ -1076,6 +1111,83 @@ fn normalize_persist(declaration: &str) -> std::result::Result<PathBuf, &'static
     Ok(normalized)
 }
 
+/// Validate guest env declarations. `BTreeMap` iteration is key-sorted, which
+/// is both the order the pairs are published in and the order definition
+/// equality compares — so two configs that differ only in declaration order
+/// are the same tool.
+fn validate_env(
+    raw: BTreeMap<String, String>,
+    file: &Path,
+    index: usize,
+    name: &ToolName,
+) -> Result<BTreeMap<String, String>> {
+    for (key, value) in &raw {
+        if let Err(reason) = check_env_key(key) {
+            return Err(tool_error(
+                file,
+                index,
+                name,
+                format!("env key {}: {reason}", quoted_str(key)),
+            ));
+        }
+        // Key only, never the value: a user may have mistaken this for a
+        // place to put a credential (same rule as `args`).
+        if value.contains('\0') {
+            return Err(tool_error(
+                file,
+                index,
+                name,
+                format!("env {}: value must not contain NUL", quoted_str(key)),
+            ));
+        }
+    }
+    Ok(raw)
+}
+
+/// An env entry crosses `execve` as a NUL-terminated `KEY=VALUE` string, so a
+/// key carrying `=` or NUL would re-split or truncate somewhere downstream
+/// instead of failing. Whitespace/control keys are unreachable from any shell
+/// and are almost certainly a typo. Returns a static reason, never the value.
+fn check_env_key(key: &str) -> std::result::Result<(), &'static str> {
+    if key.is_empty() {
+        return Err("must not be empty");
+    }
+    if key.contains('=') {
+        return Err("must not contain '='");
+    }
+    if key.contains('\0') {
+        return Err("must not contain NUL");
+    }
+    if key
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err("must not contain whitespace or control characters");
+    }
+    // Rejected here, not for safety, but for the *diagnostic*: the vendored SDK
+    // rejects this prefix too (`SandboxBuilder::env`,
+    // vendor/microsandbox/sdk/rust/lib/sandbox/builder.rs:917-924, re-checked at
+    // build() by validate_env, .../sandbox/mod.rs:1565-1574) — but it surfaces
+    // as a late `preparing sandbox config: …` with no file and no declaration
+    // index. One vendored prefix with one owner is not a deny-list (D3d).
+    if key.starts_with("MSB_") {
+        return Err("must not use the reserved MSB_ prefix (microsandbox owns it)");
+    }
+    // The guest identity triple, and only it. `user::guest_identity_env` is the
+    // single producer, and it runs *only in non-root mode* — so unlike
+    // PATH/IS_SANDBOX/LANG, emission position cannot protect these: under
+    // `--root` a declaration here would reach execve unopposed and would also
+    // suppress agentd's passwd-derived /root fallback. Validation cannot be
+    // mode-aware (this module knows nothing about launch), so the rejection is
+    // unconditional; in non-root mode such a declaration was inert anyway. D3c.
+    if matches!(key, "HOME" | "USER" | "LOGNAME") {
+        return Err(
+            "must not be declared by a tool (agent-vm owns the guest identity environment)",
+        );
+    }
+    Ok(())
+}
+
 fn supported_provider_names() -> String {
     CredentialProvider::ALL
         .into_iter()
@@ -1129,7 +1241,8 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
     anyhow!(
         "config: {}{location}: invalid TOML or tool schema; check syntax and field types. \
          Required: a string `name` and `command`; `args`, `credentials`, and `persist` are \
-         arrays of strings; `layer` has exactly one string selector, `builtin` or `path`.",
+         arrays of strings; `env` is a table of string values; `layer` has exactly one \
+         string selector, `builtin` or `path`.",
         quoted_path(file)
     )
 }
@@ -1662,6 +1775,206 @@ mod tests {
         assert!(left[0].same_definition(&right[0]));
     }
 
+    // -- env --------------------------------------------------------------
+
+    /// **V1.** `env` round-trips key-sorted despite its declaration order (a
+    /// `BTreeMap`, D4), counts entries for `doctor` without exposing them, and
+    /// defaults to empty.
+    #[test]
+    fn env_round_trips_key_sorted_and_defaults_empty() {
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nenv = { B = \"2\", A = \"1\" }\n");
+        let report = fixture.load().unwrap();
+        let tool = &report.resolved().as_slice()[0];
+        let pairs: Vec<(&str, &str)> = tool
+            .guest_env()
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(pairs, [("A", "1"), ("B", "2")]);
+        assert_eq!(tool.env_count(), 2);
+
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\n");
+        let report = fixture.load().unwrap();
+        let tool = &report.resolved().as_slice()[0];
+        assert!(tool.guest_env().is_empty());
+        assert_eq!(tool.env_count(), 0);
+    }
+
+    /// **V2.** Both sides of every `check_env_key` boundary, plus the value
+    /// check. The accept cases for `PATH`/`IS_SANDBOX`/`LANG`/`TERM` are as
+    /// load-bearing as the reject cases: they are the executable form of D3's
+    /// split between "rejected at the config seam" (conditional launcher env)
+    /// and "governed by emission position" (unconditional launcher env), and
+    /// they fail if someone later hardens `check_env_key` into a general
+    /// deny-list without reading D3 (F4c).
+    #[test]
+    fn env_key_and_value_validation_boundaries() {
+        const IDENTITY: &str =
+            "must not be declared by a tool (agent-vm owns the guest identity environment)";
+        for (key, reason) in [
+            ("", "must not be empty"),
+            ("A=B", "must not contain '='"),
+            ("A\u{0}B", "must not contain NUL"),
+            ("A B", "must not contain whitespace or control characters"),
+            (
+                "A\u{1}B",
+                "must not contain whitespace or control characters",
+            ),
+            (
+                "MSB_FOO",
+                "must not use the reserved MSB_ prefix (microsandbox owns it)",
+            ),
+            ("HOME", IDENTITY),
+            ("USER", IDENTITY),
+            ("LOGNAME", IDENTITY),
+        ] {
+            assert_eq!(check_env_key(key), Err(reason), "key {key:?}");
+        }
+        for key in [
+            // Ordinary names, a leading digit, and lowercase are all fine: the
+            // key is a passthrough, not a shell identifier.
+            "A_1",
+            "lowercase",
+            "1LEADINGDIGIT",
+            // Only the `MSB_` *prefix* is reserved — not a substring.
+            "MSBX",
+            "XMSB_",
+            // The identity rejection is exact and case-sensitive, not a
+            // substring or prefix match.
+            "HOMEDIR",
+            "MY_HOME",
+            "home",
+            // Launcher-owned but position-protected: deliberately accepted.
+            "PATH",
+            "IS_SANDBOX",
+            "LANG",
+            "TERM",
+            // The host-conditional passthrough (`run.rs` publishes these only
+            // when the host has them set), a third class that is neither
+            // position-protected nor rejected — deliberately unguarded,
+            // because a declaration that sets `env` can already set `command`
+            // (ADR-0016).
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            assert_eq!(check_env_key(key), Ok(()), "key {key:?}");
+        }
+
+        // An empty value, and one containing spaces, `=` and a newline, are
+        // all legitimate ("set but empty" is meaningful).
+        let ok = Fixture::new();
+        ok.user(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nenv = { FOO = \"\", BAR = \"a b=c\\n\" }\n",
+        );
+        assert!(ok.load().is_ok());
+
+        // A NUL in the *value* is rejected, and the value is never echoed (D6).
+        const SENTINEL: &str = "SENTINEL_SECRET_abc123";
+        let nul = Fixture::new();
+        nul.user(&format!(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nenv = {{ FOO = \"{SENTINEL}\\u0000end\" }}\n"
+        ));
+        let error = nul.load().unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("env \"FOO\": value must not contain NUL"),
+            "{rendered}"
+        );
+        for rendered in [
+            format!("{error}"),
+            format!("{error:#}"),
+            format!("{error:?}"),
+        ] {
+            assert!(!rendered.contains(SENTINEL), "secret leaked: {rendered}");
+        }
+    }
+
+    /// **V2b (M3).** The `MSB_` prefix is rejected at the *config seam*, with
+    /// the config file and the declaration index, exactly like every other
+    /// `env` error — not as the vendored SDK's late, contextless `preparing
+    /// sandbox config: …` failure. That diagnostic shape is the whole point of
+    /// D3d; without the seam check the late error is all the user sees.
+    #[test]
+    fn env_key_with_msb_prefix_is_rejected_at_the_config_seam() {
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nenv = { MSB_FOO = \"1\" }\n");
+        let error = fixture.load().unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("must not use the reserved MSB_ prefix (microsandbox owns it)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("declaration [0]"), "{rendered}");
+        assert!(
+            rendered.contains(&fixture.user.to_string_lossy().into_owned()),
+            "the diagnostic must name the config file: {rendered}"
+        );
+    }
+
+    /// **V2c (D3c).** `HOME`/`USER`/`LOGNAME` are rejected in every mode, with
+    /// the same `tool_error` shape as every other `env` error (file +
+    /// declaration index), and the declared value is never echoed (D6). The
+    /// rejection is unconditional because config validation cannot know about
+    /// `--root`, where emission position would not protect these keys.
+    #[test]
+    fn env_key_naming_the_guest_identity_is_rejected() {
+        for key in ["HOME", "USER", "LOGNAME"] {
+            let fixture = Fixture::new();
+            fixture.user(&format!(
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nenv = {{ {key} = \"/x\" }}\n"
+            ));
+            let error = fixture.load().unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(
+                    "must not be declared by a tool (agent-vm owns the guest identity environment)"
+                ),
+                "key={key}: {rendered}"
+            );
+            assert!(
+                rendered.contains("declaration [0]"),
+                "key={key}: {rendered}"
+            );
+            assert!(
+                rendered.contains(&fixture.user.to_string_lossy().into_owned()),
+                "key={key}: the diagnostic must name the config file: {rendered}"
+            );
+            assert!(
+                !rendered.contains("/x"),
+                "key={key}: the value must not be echoed: {rendered}"
+            );
+        }
+    }
+
+    /// **V5.** The shipped catalog declares `CODEX_HOME` on exactly `codex`
+    /// and `shell`; `opencode`, `claude` and `copilot` declare no env. This is
+    /// the single assertion a future edit to `default-tools.toml` must
+    /// consciously update (D2, F1).
+    #[test]
+    fn shipped_catalog_declares_codex_home_only_for_codex_and_shell() {
+        for tool in default_tools().unwrap() {
+            let pairs: Vec<(&str, &str)> = tool
+                .guest_env()
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            match tool.name() {
+                "codex" | "shell" => assert_eq!(
+                    pairs,
+                    [("CODEX_HOME", "/agent-vm-state/codex")],
+                    "{}",
+                    tool.name()
+                ),
+                "opencode" | "claude" | "copilot" => {
+                    assert!(pairs.is_empty(), "{} must declare no env", tool.name())
+                }
+                other => panic!("unexpected default tool {other}"),
+            }
+        }
+    }
+
     #[test]
     fn unknown_keys_and_wrong_types_are_hard_errors() {
         for body in [
@@ -1919,7 +2232,7 @@ mod tests {
 
     #[test]
     fn each_differing_field_is_reported_individually_in_fixed_order() {
-        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\nlayer = { builtin = \"codex\" }\ncredentials = [\"openai\"]\npersist = [\"p\"]\ninteractive_shell = false\n";
+        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\nlayer = { builtin = \"codex\" }\ncredentials = [\"openai\"]\npersist = [\"p\"]\ninteractive_shell = false\nenv = { A = \"1\" }\n";
         let cases = [
             ("command = \"other\"", ToolField::Command),
             ("args = [\"b\"]", ToolField::Args),
@@ -1927,6 +2240,7 @@ mod tests {
             ("credentials = [\"anthropic\"]", ToolField::Credentials),
             ("persist = [\"q\"]", ToolField::Persist),
             ("interactive_shell = true", ToolField::InteractiveShell),
+            ("env = { A = \"2\" }", ToolField::Env),
         ];
         for (mutated, expected) in cases {
             let project_body = base.replace(
@@ -1937,6 +2251,7 @@ mod tests {
                     ToolField::Credentials => "credentials = [\"openai\"]",
                     ToolField::Persist => "persist = [\"p\"]",
                     ToolField::InteractiveShell => "interactive_shell = false",
+                    ToolField::Env => "env = { A = \"1\" }",
                 },
                 mutated,
             );
@@ -1953,6 +2268,23 @@ mod tests {
                 &ToolOrigin::User(fixture.user.clone())
             );
         }
+
+        // With several fields differing at once, `env` is reported *last*, after
+        // `interactive_shell` (D7). This is the multi-field half of V3; the
+        // per-field cases above are the other half.
+        let project_body = base
+            .replace("interactive_shell = false", "interactive_shell = true")
+            .replace("env = { A = \"1\" }", "env = { A = \"2\" }");
+        let fixture = Fixture::new();
+        fixture.user(base).project(&project_body);
+        let report = fixture.load().unwrap();
+        assert_eq!(report.conflicts().len(), 1);
+        assert_eq!(
+            report.conflicts()[0].fields(),
+            &[ToolField::InteractiveShell, ToolField::Env],
+            "env must be reported last"
+        );
+        assert_eq!(ToolField::Env.as_str(), "env");
     }
 
     #[test]

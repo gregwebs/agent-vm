@@ -122,6 +122,11 @@ turns that into the `ProviderSet` launch threads through. A **Tool** (#82's
 term) is a resolved command carrying a provider set; do not call a provider a
 "tool" or "agent".
 
+The only guest env a provider owns is `COPILOT_GITHUB_TOKEN` (Copilot, and only
+when selected). `CODEX_HOME` is **not** a provider fact: it names codex-the-
+tool's config dir, so it lives on the `codex` (and `shell`) tool's own `env`
+([agent-vm #119](https://github.com/gregwebs/agent-vm/issues/119), ADR-0016).
+
 The legacy gating is **asymmetric**: `Anthropic`/`OpenAi` capture runs on
 *every* launch regardless of the selected tool, and the claude/codex/opencode
 bypass configs are written unconditionally (`Scope::Always`). This is
@@ -161,15 +166,23 @@ symlinks and non-root mode's host-side provisioning cannot drift (ADR-0002).
 
 A validated **declarative tool definition** (`config::Tool`): a guest
 `command`, its default `argv`, an optional **tooling layer**, a list of
-**credential providers**, extra guest-HOME-relative `persist` paths, an
-`interactive_shell` flag, and the **tool config tier** it came from. A tool is
-**data**, not a credential provider and not a command to execute on the host.
+**credential providers**, extra guest-HOME-relative `persist` paths, a
+guest `env` map, an `interactive_shell` flag, and the **tool config tier** it
+came from. A tool is **data**, not a credential provider and not a command to
+execute on the host.
 
 A tool *is* the launch verb: `agent-vm <name>` works because the resolved
 configuration declares a tool named `<name>`, and the CLI builds its
 subcommands from that catalog (#82). `layer` and `persist` remain metadata
 until #84/#83. `interactive_shell` selects the bash `-c` argument-joining the
 shipped `shell` tool uses.
+
+`env` is published into the guest **before** the launcher's own environment
+and the guest applies it last-wins, so it cannot override `PATH`,
+`IS_SANDBOX` or `LANG` — but `HOME`, `USER` and `LOGNAME` are published only
+in non-root mode, so position would not protect those under `--root`; that
+identity triple is **rejected** at the config seam in every mode instead. See
+[ADR-0016](docs/adr/0016-tool-declared-guest-env.md).
 
 ### Launch catalog
 
