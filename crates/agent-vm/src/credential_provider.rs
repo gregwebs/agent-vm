@@ -23,7 +23,7 @@
 //! |---|---|---|---|---|
 //! | host credential capture | always | always | when selected | when selected \|\| github-egress |
 //! | bypass config written | always | always | always | when selected |
-//! | guest home symlinks | always | n/a (`CODEX_HOME`) | always | always |
+//! | guest home symlinks | always | n/a (the codex tool's `env`) | always | always |
 //! | eager state dir (`ensure_dirs`) | `claude` | `codex` | `opencode` | — |
 //! | guest env | — | — | — | `COPILOT_GITHUB_TOKEN` when selected |
 //! | proxy secret registered | when token present | when token present | when token present | when token present **and** selected |
@@ -177,14 +177,6 @@ pub const GENERIC_HOME_LINKS: &[HomeLink] = &[
     },
 ];
 
-/// Guest env that is not owned by any provider. `CODEX_HOME` lives here
-/// because it names codex-the-tool's config dir, not a credential
-/// subsystem; moving it onto the resolved tool where it belongs is
-/// [agent-vm #119](https://github.com/gregwebs/agent-vm/issues/119).
-// TODO(#119): move `CODEX_HOME` onto the resolved tool (a config field), not a
-// generic const.
-pub const GENERIC_GUEST_ENV: &[(&str, &str)] = &[("CODEX_HOME", "/agent-vm-state/codex")];
-
 /// Every link provisioned into the guest HOME, provider links first (in
 /// `ALL` order) then generic. Unconditional: see the module-level "always-on
 /// is preserved" note.
@@ -214,60 +206,18 @@ pub fn eager_state_dirs() -> Vec<&'static str> {
     dirs
 }
 
-/// The two guest-env emission *slots*, in publication order.
-///
-/// `SandboxBuilder::env` **appends** to a `Vec<EnvVar>` (serialized as a JSON
-/// *array*, not a key→value map — see
-/// `vendor/microsandbox/sdk/rust/lib/sandbox/builder.rs`), so the pre-#81
-/// config JSON emitted the generic `CODEX_HOME` early (right after the
-/// root-mode `.patch()` block) and the provider-owned `COPILOT_GITHUB_TOKEN`
-/// last (after `GUEST_ALWAYS_ENV`). This prefactor's headline AC is
-/// byte-identical config JSON, so the two historical positions are named
-/// explicitly rather than collapsed into one loop — the same explicit-splice
-/// treatment as `credential_injection`'s `WIRE_ORDER`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuestEnvSlot {
-    /// `GENERIC_GUEST_ENV`: pairs owned by no provider.
-    Generic,
-    /// The selected providers' own pairs (`ProviderSpec::guest_env`).
-    ProviderOwned,
-}
-
-/// Both emission slots, in publication order.
-pub const GUEST_ENV_SLOTS: [GuestEnvSlot; 2] = [GuestEnvSlot::Generic, GuestEnvSlot::ProviderOwned];
-
-/// The `(key, value)` pairs published in one emission slot for `selection`.
-pub fn guest_env_slot(
-    slot: GuestEnvSlot,
-    selection: ProviderSet,
-) -> Vec<(&'static str, &'static str)> {
-    match slot {
-        GuestEnvSlot::Generic => GENERIC_GUEST_ENV.to_vec(),
-        GuestEnvSlot::ProviderOwned => {
-            let mut env = Vec::new();
-            for provider in CredentialProvider::ALL {
-                for &(key, value, scope) in provider.spec().guest_env {
-                    if scope.applies(provider, selection) {
-                        env.push((key, value));
-                    }
-                }
-            }
-            env
-        }
-    }
-}
-
-/// The full guest-env set in canonical order (generic, then provider-owned).
-/// Callers that must reproduce the historical serialization positions walk
-/// [`GUEST_ENV_SLOTS`] / call [`guest_env_slot`] instead.
-///
-/// Used by tests only today; [`crate::run`] publishes the two slots at their
-/// historical positions rather than this concatenation.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn guest_env(selection: ProviderSet) -> Vec<(&'static str, &'static str)> {
+/// The guest env pairs owned by the *selected* providers, in
+/// `CredentialProvider::ALL` order. A tool's own env is not here — it is
+/// config ([`crate::config::Tool::guest_env`]), published earlier by
+/// `run::launch`.
+pub fn provider_guest_env(selection: ProviderSet) -> Vec<(&'static str, &'static str)> {
     let mut env = Vec::new();
-    for slot in GUEST_ENV_SLOTS {
-        env.extend(guest_env_slot(slot, selection));
+    for provider in CredentialProvider::ALL {
+        for &(key, value, scope) in provider.spec().guest_env {
+            if scope.applies(provider, selection) {
+                env.push((key, value));
+            }
+        }
     }
     env
 }
@@ -596,8 +546,8 @@ const SPECS: [ProviderSpec; 4] = [
         host_credential_home_relative: ".codex/auth.json",
         eager_state_dirs: &["codex"],
         // Codex is deliberately absent from the dotfile links: it locates its
-        // config via the `CODEX_HOME` env var (`GENERIC_GUEST_ENV`), not a
-        // dotfile symlink.
+        // config via the `CODEX_HOME` env var, which the *codex tool* declares
+        // in config (`config::Tool::guest_env`), not this provider.
         home_links: &[],
         guest_env: &[],
         proxy: Some(ProxySecret {
@@ -681,8 +631,9 @@ const SPECS: [ProviderSpec; 4] = [
         // execve never sources `/etc/profile.d`, unlike the original Bash
         // agent-vm. The value is the placeholder; the proxy substitutes the
         // real GitHub OAuth token on the wire. The pair is emitted last
-        // (`GuestEnvSlot::ProviderOwned`); see the module doc for why exporting
-        // it to a non-Copilot guest would be a proxy/substitution violation.
+        // (`provider_guest_env`, published after `GUEST_ALWAYS_ENV`); see the
+        // module doc for why exporting it to a non-Copilot guest would be a
+        // proxy/substitution violation.
         guest_env: &[(
             "COPILOT_GITHUB_TOKEN",
             secrets::COPILOT_TOKEN_PLACEHOLDER,
@@ -927,95 +878,53 @@ mod tests {
         );
     }
 
-    /// V13: the guest-env set per tool. `CODEX_HOME` is always exported;
-    /// `COPILOT_GITHUB_TOKEN` only for a Copilot launch. Exporting the
-    /// Copilot placeholder into every guest would make the guest send an
-    /// unsubstituted bearer to the Copilot API.
+    /// **V6.** The *provider-owned* guest-env set, per selection: only Copilot
+    /// contributes a pair, and only when it is selected. Exporting the Copilot
+    /// placeholder into a non-Copilot guest would make the guest send an
+    /// unsubstituted bearer to the Copilot API. `CODEX_HOME` must never appear
+    /// here — it moved onto the codex tool's config `env` (#119), so the tool
+    /// owns that emission, not a provider.
     #[test]
-    fn guest_env_matches_legacy_per_agent() {
+    fn provider_guest_env_is_the_selected_providers_pairs_only() {
+        const COPILOT: [(&str, &str); 1] = [("COPILOT_GITHUB_TOKEN", "msb-copilot-placeholder-v2")];
         // Type alias keeps the nested tuple out of clippy's `type_complexity`
-        // lint (`--all-targets`), which CI does not gate on.
-        type LegacyGuestEnv = [(
+        // lint, which the `--all-targets -D warnings` gate turns into an error.
+        type Case = (
             &'static [&'static str],
             &'static [(&'static str, &'static str)],
-        ); 5];
-        let legacy: LegacyGuestEnv = [
-            (&["anthropic"], &[("CODEX_HOME", "/agent-vm-state/codex")]),
-            (&["openai"], &[("CODEX_HOME", "/agent-vm-state/codex")]),
+        );
+        let cases: [Case; 6] = [
+            (&[], &[]),
+            (&["anthropic"], &[]),
+            (&["openai"], &[]),
+            (&["openai", "opencode-static"], &[]),
+            (&["copilot"], &COPILOT),
+            // The full set is the only case that distinguishes "gated on
+            // Copilot" from "gated on being the only provider": a
+            // `Scope::applies` regression that leaks a non-selected provider's
+            // pair shows up here and nowhere else.
             (
-                &["openai", "opencode-static"],
-                &[("CODEX_HOME", "/agent-vm-state/codex")],
-            ),
-            (
-                &["openai", "opencode-static"],
-                &[("CODEX_HOME", "/agent-vm-state/codex")],
-            ),
-            (
-                &["copilot"],
-                &[
-                    ("CODEX_HOME", "/agent-vm-state/codex"),
-                    ("COPILOT_GITHUB_TOKEN", "msb-copilot-placeholder-v2"),
-                ],
+                &["anthropic", "openai", "opencode-static", "copilot"],
+                &COPILOT,
             ),
         ];
-        for (names, expected) in legacy {
+        for (names, expected) in cases {
             let selection = ProviderSet::new(
                 names
                     .iter()
                     .map(|name| CredentialProvider::from_config_name(name).unwrap()),
             );
-            assert_eq!(guest_env(selection), expected, "for {names:?}");
-        }
-        // Empty selection still exports the generic env.
-        assert_eq!(
-            guest_env(ProviderSet::default()),
-            vec![("CODEX_HOME", "/agent-vm-state/codex")]
-        );
-    }
-
-    /// The two emission *slots* (`GUEST_ENV_SLOTS`) are pinned, not merely the
-    /// combined set: `SandboxBuilder::env` appends to a `Vec<EnvVar>`
-    /// (serialized as a JSON array), so the *position* of each pair is
-    /// observable in the emitted config JSON and the pre-#81 positions differ
-    /// from each other. `Generic` must hold exactly the generic pairs for any
-    /// selection; `ProviderOwned` must hold exactly the selected providers'
-    /// pairs and never the generic ones.
-    #[test]
-    fn guest_env_slots_pin_generic_and_provider_owned() {
-        use GuestEnvSlot::{Generic, ProviderOwned};
-        let copilot = ProviderSet::new([CredentialProvider::Copilot]);
-
-        // Slot 1 is exactly the generic pairs, for every selection —
-        // transcribed from the pre-#81 `.env("CODEX_HOME", …)` call, not from
-        // `GENERIC_GUEST_ENV`, so moving a provider pair into the generic slot
-        // fails here.
-        for selection in [ProviderSet::default(), copilot] {
-            assert_eq!(
-                guest_env_slot(Generic, selection),
-                vec![("CODEX_HOME", "/agent-vm-state/codex")],
-                "the generic slot must never carry a provider-owned pair"
+            let pairs = provider_guest_env(selection);
+            // Before the exact-set assertion on purpose: on an ownership
+            // regression this fires first with the "ownership moved" message,
+            // rather than an opaque `left == right` diff that also happens to
+            // name the offender.
+            assert!(
+                !pairs.iter().any(|(key, _)| *key == "CODEX_HOME"),
+                "the tool owns CODEX_HOME now, not a provider ({names:?})"
             );
+            assert_eq!(pairs, expected, "for {names:?}");
         }
-        // Slot 2 is exactly the provider-owned pairs, and is empty without one.
-        assert_eq!(
-            guest_env_slot(ProviderOwned, copilot),
-            vec![("COPILOT_GITHUB_TOKEN", "msb-copilot-placeholder-v2")]
-        );
-        assert!(guest_env_slot(ProviderOwned, ProviderSet::default()).is_empty());
-        assert!(
-            guest_env_slot(
-                ProviderOwned,
-                ProviderSet::new([CredentialProvider::Anthropic])
-            )
-            .is_empty()
-        );
-        // The two slots, in order, are the whole set.
-        let mut walked = Vec::new();
-        for slot in GUEST_ENV_SLOTS {
-            walked.extend(guest_env_slot(slot, copilot));
-        }
-        assert_eq!(walked, guest_env(copilot));
-        assert_eq!(GUEST_ENV_SLOTS, [Generic, ProviderOwned]);
     }
 
     /// Every `Scope`/`CaptureScope`/`proxy_requires_selection` value pinned to

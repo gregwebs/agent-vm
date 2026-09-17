@@ -1432,17 +1432,21 @@ pub(crate) async fn launch(tool: &Tool, args: Args) -> Result<i32> {
         }
     });
 
-    // Guest env, slot 1 of 2 (`credential_provider::GUEST_ENV_SLOTS`): the
-    // *generic* pairs (`GENERIC_GUEST_ENV`, e.g. `CODEX_HOME`). Published here
-    // — right after the root-mode `.patch()` — because `SandboxBuilder::env`
-    // appends to a `Vec<EnvVar>` (serialized as a JSON *array*), and that is
-    // where the pre-#81 config put `CODEX_HOME`. Slot 2 (the provider-owned
-    // pairs) is published after `GUEST_ALWAYS_ENV` below, matching its
-    // historical position; see `credential_provider::GuestEnvSlot` for why the
-    // two slots are kept separate.
-    for (key, value) in
-        credential_provider::guest_env_slot(credential_provider::GuestEnvSlot::Generic, providers)
-    {
+    // Guest env, part 1 of 2: the launched tool's own `env` pairs. Published
+    // here — right after the root-mode `.patch()` — because
+    // `SandboxBuilder::env` appends to a `Vec<EnvVar>` and the guest applies
+    // that array last-wins (agentd's `Command::env` loop). Publishing the
+    // tool's config-declared env *first* stops a project config from
+    // *accidentally* redirecting PATH, IS_SANDBOX, LANG or a provider's
+    // variable — the launcher's own later emission wins. This is defence in
+    // depth, not a trust boundary: a config that can declare `env` can already
+    // declare `command`, so ADR-0015's rule stands — running in a directory
+    // means trusting its `.agent-vm/`. The ordering only helps for env the
+    // launcher *always* publishes: HOME/USER/LOGNAME are published only in
+    // non-root mode (`user::resolve_guest_identity`), so `config::check_env_key`
+    // rejects those three keys outright instead — see ADR-0016. Part 2
+    // (provider-owned) is published after `GUEST_ALWAYS_ENV`.
+    for (key, value) in tool.guest_env() {
         builder = builder.env(key, value);
     }
 
@@ -1527,16 +1531,13 @@ pub(crate) async fn launch(tool: &Tool, args: Args) -> Result<i32> {
         builder = builder.env(*key, *value);
     }
 
-    // Guest env, slot 2 of 2: the *provider-owned* pairs. Today only Copilot
+    // Guest env, part 2 of 2: the *provider-owned* pairs. Today only Copilot
     // contributes one — `COPILOT_GITHUB_TOKEN`, and only when Copilot is
     // selected. Published last, after `GUEST_ALWAYS_ENV`, matching the pre-#81
     // config; the security rationale for the pair (and for gating it on the
     // selected provider) lives on `CredentialProvider::Copilot`'s spec and on
     // `credential_provider::proxy_requires_selection`.
-    for (key, value) in credential_provider::guest_env_slot(
-        credential_provider::GuestEnvSlot::ProviderOwned,
-        providers,
-    ) {
+    for (key, value) in credential_provider::provider_guest_env(providers) {
         builder = builder.env(key, value);
     }
 

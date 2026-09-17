@@ -29,10 +29,6 @@
   },
   "env": [
     {
-      "key": "CODEX_HOME",
-      "value": "/agent-vm-state/codex"
-    },
-    {
       "key": "PATH",
       "value": "/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin"
     },

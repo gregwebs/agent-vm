@@ -18,6 +18,14 @@
 //! `bb299d1`; `UPDATE_LAUNCH_GOLDENS=1` reproduces them from any host (see
 //! [`assert_matches_golden`]).
 //!
+//! #119 moved `CODEX_HOME` off the every-launch generic env
+//! (`credential_provider::GENERIC_GUEST_ENV`) onto the `codex` (and `shell`)
+//! tool's own config `env`, so `opencode`/`claude`/`copilot` emit no
+//! `CODEX_HOME` entry. That is an intentional divergence from the `bb299d1`
+//! capture, **hand-edited** in exactly those three fixtures rather than
+//! bulk-regenerated — it is not drift, and must not be "fixed" by re-running
+//! `UPDATE_LAUNCH_GOLDENS=1` on a developer host.
+//!
 //! The project's temp root lives under `CARGO_TARGET_TMPDIR` (inside `target/`),
 //! deliberately *off* the guest's tmpfs prefixes (`/tmp`, `/run`, …), so the
 //! guest mirrors the project path on macOS and Linux alike — the shape every
@@ -411,6 +419,24 @@ fn debug_guest_command(stderr: &str) -> String {
     line.lines().next().unwrap_or_default().to_string()
 }
 
+/// The dumped `SandboxConfig`'s `env` array as `(key, value)` pairs, in
+/// emission order. Shared by the #119 ordering tests and
+/// [`assert_tool_dependent_content`]; callers that care about *which* of two
+/// same-key entries is later use `rposition` on the returned `Vec`.
+fn env_pairs(config: &serde_json::Value) -> Vec<(&str, &str)> {
+    config["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["key"].as_str().unwrap(),
+                entry["value"].as_str().unwrap(),
+            )
+        })
+        .collect()
+}
+
 /// `... (state: /path/to/<hash>)` from the launch banner.
 fn state_dir(stderr: &str) -> PathBuf {
     let marker = "(state: ";
@@ -541,27 +567,18 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         "intercept hook argv changed for {tool}"
     );
 
-    let env: Vec<(&str, &str)> = config["env"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| {
-            (
-                entry["key"].as_str().unwrap(),
-                entry["value"].as_str().unwrap(),
-            )
-        })
-        .collect();
+    let env = env_pairs(config);
     let env_of = |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
     assert_eq!(
         env_of("PATH"),
         Some(PATH_VALUE),
         "PATH env changed for {tool}"
     );
+    let expects_codex_home = matches!(tool, "codex" | "shell");
     assert_eq!(
         env_of("CODEX_HOME"),
-        Some("/agent-vm-state/codex"),
-        "CODEX_HOME env changed for {tool}"
+        expects_codex_home.then_some("/agent-vm-state/codex"),
+        "CODEX_HOME must be emitted only for the tools that declare it ({tool})"
     );
 
     // The credential secret set is tool-dependent; each secret's placeholder and
@@ -777,6 +794,239 @@ fn a_project_declared_tool_launches_its_own_command() {
         "/bin/echo --fast hi",
         "guest command line for the project-declared tool\nstderr:\n{stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// E2 / E2b / E2c / E3 — tool-declared guest env (#119)
+// ---------------------------------------------------------------------------
+
+/// **E2 (#119 D3a).** The launched tool's own `env` is published *before* the
+/// launcher's, and the guest applies the array last-wins, so a config that
+/// declares `PATH` cannot redirect the guest: the launcher's later emission
+/// wins. This is the footgun guard that stops a project config from
+/// *accidentally* redirecting the launcher's own env — defence in depth on top
+/// of ADR-0015's trust boundary (a declaration that sets `env` can already set
+/// `command` and `args`, i.e. run arbitrary guest code), not a substitute for
+/// it.
+///
+/// Deliberately does **not** call [`assert_tool_dependent_content`] (M1): its
+/// `env_of` is a first-match `.find()`, so it would read the *first* `PATH`
+/// here — the declared `/evil` — and fail. E2 defines its own last-match helper
+/// instead; the shared helper's `.find()` stays correct for the shipped tools,
+/// which declare no colliding key.
+#[test]
+fn project_tool_env_is_overridden_by_the_launchers_own_env() {
+    let harness = Harness::new();
+    harness.write_project(
+        "[[tools]]\nname = \"envtool\"\ncommand = \"/bin/echo\"\nenv = { AVM_TEST = \"ok\", PATH = \"/evil\" }\n",
+    );
+    let out = harness.launch("envtool", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "envtool did not reach the debug dump: {stderr}"
+    );
+    let config = debug_config_json(&stderr);
+    let env = env_pairs(&config);
+
+    let avm_test = env
+        .iter()
+        .position(|(key, _)| *key == "AVM_TEST")
+        .expect("the tool's own AVM_TEST must be published");
+    assert_eq!(env[avm_test].1, "ok");
+
+    let last_path = env
+        .iter()
+        .rposition(|(key, _)| *key == "PATH")
+        .expect("PATH must be published");
+    assert_eq!(
+        env[last_path].1, PATH_VALUE,
+        "the launcher's PATH must win over the tool's declaration"
+    );
+    assert!(
+        avm_test < last_path,
+        "the tool's env must be published before the launcher's PATH"
+    );
+}
+
+/// **E2b (#119 D3c, M2).** `HOME`/`USER`/`LOGNAME` are refused at the config
+/// seam in *every* mode — including `--root`, the mode where emission position
+/// would not have protected them (agent-vm publishes the identity triple only
+/// in non-root mode). The refusal happens at config load, before `run.rs`
+/// computes `root_mode`, so it never reaches `builder.build()` (`CONFIG_MARKER`
+/// absent) — exactly like `a_broken_config_fails_a_launch_with_the_config_error`
+/// asserts for malformed TOML. All three keys are exercised, each in both
+/// modes — the `--root` half is the case position would not have covered.
+#[test]
+fn a_tool_declaring_the_guest_identity_is_refused_in_every_mode() {
+    for key in ["HOME", "USER", "LOGNAME"] {
+        for extra in [vec!["--root"], vec![]] {
+            let harness = Harness::new();
+            harness.write_project(&format!(
+                "[[tools]]\nname = \"envtool\"\ncommand = \"/bin/echo\"\nenv = {{ {key} = \"/evil\" }}\n"
+            ));
+            let out = harness.launch("envtool", &extra);
+            // Every launch in this harness exits nonzero — it ends by pulling
+            // `BOGUS_IMAGE` — so `out.status` carries no signal here. The
+            // rejection is proven by the stderr assertions below, and the
+            // absent `CONFIG_MARKER` shows it never reached `builder.build()`.
+            let stderr = stderr_of(&out);
+            assert!(
+                stderr.contains(&format!("env key \"{key}\"")),
+                "{key} {extra:?}: the diagnostic must name the rejected key: {stderr}"
+            );
+            assert!(
+                stderr.contains(
+                    "must not be declared by a tool (agent-vm owns the guest identity environment)"
+                ),
+                "{key} {extra:?}: {stderr}"
+            );
+            assert!(
+                !stderr.contains(CONFIG_MARKER),
+                "{key} {extra:?}: the launch must not reach builder.build(): {stderr}"
+            );
+        }
+    }
+}
+
+/// **E2c (#119 D3b).** The launcher's *unconditional* env — `PATH`,
+/// `IS_SANDBOX`, `LANG` (see `run::GUEST_ALWAYS_ENV`, `run.rs:49`) — really is
+/// published on every launch, root mode included. This is the premise that
+/// licenses leaving those three *out* of `check_env_key`'s rejection set:
+/// position, not validation, protects them. **If this test ever fails, either
+/// restore the unconditional emission or add that key to `check_env_key`'s
+/// rejection set — D3b.** Root mode is the case that removed
+/// `HOME`/`USER`/`LOGNAME` and so the case that could plausibly remove these.
+#[test]
+fn the_launchers_unconditional_env_is_published_in_both_modes() {
+    for extra in [vec![], vec!["--root"]] {
+        let harness = Harness::new();
+        harness.write_project("[[tools]]\nname = \"plain\"\ncommand = \"/bin/echo\"\n");
+        let out = harness.launch("plain", &extra);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(CONFIG_MARKER),
+            "plain did not reach the debug dump ({extra:?}): {stderr}"
+        );
+        let config = debug_config_json(&stderr);
+        let env = env_pairs(&config);
+        let env_of = |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+        assert_eq!(env_of("PATH"), Some(PATH_VALUE), "{extra:?}");
+        assert_eq!(env_of("IS_SANDBOX"), Some("1"), "{extra:?}");
+        assert_eq!(env_of("LANG"), Some("C.UTF-8"), "{extra:?}");
+    }
+}
+
+/// **E3 (#119).** A user-declared tool that declares no `env` launches with no
+/// `CODEX_HOME` — the general rule, where E1 covers the shipped tools.
+#[test]
+fn a_user_declared_tool_without_env_gets_no_codex_home() {
+    let harness = Harness::new();
+    harness.write_project("[[tools]]\nname = \"plain\"\ncommand = \"/bin/echo\"\n");
+    let out = harness.launch("plain", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "plain did not reach the debug dump: {stderr}"
+    );
+    let config = debug_config_json(&stderr);
+    let env = env_pairs(&config);
+    let keys: Vec<&str> = env.iter().map(|(key, _)| *key).collect();
+    assert!(
+        !keys.contains(&"CODEX_HOME"),
+        "a tool that declares no env must get no CODEX_HOME: {keys:?}"
+    );
+}
+
+/// **#119.** A tool's own `env` is published in `--root` mode too, and the
+/// value crosses into the emitted `SandboxConfig` byte-for-byte — including an
+/// embedded `=`. The identity triple is rejected (E2b) precisely *because* the
+/// launcher publishes it only in non-root mode; this pins that the tool's own
+/// env is not accidentally made mode-conditional the same way (behaviour must
+/// not silently differ between modes), and that nothing re-splits the value on
+/// its `=` (only the `KEY=VALUE` delimiter is the first one).
+#[test]
+fn tool_declared_env_is_published_in_both_modes_and_keeps_equals_signs() {
+    for extra in [vec![], vec!["--root"]] {
+        let harness = Harness::new();
+        harness.write_project(
+            "[[tools]]\nname = \"envtool\"\ncommand = \"/bin/echo\"\nenv = { AVM_TEST = \"ok=still=ok\" }\n",
+        );
+        let out = harness.launch("envtool", &extra);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(CONFIG_MARKER),
+            "envtool {extra:?} did not reach the debug dump: {stderr}"
+        );
+        let config = debug_config_json(&stderr);
+        let env = env_pairs(&config);
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| *key == "AVM_TEST")
+                .map(|(_, value)| *value),
+            Some("ok=still=ok"),
+            "the tool's env value must reach the guest intact ({extra:?})"
+        );
+    }
+}
+
+/// **#119 (F8).** `codex` and `shell` are the only shipped tools that declare
+/// `CODEX_HOME` (V5). A user who shadows either in `~/.config/agent-vm/config.toml`
+/// replaces its definition **wholesale**, so the shipped `env` is not inherited
+/// and the tool gets no `CODEX_HOME` unless the user re-declares it — the
+/// upgrade regression `USAGE.md` / ADR-0016 warn about. This pins both halves:
+/// the loss (the warning's premise) and the documented remedy (re-declaring the
+/// pair restores it).
+#[test]
+fn a_shadowed_shipped_tool_does_not_inherit_the_shipped_env() {
+    // Each definition mirrors the shipped tool minus its `env`. `shell` must be
+    // interactive so the shadow registers as the shell verb, exactly as the
+    // built-in does.
+    let cases: [(&str, &str); 2] = [
+        ("codex", "command = \"codex\"\ncredentials = [\"openai\"]\n"),
+        (
+            "shell",
+            "command = \"bash\"\nargs = [\"-O\", \"histappend\"]\ninteractive_shell = true\ncredentials = [\"openai\", \"opencode-static\"]\n",
+        ),
+    ];
+    for (name, definition) in cases {
+        // Shadowed *without* `env`: the shipped CODEX_HOME is not inherited.
+        let harness = Harness::new();
+        harness.write_user(&format!("[[tools]]\nname = \"{name}\"\n{definition}"));
+        let out = harness.launch_default(name);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(CONFIG_MARKER),
+            "shadowed {name} did not reach the debug dump: {stderr}"
+        );
+        let config = debug_config_json(&stderr);
+        let keys: Vec<&str> = env_pairs(&config).into_iter().map(|(key, _)| key).collect();
+        assert!(
+            !keys.contains(&"CODEX_HOME"),
+            "a shadowed {name} must not inherit the shipped CODEX_HOME: {keys:?}"
+        );
+
+        // Re-declaring the pair is the documented remedy.
+        let harness = Harness::new();
+        harness.write_user(&format!(
+            "[[tools]]\nname = \"{name}\"\n{definition}env = {{ CODEX_HOME = \"/agent-vm-state/codex\" }}\n"
+        ));
+        let out = harness.launch_default(name);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(CONFIG_MARKER),
+            "{name} with the remedy did not reach the debug dump: {stderr}"
+        );
+        let config = debug_config_json(&stderr);
+        let env = env_pairs(&config);
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| *key == "CODEX_HOME")
+                .map(|(_, value)| *value),
+            Some("/agent-vm-state/codex"),
+            "the documented remedy must restore CODEX_HOME for a shadowed {name}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
