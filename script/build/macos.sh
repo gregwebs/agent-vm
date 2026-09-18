@@ -67,6 +67,7 @@ cargo_component_error() {
 
 preflight() {
     local tool rust_version version major remainder minor
+    local needed_major needed_remainder needed_minor
 
     if [[ "$(uname -s)" != Darwin ]]; then
         echo "error: ./script/build/macos.sh supports macOS only" >&2
@@ -97,8 +98,17 @@ preflight() {
         echo "error: could not parse Rust version from: $rust_version" >&2
         exit 1
     fi
+    # The floor guard compares MAJOR.MINOR only: the patch component is
+    # intentionally ignored because run_rust_tool already pins the exact
+    # toolchain via `rustup run "$RUST_TOOLCHAIN"` with RUSTUP_AUTO_INSTALL=0,
+    # so this is only a coarse "grossly old toolchain" backstop. The
+    # `major != needed_major` arm deliberately rejects a *newer* major too
+    # (rustc 2.0.0 against a 1.98.1 pin reads "Rust 1.98.1 or newer is
+    # required"); an edition/major jump is not something this script waves
+    # through.
     needed_major="${RUST_TOOLCHAIN%%.*}"
-    needed_minor="${RUST_TOOLCHAIN#*.}"
+    needed_remainder="${RUST_TOOLCHAIN#*.}"
+    needed_minor="${needed_remainder%%.*}"
     if ((major != needed_major)) || ((minor < needed_minor)); then
         echo "error: Rust $RUST_TOOLCHAIN or newer is required; found $version" >&2
         echo "Install the known-good toolchain with 'rustup toolchain install $RUST_TOOLCHAIN'." >&2
