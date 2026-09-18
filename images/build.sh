@@ -1,19 +1,40 @@
 #!/usr/bin/env bash
-# Build the agent-vm OCI image and push it to a host-local registry.
+# Build the agent-vm OCI images and push them to a host-local registry.
+#
+# Two images are built and published (issue #84): the tool-free
+# `agent-vm-base:latest` and the composed `agent-vm-template:latest` (the base
+# plus the four shipped tool layers, chained in declaration order). A launch
+# whose configured tool set differs from the default composes from the base.
 #
 # microsandbox pulls images from registries by reference, so we run a tiny
 # registry:2 container bound to 127.0.0.1:5000 and treat it as our local
 # image store. The registry is shared across `agent-vm setup` runs; we
 # create it on demand and recover by hand if a prior session left it in a
 # bad state (running but no port published, crashed inside, etc.).
+#
+# Intermediate tool layers are `--load`ed into the daemon (they are not
+# published) and the next step builds `FROM` the daemon tag. This needs a
+# builder whose driver shares the daemon's image store (the `docker` driver,
+# which `docker/setup-buildx-action` with `driver: docker` also uses). If your
+# default builder is `docker-container`, either create a `docker`-driver
+# builder (`docker buildx create --driver docker --use`) or use the published
+# images and `script/build/import-image.sh`.
 
 set -euo pipefail
 
 REGISTRY_NAME="${AGENT_VM_REGISTRY_NAME:-agent-vm-registry}"
 REGISTRY_PORT="${AGENT_VM_REGISTRY_PORT:-5000}"
 IMAGE_TAG="${AGENT_VM_IMAGE_TAG:-localhost:${REGISTRY_PORT}/agent-vm-template:latest}"
+BASE_TAG="${AGENT_VM_BASE_IMAGE_TAG:-localhost:${REGISTRY_PORT}/agent-vm-base:latest}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The four shipped tool layers, in declaration order — matching
+# crates/agent-vm/src/default-tools.toml, the launcher's chain order, and CI's
+# build order. The last one produces the composed template, so it is split out
+# (no negative array indexing, which macOS's bash 3.2 lacks).
+INTERMEDIATE_LAYERS=(codex opencode claude)
+FINAL_LAYER=copilot
 
 # Returns 0 if /v2/ on the registry port answers within the timeout.
 # Quiet — caller decides whether to log.
@@ -111,70 +132,110 @@ ensure_registry() {
     return 1
 }
 
-build_and_push() {
-    echo "==> Building ${IMAGE_TAG} (zstd-compressed layers)"
-    # Use buildx with `type=registry` so the layers are zstd-compressed on
-    # the way to the registry — gzip→zstd is the dominant per-layer
-    # cost during `agent-vm setup`, and a benchmark on /usr/lib showed
-    # ~24× faster end-to-end ingest with no change to microsandbox
-    # (`tar_ingest.rs:427` already accepts the `+zstd` media type).
-    #
-    # `force-compression=true` re-emits even already-compressed base-image
-    # layers as zstd; without it, only the layers we ADD are zstd while
-    # everything from the base image stays gzip, partially defeating the
-    # win. `registry.insecure=true` lets us push to the loopback HTTP
-    # registry. We use `compression-level=3` (zstd's default) — the
-    # bench shows diminishing returns past that for binary-heavy layers.
+# The zstd registry exporter. Use `type=registry` so layers are zstd-compressed
+# on the way to the registry — gzip→zstd is the dominant per-layer cost during
+# `agent-vm setup`, and a benchmark on /usr/lib showed ~24× faster end-to-end
+# ingest with no change to microsandbox (`tar_ingest.rs:427` already accepts the
+# `application/vnd.oci.image.layer.v1.tar+zstd` media type).
+#
+# `force-compression=true` re-emits even already-compressed base-image layers as
+# zstd; without it, only the layers we ADD are zstd while everything from the
+# base image stays gzip, partially defeating the win. `registry.insecure=true`
+# lets us push to the loopback HTTP registry. We use `compression-level=3`
+# (zstd's default) — the bench shows diminishing returns past that for
+# binary-heavy layers.
+REGISTRY_OUTPUT="type=registry,push=true,registry.insecure=true,compression=zstd,compression-level=3,force-compression=true"
 
-    # If the host is itself behind a TLS-intercept proxy (agent-vm-
-    # inside-agent-vm during local dev, or a corporate egress MITM),
-    # the buildkit container's outbound HTTPS sees the proxy's CA and
-    # curl/apt fail with "unable to verify the legitimacy of the
-    # server". Detect the host CA and:
-    #   - pass it as a buildx secret (the Dockerfile imports it
-    #     conditionally; no-op when the secret is absent),
-    #   - key the RUN-cache invalidation off its mtime (CA_SHIM_
-    #     CACHEBUST — see Dockerfile comment for why secret content
-    #     alone doesn't invalidate the cache),
-    #   - run the RUN steps in the host network namespace, because
-    #     buildkit's default bridge stack drops some HTTPS connec-
-    #     tions (curl 56 `SSL_read: unexpected eof`) mid-redirect
-    #     through the MITM proxy.
-    # Production CI has no such host CA and skips all of this.
-    local extra=()
-    local host_ca="${AGENT_VM_BUILD_HOST_CA:-/usr/local/share/ca-certificates/microsandbox-ca.crt}"
-    local mitm_detected=
-    if [ -f "${host_ca}" ]; then
-        echo "==> Including host CA ${host_ca} as buildx secret (TLS-intercept proxy detected)"
-        extra+=(--secret "id=hostca,src=${host_ca}")
-        extra+=(--build-arg "CA_SHIM_CACHEBUST=$(stat -c %Y "${host_ca}")")
-        extra+=(--allow "network.host")
-        extra+=(--network "host")
-        mitm_detected=1
-    fi
+# Extra buildx args shared by every step: the host-CA shim (TLS-intercept dev
+# hosts) and the `AGENT_INSTALL_SOFT_FAIL` policy. The tool layers inherit the
+# base's baked CA, but the installers they run still need host network access
+# and the soft-fail arg, so these flags go on every step.
+#
+# If the host is itself behind a TLS-intercept proxy (agent-vm-inside-agent-vm
+# during local dev, or a corporate egress MITM), the buildkit container's
+# outbound HTTPS sees the proxy's CA and curl/apt fail with "unable to verify
+# the legitimacy of the server". Detect the host CA and:
+#   - pass it as a buildx secret (the base Dockerfile imports it
+#     conditionally; no-op when the secret is absent),
+#   - key the RUN-cache invalidation off its mtime (CA_SHIM_CACHEBUST — see the
+#     Dockerfile comment for why secret content alone doesn't invalidate the
+#     cache),
+#   - run the RUN steps in the host network namespace, because buildkit's
+#     default bridge stack drops some HTTPS connections (curl 56 `SSL_read:
+#     unexpected eof`) mid-redirect through the MITM proxy.
+# Production CI has no such host CA and skips all of this.
+EXTRA=()
+HOST_CA="${AGENT_VM_BUILD_HOST_CA:-/usr/local/share/ca-certificates/microsandbox-ca.crt}"
+MITM_DETECTED=
+if [ -f "${HOST_CA}" ]; then
+    echo "==> Including host CA ${HOST_CA} as buildx secret (TLS-intercept proxy detected)"
+    EXTRA+=(--secret "id=hostca,src=${HOST_CA}")
+    EXTRA+=(--build-arg "CA_SHIM_CACHEBUST=$(stat -c %Y "${HOST_CA}")")
+    EXTRA+=(--allow "network.host")
+    EXTRA+=(--network "host")
+    MITM_DETECTED=1
+fi
 
-    # AGENT_INSTALL_SOFT_FAIL — independent toggle (not tied to CA
-    # detection) so a clean-network developer rebuilding during an
-    # upstream installer outage can opt in, and someone debugging
-    # installer changes on a MITM host can force hard-fail with
-    # `AGENT_VM_BUILD_SOFT_FAIL_AGENTS=0`.
-    #
-    # Default policy: MITM-detected hosts → soft-fail (the same TLS
-    # interception that triggers the CA shim also hits curl 56 on
-    # some GitHub release-asset URLs); clean hosts → hard-fail
-    # (matching production CI).
-    local soft_fail="${AGENT_VM_BUILD_SOFT_FAIL_AGENTS:-${mitm_detected}}"
-    if [ -n "${soft_fail}" ] && [ "${soft_fail}" != "0" ]; then
-        echo "==> Soft-fail mode enabled for agent installers + codestyle clone (AGENT_VM_BUILD_SOFT_FAIL_AGENTS=0 to disable)"
-        extra+=(--build-arg "AGENT_INSTALL_SOFT_FAIL=1")
-    fi
+# AGENT_INSTALL_SOFT_FAIL — independent toggle (not tied to CA detection) so a
+# clean-network developer rebuilding during an upstream installer outage can opt
+# in, and someone debugging installer changes on a MITM host can force hard-fail
+# with `AGENT_VM_BUILD_SOFT_FAIL_AGENTS=0`.
+#
+# Default policy: MITM-detected hosts → soft-fail (the same TLS interception
+# that triggers the CA shim also hits curl 56 on some GitHub release-asset
+# URLs); clean hosts → hard-fail (matching production CI).
+SOFT_FAIL="${AGENT_VM_BUILD_SOFT_FAIL_AGENTS:-${MITM_DETECTED}}"
+if [ -n "${SOFT_FAIL}" ] && [ "${SOFT_FAIL}" != "0" ]; then
+    echo "==> Soft-fail mode enabled for agent installers (AGENT_VM_BUILD_SOFT_FAIL_AGENTS=0 to disable)"
+    EXTRA+=(--build-arg "AGENT_INSTALL_SOFT_FAIL=1")
+fi
 
+build_base() {
+    echo "==> Building ${BASE_TAG} (tool-free base, zstd layers)"
     docker buildx build \
-        -t "${IMAGE_TAG}" \
-        "${extra[@]}" \
-        --output "type=registry,push=true,registry.insecure=true,compression=zstd,compression-level=3,force-compression=true" \
+        -t "${BASE_TAG}" \
+        "${EXTRA[@]}" \
+        --output "${REGISTRY_OUTPUT}" \
         -f "${SCRIPT_DIR}/Dockerfile" \
         "${SCRIPT_DIR}"
+}
+
+# One intermediate tool layer, `--load`ed into the daemon so the next step's
+# `FROM` can reference it. ${1} is the tool name (a directory under
+# images/tools/); ${2} is the reference this step builds FROM.
+build_intermediate() {
+    local tool="$1" from="$2"
+    echo "==> Building tool layer ${tool} FROM ${from}"
+    docker buildx build \
+        -t "agent-vm-${tool}-build:latest" \
+        --build-arg "BASE_IMAGE=${from}" \
+        "${EXTRA[@]}" \
+        --load \
+        "${SCRIPT_DIR}/tools/${tool}"
+}
+
+# The final tool layer (copilot) produces the published composed template.
+build_template() {
+    local from="$1"
+    echo "==> Building ${IMAGE_TAG} (composed default: base + tool layers, zstd layers)"
+    docker buildx build \
+        -t "${IMAGE_TAG}" \
+        --build-arg "BASE_IMAGE=${from}" \
+        "${EXTRA[@]}" \
+        --output "${REGISTRY_OUTPUT}" \
+        "${SCRIPT_DIR}/tools/${FINAL_LAYER}"
+}
+
+build_and_push() {
+    build_base
+
+    local prev="${BASE_TAG}" tool
+    # Every layer but the last is an unpublished intermediate.
+    for tool in "${INTERMEDIATE_LAYERS[@]}"; do
+        build_intermediate "${tool}" "${prev}"
+        prev="agent-vm-${tool}-build:latest"
+    done
+    build_template "${prev}"
 }
 
 main() {
@@ -188,7 +249,7 @@ main() {
     fi
     ensure_registry
     build_and_push
-    echo "==> ${IMAGE_TAG} ready"
+    echo "==> ${BASE_TAG} and ${IMAGE_TAG} ready"
 }
 
 main "$@"
