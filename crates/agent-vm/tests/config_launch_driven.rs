@@ -14,9 +14,16 @@
 //!
 //! `tests/fixtures/config-launch/<tool>.golden` records, for each of the five
 //! default tools, the `SandboxConfig` JSON (normalized) and a snapshot of the
-//! per-project state dir. They were captured from the pre-#82 binary at commit
-//! `bb299d1`; `UPDATE_LAUNCH_GOLDENS=1` reproduces them from any host (see
-//! [`assert_matches_golden`]).
+//! per-project state dir. They now record each verb's **declared provisioning
+//! set** (#118): `codex` provisions `{openai}`, `claude` `{anthropic}`, and so
+//! on, so the proxy secret set, the intercept rules and the written guest
+//! placeholders differ per verb. `UPDATE_LAUNCH_GOLDENS=1` reproduces them from
+//! any host (see [`assert_matches_golden`]).
+//!
+//! `intercept.hook` is now verb-dependent: it is present exactly when a verb
+//! has a proxied route (`Plan::configure_network` only calls `.intercept()`
+//! when the route list is non-empty), so `copilot` keeps the serde-default
+//! intercept body.
 //!
 //! #119 moved `CODEX_HOME` off the every-launch generic env
 //! (`credential_provider::GENERIC_GUEST_ENV`) onto the `codex` (and `shell`)
@@ -463,7 +470,9 @@ fn snapshot(state: &Path) -> BTreeMap<String, String> {
             "claude/.credentials.json",
             state.join("claude/.credentials.json"),
         ),
+        ("codex/auth.json", state.join("codex/auth.json")),
         ("codex/config.toml", state.join("codex/config.toml")),
+        ("copilot/config.json", state.join("copilot/config.json")),
         (
             "opencode-config/opencode.json",
             state.join("opencode-config/opencode.json"),
@@ -555,18 +564,6 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
     .collect();
     assert_eq!(mounts, expected_mounts, "mount set changed for {tool}");
 
-    // The intercept hook argv is tool-independent but security-relevant.
-    assert_eq!(
-        config["network"]["intercept"]["hook"],
-        serde_json::json!([
-            "$AGENT_VM_BIN",
-            "_intercept-hook",
-            "--state-dir",
-            "$STATE_DIR"
-        ]),
-        "intercept hook argv changed for {tool}"
-    );
-
     let env = env_pairs(config);
     let env_of = |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
     assert_eq!(
@@ -581,28 +578,27 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         "CODEX_HOME must be emitted only for the tools that declare it ({tool})"
     );
 
-    // The credential secret set is tool-dependent; each secret's placeholder and
-    // allowlist shape is pinned.
+    // The credential secret set follows the verb's provisioning set.
     let secrets = config["network"]["secrets"]["secrets"].as_array().unwrap();
     let env_vars: Vec<&str> = secrets
         .iter()
         .map(|secret| secret["env_var"].as_str().unwrap())
         .collect();
     let expected_env_vars: &[&str] = match tool {
-        "opencode" | "shell" => &[
-            "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+        "codex" => &["MSB_AGENT_VM_OPENAI_UNUSED"],
+        "opencode" => &[
             "MSB_AGENT_VM_OPENAI_UNUSED",
             "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
         ],
-        "copilot" => &[
+        "claude" => &["MSB_AGENT_VM_ANTHROPIC_UNUSED"],
+        "copilot" => &["MSB_AGENT_VM_COPILOT_UNUSED"],
+        "shell" => &[
             "MSB_AGENT_VM_ANTHROPIC_UNUSED",
             "MSB_AGENT_VM_OPENAI_UNUSED",
+            "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
             "MSB_AGENT_VM_COPILOT_UNUSED",
         ],
-        _ => &[
-            "MSB_AGENT_VM_ANTHROPIC_UNUSED",
-            "MSB_AGENT_VM_OPENAI_UNUSED",
-        ],
+        other => panic!("unknown default tool {other}"),
     };
     assert_eq!(env_vars, expected_env_vars, "secret set changed for {tool}");
     for secret in secrets {
@@ -622,17 +618,70 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
             "{tool}: secret source path is not tokenized"
         );
     }
-    if tool == "copilot" {
-        assert_eq!(
-            env_of("COPILOT_GITHUB_TOKEN"),
-            Some("msb-copilot-placeholder-v2"),
-            "copilot token env changed"
-        );
+
+    // `COPILOT_GITHUB_TOKEN` follows the provisioning set *and* a successful
+    // capture: the harness seeds the device-flow cache, so `copilot` and
+    // `shell` (which provisions Copilot) get it, and no other verb does.
+    let expects_copilot_token = matches!(tool, "copilot" | "shell");
+    assert_eq!(
+        env_of("COPILOT_GITHUB_TOKEN"),
+        expects_copilot_token.then_some("msb-copilot-placeholder-v2"),
+        "COPILOT_GITHUB_TOKEN must follow the provisioning set and a successful capture ({tool})"
+    );
+
+    // The intercept hook is now verb-dependent, present **exactly when** a verb
+    // has a proxied route: `Plan::configure_network` only calls `.intercept()`
+    // when the route list is non-empty, so `copilot` (no `oauth_token_route`,
+    // no GitHub egress) keeps the serde-default body. Losing the hook on a
+    // no-route launch is acceptable — the hook only fires on a matched route
+    // (`InterceptConfig`'s docs), and the `--allowed-repo` push restriction
+    // rides the GitHub-egress routes, which are unaffected.
+    let rules = config["network"]["intercept"]["rules"].as_array().unwrap();
+    let hook = &config["network"]["intercept"]["hook"];
+    if rules.is_empty() {
+        assert!(hook.is_null(), "hook present with no routes ({tool})");
     } else {
         assert_eq!(
-            env_of("COPILOT_GITHUB_TOKEN"),
-            None,
-            "COPILOT_GITHUB_TOKEN must only be set for copilot"
+            hook,
+            &serde_json::json!([
+                "$AGENT_VM_BIN",
+                "_intercept-hook",
+                "--state-dir",
+                "$STATE_DIR"
+            ]),
+            "intercept hook argv changed for {tool}"
+        );
+    }
+
+    // The leak this ticket closes: the intercept rule set per verb.
+    let actual_rules: Vec<(&str, &str)> = rules
+        .iter()
+        .map(|rule| {
+            (
+                rule["host"].as_str().unwrap(),
+                rule["path_prefix"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let expected_rules: &[(&str, &str)] = match tool {
+        "codex" | "opencode" => &[("auth.openai.com", "/oauth/token")],
+        "claude" => &[("platform.claude.com", "/v1/oauth/token")],
+        "copilot" => &[],
+        "shell" => &[
+            ("platform.claude.com", "/v1/oauth/token"),
+            ("auth.openai.com", "/oauth/token"),
+        ],
+        other => panic!("unknown default tool {other}"),
+    };
+    assert_eq!(
+        actual_rules, expected_rules,
+        "intercept rules changed for {tool}"
+    );
+    if tool == "copilot" {
+        assert_eq!(
+            config["network"]["intercept"]["max_request_bytes"],
+            serde_json::json!(65536),
+            "copilot's intercept object must degrade to the serde default body"
         );
     }
 }
@@ -645,7 +694,7 @@ fn golden_path(tool: &str) -> PathBuf {
 
 /// `UPDATE_LAUNCH_GOLDENS=1` rewrites the fixtures instead of asserting, so a
 /// future intentional default change has a mechanical update path. The
-/// fixtures in-tree were captured from `bb299d1` (pre-#82 `main`).
+/// fixtures in-tree were regenerated for #118 (the provisioning-set change).
 fn assert_matches_golden(tool: &str, actual: &str) {
     let path = golden_path(tool);
     if std::env::var_os("UPDATE_LAUNCH_GOLDENS").is_some() {
@@ -656,7 +705,7 @@ fn assert_matches_golden(tool: &str, actual: &str) {
         .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
     assert_eq!(
         actual, expected,
-        "launch observation for {tool} changed vs the {tool} golden captured at bb299d1\n\
+        "launch observation for {tool} changed vs the {tool} golden regenerated for #118\n\
          (rerun with UPDATE_LAUNCH_GOLDENS=1 only if the change is intentional)"
     );
 }
@@ -666,7 +715,7 @@ fn assert_matches_golden(tool: &str, actual: &str) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn default_tools_launch_identically_to_main() {
+fn default_tools_launch_with_their_declared_provisioning() {
     for tool in DEFAULT_TOOLS {
         let harness = Harness::new();
         let out = harness.launch_default(tool);
@@ -1320,4 +1369,470 @@ fn shell_user_args_are_joined_and_escaped_in_the_guest_command_line() {
         r#"bash -O histappend -c 'a b' 'c'\''d'"#,
         "the interactive-shell join must shell-escape each arg\nstderr:\n{stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #118 — the provisioning set gates every provider-owned facet
+// ---------------------------------------------------------------------------
+
+/// The `MSB_AGENT_VM_*` secret env vars registered in a dumped `SandboxConfig`.
+fn registered_secret_env_vars(config: &serde_json::Value) -> Vec<&str> {
+    config["network"]["secrets"]["secrets"]
+        .as_array()
+        .map(|secrets| {
+            secrets
+                .iter()
+                .map(|secret| secret["env_var"].as_str().unwrap())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_json(path: &Path) -> Option<serde_json::Value> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+/// **The #118 acceptance criterion.** A `codex` guest holds no Anthropic
+/// capability: no host secret, no intercept rule, no guest placeholder — while
+/// the `.claude` symlink is deliberately still there (furniture is not a
+/// capability; narrowing it would collide with a real `~/.claude` next launch).
+#[test]
+fn a_codex_launch_provisions_openai_only() {
+    let harness = Harness::new();
+    let out = harness.launch_default("codex");
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    let state = state_dir(&stderr);
+
+    assert!(
+        !registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "a codex launch must not register the Anthropic secret"
+    );
+    let rules = config["network"]["intercept"]["rules"].as_array().unwrap();
+    assert!(
+        rules
+            .iter()
+            .all(|rule| rule["host"].as_str() != Some("platform.claude.com")),
+        "a codex launch must not register an Anthropic intercept route"
+    );
+    assert!(
+        !state.join("claude/.credentials.json").exists(),
+        "a codex launch must not write the Claude placeholder"
+    );
+    let host_secrets = PathBuf::from(format!("{}.secrets", state.display()));
+    assert!(
+        !host_secrets.join("anthropic").exists(),
+        "the host's Anthropic token must never be captured for codex"
+    );
+    // Furniture stays: the `.claude` symlink is unconditional.
+    assert!(
+        std::fs::symlink_metadata(state.join("home/.claude"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the `.claude` guest-HOME link must remain (furniture is not a capability)"
+    );
+}
+
+/// A `shell` guest gets all four, and Copilot is *working*: substitution entry,
+/// placeholder config and env var all present together.
+#[test]
+fn a_shell_launch_provisions_all_four_with_a_working_copilot() {
+    let harness = Harness::new();
+    let out = harness.launch_default("shell");
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    let state = state_dir(&stderr);
+
+    let env_vars = registered_secret_env_vars(&config);
+    for expected in [
+        "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+        "MSB_AGENT_VM_OPENAI_UNUSED",
+        "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
+        "MSB_AGENT_VM_COPILOT_UNUSED",
+    ] {
+        assert!(
+            env_vars.contains(&expected),
+            "shell missing {expected}: {env_vars:?}"
+        );
+    }
+    let env = env_pairs(&config);
+    assert_eq!(
+        env.iter()
+            .find(|(key, _)| *key == "COPILOT_GITHUB_TOKEN")
+            .map(|(_, value)| *value),
+        Some("msb-copilot-placeholder-v2")
+    );
+    let copilot = read_json(&state.join("copilot/config.json")).expect("copilot config present");
+    assert_eq!(copilot["github_token"], "msb-copilot-placeholder-v2");
+}
+
+/// Placeholder ⇒ substitution entry, for every default verb. The general form
+/// of the two above, so a future provider cannot be added without it.
+#[test]
+fn no_default_verb_provisions_a_placeholder_without_its_substitution_entry() {
+    for tool in DEFAULT_TOOLS {
+        let harness = Harness::new();
+        let out = harness.launch_default(tool);
+        let stderr = stderr_of(&out);
+        let config = debug_config_json(&stderr);
+        let state = state_dir(&stderr);
+        let registered = registered_secret_env_vars(&config);
+        let placeholder_requires_its_entry = [
+            (
+                state.join("claude/.credentials.json").exists(),
+                "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+                "claude/.credentials.json",
+            ),
+            (
+                state.join("codex/auth.json").exists(),
+                "MSB_AGENT_VM_OPENAI_UNUSED",
+                "codex/auth.json",
+            ),
+            (
+                read_json(&state.join("copilot/config.json"))
+                    .and_then(|value| value.get("github_token").cloned())
+                    .is_some(),
+                "MSB_AGENT_VM_COPILOT_UNUSED",
+                "copilot/config.json",
+            ),
+            (
+                read_json(&state.join("opencode/auth.json"))
+                    .and_then(|value| value.get("openai").cloned())
+                    .is_some(),
+                "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
+                "opencode/auth.json",
+            ),
+        ];
+        for (placeholder_present, entry, file) in placeholder_requires_its_entry {
+            assert_eq!(
+                placeholder_present,
+                registered.contains(&entry),
+                "for {tool}: a placeholder in {file} must exist iff {entry} is registered",
+            );
+        }
+    }
+}
+
+/// A failed Copilot capture on a `shell` launch removes the stale placeholder a
+/// previous `copilot` launch left behind (the exact scenario the criterion
+/// names). Both launches share one state dir.
+#[test]
+fn a_failed_copilot_capture_clears_the_stale_shell_placeholder() {
+    let harness = Harness::new();
+
+    // (a) A successful copilot launch writes the placeholder config.
+    let first = harness.launch_default("copilot");
+    let state = state_dir(&stderr_of(&first));
+    let copilot = read_json(&state.join("copilot/config.json")).expect("copilot config written");
+    assert_eq!(copilot["github_token"], "msb-copilot-placeholder-v2");
+
+    // (b) Remove the device-flow cache so the next capture fails.
+    std::fs::remove_file(
+        harness
+            .home_root
+            .join(".cache/claude-vm/copilot-token.json"),
+    )
+    .unwrap();
+
+    // (c) A shell launch provisions Copilot but cannot capture it.
+    let second = harness.launch_default("shell");
+    let stderr = stderr_of(&second);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "the shell launch must not bail on a failed, non-required Copilot capture: {stderr}"
+    );
+    let config = debug_config_json(&stderr);
+    assert!(
+        !registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_COPILOT_UNUSED"),
+        "no substitution entry was registered, so no secret may be"
+    );
+    let env = env_pairs(&config);
+    assert!(
+        !env.iter().any(|(key, _)| *key == "COPILOT_GITHUB_TOKEN"),
+        "an unsubstituted placeholder bearer must not be exported"
+    );
+    let copilot = read_json(&state.join("copilot/config.json")).unwrap();
+    assert!(
+        copilot.get("github_token").is_none(),
+        "the stale placeholder must be cleared: {copilot}"
+    );
+}
+
+/// A dangling `tools` reference is reported as a config error by a launch verb
+/// while `doctor` still renders every section (a deferred config failure).
+#[test]
+fn a_dangling_tools_reference_fails_a_launch_but_not_doctor() {
+    let harness = Harness::new();
+    harness.write_project("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"nope\"]\n");
+
+    let launch = harness.launch_default("t");
+    assert!(
+        !launch.status.success(),
+        "a dangling reference must fail the launch"
+    );
+    let launch_err = stderr_of(&launch);
+    assert!(launch_err.contains("config:"), "{launch_err}");
+    assert!(
+        launch_err.contains("names no tool in the resolved catalog"),
+        "{launch_err}"
+    );
+    assert!(
+        !launch_err.contains("unrecognized subcommand"),
+        "it must not degrade into clap's unrecognized-subcommand: {launch_err}"
+    );
+    assert!(!launch_err.contains(CONFIG_MARKER), "{launch_err}");
+
+    let doctor = harness.base_command().arg("doctor").output().unwrap();
+    assert!(!doctor.status.success(), "doctor must exit nonzero");
+    let stdout = stdout_of(&doctor);
+    for heading in [
+        "==> active microsandbox home",
+        "==> host agent credentials",
+        "==> tool configuration",
+        "==> agent-vm doctor: available operations",
+    ] {
+        assert!(stdout.contains(heading), "missing {heading}: {stdout}");
+    }
+    assert!(
+        stdout.contains("names no tool in the resolved catalog"),
+        "the config section must render the failure: {stdout}"
+    );
+}
+
+/// A declared `shell` that opts out (`tools = []`) provisions nothing, and the
+/// launch still boots — with **no TLS overlay**, because `apply_to` returns the
+/// builder untouched when `secrets` is empty. The shape is newly reachable.
+#[test]
+fn a_zero_provisioning_launch_boots_with_no_tls_overlay() {
+    let harness = Harness::new();
+    harness.write_project(
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\ntools = []\n",
+    );
+    let out = harness.launch_default("shell");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "a zero-provisioning launch must still boot: {stderr}"
+    );
+    let config = debug_config_json(&stderr);
+    assert!(
+        registered_secret_env_vars(&config).is_empty(),
+        "no provider is provisioned"
+    );
+    let tls_enabled = config["network"]["tls"]["enabled"]
+        .as_bool()
+        .unwrap_or(false);
+    assert!(
+        !tls_enabled,
+        "no TLS overlay when there is nothing to substitute"
+    );
+    let intercept = &config["network"]["intercept"];
+    if !intercept.is_null() {
+        assert!(
+            intercept["rules"].as_array().unwrap().is_empty(),
+            "`.intercept()` must not run: {intercept}"
+        );
+    }
+    // A zero-provisioning launch never calls `.network()` at all
+    // (`credential_injection::Plan::apply_to` early-returns, and `network::Plan`
+    // has no egress policy to apply here), so the dumped spec carries **no**
+    // `policy` subdocument. Pin that observed shape too, so a future change that
+    // starts emitting a policy here is noticed rather than silently absorbed.
+    assert!(
+        config["network"].get("policy").is_none(),
+        "a zero-provisioning launch carries no explicit policy"
+    );
+    // "No explicit policy" is not an *open* policy, but it is not a narrower
+    // egress either: the engine materializes an unset policy as
+    // `NetworkPolicy::default()` — `default_egress: deny` plus the public-profile
+    // allow — which is exactly what a wired launch's `.network()` overlay
+    // materializes (ADR-0017). A zero-provisioning launch is therefore exactly
+    // as open as a wired one. Compare the *whole* materialized policy (via its
+    // serialized form, since `NetworkPolicy` has no `PartialEq`) so a rule-level
+    // relaxation — an added allow, a flipped `default_ingress` — is caught, not
+    // just the default action.
+    let materialized: microsandbox_network::config::NetworkConfig =
+        serde_json::from_value(config["network"].clone())
+            .expect("the engine accepts a spec with no policy subdocument");
+    let wired_default = microsandbox_network::config::NetworkConfig::default();
+    assert_eq!(
+        serde_json::to_value(&materialized.policy).unwrap(),
+        serde_json::to_value(&wired_default.policy).unwrap(),
+        "a zero-provisioning launch materializes the same default policy as a wired launch"
+    );
+}
+
+/// Under a **custom** catalog the fallback `shell` provisions **nothing** — the
+/// old always-on capture must not come back as a "fix" for a failing
+/// user-config test.
+#[test]
+fn a_fallback_shell_under_a_custom_catalog_provisions_nothing() {
+    let harness = Harness::new();
+    harness.write_user("[[tools]]\nname = \"solo\"\ncommand = \"/bin/echo\"\n");
+    let out = harness.launch_default("shell");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let config = debug_config_json(&stderr);
+    let env_vars = registered_secret_env_vars(&config);
+    assert!(
+        !env_vars.contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED")
+            && !env_vars.contains(&"MSB_AGENT_VM_OPENAI_UNUSED"),
+        "the built-in fallback shell closes over its own file only: {env_vars:?}"
+    );
+    let state = state_dir(&stderr);
+    assert!(!state.join("claude/.credentials.json").exists());
+    let host_secrets = PathBuf::from(format!("{}.secrets", state.display()));
+    assert!(!host_secrets.join("anthropic").exists());
+}
+
+/// **The other half of "a guest cannot spend a credential its verb did not
+/// provision."** The pre-#118 leak was a substitution entry the verb never
+/// declared; this pins the floor beneath it — the host's real tokens live in
+/// the `<state>.secrets` *sibling*, which is never bind-mounted, so a
+/// non-provisioned provider is not merely unsubstitutable, it is unreadable.
+/// A `shell` launch captures all three, which keeps the "no such mount"
+/// assertion load-bearing instead of vacuous.
+#[test]
+fn host_credentials_are_never_bind_mounted_into_the_guest() {
+    let harness = Harness::new();
+    let out = harness.launch_default("shell");
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    let state = state_dir(&stderr);
+    let secrets = PathBuf::from(format!("{}.secrets", state.display()));
+
+    for provider in ["anthropic", "openai", "copilot"] {
+        assert!(
+            secrets.join(provider).exists(),
+            "a shell launch must capture the host {provider} token, else this test proves nothing"
+        );
+    }
+
+    let mut mounted_hosts: Vec<&str> = Vec::new();
+    for mount in config["mounts"].as_array().unwrap() {
+        let host = mount["host"].as_str().unwrap();
+        mounted_hosts.push(host);
+        assert!(
+            !Path::new(host).starts_with(&secrets),
+            "the host secret dir must never be bind-mounted; got {host}"
+        );
+    }
+    // The state dir itself *is* mounted (at `/agent-vm-state`); it holds
+    // placeholders only. Anything else the guest sees is furniture.
+    assert!(
+        mounted_hosts
+            .iter()
+            .any(|host| *host == state.to_string_lossy()),
+        "the state dir must be a mount source: {mounted_hosts:?}"
+    );
+}
+
+/// Copilot is not repo-scoped, so `--no-git` (which suppresses *GitHub egress*)
+/// must not suppress its capture: the device-flow cache is still read and
+/// `COPILOT_GITHUB_TOKEN` is still exported. #118 moved Copilot's capture onto
+/// the provisioning set and deleted the `WhenSelectedOrGithubEgress`
+/// disjunction; this pins that `--no-git` stays orthogonal to it.
+#[test]
+fn copilot_is_captured_despite_no_git() {
+    for tool in ["copilot", "shell"] {
+        let harness = Harness::new();
+        let out = harness.launch(tool, &["--no-git"]);
+        let stderr = stderr_of(&out);
+        let config = debug_config_json(&stderr);
+        let env_vars = registered_secret_env_vars(&config);
+        assert!(
+            env_vars.contains(&"MSB_AGENT_VM_COPILOT_UNUSED"),
+            "{tool} --no-git must still capture Copilot from the device-flow cache: {env_vars:?}"
+        );
+        assert_eq!(
+            env_pairs(&config)
+                .iter()
+                .find(|(key, _)| *key == "COPILOT_GITHUB_TOKEN")
+                .map(|(_, value)| *value),
+            Some("msb-copilot-placeholder-v2"),
+            "{tool} --no-git must still export COPILOT_GITHUB_TOKEN"
+        );
+    }
+}
+
+/// A **required** provider with no host credential fails loudly *before boot*;
+/// a provider with no [`missing_credential_error`] degrades quietly. The bail
+/// loop reads the tool's `credentials` (the requirement set), never its
+/// provisioning set, so `codex` still launches — degraded — with no OpenAI
+/// login, while `claude` refuses.
+#[test]
+fn a_missing_required_host_credential_bails_before_boot() {
+    let harness = Harness::new();
+    std::fs::remove_file(harness.home_root.join(".claude/.credentials.json")).unwrap();
+    let out = harness.launch_default("claude");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("no usable Claude credential found on the host"),
+        "claude must hard-bail with the actionable message:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "the bail must happen before the sandbox is built:\n{stderr}"
+    );
+
+    let harness = Harness::new();
+    std::fs::remove_file(harness.home_root.join(".codex/auth.json")).unwrap();
+    let out = harness.launch_default("codex");
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    assert!(
+        registered_secret_env_vars(&config).is_empty(),
+        "no OpenAI credential means nothing to register"
+    );
+    let state = state_dir(&stderr);
+    assert!(
+        !state.join("codex/auth.json").exists(),
+        "a placeholder must not appear without its substitution entry"
+    );
+}
+
+/// The broadest verb with **no** host credential at all: `shell` provisions all
+/// four, requires none, so it boots with an empty wire and the placeholder
+/// invariant holds at its zero-boundary.
+#[test]
+fn a_shell_launch_with_no_host_credentials_wires_nothing() {
+    let harness = Harness::new();
+    for relative in [
+        ".claude/.credentials.json",
+        ".codex/auth.json",
+        ".cache/claude-vm/copilot-token.json",
+    ] {
+        std::fs::remove_file(harness.home_root.join(relative)).unwrap();
+    }
+    let out = harness.launch_default("shell");
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    assert!(
+        registered_secret_env_vars(&config).is_empty(),
+        "nothing was captured, so nothing may be registered"
+    );
+    assert!(
+        !env_pairs(&config)
+            .iter()
+            .any(|(key, _)| *key == "COPILOT_GITHUB_TOKEN"),
+        "an unwired Copilot must not export a placeholder bearer"
+    );
+    let state = state_dir(&stderr);
+    for rel in [
+        "claude/.credentials.json",
+        "codex/auth.json",
+        "copilot/config.json",
+    ] {
+        assert!(!state.join(rel).exists(), "{rel} must not exist");
+    }
+    let secrets = PathBuf::from(format!("{}.secrets", state.display()));
+    for provider in ["anthropic", "openai", "copilot"] {
+        assert!(
+            !secrets.join(provider).exists(),
+            "{provider} must not be captured"
+        );
+    }
 }

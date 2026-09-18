@@ -10,30 +10,39 @@
 //! user-populated BYO-API-key row inside OpenCode's `auth.json`, a different
 //! concept that deliberately stays untouched.
 //!
-//! # The legacy asymmetry this table encodes
+//! # One gating rule
 //!
-//! The hardest acceptance criterion for #81 is **zero behaviour change**, and
-//! today's gating is asymmetric: most credential work runs on every launch
-//! regardless of which tool was picked. A naive "each provider owns its
-//! stuff, iterate the selected set" refactor would silently delete every
-//! `Always` in the table below. Each cell is therefore an explicit, tested
-//! field rather than an inference.
+//! Every provider-owned facet a launch can reach — host credential capture,
+//! the guest placeholder files, the proxy secret and its intercept route, the
+//! first-run bypass configs, and the provider guest env — is gated on one
+//! predicate: membership in the launch's **provisioning set**
+//! (`config::CatalogEntry::provisioned`, the transitive closure of the tool's
+//! `tools` over the catalog, unioned with each visited tool's `credentials`).
+//! A `"*"` entry closes over the declaring tool's **own configuration file**
+//! (origin equality — `ToolOrigin`), never the merged catalog, so one file's
+//! tools cannot widen another file's tool. There is deliberately no per-facet
+//! `Scope` field any more: one rule needs no table.
+//!
+//! **Invariant: a placeholder is never provisioned into the guest unless this
+//! launch registers its substitution entry.** For Anthropic/OpenAI/
+//! OpenCode-static this holds by construction — their placeholders live in
+//! files written *by* capture. Copilot is the exception (its placeholder lives
+//! in `copilot/config.json`, a *config* file), which is why
+//! `write_copilot_guest_config` runs **after** `secrets::refresh_copilot` and
+//! why `COPILOT_GITHUB_TOKEN` is gated on wiring as well as membership. See
+//! ADR-0017.
 //!
 //! | Facet | Anthropic | OpenAI | OpenCode-static | Copilot |
 //! |---|---|---|---|---|
-//! | host credential capture | always | always | when selected | when selected \|\| github-egress |
-//! | bypass config written | always | always | always | when selected |
 //! | guest home symlinks | always | n/a (the codex tool's `env`) | always | always |
 //! | eager state dir (`ensure_dirs`) | `claude` | `codex` | `opencode` | — |
-//! | guest env | — | — | — | `COPILOT_GITHUB_TOKEN` when selected |
-//! | proxy secret registered | when token present | when token present | when token present | when token present **and** selected |
+//! | guest env | — | — | — | `COPILOT_GITHUB_TOKEN` when provisioned **and** wired |
+//! | proxy secret registered | when token present | when token present | when token present | when token present **and** provisioned |
 //! | missing-credential hard bail | yes | no | no | yes |
 //!
-//! `Always` is a *preserved legacy behaviour*, not a design goal. Narrowing it
-//! is a behaviour change tracked in
-//! [agent-vm #118](https://github.com/gregwebs/agent-vm/issues/118) (#82 kept
-//! it intact to meet its identical-behaviour criterion), which is why it is
-//! spelled out in [`Scope`] rather than hard-coded.
+//! The remaining `always` rows (guest home links, eager state dirs) are
+//! **furniture, not capability** — the whole state dir is already bind-mounted
+//! at `/agent-vm-state`, so they are deliberately not gated. See ADR-0017.
 //!
 //! # Names
 //!
@@ -135,6 +144,10 @@ impl ProviderSet {
         self.0 & (1 << (provider as u8)) != 0
     }
 
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
     /// Always yields in `CredentialProvider::ALL` order — determinism matters
     /// for error ordering and for the guest-env/link ordering tests.
     pub fn iter(self) -> impl Iterator<Item = CredentialProvider> {
@@ -206,46 +219,47 @@ pub fn eager_state_dirs() -> Vec<&'static str> {
     dirs
 }
 
-/// The guest env pairs owned by the *selected* providers, in
-/// `CredentialProvider::ALL` order. A tool's own env is not here — it is
-/// config ([`crate::config::Tool::guest_env`]), published earlier by
-/// `run::launch`.
-pub fn provider_guest_env(selection: ProviderSet) -> Vec<(&'static str, &'static str)> {
+/// The two per-launch provider sets the gating reads. Two separate
+/// `ProviderSet` parameters would be swappable at the call site.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LaunchProviders {
+    /// Everything this launch provisions (the tool's `tools` closure).
+    pub(crate) provisioned: ProviderSet,
+    /// Those whose host credential was captured, so the proxy holds a
+    /// substitution entry. `wired ⊆ provisioned` by construction.
+    pub(crate) wired: ProviderSet,
+}
+
+/// The guest env pairs owned by the providers this launch both provisions and
+/// wired. A tool's own env is not here — it is config
+/// ([`crate::config::Tool::guest_env`]), published earlier by `run::launch`.
+///
+/// Membership alone is not enough: `shell` provisions Copilot without
+/// requiring it, so a failed Copilot capture would otherwise export an
+/// unsubstituted placeholder bearer.
+pub fn provider_guest_env(launch: LaunchProviders) -> Vec<(&'static str, &'static str)> {
     let mut env = Vec::new();
     for provider in CredentialProvider::ALL {
-        for &(key, value, scope) in provider.spec().guest_env {
-            if scope.applies(provider, selection) {
-                env.push((key, value));
-            }
+        if !(launch.provisioned.contains(provider) && launch.wired.contains(provider)) {
+            continue;
+        }
+        for &(key, value) in provider.spec().guest_env {
+            env.push((key, value));
         }
     }
     env
 }
 
-/// The hard-stop message when a selected provider produced no usable
+/// The hard-stop message when a **required** provider produced no usable
 /// credential, or `None` if this provider degrades gracefully.
 pub fn missing_credential_error(provider: CredentialProvider) -> Option<&'static str> {
     provider.spec().missing_credential_error
-}
-
-/// Whether the substituting proxy must only register `provider`'s secret when
-/// the provider was selected. This is the one security-critical asymmetry: a
-/// Copilot placeholder exported into a non-Copilot guest would be sent to the
-/// Copilot API with no registered substitution entry.
-pub(crate) fn proxy_requires_selection(provider: CredentialProvider) -> bool {
-    provider.spec().proxy_requires_selection
 }
 
 /// What the substituting proxy must register for `provider` — `None` when the
 /// provider has no proxied secret of its own.
 pub(crate) fn proxy_secret(provider: CredentialProvider) -> Option<ProxySecret> {
     provider.spec().proxy.clone()
-}
-
-/// The capture gate for `provider`, read by [`crate::secrets::refresh`] as the
-/// single source of truth for the legacy asymmetry.
-pub(crate) fn capture_scope(provider: CredentialProvider) -> CaptureScope {
-    provider.spec().capture
 }
 
 /// Whether an OAuth-rotatable provider accepts a refresh placeholder, plus the
@@ -255,30 +269,31 @@ pub(crate) fn oauth_rotation(provider: CredentialProvider) -> Option<&'static OA
     provider.oauth_rotation()
 }
 
-/// Write the first-run bypass configs for the selected providers, then the
-/// generic `bash_history` seed. Idempotent across launches; merges instead of
-/// overwrites so user tweaks survive.
+/// Write the first-run bypass configs for the **provisioned** providers, then
+/// the generic `bash_history` seed. Idempotent across launches; merges instead
+/// of overwriting so user tweaks survive.
 ///
-/// **Not the same writer as [`crate::secrets::write_opencode_model_default`].**
-/// Both touch `opencode-config/opencode.json`; they are ordered and disagree
-/// on purpose. This function seeds `model = "openai/gpt-5.5"` *before*
-/// capture; `write_opencode_model_default` runs *after* capture and removes
-/// that key when the launch ended up wired to a non-OpenAI OpenCode provider.
-/// Do not merge them.
+/// Copilot is deliberately absent: its `copilot/config.json` carries the
+/// proxy placeholder, so it is written *after* capture by
+/// [`write_copilot_guest_config`] — writing it here would provision a
+/// placeholder the launch may never register. Do **not** "fix" that by
+/// reordering this whole function: `secrets::write_opencode_model_default`
+/// (post-capture) deliberately disagrees with `write_opencode_bypass`
+/// (pre-capture) about `opencode-config/opencode.json`.
 pub(crate) fn write_bypass_configs(
     guest: &GuestStateDir,
     ctx: &BypassContext<'_>,
-    selection: ProviderSet,
+    provisioned: ProviderSet,
 ) -> Result<()> {
     for provider in CredentialProvider::ALL {
-        if !provider.spec().bypass.applies(provider, selection) {
+        if !provisioned.contains(provider) {
             continue;
         }
         match provider {
             CredentialProvider::Anthropic => write_anthropic_bypass(guest, ctx)?,
             CredentialProvider::OpenAi => write_openai_bypass(guest)?,
             CredentialProvider::OpencodeStatic => write_opencode_bypass(guest)?,
-            CredentialProvider::Copilot => write_copilot_bypass(guest)?,
+            CredentialProvider::Copilot => {}
         }
     }
     // Generic: pairs with the `.bash_history` link in `GENERIC_HOME_LINKS`.
@@ -364,7 +379,10 @@ fn write_opencode_bypass(guest: &GuestStateDir) -> Result<()> {
     Ok(())
 }
 
-fn write_copilot_bypass(guest: &GuestStateDir) -> Result<()> {
+/// Write Copilot's guest config. Called by [`crate::secrets::refresh`] **only
+/// when the Copilot token was captured this launch**, because `github_token`
+/// holds the proxy placeholder.
+pub(crate) fn write_copilot_guest_config(guest: &GuestStateDir) -> Result<()> {
     let mut copilot = secrets::read_guest_json_object(guest, Path::new("copilot/config.json"));
     copilot.insert("trusted_folders".into(), serde_json::json!(["/"]));
     copilot.insert(
@@ -377,59 +395,6 @@ fn write_copilot_bypass(guest: &GuestStateDir) -> Result<()> {
         0o600,
     )?;
     Ok(())
-}
-
-/// Whether a facet applies on every launch or only when the launched tool
-/// declared the provider. Today most facets are `Always` — that is a
-/// *preserved legacy behaviour*, not a design goal;
-/// [agent-vm #118](https://github.com/gregwebs/agent-vm/issues/118) narrows
-/// them deliberately, which is exactly why it is spelled out here.
-// TODO(#118): narrow the `Always` scopes deliberately — each is a *preserved*
-// legacy behaviour, not a design goal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scope {
-    Always,
-    WhenSelected,
-}
-
-impl Scope {
-    /// Whether this facet applies for the given selection. `github_egress` is
-    /// deliberately absent: only [`CaptureScope`] has the three-way case.
-    fn applies(self, provider: CredentialProvider, selection: ProviderSet) -> bool {
-        match self {
-            Scope::Always => true,
-            Scope::WhenSelected => selection.contains(provider),
-        }
-    }
-}
-
-/// Capture gate for a provider. A distinct type from [`Scope`] because Copilot
-/// has the one three-way case: captured when selected *or* when GitHub egress
-/// is already on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CaptureScope {
-    Always,
-    WhenSelected,
-    /// Copilot only: the Copilot API takes a GitHub OAuth token, which is also
-    /// captured whenever GitHub egress is on. See `secrets.rs`'s D1 note.
-    WhenSelectedOrGithubEgress,
-}
-
-impl CaptureScope {
-    pub(crate) fn applies(
-        self,
-        provider: CredentialProvider,
-        selection: ProviderSet,
-        github_egress: bool,
-    ) -> bool {
-        match self {
-            CaptureScope::Always => true,
-            CaptureScope::WhenSelected => selection.contains(provider),
-            CaptureScope::WhenSelectedOrGithubEgress => {
-                selection.contains(provider) || github_egress
-            }
-        }
-    }
 }
 
 /// A proxy-substitution entry: the env var it is registered under, the
@@ -471,11 +436,8 @@ struct ProviderSpec {
     /// Created by `ProjectSession::ensure_dirs` before boot.
     eager_state_dirs: &'static [&'static str],
     home_links: &'static [HomeLink],
-    guest_env: &'static [(&'static str, &'static str, Scope)],
+    guest_env: &'static [(&'static str, &'static str)],
     proxy: Option<ProxySecret>,
-    proxy_requires_selection: bool,
-    capture: CaptureScope,
-    bypass: Scope,
     missing_credential_error: Option<&'static str>,
     oauth_rotation: Option<OAuthRotation>,
 }
@@ -527,9 +489,6 @@ const SPECS: [ProviderSpec; 4] = [
                 secrets::ANTHROPIC_OAUTH_TOKEN_PATH,
             )),
         }),
-        proxy_requires_selection: false,
-        capture: CaptureScope::Always,
-        bypass: Scope::Always,
         missing_credential_error: Some(ANTHROPIC_MISSING),
         oauth_rotation: Some(OAuthRotation {
             sni_host: secrets::ANTHROPIC_OAUTH_HOST,
@@ -561,9 +520,6 @@ const SPECS: [ProviderSpec; 4] = [
             basic_auth: false,
             oauth_token_route: Some((secrets::OPENAI_OAUTH_HOST, secrets::OPENAI_OAUTH_TOKEN_PATH)),
         }),
-        proxy_requires_selection: false,
-        capture: CaptureScope::Always,
-        bypass: Scope::Always,
         missing_credential_error: None,
         oauth_rotation: Some(OAuthRotation {
             sni_host: secrets::OPENAI_OAUTH_HOST,
@@ -603,9 +559,6 @@ const SPECS: [ProviderSpec; 4] = [
             basic_auth: false,
             oauth_token_route: None,
         }),
-        proxy_requires_selection: false,
-        capture: CaptureScope::WhenSelected,
-        bypass: Scope::Always,
         missing_credential_error: None,
         oauth_rotation: None,
     },
@@ -634,11 +587,7 @@ const SPECS: [ProviderSpec; 4] = [
         // (`provider_guest_env`, published after `GUEST_ALWAYS_ENV`); see the
         // module doc for why exporting it to a non-Copilot guest would be a
         // proxy/substitution violation.
-        guest_env: &[(
-            "COPILOT_GITHUB_TOKEN",
-            secrets::COPILOT_TOKEN_PLACEHOLDER,
-            Scope::WhenSelected,
-        )],
+        guest_env: &[("COPILOT_GITHUB_TOKEN", secrets::COPILOT_TOKEN_PLACEHOLDER)],
         proxy: Some(ProxySecret {
             env_var: "MSB_AGENT_VM_COPILOT_UNUSED",
             placeholder: secrets::COPILOT_TOKEN_PLACEHOLDER,
@@ -649,9 +598,6 @@ const SPECS: [ProviderSpec; 4] = [
             basic_auth: false,
             oauth_token_route: None,
         }),
-        proxy_requires_selection: true,
-        capture: CaptureScope::WhenSelectedOrGithubEgress,
-        bypass: Scope::WhenSelected,
         missing_credential_error: Some(COPILOT_MISSING),
         oauth_rotation: None,
     },
@@ -790,80 +736,106 @@ mod tests {
         );
     }
 
-    /// V4: characterization golden for the bypass configs written on a
-    /// *codex* (non-copilot) launch, captured on the pre-refactor tree. The
-    /// claude/codex/opencode files are written **unconditionally** — a
-    /// `Scope::Always` transcribed as `WhenSelected` is the single biggest
-    /// regression class this ticket guards against.
+    /// **U1.** `write_bypass_configs` writes exactly the bypass configs for
+    /// the **provisioned** providers (plus the generic `bash_history`), and
+    /// nothing else. The empty row proves the gate closes; the all-four row
+    /// catches a revert of the Copilot reorder — `copilot/config.json` holds a
+    /// placeholder and is written post-capture, never here.
     #[test]
-    fn bypass_configs_written_for_codex_launch_match_legacy() {
-        let (state, guest) = guest();
+    fn write_bypass_configs_follows_the_provisioning_set() {
+        use CredentialProvider::*;
         let ctx = BypassContext {
             project_guest_path: "/workspace/p",
         };
-        write_bypass_configs(&guest, &ctx, ProviderSet::new([CredentialProvider::OpenAi])).unwrap();
-
-        let golden: &[(&str, &[u8], u32)] = &[
+        let claude_settings: (&str, Vec<u8>, u32) = (
+            "claude/settings.json",
+            br#"{"theme":"dark","hasCompletedOnboarding":true,"skipDangerousModePermissionPrompt":true,"effortLevel":"xhigh"}"#.to_vec(),
+            0o644,
+        );
+        let claude_json: (&str, Vec<u8>, u32) = (
+            "claude.json",
+            br#"{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"projects":{"/workspace/p":{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true,"history":[]}}}"#.to_vec(),
+            0o644,
+        );
+        let codex_config: (&str, Vec<u8>, u32) = (
+            "codex/config.toml",
+            b"sandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\n".to_vec(),
+            0o644,
+        );
+        let opencode_config: (&str, Vec<u8>, u32) = (
+            "opencode-config/opencode.json",
+            br#"{"$schema":"https://opencode.ai/config.json","model":"openai/gpt-5.5","autoupdate":false}"#.to_vec(),
+            0o644,
+        );
+        // Type alias keeps the nested tuple out of clippy's `type_complexity`
+        // lint, which the `--all-targets -D warnings` gate turns into an error.
+        type GoldenFile = (&'static str, Vec<u8>, u32);
+        let cases: [(Vec<CredentialProvider>, Vec<GoldenFile>); 5] = [
+            (vec![], vec![]),
+            (vec![OpenAi], vec![codex_config.clone()]),
             (
-                "claude/settings.json",
-                br#"{"theme":"dark","hasCompletedOnboarding":true,"skipDangerousModePermissionPrompt":true,"effortLevel":"xhigh"}"#,
-                0o644,
+                vec![Anthropic],
+                vec![claude_settings.clone(), claude_json.clone()],
             ),
+            (vec![OpencodeStatic], vec![opencode_config.clone()]),
             (
-                "claude.json",
-                br#"{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"projects":{"/workspace/p":{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true,"history":[]}}}"#,
-                0o644,
+                vec![Anthropic, OpenAi, OpencodeStatic, Copilot],
+                vec![
+                    claude_settings.clone(),
+                    claude_json.clone(),
+                    codex_config.clone(),
+                    opencode_config.clone(),
+                ],
             ),
-            (
-                "codex/config.toml",
-                b"sandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\n",
-                0o644,
-            ),
-            (
-                "opencode-config/opencode.json",
-                br#"{"$schema":"https://opencode.ai/config.json","model":"openai/gpt-5.5","autoupdate":false}"#,
-                0o644,
-            ),
-            ("bash_history", b"", 0o600),
         ];
-        for (relative, bytes, mode) in golden {
-            let actual = guest
-                .read(Path::new(relative))
-                .unwrap()
-                .unwrap_or_else(|| panic!("{relative} must be written by the bypass writer"));
-            assert_eq!(&actual, bytes, "bytes for {relative} changed");
-            assert_eq!(
-                std::fs::metadata(state.path().join(relative))
+        for (provisioned, files) in cases {
+            let (state, guest) = guest();
+            write_bypass_configs(&guest, &ctx, ProviderSet::new(provisioned.clone())).unwrap();
+            let mut expected = files;
+            expected.push(("bash_history", b"".to_vec(), 0o600));
+            for (relative, bytes, mode) in &expected {
+                let actual = guest
+                    .read(Path::new(relative))
                     .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                *mode,
-                "mode for {relative} changed"
+                    .unwrap_or_else(|| panic!("{relative} must be written for {provisioned:?}"));
+                assert_eq!(
+                    &actual, bytes,
+                    "bytes for {relative} changed ({provisioned:?})"
+                );
+                assert_eq!(
+                    std::fs::metadata(state.path().join(relative))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    *mode,
+                    "mode for {relative} changed ({provisioned:?})"
+                );
+            }
+            assert_eq!(
+                count_files(state.path()),
+                expected.len(),
+                "an unexpected file was written for {provisioned:?}"
+            );
+            assert!(
+                !state.path().join("copilot").exists(),
+                "copilot/config.json must never be written by the pre-capture pass ({provisioned:?})"
             );
         }
-        assert!(!state.path().join("copilot").exists());
-        assert_eq!(count_files(state.path()), golden.len());
     }
 
-    /// V5: the copilot bypass config is written **only** when Copilot is
-    /// selected, at 0600, carrying the placeholder (never a real token).
+    /// **U2.** Copilot's guest config is written by the post-capture writer
+    /// only, carries the placeholder at 0600, and its placeholder is removed
+    /// again when a later launch does not wire Copilot — without disturbing
+    /// keys we do not own.
     #[test]
-    fn copilot_bypass_config_only_when_selected() {
+    fn copilot_guest_config_round_trips_and_clears_only_our_placeholder() {
         let (state, guest) = guest();
-        let ctx = BypassContext {
-            project_guest_path: "/workspace/p",
-        };
-        write_bypass_configs(
-            &guest,
-            &ctx,
-            ProviderSet::new([CredentialProvider::Copilot]),
-        )
-        .unwrap();
+        write_copilot_guest_config(&guest).unwrap();
         let bytes = guest
             .read(Path::new("copilot/config.json"))
             .unwrap()
-            .expect("copilot/config.json must be written for a copilot launch");
+            .expect("copilot/config.json must be written");
         assert_eq!(
             bytes,
             br#"{"trusted_folders":["/"],"github_token":"msb-copilot-placeholder-v2"}"#
@@ -876,97 +848,121 @@ mod tests {
                 & 0o777,
             0o600
         );
+
+        crate::secrets::clear_copilot_guest_token(&guest).unwrap();
+        let config: serde_json::Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("copilot/config.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(config.get("github_token").is_none(), "{config}");
+        assert_eq!(config["trusted_folders"], serde_json::json!(["/"]));
+
+        // Idempotent.
+        crate::secrets::clear_copilot_guest_token(&guest).unwrap();
+
+        // A fresh guest creates nothing.
+        let (fresh_state, fresh_guest) = self::guest();
+        crate::secrets::clear_copilot_guest_token(&fresh_guest).unwrap();
+        assert!(!fresh_state.path().join("copilot").exists());
+
+        // Asymmetric boundary: a real user value is left untouched.
+        let (_seed_state, seeded) = self::guest();
+        seeded
+            .atomic_write(
+                Path::new("copilot/config.json"),
+                br#"{"github_token":"ghu_real_user_value"}"#,
+                0o600,
+            )
+            .unwrap();
+        crate::secrets::clear_copilot_guest_token(&seeded).unwrap();
+        let config: serde_json::Value = serde_json::from_slice(
+            &seeded
+                .read(Path::new("copilot/config.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["github_token"], "ghu_real_user_value");
     }
 
-    /// **V6.** The *provider-owned* guest-env set, per selection: only Copilot
-    /// contributes a pair, and only when it is selected. Exporting the Copilot
-    /// placeholder into a non-Copilot guest would make the guest send an
-    /// unsubstituted bearer to the Copilot API. `CODEX_HOME` must never appear
-    /// here — it moved onto the codex tool's config `env` (#119), so the tool
-    /// owns that emission, not a provider.
+    /// **U3.** `provider_guest_env` is membership in the **provisioning set**
+    /// **times** wiring: only Copilot contributes a pair, and only when this
+    /// launch both provisions it and captured its token. Exporting the Copilot
+    /// placeholder into a non-Copilot guest — or after a failed capture — would
+    /// make the guest send an unsubstituted bearer to the Copilot API.
+    /// `CODEX_HOME` must never appear here — it moved onto the codex tool's
+    /// config `env` (#119), so the tool owns that emission, not a provider.
     #[test]
-    fn provider_guest_env_is_the_selected_providers_pairs_only() {
+    fn provider_guest_env_is_membership_times_wiring() {
+        use CredentialProvider::*;
         const COPILOT: [(&str, &str); 1] = [("COPILOT_GITHUB_TOKEN", "msb-copilot-placeholder-v2")];
         // Type alias keeps the nested tuple out of clippy's `type_complexity`
         // lint, which the `--all-targets -D warnings` gate turns into an error.
         type Case = (
-            &'static [&'static str],
+            &'static [CredentialProvider],
+            &'static [CredentialProvider],
             &'static [(&'static str, &'static str)],
         );
+        let all: &'static [CredentialProvider] = &[Anthropic, OpenAi, OpencodeStatic, Copilot];
         let cases: [Case; 6] = [
-            (&[], &[]),
-            (&["anthropic"], &[]),
-            (&["openai"], &[]),
-            (&["openai", "opencode-static"], &[]),
-            (&["copilot"], &COPILOT),
-            // The full set is the only case that distinguishes "gated on
-            // Copilot" from "gated on being the only provider": a
-            // `Scope::applies` regression that leaks a non-selected provider's
-            // pair shows up here and nowhere else.
+            (&[], &[], &[]),
+            // The load-bearing row: provisioned but not wired.
+            (&[Copilot], &[], &[]),
+            // Defence in depth (unreachable by construction: `wired ⊆ provisioned`).
+            (&[], &[Copilot], &[]),
+            (&[Copilot], &[Copilot], &COPILOT),
+            (all, all, &COPILOT),
             (
-                &["anthropic", "openai", "opencode-static", "copilot"],
-                &COPILOT,
+                &[Anthropic, OpenAi, OpencodeStatic],
+                &[Anthropic, OpenAi, OpencodeStatic],
+                &[],
             ),
         ];
-        for (names, expected) in cases {
-            let selection = ProviderSet::new(
-                names
-                    .iter()
-                    .map(|name| CredentialProvider::from_config_name(name).unwrap()),
-            );
-            let pairs = provider_guest_env(selection);
+        for (provisioned, wired, expected) in cases {
+            let launch = LaunchProviders {
+                provisioned: ProviderSet::new(provisioned.iter().copied()),
+                wired: ProviderSet::new(wired.iter().copied()),
+            };
+            let pairs = provider_guest_env(launch);
             // Before the exact-set assertion on purpose: on an ownership
             // regression this fires first with the "ownership moved" message,
             // rather than an opaque `left == right` diff that also happens to
             // name the offender.
             assert!(
                 !pairs.iter().any(|(key, _)| *key == "CODEX_HOME"),
-                "the tool owns CODEX_HOME now, not a provider ({names:?})"
+                "the tool owns CODEX_HOME now, not a provider ({provisioned:?})"
             );
-            assert_eq!(pairs, expected, "for {names:?}");
+            assert_eq!(
+                pairs, expected,
+                "for provisioned={provisioned:?} wired={wired:?}"
+            );
         }
     }
 
-    /// Every `Scope`/`CaptureScope`/`proxy_requires_selection` value pinned to
-    /// the legacy gating. The Anthropic/OpenAI capture scopes are read by no
-    /// behaviour today (capture is unconditional), so only this direct value
-    /// test would fail if one were transcribed wrong.
+    /// **U4.** The legacy scope machinery is deleted, not merely unused:
+    /// `Scope`, `CaptureScope` and `proxy_requires_selection` no longer exist.
+    /// This scans the **definitions** only — historical mentions in doc
+    /// comments are legitimate (they are how ADR-0017 records why the enums
+    /// went away). The compiler plus the deleted behaviour are the real guard;
+    /// this is a cheap tripwire.
     #[test]
-    fn scopes_match_legacy_gating() {
-        use CaptureScope::*;
-        assert_eq!(capture_scope(CredentialProvider::Anthropic), Always);
-        assert_eq!(capture_scope(CredentialProvider::OpenAi), Always);
-        assert_eq!(
-            capture_scope(CredentialProvider::OpencodeStatic),
-            WhenSelected
-        );
-        assert_eq!(
-            capture_scope(CredentialProvider::Copilot),
-            WhenSelectedOrGithubEgress
-        );
-
-        for provider in [
-            CredentialProvider::Anthropic,
-            CredentialProvider::OpenAi,
-            CredentialProvider::OpencodeStatic,
-        ] {
-            assert_eq!(
-                provider.spec().bypass,
-                Scope::Always,
-                "bypass configs must be written unconditionally for {provider:?}"
-            );
-        }
-        assert_eq!(
-            CredentialProvider::Copilot.spec().bypass,
-            Scope::WhenSelected
-        );
-
-        assert!(!proxy_requires_selection(CredentialProvider::Anthropic));
-        assert!(!proxy_requires_selection(CredentialProvider::OpenAi));
-        assert!(!proxy_requires_selection(
-            CredentialProvider::OpencodeStatic
+    fn the_legacy_scope_machinery_is_absent_from_the_source() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/credential_provider.rs"
         ));
-        assert!(proxy_requires_selection(CredentialProvider::Copilot));
+        // The needles are assembled so this very test's source does not contain
+        // them contiguously (an `include_str!` self-reference would always hit).
+        for banned in [
+            ["enum", " Scope"].concat(),
+            ["enum", " CaptureScope"].concat(),
+            ["fn ", "proxy_requires_selection"].concat(),
+        ] {
+            assert!(!src.contains(&banned), "{banned} came back");
+        }
     }
 
     /// V11: config-name round trip; unknown names rejected.
@@ -1082,8 +1078,6 @@ mod tests {
             assert!(!provider.doctor_label().is_empty());
             let _ = provider.doctor_parses_expiry();
             let _ = provider.host_credential_path();
-            let _ = proxy_requires_selection(provider);
-            let _ = capture_scope(provider);
             let _ = oauth_rotation(provider);
             if let Some(secret) = proxy_secret(provider) {
                 assert!(!secret.env_var.is_empty());

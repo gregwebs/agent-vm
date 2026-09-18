@@ -33,11 +33,18 @@
 # `codex` needs CODEX_HOME because codex is the one agent with no ~/<dotfile>
 # symlink into the state dir — its install prefix holds `packages/` and a
 # symlink at ~/.codex would shadow the binary itself (ARCHITECTURE.md,
-# credential_provider::guest_home_links). `shell` carries the same pair because
-# it already declares `credentials = ["openai", ...]`: the state dir and
-# codex/auth.json are provisioned on a shell launch either way, so dropping the
-# pointer would leave a fully-provisioned, unreachable credential. The other
-# three agents never read CODEX_HOME.
+# credential_provider::guest_home_links). `shell` carries the same pair
+# because its omitted `tools` defaults to the wildcard, and in the shipped
+# default catalog that wildcard closes over this file's four agents (see
+# ADR-0017), so codex/auth.json is provisioned on a shell launch and dropping
+# the pointer would leave a fully-provisioned, unreachable credential. The
+# other three agents never read CODEX_HOME.
+#
+# `shell` declares no `credentials`: it is not an agent and must not inherit
+# any provider's hard bail (Anthropic's and Copilot's would make `agent-vm
+# shell` fail for any user without both host logins). Its omitted `tools`
+# defaults to `["*"]`, so it *provisions* every provider the catalog's tools
+# declare without *requiring* any of them. See ADR-0017.
 
 [[tools]]
 name = "codex"
@@ -89,7 +96,6 @@ persist = []
 name = "shell"
 command = "bash"
 args = ["-O", "histappend"]
-credentials = ["openai", "opencode-static"]
 persist = []
 interactive_shell = true
 env = { CODEX_HOME = "/agent-vm-state/codex" }

@@ -15,7 +15,9 @@ pub(crate) struct Inputs<'a> {
     pub creds: &'a CredsState,
     pub state_dir: &'a Path,
     pub allowed_repos: &'a [String],
-    pub providers: ProviderSet,
+    /// The launch's provisioning set; a provider outside it is never
+    /// registered.
+    pub provisioned: ProviderSet,
 }
 
 /// Registration order for the substituting proxy's secrets. Explicit because
@@ -25,7 +27,7 @@ pub(crate) struct Inputs<'a> {
 /// `secrets::placeholders_are_pairwise_distinct` proves no placeholder is a
 /// substring of another, so substitution cannot pick the wrong secret — but
 /// this is a prefactor, so the wire order stays byte-identical and is asserted
-/// by `proxy_plan_matches_legacy_for_each_agent`.
+/// by `proxy_plan_registers_only_the_provisioned_providers`.
 enum WireSlot {
     Provider(CredentialProvider),
     GithubEgress,
@@ -80,9 +82,10 @@ impl Plan {
         for slot in WIRE_ORDER {
             match slot {
                 WireSlot::Provider(provider) => {
-                    if credential_provider::proxy_requires_selection(provider)
-                        && !inputs.providers.contains(provider)
-                    {
+                    // One rule for every provider: a secret outside the
+                    // provisioning set is never registered, so a placeholder
+                    // can never reach a guest without its substitution entry.
+                    if !inputs.provisioned.contains(provider) {
                         continue;
                     }
                     let (Some(spec), Some(path)) = (
@@ -239,12 +242,12 @@ mod tests {
     fn path(name: &str) -> PathBuf {
         PathBuf::from(format!("/host/{name}"))
     }
-    fn inputs(creds: &CredsState, providers: ProviderSet) -> Inputs<'_> {
+    fn inputs(creds: &CredsState, provisioned: ProviderSet) -> Inputs<'_> {
         Inputs {
             creds,
             state_dir: Path::new("/state/project"),
             allowed_repos: &[],
-            providers,
+            provisioned,
         }
     }
 
@@ -292,13 +295,13 @@ mod tests {
         );
     }
 
-    /// V6: per-tool secret order. With every token file present, the
-    /// *legacy asymmetry* shows: anthropic/openai/opencode-openai/gh are
-    /// registered for **every** tool (only Copilot requires selection). The
-    /// order is fixed by `WIRE_ORDER`, with `gh` spliced between the OpenCode
-    /// and Copilot entries.
+    /// V6: per-tool secret order. The registered secret order is fixed by
+    /// `WIRE_ORDER`, with `gh` spliced between the OpenCode and Copilot
+    /// entries, and each provider is registered only when it is in the
+    /// launch's **provisioning set** (GitHub egress is orthogonal and stays
+    /// its own slot).
     #[test]
-    fn proxy_plan_matches_legacy_for_each_agent() {
+    fn proxy_plan_registers_only_the_provisioned_providers() {
         let creds = CredsState {
             anthropic_token_file: Some(path("anthropic")),
             openai_token_file: Some(path("openai")),
@@ -307,12 +310,6 @@ mod tests {
             copilot_token_file: Some(path("copilot")),
             ..CredsState::default()
         };
-        let base = [
-            "MSB_AGENT_VM_ANTHROPIC_UNUSED",
-            "MSB_AGENT_VM_OPENAI_UNUSED",
-            "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
-            "MSB_AGENT_VM_GH_UNUSED",
-        ];
         let opencode = ProviderSet::new([
             CredentialProvider::OpenAi,
             CredentialProvider::OpencodeStatic,
@@ -321,25 +318,35 @@ mod tests {
             (
                 "claude",
                 ProviderSet::new([CredentialProvider::Anthropic]),
-                &base,
+                &["MSB_AGENT_VM_ANTHROPIC_UNUSED", "MSB_AGENT_VM_GH_UNUSED"],
             ),
             (
                 "codex",
                 ProviderSet::new([CredentialProvider::OpenAi]),
-                &base,
+                &["MSB_AGENT_VM_OPENAI_UNUSED", "MSB_AGENT_VM_GH_UNUSED"],
             ),
-            ("opencode", opencode, &base),
-            ("shell", opencode, &base),
             (
-                "copilot",
-                ProviderSet::new([CredentialProvider::Copilot]),
+                "opencode",
+                opencode,
                 &[
-                    "MSB_AGENT_VM_ANTHROPIC_UNUSED",
                     "MSB_AGENT_VM_OPENAI_UNUSED",
                     "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
                     "MSB_AGENT_VM_GH_UNUSED",
-                    "MSB_AGENT_VM_COPILOT_UNUSED",
                 ],
+            ),
+            (
+                "shell",
+                opencode,
+                &[
+                    "MSB_AGENT_VM_OPENAI_UNUSED",
+                    "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
+                    "MSB_AGENT_VM_GH_UNUSED",
+                ],
+            ),
+            (
+                "copilot",
+                ProviderSet::new([CredentialProvider::Copilot]),
+                &["MSB_AGENT_VM_GH_UNUSED", "MSB_AGENT_VM_COPILOT_UNUSED"],
             ),
         ];
         for (name, providers, expected) in cases {
@@ -425,7 +432,7 @@ mod tests {
                     creds: &creds,
                     state_dir: Path::new("/state/project"),
                     allowed_repos: &allowed_repos,
-                    providers: all(),
+                    provisioned: all(),
                 },
             )
             .unwrap(),
@@ -545,19 +552,17 @@ mod tests {
     }
 
     #[test]
-    fn copilot_requires_selected_agent_and_partial_credentials_do_not_cross_configure() {
+    fn captured_providers_register_only_when_provisioned() {
         let creds = CredsState {
             anthropic_token_file: Some(path("anthropic")),
             copilot_token_file: Some(path("copilot")),
             ..CredsState::default()
         };
+        // Nothing provisioned: not even the captured Anthropic token is
+        // registered — the capability leak this ticket closes.
         let without =
             network(Plan::new(path("agent-vm"), inputs(&creds, ProviderSet::default())).unwrap());
-        assert_eq!(without.secrets.secrets.len(), 1);
-        assert_eq!(
-            without.secrets.secrets[0].placeholder,
-            secrets::ANTHROPIC_ACCESS_PLACEHOLDER
-        );
+        assert!(without.secrets.secrets.is_empty());
         assert!(
             without
                 .intercept
@@ -572,17 +577,26 @@ mod tests {
                 .iter()
                 .any(|entry| entry.placeholder == secrets::COPILOT_TOKEN_PLACEHOLDER)
         );
+        assert!(
+            with.secrets
+                .secrets
+                .iter()
+                .any(|entry| entry.placeholder == secrets::ANTHROPIC_ACCESS_PLACEHOLDER)
+        );
     }
 
     #[test]
-    fn shell_no_git_still_injects_available_provider_credentials() {
+    fn provisioned_openai_and_opencode_register_their_secrets() {
         let creds = CredsState {
             openai_token_file: Some(path("openai")),
             opencode_openai_access_token_file: Some(path("openai")),
             ..CredsState::default()
         };
-        let config =
-            network(Plan::new(path("agent-vm"), inputs(&creds, ProviderSet::default())).unwrap());
+        let provisioned = ProviderSet::new([
+            CredentialProvider::OpenAi,
+            CredentialProvider::OpencodeStatic,
+        ]);
+        let config = network(Plan::new(path("agent-vm"), inputs(&creds, provisioned)).unwrap());
         assert_eq!(config.secrets.secrets.len(), 2);
         assert!(
             config
@@ -718,12 +732,13 @@ mod tests {
 
     #[test]
     fn partial_provider_plans_omit_other_secrets_and_routes() {
-        for (creds, expected_placeholder, expected_route_host) in [
+        for (creds, provisioned, expected_placeholder, expected_route_host) in [
             (
                 CredsState {
                     anthropic_token_file: Some(path("anthropic")),
                     ..CredsState::default()
                 },
+                ProviderSet::new([CredentialProvider::Anthropic]),
                 secrets::ANTHROPIC_ACCESS_PLACEHOLDER,
                 Some(secrets::ANTHROPIC_OAUTH_HOST),
             ),
@@ -732,6 +747,7 @@ mod tests {
                     openai_token_file: Some(path("openai")),
                     ..CredsState::default()
                 },
+                ProviderSet::new([CredentialProvider::OpenAi]),
                 secrets::OPENAI_ACCESS_PLACEHOLDER,
                 Some(secrets::OPENAI_OAUTH_HOST),
             ),
@@ -740,13 +756,12 @@ mod tests {
                     gh_token_file: Some(path("gh")),
                     ..CredsState::default()
                 },
+                ProviderSet::default(),
                 secrets::GH_TOKEN_PLACEHOLDER,
                 Some(secrets::GITHUB_API_HOST),
             ),
         ] {
-            let config = network(
-                Plan::new(path("agent-vm"), inputs(&creds, ProviderSet::default())).unwrap(),
-            );
+            let config = network(Plan::new(path("agent-vm"), inputs(&creds, provisioned)).unwrap());
             assert_eq!(config.secrets.secrets.len(), 1);
             assert_eq!(config.secrets.secrets[0].placeholder, expected_placeholder);
             if let Some(host) = expected_route_host {
@@ -775,11 +790,14 @@ mod tests {
             .policy(base_policy.clone())
             .port(8080, 3000)
             .auto_publish();
-        let config = Plan::new(path("agent-vm"), inputs(&creds, ProviderSet::default()))
-            .unwrap()
-            .configure_network(base)
-            .build()
-            .unwrap();
+        let config = Plan::new(
+            path("agent-vm"),
+            inputs(&creds, ProviderSet::new([CredentialProvider::Anthropic])),
+        )
+        .unwrap()
+        .configure_network(base)
+        .build()
+        .unwrap();
         assert_eq!(config.ports.len(), 1);
         assert_eq!(config.ports[0].host_port, 8080);
         assert!(config.auto_publish.is_some());

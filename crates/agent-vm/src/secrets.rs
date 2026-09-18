@@ -237,9 +237,8 @@ pub struct CredsState {
     /// present, else falls back to the captured `gh auth token` (a gh
     /// login with the Copilot scope works against the Copilot API).
     ///
-    /// `Some` whenever a usable token was found and either the Copilot
-    /// provider is selected or GitHub egress is already enabled for
-    /// another tool (`CaptureScope::WhenSelectedOrGithubEgress`). Crucially
+    /// `Some` whenever a usable token was found **and** this launch provisions
+    /// Copilot (`CredentialProvisioning.provisioned`). Crucially
     /// this is NOT gated on `--no-git` for a Copilot launch: the Copilot
     /// API is not repo-scoped, so `agent-vm copilot` must work even in a
     /// non-GitHub project.
@@ -276,6 +275,21 @@ impl CredsState {
             CredentialProvider::OpencodeStatic => self.opencode_openai_access_token_file.as_deref(),
             CredentialProvider::Copilot => self.copilot_token_file.as_deref(),
         }
+    }
+
+    /// The providers whose host credential this launch actually captured —
+    /// exactly the ones [`Self::token_file`] answers `Some` for, in
+    /// `CredentialProvider::ALL` order. The single source of the placeholder
+    /// invariant's "wired" half: `wired ⊆ provisioned` by construction (capture
+    /// is gated on membership), and the guest-env gate conjoins both anyway so
+    /// a future capture path cannot leak a placeholder into a guest that never
+    /// declared the provider.
+    pub(crate) fn wired(&self) -> ProviderSet {
+        ProviderSet::new(
+            CredentialProvider::ALL
+                .into_iter()
+                .filter(|provider| self.token_file(*provider).is_some()),
+        )
     }
 }
 
@@ -444,13 +458,22 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
     openai_token_path(state_dir)
 }
 
-/// What this launch wants captured. Replaces three positional `bool`s
-/// (CODING_STANDARDS: don't put same-typed args in a row).
+/// What this launch provisions. `github_egress` is orthogonal to the tool
+/// (`--no-git` / detected repos) and deliberately no longer feeds capture.
 #[derive(Debug, Clone, Copy)]
-pub struct CredentialSelection {
-    pub providers: ProviderSet,
-    /// Driven by `--no-git` / detected repos, orthogonal to the tool.
+pub struct CredentialProvisioning {
+    pub provisioned: ProviderSet,
     pub github_egress: bool,
+}
+
+impl CredentialProvisioning {
+    /// Whether this launch provisions `provider` — the one predicate every
+    /// capture gate reads. Naming it keeps the four gates in [`refresh`]
+    /// identical instead of four differently-written copies of the same
+    /// membership test.
+    fn wants(&self, provider: CredentialProvider) -> bool {
+        self.provisioned.contains(provider)
+    }
 }
 
 /// Read host credentials, write the token file (atomically, 0600) and
@@ -465,20 +488,8 @@ pub struct CredentialSelection {
 pub fn refresh(
     state_dir: &Path,
     project_guest_path: &str,
-    selection: &CredentialSelection,
+    provisioning: &CredentialProvisioning,
 ) -> Result<CredsState> {
-    // The capture gate for each provider is the legacy asymmetry spelled out
-    // in `credential_provider`'s table. Deriving it from the table keeps the
-    // "why" local: Anthropic/OpenAI capture unconditionally (Always), while
-    // OpenCode-static follows the selection and Copilot follows the selection
-    // *or* GitHub egress.
-    let captures = |provider: CredentialProvider| {
-        credential_provider::capture_scope(provider).applies(
-            provider,
-            selection.providers,
-            selection.github_egress,
-        )
-    };
     let _lock =
         ProjectRefreshLock::acquire(state_dir).context("acquiring per-project refresh lock")?;
     // The token files hold the host's *real* access tokens, so their
@@ -502,36 +513,43 @@ pub fn refresh(
         tracing::warn!(error = %error, "leaving non-empty legacy guest token directory");
     }
 
-    // First-run bypasses, run regardless of whether the user has host
-    // credentials for the provider. Without these the in-VM agent
-    // blocks on a terminal-style wizard at first launch. The `Always` scope
-    // in the provider table keeps claude/codex/opencode configs flowing on
-    // every launch, not just the selected tool's.
+    // First-run bypasses, run for every provisioned provider regardless of
+    // whether the user has host credentials for it. Without these the in-VM
+    // agent blocks on a terminal-style wizard at first launch. Copilot's
+    // config is not written here: it carries the proxy placeholder and is
+    // written after capture (see below).
     let bypass_ctx = credential_provider::BypassContext { project_guest_path };
-    credential_provider::write_bypass_configs(&guest, &bypass_ctx, selection.providers)?;
+    credential_provider::write_bypass_configs(&guest, &bypass_ctx, provisioning.provisioned)?;
 
-    let anthropic_token_file = with_provider_lock(state_dir, REFRESH_LOCK_ANTHROPIC, || {
-        refresh_anthropic(state_dir, &guest)
-    })
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "anthropic credential refresh failed; skipping");
+    let anthropic_token_file = if provisioning.wants(CredentialProvider::Anthropic) {
+        with_provider_lock(state_dir, REFRESH_LOCK_ANTHROPIC, || {
+            refresh_anthropic(state_dir, &guest)
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "anthropic credential refresh failed; skipping");
+            None
+        })
+    } else {
         None
-    });
-    clear_stale_anthropic_placeholder(&guest, anthropic_token_file.is_some());
-    let openai_token_file = with_provider_lock(state_dir, REFRESH_LOCK_OPENAI, || {
-        refresh_openai(state_dir, &guest)
-    })
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "openai credential refresh failed; skipping");
+    };
+    let openai_token_file = if provisioning.wants(CredentialProvider::OpenAi) {
+        with_provider_lock(state_dir, REFRESH_LOCK_OPENAI, || {
+            refresh_openai(state_dir, &guest)
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "openai credential refresh failed; skipping");
+            None
+        })
+    } else {
         None
-    });
+    };
     // OpenCode auths against OpenAI like Codex does. If the user has
     // host Codex/OpenAI credentials, we synthesize an OpenCode-shaped
     // `auth.json` whose `access` field is a placeholder JWT — the
     // proxy substitutes that placeholder for the same real OpenAI
     // access token on outbound traffic. So OpenCode shares the
     // `openai_token_file` with Codex.
-    let want_opencode = captures(CredentialProvider::OpencodeStatic);
+    let want_opencode = provisioning.wants(CredentialProvider::OpencodeStatic);
     let opencode_oauth = if want_opencode && openai_token_file.is_some() {
         match opencode_oauth_entry() {
             Ok(entry) => entry,
@@ -549,7 +567,7 @@ pub fn refresh(
     // suppressed via `--no-git`). The launcher sets `github_egress=false`
     // when the user opted out or when no GitHub remote was found and no
     // `--repo` overrides were given.
-    let gh_token_file = if selection.github_egress {
+    let gh_token_file = if provisioning.github_egress {
         refresh_gh(state_dir).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "gh credential capture failed; skipping");
             None
@@ -558,27 +576,14 @@ pub fn refresh(
         None
     };
 
-    // D1: capture the host's GitHub Copilot token. Prefer the
-    // device-flow cache the original Bash agent-vm wrote
-    // (`~/.cache/claude-vm/copilot-token.json`); fall back to the
-    // `gh auth token` we just captured (a gh login carries the
-    // Copilot scope for users with a Copilot seat).
-    //
-    // Unlike the gh capture, this is NOT gated on `github_egress`. The
-    // Copilot API is reached with a GitHub OAuth token, but it is not
-    // repo-scoped the way `api.github.com` push is — so the reason to
-    // run `agent-vm copilot` (GitHub-backed AI) must not be switched off
-    // just because the project has no detected GitHub remote or the user
-    // passed `--no-git`. `captures(Copilot)` is the
-    // `WhenSelectedOrGithubEgress` scope: the token is captured whenever
-    // the Copilot provider is selected, or when GitHub egress is already
-    // enabled for another tool so an existing gh login still flows
-    // through. When Copilot is selected without GitHub egress there is no
-    // gh fallback token, so capture succeeds only via the device-flow
-    // cache; the caller surfaces a clear error if nothing was obtained
-    // rather than letting the guest send an unsubstituted placeholder
-    // bearer.
-    let copilot_token_file = if captures(CredentialProvider::Copilot) {
+    // D1: the Copilot API is reached with a GitHub OAuth token, but it is not
+    // repo-scoped the way `api.github.com` push is — so capture follows the
+    // provisioning set only, never `github_egress`. The former
+    // `WhenSelectedOrGithubEgress` disjunction existed so an existing `gh`
+    // login "still flowed through"; nothing consumed it (no substitution
+    // entry, no `copilot/config.json`, no `COPILOT_GITHUB_TOKEN`), so it only
+    // made `creds_notice` claim a provider the guest could not use.
+    let copilot_token_file = if provisioning.wants(CredentialProvider::Copilot) {
         refresh_copilot(state_dir, gh_token_file.as_deref()).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "copilot credential capture failed; skipping");
             None
@@ -586,6 +591,11 @@ pub fn refresh(
     } else {
         None
     };
+    // The placeholder in `copilot/config.json` is only safe once the proxy has
+    // something to substitute it with, so this write is post-capture.
+    if copilot_token_file.is_some() {
+        credential_provider::write_copilot_guest_config(&guest)?;
+    }
 
     // SHA-256 snapshot of host credential files for post-run mutation
     // detection. Phase 4's refresh hook *legitimately* rewrites these;
@@ -610,12 +620,19 @@ pub fn refresh(
         .openai_wired
         .then(|| opencode_openai_token_path(state_dir));
     let opencode_api_token_files = opencode_refresh.api_providers;
-    write_opencode_model_default(
-        &guest,
-        opencode_openai_access_token_file.is_some() || opencode_api_token_files.is_empty(),
-    )?;
+    if want_opencode {
+        write_opencode_model_default(
+            &guest,
+            opencode_openai_access_token_file.is_some() || opencode_api_token_files.is_empty(),
+        )?;
+    }
 
-    Ok(CredsState {
+    // Build the state first, then ask it which providers it actually wired
+    // (`wired()` is the single owner of that mapping). If a fifth provider is
+    // ever added, `token_file` and `wired` gain one match arm together instead
+    // of this clearer silently clearing the wrong file and the guest-env gate
+    // silently exporting another.
+    let creds = CredsState {
         anthropic_token_file,
         openai_token_file,
         opencode_openai_access_token_file,
@@ -623,7 +640,9 @@ pub fn refresh(
         gh_token_file,
         copilot_token_file,
         snapshot,
-    })
+    };
+    clear_unwired_placeholders(&guest, creds.wired());
+    Ok(creds)
 }
 
 /// Author identity to bake into the guest's `~/.gitconfig` so commits
@@ -1091,27 +1110,131 @@ fn write_opencode_model_default(guest: &GuestStateDir, pin_openai_model: bool) -
     )
 }
 
-/// Drop a guest Claude placeholder left over from an earlier, successful
-/// launch when *this* launch captured nothing.
+/// Drop a `github_token` placeholder left by an earlier launch that *did* wire
+/// Copilot, when this launch did not. The guest state dir persists across
+/// launches; the proxy's substitution entry does not, so leaving it would send
+/// `Bearer msb-copilot-placeholder-v2` verbatim to the Copilot API.
 ///
-/// The guest state dir persists across launches, but the proxy's
-/// substitution entry does not: it is rebuilt per launch from
-/// [`CredsState`]. So a stale placeholder plus a failed capture means the
-/// guest sends `Bearer msb-anthropic-placeholder-a-v2` verbatim — the
-/// in-VM agent looks signed in until every request 401s, and the obvious
-/// next move (`/login` in the guest) is itself refused by the OAuth hook.
-/// Removing it makes the guest *visibly* signed out and lets
-/// `run::launch` fail with an actionable message instead.
-///
-/// Best-effort: a removal failure is logged, not fatal — the launch is
-/// about to bail for a Claude launch anyway, and a codex/opencode launch
-/// should not be blocked by a stray Claude file.
-fn clear_stale_anthropic_placeholder(guest: &GuestStateDir, captured: bool) {
-    if captured {
-        return;
+/// Only *our* placeholder is removed, and only that key — a user may have
+/// added keys, and `trusted_folders` is harmless furniture (same rule as
+/// OpenCode's user-authored `auth.json` rows).
+pub(crate) fn clear_copilot_guest_token(guest: &GuestStateDir) -> Result<()> {
+    let relative = Path::new("copilot/config.json");
+    let mut config = read_guest_json_object(guest, relative);
+    if config.get("github_token").and_then(Value::as_str) != Some(COPILOT_TOKEN_PLACEHOLDER) {
+        return Ok(());
     }
-    if let Err(error) = guest.remove_file(Path::new("claude/.credentials.json")) {
-        tracing::warn!(error = %error, "leaving stale Anthropic guest placeholder");
+    config.remove("github_token");
+    guest.atomic_write(
+        relative,
+        &serde_json::to_vec(&Value::Object(config))?,
+        0o600,
+    )
+}
+
+/// True when guest JSON at `relative` holds `placeholder` at `pointer`.
+/// Unreadable, absent, non-JSON, or differently-shaped content is *not* ours.
+fn guest_json_holds(
+    guest: &GuestStateDir,
+    relative: &Path,
+    pointer: &str,
+    placeholder: &str,
+) -> bool {
+    let Ok(Some(raw)) = guest.read(relative) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
+        return false;
+    };
+    value.pointer(pointer).and_then(Value::as_str) == Some(placeholder)
+}
+
+/// Remove `claude/.credentials.json` only when it holds *our* placeholder.
+///
+/// The state dir is bind-mounted writable into the guest and persists across
+/// launches, so an in-guest Claude OAuth login can leave a **real** credential
+/// at this path. A launch that does not wire Anthropic must not delete it —
+/// only the body [`refresh_anthropic`] authored is cleared, exactly as the
+/// Copilot and OpenCode clearers scope on their own placeholder.
+fn clear_stale_anthropic_placeholder(guest: &GuestStateDir) -> Result<()> {
+    let relative = Path::new("claude/.credentials.json");
+    if guest_json_holds(
+        guest,
+        relative,
+        "/claudeAiOauth/accessToken",
+        ANTHROPIC_ACCESS_PLACEHOLDER,
+    ) {
+        guest.remove_file(relative)?;
+    }
+    Ok(())
+}
+
+/// Remove `codex/auth.json` only when it holds *our* placeholder.
+///
+/// Same hazard and same rule as [`clear_stale_anthropic_placeholder`]: an
+/// in-guest `codex login` writes a real credential to `$CODEX_HOME/auth.json`
+/// (which lives in the writable state mount), and it must survive a launch that
+/// wires no OpenAI. [`refresh_openai`] writes the placeholder either into
+/// `tokens.access_token` (the ChatGPT OAuth shape) or at `OPENAI_API_KEY` (the
+/// API-key shape), so both are checked.
+fn clear_stale_openai_placeholder(guest: &GuestStateDir) -> Result<()> {
+    let relative = Path::new("codex/auth.json");
+    let ours = guest_json_holds(
+        guest,
+        relative,
+        "/tokens/access_token",
+        OPENAI_ACCESS_PLACEHOLDER,
+    ) || guest_json_holds(
+        guest,
+        relative,
+        "/OPENAI_API_KEY",
+        OPENAI_ACCESS_PLACEHOLDER,
+    );
+    if ours {
+        guest.remove_file(relative)?;
+    }
+    Ok(())
+}
+
+/// Remove every guest-visible placeholder this launch did not wire.
+///
+/// The guest state dir persists across launches, but the proxy's substitution
+/// entry does not: it is rebuilt per launch from [`CredsState`]. A stale
+/// placeholder plus an unwired provider therefore means the guest sends the
+/// literal placeholder as a bearer — the in-guest agent looks signed in until
+/// every request 401s, and the obvious next move (`/login` in the guest) is
+/// itself refused by the OAuth hook. Removing it makes the guest *visibly*
+/// signed out and lets `run::launch` fail with an actionable message instead.
+///
+/// **Only our own placeholder is removed, never a guest-authored credential.**
+/// Every arm is content-scoped: the Anthropic and OpenAI arms check the value
+/// [`refresh_anthropic`]/[`refresh_openai`] wrote, the Copilot arm checks
+/// `github_token`, and OpenCode's `opencode/auth.json` is deliberately **not**
+/// handled here at all — it is a merged document holding user-authored
+/// provider entries, and [`refresh_opencode_with_paths`] already removes
+/// exactly our own synthetic `openai` row when OpenCode is not wired. (It also
+/// writes that file on every launch even when OpenCode is not provisioned — a
+/// pre-existing behaviour the invariant must know, or the “file absent”
+/// intuition misleads.)
+///
+/// Best-effort: a removal failure is logged, not fatal — a launch that needs
+/// the provider is about to bail anyway, and a launch that does not must not
+/// be blocked by a stray file.
+fn clear_unwired_placeholders(guest: &GuestStateDir, wired: ProviderSet) {
+    for provider in CredentialProvider::ALL {
+        if wired.contains(provider) {
+            continue;
+        }
+        let result = match provider {
+            CredentialProvider::Anthropic => clear_stale_anthropic_placeholder(guest),
+            CredentialProvider::OpenAi => clear_stale_openai_placeholder(guest),
+            // OpenCode's merged `auth.json` is handled by its own capture path.
+            CredentialProvider::OpencodeStatic => Ok(()),
+            CredentialProvider::Copilot => clear_copilot_guest_token(guest),
+        };
+        if let Err(error) = result {
+            tracing::warn!(provider = ?provider, error = %error, "leaving stale guest placeholder");
+        }
     }
 }
 
@@ -1860,10 +1983,10 @@ mod tests {
         }
     }
 
-    /// Build a [`CredentialSelection`] for tests.
-    fn selection(providers: ProviderSet, github_egress: bool) -> CredentialSelection {
-        CredentialSelection {
-            providers,
+    /// Build a [`CredentialProvisioning`] for tests.
+    fn provisioning(provisioned: ProviderSet, github_egress: bool) -> CredentialProvisioning {
+        CredentialProvisioning {
+            provisioned,
             github_egress,
         }
     }
@@ -1884,12 +2007,12 @@ mod tests {
         let creds = super::refresh(
             sd,
             "/workspace/p",
-            &selection(ProviderSet::default(), false),
+            &provisioning(ProviderSet::default(), false),
         )
         .unwrap();
         assert!(
             creds.copilot_token_file.is_none(),
-            "copilot token captured despite no GitHub egress and no Copilot provider"
+            "copilot token captured despite not provisioning Copilot"
         );
         // Independent of capture: the path the proxy would re-read must
         // never be under the guest mount (threat-model invariant).
@@ -1903,56 +2026,54 @@ mod tests {
         assert_eq!(cp.parent().unwrap().parent(), sd.parent());
     }
 
-    /// V7: the copilot capture gate is the disjunction
-    /// `github_egress || providers.contains(Copilot)`, not the provider alone.
-    /// Override `$HOME` to a temp dir holding a device-flow cache so capture
-    /// is deterministic without a logged-in `gh`.
+    /// **S4.** `github_egress` no longer feeds Copilot capture, and nothing
+    /// else detects the return of the deleted `WhenSelectedOrGithubEgress`
+    /// disjunction. A **fake `gh`** is put on `PATH` under the shared env guard
+    /// so `gh_token_file` is genuinely `Some` and the assertion can fail for the
+    /// reason the test exists — not because `gh` happens to be absent here.
     #[test]
-    fn copilot_capture_follows_use_github_or_want_copilot_disjunction() {
+    fn github_egress_no_longer_captures_copilot() {
+        use std::os::unix::fs::PermissionsExt as _;
         let mut env = crate::test_env::guard();
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".cache/claude-vm")).unwrap();
+        // The device-flow cache is present too, so Copilot capture would
+        // succeed if the deleted disjunction still ran.
         std::fs::write(
             home.path().join(".cache/claude-vm/copilot-token.json"),
             br#"{"access_token":"gho_canary_copilot"}"#,
         )
         .unwrap();
+        // A fake `gh auth token` so the GitHub-egress capture is decisive.
+        let bin = tempfile::tempdir().unwrap();
+        let fake_gh = bin.path().join("gh");
+        std::fs::write(&fake_gh, "#!/bin/sh\necho gho_fake_gh_token\n").unwrap();
+        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         env.set_var("HOME", home.path());
+        // Prepend (do not replace) so a concurrent test that spawns `git` still
+        // resolves it; the fake `gh` still wins the lookup.
+        let path = format!(
+            "{}:{}",
+            bin.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        env.set_var("PATH", path);
         let state = tempfile::tempdir().unwrap();
 
-        // github_egress=true, Copilot not selected → captured via GitHub egress.
         let creds = super::refresh(
             state.path(),
             "/workspace/p",
-            &selection(ProviderSet::default(), true),
+            &provisioning(ProviderSet::new([CredentialProvider::OpenAi]), true),
         )
         .unwrap();
         assert!(
-            creds.copilot_token_file.is_some(),
-            "copilot must be captured when GitHub egress is enabled"
+            creds.gh_token_file.is_some(),
+            "the fake gh must produce a token, or this test asserts nothing"
         );
-        // Copilot selected, github_egress=false → still captured via the
-        // provider. This is the arm that makes `agent-vm copilot --no-git` (or
-        // `agent-vm copilot` in a non-GitHub project) work at all — the one
-        // the D1 note exists to defend.
-        let creds = super::refresh(
-            state.path(),
-            "/workspace/p",
-            &selection(ProviderSet::new([CredentialProvider::Copilot]), false),
-        )
-        .unwrap();
         assert!(
-            creds.copilot_token_file.is_some(),
-            "copilot must be captured when the Copilot provider is selected even without GitHub egress"
+            creds.copilot_token_file.is_none(),
+            "GitHub egress must no longer capture a Copilot token"
         );
-        // Neither condition → not captured.
-        let creds = super::refresh(
-            state.path(),
-            "/workspace/p",
-            &selection(ProviderSet::default(), false),
-        )
-        .unwrap();
-        assert!(creds.copilot_token_file.is_none());
     }
 
     /// **Placeholder distinctness**. If one placeholder were a
@@ -2095,41 +2216,403 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn a_failed_capture_removes_the_stale_guest_claude_placeholder() {
-        let state = tempfile::tempdir().unwrap();
-        let guest = GuestStateDir::open(state.path()).unwrap();
-        let relative = Path::new("claude/.credentials.json");
-        guest
-            .atomic_write(relative, br#"{"claudeAiOauth":{}}"#, 0o600)
-            .unwrap();
-
-        clear_stale_anthropic_placeholder(&guest, false);
-
-        assert!(
-            !state.path().join(relative).exists(),
-            "a placeholder nothing will substitute must not be left behind"
+    /// **S1 / the invariant.** A guest-visible placeholder exists only if this
+    /// launch registered a substitution entry for it.
+    fn assert_placeholder_invariant(state_dir: &Path, creds: &CredsState) {
+        let guest = GuestStateDir::open(state_dir).unwrap();
+        // The Anthropic and OpenAI arms are *content*-scoped, mirroring the
+        // production clearers: the invariant is *our placeholder* ⇔ wired, not
+        // *a file at the path* ⇔ wired. A guest-authored credential (a real
+        // in-guest `claude`/`codex` login) is not our placeholder and must not
+        // be counted as one.
+        assert_eq!(
+            guest_json_holds(
+                &guest,
+                Path::new("claude/.credentials.json"),
+                "/claudeAiOauth/accessToken",
+                ANTHROPIC_ACCESS_PLACEHOLDER,
+            ),
+            creds.anthropic_token_file.is_some(),
+            "claude placeholder vs wired"
         );
-        // Idempotent: a launch with no placeholder to begin with is fine.
-        clear_stale_anthropic_placeholder(&guest, false);
+        assert_eq!(
+            guest_json_holds(
+                &guest,
+                Path::new("codex/auth.json"),
+                "/tokens/access_token",
+                OPENAI_ACCESS_PLACEHOLDER,
+            ) || guest_json_holds(
+                &guest,
+                Path::new("codex/auth.json"),
+                "/OPENAI_API_KEY",
+                OPENAI_ACCESS_PLACEHOLDER,
+            ),
+            creds.openai_token_file.is_some(),
+            "codex placeholder vs wired"
+        );
+        let copilot = guest
+            .read(Path::new("copilot/config.json"))
+            .unwrap()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get("github_token").cloned());
+        assert_eq!(
+            copilot.is_some(),
+            creds.copilot_token_file.is_some(),
+            "copilot placeholder vs wired"
+        );
+        let opencode = guest
+            .read(Path::new("opencode/auth.json"))
+            .unwrap()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get("openai").cloned());
+        assert_eq!(
+            opencode.is_some(),
+            creds.opencode_openai_access_token_file.is_some(),
+            "opencode placeholder vs wired"
+        );
     }
 
+    /// **S2.** A launch that wires nothing removes every stale guest
+    /// placeholder — including Copilot's config key — while leaving
+    /// user-authored rows (OpenCode's `zai`) alone. The Anthropic and OpenAI
+    /// fixtures are the bodies `refresh_anthropic`/`refresh_openai` actually
+    /// write (review B1), not arbitrary JSON, so the removal is proven to be
+    /// *content-scoped* rather than path-scoped.
     #[test]
-    fn a_successful_capture_leaves_the_guest_placeholder_in_place() {
+    fn the_stale_clearer_covers_every_provider_and_spares_user_rows() {
+        let mut env = crate::test_env::guard();
+        // A HOME with no host credentials, so this launch captures nothing.
+        let home = tempfile::tempdir().unwrap();
+        env.set_var("HOME", home.path());
         let state = tempfile::tempdir().unwrap();
         let guest = GuestStateDir::open(state.path()).unwrap();
-        let relative = Path::new("claude/.credentials.json");
         guest
             .atomic_write(
-                relative,
-                br#"{"claudeAiOauth":{"accessToken":"ph"}}"#,
+                Path::new("claude/.credentials.json"),
+                format!(
+                    r#"{{"claudeAiOauth":{{"accessToken":"{ANTHROPIC_ACCESS_PLACEHOLDER}"}}}}"#
+                )
+                .as_bytes(),
+                0o600,
+            )
+            .unwrap();
+        guest
+            .atomic_write(
+                Path::new("codex/auth.json"),
+                format!(r#"{{"tokens":{{"access_token":"{OPENAI_ACCESS_PLACEHOLDER}"}}}}"#)
+                    .as_bytes(),
+                0o600,
+            )
+            .unwrap();
+        guest
+            .atomic_write(
+                Path::new("copilot/config.json"),
+                br#"{"trusted_folders":["/"],"github_token":"msb-copilot-placeholder-v2"}"#,
+                0o600,
+            )
+            .unwrap();
+        guest
+            .atomic_write(
+                Path::new("opencode/auth.json"),
+                format!(
+                    r#"{{"openai":{{"type":"oauth","access":"{OPENCODE_OPENAI_ACCESS_PLACEHOLDER}"}},"zai":{{"type":"api","key":"user"}}}}"#
+                )
+                .as_bytes(),
                 0o600,
             )
             .unwrap();
 
-        clear_stale_anthropic_placeholder(&guest, true);
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &provisioning(ProviderSet::default(), false),
+        )
+        .unwrap();
 
-        assert!(state.path().join(relative).exists());
+        assert!(
+            !state.path().join("claude/.credentials.json").exists(),
+            "stale Anthropic placeholder survived"
+        );
+        assert!(
+            !state.path().join("codex/auth.json").exists(),
+            "stale OpenAI placeholder survived"
+        );
+        let copilot: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("copilot/config.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(copilot.get("github_token").is_none(), "{copilot}");
+        assert_eq!(copilot["trusted_folders"], serde_json::json!(["/"]));
+        let opencode: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("opencode/auth.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            opencode.get("openai").is_none(),
+            "our synthetic row survived"
+        );
+        assert_eq!(
+            opencode["zai"],
+            serde_json::json!({"type": "api", "key": "user"}),
+            "a user-authored OpenCode row must be preserved"
+        );
+        assert_placeholder_invariant(state.path(), &creds);
+    }
+
+    /// **S2b (review B1).** The clearer is content-scoped, not path-scoped: a
+    /// **real** credential an in-guest login wrote into the writable state
+    /// mount (`codex login`, a Claude OAuth flow) survives a launch that wires
+    /// nothing. Before the B1 fix both files were deleted unconditionally, so
+    /// this test failed.
+    #[test]
+    fn the_stale_clearer_spares_a_guest_authored_credential() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap(); // no host credentials
+        env.set_var("HOME", home.path());
+        let state = tempfile::tempdir().unwrap();
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        guest
+            .atomic_write(
+                Path::new("claude/.credentials.json"),
+                br#"{"claudeAiOauth":{"accessToken":"sk-ant-real-canary"}}"#,
+                0o600,
+            )
+            .unwrap();
+        guest
+            .atomic_write(
+                Path::new("codex/auth.json"),
+                br#"{"tokens":{"access_token":"real-canary-token"}}"#,
+                0o600,
+            )
+            .unwrap();
+
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &provisioning(ProviderSet::default(), false),
+        )
+        .unwrap();
+        assert!(creds.wired() == ProviderSet::default());
+
+        let anthropic: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("claude/.credentials.json"))
+                .unwrap()
+                .expect("a guest-authored Claude credential must survive"),
+        )
+        .unwrap();
+        assert_eq!(
+            anthropic["claudeAiOauth"]["accessToken"],
+            "sk-ant-real-canary"
+        );
+        let openai: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("codex/auth.json"))
+                .unwrap()
+                .expect("a guest-authored Codex credential must survive"),
+        )
+        .unwrap();
+        assert_eq!(openai["tokens"]["access_token"], "real-canary-token");
+        // The real credential is present (above) *and* no placeholder is: the
+        // content-scoped helper now admits this scenario, where it previously
+        // had to be skipped because file-presence read as "placeholder".
+        assert_placeholder_invariant(state.path(), &creds);
+    }
+
+    /// **S3.** A `shell`-shaped launch (all four provisioned) whose Copilot
+    /// capture fails (no device-flow cache, `--no-git`) does not bail and
+    /// exports no `COPILOT_GITHUB_TOKEN` — the invariant’s named scenario.
+    #[test]
+    fn a_shell_shaped_launch_whose_copilot_capture_fails_exports_nothing() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap(); // no cache, no gh
+        env.set_var("HOME", home.path());
+        let state = tempfile::tempdir().unwrap();
+        let all = ProviderSet::new(CredentialProvider::ALL);
+        let creds =
+            super::refresh(state.path(), "/workspace/p", &provisioning(all, false)).unwrap();
+        assert!(creds.copilot_token_file.is_none());
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        let copilot = guest.read(Path::new("copilot/config.json")).unwrap();
+        if let Some(bytes) = copilot {
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(value.get("github_token").is_none(), "{value}");
+        }
+        let pairs = crate::credential_provider::provider_guest_env(
+            crate::credential_provider::LaunchProviders {
+                provisioned: all,
+                wired: creds.wired(),
+            },
+        );
+        assert!(pairs.is_empty(), "{pairs:?}");
+        // Copilot is provisioned, not required: no hard bail.
+        assert!(
+            credential_provider::missing_credential_error(CredentialProvider::Copilot).is_some()
+        );
+        assert_placeholder_invariant(state.path(), &creds);
+    }
+
+    /// **S5.** A `{OpencodeStatic}`-only launch does not bail, but does not
+    /// produce an OpenCode sign-in either: `opencode-static`'s wiring needs
+    /// `openai`'s capture, and neither is provisioned here. The prerequisite is
+    /// explicit (ADR-0017) and pinned here.
+    #[test]
+    fn opencode_static_alone_needs_openai_and_does_not_bail() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        env.set_var("HOME", home.path());
+        let state = tempfile::tempdir().unwrap();
+        // A `HOME` with OpenAI host creds only, so a launch that *did* gate
+        // OpenAi capture would wire OpenCode.
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/auth.json"),
+            br#"{"tokens":{"access_token":"fake"}}"#,
+        )
+        .unwrap();
+        let opencode_only = ProviderSet::new([CredentialProvider::OpencodeStatic]);
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &provisioning(opencode_only, false),
+        )
+        .unwrap();
+        assert!(creds.openai_token_file.is_none());
+        assert!(
+            creds.opencode_openai_access_token_file.is_none(),
+            "opencode-static without OpenAi must not wire a sign-in"
+        );
+        // No hard bail exists for opencode-static.
+        assert!(
+            credential_provider::missing_credential_error(CredentialProvider::OpencodeStatic)
+                .is_none()
+        );
+        // The bypass file still exists (U1's `{OpencodeStatic}` row).
+        assert!(state.path().join("opencode-config/opencode.json").exists());
+        assert_placeholder_invariant(state.path(), &creds);
+    }
+
+    /// **S6.** `clear_unwired_placeholders` is idempotent and creates nothing:
+    /// the natural wrong implementation (read `{}` for the absent file, write
+    /// it back) creates the very file it means to remove.
+    #[test]
+    fn clear_unwired_placeholders_is_idempotent_and_creates_nothing() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        env.set_var("HOME", home.path());
+        let state = tempfile::tempdir().unwrap();
+        for _ in 0..2 {
+            let _ = super::refresh(
+                state.path(),
+                "/workspace/p",
+                &provisioning(ProviderSet::default(), false),
+            )
+            .unwrap();
+        }
+        assert!(!state.path().join("copilot/config.json").exists());
+        assert!(!state.path().join("claude/.credentials.json").exists());
+        assert!(!state.path().join("codex/auth.json").exists());
+        // OpenCode's writer is unconditional: the file exists and is empty.
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        let opencode: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("opencode/auth.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(opencode, serde_json::json!({}), "{opencode}");
+    }
+
+    /// **S7.** The rule has a documented hash-only host exception:
+    /// `snapshot_host_creds()` runs even when the provisioning set is empty.
+    /// This is where a future “gate everything” edit trips.
+    #[test]
+    fn snapshot_host_creds_runs_with_an_empty_provisioning_set() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/.credentials.json"),
+            br#"{"claudeAiOauth":{"accessToken":"fake"}}"#,
+        )
+        .unwrap();
+        env.set_var("HOME", home.path());
+        let state = tempfile::tempdir().unwrap();
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &provisioning(ProviderSet::default(), false),
+        )
+        .unwrap();
+        let snapshot = creds.snapshot.expect("the host snapshot must always run");
+        assert!(
+            snapshot.claude.is_some(),
+            "the hash-only host snapshot is deliberately outside the provisioning gate"
+        );
+        // And the guest still gets no Anthropic placeholder (nothing was wired).
+        assert!(!state.path().join("claude/.credentials.json").exists());
+    }
+
+    /// Every guest-visible placeholder keeps mode 0600 and the host secret dir
+    /// stays 0700 after the capture gating and the Copilot write reorder (#118).
+    /// The *set* of files written changed, so the modes are re-pinned here
+    /// rather than inferred from the writers that were left alone.
+    #[test]
+    fn captured_placeholders_are_mode_0600_and_the_secret_dir_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        for (relative, bytes) in [
+            (
+                ".claude/.credentials.json",
+                &br#"{"claudeAiOauth":{"accessToken":"fake"}}"#[..],
+            ),
+            (
+                ".codex/auth.json",
+                &br#"{"tokens":{"access_token":"fake"}}"#[..],
+            ),
+            (
+                ".cache/claude-vm/copilot-token.json",
+                &br#"{"access_token":"fake"}"#[..],
+            ),
+        ] {
+            let path = home.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        env.set_var("HOME", home.path());
+        let state = tempfile::tempdir().unwrap();
+        let all = ProviderSet::new(CredentialProvider::ALL);
+        let creds =
+            super::refresh(state.path(), "/workspace/p", &provisioning(all, false)).unwrap();
+
+        for relative in [
+            "claude/.credentials.json",
+            "codex/auth.json",
+            "copilot/config.json",
+            "opencode/auth.json",
+        ] {
+            assert_eq!(mode(&state.path().join(relative)), 0o600, "{relative}");
+        }
+        let secrets = host_secret_dir_path(state.path());
+        assert_eq!(mode(&secrets), 0o700, "host secret dir");
+        for provider in ["anthropic", "openai", "copilot"] {
+            assert_eq!(
+                mode(&secrets.join(provider)),
+                0o600,
+                "host {provider} token"
+            );
+        }
+        assert_placeholder_invariant(state.path(), &creds);
     }
 
     #[test]

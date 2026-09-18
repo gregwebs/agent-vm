@@ -510,7 +510,9 @@ Current design of record:
 
 ### The two-layer placeholder dance
 
-Per provider, at every launch:
+Per **provisioned** provider, at every launch (capture is gated on the launch's
+provisioning set — the tools the launched tool declares, transitively; see
+[ADR-0017](docs/adr/0017-tool-declared-provisioning.md)):
 
 1. **Host side.** agent-vm reads the host credential file
    (`~/.claude/.credentials.json`, `~/.codex/auth.json`,

@@ -401,6 +401,7 @@ command = "mytool"                   # required; the guest command name
 args = ["--flag"]                    # optional; default argv (array of strings)
 layer = { builtin = "codex" }        # optional; EXACTLY one of builtin/path
 credentials = ["openai"]             # optional; credential provider names
+tools = ["claude"]                   # optional; tools to provision (same file, or name one)
 persist = [".cache/mytool"]          # optional; guest-HOME-relative paths
 env = { VAR = "value" }              # optional; guest env pairs for this tool
 interactive_shell = false            # optional; join trailing args into `-c`
@@ -425,7 +426,20 @@ interactive_shell = false            # optional; join trailing args into `-c`
 - `credentials` — optional; provider **config names**, which differ from
   the `agent-vm doctor` row labels. Valid: `anthropic`, `openai`,
   `opencode-static`, `copilot`. Note `opencode` (the doctor label) is **not**
-  a valid name — use `opencode-static`.
+  a valid name — use `opencode-static`. This is the **requirement** set: a
+  launch hard-fails before boot when one of them yielded no usable host login.
+- `tools` — optional; the names of **other tools whose credentials this tool's
+  guest should have**. Not provider names. Named tools are *provisioned*, never
+  *required*, so naming a tool you have no host login for degrades silently
+  rather than failing the launch. The single entry `"*"` closes over the tools
+  declared in the **same configuration file** as this tool, and must be the only
+  entry; `*` is not a legal tool `name`. A tool in a *different* file (for
+  example a tool in your user config, from inside a project config) is reached
+  only by **naming it explicitly** — that name is the opt-in. Naming a tool the
+  catalog does not provide is a hard error. **Omitted means `["*"]` for a tool
+  named `shell` and `[]` for every other name** — write `tools = []`
+  explicitly to give a `shell` no provisioning at all. `opencode-static` only
+  produces a working sign-in when `openai` is also provisioned.
 - `persist` — optional; guest-HOME-relative paths to preserve across runs.
   Absolute paths, any `..` component, NUL, and root-equivalent spellings
   (`.`/`./`/empty) are rejected; harmless `.`/`//`/trailing-`/` spellings are
@@ -454,17 +468,20 @@ interactive_shell = false            # optional; join trailing args into `-c`
 Unknown keys, wrong types, malformed TOML, unknown `layer.builtin`, unknown
 provider names, duplicate tool names within one file, duplicate normalized
 persist entries within one tool, and two tools claiming the same normalized
-persist path are all **hard errors** — as are invalid `env` entries: a key
-that is empty, or contains `=`/NUL/whitespace/control characters, or starts
-with `MSB_`, or is `HOME`/`USER`/`LOGNAME`, and an `env` **value** containing
-NUL. There is no silent fallback to the defaults.
+persist path are all **hard errors** — as are invalid `tools` entries: `"*"`
+mixed with other entries, an empty or NUL-containing name, a tool name no
+catalog tool provides, and a tool named `*`. They are also hard errors for
+invalid `env` entries: a key that is empty, or contains
+`=`/NUL/whitespace/control characters, or starts with `MSB_`, or is
+`HOME`/`USER`/`LOGNAME`, and an `env` **value** containing NUL. There is no
+silent fallback to the defaults.
 
 ### Merge order and defaults
 
 The user file is authoritative for any tool name it contains; the project
 file may add whole tool definitions the user did not write. This is a union
 of whole definitions, **not** a field-by-field overlay: a repo cannot fill in
-an omitted `persist`, `layer`, or `credentials` on a user-defined tool.
+an omitted `persist`, `layer`, `credentials`, or `tools` on a user-defined tool.
 Resolved order is user declarations first, then project-only declarations (the
 order `--help` and `doctor` both use). When a project declaration of an
 existing name differs, `doctor` warns once and the user definition wins, e.g.:
@@ -495,11 +512,47 @@ persisted as files, not a flag; do not add one.
 `codex` and `shell` are the only shipped tools that declare `env`: both set
 `CODEX_HOME=/agent-vm-state/codex`. Codex is the one agent with no
 `~/<dotfile>` symlink into the project state dir (its install prefix holds
-`packages/`, so a `~/.codex` symlink would shadow the binary itself), and
-`shell` already provisions the same OpenAI credential into that state dir, so
+`packages/`, so a `~/.codex` symlink would shadow the binary itself), and in
+the shipped catalog `shell` provisions every tool in `default-tools.toml` (its
+omitted `tools` defaults to the wildcard, which closes over that file), so the
+OpenAI credential is provisioned into that state dir on a shell launch;
 dropping the pointer would leave a fully-provisioned, unreachable credential.
 The other three agents never read `CODEX_HOME`. See
 [ADR-0016](docs/adr/0016-tool-declared-guest-env.md).
+
+The built-in `shell` declares **no** `credentials` and omits `tools`, so in the
+shipped catalog it *provisions* every provider `default-tools.toml`'s tools
+declare without *requiring* any of them: `agent-vm shell` still works for a user
+with no Anthropic or Copilot login, and an in-guest `copilot` now works too. The
+wildcard is scoped to the file it is written in — if you replace the shipped
+catalog, your own `shell` gets the same name-based default but closes over
+**your** file. Add `tools = []` to opt out.
+
+**Upgrading (provisioning).** The built-in `shell` no longer declares
+`credentials`, and a tool's `tools = ["*"]` closes over the tools declared in
+**the same configuration file** — never another file's. So if your config
+declares tools, every `shell` in it — one you declared or the appended
+fallback — provisions only what its *own file* declares, and a file whose only
+tool is `shell` provisions nothing. Before this release such a `shell` still
+captured the host's Anthropic and OpenAI logins unconditionally. To restore
+that on your `shell`, declare one in **your own file** if you were relying on
+the appended fallback, and then either
+
+* **declare the agent tools in that same file**, so the wildcard closes over
+them again, or
+* **put providers on its `credentials`**:
+
+```toml
+[[tools]]
+name = "shell"
+command = "zsh"
+credentials = ["openai", "opencode-static"]   # safe: no hard bail
+```
+
+`credentials` is the **requirement** set, so adding `anthropic` or `copilot`
+there makes `agent-vm shell` hard-fail for a user without that host login —
+which is exactly why the shipped `shell` no longer carries them. Run `agent-vm
+doctor` to see the resolved set as `provisions=…`.
 
 **Upgrading:** `CODEX_HOME` used to be set on *every* launch. It is now
 declared by the shipped `codex` and `shell` tools. If you declare your own
@@ -616,6 +669,21 @@ rather than starting a signed-out agent.
 
 Run `agent-vm doctor` to see what was found on the host, when the Claude
 token expires, and which credentials reached the current project.
+
+### What each verb gets
+
+A launch only captures, injects and proxies the credentials its verb
+**provisions**: its own `credentials`, plus those of every tool it names in
+`tools`, transitively. `agent-vm codex` never captures your Anthropic token;
+`agent-vm claude` never captures your OpenAI one. `agent-vm shell` provisions
+all four, because in the shipped catalog the built-in `shell`'s wildcard closes
+over `default-tools.toml`'s four agents. `agent-vm doctor` prints each verb's
+resolved set as `provisions=…` next to its `credentials=…` requirement set.
+
+The guest's `~/.claude`, `~/.copilot` and `~/.config/opencode` symlinks are
+created on every launch regardless — they are furniture, not capability. What a
+guest can *use* is the placeholder plus its proxy substitution entry, and
+neither exists for a provider the verb did not provision.
 
 Reads from the host:
 

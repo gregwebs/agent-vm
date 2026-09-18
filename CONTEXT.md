@@ -118,29 +118,30 @@ refresh placeholders, host login hint) the interception hook reads.
 Which tool needs which provider **is configuration** (#80/#82): a tool names
 its providers in config (`anthropic` / `openai` / `opencode-static` /
 `copilot`, `CredentialProvider::config_name`), and `Tool::credential_providers`
-turns that into the `ProviderSet` launch threads through. A **Tool** (#82's
-term) is a resolved command carrying a provider set; do not call a provider a
-"tool" or "agent".
+turns that into the `ProviderSet` the launch treats as the **requirement** set.
+A **Tool** (#82's term) is a resolved command carrying a provider set; do not
+call a provider a "tool" or "agent".
 
 The only guest env a provider owns is `COPILOT_GITHUB_TOKEN` (Copilot, and only
-when selected). `CODEX_HOME` is **not** a provider fact: it names codex-the-
+when this launch both provisions Copilot **and** captured its token).
+`CODEX_HOME` is **not** a provider fact: it names codex-the-
 tool's config dir, so it lives on the `codex` (and `shell`) tool's own `env`
 ([agent-vm #119](https://github.com/gregwebs/agent-vm/issues/119), ADR-0016).
 
-The legacy gating is **asymmetric**: `Anthropic`/`OpenAi` capture runs on
-*every* launch regardless of the selected tool, and the claude/codex/opencode
-bypass configs are written unconditionally (`Scope::Always`). This is
-preserved behaviour, not a design goal — narrowing it is
-[agent-vm #118](https://github.com/gregwebs/agent-vm/issues/118), *not* #82
-(doing it in #82 would break its own identical-behaviour criterion). Each cell
-is an explicit `Scope`/`CaptureScope` field rather than an inference from the
-selected set precisely so that narrowing is a contained change. `Copilot` is
-the one provider the proxy only registers when it is selected.
+Every provider-owned facet a launch can reach is gated on one predicate: the
+launch's **provisioning set** — host credential capture, the guest placeholder
+files, the proxy secret and its intercept route, the first-run bypass configs,
+and the provider guest env. There is no per-facet scope. The two pre-#118
+spellings of that gating (`Scope`, `CaptureScope`) are deleted. See
+[ADR-0017](docs/adr/0017-tool-declared-provisioning.md). `Copilot` is the one
+provider whose placeholder lives in a *config* file written after capture, so
+its config is written and its env var exported only when its token was wired.
 
 **GitHub egress is not a provider.** The `gh` token is gated by `--no-git` /
 detected repos, orthogonal to the launched tool, so it has no
 `CredentialProvider` variant; `credential_injection` keeps its own block and
-splices it into the proxy's fixed `WIRE_ORDER`.
+splices it into the proxy's fixed `WIRE_ORDER`. GitHub egress no longer feeds
+any provider's **capture** (the pre-#118 Copilot disjunction is gone).
 
 _Avoid_ the `doctor_label` (`claude` / `codex` / `opencode` / `copilot`) as the
 provider's name: the label names the host CLI that owns the file (retained so
@@ -151,6 +152,56 @@ doctor` into `credentials = [...]` is rejected by #80's validator.
 _Not the same as_ `OpencodeApiProvider`: that is a *dynamic*,
 user-populated BYO-API-key row inside OpenCode's `auth.json`, not a
 compiled-in subsystem.
+
+### Required credential providers
+
+The providers a tool names in `credentials = [...]`. This is the
+**requirement** set: a launch hard-fails before boot when one of them yielded
+no usable host credential (`credential_provider::missing_credential_error`,
+consumed by `run::launch`). The requirement set is a subset of the provisioning
+set — being provisioned is not being required — and it is **equal** to it
+whenever the tool declares no `tools`, which is the common case (four of the
+five shipped verbs: `codex`, `opencode`, `claude`, `copilot`).
+
+### Available tools
+
+The catalog tools a tool names in `tools = [...]` (`config::DeclaredTools`):
+the tools it wants **available in its guest**. They name *tools*, never
+credential providers. `["*"]` — which must be the sole entry, and which is the
+default for a tool named `shell` — closes over the tools declared in the
+**same configuration file** as the declaring tool, **not** the merged catalog
+(the file is identified by `config::ToolOrigin`; the built-in `shell` fallback's
+file is the embedded `default-tools.toml`). A tool declared in a *different*
+configuration file is reachable only by **naming it explicitly** — that explicit
+name is the cross-file opt-in. An omitted `tools` is `[]` for every other name.
+A name that no catalog tool provides is a hard config error.
+
+_Avoid_: "dependencies" — a named tool is provisioned, not required, and
+nothing is installed or built for it (that is a **tooling layer**).
+
+### Provisioning set
+
+Everything one launch provisions: the least fixed point of
+
+    provisioning(t) = credentials(t) ∪ ⋃ { provisioning(u) | u ∈ tools(t) }
+
+over the launch catalog (`config::CatalogEntry::provisioned`), where a `"*"`
+entry expands to the declaring tool's **own configuration file** (origin
+equality), not the whole catalog. It is the **single** gate on every
+provider-owned facet — host credential capture, the guest placeholder files,
+the proxy secret and its intercept route, the first-run bypass configs, and the
+provider guest env. A cycle is a fixed point, not an error.
+
+Distinct from the **required credential providers**: in the shipped catalog
+`agent-vm shell` provisions all four without requiring any, so it works for a
+user with no Anthropic or Copilot login. (Under a *custom* catalog the fallback
+`shell` is a different file from the user's tools and provisions only its own
+`credentials`; see **Available tools**.)
+
+_Avoid_: "the selected tool's providers" / "when selected". That phrasing came
+from the pre-#118 `Scope`/`CaptureScope` fields, which are deleted: gating is
+membership in the provisioning set, which is not the launched tool's own
+`credentials`. See [ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
 
 ### Guest home link
 
@@ -166,16 +217,21 @@ symlinks and non-root mode's host-side provisioning cannot drift (ADR-0002).
 
 A validated **declarative tool definition** (`config::Tool`): a guest
 `command`, its default `argv`, an optional **tooling layer**, a list of
-**credential providers**, extra guest-HOME-relative `persist` paths, a
-guest `env` map, an `interactive_shell` flag, and the **tool config tier** it
-came from. A tool is **data**, not a credential provider and not a command to
-execute on the host.
+**credential providers** (`credentials`, the requirement set), a list of
+**available tools** (`tools`, which drives the provisioning set), extra
+guest-HOME-relative `persist` paths, a guest `env` map, an `interactive_shell`
+flag, and the **tool config tier** it came from. A tool is **data**, not a
+credential provider and not a command to execute on the host.
 
 A tool *is* the launch verb: `agent-vm <name>` works because the resolved
 configuration declares a tool named `<name>`, and the CLI builds its
 subcommands from that catalog (#82). `layer` and `persist` remain metadata
 until #84/#83. `interactive_shell` selects the bash `-c` argument-joining the
 shipped `shell` tool uses.
+
+`credentials` is the **requirement** set (a launch hard-fails when one yields
+nothing); `tools` drives the **provisioning** set (named tools are provisioned,
+never required). See **Required credential providers** and **Available tools**.
 
 `env` is published into the guest **before** the launcher's own environment
 and the guest applies it last-wins, so it cannot override `PATH`,
@@ -188,9 +244,12 @@ identity triple is **rejected** at the config seam in every mode instead. See
 
 The verbs a launch actually offers (`config::LaunchCatalog`): the resolved
 merge result, plus the built-in `shell` appended when no declared tool claims
-that name. Both `agent-vm --help` and `agent-vm doctor` render it, so their
-verb lists and order cannot disagree. Distinct from `ResolvedTools`, which is
-the pure merge result and never contains the fallback.
+that name. The catalog resolves each entry's **provisioning set**
+(`config::CatalogEntry`) before dispatch, so `--help`, `doctor` and
+`run::launch` cannot disagree about it either. Both `agent-vm --help` and
+`agent-vm doctor` render it, so their verb lists and order cannot disagree.
+Distinct from `ResolvedTools`, which is the pure merge result and never
+contains the fallback.
 
 _Avoid_: calling a **credential provider** a "tool" or "agent".
 
