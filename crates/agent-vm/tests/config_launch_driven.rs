@@ -86,7 +86,7 @@ const DEFAULT_TOOLS: [&str; 5] = ["codex", "opencode", "claude", "copilot", "she
 
 /// The tool-independent guest `PATH` every default tool launches with. Pinned
 /// both by the goldens and by [`assert_tool_dependent_content`].
-const PATH_VALUE: &str = "/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin";
+const PATH_VALUE: &str = "/usr/local/bin:/usr/bin:/usr/sbin:/bin";
 
 /// The resolved guest command line each default tool must produce with no user
 /// args (`command` + `argv`). Transcribed by hand from `run::Agent`'s

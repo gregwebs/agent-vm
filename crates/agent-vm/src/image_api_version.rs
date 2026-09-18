@@ -114,6 +114,19 @@ mod tests {
         }
     }
 
+    /// Pins the #84 bump: the launcher supports exactly API 1, 2 and 3. An
+    /// API-3 base (tool-free, no agent binaries) must boot, and API 4 must be
+    /// rejected as too new.
+    #[test]
+    fn supported_range_is_exactly_1_through_3() {
+        for v in [1u32, 2, 3] {
+            verify_in_range(v).unwrap_or_else(|e| panic!("API {v} must be supported: {e}"));
+        }
+        for v in [0u32, 4] {
+            assert!(verify_in_range(v).is_err(), "API {v} must be rejected");
+        }
+    }
+
     #[test]
     fn verify_rejects_too_new_with_hint() {
         let err = verify_in_range(MAX_SUPPORTED_IMAGE_API + 1).unwrap_err();

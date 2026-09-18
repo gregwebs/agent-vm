@@ -235,6 +235,17 @@ pub(crate) fn shipped_tool_commands() -> Result<Vec<String>> {
         .collect())
 }
 
+/// The shipped default layer sequence — the projection `tool_layer::chain_root`
+/// compares a configured catalog against to decide the chain root (issue #84's
+/// fast path). Derived from [`default_tools`], never hand-copied, in declaration
+/// order; tools with no `layer` (such as `shell`) contribute nothing.
+pub(crate) fn shipped_tool_layers() -> Result<Vec<ToolLayer>> {
+    Ok(default_tools()?
+        .into_iter()
+        .filter_map(|tool| tool.layer().cloned())
+        .collect())
+}
+
 /// The outcome of loading the tool config, as data. One value rather than a
 /// `LaunchCatalog` plus a parallel `Option<Error>`, so the catalog and the
 /// deferred error cannot disagree about which state the process is in.
@@ -324,6 +335,44 @@ impl LaunchCatalog {
             .iter()
             .position(|entry| entry.tool.name() == name)?;
         Some(self.entries.remove(index))
+    }
+
+    /// Every tool layer this catalog declares, in catalog (declaration) order,
+    /// deduplicated by layer value (two tools naming the same `{ builtin = … }`
+    /// produce one chain step, not two identical installs).
+    ///
+    /// The image a launch boots is a property of the **whole catalog**, not of
+    /// the invoked verb, so this must be read *before* [`Self::take_entry`]
+    /// removes one — otherwise the launched tool's own layer is dropped.
+    pub(crate) fn declared_layers(&self) -> Vec<DeclaredLayer> {
+        let mut seen: Vec<&ToolLayer> = Vec::new();
+        let mut out = Vec::new();
+        for entry in &self.entries {
+            let tool = entry.tool();
+            let Some(layer) = tool.layer() else {
+                continue;
+            };
+            if seen.contains(&layer) {
+                continue;
+            }
+            seen.push(layer);
+            out.push(DeclaredLayer {
+                tool: tool.name().to_string(),
+                command: tool.command().to_string(),
+                layer: layer.clone(),
+                anchor: match tool.origin() {
+                    ToolOrigin::BuiltIn => None,
+                    // D7: a `path` layer anchors on the directory of the config
+                    // file that declared it — a user-tier config's cwd is
+                    // arbitrary, so the declaring file is the only well-defined
+                    // anchor.
+                    ToolOrigin::User(file) | ToolOrigin::Project(file) => {
+                        file.parent().map(Path::to_path_buf)
+                    }
+                },
+            });
+        }
+        out
     }
 }
 
@@ -610,7 +659,7 @@ pub(crate) enum BuiltinLayer {
 }
 
 impl BuiltinLayer {
-    const ALL: [BuiltinLayer; 4] = [
+    pub(crate) const ALL: [BuiltinLayer; 4] = [
         BuiltinLayer::Codex,
         BuiltinLayer::Opencode,
         BuiltinLayer::Claude,
@@ -639,15 +688,65 @@ impl BuiltinLayer {
     }
 }
 
-/// A declared layer path, kept exactly as written (nonempty, NUL-free). It is
-/// never canonicalized, resolved against a base directory, or checked for
-/// existence — that anchoring belongs to #84.
+/// A declared layer path, kept exactly as written (nonempty, NUL-free) at parse
+/// time; anchored and existence-checked by `tool_layer::materialize` (D7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LayerPath(PathBuf);
 
 impl LayerPath {
     pub(crate) fn as_path(&self) -> &Path {
         &self.0
+    }
+
+    /// Re-anchor this declared path against the directory of the config file
+    /// that declared it (D7). An absolute path is returned unchanged; a
+    /// relative one is joined onto `anchor`. The caller then canonicalises and
+    /// validates existence, so a missing anchor is a hard error rather than a
+    /// silent cwd-relative resolution.
+    pub(crate) fn anchored(&self, anchor: Option<&Path>) -> Result<PathBuf> {
+        if self.0.is_absolute() {
+            return Ok(self.0.clone());
+        }
+        let anchor = anchor.ok_or_else(|| {
+            anyhow!(
+                "config: layer path {} is relative but its declaring config file has no \
+                 directory to anchor it against",
+                quoted_path(&self.0)
+            )
+        })?;
+        Ok(anchor.join(&self.0))
+    }
+}
+
+/// One tool layer the catalog declares, with the anchor its `path` form resolves
+/// against (D7). Ordered and deduplicated by
+/// [`LaunchCatalog::declared_layers`]. Carries the tool's guest `command` so
+/// `setup` can decide which verification targets a not-yet-composed layer
+/// supplies (D10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredLayer {
+    tool: String,
+    command: String,
+    layer: ToolLayer,
+    /// `dirname` of the declaring config file; `None` for the built-in tier.
+    anchor: Option<PathBuf>,
+}
+
+impl DeclaredLayer {
+    pub(crate) fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    pub(crate) fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub(crate) fn layer(&self) -> &ToolLayer {
+        &self.layer
+    }
+
+    pub(crate) fn anchor(&self) -> Option<&Path> {
+        self.anchor.as_deref()
     }
 }
 
@@ -2060,6 +2159,23 @@ mod tests {
             assert_eq!(actual.len(), providers.len(), "{name}");
             assert_eq!(tool.is_interactive_shell(), interactive_shell, "{name}");
         }
+    }
+
+    /// The projection `tool_layer::chain_root` compares a configured catalog
+    /// against: exactly the four builtin layers, in `default-tools.toml` order.
+    /// Derived, never hand-copied, so a reordered or re-typed default is caught
+    /// here rather than by a wrong-image boot.
+    #[test]
+    fn shipped_tool_layers_are_the_four_builtins_in_declaration_order() {
+        assert_eq!(
+            shipped_tool_layers().unwrap(),
+            vec![
+                ToolLayer::Builtin(BuiltinLayer::Codex),
+                ToolLayer::Builtin(BuiltinLayer::Opencode),
+                ToolLayer::Builtin(BuiltinLayer::Claude),
+                ToolLayer::Builtin(BuiltinLayer::Copilot),
+            ]
+        );
     }
 
     /// **T1.** The provisioning set of each shipped verb, transcribed from

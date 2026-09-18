@@ -30,10 +30,13 @@ Network egress:
       --allow-host              Allow the guest to reach the host's 127.0.0.1 services
 
 Image:
-      --image <REF>   Override the OCI image reference [env: AGENT_VM_IMAGE_TAG]
-      --update-check  Check the registry for a newer image at launch (opt-in)
-      --layer <DIR>   Append a tooling layer to this launch's chain (repeatable)
-  -y, --yes           Assume "yes" to the tooling-layer build confirmation prompt
+      --image <REF>       Boot this image verbatim, skipping tool-layer composition [env:
+                          AGENT_VM_IMAGE_TAG]
+      --base-image <REF>  The tool-free base that tool layers are composed onto [env:
+                          AGENT_VM_BASE_IMAGE]
+      --update-check      Check the registry for a newer image at launch (opt-in)
+      --layer <DIR>       Append a tooling layer to this launch's chain (repeatable)
+  -y, --yes               Assume "yes" to the tooling-layer build confirmation prompt
 
 Guest user:
       --root  Run the guest as root (uid 0) instead of the default host user
