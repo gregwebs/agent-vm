@@ -4,6 +4,8 @@
 //! bump the image-API range, or change other distribution wiring
 //! without grepping for string literals across subcommands.
 
+use vstd::prelude::*;
+
 /// Default OCI image reference. This is the GUEST TEMPLATE image
 /// that agent-vm boots inside each per-project microVM — NOT the
 /// agent-vm tool itself (the binary running this code). The image
@@ -41,8 +43,12 @@ pub const MAX_SUPPORTED_IMAGE_API: u32 = 2;
 /// from inside the guest immediately after boot.
 pub const IMAGE_API_VERSION_PATH: &str = "/etc/agent-vm-image-version";
 
+// Inside `verus!` because `image_capabilities::chrome_mcp_policy`'s contract
+// names it, and Verus refuses to read a const declared outside the macro.
+verus! {
 /// API 2 requires optional image features to advertise an explicit marker.
 pub const FIRST_ADVERTISED_CAPABILITIES_IMAGE_API: u32 = 2;
+}
 
 /// Marker written last by the Chrome DevTools tooling layer after its checks pass.
 pub const CHROME_MCP_CAPABILITY_PATH: &str = "/etc/agent-vm-capabilities/chrome-devtools-mcp";

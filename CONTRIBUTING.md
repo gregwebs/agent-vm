@@ -13,6 +13,10 @@ the end-user reference.
   output placement, state-dir cleanup, commit-message style.
 - [docs/adr/](docs/adr/) — architecture decision records for the
   important technical trade-offs.
+- [ADR-0018](docs/adr/0018-machine-checked-boundary-contracts.md) — a new
+  **pure** function that decides a security boundary, a resource limit, or the
+  parse of untrusted input carries a machine-checked `verus!` contract. Extract
+  the decision, not the I/O.
 
 ## Build from source
 
@@ -69,6 +73,45 @@ shellcheck` on Debian/Ubuntu); the full gate also needs the recursive submodule
 and a working Cargo toolchain, while `bash script/test/ci-contracts.sh
 --guard-only` runs just the shell guard and needs neither.
 
+### Verifying contracts locally (optional)
+
+A few pure boundary predicates carry machine-checked Verus contracts
+([ADR-0018](docs/adr/0018-machine-checked-boundary-contracts.md)). **Verus is not
+needed for an ordinary build**: `cargo build`, `cargo test` and `cargo clippy` work
+with no Verus on `PATH`, because a `verus!` block erases to ordinary Rust. CI verifies
+the contracts in [`.github/workflows/verus.yml`](.github/workflows/verus.yml), which is
+the single source of truth for the pinned release and its digest — take both from
+there if this section ever looks stale.
+
+To run the same check locally, install the pinned release. On Linux:
+
+```bash
+release=0.2026.09.16.7325eee
+zip="verus-$release-x86-linux.zip"
+curl -fSLO "https://github.com/verus-lang/verus/releases/download/release/rolling/$release/$zip"
+echo "5e386d253a29bdac7d475a43b6f58dbcc9099c77953cb16180c9ef5832c50038  $zip" | sha256sum -c -
+unzip -q "$zip"                     # unpack anywhere; creates verus-x86-linux/
+export PATH="$PWD/verus-x86-linux:$PATH"
+```
+
+On macOS the asset is `verus-$release-arm64-macos.zip`, the unpacked directory is
+`verus-arm64-macos/`, and the digest check is `shasum -a 256 -c -`. That asset is a
+different file with a different digest; this repo pins and enforces only the
+`x86-linux` digest, because that is the one CI uses.
+
+Then, from the repository root:
+
+```bash
+CARGO_TARGET_DIR=target/verus cargo verus verify -p agent-vm
+```
+
+`CARGO_TARGET_DIR` matters: `cargo verus` sets `RUSTC_WRAPPER`, which is part of
+cargo's fingerprint, so sharing one `target/` with ordinary builds makes every switch
+a full rebuild. Expect a few minutes the first time and a few seconds thereafter.
+
+`bash script/test/verus-verification.sh` runs exactly what CI runs: the verification
+plus the assertion that it actually verified something, then a pair of throwaway
+fixtures proving the verifier can both pass and fail.
 
 ## Commit message style
 

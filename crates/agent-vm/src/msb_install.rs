@@ -32,6 +32,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use vstd::prelude::*;
 
 /// The upstream Microsandbox version this build vendors, read directly out
 /// of `vendor/microsandbox/Cargo.toml` at COMPILE TIME (`include_str!`) so
@@ -429,14 +430,41 @@ fn state_root_overridden() -> bool {
     std::env::var_os("AGENT_VM_STATE_DIR").is_some() || std::env::var_os("XDG_STATE_HOME").is_some()
 }
 
-/// Maximum byte length of a Unix-domain socket path this platform can
-/// actually bind, leaving room for the mandatory NUL terminator inside
-/// `sockaddr_un.sun_path` (a fixed-size buffer: 104 bytes on macOS/BSD,
-/// 108 on Linux — the raw buffer size, not the usable string length).
+// Maximum byte length of a Unix-domain socket path this platform can
+// actually bind, leaving room for the mandatory NUL terminator inside
+// `sockaddr_un.sun_path` (a fixed-size buffer: 104 bytes on macOS/BSD,
+// 108 on Linux — the raw buffer size, not the usable string length).
+//
+// Wrapped in `verus!` (D5: Verus cannot read a const declared outside the
+// macro), which also means rustdoc no longer documents it — it is private
+// either way.
 #[cfg(target_os = "macos")]
+verus! {
 const SUN_PATH_USABLE_LEN: usize = 104 - 1;
+}
 #[cfg(all(unix, not(target_os = "macos")))]
+verus! {
 const SUN_PATH_USABLE_LEN: usize = 108 - 1;
+}
+
+verus! {
+
+/// The whole decision: a path of exactly `SUN_PATH_USABLE_LEN` bytes fits;
+/// one more byte does not.
+///
+/// Module-private: it names the module-private `SUN_PATH_USABLE_LEN`, and
+/// nothing outside needs the kernel.
+spec fn socket_path_fits_spec(len: usize) -> bool {
+    len <= SUN_PATH_USABLE_LEN
+}
+
+fn socket_path_fits(len: usize) -> (ok: bool)
+    ensures ok == socket_path_fits_spec(len),
+{
+    len <= SUN_PATH_USABLE_LEN
+}
+
+} // verus!
 
 /// Fail closed, before boot, if `sandbox_name`'s real agent/control socket
 /// paths under `msb_home_dir()` would overflow this platform's
@@ -468,9 +496,13 @@ pub fn ensure_socket_paths_fit(sandbox_name: &str) -> Result<()> {
 /// already-derived socket path instead of deriving one from live env vars
 /// — lets tests supply a contrived long path without needing a real
 /// overlong `$HOME`/`AGENT_VM_STATE_DIR` in the process environment.
+///
+/// Trusted adapter: `socket_path_fits` proves the accept/reject comparison,
+/// including at the boundary; the byte measurement (`as_os_str().len()`) and
+/// the error formatting are outside the proof.
 fn check_socket_path_len(socket_path: &Path, sandbox_name: &str) -> Result<()> {
     let len = socket_path.as_os_str().len();
-    if len > SUN_PATH_USABLE_LEN {
+    if !socket_path_fits(len) {
         bail!(
             "the control socket path for sandbox {sandbox_name:?} is {len} bytes, exceeding \
              this platform's {SUN_PATH_USABLE_LEN}-byte Unix-domain-socket path limit:\n  {}\n\

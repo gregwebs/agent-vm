@@ -11,6 +11,11 @@
 #     kept in exact lockstep with the channel by policy (see its comment).
 #   - .github/workflows/ci.yml: dtolnay/rust-toolchain's `toolchain:` input,
 #     pinned explicitly rather than auto-read for CI-install auditability.
+#   - .github/workflows/verus.yml: the verification job's own
+#     dtolnay/rust-toolchain `toolchain:` input. Doubly constrained -- it must
+#     equal this channel and the toolchain named in the pinned Verus release's
+#     version.json (see docs/adr/0018-machine-checked-boundary-contracts.md),
+#     so a bump that moves one without the other fails here.
 #   - .github/workflows/release-npm.yml: two explicit
 #     `rustup toolchain install` legs, same reproducibility rationale.
 #   - script/build/macos.sh: its own RUST_TOOLCHAIN copy (so the script never
@@ -97,6 +102,22 @@ check_cargo_toml() {
 
 check_ci_yml() {
     local file=.github/workflows/ci.yml found
+    found="$(sed -n 's/^[[:space:]]*toolchain: "\(.*\)"$/\1/p' "$file")"
+    if [[ -z "$found" ]]; then
+        fail_missing_anchor "$file" 'toolchain: "..." (dtolnay/rust-toolchain input)'
+        return
+    fi
+    if [[ "$found" == "$channel" ]]; then
+        ok "$file toolchain = $found"
+        return
+    fi
+    fail "$file toolchain is $found but canonical channel is $channel"
+    printf '       fix: set toolchain: "%s" in %s, or update rust-toolchain.toml if %s was intended.\n' \
+        "$channel" "$file" "$found"
+}
+
+check_verus_yml() {
+    local file=.github/workflows/verus.yml found
     found="$(sed -n 's/^[[:space:]]*toolchain: "\(.*\)"$/\1/p' "$file")"
     if [[ -z "$found" ]]; then
         fail_missing_anchor "$file" 'toolchain: "..." (dtolnay/rust-toolchain input)'
@@ -245,6 +266,7 @@ main() {
 
     check_cargo_toml
     check_ci_yml
+    check_verus_yml
     check_release_npm
     check_macos_rust_toolchain_var
     check_macos_build_md

@@ -321,6 +321,25 @@ clauses, the grandfathering hole, what C4 omits).
 _Avoid_: "Dockerfile contract" — only a layer's *final* stage is exported, so
 `FROM ${BASE_IMAGE}` matters there; the checks are on built images.
 
+## Boundary contract
+
+A `verus!` block, in the module that owns a **pure** function whose decision is
+a security boundary, a resource limit, or the parse of untrusted input,
+carrying machine-checked `requires`/`ensures` and loop invariants. The rule for
+when one is required, the **verified surface** (one row per site, naming exactly
+what is proved), the **trusted boundary** (what the proved code calls and
+trusts — `str::as_bytes`, `OsStr::len`, `url::Url::parse`, `anyhow` formatting,
+the `String`/`Vec` assembly, every syscall), and the rule that a contract is
+obtained by **extracting the decision, not the I/O**, are all
+[ADR-0018](docs/adr/0018-machine-checked-boundary-contracts.md). A plain build
+needs no Verus: the macro erases to ordinary Rust. CI verifies the contracts in
+`.github/workflows/verus.yml`, gated and self-asserting (a run that verifies
+nothing fails).
+
+_Avoid_: "verified module" — the unit is the decision, not the module it lives
+in; "contract test" — a test samples the input space, a contract is checked for
+all inputs.
+
 ## Forked mount
 
 A writable, project-scoped persistent mount initialized once from a host **directory**. After initialization, the fork and source are independent: changes do not propagate in either direction. A fork can optionally omit entries while seeding (`:fork:exclude=REL`); omissions are seed-only and are not a persistent guest access restriction. Files are never forked — a regular file is mounted read-only instead.
