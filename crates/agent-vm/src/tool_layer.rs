@@ -263,6 +263,19 @@ mod tests {
         assert!(matches!(&root, ChainRoot::Verbatim(r) if r == "img:1"));
         assert!(!root.composes_tool_layers());
 
+        // `--image` with a non-default set is still verbatim and composes
+        // nothing.
+        let claude_only_nondefault = vec![builtin(BuiltinLayer::Claude)];
+        let root = chain_root(
+            Some("img:1".into()),
+            None,
+            &claude_only_nondefault,
+            &shipped,
+        )
+        .expect("verbatim root");
+        assert!(matches!(&root, ChainRoot::Verbatim(_)));
+        assert!(!root.composes_tool_layers());
+
         let err = chain_root(
             Some("img:1".into()),
             Some("base:1".into()),
@@ -308,6 +321,23 @@ mod tests {
             matches!(root, ChainRoot::Base(_)),
             "a permutation must compose"
         );
+    }
+
+    /// D1: the root keys on the declared *layer sequence*, not the tool names.
+    /// A catalog whose tool names differ but whose layer sequence is identical
+    /// still boots the template.
+    #[test]
+    fn renamed_tools_with_the_same_layer_sequence_still_boot_the_template() {
+        let renamed = declared_from_config(
+            "[[tools]]\nname = \"codex-x\"\ncommand = \"codex\"\nlayer = { builtin = \"codex\" }\n\
+             [[tools]]\nname = \"opencode-x\"\ncommand = \"opencode\"\nlayer = { builtin = \"opencode\" }\n\
+             [[tools]]\nname = \"claude-x\"\ncommand = \"claude\"\nlayer = { builtin = \"claude\" }\n\
+             [[tools]]\nname = \"copilot-x\"\ncommand = \"copilot\"\nlayer = { builtin = \"copilot\" }\n",
+        );
+        let declared: Vec<ToolLayer> = renamed.iter().map(|l| l.layer().clone()).collect();
+        assert_eq!(declared, shipped());
+        let root = chain_root(None, None, &declared, &shipped()).expect("root");
+        assert!(matches!(root, ChainRoot::Template(_)));
     }
 
     // -- §6.3(3): the embedded snapshot matches the on-disk sources -------
