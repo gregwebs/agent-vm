@@ -85,9 +85,6 @@ delete_first_matching_line() {
 # test suite keeps working across future pin bumps without edits.
 current_channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$REPO_ROOT/rust-toolchain.toml")"
 [[ -n "$current_channel" ]] || fail "could not read the current channel from $REPO_ROOT/rust-toolchain.toml"
-current_minor="${current_channel#*.}"
-current_minor="${current_minor%%.*}"
-[[ "$current_minor" =~ ^[0-9]+$ ]] || fail "could not parse the current channel's minor version: $current_channel"
 # Deliberately distinct from the real pin for every mismatch case below.
 other_channel="9.99"
 
@@ -134,16 +131,19 @@ output="$(expect_fail "$tree" 1)"
 assert_contains "$output" "release-npm.yml"
 assert_contains "$output" "expected 2"
 
-# Case 6: macos.sh's numeric floor guard drifts while RUST_TOOLCHAIN stays
-# correct (proves the floor copy is covered independently).
-tree="$(make_tree case6-floor)"
-other_minor=$((current_minor + 1))
-sed -i.bak "s/minor < $current_minor/minor < $other_minor/" "$tree/script/build/macos.sh"
+# Case 6: macos.sh's RUST_TOOLCHAIN copy drifts from the canonical channel.
+# (Until cf8a418 this case mutated a hardcoded `minor < N` floor literal; that
+# commit derived the floor from $RUST_TOOLCHAIN and deleted the checker's
+# check_macos_floor_guard, leaving this case's sed matching nothing. Do not
+# restore the old form -- there is no floor literal.)
+tree="$(make_tree case6-macos-var)"
+sed -i.bak "s/^RUST_TOOLCHAIN=$current_channel\$/RUST_TOOLCHAIN=$other_channel/" \
+    "$tree/script/build/macos.sh"
 rm -f "$tree/script/build/macos.sh.bak"
 output="$(expect_fail "$tree" 1)"
-assert_contains "$output" "floor guard"
-assert_contains "$output" "$other_minor"
-assert_contains "$output" "  ok  script/build/macos.sh RUST_TOOLCHAIN = $current_channel"
+assert_contains "$output" "script/build/macos.sh"
+assert_contains "$output" "$other_channel"
+assert_contains "$output" "fix: set RUST_TOOLCHAIN=$current_channel"
 
 # Case 7: one of macos-build.md's copy-paste commands drifts (proves the
 # docs copy is checked per-occurrence, not merely for presence).

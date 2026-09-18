@@ -44,6 +44,7 @@ jobs:
           cargo clippy --locked -p msb-krun-compat-evidence --all-targets -- -D warnings
           ./script/test/msb-krun-compat-contract.sh
           bash script/test/build-workflow.sh
+          bash script/test/rust-toolchain-consistency.sh
           bash -n vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh \
             script/check-runtime-provenance.sh script/test/runtime-provenance.sh \
             script/test/msb-krun-compat.sh script/test/msb-krun-compat-contract.sh \
