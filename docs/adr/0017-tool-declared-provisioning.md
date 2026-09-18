@@ -151,8 +151,9 @@ Per-verb effect under the shipped default catalog:
 - **`--no-git` / `gh` egress stays orthogonal** to the tool and keeps its own
   capture and wire slot.
 - **`missing_credential_error`'s gate stays the launched tool's `credentials`.**
-- **`layer` and `persist` are untouched** ([#84](https://github.com/gregwebs/agent-vm/issues/84),
-  [#83](https://github.com/gregwebs/agent-vm/issues/83)).
+- **`layer` is untouched** ([#84](https://github.com/gregwebs/agent-vm/issues/84));
+  the provisioning closure now also folds each visited tool's `persist` paths
+  ([#83](https://github.com/gregwebs/agent-vm/issues/83)).
 
 ## Alternatives
 

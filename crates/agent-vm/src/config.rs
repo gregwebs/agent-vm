@@ -65,12 +65,14 @@
 //! subcommands) and `doctor` (to render them) both start from: the resolved
 //! merge result plus the built-in `shell` fallback (see [`LaunchCatalog`]).
 //! Layer paths are still metadata only — they are compared as declared values
-//! and never resolved, checked for existence, or built. Relative-path
-//! anchoring and persisted-path overlap safety belong to their consuming
-//! tickets (#83/#84).
+//! and never resolved, checked for existence, or built (#84). Persisted-path
+//! overlap safety is defined here (#83): [`guest_paths_overlap`] backs the
+//! within-tool, cross-tool and reserved-link checks, and `guest_home::links`
+//! turns the surviving paths into the one guest-HOME link list both
+//! guest-user modes provision from.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fmt,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -78,6 +80,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
+use vstd::prelude::*;
 
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 
@@ -186,16 +189,61 @@ impl ConfigReport {
     /// merge result", and the fallback is not a declaration.
     pub(crate) fn into_launch_catalog(self) -> Result<LaunchCatalog> {
         let ConfigReport { resolved, .. } = self;
-        let mut tools = resolved.0;
-        let shell_fallback_added = !tools.iter().any(|tool| tool.name() == SHELL_TOOL_NAME);
-        if shell_fallback_added {
-            tools.push(builtin_shell()?);
-        }
-        Ok(LaunchCatalog {
-            entries: resolve_provisioning(tools)?,
-            shell_fallback_added,
-        })
+        catalog_from_tools(resolved.0)
     }
+}
+
+/// Append the built-in `shell` fallback when no declared tool claims the name,
+/// then resolve every entry's provisioning facets. The one constructor for both
+/// a loaded config ([`ConfigReport::into_launch_catalog`]) and the compiled-in
+/// defaults ([`default_launch_catalog`]), so the fallback cannot differ between
+/// them.
+fn catalog_from_tools(mut tools: Vec<Tool>) -> Result<LaunchCatalog> {
+    let shell_fallback_added = !tools.iter().any(|tool| tool.name() == SHELL_TOOL_NAME);
+    if shell_fallback_added {
+        tools.push(builtin_shell()?);
+    }
+    Ok(LaunchCatalog {
+        entries: resolve_provisioning(tools)?,
+        shell_fallback_added,
+    })
+}
+
+/// The compiled-in default launch catalog, resolved without touching the
+/// environment. Used by `setup` to verify the shipped tools when a project or
+/// user config is broken (a missing default entry is already a hard error, so
+/// this cannot itself fail on the shipped catalog), and by tests.
+pub(crate) fn default_launch_catalog() -> Result<LaunchCatalog> {
+    catalog_from_tools(default_tools()?)
+}
+
+/// The `command` values of the compiled-in default tools: the binaries the
+/// published image is contractually required to carry. `setup` derives its
+/// fatal-vs-warn severity from membership here, **not** from a tool's
+/// [`ToolOrigin`], because that contract belongs to the *binary*, not to the
+/// tier that declared the tool. Otherwise a user config that restates `claude`
+/// (to change `args`, say) would turn a missing `claude` back into a warning.
+/// Derived from [`default_tools`], never hand-copied.
+///
+/// `Result` because the compiled-in defaults are parsed through the same
+/// raw-to-validated path as user input; a broken default is already a hard
+/// error elsewhere ([`default_launch_catalog`]).
+pub(crate) fn shipped_tool_commands() -> Result<Vec<String>> {
+    Ok(default_tools()?
+        .iter()
+        .map(|tool| tool.command().to_string())
+        .collect())
+}
+
+/// The outcome of loading the tool config, as data. One value rather than a
+/// `LaunchCatalog` plus a parallel `Option<Error>`, so the catalog and the
+/// deferred error cannot disagree about which state the process is in.
+///
+/// Lives here, not in `cli`, because the `Broken` arm is a *config* error and
+/// `setup` needs to read it without depending on `cli`.
+pub(crate) enum Catalog {
+    Ready(LaunchCatalog),
+    Broken(anyhow::Error),
 }
 
 /// The name the built-in `shell` fallback claims, and the one tool name whose
@@ -225,6 +273,10 @@ pub(crate) struct LaunchCatalog {
 pub(crate) struct CatalogEntry {
     tool: Tool,
     provisioned: ProviderSet,
+    /// Every `persist` path this launch provisions: the union over its
+    /// provisioning closure, in catalog then declaration order. Deterministic
+    /// because it folds over the catalog, not the closure's traversal order.
+    persist: Vec<PersistPath>,
 }
 
 impl CatalogEntry {
@@ -237,6 +289,13 @@ impl CatalogEntry {
     /// requirement set — the pre-boot hard bail still reads `credentials`.
     pub(crate) fn provisioned(&self) -> ProviderSet {
         self.provisioned
+    }
+
+    /// Every `persist` path this launch provisions, as the guest-HOME link
+    /// list needs them. Parallel to [`Self::provisioned`]: both are facets of
+    /// the one launch closure.
+    pub(crate) fn persist(&self) -> &[PersistPath] {
+        &self.persist
     }
 }
 
@@ -251,11 +310,15 @@ impl LaunchCatalog {
         self.shell_fallback_added
     }
 
-    /// Consume the catalog, returning the **whole entry** named `name` for
-    /// dispatch. The entry is handed on intact (rather than split into
-    /// `(Tool, ProviderSet)`) so the two facts cannot be mismatched at any of
-    /// the call sites (`cli.rs` dispatch, `main.rs`, `run::launch`).
-    pub(crate) fn into_entry(mut self, name: &str) -> Option<CatalogEntry> {
+    /// Remove just the named entry from the catalog and hand it on for
+    /// dispatch, leaving the rest of the catalog usable. Removing one entry
+    /// (rather than consuming the whole catalog, as the pre-#83 `into_entry`
+    /// did) is what lets `cli::parse_from` pass the catalog on to a built-in
+    /// verb — `setup` reads it to decide what to verify. The entry is handed on
+    /// intact (rather than split into `(Tool, ProviderSet, Vec<PersistPath>)`)
+    /// so the facts cannot be mismatched at any of the call sites (`cli.rs`
+    /// dispatch, `main.rs`, `run::launch`).
+    pub(crate) fn take_entry(&mut self, name: &str) -> Option<CatalogEntry> {
         let index = self
             .entries
             .iter()
@@ -418,6 +481,13 @@ impl Tool {
 
     pub(crate) fn persist_count(&self) -> usize {
         self.persist.len()
+    }
+
+    /// The tool's own declared paths, in declaration order. `persist_count`
+    /// stays for `doctor`, which must not grow a second way to read the same
+    /// field.
+    pub(crate) fn persist(&self) -> &[PersistPath] {
+        &self.persist
     }
 
     /// This tool's own guest environment, sorted by key (a `BTreeMap`
@@ -590,6 +660,13 @@ pub(crate) struct PersistPath(PathBuf);
 impl PersistPath {
     pub(crate) fn as_path(&self) -> &Path {
         &self.0
+    }
+
+    /// A persist path built through the same normalization the parser uses, for
+    /// unit tests outside `config` (which cannot name the private inner field).
+    #[cfg(test)]
+    pub(crate) fn for_test(declaration: &str) -> Self {
+        PersistPath(normalize_persist(declaration).expect("valid test persist path"))
     }
 }
 
@@ -832,29 +909,44 @@ fn merge(user_tools: Vec<Tool>, project_tools: Vec<Tool>) -> (Vec<Tool>, Vec<Con
     (resolved, conflicts)
 }
 
-/// Exact normalized-path ownership across the resolved winners: no two
-/// distinct tools may claim the same guest-HOME-relative location. This is
-/// not a containment proof — ancestor/descendant and provider-link overlap
-/// safety is #83's to define.
+/// Overlap ownership across the resolved winners: two distinct tools may not
+/// claim the same guest-HOME-relative location, nor an ancestor/descendant pair
+/// (linking both would leave one path a dangling symlink and make the other
+/// uncreatable). The compiled-in link list is checked separately, per tool, in
+/// [`validate_persist`]; the launch's guest mount points are checked in
+/// `run::launch` because the project path is not a config fact.
 fn validate_persist_ownership(tools: &[Tool]) -> Result<()> {
-    let mut owners: HashMap<&Path, &Tool> = HashMap::new();
+    // (path, tool) in catalog then declaration order, so the diagnostic names
+    // the earlier claimant as "already claimed by" and the later tool as the
+    // offender.
+    let mut claimed: Vec<(&Path, &Tool)> = Vec::new();
     for tool in tools {
         for path in &tool.persist {
-            match owners.get(path.as_path()) {
-                Some(existing) => {
+            for (existing_path, existing_tool) in &claimed {
+                if !guest_paths_overlap(path.as_path(), existing_path) {
+                    continue;
+                }
+                if *existing_path == path.as_path() {
                     return Err(anyhow!(
                         "config: guest persist path {} is claimed by tool {} ({}) and tool {} ({}); remove or rename one claim",
                         quoted_path(path.as_path()),
-                        quoted_str(existing.name.as_str()),
-                        describe_origin(&existing.origin),
+                        quoted_str(existing_tool.name.as_str()),
+                        describe_origin(&existing_tool.origin),
                         quoted_str(tool.name.as_str()),
                         describe_origin(&tool.origin),
                     ));
                 }
-                None => {
-                    owners.insert(path.as_path(), tool);
-                }
+                return Err(anyhow!(
+                    "config: guest persist path {} declared by tool {} ({}) overlaps {} claimed by tool {} ({}); one would shadow the other",
+                    quoted_path(path.as_path()),
+                    quoted_str(tool.name.as_str()),
+                    describe_origin(&tool.origin),
+                    quoted_path(existing_path),
+                    quoted_str(existing_tool.name.as_str()),
+                    describe_origin(&existing_tool.origin),
+                ));
             }
+            claimed.push((path.as_path(), tool));
         }
     }
     Ok(())
@@ -918,33 +1010,50 @@ fn resolve_provisioning(tools: Vec<Tool>) -> Result<Vec<CatalogEntry>> {
         }
     }
 
-    let sets: Vec<ProviderSet> = (0..tools.len())
-        .map(|start| provisioning_closure(&tools, &index, start))
+    // One closure per tool, then both facets folded over it in catalog order so
+    // the result is deterministic (the closure's stack-pop order is not).
+    let closures: Vec<Vec<bool>> = (0..tools.len())
+        .map(|start| launch_closure(&tools, &index, start))
+        .collect();
+    let facets: Vec<(ProviderSet, Vec<PersistPath>)> = closures
+        .iter()
+        .map(|visited| {
+            let mut provisioned = ProviderSet::default();
+            let mut persist = Vec::new();
+            for (position, seen) in visited.iter().enumerate() {
+                if !*seen {
+                    continue;
+                }
+                provisioned = provisioned.union(tools[position].credential_providers());
+                persist.extend(tools[position].persist().iter().cloned());
+            }
+            (provisioned, persist)
+        })
         .collect();
     Ok(tools
         .into_iter()
-        .zip(sets)
-        .map(|(tool, provisioned)| CatalogEntry { tool, provisioned })
+        .zip(facets)
+        .map(|(tool, (provisioned, persist))| CatalogEntry {
+            tool,
+            provisioned,
+            persist,
+        })
         .collect())
 }
 
-/// One tool's closure. A cycle is harmless rather than an error: `visited`
-/// admits each tool at most once, so the walk terminates at the fixed point.
-/// (`shell`'s wildcard necessarily includes `shell` itself.)
-fn provisioning_closure(
-    tools: &[Tool],
-    index: &HashMap<String, usize>,
-    start: usize,
-) -> ProviderSet {
+/// One tool's closure: which catalog tools a launch `start` visits, as a
+/// visited-tool mask. The least fixed point of `tools`, with `"*"` closing over
+/// the declaring tool's own configuration file. A cycle is harmless rather than
+/// an error: `visited` admits each tool at most once, so the walk terminates at
+/// the fixed point. (`shell`'s wildcard necessarily includes `shell` itself.)
+fn launch_closure(tools: &[Tool], index: &HashMap<String, usize>, start: usize) -> Vec<bool> {
     let mut visited = vec![false; tools.len()];
     let mut stack = vec![start];
-    let mut set = ProviderSet::default();
     while let Some(position) = stack.pop() {
         if std::mem::replace(&mut visited[position], true) {
             continue;
         }
         let tool = &tools[position];
-        set = set.union(tool.credential_providers());
         match tool.declared_tools() {
             // `"*"` closes over the declaring tool's **own configuration
             // file** — the tools whose origin equals this tool's. In the
@@ -971,7 +1080,7 @@ fn provisioning_closure(
             ),
         }
     }
-    set
+    visited
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,27 +1405,137 @@ fn validate_tool_refs(
     Ok(DeclaredTools::Named(names))
 }
 
+verus! {
+
+/// The one byte a guest path uses to separate components. Declared inside the
+/// `verus!` block because Verus cannot read a `const` declared outside it (see
+/// `defaults.rs`).
+pub const GUEST_PATH_SEPARATOR: u8 = b'/';
+
+/// `p` is a whole **component-wise** prefix of `q`: `q` begins with `p` followed
+/// by the separator, so `a/b` is one of `a/b/c` but `a/b` is *not* one of
+/// `a/bc`. Byte-level so the decision is translatable; the `Path` → bytes
+/// measurement is the trusted adapter ([`guest_paths_overlap`]).
+pub open spec fn is_separator_prefix(p: Seq<u8>, q: Seq<u8>) -> bool {
+    p.len() < q.len()
+        && q.subrange(0, p.len() as int) =~= p
+        && q[p.len() as int] == GUEST_PATH_SEPARATOR
+}
+
+/// Two `/`-joined relative guest paths overlap iff they are equal or one is a
+/// component-wise ancestor of the other. This is the single predicate behind
+/// four call sites (within-tool, across-tool, against the compiled-in link
+/// list, and against the launch's guest mount points) — see ADR-0018.
+pub fn byte_paths_overlap(a: &[u8], b: &[u8]) -> (result: bool)
+    ensures result == (a@ =~= b@
+        || is_separator_prefix(a@, b@)
+        || is_separator_prefix(b@, a@)),
+{
+    let alen = a.len();
+    let blen = b.len();
+    let min = if alen < blen { alen } else { blen };
+    let mut i: usize = 0;
+    while i < min
+        invariant
+            i <= min,
+            min <= alen,
+            min <= blen,
+            alen == a@.len(),
+            blen == b@.len(),
+            min == if alen < blen { alen } else { blen },
+            forall|j: int| 0 <= j < i ==> a@[j] == b@[j],
+        decreases min - i,
+    {
+        if a[i] != b[i] {
+            assert(a@ != b@);
+            assert(!is_separator_prefix(a@, b@));
+            assert(!is_separator_prefix(b@, a@));
+            return false;
+        }
+        i += 1;
+    }
+    if alen == blen {
+        assert(a@ =~= b@);
+        true
+    } else if alen < blen {
+        b[alen] == GUEST_PATH_SEPARATOR
+    } else {
+        a[blen] == GUEST_PATH_SEPARATOR
+    }
+}
+
+} // verus!
+
+/// `true` when linking both `a` and `b` into the guest HOME would make one
+/// shadow the other. Both must be normalized relative paths (`PersistPath`'s
+/// invariant, or a compiled-in `HomeLink::home_relative`).
+///
+/// The trusted half of [`byte_paths_overlap`]: `OsStr::as_bytes`, plus the
+/// *invariant* that a normalized persist path's `Path` rendering is its
+/// components joined by single `/` (established by [`normalize_persist`], not
+/// proved). Recorded in ADR-0018's trusted-boundary list.
+pub(crate) fn guest_paths_overlap(a: &Path, b: &Path) -> bool {
+    byte_paths_overlap(a.as_os_str().as_bytes(), b.as_os_str().as_bytes())
+}
+
 fn validate_persist(
     raw: Vec<String>,
     file: &Path,
     index: usize,
     name: &ToolName,
 ) -> Result<Vec<PersistPath>> {
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut persist = Vec::with_capacity(raw.len());
+    let mut persist: Vec<PersistPath> = Vec::with_capacity(raw.len());
     for (position, declaration) in raw.into_iter().enumerate() {
         let normalized = normalize_persist(&declaration).map_err(|reason| {
             tool_error(file, index, name, format!("persist[{position}]: {reason}"))
         })?;
-        if !seen.insert(normalized.clone()) {
+        // O(n²) over a handful of declared paths, deliberately: the predicate is
+        // overlap, not equality, so a `HashSet` cannot answer it. Two distinct
+        // normalized spellings of the same path are impossible
+        // (`normalize_persist`), so `==` identifies the exact-duplicate case and
+        // keeps today's message byte-for-byte.
+        for existing in &persist {
+            if !guest_paths_overlap(existing.as_path(), &normalized) {
+                continue;
+            }
+            if existing.as_path() == normalized.as_path() {
+                return Err(tool_error(
+                    file,
+                    index,
+                    name,
+                    format!(
+                        "persist[{position}]: duplicate declaration; this tool already claims the normalized path"
+                    ),
+                ));
+            }
             return Err(tool_error(
                 file,
                 index,
                 name,
                 format!(
-                    "persist[{position}]: duplicate declaration; this tool already claims the normalized path"
+                    "persist[{position}]: overlaps this tool's persist path {}; one would shadow the other",
+                    quoted_path(existing.as_path())
                 ),
             ));
+        }
+        // The compiled-in link list is derived from `guest_home_links()`, never
+        // a hand-copied list, so a provider added later is covered
+        // automatically. A `persist` entry that is an ancestor *or* descendant
+        // of a reserved path would silently shadow a credential dir or be
+        // shadowed by it.
+        for link in crate::credential_provider::guest_home_links() {
+            if guest_paths_overlap(&normalized, Path::new(link.home_relative)) {
+                return Err(tool_error(
+                    file,
+                    index,
+                    name,
+                    format!(
+                        "persist[{position}]: {} overlaps the reserved guest HOME path {}, which agent-vm links to the project state dir",
+                        quoted_path(&normalized),
+                        link.home_relative
+                    ),
+                ));
+            }
         }
         persist.push(PersistPath(normalized));
     }
@@ -1583,6 +1802,7 @@ pub(crate) fn escape_str(text: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::collections::HashSet;
     use std::fs;
 
     // -- fixture helpers ---------------------------------------------------
@@ -1966,16 +2186,25 @@ mod tests {
         assert_eq!(catalog.as_slice().len(), 2);
     }
 
-    /// `into_entry` moves exactly the named entry out, consuming the catalog.
+    /// `take_entry` moves exactly the named entry out, leaving the catalog
+    /// usable — the property `cli::parse_from` needs to hand the catalog on to
+    /// a built-in verb (`setup` reads it).
     #[test]
-    fn launch_catalog_into_entry_returns_the_named_entry() {
+    fn launch_catalog_take_entry_returns_the_named_entry() {
         let fixture = Fixture::new();
         fixture.user(&one_tool("solo"));
-        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
-        let solo = catalog.into_entry("solo").expect("solo is in the catalog");
+        let mut catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        let solo = catalog.take_entry("solo").expect("solo is in the catalog");
         assert_eq!(solo.tool().name(), "solo");
-        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
-        assert!(catalog.into_entry("absent").is_none());
+        // The rest of the catalog survives, including the `shell` fallback.
+        assert!(
+            catalog
+                .as_slice()
+                .iter()
+                .any(|entry| entry.tool().name() == "shell")
+        );
+        assert!(catalog.take_entry("solo").is_none(), "removed once");
+        assert!(catalog.take_entry("absent").is_none());
     }
 
     /// The provisioning set of `name` in `catalog`, in `CredentialProvider::ALL`
@@ -2965,6 +3194,163 @@ mod tests {
         assert!(fixture.load().is_err(), "the loser must still be validated");
     }
 
+    // -- overlap predicate and the #83 rejections -------------------------
+
+    /// **V1.** The overlap predicate, by table. Component-wise, not
+    /// string-prefix: `.cache` overlaps `.cache/x` but not `.cachex`.
+    #[test]
+    fn overlap_predicate_matches_the_table() {
+        let cases: &[(&str, &str, bool)] = &[
+            (".cache", ".cache/x", true),
+            (".cache/x", ".cache", true),
+            (".cache", ".cachex", false),
+            (".cache", ".cache", true),
+            ("a/b/c", "a/b", true),
+            ("a", "b", false),
+            ("a/b", "a/bc", false),
+        ];
+        for (a, b, expected) in cases {
+            assert_eq!(
+                guest_paths_overlap(Path::new(a), Path::new(b)),
+                *expected,
+                "overlap({a}, {b})"
+            );
+            // Symmetry is part of the contract.
+            assert_eq!(
+                guest_paths_overlap(Path::new(b), Path::new(a)),
+                *expected,
+                "overlap({b}, {a})"
+            );
+        }
+    }
+
+    /// **V2.** The overlap rejections surface through `load`, each naming the
+    /// offending `persist` index and the mechanism, never a secret.
+    #[test]
+    fn persist_overlap_rejections_surface_through_load() {
+        // (a) Both paths in one tool: ancestor first, descendant second.
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\".cache\", \".cache/x\"]\n",
+        );
+        let rendered = format!("{:#}", fixture.load().unwrap_err());
+        assert!(rendered.contains("persist[1]"), "{rendered}");
+        assert!(
+            rendered.contains("overlaps this tool's persist path"),
+            "{rendered}"
+        );
+
+        // (b) Across two tools: the later claimant names both tools.
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"one\"\ncommand = \"one\"\npersist = [\".cache\"]\n[[tools]]\nname = \"two\"\ncommand = \"two\"\npersist = [\".cache/x\"]\n",
+        );
+        let rendered = format!("{:#}", fixture.load().unwrap_err());
+        assert!(
+            rendered.contains("one") && rendered.contains("two"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("overlaps"), "{rendered}");
+
+        // (c)-(e) Reserved compiled-in links: equal, ancestor, descendant.
+        for path in [".claude", ".config", ".local/share/opencode/sub"] {
+            let fixture = Fixture::new();
+            fixture.user(&format!(
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\"{path}\"]\n"
+            ));
+            let rendered = format!("{:#}", fixture.load().unwrap_err());
+            assert!(
+                rendered.contains("overlaps the reserved guest HOME path"),
+                "persist={path:?}: {rendered}"
+            );
+        }
+
+        // The negative: a string prefix that is not a component prefix loads.
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\".cache\", \".cachex\"]\n",
+        );
+        assert!(fixture.load().is_ok(), ".cachex must not overlap .cache");
+
+        // A path sharing a compiled link's *parent* is allowed: `.config/mytool`
+        // sits beside `.config/gh`/`.config/opencode`, not inside either.
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\".config/mytool\", \".local/share/mytool\"]\n",
+        );
+        assert!(
+            fixture.load().is_ok(),
+            "sibling-of-a-compiled-link must load"
+        );
+    }
+
+    /// **V3.** `provisioned()` is unchanged for every embedded default entry by
+    /// the `launch_closure` refactor.
+    #[test]
+    fn default_catalog_provisioning_is_unchanged() {
+        use CredentialProvider::*;
+        let catalog = Fixture::new()
+            .load()
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap();
+        let observed: Vec<(&str, Vec<CredentialProvider>)> = catalog
+            .as_slice()
+            .iter()
+            .map(|entry| (entry.tool().name(), entry.provisioned().iter().collect()))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("codex", vec![OpenAi]),
+                ("opencode", vec![OpenAi, OpencodeStatic]),
+                ("claude", vec![Anthropic]),
+                ("copilot", vec![Copilot]),
+                ("shell", vec![Anthropic, OpenAi, OpencodeStatic, Copilot]),
+            ]
+        );
+    }
+
+    /// **V3.** `persist` folds over the same closure, in **catalog** not
+    /// traversal order, and a cycle is a fixed point.
+    #[test]
+    fn persist_paths_fold_over_the_closure_in_catalog_order() {
+        let persist_of = |catalog: &LaunchCatalog, name: &str| -> Vec<String> {
+            catalog
+                .as_slice()
+                .iter()
+                .find(|entry| entry.tool().name() == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .persist()
+                .iter()
+                .map(|path| path.as_path().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\"x\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = [\"a\"]\npersist = [\"y\"]\n\
+             [[tools]]\nname = \"shell\"\ncommand = \"bash\"\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(persist_of(&catalog, "a"), vec!["x"]);
+        assert_eq!(persist_of(&catalog, "b"), vec!["x", "y"]);
+        // `shell`'s omitted `tools` is the wildcard over its own file, which
+        // declares `a`, `b` and `shell`.
+        assert_eq!(persist_of(&catalog, "shell"), vec!["x", "y"]);
+
+        // A cycle is a fixed point, and the union still folds in catalog order.
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ntools = [\"b\"]\npersist = [\"x\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ntools = [\"a\"]\npersist = [\"y\"]\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(persist_of(&catalog, "a"), vec!["x", "y"]);
+        assert_eq!(persist_of(&catalog, "b"), vec!["x", "y"]);
+    }
+
     // -- filesystem limits and special files ------------------------------
 
     #[test]
@@ -3261,6 +3647,31 @@ mod tests {
             proptest::prop_assert_eq!(provisioned_set(&catalog, "shell"), union.clone());
             proptest::prop_assert_eq!(provisioned_set(&catalog, "t1"), union);
         }
+
+        /// **V1 (the erased-build half).** The overlap predicate is symmetric,
+        /// and `overlap(a, b)` holds iff `a`'s components are a prefix of
+        /// `b`'s (or vice versa) — restated over `Vec<String>` components, an
+        /// independent re-derivation of the Verus `ensures`.
+        #[test]
+        fn overlap_is_symmetric_and_component_prefixes(
+            a in proptest::collection::vec("[a-z]{1,4}", 1..4),
+            b in proptest::collection::vec("[a-z]{1,4}", 1..4),
+        ) {
+            let pa = a.join("/");
+            let pb = b.join("/");
+            let left = guest_paths_overlap(Path::new(&pa), Path::new(&pb));
+            let right = guest_paths_overlap(Path::new(&pb), Path::new(&pa));
+            proptest::prop_assert_eq!(left, right);
+
+            let expected = component_prefix(&a, &b) || component_prefix(&b, &a);
+            proptest::prop_assert_eq!(left, expected);
+        }
+    }
+
+    /// `a`'s components are a prefix of `b`'s (component-wise), the independent
+    /// re-derivation of `guest_paths_overlap` the proptest compares against.
+    fn component_prefix(a: &[String], b: &[String]) -> bool {
+        a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| x == y)
     }
 
     fn dedupe(names: Vec<String>) -> Vec<String> {

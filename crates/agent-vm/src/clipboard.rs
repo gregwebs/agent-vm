@@ -49,7 +49,10 @@ enum Op {
 
 pub fn run(args: Args) -> Result<()> {
     let session = ProjectSession::for_cwd()?;
-    session.ensure_dirs()?;
+    // Clipboard runs inside the guest, with the project config present but no
+    // launch catalog in hand; the compiled-in link list is enough for the state
+    // dirs it needs.
+    session.ensure_dirs(&crate::guest_home::links(&[]))?;
     let path = clipboard_path(&session);
 
     match args.op {

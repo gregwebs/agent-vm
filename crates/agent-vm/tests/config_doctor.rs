@@ -420,6 +420,48 @@ fn unknown_provider_is_a_hard_error_still_prints_the_other_sections() {
     );
 }
 
+/// **V14 (#83).** The `persist` rules rejected by `config.rs` are exercised
+/// end to end through the binary: absolute paths, two tools claiming the same
+/// path, an overlapping (ancestor/descendant) pair, and a reserved compiled-in
+/// collision. Each fails `doctor` and names the offending field, never a value.
+#[test]
+fn persist_rule_violations_surface_through_the_binary() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "absolute",
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\"/etc/passwd\"]\n",
+            "must be relative to the guest HOME",
+        ),
+        (
+            "two tools claiming one path",
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\"shared\"]\n[[tools]]\nname = \"b\"\ncommand = \"b\"\npersist = [\"shared\"]\n",
+            "is claimed by tool",
+        ),
+        (
+            "an overlapping pair",
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\".cache\"]\n[[tools]]\nname = \"b\"\ncommand = \"b\"\npersist = [\".cache/x\"]\n",
+            "overlaps",
+        ),
+        (
+            "a reserved compiled-in path",
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\".claude\"]\n",
+            "overlaps the reserved guest HOME path",
+        ),
+    ];
+    for (label, body, expected) in cases {
+        let h = Harness::new();
+        h.write_user(body);
+        let out = h.run_doctor();
+        assert_failure(&out);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(expected),
+            "{label}: expected {expected:?}: {stderr}"
+        );
+        assert!(stderr.contains("persist"), "{label}: {stderr}");
+    }
+}
+
 #[test]
 fn traversal_and_bad_toml_fail_with_context() {
     let traversal = Harness::new();

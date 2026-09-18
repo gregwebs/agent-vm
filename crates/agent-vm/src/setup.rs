@@ -7,10 +7,29 @@
 //!
 //! Local source builds and cache-only image imports are separate root
 //! workflows; setup intentionally pulls the selected registry image.
+//!
+//! # What "verify" means
+//!
+//! Verification runs every configured tool's `command` directly with
+//! `--version` (`sandbox.exec`, argv — never a shell string), because a config
+//! `command` is not validated beyond non-empty/NUL-free and must never be
+//! concatenated into a script. A non-zero exit is the hard gate, matching
+//! `images/Dockerfile`'s build-time check, so a present-but-broken binary fails
+//! instead of slipping through a `command -v` exists-check. `command -v` runs
+//! only *after* a failure, to distinguish "absent" from "present but broken" in
+//! the diagnostic.
+//!
+//! Severity follows the `command`, not the declaring tier: a `command` the
+//! published image is contractually required to carry (see
+//! [`config::shipped_tool_commands`]) is fatal, while any other `command` only
+//! warns — `setup` does not build a project's `.agent-vm/layers/` chain and so
+//! cannot tell whether a tooling layer supplies it.
 
 use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
-use microsandbox::{Sandbox, sandbox::PullPolicy};
+use microsandbox::{ExecOutput, MicrosandboxError, Sandbox, sandbox::PullPolicy};
+
+use crate::config::{self, Catalog, LaunchCatalog};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -28,7 +47,54 @@ pub struct Args {
     image: Option<String>,
 }
 
-pub async fn run(args: Args) -> Result<()> {
+/// One in-guest command `setup` proves works. A newtype rather than
+/// `(String, String, bool)`: the two string halves are same-typed and would be
+/// swappable at the call site.
+struct VerifyTarget {
+    /// Every catalog verb sharing this command, in catalog order — a shared
+    /// binary (`shell` and a user's `mysh` both `bash`) is verified once but
+    /// reported against all its verbs.
+    tools: Vec<String>,
+    command: String,
+    /// `true` iff `command` is one of the compiled-in defaults' commands (see
+    /// [`config::shipped_tool_commands`]). That contract is a property of the
+    /// binary, not of the declaring tier: a user/project config that redeclares
+    /// a shipped tool (or shares its command) must not be able to downgrade its
+    /// absence to a warning.
+    required: bool,
+}
+
+/// The catalog tools `setup` verifies, in catalog order, deduped by `command`.
+/// `required` is true iff the `command` is one of the compiled-in defaults'
+/// commands ([`config::shipped_tool_commands`]).
+fn verification_targets(catalog: &LaunchCatalog) -> Result<Vec<VerifyTarget>> {
+    let shipped = config::shipped_tool_commands()?;
+    let mut targets: Vec<VerifyTarget> = Vec::new();
+    for entry in catalog.as_slice() {
+        let tool = entry.tool();
+        let required = shipped.iter().any(|command| command == tool.command());
+        match targets
+            .iter_mut()
+            .find(|target| target.command == tool.command())
+        {
+            Some(existing) => {
+                // Two tools sharing a command share `required` too (it is a
+                // function of the command), so there is nothing to fold; the
+                // extra verb is still listed so the diagnostic names every
+                // tool that shares the missing binary.
+                existing.tools.push(tool.name().to_string());
+            }
+            None => targets.push(VerifyTarget {
+                tools: vec![tool.name().to_string()],
+                command: tool.command().to_string(),
+                required,
+            }),
+        }
+    }
+    Ok(targets)
+}
+
+pub async fn run(args: Args, catalog: Catalog) -> Result<()> {
     // setup also reaches connect_and_migrate (via Sandbox::builder/build and
     // Sandbox::remove), so it can hit the same forward-migrated-DB crash as
     // the boot path. See src/msb_preflight.rs and issue #30.
@@ -38,18 +104,38 @@ pub async fn run(args: Args) -> Result<()> {
         .image
         .unwrap_or_else(|| crate::defaults::DEFAULT_IMAGE_REF.to_string());
 
+    // Resolve the verification targets *before* pulling, so a broken config
+    // still pulls and boots the image — setup's recovery path must not be
+    // blocked by a config typo. A broken config falls back to the compiled-in
+    // default tools (which cannot themselves be broken: a missing default entry
+    // is already a hard error), matching today's behaviour where a broken
+    // project config did not affect `setup` at all.
+    let targets = match &catalog {
+        Catalog::Ready(catalog) => verification_targets(catalog)?,
+        Catalog::Broken(error) => {
+            println!(
+                "==> WARNING: tool configuration could not be read: {error:#}; \
+                 run `agent-vm doctor`"
+            );
+            println!("==> Falling back to the shipped default tools for verification");
+            verification_targets(
+                &config::default_launch_catalog().context("resolving the shipped default tools")?,
+            )?
+        }
+    };
+
     println!("==> Pulling {image} into the microsandbox cache");
     crate::pull::pull_image(&image).await?;
 
     if !args.no_verify {
-        verify_image(&image).await?;
+        verify_image(&image, &targets).await?;
     }
 
     println!("==> {image} ready");
     Ok(())
 }
 
-async fn verify_image(image: &str) -> Result<()> {
+async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
     println!("==> Verifying {image}");
     println!("==> Booting throwaway sandbox (this is the first VM cold-start; ~3s on a warm host)");
     // The pull step above already pulled the new manifest, so IfMissing
@@ -89,31 +175,37 @@ async fn verify_image(image: &str) -> Result<()> {
             )
         })?;
 
-    // Per-agent --version checks, run independently so the error
-    // names which one fails instead of a generic && short-circuit.
+    // Per-tool `--version` checks, run independently so the error names which
+    // one fails instead of a generic && short-circuit.
     println!("==> Checking in-VM agent versions");
-    for (name, cmd) in [
-        ("claude", "claude --version"),
-        ("opencode", "opencode --version"),
-        ("codex", "codex --version"),
-    ] {
-        let out = sandbox
-            .shell(cmd)
-            .await
-            .with_context(|| format!("running `{cmd}` inside sandbox"))?;
-        let stdout = out.stdout()?;
-        let trimmed = stdout.trim_end();
-        if out.status().code != 0 {
-            sandbox.stop_and_wait().await.ok();
-            Sandbox::remove("agent-vm-setup-verify").await.ok();
-            bail!(
-                "`{cmd}` in {image} exited {} — the {name} agent is missing or broken in this image. \
-                 Pull a newer tag (`agent-vm pull`) or report at \
-                 https://github.com/wirenboard/agent-vm/issues. Output:\n{trimmed}",
-                out.status().code
-            );
+    for target in targets {
+        // A direct argv exec (never a shell string), so a present-but-broken
+        // binary fails rather than passing an exists-check.
+        match sandbox.exec(&target.command, ["--version"]).await {
+            Ok(out) if out.status().code == 0 => println!("    {}", out.stdout()?.trim_end()),
+            outcome => {
+                // Diagnostic only: distinguish absent from present-but-broken.
+                // A constant script; the untrusted command travels in argv ($1).
+                let present = sandbox
+                    .exec(
+                        "sh",
+                        [
+                            "-c",
+                            r#"command -v -- "$1" > /dev/null"#,
+                            "sh",
+                            &target.command,
+                        ],
+                    )
+                    .await
+                    .map(|out| out.status().code == 0)
+                    .unwrap_or(false);
+                if let Err(error) = report(target, present, outcome) {
+                    sandbox.stop_and_wait().await.ok();
+                    Sandbox::remove("agent-vm-setup-verify").await.ok();
+                    return Err(error);
+                }
+            }
         }
-        println!("    {trimmed}");
     }
 
     println!("==> Stopping verify sandbox");
@@ -121,4 +213,235 @@ async fn verify_image(image: &str) -> Result<()> {
     Sandbox::remove("agent-vm-setup-verify").await.ok();
 
     Ok(())
+}
+
+/// Compose the diagnostic from the command's severity (`required`) and whether
+/// the command exists at all (`present`). A required command — one the
+/// published image is contractually required to carry, regardless of which tier
+/// declared the tool — bails; any other command warns and `setup` continues,
+/// because `setup` does not build the tooling layer that might supply it.
+///
+/// A transport failure — `sandbox.exec` returning `Err` because the sandbox
+/// died or agentd is unreachable — is indistinguishable here from an absent
+/// binary, so a non-required tool is warned about and `setup` continues. That
+/// is deliberate: `setup` cannot repair a dead sandbox by failing the run, and
+/// the image-API check has already passed by this point.
+fn report(
+    target: &VerifyTarget,
+    present: bool,
+    outcome: Result<ExecOutput, MicrosandboxError>,
+) -> Result<()> {
+    let verbs = target
+        .tools
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Never the raw `command`: it is not validated beyond non-empty/NUL-free, so
+    // printing it unescaped could inject terminal control sequences.
+    let command = config::escape_str(&target.command);
+    let failure = match &outcome {
+        Ok(out) => {
+            let code = out.status().code;
+            // The evidence the pre-change bail carried, kept here so the
+            // "present but `--version` exited N" case is not just a verdict.
+            // Escaped: it is in-guest tool output, not a trusted value.
+            let mut output = out.stdout().unwrap_or_default().trim().to_string();
+            if output.is_empty() {
+                output = out.stderr().unwrap_or_default().trim().to_string();
+            }
+            if output.is_empty() {
+                format!("present but `--version` exited {code}")
+            } else {
+                format!(
+                    "present but `--version` exited {code}; output: {}",
+                    config::escape_str(&output)
+                )
+            }
+        }
+        Err(error) => format!("not runnable (`--version` could not start: {error})"),
+    };
+
+    if target.required {
+        // A shipped tool is contractually required to work in the published
+        // image, so this is fatal. The message distinguishes absent from
+        // present-but-broken via `present` (the diagnostic, not the gate).
+        let because = if present {
+            format!("{failure} — the shipped binary is broken in this image")
+        } else {
+            "missing from the image".to_string()
+        };
+        bail!(
+            "{verbs}: command {command} is {because}. Pull a newer tag (`agent-vm pull`) or report at \
+             https://github.com/wirenboard/agent-vm/issues"
+        );
+    }
+    if present {
+        println!("==> WARNING: {verbs}: command {command} is {failure}");
+    } else {
+        println!(
+            "==> WARNING: {verbs}: command {command} is not in the image; if a `.agent-vm/layers/` \
+             tooling layer supplies it that is expected — `setup` does not build layers; \
+             otherwise check the tool's `command`"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ConfigPaths;
+
+    /// The compiled-in default catalog, resolved without touching the
+    /// developer's `$HOME` or cwd.
+    fn default_catalog() -> LaunchCatalog {
+        config::default_launch_catalog().expect("the embedded default catalog resolves")
+    }
+
+    /// A catalog from a throwaway project file.
+    fn catalog_from(body: &str) -> LaunchCatalog {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("config.toml");
+        std::fs::write(&project, body).unwrap();
+        config::load(&ConfigPaths {
+            user: Some(dir.path().join("no-user-config.toml")),
+            project,
+        })
+        .expect("the fixture config parses")
+        .into_launch_catalog()
+        .expect("the fixture catalog resolves")
+    }
+
+    /// `(verbs, command, required)` for each target, in order.
+    fn summary(targets: &[VerifyTarget]) -> Vec<(String, String, bool)> {
+        targets
+            .iter()
+            .map(|target| {
+                (
+                    target.tools.join(","),
+                    target.command.clone(),
+                    target.required,
+                )
+            })
+            .collect()
+    }
+
+    // -- V9: the default catalog verifies copilot, in catalog order ---------
+
+    #[test]
+    fn default_catalog_verifies_every_shipped_tool_including_copilot() {
+        assert_eq!(
+            summary(&verification_targets(&default_catalog()).expect("targets")),
+            vec![
+                ("codex".to_string(), "codex".to_string(), true),
+                ("opencode".to_string(), "opencode".to_string(), true),
+                ("claude".to_string(), "claude".to_string(), true),
+                ("copilot".to_string(), "copilot".to_string(), true),
+                ("shell".to_string(), "bash".to_string(), true),
+            ]
+        );
+    }
+
+    // -- V9: command-driven required, dedupe listing every verb ------------
+
+    #[test]
+    fn user_declared_tools_are_not_required() {
+        let targets = verification_targets(&catalog_from(
+            "[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\n",
+        ))
+        .expect("targets");
+        let mytool = targets
+            .iter()
+            .find(|target| target.command == "my-agent")
+            .expect("mytool is verified");
+        assert!(!mytool.required, "a user/project tool only warns");
+    }
+
+    #[test]
+    fn a_config_redeclaring_a_shipped_tool_is_still_required() {
+        // The published image is contractually required to carry `claude`, and
+        // that contract belongs to the *command*, not to the declaring tier. A
+        // user who copies `claude` into their config to change `args` must not
+        // be able to turn a missing `claude` back into a warning.
+        let targets = verification_targets(&catalog_from(
+            "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\nargs = [\"--x\"]\n",
+        ))
+        .expect("targets");
+        let claude = targets
+            .iter()
+            .find(|target| target.command == "claude")
+            .expect("claude is verified");
+        assert!(
+            claude.required,
+            "redeclaring a shipped tool keeps its binary required"
+        );
+    }
+
+    #[test]
+    fn tools_sharing_a_command_dedupe_and_list_every_verb() {
+        // `bash` is the shipped `shell`'s command; a user tool also names it, so
+        // the target is shared. `required` follows the command, so it stays
+        // true however the sharing tool was declared — otherwise any user could
+        // silence the shipped `shell` check by adding `command = "bash"`.
+        let targets = verification_targets(&catalog_from(
+            "[[tools]]\nname = \"mysh\"\ncommand = \"bash\"\n",
+        ))
+        .expect("targets");
+        let bash: Vec<&VerifyTarget> = targets
+            .iter()
+            .filter(|target| target.command == "bash")
+            .collect();
+        assert_eq!(bash.len(), 1, "one target per command");
+        assert_eq!(bash[0].tools, vec!["mysh".to_string(), "shell".to_string()]);
+        assert!(bash[0].required, "a shipped command stays required");
+    }
+
+    // -- V9: `report`'s severity table (manual 2/3, codified) --------------
+
+    fn target(tools: &[&str], command: &str, required: bool) -> VerifyTarget {
+        VerifyTarget {
+            tools: tools.iter().map(|name| (*name).to_string()).collect(),
+            command: command.to_string(),
+            required,
+        }
+    }
+
+    /// The shape a missing binary takes at the `sandbox.exec` boundary (a dead
+    /// sandbox is indistinguishable here, deliberately — see `report`'s doc).
+    fn not_runnable() -> Result<ExecOutput, MicrosandboxError> {
+        Err(MicrosandboxError::InvalidConfig("test".to_string()))
+    }
+
+    /// Manual 3 (codified): a missing *shipped* command is fatal. The real-VM
+    /// run in `verifications.md` uses a derived image with `codex` removed;
+    /// this pins the same decision boot-free.
+    #[test]
+    fn report_bails_for_a_missing_shipped_command() {
+        let err = report(&target(&["codex"], "codex", true), false, not_runnable())
+            .expect_err("a missing shipped command must be fatal");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("codex"), "{rendered}");
+        assert!(rendered.contains("missing from the image"), "{rendered}");
+    }
+
+    /// Manual 2 (codified): a missing *user/project* command warns and the run
+    /// continues — `setup` does not build `.agent-vm/layers/`.
+    #[test]
+    fn report_warns_for_a_missing_optional_command() {
+        assert!(
+            report(&target(&["mytool"], "mytool", false), false, not_runnable()).is_ok(),
+            "a missing user command only warns"
+        );
+    }
+
+    /// A shipped command that exists but whose `--version` could not run is
+    /// still fatal, and the message says "broken" rather than "missing".
+    #[test]
+    fn report_bails_for_a_broken_shipped_command() {
+        let err = report(&target(&["claude"], "claude", true), true, not_runnable())
+            .expect_err("a broken shipped command must be fatal");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("broken"), "{rendered}");
+    }
 }

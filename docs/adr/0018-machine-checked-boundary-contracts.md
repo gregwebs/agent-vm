@@ -49,7 +49,7 @@ The attribute style is excluded. Function-level `#[verus_spec]` measures free bu
 
 ### The verified surface
 
-One `verus!` block per owning module, in place, no new crate and no moved code. `cargo verus verify --locked -p agent-vm` reports **19 verified, 0 errors** across them.
+One `verus!` block per owning module, in place, no new crate and no moved code. `cargo verus verify --locked -p agent-vm` reports **22 verified, 0 errors** across them.
 
 | Site (module) | Contract that is machine-checked |
 |---|---|
@@ -58,12 +58,14 @@ One `verus!` block per owning module, in place, no new crate and no moved code. 
 | `msb_install.rs` — `socket_path_fits` | **The accept/reject comparison, including at the boundary** (`len <= SUN_PATH_USABLE_LEN`). Stated plainly: the exec body restates the spec, so what is proved is that the decision *is* that comparison — **not** that the socket-path invariant holds end to end. |
 | `intercept_hook/oauth_refresh.rs` — `path_is_exact` | **An accepted path target contains no `?`, `#` or `\`, and no escaping `%XX`.** The escape half is re-derived from the already-proved `contains_escaped_path_escape_bytes` `ensures`, not re-proved. |
 | `intercept_hook/http.rs` — `header_block_end`, `is_token_bytes`, `has_no_crlf` | **The body starts exactly at the separator** (`Some(i)` gives `separator_at` *and* firstness, which is what makes `raw[i + 4..]` a non-panicking slice), **header names are non-empty tokens**, and **values contain no CR or LF**. |
+| `config.rs` — `byte_paths_overlap` | **Two normalized guest paths overlap iff equal or one is a component-wise ancestor of the other** (`is_separator_prefix`): `.cache` overlaps `.cache/x` but not `.cachex`. A single loop invariant — "every position behind the cursor is equal" — supplies both the equal case and the separator check at the shorter length. Byte-level, so it is the decision only; the `Path` → bytes measurement is the trusted adapter `guest_paths_overlap`. |
 
 ### The trusted boundary
 
 Stated so that nobody reads more into the surface than is there. Verified code calls into, and trusts, the following; **none of it is proved**:
 
 - `str::as_bytes` (total and infallible; the escape property is a property of bytes either way);
+- `OsStr::as_bytes` in `config::guest_paths_overlap`, plus the *invariant* that a normalized `PersistPath`'s `Path` rendering is its components joined by single `/` (established by `normalize_persist`, not proved), and that a compiled `HomeLink::home_relative` is likewise `/`-joined. The launch-time mount check (`guest_home::mount_conflicts`) extends the same precondition to the guest mount paths it feeds the predicate: each is normalized by `resolve_project_guest_path` / `mount::normalize_guest` before it arrives;
 - `OsStr::len` — the socket-path decision is proved, the *byte measurement* of the path is not;
 - `url::Url::parse`, and the scheme/host/port/userinfo/query/fragment checks in `validated_target`;
 - `anyhow` context and error formatting, and the `String`/`Vec` assembly and `str::from_utf8` calls in `Request::parse`;

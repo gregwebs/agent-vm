@@ -30,6 +30,8 @@ use std::{
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::guest_home::{self, GuestHomeLink, LinkSource};
+
 /// Everything Phase 2 needs to know about a project invocation.
 pub struct ProjectSession {
     pub project_dir: PathBuf,
@@ -73,13 +75,29 @@ impl ProjectSession {
     ///
     /// `state_dir` itself is created **first** (it is not one of the provider
     /// dirs `eager_state_dirs` returns); dropping that would break first-launch
-    /// provisioning for a brand-new project.
-    pub fn ensure_dirs(&self) -> Result<()> {
+    /// provisioning for a brand-new project. Afterwards every link target's
+    /// parent is created (see the loop below).
+    pub fn ensure_dirs(&self, links: &[GuestHomeLink]) -> Result<()> {
         std::fs::create_dir_all(&self.state_dir)
             .with_context(|| format!("creating {}", self.state_dir.display()))?;
         for name in crate::credential_provider::eager_state_dirs() {
             let dir = self.state_dir.join(name);
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        // Every link's target parent, so a dangling `persist` symlink resolves
+        // to a creatable path in the guest (the guest's `open(O_CREAT)` through
+        // the link creates the real file host-side). For a compiled link the
+        // parent is the state dir itself — already created above — so this loop
+        // is uniform, adds no special case, and moves no existing golden. It
+        // runs in **both** modes: root mode does not call
+        // `provision_guest_home`, but its `.patch()`-baked symlinks still need
+        // their targets' parents to exist on the host.
+        for link in links {
+            let target = self.state_dir.join(&link.state_relative);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", crate::config::escape_path(parent)))?;
+            }
         }
         Ok(())
     }
@@ -119,36 +137,123 @@ impl ProjectSession {
     /// links already dangle host-side when no gh token was captured.
     ///
     /// Call only in non-root mode, any time after [`Self::ensure_dirs`].
-    pub fn provision_guest_home(&self) -> Result<()> {
+    pub fn provision_guest_home(&self, links: &[GuestHomeLink]) -> Result<()> {
         let home = self.guest_home_dir();
-        for dir in [&home, &home.join(".local/share"), &home.join(".config")] {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+        for dir in guest_home::link_parent_dirs(links) {
+            let dir = home.join(dir);
+            create_dir_all_beneath(&home, &dir)?;
         }
-        for (link, target) in guest_home_symlinks(&home) {
-            // force_symlink already attributes failures to the specific
-            // link/target pair; add distinct, higher-altitude context here
-            // instead of repeating that same string.
-            force_symlink(&target, &link)
-                .with_context(|| format!("provisioning guest home in {}", home.display()))?;
+        for (link, (link_path, target)) in links.iter().zip(guest_home_symlinks(&home, links)) {
+            match link.source {
+                LinkSource::Compiled => {
+                    force_symlink(&target, &link_path).with_context(|| {
+                        format!("provisioning guest home in {}", home.display())
+                    })?;
+                }
+                LinkSource::Declared => {
+                    let target_path = self.state_dir.join(&link.state_relative);
+                    link_declared_persist(&target_path, &target, &link_path).with_context(
+                        || format!("provisioning guest home in {}", home.display()),
+                    )?;
+                }
+            }
         }
         Ok(())
     }
 }
 
-/// Pure mapping from [`crate::credential_provider::guest_home_links`] to
+/// Create `dir` and its parents, refusing to descend through a symlink at or
+/// below `home`. [`std::fs::create_dir_all`] follows symlinks in *parent*
+/// components, so a guest-planted symlink (the non-root guest HOME is a bind
+/// mount the in-guest agent writes to freely) could redirect host-side
+/// provisioning outside the state dir — e.g. `~/.cache -> /etc`. This is the
+/// guard that makes [`link_declared_persist`]'s "both paths are under the
+/// project state dir" argument true rather than assumed, and it also covers the
+/// compiled links' ancestors (`.local`, `.config`).
+fn create_dir_all_beneath(home: &Path, dir: &Path) -> Result<()> {
+    let relative = dir.strip_prefix(home).unwrap_or(dir);
+    let mut current = home.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        if std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            anyhow::bail!(
+                "refusing to provision {}: {} is a symlink, not a directory; a \
+                 symlinked path under the guest HOME must not redirect host-side provisioning",
+                crate::config::escape_path(dir),
+                crate::config::escape_path(&current)
+            );
+        }
+    }
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating {}", crate::config::escape_path(dir)))
+}
+
+/// Pure mapping from the resolved [`GuestHomeLink`] list to
 /// `(host link path, guest target string)` pairs rooted at `home`. Split out
 /// from [`ProjectSession::provision_guest_home`] so the link→target mapping is
 /// unit-testable without touching the filesystem.
-fn guest_home_symlinks(home: &Path) -> Vec<(PathBuf, String)> {
-    crate::credential_provider::guest_home_links()
+fn guest_home_symlinks(home: &Path, links: &[GuestHomeLink]) -> Vec<(PathBuf, String)> {
+    links
         .iter()
-        .map(|link| {
-            (
-                home.join(link.home_relative),
-                format!("/agent-vm-state/{}", link.state_relative),
-            )
-        })
+        .map(|link| (home.join(&link.home_relative), link.guest_target()))
         .collect()
+}
+
+/// Link a tool-declared `persist` path, migrating whatever is already there.
+///
+/// A regular file or directory at the path is the user's data: in non-root mode
+/// the guest HOME is itself persistent, so the first launch after adding a
+/// `persist` entry finds real content that a previous launch wrote. It is
+/// *moved* into the state dir rather than deleted (`force_symlink`'s
+/// file-replacing behaviour would be data loss here) and rather than refused
+/// (a hard error would fail every launch whose provisioning closure reaches
+/// this tool — including the `shell` a user would reach for to fix it).
+///
+/// `rename` never destroys: both paths are under the project state dir, so it
+/// is same-filesystem and atomic, and a destination that already exists is an
+/// ambiguity (two sources of truth) that is reported, not resolved.
+fn link_declared_persist(target_path: &Path, target: &str, link: &Path) -> Result<()> {
+    // Every path in a diagnostic below is config-derived (it embeds a `persist`
+    // entry, which may legally contain ESC/ANSI bytes), so it is escaped with
+    // the same rule `config`'s own diagnostics use — never printed raw.
+    match std::fs::symlink_metadata(link) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            // Idempotent relaunch, or a retarget: replace the link.
+            std::fs::remove_file(link).with_context(|| {
+                format!("removing existing {}", crate::config::escape_path(link))
+            })?;
+        }
+        Ok(_) => {
+            if std::fs::symlink_metadata(target_path).is_ok() {
+                anyhow::bail!(
+                    "guest home path {} holds real content and its persist target {} also exists; \
+                     move or remove one of them",
+                    crate::config::escape_path(link),
+                    crate::config::escape_path(target_path)
+                );
+            }
+            std::fs::rename(link, target_path).with_context(|| {
+                format!(
+                    "migrating {} into {}",
+                    crate::config::escape_path(link),
+                    crate::config::escape_path(target_path)
+                )
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("stat {}", crate::config::escape_path(link)));
+        }
+    }
+    std::os::unix::fs::symlink(target, link).with_context(|| {
+        format!(
+            "symlinking {} -> {}",
+            crate::config::escape_path(link),
+            crate::config::escape_str(target)
+        )
+    })
 }
 
 /// Create a symlink at `link` pointing at `target`, replacing whatever
@@ -257,7 +362,9 @@ mod tests {
     #[test]
     fn ensure_dirs_creates_state_root_and_legacy_subdirs() {
         let session = throwaway_session();
-        session.ensure_dirs().expect("ensure_dirs");
+        session
+            .ensure_dirs(&guest_home::links(&[]))
+            .expect("ensure_dirs");
         assert!(session.state_dir.is_dir(), "state root must be created");
         for sub in ["claude", "codex", "opencode"] {
             assert!(
@@ -268,12 +375,33 @@ mod tests {
         std::fs::remove_dir_all(&session.project_dir).ok();
     }
 
+    /// V6: a declared `persist` path's target *parent* is created (so the guest
+    /// can create the file through the dangling link), while the target itself
+    /// is deliberately left absent — pre-creating it would break a
+    /// file-valued entry.
+    #[test]
+    fn ensure_dirs_creates_declared_target_parents() {
+        let session = throwaway_session();
+        let links = guest_home::links(&[
+            crate::config::PersistPath::for_test(".aider.conf.yml"),
+            crate::config::PersistPath::for_test(".cache/aider"),
+        ]);
+        session.ensure_dirs(&links).expect("ensure_dirs");
+        for sub in ["claude", "codex", "opencode"] {
+            assert!(session.state_dir.join(sub).is_dir());
+        }
+        assert!(session.state_dir.join("persist").is_dir());
+        assert!(session.state_dir.join("persist/.cache").is_dir());
+        assert!(!session.state_dir.join("persist/.aider.conf.yml").exists());
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
     // ── non-root guest HOME provisioning ───────────────────────────
 
     #[test]
     fn guest_home_symlinks_map_matches_guest_home_links() {
         let home = Path::new("/state/home");
-        let links = guest_home_symlinks(home);
+        let links = guest_home_symlinks(home, &guest_home::links(&[]));
         assert_eq!(
             links.len(),
             crate::credential_provider::guest_home_links().len()
@@ -344,7 +472,7 @@ mod tests {
     fn provision_guest_home_creates_dirs_and_dangling_symlinks() {
         let session = throwaway_session();
         session
-            .provision_guest_home()
+            .provision_guest_home(&guest_home::links(&[]))
             .expect("provision_guest_home");
 
         let home = session.guest_home_dir();
@@ -364,13 +492,15 @@ mod tests {
     #[test]
     fn provision_guest_home_is_idempotent() {
         let session = throwaway_session();
-        session.provision_guest_home().expect("first provision");
+        session
+            .provision_guest_home(&guest_home::links(&[]))
+            .expect("first provision");
         // A stray real file where a symlink should go must not abort a
         // re-launch in the same project.
         std::fs::remove_file(session.guest_home_dir().join(".gitconfig")).ok();
         std::fs::write(session.guest_home_dir().join(".gitconfig"), "stray").unwrap();
         session
-            .provision_guest_home()
+            .provision_guest_home(&guest_home::links(&[]))
             .expect("second provision must replace the stray file, not fail");
         let target =
             std::fs::read_link(session.guest_home_dir().join(".gitconfig")).expect("readlink");
@@ -400,6 +530,153 @@ mod tests {
         // The directory and its contents must still be there.
         assert!(link.join("nested/real-file").is_file());
 
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
+    // ── V7: declared `persist` link provisioning ──────────────────
+
+    const DECLARED_GUEST_TARGET: &str = "/agent-vm-state/persist/.aider.conf.yml";
+
+    /// A session with a `persist/` target parent already created (what
+    /// `ensure_dirs` does in production), plus the link path for the headline
+    /// `.aider.conf.yml` entry.
+    fn declared_persist_fixture() -> (ProjectSession, PathBuf, PathBuf) {
+        let session = throwaway_session();
+        let home = session.guest_home_dir();
+        std::fs::create_dir_all(&home).unwrap();
+        let target = session.state_dir.join("persist/.aider.conf.yml");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let link = home.join(".aider.conf.yml");
+        (session, link, target)
+    }
+
+    #[test]
+    fn link_declared_persist_creates_a_dangling_link_when_absent() {
+        let (session, link, target) = declared_persist_fixture();
+        link_declared_persist(&target, DECLARED_GUEST_TARGET, &link).expect("create");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from(DECLARED_GUEST_TARGET)
+        );
+        // Dangling on the host: the guest creates the real file through it.
+        assert!(!target.exists());
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
+    #[test]
+    fn link_declared_persist_replaces_a_symlink_idempotently() {
+        let (session, link, target) = declared_persist_fixture();
+        link_declared_persist(&target, DECLARED_GUEST_TARGET, &link).expect("first");
+        // A second launch (retarget) must not fail on `AlreadyExists`.
+        link_declared_persist(&target, DECLARED_GUEST_TARGET, &link).expect("second");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from(DECLARED_GUEST_TARGET)
+        );
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
+    #[test]
+    fn link_declared_persist_migrates_a_real_file() {
+        let (session, link, target) = declared_persist_fixture();
+        std::fs::write(&link, "host content").unwrap();
+        link_declared_persist(&target, DECLARED_GUEST_TARGET, &link).expect("migrate");
+        // The content moved into the state dir (never deleted) and the link
+        // now resolves host-side.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "host content");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from(DECLARED_GUEST_TARGET)
+        );
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
+    #[test]
+    fn link_declared_persist_migrates_a_real_directory() {
+        let (session, link, target) = declared_persist_fixture();
+        std::fs::create_dir_all(link.join("nested")).unwrap();
+        std::fs::write(link.join("nested/file"), "kept").unwrap();
+        link_declared_persist(&target, DECLARED_GUEST_TARGET, &link).expect("migrate");
+        assert_eq!(
+            std::fs::read_to_string(target.join("nested/file")).unwrap(),
+            "kept"
+        );
+        assert!(link.is_symlink());
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
+    #[test]
+    fn link_declared_persist_errors_when_both_sides_hold_real_content() {
+        let (session, link, target) = declared_persist_fixture();
+        std::fs::write(&link, "home copy").unwrap();
+        std::fs::write(&target, "state copy").unwrap();
+        let err = link_declared_persist(&target, DECLARED_GUEST_TARGET, &link)
+            .expect_err("two real copies is an ambiguity, not a migration");
+        let message = err.to_string();
+        assert!(message.contains(&link.display().to_string()), "{message}");
+        assert!(message.contains(&target.display().to_string()), "{message}");
+        // Neither side was touched.
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "home copy");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "state copy");
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
+    #[test]
+    fn link_declared_persist_escapes_control_bytes_in_its_diagnostic() {
+        // A `persist` entry may legally contain ESC/ANSI bytes (`normalize_persist`
+        // rejects only empty/NUL/absolute/`..`), so the error must render them
+        // escaped, exactly as `config`'s own diagnostics do — otherwise a
+        // project config could drive the terminal.
+        let session = throwaway_session();
+        let home = session.guest_home_dir();
+        std::fs::create_dir_all(&home).unwrap();
+        let relative = ".aider\u{1b}[31m.conf.yml";
+        let target = session.state_dir.join("persist").join(relative);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let link = home.join(relative);
+        std::fs::write(&link, "home copy").unwrap();
+        std::fs::write(&target, "state copy").unwrap();
+
+        let err = link_declared_persist(&target, "ignored", &link)
+            .expect_err("two real copies is an ambiguity, not a migration");
+        let message = err.to_string();
+        assert!(
+            !message.contains('\u{1b}'),
+            "raw ESC reached the diagnostic: {message:?}"
+        );
+        assert!(
+            message.contains("\\x1b"),
+            "the byte was not escaped: {message:?}"
+        );
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
+    #[test]
+    fn provision_guest_home_refuses_a_symlinked_ancestor() {
+        // `create_dir_all` follows symlinks in parent components, so a symlink
+        // the in-guest agent planted in the persistent HOME (`~/.cache -> /etc`)
+        // would redirect host-side provisioning outside the state dir. The walk
+        // must refuse it rather than follow it.
+        let session = throwaway_session();
+        let home = session.guest_home_dir();
+        std::fs::create_dir_all(&home).unwrap();
+        let elsewhere = session.project_dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(".cache")).unwrap();
+
+        let links = guest_home::links(&[crate::config::PersistPath::for_test(".cache/aider")]);
+        let err = session
+            .provision_guest_home(&links)
+            .expect_err("a symlinked ancestor must be refused, not followed");
+        assert!(
+            err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+        // The symlink was not traversed: nothing was created under its target.
+        assert!(
+            std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "provisioning followed the planted symlink"
+        );
         std::fs::remove_dir_all(&session.project_dir).ok();
     }
 }

@@ -66,6 +66,13 @@ so emitting HOME first is unconditionally safe. `run.rs`'s
 `SandboxBuilder`'s internal mount list has no public read accessor to
 assert against directly.
 
+Because that ordering is what makes a mountpoint inside `$HOME` **silently**
+shadow a dotfile, a tool-declared `persist` path (see
+[ADR-0015](0015-config-driven-tools.md)) is checked against the resolved guest
+mount points at launch, before any provisioning (`guest_home::mount_conflicts`).
+A config cannot see the project path, so this axis is not checkable at parse
+time.
+
 ### Username is resolved env-first
 
 Order: `$USER` → `$LOGNAME` → the passwd-DB name for the uid

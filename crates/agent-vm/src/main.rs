@@ -9,6 +9,7 @@ mod defaults;
 mod doctor;
 mod env_flag;
 mod github_graphql;
+mod guest_home;
 mod host_paths;
 mod image_api_version;
 mod image_capabilities;
@@ -64,7 +65,10 @@ fn main() -> Result<()> {
     // is safe ahead of this block.
     let needs_msb_setup = !matches!(
         dispatch,
-        Dispatch::Builtin(Cmd::InterceptHook(_) | Cmd::Clipboard(_))
+        Dispatch::Builtin {
+            cmd: Cmd::InterceptHook(_) | Cmd::Clipboard(_),
+            ..
+        }
     );
     if needs_msb_setup {
         msb_install::point_at_msb()?;
@@ -83,12 +87,20 @@ fn main() -> Result<()> {
     // `msb_cmd::run` is fully synchronous (just spawns a child and waits);
     // dispatch it before paying for a tokio runtime we'd otherwise spin up
     // and immediately block on for a single `Command::status()` call.
-    if let Dispatch::Builtin(Cmd::Msb(args)) = dispatch {
+    if let Dispatch::Builtin {
+        cmd: Cmd::Msb(args),
+        ..
+    } = dispatch
+    {
         return exit_with(msb_cmd::run(args)?);
     }
     // doctor is also pure sync fs work (no VM/network I/O); dispatch it
     // before the runtime for the same reason as Msb above.
-    if let Dispatch::Builtin(Cmd::Doctor(args)) = dispatch {
+    if let Dispatch::Builtin {
+        cmd: Cmd::Doctor(args),
+        ..
+    } = dispatch
+    {
         doctor::run(args)?;
         return Ok(());
     }
@@ -96,16 +108,33 @@ fn main() -> Result<()> {
     runtime.block_on(async move {
         match dispatch {
             Dispatch::Launch { entry, args } => exit_with(run::launch(&entry, *args).await?),
-            Dispatch::Builtin(Cmd::Setup(args)) => setup::run(args).await,
-            Dispatch::Builtin(Cmd::Pull(args)) => pull::run(args).await,
-            Dispatch::Builtin(Cmd::Clipboard(args)) => clipboard::run(args),
-            Dispatch::Builtin(Cmd::InterceptHook(args)) => intercept_hook::run(args).await,
+            Dispatch::Builtin {
+                cmd: Cmd::Setup(args),
+                catalog,
+            } => setup::run(args, catalog).await,
+            Dispatch::Builtin {
+                cmd: Cmd::Pull(args),
+                ..
+            } => pull::run(args).await,
+            Dispatch::Builtin {
+                cmd: Cmd::Clipboard(args),
+                ..
+            } => clipboard::run(args),
+            Dispatch::Builtin {
+                cmd: Cmd::InterceptHook(args),
+                ..
+            } => intercept_hook::run(args).await,
             // Already dispatched and returned from, above, before the
             // runtime was built.
-            Dispatch::Builtin(Cmd::Msb(_)) => {
+            Dispatch::Builtin {
+                cmd: Cmd::Msb(_), ..
+            } => {
                 unreachable!("Cmd::Msb is dispatched pre-runtime, see above")
             }
-            Dispatch::Builtin(Cmd::Doctor(_)) => {
+            Dispatch::Builtin {
+                cmd: Cmd::Doctor(_),
+                ..
+            } => {
                 unreachable!("Cmd::Doctor is dispatched pre-runtime, see above")
             }
         }

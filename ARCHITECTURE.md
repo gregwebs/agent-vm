@@ -64,14 +64,19 @@ A launch is one pass, and the ordering is load-bearing:
 7. Teardown stops the sandbox, removes it, and re-checks the credential
    snapshot.
 
-### Tool configuration is diagnostic only (not in the launch path)
+### Tool configuration drives the CLI and the guest-HOME links
 
 `config.rs` reads two ordered **catalogs** — `$HOME/.config/agent-vm/config.toml`
 and `<cwd>/.agent-vm/config.toml` — validates each strictly, and resolves a
 whole-definition union (user definitions win; the project may only add names
 the user did not write). When both declare zero tools it falls back to the
-five compiled-in defaults embedded from `default-tools.toml`. The only
-consumer today is ordinary `agent-vm doctor`, which renders a preview:
+five compiled-in defaults embedded from `default-tools.toml`. The resolved
+catalog is what the CLI builds its launch verbs from (#82), and
+`run::launch` reads back each entry's provisioning set — the credential
+providers *and*, since #83, the `persist` paths that become guest-HOME
+links (`guest_home.rs`) — so the verb list and the guest state it provisions
+share one source of truth. `agent-vm doctor` still renders the resolved
+catalog read-only:
 
 ```
 user file --------> parse + validate --+
@@ -80,16 +85,17 @@ project file -----> parse + validate --+    + conflicts       ownership
                                                           |
                                                    ResolvedTools
                                                           |
+                                              LaunchCatalog  --> CLI verbs
+                                                          |       + run::launch
                                             doctor preview (read-only)
 ```
 
-There is deliberately **no arrow from this module to launch**, credential
-capture, Docker, layers, or guest state. Layer paths are declarative metadata
-that is never resolved or built, and config warnings are never logged —
-doctor renders them explicitly. `doctor --reset-msb-db` never reads config, so
-a broken file cannot block db recovery. Runtime consumption (selecting a tool,
-narrowing credential gating, building layers from config) belongs to #82/#83/#84.
-See [USAGE](USAGE.md#tool-configuration-diagnostic-preview) for the schema and
+Layer paths remain declarative metadata that is never resolved or built
+(#84), and config warnings are never logged — doctor renders them explicitly.
+`doctor --reset-msb-db` never reads config, so a broken file cannot block db
+recovery. There is still no arrow from this module to credential *capture*,
+Docker, or guest state; it resolves the provisioning set and the launch
+consumes it. See [USAGE](USAGE.md#tool-configuration) for the schema and
 rules and [CONTEXT](CONTEXT.md) for the vocabulary.
 
 ### Why a git submodule for microsandbox

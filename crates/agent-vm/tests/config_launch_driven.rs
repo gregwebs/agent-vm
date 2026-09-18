@@ -308,17 +308,25 @@ impl Harness {
         let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
         normalize_host_identity(&mut value);
         drop_host_gid_group_append(&mut value);
-        // Drop the `Mkdir` patches: they are a mechanical function of the
-        // project path's ancestors, which differ by platform (macOS
-        // canonicalizes `/tmp` -> `/private/tmp`, Linux does not, and the
-        // checkout path itself differs). They are not what this fixture guards;
-        // every other patch (the `/etc/passwd` identity append, already
-        // tokenized) is kept.
+        // Drop the project-path `Mkdir` patches: they are a mechanical
+        // function of the project path's ancestors, which differ by platform
+        // (macOS canonicalizes `/tmp` -> `/private/tmp`, Linux does not, and
+        // the checkout path itself differs). **Root-mode dotfile mkdirs
+        // (`/root/...`) are kept** — #83's `persist` links need `/root/.cache`
+        // and friends, and their presence is the assertion, so filtering them
+        // out would weaken the check rather than stabilize it. Non-root emits
+        // no `/root/...` mkdir, so the goldens do not move.
         if let Some(patches) = value
             .get_mut("patches")
             .and_then(|patches| patches.as_array_mut())
         {
-            patches.retain(|patch| patch.get("Mkdir").is_none());
+            patches.retain(|patch| match patch.get("Mkdir") {
+                None => true,
+                Some(mkdir) => mkdir
+                    .get("path")
+                    .and_then(|path| path.as_str())
+                    .is_some_and(|path| path.starts_with("/root/")),
+            });
         }
         // The microsandbox builder stores mounts in a hash-ordered collection,
         // so `mounts` come out in a run-dependent order (it varies even for
@@ -1835,4 +1843,279 @@ fn a_shell_launch_with_no_host_credentials_wires_nothing() {
             "{provider} must not be captured"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #83 — per-tool persisted guest paths
+// ---------------------------------------------------------------------------
+
+/// A project tool that adds no credential provider, only `persist` paths — the
+/// headline case from issue #83.
+const AIDER_PERSIST: &str = "[[tools]]\nname = \"aider\"\ncommand = \"/bin/echo\"\n\
+     credentials = []\npersist = [\".aider.conf.yml\", \".cache/aider\"]\n";
+
+/// The same tool declared *without* `persist`, to land the state dir before the
+/// migration case rewrites the config.
+const AIDER_PLAIN: &str =
+    "[[tools]]\nname = \"aider\"\ncommand = \"/bin/echo\"\ncredentials = []\n";
+
+/// The eight compiled-in guest-HOME links, always provisioned.
+const COMPILED_LINKS: [&str; 8] = [
+    ".claude",
+    ".claude.json",
+    ".local/share/opencode",
+    ".config/opencode",
+    ".copilot",
+    ".gitconfig",
+    ".config/gh",
+    ".bash_history",
+];
+
+/// **V10 (AC1, AC2).** A tool with no credential provider gets its `persist`
+/// entries linked into the project state dir under the `persist/` namespace,
+/// and the eight compiled links remain — additive, not replacing.
+#[test]
+fn a_declared_persist_tool_links_into_state_and_stays_additive() {
+    let harness = Harness::new();
+    harness.write_project(AIDER_PERSIST);
+
+    let out = harness.launch("aider", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "aider did not launch: {stderr}"
+    );
+    let state = state_dir(&stderr);
+    let snap = snapshot(&state);
+
+    assert_eq!(
+        snap.get("link:.aider.conf.yml").map(String::as_str),
+        Some("/agent-vm-state/persist/.aider.conf.yml")
+    );
+    assert_eq!(
+        snap.get("link:.cache/aider").map(String::as_str),
+        Some("/agent-vm-state/persist/.cache/aider")
+    );
+    assert!(
+        state.join("persist/.cache").is_dir(),
+        "the declared target's parent must exist"
+    );
+    for compiled in COMPILED_LINKS {
+        assert!(
+            snap.contains_key(&format!("link:{compiled}")),
+            "the compiled link {compiled} must remain: {snap:?}"
+        );
+    }
+}
+
+/// **V11 (AC1).** In `--root` mode the same list is baked into the rootfs: the
+/// declared links become `/root/...` symlink patches, a `/root/.cache` mkdir is
+/// emitted for the ancestor, and the compiled symlink steps are unchanged.
+#[test]
+fn root_mode_bakes_declared_persist_links_into_the_rootfs() {
+    let harness = Harness::new();
+    harness.write_project(AIDER_PERSIST);
+
+    let out = harness.launch("aider", &["--root"]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "aider --root did not launch: {stderr}"
+    );
+    let config = debug_config_json(&stderr);
+    let patches = config["patches"].as_array().unwrap();
+
+    let symlinks: Vec<(&str, &str)> = patches
+        .iter()
+        .filter_map(|patch| {
+            patch.get("Symlink").map(|link| {
+                (
+                    link["target"].as_str().unwrap(),
+                    link["link"].as_str().unwrap(),
+                )
+            })
+        })
+        .collect();
+    let mkdirs: Vec<&str> = patches
+        .iter()
+        .filter_map(|patch| patch.get("Mkdir").and_then(|mkdir| mkdir["path"].as_str()))
+        .collect();
+
+    for expected in [
+        (
+            "/agent-vm-state/persist/.aider.conf.yml",
+            "/root/.aider.conf.yml",
+        ),
+        ("/agent-vm-state/persist/.cache/aider", "/root/.cache/aider"),
+        // A compiled link, unchanged.
+        ("/agent-vm-state/claude", "/root/.claude"),
+    ] {
+        assert!(
+            symlinks.contains(&expected),
+            "missing {expected:?}: {symlinks:?}"
+        );
+    }
+    assert!(
+        mkdirs.contains(&"/root/.cache"),
+        "missing /root/.cache: {mkdirs:?}"
+    );
+}
+
+/// **V12 (AC2).** `persist` is additive with a tool's credential links: a tool
+/// declaring `credentials = ["anthropic"]` and `persist = [".x"]` keeps
+/// `.claude`/`.claude.json` without restating them.
+#[test]
+fn persist_is_additive_with_credential_links() {
+    let harness = Harness::new();
+    harness.write_project(
+        "[[tools]]\nname = \"mytool\"\ncommand = \"/bin/echo\"\ncredentials = [\"anthropic\"]\npersist = [\".x\"]\n",
+    );
+
+    let out = harness.launch("mytool", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "mytool did not launch: {stderr}"
+    );
+    let snap = snapshot(&state_dir(&stderr));
+    assert!(snap.contains_key("link:.claude"), "{snap:?}");
+    assert!(snap.contains_key("link:.claude.json"), "{snap:?}");
+    assert_eq!(
+        snap.get("link:.x").map(String::as_str),
+        Some("/agent-vm-state/persist/.x")
+    );
+}
+
+/// **V13 (AC4).** The link survives a second launch: after the guest writes the
+/// real file through the link (simulated host-side), a relaunch neither errors
+/// nor migrates it — the link still resolves to the persist namespace and the
+/// content is intact. A survival-only assertion would pass with the feature
+/// deleted, so this asserts the link target.
+#[test]
+fn a_declared_persist_link_survives_a_second_launch() {
+    let harness = Harness::new();
+    harness.write_project(AIDER_PERSIST);
+
+    let first = harness.launch("aider", &[]);
+    let state = state_dir(&stderr_of(&first));
+    // The guest's `open(O_CREAT)` through the dangling link creates the real
+    // file host-side; simulate it.
+    std::fs::write(state.join("persist/.aider.conf.yml"), "guest wrote this").unwrap();
+
+    let second = harness.launch("aider", &[]);
+    assert!(
+        stderr_of(&second).contains(CONFIG_MARKER),
+        "second launch failed: {}",
+        stderr_of(&second)
+    );
+    let link = state.join("home/.aider.conf.yml");
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        PathBuf::from("/agent-vm-state/persist/.aider.conf.yml"),
+        "the link must still resolve to the persist namespace"
+    );
+    // The real file is host-side under the state dir, never overwritten or
+    // migrated by the relaunch.
+    assert_eq!(
+        std::fs::read_to_string(state.join("persist/.aider.conf.yml")).unwrap(),
+        "guest wrote this"
+    );
+}
+
+/// **V13b (migration).** A real file already in the (persistent, non-root) guest
+/// HOME is *moved* into the state dir the first time the tool declares it —
+/// never deleted.
+#[test]
+fn a_pre_existing_home_file_is_migrated_into_the_persist_namespace() {
+    let harness = Harness::new();
+    harness.write_project(AIDER_PLAIN);
+    let first = harness.launch("aider", &[]);
+    let state = state_dir(&stderr_of(&first));
+
+    std::fs::write(state.join("home/.aider.conf.yml"), "old home content").unwrap();
+
+    harness.write_project(AIDER_PERSIST);
+    let second = harness.launch("aider", &[]);
+    assert!(
+        stderr_of(&second).contains(CONFIG_MARKER),
+        "second launch failed: {}",
+        stderr_of(&second)
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("persist/.aider.conf.yml")).unwrap(),
+        "old home content",
+        "the pre-existing content must be moved, not deleted"
+    );
+    assert_eq!(
+        std::fs::read_link(state.join("home/.aider.conf.yml")).unwrap(),
+        PathBuf::from("/agent-vm-state/persist/.aider.conf.yml")
+    );
+}
+
+/// **V13b (mount check).** A `persist` path that would be shadowed by a mount
+/// under HOME is rejected before boot — no debug config dump, no provisioning.
+#[test]
+fn a_persist_path_shadowing_a_mount_under_home_is_rejected_before_boot() {
+    let harness = Harness::new();
+    harness.write_project(
+        "[[tools]]\nname = \"aider\"\ncommand = \"/bin/echo\"\ncredentials = []\npersist = [\"code\"]\n",
+    );
+    // A `--mount` whose guest path is under the mirrored HOME and overlaps the
+    // declared `code` path.
+    let guest = format!("{}/code", harness.home_root.display());
+    let mount = format!("{}:{guest}", harness.project_root.display());
+
+    let out = harness.launch("aider", &["--mount", &mount]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("would collide with the guest mount point"),
+        "expected the mount-shadowing rejection: {stderr}"
+    );
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "the launch must be rejected before boot: {stderr}"
+    );
+}
+
+/// **Q1 guard, end to end.** A symlink the in-guest agent planted at an
+/// ancestor of a declared `persist` path must be refused, not followed. The
+/// non-root guest HOME is a bind mount the agent writes freely, so
+/// `create_dir_all` through `~/.cache -> /etc` would redirect host-side
+/// provisioning (and `link_declared_persist`'s `rename`) outside the state dir.
+/// `session::create_dir_all_beneath` is the guard; this drives it through the
+/// real binary.
+#[test]
+fn a_guest_planted_symlinked_ancestor_is_refused_before_boot() {
+    let harness = Harness::new();
+    // First launch mostly to materialize the per-project state dir (the
+    // provisioning runs before the bogus-image pull fails). Only the file
+    // entry, so `.cache` is *not* created as a real directory.
+    harness.write_project(
+        "[[tools]]\nname = \"aider\"\ncommand = \"/bin/echo\"\ncredentials = []\npersist = [\".aider.conf.yml\"]\n",
+    );
+    let first = harness.launch("aider", &[]);
+    let state = state_dir(&stderr_of(&first));
+
+    // The agent plants `~/.cache` as a symlink out of the state dir.
+    let planted = harness.project_root.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::create_dir_all(state.join("home")).unwrap();
+    std::os::unix::fs::symlink(&planted, state.join("home/.cache")).unwrap();
+
+    // The second launch declares `persist = [".cache/aider"]`, so provisioning
+    // walks the planted `.cache` ancestor.
+    harness.write_project(
+        "[[tools]]\nname = \"aider\"\ncommand = \"/bin/echo\"\ncredentials = []\npersist = [\".cache/aider\"]\n",
+    );
+    let second = harness.launch("aider", &[]);
+    let stderr = stderr_of(&second);
+    assert!(stderr.contains("symlink"), "expected the refusal: {stderr}");
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "must be refused before boot: {stderr}"
+    );
+    assert!(
+        std::fs::read_dir(&planted).unwrap().next().is_none(),
+        "provisioning followed the planted symlink"
+    );
 }

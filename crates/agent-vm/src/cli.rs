@@ -38,7 +38,7 @@ use std::ffi::OsString;
 use anyhow::{Result, anyhow};
 use clap::{Args as _, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
-use crate::config::{CatalogEntry, ConfigReport, LaunchCatalog, Tool};
+use crate::config::{Catalog, CatalogEntry, ConfigReport, Tool};
 use crate::run;
 use crate::{clipboard, doctor, intercept_hook, msb_cmd, pull, setup};
 
@@ -103,10 +103,14 @@ pub(crate) enum Cmd {
 }
 
 /// What [`parse_from`] decided to do. Built-in verbs keep their derived clap
-/// types; a launch verb resolves to one entry of the catalog plus the shared
-/// launch `Args`.
+/// types **and** the loaded catalog: only `Cmd::Setup` reads it (it verifies
+/// every configured tool's command), but every built-in carries it so the
+/// catalog a launch *would* have used is the same value `setup` reads.
 pub(crate) enum Dispatch {
-    Builtin(Cmd),
+    Builtin {
+        cmd: Cmd,
+        catalog: Catalog,
+    },
     // `args` is boxed so `Dispatch` does not carry the shared launch `Args`'s
     // full size inline (clippy `large_enum_variant`).
     Launch {
@@ -128,14 +132,6 @@ pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "_intercept-hook",
     "help",
 ];
-
-/// The outcome of loading the tool config, as data. One value rather than a
-/// `LaunchCatalog` plus a parallel `Option<Error>`, so the catalog and the
-/// deferred error cannot disagree about which state the process is in.
-pub(crate) enum Catalog {
-    Ready(LaunchCatalog),
-    Broken(anyhow::Error),
-}
 
 /// Build the full command (built-ins + one subcommand per catalog entry) and
 /// parse `argv`.
@@ -196,7 +192,7 @@ where
         // The catalog is authoritative (checked first) so a future built-in
         // added without updating `RESERVED_TOOL_NAMES` fails a test rather
         // than silently shadowing a user's tool.
-        (Some((name, sub)), Catalog::Ready(catalog)) => match catalog.into_entry(name) {
+        (Some((name, sub)), Catalog::Ready(mut catalog)) => match catalog.take_entry(name) {
             Some(entry) => Ok(Dispatch::Launch {
                 entry,
                 args: Box::new(run::Args::from_arg_matches(sub)?),
@@ -204,15 +200,23 @@ where
             // Not a tool, so a fixed built-in: the two name sets are disjoint
             // (`RESERVED_TOOL_NAMES`, asserted by a test) and external
             // subcommands are off on this path, so clap could not have accepted
-            // anything else.
-            None => Ok(Dispatch::Builtin(Cli::from_arg_matches(&matches)?.cmd)),
+            // anything else. The catalog (minus the taken launch entry, which
+            // only a launch verb would have matched) is carried to the built-in
+            // so `setup` can read it.
+            None => Ok(Dispatch::Builtin {
+                cmd: Cli::from_arg_matches(&matches)?.cmd,
+                catalog: Catalog::Ready(catalog),
+            }),
         },
         (Some((name, _)), Catalog::Broken(config_error)) => {
             // A registered built-in still works; anything else is an unknown
             // verb clap accepted as an external subcommand, and carries the
             // config error.
             match Cli::from_arg_matches(&matches) {
-                Ok(cli) => Ok(Dispatch::Builtin(cli.cmd)),
+                Ok(cli) => Ok(Dispatch::Builtin {
+                    cmd: cli.cmd,
+                    catalog: Catalog::Broken(config_error),
+                }),
                 Err(_) => Err(config_error_with_hint(&config_error, name)),
             }
         }
@@ -316,7 +320,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ConfigPaths, RESERVED_TOOL_NAMES};
+    use crate::config::{ConfigPaths, LaunchCatalog, RESERVED_TOOL_NAMES};
     use std::path::Path;
 
     /// A `ConfigReport` loaded from `body` in a throwaway project file. `load`
@@ -430,15 +434,18 @@ mod tests {
                 assert_eq!(entry.tool().command(), "my-agent");
                 assert_eq!(args.agent_args, ["--resume"]);
             }
-            Dispatch::Builtin(_) => panic!("mytool should dispatch as a launch"),
+            Dispatch::Builtin { .. } => panic!("mytool should dispatch as a launch"),
         }
 
         // A built-in still dispatches as a built-in.
         let dispatch =
             parse_from(["agent-vm", "doctor"], Ok(report_from(body))).expect("doctor parses");
         match dispatch {
-            Dispatch::Builtin(Cmd::Doctor(_)) => {}
-            Dispatch::Builtin(_) => panic!("expected the doctor built-in"),
+            Dispatch::Builtin {
+                cmd: Cmd::Doctor(_),
+                ..
+            } => {}
+            Dispatch::Builtin { .. } => panic!("expected the doctor built-in"),
             Dispatch::Launch { .. } => panic!("doctor is not a launch verb"),
         }
     }
