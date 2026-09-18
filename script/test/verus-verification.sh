@@ -10,6 +10,13 @@
 #                throwaway fixture crates.
 #
 # With no argument, runs both.
+#
+# Analysis runs on a colour-stripped copy of cargo's output: CI's
+# dtolnay/rust-toolchain step exports CARGO_TERM_COLOR=always (it wants colour in
+# the job log), which wraps cargo's status words in escape sequences and defeats
+# the line anchors below. Reproduce that condition locally with
+# `CARGO_TERM_COLOR=always bash script/test/verus-verification.sh --repo-gate`.
+# The raw output is still what gets echoed, so the log keeps its colour.
 
 set -euo pipefail
 
@@ -20,6 +27,10 @@ RESULTS_OK='verification results:: [1-9][0-9]* verified, 0 errors'
 fail() {
     echo "FAIL: $*" >&2
     exit 1
+}
+
+strip_ansi() {
+    sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g'
 }
 
 # The fixture tree lives in a script-level variable so the EXIT trap can still
@@ -39,7 +50,7 @@ require_cargo_verus() {
 }
 
 repo_gate() {
-    local target_dir output status region
+    local target_dir output plain status region
     target_dir="${CARGO_TARGET_DIR:-$REPO_ROOT/target/verus}"
 
     # cargo re-prints a crate's "verification results::" line only when it
@@ -54,13 +65,14 @@ repo_gate() {
     status=$?
     set -e
     printf '%s\n' "$output"
+    plain="$(printf '%s\n' "$output" | strip_ansi)"
 
     [[ $status -eq 0 ]] ||
         fail "cargo verus verify --locked -p agent-vm exited $status (expected 0)"
 
     # vstd's own results line is printed before this crate's, so read only the
     # output from cargo's "Checking agent-vm" line onward.
-    region="$(printf '%s\n' "$output" |
+    region="$(printf '%s\n' "$plain" |
         sed -n -E '/^[[:space:]]*(Checking|Compiling) agent-vm /,$p')"
     [[ -n "$region" ]] ||
         fail "cargo verus never checked the agent-vm crate: [package.metadata.verus] verify = true may have been removed from crates/agent-vm/Cargo.toml"
@@ -112,6 +124,7 @@ controls() {
     out="$(cd "$FIXTURE_ROOT/positive" && CARGO_TARGET_DIR="$target" cargo verus verify 2>&1)"
     status=$?
     set -e
+    out="$(printf '%s\n' "$out" | strip_ansi)"
     [[ $status -eq 0 ]] || {
         printf '%s\n' "$out"
         fail "positive control exited $status, expected 0"
@@ -127,6 +140,7 @@ controls() {
     out="$(cd "$FIXTURE_ROOT/negative" && CARGO_TARGET_DIR="$target" cargo verus verify 2>&1)"
     status=$?
     set -e
+    out="$(printf '%s\n' "$out" | strip_ansi)"
     [[ $status -ne 0 ]] || {
         printf '%s\n' "$out"
         fail "negative control exited 0: the verifier accepted a false postcondition"
