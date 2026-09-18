@@ -130,6 +130,42 @@ build hard-fails and tells you to rerun this script.
 
 The script accepts zero to two positional arguments. The Docker source defaults to `agent-vm-template:latest`, and the destination tag defaults to the source. It verifies the Docker image is exactly `linux/arm64`, resolves agent-vm's state directory, and pipes `docker save` into `msb image load`. It does not run a registry or create a caller-managed tar archive. `msb` currently stages stdin in a temporary file before ingesting it, so temporary free space roughly equal to the Docker archive is still required.
 
+### Composing from a local tool-free base (`--base-image`)
+
+Issue #84 split the image into a tool-free base plus one layer per tool. A launch
+whose configured tool set differs from the shipped default composes those layers
+onto the base locally; `--base-image` (env `AGENT_VM_BASE_IMAGE`) points that
+composition at a local base. To build the base and the four tool layers by hand
+and exercise the composed path:
+
+```bash
+set -euo pipefail
+# 1. base + the four tool layers, chained.
+docker buildx build --platform linux/arm64 --load -t agent-vm-base:dev -f images/Dockerfile images
+prev=agent-vm-base:dev
+for t in codex opencode claude copilot; do
+  docker buildx build --platform linux/arm64 \
+    --build-arg BASE_IMAGE="$prev" -t "agent-vm-$t:dev" "images/tools/$t"
+  prev="agent-vm-$t:dev"
+done
+docker tag "$prev" agent-vm-template:dev
+
+# 2. Import BOTH tags into agent-vm's private cache.
+./script/build/import-image.sh agent-vm-template:dev
+./script/build/import-image.sh agent-vm-base:dev
+
+# 3. Compose from the local base (this always composes, even for the default set).
+./target/macos-dev/bin/agent-vm shell --base-image agent-vm-base:dev \
+  -- 'for b in claude codex opencode copilot; do "$b" --version; done'
+```
+
+The local tag `agent-vm-base:dev` shares its repository name with
+`layer::BASE_REPO`'s Docker-local base links (`agent-vm-base:<64-hex>`). That is
+a listing collision only: a link tag is always 64 hex characters, so no link can
+be shadowed.
+`images/build.sh` performs the same chain against a loopback registry and pushes
+both published tags (`agent-vm-base:latest`, `agent-vm-template:latest`).
+
 Cache references are exact. Importing `agent-vm-template:latest` does not populate `ghcr.io/wirenboard/agent-vm-template:latest`.
 
 From a disposable project directory, verify the cached image without a registry update check:

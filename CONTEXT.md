@@ -235,9 +235,10 @@ credential provider and not a command to execute on the host.
 
 A tool *is* the launch verb: `agent-vm <name>` works because the resolved
 configuration declares a tool named `<name>`, and the CLI builds its
-subcommands from that catalog (#82). `layer` remains metadata until #84;
-`persist` is consumed by the launch (#83). `interactive_shell` selects the bash
-`-c` argument-joining the shipped `shell` tool uses.
+subcommands from that catalog (#82). `layer` is consumed by the launch (#84): it
+is the tool's **tool layer**. `persist` is consumed by the launch (#83).
+`interactive_shell` selects the bash `-c` argument-joining the shipped `shell`
+tool uses.
 
 `credentials` is the **requirement** set (a launch hard-fails when one yields
 nothing); `tools` drives the **provisioning** set (named tools are provisioned,
@@ -285,18 +286,64 @@ launch verb reports the config error rather than clap's "unrecognized
 subcommand" (a verb near a built-in gets a did-you-mean hint *appended* to
 that error, never in place of it), and `--help` still lists the built-ins.
 
+## Chain root
+
+The published image reference a launch's chain builds `FROM` and boots when no
+project tooling layer is declared — resolved by the pure
+`tool_layer::chain_root` (type `tool_layer::ChainRoot`). It is one of:
+
+- the **composed default image** verbatim, when `--image` is unset, no
+  `--base-image` is given, and the catalog's declared layer sequence equals the
+  shipped default;
+- the **base image** when the declared sequence differs, or `--base-image` is
+  given (both compose the declared tool layers locally);
+- a `--image` value, booted verbatim with no tool composition.
+
+This is the term to use wherever older text said "the base a layer builds
+`FROM`". It is the reference `--update-check` probes and `agent-vm pull`
+fetches (always a published tag, never a locally composed
+`agent-vm-layer:<hash>`). See `docs/adr/0019-tool-free-base-and-per-tool-layers.md`.
+
+_Avoid_: calling the chain root "the base image" — under the fast path it is the
+composed default, not the base.
+
 ## Base image
 
-The OCI **guest template** agent-vm boots inside each per-project microVM
-(default `ghcr.io/wirenboard/agent-vm-template:latest`) — Debian plus the
-in-VM coding agents (Claude Code, Codex CLI, OpenCode). "Base image" and
-"guest template" name the same thing; use "base image" in code and docs that
-also talk about tooling layers, since it is the base a layer builds `FROM`.
-Resolved via `--image` / `AGENT_VM_IMAGE_TAG` / `defaults::DEFAULT_IMAGE_REF`
-(`run.rs`'s `base_image` binding). msb's resolved per-platform **manifest
-digest** is authoritative: it is step 0's hash input and what boot resolves,
-even when Docker needs a separate build-time name for the same base (see
-**Base link**). See `docs/adr/0003-project-tooling-layers.md`.
+The **tool-free** OCI base agent-vm composes from when a launch needs local tool
+layers (default `ghcr.io/wirenboard/agent-vm-base:latest`) — Debian 13 plus the
+docker engine, diagnostic CLIs, the `agent-vm-install` helper and the host-CA
+shim, but **no agent CLI**. Resolved via `--base-image` /
+`AGENT_VM_BASE_IMAGE` / `defaults::DEFAULT_BASE_IMAGE_REF`. msb's resolved
+per-platform **manifest digest** is authoritative: it is step 0's hash input and
+what boot resolves, even when Docker needs a separate build-time name for the
+same base (see **Base link**). See
+`docs/adr/0019-tool-free-base-and-per-tool-layers.md`.
+
+> The published `ghcr.io/…/agent-vm-base` repository is a **different namespace**
+> from `layer::BASE_REPO`'s unqualified Docker-local `agent-vm-base:<hex>` links
+> (see **Base link**). The names coincide by intent but never collide, because a
+> link tag is always 64 hex characters.
+
+## Composed default image
+
+The OCI **guest template** agent-vm boots verbatim when the declared tool set
+equals the shipped default: `ghcr.io/wirenboard/agent-vm-template:latest`
+(`defaults::DEFAULT_IMAGE_REF`), published by CI as the base plus the four
+shipped **tool layers** chained in declaration order. It is never rebuilt
+locally. With no project tooling layers the launch performs zero Docker calls;
+with project layers, they chain on top of it.
+
+## Tool layer
+
+One tooling layer the catalog declares, via a `[[tools]]` entry's `layer` field:
+either `{ builtin = "codex"|"opencode"|"claude"|"copilot" }` (a source embedded
+in the binary from `images/tools/`, materialised into a throwaway build context
+on the compose path) or `{ path = "…" }` (a directory anchored on the declaring
+config file's directory). Distinguish from **Tooling layer**, which is
+project-declared and named on disk or on the command line. The chain a launch
+builds is the catalog's tool layers, then the project's tooling layers, then any
+`--layer` steps. Resolved by `tool_layer::chain_root` → `tool_layer::materialize`.
+See `docs/adr/0019-tool-free-base-and-per-tool-layers.md`.
 
 ## Base link
 
@@ -307,33 +354,39 @@ build-time `docker pull <repo>@<digest>` + `docker tag`). It is the *bridge*
 between the two image stores, not a second identity: the manifest digest stays
 step 0's hash input, and the link is never consulted on a cache-hit launch
 (which spawns no Docker process). See
-`docs/adr/0003-project-tooling-layers.md`'s issue-#98 amendment.
+`docs/adr/0003-project-tooling-layers.md`'s issue-#98 amendment. Distinct from
+the published `ghcr.io/…/agent-vm-base` repository (see **Base image**): this is
+an unqualified, Docker-local tag, always 64 hex characters.
 
 ## Tooling layer
 
 A `Dockerfile` (plus its build context — the rest of that directory) that
 adds project-specific tools `FROM` the previous step in the chain:
-compilers, cross-toolchains, anything the base doesn't carry. Not
-necessarily project-owned: a step is either a `.agent-vm/layers/` subdirectory
-of the project, or a `--layer DIR` directory anywhere else on disk. A
-single tooling layer is one step of a "layer chain" (see below); resolved by
+compilers, cross-toolchains, anything the current image doesn't carry. Not
+necessarily project-owned: a step is either a catalog **tool layer**, a
+`.agent-vm/layers/` subdirectory of the project, or a `--layer DIR` directory
+anywhere else on disk. A single tooling layer is one step of a "layer chain"
+(see below); project steps are resolved by
 `layer::resolve_layer_chain`. There is no environment-variable override —
 `$AGENT_VM_LAYER` is rejected outright if set — but there is composition: the
-chain is the project's own `.agent-vm/layers/*/` steps, then any `--layer
+chain is the catalog's tool layers (issue #84), then the project's own
+`.agent-vm/layers/*/` steps, then any `--layer
 DIR` values (repeatable, appended after, never prepended). Every step's
 built image must satisfy the **Layer image contract**. See
 `docs/adr/0003-project-tooling-layers.md`.
 
 ## Layer chain
 
-The project's tooling layers plus any `--layer` flags, in build order: the
+The chain a launch builds, in build order: the catalog's **tool layers** (issue
+#84), then the project's tooling layers — the
 immediate subdirectories of `.agent-vm/layers/`, sorted byte-lexicographically
-by directory name (`10-toolchain` before `20-chrome`), then each `--layer DIR`
-in command-line order. Each step builds `FROM` the previous step (the base
-image for step 0); only the **final** step is ingested into the msb cache —
+by directory name (`10-toolchain` before `20-chrome`) — then each `--layer DIR`
+in command-line order. Each step builds `FROM` the previous step (the **chain
+root** for step 0); only the **final** step is ingested into the msb cache —
 intermediates live in docker's own local image store, pinned for the next
 step by tag. `layer::plan_chain` computes the whole chain's identities up
 front (pure, no I/O beyond hashing); `layer::execute_chain` drives the build.
+An empty chain boots the chain root with no build (the fast path).
 A leftover singular `.agent-vm/layer/` (the pre-chain, one-layer-only layout)
 is a hard migration error naming the path, not a supported alias, and a
 `--layer` cannot reach it either — the check runs first and unconditionally.

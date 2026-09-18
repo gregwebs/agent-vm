@@ -33,7 +33,7 @@ top of microsandbox, and it is what lives on `main`.
 ```bash
 npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm <cmd>
 
-agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
+agent-vm setup            # pulls the image this config boots from and verifies it boots
 
 cd ~/your-project
 agent-vm claude           # a configured launch verb; see `agent-vm --help`

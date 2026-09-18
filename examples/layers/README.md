@@ -9,7 +9,12 @@ numbered subdirectory per step, built in order. See
 chain" / "Derived image" entries in `CONTEXT.md` for the full mechanism.
 
 The directories under `examples/layers/` are worked examples, not activated
-by default. Copy one into place as a numbered step to use it every time:
+by default. The four shipped tool layers under `images/tools/`
+(`codex`, `opencode`, `claude`, `copilot`) are the repo's other worked examples —
+and the ones agent-vm composes first: a launch's chain is the catalog's tool
+layers, then the project's own `.agent-vm/layers/*` steps, then `--layer` flags,
+so a project layer always builds on top of them. Copy one into place as a
+numbered step to use it every time:
 
 ```sh
 cp -r examples/layers/wirenboard-cpp .agent-vm/layers/10-wirenboard-cpp

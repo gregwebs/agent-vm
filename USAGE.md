@@ -77,13 +77,54 @@ state, so it sees the same sandboxes agent-vm does.
 
 ## Image release cadence
 
-The base OCI image (`ghcr.io/wirenboard/agent-vm-template:latest`) is
-rebuilt hourly by CI, picking up the latest Claude Code, Codex CLI,
-and OpenCode releases automatically. Pin a specific build with
-`--image ghcr.io/wirenboard/agent-vm-template:YYYY-MM-DDTHH` (date tags are
-immutable; the last 14 days are retained).
+CI publishes two OCI images from one run:
 
-The agent-vm binary and the image are version-locked through an
+- `ghcr.io/wirenboard/agent-vm-base:latest` — the **tool-free base**: Debian
+  plus the docker engine, diagnostic CLIs and the tool-layer facilities, with
+  **no** agent CLI.
+- `ghcr.io/wirenboard/agent-vm-template:latest` — the **composed default**: the
+  base plus the four shipped tool layers (codex, opencode, claude, copilot),
+  chained in declaration order.
+
+Both are rebuilt hourly, picking up the latest Claude Code, Codex CLI, and
+OpenCode releases automatically, and both accept a pinned
+`…:YYYY-MM-DDTHH` tag (immutable; the last 14 days are retained).
+
+**Which image a launch uses** depends on your configured tool set:
+
+- If your declared tool layers equal the shipped default and you have no
+  project `.agent-vm/layers/`, the launch boots the composed template
+  **verbatim — no build, no Docker**. This is the fast path, and it is why an
+  unchanged config launches exactly as fast as before the split.
+- Any other tool set composes the declared tool layers onto the base locally on
+  the first launch (hash-cached thereafter).
+
+Flags:
+
+- `--image REF` boots an image **verbatim** and skips tool composition (project
+  layers still chain on top). For example
+  `--image ghcr.io/wirenboard/agent-vm-template:YYYY-MM-DDTHH`.
+- `--base-image REF` (env `AGENT_VM_BASE_IMAGE`) chooses the tool-free base that
+  tool layers are composed onto, and **always** composes locally — it is how a
+  source-checkout user tests a locally built/imported base. `--image` and
+  `--base-image` are mutually exclusive.
+
+A locally composed tool layer **freezes its agent version at build time**: the
+layer hash covers its directory, and no `AGENT_VERSION_*` is passed on a local
+build, so a non-default tool set keeps whatever upstream shipped the day it
+first built until the base moves. Pin the base with `--base-image …:YYYY-MM-DDTHH`
+to control that. This is the same behaviour every project tooling layer already
+has.
+
+On a host behind a TLS-intercept proxy, a locally composed chain cannot
+soft-fail a broken upstream installer (the launcher deliberately does not pass
+`AGENT_INSTALL_SOFT_FAIL` on the compose path — a silently cached
+"healthy-looking image missing its toolchain" is the one outcome the layer
+contract exists to prevent). Build the layer yourself with `images/build.sh`
+(which sets the soft-fail arg) and pass `--base-image`/`--layer`, or use the
+published template.
+
+The agent-vm binary and the images are version-locked through an
 **image-API-version** integer
 (`/etc/agent-vm-image-version` inside the image). Mismatch → clean
 error at launch instead of mysterious in-VM failures.
@@ -96,7 +137,8 @@ Each launcher accepts:
 |---|---|
 | `--memory N` | VM memory GiB (default 2) |
 | `--cpus N` | vCPUs (default 2) |
-| `--image REF` | override the OCI image |
+| `--image REF` | boot this image verbatim, skipping tool-layer composition |
+| `--base-image REF` | the tool-free base tool layers are composed onto (always composes) |
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
