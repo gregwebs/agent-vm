@@ -61,6 +61,14 @@ script, and its docs). After bumping the pin, run
 `./script/check-rust-toolchain.sh` — it's a sub-second local check that
 fails closed with an actionable diagnostic for every copy left stale.
 
+The CI pre-build gate is `script/test/ci-contracts.sh`: it checks runtime source
+provenance, runs the harness contracts, and syntax-checks (`bash -n`) and lints
+(`shellcheck`) every script the workflow runs. Run it locally with shellcheck
+installed (`brew install shellcheck` on macOS, `sudo apt-get install -y
+shellcheck` on Debian/Ubuntu); the full gate also needs the recursive submodule
+and a working Cargo toolchain, while `bash script/test/ci-contracts.sh
+--guard-only` runs just the shell guard and needs neither.
+
 
 ## Commit message style
 
