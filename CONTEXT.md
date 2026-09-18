@@ -190,7 +190,10 @@ entry expands to the declaring tool's **own configuration file** (origin
 equality), not the whole catalog. It is the **single** gate on every
 provider-owned facet — host credential capture, the guest placeholder files,
 the proxy secret and its intercept route, the first-run bypass configs, and the
-provider guest env. A cycle is a fixed point, not an error.
+provider guest env. A cycle is a fixed point, not an error. The same closure
+also folds the tools' `persist` paths (`config::CatalogEntry::persist`), which
+the launch turns into guest-HOME links (`guest_home::links`) — one closure, two
+facets.
 
 Distinct from the **required credential providers**: in the shipped catalog
 `agent-vm shell` provisions all four without requiring any, so it works for a
@@ -209,9 +212,16 @@ A `(home_relative, state_relative)` pair mapping a guest `$HOME` dotfile to an
 entry under the per-project state dir (`credential_provider::HomeLink`).
 Provider-owned links come first, in `CredentialProvider::ALL` order, then the
 `GENERIC_HOME_LINKS` that no provider owns (`.gitconfig`, `.config/gh`,
-`.bash_history`). Both guest-user modes consume the single
-`credential_provider::guest_home_links()` list, so root mode's `.patch()`
-symlinks and non-root mode's host-side provisioning cannot drift (ADR-0002).
+`.bash_history`), then one link per `persist` path in the launch's
+**provisioning closure**, under `<state>/persist/`
+(`guest_home::links(persist)`). Both guest-user modes consume the single
+`guest_home::links` list, so root mode's `.patch()` symlinks and non-root mode's
+host-side provisioning cannot drift (ADR-0002). `LinkSource` marks which links
+are compiled-in and which are config-declared; the non-root site reads it (only
+a **declared** link may replace real content by migrating it — a compiled one
+keeps `force_symlink`'s refuse-a-directory contract), while root mode
+force-symlinks both, because `/root` is rebaked into a fresh rootfs every boot
+so nothing real is ever at a link path there.
 
 ## Tool
 
@@ -225,9 +235,9 @@ credential provider and not a command to execute on the host.
 
 A tool *is* the launch verb: `agent-vm <name>` works because the resolved
 configuration declares a tool named `<name>`, and the CLI builds its
-subcommands from that catalog (#82). `layer` and `persist` remain metadata
-until #84/#83. `interactive_shell` selects the bash `-c` argument-joining the
-shipped `shell` tool uses.
+subcommands from that catalog (#82). `layer` remains metadata until #84;
+`persist` is consumed by the launch (#83). `interactive_shell` selects the bash
+`-c` argument-joining the shipped `shell` tool uses.
 
 `credentials` is the **requirement** set (a launch hard-fails when one yields
 nothing); `tools` drives the **provisioning** set (named tools are provisioned,

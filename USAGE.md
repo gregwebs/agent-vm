@@ -51,6 +51,20 @@ configuration* below). With no config files you get the five shipped defaults
 fallback) exists. `agent-vm --help` and `agent-vm doctor` always show the same
 list, in the same order.
 
+`agent-vm setup` pulls the selected image and, unless `--no-verify` is given,
+boots a throwaway sandbox and verifies **every configured tool** by running its
+`command` with `--version` (a direct argv exec, never a shell string — a
+present-but-broken binary fails rather than passing an `exists` check). A
+tool whose `command` is one the shipped image must carry
+(`codex`/`opencode`/`claude`/`copilot`/`shell`), or one whose `--version` exits
+non-zero, is fatal — including when a user or project config declares it. Any
+other `command` only warns, because `setup` does not build the project's
+`.agent-vm/layers/` chain and cannot tell whether a tooling layer supplies it.
+`setup` executes the configured commands inside the throwaway VM — the same
+trust as running any agent-vm command in a directory with a `.agent-vm/`. A
+broken config warns and falls back to the shipped defaults, so a config typo
+never blocks the pull/boot/verify recovery path.
+
 `agent-vm` keeps its sandbox registry under a private `MSB_HOME` —
 `~/.local/state/agent-vm/msb-home` on Linux, `~/.agent-vm-msb` on macOS
 (shortened so per-sandbox Unix-socket paths stay well under macOS's
@@ -402,7 +416,7 @@ args = ["--flag"]                    # optional; default argv (array of strings)
 layer = { builtin = "codex" }        # optional; EXACTLY one of builtin/path
 credentials = ["openai"]             # optional; credential provider names
 tools = ["claude"]                   # optional; tools to provision (same file, or name one)
-persist = [".cache/mytool"]          # optional; guest-HOME-relative paths
+persist = [".cache/mytool"]          # optional; guest-HOME-relative, kept under <state>/persist/
 env = { VAR = "value" }              # optional; guest env pairs for this tool
 interactive_shell = false            # optional; join trailing args into `-c`
 ```
@@ -440,11 +454,33 @@ interactive_shell = false            # optional; join trailing args into `-c`
   named `shell` and `[]` for every other name** — write `tools = []`
   explicitly to give a `shell` no provisioning at all. `opencode-static` only
   produces a working sign-in when `openai` is also provisioned.
-- `persist` — optional; guest-HOME-relative paths to preserve across runs.
-  Absolute paths, any `..` component, NUL, and root-equivalent spellings
-  (`.`/`./`/empty) are rejected; harmless `.`/`//`/trailing-`/` spellings are
-  normalized. Metadata only in this release (see
-  [#83](https://github.com/gregwebs/agent-vm/issues/83)).
+- `persist` — optional; guest-`$HOME`-relative paths to keep across runs.
+  Each path is symlinked into the project state dir under `<state>/persist/`,
+  so the real file lives next to the rest of the project state (`agent-vm
+  doctor` prints the state dir) — one place to find and back it up. Absolute
+  paths, any `..` component, NUL, and root-equivalent spellings (`.`/`./`/empty)
+  are rejected; harmless `.`/`//`/trailing-`/` spellings are normalized. Two
+  paths that **overlap** — equal, or one a component-wise ancestor of the other
+  — are a hard error whether they are two entries of the same tool, two
+  different tools, or a `persist` path against one of the dotfiles agent-vm
+  itself links into the state dir (the credential/config links `agent-vm
+  doctor` lists, e.g. `.claude`, `.config/gh`); one would silently shadow the
+  other. `.cache` and `.cachex` do **not** overlap (components, not string
+  prefixes). Which paths a launch gets follows the same `tools` closure as its
+  credentials, so a `shell` (whose omitted `tools` is `["*"]`) sees every
+  declared path in its own file. A `persist` path that would collide with the
+  project bind mount or a `--mount` under `$HOME` is rejected at launch, before
+  anything is provisioned, because agentd creates those mount points inside the
+  already-mounted `$HOME`. On the first launch after an entry is added, real
+  content already at the guest path is **moved** into `<state>/persist/` (never
+  deleted); if the target already holds content too, the launch fails naming
+  both paths and you choose. Targets are deliberately **not** pre-created, so a
+  **directory-valued** entry needs one `mkdir -p '<state>/persist/<path>'` on
+  the host (or `/agent-vm-state/persist/<path>` from `agent-vm shell`) once per
+  project — a file-valued entry such as `.aider.conf.yml` just works, because
+  the guest's `open(O_CREAT)` through the dangling symlink creates the real
+  file. Leftover links from a previous launch of a different tool are benign:
+  nothing prunes them, by design.
 - `env` — optional; a table of guest environment variables set for this tool
   only. Keys must be nonempty and contain no `=`, NUL, whitespace or control
   characters, and must not start with `MSB_` (reserved by microsandbox).
@@ -466,9 +502,10 @@ interactive_shell = false            # optional; join trailing args into `-c`
   `shell` tool sets it.
 
 Unknown keys, wrong types, malformed TOML, unknown `layer.builtin`, unknown
-provider names, duplicate tool names within one file, duplicate normalized
-persist entries within one tool, and two tools claiming the same normalized
-persist path are all **hard errors** — as are invalid `tools` entries: `"*"`
+provider names, duplicate tool names within one file, and **overlapping**
+`persist` entries (equal or one an ancestor of the other — within one tool,
+across tools, or against a path agent-vm itself links into the state dir) are
+all **hard errors** — as are invalid `tools` entries: `"*"`
 mixed with other entries, an empty or NUL-containing name, a tool name no
 catalog tool provides, and a tool named `*`. They are also hard errors for
 invalid `env` entries: a key that is empty, or contains

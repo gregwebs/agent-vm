@@ -962,11 +962,17 @@ pub struct Args {
 pub(crate) async fn launch(entry: &CatalogEntry, args: Args) -> Result<i32> {
     let tool = entry.tool();
     let provisioned = entry.provisioned();
-    // First statement, deliberately: a still-set $AGENT_VM_LAYER is rejected
-    // before anything else runs — state dirs, guest HOME provisioning, stale
-    // sandbox reaping, or the msb-db preflight below — because the hazard is
-    // "no project layers + env var set ⇒ silent base boot", and none of that
+    // The launch's guest-HOME link list: the compiled-in providers plus one
+    // link per `persist` path in this launch's provisioning closure. Computed
+    // once and threaded to both provisioning sites and the root-mode rootfs
+    // patch, so they cannot drift (CONTEXT.md → *Guest HOME*).
+    let home_links = crate::guest_home::links(entry.persist());
+    // First effectful statement, deliberately: a still-set $AGENT_VM_LAYER is
+    // rejected before anything else runs — state dirs, guest HOME provisioning,
+    // stale sandbox reaping, or the msb-db preflight below — because the hazard
+    // is "no project layers + env var set ⇒ silent base boot", and none of that
     // setup should happen on the way to a launch that's about to be rejected.
+    // (The bindings above are pure: `entry` and `home_links` touch no state.)
     reject_removed_layer_env(env::var_os("AGENT_VM_LAYER").as_deref())?;
 
     // Resolve root vs. non-root guest mode up front — it gates dir
@@ -1014,6 +1020,34 @@ pub(crate) async fn launch(entry: &CatalogEntry, args: Args) -> Result<i32> {
     )
     .context("preparing --mount")?;
 
+    // A `persist` path that overlaps a guest mount point (the project bind, when
+    // it lives under HOME, or any `--mount` under HOME) would be silently
+    // shadowed: agentd mounts HOME first, then creates the project mountpoint
+    // *inside* the already-mounted HOME and mounts over it (ADR-0002). Checked
+    // here — after the mount plan is resolved, before anything is provisioned —
+    // because the project path is not a config fact, and a rejected launch must
+    // not create state.
+    let guest_home_path = guest_identity
+        .as_ref()
+        .map(|identity| PathBuf::from(identity.host_home()))
+        .unwrap_or_else(|| PathBuf::from("/root"));
+    let mut guest_mount_paths: Vec<PathBuf> = core_volumes
+        .iter()
+        .map(|volume| PathBuf::from(&volume.guest_path))
+        .collect();
+    guest_mount_paths.extend(mount_plan.volumes.iter().map(|volume| volume.guest.clone()));
+    if let Some((link, mount)) =
+        crate::guest_home::mount_conflicts(&home_links, &guest_home_path, &guest_mount_paths)
+            .first()
+    {
+        anyhow::bail!(
+            "config: persist path {} would collide with the guest mount point {}; \
+             rename the persist path or move the mount",
+            crate::config::escape_path(&link.home_relative),
+            crate::config::escape_path(mount)
+        );
+    }
+
     // These checks open/create Microsandbox state, so they must remain after
     // the side-effect-free mount rejection boundary.
     crate::msb_install::ensure_msb_home(&crate::msb_install::msb_home_dir()?)?;
@@ -1021,10 +1055,10 @@ pub(crate) async fn launch(entry: &CatalogEntry, args: Args) -> Result<i32> {
     // See src/msb_preflight.rs and issue #30.
     crate::msb_preflight::ensure_db_not_ahead().await?;
     crate::msb_install::ensure_socket_paths_fit(&session.sandbox_name)?;
-    session.ensure_dirs()?;
+    session.ensure_dirs(&home_links)?;
     if !root_mode {
         session
-            .provision_guest_home()
+            .provision_guest_home(&home_links)
             .context("provisioning non-root guest HOME")?;
     }
     // Core binds carry no follow opt-in, so a symlink in a configured state
@@ -1404,15 +1438,17 @@ pub(crate) async fn launch(entry: &CatalogEntry, args: Args) -> Result<i32> {
         if root_mode {
             // Root mode: the dotfile symlinks live at un-shadowed
             // rootfs paths (/root/...), so baking them via `.patch()`
-            // is correct — nothing mounts over /root at runtime.
-            p = p
-                .mkdir("/root/.local", None)
-                .mkdir("/root/.local/share", None)
-                .mkdir("/root/.config", None);
-            for link in credential_provider::guest_home_links() {
+            // is correct — nothing mounts over /root at runtime. The
+            // ancestor chain (`.local`, `.local/share`, `.config`, plus a
+            // declared path's own ancestors) is parents-first by construction,
+            // which is what the builder's sequential mkdir needs.
+            for dir in crate::guest_home::link_parent_dirs(&home_links) {
+                p = p.mkdir(format!("/root/{}", dir.display()), None);
+            }
+            for link in &home_links {
                 p = p.symlink(
-                    format!("/agent-vm-state/{}", link.state_relative),
-                    format!("/root/{}", link.home_relative),
+                    link.guest_target(),
+                    format!("/root/{}", link.home_relative.display()),
                     true,
                 );
             }
