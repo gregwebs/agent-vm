@@ -2261,11 +2261,10 @@ fn parse_github_slug(url: &str) -> Option<String> {
         r
     } else if let Some(r) = url.strip_prefix("ssh://git@github.com/") {
         r
-    } else if let Some(r) = url.strip_prefix("ssh://git@github.com:") {
+    } else {
+        let r = url.strip_prefix("ssh://git@github.com:")?;
         // some hosts include a port-style colon; strip until next /
         r.split_once('/').map(|(_, p)| p)?
-    } else {
-        return None;
     };
     let trimmed = rest.trim_end_matches('/');
     let mut parts = trimmed.split('/');

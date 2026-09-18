@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$script_dir_path" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-RUST_TOOLCHAIN=1.94
+RUST_TOOLCHAIN=1.98.1
 
 usage() {
     cat <<'EOF'
