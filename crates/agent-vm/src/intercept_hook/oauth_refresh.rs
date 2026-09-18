@@ -17,6 +17,7 @@ use crate::{
     host_paths::{MAX_HOST_CREDENTIAL_FILE_BYTES, read_bounded_regular_file},
     secrets,
 };
+use vstd::prelude::*;
 
 pub(super) fn handle(
     raw_request: &[u8],
@@ -322,9 +323,39 @@ fn exactly_one_header<'a>(
     Ok(values[0])
 }
 
+verus! {
+
+/// The pure kernel of `validated_target`: everything it proves about a path.
+/// URL parsing and the authority checks are trusted and live outside.
+pub(super) fn path_is_exact(bytes: &[u8]) -> (ok: bool)
+    ensures
+        ok ==> forall|i: int| 0 <= i < bytes@.len()
+            ==> bytes@[i] != 0x3f && bytes@[i] != 0x23 && bytes@[i] != 0x5c,
+        ok ==> forall|i: int| !http::escape_at(bytes@, i),
+{
+    let mut index = 0;
+    while index < bytes.len()
+        invariant
+            index <= bytes.len(),
+            forall|j: int| 0 <= j < index
+                ==> bytes@[j] != 0x3f && bytes@[j] != 0x23 && bytes@[j] != 0x5c,
+        decreases bytes.len() - index,
+    {
+        // 0x3f '?', 0x23 '#', 0x5c '\'
+        let b = bytes[index];
+        if b == 0x3f || b == 0x23 || b == 0x5c {
+            return false;
+        }
+        index += 1;
+    }
+    !http::contains_escaped_path_escape_bytes(bytes)
+}
+
+} // verus!
+
 fn validated_target(target: &str, sni: &str) -> std::result::Result<String, OAuthRejection> {
     if target.starts_with('/') {
-        if target.contains(['?', '#', '\\']) || http::contains_escaped_path_escape(target) {
+        if !path_is_exact(target.as_bytes()) {
             return Err(OAuthRejection::forbidden(
                 "OAuth refresh target is not exact",
             ));
@@ -347,7 +378,12 @@ fn validated_target(target: &str, sni: &str) -> std::result::Result<String, OAut
             "OAuth refresh authority does not match SNI",
         ));
     }
-    if http::contains_escaped_path_escape(url.path()) || url.path().contains('\\') {
+    // `path_is_exact` rejects `?` and `#` as well as escapes and `\`, which the
+    // old `contains_escaped_path_escape(..) || contains('\\')` pair did not.
+    // That is strictly narrower, never wider: `Url::parse` routes `?`/`#` into
+    // the query/fragment, and the authority check above already rejects any
+    // target carrying one.
+    if !path_is_exact(url.path().as_bytes()) {
         return Err(OAuthRejection::forbidden(
             "OAuth refresh target is not exact",
         ));

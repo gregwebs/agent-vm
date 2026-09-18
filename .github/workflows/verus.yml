@@ -1,0 +1,116 @@
+name: verus
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  VERUS_RELEASE: "0.2026.09.16.7325eee"
+  # sha256 of verus-0.2026.09.16.7325eee-x86-linux.zip (485510601 bytes),
+  # measured twice: on the planning host and independently by the plan
+  # reviewer. A Verus bump is a deliberate change: move the release, this
+  # digest, the `vstd` pin in crates/agent-vm/Cargo.toml and the copy in
+  # CONTRIBUTING.md together.
+  VERUS_SHA256: "5e386d253a29bdac7d475a43b6f58dbcc9099c77953cb16180c9ef5832c50038"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      # Copied from ci.yml's "Install build dependencies" step, minus the
+      # actionlint install this job does not need. musl-tools is required by
+      # the agentd cross-build below; the rest are needed to compile agent-vm
+      # at all. Keep this list in step with ci.yml's.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev musl-tools shellcheck
+
+      - name: Shell guard for this workflow's script
+        run: |
+          bash -n script/test/verus-verification.sh
+          shellcheck script/test/verus-verification.sh
+
+      # This literal is enforced against rust-toolchain.toml by
+      # script/check-rust-toolchain.sh's check_verus_yml, and must also equal
+      # the toolchain named in the pinned Verus release's version.json
+      # (1.98.1-x86_64-unknown-linux-gnu).
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.98.1"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Caches the UNPACKED tree (1.63 GB / 4617 files), not the zip, so a hit
+      # skips both the download and the unpack. Both things a Verus bump moves
+      # -- the release and its digest -- are in the key, so a restored tree is
+      # always the tree that digest names.
+      - name: Cache Verus
+        id: verus-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.verus
+          key: verus-${{ env.VERUS_RELEASE }}-x86-linux-${{ env.VERUS_SHA256 }}
+
+      - name: Install Verus
+        if: steps.verus-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          zip="verus-${VERUS_RELEASE}-x86-linux.zip"
+          curl -fSL --retry 3 -o "$zip" \
+            "https://github.com/verus-lang/verus/releases/download/release/rolling/${VERUS_RELEASE}/${zip}"
+          echo "${VERUS_SHA256}  ${zip}" | sha256sum -c -
+          mkdir -p "$HOME/.verus"
+          unzip -q "$zip" -d "$HOME/.verus"
+          rm -f "$zip"
+
+      # Runs on hit and miss alike -- the install step above is skipped on a
+      # hit, and $GITHUB_PATH must be written either way. `cat version.json`
+      # puts the bundled toolchain in the log, so a release that stops matching
+      # the toolchain pin above is visible at a glance.
+      - name: Put Verus on PATH
+        run: |
+          set -euo pipefail
+          bin="$(find "$HOME/.verus" -maxdepth 3 -type f -name cargo-verus | head -n1)"
+          [ -n "$bin" ] || { echo "cargo-verus not found under $HOME/.verus" >&2; exit 1; }
+          dir="$(dirname "$bin")"
+          cat "$dir/version.json"
+          echo "$dir" >> "$GITHUB_PATH"
+
+      # The microsandbox SDK embeds the guest agentd binary:
+      # vendor/microsandbox/crates/filesystem/build.rs panics unless
+      # vendor/microsandbox/build/agentd exists and is newer than
+      # crates/agentd + crates/protocol. Mirrors ci.yml's step.
+      - name: Build guest agentd
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release \
+            --manifest-path vendor/microsandbox/crates/agentd/Cargo.toml \
+            --target-dir vendor/microsandbox/target \
+            --target x86_64-unknown-linux-musl
+          mkdir -p vendor/microsandbox/build
+          cp vendor/microsandbox/target/x86_64-unknown-linux-musl/release/agentd \
+            vendor/microsandbox/build/agentd
+          touch vendor/microsandbox/build/agentd
+
+      # Gating, deliberately not `continue-on-error`. Verification is erased
+      # from the ordinary build, so a weakened contract fails nothing locally:
+      # this job is the only drift guard. Same rationale as ci.yml's Clippy
+      # step. The script -- not a bare `cargo verus verify`, which exits 0
+      # while verifying nothing -- is what makes this step a gate.
+      - name: Verify contracts (gating)
+        run: bash script/test/verus-verification.sh --repo-gate
+
+      - name: Controls (the gate must be able to pass and to fail)
+        run: bash script/test/verus-verification.sh --controls

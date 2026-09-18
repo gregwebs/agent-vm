@@ -1,10 +1,13 @@
 //! Resolve optional image capabilities after the sandbox is booted.
 
 use microsandbox::Sandbox;
+use vstd::prelude::*;
 
 use crate::defaults::{CHROME_MCP_CAPABILITY_PATH, FIRST_ADVERTISED_CAPABILITIES_IMAGE_API};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+verus! {
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Structural)]
 enum ChromeMcpDecision {
     Legacy,
     Advertised,
@@ -13,12 +16,28 @@ enum ChromeMcpDecision {
 }
 
 impl ChromeMcpDecision {
-    fn enabled(self) -> bool {
+    fn enabled(self) -> (r: bool)
+        ensures r == (self == ChromeMcpDecision::Legacy
+                   || self == ChromeMcpDecision::Advertised),
+    {
         matches!(self, Self::Legacy | Self::Advertised)
     }
 }
 
-fn chrome_mcp_policy(image_api: u32, marker_present: bool, opted_out: bool) -> ChromeMcpDecision {
+/// Precedence is total: exactly one arm applies to every input, `OptedOut`
+/// dominates, and nothing else can produce `OptedOut`.
+fn chrome_mcp_policy(image_api: u32, marker_present: bool, opted_out: bool)
+    -> (d: ChromeMcpDecision)
+    ensures
+        opted_out ==> d == ChromeMcpDecision::OptedOut,
+        d == ChromeMcpDecision::OptedOut ==> opted_out,
+        !opted_out && image_api < FIRST_ADVERTISED_CAPABILITIES_IMAGE_API
+            ==> d == ChromeMcpDecision::Legacy,
+        !opted_out && image_api >= FIRST_ADVERTISED_CAPABILITIES_IMAGE_API && marker_present
+            ==> d == ChromeMcpDecision::Advertised,
+        !opted_out && image_api >= FIRST_ADVERTISED_CAPABILITIES_IMAGE_API && !marker_present
+            ==> d == ChromeMcpDecision::Unavailable,
+{
     if opted_out {
         ChromeMcpDecision::OptedOut
     } else if image_api < FIRST_ADVERTISED_CAPABILITIES_IMAGE_API {
@@ -29,6 +48,8 @@ fn chrome_mcp_policy(image_api: u32, marker_present: bool, opted_out: bool) -> C
         ChromeMcpDecision::Unavailable
     }
 }
+
+} // verus!
 
 /// Resolve whether the launcher-owned Chrome MCP entry belongs in state.
 /// API 1 predates advertised capabilities and promised Chrome implicitly.

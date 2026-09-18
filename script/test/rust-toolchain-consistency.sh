@@ -33,6 +33,7 @@ make_tree() {
     cp "$REPO_ROOT/rust-toolchain.toml" "$dir/rust-toolchain.toml"
     cp "$REPO_ROOT/Cargo.toml" "$dir/Cargo.toml"
     cp "$REPO_ROOT/.github/workflows/ci.yml" "$dir/.github/workflows/ci.yml"
+    cp "$REPO_ROOT/.github/workflows/verus.yml" "$dir/.github/workflows/verus.yml"
     cp "$REPO_ROOT/.github/workflows/release-npm.yml" "$dir/.github/workflows/release-npm.yml"
     cp "$REPO_ROOT/script/build/macos.sh" "$dir/script/build/macos.sh"
     cp "$REPO_ROOT/macos-build.md" "$dir/macos-build.md"
@@ -204,5 +205,15 @@ set -e
 [[ "$status" == 2 ]] || fail "expected exit 2 for a nonexistent --root, got $status"$'\n'"--- output ---"$'\n'"$output"
 assert_contains "$output" "$tree"
 assert_contains "$output" "not a directory"
+
+# Case 13: mismatched verus.yml toolchain input (mirrors case 3 for the
+# verification workflow's own copy of the pin).
+tree="$(make_tree case13-verus)"
+sed -i.bak "s/toolchain: \"$current_channel\"/toolchain: \"$other_channel\"/" \
+    "$tree/.github/workflows/verus.yml"
+rm -f "$tree/.github/workflows/verus.yml.bak"
+output="$(expect_fail "$tree" 1)"
+assert_contains "$output" "verus.yml"
+assert_contains "$output" "$other_channel"
 
 echo "rust-toolchain consistency seam tests passed"
