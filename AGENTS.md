@@ -11,6 +11,7 @@ feature branch, before the PR lands on `main`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md#submodule-merges) for
 working with submodules.
+You will need to init them when using a new git worktree.
 
 
 ## Agent skills
