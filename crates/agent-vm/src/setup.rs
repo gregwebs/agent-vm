@@ -78,10 +78,13 @@ struct VerifyTarget {
     tools: Vec<String>,
     command: String,
     /// `true` iff `command` is one of the compiled-in defaults' commands (see
-    /// [`config::shipped_tool_commands`]). That contract is a property of the
-    /// binary, not of the declaring tier: a user/project config that redeclares
-    /// a shipped tool (or shares its command) must not be able to downgrade its
-    /// absence to a warning.
+    /// [`config::shipped_tool_commands`]) **and** no declared tool layer
+    /// supplies it. That contract is a property of the binary, not of the
+    /// declaring tier: a user/project config that redeclares a shipped tool (or
+    /// shares its command) must not be able to downgrade its absence to a
+    /// warning. The one exception is D10's: when the verified image is the
+    /// tool-free base and a declared tool layer supplies the command, the base
+    /// is not expected to carry it.
     required: bool,
 }
 
@@ -287,10 +290,10 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
 }
 
 /// Compose the diagnostic from the command's severity (`required`) and whether
-/// the command exists at all (`present`). A required command — one the
-/// published image is contractually required to carry, regardless of which tier
-/// declared the tool — bails; any other command warns and `setup` continues,
-/// because `setup` does not build the tooling layer that might supply it.
+/// the command exists at all (`present`). A required command — one the verified
+/// image is contractually required to carry, regardless of which tier declared
+/// the tool — bails; any other command warns and `setup` continues, because
+/// `setup` does not build the tooling layer that might supply it.
 ///
 /// A transport failure — `sandbox.exec` returning `Err` because the sandbox
 /// died or agentd is unreachable — is indistinguishable here from an absent

@@ -148,15 +148,19 @@ pub(crate) fn materialize(
                 temps.push(temp);
             }
             ToolLayer::Path(declared_path) => {
+                let declared_in = match layer.anchor() {
+                    Some(dir) => format!(" (declared in {})", dir.display()),
+                    None => String::new(),
+                };
                 let anchored = declared_path.anchored(layer.anchor()).with_context(|| {
                     format!(
-                        "resolving the `layer = {{ path = … }}` declared by tool \"{}\"",
+                        "resolving the `layer = {{ path = … }}` declared by tool \"{}\"{declared_in}",
                         layer.tool()
                     )
                 })?;
                 let canonical = anchored.canonicalize().with_context(|| {
                     format!(
-                        "tool \"{}\": layer path {} does not exist",
+                        "tool \"{}\": layer path {} does not exist{declared_in}",
                         layer.tool(),
                         anchored.display()
                     )
