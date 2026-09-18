@@ -38,7 +38,7 @@ use std::ffi::OsString;
 use anyhow::{Result, anyhow};
 use clap::{Args as _, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
-use crate::config::{ConfigReport, LaunchCatalog, Tool};
+use crate::config::{CatalogEntry, ConfigReport, LaunchCatalog, Tool};
 use crate::run;
 use crate::{clipboard, doctor, intercept_hook, msb_cmd, pull, setup};
 
@@ -108,8 +108,11 @@ pub(crate) enum Cmd {
 pub(crate) enum Dispatch {
     Builtin(Cmd),
     // `args` is boxed so `Dispatch` does not carry the shared launch `Args`'s
-    // full size inline (clippy `large_enum_variant`); the tool itself is small.
-    Launch { tool: Tool, args: Box<run::Args> },
+    // full size inline (clippy `large_enum_variant`).
+    Launch {
+        entry: CatalogEntry,
+        args: Box<run::Args>,
+    },
 }
 
 /// Every subcommand name `build_command` registers that is not a tool,
@@ -149,7 +152,13 @@ where
     T: Into<OsString> + Clone,
 {
     let catalog = match config {
-        Ok(report) => Catalog::Ready(report.into_launch_catalog()?),
+        // A dangling `tools` reference is *user* input, so it must degrade to
+        // the deferred-error path (ADR-0015) rather than `?`-propagate and take
+        // `doctor`/`--help`/`clipboard` down with it.
+        Ok(report) => match report.into_launch_catalog() {
+            Ok(catalog) => Catalog::Ready(catalog),
+            Err(error) => Catalog::Broken(error),
+        },
         Err(error) => Catalog::Broken(error),
     };
 
@@ -187,9 +196,9 @@ where
         // The catalog is authoritative (checked first) so a future built-in
         // added without updating `RESERVED_TOOL_NAMES` fails a test rather
         // than silently shadowing a user's tool.
-        (Some((name, sub)), Catalog::Ready(catalog)) => match catalog.into_tool(name) {
-            Some(tool) => Ok(Dispatch::Launch {
-                tool,
+        (Some((name, sub)), Catalog::Ready(catalog)) => match catalog.into_entry(name) {
+            Some(entry) => Ok(Dispatch::Launch {
+                entry,
                 args: Box::new(run::Args::from_arg_matches(sub)?),
             }),
             // Not a tool, so a fixed built-in: the two name sets are disjoint
@@ -218,8 +227,8 @@ pub(crate) fn build_command(catalog: &Catalog) -> clap::Command {
     let mut command = Cli::command();
     match catalog {
         Catalog::Ready(catalog) => {
-            for tool in catalog.as_slice() {
-                command = command.subcommand(launch_subcommand(tool));
+            for entry in catalog.as_slice() {
+                command = command.subcommand(launch_subcommand(entry.tool()));
             }
         }
         // D1: with no catalog, any unknown verb must be able to surface the
@@ -416,9 +425,9 @@ mod tests {
         )
         .expect("mytool parses");
         match dispatch {
-            Dispatch::Launch { tool, args } => {
-                assert_eq!(tool.name(), "mytool");
-                assert_eq!(tool.command(), "my-agent");
+            Dispatch::Launch { entry, args } => {
+                assert_eq!(entry.tool().name(), "mytool");
+                assert_eq!(entry.tool().command(), "my-agent");
                 assert_eq!(args.agent_args, ["--resume"]);
             }
             Dispatch::Builtin(_) => panic!("mytool should dispatch as a launch"),
@@ -432,6 +441,22 @@ mod tests {
             Dispatch::Builtin(_) => panic!("expected the doctor built-in"),
             Dispatch::Launch { .. } => panic!("doctor is not a launch verb"),
         }
+    }
+
+    // -- T5: a dangling `tools` reference degrades (D3) -------------------
+
+    #[test]
+    fn a_dangling_tools_reference_is_a_deferred_config_error() {
+        let body = "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n";
+        // A launch verb reports the config error, never clap's
+        // unrecognized-subcommand, exactly like a syntactically broken config.
+        let result = parse_from(["agent-vm", "t"], Ok(report_from(body)));
+        let text = format!("{:#}", result.err().expect("`t` must fail"));
+        assert!(
+            text.contains("names no tool in the resolved catalog"),
+            "{text}"
+        );
+        assert!(!text.contains("unrecognized subcommand"), "{text}");
     }
 
     // -- T10: the asymmetric broken-config acceptance criterion -----------

@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
-use crate::config::Tool;
+use crate::config::{CatalogEntry, Tool};
 use crate::credential_provider;
 use crate::layer;
 use crate::mount;
@@ -953,11 +953,15 @@ pub struct Args {
     pub(crate) agent_args: Vec<String>,
 }
 
-/// Take the resolved [`Tool`] rather than destructured fields: #83 needs
-/// `persist` and #84 needs `layer` from the same value, and three same-typed
-/// `&str`/`&[String]` parameters would violate `CODING_STANDARDS.md`'s
-/// "don't take several same-typed args in a row".
-pub(crate) async fn launch(tool: &Tool, args: Args) -> Result<i32> {
+/// Take the resolved **catalog entry**, which carries both the tool and the
+/// provisioning set the launch catalog resolved for it. The set is *read from
+/// the entry*, never recomputed from the tool: it is the transitive closure
+/// over the catalog the tool was declared in, which a single [`Tool`] cannot
+/// see. Passing the entry whole is deliberate — the two facts can never be
+/// mismatched here.
+pub(crate) async fn launch(entry: &CatalogEntry, args: Args) -> Result<i32> {
+    let tool = entry.tool();
+    let provisioned = entry.provisioned();
     // First statement, deliberately: a still-set $AGENT_VM_LAYER is rejected
     // before anything else runs — state dirs, guest HOME provisioning, stale
     // sandbox reaping, or the msb-db preflight below — because the hazard is
@@ -1212,36 +1216,38 @@ pub(crate) async fn launch(tool: &Tool, args: Args) -> Result<i32> {
     let use_github = !allowed_repos.is_empty();
     notices.emit(repo_scope_notice(&allowed_repos))?;
 
-    // The credential subsystems this tool depends on. `github_egress`
-    // (`use_github`, driven by `--no-git` / detected repos) stays orthogonal
-    // to the tool.
-    let providers = tool.credential_providers();
-
-    // D1: the Copilot API is reached with a GitHub OAuth token, but
-    // unlike the gh CLI / repo-push path it is not repo-scoped — so
-    // Copilot's token capture and egress must follow the *selected tool's
-    // provider set*, not `use_github`. A user running `agent-vm copilot` in
-    // a non-GitHub project (or with `--no-git`) still expects Copilot to
-    // work; conversely a claude/codex/opencode/shell session in a GitHub
-    // repo should NOT get Copilot egress opened or a duplicate gh token
-    // written to a copilot secret file it never uses. `secrets::refresh`
-    // models this as `CaptureScope::WhenSelectedOrGithubEgress`.
+    // `provisioned` is the launch catalog's resolved closure (parameter).
+    // The requirement set is the tool's own `credentials`, read by the bail
+    // loop below; `github_egress` (`use_github`, driven by `--no-git` /
+    // detected repos) stays orthogonal to the tool.
     let creds = crate::secrets::refresh(
         &session.state_dir,
         &project_guest_path,
-        &crate::secrets::CredentialSelection {
-            providers,
+        &crate::secrets::CredentialProvisioning {
+            provisioned,
             github_egress: use_github,
         },
     )
     .context("snapshotting host credentials")?;
 
-    // When a selected provider produced no usable credential, fail loudly
+    // Providers the proxy actually holds a substitution entry for. Derive it
+    // once from `CredsState::wired()` so the guest-env gate and the placeholder
+    // clearer cannot desynchronise from `token_file`.
+    let launch_providers = credential_provider::LaunchProviders {
+        provisioned,
+        wired: creds.wired(),
+    };
+
+    // When a *required* provider produced no usable credential, fail loudly
     // here rather than letting the guest send an unsubstituted placeholder
     // bearer (the proxy drops it as a violation, or the vendor returns a
     // confusing 401). Only Anthropic and Copilot carry a message; no default
-    // tool selects both, so at most one fires. Iteration is in
+    // tool requires both, so at most one fires. Iteration is in
     // `CredentialProvider::ALL` order, so the error stays deterministic.
+    //
+    // The requirement set stays the launched tool's own `credentials`: a tool
+    // that reaches another through `tools` gets that tool's credential
+    // *provisioned* without inheriting its hard bail.
     //
     // Anthropic: a failed capture used to be only a `tracing::warn!` and the
     // launch continued, so the in-VM Claude Code came up signed out. The
@@ -1250,7 +1256,7 @@ pub(crate) async fn launch(tool: &Tool, args: Args) -> Result<i32> {
     // accepts `grant_type=refresh_token` with the placeholder refresh token
     // *only*, so an authorization-code exchange is rejected and Claude Code
     // surfaces a bare "OAuth error ... status code 400".
-    for provider in providers.iter() {
+    for provider in tool.credential_providers().iter() {
         if creds.token_file(provider).is_none()
             && let Some(message) = credential_provider::missing_credential_error(provider)
         {
@@ -1463,7 +1469,7 @@ pub(crate) async fn launch(tool: &Tool, args: Args) -> Result<i32> {
             creds: &creds,
             state_dir: &session.state_dir,
             allowed_repos: &allowed_repos,
-            providers,
+            provisioned,
         },
     )?;
 
@@ -1532,12 +1538,10 @@ pub(crate) async fn launch(tool: &Tool, args: Args) -> Result<i32> {
     }
 
     // Guest env, part 2 of 2: the *provider-owned* pairs. Today only Copilot
-    // contributes one — `COPILOT_GITHUB_TOKEN`, and only when Copilot is
-    // selected. Published last, after `GUEST_ALWAYS_ENV`, matching the pre-#81
-    // config; the security rationale for the pair (and for gating it on the
-    // selected provider) lives on `CredentialProvider::Copilot`'s spec and on
-    // `credential_provider::proxy_requires_selection`.
-    for (key, value) in credential_provider::provider_guest_env(providers) {
+    // contributes one — `COPILOT_GITHUB_TOKEN` — and only when this launch both
+    // provisions Copilot and captured its token. Published last, after
+    // `GUEST_ALWAYS_ENV`.
+    for (key, value) in credential_provider::provider_guest_env(launch_providers) {
         builder = builder.env(key, value);
     }
 
@@ -2532,8 +2536,9 @@ mod tests {
         catalog
             .as_slice()
             .iter()
-            .find(|tool| tool.name() == name)
+            .find(|entry| entry.tool().name() == name)
             .unwrap()
+            .tool()
     }
 
     /// **T2.** Differential characterization of [`inner_argv`] against the

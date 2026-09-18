@@ -95,7 +95,7 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     runtime.block_on(async move {
         match dispatch {
-            Dispatch::Launch { tool, args } => exit_with(run::launch(&tool, *args).await?),
+            Dispatch::Launch { entry, args } => exit_with(run::launch(&entry, *args).await?),
             Dispatch::Builtin(Cmd::Setup(args)) => setup::run(args).await,
             Dispatch::Builtin(Cmd::Pull(args)) => pull::run(args).await,
             Dispatch::Builtin(Cmd::Clipboard(args)) => clipboard::run(args),

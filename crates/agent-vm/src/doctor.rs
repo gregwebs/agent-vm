@@ -45,6 +45,7 @@ use clap::Args as ClapArgs;
 use crate::config::{
     ConfigConflict, ConfigReport, TierReport, TierStatus, Tool, ToolLayer, ToolOrigin,
 };
+use crate::credential_provider::{CredentialProvider, ProviderSet};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -385,8 +386,12 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>) {
     out.push_str(resolved_label);
     let failure = match report.into_launch_catalog() {
         Ok(catalog) => {
-            for (index, tool) in catalog.as_slice().iter().enumerate() {
-                out.push_str(&format!("  {}. {}\n", index + 1, describe_tool(tool)));
+            for (index, entry) in catalog.as_slice().iter().enumerate() {
+                out.push_str(&format!(
+                    "  {}. {}\n",
+                    index + 1,
+                    describe_tool(entry.tool(), entry.provisioned())
+                ));
             }
             if catalog.shell_fallback_added() {
                 out.push_str(
@@ -396,8 +401,9 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>) {
             }
             None
         }
-        // Only reachable if the embedded defaults are internally broken — a
-        // programming error, not a config the user can fix.
+        // A dangling `tools` reference lands here, as does an internally broken
+        // embedded default. Both are reported in-band so the rest of `doctor`
+        // still renders.
         Err(error) => {
             out.push_str(&format!("error: {error:#}\n"));
             Some(error)
@@ -447,7 +453,7 @@ fn describe_tier(tier: &TierReport) -> String {
     }
 }
 
-fn describe_tool(tool: &Tool) -> String {
+fn describe_tool(tool: &Tool, provisioned: ProviderSet) -> String {
     let layer = match tool.layer() {
         None => "none".to_string(),
         Some(ToolLayer::Builtin(builtin)) => format!("builtin:{}", builtin.as_str()),
@@ -455,15 +461,15 @@ fn describe_tool(tool: &Tool) -> String {
             format!("path:{}", crate::config::escape_path(path.as_path()))
         }
     };
-    let credentials = if tool.credentials().is_empty() {
-        "none".to_string()
-    } else {
-        tool.credentials()
-            .iter()
-            .map(|provider| provider.config_name())
-            .collect::<Vec<_>>()
-            .join(",")
-    };
+    // Both columns render through the same helper, in `CredentialProvider::ALL`
+    // order. `credentials` is stored in *declaration* order
+    // (`validate_credentials` — a plain map/collect), so rendering it directly
+    // beside an `ALL`-ordered `provisions=` would show the same set in two
+    // orders for a tool declaring `["copilot","anthropic"]`, which reads as a
+    // bug. Canonicalize both to `ALL` order; the shipped rows are already in
+    // that order, so no existing expectation changes.
+    let credentials = provider_names(ProviderSet::new(tool.credentials().iter().copied()).iter());
+    let provisions = provider_names(provisioned.iter());
     let source = match tool.origin() {
         ToolOrigin::BuiltIn => "built-in".to_string(),
         ToolOrigin::User(file) => format!("user:{}", crate::config::escape_path(file)),
@@ -485,12 +491,25 @@ fn describe_tool(tool: &Tool) -> String {
         format!("; env={env_count}")
     };
     format!(
-        "{} -> \"{}\"; args={}; layer={layer}; credentials={credentials}; persist={}; source={source}{interactive_shell}{env}",
+        "{} -> \"{}\"; args={}; layer={layer}; credentials={credentials}; \
+         provisions={provisions}; persist={}; source={source}{interactive_shell}{env}",
         crate::config::escape_str(tool.name()),
         crate::config::escape_str(tool.command()),
         tool.arg_count(),
         tool.persist_count(),
     )
+}
+
+/// `anthropic,openai` / `none`, in `CredentialProvider::ALL` order. Both
+/// columns pass through here, so the requirement set and the provisioning set
+/// can never render the same provider two different ways.
+fn provider_names(providers: impl Iterator<Item = CredentialProvider>) -> String {
+    let names: Vec<&str> = providers.map(CredentialProvider::config_name).collect();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(",")
+    }
 }
 
 /// `expires in 3h22m` / `EXPIRED 15m ago`. Minute resolution is enough to
@@ -964,13 +983,13 @@ mod tests {
 
         assert!(
             text.contains(
-                "shell -> \"bash\"; args=2; layer=none; credentials=openai,opencode-static; persist=0; source=built-in; interactive_shell=true; env=1"
+                "shell -> \"bash\"; args=2; layer=none; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=0; source=built-in; interactive_shell=true; env=1"
             ),
             "{text}"
         );
         assert!(
             text.contains(
-                "codex -> \"codex\"; args=0; layer=builtin:codex; credentials=openai; persist=0; source=built-in; env=1"
+                "codex -> \"codex\"; args=0; layer=builtin:codex; credentials=openai; provisions=openai; persist=0; source=built-in; env=1"
             ),
             "{text}"
         );
@@ -979,7 +998,7 @@ mod tests {
         // no `; env=0` suffix. V7 (D6/D7).
         assert!(
             !text.contains(
-                "claude -> \"claude\"; args=1; layer=builtin:claude; credentials=anthropic; persist=0; source=built-in; env"
+                "claude -> \"claude\"; args=1; layer=builtin:claude; credentials=anthropic; provisions=anthropic; persist=0; source=built-in; env"
             ),
             "{text}"
         );
@@ -1002,7 +1021,7 @@ mod tests {
         let (text, _) = describe_config(report);
         assert!(
             text.contains(
-                "secret -> \"secret\"; args=0; layer=none; credentials=none; persist=0; source=user:"
+                "secret -> \"secret\"; args=0; layer=none; credentials=none; provisions=none; persist=0; source=user:"
             ),
             "{text}"
         );

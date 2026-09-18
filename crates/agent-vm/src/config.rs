@@ -187,21 +187,26 @@ impl ConfigReport {
     pub(crate) fn into_launch_catalog(self) -> Result<LaunchCatalog> {
         let ConfigReport { resolved, .. } = self;
         let mut tools = resolved.0;
-        let shell_fallback_added = !tools.iter().any(|tool| tool.name() == SHELL_FALLBACK_NAME);
+        let shell_fallback_added = !tools.iter().any(|tool| tool.name() == SHELL_TOOL_NAME);
         if shell_fallback_added {
             tools.push(builtin_shell()?);
         }
         Ok(LaunchCatalog {
-            tools,
+            entries: resolve_provisioning(tools)?,
             shell_fallback_added,
         })
     }
 }
 
-/// The name the built-in `shell` fallback claims. A config that declares
-/// `shell` (even as a typo like `shel`) suppresses the fallback for `shell`
-/// only when it declares exactly this name.
-const SHELL_FALLBACK_NAME: &str = "shell";
+/// The name the built-in `shell` fallback claims, and the one tool name whose
+/// omitted `tools` defaults to the wildcard. One const so the catalog's
+/// fallback and the `tools` default cannot drift apart.
+pub(crate) const SHELL_TOOL_NAME: &str = "shell";
+
+/// The reserved wildcard spelling in `tools = [...]`. Also rejected as a tool
+/// *name* ([`validate_name`]) so the wildcard is unambiguous rather than merely
+/// conventional.
+const ALL_TOOLS_WILDCARD: &str = "*";
 
 /// The verbs a launch actually offers, in chain order: the resolved merge
 /// result, plus the built-in `shell` appended when no declared tool claims
@@ -209,13 +214,35 @@ const SHELL_FALLBACK_NAME: &str = "shell";
 /// user without a way into the guest to debug that config.
 #[derive(Debug)]
 pub(crate) struct LaunchCatalog {
-    tools: Vec<Tool>,
+    entries: Vec<CatalogEntry>,
     shell_fallback_added: bool,
 }
 
+/// One launch-catalog entry: a tool plus the provisioning set resolved for it.
+/// The set is computed once, here, because every consumer (launch, the proxy,
+/// the guest env, `doctor`) must agree on it exactly.
+#[derive(Debug)]
+pub(crate) struct CatalogEntry {
+    tool: Tool,
+    provisioned: ProviderSet,
+}
+
+impl CatalogEntry {
+    pub(crate) fn tool(&self) -> &Tool {
+        &self.tool
+    }
+
+    /// Everything a launch of this tool provisions: its own `credentials`
+    /// unioned with the transitive closure over its `tools`. **Not** the
+    /// requirement set — the pre-boot hard bail still reads `credentials`.
+    pub(crate) fn provisioned(&self) -> ProviderSet {
+        self.provisioned
+    }
+}
+
 impl LaunchCatalog {
-    pub(crate) fn as_slice(&self) -> &[Tool] {
-        &self.tools
+    pub(crate) fn as_slice(&self) -> &[CatalogEntry] {
+        &self.entries
     }
 
     /// True when the built-in `shell` was appended because no declared tool
@@ -224,13 +251,16 @@ impl LaunchCatalog {
         self.shell_fallback_added
     }
 
-    /// Consume the catalog, returning the tool named `name` for dispatch (the
-    /// remaining tools are dropped). `remove` rather than `swap_remove` keeps
-    /// the surviving order stable, though nothing observes it once `self` is
-    /// consumed.
-    pub(crate) fn into_tool(mut self, name: &str) -> Option<Tool> {
-        let index = self.tools.iter().position(|tool| tool.name() == name)?;
-        Some(self.tools.remove(index))
+    /// Consume the catalog, returning the **whole entry** named `name` for
+    /// dispatch. The entry is handed on intact (rather than split into
+    /// `(Tool, ProviderSet)`) so the two facts cannot be mismatched at any of
+    /// the call sites (`cli.rs` dispatch, `main.rs`, `run::launch`).
+    pub(crate) fn into_entry(mut self, name: &str) -> Option<CatalogEntry> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.tool.name() == name)?;
+        Some(self.entries.remove(index))
     }
 }
 
@@ -241,11 +271,9 @@ impl LaunchCatalog {
 fn builtin_shell() -> Result<Tool> {
     default_tools()?
         .into_iter()
-        .find(|tool| tool.name() == SHELL_FALLBACK_NAME)
+        .find(|tool| tool.name() == SHELL_TOOL_NAME)
         .ok_or_else(|| {
-            anyhow!(
-                "config: the built-in defaults have no `{SHELL_FALLBACK_NAME}` tool; this is a bug"
-            )
+            anyhow!("config: the built-in defaults have no `{SHELL_TOOL_NAME}` tool; this is a bug")
         })
 }
 
@@ -313,6 +341,10 @@ pub(crate) struct Tool {
     argv: Vec<String>,
     layer: Option<ToolLayer>,
     credentials: Vec<CredentialProvider>,
+    /// The catalog tools this tool wants available in its guest (a
+    /// **provisioning** input), distinct from `credentials` (the
+    /// **requirement** set).
+    tools: DeclaredTools,
     persist: Vec<PersistPath>,
     interactive_shell: bool,
     /// This tool's own guest env, key-sorted. Keys are validated at
@@ -321,6 +353,12 @@ pub(crate) struct Tool {
     /// [`Self::env_count`] — the same rule as `argv`.
     env: BTreeMap<String, String>,
     origin: ToolOrigin,
+    /// The tool's position in its declaring file's `[[tools]]` list. Provenance
+    /// like `origin`, not a config field: excluded from definition equality and
+    /// from [`ToolField`], and carried only so [`resolve_provisioning`] can emit
+    /// the repo's fixed `declaration [i]` diagnostic for a dangling reference
+    /// (a shadowed same-file tool makes a re-derived count wrong).
+    declaration_index: usize,
 }
 
 impl Tool {
@@ -371,6 +409,13 @@ impl Tool {
         &self.credentials
     }
 
+    /// The catalog tools this tool declares. Names are resolved against the
+    /// **launch catalog** (which includes the appended `shell` fallback), not
+    /// against the tier that declared them.
+    pub(crate) fn declared_tools(&self) -> &DeclaredTools {
+        &self.tools
+    }
+
     pub(crate) fn persist_count(&self) -> usize {
         self.persist.len()
     }
@@ -406,6 +451,7 @@ impl Tool {
             && self.argv == other.argv
             && self.layer == other.layer
             && self.credentials == other.credentials
+            && self.tools == other.tools
             && self.persist == other.persist
             && self.interactive_shell == other.interactive_shell
             && self.env == other.env
@@ -425,6 +471,9 @@ impl Tool {
         }
         if self.credentials != other.credentials {
             fields.push(ToolField::Credentials);
+        }
+        if self.tools != other.tools {
+            fields.push(ToolField::Tools);
         }
         if self.persist != other.persist {
             fields.push(ToolField::Persist);
@@ -452,6 +501,25 @@ impl ToolName {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// The catalog tools a tool wants available in its guest. These name **tools**,
+/// not credential providers: the transitive closure over them, unioned with
+/// each visited tool's own `credentials`, is the tool's provisioning set.
+///
+/// An enum rather than a `Vec<ToolName>` plus a `bool`: `"*"` must be the sole
+/// entry, and making the mixed form unrepresentable after validation means no
+/// consumer has to re-check it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeclaredTools {
+    /// `tools = ["*"]`, and the default for a tool named [`SHELL_TOOL_NAME`].
+    /// Closes over the tools declared in the **same configuration file** as
+    /// this tool (origin equality; `BuiltIn` = the embedded
+    /// `default-tools.toml`) — never the merged catalog.
+    All,
+    /// Declaration order preserved (definition equality is order-significant,
+    /// exactly like `credentials`). May be empty; may name the tool itself.
+    Named(Vec<ToolName>),
 }
 
 /// A tool's optional tooling layer. In this PR it is metadata only: a builtin
@@ -533,6 +601,7 @@ pub(crate) enum ToolField {
     Args,
     Layer,
     Credentials,
+    Tools,
     Persist,
     // Appended last: `each_differing_field_is_reported_individually_in_fixed_order`
     // and the multi-field ordering test depend on this sequence.
@@ -547,6 +616,7 @@ impl ToolField {
             ToolField::Args => "args",
             ToolField::Layer => "layer",
             ToolField::Credentials => "credentials",
+            ToolField::Tools => "tools",
             ToolField::Persist => "persist",
             ToolField::InteractiveShell => "interactive_shell",
             ToolField::Env => "env",
@@ -798,6 +868,112 @@ fn describe_origin(origin: &ToolOrigin) -> String {
     }
 }
 
+/// The declaring file a diagnostic names. `BuiltIn` stores no path because
+/// there is exactly one built-in file; name it here, matching the string
+/// [`default_tools`] passes to the parser.
+fn origin_file(origin: &ToolOrigin) -> &Path {
+    match origin {
+        ToolOrigin::BuiltIn => Path::new("default-tools.toml"),
+        ToolOrigin::User(file) | ToolOrigin::Project(file) => file,
+    }
+}
+
+/// Resolve every tool's provisioning set as the least fixed point of
+///
+/// ```text
+/// provisioning(t) = credentials(t) ∪ ⋃ { provisioning(u) | u ∈ tools(t) }
+/// ```
+///
+/// where `tools(t)` names catalog tools and a `"*"` entry expands to the tools
+/// **declared in the same configuration file as `t`** — the tools whose
+/// `ToolOrigin` equals `t`'s — not to the whole catalog.
+///
+/// Dangling references fail closed *before* any closure is walked, so the
+/// diagnostic names the declaring file rather than a half-resolved set. The
+/// dangling check is over the **merged catalog** (an explicit name is the
+/// cross-file opt-in), which is deliberately wider than the wildcard's group.
+fn resolve_provisioning(tools: Vec<Tool>) -> Result<Vec<CatalogEntry>> {
+    let index: HashMap<String, usize> = tools
+        .iter()
+        .enumerate()
+        .map(|(position, tool)| (tool.name.as_str().to_string(), position))
+        .collect();
+
+    for tool in &tools {
+        if let DeclaredTools::Named(names) = tool.declared_tools() {
+            for (position, reference) in names.iter().enumerate() {
+                if !index.contains_key(reference.as_str()) {
+                    return Err(tool_error(
+                        origin_file(&tool.origin),
+                        tool.declaration_index,
+                        &tool.name,
+                        format!(
+                            "tools[{position}]: {} names no tool in the resolved catalog; \
+                             declare that tool or remove the entry",
+                            quoted_str(reference.as_str())
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    let sets: Vec<ProviderSet> = (0..tools.len())
+        .map(|start| provisioning_closure(&tools, &index, start))
+        .collect();
+    Ok(tools
+        .into_iter()
+        .zip(sets)
+        .map(|(tool, provisioned)| CatalogEntry { tool, provisioned })
+        .collect())
+}
+
+/// One tool's closure. A cycle is harmless rather than an error: `visited`
+/// admits each tool at most once, so the walk terminates at the fixed point.
+/// (`shell`'s wildcard necessarily includes `shell` itself.)
+fn provisioning_closure(
+    tools: &[Tool],
+    index: &HashMap<String, usize>,
+    start: usize,
+) -> ProviderSet {
+    let mut visited = vec![false; tools.len()];
+    let mut stack = vec![start];
+    let mut set = ProviderSet::default();
+    while let Some(position) = stack.pop() {
+        if std::mem::replace(&mut visited[position], true) {
+            continue;
+        }
+        let tool = &tools[position];
+        set = set.union(tool.credential_providers());
+        match tool.declared_tools() {
+            // `"*"` closes over the declaring tool's **own configuration
+            // file** — the tools whose origin equals this tool's. In the
+            // shipped default catalog every tool is `BuiltIn` (the embedded
+            // `default-tools.toml`), so this is all five; when a user config
+            // replaces the defaults the appended fallback shell is the only
+            // `BuiltIn` tool, so it closes over itself alone and provisions
+            // only its own (empty) `credentials`.
+            DeclaredTools::All => {
+                let origin = tool.origin();
+                stack.extend(
+                    tools
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, candidate)| candidate.origin() == origin)
+                        .map(|(position, _)| position),
+                );
+            }
+            // Every name was proven present by `resolve_provisioning` above.
+            DeclaredTools::Named(names) => stack.extend(
+                names
+                    .iter()
+                    .filter_map(|reference| index.get(reference.as_str()).copied()),
+            ),
+        }
+    }
+    set
+}
+
 // ---------------------------------------------------------------------------
 // Raw schema and validation
 // ---------------------------------------------------------------------------
@@ -819,6 +995,12 @@ struct RawTool {
     layer: Option<RawLayer>,
     #[serde(default)]
     credentials: Vec<String>,
+    /// `None` (omitted) is **not** the same as `Some(vec![])`: omitted defaults
+    /// by name (`["*"]` for `shell`, `[]` otherwise), while an explicit
+    /// `tools = []` always means "no other tools" — including for `shell`.
+    /// No `#[serde(default)]`: serde already treats an `Option` field as
+    /// optional, and the attribute would read as load-bearing.
+    tools: Option<Vec<String>>,
     #[serde(default)]
     persist: Vec<String>,
     #[serde(default)]
@@ -860,6 +1042,7 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
         let argv = validate_argv(tool.args, file, index, &name)?;
         let layer = validate_layer(tool.layer, file, index, &name)?;
         let credentials = validate_credentials(tool.credentials, file, index, &name)?;
+        let tools_field = validate_tool_refs(tool.tools, file, index, &name)?;
         let persist = validate_persist(tool.persist, file, index, &name)?;
         let env = validate_env(tool.env, file, index, &name)?;
 
@@ -869,10 +1052,12 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
             argv,
             layer,
             credentials,
+            tools: tools_field,
             persist,
             interactive_shell: tool.interactive_shell,
             env,
             origin: kind.origin(file),
+            declaration_index: index,
         });
     }
     Ok(tools)
@@ -920,6 +1105,14 @@ fn validate_name(raw: &str, file: &Path, index: usize) -> Result<ToolName> {
             index,
             Some(raw),
             "name must not be `.` or `..`",
+        ));
+    }
+    if raw == ALL_TOOLS_WILDCARD {
+        return Err(declaration_error(
+            file,
+            index,
+            Some(raw),
+            "name `*` is reserved: it is the wildcard in a tool's `tools` list",
         ));
     }
     if RESERVED_TOOL_NAMES.contains(&raw) {
@@ -1049,6 +1242,58 @@ fn validate_credentials(
             })
         })
         .collect()
+}
+
+/// Validate one tool's `tools` declaration *within its tier*. Reference
+/// resolution is deliberately **not** here: a project tool may legitimately
+/// name a user tool, or the appended `shell` fallback, so the dangling check
+/// belongs to the launch catalog ([`resolve_provisioning`]).
+fn validate_tool_refs(
+    raw: Option<Vec<String>>,
+    file: &Path,
+    index: usize,
+    name: &ToolName,
+) -> Result<DeclaredTools> {
+    let Some(raw) = raw else {
+        return Ok(if name.as_str() == SHELL_TOOL_NAME {
+            DeclaredTools::All
+        } else {
+            DeclaredTools::Named(Vec::new())
+        });
+    };
+    if raw.iter().any(|entry| entry == ALL_TOOLS_WILDCARD) {
+        if raw.len() != 1 {
+            return Err(tool_error(
+                file,
+                index,
+                name,
+                "tools: `*` must be the only entry; it already means every tool \
+                 declared in this configuration file",
+            ));
+        }
+        return Ok(DeclaredTools::All);
+    }
+    let mut names = Vec::with_capacity(raw.len());
+    for (position, entry) in raw.into_iter().enumerate() {
+        if entry.is_empty() {
+            return Err(tool_error(
+                file,
+                index,
+                name,
+                format!("tools[{position}]: must not be empty"),
+            ));
+        }
+        if entry.contains('\0') {
+            return Err(tool_error(
+                file,
+                index,
+                name,
+                format!("tools[{position}]: must not contain NUL"),
+            ));
+        }
+        names.push(ToolName(entry));
+    }
+    Ok(DeclaredTools::Named(names))
 }
 
 fn validate_persist(
@@ -1240,7 +1485,7 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
     };
     anyhow!(
         "config: {}{location}: invalid TOML or tool schema; check syntax and field types. \
-         Required: a string `name` and `command`; `args`, `credentials`, and `persist` are \
+         Required: a string `name` and `command`; `args`, `credentials`, `tools`, and `persist` are \
          arrays of strings; `env` is a table of string values; `layer` has exactly one \
          string selector, `builtin` or `path`.",
         quoted_path(file)
@@ -1337,6 +1582,7 @@ pub(crate) fn escape_str(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs;
 
     // -- fixture helpers ---------------------------------------------------
@@ -1447,14 +1693,7 @@ mod tests {
             ),
             ("claude", "claude", 1, vec!["anthropic"], 0, Some("claude")),
             ("copilot", "copilot", 1, vec!["copilot"], 0, Some("copilot")),
-            (
-                "shell",
-                "bash",
-                2,
-                vec!["openai", "opencode-static"],
-                0,
-                None,
-            ),
+            ("shell", "bash", 2, vec![], 0, None),
         ];
         for (tool, (name, command, arg_count, providers, persist, layer)) in
             tools.iter().zip(expected)
@@ -1541,10 +1780,11 @@ mod tests {
     /// `run::Agent`'s `command()`/`default_args()`/`credential_providers()` and
     /// `matches!(agent, Agent::Shell)` as of `bb299d1` (the pre-#82 `main`).
     /// This is the only thing between a typo in `default-tools.toml` and a
-    /// silently wrong default launch. The provider column also re-states
-    /// #81's asymmetry (`copilot ⇔ Copilot`, `opencode|shell ⇔
-    /// OpencodeStatic`, `claude ⇔ Anthropic`, `codex|opencode|shell ⇔
-    /// OpenAi`).
+    /// silently wrong default launch. The provider column is the **requirement**
+    /// set (`credentials`), not the provisioning set: `shell` declares none, so
+    /// it rows as `&[]` (see
+    /// `default_catalog_provisioning_sets_are_exactly_the_spec_table` for the
+    /// provisioning side).
     #[test]
     fn default_tools_match_the_legacy_agent_table() {
         use CredentialProvider::*;
@@ -1579,13 +1819,7 @@ mod tests {
                 &[Copilot],
                 false,
             ),
-            (
-                "shell",
-                "bash",
-                &["-O", "histappend"],
-                &[OpenAi, OpencodeStatic],
-                true,
-            ),
+            ("shell", "bash", &["-O", "histappend"], &[], true),
         ];
         assert_eq!(tools.len(), cases.len());
         for (tool, (name, command, argv, providers, interactive_shell)) in tools.iter().zip(cases) {
@@ -1608,35 +1842,45 @@ mod tests {
         }
     }
 
-    /// Every default selects a provider its legacy variant gated on, and no
-    /// extra one. Re-stated as an exact set so a silently added or dropped
-    /// provider trips here rather than only in the launch integration test.
+    /// **T1.** The provisioning set of each shipped verb, transcribed from
+    /// ADR-0017's per-verb table. The acceptance criterion written as an
+    /// assertion; fails on *any* closure or default bug. `credentials` is the
+    /// *requirement* set and is asserted separately, so an implementation that
+    /// conflates the two fails here.
     #[test]
-    fn default_tools_provider_sets_are_exactly_the_legacy_asymmetry() {
+    fn default_catalog_provisioning_sets_are_exactly_the_spec_table() {
         use CredentialProvider::*;
-        for tool in default_tools().unwrap() {
-            let set = tool.credential_providers();
-            let name = tool.name();
+        let catalog = Fixture::new()
+            .load()
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap();
+        let expected: [(&str, &[CredentialProvider], &[CredentialProvider]); 5] = [
+            //  verb        credentials (required)     provisioned
+            ("codex", &[OpenAi], &[OpenAi]),
+            (
+                "opencode",
+                &[OpenAi, OpencodeStatic],
+                &[OpenAi, OpencodeStatic],
+            ),
+            ("claude", &[Anthropic], &[Anthropic]),
+            ("copilot", &[Copilot], &[Copilot]),
+            ("shell", &[], &[Anthropic, OpenAi, OpencodeStatic, Copilot]),
+        ];
+        assert_eq!(catalog.as_slice().len(), expected.len());
+        for (name, credentials, provisioned) in expected {
+            let entry = catalog
+                .as_slice()
+                .iter()
+                .find(|entry| entry.tool().name() == name)
+                .unwrap_or_else(|| panic!("{name} missing from the default catalog"));
             assert_eq!(
-                set.contains(Copilot),
-                name == "copilot",
-                "copilot gating changed for {name}"
+                entry.tool().credentials(),
+                credentials,
+                "requirement set for {name}"
             );
-            assert_eq!(
-                set.contains(OpencodeStatic),
-                name == "opencode" || name == "shell",
-                "opencode-static gating changed for {name}"
-            );
-            assert_eq!(
-                set.contains(Anthropic),
-                name == "claude",
-                "anthropic gating changed for {name}"
-            );
-            assert_eq!(
-                set.contains(OpenAi),
-                name == "codex" || name == "opencode" || name == "shell",
-                "openai gating changed for {name}"
-            );
+            let actual: Vec<CredentialProvider> = entry.provisioned().iter().collect();
+            assert_eq!(actual, provisioned, "provisioning set for {name}");
         }
     }
 
@@ -1660,14 +1904,19 @@ mod tests {
         let fixture = Fixture::new();
         fixture.user(&one_tool("solo"));
         let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
-        let names: Vec<&str> = catalog.as_slice().iter().map(Tool::name).collect();
+        let names: Vec<&str> = catalog
+            .as_slice()
+            .iter()
+            .map(|entry| entry.tool().name())
+            .collect();
         assert_eq!(names, ["solo", "shell"]);
         assert!(catalog.shell_fallback_added());
         let shell = catalog
             .as_slice()
             .iter()
-            .find(|tool| tool.name() == "shell")
-            .unwrap();
+            .find(|entry| entry.tool().name() == "shell")
+            .unwrap()
+            .tool();
         assert_eq!(shell.origin(), &ToolOrigin::BuiltIn);
         assert_eq!(shell.command(), "bash");
         assert!(shell.is_interactive_shell());
@@ -1682,8 +1931,8 @@ mod tests {
         let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
         assert!(!catalog.shell_fallback_added());
         assert_eq!(catalog.as_slice().len(), 1);
-        assert_eq!(catalog.as_slice()[0].name(), "shell");
-        assert_eq!(catalog.as_slice()[0].command(), "zsh");
+        assert_eq!(catalog.as_slice()[0].tool().name(), "shell");
+        assert_eq!(catalog.as_slice()[0].tool().command(), "zsh");
     }
 
     /// **T4c/T4d.** The default path (both tiers empty, or `tools = []`) does
@@ -1696,7 +1945,11 @@ mod tests {
             fixture.user(user).project(project);
             let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
             assert!(!catalog.shell_fallback_added());
-            let names: Vec<&str> = catalog.as_slice().iter().map(Tool::name).collect();
+            let names: Vec<&str> = catalog
+                .as_slice()
+                .iter()
+                .map(|entry| entry.tool().name())
+                .collect();
             assert_eq!(names, ["codex", "opencode", "claude", "copilot", "shell"]);
         }
     }
@@ -1713,16 +1966,319 @@ mod tests {
         assert_eq!(catalog.as_slice().len(), 2);
     }
 
-    /// `into_tool` moves exactly the named tool out, consuming the catalog.
+    /// `into_entry` moves exactly the named entry out, consuming the catalog.
     #[test]
-    fn launch_catalog_into_tool_returns_the_named_tool() {
+    fn launch_catalog_into_entry_returns_the_named_entry() {
         let fixture = Fixture::new();
         fixture.user(&one_tool("solo"));
         let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
-        let solo = catalog.into_tool("solo").expect("solo is in the catalog");
-        assert_eq!(solo.name(), "solo");
+        let solo = catalog.into_entry("solo").expect("solo is in the catalog");
+        assert_eq!(solo.tool().name(), "solo");
         let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
-        assert!(catalog.into_tool("absent").is_none());
+        assert!(catalog.into_entry("absent").is_none());
+    }
+
+    /// The provisioning set of `name` in `catalog`, in `CredentialProvider::ALL`
+    /// order.
+    fn provisioned_of(catalog: &LaunchCatalog, name: &str) -> Vec<CredentialProvider> {
+        catalog
+            .as_slice()
+            .iter()
+            .find(|entry| entry.tool().name() == name)
+            .unwrap_or_else(|| panic!("{name} missing from the catalog"))
+            .provisioned()
+            .iter()
+            .collect()
+    }
+
+    /// [`provisioned_of`] as an order-independent set, for the proptests.
+    fn provisioned_set(catalog: &LaunchCatalog, name: &str) -> BTreeSet<CredentialProvider> {
+        provisioned_of(catalog, name).into_iter().collect()
+    }
+
+    fn provider_from_u8(value: u8) -> CredentialProvider {
+        CredentialProvider::ALL[(value as usize) % CredentialProvider::ALL.len()]
+    }
+
+    /// Build a one-file catalog from `(credentials, tool-edges)` specs, named
+    /// `t0..t{n-1}`. Edges are reduced modulo the tool count so references are
+    /// never dangling (T7's generators produce indices).
+    fn single_file_catalog(specs: &[(Vec<u8>, Vec<usize>)]) -> LaunchCatalog {
+        let n = specs.len();
+        let mut body = String::new();
+        for (index, (credentials, edges)) in specs.iter().enumerate() {
+            body.push_str("[[tools]]\n");
+            body.push_str(&format!("name = \"t{index}\"\ncommand = \"t{index}\"\n"));
+            if !credentials.is_empty() {
+                let names: Vec<String> = credentials
+                    .iter()
+                    .map(|c| format!("\"{}\"", provider_from_u8(*c).config_name()))
+                    .collect();
+                body.push_str(&format!("credentials = [{}]\n", names.join(", ")));
+            }
+            if !edges.is_empty() {
+                let names: Vec<String> = edges
+                    .iter()
+                    .map(|edge| format!("\"t{}\"", edge % n))
+                    .collect();
+                body.push_str(&format!("tools = [{}]\n", names.join(", ")));
+            }
+        }
+        let fixture = Fixture::new();
+        fixture.user(&body);
+        fixture.load().unwrap().into_launch_catalog().unwrap()
+    }
+
+    /// **T2.** Omitted `tools` defaults to the wildcard for a tool named
+    /// [`SHELL_TOOL_NAME`] and to none for every other name. Row 4 (an explicit
+    /// `tools = []` on a declared `shell`) is the asymmetric pair that a
+    /// `Vec<String>` + `#[serde(default)]` implementation would fail.
+    #[test]
+    fn omitted_tools_defaults_to_the_wildcard_only_for_the_shell_name() {
+        use CredentialProvider::*;
+
+        // Row 1: a user config declaring one non-shell tool. The appended
+        // fallback `shell` is BuiltIn and closes over its own file only.
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(
+            provisioned_of(&catalog, "shell"),
+            Vec::<CredentialProvider>::new()
+        );
+        assert_eq!(provisioned_of(&catalog, "claude"), vec![Anthropic]);
+
+        // Row 3: a declared `shell` in the *same file* as `claude` closes over
+        // it (omitted `tools` => the wildcard).
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"shell\"\ncommand = \"zsh\"\n[[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(provisioned_of(&catalog, "shell"), vec![Anthropic]);
+
+        // Row 4: `tools = []` opts a declared `shell` out entirely.
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"shell\"\ncommand = \"zsh\"\ntools = []\n[[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(
+            provisioned_of(&catalog, "shell"),
+            Vec::<CredentialProvider>::new()
+        );
+
+        // Row 5: a non-shell name defaults to none, over the appended fallback.
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"notshell\"\ncommand = \"notshell\"\ncredentials = [\"copilot\"]\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(provisioned_of(&catalog, "notshell"), vec![Copilot]);
+        let notshell = catalog
+            .as_slice()
+            .iter()
+            .find(|entry| entry.tool().name() == "notshell")
+            .unwrap()
+            .tool();
+        assert_eq!(notshell.declared_tools(), &DeclaredTools::Named(Vec::new()));
+    }
+
+    /// **T3.** A tool that declares another tool is *provisioned* with that
+    /// tool's credentials (transitively) but not *required* to have them.
+    #[test]
+    fn a_declared_tool_contributes_its_credentials_transitively() {
+        use CredentialProvider::*;
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"pi\"\ncommand = \"pi\"\ncredentials = [\"openai\"]\ntools = [\"bridge\"]\n\
+             [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ntools = [\"claude\"]\n\
+             [[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(provisioned_of(&catalog, "pi"), vec![Anthropic, OpenAi]);
+        let pi = catalog
+            .as_slice()
+            .iter()
+            .find(|entry| entry.tool().name() == "pi")
+            .unwrap()
+            .tool();
+        let requirement: Vec<CredentialProvider> = pi.credential_providers().iter().collect();
+        assert_eq!(requirement, vec![OpenAi], "pi only *requires* openai");
+    }
+
+    /// **T3.** A cycle is a fixed point, not an error; a self-reference is
+    /// legal. A naive recursion without a visited set *hangs* here.
+    #[test]
+    fn a_tools_cycle_resolves_instead_of_hanging_or_erroring() {
+        use CredentialProvider::*;
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ncredentials = [\"anthropic\"]\ntools = [\"b\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ncredentials = [\"openai\"]\ntools = [\"a\"]\n\
+             [[tools]]\nname = \"c\"\ncommand = \"c\"\ncredentials = [\"copilot\"]\ntools = [\"c\"]\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(provisioned_of(&catalog, "a"), vec![Anthropic, OpenAi]);
+        assert_eq!(provisioned_of(&catalog, "b"), vec![Anthropic, OpenAi]);
+        assert_eq!(provisioned_of(&catalog, "c"), vec![Copilot]);
+    }
+
+    /// **T3 / §A1.** The wildcard closes over the declaring tool's **own
+    /// configuration file**, not the merged catalog. Two same-file tools group;
+    /// a tool in the other tier does not.
+    #[test]
+    fn the_wildcard_closes_over_its_own_file_only() {
+        use CredentialProvider::*;
+        let fixture = Fixture::new();
+        fixture
+            .user(
+                "[[tools]]\nname = \"w\"\ncommand = \"w\"\ncredentials = [\"copilot\"]\ntools = [\"*\"]\n\
+                 [[tools]]\nname = \"u\"\ncommand = \"u\"\ncredentials = [\"openai\"]\n",
+            )
+            .project(
+                "[[tools]]\nname = \"p\"\ncommand = \"p\"\ncredentials = [\"anthropic\"]\n",
+            );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(provisioned_of(&catalog, "w"), vec![OpenAi, Copilot]);
+        assert!(
+            !provisioned_of(&catalog, "w").contains(&Anthropic),
+            "the project tier is a different file and must not be swept in by `*`"
+        );
+    }
+
+    /// **T3 / §A1.** The cross-file opt-in is naming the tool explicitly.
+    #[test]
+    fn naming_another_files_tool_is_the_cross_file_opt_in() {
+        use CredentialProvider::*;
+        let fixture = Fixture::new();
+        fixture
+            .user(
+                "[[tools]]\nname = \"w\"\ncommand = \"w\"\ncredentials = [\"copilot\"]\ntools = [\"p\"]\n\
+                 [[tools]]\nname = \"u\"\ncommand = \"u\"\ncredentials = [\"openai\"]\n",
+            )
+            .project(
+                "[[tools]]\nname = \"p\"\ncommand = \"p\"\ncredentials = [\"anthropic\"]\n",
+            );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(provisioned_of(&catalog, "w"), vec![Anthropic, Copilot]);
+    }
+
+    /// **T3 / §A1.** The synthesized fallback `shell` (BuiltIn) is the only
+    /// BuiltIn tool under a custom catalog, so its wildcard closes over itself
+    /// alone and it provisions nothing.
+    #[test]
+    fn the_fallback_shell_under_a_custom_catalog_provisions_nothing() {
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n");
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(
+            provisioned_of(&catalog, "shell"),
+            Vec::<CredentialProvider>::new()
+        );
+    }
+
+    /// **T3 / §A1.** In the shipped default catalog every tool is BuiltIn, so
+    /// `shell`'s wildcard still closes over all five — the spec table is
+    /// unchanged by the file-scoped rule. This pins the *reason* (origin
+    /// equality), so a change to `default-tools.toml` or the fallback's origin
+    /// is caught here.
+    #[test]
+    fn the_shipped_default_wildcard_covers_all_five_builtin_tools() {
+        use CredentialProvider::*;
+        let catalog = Fixture::new()
+            .load()
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap();
+        assert_eq!(
+            provisioned_of(&catalog, "shell"),
+            vec![Anthropic, OpenAi, OpencodeStatic, Copilot]
+        );
+    }
+
+    /// **T3 / §A1, the review's B3 inverted.** A project tool must **not** widen
+    /// the user's wildcard `shell`: with each file scoped to itself, a project
+    /// `credentials = ["copilot"]` cannot reach the user's shell. The user's
+    /// shell also declares no `credentials`, and its `"*"` closes over its own
+    /// file — which declares only `shell` itself — so the exact provisioned set
+    /// is empty (review M1: the old `!contains(Copilot)` assertion passed for
+    /// both `{}` and the pre-change `{anthropic, openai, opencode-static}`).
+    #[test]
+    fn a_project_tool_does_not_widen_the_users_wildcard_shell() {
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n")
+            .project("[[tools]]\nname = \"p\"\ncommand = \"p\"\ncredentials = [\"copilot\"]\n");
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(
+            provisioned_of(&catalog, "shell"),
+            Vec::<CredentialProvider>::new(),
+            "a file whose only tool is `shell` provisions nothing"
+        );
+        let shell = catalog
+            .as_slice()
+            .iter()
+            .find(|entry| entry.tool().name() == "shell")
+            .unwrap()
+            .tool();
+        assert!(
+            shell.credential_providers().iter().next().is_none(),
+            "the user shell declares no credentials"
+        );
+    }
+
+    /// **T4.** The `tools` validation rules, all rejections. The dangling rows
+    /// assert the **full rendered string** (the diagnostic that drops the file
+    /// or the declaration index is the regression this catches).
+    #[test]
+    fn tools_validation_rejects_the_malformed_shapes() {
+        // `*` mixed with another entry.
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"*\", \"claude\"]\n");
+        let rendered = format!("{:#}", fixture.load().unwrap_err());
+        assert!(rendered.contains("must be the only entry"), "{rendered}");
+
+        // A dangling name in the *project* tier: the full string.
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n")
+            .project("");
+        let error = fixture.load().unwrap().into_launch_catalog().unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "config: {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry",
+                quoted_path(&fixture.user)
+            )
+        );
+
+        // The same in the project tier names the *project* file.
+        let fixture = Fixture::new();
+        fixture.project("[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n");
+        let error = fixture.load().unwrap().into_launch_catalog().unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "config: {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry",
+                quoted_path(&fixture.project)
+            )
+        );
+
+        // `name = "*"` is reserved.
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"*\"\ncommand = \"t\"\n");
+        let rendered = format!("{:#}", fixture.load().unwrap_err());
+        assert!(rendered.contains("reserved"), "{rendered}");
+
+        // An empty entry names its index.
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"\"]\n");
+        let rendered = format!("{:#}", fixture.load().unwrap_err());
+        assert!(rendered.contains("tools[0]"), "{rendered}");
+        assert!(rendered.contains("must not be empty"), "{rendered}");
     }
 
     // -- interactive_shell ------------------------------------------------
@@ -2232,12 +2788,13 @@ mod tests {
 
     #[test]
     fn each_differing_field_is_reported_individually_in_fixed_order() {
-        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\nlayer = { builtin = \"codex\" }\ncredentials = [\"openai\"]\npersist = [\"p\"]\ninteractive_shell = false\nenv = { A = \"1\" }\n";
+        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\nlayer = { builtin = \"codex\" }\ncredentials = [\"openai\"]\ntools = [\"base\"]\npersist = [\"p\"]\ninteractive_shell = false\nenv = { A = \"1\" }\n";
         let cases = [
             ("command = \"other\"", ToolField::Command),
             ("args = [\"b\"]", ToolField::Args),
             ("layer = { builtin = \"claude\" }", ToolField::Layer),
             ("credentials = [\"anthropic\"]", ToolField::Credentials),
+            ("tools = [\"other\"]", ToolField::Tools),
             ("persist = [\"q\"]", ToolField::Persist),
             ("interactive_shell = true", ToolField::InteractiveShell),
             ("env = { A = \"2\" }", ToolField::Env),
@@ -2249,6 +2806,7 @@ mod tests {
                     ToolField::Args => "args = [\"a\"]",
                     ToolField::Layer => "layer = { builtin = \"codex\" }",
                     ToolField::Credentials => "credentials = [\"openai\"]",
+                    ToolField::Tools => "tools = [\"base\"]",
                     ToolField::Persist => "persist = [\"p\"]",
                     ToolField::InteractiveShell => "interactive_shell = false",
                     ToolField::Env => "env = { A = \"1\" }",
@@ -2609,6 +3167,99 @@ mod tests {
             for path in &normalized {
                 proptest::prop_assert_eq!(path, &normalized[0]);
             }
+        }
+
+        /// **T7.1 / T7.4.** Every generated catalog resolves (termination,
+        /// including the self-edges and cycles unconstrained indices produce)
+        /// and `credentials(t) ⊆ provisioning(t)` for every tool.
+        #[test]
+        fn credentials_are_a_subset_of_provisioning_and_resolution_terminates(
+            specs in proptest::collection::vec(
+                (
+                    proptest::collection::vec(0u8..4, 0..3),
+                    proptest::collection::vec(0usize..5, 0..3),
+                ),
+                1..5,
+            ),
+        ) {
+            let catalog = single_file_catalog(&specs);
+            for (index, (credentials, _edges)) in specs.iter().enumerate() {
+                let provisioned = provisioned_set(&catalog, &format!("t{index}"));
+                for credential in credentials {
+                    let provider = provider_from_u8(*credential);
+                    proptest::prop_assert!(
+                        provisioned.contains(&provider),
+                        "t{index} lost {provider:?}"
+                    );
+                }
+            }
+        }
+
+        /// **T7.2.** Adding a `tools` edge `t0 → t{target}` never shrinks `t0`'s
+        /// provisioning set, and the result is a superset of the target's.
+        #[test]
+        fn adding_a_tools_edge_never_shrinks_provisioning(
+            specs in proptest::collection::vec(
+                (
+                    proptest::collection::vec(0u8..4, 0..3),
+                    proptest::collection::vec(0usize..5, 0..3),
+                ),
+                1..5,
+            ),
+            target in 0usize..5,
+        ) {
+            let n = specs.len();
+            let target = target % n;
+            let before = single_file_catalog(&specs);
+            let mut extended = specs.clone();
+            extended[0].1.push(target);
+            let after = single_file_catalog(&extended);
+            let before_set = provisioned_set(&before, "t0");
+            let after_set = provisioned_set(&after, "t0");
+            proptest::prop_assert!(after_set.is_superset(&before_set));
+            let target_set = provisioned_set(&after, &format!("t{target}"));
+            proptest::prop_assert!(after_set.is_superset(&target_set));
+        }
+
+        /// **T7.3.** With every generated tool in one file, a wildcard tool's
+        /// provisioning set is the union of the whole file's `credentials` — an
+        /// independent re-derivation that never walks the closure. Covers both
+        /// the omission path (a tool named `shell`) and the literal `["*"]`
+        /// spelling, and asserts the two agree.
+        #[test]
+        fn a_single_file_wildcard_provisions_the_whole_files_credentials(
+            creds in proptest::collection::vec(proptest::collection::vec(0u8..4, 0..3), 2..5),
+        ) {
+            let mut body = String::new();
+            for (index, credentials) in creds.iter().enumerate() {
+                let name = if index == 0 {
+                    "shell".to_string()
+                } else {
+                    format!("t{index}")
+                };
+                body.push_str("[[tools]]\n");
+                body.push_str(&format!("name = \"{name}\"\ncommand = \"{name}\"\n"));
+                if !credentials.is_empty() {
+                    let names: Vec<String> = credentials
+                        .iter()
+                        .map(|c| format!("\"{}\"", provider_from_u8(*c).config_name()))
+                        .collect();
+                    body.push_str(&format!("credentials = [{}]\n", names.join(", ")));
+                }
+                if index == 1 {
+                    body.push_str("tools = [\"*\"]\n");
+                }
+            }
+            let fixture = Fixture::new();
+            fixture.user(&body);
+            let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+            let union: BTreeSet<CredentialProvider> = creds
+                .iter()
+                .flatten()
+                .map(|credential| provider_from_u8(*credential))
+                .collect();
+            proptest::prop_assert_eq!(provisioned_set(&catalog, "shell"), union.clone());
+            proptest::prop_assert_eq!(provisioned_set(&catalog, "t1"), union);
         }
     }
 

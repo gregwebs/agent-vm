@@ -166,6 +166,9 @@ mod tests {
 
     #[test]
     fn run_with_path_inherits_process_env_without_clearing_it() {
+        // Serialize against tests that mutate process-wide env (e.g. a fake
+        // `gh` on PATH), or the PATH read below can race a mutation.
+        let _guard = crate::test_env::guard();
         // Guards the actual ticket bug: msb only sees agent-vm's private
         // MSB_HOME because the child inherits the full process env. We
         // can't assert on MSB_HOME directly without mutating process-wide
