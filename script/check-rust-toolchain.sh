@@ -14,8 +14,9 @@
 #   - .github/workflows/release-npm.yml: two explicit
 #     `rustup toolchain install` legs, same reproducibility rationale.
 #   - script/build/macos.sh: its own RUST_TOOLCHAIN copy (so the script never
-#     depends on or changes the caller's global default toolchain), the
-#     numeric floor guard, and the two hardcoded error messages.
+#     depends on or changes the caller's global default toolchain). The
+#     numeric floor guard and both error messages interpolate that copy, so
+#     checking the variable covers them -- they are not separate literals.
 #   - macos-build.md: contributor-facing copy-paste install/run commands. A
 #     stale one actively misleads a contributor, so every occurrence of the
 #     three anchor commands is checked, not merely their presence.
@@ -26,18 +27,19 @@
 #     assertions fail when it runs; checking them here would be circular.
 #   - docs/adr/0005's "Rust 1.94 pin" mentions -- a frozen historical record
 #     of the pin at decision time, not a copy that should track future bumps.
+#     The "1.94" in that phrase is quoted ADR text; do not update it on a bump.
 #
 # False-positive trap:
 # Every pattern below is anchored to its surrounding keyword
-# (RUST_TOOLCHAIN=, "minor < ", "Rust ... or newer", "rustup toolchain
-# install ", "rustup run ", "rustup component add cargo --toolchain ") so a
-# blanket version-token scan is never used and these tokens are never
-# mistaken for the pin.
+# (RUST_TOOLCHAIN=, "rustup toolchain install ", "rustup run ", "rustup
+# component add cargo --toolchain ") so a blanket version-token scan is never
+# used and these tokens are never mistaken for the pin.
 #
-# Channel form: two-component MAJOR.MINOR (currently 1.94). An optional patch
-# component (1.94.0) is tolerated by normalizing to MAJOR.MINOR for the
-# numeric floor-guard comparison; the string-literal consumers require exact
-# equality to the canonical channel string as written.
+# Channel form: the canonical channel may be two-component (MAJOR.MINOR) or
+# three-component (MAJOR.MINOR.PATCH). Every string-literal consumer is
+# compared for exact equality to the canonical channel string as written; the
+# MAJOR.MINOR parse below survives only as a shape sanity-check on the channel
+# itself (it is no longer used for any floor-guard comparison).
 #
 # Usage: script/check-rust-toolchain.sh [--root DIR] [--print]
 #   --root DIR   Treat DIR as the repository root (default: this script's own
@@ -227,7 +229,7 @@ main() {
         exit 2
     }
 
-    local channel_major="${channel%%.*}" channel_rest="${channel#*.}"
+    local channel_major="${channel%%.*}" channel_rest="${channel#*.}" channel_minor
     channel_minor="${channel_rest%%.*}"
     [[ "$channel_major" =~ ^[0-9]+$ && "$channel_minor" =~ ^[0-9]+$ ]] || {
         echo "error: could not parse a MAJOR.MINOR channel from $toolchain_toml: $channel" >&2
@@ -254,10 +256,9 @@ main() {
     echo "rust-toolchain: all consumers agree"
 }
 
-# channel/channel_minor are set by main() and read by the check_* functions
-# above; deliberately not passed as arguments since every check needs both
-# and this is a single-purpose script, not a library.
+# `channel` is set by main() and read by the check_* functions above;
+# deliberately not passed as an argument. channel_minor is local to main()
+# and used only for its channel-shape validation.
 channel=
-channel_minor=
 
 main "$@"

@@ -2,19 +2,18 @@
 # Rust version this repo builds with; `cargo`/`rustup` auto-select it for any
 # invocation rooted here. Every other copy of this version -- Cargo.toml's
 # rust-version, CI's dtolnay/rust-toolchain input, the release workflow's
-# explicit installs, script/build/macos.sh's own RUST_TOOLCHAIN literal and
-# floor guard, and macos-build.md's copy-paste commands -- is a duplicated
+# explicit installs, script/build/macos.sh's own RUST_TOOLCHAIN literal, and
+# macos-build.md's copy-paste commands -- is a duplicated
 # literal that can't simply read this file (see script/check-rust-toolchain.sh's
 # header for why each exists), so it is enforced against this channel by
-# script/check-rust-toolchain.sh. That checker runs in CI (the ubuntu
-# contract step directly, the macOS leg transitively via
-# script/test/build-workflow.sh) and locally in under a second via
-# `./script/check-rust-toolchain.sh`.
+# script/check-rust-toolchain.sh. That checker runs in CI on both legs
+# transitively via script/test/build-workflow.sh, and locally in under a
+# second via `./script/check-rust-toolchain.sh`.
 #
 # vendor/microsandbox is excluded from this workspace and pins its own
 # toolchain requirements independently (edition 2024, >=1.85) — it still
-# compiles fine under 1.94; see the toolchain-bump commit body for the
+# compiles fine under 1.98.1; see the toolchain-bump commit body for the
 # verification.
 [toolchain]
-channel = "1.94"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]

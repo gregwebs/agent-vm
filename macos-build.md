@@ -4,7 +4,7 @@ These instructions support Apple Silicon Macs (`arm64`, M1 or newer). Intel macO
 
 ## Prerequisites
 
-Install the Xcode Command Line Tools, rustup with the known-good Rust 1.94 toolchain, and Docker Desktop. Docker remains required for the separate guest-agent and local OCI-image steps; Apple's `container` CLI is additionally supported for the firmware kernel bundle:
+Install the Xcode Command Line Tools, rustup with the known-good Rust 1.98.1 toolchain, and Docker Desktop. Docker remains required for the separate guest-agent and local OCI-image steps; Apple's `container` CLI is additionally supported for the firmware kernel bundle:
 
 ```bash
 xcode-select --install
@@ -12,7 +12,7 @@ brew install rustup
 brew install --cask docker
 rustup-init -y
 source "$HOME/.cargo/env"
-rustup toolchain install 1.94
+rustup toolchain install 1.98.1
 ```
 
 Start Docker Desktop, initialize the recursive submodules, and check the exact toolchain used by the build:
@@ -20,11 +20,11 @@ Start Docker Desktop, initialize the recursive submodules, and check the exact t
 ```bash
 docker info
 git submodule update --init --recursive
-RUSTUP_AUTO_INSTALL=0 rustup run 1.94 rustc --version
-RUSTUP_AUTO_INSTALL=0 rustup run 1.94 cargo --version
+RUSTUP_AUTO_INSTALL=0 rustup run 1.98.1 rustc --version
+RUSTUP_AUTO_INSTALL=0 rustup run 1.98.1 cargo --version
 ```
 
-The guarded checks do not download a missing toolchain. The canonical build selects installed Rust 1.94 locally through rustup; it neither depends on nor changes your global default toolchain.
+The guarded checks do not download a missing toolchain. The canonical build selects installed Rust 1.98.1 locally through rustup; it neither depends on nor changes your global default toolchain.
 
 The vendored build compiles the Linux guest helper through Docker. Its firmware helper accepts `LIBKRUNFW_BUILD_BACKEND=auto|container|docker`: `auto` prefers Apple's `container` CLI, then Docker. Both backends upload a filtered source snapshot to container-native `/work`, build there, and copy only `kernel.c` back. Keep enough container and temporary disk space for those outputs and for one staged Docker image archive during local image import. The helper inherits runtime DNS by default; if Apple's Container runtime cannot resolve Fedora mirrors, explicitly provide the resolver chosen for your network, for example `LIBKRUNFW_BUILD_BACKEND=container LIBKRUNFW_BUILD_DNS=1.1.1.1 ./script/build/macos.sh`. It never selects a public resolver itself; the override accepts one IPv4 address and applies only to the firmware builder.
 
@@ -240,26 +240,26 @@ under `build/` receives `msb-entitlements.plist`. If the repository-local
 firmware output is missing, the same script rebuilds and restores it
 automatically.
 
-### Rust 1.94 or its Cargo component is missing or unusable
+### Rust 1.98.1 or its Cargo component is missing or unusable
 
-The build uses the installed Rust 1.94 toolchain through rustup with automatic installation disabled. If the toolchain is absent or corrupted, install or repair it without changing the global default:
+The build uses the installed Rust 1.98.1 toolchain through rustup with automatic installation disabled. If the toolchain is absent or corrupted, install or repair it without changing the global default:
 
 ```bash
-rustup toolchain install 1.94
+rustup toolchain install 1.98.1
 ```
 
 If the toolchain's compiler works but Cargo is missing or unusable, restore only the Cargo component:
 
 ```bash
-rustup component add cargo --toolchain 1.94
+rustup component add cargo --toolchain 1.98.1
 ```
 
 On rustup 1.29 for macOS, either bootstrap command can fail during channel synchronization with `invalid peer certificate ... OSStatus -26276`. For that specific failure, retry the applicable command once with rustup's official curl backend:
 
 ```bash
-RUSTUP_USE_CURL=1 rustup toolchain install 1.94
+RUSTUP_USE_CURL=1 rustup toolchain install 1.98.1
 # Or, for a missing Cargo component:
-RUSTUP_USE_CURL=1 rustup component add cargo --toolchain 1.94
+RUSTUP_USE_CURL=1 rustup component add cargo --toolchain 1.98.1
 ```
 
 This selects a TLS-verifying HTTPS backend; it does not disable certificate verification. The curl backend is deprecated, so use the variable only for this targeted rustup 1.29 recovery and do not export it permanently. The build script never sets it or downloads a toolchain. This rustup bootstrap failure is separate from the later registry/`agent-vm setup` trust-service failure.

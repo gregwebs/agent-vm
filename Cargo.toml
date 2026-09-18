@@ -6,14 +6,14 @@ members = ["crates/agent-vm", "crates/msb-krun-compat-evidence"]
 exclude = ["vendor/microsandbox"]
 
 [workspace.package]
-version = "0.1.37"
+version = "0.1.38"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wirenboard/agent-vm"
 # Kept in exact lockstep with rust-toolchain.toml's channel, which is the
 # canonical pin and owner (see that file's header). script/check-rust-toolchain.sh
 # enforces the two stay equal, in CI and locally.
-rust-version = "1.94"
+rust-version = "1.98.1"
 
 [profile.release]
 codegen-units = 16
