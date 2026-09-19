@@ -4200,6 +4200,42 @@ mod prepare_tests {
         assert!(store_tree(store.path()).is_empty(), "{error}");
     }
 
+    /// With two `:follow-links` declarations, `expand_follow_links` does not
+    /// record which one discovered a target (and legitimately merges the two
+    /// when both do), so the refusal must not blame both — let alone the one
+    /// that contributed nothing.
+    #[test]
+    fn a_discovered_leak_with_two_follow_links_declarations_blames_neither() {
+        use std::os::unix::fs::symlink;
+
+        let (_home, home) = pi_home();
+        let leak = home.join("leak");
+        let innocent = home.join("innocent");
+        fs::create_dir_all(&leak).unwrap();
+        fs::create_dir_all(&innocent).unwrap();
+        symlink(home.join(".pi"), leak.join("pi-link")).unwrap();
+        let declarations = [
+            format!("{}:ro:follow-links", leak.display()),
+            format!("{}:ro:follow-links", innocent.display()),
+        ];
+        let store = tempfile::tempdir().unwrap();
+
+        let error = prepare(
+            parse_extra_mounts(&declarations).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("would expose"), "{error}");
+        assert!(
+            error.contains("discovered by one of your --mount"),
+            "{error}"
+        );
+        assert!(!error.contains("discovered by --mount"), "{error}");
+        assert!(store_tree(store.path()).is_empty(), "{error}");
+    }
+
     #[test]
     fn fork_of_pi_home_omits_both_files_and_copies_everything_else() {
         let (_home, home) = pi_home();

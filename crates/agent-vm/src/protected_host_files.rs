@@ -1024,6 +1024,38 @@ mod tests {
         assert_eq!(exposure.severity, Severity::Refuse);
     }
 
+    /// A refusal of one of agent-vm's own binds names *that* bind's role and
+    /// remedy, not "the project directory" for all three. A broad
+    /// `AGENT_VM_STATE_DIR` is the case that made this a defect: the project
+    /// bind's cwd remedy would be useless advice for it.
+    #[test]
+    fn core_refusals_name_the_bind_role_and_its_own_remedy() {
+        let (_home, home) = home();
+        write(&home.join(".pi/agent/auth.json"), "{\"token\":\"t\"}");
+        let protected = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        let exposure = protected.exposure(&home.join(".pi")).unwrap().unwrap();
+
+        let state = CoreHostSource::new(CoreBind::StateDir, home.join(".pi"));
+        let message = protected.core_message(&state, &exposure);
+        assert!(message.contains("state directory"), "{message}");
+        assert!(message.contains("AGENT_VM_STATE_DIR"), "{message}");
+        assert!(!message.contains("project directory"), "{message}");
+
+        let guest_home = CoreHostSource::new(CoreBind::GuestHome, home.join(".pi"));
+        let message = protected.core_message(&guest_home, &exposure);
+        assert!(message.contains("guest home bind"), "{message}");
+        assert!(message.contains("outside"), "{message}");
+
+        // The advisories use the same role vocabulary, for the binds that
+        // expose no protected file.
+        let advisories = protected.core_advisories(&guest_home).join("\n");
+        assert!(advisories.contains("guest home bind"), "{advisories}");
+        assert!(
+            advisories.contains("Host Pi extensions and installed packages"),
+            "{advisories}"
+        );
+    }
+
     proptest::proptest! {
         #[test]
         fn exposing_index_matches_naive_position(
