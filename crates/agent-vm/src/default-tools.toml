@@ -9,10 +9,9 @@
 # re-parsed — there is no second definition.
 #
 # Order matters. The declaration order below is the order `agent-vm --help`
-# and `agent-vm doctor` show the verbs, and the order #84 will compose tooling
-# layers in. The image build keeps the same cache-motivated ordering (codex
-# first, then opencode, then claude) — see images/Dockerfile's "Layer order is
-# deliberate" comment.
+# and `agent-vm doctor` show the verbs, and the order the tool layers are
+# composed in (#84). The image build keeps the same cache-motivated ordering
+# (codex first, then opencode, then claude) — see images/tools/README.md.
 #
 # `args` holds the flags prepended before the user's own args (`run::inner_argv`
 # drops any the user already passed). The microVM is the security boundary, so

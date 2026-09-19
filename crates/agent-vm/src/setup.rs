@@ -8,6 +8,15 @@
 //! Local source builds and cache-only image imports are separate root
 //! workflows; setup intentionally pulls the selected registry image.
 //!
+//! # Which image it verifies
+//!
+//! Setup verifies *the published image this configuration would boot from*
+//! ([`crate::tool_layer::chain_root`]): the composed default template for the
+//! shipped default tool set, or the tool-free base when the configured set
+//! differs. It verifies the published root; it does **not** build a local tool
+//! chain (the first launch does that), so it cannot prove a not-yet-composed
+//! tool layer works.
+//!
 //! # What "verify" means
 //!
 //! Verification runs every configured tool's `command` directly with
@@ -20,14 +29,19 @@
 //! the diagnostic.
 //!
 //! Severity follows the `command`, not the declaring tier: a `command` the
-//! published image is contractually required to carry (see
-//! [`config::shipped_tool_commands`]) is fatal, while any other `command` only
-//! warns — `setup` does not build a project's `.agent-vm/layers/` chain and so
-//! cannot tell whether a tooling layer supplies it.
+//! verified image is contractually required to carry (see
+//! [`config::shipped_tool_commands`]) is fatal. Two things soften that, and
+//! only two: a command the *base* has never been expected to carry (any
+//! non-shipped `command`) warns; and, when `setup` is verifying the tool-free
+//! base because the launch composes locally (D10), a shipped command **that a
+//! declared tool layer supplies** is downgraded to a notice — the layer carries
+//! it, not the base. A shipped command no declared layer supplies stays fatal,
+//! so a genuinely broken base still fails `setup`.
 
 use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
 use microsandbox::{ExecOutput, MicrosandboxError, Sandbox, sandbox::PullPolicy};
+use std::collections::BTreeMap;
 
 use crate::config::{self, Catalog, LaunchCatalog};
 
@@ -37,14 +51,21 @@ pub struct Args {
     #[arg(long)]
     no_verify: bool,
 
-    /// Override the image reference.
+    /// Boot and verify this image verbatim, skipping tool-layer composition.
     ///
-    /// Defaults to `ghcr.io/wirenboard/agent-vm-template:latest`.
-    /// Source-checkout users who built a local image can point at it
-    /// (`--image localhost:5000/agent-vm-template:latest`) — agent-vm
-    /// detects local registries and uses plain HTTP.
+    /// Defaults to the image this configuration would boot from — the composed
+    /// default template for the shipped tool set, or the tool-free base when
+    /// the configured set differs. Mutually exclusive with `--base-image`.
     #[arg(long, env = "AGENT_VM_IMAGE_TAG", value_name = "REF")]
     image: Option<String>,
+
+    /// Verify the tool-free base that tool layers are composed onto.
+    ///
+    /// Default `ghcr.io/wirenboard/agent-vm-base:latest`. Passing this always
+    /// targets the base, even when the tool set matches the shipped default.
+    /// Mutually exclusive with `--image`.
+    #[arg(long = "base-image", env = "AGENT_VM_BASE_IMAGE", value_name = "REF")]
+    base_image: Option<String>,
 }
 
 /// One in-guest command `setup` proves works. A newtype rather than
@@ -57,22 +78,33 @@ struct VerifyTarget {
     tools: Vec<String>,
     command: String,
     /// `true` iff `command` is one of the compiled-in defaults' commands (see
-    /// [`config::shipped_tool_commands`]). That contract is a property of the
-    /// binary, not of the declaring tier: a user/project config that redeclares
-    /// a shipped tool (or shares its command) must not be able to downgrade its
-    /// absence to a warning.
+    /// [`config::shipped_tool_commands`]) **and** no declared tool layer
+    /// supplies it. That contract is a property of the binary, not of the
+    /// declaring tier: a user/project config that redeclares a shipped tool (or
+    /// shares its command) must not be able to downgrade its absence to a
+    /// warning. The one exception is D10's: when the verified image is the
+    /// tool-free base and a declared tool layer supplies the command, the base
+    /// is not expected to carry it.
     required: bool,
 }
 
 /// The catalog tools `setup` verifies, in catalog order, deduped by `command`.
 /// `required` is true iff the `command` is one of the compiled-in defaults'
-/// commands ([`config::shipped_tool_commands`]).
-fn verification_targets(catalog: &LaunchCatalog) -> Result<Vec<VerifyTarget>> {
+/// commands ([`config::shipped_tool_commands`]) **and** no declared tool layer
+/// supplies it (`supplied`, non-empty only when the verified root is the
+/// tool-free base — D10). A command a declared layer will supply is a fact
+/// about a *different* image than the one being verified, so its absence from
+/// the base is expected.
+fn verification_targets(
+    catalog: &LaunchCatalog,
+    supplied: &BTreeMap<String, String>,
+) -> Result<Vec<VerifyTarget>> {
     let shipped = config::shipped_tool_commands()?;
     let mut targets: Vec<VerifyTarget> = Vec::new();
     for entry in catalog.as_slice() {
         let tool = entry.tool();
-        let required = shipped.iter().any(|command| command == tool.command());
+        let required = shipped.iter().any(|command| command == tool.command())
+            && !supplied.contains_key(tool.command());
         match targets
             .iter_mut()
             .find(|target| target.command == tool.command())
@@ -100,29 +132,71 @@ pub async fn run(args: Args, catalog: Catalog) -> Result<()> {
     // the boot path. See src/msb_preflight.rs and issue #30.
     crate::msb_preflight::ensure_db_not_ahead().await?;
 
-    let image = args
-        .image
-        .unwrap_or_else(|| crate::defaults::DEFAULT_IMAGE_REF.to_string());
-
     // Resolve the verification targets *before* pulling, so a broken config
     // still pulls and boots the image — setup's recovery path must not be
     // blocked by a config typo. A broken config falls back to the compiled-in
     // default tools (which cannot themselves be broken: a missing default entry
     // is already a hard error), matching today's behaviour where a broken
     // project config did not affect `setup` at all.
-    let targets = match &catalog {
-        Catalog::Ready(catalog) => verification_targets(catalog)?,
+    let (verify_catalog, declared_layers) = match catalog {
+        Catalog::Ready(catalog) => {
+            let layers = catalog.declared_layers();
+            (catalog, layers)
+        }
         Catalog::Broken(error) => {
             println!(
                 "==> WARNING: tool configuration could not be read: {error:#}; \
                  run `agent-vm doctor`"
             );
             println!("==> Falling back to the shipped default tools for verification");
-            verification_targets(
-                &config::default_launch_catalog().context("resolving the shipped default tools")?,
-            )?
+            let defaults =
+                config::default_launch_catalog().context("resolving the shipped default tools")?;
+            let layers = defaults.declared_layers();
+            (defaults, layers)
         }
     };
+
+    // The image this configuration would boot from (issue #84). `setup`
+    // verifies the published *root*; it never builds the local tool chain.
+    let declared_layer_values: Vec<config::ToolLayer> =
+        declared_layers.iter().map(|l| l.layer().clone()).collect();
+    let root = crate::tool_layer::chain_root(
+        args.image.clone(),
+        args.base_image.clone(),
+        &declared_layer_values,
+        &config::shipped_tool_layers()?,
+    )?;
+    let image = root.reference().to_string();
+
+    // D10: a shipped command is downgraded to a notice only when the launch
+    // composes locally (`Base`) AND a declared tool layer supplies it. On every
+    // other root, nothing is downgraded.
+    let supplied: BTreeMap<String, String> = if root.composes_tool_layers() {
+        declared_layers
+            .iter()
+            .map(|layer| (layer.command().to_string(), layer.tool().to_string()))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+
+    let targets = verification_targets(&verify_catalog, &supplied)?;
+
+    // One line per layer-supplied command, naming the layer that will supply
+    // it on the first composed launch.
+    let shipped = config::shipped_tool_commands()?;
+    for target in &targets {
+        if let Some(tool) = supplied.get(&target.command)
+            && !target.required
+            && shipped.iter().any(|command| command == &target.command)
+        {
+            println!(
+                "==> {} is supplied by tool layer \"{tool}\", which this base does not carry yet; \
+                 verifying the published base only. The first launch composes the chain.",
+                target.command
+            );
+        }
+    }
 
     println!("==> Pulling {image} into the microsandbox cache");
     crate::pull::pull_image(&image).await?;
@@ -199,7 +273,7 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
                     .await
                     .map(|out| out.status().code == 0)
                     .unwrap_or(false);
-                if let Err(error) = report(target, present, outcome) {
+                if let Err(error) = report(image, target, present, outcome) {
                     sandbox.stop_and_wait().await.ok();
                     Sandbox::remove("agent-vm-setup-verify").await.ok();
                     return Err(error);
@@ -216,10 +290,16 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
 }
 
 /// Compose the diagnostic from the command's severity (`required`) and whether
-/// the command exists at all (`present`). A required command — one the
-/// published image is contractually required to carry, regardless of which tier
-/// declared the tool — bails; any other command warns and `setup` continues,
-/// because `setup` does not build the tooling layer that might supply it.
+/// the command exists at all (`present`). A required command — one the verified
+/// image is contractually required to carry, regardless of which tier declared
+/// the tool — bails; any other command warns and `setup` continues, because
+/// `setup` does not build the tooling layer that might supply it.
+///
+/// `image` is the reference `setup` verified, so the fatal diagnostic can name
+/// the image this configuration boots and point at the `layer` field that would
+/// supply the command — the failure a user hits after redeclaring a shipped tool
+/// *without* a `layer` (the declaration that was cheap while `layer` was
+/// metadata).
 ///
 /// A transport failure — `sandbox.exec` returning `Err` because the sandbox
 /// died or agentd is unreachable — is indistinguishable here from an absent
@@ -227,6 +307,7 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
 /// is deliberate: `setup` cannot repair a dead sandbox by failing the run, and
 /// the image-API check has already passed by this point.
 fn report(
+    image: &str,
     target: &VerifyTarget,
     present: bool,
     outcome: Result<ExecOutput, MicrosandboxError>,
@@ -271,8 +352,14 @@ fn report(
         } else {
             "missing from the image".to_string()
         };
+        // `image` is user-supplied on `--base-image`/`--image`, so escape it
+        // before it reaches a terminal.
+        let image = config::escape_str(image);
         bail!(
-            "{verbs}: command {command} is {because}. Pull a newer tag (`agent-vm pull`) or report at \
+            "{verbs}: command {command} is {because} — {image} is the image this configuration \
+             boots. If the tool is meant to be composed locally, declare `layer = {{ builtin = \
+             … }}` (or a `path`) on it: `setup` verifies the base and the first launch composes \
+             it. Otherwise pull a newer tag (`agent-vm pull`) or report at \
              https://github.com/wirenboard/agent-vm/issues"
         );
     }
@@ -332,7 +419,7 @@ mod tests {
     #[test]
     fn default_catalog_verifies_every_shipped_tool_including_copilot() {
         assert_eq!(
-            summary(&verification_targets(&default_catalog()).expect("targets")),
+            summary(&verification_targets(&default_catalog(), &BTreeMap::new()).expect("targets")),
             vec![
                 ("codex".to_string(), "codex".to_string(), true),
                 ("opencode".to_string(), "opencode".to_string(), true),
@@ -347,9 +434,10 @@ mod tests {
 
     #[test]
     fn user_declared_tools_are_not_required() {
-        let targets = verification_targets(&catalog_from(
-            "[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\n",
-        ))
+        let targets = verification_targets(
+            &catalog_from("[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\n"),
+            &BTreeMap::new(),
+        )
         .expect("targets");
         let mytool = targets
             .iter()
@@ -364,9 +452,10 @@ mod tests {
         // that contract belongs to the *command*, not to the declaring tier. A
         // user who copies `claude` into their config to change `args` must not
         // be able to turn a missing `claude` back into a warning.
-        let targets = verification_targets(&catalog_from(
-            "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\nargs = [\"--x\"]\n",
-        ))
+        let targets = verification_targets(
+            &catalog_from("[[tools]]\nname = \"claude\"\ncommand = \"claude\"\nargs = [\"--x\"]\n"),
+            &BTreeMap::new(),
+        )
         .expect("targets");
         let claude = targets
             .iter()
@@ -384,9 +473,10 @@ mod tests {
         // the target is shared. `required` follows the command, so it stays
         // true however the sharing tool was declared — otherwise any user could
         // silence the shipped `shell` check by adding `command = "bash"`.
-        let targets = verification_targets(&catalog_from(
-            "[[tools]]\nname = \"mysh\"\ncommand = \"bash\"\n",
-        ))
+        let targets = verification_targets(
+            &catalog_from("[[tools]]\nname = \"mysh\"\ncommand = \"bash\"\n"),
+            &BTreeMap::new(),
+        )
         .expect("targets");
         let bash: Vec<&VerifyTarget> = targets
             .iter()
@@ -395,6 +485,96 @@ mod tests {
         assert_eq!(bash.len(), 1, "one target per command");
         assert_eq!(bash[0].tools, vec!["mysh".to_string(), "shell".to_string()]);
         assert!(bash[0].required, "a shipped command stays required");
+    }
+
+    // -- D10: the narrowed `Base`-root downgrade ----------------------------
+
+    /// Mirrors `run`'s computation: chain_root over the catalog's declared
+    /// layers, then the supplied-command set only when the root composes.
+    fn targets_for(body: &str, image: Option<String>, base: Option<String>) -> Vec<VerifyTarget> {
+        let catalog = catalog_from(body);
+        let declared = catalog.declared_layers();
+        let values: Vec<config::ToolLayer> = declared.iter().map(|l| l.layer().clone()).collect();
+        let root = crate::tool_layer::chain_root(
+            image,
+            base,
+            &values,
+            &config::shipped_tool_layers().expect("shipped layers"),
+        )
+        .expect("chain_root");
+        let supplied: BTreeMap<String, String> = if root.composes_tool_layers() {
+            declared
+                .iter()
+                .map(|l| (l.command().to_string(), l.tool().to_string()))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        verification_targets(&catalog, &supplied).expect("targets")
+    }
+
+    fn required_of(targets: &[VerifyTarget], command: &str) -> bool {
+        targets
+            .iter()
+            .find(|t| t.command == command)
+            .unwrap_or_else(|| panic!("{command} is verified"))
+            .required
+    }
+
+    /// A `Base` root with `tools=["claude"]` (declaring the layer) downgrades
+    /// `claude` —a layer supplies it—but `bash` (supplied by no layer) stays
+    /// fatal, so a genuinely broken base still fails `setup`.
+    #[test]
+    fn base_root_downgrades_only_layer_supplied_commands() {
+        let targets = targets_for(
+            "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\nlayer = { builtin = \"claude\" }\n",
+            None,
+            None,
+        );
+        assert!(!required_of(&targets, "claude"), "claude is layer-supplied");
+        assert!(
+            required_of(&targets, "bash"),
+            "bash is supplied by no layer"
+        );
+    }
+
+    /// A `Base` root where a shipped command is declared **without** a layer
+    /// keeps that command fatal: the narrowing is by declared layer, not by
+    /// tool set.
+    #[test]
+    fn base_root_without_a_supplying_layer_keeps_the_command_fatal() {
+        let targets = targets_for(
+            "[[tools]]\nname = \"mytool\"\ncommand = \"codex\"\n",
+            None,
+            None,
+        );
+        assert!(
+            required_of(&targets, "codex"),
+            "a shipped command no layer supplies stays fatal"
+        );
+    }
+
+    /// `Template` and `Verbatim` roots downgrade nothing.
+    #[test]
+    fn non_composing_roots_downgrade_nothing() {
+        // Template: a default-shaped layer sequence boots the composed image.
+        let default_body = "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nlayer = { builtin = \"codex\" }\n\
+             [[tools]]\nname = \"opencode\"\ncommand = \"opencode\"\nlayer = { builtin = \"opencode\" }\n\
+             [[tools]]\nname = \"claude\"\ncommand = \"claude\"\nlayer = { builtin = \"claude\" }\n\
+             [[tools]]\nname = \"copilot\"\ncommand = \"copilot\"\nlayer = { builtin = \"copilot\" }\n";
+        let targets = targets_for(default_body, None, None);
+        assert!(
+            required_of(&targets, "claude"),
+            "Template downgrades nothing"
+        );
+
+        // Verbatim via --image: even a layer-supplied command is required.
+        let targets = targets_for(
+            "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\nlayer = { builtin = \"claude\" }\n",
+            Some("myimg:1".to_string()),
+            None,
+        );
+        assert!(required_of(&targets, "claude"));
     }
 
     // -- V9: `report`'s severity table (manual 2/3, codified) --------------
@@ -415,14 +595,26 @@ mod tests {
 
     /// Manual 3 (codified): a missing *shipped* command is fatal. The real-VM
     /// run in `verifications.md` uses a derived image with `codex` removed;
-    /// this pins the same decision boot-free.
+    /// this pins the same decision boot-free. The message names the image this
+    /// configuration boots, so a user who redeclared a shipped tool without a
+    /// `layer` learns why the guest would be missing it.
     #[test]
     fn report_bails_for_a_missing_shipped_command() {
-        let err = report(&target(&["codex"], "codex", true), false, not_runnable())
-            .expect_err("a missing shipped command must be fatal");
+        let err = report(
+            "ghcr.io/wirenboard/agent-vm-base:latest",
+            &target(&["codex"], "codex", true),
+            false,
+            not_runnable(),
+        )
+        .expect_err("a missing shipped command must be fatal");
         let rendered = format!("{err:#}");
         assert!(rendered.contains("codex"), "{rendered}");
         assert!(rendered.contains("missing from the image"), "{rendered}");
+        assert!(
+            rendered.contains("ghcr.io/wirenboard/agent-vm-base:latest"),
+            "the diagnostic names the image this configuration boots: {rendered}"
+        );
+        assert!(rendered.contains("layer"), "{rendered}");
     }
 
     /// Manual 2 (codified): a missing *user/project* command warns and the run
@@ -430,7 +622,13 @@ mod tests {
     #[test]
     fn report_warns_for_a_missing_optional_command() {
         assert!(
-            report(&target(&["mytool"], "mytool", false), false, not_runnable()).is_ok(),
+            report(
+                "agent-vm-template:1",
+                &target(&["mytool"], "mytool", false),
+                false,
+                not_runnable()
+            )
+            .is_ok(),
             "a missing user command only warns"
         );
     }
@@ -439,8 +637,13 @@ mod tests {
     /// still fatal, and the message says "broken" rather than "missing".
     #[test]
     fn report_bails_for_a_broken_shipped_command() {
-        let err = report(&target(&["claude"], "claude", true), true, not_runnable())
-            .expect_err("a broken shipped command must be fatal");
+        let err = report(
+            "agent-vm-base:1",
+            &target(&["claude"], "claude", true),
+            true,
+            not_runnable(),
+        )
+        .expect_err("a broken shipped command must be fatal");
         let rendered = format!("{err:#}");
         assert!(rendered.contains("broken"), "{rendered}");
     }

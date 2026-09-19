@@ -16,11 +16,12 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
-use crate::config::{CatalogEntry, Tool};
+use crate::config::{self, CatalogEntry, Tool};
 use crate::credential_provider;
 use crate::layer;
 use crate::mount;
 use crate::session::ProjectSession;
+use crate::tool_layer;
 use crate::user;
 
 /// Paths that the guest will tmpfs-mount at boot, wiping anything our
@@ -48,13 +49,19 @@ const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 ///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
 
-/// The launcher's baked fallback guest `PATH` — kept in sync by hand with
-/// `images/Dockerfile`'s `ENV PATH=…`. Used only when the booted image's own
-/// OCI config declares no `PATH` (e.g. the image metadata isn't cached yet
-/// on a cold first run, before the pull that happens later in `launch()`).
+/// The launcher's baked fallback guest `PATH` — kept in sync by hand with the
+/// **base** `images/Dockerfile`'s `ENV PATH=…`. Used only when the booted
+/// image's own OCI config declares no `PATH` (e.g. the image metadata isn't
+/// cached yet on a cold first run, before the pull that happens later in
+/// `launch()`).
+///
+/// Deliberately names no tool prefix: which tool prefixes exist is a property
+/// of the composed image, read from its OCI config by
+/// [`image_config_path_and_digest`]. The tool layers append their own prefixes
+/// additively, so the base's value is the correct floor.
 /// See [`layer::contract::path_from_config_env`] and
 /// [`image_config_path_and_digest`].
-const FALLBACK_GUEST_PATH: &str = "/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin";
+const FALLBACK_GUEST_PATH: &str = "/usr/local/bin:/usr/bin:/usr/sbin:/bin";
 
 /// Best-effort read of the booted image's config `PATH`, plus the base
 /// image's manifest digest (fed to the tooling-layer hash in `layer.rs`).
@@ -504,30 +511,41 @@ impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
     }
 }
 
-/// If the project declares a tooling-layer chain and/or `layer_flags` is
-/// non-empty, build+load the composed chain (lazily, hash-cached per step,
-/// with one confirmation for the whole chain on a miss — see ADR-0003) and
-/// return the final derived tag to boot instead of `base_image`. Returns
-/// `Ok(None)` when neither source declares anything, so `launch()` boots
-/// `base_image` unchanged — a non-layer project's behavior is byte-identical
-/// to before tooling layers existed.
+/// If the catalog declares tool layers (via `root`), the project declares a
+/// tooling-layer chain, and/or `layer_flags` is non-empty, build+load the
+/// composed chain (lazily, hash-cached per step, with one confirmation for the
+/// whole chain on a miss — see ADR-0003) and return the final derived tag to
+/// boot instead of `root.reference()`. Returns `Ok(None)` when no source
+/// declares anything, so `launch()` boots `root.reference()` unchanged — a
+/// non-layer project's behavior is byte-identical to before tooling layers
+/// existed (issue #84's fast path).
+///
+/// `tool_steps` are the catalog's materialised tool layers, in declaration
+/// order, ahead of the project's own steps. They are prepended rather than
+/// routed through `layer::resolve_layer_chain`, so they deliberately bypass
+/// that function's project-local rules (reject-the-project-dir,
+/// reject-duplicate-flags): those rules are about user-named directories, and
+/// a temp build context cannot violate them.
 ///
 /// Extracted out of `launch()` so the orchestration reads top-to-bottom
 /// without the surrounding ~150 lines of mount/credential/network setup
 /// interleaved with it, and so each step (resolve, plan, execute) is a
 /// single `?`-propagated call a reader can follow in order.
 async fn resolve_boot_image_with_layer<W: std::io::Write>(
-    base_image: &str,
+    root: &tool_layer::ChainRoot,
+    tool_steps: &[layer::ChainDir],
     layer_flags: &[PathBuf],
     project_dir: &Path,
     auto_confirm: bool,
     notices: &mut LaunchNotices<W>,
     cache_dir_override: Option<&Path>,
 ) -> Result<Option<String>> {
-    let layer_dirs = layer::resolve_layer_chain(project_dir, layer_flags)?;
-    if layer_dirs.is_empty() {
+    let mut chain = tool_steps.to_vec();
+    chain.extend(layer::resolve_layer_chain(project_dir, layer_flags)?);
+    if chain.is_empty() {
         return Ok(None);
     }
+    let base_image = root.reference();
 
     // The cache that owns the base metadata and receives the final ingest.
     // A test overrides it with a tempdir; production uses the configured msb
@@ -554,7 +572,7 @@ async fn resolve_boot_image_with_layer<W: std::io::Write>(
             );
         }
         notices.emit(format!(
-            "==> Tooling layer present; pulling base {base_image} first…"
+            "==> Composing tool layers; pulling the chain root {base_image} first…"
         ))?;
         crate::pull::pull_image(base_image)
             .await
@@ -574,7 +592,7 @@ async fn resolve_boot_image_with_layer<W: std::io::Write>(
     //    process on a pure cache hit. `base_image` and `base_digest` stay
     //    separate: the digest anchors the hash, the ref is only what
     //    `pin_base` may pull to establish the Docker base link.
-    let plan = layer::plan_chain(&layer_dirs, project_dir, &base_digest)?;
+    let plan = layer::plan_chain(&chain, project_dir, &base_digest)?;
 
     // 3. Execute: cache-hit fast path, or confirm-then-build-forward. Any
     //    failure past this point is a hard fail — launch() must never
@@ -762,6 +780,7 @@ Networking (deny-by-default; flags compose):
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
   AGENT_VM_IMAGE_TAG                    same as --image
+  AGENT_VM_BASE_IMAGE                   same as --base-image
   AGENT_VM_ROOT                         same as --root (1|true|yes|on)
   AGENT_VM_UPDATE_CHECK                 check the registry for a newer image (1|true|yes|on)
   AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls (1|true|yes|on)
@@ -877,10 +896,10 @@ pub struct Args {
     #[command(flatten)]
     network: crate::network::Args,
 
-    /// Override the OCI image reference.
+    /// Boot this image verbatim, skipping tool-layer composition.
     ///
-    /// Default: `ghcr.io/wirenboard/agent-vm-template:latest`. Use a
-    /// timestamped tag (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
+    /// The project's own `.agent-vm/layers/*` and any `--layer DIR` still
+    /// chain on top. Mutually exclusive with `--base-image`.
     #[arg(
         long,
         env = "AGENT_VM_IMAGE_TAG",
@@ -888,6 +907,20 @@ pub struct Args {
         help_heading = "Image"
     )]
     image: Option<String>,
+
+    /// The tool-free base that tool layers are composed onto.
+    ///
+    /// Default `ghcr.io/wirenboard/agent-vm-base:latest`. Passing this always
+    /// composes locally, even when your tool set matches the shipped default
+    /// (which otherwise boots the published composed template). Mutually
+    /// exclusive with `--image`.
+    #[arg(
+        long = "base-image",
+        env = "AGENT_VM_BASE_IMAGE",
+        value_name = "REF",
+        help_heading = "Image"
+    )]
+    base_image: Option<String>,
 
     /// Check the registry for a newer image at launch (opt-in).
     ///
@@ -959,7 +992,11 @@ pub struct Args {
 /// over the catalog the tool was declared in, which a single [`Tool`] cannot
 /// see. Passing the entry whole is deliberate — the two facts can never be
 /// mismatched here.
-pub(crate) async fn launch(entry: &CatalogEntry, args: Args) -> Result<i32> {
+pub(crate) async fn launch(
+    entry: &CatalogEntry,
+    layers: &[config::DeclaredLayer],
+    args: Args,
+) -> Result<i32> {
     let tool = entry.tool();
     let provisioned = entry.provisioned();
     // The launch's guest-HOME link list: the compiled-in providers plus one
@@ -1084,16 +1121,40 @@ pub(crate) async fn launch(entry: &CatalogEntry, args: Args) -> Result<i32> {
     notices.emit(launch_banner(&session))?;
     let _ = &session.project_hash;
 
-    // `base_image` stays a separate binding from `image` for the lifetime of
-    // `launch()`: the opt-in registry update-check below (run.rs:566ish)
-    // must keep probing the *base*, never a reassigned tooling-layer tag,
-    // which has no registry to probe (see the call site's comment there).
-    let base_image = args
-        .image
-        .clone()
-        .or_else(|| env::var("AGENT_VM_IMAGE_TAG").ok())
-        .unwrap_or_else(|| crate::defaults::DEFAULT_IMAGE_REF.to_string());
-    let mut image = base_image.clone();
+    // The chain root: which published tag this launch builds FROM and boots,
+    // and whether the declared tool layers must be composed onto it. Pure, and
+    // the one place the `--image` / `--base-image` / default-set decision lives
+    // (see `tool_layer::chain_root`).
+    //
+    // `root.reference()` stays a separate binding from the possibly-reassigned
+    // `image` for the lifetime of `launch()`: the opt-in registry update-check
+    // below must keep probing a *published* tag, never a locally composed
+    // tooling-layer tag, which has no registry to probe (see the call site's
+    // comment there).
+    let declared: Vec<crate::config::ToolLayer> = layers
+        .iter()
+        .map(config::DeclaredLayer::layer)
+        .cloned()
+        .collect();
+    let root = crate::tool_layer::chain_root(
+        args.image.clone(),
+        args.base_image.clone(),
+        &declared,
+        &config::shipped_tool_layers()?,
+    )?;
+    let mut image = root.reference().to_string();
+
+    // Materialise the builtin tool layers into throwaway build contexts (D2).
+    // Only the compose path touches the filesystem; the template fast path and
+    // `--image` create no temp directory. The guard is bound *here*, at launch
+    // scope, so it outlives the whole chain resolution and build — dropping it
+    // earlier would delete the build context out from under `docker buildx`.
+    let (tool_steps, _materialized) = if root.composes_tool_layers() {
+        let (steps, guard) = crate::tool_layer::materialize(layers)?;
+        (steps, Some(guard))
+    } else {
+        (Vec::new(), None)
+    };
     let memory_mib: u32 = args
         .memory
         .checked_mul(1024)
@@ -1101,16 +1162,17 @@ pub(crate) async fn launch(entry: &CatalogEntry, args: Args) -> Result<i32> {
     let cpus = args.cpus;
 
     // Tooling-layer resolution (issue #13, extended to an ordered chain by
-    // #79, then to an additive repeatable `--layer` by amendment A1): if the
-    // project declares `.agent-vm/layers/*/Dockerfile` subdirectories and/or
-    // `--layer DIR` is given (appended after the project's own steps),
-    // build+load the composed derived image now (lazily, hash-cached per
-    // step, with one confirmation for the whole chain on a miss) and boot it
-    // instead of the base. Neither source declared ⇒ `image` is left as
-    // `base_image`, byte-identical to today.
+    // #79, then to an additive repeatable `--layer` by amendment A1, then to
+    // the catalog's tool steps by #84): the chain is the catalog's declared
+    // tool layers (empty unless `root` composes), then the project's
+    // `.agent-vm/layers/*` steps, then any `--layer DIR`. It is built and
+    // loaded now (lazily, hash-cached per step, with one confirmation for the
+    // whole chain on a miss) and booted instead of the root. An empty chain
+    // leaves `image` as `root.reference()` — the zero-build fast path.
     let auto_confirm = should_auto_confirm(args.yes, env::var("AGENT_VM_YES").ok().as_deref());
     if let Some(derived) = resolve_boot_image_with_layer(
-        &base_image,
+        &root,
+        &tool_steps,
         &args.layer,
         &session.project_dir,
         auto_confirm,
@@ -1165,12 +1227,12 @@ pub(crate) async fn launch(entry: &CatalogEntry, args: Args) -> Result<i32> {
         // during boot; otherwise it's simply skipped and the next launch
         // catches up. Previously this was awaited and blocked every boot.
         //
-        // Deliberately `base_image`, not `image`: when a tooling layer
+        // Deliberately `root.reference()`, not `image`: when a tooling layer
         // reassigned `image` to the registry-less derived tag
         // (`agent-vm-layer:<hash>`), probing it would HEAD a nonexistent
-        // registry ref and always miss. The pulled-marker + update banner
-        // are a property of the base image the layer builds FROM.
-        let img = base_image.clone();
+        // registry ref and always miss. The pulled-marker + update banner are
+        // a property of the published image the chain builds FROM.
+        let img = root.reference().to_string();
         tokio::spawn(async move {
             seed_pulled_marker_if_absent(&img).await;
             // Detached task: there is no launch error boundary to reach
@@ -1535,8 +1597,8 @@ pub(crate) async fn launch(entry: &CatalogEntry, args: Args) -> Result<i32> {
     // The value now comes from the booted image's own OCI config `Env`
     // (`PATH=…`) rather than a hard-coded literal, so a tooling-layer's
     // `ENV PATH=/project/bin:$PATH` actually reaches the guest exec
-    // environment. FALLBACK_GUEST_PATH — kept in sync by hand with the
-    // `ENV PATH=…` in images/Dockerfile — is used only when the image
+    // environment. FALLBACK_GUEST_PATH — kept in sync by hand with the base
+    // `images/Dockerfile`'s `ENV PATH=…` — is used only when the image
     // metadata isn't available (e.g. a cold cache on first run, before this
     // launch's own pull completes); for the base image the two are
     // byte-identical today, so this is behavior-identical in the common
@@ -2359,18 +2421,26 @@ fn parse_github_slug(url: &str) -> Option<String> {
 const STRIP_IPV6_NAMESERVERS: &str =
     "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true";
 
-/// Seed the image's baked Claude LSP plugins into the persistent state dir on
-/// first boot (PLAN.md D2). The image installs them at build time under
-/// `/opt/agent/.claude` (shared, world-readable prefix — see the non-root
-/// guest ADR), but the runtime persistence symlink — `~/.claude ->
-/// /agent-vm-state/claude`, i.e. `/root/.claude` in `--root` mode or
-/// `<state_dir>/home/.claude` in the non-root default — shadows that tree so
-/// the booted guest's `claude plugin list` is empty. The image ships
-/// `/opt/agent-vm/seed-claude-plugins.sh`, which copies the stash into
-/// the state dir once. Guarded on the script's presence so older images (no
-/// stash) are an inert no-op, and idempotent so it only does work on first boot.
-const SEED_CLAUDE_PLUGINS: &str =
-    "[ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh || true";
+/// Run the image's first-boot seed hooks. A tool layer that bakes state which
+/// the guest's runtime persistence symlinks would shadow (the claude LSP
+/// plugin tree under `~/.claude`, whose symlink into the state dir hides it)
+/// drops an executable under `/opt/agent-vm/seed.d/`; the claude tool layer
+/// installs `10-claude-plugins` there. Tool-agnostic by design: the launcher no
+/// longer names any tool (epic #78), and an image with no such layer runs
+/// nothing. Each hook must be idempotent — this runs on every boot.
+///
+/// The second clause is a compatibility fallback, NOT dead code:
+/// `MIN_SUPPORTED_IMAGE_API` is still 1, so this launcher must keep working
+/// against an already-cached API-2 template, which ships
+/// `/opt/agent-vm/seed-claude-plugins.sh` and has no `seed.d/`. Without it,
+/// upgrading the launcher without re-pulling would silently empty
+/// `claude plugin list` with no error anywhere.
+/// DELETE THIS CLAUSE when `MIN_SUPPORTED_IMAGE_API` reaches 3.
+const RUN_IMAGE_SEED_HOOKS: &str = concat!(
+    "for _h in /opt/agent-vm/seed.d/*; do [ -x \"$_h\" ] && \"$_h\"; done\n",
+    "[ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh",
+    "; true",
+);
 
 /// The guest command line: the tool's default argv (minus any flag the user
 /// already passed), then the user's own args — or, for an interactive shell, a
@@ -2429,7 +2499,7 @@ fn build_agent_shell_line(
     let path = shell_escape(project_guest_path);
     let prelude = format!(
         "{STRIP_IPV6_NAMESERVERS}\n\
-         {SEED_CLAUDE_PLUGINS}\n\
+         {RUN_IMAGE_SEED_HOOKS}\n\
          [ -t 0 ] || exec < /dev/null\n\
          {chrome_mcp_prelude}\
          _hook={path}/.agent-vm.runtime.sh\n\
@@ -3241,7 +3311,10 @@ mod tests {
         };
         let mut notices = LaunchNotices::new(output);
         let got = resolve_boot_image_with_layer(
-            "ghcr.io/wirenboard/agent-vm-template:latest",
+            &tool_layer::ChainRoot::Verbatim(
+                "ghcr.io/wirenboard/agent-vm-template:latest".to_string(),
+            ),
+            &[],
             &[],
             project.path(),
             false,
@@ -3274,7 +3347,10 @@ mod tests {
         };
         let mut notices = LaunchNotices::new(output);
         let err = resolve_boot_image_with_layer(
-            "ghcr.io/wirenboard/agent-vm-template:latest",
+            &tool_layer::ChainRoot::Verbatim(
+                "ghcr.io/wirenboard/agent-vm-template:latest".to_string(),
+            ),
+            &[],
             &[],
             project.path(),
             false,
@@ -3314,7 +3390,10 @@ mod tests {
         };
         let mut notices = LaunchNotices::new(output);
         let err = resolve_boot_image_with_layer(
-            "ghcr.io/wirenboard/agent-vm-template:latest",
+            &tool_layer::ChainRoot::Verbatim(
+                "ghcr.io/wirenboard/agent-vm-template:latest".to_string(),
+            ),
+            &[],
             &[],
             project.path(),
             true,
@@ -3467,7 +3546,8 @@ mod tests {
         };
         let mut notices = LaunchNotices::new(output);
         let got = resolve_boot_image_with_layer(
-            &local_base_ref,
+            &tool_layer::ChainRoot::Verbatim(local_base_ref.clone()),
+            &[],
             &[],
             project.path(),
             true,
@@ -3489,6 +3569,247 @@ mod tests {
         );
         // `guard` (and the temp cache/archive/project tempdirs) drop here,
         // removing only the disposable source/link tags this test created.
+        drop(guard);
+    }
+
+    // --- issue #84: the builtin tool-layer compose path, end to end -------
+
+    /// The declared layers of a one-tool config, as `launch` reads them from
+    /// the catalog (before `take_entry`).
+    fn declared_layers_of(body: &str) -> Vec<crate::config::DeclaredLayer> {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("config.toml");
+        std::fs::write(&project, body).unwrap();
+        crate::config::load(&crate::config::ConfigPaths {
+            user: Some(dir.path().join("no-user.toml")),
+            project,
+        })
+        .expect("fixture config parses")
+        .into_launch_catalog()
+        .expect("fixture catalog resolves")
+        .declared_layers()
+    }
+
+    /// Issue-#84 review, Finding 6: the *compose* path —
+    /// `tool_layer::materialize`'s temp build context feeding
+    /// `plan_chain`/`execute_chain` — was exercised by nothing. This runs it
+    /// for real for one builtin layer (`claude`, whose Dockerfile does
+    /// `COPY --chmod=0755 seed-claude-plugins.sh`, so it also covers the
+    /// materialised-0644-plus-Dockerfile-chmod rule) against an imported
+    /// tool-free base, and asserts the result is a genuine composition:
+    ///
+    /// * the boot tag is the plan computed from the same materialised dirs
+    ///   (the tool step was built, not skipped or substituted);
+    /// * the plan's label names the tool and the builtin layer;
+    /// * the composed image is ingested into the msb cache;
+    /// * its `rootfs.diff_ids` **strictly extend** the base's, in order — the
+    ///   same identity CI's `build-image.yml` prefix-asserts for the published
+    ///   template;
+    /// * its `PATH` is a superset of the base's (contract C2 on a real build;
+    ///   the unit test is only a text proxy).
+    ///
+    /// Needs docker/buildx, network for the agent installer, and a **tool-free
+    /// base** in Docker's local store — it carries `agent-vm-install`, which
+    /// the tool layer's Dockerfile calls. Point `AGENT_VM_E2E_BASE_IMAGE` at
+    /// one (`agent-vm-base:dev` from macos-build.md) and run:
+    /// `AGENT_VM_E2E_BASE_IMAGE=agent-vm-base:dev \
+    ///  cargo test -p agent-vm --bin agent-vm -- e2e_builtin_tool_layer --ignored --test-threads=1`
+    #[tokio::test]
+    #[ignore = "needs docker buildx, network, and AGENT_VM_E2E_BASE_IMAGE=<tool-free base>"]
+    async fn e2e_builtin_tool_layer_composes_onto_an_imported_base() {
+        if layer::ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let parent = match std::env::var("AGENT_VM_E2E_BASE_IMAGE") {
+            Ok(parent) => parent,
+            Err(_) => {
+                eprintln!(
+                    "skipping: set AGENT_VM_E2E_BASE_IMAGE to a tool-free base build (e.g. \
+                     agent-vm-base:dev); a tool layer's Dockerfile calls the base's \
+                     `agent-vm-install`"
+                );
+                return;
+            }
+        };
+        if !docker_tag_exists(&parent) {
+            eprintln!("skipping: base {parent} is not in docker's local image store");
+            return;
+        }
+
+        // A uniquely marked disposable child, so the `docker save`-imported msb
+        // manifest digest — and therefore the Docker base link — is unique per
+        // run. Mirrors `import-image.sh` and the #98 test above.
+        let nonce = e2e_nonce();
+        let source = format!("agent-vm-e2e-base:{nonce}");
+        if docker_tag_exists(&source) {
+            eprintln!("skipping: disposable source tag {source} already exists");
+            return;
+        }
+        let ctx = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ctx.path().join("Dockerfile"),
+            format!("ARG PARENT={parent}\nFROM ${{PARENT}}\nLABEL agent-vm-e2e-nonce={nonce}\n"),
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("docker")
+                .args([
+                    "build",
+                    "--build-arg",
+                    &format!("PARENT={parent}"),
+                    "-t",
+                    &source,
+                    ctx.path().to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success(),
+            "disposable child build must succeed"
+        );
+        let mut guard = DockerTagGuard::default();
+        guard.own(&source);
+
+        // Import the disposable base into an isolated msb cache, then create
+        // the Docker base link from the docker source image exactly as
+        // `import-image.sh` does.
+        let archive = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+        assert!(
+            std::process::Command::new("docker")
+                .args(["save", &source, "-o", archive.path().to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success(),
+            "docker save must succeed"
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let local_base_ref = format!("agent-vm-e2e-local:{nonce}");
+        microsandbox_image::load_archive(
+            cache.path(),
+            archive.path(),
+            microsandbox_image::ImageLoadOptions {
+                tags: vec![local_base_ref.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("load_archive into the temp cache");
+        let reference: microsandbox_image::Reference = local_base_ref.parse().unwrap();
+        let cache_handle = microsandbox_image::GlobalCache::new_async(cache.path())
+            .await
+            .unwrap();
+        let digest = cache_handle
+            .read_image_metadata_async(&reference)
+            .await
+            .unwrap()
+            .expect("imported base metadata must be present")
+            .manifest_digest;
+        let link = layer::docker_base_tag(&digest).expect("valid sha256 manifest digest");
+        if docker_tag_exists(&link) {
+            eprintln!("skipping: base link {link} already exists");
+            return;
+        }
+        assert!(
+            std::process::Command::new("docker")
+                .args(["tag", &source, &link])
+                .status()
+                .unwrap()
+                .success(),
+            "docker tag must succeed"
+        );
+        guard.own(&link);
+
+        // The real compose path: a builtin layer materialised into a temp
+        // build context, fed to the resolver as the tool steps.
+        let declared = declared_layers_of(
+            "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\n\
+             layer = { builtin = \"claude\" }\ncredentials = [\"anthropic\"]\n",
+        );
+        assert_eq!(declared.len(), 1);
+        let (tool_steps, _materialized) = tool_layer::materialize(&declared).expect("materialize");
+        assert_eq!(tool_steps.len(), 1, "one builtin layer, one chain step");
+
+        let project = tempfile::tempdir().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut notices = LaunchNotices::new(output);
+        let got = resolve_boot_image_with_layer(
+            &tool_layer::ChainRoot::Base(local_base_ref.clone()),
+            &tool_steps,
+            &[],
+            project.path(),
+            true,
+            &mut notices,
+            Some(cache.path()),
+        )
+        .await
+        .expect("composing a builtin tool layer onto an imported base")
+        .expect("a derived tag");
+
+        let plan = layer::plan_chain(&tool_steps, project.path(), &digest).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            got, plan[0].id.tag,
+            "the boot tag must be the plan computed from the materialised tool step"
+        );
+        assert_eq!(plan[0].label, "tool \"claude\" (builtin layer claude)");
+        assert!(
+            layer::derived_is_cached(cache.path(), &got).await.unwrap(),
+            "the composed image must be ingested into the msb cache"
+        );
+
+        // The composed image really extends the base.
+        let composed_ref: microsandbox_image::Reference = got.parse().unwrap();
+        let composed_md = cache_handle
+            .read_image_metadata_async(&composed_ref)
+            .await
+            .unwrap()
+            .expect("composed image metadata must be present");
+        let composed = layer::contract::ImageFacts::from_cached_metadata(&composed_md)
+            .expect("composed image facts");
+        let base = layer::docker_image_facts(&source)
+            .await
+            .unwrap()
+            .expect("base image facts");
+        assert!(
+            composed.diff_ids.len() > base.diff_ids.len(),
+            "the template must add rootfs layers beyond the base: {} vs {}",
+            composed.diff_ids.len(),
+            base.diff_ids.len()
+        );
+        assert_eq!(
+            &composed.diff_ids[..base.diff_ids.len()],
+            &base.diff_ids[..],
+            "the composed image's diff_ids must begin with the base's, in order"
+        );
+
+        // C2 on a real build: the layer's `ENV PATH=<new>:${PATH}` must leave
+        // every base entry reachable.
+        let path_entries = |facts: &layer::contract::ImageFacts| -> Vec<String> {
+            facts
+                .env
+                .iter()
+                .rev()
+                .find_map(|entry| entry.strip_prefix("PATH="))
+                .map(|value| value.split(':').map(str::to_string).collect())
+                .unwrap_or_default()
+        };
+        let base_path = path_entries(&base);
+        let composed_path = path_entries(&composed);
+        for entry in &base_path {
+            assert!(
+                composed_path.contains(entry),
+                "C2: {entry:?} must remain on PATH; got {composed_path:?}"
+            );
+        }
+        assert!(
+            composed_path.iter().any(|e| e == "/opt/agent/.local/bin"),
+            "the claude layer's prefix must be on PATH; got {composed_path:?}"
+        );
+
         drop(guard);
     }
 
@@ -3995,13 +4316,45 @@ mod tests {
     }
 
     #[test]
-    fn build_agent_shell_line_seeds_claude_plugins_before_exec() {
-        // D2: the prelude seeds the baked LSP plugins into the persistent
-        // state dir, and must do so before the agent execs.
+    fn build_agent_shell_line_runs_seed_hooks_before_exec() {
+        // The prelude runs the image's seed hooks before the agent execs. Both
+        // clauses are asserted: the generic `seed.d` loop AND the legacy
+        // `/opt/agent-vm/seed-claude-plugins.sh` fallback. A test that checked
+        // only the loop would let the silent-regression fix (D11) be reverted —
+        // on a cached API-2 image the legacy clause is the ONLY thing that
+        // seeds plugins, and its absence is symptomless.
         let line = build_agent_shell_line("/work/proj", "", "claude", &[]);
-        let seed = line.find(SEED_CLAUDE_PLUGINS).expect("seed step present");
+        let seed = line
+            .find(RUN_IMAGE_SEED_HOOKS)
+            .expect("seed-hook step present");
         let exec = line.find("exec 'claude'").expect("exec present");
-        assert!(seed < exec, "seed must run before exec; got: {line}");
+        assert!(seed < exec, "seed hooks must run before exec; got: {line}");
+        assert!(
+            line.contains("for _h in /opt/agent-vm/seed.d/*"),
+            "the generic seed.d loop must be emitted; got: {line}"
+        );
+        // The fallback's removal is tied to MIN_SUPPORTED_IMAGE_API reaching 3
+        // (see the const's doc comment); keep it until then.
+        assert!(
+            line.contains("/opt/agent-vm/seed-claude-plugins.sh"),
+            "the legacy seed fallback must be emitted while MIN_SUPPORTED_IMAGE_API < 3; got: {line}"
+        );
+    }
+
+    /// Guard the hand-maintained tie to the base Dockerfile's `ENV PATH`.
+    /// After #84 the fallback must name no `/opt/agent` tool prefix — the tool
+    /// layers append their own prefixes to the composed image, and the base
+    /// carries none.
+    #[test]
+    fn fallback_guest_path_names_no_tool_prefix() {
+        assert!(
+            !FALLBACK_GUEST_PATH.contains("/opt/agent"),
+            "the fallback PATH must name no tool prefix; got {FALLBACK_GUEST_PATH}"
+        );
+        assert_eq!(
+            FALLBACK_GUEST_PATH,
+            "/usr/local/bin:/usr/bin:/usr/sbin:/bin"
+        );
     }
 
     /// Guard the exact `sed` program in `STRIP_IPV6_NAMESERVERS`. The

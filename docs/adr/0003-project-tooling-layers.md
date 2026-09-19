@@ -18,6 +18,11 @@ other decision here (registry-less ingest, hash-as-staleness-check, hard-fail,
 the layer image contract) is unchanged and now applies per chain step; msb's
 per-platform manifest digest remains the identity anchor for step 0's hash.
 
+Extended by [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) (issue #84):
+the layer contract now also governs the four shipped per-tool layers under
+`images/tools/`, and a launch's chain may begin with the catalog's tool steps
+before the project's own.
+
 ## Context
 
 The base image (`ghcr.io/wirenboard/agent-vm-template:latest`, the "guest
@@ -184,14 +189,18 @@ derived config and reaches the guest exec environment with no further
 wiring.
 
 **No-guard trade-off**: nothing enforced that a layer's `ENV PATH` stays
-additive. A layer that *replaces* rather than extends `PATH` — dropping the
-base's `/opt/agent/.local/bin`, `/opt/agent/.claude/local/bin`,
-`/opt/agent/.opencode/bin`, `/usr/sbin` — breaks the in-VM agents (and, in
-`--root` launches, dockerd's own PATH lookups for helper binaries) with no
-launch-time error; it just silently produces broken tool resolution inside
-the guest. Originally a contract requirement only; issue #97 now **enforces**
-it (clause C2 of the layer image contract below), so the trade-off is closed
-for the four enforced clauses.
+additive. A layer that *replaces* rather than extends `PATH` — dropping a
+predecessor's entries, such as a tool layer's `/opt/agent/.local/bin`,
+`/opt/agent/.claude/local/bin`, `/opt/agent/.opencode/bin`, or the base's
+`/usr/sbin` — breaks the in-VM agents (and, in `--root` launches, dockerd's own
+PATH lookups for helper binaries) with no launch-time error; it just silently
+produces broken tool resolution inside the guest. Originally a contract
+requirement only; issue #97 now **enforces** it (clause C2 of the layer image
+contract below), so the trade-off is closed for the four enforced clauses.
+(After [#84](https://github.com/gregwebs/agent-vm/issues/84) the tool prefixes
+come from the tool layers stacked above the base, not from the base itself —
+see [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) — but the C2 rule is
+unchanged.)
 
 ### The layer image contract
 
@@ -207,7 +216,7 @@ before the prompt and gives an error the image check cannot phrase
 | # | Clause | Status | Enforced how | Failure if unenforced |
 |---|---|---|---|---|
 | **C1** | **Builds on its predecessor.** The step's final `FROM` resolves `${BASE_IMAGE}`, which agent-vm sets to the base link for step 0 and to the previous step's tag afterwards. | **Enforced** | (a) text lint of the Dockerfile before the confirmation prompt; (b) the built image's `rootfs.diff_ids` start with the predecessor's, in order | The chain silently does nothing; the content hash no longer describes what booted |
-| **C2** | **Keeps `PATH` additive.** Every directory on the predecessor's `PATH` is still on the built image's `PATH`. | **Enforced** | built `PATH` ⊇ predecessor `PATH` (per-directory, order-insensitive) | The in-VM agents (`/opt/agent/.local/bin`, `.claude/local/bin`, `.opencode/bin`) and dockerd's helper lookups vanish, with no launch-time error |
+| **C2** | **Keeps `PATH` additive.** Every directory on the predecessor's `PATH` is still on the built image's `PATH`. | **Enforced** | built `PATH` ⊇ predecessor `PATH` (per-directory, order-insensitive) | A tool layer's prefixes (`/opt/agent/.local/bin`, `.claude/local/bin`, `.opencode/bin`) and dockerd's helper lookups vanish, with no launch-time error |
 | **C3** | **Ends as root.** The *final* derived image's config `User` is unset, `root`, or `0` (optionally with a `:group`). | **Enforced** | final step only | `merge_image_defaults` adopts the image's `User` as `MSB_USER`, so every `--root` exec is silently demoted |
 | **C4** | **Targets the host platform.** The base image the chain builds on is a host-platform image, and no step's final `FROM` overrides the build platform. | **Enforced (partly)** | (a) C4a — the base link's `os`/`architecture` equal the host's, checked once before the first build; (b) C4b — the early lint rejects a `--platform=` on the final `FROM` other than `$TARGETPLATFORM`; (c) C4c — an internal assertion that the exported config carries the platform agent-vm requested | `Exec format error` in the guest; or, for the final step, `load_archive`'s "OCI layout contains no image manifests for the host platform" |
 | **C5** | **Doesn't touch agent-vm's own files.** Never writes `/etc/agent-vm-image-version` (`defaults::IMAGE_API_VERSION_PATH`) and never removes or rewrites files under `/opt/agent`. | Documented | — | The image-API-version range check mis-reports; the in-VM agents break |

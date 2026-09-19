@@ -92,6 +92,15 @@ getrandom = "0.4"
 # deps for the pattern; `tempfile::Builder::tempfile_in` is used to keep the
 # file under the msb cache dir rather than the system tmp, per AGENTS.md).
 tempfile = "3"
+# Embeds `images/tools/` into the binary so a non-default tool set can be
+# composed by an npm-installed agent-vm, which has no repo checkout to read
+# the layer sources from (issue #84). `include_dir!` (rather than a
+# hand-written `include_str!` table) keeps "someone added a file to
+# images/tools/" from needing a matching Rust edit; build.rs registers the
+# directory as a rebuild input and
+# tool_layer::tests::embedded_sources_match_the_on_disk_tree catches the
+# added-file drift. See src/tool_layer.rs.
+include_dir = "0.7"
 
 [dev-dependencies]
 # Property tests for `mount::lexical_link_path` (pure string surgery over

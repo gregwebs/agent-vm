@@ -22,26 +22,54 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
+use crate::config::{self, Catalog};
+
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Override the image reference.
+    /// Boot-verbatim override: pull this image and skip tool-layer
+    /// composition.
     ///
-    /// Defaults to `ghcr.io/wirenboard/agent-vm-template:latest` or the
-    /// value of `AGENT_VM_IMAGE_TAG`. Use a timestamped tag
-    /// (`...:YYYY-MM-DDTHH`) to pin a specific build.
+    /// Defaults to the image this configuration would boot from — the composed
+    /// default template `ghcr.io/wirenboard/agent-vm-template:latest` for the
+    /// shipped default tool set, or the tool-free base when the configured set
+    /// differs. Use a timestamped tag (`...:YYYY-MM-DDTHH`) to pin a specific
+    /// build. Mutually exclusive with `--base-image`.
     #[arg(long, env = "AGENT_VM_IMAGE_TAG", value_name = "REF")]
     image: Option<String>,
+
+    /// Pull the tool-free base that tool layers are composed onto.
+    ///
+    /// Default `ghcr.io/wirenboard/agent-vm-base:latest`. Passing this always
+    /// targets the base, even when the tool set matches the shipped default.
+    /// Mutually exclusive with `--image`.
+    #[arg(long = "base-image", env = "AGENT_VM_BASE_IMAGE", value_name = "REF")]
+    base_image: Option<String>,
 }
 
-pub async fn run(args: Args) -> Result<()> {
+pub async fn run(args: Args, catalog: Catalog) -> Result<()> {
     // pull also reaches connect_and_migrate (via Sandbox::create_with_pull_progress),
     // so it can hit the same forward-migrated-DB crash as the boot path. See
     // src/msb_preflight.rs and issue #30.
     crate::msb_preflight::ensure_db_not_ahead().await?;
 
-    let image = args
-        .image
-        .unwrap_or_else(|| crate::defaults::DEFAULT_IMAGE_REF.to_string());
+    // Resolve the same published root a launch would boot from (issue #84), so
+    // `pull` warms the image the next launch actually needs. A broken config
+    // has no declared tool set, so fall back to the shipped default (the
+    // historical behaviour).
+    let declared_layers = match &catalog {
+        Catalog::Ready(catalog) => catalog.declared_layers(),
+        Catalog::Broken(_) => config::default_launch_catalog()?.declared_layers(),
+    };
+    let declared: Vec<config::ToolLayer> =
+        declared_layers.iter().map(|l| l.layer().clone()).collect();
+    let root = crate::tool_layer::chain_root(
+        args.image.clone(),
+        args.base_image.clone(),
+        &declared,
+        &config::shipped_tool_layers()?,
+    )?;
+    let image = root.reference().to_string();
+    println!("==> {image} resolved as the image this configuration boots from");
     pull_image(&image).await?;
     println!("==> {image} pulled into the microsandbox cache");
     Ok(())

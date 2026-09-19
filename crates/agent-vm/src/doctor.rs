@@ -7,8 +7,10 @@
 //! With no flag, doctor prints the active `MSB_HOME`/schema, the host
 //! credential sources, and the resolved tool configuration. The **verb list**
 //! this section renders is authoritative — it is the same [`crate::cli`]
-//! catalog `--help` shows. The *layer chain* is still metadata only (#84 owns
-//! building it), and argument *values* are still hidden (only their count is
+//! catalog `--help` shows. The *layer chain* is rendered from each tool's
+//! declared `layer` as written: `doctor` never resolves an anchor, checks a
+//! path's existence, or builds the chain — [`crate::tool_layer`] owns that at
+//! launch (#84). Argument *values* are still hidden (only their count is
 //! shown, so a secret in `args` is never echoed). A broken config still exits
 //! nonzero, but its failure is reported *inside* the config section so it
 //! never suppresses the sections above it — and never blocks recovery
@@ -362,10 +364,12 @@ fn describe_credentials(report: &CredReport) -> String {
 /// wording is unit-tested without a real filesystem, mirroring
 /// [`describe_home`]/[`describe_credentials`].
 ///
-/// The verb list is authoritative; the *layer chain* is still metadata only
-/// (#84 owns building it), and it shows argument *counts* rather than values
-/// (a user may have mistakenly put a secret in `args`). Untrusted names/paths
-/// are escaped so a config file cannot inject terminal controls.
+/// The verb list is authoritative; the *layer chain* is rendered from each
+/// tool's declared `layer` as written — `doctor` never resolves an anchor,
+/// checks existence, or builds it ([`crate::tool_layer`] does, at launch, per
+/// #84) — and it shows argument *counts* rather than values (a user may have
+/// mistakenly put a secret in `args`). Untrusted names/paths are escaped so a
+/// config file cannot inject terminal controls.
 fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>) {
     // Everything that needs a borrow is rendered before `report` is consumed
     // by `into_launch_catalog`.
@@ -375,9 +379,11 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>) {
         describe_tier(report.project()),
     );
     let resolved_label = if report.uses_defaults() {
-        "resolved: built-in defaults; launch-verb / future tool-layer order\n"
+        // The verb order is the catalog order, which is exactly the tool-layer
+        // chain order #84 composes (`LaunchCatalog::declared_layers`).
+        "resolved: built-in defaults; launch-verb / tool-layer order\n"
     } else {
-        "resolved: declared tools; launch-verb / future tool-layer order\n"
+        "resolved: declared tools; launch-verb / tool-layer order\n"
     };
     let conflicts = render_conflicts(report.conflicts());
 

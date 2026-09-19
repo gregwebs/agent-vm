@@ -38,7 +38,7 @@ use std::ffi::OsString;
 use anyhow::{Result, anyhow};
 use clap::{Args as _, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
-use crate::config::{Catalog, CatalogEntry, ConfigReport, Tool};
+use crate::config::{self, Catalog, CatalogEntry, ConfigReport, Tool};
 use crate::run;
 use crate::{clipboard, doctor, intercept_hook, msb_cmd, pull, setup};
 
@@ -115,6 +115,12 @@ pub(crate) enum Dispatch {
     // full size inline (clippy `large_enum_variant`).
     Launch {
         entry: CatalogEntry,
+        /// The catalog's declared tool layers, read **before** `take_entry`
+        /// removed the launched verb (issue #84). The booted image is a
+        /// property of the whole catalog, not of the invoked verb, so reading
+        /// this after `take_entry` would silently drop the launched tool's own
+        /// layer.
+        layers: Vec<config::DeclaredLayer>,
         args: Box<run::Args>,
     },
 }
@@ -192,22 +198,29 @@ where
         // The catalog is authoritative (checked first) so a future built-in
         // added without updating `RESERVED_TOOL_NAMES` fails a test rather
         // than silently shadowing a user's tool.
-        (Some((name, sub)), Catalog::Ready(mut catalog)) => match catalog.take_entry(name) {
-            Some(entry) => Ok(Dispatch::Launch {
-                entry,
-                args: Box::new(run::Args::from_arg_matches(sub)?),
-            }),
-            // Not a tool, so a fixed built-in: the two name sets are disjoint
-            // (`RESERVED_TOOL_NAMES`, asserted by a test) and external
-            // subcommands are off on this path, so clap could not have accepted
-            // anything else. The catalog (minus the taken launch entry, which
-            // only a launch verb would have matched) is carried to the built-in
-            // so `setup` can read it.
-            None => Ok(Dispatch::Builtin {
-                cmd: Cli::from_arg_matches(&matches)?.cmd,
-                catalog: Catalog::Ready(catalog),
-            }),
-        },
+        (Some((name, sub)), Catalog::Ready(mut catalog)) => {
+            // Read the declared layers BEFORE `take_entry`: the image a launch
+            // boots is a property of the whole catalog, so removing the
+            // launched verb first would drop its own layer (issue #84).
+            let layers = catalog.declared_layers();
+            match catalog.take_entry(name) {
+                Some(entry) => Ok(Dispatch::Launch {
+                    entry,
+                    layers,
+                    args: Box::new(run::Args::from_arg_matches(sub)?),
+                }),
+                // Not a tool, so a fixed built-in: the two name sets are disjoint
+                // (`RESERVED_TOOL_NAMES`, asserted by a test) and external
+                // subcommands are off on this path, so clap could not have accepted
+                // anything else. The catalog (minus the taken launch entry, which
+                // only a launch verb would have matched) is carried to the built-in
+                // so `setup` can read it.
+                None => Ok(Dispatch::Builtin {
+                    cmd: Cli::from_arg_matches(&matches)?.cmd,
+                    catalog: Catalog::Ready(catalog),
+                }),
+            }
+        }
         (Some((name, _)), Catalog::Broken(config_error)) => {
             // A registered built-in still works; anything else is an unknown
             // verb clap accepted as an external subcommand, and carries the
@@ -416,6 +429,28 @@ mod tests {
         }
     }
 
+    /// Issue #84's `take_entry` ordering trap: a launch verb's `Dispatch` must
+    /// carry the layers read from the catalog *before* the launched verb is
+    /// removed, so `claude` under the default config carries all four shipped
+    /// layers in order (its own included).
+    #[test]
+    fn a_launch_carries_every_declared_layer_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::load(&ConfigPaths {
+            user: Some(dir.path().join("no-user-config.toml")),
+            project: dir.path().join("no-project-config.toml"),
+        });
+        let dispatch = parse_from(["agent-vm", "claude"], config).expect("claude parses");
+        match dispatch {
+            Dispatch::Launch { entry, layers, .. } => {
+                assert_eq!(entry.tool().name(), "claude");
+                let seq: Vec<_> = layers.iter().map(|l| l.layer().clone()).collect();
+                assert_eq!(seq, crate::config::shipped_tool_layers().unwrap());
+            }
+            Dispatch::Builtin { .. } => panic!("claude is a launch verb"),
+        }
+    }
+
     // -- T9: dispatch to a launch verb and to a built-in ------------------
 
     #[test]
@@ -429,7 +464,7 @@ mod tests {
         )
         .expect("mytool parses");
         match dispatch {
-            Dispatch::Launch { entry, args } => {
+            Dispatch::Launch { entry, args, .. } => {
                 assert_eq!(entry.tool().name(), "mytool");
                 assert_eq!(entry.tool().command(), "my-agent");
                 assert_eq!(args.agent_args, ["--resume"]);

@@ -77,13 +77,54 @@ state, so it sees the same sandboxes agent-vm does.
 
 ## Image release cadence
 
-The base OCI image (`ghcr.io/wirenboard/agent-vm-template:latest`) is
-rebuilt hourly by CI, picking up the latest Claude Code, Codex CLI,
-and OpenCode releases automatically. Pin a specific build with
-`--image ghcr.io/wirenboard/agent-vm-template:YYYY-MM-DDTHH` (date tags are
-immutable; the last 14 days are retained).
+CI publishes two OCI images from one run:
 
-The agent-vm binary and the image are version-locked through an
+- `ghcr.io/wirenboard/agent-vm-base:latest` — the **tool-free base**: Debian
+  plus the docker engine, diagnostic CLIs and the tool-layer facilities, with
+  **no** agent CLI.
+- `ghcr.io/wirenboard/agent-vm-template:latest` — the **composed default**: the
+  base plus the four shipped tool layers (codex, opencode, claude, copilot),
+  chained in declaration order.
+
+Both are rebuilt hourly, picking up the latest Claude Code, Codex CLI, and
+OpenCode releases automatically, and both accept a pinned
+`…:YYYY-MM-DDTHH` tag (immutable; the last 14 days are retained).
+
+**Which image a launch uses** depends on your configured tool set:
+
+- If your declared tool layers equal the shipped default and you have no
+  project `.agent-vm/layers/`, the launch boots the composed template
+  **verbatim — no build, no Docker**. This is the fast path, and it is why an
+  unchanged config launches exactly as fast as before the split.
+- Any other tool set composes the declared tool layers onto the base locally on
+  the first launch (hash-cached thereafter).
+
+Flags:
+
+- `--image REF` boots an image **verbatim** and skips tool composition (project
+  layers still chain on top). For example
+  `--image ghcr.io/wirenboard/agent-vm-template:YYYY-MM-DDTHH`.
+- `--base-image REF` (env `AGENT_VM_BASE_IMAGE`) chooses the tool-free base that
+  tool layers are composed onto, and **always** composes locally — it is how a
+  source-checkout user tests a locally built/imported base. `--image` and
+  `--base-image` are mutually exclusive.
+
+A locally composed tool layer **freezes its agent version at build time**: the
+layer hash covers its directory, and no `AGENT_VERSION_*` is passed on a local
+build, so a non-default tool set keeps whatever upstream shipped the day it
+first built until the base moves. Pin the base with `--base-image …:YYYY-MM-DDTHH`
+to control that. This is the same behaviour every project tooling layer already
+has.
+
+On a host behind a TLS-intercept proxy, a locally composed chain cannot
+soft-fail a broken upstream installer (the launcher deliberately does not pass
+`AGENT_INSTALL_SOFT_FAIL` on the compose path — a silently cached
+"healthy-looking image missing its toolchain" is the one outcome the layer
+contract exists to prevent). Build the layer yourself with `images/build.sh`
+(which sets the soft-fail arg) and pass `--base-image`/`--layer`, or use the
+published template.
+
+The agent-vm binary and the images are version-locked through an
 **image-API-version** integer
 (`/etc/agent-vm-image-version` inside the image). Mismatch → clean
 error at launch instead of mysterious in-VM failures.
@@ -96,7 +137,8 @@ Each launcher accepts:
 |---|---|
 | `--memory N` | VM memory GiB (default 2) |
 | `--cpus N` | vCPUs (default 2) |
-| `--image REF` | override the OCI image |
+| `--image REF` | boot this image verbatim, skipping tool-layer composition |
+| `--base-image REF` | the tool-free base tool layers are composed onto (always composes) |
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
@@ -434,9 +476,17 @@ interactive_shell = false            # optional; join trailing args into `-c`
   **count**, never the values, so a secret accidentally placed here is not
   echoed. Args are not shell-split or expanded.
 - `layer` — optional; a table with **exactly one** of `builtin` (one of
-  `codex`, `opencode`, `claude`, `copilot`) or `path` (a declared path). A
-  layer is metadata only in this release: it is **not** resolved, checked
-  for existence, or built (see [#84](https://github.com/gregwebs/agent-vm/issues/84)).
+  `codex`, `opencode`, `claude`, `copilot`) or `path`. It **selects the tool
+  layer composed onto the base** for a launch whose tool set differs from the
+  shipped default (see [Image release cadence](#image-release-cadence)):
+  `builtin` names one of the four layers embedded in the binary, `path` a
+  directory (relative to the declaring config file, or absolute) holding a
+  `Dockerfile` that builds `FROM` the base per
+  [ADR-0003](docs/adr/0003-project-tooling-layers.md). A tool with no `layer`
+  contributes nothing to the composed image, so **omitting it on a redeclared
+  shipped tool boots a guest without that tool** — declare
+  `layer = { builtin = "claude" }` if you meant to compose it (see the upgrade
+  note below).
 - `credentials` — optional; provider **config names**, which differ from
   the `agent-vm doctor` row labels. Valid: `anthropic`, `openai`,
   `opencode-static`, `copilot`. Note `opencode` (the doctor label) is **not**
@@ -500,6 +550,17 @@ interactive_shell = false            # optional; join trailing args into `-c`
   user's trailing args are joined (and shell-escaped) into a single `bash -c`
   command line instead of being appended as separate argv entries. The shipped
   `shell` tool sets it.
+
+> **Upgrading from a config that treated `layer` as metadata.** Before the
+> base/tool-layer split, `layer` was parsed but ignored, so a `[[tools]]` entry
+> that redeclared a shipped tool only to adjust its `args` worked without one.
+> The field now decides what the image composes: an entry that redeclares a
+> shipped tool must carry `layer = { builtin = … }` (or a `path`), or a
+> non-default tool set composes a chain with no layer for that tool and the
+> launch boots a guest without it. The symptom is a bare command-not-found in
+> the guest, or a `setup` failure naming the image it checked; adding the
+> `layer` restores the old behaviour by composing that layer on the first
+> launch. Nothing else about a redeclaration changed.
 
 Unknown keys, wrong types, malformed TOML, unknown `layer.builtin`, unknown
 provider names, duplicate tool names within one file, and **overlapping**

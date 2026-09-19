@@ -6,7 +6,7 @@ base=$1
 layer=$2
 api1_layer=$3
 
-# The API-2 base must not retain a partial browser integration.
+# The API-3 base must not retain a partial browser integration.
 docker run --rm --security-opt seccomp=unconfined "$base" sh -ec '
     ! command -v chromium
     ! test -e /usr/bin/google-chrome
@@ -15,7 +15,7 @@ docker run --rm --security-opt seccomp=unconfined "$base" sh -ec '
     ! test -e /etc/sudoers.d/agent-vm-chrome
     ! test -e /usr/local/bin/agent-vm-chrome-mcp
     ! test -e /etc/agent-vm-capabilities/chrome-devtools-mcp
-    test "$(cat /etc/agent-vm-image-version)" = 2
+    test "$(cat /etc/agent-vm-image-version)" = 3
 '
 
 # The derived image advertises only after all security-sensitive artifacts work.

@@ -113,6 +113,115 @@ a full rebuild. Expect a few minutes the first time and a few seconds thereafter
 plus the assertion that it actually verified something, then a pair of throwaway
 fixtures proving the verifier can both pass and fail.
 
+### End-to-end (VM-boot) tests (optional)
+
+These boot real microVMs and are the only way to observe the launcher, the
+images and the guest together. **They do not run on CI**: GitHub's macOS runners
+are Intel and cannot boot these `linux/arm64` guests, and they need `docker` plus
+multiple GB of images. `script/test/e2e.sh` is the single entry point; it runs
+the checks described below and exits non-zero on any failure.
+
+Prerequisites: an Apple Silicon Mac with colima or Docker Desktop running, plus
+the locally built `linux/arm64` dev images (`agent-vm-base:dev`,
+`agent-vm-codex:dev`, … `agent-vm-template:dev`) from
+[Local image builds](macos-build.md). `script/build/import-image.sh` loads those
+into agent-vm's own cache; it needs the *release* bundle's `msb` at
+`target/macos/bin/msb`, so run `./script/build/macos.sh` once even if you
+otherwise use the `--dev` loop.
+
+Use your **normal** state dir. Do not point `AGENT_VM_STATE_DIR` at a freshly
+created directory for no reason — an already-populated dir is what makes the
+import and the boot agree (see *The shared-cache trap* below):
+
+```bash
+export AGENT_VM_STATE_DIR="$HOME/.local/state/agent-vm"   # your usual state root
+./script/build/import-image.sh agent-vm-base:dev
+./script/build/import-image.sh agent-vm-template:dev
+./script/test/e2e.sh
+```
+
+Set `AGENT_VM_E2E_OLD_LAUNCHER` (a pre-#84 binary),
+`AGENT_VM_E2E_LEGACY_IMAGE` (a cached API-1/2 image),
+`AGENT_VM_E2E_SETUP_BASE_REF` (a pullable `linux/arm64` base ref),
+`AGENT_VM_E2E_UPDATE_CHECK=1` and/or `AGENT_VM_E2E_RUST=1` to enable the opt-in
+checks; `./script/test/e2e.sh --help` lists them. Each check maps to an
+acceptance criterion in the issue that introduced it (#84): the tool-free base,
+the fast path (a default launch boots the published template with **zero**
+`docker` invocations), per-tool-layer composition, the project-layer chain, and
+the legacy API-1/2 seed fallback.
+
+#### The shared-cache trap
+
+A fresh `AGENT_VM_STATE_DIR` with `AGENT_VM_SHARE_MSB_CACHE` enabled is the one
+state that does **not** work out of the box, and the failure is confusing, so it
+is worth naming. `agent-vm`'s boot rewrites `<state>/msb-home/config.json` to
+point `paths.cache` at the shared `~/.microsandbox/cache`, but
+`script/build/import-image.sh` runs `msb image load` directly and never applies
+that redirect. So on a fresh dir the imported blobs land in the private
+`<state>/msb-home/cache`, the first boot then repoints `paths.cache` at the
+shared cache, and msb finds the image in its database — `msb image ls` lists it —
+but not its layer blobs there. It falls through to a registry pull of a local
+tag and fails with `Not authorized … index.docker.io/.../agent-vm-template`.
+An existing state dir is consistent because its `config.json` was written before
+the import; `script/test/e2e.sh` also seeds a fresh dir by running a non-booting
+builtin (`agent-vm doctor`) first, so it works either way. A follow-up should
+teach `import-image.sh` the same shared-cache redirect so the raw recipe above
+also works from scratch.
+
+#### `bash -c`, not `bash -lc`, for in-guest commands
+
+When you pass a command to the guest yourself, pass it through a non-login
+shell. The image puts the agent CLIs on `PATH` via `ENV`, but a login shell
+sources `/etc/profile`, which overwrites `PATH` and drops
+`/opt/agent/.local/bin` (and the claude/opencode prefixes). The trap is that the
+tools are present yet report as missing:
+
+```bash
+# correct — finds claude/codex/opencode
+agent-vm shell --image agent-vm-template:dev -- bash -c 'claude --version'
+# WRONG — "/etc/profile" resets PATH; `command -v claude` prints nothing
+agent-vm shell --image agent-vm-template:dev -- bash -lc 'claude --version'
+```
+
+`script/test/e2e.sh` always uses `bash -c` for exactly this reason. (A shell
+exported `AGENT_VM_IMAGE_TAG`/`AGENT_VM_BASE_IMAGE` is the same class of trap:
+they act as `--image`/`--base-image`, so a “default config” check silently boots
+the wrong image. The harness clears both.)
+
+#### The `#[ignore]`d Rust Docker e2e tests
+
+The repo also carries `#[ignore]`d tests that drive a real `docker buildx` build
+(no VM boot). Run the whole set with a base image that has `agent-vm-install`:
+
+```bash
+AGENT_VM_E2E_BASE_IMAGE=agent-vm-base:dev \
+  cargo test -p agent-vm --bin agent-vm -- e2e_ --ignored --test-threads=1
+```
+
+The compose-path test alone (the one #84 added):
+
+```bash
+AGENT_VM_E2E_BASE_IMAGE=agent-vm-base:dev \
+  cargo test -p agent-vm --bin agent-vm -- \
+    e2e_builtin_tool_layer_composes_onto_an_imported_base --ignored --test-threads=1
+```
+
+There is no `--lib` target, so `--bin agent-vm` is required. The layer tests
+default to `alpine:latest` when `AGENT_VM_E2E_BASE_IMAGE` is unset (they skip if
+it is not resolvable), and `AGENT_VM_E2E_REGISTRY_BASE` gates the one test that
+needs a real registry. These tests are `#[ignore]`d, so **CI never runs them**.
+
+#### What runs where
+
+| Harness | Runs on CI | Notes |
+|---|---|---|
+| `cargo test --workspace` | yes (`ci.yml`) | `#[ignore]`d e2e excluded |
+| `script/test/e2e.sh` | **no** | needs Apple Silicon + a VM boot |
+| `cargo test … -- --ignored` | **no** | needs docker/buildx |
+| `script/test/chrome-layer-contract.sh` / `chrome-layer-runtime.sh` | yes (`chrome-layer-contract.yml`) | docker-driver build + contract |
+| `script/test/build-workflow.sh` | yes (macOS leg of `ci.yml`) | fake-plutil seam, no VM |
+| `script/test/ci-contracts.sh`, `image-promotion-gate.sh`, `verus-verification.sh` | yes | static / contract gates |
+
 ## Commit message style
 
 Commits on this branch use a multi-paragraph "Why / How" style.

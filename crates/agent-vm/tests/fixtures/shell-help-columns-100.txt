@@ -152,12 +152,21 @@ Network egress:
 
 Image:
       --image <REF>
-          Override the OCI image reference.
+          Boot this image verbatim, skipping tool-layer composition.
 
-          Default: `ghcr.io/wirenboard/agent-vm-template:latest`. Use a timestamped tag
-          (`...:YYYY-MM-DDTHH`) to pin a reproducible image.
+          The project's own `.agent-vm/layers/*` and any `--layer DIR` still chain on top. Mutually
+          exclusive with `--base-image`.
 
           [env: AGENT_VM_IMAGE_TAG]
+
+      --base-image <REF>
+          The tool-free base that tool layers are composed onto.
+
+          Default `ghcr.io/wirenboard/agent-vm-base:latest`. Passing this always composes locally,
+          even when your tool set matches the shipped default (which otherwise boots the published
+          composed template). Mutually exclusive with `--image`.
+
+          [env: AGENT_VM_BASE_IMAGE]
 
       --update-check
           Check the registry for a newer image at launch (opt-in).
@@ -231,6 +240,7 @@ Networking (deny-by-default; flags compose):
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
   AGENT_VM_IMAGE_TAG                    same as --image
+  AGENT_VM_BASE_IMAGE                   same as --base-image
   AGENT_VM_ROOT                         same as --root (1|true|yes|on)
   AGENT_VM_UPDATE_CHECK                 check the registry for a newer image (1|true|yes|on)
   AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls (1|true|yes|on)

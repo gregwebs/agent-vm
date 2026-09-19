@@ -90,8 +90,11 @@ project file -----> parse + validate --+    + conflicts       ownership
                                             doctor preview (read-only)
 ```
 
-Layer paths remain declarative metadata that is never resolved or built
-(#84), and config warnings are never logged — doctor renders them explicitly.
+This module resolves declarative config only: the `layer` each tool declares is
+resolved, anchored and built by `crates/agent-vm/src/tool_layer.rs`
+(`chain_root`, `materialize`) and `crates/agent-vm/src/layer.rs` at launch, not
+here — see [ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md).
+Config warnings are never logged — doctor renders them explicitly.
 `doctor --reset-msb-db` never reads config, so a broken file cannot block db
 recovery. There is still no arrow from this module to credential *capture*,
 Docker, or guest state; it resolves the provisioning set and the launch
@@ -354,7 +357,8 @@ in play. The launcher reads `PATH` out of the booted image's OCI config
 (`path_from_config_env`, last `PATH=` entry wins, matching successive shell
 assignments across base and derived `ENV` layers) and publishes it on the
 builder. `FALLBACK_GUEST_PATH` covers the cold-start case where image metadata
-is not cached yet, and is hand-synced with `images/Dockerfile`.
+is not cached yet, and is hand-synced with the **base** `images/Dockerfile`'s
+`ENV PATH` (after #84 it names no tool prefix; the tool layers append theirs).
 
 Agent binaries live under `/opt/agent` — a shared, world-readable prefix
 (`chmod -R a+rX`) rather than `/root` — so the same `PATH` resolves identically
@@ -440,36 +444,48 @@ chance to finish *after* the stream closes rather than dropping it mid-flight.
 
 ### What is in it
 
-The Dockerfile (`images/Dockerfile`, Debian 13 slim) carries what the agents
-need and the tools that are universally useful in an agent session: base CLI
-utilities (`curl`, `wget`, `git`, `jq`, `python3`, `ripgrep`, `fd-find`) plus
-network and process diagnostics, `gh` from the GitHub apt repo, Node.js 22 from
-NodeSource, the Docker engine with `fuse-overlayfs`, zellij, the four
-`claude-plugins-official` LSP servers, and the agent CLIs themselves — Claude
-Code, Codex, OpenCode, and `@github/copilot` — installed through their canonical
-installer scripts so the image tracks upstream release channels.
+The Dockerfile (`images/Dockerfile`, Debian 13 slim) is the **tool-free base**:
+it carries what every agent session needs — base CLI utilities (`curl`, `wget`,
+`git`, `jq`, `python3`, `ripgrep`, `fd-find`) plus network and process
+diagnostics, `gh` from the GitHub apt repo, Node.js 22 from NodeSource, the
+Docker engine with `fuse-overlayfs`, zellij, and the tool-layer facilities (the
+`agent-vm-install` helper, the host-CA shim, the `/opt/agent` prefix, an empty
+`/opt/agent-vm/seed.d/`). It carries **no** agent CLI.
 
-Every line has to keep working through `apt-get update` churn, so the bar to
-add anything is "needed by an in-scope agent flow". Chromium is *not* in the
-base image: it is an opt-in `examples/layers/chrome-devtools` tooling layer,
-detected after boot via an image-capability marker.
+The four shipped agents live in standalone layers under `images/tools/`
+(`codex`, `opencode`, `claude`, `copilot`), each building `FROM` the base and
+installing through its canonical installer script so the layer tracks its
+upstream release channel. CI chains base plus these four (in declaration order)
+and publishes the result as the composed default; a non-default tool set
+composes them locally. The claude layer also carries the four
+`claude-plugins-official` LSP servers. Chromium is *not* in the base: it is an
+opt-in `examples/layers/chrome-devtools` tooling layer, detected after boot via
+an image-capability marker.
 
 Two build-time subtleties are worth knowing:
 
-- The agent CLIs are installed under `HOME=/opt/agent` and the tree is made
-  world-readable, which is what lets the same `PATH` work for both guest-user
-  modes.
+- Tool layers install under `HOME=/opt/agent` and make the tree world-readable,
+  which is what lets the same `PATH` work for both guest-user modes. The prefix
+  itself is created by the base (`RUN mkdir -p /opt/agent && chmod 755
+  /opt/agent`), so every layer inherits a `a+rX` (C7) starting point.
 - The running guest symlinks `$HOME/.claude` onto persistent state, which
-  **shadows** the LSP plugin tree baked at build time. The build therefore
-  stashes the plugins to `/opt/agent-vm/claude-seed` and the launcher prelude
-  re-seeds them (`SEED_CLAUDE_PLUGINS` in `run.rs`). Without that the guest
-  ships with zero plugins and the build still looks clean.
+  **shadows** the LSP plugin tree baked at build time. The claude layer
+  therefore stashes the plugins to `/opt/agent-vm/claude-seed` and installs a
+  first-boot seed hook at `/opt/agent-vm/seed.d/10-claude-plugins`; the launcher
+  prelude (`RUN_IMAGE_SEED_HOOKS` in `run.rs`) runs every executable under
+  `seed.d/`. Tool-agnostic: the launcher no longer names claude. While
+  `MIN_SUPPORTED_IMAGE_API` is still 1 the prelude also runs the legacy
+  `/opt/agent-vm/seed-claude-plugins.sh` when present, so an already-cached
+  API-2 template still seeds; without that fallback the regression would be
+  symptomless (an empty `claude plugin list`).
 
 ### Distribution: OCI references, not bind or disk images
 
 microsandbox's `RootfsSource` supports an OCI reference, a host directory
-(`Bind`), or a qcow2/raw/vmdk file. agent-vm uses the OCI path, defaulting to
-`ghcr.io/wirenboard/agent-vm-template:latest`.
+(`Bind`), or a qcow2/raw/vmdk file. agent-vm uses the OCI path. Two repositories
+are published: `ghcr.io/wirenboard/agent-vm-base` (the tool-free base) and
+`ghcr.io/wirenboard/agent-vm-template` (the composed default), the latter the
+default the fast path boots.
 
 - **Standard OCI semantics.** microsandbox's layer cache, GC, snapshotting, and
   metadata DB all key off OCI references. Going through that path means getting

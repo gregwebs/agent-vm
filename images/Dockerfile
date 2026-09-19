@@ -1,38 +1,39 @@
-# agent-vm GUEST TEMPLATE image — the OCI image that the agent-vm
-# tool boots *inside* its per-project microVM. NOT the agent-vm
-# tool itself (that's the Rust binary published as
+# agent-vm TOOL-FREE BASE image — the OCI image that tool layers build
+# FROM and that the agent-vm tool boots *inside* its per-project
+# microVM when the configured tool set is composed locally. NOT the
+# agent-vm tool itself (that's the Rust binary published as
 # @wirenboard/agent-vm on npm).
 #
-# Contents: Debian 13 slim + the four AI coding agents (Claude
-# Code, OpenCode, Codex, GitHub Copilot), the docker engine
-# (docker.io + containerd + runc + fuse-overlayfs), network/diagnostic
-# CLIs. The WB C/C++ build-essentials
-# family and armhf/arm64 cross toolchains live as an opt-in example
-# tooling layer at examples/layers/wirenboard-cpp/ instead of in
-# this base image — see docs/adr/0003-project-tooling-layers.md.
-# Other heavy extras (LSPs, additional MCP servers, docker-buildx)
-# are deliberately deferred too.
+# Contents: Debian 13 slim + the docker engine (docker.io + containerd
+# + runc + fuse-overlayfs), network/diagnostic CLIs, the
+# `agent-vm-install` helper, and the host-CA shim. It carries NO agent
+# CLI: the four shipped agents live in standalone tool layers under
+# images/tools/ (codex, opencode, claude, copilot), each building FROM
+# this base per ADR-0003's layer image contract. The WB C/C++
+# build-essentials family and armhf/arm64 cross toolchains live as an
+# opt-in example tooling layer at examples/layers/wirenboard-cpp/
+# instead of in this base image — see
+# docs/adr/0003-project-tooling-layers.md. Other heavy extras (LSPs,
+# additional MCP servers, docker-buildx) are deliberately deferred too.
 #
-# Layer policy: the file is ordered so the LAST RUN steps are the
-# agent installers (the most frequently updated content). Each is
-# keyed on its agent's upstream version via a per-agent
-# `AGENT_VERSION_*` ARG (see below), so the hourly cron rebuilds an
-# installer layer ONLY when that agent actually released — an
-# unchanged build is a pure cache hit. Everything earlier — Debian
-# base, docker engine, Python lint pins, codestyle clone —
-# stays cached across rebuilds, so users pulling `:latest` re-download
-# only the layer(s) for whichever agent actually changed (and nothing
-# at all when none did).
+# The tool layers are composed two ways. CI chains base + the four
+# default layers and publishes the result as
+# ghcr.io/wirenboard/agent-vm-template (the "composed default image"),
+# which is what a default-config launch boots verbatim. A launch whose
+# configured tool set differs composes from this base locally. Both are
+# published by the hourly CI workflow
+# (.github/workflows/build-image.yml); source-checkout users can build
+# locally and push to a host-local registry via images/build.sh.
 #
-# Published to ghcr.io/wirenboard/agent-vm-template:latest by the
-# hourly CI workflow (.github/workflows/build-image.yml). Source-
-# checkout users can also build locally and push to a host-local
-# registry via images/build.sh.
+# Layer ordering (most frequently changed content last) is now the tool
+# layers' concern, not this file's — see images/tools/README.md. This
+# base's own steps (Debian, docker engine, diag tooling) change rarely
+# and stay cached across rebuilds.
 
 FROM debian:13-slim
 
-LABEL org.opencontainers.image.title="agent-vm guest template"
-LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + Claude Code + OpenCode + Codex + GitHub Copilot + diag tooling (ssh/ping/etc.). Rebuilt hourly to pick up new agent releases. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
+LABEL org.opencontainers.image.title="agent-vm tool-free base"
+LABEL org.opencontainers.image.description="Tool-free OCI base image that agent-vm tool layers build FROM and that the agent-vm tool (npm: @wirenboard/agent-vm) boots inside each per-project microVM. Contains Debian 13 + docker engine + diag tooling (ssh/ping/etc.) but NO agent CLI — see images/tools/ for the per-tool layers. NOT the agent-vm runtime itself — install that via `npm install -g @wirenboard/agent-vm`."
 
 # LANG=C.UTF-8: debian:slim ships with NO locale set, leaving the guest in
 # C/POSIX — which renders a non-ASCII (e.g. Cyrillic) cwd as `M-P…` meta-
@@ -44,7 +45,7 @@ LABEL org.opencontainers.image.description="Guest OCI image that the agent-vm to
 # makes any other use of the image correct too.
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
-    PATH=/opt/agent/.local/bin:/opt/agent/.claude/local/bin:/opt/agent/.opencode/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin \
+    PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin \
     LANG=C.UTF-8
 
 # Image-API contract version. Bump on BREAKING image changes only
@@ -53,7 +54,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # and tooling additions (build-essential, ssh, etc.) do NOT change
 # this — they're additive. See `crates/agent-vm/src/defaults.rs`
 # for the matching range in the binary.
-RUN echo 2 > /etc/agent-vm-image-version
+RUN echo 3 > /etc/agent-vm-image-version
 
 # Conditionally trust a host-supplied CA bundle. Only fires when
 # `images/build.sh` is invoked on a host that sits behind a TLS-
@@ -154,7 +155,8 @@ RUN install -dm 755 /etc/apt/keyrings \
  && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
 
-# Node.js 22 from NodeSource — needed for Claude Code, OpenCode, MCP servers.
+# Node.js 22 from NodeSource — needed by MCP servers and by several tool
+# layers' installers (the agents themselves are not in this base).
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
@@ -277,155 +279,27 @@ RUN printf '%s\n' \
  && chmod 0755 /usr/local/bin/agent-vm-install \
  && test -s /usr/local/bin/agent-vm-install
 
-# The three agents each get their own RUN + their own version arg so
-# a single agent's release rebuilds only that layer (and, by Docker's
-# layer cascade, the layers stacked ABOVE it).
-#
-# Layer order is deliberate and is NOT by size. A change to any layer
-# forces every layer above it to rebuild, so the TOPMOST agent layer
-# is re-emitted on essentially every build that changes anything,
-# while the BOTTOM agent layer is re-emitted only when it itself
-# bumps. The agent that is both largest and most frequently released
-# therefore belongs at the BOTTOM, not the top:
-#   - codex    ~95 MiB, multiple stable cuts/day → bottom (first)
-#   - opencode ~50 MiB, several per week         → middle
-#   - claude   ~68 MiB, ~daily                   → top (last)
-# This minimizes expected re-pushed bytes per changed build across
-# the plausible release-frequency range; putting the big codex layer
-# on top (so it re-pushes on every change) is the worst case. Each
-# RUN references its version arg (`: "${AGENT_VERSION_*}"`) so
-# BuildKit ties the layer's cache key to the version string and
-# rebuilds it ONLY when that string changes.
-#
-# Agent installers HARD-FAIL by default — if an upstream installer
-# is broken or removed, the hourly cron should NOT silently ship an
-# image missing an agent. `AGENT_INSTALL_SOFT_FAIL=1` (build-arg,
-# auto-set by images/build.sh on TLS-intercept dev hosts; CI never
-# sets it) turns the three RUNs into warnings instead.
-
-# Shared, world-readable prefix for the agent installs below — NOT /root,
-# which is mode 0700 and unreadable by the non-root guest user agent-vm
-# boots by default (crates/agent-vm/src/run.rs). Each installer RUN sets
-# HOME=/opt/agent for the duration of the install (so the upstream
-# installer script drops its files there) and re-asserts a+rX afterward, in
-# case the installer itself narrowed permissions on something. This also
-# relocates codex's packages/ tree off /root — codex resolves packages/
-# relative to its install location, not via the runtime CODEX_HOME env, so
-# without this a non-root guest's codex would fail to load even though
-# CODEX_HOME already points elsewhere for config/auth.
+# Tool layers build FROM this base and install into /opt/agent, a shared,
+# world-readable prefix — NOT /root, which is mode 0700 and unreadable by the
+# non-root guest user agent-vm boots by default (crates/agent-vm/src/run.rs).
+# The tool layer sets HOME=/opt/agent for the duration of the install (so the
+# upstream installer drops its files there) and re-asserts a+rX afterward, in
+# case the installer narrowed permissions on something. The prefix lives here,
+# not in each layer, because it is tool-agnostic and C7 (a+rX) requires it to
+# be world-traversable. See images/tools/README.md.
 RUN mkdir -p /opt/agent && chmod 755 /opt/agent
 
-# Codex CLI official installer.
-ARG AGENT_VERSION_CODEX=
-RUN : "codex ${AGENT_VERSION_CODEX}" \
- && HOME=/opt/agent agent-vm-install codex sh \
-        https://github.com/openai/codex/releases/latest/download/install.sh \
- && chmod -R a+rX /opt/agent
-
-# OpenCode official installer. Installs into $HOME/.opencode/bin (=
-# /opt/agent/.opencode/bin); PATH already includes it. Symlink into
-# /usr/local/bin so non-login shells find it too. The symlink is
-# best-effort — under soft-fail mode the install may have been skipped, in
-# which case there's nothing to link.
-ARG AGENT_VERSION_OPENCODE=
-RUN : "opencode ${AGENT_VERSION_OPENCODE}" \
- && HOME=/opt/agent agent-vm-install opencode bash https://opencode.ai/install \
- && { [ -x /opt/agent/.opencode/bin/opencode ] \
-        && ln -sf /opt/agent/.opencode/bin/opencode /usr/local/bin/opencode \
-        || true; } \
- && chmod -R a+rX /opt/agent
-
-# Claude Code official installer. MUST precede the LSP-plugin install below,
-# which invokes /opt/agent/.local/bin/claude.
-ARG AGENT_VERSION_CLAUDE=
-RUN : "claude ${AGENT_VERSION_CLAUDE}" \
- && HOME=/opt/agent agent-vm-install claude bash https://claude.ai/install.sh \
- && chmod -R a+rX /opt/agent
-
-# Claude Code LSP plugins (C/C++, Python, TypeScript, Go) baked in so
-# in-VM Claude has code intelligence on first launch. Ports the four
-# language servers the original `setup` installed (claude-vm.sh:348-362):
-# clangd-lsp / pyright-lsp / typescript-lsp / gopls-lsp from the
-# claude-plugins-official marketplace.
+# The `agent-vm-install` helper above and the host-CA shim near the top of
+# this file are inherited by every tool layer that builds FROM this base; a
+# tool layer must not re-declare them or thread `CA_SHIM_CACHEBUST` into its
+# own build. See images/tools/README.md.
 #
-# Marketplace registration first: `claude plugin marketplace add` clones
-# https://github.com/anthropics/claude-plugins-official.git into Claude's
-# plugin state, then each `claude plugin install <name>@<marketplace>`
-# resolves against it. The bare repo URL is what the original git-cloned
-# by hand; `marketplace add` lets the CLI manage the clone + index for us.
-#
-# Best-effort: a transient
-# registry/clone blip during the hourly build must not fail the whole
-# image. Each step is guarded with `|| echo skipped`; a missing plugin
-# costs in-VM code intelligence for that language, not a broken image —
-# Claude still boots and the user can re-run `claude plugin install`.
-#
-# Must come AFTER the Claude install above — `claude` didn't exist before
-# it. node/npm (from the nodejs RUN) and git (from the base apt RUN) are
-# both already present, which the marketplace clone + plugin resolution
-# need.
-#
-# Invoke claude by ABSOLUTE PATH (/opt/agent/.local/bin/claude): the
-# installer drops the binary there but Docker RUN uses a non-login /bin/sh
-# that never sources the shell profile the installer edits, so a bare
-# `claude` risks command-not-found (rc 127) if PATH resolution ever
-# changes. The absolute path matches the `--version` sanity check below and
-# the OpenCode block's /opt/agent/.opencode/bin/opencode.
-#
-# HOME=/opt/agent on every invocation: `claude plugin install` writes
-# plugins to $HOME/.claude/plugins, and the Dockerfile's global
-# `ENV HOME=/root` is otherwise still in effect for this RUN. Without this,
-# claude would keep writing plugins to /root/.claude/plugins — invisible to
-# the D2 stash below, which now reads from the relocated
-# /opt/agent/.claude/plugins — silently shipping the guest with ZERO LSP
-# plugins (seed-claude-plugins.sh would find nothing to seed and no-op).
-#
-# A `claude plugin list` runs after the loop so the build log shows which
-# plugins actually landed — without it the best-effort guards would hide a
-# total no-op behind a clean build. If `marketplace add` ever rejects the
-# `owner/repo` shorthand, swap in the explicit URL
-# https://github.com/anthropics/claude-plugins-official.git.
-RUN { HOME=/opt/agent /opt/agent/.local/bin/claude plugin marketplace add anthropics/claude-plugins-official \
-        || echo "==> LSP marketplace add skipped (will lazy-add at first plugin use)"; } \
- && for lsp in clangd-lsp pyright-lsp typescript-lsp gopls-lsp; do \
-        HOME=/opt/agent /opt/agent/.local/bin/claude plugin install "${lsp}@claude-plugins-official" \
-        || echo "==> LSP plugin ${lsp} skipped (install at runtime if needed)"; \
-    done \
- && echo "==> LSP plugins installed at build time:" \
- && { HOME=/opt/agent /opt/agent/.local/bin/claude plugin list || true; } \
- && chmod -R a+rX /opt/agent
-
-# D2 fix: the running guest symlinks $HOME/.claude -> /agent-vm-state/claude
-# (persistence, run.rs — /root/.claude in root mode, <state_dir>/home/.claude
-# in the default non-root mode), which shadows the plugin tree baked just
-# above so the booted guest's `claude plugin list` shows nothing. Stash the
-# plugins + settings to a NON-shadowed path and ship a first-boot seed
-# script; the launcher prelude calls it before exec'ing the agent. Source is
-# /opt/agent/.claude/... (relocated above, alongside HOME=/opt/agent), not
-# /root/.claude — reading the old root path here would silently make this
-# stash (and thus every non-root guest's LSP plugins) a no-op.
-# Best-effort like the LSP install above: if a transient blip skipped the
-# plugins, stash nothing rather than hard-failing the image — the first-boot
-# seed then becomes a no-op and plugins lazy-install at runtime.
-RUN mkdir -p /opt/agent-vm/claude-seed \
- && if [ -d /opt/agent/.claude/plugins ]; then \
-        cp -a /opt/agent/.claude/plugins /opt/agent-vm/claude-seed/plugins; \
-        [ -f /opt/agent/.claude/settings.json ] \
-            && cp -a /opt/agent/.claude/settings.json /opt/agent-vm/claude-seed/settings.json; \
-        echo "==> stashed claude LSP plugins for first-boot seeding"; \
-    else \
-        echo "==> no /opt/agent/.claude/plugins to stash (LSP install skipped); D2 seed is a no-op"; \
-    fi \
- && chmod -R a+rX /opt/agent-vm/claude-seed
-COPY seed-claude-plugins.sh /opt/agent-vm/seed-claude-plugins.sh
-RUN chmod +x /opt/agent-vm/seed-claude-plugins.sh
-
-# D1: GitHub Copilot CLI. Its own RUN layer so the AGENT_INSTALL_CACHEBUST
-# arg above invalidates it on the hourly build like the other agents, and
-# so a wrong package/binary name fails the image build loudly (via the
-# `copilot --version` smoke check) instead of surfacing as a
-# command-not-found inside the guest at `agent-vm copilot` time.
-RUN npm install -g @github/copilot && copilot --version
+# First-boot seed hooks. A tool layer that bakes state which the guest's
+# runtime persistence symlinks would shadow (e.g. the claude LSP plugin tree
+# under ~/.claude) drops an executable here; the launcher's prelude runs every
+# entry once per boot (run.rs's RUN_IMAGE_SEED_HOOKS). Empty in this tool-free
+# base.
+RUN mkdir -p /opt/agent-vm/seed.d && chmod -R a+rX /opt/agent-vm
 
 # Sanity check at build time. Every command is invoked directly
 # (`tool --version >/dev/null`) so a present-but-broken binary —
@@ -433,14 +307,11 @@ RUN npm install -g @github/copilot && copilot --version
 # fails the build instead of slipping through a `command -v` exists-
 # check. `set -e` propagates the first failure.
 #
-# Agent CLIs (claude/opencode/codex) are HARD-required unless
-# `AGENT_INSTALL_SOFT_FAIL` is set, in which case they're SOFT
-# (missing → warning, not failure) — matches the policy on the
-# installer RUNs above. zellij follows
-# the same policy (their RUNs above also honor AGENT_INSTALL_SOFT_FAIL,
-# scoped to the network fetch only — see the zellij RUN's comment for
-# why a checksum mismatch is never soft-failable even though a
-# download failure is).
+# The agent CLIs are NOT checked here any more: they are not in this base.
+# Each tool layer carries its own `--version` gate (see images/tools/). zellij
+# follows the AGENT_INSTALL_SOFT_FAIL policy (its RUN above also honors it,
+# scoped to the network fetch only — see the zellij RUN's comment for why a
+# checksum mismatch is never soft-failable even though a download failure is).
 RUN set -e \
  && echo "== HARD requirements ==" \
  && dockerd --version >/dev/null \
@@ -457,18 +328,6 @@ RUN set -e \
       else \
           echo "  zellij: MISSING — hard sanity failure" >&2; exit 1; \
       fi; } \
- && echo "== agent CLIs ==" \
- && for bin in claude opencode codex copilot; do \
-        if "$bin" --version >/dev/null 2>&1; then \
-            ver=$("$bin" --version 2>&1 | head -1); \
-            echo "  $bin: $ver"; \
-        elif [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then \
-            echo "  $bin: MISSING (soft-fail mode)"; \
-        else \
-            echo "  $bin: MISSING — hard sanity failure" >&2; \
-            exit 1; \
-        fi; \
-    done \
  && echo "== sanity OK =="
 
 # Smoke entrypoint; the launcher overrides this in Phase 2.

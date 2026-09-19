@@ -111,6 +111,19 @@ main() {
     msb_home="$(resolve_msb_home)"
     mkdir -p "$msb_home"
 
+    # Shared-cache consistency (agent-vm #84 verification). This load runs with
+    # *this* process's environment, but `agent-vm`'s later boot calls
+    # `ensure_msb_home`, which — when AGENT_VM_SHARE_MSB_CACHE is enabled —
+    # merge-writes msb-home/config.json to point `paths.cache` at the shared
+    # ${AGENT_VM_MSB_CACHE_DIR:-$HOME/.microsandbox/cache}. This script does not
+    # apply that redirect, so on a *fresh* state dir the blobs land in the
+    # private msb-home/cache, the first boot then repoints `paths.cache` at the
+    # shared cache, and msb — finding the image in its db but not its layers
+    # there — falls through to a registry pull of a local tag and fails with
+    # `Not authorized … index.docker.io/...`. Import and boot must agree on the
+    # cache: use a state dir whose config.json already matches, or keep
+    # AGENT_VM_SHARE_MSB_CACHE consistent across both. See CONTRIBUTING.md's
+    # "End-to-end (VM-boot) tests". Follow-up: apply the redirect here.
     echo "==> Importing $image as $tag into agent-vm's private cache"
     docker save "$image" | MSB_HOME="$msb_home" \
         target/macos/bin/msb image load --tag "$tag"

@@ -31,6 +31,7 @@ mod session;
 mod setup;
 #[cfg(test)]
 mod test_env;
+mod tool_layer;
 mod user;
 
 use anyhow::{Context, Result};
@@ -107,15 +108,19 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     runtime.block_on(async move {
         match dispatch {
-            Dispatch::Launch { entry, args } => exit_with(run::launch(&entry, *args).await?),
+            Dispatch::Launch {
+                entry,
+                layers,
+                args,
+            } => exit_with(run::launch(&entry, &layers, *args).await?),
             Dispatch::Builtin {
                 cmd: Cmd::Setup(args),
                 catalog,
             } => setup::run(args, catalog).await,
             Dispatch::Builtin {
                 cmd: Cmd::Pull(args),
-                ..
-            } => pull::run(args).await,
+                catalog,
+            } => pull::run(args, catalog).await,
             Dispatch::Builtin {
                 cmd: Cmd::Clipboard(args),
                 ..

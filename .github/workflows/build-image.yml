@@ -1,14 +1,18 @@
 name: build-image
 
-# Build the agent-vm OCI image and push to GHCR on:
+# Build the agent-vm OCI images and push to GHCR on:
 # - hourly schedule (picks up new claude-code/codex/opencode releases),
-# - any push that touches images/ (Dockerfile or related),
+# - any push that touches images/ (Dockerfile, tool layers or related),
 # - manual dispatch (force a rebuild).
 #
-# Tags pushed:
-# - `latest`             — moving tag, used by agent-vm by default.
-# - `YYYY-MM-DDTHH`      — immutable, for users who need to pin.
-# - `<short-sha>`        — also immutable, for traceability to source.
+# Two repositories are published from one run (issue #84):
+# - `agent-vm-base`     — the tool-free base (images/Dockerfile).
+# - `agent-vm-template` — the composed default: base + the four shipped tool
+#                         layers (images/tools/{codex,opencode,claude,copilot}),
+#                         chained in declaration order.
+# Each carries `latest` / `YYYY-MM-DDTHH` / `sha-<gitsha>`. Building both in the
+# same run is what makes the template provably base + layers (asserted below on
+# rootfs.diff_ids).
 #
 # The binary release pipeline (release-npm.yml) runs on a separate
 # cadence; image-API-version contract (images/Dockerfile + defaults.rs)
@@ -36,6 +40,7 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/agent-vm-template
+  BASE: ghcr.io/${{ github.repository_owner }}/agent-vm-base
 
 jobs:
   build:
@@ -54,7 +59,7 @@ jobs:
           # Immutable hourly pin (:YYYY-MM-DDTHH).
           echo "tag=$(date -u +%Y-%m-%dT%H)" >> "$GITHUB_OUTPUT"
           # SOURCE_DATE_EPOCH = HEAD commit time. Fed to buildkit (see
-          # the build step), it clamps the image config's `created`
+          # the build steps), it clamps the image config's `created`
           # field and every history timestamp to a value that is
           # CONSTANT across the hourly cron builds of a given commit.
           # So two builds with the same commit + same agent versions +
@@ -79,11 +84,13 @@ jobs:
           x64=$(npm view @wirenboard/agent-vm-linux-x64 version 2>/dev/null || true)
           arm64=$(npm view @wirenboard/agent-vm-linux-arm64 version 2>/dev/null || true)
           if script/check-image-promotion-gate.sh "$minimum" "$main" "$x64" "$arm64"; then
-            echo "tag=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+            echo "base_tag=${BASE}:latest" >> "$GITHUB_OUTPUT"
+            echo "template_tag=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
             echo "Published cross-platform launcher $main satisfies $minimum; latest promotion enabled."
           else
             echo "::warning::the required cross-platform launcher is unavailable or incompatible (minimum=$minimum main=$main x64=$x64 arm64=$arm64); immutable candidate tags will be pushed but latest remains unchanged"
-            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "base_tag=" >> "$GITHUB_OUTPUT"
+            echo "template_tag=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Docker Buildx
@@ -104,7 +111,7 @@ jobs:
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
           # Resolve each agent's current upstream version and feed it to
-          # the Dockerfile as a per-agent cache key (AGENT_VERSION_*), so
+          # the tool layer as a per-agent cache key (AGENT_VERSION_*), so
           # an installer layer is rebuilt only when its agent actually
           # released — not on every hourly cron run. Each source is the
           # EXACT one the matching installer reads, so the key tracks
@@ -147,141 +154,233 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "resolved agent versions: codex=$codex opencode=$opencode claude=$claude"
 
-      - name: Build and push
-        id: build
+      # The zstd registry exporter shared by the two published builds. The
+      # benchmark in crates/agent-vm/examples/erofs_bench.rs showed gzip → zstd
+      # cuts the per-layer OCI→EROFS conversion cost by ~24× (143s → 5s on
+      # 856 MB of /usr/lib). `force-compression=true` re-emits even
+      # already-compressed base-image layers as zstd; without it the base layers
+      # would stay gzip, halving the win. `compression-level=3` is zstd's
+      # default — the bench shows diminishing returns past that for
+      # binary-heavy content. microsandbox's `tar_ingest.rs:427` already accepts
+      # the `application/vnd.oci.image.layer.v1.tar+zstd` media type.
+      # `rewrite-timestamp=true` clamps the mtime of every file INSIDE each
+      # layer tar to SOURCE_DATE_EPOCH (the commit time). SOURCE_DATE_EPOCH
+      # alone only fixes the image config; layer file mtimes default to build
+      # wall-clock, so a `cache-from` MISS (gha eviction / size cap / a
+      # base-layer invalidation) would re-run the apt/curl RUN steps and emit
+      # layers with fresh mtimes → new diff_ids → new manifest digest for an
+      # unchanged commit, re-introducing the ~700 MiB consumer re-pull.
+      #
+      # Why the intermediates below are pushed (by digest) rather than
+      # `--load`ed: buildx's default `docker-container` driver cannot resolve a
+      # `FROM` out of the runner's local docker image store, so each step's
+      # predecessor must be a registry reference. Pushing by digest gives a
+      # resolvable, immutable `FROM` with no tag to pollute the registry or the
+      # retention regex (see the `retain` job). Chaining by digest — never by a
+      # moving tag — is the same rule ADR-0003 applies locally.
+
+      - name: Build and push base
+        id: base
         env:
-          # Clamps buildkit's image-config `created` + history
-          # timestamps to the commit time (see "Compute timestamp tag +
-          # source epoch") so an unchanged build yields an identical
-          # manifest digest. docker/build-push-action forwards
-          # SOURCE_DATE_EPOCH from the environment to buildkit.
           SOURCE_DATE_EPOCH: ${{ steps.ts.outputs.epoch }}
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: images
           file: images/Dockerfile
-          # `outputs: type=registry,push=true` replaces a bare
-          # `push: true` so we can carry compression directives on the
-          # same step. The benchmark in crates/agent-vm/examples/
-          # erofs_bench.rs showed gzip → zstd cuts the per-layer
-          # OCI→EROFS conversion cost by ~24× (143s → 5s on 856 MB
-          # of /usr/lib). `force-compression=true` re-emits even
-          # already-compressed base-image layers as zstd; without it
-          # we'd only re-compress layers we add and the base layers
-          # would stay gzip, halving the win. `compression-level=3`
-          # is zstd's default — the bench shows diminishing returns
-          # past that for binary-heavy content.
-          # microsandbox's `tar_ingest.rs:427` already accepts the
-          # `application/vnd.oci.image.layer.v1.tar+zstd` media type.
-          #
-          # `rewrite-timestamp=true` clamps the mtime of every file
-          # INSIDE each layer tar to SOURCE_DATE_EPOCH (the commit time).
-          # SOURCE_DATE_EPOCH alone only fixes the image config; layer
-          # file mtimes default to build wall-clock, so a `cache-from`
-          # MISS (gha eviction / size cap / a base-layer invalidation)
-          # would re-run the apt/curl RUN steps and emit layers with
-          # fresh mtimes → new diff_ids → new manifest digest for an
-          # unchanged commit, re-introducing the ~700 MiB consumer
-          # re-pull. Clamping mtimes makes the layer digests — and thus
-          # the manifest digest — reproducible independent of cache
-          # state, so the digest only moves on a real content change.
           outputs: type=registry,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
-          # Per-agent version cache keys. `Resolve agent versions`
-          # above looks up each agent's current upstream version; the
-          # Dockerfile references these in the matching installer RUN,
-          # so a layer is rebuilt ONLY when that agent actually
-          # released — not on every hourly cron run. This keeps an
-          # unchanged hourly build a pure cache hit (identical
-          # agent-layer digests → `:latest` consumers re-pull nothing)
-          # instead of re-emitting ~200 MiB of fresh-but-identical
-          # agent layers every hour. The heavy apt/docker/node layers below the
-          # args stay cached regardless; Chrome DevTools is opt-in.
-          build-args: |
-            AGENT_VERSION_CODEX=${{ steps.ver.outputs.codex }}
-            AGENT_VERSION_OPENCODE=${{ steps.ver.outputs.opencode }}
-            AGENT_VERSION_CLAUDE=${{ steps.ver.outputs.claude }}
-          # `cache-from`/`cache-to` keep layer rebuilds fast when only
-          # the agent-version layers at the top of the Dockerfile
-          # change (the common hourly case).
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          # No provenance/SBOM attestation. Either one makes buildx wrap
-          # even a single-platform build in an OCI index whose extra
-          # attestation manifest embeds the build time, so the index
-          # digest changes every build even when the image content is
-          # identical — which would keep `:latest`'s digest churning
-          # hourly (and nag the update banner) despite a stable
-          # linux/amd64 manifest. We don't consume either anywhere.
-          # Both are pinned off (provenance defaults to mode=min on push;
-          # sbom defaults off but is pinned so a future default flip
-          # can't silently re-introduce the index). The "Show pushed
-          # digest" step asserts the push stayed a single manifest.
+          cache-from: type=gha,scope=base
+          cache-to: type=gha,mode=max,scope=base
+          # No provenance/SBOM attestation. Either one makes buildx wrap even a
+          # single-platform build in an OCI index whose extra attestation
+          # manifest embeds the build time, so the index digest changes every
+          # build even when the image content is identical — which would keep
+          # `:latest`'s digest churning hourly (and nag the update banner)
+          # despite a stable linux/amd64 manifest. We don't consume either
+          # anywhere. Both are pinned off (provenance defaults to mode=min on
+          # push; sbom defaults off but is pinned so a future default flip can't
+          # silently re-introduce the index). The single-manifest assertion
+          # below guards both repositories.
           provenance: false
           sbom: false
-          # Moving tags (`:latest`, `:YYYY-MM-DDTHH`) are gated to
-          # the integration branches (`main`, `rewrite-microsandbox`)
-          # so workflow_dispatch on a feature branch can verify the
-          # build without clobbering production. The immutable
-          # `:sha-…` tag is always pushed and is what we inspect
-          # for branch-level verification.
-          # rewrite-microsandbox is included because it's the de-facto
-          # trunk for the microsandbox-rewrite work; release-npm
-          # already documents that workflow_dispatch happens from
-          # there too (release-npm.yml:96).
+          # Moving tags (`:latest`, `:YYYY-MM-DDTHH`) are gated to the
+          # integration branches (`main`, `rewrite-microsandbox`) so
+          # workflow_dispatch on a feature branch can verify the build without
+          # clobbering production. The immutable `:sha-…` tag is always pushed
+          # and is what we inspect for branch-level verification.
           tags: |
-            ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && steps.latest.outputs.tag || '' }}
-            ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && format('{0}:{1}', env.IMAGE, steps.ts.outputs.tag) || '' }}
-            ${{ env.IMAGE }}:sha-${{ github.sha }}
-          # Tag with the short SHA too so we can trace any image
-          # back to the exact Dockerfile commit.
-          # NOTE: no `org.opencontainers.image.created` label. It was
-          # set to the per-hour timestamp and lived in the image config,
-          # so it changed the manifest digest every cron build even with
-          # identical content (the root cause of the hourly re-pull). The
-          # config still carries a `created` field, but clamped to the
-          # commit time via SOURCE_DATE_EPOCH, so it's stable per commit.
-          # `revision` (the commit sha) is stable across a commit's
-          # hourly builds, so it doesn't reintroduce churn.
+            ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && steps.latest.outputs.base_tag || '' }}
+            ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && format('{0}:{1}', env.BASE, steps.ts.outputs.tag) || '' }}
+            ${{ env.BASE }}:sha-${{ github.sha }}
+          # NOTE: no `org.opencontainers.image.created` label. It was set to the
+          # per-hour timestamp and lived in the image config, so it changed the
+          # manifest digest every cron build even with identical content (the
+          # root cause of the hourly re-pull). The config still carries a
+          # `created` field, but clamped to the commit time via
+          # SOURCE_DATE_EPOCH, so it's stable per commit. `revision` (the commit
+          # sha) is stable across a commit's hourly builds, so it doesn't
+          # reintroduce churn.
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Show pushed digest + assert single manifest
-        run: |
-          echo "Pushed ${IMAGE}:${STEPS_TS_OUTPUTS_TAG}"
-          echo "  digest: ${STEPS_BUILD_OUTPUTS_DIGEST}"
-          # Guard the digest-stability invariant: the push must be a
-          # single image manifest, NOT a multi-arch index. An index
-          # (from a re-enabled provenance/sbom attestation, or a buildx
-          # default flip) carries a build-time-varying attestation digest
-          # and would silently restore the hourly `:latest` churn this
-          # workflow exists to prevent. The immutable `:sha-…` tag is
-          # always pushed (on every branch), so inspect that.
-          ref="${IMAGE}:sha-${{ github.sha }}"
-          if mt=$(docker buildx imagetools inspect --raw "$ref" 2>/dev/null | jq -r '.mediaType'); then
-            echo "  pushed mediaType: $mt"
-            case "$mt" in
-              *manifest.list*|*image.index*)
-                echo "::error::pushed an index ($mt) — an attestation leaked back in; :latest digest will churn hourly. Ensure provenance:false + sbom:false."
-                exit 1 ;;
-            esac
-          else
-            echo "::warning::could not inspect $ref to assert single-manifest; skipping the check"
-          fi
+      # The three `AGENT_VERSION_*`-keyed tool layers. Each builds FROM the
+      # previous step's digest and pushes its result by digest (no tag), so the
+      # next step can resolve a `FROM` the docker-container driver can see while
+      # leaving nothing in the registry for the retention regex to protect.
+      - name: Build and push codex tool layer
+        id: codex
         env:
-          STEPS_TS_OUTPUTS_TAG: ${{ steps.ts.outputs.tag }}
-          STEPS_BUILD_OUTPUTS_DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_DATE_EPOCH: ${{ steps.ts.outputs.epoch }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: images/tools/codex
+          build-args: |
+            BASE_IMAGE=${{ env.BASE }}@${{ steps.base.outputs.digest }}
+            AGENT_VERSION_CODEX=${{ steps.ver.outputs.codex }}
+          outputs: type=image,name=${{ env.BASE }},push-by-digest=true,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
+          cache-from: type=gha,scope=codex
+          cache-to: type=gha,mode=max,scope=codex
+          provenance: false
+          sbom: false
+
+      - name: Build and push opencode tool layer
+        id: opencode
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.ts.outputs.epoch }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: images/tools/opencode
+          build-args: |
+            BASE_IMAGE=${{ env.BASE }}@${{ steps.codex.outputs.digest }}
+            AGENT_VERSION_OPENCODE=${{ steps.ver.outputs.opencode }}
+          outputs: type=image,name=${{ env.BASE }},push-by-digest=true,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
+          cache-from: type=gha,scope=opencode
+          cache-to: type=gha,mode=max,scope=opencode
+          provenance: false
+          sbom: false
+
+      - name: Build and push claude tool layer
+        id: claude
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.ts.outputs.epoch }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: images/tools/claude
+          build-args: |
+            BASE_IMAGE=${{ env.BASE }}@${{ steps.opencode.outputs.digest }}
+            AGENT_VERSION_CLAUDE=${{ steps.ver.outputs.claude }}
+          outputs: type=image,name=${{ env.BASE }},push-by-digest=true,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
+          cache-from: type=gha,scope=claude
+          cache-to: type=gha,mode=max,scope=claude
+          provenance: false
+          sbom: false
+
+      # The final tool layer produces the published composed template.
+      - name: Build and push template (copilot tool layer)
+        id: build
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.ts.outputs.epoch }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: images/tools/copilot
+          build-args: |
+            BASE_IMAGE=${{ env.BASE }}@${{ steps.claude.outputs.digest }}
+          outputs: type=registry,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
+          cache-from: type=gha,scope=copilot
+          cache-to: type=gha,mode=max,scope=copilot
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && steps.latest.outputs.template_tag || '' }}
+            ${{ (github.ref_name == 'main' || github.ref_name == 'rewrite-microsandbox') && format('{0}:{1}', env.IMAGE, steps.ts.outputs.tag) || '' }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Show pushed digests + assert single manifests
+        env:
+          BASE_REF: ${{ env.BASE }}:sha-${{ github.sha }}
+          TMPL_REF: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          BASE_DIGEST: ${{ steps.base.outputs.digest }}
+          TEMPLATE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "Pushed ${BASE_REF} (${BASE_DIGEST})"
+          echo "Pushed ${TMPL_REF} (${TEMPLATE_DIGEST})"
+          # Guard the digest-stability invariant for BOTH repositories: each push
+          # must be a single image manifest, NOT a multi-arch index. An index
+          # (from a re-enabled provenance/sbom attestation, or a buildx default
+          # flip) carries a build-time-varying attestation digest and would
+          # silently restore the hourly `:latest` churn this workflow exists to
+          # prevent. The immutable `:sha-…` tags are always pushed (on every
+          # branch), so inspect those.
+          for ref in "$BASE_REF" "$TMPL_REF"; do
+            if mt=$(docker buildx imagetools inspect --raw "$ref" 2>/dev/null | jq -r '.mediaType'); then
+              echo "  $ref mediaType: $mt"
+              case "$mt" in
+                *manifest.list*|*image.index*)
+                  echo "::error::pushed an index ($mt) — an attestation leaked back in; :latest digest will churn hourly. Ensure provenance:false + sbom:false."
+                  exit 1 ;;
+              esac
+            else
+              echo "::warning::could not inspect $ref to assert single-manifest; skipping the check"
+            fi
+          done
+
+      - name: Assert the template is provably base + tool layers
+        env:
+          BASE_REF: ${{ env.BASE }}:sha-${{ github.sha }}
+          TMPL_REF: ${{ env.IMAGE }}:sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Compare rootfs.diff_ids from the image config, NOT the manifest's
+          # `.layers[].digest`. Every build step carries `force-compression=true`
+          # and `rewrite-timestamp=true`, which re-emit inherited base layers as
+          # fresh blobs in the final push, so the compressed blob digests are not
+          # guaranteed equal across the two pushes and a manifest-digest
+          # comparison could fail a perfectly correct build — whose cheap "fix"
+          # under time pressure is to weaken the gate into uselessness.
+          # `diff_ids` are the UNCOMPRESSED layer identities, the same identity
+          # the repo's own C1 check uses (layer/contract.rs). Prefix, not
+          # superset: a superset check would pass for a template that reordered
+          # the layers.
+          fmt='{{json .Image.RootFS.DiffIDs}}'
+          base_ids=$(docker buildx imagetools inspect --format "$fmt" "$BASE_REF" | jq -r '.[]')
+          tmpl_ids=$(docker buildx imagetools inspect --format "$fmt" "$TMPL_REF" | jq -r '.[]')
+          n=$(printf '%s\n' "$base_ids" | wc -l | tr -d ' ')
+          m=$(printf '%s\n' "$tmpl_ids" | wc -l | tr -d ' ')
+          # A pure prefix test passes for a "template" that IS the base (no tool
+          # layer at all): head -n "$n" returns base_ids unchanged. That happens
+          # for real when a tool Dockerfile's default `ARG BASE_IMAGE=` wins
+          # because a `build-args:` key was dropped — the final step then builds
+          # FROM yesterday's published base and its diff_ids still prefix-match.
+          # The point of this step is to prove four layers were ADDED, so require
+          # strictly more layers than the base has.
+          if [ "$m" -le "$n" ]; then
+            echo "::error::the template has no rootfs layers beyond the base ($m <= $n); a tool-layer build was dropped or chained FROM the wrong base"
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$tmpl_ids" | head -n "$n")" != "$base_ids" ]; then
+            echo "::error::the template's rootfs diff_ids do not start with the base's; the template was not built FROM this base"
+            exit 1
+          fi
+          echo "  template rootfs begins with the base's $n diff_ids and adds $((m - n)) — provably base + tool layers"
 
   retain:
-    # Delete date-tagged image versions older than 14 days so the
-    # registry doesn't grow unbounded. `latest` and `sha-...` tags
-    # are immune via the ignore-versions regex.
+    # Delete dated image versions older than 14 days so the registry doesn't
+    # grow unbounded. `latest` and `sha-...` tags are immune via the
+    # ignore-versions regex. Runs for BOTH repositories (issue #84), and the
+    # per-tool intermediate manifests — pushed by digest with no tag — are
+    # matched by no protected tag and so are age-pruned like any other version.
     #
-    # Why a custom script and not actions/delete-package-versions's
-    # `min-versions-to-keep`: that knob only fires once you HAVE at
-    # least N versions, so a paused/disabled cron can leave stale
-    # versions outliving the 14-day window unbounded. The age-based
-    # approach prunes correctly regardless of build cadence.
+    # Expected steady state, so a future reader does not read this as a leak:
+    # each hourly run creates three untagged intermediate versions (codex,
+    # opencode, claude) in `agent-vm-base` — ~72/day — plus one tagged version
+    # per repository. At a 14-day horizon that is ~1,000 untagged versions in
+    # `agent-vm-base`, pruned only by age. The listing is paginated at 100/page,
+    # and this job now walks two packages; ~1,000 versions is the number the
+    # pagination must stay comfortable with.
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -292,47 +391,57 @@ jobs:
         with:
           script: |
             const owner = context.repo.owner;
-            // GHCR package name — `agent-vm-template`, not the repo's
-            // short name. The repo was renamed in ca6a2a3 but this
-            // string was left stale, so every `retain` run since then
-            // has failed with HttpError 404 and pruned nothing.
-            const pkg = 'agent-vm-template';
+            // GHCR package names — `agent-vm-template` and `agent-vm-base`, not
+            // the repo's short name. (The repo was renamed in ca6a2a3 but the
+            // original string was left stale, so every `retain` run since then
+            // failed with HttpError 404 and pruned nothing.)
+            const packages = ['agent-vm-template', 'agent-vm-base'];
             const horizonMs = 14 * 24 * 60 * 60 * 1000;
             const now = Date.now();
             // Patterns we never delete, regardless of age.
             const keepTagRe = /^(latest|sha-[0-9a-f]+)$/i;
 
-            // List all versions (paginated).
-            const versions = await github.paginate(
-              github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg,
-              {
-                package_type: 'container',
-                package_name: pkg,
-                org: owner,
-                per_page: 100,
-              }
-            );
-            core.info(`found ${versions.length} versions of ${owner}/${pkg}`);
-
-            let deleted = 0;
-            for (const v of versions) {
-              const tags = (v.metadata?.container?.tags) ?? [];
-              // Skip anything carrying a protected tag.
-              if (tags.some((t) => keepTagRe.test(t))) continue;
-              // Untagged manifest lists / blob orphans can be GC'd too.
-              const age = now - new Date(v.created_at).getTime();
-              if (age <= horizonMs) continue;
-              core.info(`deleting ${pkg}@${v.id} tags=${JSON.stringify(tags)} age_days=${(age/86400000).toFixed(1)}`);
+            for (const pkg of packages) {
+              let versions;
               try {
-                await github.rest.packages.deletePackageVersionForOrg({
-                  package_type: 'container',
-                  package_name: pkg,
-                  org: owner,
-                  package_version_id: v.id,
-                });
-                deleted++;
+                // List all versions (paginated).
+                versions = await github.paginate(
+                  github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg,
+                  {
+                    package_type: 'container',
+                    package_name: pkg,
+                    org: owner,
+                    per_page: 100,
+                  }
+                );
               } catch (e) {
-                core.warning(`delete ${v.id} failed: ${e.message}`);
+                // `agent-vm-base` does not exist until the first #84 build
+                // succeeds; a missing package is not a failure.
+                core.warning(`could not list ${owner}/${pkg}: ${e.message}`);
+                continue;
               }
+              core.info(`found ${versions.length} versions of ${owner}/${pkg}`);
+
+              let deleted = 0;
+              for (const v of versions) {
+                const tags = (v.metadata?.container?.tags) ?? [];
+                // Skip anything carrying a protected tag.
+                if (tags.some((t) => keepTagRe.test(t))) continue;
+                // Untagged manifest lists / blob orphans can be GC'd too.
+                const age = now - new Date(v.created_at).getTime();
+                if (age <= horizonMs) continue;
+                core.info(`deleting ${pkg}@${v.id} tags=${JSON.stringify(tags)} age_days=${(age/86400000).toFixed(1)}`);
+                try {
+                  await github.rest.packages.deletePackageVersionForOrg({
+                    package_type: 'container',
+                    package_name: pkg,
+                    org: owner,
+                    package_version_id: v.id,
+                  });
+                  deleted++;
+                } catch (e) {
+                  core.warning(`delete ${v.id} failed: ${e.message}`);
+                }
+              }
+              core.info(`deleted ${deleted} version(s) of ${pkg} older than 14 days`);
             }
-            core.info(`deleted ${deleted} version(s) older than 14 days`);
