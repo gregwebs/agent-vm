@@ -4743,6 +4743,298 @@ mod prepare_tests {
         assert!(!data.join("agent/auth.json").exists());
     }
 
+    // ── F1: the static signal's spelling gap (review round 3) ─────────
+
+    /// The M13 ordering at the copy level: the fork root passes the source-kind
+    /// check, is renamed away before the copier's measurement, is recreated
+    /// with both credentials, and `relatives_under` runs against the *existing*
+    /// recreated root. Returns the staged fork data.
+    fn fork_data_after_a_root_recreated_before_relatives(
+        home_for_measure: &Path,
+        root_spelling: &Path,
+        real_root: &Path,
+        store: &Path,
+    ) -> PathBuf {
+        let lock = open_regular_lock(&store.join("fork.lock")).unwrap();
+        lock_exclusive(&lock).unwrap();
+        require_fork_directory(
+            fork_source_kind(root_spelling).unwrap(),
+            &root_spelling.display().to_string(),
+        )
+        .unwrap();
+        let stash = real_root.parent().unwrap().join("stashed-root");
+        fs::rename(real_root, &stash).unwrap();
+        let protected = ProtectedHostFiles::measure(Some(home_for_measure)).unwrap();
+        fs::rename(&stash, real_root).unwrap();
+        fs::create_dir_all(real_root.join("agent")).unwrap();
+        fs::write(real_root.join("agent/auth.json"), "synthetic-secret").unwrap();
+        fs::write(real_root.join("agent/models.json"), "synthetic-models").unwrap();
+        let protected_relative = protected.relatives_under(root_spelling).unwrap();
+        let policy = CopyPolicy {
+            exclusions: &[],
+            follow: false,
+            protected_ids: protected.identities(),
+            protected_relative: &protected_relative,
+        };
+        let data = store.join("data");
+        let mut report = CopyReport::default();
+        copy_root(root_spelling, &data, &policy, &mut report).unwrap();
+        data
+    }
+
+    /// The same ordering one step later: `relatives_under` runs while the root
+    /// is still **missing** (the `root_spellings` literal fallback), and the
+    /// root is recreated with a credential only just before `copy_root`.
+    fn fork_data_when_the_root_is_absent_at_relatives_time(
+        home_for_measure: &Path,
+        root_spelling: &Path,
+        real_root: &Path,
+        store: &Path,
+    ) -> PathBuf {
+        let lock = open_regular_lock(&store.join("fork.lock")).unwrap();
+        lock_exclusive(&lock).unwrap();
+        require_fork_directory(
+            fork_source_kind(root_spelling).unwrap(),
+            &root_spelling.display().to_string(),
+        )
+        .unwrap();
+        let stash = real_root.parent().unwrap().join("stashed-root");
+        fs::rename(real_root, &stash).unwrap();
+        let protected = ProtectedHostFiles::measure(Some(home_for_measure)).unwrap();
+        // Still gone: this is the literal-spelling fallback of `root_spellings`.
+        let protected_relative = protected.relatives_under(root_spelling).unwrap();
+        fs::rename(&stash, real_root).unwrap();
+        fs::create_dir_all(real_root.join("agent")).unwrap();
+        fs::write(real_root.join("agent/auth.json"), "synthetic-secret").unwrap();
+        let policy = CopyPolicy {
+            exclusions: &[],
+            follow: false,
+            protected_ids: protected.identities(),
+            protected_relative: &protected_relative,
+        };
+        let data = store.join("data");
+        let mut report = CopyReport::default();
+        copy_root(root_spelling, &data, &policy, &mut report).unwrap();
+        data
+    }
+
+    /// Control for the two tests below: a canonical root spelling is omitted
+    /// even though the root was missing when the signals were derived.
+    #[test]
+    fn fork_of_a_missing_pi_home_still_omits_the_credential() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let root = home.join(".pi");
+        fs::create_dir(&root).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let data =
+            fork_data_when_the_root_is_absent_at_relatives_time(&home, &root, &root, store.path());
+        assert!(!data.join("agent/auth.json").exists());
+    }
+
+    /// F1, reproduced: the same window, but `$HOME` — and therefore the
+    /// `--mount ~/.pi` spelling — is reached through a symlink. A fork root is
+    /// deliberately **never** canonicalized (`expand_follow_links` skips forks),
+    /// so comparing a canonical-or-literal root against canonical Pi-home paths
+    /// only made the static signal empty and copied the credential.
+    #[test]
+    fn fork_of_a_missing_pi_home_still_omits_through_a_symlinked_home_spelling() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        let alias = base.join("home-alias");
+        symlink(&home, &alias).unwrap();
+        let real_root = home.join(".pi");
+        fs::create_dir(&real_root).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let data = fork_data_when_the_root_is_absent_at_relatives_time(
+            &alias,
+            &alias.join(".pi"),
+            &real_root,
+            store.path(),
+        );
+        assert!(
+            !data.join("agent/auth.json").exists(),
+            "a non-canonical fork-root spelling lost the static signal"
+        );
+    }
+
+    /// The canonical-spelling half of the M13 ordering, asserting the omission
+    /// is of the credential and not an empty copy. It isolates the two tests
+    /// above to their *spelling*: the ordering alone was already handled.
+    #[test]
+    fn fork_omission_survives_a_root_recreated_before_relatives_are_computed() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let root = home.join(".pi");
+        fs::create_dir(&root).unwrap();
+        // A non-credential sibling proves the directory itself is copied.
+        fs::write(root.join("settings.json"), "{}").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let data =
+            fork_data_after_a_root_recreated_before_relatives(&home, &root, &root, store.path());
+        assert!(data.join("settings.json").is_file());
+        assert!(!data.join("agent/auth.json").exists());
+        assert!(!data.join("agent/models.json").exists());
+    }
+
+    /// A symlinked `$HOME` spelling with the root *existing* at
+    /// `relatives_under` time: `canonicalize` succeeds, so this was already
+    /// omitted before F1. Paired with the attack above, it isolates the cause
+    /// to the missing-root fallback rather than the symlink as such.
+    #[test]
+    fn fork_of_a_symlinked_home_spelling_still_omits_while_the_root_exists() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        let alias = base.join("home-alias");
+        symlink(&home, &alias).unwrap();
+        let real_root = home.join(".pi");
+        let spelled_root = alias.join(".pi");
+        fs::create_dir(&real_root).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let data = fork_data_after_a_root_recreated_before_relatives(
+            &alias,
+            &spelled_root,
+            &real_root,
+            store.path(),
+        );
+        assert!(!data.join("agent/auth.json").exists());
+    }
+
+    /// A nested `:fork` of a subdirectory of the Pi home under the same race:
+    /// the static table must strip down to the bare filenames.
+    #[test]
+    fn fork_of_a_nested_pi_home_subdirectory_still_omits() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let root = home.join(".pi/agent");
+        fs::create_dir_all(&root).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let lock = open_regular_lock(&store.path().join("fork.lock")).unwrap();
+        lock_exclusive(&lock).unwrap();
+        require_fork_directory(
+            fork_source_kind(&root).unwrap(),
+            &root.display().to_string(),
+        )
+        .unwrap();
+        fs::rename(&root, home.join(".pi/stashed")).unwrap();
+        let protected = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("auth.json"), "synthetic-secret").unwrap();
+        fs::write(root.join("models.json"), "synthetic-models").unwrap();
+        let protected_relative = protected.relatives_under(&root).unwrap();
+        let policy = CopyPolicy {
+            exclusions: &[],
+            follow: false,
+            protected_ids: protected.identities(),
+            protected_relative: &protected_relative,
+        };
+        let data = store.path().join("data");
+        let mut report = CopyReport::default();
+        copy_root(&root, &data, &policy, &mut report).unwrap();
+        assert!(!data.join("auth.json").exists());
+        assert!(!data.join("models.json").exists());
+    }
+
+    /// F1, the headline `--mount ~/.pi:fork` shape: `~/.pi` is a symlink that
+    /// is absent at measurement and restored before the copy. The root
+    /// canonicalizes to the *target* while no snapshot resolved the link, so
+    /// only the literal root spelling can match.
+    #[test]
+    fn fork_of_a_symlinked_pi_home_recreated_after_measurement_still_omits() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        let elsewhere = base.join("elsewhere-pi");
+        fs::create_dir(&elsewhere).unwrap();
+        let root = home.join(".pi");
+        symlink(&elsewhere, &root).unwrap();
+
+        let store = tempfile::tempdir().unwrap();
+        let lock = open_regular_lock(&store.path().join("fork.lock")).unwrap();
+        lock_exclusive(&lock).unwrap();
+        require_fork_directory(
+            fork_source_kind(&root).unwrap(),
+            &root.display().to_string(),
+        )
+        .unwrap();
+        // The host removes the link (so no measurement can see the target),
+        // then restores it with a credential before the copy.
+        fs::remove_file(&root).unwrap();
+        let protected = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        symlink(&elsewhere, &root).unwrap();
+        fs::create_dir_all(elsewhere.join("agent")).unwrap();
+        fs::write(elsewhere.join("agent/auth.json"), "synthetic-secret").unwrap();
+        let protected_relative = protected.relatives_under(&root).unwrap();
+        let policy = CopyPolicy {
+            exclusions: &[],
+            follow: false,
+            protected_ids: protected.identities(),
+            protected_relative: &protected_relative,
+        };
+        let data = store.path().join("data");
+        let mut report = CopyReport::default();
+        copy_root(&root, &data, &policy, &mut report).unwrap();
+        assert!(
+            !data.join("agent/auth.json").exists(),
+            "symlinked ~/.pi recreated after measurement copied the credential"
+        );
+    }
+
+    /// Anti-over-omission control: an unrelated fork root that happens to
+    /// contain its own `agent/auth.json` keeps it. The extra root/Pi-home
+    /// spellings must not turn every root containing that name into a hit.
+    #[test]
+    fn fork_of_an_unrelated_root_keeps_its_own_agent_auth_json() {
+        let (_home, home) = pi_home();
+        let source = tempfile::tempdir().unwrap();
+        let source = source.path().canonicalize().unwrap();
+        fs::create_dir_all(source.join("agent")).unwrap();
+        fs::write(source.join("agent/auth.json"), "not-pi").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork", source.display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+        assert!(
+            data.join("agent/auth.json").is_file(),
+            "an unrelated root's own agent/auth.json must survive"
+        );
+    }
+
+    /// The omission is derived from the host root, not the guest path, so a
+    /// remapped guest spelling changes nothing.
+    #[test]
+    fn remapped_guest_path_does_not_change_fork_omission() {
+        let (_home, home) = pi_home();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!(
+                "{}:/somewhere/else:fork",
+                home.join(".pi").display()
+            )])
+            .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+        assert!(data.join("settings.json").is_file());
+        assert!(!data.join("agent/auth.json").exists());
+        assert!(!data.join("agent/models.json").exists());
+    }
+
     #[test]
     fn identity_version_v3_reseeds_a_v2_fork_and_reports_the_orphan() {
         let source = tempfile::tempdir().unwrap();

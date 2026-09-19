@@ -91,7 +91,12 @@ pub(crate) enum Severity {
 
 /// One measured route: a real directory that physically contains a protected
 /// file — or the file itself — and where the file sits inside it.
-#[derive(Clone, Debug)]
+///
+/// `PartialEq` is over the **whole** route, deliberately: two routes can share
+/// `(dev, ino, file)` while differing in `canonical`/`relative` (a macOS
+/// firmlink or a Linux host-bind alias), and [`ProtectedHostFiles::union`] must
+/// keep both rather than drop one — see its doc comment.
+#[derive(Clone, Debug, PartialEq)]
 struct Route {
     dev: u64,
     ino: u64,
@@ -169,14 +174,19 @@ pub(crate) struct ProtectedHostFiles {
     /// re-measure under its lock without being handed the path a second time.
     /// Kept raw (not canonicalized): `measure` canonicalizes it itself.
     host_home: Option<PathBuf>,
-    /// `$HOME/.pi`, once `$HOME` is known — `None` only when neither `$HOME`
-    /// nor the account record could name a home.
-    pi_home: Option<PathBuf>,
-    /// The canonical target of [`Self::pi_home`], when it resolves. It differs
-    /// from the spelling only when `~/.pi` is itself a symlink; both spellings
-    /// are recognised so `:fork` is recommended at the *target* of such a link
-    /// too (ADR-0020).
-    resolved_pi_home: Option<PathBuf>,
+    /// Every spelling of the Pi home this snapshot knows, in preference order:
+    /// the configured `$HOME/.pi` first (messages name it), then the same path
+    /// under a raw `$HOME` spelling when that differs, then any target a
+    /// symlinked `~/.pi` resolved to. Empty only when neither `$HOME` nor the
+    /// account record could name a home.
+    ///
+    /// A `Vec` rather than one path because [`Self::union`] keeps the spellings
+    /// *both* snapshots saw — a `~/.pi` link re-pointed between two
+    /// measurements would otherwise lose the first target's signal — and
+    /// because the static fork-omission signal and the `inside_pi_home`
+    /// advisories compare against every spelling, so no single one is
+    /// load-bearing (ADR-0020).
+    pi_homes: Vec<PathBuf>,
     severity: Severity,
     routes: Vec<Route>,
     /// `(dev, ino)` of the protected files themselves (not their ancestors),
@@ -219,8 +229,7 @@ impl ProtectedHostFiles {
         let Some(home) = host_home else {
             return Ok(Self {
                 host_home: None,
-                pi_home: None,
-                resolved_pi_home: None,
+                pi_homes: Vec::new(),
                 severity: Severity::Advise,
                 routes: Vec::new(),
                 identity_ids: Vec::new(),
@@ -239,11 +248,23 @@ impl ProtectedHostFiles {
             }
         };
         let pi_home = base.join(PI_HOME_NAME);
+        let mut pi_homes = vec![pi_home.clone()];
+        // The raw spelling: a shell expands `~/.pi` through whatever `$HOME`
+        // is, symlink and all, and that spelling reaches `relatives_under`
+        // uncanonicalized. Without it a fork root spelled the way the user
+        // typed it would match nothing (F1).
+        let raw_pi_home = home.join(PI_HOME_NAME);
+        if raw_pi_home.is_absolute() {
+            push_unique(&mut pi_homes, raw_pi_home);
+        }
         // The canonical target, when `~/.pi` is a symlink to the Pi home
-        // somewhere else. It is *not* a substitute for `pi_home` as a route
+        // somewhere else. It is *not* a substitute for the configured spelling
         // (the route set is the resolver's job); it exists so the *remedy* and
-        // the advisories recognise the target spelling too.
-        let resolved_pi_home = pi_home.canonicalize().ok();
+        // the advisories recognise the target spelling too, and so a fork root
+        // spelled through the target still gets the static signal.
+        if let Ok(target) = pi_home.canonicalize() {
+            push_unique(&mut pi_homes, target);
+        }
         let severity = match fs::symlink_metadata(&pi_home) {
             // Existence of the *files* is irrelevant: the Pi home is what makes
             // a live window dangerous (see `Severity`).
@@ -272,8 +293,7 @@ impl ProtectedHostFiles {
         }
         Ok(Self {
             host_home: Some(home.to_path_buf()),
-            pi_home: Some(pi_home),
-            resolved_pi_home,
+            pi_homes,
             severity,
             routes,
             identity_ids,
@@ -294,10 +314,17 @@ impl ProtectedHostFiles {
     /// snapshot, and host state can change between two of them: an atomic
     /// credential replacement can make a later snapshot *forget* an inode an
     /// earlier one positively identified (a surviving hardlink still holds the
-    /// old credential bytes), and a fork root renamed away and recreated can
-    /// make it forget a route. Omission is a safety property, so the copier
-    /// keeps every identity and route either snapshot saw (ADR-0020).
-    /// Deduplicated by `(dev, ino, file)`, the same key the route set uses.
+    /// old credential bytes), a fork root renamed away and recreated can make
+    /// it forget a route, and a `~/.pi` link re-pointed can make it forget a
+    /// target. Omission is a safety property, so the copier keeps every
+    /// identity, route and Pi-home spelling either snapshot saw (ADR-0020).
+    ///
+    /// Identities are deduplicated by `(dev, ino, file)`, which is their key.
+    /// Everything else is deduplicated by its whole value: two routes can share
+    /// `(dev, ino, file)` while differing in `canonical`/`relative` — a macOS
+    /// firmlink or Linux host-bind alias, the case `matches` folds by identity
+    /// — and keeping only the first would discard the second's containment
+    /// signal for a root that is a subdirectory of it.
     pub(crate) fn union(&self, other: &Self) -> Self {
         let mut identity_ids = self.identity_ids.clone();
         let mut identity_files = self.identity_files.clone();
@@ -309,22 +336,22 @@ impl ProtectedHostFiles {
         }
         let mut routes: Vec<Route> = self.routes.to_vec();
         for route in &other.routes {
-            let duplicate = routes.iter().any(|existing| {
-                existing.dev == route.dev
-                    && existing.ino == route.ino
-                    && existing.file == route.file
-            });
-            if !duplicate {
+            if !routes.contains(route) {
                 routes.push(route.clone());
             }
         }
+        let mut pi_homes = self.pi_homes.clone();
+        for spelling in &other.pi_homes {
+            if !pi_homes.contains(spelling) {
+                pi_homes.push(spelling.clone());
+            }
+        }
         Self {
+            // `refreshed` re-measures from *this* snapshot's home, so the two
+            // agree here; keeping the first is enough because every spelling
+            // derived from it is already baked into `pi_homes`.
             host_home: self.host_home.clone().or_else(|| other.host_home.clone()),
-            pi_home: self.pi_home.clone().or_else(|| other.pi_home.clone()),
-            resolved_pi_home: self
-                .resolved_pi_home
-                .clone()
-                .or_else(|| other.resolved_pi_home.clone()),
+            pi_homes,
             // The more protective verdict wins; a `~/.pi` present in either
             // snapshot is enough to make a live window dangerous.
             severity: if self.severity == Severity::Refuse || other.severity == Severity::Refuse {
@@ -347,7 +374,7 @@ impl ProtectedHostFiles {
     /// an `env -i`/daemon/CI launch still gets a real home and this refusal is
     /// reached only when *both* sources fail (no passwd entry for the uid).
     pub(crate) fn require_home(&self, mount_count: usize) -> Result<()> {
-        if self.pi_home.is_none() && mount_count > 0 {
+        if self.pi_homes.is_empty() && mount_count > 0 {
             bail!(
                 "neither $HOME nor the account record could name your home directory, so agent-vm \
                  cannot tell whether a --mount would expose host Pi credential files. Set HOME, \
@@ -386,40 +413,48 @@ impl ProtectedHostFiles {
     }
 
     /// The static half of [`Self::relatives_under`]: where each protected file
-    /// *would* sit under `root`, from the path table alone — the `$HOME`
-    /// spelling and, when `~/.pi` is a symlink, its resolved target. It reads
-    /// no measured route and no `(dev, ino)`, so it holds for a root no
-    /// measurement saw. It is a *supplement*: a hardlink or a symlinked
-    /// credential target the table cannot name is still covered only by the
-    /// measured identity.
+    /// *would* sit under `root`, from the path table alone — the configured
+    /// `$HOME/.pi`, the raw `$HOME/.pi` spelling, and (when `~/.pi` is a
+    /// symlink) every target it resolved to. It reads no measured route and no
+    /// `(dev, ino)`, so it holds for a root no measurement saw. It is a
+    /// *supplement*: a hardlink or a symlinked credential target the table
+    /// cannot name is still covered only by the measured identity.
+    ///
+    /// **Both spellings of both sides** are compared, which is what makes the
+    /// signal survive a `$HOME` reached through a symlink or a `~/.pi` link
+    /// that was absent at measurement time (F1). A fork root is deliberately
+    /// never canonicalized before the copier reads it (`expand_follow_links`
+    /// skips forks), so comparing a canonical-or-literal root against
+    /// canonical Pi-home paths alone left the credential unprotected in the
+    /// very M13 rename window this signal exists for.
     fn static_relatives(&self, root: &Path) -> Vec<(PathBuf, ProtectedFile)> {
-        let Some(canonical) = normalized_root(root) else {
+        let roots = root_spellings(root);
+        if roots.is_empty() {
             return Vec::new();
-        };
+        }
         let mut relatives = Vec::new();
-        for pi_home in [&self.pi_home, &self.resolved_pi_home]
-            .into_iter()
-            .flatten()
-        {
+        for pi_home in &self.pi_homes {
             for file in ProtectedFile::ALL {
                 let absolute = pi_home.join(file.pi_home_relative());
-                if let Ok(relative) = absolute.strip_prefix(&canonical) {
-                    push_relative(&mut relatives, relative.to_path_buf(), file);
+                for candidate in &roots {
+                    if let Ok(relative) = absolute.strip_prefix(candidate) {
+                        push_relative(&mut relatives, relative.to_path_buf(), file);
+                    }
                 }
             }
         }
         relatives
     }
 
-    /// Advisory-only: is `root` at/inside the host Pi home? Recognises both
-    /// spellings (`~/.pi` and, when it is a symlink, its canonical target).
-    /// Path-based, so an alias reached any other way may miss a *warning*;
-    /// it is never a refusal. `Path::starts_with` is true for equal paths, so
-    /// the Pi home itself is covered without a separate equality test.
+    /// Advisory-only: is `root` at/inside the host Pi home? Recognises every
+    /// spelling in [`Self::pi_homes`] (`~/.pi`, its raw spelling, and, when it
+    /// is a symlink, its canonical target). Path-based, so an alias reached
+    /// any other way may miss a *warning*; it is never a refusal.
+    /// `Path::starts_with` is true for equal paths, so the Pi home itself is
+    /// covered without a separate equality test.
     pub(crate) fn inside_pi_home(&self, root: &Path) -> bool {
-        [&self.pi_home, &self.resolved_pi_home]
-            .into_iter()
-            .flatten()
+        self.pi_homes
+            .iter()
             .any(|pi_home| root.starts_with(pi_home))
     }
 
@@ -432,7 +467,7 @@ impl ProtectedHostFiles {
     }
 
     pub(crate) fn pi_home(&self) -> Option<&Path> {
-        self.pi_home.as_deref()
+        self.pi_homes.first().map(PathBuf::as_path)
     }
 
     /// Human-readable refusal for an explicit or `follow-links`-discovered
@@ -716,17 +751,30 @@ fn push_relative(
     }
 }
 
-/// A fork root's path for the static signal: its canonical path when it exists,
-/// otherwise its own spelling when that is absolute. A root no measurement saw
-/// must still yield a signal, so a missing path falls back to the configured
-/// spelling — the copier canonicalizes the root before reading it, so an
-/// existing root always matches its canonical form. A relative spelling cannot
-/// be compared against the absolute Pi-home paths.
-fn normalized_root(root: &Path) -> Option<PathBuf> {
-    match root.canonicalize() {
-        Ok(canonical) => Some(canonical),
-        Err(_) if root.is_absolute() => Some(root.to_path_buf()),
-        Err(_) => None,
+/// Every spelling of a fork root the static signal can compare against: the
+/// root's canonical path when it exists, and its own spelling when that is
+/// absolute. A fork root is deliberately **never** canonicalized before the
+/// copier reads it (`expand_follow_links` skips forks), so when `$HOME` is
+/// reached through a symlink the two spellings differ — and a root renamed away
+/// before `relatives_under` has only the literal one. A relative spelling
+/// cannot be compared against the absolute Pi-home paths.
+fn root_spellings(root: &Path) -> Vec<PathBuf> {
+    let mut spellings = Vec::new();
+    if let Ok(canonical) = root.canonicalize() {
+        push_unique(&mut spellings, canonical);
+    }
+    if root.is_absolute() {
+        push_unique(&mut spellings, root.to_path_buf());
+    }
+    spellings
+}
+
+/// Append `path` unless the vector already holds it. The spellings in
+/// [`ProtectedHostFiles::pi_homes`] deliberately overlap (the configured one,
+/// the raw `$HOME` one, and a symlink's target are often identical).
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
     }
 }
 
@@ -912,6 +960,59 @@ mod tests {
         let sibling = home.join(".pistachio");
         fs::create_dir(&sibling).unwrap();
         assert!(protected.relatives_under(&sibling).unwrap().is_empty());
+    }
+
+    /// F2/F3: `union` must keep *everything* either snapshot saw, so a
+    /// credential can never be forgotten by a snapshot taken at the wrong
+    /// moment. Two routes sharing `(dev, ino, file)` but differing in
+    /// `canonical`/`relative` (the firmlink / host-bind alias `matches` folds by
+    /// identity) must both survive — dropping one would lose its containment
+    /// signal for a root that is a subdirectory of it. A re-pointed Pi-home
+    /// spelling must survive too.
+    #[test]
+    fn union_keeps_every_route_and_every_pi_home_spelling() {
+        let old_route = Route {
+            dev: 1,
+            ino: 2,
+            canonical: PathBuf::from("/alias/pi"),
+            file: ProtectedFile::PiAuth,
+            relative: PathBuf::from("agent/auth.json"),
+        };
+        let alias_of_old_route = Route {
+            canonical: PathBuf::from("/host-bind/pi"),
+            ..old_route.clone()
+        };
+        let old = ProtectedHostFiles {
+            host_home: Some(PathBuf::from("/home")),
+            pi_homes: vec![PathBuf::from("/home/.pi"), PathBuf::from("/ext/pi")],
+            severity: Severity::Advise,
+            routes: vec![old_route.clone()],
+            identity_ids: vec![(1, 2)],
+            identity_files: vec![ProtectedFile::PiAuth],
+        };
+        let fresh = ProtectedHostFiles {
+            host_home: Some(PathBuf::from("/home")),
+            pi_homes: vec![PathBuf::from("/home/.pi"), PathBuf::from("/other/pi")],
+            severity: Severity::Refuse,
+            routes: vec![alias_of_old_route.clone()],
+            identity_ids: vec![(1, 2)],
+            identity_files: vec![ProtectedFile::PiAuth],
+        };
+
+        let unioned = old.union(&fresh);
+        assert!(unioned.routes.contains(&old_route));
+        assert!(
+            unioned.routes.contains(&alias_of_old_route),
+            "a route alias sharing (dev, ino, file) must not be dropped"
+        );
+        for spelling in ["/home/.pi", "/ext/pi", "/other/pi"] {
+            assert!(
+                unioned.inside_pi_home(Path::new(spelling)),
+                "{spelling} must survive the union"
+            );
+        }
+        assert_eq!(unioned.pi_home(), Some(Path::new("/home/.pi")));
+        assert_eq!(unioned.severity, Severity::Refuse);
     }
 
     /// The TOCTOU-defeating case: an implementation that measured only existing
