@@ -3383,6 +3383,13 @@ mod tests {
             ("/", "/a", false),
             ("/a", "/", false),
             ("/a", "/a", true),
+            // A *relative* path must hit the separator check too: the kernel
+            // must not require a leading `/` (a mutant that does survives only
+            // the independent-draw proptest; see the correlated oracle below).
+            ("a", "a/a", true),
+            ("a", "a", true),
+            ("a/a", "a", false),
+            ("a/b/c", "a/b", false),
         ];
         for (a, b, expected) in cases {
             assert_eq!(
@@ -3853,6 +3860,47 @@ mod tests {
                 component_prefix(&a, &b),
                 "contains({:?}, {:?})", a, b
             );
+        }
+
+        /// **V3 (correlated).** The oracle above draws `a` and `b`
+        /// independently, so it almost never produces an ancestor/descendant
+        /// pair and cannot falsify a kernel that mishandles the *positive*
+        /// case — one that requires a leading `/`, say. This builds
+        /// `descendant = ancestor ++ extra` (guaranteed correlated) and also
+        /// checks an unrelated vector and a sibling-prefix string, all against
+        /// the independent `Path::starts_with` oracle. Both spellings are
+        /// exercised, because the separator check must fire for a *relative*
+        /// path too (`"a"` contains `"a/a"`).
+        #[test]
+        fn byte_path_contains_matches_the_correlated_path_oracle(
+            ancestor in proptest::collection::vec("[a-z]{1,3}", 1..4),
+            extra in proptest::collection::vec("[a-z]{1,3}", 0..3),
+            other in proptest::collection::vec("[a-z]{1,3}", 1..4),
+        ) {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let descendant = ancestor
+                .iter()
+                .chain(&extra)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("/");
+            let ancestor_path = ancestor.join("/");
+            let sibling = format!("{}x", ancestor_path);
+            let unrelated = other.join("/");
+            for lead in ["", "/"] {
+                let left = format!("{lead}{ancestor_path}");
+                let a_path = Path::new(OsStr::from_bytes(left.as_bytes()));
+                for candidate in [descendant.as_str(), unrelated.as_str(), sibling.as_str()] {
+                    let right = format!("{lead}{candidate}");
+                    let d_path = Path::new(OsStr::from_bytes(right.as_bytes()));
+                    proptest::prop_assert_eq!(
+                        byte_path_contains(left.as_bytes(), right.as_bytes()),
+                        d_path.starts_with(a_path),
+                        "contains({:?}, {:?})", left, right
+                    );
+                }
+            }
         }
     }
 
