@@ -22,6 +22,7 @@ mod msb_install;
 mod msb_preflight;
 mod msb_schema;
 mod network;
+mod protected_host_files;
 mod pull;
 mod pull_progress;
 mod pulled_marker;

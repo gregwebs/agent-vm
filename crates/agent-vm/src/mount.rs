@@ -11,6 +11,9 @@ use anyhow::{Context, Result};
 #[cfg(test)]
 use microsandbox::sandbox::MountBuilder;
 
+use crate::protected_host_files::{
+    ProtectedFile, ProtectedHostFiles, ProtectedIdentities, Severity,
+};
 use crate::run::guest_path_is_mountable;
 
 /// A recognized `--mount` mode keyword: `ro`, `rw`, `fork`, or `follow-links`
@@ -1068,7 +1071,13 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let raw = format!("{}:/guest:fork:exclude=secret", source.path().display());
         let mut mounts = parse_extra_mounts(&[raw]).unwrap();
-        prepare_forks(&mut mounts, store.path(), &std::collections::HashMap::new()).unwrap();
+        prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &ProtectedHostFiles::measure(None).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(mounts[0].host.join("visible")).unwrap(),
             "one"
@@ -1080,7 +1089,13 @@ mod tests {
             source.path().display()
         )])
         .unwrap();
-        prepare_forks(&mut again, store.path(), &std::collections::HashMap::new()).unwrap();
+        prepare_forks(
+            &mut again,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &ProtectedHostFiles::measure(None).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(again[0].host.join("visible")).unwrap(),
             "one"
@@ -1757,6 +1772,12 @@ pub(crate) struct MountContext {
     /// Guest paths owned by agent-vm itself.  An explicit mount may not
     /// replace one: that would silently change HOME/project/state semantics.
     pub(crate) core_guest_mounts: Vec<PathBuf>,
+    /// Host sources of agent-vm's own binds (guest HOME, project dir, state
+    /// dir).  Checked for protected-file exposure exactly like an explicit
+    /// mount, because the project bind is the canonicalized cwd and is
+    /// writable (`session.rs:45`): `cd ~ && agent-vm shell` would hand the
+    /// guest the whole host `$HOME`.
+    pub(crate) core_host_sources: Vec<PathBuf>,
 }
 
 /// Normalize the guest spelling before it participates in identity or
@@ -1793,6 +1814,24 @@ pub(crate) fn prepare(
     requests: Vec<ExtraMount>,
     context: &MountContext,
 ) -> Result<PreparedMountPlan> {
+    // Measure the protected host-file route set once, then refuse to launch a
+    // core bind that would hand one over. The project bind is the
+    // canonicalized cwd, so `cd ~ && agent-vm shell` is an exposure route even
+    // with no `--mount` at all.
+    let protected = ProtectedHostFiles::measure(context.host_home.as_deref())?;
+    let mut notices = Vec::new();
+    for source in &context.core_host_sources {
+        let Some(exposure) = protected.exposure(source)? else {
+            continue;
+        };
+        match exposure.severity {
+            Severity::Refuse => anyhow::bail!("{}", protected.core_message(source, &exposure)),
+            Severity::Advise => {
+                notices.push(protected.message(&source.display().to_string(), &exposure, None))
+            }
+        }
+    }
+
     let mut requests = requests;
     for request in &mut requests {
         request.guest = normalize_guest(
@@ -1891,12 +1930,35 @@ pub(crate) fn prepare(
             },
         });
     }
+    // Refuse a live bind that would hand a protected host file to the guest,
+    // and collect the Pi advisories. Runs after `expand_follow_links` (so a
+    // followed alias is an ordinary discovered bind) and before
+    // `validate_plan`/`prepare_forks` (so a refusal has no side effects).
+    enforce_protected_files(&expanded, explicit_count, &protected, &mut notices)?;
+    // A fork seeded by a pre-#90 build may already contain a copy of a
+    // protected file, and a READY fork is reused *without* reading its source,
+    // so no source-side check catches it. Report the orphaned directory that
+    // the v3 identity no longer reuses.
+    for mount in unique.iter().filter(|mount| mount.is_fork()) {
+        if let Some(orphan) = legacy_fork_dir(mount, &context.mount_store) {
+            notices.push(format!(
+                "==> A fork from an earlier agent-vm build is no longer used: {}. It may \
+                 contain a copy of a host credential file — remove it.",
+                orphan.display()
+            ));
+        }
+    }
     validate_plan(&mut volumes, &context.core_guest_mounts)?;
 
     // Only a validated complete set of core, explicit, and followed claims
     // may publish any host-managed state. The first state mutation happens
     // inside `prepare_forks`; everything above is rejection or classification.
-    let mut notices = prepare_forks(&mut unique, &context.mount_store, &known_fork_kinds)?;
+    notices.extend(prepare_forks(
+        &mut unique,
+        &context.mount_store,
+        &known_fork_kinds,
+        &protected,
+    )?);
     sync_fork_representations(&unique, &mut expanded)?;
     notices.extend(warnings.into_iter().map(|warning| format!("==> {warning}")));
 
@@ -1937,6 +1999,110 @@ pub(crate) fn prepare(
     })
 }
 
+/// Refuse any live bind that would hand a protected host file to the guest,
+/// and collect the Pi advisories. Forks are exempt from the refusal on
+/// purpose: their *content* is decided by the copy engine (`copy_opened`),
+/// not by this root-level check.
+///
+/// Precedence is honest, not "security first": `normalize_guest`, the core
+/// collision/dedup pass, `preflight_forks` and the per-mount `file`+`rw`
+/// rejection all run earlier and can bail. Every one of them is read-only, so a
+/// leaky-*and*-invalid plan is still refused with **no side effects** — only
+/// the message the user sees is the earlier one.
+fn enforce_protected_files(
+    expanded: &[ExtraMount],
+    explicit_count: usize,
+    protected: &ProtectedHostFiles,
+    notices: &mut Vec<String>,
+) -> Result<()> {
+    // Not at the top of `prepare`: `expand_follow_links`'s more specific
+    // "$HOME is not set — required for --mount follow-links" must still win for
+    // a `follow-links` mount with no `$HOME`.
+    protected.require_home(expanded.len())?;
+    if expanded.is_empty() {
+        return Ok(());
+    }
+    let declarations: Vec<String> = expanded[..explicit_count]
+        .iter()
+        .filter(|mount| mount.follows_links() && !mount.is_fork())
+        .map(|mount| mount.source_spelling.clone())
+        .collect();
+    let mut seen: Vec<String> = Vec::new();
+    for (index, mount) in expanded.iter().enumerate() {
+        // Advisories are evaluated against the *declaration*, never
+        // `mount.host`: `preflight_forks` repoints a READY fork's host at
+        // `<store>/forks/<id>/data`, so a notice keyed on `mount.host` would
+        // silently stop firing on every launch after the first.
+        let declaration = declaration_path(mount);
+        if !mount.is_fork() {
+            if let Some(exposure) = protected.exposure(&mount.host)? {
+                let discovered = (index >= explicit_count).then(|| declarations.join(", "));
+                let message =
+                    protected.message(&mount.source_spelling, &exposure, discovered.as_deref());
+                match exposure.severity {
+                    // A live window onto host bytes cannot be made safe by any
+                    // overlay: `pi auth login` on the host can create
+                    // `auth.json` inside a bind that is already open.
+                    Severity::Refuse => anyhow::bail!("{message}"),
+                    Severity::Advise => push_notice(notices, &mut seen, message),
+                }
+            }
+            if protected.inside_pi_home(&declaration) {
+                push_notice(
+                    notices,
+                    &mut seen,
+                    format!(
+                        "==> {} is a live bind of host Pi state; :fork is recommended so the \
+                         guest cannot write host Pi state and host changes cannot leak in",
+                        mount.source_spelling
+                    ),
+                );
+            }
+        }
+        if let Some(pi_home) = protected.pi_home()
+            && protected.inside_pi_home(&declaration)
+        {
+            push_notice(
+                notices,
+                &mut seen,
+                format!(
+                    "==> Host Pi extensions and installed packages under {} may be built for \
+                     this host's OS/arch and may not run in the Linux guest",
+                    pi_home.display()
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The path a declaration actually names, for advisories. A missing source (a
+/// fork reused after its source was removed) falls back to the literal
+/// spelling rather than failing the launch.
+fn declaration_path(mount: &ExtraMount) -> PathBuf {
+    Path::new(&mount.source_spelling)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&mount.source_spelling))
+}
+
+fn push_notice(notices: &mut Vec<String>, seen: &mut Vec<String>, message: String) {
+    if seen.contains(&message) {
+        return;
+    }
+    seen.push(message.clone());
+    notices.push(message);
+}
+
+/// A pre-#90 fork directory that the v3 identity no longer reuses, if one
+/// exists. Reported, never deleted: it may hold valuable guest state (and a
+/// copy of a protected file).
+fn legacy_fork_dir(mount: &ExtraMount, mount_store: &Path) -> Option<PathBuf> {
+    let path = mount_store
+        .join("forks")
+        .join(fork_id(mount, LEGACY_IDENTITY_VERSION_V2));
+    fs::symlink_metadata(&path).is_ok().then_some(path)
+}
+
 /// Validate every fork without creating its store or inspecting an
 /// uninitialized source beyond its kind. READY is checked first, so a fork
 /// stays reusable after its original source disappears or changes type.
@@ -1946,7 +2112,7 @@ fn preflight_forks(
 ) -> Result<std::collections::HashMap<PathBuf, PreparedNodeKind>> {
     let mut kinds = std::collections::HashMap::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
-        let id = fork_id(mount);
+        let id = fork_id(mount, IDENTITY_VERSION);
         let final_dir = mount_store.join("forks").join(&id);
         if final_dir_exists(&final_dir)? {
             let kind = validate_ready(&final_dir, mount, &id)?;
@@ -2106,7 +2272,16 @@ fn same_volume(a: &PreparedVolume, b: &PreparedVolume) -> bool {
 }
 
 const MANIFEST_VERSION: u32 = 2;
-const IDENTITY_VERSION: &[u8] = b"agent-vm-fork-identity-v2";
+/// v3 because a READY fork is reused *without* reading its source, so a fork
+/// seeded by a pre-#90 build may already contain a copied protected file and no
+/// source-side check could catch it. Bumping the identity makes every reusable
+/// fork one that was seeded *under* protection — a structural invariant instead
+/// of a runtime scan. Forks had never shipped in a release, so no released
+/// user has one to orphan (ADR-0020).
+const IDENTITY_VERSION: &[u8] = b"agent-vm-fork-identity-v3";
+/// Only to report the orphaned directory the v3 identity leaves behind
+/// ([`legacy_fork_dir`]); never used to reuse or validate a fork.
+const LEGACY_IDENTITY_VERSION_V2: &[u8] = b"agent-vm-fork-identity-v2";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const FORK_MAX_LINK_DEPTH: usize = 40;
 
@@ -2225,10 +2400,11 @@ pub(crate) fn prepare_forks(
     mounts: &mut [ExtraMount],
     mount_store: &Path,
     expected_kinds: &std::collections::HashMap<PathBuf, PreparedNodeKind>,
+    protected: &ProtectedHostFiles,
 ) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
-        let id = fork_id(mount);
+        let id = fork_id(mount, IDENTITY_VERSION);
         let final_dir = mount_store.join("forks").join(&id);
         ensure_store(mount_store)?;
         let lock_path = mount_store.join("locks").join(format!("{id}.lock"));
@@ -2264,12 +2440,28 @@ pub(crate) fn prepare_forks(
             .tempdir_in(&staging_parent)
             .context("creating fork staging directory")?;
         let staged_data = stage.path().join("data");
+        // The second omission signal, computed from the *source* under the
+        // same lock as the copy: a protected file created between `measure`
+        // and `copy_opened` has no measured identity to match, but its path is
+        // known. Identity alone would copy it (ADR-0020).
+        let protected_relative = protected.relatives_under(&mount.host)?;
         let policy = CopyPolicy {
             exclusions: &mount.exclusions,
             follow: mount.follows_links(),
+            protected_ids: protected.identities(),
+            protected_relative: &protected_relative,
         };
-        let kind = copy_root(&mount.host, &staged_data, &policy)
+        let mut report = CopyReport::default();
+        let kind = copy_root(&mount.host, &staged_data, &policy, &mut report)
             .with_context(|| format!("initializing fork from {}", mount.source_spelling))?;
+        for (relative, file) in &report.omitted {
+            notices.push(format!(
+                "==> Omitted {} {} from the fork of {}",
+                file.description(),
+                relative.display(),
+                mount.source_spelling
+            ));
+        }
         let manifest = ForkManifest {
             version: MANIFEST_VERSION,
             id: id.clone(),
@@ -2307,10 +2499,10 @@ pub(crate) fn prepare_forks(
     Ok(notices)
 }
 
-fn fork_id(mount: &ExtraMount) -> String {
+fn fork_id(mount: &ExtraMount, version: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
-    hash.update(IDENTITY_VERSION);
+    hash.update(version);
     for value in std::iter::once(mount.source_spelling.as_bytes())
         .chain(std::iter::once(mount.guest.as_os_str().as_encoded_bytes()))
         .chain(std::iter::once(if mount.follows_links() {
@@ -2596,11 +2788,32 @@ fn merge_exclusions(existing: &mut Vec<PathBuf>, additions: Vec<PathBuf>) {
     *existing = collapsed;
 }
 /// Everything the copier needs besides the two paths: the declaration's own
-/// exclusions and follow policy. Bundled because these are adjacent same-typed
-/// arguments (CODING_STANDARDS: do not repeat a type in a row).
+/// exclusions and follow policy, plus the protected-file membership and paths.
+/// Bundled because these are adjacent same-typed arguments
+/// (CODING_STANDARDS: do not repeat a type in a row).
 struct CopyPolicy<'a> {
     exclusions: &'a [PathBuf],
     follow: bool,
+    protected_ids: ProtectedIdentities<'a>,
+    /// Fork-root-relative paths of protected files, **even ones that do not
+    /// exist yet**. The second omission signal: identity alone cannot catch a
+    /// protected file created between `measure` and the copy.
+    protected_relative: &'a [(PathBuf, ProtectedFile)],
+}
+
+impl CopyPolicy<'_> {
+    fn protected_file_at(&self, relative: &Path) -> Option<ProtectedFile> {
+        self.protected_relative
+            .iter()
+            .find(|(path, _)| path == relative)
+            .map(|(_, file)| *file)
+    }
+}
+
+/// What the copier refused to copy, for notices.
+#[derive(Default)]
+struct CopyReport {
+    omitted: Vec<(PathBuf, ProtectedFile)>,
 }
 
 /// A node the copier either published or deliberately did not. The enum forces
@@ -2620,6 +2833,7 @@ fn copy_root(
     source: &Path,
     destination: &Path,
     policy: &CopyPolicy<'_>,
+    report: &mut CopyReport,
 ) -> Result<PreparedNodeKind> {
     use rustix::fs::{self as rfs, FileType, Mode, OFlags};
     let source = source
@@ -2641,7 +2855,15 @@ fn copy_root(
     if FileType::from_raw_mode(rfs::fstat(&fd)?.st_mode) != FileType::Directory {
         anyhow::bail!("fork root {} must be a directory", source.display());
     }
-    match copy_opened(&fd, destination, Path::new(""), policy, 0, &mut Vec::new())? {
+    match copy_opened(
+        &fd,
+        destination,
+        Path::new(""),
+        policy,
+        0,
+        &mut Vec::new(),
+        report,
+    )? {
         CopiedNode::Copied(kind) => Ok(kind),
         // Unreachable today: protected entries are files and a fork root is
         // `O_DIRECTORY`-enforced. Answered anyway so a future change cannot
@@ -2658,6 +2880,7 @@ fn copy_opened(
     policy: &CopyPolicy<'_>,
     depth: usize,
     active: &mut Vec<(u64, u64)>,
+    report: &mut CopyReport,
 ) -> Result<CopiedNode> {
     use rustix::fs::{self as rfs, FileType, Mode, OFlags};
     use std::os::unix::fs::PermissionsExt;
@@ -2668,6 +2891,17 @@ fn copy_opened(
         return Ok(CopiedNode::Copied(PreparedNodeKind::Directory));
     }
     let stat = rfs::fstat(fd)?;
+    // Before the destination is created, so an omitted node writes nothing at
+    // all — no empty file, no placeholder (an overlay would be a mask, and
+    // ADR-0014 removed mask machinery).
+    if let Some(file) = policy
+        .protected_ids
+        .matched(stat.st_dev as u64, stat.st_ino as u64)
+        .or_else(|| policy.protected_file_at(relative))
+    {
+        report.omitted.push((relative.to_path_buf(), file));
+        return Ok(CopiedNode::Omitted);
+    }
     let ty = FileType::from_raw_mode(stat.st_mode);
     if ty == FileType::RegularFile {
         let mut source = std::fs::File::from(rustix::io::dup(fd)?);
@@ -2722,7 +2956,9 @@ fn copy_opened(
                 // openat resolves the link relative to the already-pinned
                 // parent descriptor.  Unlike synthesizing /dev/fd paths it
                 // works on macOS as well as Linux and keeps relative links
-                // inside the directory that contained their raw text.
+                // inside the directory that contained their raw text. Without
+                // `NOFOLLOW`, a followed target is classified by its own
+                // `fstat`, so an omitted protected file is not materialized.
                 let target = rfs::openat(
                     fd,
                     name,
@@ -2737,6 +2973,7 @@ fn copy_opened(
                     policy,
                     depth + 1,
                     active,
+                    report,
                 )?;
             }
         } else {
@@ -2746,7 +2983,15 @@ fn copy_opened(
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
             )?;
-            copy_opened(&child, &child_dst, &child_relative, policy, depth, active)?;
+            copy_opened(
+                &child,
+                &child_dst,
+                &child_relative,
+                policy,
+                depth,
+                active,
+                report,
+            )?;
         }
     }
     fs::set_permissions(
@@ -2761,11 +3006,38 @@ fn copy_opened(
 mod prepare_tests {
     use super::*;
 
+    /// A real, empty `$HOME` shared by every test in this binary. `measure`
+    /// needs a locatable home for `require_home`; with no `~/.pi` it yields
+    /// `Severity::Advise` and no exposure for a test source that is not an
+    /// ancestor of the home. Held in a `OnceLock` so the directory outlives
+    /// every `MountContext` without each call leaking its own.
+    fn test_home() -> PathBuf {
+        static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        HOME.get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .to_path_buf()
+    }
+
     fn context(store: &Path) -> MountContext {
+        context_with_home(store, test_home())
+    }
+
+    fn context_with_home(store: &Path, home: PathBuf) -> MountContext {
+        MountContext {
+            mount_store: store.to_path_buf(),
+            host_home: Some(home),
+            core_guest_mounts: Vec::new(),
+            core_host_sources: Vec::new(),
+        }
+    }
+
+    /// The fail-closed `$HOME`-unset case (`ProtectedHostFiles::require_home`).
+    fn context_without_home(store: &Path) -> MountContext {
         MountContext {
             mount_store: store.to_path_buf(),
             host_home: None,
             core_guest_mounts: Vec::new(),
+            core_host_sources: Vec::new(),
         }
     }
 
@@ -3018,6 +3290,7 @@ mod prepare_tests {
                 mount_store: store.path().to_path_buf(),
                 host_home: Some(home),
                 core_guest_mounts: vec![target],
+                core_host_sources: Vec::new(),
             };
 
             let error =
@@ -3162,6 +3435,7 @@ mod prepare_tests {
                         mount_store: store.path().to_path_buf(),
                         host_home: Some(root.path().to_path_buf()),
                         core_guest_mounts: vec![root.path().join("core-child")],
+                        core_host_sources: Vec::new(),
                     },
                 );
                 assert!(
@@ -3246,6 +3520,7 @@ mod prepare_tests {
                 mount_store: store.path().to_path_buf(),
                 host_home: Some(home_path.clone()),
                 core_guest_mounts: Vec::new(),
+                core_host_sources: Vec::new(),
             },
         )
         .unwrap_err();
@@ -3767,7 +4042,7 @@ mod prepare_tests {
         let store = tempfile::tempdir().unwrap();
         let request =
             parse_extra_mounts(&[format!("{}:/guest:fork", source.path().display())]).unwrap();
-        let id = fork_id(&request[0]);
+        let id = fork_id(&request[0], IDENTITY_VERSION);
         ensure_store(store.path()).unwrap();
         fs::create_dir(
             store
@@ -3835,5 +4110,440 @@ mod prepare_tests {
         };
         assert_eq!(reused_data, &data);
         assert_eq!(fs::read_to_string(data.join("seed")).unwrap(), "first");
+    }
+
+    // ── protected host files (issue #90) ─────────────────────────────
+
+    /// A `$HOME` with a real `~/.pi`, and a context pointed at it. The
+    /// `TempDir` is returned so it outlives the context.
+    fn pi_home() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let canonical = home.path().canonicalize().unwrap();
+        fs::create_dir_all(canonical.join(".pi/agent")).unwrap();
+        fs::write(canonical.join(".pi/agent/auth.json"), "{\"token\":\"t\"}").unwrap();
+        fs::write(canonical.join(".pi/agent/models.json"), "{}").unwrap();
+        fs::write(canonical.join(".pi/settings.json"), "{}").unwrap();
+        (home, canonical)
+    }
+
+    fn fork_data(plan: &PreparedMountPlan) -> PathBuf {
+        match &plan.volumes[0].source {
+            PreparedVolumeSource::WritableBind(path) => path.clone(),
+            other => panic!("fork must be writable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ro_and_rw_mounts_of_pi_home_are_refused_before_store_creation() {
+        let (_home, home) = pi_home();
+        for declaration in [
+            format!("{}:ro", home.join(".pi").display()),
+            format!("{}:rw", home.join(".pi").display()),
+            format!("{}:ro", home.display()),
+            format!("{}:/mnt/pi:ro", home.join(".pi").display()),
+        ] {
+            let store = tempfile::tempdir().unwrap();
+            let error = prepare(
+                parse_extra_mounts(std::slice::from_ref(&declaration)).unwrap(),
+                &context_with_home(store.path(), home.clone()),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&home.join(".pi/agent/auth.json").display().to_string()),
+                "{declaration}: {error}"
+            );
+            assert!(error.contains(":fork"), "{declaration}: {error}");
+            assert!(
+                store_tree(store.path()).is_empty(),
+                "a refused plan must not create fork state: {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn followed_symlink_alias_to_pi_home_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let (_home, home) = pi_home();
+        let live = tempfile::tempdir().unwrap();
+        let link = live.path().join("pi-link");
+        symlink(home.join(".pi"), &link).unwrap();
+        let declaration = format!("{}:ro:follow-links", live.path().display());
+        let store = tempfile::tempdir().unwrap();
+
+        let error = prepare(
+            parse_extra_mounts(std::slice::from_ref(&declaration)).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        // The *discovered* bind is the leak; the message names the declaration
+        // it came from, because the user never typed that path.
+        assert!(error.contains("discovered by --mount"), "{error}");
+        assert!(
+            error.contains(&live.path().display().to_string()),
+            "{error}"
+        );
+        assert!(store_tree(store.path()).is_empty(), "{error}");
+    }
+
+    #[test]
+    fn fork_of_pi_home_omits_both_files_and_copies_everything_else() {
+        let (_home, home) = pi_home();
+        fs::create_dir_all(home.join(".pi/extensions")).unwrap();
+        fs::write(home.join(".pi/extensions/x.js"), "x").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/pi:fork", home.join(".pi").display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("settings.json").is_file());
+        assert!(data.join("extensions/x.js").is_file());
+        // The containing directory stays; only the protected files are absent.
+        assert!(data.join("agent").is_dir());
+        assert!(!data.join("agent/auth.json").exists());
+        assert!(!data.join("agent/models.json").exists());
+        let notices = plan.notices.join("\n");
+        assert!(
+            notices.contains("Omitted host Pi credential file agent/auth.json"),
+            "{notices}"
+        );
+        assert!(
+            notices.contains("Omitted host Pi provider-configuration file agent/models.json"),
+            "{notices}"
+        );
+    }
+
+    #[test]
+    fn fork_follow_links_does_not_materialize_a_protected_target() {
+        use std::os::unix::fs::symlink;
+
+        let (_home, home) = pi_home();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("keep"), "keep").unwrap();
+        symlink(home.join(".pi/agent/auth.json"), source.path().join("link")).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!(
+                "{}:/guest:fork:follow-links",
+                source.path().display()
+            )])
+            .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("keep").is_file());
+        // Not a symlink, and not the materialized target: nothing at all.
+        assert!(!data.join("link").exists());
+        assert!(
+            plan.notices
+                .join("\n")
+                .contains("Omitted host Pi credential file link"),
+            "{:?}",
+            plan.notices
+        );
+    }
+
+    #[test]
+    fn fork_omits_a_hardlink_to_a_protected_file() {
+        let (_home, home) = pi_home();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("keep"), "keep").unwrap();
+        fs::hard_link(
+            home.join(".pi/agent/auth.json"),
+            source.path().join("copy.json"),
+        )
+        .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork", source.path().display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("keep").is_file());
+        assert!(!data.join("copy.json").exists());
+        assert!(
+            plan.notices
+                .join("\n")
+                .contains("Omitted host Pi credential file copy.json"),
+            "{:?}",
+            plan.notices
+        );
+    }
+
+    /// The identity signal alone fails this: the file does not exist when
+    /// `measure` runs, so it has no measured inode. Only the fork-root-relative
+    /// path signal catches it.
+    #[test]
+    fn fork_omits_a_protected_file_created_after_measurement() {
+        let _checkpoint_guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let source = tempfile::tempdir().unwrap();
+        let canonical = source.path().canonicalize().unwrap();
+        fs::write(canonical.join("keep"), "keep").unwrap();
+        // Arming on the *root* fires before the directory is enumerated, so
+        // the new file is deterministically mid-copy rather than racing
+        // readdir.
+        let target = canonical.clone();
+        set_copy_checkpoint(
+            &canonical,
+            Box::new(move |path| {
+                if path == target {
+                    fs::create_dir_all(target.join(".pi/agent")).unwrap();
+                    fs::write(target.join(".pi/agent/auth.json"), "{\"token\":\"t\"}").unwrap();
+                }
+            }),
+        );
+        let store = tempfile::tempdir().unwrap();
+        let result = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork", canonical.display())]).unwrap(),
+            // No `~/.pi` at measure time: the fork root is this home.
+            &context_with_home(store.path(), canonical.clone()),
+        );
+        clear_copy_checkpoint();
+        let plan = result.unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("keep").is_file());
+        assert!(!data.join(".pi/agent/auth.json").exists());
+        assert!(
+            plan.notices
+                .join("\n")
+                .contains("Omitted host Pi credential file .pi/agent/auth.json"),
+            "{:?}",
+            plan.notices
+        );
+        assert!(canonical.join(".pi/agent/auth.json").is_file());
+    }
+
+    #[test]
+    fn protected_refusal_precedes_validate_plan_topology_errors() {
+        let (_home, home) = pi_home();
+        let file = tempfile::tempdir().unwrap();
+        let plain = file.path().join("plain");
+        fs::write(&plain, "plain").unwrap();
+
+        // Both orders: a leaky plan that is *also* invalid still reports the
+        // leak, because every pass before this one is read-only.
+        for declarations in [
+            vec![
+                format!("{}:/leak:ro", home.join(".pi").display()),
+                format!("{}:/leak/f:ro", plain.display()),
+            ],
+            vec![
+                format!("{}:/leak/f:ro", plain.display()),
+                format!("{}:/leak:ro", home.join(".pi").display()),
+            ],
+        ] {
+            let store = tempfile::tempdir().unwrap();
+            let error = prepare(
+                parse_extra_mounts(&declarations).unwrap(),
+                &context_with_home(store.path(), home.clone()),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("would expose"), "{error}");
+            assert!(store_tree(store.path()).is_empty(), "{error}");
+        }
+
+        // The companion: an earlier-stage rejection still wins, pinning the
+        // honest precedence (side-effect freedom, not "security message
+        // first").
+        let store = tempfile::tempdir().unwrap();
+        let error = prepare(
+            parse_extra_mounts(&[
+                format!("{}:/fork:fork", plain.display()),
+                format!("{}:/leak:ro", home.join(".pi").display()),
+            ])
+            .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("a :fork source must be a directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn core_project_bind_that_is_home_is_refused() {
+        let (_home, home) = pi_home();
+        let store = tempfile::tempdir().unwrap();
+        let mut ctx = context_with_home(store.path(), home.clone());
+        ctx.core_host_sources = vec![home.clone()];
+
+        let error = prepare(Vec::new(), &ctx).unwrap_err().to_string();
+        assert!(error.contains("project directory"), "{error}");
+        assert!(
+            error.contains(&home.join(".pi/agent/auth.json").display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("instead of $HOME"), "{error}");
+        assert!(store_tree(store.path()).is_empty(), "{error}");
+    }
+
+    #[test]
+    fn core_project_bind_inside_pi_home_is_refused() {
+        let (_home, home) = pi_home();
+        let store = tempfile::tempdir().unwrap();
+        let mut ctx = context_with_home(store.path(), home.clone());
+        ctx.core_host_sources = vec![home.join(".pi")];
+
+        let error = prepare(Vec::new(), &ctx).unwrap_err().to_string();
+        assert!(error.contains("project directory"), "{error}");
+        assert!(
+            error.contains(&format!("outside {}", home.join(".pi").display())),
+            "{error}"
+        );
+
+        // An unrelated core source is untouched by the same check.
+        ctx.core_host_sources = vec![home.join("elsewhere")];
+        fs::create_dir(home.join("elsewhere")).unwrap();
+        assert!(prepare(Vec::new(), &ctx).is_ok());
+    }
+
+    #[test]
+    fn pi_home_advisories_repeat_on_a_reused_fork() {
+        let (_home, home) = pi_home();
+        let store = tempfile::tempdir().unwrap();
+        let declaration = format!("{}:/pi:fork", home.join(".pi").display());
+        let declaration = parse_extra_mounts(&[declaration]).unwrap();
+
+        let seeded = prepare(
+            declaration.clone(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        assert!(seeded.notices.join("\n").contains("Initialized fork"));
+        assert!(
+            seeded
+                .notices
+                .join("\n")
+                .contains("may not run in the Linux guest"),
+            "{:?}",
+            seeded.notices
+        );
+
+        // `preflight_forks` repoints the fork at its committed data, so a
+        // notice keyed on `mount.host` would silently stop firing here.
+        let reused = prepare(declaration, &context_with_home(store.path(), home.clone())).unwrap();
+        assert!(reused.notices.join("\n").contains("Reusing fork"));
+        assert!(
+            reused
+                .notices
+                .join("\n")
+                .contains("may not run in the Linux guest"),
+            "{:?}",
+            reused.notices
+        );
+    }
+
+    #[test]
+    fn pi_extensions_live_bind_warns_and_is_allowed() {
+        let (_home, home) = pi_home();
+        fs::create_dir_all(home.join(".pi/extensions")).unwrap();
+        fs::write(home.join(".pi/extensions/x.js"), "x").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:ro", home.join(".pi/extensions").display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+
+        let notices = plan.notices.join("\n");
+        assert!(
+            notices.contains("is a live bind of host Pi state"),
+            "{notices}"
+        );
+        assert!(
+            notices.contains("may be built for this host's OS/arch"),
+            "{notices}"
+        );
+        assert!(!notices.contains("Omitted"), "{notices}");
+    }
+
+    #[test]
+    fn non_pi_mounts_and_forks_are_unchanged() {
+        let (_home, home) = pi_home();
+        for (label, home_home) in [("pi home present", Some(home.clone())), ("no .pi", None)] {
+            let home_home = home_home.unwrap_or_else(test_home);
+            let source = tempfile::tempdir().unwrap();
+            fs::write(source.path().join("seed"), "seed").unwrap();
+            let store = tempfile::tempdir().unwrap();
+            let plan = prepare(
+                parse_extra_mounts(&[format!("{}:ro", source.path().display())]).unwrap(),
+                &context_with_home(store.path(), home_home.clone()),
+            )
+            .unwrap();
+            assert!(plan.notices.is_empty(), "{label}: {:?}", plan.notices);
+
+            let store = tempfile::tempdir().unwrap();
+            let fork = prepare(
+                parse_extra_mounts(&[format!("{}:/guest:fork", source.path().display())]).unwrap(),
+                &context_with_home(store.path(), home_home),
+            )
+            .unwrap();
+            let notices = fork.notices.join("\n");
+            assert!(!notices.contains("Omitted"), "{label}: {notices}");
+            assert!(!notices.contains("host Pi state"), "{label}: {notices}");
+        }
+    }
+
+    #[test]
+    fn identity_version_v3_reseeds_a_v2_fork_and_reports_the_orphan() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("seed"), "seed").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let request =
+            parse_extra_mounts(&[format!("{}:/guest:fork", source.path().display())]).unwrap();
+        let legacy = store
+            .path()
+            .join("forks")
+            .join(fork_id(&request[0], LEGACY_IDENTITY_VERSION_V2));
+        fs::create_dir_all(legacy.join("data")).unwrap();
+        fs::write(legacy.join("data/agent-auth.json"), "old credential copy").unwrap();
+
+        let plan = prepare(request, &context(store.path())).unwrap();
+        let data = fork_data(&plan);
+
+        assert_ne!(data, legacy.join("data"), "a v2 fork must not be reused");
+        assert_eq!(fs::read_to_string(data.join("seed")).unwrap(), "seed");
+        assert!(
+            legacy.join("data/agent-auth.json").is_file(),
+            "the orphan is reported, never deleted"
+        );
+        let notices = plan.notices.join("\n");
+        assert!(
+            notices.contains("A fork from an earlier agent-vm build is no longer used"),
+            "{notices}"
+        );
+        assert!(notices.contains(&legacy.display().to_string()), "{notices}");
+    }
+
+    #[test]
+    fn no_home_refuses_a_declared_mount_but_not_an_empty_plan() {
+        let source = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let ctx = context_without_home(store.path());
+        assert!(prepare(Vec::new(), &ctx).is_ok());
+
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:ro", source.path().display())]).unwrap(),
+            &ctx,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("$HOME is not set"), "{error}");
+        assert!(store_tree(store.path()).is_empty(), "{error}");
     }
 }
