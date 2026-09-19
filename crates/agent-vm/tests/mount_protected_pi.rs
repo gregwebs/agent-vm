@@ -370,29 +370,59 @@ fn fork_of_the_host_pi_home_boots_with_credentials_omitted() {
     );
 }
 
+/// `$HOME` unset does **not** make the home unknowable (finding MF1):
+/// `run.rs` falls back to the account record (`getpwuid_r(geteuid()).pw_dir`),
+/// so a declared `--mount` is no longer refused merely because the environment
+/// did not carry `$HOME`. The dumped config proves the launch got past
+/// `mount::prepare` and `builder.build()` ran.
 #[test]
-fn unset_home_with_a_mount_is_refused() {
+fn unset_home_with_a_mount_uses_the_account_record() {
     let h = Harness::new();
     let source = h.home_path().join("notes");
     std::fs::create_dir(&source).unwrap();
     let mount = format!("{}:ro", source.display());
 
-    let refused = h.run_verb(
+    let launched = h.run_verb(
         "shell",
         &[&mount],
         /* set_home */ false,
         h.project.path(),
     );
-    let stderr = stderr_of(&refused);
-    assert!(!refused.status.success(), "{stderr}");
-    assert!(stderr.contains("$HOME is not set"), "{stderr}");
-    assert_no_launch_side_effects(&h, &stderr);
+    let stderr = stderr_of(&launched);
+    assert!(!stderr.contains("$HOME is not set"), "{stderr}");
+    assert!(
+        !stderr.contains("neither $HOME nor the account record"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("[debug] sandbox config JSON"), "{stderr}");
+}
+
+/// The other half of MF1: with `$HOME` unset the account record still supplies
+/// the route set, so a bind of an ancestor of *that* home is refused (or
+/// advised) rather than silently greeted with `==> Booting sandbox`.
+///
+/// `/` is an ancestor of every home, so this pins the fix without knowing the
+/// machine's account record: it is exactly the case the old code failed open
+/// on, because an empty route set matched nothing.
+#[test]
+fn unset_home_still_protects_an_ancestor_of_the_account_record_home() {
+    let h = Harness::new();
+
+    let out = h.run_verb(
+        "shell",
+        &["/:/host-root:ro"],
+        /* set_home */ false,
+        h.project.path(),
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("would expose"), "{stderr}");
+    assert!(!stderr.contains("$HOME is not set"), "{stderr}");
 }
 
 #[test]
 fn mount_of_an_unrelated_home_subdir_still_works() {
     let h = Harness::new();
-    h.seed_pi_home();
+    let pi_home = h.seed_pi_home();
     let notes = h.home_path().join("notes");
     std::fs::create_dir(&notes).unwrap();
     std::fs::write(notes.join("note.md"), "note").unwrap();
@@ -410,6 +440,16 @@ fn mount_of_an_unrelated_home_subdir_still_works() {
     );
     // No Pi advisory: the mount is not inside the Pi home and exposes nothing.
     assert!(!stderr.contains("host Pi state"), "{stderr}");
+    // The stronger boot-free substitute for the mid-session TOCTOU: an allowed
+    // launch binds *nothing* under the Pi home, so nothing there can change
+    // under the guest's feet.
+    assert!(
+        !binds
+            .iter()
+            .any(|(host, _, _)| Path::new(host).starts_with(&pi_home)),
+        "an allowed launch must not bind anything under {}: {binds:?}",
+        pi_home.display()
+    );
 }
 
 #[test]

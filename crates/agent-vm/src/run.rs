@@ -20,6 +20,7 @@ use crate::config::{self, CatalogEntry, Tool};
 use crate::credential_provider;
 use crate::layer;
 use crate::mount;
+use crate::protected_host_files::CoreHostSource;
 use crate::session::ProjectSession;
 use crate::tool_layer;
 use crate::user;
@@ -1020,7 +1021,13 @@ pub(crate) async fn launch(
     // Independent of `guest_identity` (which is `None` under `--root`) so
     // the `--mount …:follow-links` $HOME guardrail is still enforced in
     // root mode instead of silently no-op'ing. See `mount::expand_follow_links`.
-    let mount_home = env::var("HOME").ok().map(PathBuf::from);
+    //
+    // `$HOME` unset does **not** mean the home is unknown: `host_home_dir`
+    // falls back to the account record, so a daemon/`env -i`/CI launch still
+    // locates the Pi home instead of failing open on the core project bind
+    // (ADR-0020). `None` here means neither source named a home, which
+    // `ProtectedHostFiles::require_home` refuses on.
+    let mount_home = user::host_home_dir();
 
     let session = ProjectSession::for_cwd()?;
     // AC#6 (agent-vm issue #40): fail closed, before touching the
@@ -1056,10 +1063,11 @@ pub(crate) async fn launch(
             // The project bind is the canonicalized cwd and writable, so
             // `cd ~ && agent-vm shell` would hand the guest the host `$HOME`
             // with no `--mount` at all. agent-vm's own binds are checked
-            // exactly like an explicit mount.
+            // exactly like an explicit mount, and each carries its role so a
+            // refusal names the bind it actually is.
             core_host_sources: core_volumes
                 .iter()
-                .map(|volume| volume.host_path.clone())
+                .map(|volume| CoreHostSource::new(volume.bind, volume.host_path.clone()))
                 .collect(),
         },
     )

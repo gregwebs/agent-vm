@@ -2,7 +2,8 @@
 //! decision that says whether a mount would hand one over.
 //!
 //! Pi (issue #90/#95/#96) keeps imported host credentials **host-side** and
-//! gives the guest placeholders (ADR-0011). A mount that put Pi's real
+//! gives the guest placeholders — Pi's mixed credential ownership, an ADR in
+//! another workstream (see #91/#94). A mount that put Pi's real
 //! `~/.pi/agent/auth.json` in front of the guest would defeat that for the one
 //! tool agent-vm is about to launch, so this module owns the whole of "which
 //! host files must never reach the guest, and is this mount one of the ways
@@ -11,7 +12,7 @@
 //! A caller hands in a path or an `fstat` result and gets a verdict; it never
 //! sees `dev`/`ino`, the route set, or Pi's on-disk layout.
 //! [`ProtectedHostFiles::measure`] is the trusted adapter (all the I/O);
-//! [`exposing_index`]/[`byte_path_contains`] are the pure decisions,
+//! [`exposing_index`] and `config::byte_path_contains` are the pure decisions,
 //! machine-checked per ADR-0018.
 //!
 //! **Why not `host_paths.rs`** (which the issue lists): that module is the
@@ -88,11 +89,79 @@ struct Route {
     relative: PathBuf,
 }
 
+/// One of agent-vm's own binds: *which* bind it is. The role is load-bearing
+/// for the refusal text, not decoration — agent-vm makes three core binds
+/// (guest home, project, state) and only one of them is the project, so a
+/// broad `AGENT_VM_STATE_DIR` must not be reported as "the project directory"
+/// or get the cwd-specific remedy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoreBind {
+    /// The project bind: the canonicalized cwd.
+    ProjectDir,
+    /// The `<state dir> -> /agent-vm-state` bind.
+    StateDir,
+    /// The guest-`$HOME` bind, whose source is agent-vm's own state directory.
+    GuestHome,
+}
+
+impl CoreBind {
+    fn description(self) -> &'static str {
+        match self {
+            Self::ProjectDir => "project directory",
+            Self::StateDir => "state directory",
+            Self::GuestHome => "guest home bind",
+        }
+    }
+
+    /// The remedy for an *exposure* of this bind, in the terms the user
+    /// actually controls (the cwd for the project bind, `AGENT_VM_STATE_DIR`
+    /// for state).
+    fn remedy(self, source: &Path, pi_home: Option<&Path>) -> String {
+        match (self, pi_home) {
+            // The common case: the project bind *is* `$HOME`.
+            (Self::ProjectDir, Some(pi_home)) if pi_home.parent() == Some(source) => {
+                "run agent-vm from a project directory instead of $HOME".to_string()
+            }
+            (Self::ProjectDir, Some(pi_home)) => format!(
+                "run agent-vm from a project directory outside {}",
+                pi_home.display()
+            ),
+            (Self::StateDir, Some(pi_home)) => {
+                format!("point AGENT_VM_STATE_DIR outside {}", pi_home.display())
+            }
+            (Self::GuestHome, Some(pi_home)) => format!(
+                "move agent-vm's state directory outside {}",
+                pi_home.display()
+            ),
+            (_, None) => "run agent-vm from a directory that does not contain it".to_string(),
+        }
+    }
+}
+
+/// One of agent-vm's own binds: the role, and the host directory it exposes.
+#[derive(Clone, Debug)]
+pub(crate) struct CoreHostSource {
+    pub(crate) bind: CoreBind,
+    pub(crate) path: PathBuf,
+}
+
+impl CoreHostSource {
+    pub(crate) fn new(bind: CoreBind, path: PathBuf) -> Self {
+        Self { bind, path }
+    }
+}
+
 /// The measured physical route set of every protected file, plus Pi's home.
 #[derive(Debug)]
 pub(crate) struct ProtectedHostFiles {
-    /// `$HOME/.pi`, once `$HOME` is known — `None` only when `$HOME` is unset.
+    /// `$HOME/.pi`, once `$HOME` is known — `None` only when neither `$HOME`
+    /// nor the account record could name a home.
     pi_home: Option<PathBuf>,
+    /// The canonical target of [`Self::pi_home`], when it resolves. It differs
+    /// from the spelling only when `~/.pi` is itself a symlink; both spellings
+    /// are recognised so `:fork` is recommended at the *target* of such a link
+    /// too (ADR-0020).
+    resolved_pi_home: Option<PathBuf>,
     severity: Severity,
     routes: Vec<Route>,
     /// `(dev, ino)` of the protected files themselves (not their ancestors),
@@ -107,10 +176,17 @@ pub(crate) struct ProtectedHostFiles {
 #[derive(Debug)]
 pub(crate) struct Exposure {
     pub(crate) file: ProtectedFile,
-    /// The protected file's own path, for the message.
+    /// The protected file's own **canonical** path, for the message.
     pub(crate) host_path: PathBuf,
+    /// The root's canonical path. Printed, so a `--mount /tmp/…` spelling on
+    /// macOS does not read as a different directory from the canonical file
+    /// path beside it, and consulted for the remedy below.
+    pub(crate) root: PathBuf,
     /// Its path inside this mount root (`""` = the root *is* the file).
     pub(crate) relative: PathBuf,
+    /// Whether the root is a regular file. A file root has **no** `:fork`
+    /// remedy: `:fork` sources must be directories.
+    pub(crate) is_file: bool,
     pub(crate) severity: Severity,
 }
 
@@ -128,6 +204,7 @@ impl ProtectedHostFiles {
         let Some(home) = host_home else {
             return Ok(Self {
                 pi_home: None,
+                resolved_pi_home: None,
                 severity: Severity::Advise,
                 routes: Vec::new(),
                 identity_ids: Vec::new(),
@@ -146,6 +223,11 @@ impl ProtectedHostFiles {
             }
         };
         let pi_home = base.join(PI_HOME_NAME);
+        // The canonical target, when `~/.pi` is a symlink to the Pi home
+        // somewhere else. It is *not* a substitute for `pi_home` as a route
+        // (the route set is the resolver's job); it exists so the *remedy* and
+        // the advisories recognise the target spelling too.
+        let resolved_pi_home = pi_home.canonicalize().ok();
         let severity = match fs::symlink_metadata(&pi_home) {
             // Existence of the *files* is irrelevant: the Pi home is what makes
             // a live window dangerous (see `Severity`).
@@ -174,6 +256,7 @@ impl ProtectedHostFiles {
         }
         Ok(Self {
             pi_home: Some(pi_home),
+            resolved_pi_home,
             severity,
             routes,
             identity_ids,
@@ -182,13 +265,19 @@ impl ProtectedHostFiles {
     }
 
     /// Fail closed when a launch declares mounts we cannot reason about:
-    /// without `$HOME` we cannot locate the Pi home (it may still exist on disk
+    /// without a home we cannot locate the Pi home (it may still exist on disk
     /// under a daemon or CI), so we cannot decide.
+    ///
+    /// This is the **fallback** path only. `run.rs` resolves the launch's home
+    /// as `$HOME`, or the account record's `pw_dir` when `$HOME` is unset, so
+    /// an `env -i`/daemon/CI launch still gets a real home and this refusal is
+    /// reached only when *both* sources fail (no passwd entry for the uid).
     pub(crate) fn require_home(&self, mount_count: usize) -> Result<()> {
         if self.pi_home.is_none() && mount_count > 0 {
             bail!(
-                "$HOME is not set, so agent-vm cannot tell whether a --mount would expose host \
-                 Pi credential files. Set HOME, or drop --mount."
+                "neither $HOME nor the account record could name your home directory, so agent-vm \
+                 cannot tell whether a --mount would expose host Pi credential files. Set HOME, \
+                 or drop --mount."
             );
         }
         Ok(())
@@ -213,12 +302,16 @@ impl ProtectedHostFiles {
         Ok(relatives)
     }
 
-    /// Advisory-only: is `root` at/inside the host Pi home? Path-based, so an
-    /// aliased spelling may miss a *warning*; it is never a refusal.
+    /// Advisory-only: is `root` at/inside the host Pi home? Recognises both
+    /// spellings (`~/.pi` and, when it is a symlink, its canonical target).
+    /// Path-based, so an alias reached any other way may miss a *warning*;
+    /// it is never a refusal. `Path::starts_with` is true for equal paths, so
+    /// the Pi home itself is covered without a separate equality test.
     pub(crate) fn inside_pi_home(&self, root: &Path) -> bool {
-        self.pi_home
-            .as_ref()
-            .is_some_and(|pi_home| root == pi_home || root.starts_with(pi_home))
+        [&self.pi_home, &self.resolved_pi_home]
+            .into_iter()
+            .flatten()
+            .any(|pi_home| root.starts_with(pi_home))
     }
 
     /// The identity set the fork copier consults per `fstat`ed node.
@@ -235,11 +328,16 @@ impl ProtectedHostFiles {
 
     /// Human-readable refusal for an explicit or `follow-links`-discovered
     /// live bind. One place, so tests assert one string.
+    ///
+    /// `discovered_by` is the *rendered* provenance of a discovered bind
+    /// (e.g. ``--mount ~/code:follow-links``), not a spelling to wrap: two
+    /// `:follow-links` declarations can discover one bind, and the caller is
+    /// the only place that knows whether the attribution is unambiguous.
     pub(crate) fn message(
         &self,
         source_spelling: &str,
         exposure: &Exposure,
-        discovered_from: Option<&str>,
+        discovered_by: Option<&str>,
     ) -> String {
         if exposure.severity == Severity::Advise {
             return format!(
@@ -247,42 +345,124 @@ impl ProtectedHostFiles {
                  login` on the host; there is no ~/{PI_HOME_NAME} today"
             );
         }
-        let discovered = match discovered_from {
-            Some(from) => format!(" (discovered by --mount {from}:follow-links)"),
+        let discovered = match discovered_by {
+            Some(from) => format!(" (discovered by {from})"),
             None => String::new(),
         };
         format!(
             "--mount {source_spelling} would expose the {} {}{}{discovered}\n\
              agent-vm keeps host Pi credentials host-side and gives the guest placeholders.\n\
-             Use `--mount {source_spelling}:fork` (a fork copies the source once and omits that \
-             file), or mount a path that does not contain it.",
+             {}",
             exposure.file.description(),
             exposure.host_path.display(),
             inside(exposure),
+            self.remedy(source_spelling, exposure),
         )
     }
 
-    /// Human-readable refusal for one of agent-vm's own binds. Names the remedy
-    /// in *cwd* terms: the project bind is the canonicalized cwd, so a launch
-    /// from `$HOME` (or from inside `~/.pi`) is what exposes the file.
-    pub(crate) fn core_message(&self, source: &Path, exposure: &Exposure) -> String {
-        let remedy = match self.pi_home() {
-            Some(pi_home) if pi_home.parent() == Some(source) => {
-                "run agent-vm from a project directory instead of $HOME".to_string()
-            }
-            Some(pi_home) => format!(
-                "run agent-vm from a project directory outside {}",
-                pi_home.display()
-            ),
-            None => "run agent-vm from a project directory that does not contain it".to_string(),
-        };
+    /// The remedy sentence for one exposure, **conditional on the root**.
+    ///
+    /// A blind `:fork` recommendation is harmful or impossible for two common
+    /// roots: forking `$HOME` copies every *other* secret in it into project
+    /// state (a worse exposure than the live bind being refused), and a
+    /// regular file cannot be forked at all — `:fork` sources must be
+    /// directories. `:fork` is exactly right at or inside the Pi home, which
+    /// is the case it was written for.
+    fn remedy(&self, source_spelling: &str, exposure: &Exposure) -> String {
+        if exposure.is_file {
+            return "Mount a different source instead: this file cannot be mounted at all."
+                .to_string();
+        }
+        if self.inside_pi_home(&exposure.root) {
+            return format!(
+                "Use `--mount {source_spelling}:fork` (a fork copies the source once and omits \
+                 that file), or mount a path that does not contain it."
+            );
+        }
+        // Broad (an ancestor *above* the Pi home: `$HOME`, `/`) or an
+        // unrelated branch (a symlinked Pi home's target parent). Forking it
+        // would copy everything under the source — including every other
+        // secret there — into writable project state.
         format!(
-            "the project directory {} contains the {} {}{}; {remedy}",
-            source.display(),
+            "Mount a narrower path that does not contain it. `--mount {source_spelling}:fork` is \
+             not a substitute here: it copies everything under {source_spelling} into project \
+             state."
+        )
+    }
+
+    /// Human-readable refusal for one of agent-vm's own binds. Names the bind's
+    /// role (project / state / guest home) and the remedy in the terms the user
+    /// controls, because the project bind is the canonicalized cwd while the
+    /// other two come from agent-vm's own state directory.
+    pub(crate) fn core_message(&self, source: &CoreHostSource, exposure: &Exposure) -> String {
+        format!(
+            "agent-vm's {} {} contains the {} {}{}; {}",
+            source.bind.description(),
+            source.path.display(),
             exposure.file.description(),
             exposure.host_path.display(),
             inside(exposure),
+            source.bind.remedy(&source.path, self.pi_home()),
         )
+    }
+
+    /// The advisories for a `--mount` declaration at/inside the Pi home:
+    /// `live_bind` adds the `:fork` recommendation (a fork's *content* is
+    /// already handled by the copy engine, so it needs only the
+    /// platform-artifact warning). Advisory-only — never a refusal.
+    pub(crate) fn mount_advisories(
+        &self,
+        declaration: &Path,
+        source_spelling: &str,
+        live_bind: bool,
+    ) -> Vec<String> {
+        if !self.inside_pi_home(declaration) {
+            return Vec::new();
+        }
+        let mut advisories = Vec::new();
+        if live_bind {
+            advisories.push(format!(
+                "==> {source_spelling} is a live bind of host Pi state; :fork is recommended so \
+                 the guest cannot write host Pi state and host changes cannot leak in"
+            ));
+        }
+        advisories.extend(self.platform_artifact_advisories());
+        advisories
+    }
+
+    /// The advisories for one of agent-vm's own binds at/inside the Pi home.
+    /// `~/.pi/extensions` as the *project* bind is a writable live window onto
+    /// host Pi state with no `--mount` at all, which is exactly the case #90's
+    /// warning deliverable is about.
+    pub(crate) fn core_advisories(&self, source: &CoreHostSource) -> Vec<String> {
+        if !self.inside_pi_home(&source.path) {
+            return Vec::new();
+        }
+        let mut advisories = vec![format!(
+            "==> agent-vm's {} {} is a live bind of host Pi state; {} so the guest cannot write \
+             host Pi state and host changes cannot leak in",
+            source.bind.description(),
+            source.path.display(),
+            source.bind.remedy(&source.path, self.pi_home()),
+        )];
+        advisories.extend(self.platform_artifact_advisories());
+        advisories
+    }
+
+    /// Host Pi artifacts may be built for this host's OS/arch. Fires for every
+    /// mount or core bind at/inside the Pi home, on every launch — including a
+    /// reused fork, whose `host` `preflight_forks` has repointed at committed
+    /// data.
+    fn platform_artifact_advisories(&self) -> Vec<String> {
+        self.pi_home()
+            .map(|pi_home| {
+                vec![format!(
+                    "==> Host Pi extensions and installed packages under {} may be built for this \
+                     host's OS/arch and may not run in the Linux guest",
+                    pi_home.display()
+                )]
+            })
+            .unwrap_or_default()
     }
 
     /// Every route `root` hits, deepest first. Pure over the measured routes.
@@ -298,15 +478,17 @@ impl ProtectedHostFiles {
         };
         let dev = metadata.dev();
         let ino = metadata.ino();
+        let is_file = metadata.is_file();
         let canonical =
             fs::canonicalize(root).context(cannot_determine(&root.display().to_string()))?;
         let mut hits = Vec::new();
         for route in &self.routes {
             // Identity folds aliases paths cannot: `canonicalize` does not fold
-            // macOS firmlinks or Linux host bind mounts. Containment covers
-            // filesystems where inode identity is unreliable.
+            // macOS firmlinks or Linux host bind mounts. Containment decides
+            // the ordinary case, and the case a root's canonical path equals a
+            // route's while `(dev, ino)` differ — see ADR-0020.
             let identity = route.dev == dev && route.ino == ino;
-            let contained = byte_path_contains(
+            let contained = crate::config::byte_path_contains(
                 canonical.as_os_str().as_bytes(),
                 route.canonical.as_os_str().as_bytes(),
             );
@@ -323,7 +505,9 @@ impl ProtectedHostFiles {
             hits.push(Exposure {
                 file: route.file,
                 host_path: relative_from(&route.canonical, &route.relative),
+                root: canonical.clone(),
                 relative,
+                is_file,
                 severity: self.severity,
             });
         }
@@ -421,12 +605,19 @@ fn relative_from(base: &Path, remaining: &Path) -> PathBuf {
     }
 }
 
-/// `--mount {src} would expose … (as {relative} inside that mount)`.
+/// `--mount {src} would expose … (as {relative} inside {root})`. The root is
+/// printed **canonically**, so on macOS a `--mount /tmp/…` spelling (whose real
+/// path is `/private/tmp/…`) does not read as a different directory from the
+/// canonical file path beside it.
 fn inside(exposure: &Exposure) -> String {
     if exposure.relative.as_os_str().is_empty() {
         String::new()
     } else {
-        format!(" (as {} inside that mount)", exposure.relative.display())
+        format!(
+            " (as {} inside {})",
+            exposure.relative.display(),
+            exposure.root.display()
+        )
     }
 }
 
@@ -478,54 +669,6 @@ pub fn exposing_index(dev: u64, ino: u64, ids: &[(u64, u64)]) -> (result: Option
         i += 1;
     }
     None
-}
-
-/// `ancestor` is `descendant` itself, or a whole **component-wise** prefix of
-/// it: `a/b` is one of `a/b/c` but `a/b` is *not* one of `a/bc`. The
-/// containment half of the exposure decision, reusing `config.rs`'s already
-/// proved `is_separator_prefix` so the sibling-prefix property is
-/// machine-checked rather than re-tested. Byte-level so the decision is
-/// translatable; the `Path` → bytes measurement is the trusted adapter in
-/// `ProtectedHostFiles::matches`.
-pub fn byte_path_contains(ancestor: &[u8], descendant: &[u8]) -> (result: bool)
-    ensures
-        result == (ancestor@ == descendant@
-            || crate::config::is_separator_prefix(ancestor@, descendant@)),
-{
-    let alen = ancestor.len();
-    let dlen = descendant.len();
-    assert(alen == ancestor@.len());
-    assert(dlen == descendant@.len());
-    // A longer "ancestor" is never a prefix of its descendant.
-    if alen > dlen {
-        assert(ancestor@ != descendant@);
-        assert(!crate::config::is_separator_prefix(ancestor@, descendant@));
-        return false;
-    }
-    let mut i: usize = 0;
-    while i < alen
-        invariant
-            i <= alen,
-            alen <= dlen,
-            alen == ancestor@.len(),
-            dlen == descendant@.len(),
-            forall|j: int| 0 <= j < i ==> ancestor@[j] == descendant@[j],
-        decreases alen - i,
-    {
-        if ancestor[i] != descendant[i] {
-            assert(ancestor@ != descendant@);
-            assert(!crate::config::is_separator_prefix(ancestor@, descendant@));
-            return false;
-        }
-        i += 1;
-    }
-    if alen == dlen {
-        assert(ancestor@ =~= descendant@);
-        true
-    } else {
-        assert(forall|j: int| 0 <= j < alen ==> ancestor@[j] == descendant@[j]);
-        descendant[alen] == crate::config::GUEST_PATH_SEPARATOR
-    }
 }
 
 } // verus!
@@ -703,23 +846,53 @@ mod tests {
         let protected = ProtectedHostFiles::measure(Some(&home)).unwrap();
         let exposure = protected.exposure(&home.join(".pi")).unwrap().unwrap();
 
+        // The Pi home itself: `:fork` is exactly the remedy (a fork omits the
+        // protected files and copies everything else).
         assert_eq!(
             protected.message("~/.pi", &exposure, None),
             format!(
-                "--mount ~/.pi would expose the host Pi credential file {}/.pi/agent/auth.json \
-                 (as agent/auth.json inside that mount)\n\
+                "--mount ~/.pi would expose the host Pi credential file {home}/.pi/agent/auth.json \
+                 (as agent/auth.json inside {home}/.pi)\n\
                  agent-vm keeps host Pi credentials host-side and gives the guest placeholders.\n\
                  Use `--mount ~/.pi:fork` (a fork copies the source once and omits that file), \
                  or mount a path that does not contain it.",
-                home.display()
+                home = home.display()
             )
         );
         // A discovered bind names the declaration it came from.
         assert!(
             protected
-                .message("~/.pi", &exposure, Some("~/code"))
+                .message("~/.pi", &exposure, Some("--mount ~/code:follow-links"))
                 .contains("(discovered by --mount ~/code:follow-links)")
         );
+
+        // A root *above* the Pi home ($HOME, `/`, …): forking it would copy
+        // every other secret under it into project state, so the message must
+        // lead with a narrower path and must not present `:fork` as the fix.
+        let broad = protected.exposure(&home).unwrap().unwrap();
+        let message = protected.message(&home.display().to_string(), &broad, None);
+        assert!(message.contains("Mount a narrower path"), "{message}");
+        assert!(
+            !message.contains(&format!("Use `--mount {}:fork`", home.display())),
+            "a broad root must not recommend forking itself: {message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "it copies everything under {} into project state",
+                home.display()
+            )),
+            "{message}"
+        );
+
+        // A root that *is* the credential file: `:fork` is impossible (a
+        // `:fork` source must be a directory), so it must not be mentioned.
+        let file = protected
+            .exposure(&home.join(".pi/agent/auth.json"))
+            .unwrap()
+            .unwrap();
+        let message = protected.message("~/.pi/agent/auth.json", &file, None);
+        assert!(message.contains("cannot be mounted at all"), "{message}");
+        assert!(!message.contains(":fork"), "{message}");
     }
 
     /// A dangling link is not an undecidable ancestor: it resolves nowhere, so
@@ -752,21 +925,40 @@ mod tests {
 
     #[test]
     fn sibling_prefix_is_not_a_hit() {
+        // Guard the naive `starts_with` byte-prefix version of containment.
+        assert!(!crate::config::byte_path_contains(
+            b"/a/pi",
+            b"/a/pistachio"
+        ));
+        assert!(crate::config::byte_path_contains(b"/a/pi", b"/a/pi"));
+        assert!(crate::config::byte_path_contains(b"/a/pi", b"/a/pi/x"));
+
+        // The `exposure` half needs a root that a naive byte-prefix
+        // implementation would actually get wrong. `exposure(~/pistachio)`
+        // cannot be that case: every route is an ancestor of the *file*, so a
+        // plain sibling under `$HOME` is either longer than the route or
+        // mismatches before the separator. A route whose canonical path merely
+        // *begins with* the root's bytes has to be constructed: make `~/.pi` a
+        // symlink to `<tmp>/pistachio/pi` and mount the sibling `<tmp>/pi`.
         let (_home, home) = home();
-        write(&home.join(".pi/agent/auth.json"), "{\"token\":\"t\"}");
-        fs::create_dir(home.join(".pistachio")).unwrap();
-        fs::create_dir(home.join(".pi-old")).unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let target = target_root.path().canonicalize().unwrap();
+        write(&target.join("pistachio/pi/agent/auth.json"), "{}");
+        std::os::unix::fs::symlink(target.join("pistachio/pi"), home.join(".pi")).unwrap();
+        fs::create_dir(target.join("pi")).unwrap();
         let protected = ProtectedHostFiles::measure(Some(&home)).unwrap();
 
-        // Guard the naive `starts_with` byte-prefix version of containment.
-        assert!(!byte_path_contains(b"/a/pi", b"/a/pistachio"));
-        for sibling in [home.join(".pistachio"), home.join(".pi-old")] {
-            assert!(
-                protected.exposure(&sibling).unwrap().is_none(),
-                "{} must not be a hit",
-                sibling.display()
-            );
-        }
+        assert!(
+            protected
+                .exposure(&target.join("pistachio/pi"))
+                .unwrap()
+                .is_some(),
+            "the symlink target itself is the Pi home"
+        );
+        assert!(
+            protected.exposure(&target.join("pi")).unwrap().is_none(),
+            "<tmp>/pi is a byte prefix of <tmp>/pistachio but not a containing component"
+        );
     }
 
     #[test]
@@ -809,7 +1001,10 @@ mod tests {
         let protected = ProtectedHostFiles::measure(None).unwrap();
         assert!(protected.require_home(0).is_ok());
         let error = protected.require_home(1).unwrap_err().to_string();
-        assert!(error.contains("$HOME is not set"), "{error}");
+        assert!(
+            error.contains("neither $HOME nor the account record"),
+            "{error}"
+        );
         assert!(protected.exposure(Path::new("/")).unwrap().is_none());
         assert!(!protected.inside_pi_home(Path::new("/.pi")));
     }
@@ -838,28 +1033,6 @@ mod tests {
         ) {
             let naive = ids.iter().position(|entry| *entry == (dev, ino));
             proptest::prop_assert_eq!(exposing_index(dev, ino, &ids), naive);
-        }
-
-        /// A genuinely independent oracle: `Path::components` rather than a
-        /// re-implementation of the loop.
-        #[test]
-        fn byte_path_contains_matches_components_oracle(
-            ancestor in proptest::collection::vec("[a-z]{1,3}", 1..4),
-            extra in proptest::collection::vec("[a-z]{1,3}", 0..3),
-            other in proptest::collection::vec("[a-z]{1,3}", 1..4),
-        ) {
-            use std::ffi::OsStr;
-            use std::os::unix::ffi::OsStrExt;
-            let descendant = ancestor.iter().chain(&extra).cloned().collect::<Vec<_>>().join("/");
-            let ancestor_path = ancestor.join("/");
-            for candidate in [descendant.as_str(), other.join("/").as_str()] {
-                let a = Path::new(OsStr::from_bytes(ancestor_path.as_bytes()));
-                let d = Path::new(OsStr::from_bytes(candidate.as_bytes()));
-                proptest::prop_assert_eq!(
-                    byte_path_contains(a.as_os_str().as_bytes(), candidate.as_bytes()),
-                    d.starts_with(a),
-                );
-            }
         }
     }
 }

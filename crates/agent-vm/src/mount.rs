@@ -11,8 +11,10 @@ use anyhow::{Context, Result};
 #[cfg(test)]
 use microsandbox::sandbox::MountBuilder;
 
+#[cfg(test)]
+use crate::protected_host_files::CoreBind;
 use crate::protected_host_files::{
-    ProtectedFile, ProtectedHostFiles, ProtectedIdentities, Severity,
+    CoreHostSource, ProtectedFile, ProtectedHostFiles, ProtectedIdentities, Severity,
 };
 use crate::run::guest_path_is_mountable;
 
@@ -1075,7 +1077,7 @@ mod tests {
             &mut mounts,
             store.path(),
             &std::collections::HashMap::new(),
-            &ProtectedHostFiles::measure(None).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1093,7 +1095,7 @@ mod tests {
             &mut again,
             store.path(),
             &std::collections::HashMap::new(),
-            &ProtectedHostFiles::measure(None).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1773,11 +1775,11 @@ pub(crate) struct MountContext {
     /// replace one: that would silently change HOME/project/state semantics.
     pub(crate) core_guest_mounts: Vec<PathBuf>,
     /// Host sources of agent-vm's own binds (guest HOME, project dir, state
-    /// dir).  Checked for protected-file exposure exactly like an explicit
-    /// mount, because the project bind is the canonicalized cwd and is
-    /// writable (`session.rs:45`): `cd ~ && agent-vm shell` would hand the
-    /// guest the whole host `$HOME`.
-    pub(crate) core_host_sources: Vec<PathBuf>,
+    /// dir) with the role each one plays. Checked for protected-file exposure
+    /// exactly like an explicit mount, because the project bind is the
+    /// canonicalized cwd and is writable (`session.rs:45`): `cd ~ && agent-vm
+    /// shell` would hand the guest the whole host `$HOME`.
+    pub(crate) core_host_sources: Vec<CoreHostSource>,
 }
 
 /// Normalize the guest spelling before it participates in identity or
@@ -1820,14 +1822,24 @@ pub(crate) fn prepare(
     // with no `--mount` at all.
     let protected = ProtectedHostFiles::measure(context.host_home.as_deref())?;
     let mut notices = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for source in &context.core_host_sources {
-        let Some(exposure) = protected.exposure(source)? else {
+        // The Pi advisories fire for one of agent-vm's *own* binds too, not
+        // just for `--mount`s: `~/.pi/extensions` as the canonicalized cwd is
+        // a writable live window onto host Pi state with no `--mount` at all
+        // (issue #90's warning deliverable).
+        for advisory in protected.core_advisories(source) {
+            push_notice(&mut notices, &mut seen, advisory);
+        }
+        let Some(exposure) = protected.exposure(&source.path)? else {
             continue;
         };
         match exposure.severity {
             Severity::Refuse => anyhow::bail!("{}", protected.core_message(source, &exposure)),
             Severity::Advise => {
-                notices.push(protected.message(&source.display().to_string(), &exposure, None))
+                let advisory =
+                    protected.message(&source.path.display().to_string(), &exposure, None);
+                push_notice(&mut notices, &mut seen, advisory);
             }
         }
     }
@@ -1957,7 +1969,7 @@ pub(crate) fn prepare(
         &mut unique,
         &context.mount_store,
         &known_fork_kinds,
-        &protected,
+        context.host_home.as_deref(),
     )?);
     sync_fork_representations(&unique, &mut expanded)?;
     notices.extend(warnings.into_iter().map(|warning| format!("==> {warning}")));
@@ -2034,46 +2046,42 @@ fn enforce_protected_files(
         // `<store>/forks/<id>/data`, so a notice keyed on `mount.host` would
         // silently stop firing on every launch after the first.
         let declaration = declaration_path(mount);
-        if !mount.is_fork() {
-            if let Some(exposure) = protected.exposure(&mount.host)? {
-                let discovered = (index >= explicit_count).then(|| declarations.join(", "));
-                let message =
-                    protected.message(&mount.source_spelling, &exposure, discovered.as_deref());
-                match exposure.severity {
-                    // A live window onto host bytes cannot be made safe by any
-                    // overlay: `pi auth login` on the host can create
-                    // `auth.json` inside a bind that is already open.
-                    Severity::Refuse => anyhow::bail!("{message}"),
-                    Severity::Advise => push_notice(notices, &mut seen, message),
-                }
-            }
-            if protected.inside_pi_home(&declaration) {
-                push_notice(
-                    notices,
-                    &mut seen,
-                    format!(
-                        "==> {} is a live bind of host Pi state; :fork is recommended so the \
-                         guest cannot write host Pi state and host changes cannot leak in",
-                        mount.source_spelling
-                    ),
-                );
+        if !mount.is_fork()
+            && let Some(exposure) = protected.exposure(&mount.host)?
+        {
+            let discovered = (index >= explicit_count).then(|| discovered_by(&declarations));
+            let message =
+                protected.message(&mount.source_spelling, &exposure, discovered.as_deref());
+            match exposure.severity {
+                // A live window onto host bytes cannot be made safe by any
+                // overlay: `pi auth login` on the host can create
+                // `auth.json` inside a bind that is already open.
+                Severity::Refuse => anyhow::bail!("{message}"),
+                Severity::Advise => push_notice(notices, &mut seen, message),
             }
         }
-        if let Some(pi_home) = protected.pi_home()
-            && protected.inside_pi_home(&declaration)
+        // A fork needs only the platform-artifact advisory: its content is the
+        // copy engine's decision, and `:fork` is what it already is.
+        let live_bind = !mount.is_fork();
+        for advisory in protected.mount_advisories(&declaration, &mount.source_spelling, live_bind)
         {
-            push_notice(
-                notices,
-                &mut seen,
-                format!(
-                    "==> Host Pi extensions and installed packages under {} may be built for \
-                     this host's OS/arch and may not run in the Linux guest",
-                    pi_home.display()
-                ),
-            );
+            push_notice(notices, &mut seen, advisory);
         }
     }
     Ok(())
+}
+
+/// The provenance phrase for a `follow-links`-discovered bind, for the refusal
+/// message. `expand_follow_links` does not carry the originating declaration
+/// per discovered target — two `:follow-links` declarations can discover the
+/// same bind — so naming every candidate would blame declarations that did not
+/// contribute it. Naming the sole candidate, or naming none of them, is never
+/// wrong.
+fn discovered_by(declarations: &[String]) -> String {
+    match declarations {
+        [only] => format!("--mount {only}:follow-links"),
+        _ => "one of your --mount …:follow-links declarations".to_string(),
+    }
 }
 
 /// The path a declaration actually names, for advisories. A missing source (a
@@ -2400,7 +2408,7 @@ pub(crate) fn prepare_forks(
     mounts: &mut [ExtraMount],
     mount_store: &Path,
     expected_kinds: &std::collections::HashMap<PathBuf, PreparedNodeKind>,
-    protected: &ProtectedHostFiles,
+    host_home: Option<&Path>,
 ) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
@@ -2440,10 +2448,14 @@ pub(crate) fn prepare_forks(
             .tempdir_in(&staging_parent)
             .context("creating fork staging directory")?;
         let staged_data = stage.path().join("data");
-        // The second omission signal, computed from the *source* under the
-        // same lock as the copy: a protected file created between `measure`
-        // and `copy_opened` has no measured identity to match, but its path is
-        // known. Identity alone would copy it (ADR-0020).
+        // The two omission signals are re-derived from a **fresh** measurement
+        // under the lock, not from the one taken at the top of `prepare`: the
+        // original route set cannot see a fork root that did not exist then
+        // (e.g. `--mount ~/.pi:fork` where `~/.pi` is created between `measure`
+        // and this point), which would leave the relative-path signal empty for
+        // exactly the window it exists to cover (ADR-0020). The measurement is
+        // a handful of stats, once per fork.
+        let protected = ProtectedHostFiles::measure(host_home)?;
         let protected_relative = protected.relatives_under(&mount.host)?;
         let policy = CopyPolicy {
             exclusions: &mount.exclusions,
@@ -4380,7 +4392,7 @@ mod prepare_tests {
         let (_home, home) = pi_home();
         let store = tempfile::tempdir().unwrap();
         let mut ctx = context_with_home(store.path(), home.clone());
-        ctx.core_host_sources = vec![home.clone()];
+        ctx.core_host_sources = vec![CoreHostSource::new(CoreBind::ProjectDir, home.clone())];
 
         let error = prepare(Vec::new(), &ctx).unwrap_err().to_string();
         assert!(error.contains("project directory"), "{error}");
@@ -4397,7 +4409,7 @@ mod prepare_tests {
         let (_home, home) = pi_home();
         let store = tempfile::tempdir().unwrap();
         let mut ctx = context_with_home(store.path(), home.clone());
-        ctx.core_host_sources = vec![home.join(".pi")];
+        ctx.core_host_sources = vec![CoreHostSource::new(CoreBind::ProjectDir, home.join(".pi"))];
 
         let error = prepare(Vec::new(), &ctx).unwrap_err().to_string();
         assert!(error.contains("project directory"), "{error}");
@@ -4407,9 +4419,44 @@ mod prepare_tests {
         );
 
         // An unrelated core source is untouched by the same check.
-        ctx.core_host_sources = vec![home.join("elsewhere")];
+        ctx.core_host_sources = vec![CoreHostSource::new(
+            CoreBind::ProjectDir,
+            home.join("elsewhere"),
+        )];
         fs::create_dir(home.join("elsewhere")).unwrap();
         assert!(prepare(Vec::new(), &ctx).is_ok());
+    }
+
+    /// A *below-`agent`* cwd inside the Pi home exposes no protected file, so
+    /// it is allowed — but it is a writable live window onto host Pi state, so
+    /// both advisories must fire with no `--mount` at all (issue #90's warning
+    /// deliverable, which the core binds were missing).
+    #[test]
+    fn core_project_bind_inside_pi_home_below_agent_warns() {
+        let (_home, home) = pi_home();
+        fs::create_dir_all(home.join(".pi/extensions")).unwrap();
+        fs::write(home.join(".pi/extensions/x.js"), "x").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut ctx = context_with_home(store.path(), home.clone());
+        ctx.core_host_sources = vec![CoreHostSource::new(
+            CoreBind::ProjectDir,
+            home.join(".pi/extensions"),
+        )];
+
+        let plan = prepare(Vec::new(), &ctx).unwrap();
+        let notices = plan.notices.join("\n");
+        assert!(
+            notices.contains("is a live bind of host Pi state"),
+            "{notices}"
+        );
+        assert!(
+            notices.contains("may be built for this host's OS/arch"),
+            "{notices}"
+        );
+        assert!(
+            notices.contains("run agent-vm from a project directory outside"),
+            "{notices}"
+        );
     }
 
     #[test]
@@ -4499,6 +4546,45 @@ mod prepare_tests {
         }
     }
 
+    /// The route set a fork's omission signals are derived from is re-measured
+    /// under the lock, so a fork root that did not exist at the top of
+    /// `prepare` (the stale set cannot see it at all — asserted below) still
+    /// gets the relative-path signal for the file created in between.
+    #[test]
+    fn fork_root_created_after_measure_is_still_omitted() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let source = home.join(".pi");
+        let store = tempfile::tempdir().unwrap();
+        let mut mounts = parse_extra_mounts(&[format!("{}:/pi:fork", source.display())]).unwrap();
+
+        // `prepare`'s measurement happens first, and `~/.pi` does not exist
+        // yet, so its route set has no entry for the fork root.
+        let stale = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        assert!(
+            stale.relatives_under(&source).unwrap().is_empty(),
+            "the stale route set cannot see a fork root that did not exist"
+        );
+
+        // …then `~/.pi` and its credential appear, before `prepare_forks`.
+        fs::create_dir_all(source.join("agent")).unwrap();
+        fs::write(source.join("agent/auth.json"), "{\"token\":\"t\"}").unwrap();
+        fs::write(source.join("settings.json"), "{}").unwrap();
+
+        prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            Some(&home),
+        )
+        .unwrap();
+        let data = &mounts[0].host;
+
+        assert!(data.join("settings.json").is_file());
+        assert!(data.join("agent").is_dir());
+        assert!(!data.join("agent/auth.json").exists());
+    }
+
     #[test]
     fn identity_version_v3_reseeds_a_v2_fork_and_reports_the_orphan() {
         let source = tempfile::tempdir().unwrap();
@@ -4543,7 +4629,10 @@ mod prepare_tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("$HOME is not set"), "{error}");
+        assert!(
+            error.contains("neither $HOME nor the account record"),
+            "{error}"
+        );
         assert!(store_tree(store.path()).is_empty(), "{error}");
     }
 }

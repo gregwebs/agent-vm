@@ -1511,10 +1511,13 @@ fn validate_tool_refs(
 
 verus! {
 
-/// The one byte a guest path uses to separate components. Declared inside the
-/// `verus!` block because Verus cannot read a `const` declared outside it (see
-/// `defaults.rs`).
-pub const GUEST_PATH_SEPARATOR: u8 = b'/';
+/// The one byte a path uses to separate components — host and guest alike.
+/// Named for the path, not the guest, because the two contracts below now
+/// serve both domains: [`byte_paths_overlap`] decides guest-path overlap, and
+/// [`byte_path_contains`] decides host-path containment for the protected
+/// Pi files (ADR-0020). Declared inside the `verus!` block because Verus cannot
+/// read a `const` declared outside it (see `defaults.rs`).
+pub const PATH_SEPARATOR: u8 = b'/';
 
 /// `p` is a whole **component-wise** prefix of `q`: `q` begins with `p` followed
 /// by the separator, so `a/b` is one of `a/b/c` but `a/b` is *not* one of
@@ -1523,37 +1526,45 @@ pub const GUEST_PATH_SEPARATOR: u8 = b'/';
 pub open spec fn is_separator_prefix(p: Seq<u8>, q: Seq<u8>) -> bool {
     p.len() < q.len()
         && q.subrange(0, p.len() as int) =~= p
-        && q[p.len() as int] == GUEST_PATH_SEPARATOR
+        && q[p.len() as int] == PATH_SEPARATOR
 }
 
-/// Two `/`-joined relative guest paths overlap iff they are equal or one is a
-/// component-wise ancestor of the other. This is the single predicate behind
-/// four call sites (within-tool, across-tool, against the compiled-in link
-/// list, and against the launch's guest mount points) — see ADR-0018.
-pub fn byte_paths_overlap(a: &[u8], b: &[u8]) -> (result: bool)
-    ensures result == (a@ =~= b@
-        || is_separator_prefix(a@, b@)
-        || is_separator_prefix(b@, a@)),
+/// The **directional** kernel: `a` is `b` itself, or a whole component-wise
+/// prefix of it — `a/b` is one of `a/b/c`, but `a/b` is *not* one of `a/bc`.
+/// Byte-level so the decision is translatable; the `Path` → bytes measurement
+/// is the trusted adapter (`guest_paths_overlap` here, and
+/// `protected_host_files`'s `matches` for host paths).
+///
+/// Two contracts share this body: [`byte_paths_overlap`] is its symmetric
+/// wrapper (ADR-0018), and it *is* the containment half of ADR-0020's exposure
+/// decision. One loop, one `ensures`, two callers.
+pub fn byte_path_contains(a: &[u8], b: &[u8]) -> (result: bool)
+    ensures
+        result == (a@ =~= b@ || is_separator_prefix(a@, b@)),
 {
     let alen = a.len();
     let blen = b.len();
-    let min = if alen < blen { alen } else { blen };
+    assert(alen == a@.len());
+    assert(blen == b@.len());
+    // A longer "ancestor" is never a prefix of its descendant.
+    if alen > blen {
+        assert(a@ != b@);
+        assert(!is_separator_prefix(a@, b@));
+        return false;
+    }
     let mut i: usize = 0;
-    while i < min
+    while i < alen
         invariant
-            i <= min,
-            min <= alen,
-            min <= blen,
+            i <= alen,
+            alen <= blen,
             alen == a@.len(),
             blen == b@.len(),
-            min == if alen < blen { alen } else { blen },
             forall|j: int| 0 <= j < i ==> a@[j] == b@[j],
-        decreases min - i,
+        decreases alen - i,
     {
         if a[i] != b[i] {
             assert(a@ != b@);
             assert(!is_separator_prefix(a@, b@));
-            assert(!is_separator_prefix(b@, a@));
             return false;
         }
         i += 1;
@@ -1561,11 +1572,23 @@ pub fn byte_paths_overlap(a: &[u8], b: &[u8]) -> (result: bool)
     if alen == blen {
         assert(a@ =~= b@);
         true
-    } else if alen < blen {
-        b[alen] == GUEST_PATH_SEPARATOR
     } else {
-        a[blen] == GUEST_PATH_SEPARATOR
+        assert(forall|j: int| 0 <= j < alen ==> a@[j] == b@[j]);
+        b[alen] == PATH_SEPARATOR
     }
+}
+
+/// Two `/`-joined relative guest paths overlap iff they are equal or one is a
+/// component-wise ancestor of the other — the symmetric wrapper around
+/// [`byte_path_contains`]. This is the single predicate behind four call sites
+/// (within-tool, across-tool, against the compiled-in link list, and against
+/// the launch's guest mount points) — see ADR-0018.
+pub fn byte_paths_overlap(a: &[u8], b: &[u8]) -> (result: bool)
+    ensures result == (a@ =~= b@
+        || is_separator_prefix(a@, b@)
+        || is_separator_prefix(b@, a@)),
+{
+    byte_path_contains(a, b) || byte_path_contains(b, a)
 }
 
 } // verus!
@@ -3345,6 +3368,31 @@ mod tests {
         }
     }
 
+    /// **V3 (ADR-0020's containment half).** The kernel is *directional*, by
+    /// table. `/a/pi` contains `/a/pi` and `/a/pi/x`, but not `/a/pistachio`
+    /// (the separator rule) and not its own parent. `/` is deliberately *not*
+    /// a containment hit for an unrelated path — `measure` records `/` itself
+    /// as a route, so the identity half is what covers it.
+    #[test]
+    fn byte_path_contains_is_directional_and_component_wise() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("/a/pi", "/a/pi", true),
+            ("/a/pi", "/a/pi/x", true),
+            ("/a/pi", "/a/pistachio", false),
+            ("/a/pi/x", "/a/pi", false),
+            ("/", "/a", false),
+            ("/a", "/", false),
+            ("/a", "/a", true),
+        ];
+        for (a, b, expected) in cases {
+            assert_eq!(
+                byte_path_contains(a.as_bytes(), b.as_bytes()),
+                *expected,
+                "contains({a}, {b})"
+            );
+        }
+    }
+
     /// **V2.** The overlap rejections surface through `load`, each naming the
     /// offending `persist` index and the mechanism, never a secret.
     #[test]
@@ -3786,6 +3834,25 @@ mod tests {
 
             let expected = component_prefix(&a, &b) || component_prefix(&b, &a);
             proptest::prop_assert_eq!(left, expected);
+        }
+
+        /// **V3 (the erased-build half of ADR-0020's containment).** The
+        /// directional kernel holds iff `a`'s components are a prefix of
+        /// `b`'s, restated over `Vec<String>` components by the same
+        /// independent oracle — direction included, so a swapped argument
+        /// order is caught.
+        #[test]
+        fn byte_path_contains_is_a_directional_component_prefix(
+            a in proptest::collection::vec("[a-z]{1,4}", 1..4),
+            b in proptest::collection::vec("[a-z]{1,4}", 1..4),
+        ) {
+            let pa = a.join("/");
+            let pb = b.join("/");
+            proptest::prop_assert_eq!(
+                byte_path_contains(pa.as_bytes(), pb.as_bytes()),
+                component_prefix(&a, &b),
+                "contains({:?}, {:?})", a, b
+            );
         }
     }
 
