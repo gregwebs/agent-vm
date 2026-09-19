@@ -53,6 +53,17 @@ impl ProtectedFile {
         }
     }
 
+    /// The same path relative to the Pi home (`~/.pi`) rather than `$HOME` —
+    /// used by the static fork-omission signal, which positions the file under
+    /// a *resolved* `~/.pi` target as well as under `$HOME`. Derived from
+    /// [`Self::home_relative`] so the two spellings cannot drift.
+    fn pi_home_relative(self) -> PathBuf {
+        Path::new(self.home_relative())
+            .strip_prefix(PI_HOME_NAME)
+            .expect("home_relative is always under ~/.pi")
+            .to_path_buf()
+    }
+
     /// For operator-facing messages.
     pub(crate) fn description(self) -> &'static str {
         match self {
@@ -80,7 +91,7 @@ pub(crate) enum Severity {
 
 /// One measured route: a real directory that physically contains a protected
 /// file — or the file itself — and where the file sits inside it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Route {
     dev: u64,
     ino: u64,
@@ -154,6 +165,10 @@ impl CoreHostSource {
 /// The measured physical route set of every protected file, plus Pi's home.
 #[derive(Debug)]
 pub(crate) struct ProtectedHostFiles {
+    /// The home this measurement was taken from, so the fork copier can
+    /// re-measure under its lock without being handed the path a second time.
+    /// Kept raw (not canonicalized): `measure` canonicalizes it itself.
+    host_home: Option<PathBuf>,
     /// `$HOME/.pi`, once `$HOME` is known — `None` only when neither `$HOME`
     /// nor the account record could name a home.
     pi_home: Option<PathBuf>,
@@ -203,6 +218,7 @@ impl ProtectedHostFiles {
     pub(crate) fn measure(host_home: Option<&Path>) -> Result<Self> {
         let Some(home) = host_home else {
             return Ok(Self {
+                host_home: None,
                 pi_home: None,
                 resolved_pi_home: None,
                 severity: Severity::Advise,
@@ -255,6 +271,7 @@ impl ProtectedHostFiles {
             identity_files.push(route.file);
         }
         Ok(Self {
+            host_home: Some(home.to_path_buf()),
             pi_home: Some(pi_home),
             resolved_pi_home,
             severity,
@@ -262,6 +279,63 @@ impl ProtectedHostFiles {
             identity_ids,
             identity_files,
         })
+    }
+
+    /// Re-measure the host state, keeping every identity and route this
+    /// snapshot already holds (see [`Self::union`]). The fork copier takes this
+    /// under the per-fork lock, so a root or credential created since the
+    /// launch's first measurement is seen, while an inode or route the first
+    /// measurement positively identified is never forgotten.
+    pub(crate) fn refreshed(&self) -> Result<Self> {
+        Ok(self.union(&Self::measure(self.host_home.as_deref())?))
+    }
+
+    /// The union of two measurements, for the fork copier. `measure` is a
+    /// snapshot, and host state can change between two of them: an atomic
+    /// credential replacement can make a later snapshot *forget* an inode an
+    /// earlier one positively identified (a surviving hardlink still holds the
+    /// old credential bytes), and a fork root renamed away and recreated can
+    /// make it forget a route. Omission is a safety property, so the copier
+    /// keeps every identity and route either snapshot saw (ADR-0020).
+    /// Deduplicated by `(dev, ino, file)`, the same key the route set uses.
+    pub(crate) fn union(&self, other: &Self) -> Self {
+        let mut identity_ids = self.identity_ids.clone();
+        let mut identity_files = self.identity_files.clone();
+        for (identity, file) in other.identity_ids.iter().zip(&other.identity_files) {
+            if !identity_ids.contains(identity) {
+                identity_ids.push(*identity);
+                identity_files.push(*file);
+            }
+        }
+        let mut routes: Vec<Route> = self.routes.to_vec();
+        for route in &other.routes {
+            let duplicate = routes.iter().any(|existing| {
+                existing.dev == route.dev
+                    && existing.ino == route.ino
+                    && existing.file == route.file
+            });
+            if !duplicate {
+                routes.push(route.clone());
+            }
+        }
+        Self {
+            host_home: self.host_home.clone().or_else(|| other.host_home.clone()),
+            pi_home: self.pi_home.clone().or_else(|| other.pi_home.clone()),
+            resolved_pi_home: self
+                .resolved_pi_home
+                .clone()
+                .or_else(|| other.resolved_pi_home.clone()),
+            // The more protective verdict wins; a `~/.pi` present in either
+            // snapshot is enough to make a live window dangerous.
+            severity: if self.severity == Severity::Refuse || other.severity == Severity::Refuse {
+                Severity::Refuse
+            } else {
+                Severity::Advise
+            },
+            routes,
+            identity_ids,
+            identity_files,
+        }
     }
 
     /// Fail closed when a launch declares mounts we cannot reason about:
@@ -291,15 +365,50 @@ impl ProtectedHostFiles {
     /// Every protected file's path relative to `root`, including files that do
     /// not exist yet — the fork copier's second signal. A protected file this
     /// root cannot reach is absent.
+    ///
+    /// Two independent sources, unioned: the **measured routes** (which catch a
+    /// symlink target, a hardlink, a mount alias, or any branch the `$HOME`
+    /// spelling does not name) and the **static path table** relative to
+    /// `root`. The static half keeps omission effective when no measurement saw
+    /// `root`: a fork root renamed away before the copier's re-measurement and
+    /// recreated before the copy otherwise leaves the route set with no entry
+    /// for it, while the identity set sees only the inode that is there now
+    /// (ADR-0020).
     pub(crate) fn relatives_under(&self, root: &Path) -> Result<Vec<(PathBuf, ProtectedFile)>> {
         let mut relatives: Vec<(PathBuf, ProtectedFile)> = Vec::new();
         for exposure in self.matches(root)? {
-            let entry = (exposure.relative, exposure.file);
-            if !relatives.contains(&entry) {
-                relatives.push(entry);
-            }
+            push_relative(&mut relatives, exposure.relative, exposure.file);
+        }
+        for (relative, file) in self.static_relatives(root) {
+            push_relative(&mut relatives, relative, file);
         }
         Ok(relatives)
+    }
+
+    /// The static half of [`Self::relatives_under`]: where each protected file
+    /// *would* sit under `root`, from the path table alone — the `$HOME`
+    /// spelling and, when `~/.pi` is a symlink, its resolved target. It reads
+    /// no measured route and no `(dev, ino)`, so it holds for a root no
+    /// measurement saw. It is a *supplement*: a hardlink or a symlinked
+    /// credential target the table cannot name is still covered only by the
+    /// measured identity.
+    fn static_relatives(&self, root: &Path) -> Vec<(PathBuf, ProtectedFile)> {
+        let Some(canonical) = normalized_root(root) else {
+            return Vec::new();
+        };
+        let mut relatives = Vec::new();
+        for pi_home in [&self.pi_home, &self.resolved_pi_home]
+            .into_iter()
+            .flatten()
+        {
+            for file in ProtectedFile::ALL {
+                let absolute = pi_home.join(file.pi_home_relative());
+                if let Ok(relative) = absolute.strip_prefix(&canonical) {
+                    push_relative(&mut relatives, relative.to_path_buf(), file);
+                }
+            }
+        }
+        relatives
     }
 
     /// Advisory-only: is `root` at/inside the host Pi home? Recognises both
@@ -594,6 +703,33 @@ fn cannot_determine(path: &str) -> String {
     format!("cannot determine whether a mount would expose {path}")
 }
 
+/// Append `(relative, file)` unless an identical pair is already present — the
+/// two sources of [`ProtectedHostFiles::relatives_under`] deliberately overlap.
+fn push_relative(
+    relatives: &mut Vec<(PathBuf, ProtectedFile)>,
+    relative: PathBuf,
+    file: ProtectedFile,
+) {
+    let entry = (relative, file);
+    if !relatives.contains(&entry) {
+        relatives.push(entry);
+    }
+}
+
+/// A fork root's path for the static signal: its canonical path when it exists,
+/// otherwise its own spelling when that is absolute. A root no measurement saw
+/// must still yield a signal, so a missing path falls back to the configured
+/// spelling — the copier canonicalizes the root before reading it, so an
+/// existing root always matches its canonical form. A relative spelling cannot
+/// be compared against the absolute Pi-home paths.
+fn normalized_root(root: &Path) -> Option<PathBuf> {
+    match root.canonicalize() {
+        Ok(canonical) => Some(canonical),
+        Err(_) if root.is_absolute() => Some(root.to_path_buf()),
+        Err(_) => None,
+    }
+}
+
 /// `base` extended by `remaining`, without `Path::join`'s trailing separator
 /// when `remaining` is empty — a `relative` is compared against copier-built
 /// paths, where `.pi/agent/auth.json/` and `.pi/agent/auth.json` differ.
@@ -730,6 +866,52 @@ mod tests {
         let relatives = protected.relatives_under(&home.join(".pi")).unwrap();
         assert!(relatives.contains(&(PathBuf::from("agent/models.json"), ProtectedFile::PiModels)));
         assert!(relatives.contains(&(PathBuf::from("agent/auth.json"), ProtectedFile::PiAuth)));
+    }
+
+    /// M13: a fork root that did not exist when the route set was measured
+    /// still gets a relative-path signal. The `$HOME` spelling's last existing
+    /// ancestor is `$HOME` itself, so the measured routes can only name
+    /// `.pi/agent/auth.json` (relative to `$HOME`) — never `agent/auth.json`,
+    /// which is what a copier of `~/.pi` sees. The static table answers for the
+    /// recreated root, for **both** protected files.
+    #[test]
+    fn relatives_under_names_protected_files_the_measurement_never_saw() {
+        let (_home, home) = home();
+        // No `~/.pi` at measurement time: the route set ends at `$HOME`.
+        let protected = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        // A host writer recreates the Pi home with a credential *after*
+        // measurement and before the copy.
+        write(&home.join(".pi/agent/auth.json"), "{\"token\":\"t\"}");
+        write(&home.join(".pi/agent/models.json"), "{}");
+
+        let relatives = protected.relatives_under(&home.join(".pi")).unwrap();
+        assert!(
+            relatives.contains(&(PathBuf::from("agent/auth.json"), ProtectedFile::PiAuth)),
+            "{relatives:?}"
+        );
+        assert!(
+            relatives.contains(&(PathBuf::from("agent/models.json"), ProtectedFile::PiModels)),
+            "{relatives:?}"
+        );
+    }
+
+    /// The static half must stay component-wise: an unrelated root and a
+    /// sibling whose name is a byte prefix of the Pi home get no signal.
+    #[test]
+    fn relatives_under_static_signal_respects_component_boundaries() {
+        let (_home, home) = home();
+        write(&home.join(".pi/agent/auth.json"), "{\"token\":\"t\"}");
+        let protected = ProtectedHostFiles::measure(Some(&home)).unwrap();
+
+        let unrelated = tempfile::tempdir().unwrap();
+        let unrelated = unrelated.path().canonicalize().unwrap();
+        assert!(protected.relatives_under(&unrelated).unwrap().is_empty());
+
+        // `$HOME/.pistachio` is a byte prefix of `$HOME/.pi/agent/auth.json`
+        // but not a component prefix of it.
+        let sibling = home.join(".pistachio");
+        fs::create_dir(&sibling).unwrap();
+        assert!(protected.relatives_under(&sibling).unwrap().is_empty());
     }
 
     /// The TOCTOU-defeating case: an implementation that measured only existing

@@ -1077,7 +1077,7 @@ mod tests {
             &mut mounts,
             store.path(),
             &std::collections::HashMap::new(),
-            None,
+            &ProtectedHostFiles::measure(None).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -1095,7 +1095,7 @@ mod tests {
             &mut again,
             store.path(),
             &std::collections::HashMap::new(),
-            None,
+            &ProtectedHostFiles::measure(None).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -1969,7 +1969,7 @@ pub(crate) fn prepare(
         &mut unique,
         &context.mount_store,
         &known_fork_kinds,
-        context.host_home.as_deref(),
+        &protected,
     )?);
     sync_fork_representations(&unique, &mut expanded)?;
     notices.extend(warnings.into_iter().map(|warning| format!("==> {warning}")));
@@ -2404,11 +2404,16 @@ struct ForkManifest {
 
 /// Initialize each fork through one lock-protected state transition. READY is
 /// validated before source access, so a seeded fork is usable after removal.
+///
+/// `protected` is the measurement taken at the top of `prepare`; the copier
+/// re-measures under the lock and unions the two (see `refreshed`), so it never
+/// forgets a credential identity or route an earlier snapshot positively
+/// identified.
 pub(crate) fn prepare_forks(
     mounts: &mut [ExtraMount],
     mount_store: &Path,
     expected_kinds: &std::collections::HashMap<PathBuf, PreparedNodeKind>,
-    host_home: Option<&Path>,
+    protected: &ProtectedHostFiles,
 ) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
@@ -2448,14 +2453,17 @@ pub(crate) fn prepare_forks(
             .tempdir_in(&staging_parent)
             .context("creating fork staging directory")?;
         let staged_data = stage.path().join("data");
-        // The two omission signals are re-derived from a **fresh** measurement
+        // The omission signals are re-derived from a **fresh** measurement
         // under the lock, not from the one taken at the top of `prepare`: the
         // original route set cannot see a fork root that did not exist then
         // (e.g. `--mount ~/.pi:fork` where `~/.pi` is created between `measure`
-        // and this point), which would leave the relative-path signal empty for
-        // exactly the window it exists to cover (ADR-0020). The measurement is
-        // a handful of stats, once per fork.
-        let protected = ProtectedHostFiles::measure(host_home)?;
+        // and this point). But the fresh snapshot is **unioned** with the
+        // original, never a replacement: an atomic credential replacement can
+        // make the fresh snapshot forget an inode the original positively
+        // identified (a surviving hardlink still holds the old bytes), and a
+        // root renamed away and recreated can make it forget a route
+        // (ADR-0020). The measurement is a handful of stats, once per fork.
+        let protected = protected.refreshed()?;
         let protected_relative = protected.relatives_under(&mount.host)?;
         let policy = CopyPolicy {
             exclusions: &mount.exclusions,
@@ -4582,10 +4590,116 @@ mod prepare_tests {
         }
     }
 
-    /// The route set a fork's omission signals are derived from is re-measured
-    /// under the lock, so a fork root that did not exist at the top of
-    /// `prepare` (the stale set cannot see it at all — asserted below) still
-    /// gets the relative-path signal for the file created in between.
+    /// M13: the per-fork lock coordinates fork *initializers*, not host Pi
+    /// writers. A host process renames the fork root away after the source kind
+    /// is checked, and recreates it — credential and all — before the copy. The
+    /// measured route set then has no entry for the root (its last existing
+    /// ancestor was `$HOME`), so only the static path table can name the files.
+    ///
+    /// The omission is asserted as the outcome; the relative list is
+    /// deliberately **not** asserted empty — that emptiness *is* the defect.
+    #[test]
+    fn fork_omission_survives_a_fork_root_recreated_after_measurement() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let source = home.join(".pi");
+        fs::create_dir(&source).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        // The lock `prepare_forks` holds while it measures; no host writer is
+        // obliged to take it.
+        let lock = open_regular_lock(&store.path().join("fork.lock")).unwrap();
+        lock_exclusive(&lock).unwrap();
+        let kind = fork_source_kind(&source).unwrap();
+        require_fork_directory(kind, &source.display().to_string()).unwrap();
+        // The host renames the root away after the kind check, before the
+        // measurement a copier would take.
+        fs::rename(&source, home.join("old-pi")).unwrap();
+        let protected = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        // It recreates the tree, with both protected files, before the copy.
+        fs::create_dir_all(source.join("agent")).unwrap();
+        fs::write(source.join("agent/auth.json"), "synthetic-secret").unwrap();
+        fs::write(source.join("agent/models.json"), "synthetic-models").unwrap();
+        let protected_relative = protected.relatives_under(&source).unwrap();
+        let policy = CopyPolicy {
+            exclusions: &[],
+            follow: false,
+            protected_ids: protected.identities(),
+            protected_relative: &protected_relative,
+        };
+        let data = store.path().join("data");
+        let mut report = CopyReport::default();
+        copy_root(&source, &data, &policy, &mut report).unwrap();
+        assert!(data.join("agent").is_dir());
+        assert!(
+            !data.join("agent/auth.json").exists(),
+            "a route set with no entry for the recreated root still copied the credential"
+        );
+        assert!(!data.join("agent/models.json").exists());
+    }
+
+    /// R1: an ordinary atomic credential replacement must not make the copier
+    /// forget an inode the launch's first measurement positively identified.
+    /// `backup-*.json` are hardlinks to the *old* credential bytes; the fresh
+    /// measurement sees only the replacement, so omission has to union the
+    /// preflight identities with the fresh ones rather than replace them.
+    #[test]
+    fn fork_omission_retains_a_preflight_credential_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_home, home) = pi_home();
+        let source = home.join("unrelated-fork");
+        fs::create_dir(&source).unwrap();
+        fs::hard_link(
+            home.join(".pi/agent/auth.json"),
+            source.join("backup-auth.json"),
+        )
+        .unwrap();
+        fs::hard_link(
+            home.join(".pi/agent/models.json"),
+            source.join("backup-models.json"),
+        )
+        .unwrap();
+        // The same measurement `prepare` takes before expanding/validating.
+        let original = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        let backup = fs::metadata(source.join("backup-auth.json")).unwrap();
+        assert!(
+            original
+                .identities()
+                .matched(backup.dev(), backup.ino())
+                .is_some(),
+            "the preflight measurement must know the hardlink's inode"
+        );
+
+        // Ordinary atomic replacements of both protected files.
+        for (path, body) in [
+            (home.join(".pi/agent/auth.json"), "replacement-auth"),
+            (home.join(".pi/agent/models.json"), "replacement-models"),
+        ] {
+            let replacement = path.with_extension("replacement");
+            fs::write(&replacement, body).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+        }
+
+        let store = tempfile::tempdir().unwrap();
+        let mut mounts = parse_extra_mounts(&[format!("{}:/fork:fork", source.display())]).unwrap();
+        prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &original,
+        )
+        .unwrap();
+        assert!(
+            !mounts[0].host.join("backup-auth.json").exists(),
+            "the fresh measurement discarded a known credential inode and copied it"
+        );
+        assert!(!mounts[0].host.join("backup-models.json").exists());
+    }
+
+    /// A fork root that did not exist at the top of `prepare` still gets the
+    /// omission signals: the copier re-measures under the lock and loses no
+    /// knowledge the earlier snapshot had, and the static path table names the
+    /// protected files under the root even when no measurement saw it.
     #[test]
     fn fork_root_created_after_measure_is_still_omitted() {
         let home = tempfile::tempdir().unwrap();
@@ -4595,11 +4709,19 @@ mod prepare_tests {
         let mut mounts = parse_extra_mounts(&[format!("{}:/pi:fork", source.display())]).unwrap();
 
         // `prepare`'s measurement happens first, and `~/.pi` does not exist
-        // yet, so its route set has no entry for the fork root.
+        // yet, so its *physical* routes have no entry for the fork root. The
+        // static path table still names both protected files under it (M13),
+        // which is what makes the omission below independent of this snapshot.
         let stale = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        let stale_relatives = stale.relatives_under(&source).unwrap();
         assert!(
-            stale.relatives_under(&source).unwrap().is_empty(),
-            "the stale route set cannot see a fork root that did not exist"
+            stale_relatives.contains(&(PathBuf::from("agent/auth.json"), ProtectedFile::PiAuth)),
+            "the static signal names the file under a root no measurement saw: {stale_relatives:?}"
+        );
+        assert!(
+            stale_relatives
+                .contains(&(PathBuf::from("agent/models.json"), ProtectedFile::PiModels)),
+            "{stale_relatives:?}"
         );
 
         // …then `~/.pi` and its credential appear, before `prepare_forks`.
@@ -4611,7 +4733,7 @@ mod prepare_tests {
             &mut mounts,
             store.path(),
             &std::collections::HashMap::new(),
-            Some(&home),
+            &stale,
         )
         .unwrap();
         let data = &mounts[0].host;
