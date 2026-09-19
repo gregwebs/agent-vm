@@ -162,7 +162,7 @@ mirror at the same absolute path). Valid mode tokens are `ro`, `rw`, `fork`,
 | `:fork` | directory root copied once into project state; nested link text preserved |
 | `:fork:follow-links` | directory root copied once; symlink targets materialized into the copy |
 | `:exclude=REL` | only with `:fork`; repeatable, normalized seed omissions |
-| a live bind (`ro`/`rw`/`follow-links`) that would expose a host Pi credential file | **refused**; nothing is masked. `:fork` instead — it omits those two files and copies the rest |
+| a live bind (`ro`/`rw`/`follow-links`) that would expose a host Pi credential file | **refused**; nothing is masked. `:fork` only where forking the root would help — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted) |
 
 A live bind is a directory, or a regular file with `:ro`. A bare file mount
 defaults to writable and is rejected, as is `:rw` on a file; the error names
@@ -201,9 +201,11 @@ v2). Every fork from an earlier build is therefore re-copied once from its
 source; the old directory is not deleted, and the launcher prints its exact
 path — `A fork from an earlier agent-vm build is no longer used: … It may
 contain a copy of a host credential file — remove it` — so nothing is left
-buried in state. A v2 fork whose original source is gone cannot be reseeded:
-the launch errors on the missing source, and the printed orphan is what you
-remove.
+buried in state. **That notice repeats on every launch until the printed
+directory is removed**; there is no acknowledgement, because acknowledging it
+would leave a directory that may hold a plaintext credential. A v2 fork whose
+original source is gone cannot be reseeded: the launch errors on the missing
+source, and the printed orphan is what you remove.
 
 ### Host Pi credential files are never mounted
 
@@ -218,20 +220,35 @@ discovers) that would expose either file — directly, through an ancestor such
 as `$HOME` or `/`, through a remapped guest path, through a symlink alias, or
 through a hardlink — is **refused**. Nothing is masked: a live bind is a window
 onto bytes written *after* boot, and `pi auth login` on the host can create
-`auth.json` inside it, so masking cannot cover the dangerous case at all.
+`auth.json` inside it, so masking cannot cover the dangerous case at all. The
+refusal prints the exposed file's canonical path and the mount root's, so a
+`/tmp/…` spelling does not read as a different directory.
 - `:fork` is different in kind — a one-time copy made host-side — so it is
 allowed: the two files are **omitted** from the copy, with a notice, and
 everything else is copied. Their containing directory stays, and the host files
 are untouched.
+- The **remedy in a refusal depends on what was mounted**, because `:fork` is
+not always one. A root at or inside `~/.pi` gets the `:fork` recommendation; a
+regular file (the credential itself) cannot be mounted at all and no `:fork` is
+suggested; a root *above* `~/.pi` — `$HOME`, `/` — is told to mount a narrower
+path, with `:fork` explicitly named as *not* a substitute, because forking it
+would copy everything else under it into writable project state.
 - A mount **at or inside `~/.pi`** (for example `--mount ~/.pi/extensions:ro`)
 is allowed but warns twice: that a live bind of host Pi state should be a
 `:fork`, and that host Pi extensions and installed packages may be built for
 this host's OS/arch and may not run in the Linux guest.
-- **Launching from `$HOME` (or from inside `~/.pi`) is refused with no
-`--mount` at all**, because the project bind is the canonicalized cwd: `cd ~ &&
-agent-vm shell` would hand the guest the whole host `$HOME`.
-- **`$HOME` unset + any `--mount`** is refused: agent-vm cannot locate the Pi
-home, so it cannot decide.
+- **Launching from `$HOME`, `~/.pi`, `~/.pi/agent`, or any ancestor of them is
+refused with no `--mount` at all**, because the project bind is the
+canonicalized cwd: `cd ~ && agent-vm shell` would hand the guest the whole host
+`$HOME`. A cwd **elsewhere inside `~/.pi`** (say `~/.pi/extensions`) exposes no
+credential file, so it is allowed — and warns, twice, for the same reasons a
+mount there does.
+- **`$HOME` unset loses nothing.** The launch's home is `$HOME` when it is set,
+otherwise the home recorded for your uid in the account database
+(`getpwuid_r`), so a daemon, CI, or `env -i` launch still runs the checks above
+— including against the project bind. Only when *neither* names a home is a
+launch that declares a `--mount` refused, because the Pi home cannot be
+located.
 
 When `~/.pi` does not exist, none of the refusals apply: there is nothing to
 leak today, so the same routes produce a one-line advisory instead (the

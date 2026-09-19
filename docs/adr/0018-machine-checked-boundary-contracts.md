@@ -49,7 +49,7 @@ The attribute style is excluded. Function-level `#[verus_spec]` measures free bu
 
 ### The verified surface
 
-One `verus!` block per owning module, in place, no new crate and no moved code. `cargo verus verify --locked -p agent-vm` reports **22 verified, 0 errors** across them.
+One `verus!` block per owning module, in place, no new crate and no moved code. `cargo verus verify --locked -p agent-vm` reports a non-zero `verified` count with `0 errors` across them.
 
 | Site (module) | Contract that is machine-checked |
 |---|---|
@@ -58,7 +58,8 @@ One `verus!` block per owning module, in place, no new crate and no moved code. 
 | `msb_install.rs` — `socket_path_fits` | **The accept/reject comparison, including at the boundary** (`len <= SUN_PATH_USABLE_LEN`). Stated plainly: the exec body restates the spec, so what is proved is that the decision *is* that comparison — **not** that the socket-path invariant holds end to end. |
 | `intercept_hook/oauth_refresh.rs` — `path_is_exact` | **An accepted path target contains no `?`, `#` or `\`, and no escaping `%XX`.** The escape half is re-derived from the already-proved `contains_escaped_path_escape_bytes` `ensures`, not re-proved. |
 | `intercept_hook/http.rs` — `header_block_end`, `is_token_bytes`, `has_no_crlf` | **The body starts exactly at the separator** (`Some(i)` gives `separator_at` *and* firstness, which is what makes `raw[i + 4..]` a non-panicking slice), **header names are non-empty tokens**, and **values contain no CR or LF**. |
-| `config.rs` — `byte_paths_overlap` | **Two normalized guest paths overlap iff equal or one is a component-wise ancestor of the other** (`is_separator_prefix`): `.cache` overlaps `.cache/x` but not `.cachex`. A single loop invariant — "every position behind the cursor is equal" — supplies both the equal case and the separator check at the shorter length. Byte-level, so it is the decision only; the `Path` → bytes measurement is the trusted adapter `guest_paths_overlap`. |
+| `config.rs` — `byte_paths_overlap` | **Two normalized guest paths overlap iff equal or one is a component-wise ancestor of the other** (`is_separator_prefix`): `.cache` overlaps `.cache/x` but not `.cachex`. A single loop invariant — "every position behind the cursor is equal" — supplies both the equal case and the separator check at the shorter length. It is now the *symmetric wrapper* around the directional kernel below, so the two decisions cannot drift. Byte-level, so it is the decision only; the `Path` → bytes measurement is the trusted adapter `guest_paths_overlap`. |
+| `config.rs` — `byte_path_contains` | **The directional kernel `byte_paths_overlap` is built from, and the containment half of ADR-0020's protected-host-file decision:** `a` is `b` itself, or a component-wise separator-prefixed prefix of it — `/a/pi` contains `/a/pi` and `/a/pi/x`, but not `/a/pistachio` and not its own parent. The sibling-prefix property is stated twice (`byte_path_contains_is_directional_and_component_wise`, plus a proptest against a `Vec<String>` component-prefix oracle), and the property holds for host paths as well as guest ones — hence the separator constant is named `PATH_SEPARATOR`, not `GUEST_PATH_SEPARATOR`. |
 
 ### The trusted boundary
 

@@ -262,16 +262,22 @@ prepare()
 Both new passes run before `prepare_forks` — the first state mutation — so a
 refused launch creates no fork store, no lock, no staging, and no session
 state. Reachability is decided by canonical **identity** (`(dev, ino)`, which
-folds macOS firmlinks and symlink/hardlink aliases that paths cannot) *and*
-component-wise canonical **containment** (which covers filesystems where inode
-identity is unreliable); neither alone is sufficient, and the containment half
-reuses `config::is_separator_prefix` under a `verus!` contract. Whether an
-exposure is a hard error or an advisory depends on whether `$HOME/.pi` exists,
-so a user who has never installed Pi can keep mounting `$HOME`. Forks alone
-carry the cost of moving: `IDENTITY_VERSION` is v3, because a READY fork is
-reused without reading its source and a pre-#90 seed may already hold a copy of
-a protected file. The two-file table, the accepted gaps, and the rejected mask
-alternative are [ADR-0020](docs/adr/0020-protect-host-pi-credential-files.md).
+folds macOS firmlinks, symlink/hardlink aliases and Linux bind mounts that
+paths cannot) *and* component-wise canonical **containment** (the common path,
+so the decision never depends on inode semantics; the case it alone decides is
+a root whose canonical path *equals* a measured route's while `(dev, ino)`
+differ). The containment half is `config::byte_path_contains`, one directional
+kernel shared with the guest-path overlap predicate under a `verus!` contract.
+The refusal's remedy is conditional on the root — `:fork` at or inside the Pi
+home, a narrower path above it, nothing for a root that is the file itself.
+Whether an exposure is a hard error or an advisory depends on whether `$HOME/.pi`
+exists, so a user who has never installed Pi can keep mounting `$HOME`; an
+unset `$HOME` still gets the check, because the launch's home falls back to the
+account record. Forks alone carry the cost of moving: `IDENTITY_VERSION` is v3,
+because a READY fork is reused without reading its source and a pre-#90 seed
+may already hold a copy of a protected file. The two-file table, the accepted
+gaps, and the rejected mask alternative are
+[ADR-0020](docs/adr/0020-protect-host-pi-credential-files.md).
 
 Live binds are ordinary mounts, each opting into per-bind root follow so a
 user's symlinked source spelling resolves once. Core volumes (HOME, project,
