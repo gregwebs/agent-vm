@@ -142,7 +142,7 @@ Each launcher accepts:
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
-| `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). Capacity is host-specific. |
+| `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). A live bind that would expose a host Pi credential file is refused — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted). Capacity is host-specific. |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 | `--layer DIR` | append a tooling layer after the project's own `.agent-vm/layers/*` (repeatable, command-line order; relative to the project dir) — see [Project tooling layers](#project-tooling-layers) |
 | `--yes` / `-y` | assume "yes" to the tooling-layer chain build confirmation (CI/non-interactive) — see [Project tooling layers](#project-tooling-layers) |
@@ -162,6 +162,7 @@ mirror at the same absolute path). Valid mode tokens are `ro`, `rw`, `fork`,
 | `:fork` | directory root copied once into project state; nested link text preserved |
 | `:fork:follow-links` | directory root copied once; symlink targets materialized into the copy |
 | `:exclude=REL` | only with `:fork`; repeatable, normalized seed omissions |
+| a live bind (`ro`/`rw`/`follow-links`) that would expose a host Pi credential file | **refused**; nothing is masked. `:fork` instead — it omits those two files and copies the rest |
 
 A live bind is a directory, or a regular file with `:ro`. A bare file mount
 defaults to writable and is rejected, as is `:rw` on a file; the error names
@@ -193,6 +194,52 @@ policy, or exclusions creates a distinct fork. A v2 fork whose manifest `kind`
 is `file` (from an older build) fails closed: the error names the exact
 directory to remove, and nothing is reseeded, migrated, or deleted
 automatically.
+
+Fork identity is versioned, and the current version is **v3** (the [host Pi
+credential rule](#host-pi-credential-files-are-never-mounted) did not exist in
+v2). Every fork from an earlier build is therefore re-copied once from its
+source; the old directory is not deleted, and the launcher prints its exact
+path — `A fork from an earlier agent-vm build is no longer used: … It may
+contain a copy of a host credential file — remove it` — so nothing is left
+buried in state. A v2 fork whose original source is gone cannot be reseeded:
+the launch errors on the missing source, and the printed orphan is what you
+remove.
+
+### Host Pi credential files are never mounted
+
+Two host files must never reach the guest: `~/.pi/agent/auth.json` (Pi's
+provider credentials) and `~/.pi/agent/models.json` (its provider
+configuration). `agent-vm` keeps host-imported Pi credentials host-side and
+gives the guest placeholders, so a mount that handed over the real file would
+defeat that for the one tool agent-vm is about to launch.
+
+- A **live bind** (`ro`, `rw`, `follow-links`, and every bind `follow-links`
+discovers) that would expose either file — directly, through an ancestor such
+as `$HOME` or `/`, through a remapped guest path, through a symlink alias, or
+through a hardlink — is **refused**. Nothing is masked: a live bind is a window
+onto bytes written *after* boot, and `pi auth login` on the host can create
+`auth.json` inside it, so masking cannot cover the dangerous case at all.
+- `:fork` is different in kind — a one-time copy made host-side — so it is
+allowed: the two files are **omitted** from the copy, with a notice, and
+everything else is copied. Their containing directory stays, and the host files
+are untouched.
+- A mount **at or inside `~/.pi`** (for example `--mount ~/.pi/extensions:ro`)
+is allowed but warns twice: that a live bind of host Pi state should be a
+`:fork`, and that host Pi extensions and installed packages may be built for
+this host's OS/arch and may not run in the Linux guest.
+- **Launching from `$HOME` (or from inside `~/.pi`) is refused with no
+`--mount` at all**, because the project bind is the canonicalized cwd: `cd ~ &&
+agent-vm shell` would hand the guest the whole host `$HOME`.
+- **`$HOME` unset + any `--mount`** is refused: agent-vm cannot locate the Pi
+home, so it cannot decide.
+
+When `~/.pi` does not exist, none of the refusals apply: there is nothing to
+leak today, so the same routes produce a one-line advisory instead (the
+residual risk is installing Pi *and* logging in during a live session). Known,
+accepted gaps, all in [`docs/adr/0020`](docs/adr/0020-protect-host-pi-credential-files.md):
+a hardlink to the file inside an otherwise-unrelated live bind; a filesystem
+whose inode identity is unreliable *and* whose alias is not a path containment;
+and a copy you made yourself.
 
 `follow-links` (unchanged) walks `HOST` on the host and bind-mounts each
 resolved directory target at its real absolute path, so links that leave

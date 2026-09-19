@@ -464,6 +464,12 @@ all inputs.
 
 ## Forked mount
 
-A writable, project-scoped persistent mount initialized once from a host **directory**. After initialization, the fork and source are independent: changes do not propagate in either direction. A fork can optionally omit entries while seeding (`:fork:exclude=REL`); omissions are seed-only and are not a persistent guest access restriction. Files are never forked — a regular file is mounted read-only instead.
+A writable, project-scoped persistent mount initialized once from a host **directory**. After initialization, the fork and source are independent: changes do not propagate in either direction. A fork can optionally omit entries while seeding (`:fork:exclude=REL`); omissions are seed-only and are not a persistent guest access restriction. Files are never forked — a regular file is mounted read-only instead. A fork never copies a **Protected host file**, whatever the declaration says (see [ADR-0020](docs/adr/0020-protect-host-pi-credential-files.md)).
 
 _Avoid_: "bind mount", which remains connected to the host path; "copy-on-write mount", which implies lazy shared backing storage.
+
+## Protected host file
+
+One of the two host Pi files agent-vm must never hand to a guest — `~/.pi/agent/auth.json` (credentials) and `~/.pi/agent/models.json` (provider configuration) — and the reason [ADR-0020](docs/adr/0020-protect-host-pi-credential-files.md) exists: Pi's imported host credentials are kept host-side and represented in the guest by placeholders ([ADR-0011](docs/adr/0011-pi-mixed-credential-ownership.md)), which a mount that exposed the file as a file would defeat. Reachability is decided by canonical **identity** (`(dev, ino)`) *and* component-wise canonical **containment**, never by lexical path matching alone; a live bind that would expose one is refused, and a fork omits it from the copy. Whether an exposure is a refusal or an advisory depends on whether `$HOME/.pi` exists. The accepted gaps (a hardlink inside an unrelated live bind, a filesystem with unreliable inode identity, a copy the user made themselves) are named in the ADR.
+
+_Avoid_: "masked file" — masks were removed by [ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md) and nothing is overlaid; "excluded" — `:exclude=REL` is a user-declared seed option, while this is an unconditional launch invariant.
