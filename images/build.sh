@@ -190,6 +190,30 @@ if [ -n "${SOFT_FAIL}" ] && [ "${SOFT_FAIL}" != "0" ]; then
     EXTRA+=(--build-arg "AGENT_INSTALL_SOFT_FAIL=1")
 fi
 
+# `build_intermediate` `--load`s each layer into the daemon so the next step's
+# `FROM` can reference it. That only works on a builder whose driver shares the
+# daemon's image store (the `docker` driver). Fail up front with an actionable
+# message rather than letting buildx fail opaquely partway through the chain.
+require_docker_driver() {
+    # Read `inspect` once into a variable: piping it into `grep -q` under
+    # `set -o pipefail` would report a false failure, because `grep -q` exits as
+    # soon as it matches and `docker` then dies of SIGPIPE.
+    local info driver
+    info=$(docker buildx inspect 2>/dev/null || true)
+    driver=$(printf '%s\n' "$info" | awk -F': *' '/^Driver:/{print $2; exit}')
+    if [ "$driver" = "docker" ]; then
+        return 0
+    fi
+    {
+        echo "the active buildx builder uses the '${driver:-unknown}' driver, not 'docker'."
+        echo "  This script --loads intermediate tool layers into the daemon, which only"
+        echo "  works when the current builder shares the daemon's image store."
+        echo "  Fix: docker buildx create --driver docker --use"
+        echo "  Or build via the loop in macos-build.md and import the tags directly."
+    } >&2
+    return 1
+}
+
 build_base() {
     echo "==> Building ${BASE_TAG} (tool-free base, zstd layers)"
     docker buildx build \
@@ -247,6 +271,7 @@ main() {
         echo "docker buildx not available — install Docker 20.10+ or 'docker buildx install'" >&2
         exit 1
     fi
+    require_docker_driver
     ensure_registry
     build_and_push
     echo "==> ${BASE_TAG} and ${IMAGE_TAG} ready"

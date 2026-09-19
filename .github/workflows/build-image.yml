@@ -305,6 +305,7 @@ jobs:
           BASE_DIGEST: ${{ steps.base.outputs.digest }}
           TEMPLATE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          set -euo pipefail
           echo "Pushed ${BASE_REF} (${BASE_DIGEST})"
           echo "Pushed ${TMPL_REF} (${TEMPLATE_DIGEST})"
           # Guard the digest-stability invariant for BOTH repositories: each push
@@ -348,11 +349,23 @@ jobs:
           base_ids=$(docker buildx imagetools inspect --format "$fmt" "$BASE_REF" | jq -r '.[]')
           tmpl_ids=$(docker buildx imagetools inspect --format "$fmt" "$TMPL_REF" | jq -r '.[]')
           n=$(printf '%s\n' "$base_ids" | wc -l | tr -d ' ')
+          m=$(printf '%s\n' "$tmpl_ids" | wc -l | tr -d ' ')
+          # A pure prefix test passes for a "template" that IS the base (no tool
+          # layer at all): head -n "$n" returns base_ids unchanged. That happens
+          # for real when a tool Dockerfile's default `ARG BASE_IMAGE=` wins
+          # because a `build-args:` key was dropped — the final step then builds
+          # FROM yesterday's published base and its diff_ids still prefix-match.
+          # The point of this step is to prove four layers were ADDED, so require
+          # strictly more layers than the base has.
+          if [ "$m" -le "$n" ]; then
+            echo "::error::the template has no rootfs layers beyond the base ($m <= $n); a tool-layer build was dropped or chained FROM the wrong base"
+            exit 1
+          fi
           if [ "$(printf '%s\n' "$tmpl_ids" | head -n "$n")" != "$base_ids" ]; then
             echo "::error::the template's rootfs diff_ids do not start with the base's; the template was not built FROM this base"
             exit 1
           fi
-          echo "  template rootfs begins with the base's $n diff_ids — provably base + tool layers"
+          echo "  template rootfs begins with the base's $n diff_ids and adds $((m - n)) — provably base + tool layers"
 
   retain:
     # Delete dated image versions older than 14 days so the registry doesn't
@@ -360,6 +373,14 @@ jobs:
     # ignore-versions regex. Runs for BOTH repositories (issue #84), and the
     # per-tool intermediate manifests — pushed by digest with no tag — are
     # matched by no protected tag and so are age-pruned like any other version.
+    #
+    # Expected steady state, so a future reader does not read this as a leak:
+    # each hourly run creates three untagged intermediate versions (codex,
+    # opencode, claude) in `agent-vm-base` — ~72/day — plus one tagged version
+    # per repository. At a 14-day horizon that is ~1,000 untagged versions in
+    # `agent-vm-base`, pruned only by age. The listing is paginated at 100/page,
+    # and this job now walks two packages; ~1,000 versions is the number the
+    # pagination must stay comfortable with.
     needs: build
     runs-on: ubuntu-latest
     permissions:

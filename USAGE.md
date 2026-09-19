@@ -476,9 +476,17 @@ interactive_shell = false            # optional; join trailing args into `-c`
   **count**, never the values, so a secret accidentally placed here is not
   echoed. Args are not shell-split or expanded.
 - `layer` — optional; a table with **exactly one** of `builtin` (one of
-  `codex`, `opencode`, `claude`, `copilot`) or `path` (a declared path). A
-  layer is metadata only in this release: it is **not** resolved, checked
-  for existence, or built (see [#84](https://github.com/gregwebs/agent-vm/issues/84)).
+  `codex`, `opencode`, `claude`, `copilot`) or `path`. It **selects the tool
+  layer composed onto the base** for a launch whose tool set differs from the
+  shipped default (see [Image release cadence](#image-release-cadence)):
+  `builtin` names one of the four layers embedded in the binary, `path` a
+  directory (relative to the declaring config file, or absolute) holding a
+  `Dockerfile` that builds `FROM` the base per
+  [ADR-0003](docs/adr/0003-project-tooling-layers.md). A tool with no `layer`
+  contributes nothing to the composed image, so **omitting it on a redeclared
+  shipped tool boots a guest without that tool** — declare
+  `layer = { builtin = "claude" }` if you meant to compose it (see the upgrade
+  note below).
 - `credentials` — optional; provider **config names**, which differ from
   the `agent-vm doctor` row labels. Valid: `anthropic`, `openai`,
   `opencode-static`, `copilot`. Note `opencode` (the doctor label) is **not**
@@ -542,6 +550,17 @@ interactive_shell = false            # optional; join trailing args into `-c`
   user's trailing args are joined (and shell-escaped) into a single `bash -c`
   command line instead of being appended as separate argv entries. The shipped
   `shell` tool sets it.
+
+> **Upgrading from a config that treated `layer` as metadata.** Before the
+> base/tool-layer split, `layer` was parsed but ignored, so a `[[tools]]` entry
+> that redeclared a shipped tool only to adjust its `args` worked without one.
+> The field now decides what the image composes: an entry that redeclares a
+> shipped tool must carry `layer = { builtin = … }` (or a `path`), or a
+> non-default tool set composes a chain with no layer for that tool and the
+> launch boots a guest without it. The symptom is a bare command-not-found in
+> the guest, or a `setup` failure naming the image it checked; adding the
+> `layer` restores the old behaviour by composing that layer on the first
+> launch. Nothing else about a redeclaration changed.
 
 Unknown keys, wrong types, malformed TOML, unknown `layer.builtin`, unknown
 provider names, duplicate tool names within one file, and **overlapping**

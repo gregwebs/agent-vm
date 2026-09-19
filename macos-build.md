@@ -140,11 +140,14 @@ and exercise the composed path:
 
 ```bash
 set -euo pipefail
-# 1. base + the four tool layers, chained.
+# 1. base + the four tool layers, chained. Every step is `--load`ed into the
+#    daemon (as `images/build.sh` does) so the next step's `FROM` resolves;
+#    that needs a `docker`-driver builder (`docker buildx create --driver
+#    docker --use`).
 docker buildx build --platform linux/arm64 --load -t agent-vm-base:dev -f images/Dockerfile images
 prev=agent-vm-base:dev
 for t in codex opencode claude copilot; do
-  docker buildx build --platform linux/arm64 \
+  docker buildx build --platform linux/arm64 --load \
     --build-arg BASE_IMAGE="$prev" -t "agent-vm-$t:dev" "images/tools/$t"
   prev="agent-vm-$t:dev"
 done
@@ -164,7 +167,8 @@ The local tag `agent-vm-base:dev` shares its repository name with
 a listing collision only: a link tag is always 64 hex characters, so no link can
 be shadowed.
 `images/build.sh` performs the same chain against a loopback registry and pushes
-both published tags (`agent-vm-base:latest`, `agent-vm-template:latest`).
+both published tags (`agent-vm-base:latest`, `agent-vm-template:latest`); it
+requires the same `docker`-driver builder and checks for it up front.
 
 Cache references are exact. Importing `agent-vm-template:latest` does not populate `ghcr.io/wirenboard/agent-vm-template:latest`.
 

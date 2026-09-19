@@ -572,7 +572,7 @@ async fn resolve_boot_image_with_layer<W: std::io::Write>(
             );
         }
         notices.emit(format!(
-            "==> Tooling layer present; pulling base {base_image} first…"
+            "==> Composing tool layers; pulling the chain root {base_image} first…"
         ))?;
         crate::pull::pull_image(base_image)
             .await
@@ -3569,6 +3569,247 @@ mod tests {
         );
         // `guard` (and the temp cache/archive/project tempdirs) drop here,
         // removing only the disposable source/link tags this test created.
+        drop(guard);
+    }
+
+    // --- issue #84: the builtin tool-layer compose path, end to end -------
+
+    /// The declared layers of a one-tool config, as `launch` reads them from
+    /// the catalog (before `take_entry`).
+    fn declared_layers_of(body: &str) -> Vec<crate::config::DeclaredLayer> {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("config.toml");
+        std::fs::write(&project, body).unwrap();
+        crate::config::load(&crate::config::ConfigPaths {
+            user: Some(dir.path().join("no-user.toml")),
+            project,
+        })
+        .expect("fixture config parses")
+        .into_launch_catalog()
+        .expect("fixture catalog resolves")
+        .declared_layers()
+    }
+
+    /// Issue-#84 review, Finding 6: the *compose* path —
+    /// `tool_layer::materialize`'s temp build context feeding
+    /// `plan_chain`/`execute_chain` — was exercised by nothing. This runs it
+    /// for real for one builtin layer (`claude`, whose Dockerfile does
+    /// `COPY --chmod=0755 seed-claude-plugins.sh`, so it also covers the
+    /// materialised-0644-plus-Dockerfile-chmod rule) against an imported
+    /// tool-free base, and asserts the result is a genuine composition:
+    ///
+    /// * the boot tag is the plan computed from the same materialised dirs
+    ///   (the tool step was built, not skipped or substituted);
+    /// * the plan's label names the tool and the builtin layer;
+    /// * the composed image is ingested into the msb cache;
+    /// * its `rootfs.diff_ids` **strictly extend** the base's, in order — the
+    ///   same identity CI's `build-image.yml` prefix-asserts for the published
+    ///   template;
+    /// * its `PATH` is a superset of the base's (contract C2 on a real build;
+    ///   the unit test is only a text proxy).
+    ///
+    /// Needs docker/buildx, network for the agent installer, and a **tool-free
+    /// base** in Docker's local store — it carries `agent-vm-install`, which
+    /// the tool layer's Dockerfile calls. Point `AGENT_VM_E2E_BASE_IMAGE` at
+    /// one (`agent-vm-base:dev` from macos-build.md) and run:
+    /// `AGENT_VM_E2E_BASE_IMAGE=agent-vm-base:dev \
+    ///  cargo test -p agent-vm --bin agent-vm -- e2e_builtin_tool_layer --ignored --test-threads=1`
+    #[tokio::test]
+    #[ignore = "needs docker buildx, network, and AGENT_VM_E2E_BASE_IMAGE=<tool-free base>"]
+    async fn e2e_builtin_tool_layer_composes_onto_an_imported_base() {
+        if layer::ensure_docker_buildx().await.is_err() {
+            eprintln!("skipping: `docker buildx` not available on PATH");
+            return;
+        }
+        let parent = match std::env::var("AGENT_VM_E2E_BASE_IMAGE") {
+            Ok(parent) => parent,
+            Err(_) => {
+                eprintln!(
+                    "skipping: set AGENT_VM_E2E_BASE_IMAGE to a tool-free base build (e.g. \
+                     agent-vm-base:dev); a tool layer's Dockerfile calls the base's \
+                     `agent-vm-install`"
+                );
+                return;
+            }
+        };
+        if !docker_tag_exists(&parent) {
+            eprintln!("skipping: base {parent} is not in docker's local image store");
+            return;
+        }
+
+        // A uniquely marked disposable child, so the `docker save`-imported msb
+        // manifest digest — and therefore the Docker base link — is unique per
+        // run. Mirrors `import-image.sh` and the #98 test above.
+        let nonce = e2e_nonce();
+        let source = format!("agent-vm-e2e-base:{nonce}");
+        if docker_tag_exists(&source) {
+            eprintln!("skipping: disposable source tag {source} already exists");
+            return;
+        }
+        let ctx = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ctx.path().join("Dockerfile"),
+            format!("ARG PARENT={parent}\nFROM ${{PARENT}}\nLABEL agent-vm-e2e-nonce={nonce}\n"),
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("docker")
+                .args([
+                    "build",
+                    "--build-arg",
+                    &format!("PARENT={parent}"),
+                    "-t",
+                    &source,
+                    ctx.path().to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success(),
+            "disposable child build must succeed"
+        );
+        let mut guard = DockerTagGuard::default();
+        guard.own(&source);
+
+        // Import the disposable base into an isolated msb cache, then create
+        // the Docker base link from the docker source image exactly as
+        // `import-image.sh` does.
+        let archive = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+        assert!(
+            std::process::Command::new("docker")
+                .args(["save", &source, "-o", archive.path().to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success(),
+            "docker save must succeed"
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let local_base_ref = format!("agent-vm-e2e-local:{nonce}");
+        microsandbox_image::load_archive(
+            cache.path(),
+            archive.path(),
+            microsandbox_image::ImageLoadOptions {
+                tags: vec![local_base_ref.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("load_archive into the temp cache");
+        let reference: microsandbox_image::Reference = local_base_ref.parse().unwrap();
+        let cache_handle = microsandbox_image::GlobalCache::new_async(cache.path())
+            .await
+            .unwrap();
+        let digest = cache_handle
+            .read_image_metadata_async(&reference)
+            .await
+            .unwrap()
+            .expect("imported base metadata must be present")
+            .manifest_digest;
+        let link = layer::docker_base_tag(&digest).expect("valid sha256 manifest digest");
+        if docker_tag_exists(&link) {
+            eprintln!("skipping: base link {link} already exists");
+            return;
+        }
+        assert!(
+            std::process::Command::new("docker")
+                .args(["tag", &source, &link])
+                .status()
+                .unwrap()
+                .success(),
+            "docker tag must succeed"
+        );
+        guard.own(&link);
+
+        // The real compose path: a builtin layer materialised into a temp
+        // build context, fed to the resolver as the tool steps.
+        let declared = declared_layers_of(
+            "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\n\
+             layer = { builtin = \"claude\" }\ncredentials = [\"anthropic\"]\n",
+        );
+        assert_eq!(declared.len(), 1);
+        let (tool_steps, _materialized) = tool_layer::materialize(&declared).expect("materialize");
+        assert_eq!(tool_steps.len(), 1, "one builtin layer, one chain step");
+
+        let project = tempfile::tempdir().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::None,
+        };
+        let mut notices = LaunchNotices::new(output);
+        let got = resolve_boot_image_with_layer(
+            &tool_layer::ChainRoot::Base(local_base_ref.clone()),
+            &tool_steps,
+            &[],
+            project.path(),
+            true,
+            &mut notices,
+            Some(cache.path()),
+        )
+        .await
+        .expect("composing a builtin tool layer onto an imported base")
+        .expect("a derived tag");
+
+        let plan = layer::plan_chain(&tool_steps, project.path(), &digest).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            got, plan[0].id.tag,
+            "the boot tag must be the plan computed from the materialised tool step"
+        );
+        assert_eq!(plan[0].label, "tool \"claude\" (builtin layer claude)");
+        assert!(
+            layer::derived_is_cached(cache.path(), &got).await.unwrap(),
+            "the composed image must be ingested into the msb cache"
+        );
+
+        // The composed image really extends the base.
+        let composed_ref: microsandbox_image::Reference = got.parse().unwrap();
+        let composed_md = cache_handle
+            .read_image_metadata_async(&composed_ref)
+            .await
+            .unwrap()
+            .expect("composed image metadata must be present");
+        let composed = layer::contract::ImageFacts::from_cached_metadata(&composed_md)
+            .expect("composed image facts");
+        let base = layer::docker_image_facts(&source)
+            .await
+            .unwrap()
+            .expect("base image facts");
+        assert!(
+            composed.diff_ids.len() > base.diff_ids.len(),
+            "the template must add rootfs layers beyond the base: {} vs {}",
+            composed.diff_ids.len(),
+            base.diff_ids.len()
+        );
+        assert_eq!(
+            &composed.diff_ids[..base.diff_ids.len()],
+            &base.diff_ids[..],
+            "the composed image's diff_ids must begin with the base's, in order"
+        );
+
+        // C2 on a real build: the layer's `ENV PATH=<new>:${PATH}` must leave
+        // every base entry reachable.
+        let path_entries = |facts: &layer::contract::ImageFacts| -> Vec<String> {
+            facts
+                .env
+                .iter()
+                .rev()
+                .find_map(|entry| entry.strip_prefix("PATH="))
+                .map(|value| value.split(':').map(str::to_string).collect())
+                .unwrap_or_default()
+        };
+        let base_path = path_entries(&base);
+        let composed_path = path_entries(&composed);
+        for entry in &base_path {
+            assert!(
+                composed_path.contains(entry),
+                "C2: {entry:?} must remain on PATH; got {composed_path:?}"
+            );
+        }
+        assert!(
+            composed_path.iter().any(|e| e == "/opt/agent/.local/bin"),
+            "the claude layer's prefix must be on PATH; got {composed_path:?}"
+        );
+
         drop(guard);
     }
 

@@ -90,8 +90,11 @@ project file -----> parse + validate --+    + conflicts       ownership
                                             doctor preview (read-only)
 ```
 
-Layer paths remain declarative metadata that is never resolved or built
-(#84), and config warnings are never logged — doctor renders them explicitly.
+This module resolves declarative config only: the `layer` each tool declares is
+resolved, anchored and built by `crates/agent-vm/src/tool_layer.rs`
+(`chain_root`, `materialize`) and `crates/agent-vm/src/layer.rs` at launch, not
+here — see [ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md).
+Config warnings are never logged — doctor renders them explicitly.
 `doctor --reset-msb-db` never reads config, so a broken file cannot block db
 recovery. There is still no arrow from this module to credential *capture*,
 Docker, or guest state; it resolves the provisioning set and the launch

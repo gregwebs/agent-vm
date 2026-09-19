@@ -64,9 +64,11 @@
 //! [`ConfigReport::into_launch_catalog`] is what `cli` (to register
 //! subcommands) and `doctor` (to render them) both start from: the resolved
 //! merge result plus the built-in `shell` fallback (see [`LaunchCatalog`]).
-//! Layer paths are still metadata only — they are compared as declared values
-//! and never resolved, checked for existence, or built (#84). Persisted-path
-//! overlap safety is defined here (#83): [`guest_paths_overlap`] backs the
+//! [`LaunchCatalog::declared_layers`] projects the catalog's ordered,
+//! deduplicated `layer` sequence, which [`crate::tool_layer`] resolves —
+//! anchoring and existence-checking a `path`, materialising a `builtin` — and
+//! builds onto the chain root (#84). Persisted-path overlap safety is defined
+//! here (#83): [`guest_paths_overlap`] backs the
 //! within-tool, cross-tool and reserved-link checks, and `guest_home::links`
 //! turns the surviving paths into the one guest-HOME link list both
 //! guest-user modes provision from.
@@ -641,8 +643,11 @@ pub(crate) enum DeclaredTools {
     Named(Vec<ToolName>),
 }
 
-/// A tool's optional tooling layer. In this PR it is metadata only: a builtin
-/// selector or a declared path that is never resolved or built.
+/// A tool's optional tooling layer. `builtin` selects one of the four layer
+/// sources embedded in the binary (`images/tools/`); `path` names a directory
+/// anchored on the declaring config file (D7). [`LaunchCatalog::declared_layers`]
+/// projects the ordered, deduplicated sequence that [`crate::tool_layer`]
+/// materialises and builds onto the chain root (#84).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolLayer {
     Builtin(BuiltinLayer),

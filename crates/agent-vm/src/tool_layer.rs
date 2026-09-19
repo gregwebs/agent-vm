@@ -230,7 +230,7 @@ fn write_tree(dir: &Dir<'_>, dest: &Path) -> Result<()> {
             DirEntry::Dir(sub) => {
                 fs::create_dir_all(&out)
                     .with_context(|| format!("creating build-context dir {}", out.display()))?;
-                write_tree(sub, dest)?;
+                write_tree(sub, &out)?;
             }
         }
     }
@@ -338,6 +338,67 @@ mod tests {
         assert_eq!(declared, shipped());
         let root = chain_root(None, None, &declared, &shipped()).expect("root");
         assert!(matches!(root, ChainRoot::Template(_)));
+    }
+
+    // -- the declaration order is transcribed into CI and images/build.sh --
+
+    fn repo_path(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative)
+    }
+
+    /// The declaration order has one source of truth, `default-tools.toml`, but
+    /// CI's five build steps and `images/build.sh`'s layer variables transcribe
+    /// it by hand (a workflow and a shell script cannot import a Rust const).
+    /// Nothing else ties them together, and the drift is silent: if CI composes
+    /// the published template in a different order than the launcher believes,
+    /// the default-set fast path boots an image that is not what the config
+    /// describes — the class of bug D1 exists to prevent. Mirrors
+    /// `layer::tests::base_repo_constant_matches_the_import_script_literal`
+    /// (issue-#84 review, Finding 4).
+    #[test]
+    fn tool_order_matches_the_ci_and_build_script_literals() {
+        let shipped: Vec<String> = crate::config::shipped_tool_layers()
+            .expect("the shipped layers resolve")
+            .iter()
+            .map(|layer| match layer {
+                ToolLayer::Builtin(builtin) => builtin.as_str().to_string(),
+                ToolLayer::Path(_) => panic!("a shipped layer must be a builtin"),
+            })
+            .collect();
+
+        let workflow = std::fs::read_to_string(repo_path(".github/workflows/build-image.yml"))
+            .expect("read .github/workflows/build-image.yml");
+        let ci_order: Vec<String> = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("context: images/tools/"))
+            .map(|tool| tool.trim().to_string())
+            .collect();
+        assert_eq!(
+            ci_order, shipped,
+            "build-image.yml must chain the tool layers in the order default-tools.toml declares"
+        );
+
+        let script =
+            std::fs::read_to_string(repo_path("images/build.sh")).expect("read images/build.sh");
+        let mut script_order: Vec<String> = Vec::new();
+        for line in script.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("INTERMEDIATE_LAYERS=(") {
+                script_order.extend(
+                    rest.trim_end_matches(')')
+                        .split_whitespace()
+                        .map(str::to_string),
+                );
+            } else if let Some(rest) = line.strip_prefix("FINAL_LAYER=") {
+                script_order.push(rest.trim().to_string());
+            }
+        }
+        assert_eq!(
+            script_order, shipped,
+            "images/build.sh must chain the tool layers in the order default-tools.toml declares"
+        );
     }
 
     // -- §6.3(3): the embedded snapshot matches the on-disk sources -------
@@ -484,6 +545,34 @@ mod tests {
         );
     }
 
+    /// Regression (issue #84 review, Finding 1): `write_tree` must place a
+    /// nested entry at its path **relative to the embed root**, not at the
+    /// context root. `include_dir::Dir::path()` is root-relative at every depth
+    /// (`include_dir-0.7.4/src/dir.rs:18-22`), so recursing with the parent's
+    /// `dest` instead of the child's hoists `sub/nested.txt` to the context
+    /// root. The shipped layers are flat today, so the flat `materialize_*`
+    /// tests above would still pass with that bug in place; this fixture tree
+    /// is deliberately nested so the test fails without the fix. The
+    /// consequence is not cosmetic: `layer::canonical_stream` hashes
+    /// *relative* paths, so a hoisted entry hashes differently from a git
+    /// checkout of the same bytes and the same layer builds twice.
+    #[test]
+    fn write_tree_preserves_nested_subdirectory_paths() {
+        static NESTED: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/tests/fixtures/tool-layer-tree");
+        let dest = TempDir::new().unwrap();
+        write_tree(&NESTED, dest.path()).expect("write_tree");
+        for rel in ["Dockerfile", "sub/nested.txt", "sub/deeper/leaf.txt"] {
+            assert!(
+                dest.path().join(rel).is_file(),
+                "{rel} must materialise at its path relative to the embed root"
+            );
+        }
+        assert!(
+            !dest.path().join("nested.txt").exists() && !dest.path().join("leaf.txt").exists(),
+            "a nested file must not be hoisted to the context root"
+        );
+    }
+
     #[test]
     fn materialized_paths_outlive_the_materialize_call() {
         let layers = declared_from_config(
@@ -503,9 +592,25 @@ mod tests {
         );
         assert_eq!(layers.len(), 1, "duplicate builtin layers dedupe");
         let (dirs, _guard) = materialize(&layers).expect("materialize");
-        assert!(dirs[0].label.contains("a"), "{}", dirs[0].label);
-        assert!(!dirs[0].label.contains("/tmp"), "{}", dirs[0].label);
-        assert!(!dirs[0].label.contains("T/"), "{}", dirs[0].label);
+        // The label identifies the *declaring tool* and the layer it selects.
+        // A bare `contains("a")` would also hold for a label that named only
+        // the builtin (`claude` contains `a`), so assert the position and the
+        // builtin name separately.
+        assert!(dirs[0].label.starts_with("tool \"a\""), "{}", dirs[0].label);
+        assert!(
+            dirs[0].label.contains("builtin layer claude"),
+            "{}",
+            dirs[0].label
+        );
+        // The temp path is meaningless to a user reading the confirmation
+        // prompt. Assert the actual property (the path is absent) rather than
+        // a `/tmp`/`T/` substring, which never appears in a format string.
+        let temp = dirs[0].dir.to_string_lossy();
+        assert!(
+            !dirs[0].label.contains(temp.as_ref()),
+            "the label must not name the materialised path: {}",
+            dirs[0].label
+        );
     }
 
     /// A `path` layer anchors on the declaring config file's directory (D7) and

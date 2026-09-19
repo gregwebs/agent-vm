@@ -273,7 +273,7 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
                     .await
                     .map(|out| out.status().code == 0)
                     .unwrap_or(false);
-                if let Err(error) = report(target, present, outcome) {
+                if let Err(error) = report(image, target, present, outcome) {
                     sandbox.stop_and_wait().await.ok();
                     Sandbox::remove("agent-vm-setup-verify").await.ok();
                     return Err(error);
@@ -295,12 +295,19 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
 /// the tool — bails; any other command warns and `setup` continues, because
 /// `setup` does not build the tooling layer that might supply it.
 ///
+/// `image` is the reference `setup` verified, so the fatal diagnostic can name
+/// the image this configuration boots and point at the `layer` field that would
+/// supply the command — the failure a user hits after redeclaring a shipped tool
+/// *without* a `layer` (the declaration that was cheap while `layer` was
+/// metadata).
+///
 /// A transport failure — `sandbox.exec` returning `Err` because the sandbox
 /// died or agentd is unreachable — is indistinguishable here from an absent
 /// binary, so a non-required tool is warned about and `setup` continues. That
 /// is deliberate: `setup` cannot repair a dead sandbox by failing the run, and
 /// the image-API check has already passed by this point.
 fn report(
+    image: &str,
     target: &VerifyTarget,
     present: bool,
     outcome: Result<ExecOutput, MicrosandboxError>,
@@ -345,8 +352,14 @@ fn report(
         } else {
             "missing from the image".to_string()
         };
+        // `image` is user-supplied on `--base-image`/`--image`, so escape it
+        // before it reaches a terminal.
+        let image = config::escape_str(image);
         bail!(
-            "{verbs}: command {command} is {because}. Pull a newer tag (`agent-vm pull`) or report at \
+            "{verbs}: command {command} is {because} — {image} is the image this configuration \
+             boots. If the tool is meant to be composed locally, declare `layer = {{ builtin = \
+             … }}` (or a `path`) on it: `setup` verifies the base and the first launch composes \
+             it. Otherwise pull a newer tag (`agent-vm pull`) or report at \
              https://github.com/wirenboard/agent-vm/issues"
         );
     }
@@ -582,14 +595,26 @@ mod tests {
 
     /// Manual 3 (codified): a missing *shipped* command is fatal. The real-VM
     /// run in `verifications.md` uses a derived image with `codex` removed;
-    /// this pins the same decision boot-free.
+    /// this pins the same decision boot-free. The message names the image this
+    /// configuration boots, so a user who redeclared a shipped tool without a
+    /// `layer` learns why the guest would be missing it.
     #[test]
     fn report_bails_for_a_missing_shipped_command() {
-        let err = report(&target(&["codex"], "codex", true), false, not_runnable())
-            .expect_err("a missing shipped command must be fatal");
+        let err = report(
+            "ghcr.io/wirenboard/agent-vm-base:latest",
+            &target(&["codex"], "codex", true),
+            false,
+            not_runnable(),
+        )
+        .expect_err("a missing shipped command must be fatal");
         let rendered = format!("{err:#}");
         assert!(rendered.contains("codex"), "{rendered}");
         assert!(rendered.contains("missing from the image"), "{rendered}");
+        assert!(
+            rendered.contains("ghcr.io/wirenboard/agent-vm-base:latest"),
+            "the diagnostic names the image this configuration boots: {rendered}"
+        );
+        assert!(rendered.contains("layer"), "{rendered}");
     }
 
     /// Manual 2 (codified): a missing *user/project* command warns and the run
@@ -597,7 +622,13 @@ mod tests {
     #[test]
     fn report_warns_for_a_missing_optional_command() {
         assert!(
-            report(&target(&["mytool"], "mytool", false), false, not_runnable()).is_ok(),
+            report(
+                "agent-vm-template:1",
+                &target(&["mytool"], "mytool", false),
+                false,
+                not_runnable()
+            )
+            .is_ok(),
             "a missing user command only warns"
         );
     }
@@ -606,8 +637,13 @@ mod tests {
     /// still fatal, and the message says "broken" rather than "missing".
     #[test]
     fn report_bails_for_a_broken_shipped_command() {
-        let err = report(&target(&["claude"], "claude", true), true, not_runnable())
-            .expect_err("a broken shipped command must be fatal");
+        let err = report(
+            "agent-vm-base:1",
+            &target(&["claude"], "claude", true),
+            true,
+            not_runnable(),
+        )
+        .expect_err("a broken shipped command must be fatal");
         let rendered = format!("{err:#}");
         assert!(rendered.contains("broken"), "{rendered}");
     }

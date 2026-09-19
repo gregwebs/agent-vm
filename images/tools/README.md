@@ -61,10 +61,14 @@ USAGE.md.
 
 ## Declaration and cache ordering
 
-The declaration order — and therefore the chain order and CI build order — is
+The declaration order — and therefore the chain order, the order
+`agent-vm doctor` lists the verbs in, and CI's build order — is
 `codex, opencode, claude, copilot`, matching
-`crates/agent-vm/src/default-tools.toml` and the
-`[[tools]]` chain.
+`crates/agent-vm/src/default-tools.toml`. That file is the single source of
+truth: `config::shipped_tool_layers()` derives the launcher's order from it,
+and `tool_layer::tests::tool_order_matches_the_ci_and_build_script_literals`
+asserts both this directory's build order (`images/build.sh`) and CI's
+(`.github/workflows/build-image.yml`) agree with it.
 
 The order is deliberate and is **not** by size. A change to any layer forces
 every layer stacked above it to rebuild, so the **topmost** layer is re-emitted
