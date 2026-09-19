@@ -2264,13 +2264,12 @@ pub(crate) fn prepare_forks(
             .tempdir_in(&staging_parent)
             .context("creating fork staging directory")?;
         let staged_data = stage.path().join("data");
-        let kind = copy_root(
-            &mount.host,
-            &staged_data,
-            &mount.exclusions,
-            mount.follows_links(),
-        )
-        .with_context(|| format!("initializing fork from {}", mount.source_spelling))?;
+        let policy = CopyPolicy {
+            exclusions: &mount.exclusions,
+            follow: mount.follows_links(),
+        };
+        let kind = copy_root(&mount.host, &staged_data, &policy)
+            .with_context(|| format!("initializing fork from {}", mount.source_spelling))?;
         let manifest = ForkManifest {
             version: MANIFEST_VERSION,
             id: id.clone(),
@@ -2596,6 +2595,22 @@ fn merge_exclusions(existing: &mut Vec<PathBuf>, additions: Vec<PathBuf>) {
     }
     *existing = collapsed;
 }
+/// Everything the copier needs besides the two paths: the declaration's own
+/// exclusions and follow policy. Bundled because these are adjacent same-typed
+/// arguments (CODING_STANDARDS: do not repeat a type in a row).
+struct CopyPolicy<'a> {
+    exclusions: &'a [PathBuf],
+    follow: bool,
+}
+
+/// A node the copier either published or deliberately did not. The enum forces
+/// `copy_root` to answer the root-omitted case instead of silently publishing
+/// an empty fork.
+enum CopiedNode {
+    Copied(PreparedNodeKind),
+    Omitted,
+}
+
 /// Copy a directory root via verified descriptors. Nested links are never
 /// followed in the default policy, so a swap cannot turn an untrusted leaf
 /// into a read of an external target. Explicit follow mode is deliberately
@@ -2604,8 +2619,7 @@ fn merge_exclusions(existing: &mut Vec<PathBuf>, additions: Vec<PathBuf>) {
 fn copy_root(
     source: &Path,
     destination: &Path,
-    exclusions: &[PathBuf],
-    follow: bool,
+    policy: &CopyPolicy<'_>,
 ) -> Result<PreparedNodeKind> {
     use rustix::fs::{self as rfs, FileType, Mode, OFlags};
     let source = source
@@ -2627,30 +2641,31 @@ fn copy_root(
     if FileType::from_raw_mode(rfs::fstat(&fd)?.st_mode) != FileType::Directory {
         anyhow::bail!("fork root {} must be a directory", source.display());
     }
-    copy_opened(
-        &fd,
-        destination,
-        Path::new(""),
-        exclusions,
-        follow,
-        0,
-        &mut Vec::new(),
-    )?;
-    Ok(PreparedNodeKind::Directory)
+    match copy_opened(&fd, destination, Path::new(""), policy, 0, &mut Vec::new())? {
+        CopiedNode::Copied(kind) => Ok(kind),
+        // Unreachable today: protected entries are files and a fork root is
+        // `O_DIRECTORY`-enforced. Answered anyway so a future change cannot
+        // publish an empty fork in place of a protected host file.
+        CopiedNode::Omitted => {
+            anyhow::bail!("fork root {} is a protected host file", source.display())
+        }
+    }
 }
 fn copy_opened(
     fd: &rustix::fd::OwnedFd,
     destination: &Path,
     relative: &Path,
-    exclusions: &[PathBuf],
-    follow: bool,
+    policy: &CopyPolicy<'_>,
     depth: usize,
     active: &mut Vec<(u64, u64)>,
-) -> Result<PreparedNodeKind> {
+) -> Result<CopiedNode> {
     use rustix::fs::{self as rfs, FileType, Mode, OFlags};
     use std::os::unix::fs::PermissionsExt;
-    if is_excluded(relative, exclusions) {
-        return Ok(PreparedNodeKind::Directory);
+    // Callers skip an excluded child before they open it; this is the
+    // defensive restatement of the same rule for the root itself. An excluded
+    // node is not an *omitted* one: nothing is reported and nothing is written.
+    if is_excluded(relative, policy.exclusions) {
+        return Ok(CopiedNode::Copied(PreparedNodeKind::Directory));
     }
     let stat = rfs::fstat(fd)?;
     let ty = FileType::from_raw_mode(stat.st_mode);
@@ -2664,7 +2679,7 @@ fn copy_opened(
         target.set_permissions(std::fs::Permissions::from_mode(
             stat.st_mode as u32 & 0o7777,
         ))?;
-        return Ok(PreparedNodeKind::File);
+        return Ok(CopiedNode::Copied(PreparedNodeKind::File));
     }
     if ty != FileType::Directory {
         anyhow::bail!("{} is not a regular file or directory", relative.display());
@@ -2686,7 +2701,7 @@ fn copy_opened(
             continue;
         }
         let child_relative = relative.join(name);
-        if is_excluded(&child_relative, exclusions) {
+        if is_excluded(&child_relative, policy.exclusions) {
             continue;
         }
         let child_stat = rfs::statat(fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
@@ -2694,7 +2709,7 @@ fn copy_opened(
         let child_dst = destination.join(name);
         copy_checkpoint(&child_relative);
         if child_ty == FileType::Symlink {
-            if !follow {
+            if !policy.follow {
                 let raw = rfs::readlinkat(fd, name, Vec::new())?;
                 std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(raw.as_bytes()), child_dst)?;
             } else {
@@ -2719,8 +2734,7 @@ fn copy_opened(
                     &target,
                     &child_dst,
                     &child_relative,
-                    exclusions,
-                    follow,
+                    policy,
                     depth + 1,
                     active,
                 )?;
@@ -2732,15 +2746,7 @@ fn copy_opened(
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
             )?;
-            copy_opened(
-                &child,
-                &child_dst,
-                &child_relative,
-                exclusions,
-                follow,
-                depth,
-                active,
-            )?;
+            copy_opened(&child, &child_dst, &child_relative, policy, depth, active)?;
         }
     }
     fs::set_permissions(
@@ -2748,7 +2754,7 @@ fn copy_opened(
         std::fs::Permissions::from_mode(stat.st_mode as u32 & 0o7777),
     )?;
     active.pop();
-    Ok(PreparedNodeKind::Directory)
+    Ok(CopiedNode::Copied(PreparedNodeKind::Directory))
 }
 
 #[cfg(test)]
