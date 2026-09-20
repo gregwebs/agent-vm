@@ -46,9 +46,10 @@ jq -r '.packages | to_entries[]
        | [.key, (.key | split("/") | last), .value.resolved, .value.integrity] | @tsv' \
     "${PREFIX}/package-lock.json" > /tmp/pi-siblings.tsv
 while IFS="$(printf '\t')" read -r key name resolved integrity; do
-    [ -n "${integrity}" ] && [ "${integrity}" != "null" ] || {
+    if [ -z "${integrity}" ] || [ "${integrity}" = "null" ]; then
         echo "==> pi: ${name} has no integrity in the committed lock -- refill it (images/tools/README.md)" >&2
-        exit 1; }
+        exit 1
+    fi
     tarball="/tmp/pi-verify/${name}.tgz"
     mkdir -p /tmp/pi-verify/x
     if ! curl -fsSL --retry 5 --retry-all-errors --http1.1 "${resolved}" -o "${tarball}"; then
