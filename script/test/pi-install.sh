@@ -7,14 +7,17 @@
 # failure, integrity mismatch never soft-failable, a count check that cannot read
 # as success, no partial tree left behind -- is exercised hermetically and fast.
 # The lockfile parser (the `jq` selector) is the REAL one, against a synthetic
-# lock, so the selector itself is under test.
+# lock, so the selector itself is under test. The final section is the exception:
+# it plants a real shadow package in a real installed tree and uses the real
+# `tar` and `diff` (RQ1), so the bytes-comparison B1 turned on is covered by the
+# production commands, not a stub.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
 INSTALLER="$REPO_ROOT/images/tools/pi/install-pi.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pi-install-test.XXXXXX")"
-trap 'rm -rf "$TEST_ROOT" /tmp/pi-verify /tmp/pi-siblings.tsv' EXIT
+trap 'rm -rf "$TEST_ROOT" /tmp/pi-verify /tmp/pi-siblings.tsv /tmp/pi-nested.tsv' EXIT
 
 REAL_JQ="$(command -v jq || true)"
 [[ -n "$REAL_JQ" ]] || { echo "FAIL: jq is required" >&2; exit 1; }
@@ -197,6 +200,137 @@ run_installer
 assert_contains "$RUN_OUTPUT" "5/5 shrinkwrap-only tarballs verified"
 [[ -z "$(find "$CASE/prefix" ! -perm -o+r -print -quit)" ]] \
     || fail "the installed prefix is not world-readable (C7)"
+
+# --- RQ1: real-filesystem shadow-package regression --------------------------
+#
+# The cases above prove install-pi.sh's failure *policy* with a fake `diff`. The
+# B1 finding was that the verification's `diff -x node_modules` never looked at
+# the bytes that ship: a shadow package planted under a `node_modules` at any
+# depth was silently excluded. These cases plant a real shadow in a real
+# installed tree and use the REAL `tar` and `diff`, so the comparison under test
+# is the production one. `npm`, `curl` and `openssl` stay faked (no registry, no
+# network): npm's output is materialised directly, curl serves prebuilt tarballs,
+# and the fake openssl returns the integrity the lock commits.
+
+SIBLINGS=(chord pi-agent-core pi-ai pi-telemetry pi-tui)
+REAL_BASE="node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works"
+
+make_real_tool() {
+    local name="$1"
+    cat >"$CASE/bin/$name"
+    chmod +x "$CASE/bin/$name"
+}
+
+new_realcase() {
+    unset AGENT_INSTALL_SOFT_FAIL
+    CASE="$TEST_ROOT/real-$1"
+    rm -rf "$CASE"
+    mkdir -p "$CASE/bin" "$CASE/prefix" "$CASE/home" "$CASE/tarballs" "$CASE/src"
+    : >"$CASE/log"
+
+    # Real tarballs (package/<name>.js) and the real extracted installed tree
+    # npm would have produced: one file per sibling, plus pi-ai's two
+    # lock-declared nested dependencies.
+    local name
+    for name in "${SIBLINGS[@]}"; do
+        mkdir -p "$CASE/src/$name/package"
+        printf 'sibling %s\n' "$name" >"$CASE/src/$name/package/$name.js"
+        tar -czf "$CASE/tarballs/$name.tgz" -C "$CASE/src/$name" package
+        mkdir -p "$CASE/prefix/$REAL_BASE/$name"
+        printf 'sibling %s\n' "$name" >"$CASE/prefix/$REAL_BASE/$name/$name.js"
+    done
+    for name in agent-base https-proxy-agent; do
+        mkdir -p "$CASE/prefix/$REAL_BASE/pi-ai/node_modules/$name"
+        : >"$CASE/prefix/$REAL_BASE/pi-ai/node_modules/$name/index.js"
+    done
+
+    make_real_tool npm <<'SH'
+#!/usr/bin/env bash
+printf 'npm <%s>\n' "$*" >>"$FAKE_LOG"
+exit 0
+SH
+    # `curl ... --http1.1 <resolved> -o <tarball>`; serve the matching real tgz.
+    make_real_tool curl <<'SH'
+#!/usr/bin/env bash
+url="${@: -3}"
+out="${@: -1}"
+cp "$CASE_TARBALLS/$(basename "$url")" "$out"
+SH
+    # Mirror the real openssl split: `dgst` reads its file argument; `base64`
+    # consumes the pipe. The lock commits sha512-AAAA and this returns it.
+    make_real_tool openssl <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+    dgst) : ;;
+    base64) cat >/dev/null; printf '%s' AAAA ;;
+esac
+SH
+}
+
+write_real_lock() {
+    local name integrity=sha512-AAAA
+    {
+        printf '{\n  "name": "agent-vm-guest-pi",\n  "version": "0.0.0",\n  "lockfileVersion": 3,\n  "packages": {\n'
+        for name in "${SIBLINGS[@]}"; do
+            printf '    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/%s": {"version": "0.86.1", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"},\n' \
+                "$name" "$name" "$integrity"
+        done
+        for name in agent-base https-proxy-agent; do
+            printf '    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/node_modules/%s": {"version": "0.0.0", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"},\n' \
+                "$name" "$name" "$integrity"
+        done
+        printf '    "node_modules/@earendil-works/pi-coding-agent": {"version": "0.86.1"}\n  }\n}\n'
+    } >"$CASE/prefix/package-lock.json"
+    printf '{"dependencies": {"@earendil-works/pi-coding-agent": "0.86.1"}}\n' >"$CASE/prefix/package.json"
+}
+
+# PATH deliberately omits any fake `tar`/`diff`: the real ones run.
+run_real_installer() {
+    set +e
+    RUN_OUTPUT="$(env -i \
+        "PATH=$CASE/bin:$JQ_DIR:/usr/bin:/bin" \
+        "HOME=$CASE/home" \
+        "FAKE_LOG=$CASE/log" \
+        "CASE_TARBALLS=$CASE/tarballs" \
+        "AGENT_VM_PI_PREFIX=$CASE/prefix" \
+        "AGENT_INSTALL_SOFT_FAIL=${AGENT_INSTALL_SOFT_FAIL-}" \
+        sh "$INSTALLER" 2>&1)"
+    RUN_STATUS=$?
+    set -e
+}
+
+# (c) the legitimate tree passes, with real diff/tar and no
+# basename exclusions.
+new_realcase legit
+write_real_lock
+run_real_installer
+[[ $RUN_STATUS -eq 0 ]] || fail "the legitimate tree must pass: $RUN_OUTPUT"
+assert_contains "$RUN_OUTPUT" "5/5 shrinkwrap-only tarballs verified"
+
+# (a) a shadow package one level below pi-ai's own node_modules.
+for soft in "" 1; do
+    new_realcase shadow-deep
+    write_real_lock
+    mkdir -p "$CASE/prefix/$REAL_BASE/pi-ai/node_modules/shadow"
+    : >"$CASE/prefix/$REAL_BASE/pi-ai/node_modules/shadow/index.js"
+    AGENT_INSTALL_SOFT_FAIL=$soft
+    run_real_installer
+    [[ $RUN_STATUS -ne 0 ]] || fail "a shadow under pi-ai/node_modules must fail (soft='${soft:-unset}')"
+    assert_contains "$RUN_OUTPUT" "differs from its verified tarball"
+done
+
+# (b) a shadow planted in a node_modules nested under pi-ai/dist, which Node
+# resolves from inside pi-ai/dist.
+for soft in "" 1; do
+    new_realcase shadow-dist
+    write_real_lock
+    mkdir -p "$CASE/prefix/$REAL_BASE/pi-ai/dist/node_modules/agent-base"
+    printf 'SHADOWED-DEEP\n' >"$CASE/prefix/$REAL_BASE/pi-ai/dist/node_modules/agent-base/index.js"
+    AGENT_INSTALL_SOFT_FAIL=$soft
+    run_real_installer
+    [[ $RUN_STATUS -ne 0 ]] || fail "a shadow under pi-ai/dist/node_modules must fail (soft='${soft:-unset}')"
+    assert_contains "$RUN_OUTPUT" "differs from its verified tarball"
+done
 
 # --- the test seam cannot become the production default ----------------------
 

@@ -587,7 +587,22 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
     );
 
     // The credential secret set follows the verb's provisioning set. `pi`
-    // provisions nothing, so the whole `secrets` object may be absent.
+    // provisions nothing, so the whole `secrets` object is absent for it; every
+    // other verb provisions at least one provider and must carry it. Assert the
+    // presence explicitly rather than defaulting the array for every verb (a
+    // structurally missing object would otherwise pass for an empty-expectation
+    // verb such as `copilot`).
+    if tool == "pi" {
+        assert!(
+            config["network"].get("secrets").is_none(),
+            "pi provisions nothing, so it must not carry a `secrets` object"
+        );
+    } else {
+        assert!(
+            config["network"]["secrets"]["secrets"].is_array(),
+            "{tool} provisions at least one provider and must carry a `secrets` object"
+        );
+    }
     let secrets = config["network"]["secrets"]["secrets"]
         .as_array()
         .cloned()
@@ -649,6 +664,21 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
     // no-route launch is acceptable — the hook only fires on a matched route
     // (`InterceptConfig`'s docs), and the `--allowed-repo` push restriction
     // rides the GitHub-egress routes, which are unaffected.
+    // `pi` has no proxied route, so the whole `intercept` object is absent for
+    // it; every other verb keeps it (copilot keeps the serde-default body).
+    // Assert the object's presence explicitly rather than defaulting for every
+    // verb, so a structurally missing object cannot pass.
+    if tool == "pi" {
+        assert!(
+            config["network"].get("intercept").is_none(),
+            "pi has no proxied route, so it must not carry an `intercept` object"
+        );
+    } else {
+        assert!(
+            config["network"]["intercept"].is_object(),
+            "{tool} must carry the `intercept` object"
+        );
+    }
     let rules = config["network"]["intercept"]["rules"]
         .as_array()
         .cloned()

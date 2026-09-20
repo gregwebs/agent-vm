@@ -137,9 +137,19 @@ done
 Paste each value into its lock entry (only the five; no other hand-edit). This is
 not decorative: npm ignores our lock for that subtree, so `install-pi.sh` enforces
 the five itself — it re-fetches each tarball, compares the sha512 to the committed
-`integrity`, and `diff -r`s the extraction against what `npm ci` installed. A
-mismatch is a **hard** build failure that `AGENT_INSTALL_SOFT_FAIL` may not
-downgrade. Two `cargo test` guards
+`integrity`, and compares the extraction against what `npm ci` installed with a
+plain `diff -r` — **no `-x node_modules`**, because that basename exclusion would
+blind the check to a shadow `node_modules` planted at *any* depth (for example
+`pi-ai/dist/node_modules/…`, which wins Node's resolution from inside `pi-ai/dist`).
+The only tolerated difference is the sibling's own nested dependency directories
+as the committed lock declares them (`pi-ai`'s
+`node_modules/{agent-base,https-proxy-agent}`, derived from the lock, not
+hard-coded), which npm itself authenticated because they carry `integrity` in
+Pi's shrinkwrap. So the bytes that ship are the bytes the hash was reviewed
+against, for every path outside those declared nested directories. A mismatch —
+an extra file, directory or symlink, a tampered file, or a missing one — is a
+**hard** build failure that `AGENT_INSTALL_SOFT_FAIL` may not downgrade. Two
+`cargo test` guards
 (`every_locked_package_carries_integrity`,
 `the_build_verified_sibling_set_is_exactly_the_five_nested_earendil_packages`)
 fail loudly if a regenerated lock drops the hashes or the nested layout moves.

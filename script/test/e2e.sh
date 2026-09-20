@@ -203,7 +203,7 @@ run_optional() {
 check_base_is_tool_free() {
   local out
   out="$(avm shell --no-git --image "$BASE_IMAGE" -- bash -c '
-    for b in claude codex opencode copilot; do
+    for b in pi claude codex opencode copilot; do
       if command -v "$b" >/dev/null 2>&1; then echo "PRESENT:$b"; else echo "absent:$b"; fi
     done
     echo "api=$(cat /etc/agent-vm-image-version)"
@@ -212,15 +212,15 @@ check_base_is_tool_free() {
     return 1
   }
   assert_no_match "no agent CLI on PATH" "^PRESENT:" "$out" || return 1
-  assert_eq "all four absent" "4" "$(grep -c '^absent:' <<<"$out")" || return 1
+  assert_eq "all five absent" "5" "$(grep -c '^absent:' <<<"$out")" || return 1
   assert_match "image API 3" "^api=3$" "$out" || return 1
 }
 
-# E1: all four --version checks pass in the composed template guest.
+# E1: all five --version checks pass in the composed template guest.
 check_template_has_all_tools() {
   local out
   out="$(avm shell --no-git --image "$TEMPLATE_IMAGE" -- bash -c '
-    for t in codex opencode claude copilot; do
+    for t in pi codex opencode claude copilot; do
       "$t" --version >/dev/null 2>&1 || { echo "MISSING:$t"; exit 1; }
     done
     echo "api=$(cat /etc/agent-vm-image-version)"
@@ -285,6 +285,46 @@ EOF
   assert_match 'one builtin "claude" tool step' 'tool "claude" \(builtin layer claude\)' "$out" || return 1
   assert_eq "codex absent from guest PATH" "codex rc=1" "$(grep -E '^codex ' <<<"$out")" || return 1
   assert_match "claude present in guest" "^claude /opt/agent" "$out" || return 1
+}
+
+# E1b / #95: tools = ["pi"] composes the pi layer onto the base, and the
+# end-user pi experience works in the guest -- the pinned version behind the
+# stable wrapper, the mandatory credential warning (also under -ne), a clean
+# print-mode stdout, and a subcommand that is forwarded rather than turned into
+# an agent prompt.
+check_tools_pi_composes() {
+  local proj="$WORK/pi-$RUN_ID"
+  mkdir -p "$proj/.agent-vm"
+  cat >"$proj/.agent-vm/config.toml" <<'EOF'
+[[tools]]
+name = "pi"
+command = "pi"
+layer = { builtin = "pi" }
+EOF
+
+  local pin
+  pin="$(jq -r '.dependencies["@earendil-works/pi-coding-agent"]' \
+    "$REPO_ROOT/images/tools/pi/package.json")"
+
+  local out
+  out="$(cd "$proj" && avm shell --yes --base-image "$BASE_IMAGE" -- bash -c '
+    printf "which=%s\n" "$(command -v pi)"
+    printf "version=%s\n" "$(pi --version)"
+    printf "warn=%s\n" "$(printf "" | pi --mode rpc --no-session --no-approve 2>/dev/null | grep -c "agent-vm: signing in here")"
+    printf "warn_ne=%s\n" "$(printf "" | pi -ne --mode rpc --no-session --no-approve 2>/dev/null | grep -c "agent-vm: signing in here")"
+    printf "print_bytes=%s\n" "$(printf "" | pi -p --no-session 2>/dev/null | wc -c | tr -d " ")"
+    printf "list=%s\n" "$(pi list)"
+  ' 2>&1)" || {
+    echo "$out" | tail -20
+    return 1
+  }
+  assert_match "one builtin pi tool step" 'tool "pi" \(builtin layer pi\)' "$out" || return 1
+  assert_match "the stable wrapper is on PATH" "^which=/usr/local/bin/pi$" "$out" || return 1
+  assert_match "the pinned version is installed" "^version=$pin$" "$out" || return 1
+  assert_match "the mandatory warning fires" "^warn=1$" "$out" || return 1
+  assert_match "--no-extensions cannot silence it" "^warn_ne=1$" "$out" || return 1
+  assert_match "print mode stdout is empty" "^print_bytes=0$" "$out" || return 1
+  assert_match "pi list is a subcommand, not a prompt" "^list=No packages installed\.$" "$out"
 }
 
 # E4: a project layer chains on the template in one step, not five.
@@ -402,6 +442,7 @@ run_check "base-is-tool-free" check_base_is_tool_free
 run_check "template-has-all-tools" check_template_has_all_tools
 run_check "fast-path-zero-docker" check_fast_path_zero_docker
 run_check "tools-claude-composes" check_tools_claude_composes
+run_check "tools-pi-composes" check_tools_pi_composes
 run_check "project-layer-chains-on-template" check_project_layer_chains_on_template
 run_optional "old-launcher-rejects-api3" AGENT_VM_E2E_OLD_LAUNCHER check_old_launcher_rejects
 run_optional "legacy-seed-fallback" AGENT_VM_E2E_LEGACY_IMAGE check_legacy_seed

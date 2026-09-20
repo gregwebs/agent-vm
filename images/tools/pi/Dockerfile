@@ -77,7 +77,17 @@ RUN set -eu; \
         echo "  pi: wrapper subcommands [$declared] != pi --help [$helped]" >&2; exit 1; \
     fi; \
     echo "  pi: subcommand allowlist matches pi --help"; \
-    rm -rf /tmp/pi-gate; \
+    if [ ! -r /opt/agent-vm/pi-extensions/guest-credential-warning.js ]; then \
+        echo "  pi: the mandatory extension is missing" >&2; exit 1; \
+    fi; \
+    if ! timeout 60 /usr/local/bin/pi --mode rpc --no-session --no-approve </dev/null 2>/dev/null | grep -q 'agent-vm: signing in here'; then \
+        echo "  pi: a real invocation does not load the mandatory extension" >&2; exit 1; \
+    fi; \
+    echo "  pi: mandatory extension loads and warns"; \
+    rm -rf /tmp/pi-gate /tmp/jiti /tmp/node-compile-cache; \
+    for c7dir in /opt/agent-vm/pi /opt/agent-vm/pi-extensions; do \
+        [ -d "$c7dir" ] || { echo "  pi: $c7dir is missing (C7)" >&2; exit 1; }; \
+    done; \
     if [ -n "$(find /opt/agent-vm/pi /opt/agent-vm/pi-extensions ! -perm -o+r -print -quit)" ]; then \
         echo "  pi: something under /opt/agent-vm is not world-readable (C7)" >&2; exit 1; \
     fi; \

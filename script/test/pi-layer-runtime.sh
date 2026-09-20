@@ -51,6 +51,16 @@ assert_warns() {
     local label="$1" text="$2"
     grep -q '"method":"notify"' <<<"$text" || fail "${label}: no notify frame"
     grep -q 'agent-vm: signing in here' <<<"$text" || fail "${label}: warning text missing"
+    # The warning is scoped to what #95 delivers (a readable credential plus the
+    # microVM boundary); #96/#94/#91 restore the persistence / host-precedence /
+    # host-import clauses together with their behaviour. The positive greps pin
+    # the current literal and the negative grep fails the day a removed clause
+    # is written back ahead of its implementation.
+    grep -q 'any process in this guest can read' <<<"$text" || fail "${label}: warning scope missing"
+    grep -q 'microVM' <<<"$text" || fail "${label}: boundary clause missing"
+    if grep -Eq 'persistent guest state|takes precedence|imported from your host' <<<"$text"; then
+        fail "${label}: warning still claims unimplemented #96/#94/#91 behaviour"
+    fi
     grep -q '"notifyType":"warning"' <<<"$text" || fail "${label}: notifyType is not warning"
 }
 
