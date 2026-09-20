@@ -19,11 +19,14 @@
 
 use std::{
     env,
-    ffi::CStr,
+    ffi::{CStr, OsStr},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
+
+use crate::protected_host_files::CoreBind;
 
 /// Safe-for-`/etc/passwd`-field username charset: a leading letter or
 /// underscore, then any run of letters/digits/underscore/hyphen.
@@ -219,6 +222,56 @@ fn resolve_host_home() -> Result<GuestHome> {
     host_home_from_env(env::var("HOME").ok())
 }
 
+/// The invoking user's home directory, for the launch decisions that must
+/// locate host state (`protected_host_files`'s measurement and the
+/// `--mount …:follow-links` `$HOME` guardrail). `$HOME` when it is set and
+/// non-empty, otherwise the account record's `pw_dir`.
+///
+/// The fallback matters because `$HOME` unset does **not** mean the home is
+/// unknown — only that this process was not told. A daemon, CI, or `env -i`
+/// launch would otherwise leave agent-vm unable to decide whether a bind
+/// exposes host Pi credentials, and the core project bind would fail *open*
+/// (ADR-0020). `None` only when even the account lookup fails, which is the
+/// state `ProtectedHostFiles::require_home` refuses on.
+///
+/// Deliberately *not* the same read as [`resolve_host_home`]: that one must
+/// mirror `$HOME` verbatim into the guest's `/etc/passwd` and so stays
+/// `$HOME`-only. This one is about locating host state, where the account
+/// record is a strictly better answer than "unknown".
+pub fn host_home_dir() -> Option<PathBuf> {
+    // SAFETY: geteuid() is an argument-free libc call with no preconditions
+    // and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    host_home_from(env::var("HOME").ok(), passwd_home_for_uid(uid))
+}
+
+/// Pure core of [`host_home_dir`] — takes both sources as parameters so the
+/// precedence and the empty-string guard are unit-testable without mutating
+/// process env or the passwd database.
+fn host_home_from(home_env: Option<String>, passwd_home: Option<PathBuf>) -> Option<PathBuf> {
+    home_env
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or(passwd_home)
+}
+
+/// `getpwuid_r(uid).pw_dir` as a `PathBuf`, or `None` on any lookup failure,
+/// missing entry, or an empty field. SAFETY: the same shape as
+/// [`passwd_name_for_uid`] — `buf` is a fixed 16 KiB stack buffer, well above
+/// any real system's `sysconf(_SC_GETPW_R_SIZE_MAX)`; `getpwuid_r` only writes
+/// within `buf`/`pwd` and retains no pointers into either after it returns.
+fn passwd_home_for_uid(uid: u32) -> Option<PathBuf> {
+    let mut buf = [0 as libc::c_char; 16 * 1024];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    let home = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_bytes();
+    (!home.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(home)))
+}
+
 /// Whether the guest runs as root (uid 0) instead of the default non-root
 /// (host-uid) mode. Enabled by the `--root` flag OR a truthy `AGENT_VM_ROOT`
 /// env var. `env_val` is the raw value of that variable (`None` when
@@ -322,6 +375,11 @@ pub fn group_append_line(gid: u32) -> Option<String> {
 pub struct DirVolume {
     pub guest_path: String,
     pub host_path: PathBuf,
+    /// Which of agent-vm's own binds this is. `launch()` forwards it so a
+    /// protected-host-file refusal names the bind's real role instead of
+    /// calling all three "the project directory", and so a bind inside the Pi
+    /// home gets the role's own remedy (ADR-0020).
+    pub bind: CoreBind,
 }
 
 /// Ordered list of the sandbox's core dir-bind volumes: HOME (non-root
@@ -341,15 +399,18 @@ pub fn core_dir_volumes(
         volumes.push(DirVolume {
             guest_path: host_home.to_string(),
             host_path: guest_home_source,
+            bind: CoreBind::GuestHome,
         });
     }
     volumes.push(DirVolume {
         guest_path: project_guest_path.to_string(),
         host_path: project_dir.to_path_buf(),
+        bind: CoreBind::ProjectDir,
     });
     volumes.push(DirVolume {
         guest_path: "/agent-vm-state".to_string(),
         host_path: state_dir.to_path_buf(),
+        bind: CoreBind::StateDir,
     });
     volumes
 }
@@ -566,6 +627,34 @@ mod tests {
     }
 
     #[test]
+    fn host_home_prefers_the_env_var_and_falls_back_to_the_account_record() {
+        // `$HOME` set and non-empty: it wins, even when the account record
+        // disagrees. (Mutating process env is not needed — `host_home_from` is
+        // the pure core, the same shape as `host_home_from_env`.)
+        assert_eq!(
+            host_home_from(
+                Some("/from/env".to_string()),
+                Some(PathBuf::from("/from/passwd"))
+            ),
+            Some(PathBuf::from("/from/env"))
+        );
+        // Unset **or empty**: the account record. An empty `$HOME` is not a
+        // home, and treating it as one is how the Pi-home check would fail
+        // open (ADR-0020).
+        for env_val in [None, Some(String::new())] {
+            assert_eq!(
+                host_home_from(env_val, Some(PathBuf::from("/from/passwd"))),
+                Some(PathBuf::from("/from/passwd")),
+                "the account record must supply the home when $HOME is not usable"
+            );
+        }
+        // Neither source: unknown, which is the one state
+        // `ProtectedHostFiles::require_home` refuses on.
+        assert_eq!(host_home_from(None, None), None);
+        assert_eq!(host_home_from(Some(String::new()), None), None);
+    }
+
+    #[test]
     fn core_dir_volumes_orders_home_before_project_when_project_nests_under_home() {
         let volumes = core_dir_volumes(
             Some(("/Users/claude", PathBuf::from("/state/home"))),
@@ -576,13 +665,16 @@ mod tests {
         assert_eq!(volumes.len(), 3);
         assert_eq!(volumes[0].guest_path, "/Users/claude");
         assert_eq!(volumes[0].host_path, PathBuf::from("/state/home"));
+        assert_eq!(volumes[0].bind, CoreBind::GuestHome);
         assert_eq!(volumes[1].guest_path, "/Users/claude/code/agent-vm");
         assert_eq!(
             volumes[1].host_path,
             PathBuf::from("/Users/claude/code/agent-vm")
         );
+        assert_eq!(volumes[1].bind, CoreBind::ProjectDir);
         assert_eq!(volumes[2].guest_path, "/agent-vm-state");
         assert_eq!(volumes[2].host_path, PathBuf::from("/state"));
+        assert_eq!(volumes[2].bind, CoreBind::StateDir);
     }
 
     #[test]
@@ -610,5 +702,7 @@ mod tests {
         assert_eq!(volumes.len(), 2);
         assert_eq!(volumes[0].guest_path, "/srv/project");
         assert_eq!(volumes[1].guest_path, "/agent-vm-state");
+        assert_eq!(volumes[0].bind, CoreBind::ProjectDir);
+        assert_eq!(volumes[1].bind, CoreBind::StateDir);
     }
 }

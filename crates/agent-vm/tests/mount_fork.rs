@@ -208,11 +208,8 @@ impl Harness {
     /// `expand_follow_links`'s own guardrail ever runs; `--root` mode skips
     /// guest-identity resolution's `$HOME` requirement entirely
     /// (`resolve_guest_identity(true)` returns `None` unconditionally), so
-    /// it is the only reachable path that actually exercises
-    /// `expand_follow_links`'s own "$HOME is not set" error, and the only
-    /// path that proves the guardrail's `$HOME` value — read directly from
-    /// the env var, independent of `guest_identity` — is actually wired
-    /// into `launch()` rather than silently no-op'ing under `--root`.
+    /// `--root` is the only reachable path that exercises `launch()`'s own
+    /// `mount_home` wiring rather than silently no-op'ing under `--root`.
     fn run_shell_opts(&self, mounts: &[&str], root: bool, set_home: bool) -> Output {
         self.run_shell_opts_from(mounts, root, set_home, self.project.path())
     }
@@ -871,15 +868,18 @@ fn follow_links_root_mode_enforces_home_guardrail() {
     );
 }
 
-/// The other half of the `--root` gap: `--root` with `$HOME` unset entirely
-/// must still hard-error (not silently mount everything unguarded) — this is
-/// the one CLI-reachable path that actually exercises
-/// `expand_follow_links`'s own "$HOME is not set — required for --mount
-/// follow-links" message, since non-root mode fails earlier for an unrelated
-/// reason (`user.rs::resolve_host_home`, required to mirror the guest's
-/// HOME) whenever `$HOME` is unset.
+/// `--root` with `$HOME` unset no longer hard-errors (finding MF1):
+/// `run.rs` resolves the launch's home from the account record
+/// (`user::host_home_dir` → `getpwuid_r(geteuid()).pw_dir`) when the
+/// environment does not carry one, so the guardrail has a home to compare
+/// against instead of refusing. This still exercises `run.rs`'s `mount_home`
+/// wiring end to end — the dumped config proves the launch got past
+/// `expand_follow_links` and `builder.build()` with a home in hand. The
+/// `home: None` case (which is now reached only when the account record fails
+/// too) stays pinned by the `mount.rs` unit tests, and the guardrail's own
+/// refusal by the sibling test above.
 #[test]
-fn follow_links_root_mode_without_home_is_a_hard_error() {
+fn follow_links_root_mode_falls_back_to_the_account_record_when_home_is_unset() {
     let h = Harness::new();
     let host_mount = h.project.path().join("m");
     std::fs::create_dir_all(&host_mount).unwrap();
@@ -891,13 +891,14 @@ fn follow_links_root_mode_without_home_is_a_hard_error() {
         /* set_home */ false,
     );
 
-    assert!(!out.status.success());
     let err = stderr_of(&out);
-    assert!(err.contains("--mount follow-links"), "stderr:\n{err}");
-    assert!(err.contains("HOME"), "stderr:\n{err}");
     assert!(
-        !err.contains("[debug] sandbox config JSON"),
-        "the guardrail must fail before builder.build() runs, stderr:\n{err}"
+        !err.contains("required for --mount follow-links"),
+        "the account record must supply the home, stderr:\n{err}"
+    );
+    assert!(
+        err.contains("[debug] sandbox config JSON"),
+        "the guardrail must have had a $HOME to run with, stderr:\n{err}"
     );
 }
 

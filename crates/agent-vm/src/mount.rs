@@ -11,6 +11,11 @@ use anyhow::{Context, Result};
 #[cfg(test)]
 use microsandbox::sandbox::MountBuilder;
 
+#[cfg(test)]
+use crate::protected_host_files::CoreBind;
+use crate::protected_host_files::{
+    CoreHostSource, ProtectedFile, ProtectedHostFiles, ResolvedRoot, Severity,
+};
 use crate::run::guest_path_is_mountable;
 
 /// A recognized `--mount` mode keyword: `ro`, `rw`, `fork`, or `follow-links`
@@ -1068,7 +1073,13 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let raw = format!("{}:/guest:fork:exclude=secret", source.path().display());
         let mut mounts = parse_extra_mounts(&[raw]).unwrap();
-        prepare_forks(&mut mounts, store.path(), &std::collections::HashMap::new()).unwrap();
+        prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &ProtectedHostFiles::measure(None).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(mounts[0].host.join("visible")).unwrap(),
             "one"
@@ -1080,7 +1091,13 @@ mod tests {
             source.path().display()
         )])
         .unwrap();
-        prepare_forks(&mut again, store.path(), &std::collections::HashMap::new()).unwrap();
+        prepare_forks(
+            &mut again,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &ProtectedHostFiles::measure(None).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(again[0].host.join("visible")).unwrap(),
             "one"
@@ -1757,6 +1774,12 @@ pub(crate) struct MountContext {
     /// Guest paths owned by agent-vm itself.  An explicit mount may not
     /// replace one: that would silently change HOME/project/state semantics.
     pub(crate) core_guest_mounts: Vec<PathBuf>,
+    /// Host sources of agent-vm's own binds (guest HOME, project dir, state
+    /// dir) with the role each one plays. Checked for protected-file exposure
+    /// exactly like an explicit mount, because the project bind is the
+    /// canonicalized cwd and is writable (`session.rs:45`): `cd ~ && agent-vm
+    /// shell` would hand the guest the whole host `$HOME`.
+    pub(crate) core_host_sources: Vec<CoreHostSource>,
 }
 
 /// Normalize the guest spelling before it participates in identity or
@@ -1793,6 +1816,34 @@ pub(crate) fn prepare(
     requests: Vec<ExtraMount>,
     context: &MountContext,
 ) -> Result<PreparedMountPlan> {
+    // Measure the protected host-file route set once, then refuse to launch a
+    // core bind that would hand one over. The project bind is the
+    // canonicalized cwd, so `cd ~ && agent-vm shell` is an exposure route even
+    // with no `--mount` at all.
+    let protected = ProtectedHostFiles::measure(context.host_home.as_deref())?;
+    let mut notices = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for source in &context.core_host_sources {
+        // The Pi advisories fire for one of agent-vm's *own* binds too, not
+        // just for `--mount`s: `~/.pi/extensions` as the canonicalized cwd is
+        // a writable live window onto host Pi state with no `--mount` at all
+        // (issue #90's warning deliverable).
+        for advisory in protected.core_advisories(source) {
+            push_notice(&mut notices, &mut seen, advisory);
+        }
+        let Some(exposure) = protected.exposure(&source.path)? else {
+            continue;
+        };
+        match exposure.severity {
+            Severity::Refuse => anyhow::bail!("{}", protected.core_message(source, &exposure)),
+            Severity::Advise => {
+                let advisory =
+                    protected.message(&source.path.display().to_string(), &exposure, None);
+                push_notice(&mut notices, &mut seen, advisory);
+            }
+        }
+    }
+
     let mut requests = requests;
     for request in &mut requests {
         request.guest = normalize_guest(
@@ -1891,12 +1942,35 @@ pub(crate) fn prepare(
             },
         });
     }
+    // Refuse a live bind that would hand a protected host file to the guest,
+    // and collect the Pi advisories. Runs after `expand_follow_links` (so a
+    // followed alias is an ordinary discovered bind) and before
+    // `validate_plan`/`prepare_forks` (so a refusal has no side effects).
+    enforce_protected_files(&expanded, explicit_count, &protected, &mut notices)?;
+    // A fork seeded by a pre-#90 build may already contain a copy of a
+    // protected file, and a READY fork is reused *without* reading its source,
+    // so no source-side check catches it. Report the orphaned directory that
+    // the v3 identity no longer reuses.
+    for mount in unique.iter().filter(|mount| mount.is_fork()) {
+        if let Some(orphan) = legacy_fork_dir(mount, &context.mount_store) {
+            notices.push(format!(
+                "==> A fork from an earlier agent-vm build is no longer used: {}. It may \
+                 contain a copy of a host credential file — remove it.",
+                orphan.display()
+            ));
+        }
+    }
     validate_plan(&mut volumes, &context.core_guest_mounts)?;
 
     // Only a validated complete set of core, explicit, and followed claims
     // may publish any host-managed state. The first state mutation happens
     // inside `prepare_forks`; everything above is rejection or classification.
-    let mut notices = prepare_forks(&mut unique, &context.mount_store, &known_fork_kinds)?;
+    notices.extend(prepare_forks(
+        &mut unique,
+        &context.mount_store,
+        &known_fork_kinds,
+        &protected,
+    )?);
     sync_fork_representations(&unique, &mut expanded)?;
     notices.extend(warnings.into_iter().map(|warning| format!("==> {warning}")));
 
@@ -1937,6 +2011,106 @@ pub(crate) fn prepare(
     })
 }
 
+/// Refuse any live bind that would hand a protected host file to the guest,
+/// and collect the Pi advisories. Forks are exempt from the refusal on
+/// purpose: their *content* is decided by the copy engine (`copy_opened`),
+/// not by this root-level check.
+///
+/// Precedence is honest, not "security first": `normalize_guest`, the core
+/// collision/dedup pass, `preflight_forks` and the per-mount `file`+`rw`
+/// rejection all run earlier and can bail. Every one of them is read-only, so a
+/// leaky-*and*-invalid plan is still refused with **no side effects** — only
+/// the message the user sees is the earlier one.
+fn enforce_protected_files(
+    expanded: &[ExtraMount],
+    explicit_count: usize,
+    protected: &ProtectedHostFiles,
+    notices: &mut Vec<String>,
+) -> Result<()> {
+    // Not at the top of `prepare`: `expand_follow_links`'s more specific
+    // "$HOME is not set — required for --mount follow-links" must still win for
+    // a `follow-links` mount with no `$HOME`.
+    protected.require_home(expanded.len())?;
+    if expanded.is_empty() {
+        return Ok(());
+    }
+    let declarations: Vec<String> = expanded[..explicit_count]
+        .iter()
+        .filter(|mount| mount.follows_links() && !mount.is_fork())
+        .map(|mount| mount.source_spelling.clone())
+        .collect();
+    let mut seen: Vec<String> = Vec::new();
+    for (index, mount) in expanded.iter().enumerate() {
+        // Advisories are evaluated against the *declaration*, never
+        // `mount.host`: `preflight_forks` repoints a READY fork's host at
+        // `<store>/forks/<id>/data`, so a notice keyed on `mount.host` would
+        // silently stop firing on every launch after the first.
+        let declaration = declaration_path(mount);
+        if !mount.is_fork()
+            && let Some(exposure) = protected.exposure(&mount.host)?
+        {
+            let discovered = (index >= explicit_count).then(|| discovered_by(&declarations));
+            let message =
+                protected.message(&mount.source_spelling, &exposure, discovered.as_deref());
+            match exposure.severity {
+                // A live window onto host bytes cannot be made safe by any
+                // overlay: `pi auth login` on the host can create
+                // `auth.json` inside a bind that is already open.
+                Severity::Refuse => anyhow::bail!("{message}"),
+                Severity::Advise => push_notice(notices, &mut seen, message),
+            }
+        }
+        // A fork needs only the platform-artifact advisory: its content is the
+        // copy engine's decision, and `:fork` is what it already is.
+        let live_bind = !mount.is_fork();
+        for advisory in protected.mount_advisories(&declaration, &mount.source_spelling, live_bind)
+        {
+            push_notice(notices, &mut seen, advisory);
+        }
+    }
+    Ok(())
+}
+
+/// The provenance phrase for a `follow-links`-discovered bind, for the refusal
+/// message. `expand_follow_links` does not carry the originating declaration
+/// per discovered target — two `:follow-links` declarations can discover the
+/// same bind — so naming every candidate would blame declarations that did not
+/// contribute it. Naming the sole candidate, or naming none of them, is never
+/// wrong.
+fn discovered_by(declarations: &[String]) -> String {
+    match declarations {
+        [only] => format!("--mount {only}:follow-links"),
+        _ => "one of your --mount …:follow-links declarations".to_string(),
+    }
+}
+
+/// The path a declaration actually names, for advisories. A missing source (a
+/// fork reused after its source was removed) falls back to the literal
+/// spelling rather than failing the launch.
+fn declaration_path(mount: &ExtraMount) -> PathBuf {
+    Path::new(&mount.source_spelling)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&mount.source_spelling))
+}
+
+fn push_notice(notices: &mut Vec<String>, seen: &mut Vec<String>, message: String) {
+    if seen.contains(&message) {
+        return;
+    }
+    seen.push(message.clone());
+    notices.push(message);
+}
+
+/// A pre-#90 fork directory that the v3 identity no longer reuses, if one
+/// exists. Reported, never deleted: it may hold valuable guest state (and a
+/// copy of a protected file).
+fn legacy_fork_dir(mount: &ExtraMount, mount_store: &Path) -> Option<PathBuf> {
+    let path = mount_store
+        .join("forks")
+        .join(fork_id(mount, LEGACY_IDENTITY_VERSION_V2));
+    fs::symlink_metadata(&path).is_ok().then_some(path)
+}
+
 /// Validate every fork without creating its store or inspecting an
 /// uninitialized source beyond its kind. READY is checked first, so a fork
 /// stays reusable after its original source disappears or changes type.
@@ -1946,7 +2120,7 @@ fn preflight_forks(
 ) -> Result<std::collections::HashMap<PathBuf, PreparedNodeKind>> {
     let mut kinds = std::collections::HashMap::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
-        let id = fork_id(mount);
+        let id = fork_id(mount, IDENTITY_VERSION);
         let final_dir = mount_store.join("forks").join(&id);
         if final_dir_exists(&final_dir)? {
             let kind = validate_ready(&final_dir, mount, &id)?;
@@ -2106,7 +2280,16 @@ fn same_volume(a: &PreparedVolume, b: &PreparedVolume) -> bool {
 }
 
 const MANIFEST_VERSION: u32 = 2;
-const IDENTITY_VERSION: &[u8] = b"agent-vm-fork-identity-v2";
+/// v3 because a READY fork is reused *without* reading its source, so a fork
+/// seeded by a pre-#90 build may already contain a copied protected file and no
+/// source-side check could catch it. Bumping the identity makes every reusable
+/// fork one that was seeded *under* protection — a structural invariant instead
+/// of a runtime scan. Forks had never shipped in a release, so no released
+/// user has one to orphan (ADR-0020).
+const IDENTITY_VERSION: &[u8] = b"agent-vm-fork-identity-v3";
+/// Only to report the orphaned directory the v3 identity leaves behind
+/// ([`legacy_fork_dir`]); never used to reuse or validate a fork.
+const LEGACY_IDENTITY_VERSION_V2: &[u8] = b"agent-vm-fork-identity-v2";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const FORK_MAX_LINK_DEPTH: usize = 40;
 
@@ -2208,6 +2391,94 @@ fn copy_checkpoint(path: &Path) {
 #[cfg(not(test))]
 fn copy_checkpoint(_: &Path) {}
 
+// A second test-only hook, with its own callback slot and the same scope/lock as
+// `copy_checkpoint`. It fires **between `copy_root`'s root resolve (T1) and the
+// copy-point measurement (T2)** — the interval S3-A/S3-B use to suppress a
+// competing measured route, and the interval R4.7's lost-association residual
+// is about (R4.4.2). Production compiles it away.
+#[cfg(test)]
+static RESOLVE_CHECKPOINT: std::sync::Mutex<Option<CopyCheckpoint>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_resolve_checkpoint(source: &Path, callback: Box<dyn Fn(&Path) + Send>) {
+    let scope = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    *RESOLVE_CHECKPOINT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some((scope, callback));
+}
+
+#[cfg(test)]
+fn clear_resolve_checkpoint() {
+    *RESOLVE_CHECKPOINT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
+}
+
+/// Test-only RAII guard: arms the resolve hook and clears it on drop, so a
+/// panicking test cannot leave a callback armed for another test that shares
+/// the slot. The caller must hold `COPY_CHECKPOINT_TEST_LOCK` for the whole
+/// arm → copy → drop lifetime, so the arm/clear pair cannot interleave with
+/// another hook user.
+#[cfg(test)]
+struct ResolveCheckpointGuard;
+
+#[cfg(test)]
+impl ResolveCheckpointGuard {
+    fn arm(source: &Path, callback: Box<dyn Fn(&Path) + Send>) -> Self {
+        set_resolve_checkpoint(source, callback);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ResolveCheckpointGuard {
+    fn drop(&mut self) {
+        clear_resolve_checkpoint();
+    }
+}
+
+/// Test-only RAII guard for the copy hook, symmetric with
+/// [`ResolveCheckpointGuard`]. The caller must hold
+/// `COPY_CHECKPOINT_TEST_LOCK` for the whole arm → copy → drop lifetime.
+#[cfg(test)]
+struct CopyCheckpointGuard;
+
+#[cfg(test)]
+impl CopyCheckpointGuard {
+    fn arm(source: &Path, callback: Box<dyn Fn(&Path) + Send>) -> Self {
+        set_copy_checkpoint(source, callback);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for CopyCheckpointGuard {
+    fn drop(&mut self) {
+        clear_copy_checkpoint();
+    }
+}
+
+#[cfg(test)]
+fn resolve_checkpoint(path: &Path) {
+    let root = COPY_CHECKPOINT_ROOT.with(|root| root.borrow().clone());
+    // Only the slot's own lock: `COPY_CHECKPOINT_TEST_LOCK` is held by the test
+    // that armed this hook, so re-acquiring it here would self-deadlock. The
+    // test lock serializes arm/clear; this lock serializes the read.
+    let guard = RESOLVE_CHECKPOINT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let (Some(root), Some((scope, callback))) = (root.as_ref(), guard.as_ref())
+        && scope == root
+    {
+        callback(path);
+    }
+}
+
+#[cfg(not(test))]
+fn resolve_checkpoint(_: &Path) {}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ForkManifest {
     version: u32,
@@ -2221,14 +2492,20 @@ struct ForkManifest {
 
 /// Initialize each fork through one lock-protected state transition. READY is
 /// validated before source access, so a seeded fork is usable after removal.
+///
+/// `protected` is the measurement taken at the top of `prepare`. The copier
+/// resolves each root itself and re-measures under the lock, unioning the two
+/// over identities (see `refreshed`), so it never forgets a credential identity
+/// an earlier snapshot positively identified (R4.4.4).
 pub(crate) fn prepare_forks(
     mounts: &mut [ExtraMount],
     mount_store: &Path,
     expected_kinds: &std::collections::HashMap<PathBuf, PreparedNodeKind>,
+    protected: &ProtectedHostFiles,
 ) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
-        let id = fork_id(mount);
+        let id = fork_id(mount, IDENTITY_VERSION);
         let final_dir = mount_store.join("forks").join(&id);
         ensure_store(mount_store)?;
         let lock_path = mount_store.join("locks").join(format!("{id}.lock"));
@@ -2264,13 +2541,33 @@ pub(crate) fn prepare_forks(
             .tempdir_in(&staging_parent)
             .context("creating fork staging directory")?;
         let staged_data = stage.path().join("data");
-        let kind = copy_root(
-            &mount.host,
-            &staged_data,
-            &mount.exclusions,
-            mount.follows_links(),
-        )
-        .with_context(|| format!("initializing fork from {}", mount.source_spelling))?;
+        // The omission signals are derived at the copier's own resolve point,
+        // from a **fresh** measurement taken there under this lock, not from
+        // the one taken at the top of `prepare`: the original route set cannot
+        // see a fork root that did not exist then (e.g. `--mount ~/.pi:fork`
+        // where `~/.pi` is created between `measure` and this point). The fresh
+        // snapshot is **unioned** with the original over identities, never a
+        // replacement: an atomic credential replacement can make the fresh
+        // snapshot forget an inode the original positively identified (a
+        // surviving hardlink still holds the old bytes). Routes and both
+        // Pi-home paths are the copy point's (R3.5). The measurement is a
+        // handful of stats, once per fork; `copy_root` takes it.
+        let policy = CopyPolicy {
+            exclusions: &mount.exclusions,
+            follow: mount.follows_links(),
+            protected,
+        };
+        let mut report = CopyReport::default();
+        let kind = copy_root(&mount.host, &staged_data, &policy, &mut report)
+            .with_context(|| format!("initializing fork from {}", mount.source_spelling))?;
+        for (relative, file) in &report.omitted {
+            notices.push(format!(
+                "==> Omitted {} {} from the fork of {}",
+                file.description(),
+                relative.display(),
+                mount.source_spelling
+            ));
+        }
         let manifest = ForkManifest {
             version: MANIFEST_VERSION,
             id: id.clone(),
@@ -2308,10 +2605,10 @@ pub(crate) fn prepare_forks(
     Ok(notices)
 }
 
-fn fork_id(mount: &ExtraMount) -> String {
+fn fork_id(mount: &ExtraMount, version: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
-    hash.update(IDENTITY_VERSION);
+    hash.update(version);
     for value in std::iter::once(mount.source_spelling.as_bytes())
         .chain(std::iter::once(mount.guest.as_os_str().as_encoded_bytes()))
         .chain(std::iter::once(if mount.follows_links() {
@@ -2596,6 +2893,74 @@ fn merge_exclusions(existing: &mut Vec<PathBuf>, additions: Vec<PathBuf>) {
     }
     *existing = collapsed;
 }
+/// What the *declaration* says, plus the launch's measurement. Carries no
+/// resolved path: the copier resolves the root itself and builds a
+/// [`NodePolicy`] at that point (R4.4.2). Bundled because these are adjacent
+/// same-typed arguments (CODING_STANDARDS: do not repeat a type in a row).
+struct CopyPolicy<'a> {
+    exclusions: &'a [PathBuf],
+    follow: bool,
+    protected: &'a ProtectedHostFiles,
+}
+
+/// What each node is judged by, bound to one resolved root. Owns its snapshot
+/// so every signal in it comes from the single measurement taken at the resolve
+/// point (R4.4.2).
+struct NodePolicy<'a> {
+    declaration: &'a CopyPolicy<'a>,
+    protected: ProtectedHostFiles,
+    /// Fork-root-relative paths of protected files, **even ones that do not
+    /// exist yet**. The second omission signal: identity alone cannot catch a
+    /// protected file created between the measurement and the copy.
+    protected_relative: Vec<(PathBuf, ProtectedFile)>,
+}
+
+impl<'a> CopyPolicy<'a> {
+    /// T2-T3 of R3.1. **One** copy-point measurement, taken immediately after
+    /// the root resolve, unioned with the launch snapshot over **identities**
+    /// (R1): an atomic credential replacement can make a fresh snapshot forget
+    /// an inode the launch positively identified. Routes and both Pi-home paths
+    /// come from the copy point (R3.5). There is deliberately no second
+    /// observation to reconcile — see R4.1.
+    fn resolve(&'a self, root: &ResolvedRoot) -> Result<NodePolicy<'a>> {
+        let protected = self.protected.refreshed()?;
+        let protected_relative = protected.relatives_under(root);
+        Ok(NodePolicy {
+            declaration: self,
+            protected,
+            protected_relative,
+        })
+    }
+}
+
+impl NodePolicy<'_> {
+    /// The two signals, in one place: `fstat` identity first, then the
+    /// fork-root-relative path. This replaces `CopyPolicy::protected_ids` and
+    /// `protected_file_at` (R4.4.2).
+    fn omits(&self, dev: u64, ino: u64, relative: &Path) -> Option<ProtectedFile> {
+        self.protected.identities().matched(dev, ino).or_else(|| {
+            self.protected_relative
+                .iter()
+                .find(|(path, _)| path == relative)
+                .map(|(_, file)| *file)
+        })
+    }
+}
+
+/// What the copier refused to copy, for notices.
+#[derive(Default)]
+struct CopyReport {
+    omitted: Vec<(PathBuf, ProtectedFile)>,
+}
+
+/// A node the copier either published or deliberately did not. The enum forces
+/// `copy_root` to answer the root-omitted case instead of silently publishing
+/// an empty fork.
+enum CopiedNode {
+    Copied(PreparedNodeKind),
+    Omitted,
+}
+
 /// Copy a directory root via verified descriptors. Nested links are never
 /// followed in the default policy, so a swap cannot turn an untrusted leaf
 /// into a read of an external target. Explicit follow mode is deliberately
@@ -2604,55 +2969,87 @@ fn merge_exclusions(existing: &mut Vec<PathBuf>, additions: Vec<PathBuf>) {
 fn copy_root(
     source: &Path,
     destination: &Path,
-    exclusions: &[PathBuf],
-    follow: bool,
+    policy: &CopyPolicy<'_>,
+    report: &mut CopyReport,
 ) -> Result<PreparedNodeKind> {
     use rustix::fs::{self as rfs, FileType, Mode, OFlags};
-    let source = source
-        .canonicalize()
-        .with_context(|| format!("resolving fork root {}", source.display()))?;
+    // T1: one `canonicalize` plus one `metadata`. The canonicalized pathname is
+    // the only thing the copier opens (T4), so a declaration spelling cannot
+    // reach the omission signal (R4.4.1-3).
+    let root = ResolvedRoot::resolve(source)?;
     #[cfg(test)]
-    let _checkpoint_scope = CopyCheckpointScope::enter(&source);
-    copy_checkpoint(&source);
-    // `O_DIRECTORY` is the load-bearing enforcement: a root that was a
+    let _checkpoint_scope = CopyCheckpointScope::enter(root.path());
+    // Test-only race in (T1, T2): the interval S3-A/S3-B use to suppress a
+    // competing measured route, and the interval R4.7's residual is about.
+    // (A no-op outside test builds, exactly like `copy_checkpoint`.)
+    resolve_checkpoint(root.path());
+    // T2-T3: the measurement is *immediately* after the resolve and before
+    // `copy_checkpoint`. After, so the relatives are derived from a canonical
+    // root; immediately after, because it is now the only observation of Pi's
+    // home; before `copy_checkpoint`, so
+    // `fork_omits_a_protected_file_created_after_measurement` still isolates
+    // relative-vs-identity (R4.4.3).
+    let policy = policy.resolve(&root)?;
+    copy_checkpoint(root.path());
+    // T4: `O_DIRECTORY` is the load-bearing enforcement: a root that was a
     // directory at preflight but is now a file or a symlink to one fails
     // here, at the descriptor actually copied from, rather than silently
     // publishing a file-root fork.
     let fd = rfs::open(
-        &source,
+        root.path(),
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .with_context(|| format!("opening fork root {}", source.display()))?;
+    .with_context(|| format!("opening fork root {}", root.path().display()))?;
     if FileType::from_raw_mode(rfs::fstat(&fd)?.st_mode) != FileType::Directory {
-        anyhow::bail!("fork root {} must be a directory", source.display());
+        anyhow::bail!("fork root {} must be a directory", root.path().display());
     }
-    copy_opened(
+    match copy_opened(
         &fd,
         destination,
         Path::new(""),
-        exclusions,
-        follow,
+        &policy,
         0,
         &mut Vec::new(),
-    )?;
-    Ok(PreparedNodeKind::Directory)
+        report,
+    )? {
+        CopiedNode::Copied(kind) => Ok(kind),
+        // Unreachable today: protected entries are files and a fork root is
+        // `O_DIRECTORY`-enforced. Answered anyway so a future change cannot
+        // publish an empty fork in place of a protected host file.
+        CopiedNode::Omitted => {
+            anyhow::bail!(
+                "fork root {} is a protected host file",
+                root.path().display()
+            )
+        }
+    }
 }
 fn copy_opened(
     fd: &rustix::fd::OwnedFd,
     destination: &Path,
     relative: &Path,
-    exclusions: &[PathBuf],
-    follow: bool,
+    policy: &NodePolicy<'_>,
     depth: usize,
     active: &mut Vec<(u64, u64)>,
-) -> Result<PreparedNodeKind> {
+    report: &mut CopyReport,
+) -> Result<CopiedNode> {
     use rustix::fs::{self as rfs, FileType, Mode, OFlags};
     use std::os::unix::fs::PermissionsExt;
-    if is_excluded(relative, exclusions) {
-        return Ok(PreparedNodeKind::Directory);
+    // Callers skip an excluded child before they open it; this is the
+    // defensive restatement of the same rule for the root itself. An excluded
+    // node is not an *omitted* one: nothing is reported and nothing is written.
+    if is_excluded(relative, policy.declaration.exclusions) {
+        return Ok(CopiedNode::Copied(PreparedNodeKind::Directory));
     }
     let stat = rfs::fstat(fd)?;
+    // Before the destination is created, so an omitted node writes nothing at
+    // all — no empty file, no placeholder (an overlay would be a mask, and
+    // ADR-0014 removed mask machinery).
+    if let Some(file) = policy.omits(stat.st_dev as u64, stat.st_ino as u64, relative) {
+        report.omitted.push((relative.to_path_buf(), file));
+        return Ok(CopiedNode::Omitted);
+    }
     let ty = FileType::from_raw_mode(stat.st_mode);
     if ty == FileType::RegularFile {
         let mut source = std::fs::File::from(rustix::io::dup(fd)?);
@@ -2664,7 +3061,7 @@ fn copy_opened(
         target.set_permissions(std::fs::Permissions::from_mode(
             stat.st_mode as u32 & 0o7777,
         ))?;
-        return Ok(PreparedNodeKind::File);
+        return Ok(CopiedNode::Copied(PreparedNodeKind::File));
     }
     if ty != FileType::Directory {
         anyhow::bail!("{} is not a regular file or directory", relative.display());
@@ -2686,7 +3083,7 @@ fn copy_opened(
             continue;
         }
         let child_relative = relative.join(name);
-        if is_excluded(&child_relative, exclusions) {
+        if is_excluded(&child_relative, policy.declaration.exclusions) {
             continue;
         }
         let child_stat = rfs::statat(fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
@@ -2694,7 +3091,7 @@ fn copy_opened(
         let child_dst = destination.join(name);
         copy_checkpoint(&child_relative);
         if child_ty == FileType::Symlink {
-            if !follow {
+            if !policy.declaration.follow {
                 let raw = rfs::readlinkat(fd, name, Vec::new())?;
                 std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(raw.as_bytes()), child_dst)?;
             } else {
@@ -2707,7 +3104,9 @@ fn copy_opened(
                 // openat resolves the link relative to the already-pinned
                 // parent descriptor.  Unlike synthesizing /dev/fd paths it
                 // works on macOS as well as Linux and keeps relative links
-                // inside the directory that contained their raw text.
+                // inside the directory that contained their raw text. Without
+                // `NOFOLLOW`, a followed target is classified by its own
+                // `fstat`, so an omitted protected file is not materialized.
                 let target = rfs::openat(
                     fd,
                     name,
@@ -2719,10 +3118,10 @@ fn copy_opened(
                     &target,
                     &child_dst,
                     &child_relative,
-                    exclusions,
-                    follow,
+                    policy,
                     depth + 1,
                     active,
+                    report,
                 )?;
             }
         } else {
@@ -2736,10 +3135,10 @@ fn copy_opened(
                 &child,
                 &child_dst,
                 &child_relative,
-                exclusions,
-                follow,
+                policy,
                 depth,
                 active,
+                report,
             )?;
         }
     }
@@ -2748,18 +3147,45 @@ fn copy_opened(
         std::fs::Permissions::from_mode(stat.st_mode as u32 & 0o7777),
     )?;
     active.pop();
-    Ok(PreparedNodeKind::Directory)
+    Ok(CopiedNode::Copied(PreparedNodeKind::Directory))
 }
 
 #[cfg(test)]
 mod prepare_tests {
     use super::*;
 
+    /// A real, empty `$HOME` shared by every test in this binary. `measure`
+    /// needs a locatable home for `require_home`; with no `~/.pi` it yields
+    /// `Severity::Advise` and no exposure for a test source that is not an
+    /// ancestor of the home. Held in a `OnceLock` so the directory outlives
+    /// every `MountContext` without each call leaking its own.
+    fn test_home() -> PathBuf {
+        static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        HOME.get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .to_path_buf()
+    }
+
     fn context(store: &Path) -> MountContext {
+        context_with_home(store, test_home())
+    }
+
+    fn context_with_home(store: &Path, home: PathBuf) -> MountContext {
+        MountContext {
+            mount_store: store.to_path_buf(),
+            host_home: Some(home),
+            core_guest_mounts: Vec::new(),
+            core_host_sources: Vec::new(),
+        }
+    }
+
+    /// The fail-closed `$HOME`-unset case (`ProtectedHostFiles::require_home`).
+    fn context_without_home(store: &Path) -> MountContext {
         MountContext {
             mount_store: store.to_path_buf(),
             host_home: None,
             core_guest_mounts: Vec::new(),
+            core_host_sources: Vec::new(),
         }
     }
 
@@ -3012,6 +3438,7 @@ mod prepare_tests {
                 mount_store: store.path().to_path_buf(),
                 host_home: Some(home),
                 core_guest_mounts: vec![target],
+                core_host_sources: Vec::new(),
             };
 
             let error =
@@ -3156,6 +3583,7 @@ mod prepare_tests {
                         mount_store: store.path().to_path_buf(),
                         host_home: Some(root.path().to_path_buf()),
                         core_guest_mounts: vec![root.path().join("core-child")],
+                        core_host_sources: Vec::new(),
                     },
                 );
                 assert!(
@@ -3240,6 +3668,7 @@ mod prepare_tests {
                 mount_store: store.path().to_path_buf(),
                 host_home: Some(home_path.clone()),
                 core_guest_mounts: Vec::new(),
+                core_host_sources: Vec::new(),
             },
         )
         .unwrap_err();
@@ -3761,7 +4190,7 @@ mod prepare_tests {
         let store = tempfile::tempdir().unwrap();
         let request =
             parse_extra_mounts(&[format!("{}:/guest:fork", source.path().display())]).unwrap();
-        let id = fork_id(&request[0]);
+        let id = fork_id(&request[0], IDENTITY_VERSION);
         ensure_store(store.path()).unwrap();
         fs::create_dir(
             store
@@ -3829,5 +4258,1784 @@ mod prepare_tests {
         };
         assert_eq!(reused_data, &data);
         assert_eq!(fs::read_to_string(data.join("seed")).unwrap(), "first");
+    }
+
+    // ── protected host files (issue #90) ─────────────────────────────
+
+    /// A `$HOME` with a real `~/.pi`, and a context pointed at it. The
+    /// `TempDir` is returned so it outlives the context.
+    fn pi_home() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let canonical = home.path().canonicalize().unwrap();
+        fs::create_dir_all(canonical.join(".pi/agent")).unwrap();
+        fs::write(canonical.join(".pi/agent/auth.json"), "{\"token\":\"t\"}").unwrap();
+        fs::write(canonical.join(".pi/agent/models.json"), "{}").unwrap();
+        fs::write(canonical.join(".pi/settings.json"), "{}").unwrap();
+        (home, canonical)
+    }
+
+    fn fork_data(plan: &PreparedMountPlan) -> PathBuf {
+        match &plan.volumes[0].source {
+            PreparedVolumeSource::WritableBind(path) => path.clone(),
+            other => panic!("fork must be writable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ro_and_rw_mounts_of_pi_home_are_refused_before_store_creation() {
+        let (_home, home) = pi_home();
+        for declaration in [
+            format!("{}:ro", home.join(".pi").display()),
+            format!("{}:rw", home.join(".pi").display()),
+            format!("{}:ro", home.display()),
+            format!("{}:/mnt/pi:ro", home.join(".pi").display()),
+        ] {
+            let store = tempfile::tempdir().unwrap();
+            let error = prepare(
+                parse_extra_mounts(std::slice::from_ref(&declaration)).unwrap(),
+                &context_with_home(store.path(), home.clone()),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&home.join(".pi/agent/auth.json").display().to_string()),
+                "{declaration}: {error}"
+            );
+            assert!(error.contains(":fork"), "{declaration}: {error}");
+            assert!(
+                store_tree(store.path()).is_empty(),
+                "a refused plan must not create fork state: {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn followed_symlink_alias_to_pi_home_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let (_home, home) = pi_home();
+        let live = tempfile::tempdir().unwrap();
+        let link = live.path().join("pi-link");
+        symlink(home.join(".pi"), &link).unwrap();
+        let declaration = format!("{}:ro:follow-links", live.path().display());
+        let store = tempfile::tempdir().unwrap();
+
+        let error = prepare(
+            parse_extra_mounts(std::slice::from_ref(&declaration)).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        // The *discovered* bind is the leak; the message names the declaration
+        // it came from, because the user never typed that path.
+        assert!(error.contains("discovered by --mount"), "{error}");
+        assert!(
+            error.contains(&live.path().display().to_string()),
+            "{error}"
+        );
+        assert!(store_tree(store.path()).is_empty(), "{error}");
+    }
+
+    /// With two `:follow-links` declarations, `expand_follow_links` does not
+    /// record which one discovered a target (and legitimately merges the two
+    /// when both do), so the refusal must not blame both — let alone the one
+    /// that contributed nothing.
+    #[test]
+    fn a_discovered_leak_with_two_follow_links_declarations_blames_neither() {
+        use std::os::unix::fs::symlink;
+
+        let (_home, home) = pi_home();
+        let leak = home.join("leak");
+        let innocent = home.join("innocent");
+        fs::create_dir_all(&leak).unwrap();
+        fs::create_dir_all(&innocent).unwrap();
+        symlink(home.join(".pi"), leak.join("pi-link")).unwrap();
+        let declarations = [
+            format!("{}:ro:follow-links", leak.display()),
+            format!("{}:ro:follow-links", innocent.display()),
+        ];
+        let store = tempfile::tempdir().unwrap();
+
+        let error = prepare(
+            parse_extra_mounts(&declarations).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("would expose"), "{error}");
+        assert!(
+            error.contains("discovered by one of your --mount"),
+            "{error}"
+        );
+        assert!(!error.contains("discovered by --mount"), "{error}");
+        assert!(store_tree(store.path()).is_empty(), "{error}");
+    }
+
+    #[test]
+    fn fork_of_pi_home_omits_both_files_and_copies_everything_else() {
+        let (_home, home) = pi_home();
+        fs::create_dir_all(home.join(".pi/extensions")).unwrap();
+        fs::write(home.join(".pi/extensions/x.js"), "x").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/pi:fork", home.join(".pi").display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("settings.json").is_file());
+        assert!(data.join("extensions/x.js").is_file());
+        // The containing directory stays; only the protected files are absent.
+        assert!(data.join("agent").is_dir());
+        assert!(!data.join("agent/auth.json").exists());
+        assert!(!data.join("agent/models.json").exists());
+        let notices = plan.notices.join("\n");
+        assert!(
+            notices.contains("Omitted host Pi credential file agent/auth.json"),
+            "{notices}"
+        );
+        assert!(
+            notices.contains("Omitted host Pi provider-configuration file agent/models.json"),
+            "{notices}"
+        );
+    }
+
+    #[test]
+    fn fork_follow_links_does_not_materialize_a_protected_target() {
+        use std::os::unix::fs::symlink;
+
+        let (_home, home) = pi_home();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("keep"), "keep").unwrap();
+        symlink(home.join(".pi/agent/auth.json"), source.path().join("link")).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!(
+                "{}:/guest:fork:follow-links",
+                source.path().display()
+            )])
+            .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("keep").is_file());
+        // Not a symlink, and not the materialized target: nothing at all.
+        assert!(!data.join("link").exists());
+        assert!(
+            plan.notices
+                .join("\n")
+                .contains("Omitted host Pi credential file link"),
+            "{:?}",
+            plan.notices
+        );
+    }
+
+    #[test]
+    fn fork_omits_a_hardlink_to_a_protected_file() {
+        let (_home, home) = pi_home();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("keep"), "keep").unwrap();
+        fs::hard_link(
+            home.join(".pi/agent/auth.json"),
+            source.path().join("copy.json"),
+        )
+        .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork", source.path().display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("keep").is_file());
+        assert!(!data.join("copy.json").exists());
+        assert!(
+            plan.notices
+                .join("\n")
+                .contains("Omitted host Pi credential file copy.json"),
+            "{:?}",
+            plan.notices
+        );
+    }
+
+    /// The identity signal alone fails this: the file does not exist when
+    /// `measure` runs, so it has no measured inode. Only the fork-root-relative
+    /// path signal catches it. It isolates *relative vs. identity* — **not**
+    /// static vs. measured route (R3.4): the path signal here is the measured
+    /// route set, and the assertion would hold identically if the static table
+    /// were empty. It also pins the ordering precondition that the measurement
+    /// stays **before** `copy_checkpoint` (§4.4.3): move the measurement after
+    /// the checkpoint and it sees the file the checkpoint just created, so
+    /// identity rescues the omission and the fixture silently stops isolating
+    /// anything.
+    #[test]
+    fn fork_omits_a_protected_file_created_after_measurement() {
+        let _checkpoint_guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let source = tempfile::tempdir().unwrap();
+        let canonical = source.path().canonicalize().unwrap();
+        fs::write(canonical.join("keep"), "keep").unwrap();
+        // Arming on the *root* fires before the directory is enumerated, so
+        // the new file is deterministically mid-copy rather than racing
+        // readdir.
+        let target = canonical.clone();
+        set_copy_checkpoint(
+            &canonical,
+            Box::new(move |path| {
+                if path == target {
+                    fs::create_dir_all(target.join(".pi/agent")).unwrap();
+                    fs::write(target.join(".pi/agent/auth.json"), "{\"token\":\"t\"}").unwrap();
+                }
+            }),
+        );
+        let store = tempfile::tempdir().unwrap();
+        let result = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork", canonical.display())]).unwrap(),
+            // No `~/.pi` at measure time: the fork root is this home.
+            &context_with_home(store.path(), canonical.clone()),
+        );
+        clear_copy_checkpoint();
+        let plan = result.unwrap();
+        let data = fork_data(&plan);
+
+        assert!(data.join("keep").is_file());
+        assert!(!data.join(".pi/agent/auth.json").exists());
+        assert!(
+            plan.notices
+                .join("\n")
+                .contains("Omitted host Pi credential file .pi/agent/auth.json"),
+            "{:?}",
+            plan.notices
+        );
+        assert!(canonical.join(".pi/agent/auth.json").is_file());
+    }
+
+    #[test]
+    fn protected_refusal_precedes_validate_plan_topology_errors() {
+        let (_home, home) = pi_home();
+        let file = tempfile::tempdir().unwrap();
+        let plain = file.path().join("plain");
+        fs::write(&plain, "plain").unwrap();
+
+        // Both orders: a leaky plan that is *also* invalid still reports the
+        // leak, because every pass before this one is read-only.
+        for declarations in [
+            vec![
+                format!("{}:/leak:ro", home.join(".pi").display()),
+                format!("{}:/leak/f:ro", plain.display()),
+            ],
+            vec![
+                format!("{}:/leak/f:ro", plain.display()),
+                format!("{}:/leak:ro", home.join(".pi").display()),
+            ],
+        ] {
+            let store = tempfile::tempdir().unwrap();
+            let error = prepare(
+                parse_extra_mounts(&declarations).unwrap(),
+                &context_with_home(store.path(), home.clone()),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("would expose"), "{error}");
+            assert!(store_tree(store.path()).is_empty(), "{error}");
+        }
+
+        // The companion: an earlier-stage rejection still wins, pinning the
+        // honest precedence (side-effect freedom, not "security message
+        // first").
+        let store = tempfile::tempdir().unwrap();
+        let error = prepare(
+            parse_extra_mounts(&[
+                format!("{}:/fork:fork", plain.display()),
+                format!("{}:/leak:ro", home.join(".pi").display()),
+            ])
+            .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("a :fork source must be a directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn core_project_bind_that_is_home_is_refused() {
+        let (_home, home) = pi_home();
+        let store = tempfile::tempdir().unwrap();
+        let mut ctx = context_with_home(store.path(), home.clone());
+        ctx.core_host_sources = vec![CoreHostSource::new(CoreBind::ProjectDir, home.clone())];
+
+        let error = prepare(Vec::new(), &ctx).unwrap_err().to_string();
+        assert!(error.contains("project directory"), "{error}");
+        assert!(
+            error.contains(&home.join(".pi/agent/auth.json").display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("instead of $HOME"), "{error}");
+        assert!(store_tree(store.path()).is_empty(), "{error}");
+    }
+
+    #[test]
+    fn core_project_bind_inside_pi_home_is_refused() {
+        let (_home, home) = pi_home();
+        let store = tempfile::tempdir().unwrap();
+        let mut ctx = context_with_home(store.path(), home.clone());
+        ctx.core_host_sources = vec![CoreHostSource::new(CoreBind::ProjectDir, home.join(".pi"))];
+
+        let error = prepare(Vec::new(), &ctx).unwrap_err().to_string();
+        assert!(error.contains("project directory"), "{error}");
+        assert!(
+            error.contains(&format!("outside {}", home.join(".pi").display())),
+            "{error}"
+        );
+
+        // An unrelated core source is untouched by the same check.
+        ctx.core_host_sources = vec![CoreHostSource::new(
+            CoreBind::ProjectDir,
+            home.join("elsewhere"),
+        )];
+        fs::create_dir(home.join("elsewhere")).unwrap();
+        assert!(prepare(Vec::new(), &ctx).is_ok());
+    }
+
+    /// A *below-`agent`* cwd inside the Pi home exposes no protected file, so
+    /// it is allowed — but it is a writable live window onto host Pi state, so
+    /// both advisories must fire with no `--mount` at all (issue #90's warning
+    /// deliverable, which the core binds were missing).
+    #[test]
+    fn core_project_bind_inside_pi_home_below_agent_warns() {
+        let (_home, home) = pi_home();
+        fs::create_dir_all(home.join(".pi/extensions")).unwrap();
+        fs::write(home.join(".pi/extensions/x.js"), "x").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut ctx = context_with_home(store.path(), home.clone());
+        ctx.core_host_sources = vec![CoreHostSource::new(
+            CoreBind::ProjectDir,
+            home.join(".pi/extensions"),
+        )];
+
+        let plan = prepare(Vec::new(), &ctx).unwrap();
+        let notices = plan.notices.join("\n");
+        assert!(
+            notices.contains("is a live bind of host Pi state"),
+            "{notices}"
+        );
+        assert!(
+            notices.contains("may be built for this host's OS/arch"),
+            "{notices}"
+        );
+        assert!(
+            notices.contains("run agent-vm from a project directory outside"),
+            "{notices}"
+        );
+    }
+
+    #[test]
+    fn pi_home_advisories_repeat_on_a_reused_fork() {
+        let (_home, home) = pi_home();
+        let store = tempfile::tempdir().unwrap();
+        let declaration = format!("{}:/pi:fork", home.join(".pi").display());
+        let declaration = parse_extra_mounts(&[declaration]).unwrap();
+
+        let seeded = prepare(
+            declaration.clone(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        assert!(seeded.notices.join("\n").contains("Initialized fork"));
+        assert!(
+            seeded
+                .notices
+                .join("\n")
+                .contains("may not run in the Linux guest"),
+            "{:?}",
+            seeded.notices
+        );
+
+        // `preflight_forks` repoints the fork at its committed data, so a
+        // notice keyed on `mount.host` would silently stop firing here.
+        let reused = prepare(declaration, &context_with_home(store.path(), home.clone())).unwrap();
+        assert!(reused.notices.join("\n").contains("Reusing fork"));
+        assert!(
+            reused
+                .notices
+                .join("\n")
+                .contains("may not run in the Linux guest"),
+            "{:?}",
+            reused.notices
+        );
+    }
+
+    #[test]
+    fn pi_extensions_live_bind_warns_and_is_allowed() {
+        let (_home, home) = pi_home();
+        fs::create_dir_all(home.join(".pi/extensions")).unwrap();
+        fs::write(home.join(".pi/extensions/x.js"), "x").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:ro", home.join(".pi/extensions").display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+
+        let notices = plan.notices.join("\n");
+        assert!(
+            notices.contains("is a live bind of host Pi state"),
+            "{notices}"
+        );
+        assert!(
+            notices.contains("may be built for this host's OS/arch"),
+            "{notices}"
+        );
+        assert!(!notices.contains("Omitted"), "{notices}");
+    }
+
+    #[test]
+    fn non_pi_mounts_and_forks_are_unchanged() {
+        let (_home, home) = pi_home();
+        for (label, home_home) in [("pi home present", Some(home.clone())), ("no .pi", None)] {
+            let home_home = home_home.unwrap_or_else(test_home);
+            let source = tempfile::tempdir().unwrap();
+            fs::write(source.path().join("seed"), "seed").unwrap();
+            let store = tempfile::tempdir().unwrap();
+            let plan = prepare(
+                parse_extra_mounts(&[format!("{}:ro", source.path().display())]).unwrap(),
+                &context_with_home(store.path(), home_home.clone()),
+            )
+            .unwrap();
+            assert!(plan.notices.is_empty(), "{label}: {:?}", plan.notices);
+
+            let store = tempfile::tempdir().unwrap();
+            let fork = prepare(
+                parse_extra_mounts(&[format!("{}:/guest:fork", source.path().display())]).unwrap(),
+                &context_with_home(store.path(), home_home),
+            )
+            .unwrap();
+            let notices = fork.notices.join("\n");
+            assert!(!notices.contains("Omitted"), "{label}: {notices}");
+            assert!(!notices.contains("host Pi state"), "{label}: {notices}");
+        }
+    }
+
+    /// M13: the per-fork lock coordinates fork *initializers*, not host Pi
+    /// writers. A host process replaces the whole fork root — credential and
+    /// all — after the source kind is checked, before the copy. The copier
+    /// resolves the recreated root at T1 and measures it at T2, so its routes
+    /// name the credential; the omission is an outcome regression, not a
+    /// signal-isolating test (R3.4).
+    #[test]
+    fn fork_omission_survives_a_fork_root_recreated_after_measurement() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let source = home.join(".pi");
+        fs::create_dir(&source).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        // The lock `prepare_forks` holds; no host writer is obliged to take it.
+        let data = fork_data_with_one_resolution_point(
+            &home,
+            &source,
+            || {},
+            || {
+                // The host replaces the tree, with both protected files, before
+                // the copy point's resolve/measurement.
+                fs::remove_dir_all(&source).unwrap();
+                fs::create_dir_all(source.join("agent")).unwrap();
+                fs::write(source.join("agent/auth.json"), "synthetic-secret").unwrap();
+                fs::write(source.join("agent/models.json"), "synthetic-models").unwrap();
+            },
+            store.path(),
+        );
+        assert!(data.join("agent").is_dir());
+        assert!(
+            !data.join("agent/auth.json").exists(),
+            "the recreated credential was copied"
+        );
+        assert!(!data.join("agent/models.json").exists());
+    }
+
+    /// R1: an ordinary atomic credential replacement must not make the copier
+    /// forget an inode the launch's first measurement positively identified.
+    /// `backup-*.json` are hardlinks to the *old* credential bytes; the fresh
+    /// measurement sees only the replacement, so omission has to union the
+    /// preflight identities with the fresh ones rather than replace them.
+    #[test]
+    fn fork_omission_retains_a_preflight_credential_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_home, home) = pi_home();
+        let source = home.join("unrelated-fork");
+        fs::create_dir(&source).unwrap();
+        fs::hard_link(
+            home.join(".pi/agent/auth.json"),
+            source.join("backup-auth.json"),
+        )
+        .unwrap();
+        fs::hard_link(
+            home.join(".pi/agent/models.json"),
+            source.join("backup-models.json"),
+        )
+        .unwrap();
+        // The same measurement `prepare` takes before expanding/validating.
+        let original = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        let backup = fs::metadata(source.join("backup-auth.json")).unwrap();
+        assert!(
+            original
+                .identities()
+                .matched(backup.dev(), backup.ino())
+                .is_some(),
+            "the preflight measurement must know the hardlink's inode"
+        );
+
+        // Ordinary atomic replacements of both protected files.
+        for (path, body) in [
+            (home.join(".pi/agent/auth.json"), "replacement-auth"),
+            (home.join(".pi/agent/models.json"), "replacement-models"),
+        ] {
+            let replacement = path.with_extension("replacement");
+            fs::write(&replacement, body).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+        }
+
+        let store = tempfile::tempdir().unwrap();
+        let mut mounts = parse_extra_mounts(&[format!("{}:/fork:fork", source.display())]).unwrap();
+        prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &original,
+        )
+        .unwrap();
+        assert!(
+            !mounts[0].host.join("backup-auth.json").exists(),
+            "the fresh measurement discarded a known credential inode and copied it"
+        );
+        assert!(!mounts[0].host.join("backup-models.json").exists());
+    }
+
+    /// A fork root that did not exist at the top of `prepare` still gets the
+    /// omission signals: the copier re-measures at its own resolve point and
+    /// loses no knowledge the earlier snapshot had, and the static path table
+    /// names the protected files under the root even when no measurement saw
+    /// it.
+    #[test]
+    fn fork_root_created_after_measure_is_still_omitted() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let source = home.join(".pi");
+        let store = tempfile::tempdir().unwrap();
+        let mut mounts = parse_extra_mounts(&[format!("{}:/pi:fork", source.display())]).unwrap();
+        // `prepare`'s measurement happens first, and `~/.pi` does not exist
+        // yet, so that snapshot knows nothing of the fork root.
+        let stale = ProtectedHostFiles::measure(Some(&home)).unwrap();
+
+        // …then `~/.pi` and its credential appear, before `prepare_forks`.
+        fs::create_dir_all(source.join("agent")).unwrap();
+        fs::write(source.join("agent/auth.json"), "{\"token\":\"t\"}").unwrap();
+        fs::write(source.join("settings.json"), "{}").unwrap();
+
+        prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &stale,
+        )
+        .unwrap();
+        let data = &mounts[0].host;
+
+        assert!(data.join("settings.json").is_file());
+        assert!(data.join("agent").is_dir());
+        assert!(!data.join("agent/auth.json").exists());
+    }
+
+    // ── The fork copier's single resolution point (Revision 4) ────────
+
+    /// Drive the copier through its single resolve point with R3.4's corrected
+    /// chronology: measure the launch → `after_launch_measurement()` (restore
+    /// what the launch must **not** have seen) → the per-fork lock and the
+    /// source-kind check → `at_the_resolve_point()` → `copy_root`, which
+    /// resolves the root (T1), measures there (T2) and copies. Returns the
+    /// staged fork data.
+    fn fork_data_with_one_resolution_point(
+        home_for_measure: &Path,
+        root_spelling: &Path,
+        after_launch_measurement: impl FnOnce(),
+        at_the_resolve_point: impl FnOnce(),
+        store: &Path,
+    ) -> PathBuf {
+        let launch = ProtectedHostFiles::measure(Some(home_for_measure)).unwrap();
+        after_launch_measurement();
+        let lock = open_regular_lock(&store.join("fork.lock")).unwrap();
+        lock_exclusive(&lock).unwrap();
+        require_fork_directory(
+            fork_source_kind(root_spelling).unwrap(),
+            &root_spelling.display().to_string(),
+        )
+        .unwrap();
+        at_the_resolve_point();
+        let policy = CopyPolicy {
+            exclusions: &[],
+            follow: false,
+            protected: &launch,
+        };
+        let data = store.join("data");
+        let mut report = CopyReport::default();
+        copy_root(root_spelling, &data, &policy, &mut report).unwrap();
+        data
+    }
+
+    /// The armed hooks for the M13 rename window plus the run flags. Dropping it
+    /// clears both callback slots, so a panicking test cannot leave one armed.
+    struct MissingRootRace {
+        hid: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        restored: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _resolve: ResolveCheckpointGuard,
+        _copy: CopyCheckpointGuard,
+    }
+
+    impl MissingRootRace {
+        fn assert_ran(&self) {
+            use std::sync::atomic::Ordering;
+            assert!(
+                self.hid.load(Ordering::SeqCst),
+                "the resolve hook did not run"
+            );
+            assert!(
+                self.restored.load(Ordering::SeqCst),
+                "the copy hook did not run"
+            );
+        }
+    }
+
+    /// Arm both of R4's hooks so `pi_directory` is hidden across the copy-point
+    /// measurement (T2) and the pure relatives derivation (T3), then restored
+    /// with both credentials between T3 and the open (T4) — the M13 rename
+    /// window, replayed through the real ordering (MF1). `canonical_root` is the
+    /// path the copier resolves to, and the scope both hooks match. The caller
+    /// must hold `COPY_CHECKPOINT_TEST_LOCK` for the whole lifetime.
+    fn hide_the_pi_directory_across_the_copy_point(
+        canonical_root: &Path,
+        pi_directory: &Path,
+        stash: &Path,
+    ) -> MissingRootRace {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let hid = Arc::new(AtomicBool::new(false));
+        let restored = Arc::new(AtomicBool::new(false));
+
+        let pi_hide = pi_directory.to_path_buf();
+        let stash_hide = stash.to_path_buf();
+        let hid_flag = Arc::clone(&hid);
+        let resolve = ResolveCheckpointGuard::arm(
+            canonical_root,
+            Box::new(move |_| {
+                fs::rename(&pi_hide, &stash_hide).unwrap();
+                assert!(
+                    !pi_hide.exists(),
+                    "the resolve hook did not hide the Pi directory"
+                );
+                hid_flag.store(true, Ordering::SeqCst);
+            }),
+        );
+
+        let pi_restore = pi_directory.to_path_buf();
+        let stash_restore = stash.to_path_buf();
+        let root_match = canonical_root.to_path_buf();
+        let restored_flag = Arc::clone(&restored);
+        let copy = CopyCheckpointGuard::arm(
+            canonical_root,
+            Box::new(move |path| {
+                if path == root_match && !restored_flag.swap(true, Ordering::SeqCst) {
+                    assert!(
+                        !pi_restore.exists(),
+                        "the Pi directory reappeared before the copy point's open"
+                    );
+                    fs::rename(&stash_restore, &pi_restore).unwrap();
+                    fs::create_dir_all(pi_restore.join("agent")).unwrap();
+                    fs::write(pi_restore.join("agent/auth.json"), "synthetic-secret").unwrap();
+                    fs::write(pi_restore.join("agent/models.json"), "synthetic-models").unwrap();
+                }
+            }),
+        );
+        MissingRootRace {
+            hid,
+            restored,
+            _resolve: resolve,
+            _copy: copy,
+        }
+    }
+
+    /// Outcome-regression control through the real M13 rename window (MF1): the
+    /// root resolves at T1, the real Pi directory is hidden across the T2
+    /// measurement and T3 relatives, and it is restored with both credentials
+    /// just before the T4 open. The canonical spelling is the control — its
+    /// literal spelling still equals the configured Pi home.
+    #[test]
+    fn fork_omits_through_a_canonical_root_spelling() {
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let root = home.join(".pi");
+        fs::create_dir_all(root.join("agent")).unwrap();
+        fs::write(root.join("settings.json"), "{}").unwrap();
+        let race =
+            hide_the_pi_directory_across_the_copy_point(&root, &root, &home.join("stashed-pi"));
+        let store = tempfile::tempdir().unwrap();
+        let data = fork_data_with_one_resolution_point(&home, &root, || {}, || {}, store.path());
+
+        race.assert_ran();
+        assert!(
+            root.join("agent/auth.json").is_file(),
+            "the credential must exist at the open, or the omission is vacuous"
+        );
+        assert!(
+            data.join("settings.json").is_file(),
+            "ordinary content must be copied"
+        );
+        assert!(
+            !data.join("agent/auth.json").exists(),
+            "the canonical control copied the credential"
+        );
+        assert!(!data.join("agent/models.json").exists());
+    }
+
+    /// F1 #1 through the same M13 window: `$HOME`, and therefore the
+    /// `--mount ~/.pi:fork` spelling, is reached through a symlink. The copier
+    /// canonicalizes the root itself, so the alias is folded (N1a/N1b are the
+    /// sibling spellings).
+    #[test]
+    fn fork_omits_through_a_symlinked_home_spelling() {
+        use std::os::unix::fs::symlink;
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        let alias = base.join("home-alias");
+        symlink(&home, &alias).unwrap();
+        let real_root = home.join(".pi");
+        fs::create_dir_all(real_root.join("agent")).unwrap();
+        fs::write(real_root.join("settings.json"), "{}").unwrap();
+        let race = hide_the_pi_directory_across_the_copy_point(
+            &real_root,
+            &real_root,
+            &home.join("stashed-pi"),
+        );
+        let store = tempfile::tempdir().unwrap();
+        let data = fork_data_with_one_resolution_point(
+            &alias,
+            &alias.join(".pi"),
+            || {},
+            || {},
+            store.path(),
+        );
+
+        race.assert_ran();
+        assert!(real_root.join("agent/auth.json").is_file());
+        assert!(data.join("settings.json").is_file());
+        assert!(
+            !data.join("agent/auth.json").exists(),
+            "a symlinked-home fork-root spelling copied the credential"
+        );
+        assert!(!data.join("agent/models.json").exists());
+    }
+
+    /// N1a through the same M13 window: `$HOME` reached through one alias, the
+    /// `--mount` spelled through a second. Before the copier canonicalized the
+    /// root, the static half compared the literal spelling and missed it.
+    #[test]
+    fn fork_omits_through_a_second_home_alias_spelling() {
+        use std::os::unix::fs::symlink;
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        let alias1 = base.join("alias1");
+        let alias2 = base.join("alias2");
+        symlink(&home, &alias1).unwrap();
+        symlink(&home, &alias2).unwrap();
+        let real_root = home.join(".pi");
+        fs::create_dir_all(real_root.join("agent")).unwrap();
+        fs::write(real_root.join("settings.json"), "{}").unwrap();
+        let race = hide_the_pi_directory_across_the_copy_point(
+            &real_root,
+            &real_root,
+            &home.join("stashed-pi"),
+        );
+        let store = tempfile::tempdir().unwrap();
+        let data = fork_data_with_one_resolution_point(
+            &alias1,
+            &alias2.join(".pi"),
+            || {},
+            || {},
+            store.path(),
+        );
+
+        race.assert_ran();
+        assert!(real_root.join("agent/auth.json").is_file());
+        assert!(data.join("settings.json").is_file());
+        assert!(
+            !data.join("agent/auth.json").exists(),
+            "a second home alias spelling copied the credential"
+        );
+        assert!(!data.join("agent/models.json").exists());
+    }
+
+    /// N1b through the same M13 window: `--mount ~/pi-link:fork` where
+    /// `~/pi-link -> ~/.pi`. The link spelling is disjoint from the configured
+    /// Pi home, so only resolving the root at its own point names the
+    /// credential.
+    #[test]
+    fn fork_omits_through_a_link_to_the_pi_home() {
+        use std::os::unix::fs::symlink;
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let pi_home = home.join(".pi");
+        fs::create_dir_all(pi_home.join("agent")).unwrap();
+        fs::write(pi_home.join("settings.json"), "{}").unwrap();
+        let link = home.join("pi-link");
+        symlink(&pi_home, &link).unwrap();
+        let race = hide_the_pi_directory_across_the_copy_point(
+            &pi_home,
+            &pi_home,
+            &home.join("stashed-pi"),
+        );
+        let store = tempfile::tempdir().unwrap();
+        let data = fork_data_with_one_resolution_point(&home, &link, || {}, || {}, store.path());
+
+        race.assert_ran();
+        assert!(pi_home.join("agent/auth.json").is_file());
+        assert!(data.join("settings.json").is_file());
+        assert!(
+            !data.join("agent/auth.json").exists(),
+            "a link to the Pi home copied the credential"
+        );
+        assert!(!data.join("agent/models.json").exists());
+    }
+
+    /// F1 #2 with the corrected chronology: the launch measures with no `~/.pi`;
+    /// `after_launch_measurement` creates the link; the credential is created
+    /// before the copy point, which measures the recreated target.
+    #[test]
+    fn fork_omits_a_symlinked_pi_home_recreated_after_the_launch_measurement() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = elsewhere.path().canonicalize().unwrap();
+        let root = home.join(".pi");
+        let store = tempfile::tempdir().unwrap();
+        let data = fork_data_with_one_resolution_point(
+            &home,
+            &root,
+            || symlink(&elsewhere, &root).unwrap(),
+            || {
+                fs::create_dir_all(elsewhere.join("agent")).unwrap();
+                fs::write(elsewhere.join("agent/auth.json"), "synthetic-secret").unwrap();
+                fs::write(elsewhere.join("agent/models.json"), "synthetic-models").unwrap();
+            },
+            store.path(),
+        );
+        assert!(!data.join("agent/auth.json").exists());
+        assert!(!data.join("agent/models.json").exists());
+    }
+
+    /// reviewer5's probe, as an omission: the launch measures with no `~/.pi`;
+    /// `after_launch_measurement` creates `~/.pi -> /ext`; the copy checkpoint
+    /// removes the link, restores it, and writes the credentials (which did not
+    /// exist at T2/T3). The route measured at T2 already named `/ext`, so both
+    /// files are omitted and an ordinary sibling is copied (RULING 3).
+    #[test]
+    fn fork_omits_when_the_pi_home_link_is_removed_after_the_measurement() {
+        use std::os::unix::fs::symlink;
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let ext = ext.path().canonicalize().unwrap();
+        let root = home.join(".pi");
+        let store = tempfile::tempdir().unwrap();
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let target = ext.clone();
+        let root_for_callback = root.clone();
+        let ran_flag = std::sync::Arc::clone(&ran);
+        let _copy_guard = CopyCheckpointGuard::arm(
+            &ext,
+            Box::new(move |path| {
+                if path == target && !ran_flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // The credentials must not exist yet, or T2/T3 could have
+                    // named them by identity instead of by the resolved route.
+                    assert!(!target.join("agent/auth.json").exists());
+                    fs::remove_file(&root_for_callback).unwrap();
+                    symlink(&target, &root_for_callback).unwrap();
+                    fs::create_dir_all(target.join("agent")).unwrap();
+                    fs::write(target.join("agent/auth.json"), "synthetic-secret").unwrap();
+                    fs::write(target.join("agent/models.json"), "synthetic-models").unwrap();
+                    fs::write(target.join("notes.txt"), "ordinary").unwrap();
+                }
+            }),
+        );
+        let data = fork_data_with_one_resolution_point(
+            &home,
+            &root,
+            || symlink(&ext, &root).unwrap(),
+            || {},
+            store.path(),
+        );
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the copy hook did not run"
+        );
+        assert!(ext.join("agent/auth.json").is_file());
+        assert!(
+            data.join("notes.txt").is_file(),
+            "the ordinary file must be copied"
+        );
+        assert!(!data.join("agent/auth.json").exists());
+        assert!(!data.join("agent/models.json").exists());
+    }
+
+    /// A nested `:fork` of a subdirectory of the Pi home under the same race:
+    /// the static table must strip down to the bare filenames.
+    #[test]
+    fn fork_of_a_nested_pi_home_subdirectory_still_omits() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let root = home.join(".pi/agent");
+        fs::create_dir_all(&root).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let data = fork_data_with_one_resolution_point(
+            &home,
+            &root,
+            || {},
+            || {
+                fs::write(root.join("auth.json"), "synthetic-secret").unwrap();
+                fs::write(root.join("models.json"), "synthetic-models").unwrap();
+            },
+            store.path(),
+        );
+        assert!(!data.join("auth.json").exists());
+        assert!(!data.join("models.json").exists());
+    }
+
+    // ── Signal-isolating tests (§7.7.3) ───────────────────────────────
+
+    /// S1: both halves of the identity union. `backup-*.json` are hardlinks to
+    /// the **launch** inodes; `replacement-*.json` are hardlinks to the
+    /// **copy-point** inodes. Dropping either half of `union` copies one pair.
+    #[test]
+    fn fork_omission_unions_preflight_and_copy_point_identities() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_home, home) = pi_home();
+        let source = home.join("unrelated-fork");
+        fs::create_dir(&source).unwrap();
+        fs::hard_link(
+            home.join(".pi/agent/auth.json"),
+            source.join("backup-auth.json"),
+        )
+        .unwrap();
+        fs::hard_link(
+            home.join(".pi/agent/models.json"),
+            source.join("backup-models.json"),
+        )
+        .unwrap();
+        let launch = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        let old_auth = fs::metadata(source.join("backup-auth.json")).unwrap();
+        let old_models = fs::metadata(source.join("backup-models.json")).unwrap();
+        assert!(
+            launch
+                .identities()
+                .matched(old_auth.dev(), old_auth.ino())
+                .is_some(),
+            "the launch snapshot must know the old credential inodes"
+        );
+        assert!(
+            launch
+                .identities()
+                .matched(old_models.dev(), old_models.ino())
+                .is_some()
+        );
+
+        // Atomically replace both credential files.
+        for (path, body) in [
+            (home.join(".pi/agent/auth.json"), "replacement-auth"),
+            (home.join(".pi/agent/models.json"), "replacement-models"),
+        ] {
+            let replacement = path.with_extension("replacement");
+            fs::write(&replacement, body).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+        }
+        // After the replacement, hardlink the *new* inodes into the same fork.
+        fs::hard_link(
+            home.join(".pi/agent/auth.json"),
+            source.join("replacement-auth.json"),
+        )
+        .unwrap();
+        fs::hard_link(
+            home.join(".pi/agent/models.json"),
+            source.join("replacement-models.json"),
+        )
+        .unwrap();
+        fs::write(source.join("ordinary.txt"), "keep").unwrap();
+
+        // The launch snapshot must not know the replacement inodes; otherwise
+        // dropping `other`'s identities could be rescued by the launch half.
+        let new_auth = fs::metadata(source.join("replacement-auth.json")).unwrap();
+        let new_models = fs::metadata(source.join("replacement-models.json")).unwrap();
+        assert!(
+            launch
+                .identities()
+                .matched(new_auth.dev(), new_auth.ino())
+                .is_none(),
+            "the launch snapshot must not know the replacement inodes"
+        );
+        assert!(
+            launch
+                .identities()
+                .matched(new_models.dev(), new_models.ino())
+                .is_none()
+        );
+
+        // Precondition: the fresh measurement does not know the old inodes, and
+        // no Pi pathname names anything under `unrelated-fork`.
+        let fresh = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        assert!(
+            fresh
+                .identities()
+                .matched(old_auth.dev(), old_auth.ino())
+                .is_none(),
+            "the fresh snapshot must have forgotten the old inode"
+        );
+        assert!(
+            launch
+                .union(&fresh)
+                .relatives_under(&ResolvedRoot::resolve(&source).unwrap())
+                .is_empty(),
+            "no Pi path names anything under an unrelated fork root"
+        );
+
+        let store = tempfile::tempdir().unwrap();
+        let mut mounts = parse_extra_mounts(&[format!("{}:/fork:fork", source.display())]).unwrap();
+        prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &launch,
+        )
+        .unwrap();
+        let data = &mounts[0].host;
+        assert!(data.join("ordinary.txt").is_file());
+        for name in [
+            "backup-auth.json",
+            "backup-models.json",
+            "replacement-auth.json",
+            "replacement-models.json",
+        ] {
+            assert!(!data.join(name).exists(), "{name} survived the copy");
+        }
+    }
+
+    /// S4: fresh-wins on the **configured** `pi_home`. The `$HOME` link is
+    /// re-pointed between the launch and the copy, so first-wins would name the
+    /// old home and copy the credential.
+    #[test]
+    fn fork_of_a_repointed_home_link_uses_the_fresh_configured_pi_home() {
+        use std::os::unix::fs::symlink;
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home_a = base.join("homeA");
+        let home_b = base.join("homeB");
+        fs::create_dir(&home_a).unwrap();
+        fs::create_dir(&home_b).unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let ext = ext.path().canonicalize().unwrap();
+        fs::create_dir(ext.join("pi")).unwrap();
+        symlink(ext.join("pi"), home_b.join(".pi")).unwrap();
+        let home_link = base.join("home-link");
+        symlink(&home_a, &home_link).unwrap();
+
+        let launch = ProtectedHostFiles::measure(Some(&home_link)).unwrap();
+        // Re-point `$HOME` at `homeB` between the launch and the copy.
+        fs::remove_file(&home_link).unwrap();
+        symlink(&home_b, &home_link).unwrap();
+
+        let pi = ext.join("pi");
+        let target = pi.clone();
+        set_copy_checkpoint(
+            &home_b,
+            Box::new(move |path| {
+                if path == Path::new(".pi") {
+                    fs::create_dir_all(target.join("agent")).unwrap();
+                    fs::write(target.join("agent/auth.json"), "synthetic-secret").unwrap();
+                    fs::write(target.join("agent/models.json"), "synthetic-models").unwrap();
+                    fs::write(target.join("notes.txt"), "ordinary").unwrap();
+                }
+            }),
+        );
+        let mut mounts =
+            parse_extra_mounts(&[format!("{}:/guest:fork:follow-links", home_link.display())])
+                .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let result = prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &launch,
+        );
+        clear_copy_checkpoint();
+
+        result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
+        let data = &mounts[0].host;
+        assert!(data.join(".pi/notes.txt").is_file());
+        assert!(
+            !data.join(".pi/agent/auth.json").exists(),
+            "first-wins on pi_home copied the credential"
+        );
+        assert!(!data.join(".pi/agent/models.json").exists());
+    }
+
+    /// S5: the copy-point measured routes. The credential is a symlinked target
+    /// that exists only from the copy point, reached through the fresh route
+    /// `(/ext, "secrets/auth.json")`; the launch knew nothing of `/ext`.
+    #[test]
+    fn fork_omits_a_symlinked_credential_target_named_only_by_the_fresh_routes() {
+        use std::os::unix::fs::symlink;
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (_home, home) = home_dir_with_pi_home_minus_credential();
+        let ext = tempfile::tempdir().unwrap();
+        let ext = ext.path().canonicalize().unwrap();
+        fs::create_dir_all(ext.join("secrets")).unwrap();
+        fs::write(ext.join("secrets/auth.json"), "old").unwrap();
+        fs::write(ext.join("secrets/notes.txt"), "ordinary").unwrap();
+        let launch = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        // The credential alias appears only after the launch measurement.
+        symlink(
+            ext.join("secrets/auth.json"),
+            home.join(".pi/agent/auth.json"),
+        )
+        .unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let auth = ext.join("secrets/auth.json");
+        let auth_cb = auth.clone();
+        let outside_path = outside.path().join("old-auth.json");
+        set_copy_checkpoint(
+            &ext,
+            Box::new(move |path| {
+                if path == Path::new("secrets/auth.json") {
+                    // Replace the inode the copy-point identity saw; keep the
+                    // old bytes reachable outside `/ext`.
+                    fs::hard_link(&auth_cb, &outside_path).unwrap();
+                    let replacement = auth_cb.with_extension("replacement");
+                    fs::write(&replacement, "replacement").unwrap();
+                    fs::rename(&replacement, &auth_cb).unwrap();
+                }
+            }),
+        );
+        let mut mounts = parse_extra_mounts(&[format!("{}:/guest:fork", ext.display())]).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let result = prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &launch,
+        );
+        clear_copy_checkpoint();
+
+        result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
+        let data = &mounts[0].host;
+        assert!(
+            data.join("secrets/notes.txt").is_file(),
+            "the ordinary sibling must be copied"
+        );
+        assert!(
+            !data.join("secrets/auth.json").exists(),
+            "a fresh route must omit the credential"
+        );
+    }
+
+    /// S3-A: the **resolved** `pi_home` static entry. The root is
+    /// `~/.pi/agent`, so at the copy point the resolved spelling `/ext/pi` must
+    /// name `agent/auth.json` while the configured `$HOME/.pi` spelling does
+    /// not strip under it.
+    #[test]
+    fn fork_of_a_pi_home_subdirectory_omits_through_the_resolved_spelling() {
+        use std::os::unix::fs::symlink;
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let ext = ext.path().canonicalize().unwrap();
+        fs::create_dir_all(ext.join("pi/agent")).unwrap();
+        symlink(ext.join("pi"), home.join(".pi")).unwrap();
+        let root = home.join(".pi/agent");
+        let stashed = ext.join("pi/stashed-agent");
+        let agent = ext.join("pi/agent");
+
+        let stashed_cb = stashed.clone();
+        let root_cb = root.clone();
+        set_resolve_checkpoint(
+            &root,
+            Box::new(move |_| fs::rename(&root_cb, &stashed_cb).unwrap()),
+        );
+        let agent_cb = agent.clone();
+        let stashed_restore = stashed.clone();
+        set_copy_checkpoint(
+            &root,
+            Box::new(move |path| {
+                if path == agent_cb {
+                    fs::rename(&stashed_restore, &agent_cb).unwrap();
+                    fs::write(agent_cb.join("auth.json"), "synthetic-secret").unwrap();
+                    fs::write(agent_cb.join("notes.txt"), "ordinary").unwrap();
+                }
+            }),
+        );
+        let mut mounts = parse_extra_mounts(&[format!("{}:/guest:fork", root.display())]).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let result = prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &ProtectedHostFiles::measure(Some(&home)).unwrap(),
+        );
+        clear_resolve_checkpoint();
+        clear_copy_checkpoint();
+
+        result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
+        let data = &mounts[0].host;
+        assert_eq!(
+            fs::read_to_string(data.join("notes.txt")).unwrap(),
+            "ordinary"
+        );
+        assert!(
+            !data.join("auth.json").exists(),
+            "resolved_pi_home must name the credential under a Pi-home subdirectory"
+        );
+    }
+
+    /// S3-B: fresh-wins on the **resolved** `pi_home`. Same shape as S3-A, but
+    /// `~/.pi` is re-pointed to `piB` before the copy point, so first-wins would
+    /// name `piA` and copy the credential. Asserts an explicit successful result
+    /// first, so a reintroduced fail-closed check dies on a named assertion.
+    #[test]
+    fn fork_of_a_repointed_pi_home_subdirectory_uses_the_fresh_resolution() {
+        use std::os::unix::fs::symlink;
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let ext = ext.path().canonicalize().unwrap();
+        fs::create_dir_all(ext.join("piA/agent")).unwrap();
+        fs::create_dir_all(ext.join("piB/agent")).unwrap();
+        symlink(ext.join("piA"), home.join(".pi")).unwrap();
+
+        let launch = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        // Re-point `~/.pi` to `piB` before the copy point.
+        fs::remove_file(home.join(".pi")).unwrap();
+        symlink(ext.join("piB"), home.join(".pi")).unwrap();
+
+        let root = home.join(".pi/agent");
+        let stashed = ext.join("piB/stashed-agent");
+        let agent = ext.join("piB/agent");
+        let stashed_cb = stashed.clone();
+        let root_cb = root.clone();
+        set_resolve_checkpoint(
+            &root,
+            Box::new(move |_| fs::rename(&root_cb, &stashed_cb).unwrap()),
+        );
+        let agent_cb = agent.clone();
+        let stashed_restore = stashed.clone();
+        set_copy_checkpoint(
+            &root,
+            Box::new(move |path| {
+                if path == agent_cb {
+                    fs::rename(&stashed_restore, &agent_cb).unwrap();
+                    fs::write(agent_cb.join("auth.json"), "synthetic-secret").unwrap();
+                    fs::write(agent_cb.join("notes.txt"), "ordinary").unwrap();
+                }
+            }),
+        );
+        let mut mounts = parse_extra_mounts(&[format!("{}:/guest:fork", root.display())]).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let result = prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &launch,
+        );
+        clear_resolve_checkpoint();
+        clear_copy_checkpoint();
+
+        result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
+        let data = &mounts[0].host;
+        assert_eq!(
+            fs::read_to_string(data.join("notes.txt")).unwrap(),
+            "ordinary"
+        );
+        assert!(
+            !data.join("auth.json").exists(),
+            "first-wins on resolved_pi_home copied the credential"
+        );
+
+        // No competing static entry covers the fixture: the configured
+        // `$HOME/.pi` spelling cannot name a file under the canonical root, so
+        // only the fresh `resolved_pi_home` can answer. (The competing measured
+        // route is suppressed by the resolve-hook rename and the credential is
+        // created later, so no identity names it either.)
+        let canonical_root = root.canonicalize().unwrap();
+        assert_eq!(canonical_root, agent);
+        assert!(
+            home.join(".pi/agent/auth.json")
+                .strip_prefix(&canonical_root)
+                .is_err(),
+            "the configured pi_home spelling must not cover the fixture"
+        );
+        assert!(
+            ext.join("piB/agent/auth.json")
+                .strip_prefix(&canonical_root)
+                .is_ok(),
+            "the fresh resolved_pi_home must name the credential"
+        );
+    }
+
+    /// S2 (integration): the **configured** `pi_home` static entry and the
+    /// `follow-links` materialization. `~/.pi -> /ext/pi`; the credential is
+    /// created by the copy checkpoint, so no identity names it and no measured
+    /// route is under `$HOME`.
+    #[test]
+    fn fork_follow_links_of_home_omits_a_credential_created_after_the_measurement() {
+        use std::os::unix::fs::symlink;
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let ext = ext.path().canonicalize().unwrap();
+        fs::create_dir(ext.join("pi")).unwrap();
+        symlink(ext.join("pi"), home.join(".pi")).unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let pi = ext.join("pi");
+        let target = pi.clone();
+        set_copy_checkpoint(
+            &home,
+            Box::new(move |path| {
+                if path == Path::new(".pi") {
+                    fs::create_dir_all(target.join("agent")).unwrap();
+                    fs::write(target.join("agent/auth.json"), "synthetic-secret").unwrap();
+                    fs::write(target.join("agent/models.json"), "synthetic-models").unwrap();
+                    fs::write(target.join("notes.txt"), "ordinary").unwrap();
+                }
+            }),
+        );
+        let result = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork:follow-links", home.display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        );
+        clear_copy_checkpoint();
+
+        let plan = result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
+        let data = fork_data(&plan);
+        assert!(data.join(".pi/notes.txt").is_file());
+        assert!(
+            !data.join(".pi/agent/auth.json").exists(),
+            "the configured pi_home must name the followed credential"
+        );
+        assert!(!data.join(".pi/agent/models.json").exists());
+    }
+
+    /// Drop-ruling control: a new, unrelated inode at a former credential
+    /// pathname is **copied** — historical routes are deliberately not retained
+    /// (R3.5, §6.8 item 5).
+    #[test]
+    fn a_new_unrelated_inode_at_a_former_credential_path_is_copied() {
+        use std::os::unix::fs::symlink;
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let ext = ext.path().canonicalize().unwrap();
+        fs::create_dir_all(ext.join("piA/agent")).unwrap();
+        fs::create_dir_all(ext.join("piB/agent")).unwrap();
+        fs::write(ext.join("piA/agent/auth.json"), "old-credential").unwrap();
+        symlink(ext.join("piA"), home.join(".pi")).unwrap();
+
+        let launch = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        // Keep the old inode alive outside `/ext`, then replace it with an
+        // ordinary new inode at the same pathname.
+        let outside = tempfile::tempdir().unwrap();
+        fs::hard_link(
+            ext.join("piA/agent/auth.json"),
+            outside.path().join("old-auth.json"),
+        )
+        .unwrap();
+        fs::remove_file(ext.join("piA/agent/auth.json")).unwrap();
+        fs::write(ext.join("piA/agent/auth.json"), "ordinary-new").unwrap();
+        // Re-point `~/.pi` at `piB` and give it a credential.
+        fs::remove_file(home.join(".pi")).unwrap();
+        symlink(ext.join("piB"), home.join(".pi")).unwrap();
+        fs::write(ext.join("piB/agent/auth.json"), "fresh-credential").unwrap();
+
+        let mut mounts = parse_extra_mounts(&[format!("{}:/guest:fork", ext.display())]).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &launch,
+        )
+        .unwrap();
+        let data = &mounts[0].host;
+        assert!(
+            !data.join("piB/agent/auth.json").exists(),
+            "fresh routes must omit the current credential"
+        );
+        assert_eq!(
+            fs::read_to_string(data.join("piA/agent/auth.json")).unwrap(),
+            "ordinary-new",
+            "a new unrelated inode at a former credential path must be copied"
+        );
+    }
+
+    /// Control: a nested `:fork` of `~/.pi/extensions` keeps its own harmless
+    /// `agent/auth.json` even while `~/.pi` is removed across the copy point.
+    /// No relevance decision is made, so nothing is refused or over-omitted
+    /// (R4.1, medium 1). The shared test lock and the post-hoc assertion keep
+    /// the arm/copy/clear lifetime exclusive and prove the race executed.
+    #[test]
+    fn a_nested_extensions_fork_survives_a_concurrent_pi_home_change() {
+        use std::os::unix::fs::symlink;
+        let _lock = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let ext = ext.path().canonicalize().unwrap();
+        let extensions = ext.join("pi/extensions");
+        fs::create_dir_all(extensions.join("agent")).unwrap();
+        fs::write(extensions.join("agent/auth.json"), "extension-own-config").unwrap();
+        fs::write(extensions.join("plugin.js"), "x").unwrap();
+        symlink(ext.join("pi"), home.join(".pi")).unwrap();
+
+        let root = home.join(".pi/extensions");
+        let home_cb = home.clone();
+        let _resolve = ResolveCheckpointGuard::arm(
+            &root,
+            Box::new(move |_| fs::remove_file(home_cb.join(".pi")).unwrap()),
+        );
+        let mut mounts = parse_extra_mounts(&[format!("{}:/guest:fork", root.display())]).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let result = prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &ProtectedHostFiles::measure(Some(&home)).unwrap(),
+        );
+
+        result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
+        assert!(
+            !home.join(".pi").exists(),
+            "the nested concurrent-change hook did not run"
+        );
+        let data = &mounts[0].host;
+        assert_eq!(
+            fs::read_to_string(data.join("agent/auth.json")).unwrap(),
+            "extension-own-config",
+            "a nested extension's own agent/auth.json must be copied"
+        );
+        assert!(data.join("plugin.js").is_file());
+    }
+
+    /// Control: an entirely unrelated fork is not refused and copies normally
+    /// while `~/.pi` is re-pointed at a **different** target across the copy
+    /// point. Kills an unconditional fail-closed check at the resolve point and
+    /// a change-triggered, root-unconditional refusal (M2).
+    #[test]
+    fn an_unrelated_fork_survives_a_concurrent_pi_home_change() {
+        use std::os::unix::fs::symlink;
+        let _lock = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let ext = ext.path().canonicalize().unwrap();
+        let pi_a = ext.join("piA");
+        let pi_b = ext.join("piB");
+        fs::create_dir_all(pi_a.join("agent")).unwrap();
+        fs::create_dir_all(pi_b.join("agent")).unwrap();
+        fs::write(pi_a.join("agent/auth.json"), "credential-a").unwrap();
+        fs::write(pi_b.join("agent/auth.json"), "credential-b").unwrap();
+        symlink(&pi_a, home.join(".pi")).unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        let unrelated = unrelated.path().canonicalize().unwrap();
+        fs::write(unrelated.join("notes.txt"), "ordinary").unwrap();
+
+        let home_cb = home.clone();
+        let pi_b_cb = pi_b.clone();
+        let _resolve = ResolveCheckpointGuard::arm(
+            &unrelated,
+            Box::new(move |_| {
+                // A genuinely different association, unlike removing and
+                // recreating the same target.
+                fs::remove_file(home_cb.join(".pi")).unwrap();
+                symlink(&pi_b_cb, home_cb.join(".pi")).unwrap();
+            }),
+        );
+        let mut mounts =
+            parse_extra_mounts(&[format!("{}:/guest:fork", unrelated.display())]).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let result = prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &ProtectedHostFiles::measure(Some(&home)).unwrap(),
+        );
+
+        result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
+        assert_eq!(
+            fs::read_link(home.join(".pi")).unwrap(),
+            pi_b,
+            "the unrelated concurrent-change hook did not re-point the Pi home"
+        );
+        let data = &mounts[0].host;
+        assert_eq!(
+            fs::read_to_string(data.join("notes.txt")).unwrap(),
+            "ordinary"
+        );
+    }
+
+    /// S6′ (integration): a root spelled through the macOS data-volume firmlink
+    /// canonicalizes to a **different** string than the measured route while
+    /// sharing `(dev, ino)`, so only the identity arm names the credential.
+    /// Skipped where the firmlink does not exist or does not fold (a platform
+    /// fact, not a code property).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fork_through_a_firmlink_spelling_omits_a_credential_created_after_the_measurement() {
+        use std::os::unix::fs::symlink;
+        let firmlink_root = Path::new("/System/Volumes/Data");
+        if !firmlink_root.exists() {
+            return;
+        }
+        let _guard = COPY_CHECKPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let pi = tempfile::tempdir().unwrap();
+        let pi = pi.path().canonicalize().unwrap();
+        let launch = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        // `~/.pi -> P` appears after the launch measurement.
+        symlink(&pi, home.join(".pi")).unwrap();
+
+        let alias = firmlink_root.join(pi.strip_prefix("/").unwrap());
+        let alias_canonical = alias.canonicalize().unwrap();
+        let canonical = pi.canonicalize().unwrap();
+        if alias_canonical == canonical {
+            return; // the firmlink is not folding on this host
+        }
+        use std::os::unix::fs::MetadataExt;
+        if fs::metadata(&alias).unwrap().ino() != fs::metadata(&canonical).unwrap().ino() {
+            return;
+        }
+
+        let pi_cb = pi.clone();
+        let home_cb = home.clone();
+        let alias_scope = alias_canonical.clone();
+        let alias_scope_cb = alias_canonical.clone();
+        set_copy_checkpoint(
+            &alias_scope,
+            Box::new(move |path| {
+                if path == alias_scope_cb {
+                    fs::remove_file(home_cb.join(".pi")).unwrap();
+                    symlink(&pi_cb, home_cb.join(".pi")).unwrap();
+                    fs::create_dir_all(pi_cb.join("agent")).unwrap();
+                    fs::write(pi_cb.join("agent/auth.json"), "synthetic-secret").unwrap();
+                    fs::write(pi_cb.join("agent/models.json"), "synthetic-models").unwrap();
+                    fs::write(pi_cb.join("notes.txt"), "ordinary").unwrap();
+                }
+            }),
+        );
+        let mut mounts = parse_extra_mounts(&[format!("{}:/guest:fork", alias.display())]).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let result = prepare_forks(
+            &mut mounts,
+            store.path(),
+            &std::collections::HashMap::new(),
+            &launch,
+        );
+        clear_copy_checkpoint();
+
+        result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
+        let data = &mounts[0].host;
+        assert!(pi.join("agent/auth.json").is_file());
+        assert!(data.join("notes.txt").is_file());
+        assert!(
+            !data.join("agent/auth.json").exists(),
+            "the identity fold must omit the credential under a firmlink spelling"
+        );
+        assert!(!data.join("agent/models.json").exists());
+        // No competing static entry covers the fixture: neither the configured
+        // `$HOME/.pi` spelling nor the resolved `P` names a file under the
+        // disjoint aliased root, so the identity fold is the only answer.
+        assert!(
+            home.join(".pi/agent/auth.json")
+                .strip_prefix(&alias_canonical)
+                .is_err(),
+            "the configured pi_home spelling must not cover the aliased root"
+        );
+        assert!(
+            pi.join("agent/auth.json")
+                .strip_prefix(&alias_canonical)
+                .is_err(),
+            "the resolved pi_home spelling must not cover the aliased root"
+        );
+    }
+
+    /// A `$HOME` with a real `~/.pi` whose `agent/auth.json` is absent — the
+    /// launch fixture for S5's "alias appears later".
+    fn home_dir_with_pi_home_minus_credential() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let canonical = home.path().canonicalize().unwrap();
+        fs::create_dir_all(canonical.join(".pi/agent")).unwrap();
+        (home, canonical)
+    }
+
+    /// Anti-over-omission control: an unrelated fork root that happens to
+    /// contain its own `agent/auth.json` keeps it. The extra root/Pi-home
+    /// spellings must not turn every root containing that name into a hit.
+    #[test]
+    fn fork_of_an_unrelated_root_keeps_its_own_agent_auth_json() {
+        let (_home, home) = pi_home();
+        let source = tempfile::tempdir().unwrap();
+        let source = source.path().canonicalize().unwrap();
+        fs::create_dir_all(source.join("agent")).unwrap();
+        fs::write(source.join("agent/auth.json"), "not-pi").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{}:/guest:fork", source.display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+        assert!(
+            data.join("agent/auth.json").is_file(),
+            "an unrelated root's own agent/auth.json must survive"
+        );
+    }
+
+    /// The omission is derived from the host root, not the guest path, so a
+    /// remapped guest spelling changes nothing.
+    #[test]
+    fn remapped_guest_path_does_not_change_fork_omission() {
+        let (_home, home) = pi_home();
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!(
+                "{}:/somewhere/else:fork",
+                home.join(".pi").display()
+            )])
+            .unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let data = fork_data(&plan);
+        assert!(data.join("settings.json").is_file());
+        assert!(!data.join("agent/auth.json").exists());
+        assert!(!data.join("agent/models.json").exists());
+    }
+
+    #[test]
+    fn identity_version_v3_reseeds_a_v2_fork_and_reports_the_orphan() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("seed"), "seed").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let request =
+            parse_extra_mounts(&[format!("{}:/guest:fork", source.path().display())]).unwrap();
+        let legacy = store
+            .path()
+            .join("forks")
+            .join(fork_id(&request[0], LEGACY_IDENTITY_VERSION_V2));
+        fs::create_dir_all(legacy.join("data")).unwrap();
+        fs::write(legacy.join("data/agent-auth.json"), "old credential copy").unwrap();
+
+        let plan = prepare(request, &context(store.path())).unwrap();
+        let data = fork_data(&plan);
+
+        assert_ne!(data, legacy.join("data"), "a v2 fork must not be reused");
+        assert_eq!(fs::read_to_string(data.join("seed")).unwrap(), "seed");
+        assert!(
+            legacy.join("data/agent-auth.json").is_file(),
+            "the orphan is reported, never deleted"
+        );
+        let notices = plan.notices.join("\n");
+        assert!(
+            notices.contains("A fork from an earlier agent-vm build is no longer used"),
+            "{notices}"
+        );
+        assert!(notices.contains(&legacy.display().to_string()), "{notices}");
+    }
+
+    #[test]
+    fn no_home_refuses_a_declared_mount_but_not_an_empty_plan() {
+        let source = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let ctx = context_without_home(store.path());
+        assert!(prepare(Vec::new(), &ctx).is_ok());
+
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:ro", source.path().display())]).unwrap(),
+            &ctx,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("neither $HOME nor the account record"),
+            "{error}"
+        );
+        assert!(store_tree(store.path()).is_empty(), "{error}");
     }
 }

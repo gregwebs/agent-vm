@@ -226,6 +226,66 @@ creates a continuing external bind. See [ADR-0014](docs/adr/0014-narrow-fork-mou
 for the narrowed policy and [ADR-0013](docs/adr/0013-add-forked-mounts.md) for the
 retained lifecycle and reset details.
 
+**Host Pi credential files never reach the guest.** Which host files those are,
+and whether a given mount is one of the ways they would, is one deep module:
+`protected_host_files.rs` measures a route set per launch and answers three
+questions — would this root expose one, where would it appear, and is this root
+inside Pi's home. `mount::prepare` is the only caller; `run.rs` never sees a
+`dev`/`ino`, a route, or Pi's layout.
+
+Two responses, because the mount families differ in kind. A **live bind** —
+core project/state/home binds, `ro`, `rw`, `follow-links`, and every bind
+`follow-links` discovers — is a window onto host bytes written *after* boot, so
+the launch is **refused**: `pi auth login` on the host can create `auth.json`
+inside a bind that is already open, and no overlay can cover a path that does
+not exist yet. A **fork** is a one-time copy made host-side under agent-vm's
+control, so the copier simply does not create the node — no empty file and no
+placeholder, because that would be a mask, and ADR-0014 removed mask
+machinery. The copier consults the node's `fstat` identity *and* its
+fork-root-relative path, so a hardlink under another name, a
+`fork:follow-links` materialized target, and a file created between
+measurement and the copy are all omitted. The copier resolves the root it is
+about to open and measures Pi's home **at that point**, so a root spelled
+through an alias the kernel folds decides identically: a route is a hit by
+`(dev, ino)` identity as well as by pathname containment. That identity fold
+holds only for an association the single measurement actually captured — a
+Pi-home relationship lost between the root resolve and that measurement, or a
+renamed alias of a Pi-home *subdirectory*, is outside it; ADR-0020's *Accepted
+gaps* name both.
+
+```text
+prepare()
+  measure protected route set (from MountContext.host_home)   [fail closed on EACCES/ELOOP]
+  enforce core binds (project = canonicalized cwd)            [refuse: "run from a project dir"]
+  normalize_guest / core collision / dedup
+  preflight_forks (READY forks repointed at owned data)
+  expand_follow_links (live hosts canonicalized; targets appended)
+  build volumes
+  enforce_protected_files(expanded)                           [refuse a live bind; collect advisories]
+  validate_plan
+  prepare_forks -> copy_root resolves the root, then copy_opened(NodePolicy { identities + relatives })  [omit, notice]
+```
+
+Both new passes run before `prepare_forks` — the first state mutation — so a
+refused launch creates no fork store, no lock, no staging, and no session
+state. Reachability is decided by canonical **identity** (`(dev, ino)`, which
+folds macOS firmlinks, symlink/hardlink aliases and Linux bind mounts that
+paths cannot) *and* component-wise canonical **containment** (the common path,
+so the decision never depends on inode semantics; the case it alone decides is
+a root whose canonical path *equals* a measured route's while `(dev, ino)`
+differ). The containment half is `config::byte_path_contains`, one directional
+kernel shared with the guest-path overlap predicate under a `verus!` contract.
+The refusal's remedy is conditional on the root — `:fork` at or inside the Pi
+home, a narrower path above it, nothing for a root that is the file itself.
+Whether an exposure is a hard error or an advisory depends on whether `$HOME/.pi`
+exists, so a user who has never installed Pi can keep mounting `$HOME`; an
+unset `$HOME` still gets the check, because the launch's home falls back to the
+account record. Forks alone carry the cost of moving: `IDENTITY_VERSION` is v3,
+because a READY fork is reused without reading its source and a pre-#90 seed
+may already hold a copy of a protected file. The two-file table, the accepted
+gaps, and the rejected mask alternative are
+[ADR-0020](docs/adr/0020-protect-host-pi-credential-files.md).
+
 Live binds are ordinary mounts, each opting into per-bind root follow so a
 user's symlinked source spelling resolves once. Core volumes (HOME, project,
 state) keep root follow at its default `false` and are canonicalized only after

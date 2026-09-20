@@ -20,6 +20,7 @@ use crate::config::{self, CatalogEntry, Tool};
 use crate::credential_provider;
 use crate::layer;
 use crate::mount;
+use crate::protected_host_files::CoreHostSource;
 use crate::session::ProjectSession;
 use crate::tool_layer;
 use crate::user;
@@ -1020,7 +1021,13 @@ pub(crate) async fn launch(
     // Independent of `guest_identity` (which is `None` under `--root`) so
     // the `--mount …:follow-links` $HOME guardrail is still enforced in
     // root mode instead of silently no-op'ing. See `mount::expand_follow_links`.
-    let mount_home = env::var("HOME").ok().map(PathBuf::from);
+    //
+    // `$HOME` unset does **not** mean the home is unknown: `host_home_dir`
+    // falls back to the account record, so a daemon/`env -i`/CI launch still
+    // locates the Pi home instead of failing open on the core project bind
+    // (ADR-0020). `None` here means neither source named a home, which
+    // `ProtectedHostFiles::require_home` refuses on.
+    let mount_home = user::host_home_dir();
 
     let session = ProjectSession::for_cwd()?;
     // AC#6 (agent-vm issue #40): fail closed, before touching the
@@ -1052,6 +1059,15 @@ pub(crate) async fn launch(
             core_guest_mounts: core_volumes
                 .iter()
                 .map(|volume| PathBuf::from(&volume.guest_path))
+                .collect(),
+            // The project bind is the canonicalized cwd and writable, so
+            // `cd ~ && agent-vm shell` would hand the guest the host `$HOME`
+            // with no `--mount` at all. agent-vm's own binds are checked
+            // exactly like an explicit mount, and each carries its role so a
+            // refusal names the bind it actually is.
+            core_host_sources: core_volumes
+                .iter()
+                .map(|volume| CoreHostSource::new(volume.bind, volume.host_path.clone()))
                 .collect(),
         },
     )
@@ -2624,6 +2640,17 @@ mod tests {
     use crate::layer::test_support::{DockerTagGuard, docker_tag_exists, e2e_nonce};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// A real, empty `$HOME` shared by every test in this binary: `prepare`
+    /// fails closed on a declared mount when `$HOME` is unset, and this is not
+    /// what these tests exercise. With no `~/.pi` it yields
+    /// `Severity::Advise` and no exposure for a source outside the home.
+    fn test_home() -> PathBuf {
+        static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        HOME.get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .to_path_buf()
+    }
 
     /// The five compiled-in `default-tools.toml` tools, for the argv tests
     /// below. Parsed via the same validated path as user input.
@@ -4722,8 +4749,9 @@ options ndots:2 timeout:1";
                 mount::parse_extra_mounts(&[raw]).unwrap(),
                 &mount::MountContext {
                     mount_store: store.path().to_path_buf(),
-                    host_home: None,
+                    host_home: Some(test_home()),
                     core_guest_mounts: Vec::new(),
+                    core_host_sources: Vec::new(),
                 },
             )
             .unwrap();
@@ -4764,8 +4792,9 @@ options ndots:2 timeout:1";
         let raw = format!("{}:/guest:fork", source.path().display());
         let context = mount::MountContext {
             mount_store: store.path().to_path_buf(),
-            host_home: None,
+            host_home: Some(test_home()),
             core_guest_mounts: Vec::new(),
+            core_host_sources: Vec::new(),
         };
         let first = mount::prepare(
             mount::parse_extra_mounts(std::slice::from_ref(&raw)).unwrap(),
@@ -4809,8 +4838,9 @@ options ndots:2 timeout:1";
                 .unwrap(),
             &mount::MountContext {
                 mount_store: self_store.path().to_path_buf(),
-                host_home: None,
+                host_home: Some(test_home()),
                 core_guest_mounts: Vec::new(),
+                core_host_sources: Vec::new(),
             },
         )
         .unwrap();
