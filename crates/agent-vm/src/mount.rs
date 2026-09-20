@@ -5213,6 +5213,8 @@ mod prepare_tests {
         let ext = tempfile::tempdir().unwrap();
         let ext = ext.path().canonicalize().unwrap();
         fs::create_dir_all(ext.join("secrets")).unwrap();
+        fs::write(ext.join("secrets/auth.json"), "old").unwrap();
+        fs::write(ext.join("secrets/notes.txt"), "ordinary").unwrap();
         let launch = ProtectedHostFiles::measure(Some(&home)).unwrap();
         // The credential alias appears only after the launch measurement.
         symlink(
@@ -5250,6 +5252,10 @@ mod prepare_tests {
 
         result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
         let data = &mounts[0].host;
+        assert!(
+            data.join("secrets/notes.txt").is_file(),
+            "the ordinary sibling must be copied"
+        );
         assert!(
             !data.join("secrets/auth.json").exists(),
             "a fresh route must omit the credential"
