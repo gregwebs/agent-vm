@@ -1050,10 +1050,17 @@ mod tests {
         assert_eq!(unioned.severity, Severity::Refuse);
     }
 
-    /// Anti-over-omission control with the relative set: 50 `refreshed`
-    /// rounds over unchanged host state must not grow the relatives. A union
-    /// that accumulated routes or Pi-home spellings instead of taking the fresh
-    /// ones would drift here (§7.7.4).
+    /// Anti-over-omission control (§7.7.4): 50 `refreshed` rounds over
+    /// unchanged host state must leave the relative set bounded and unchanged.
+    ///
+    /// This pins boundedness, not freshness. Because the host state does not
+    /// change, a union that accumulated routes or Pi-home spellings would
+    /// re-add *identical* values, which dedup by whole-value equality — the
+    /// set would stay identical and this test would still pass. The fresh-wins
+    /// property is pinned instead by the `union` unit test
+    /// (`union_keeps_every_identity_and_takes_the_fresh_measurement`) and by
+    /// the S3-B / S4 / S5 mutation kills for `resolved_pi_home`, `pi_home` and
+    /// the routes (§7.7.5).
     #[test]
     fn refreshes_do_not_grow_the_relative_set() {
         let (_home, home) = home();
