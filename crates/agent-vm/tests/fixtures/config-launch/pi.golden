@@ -1,0 +1,146 @@
+{
+  "name": "agent-vm-normalized",
+  "image": {
+    "Oci": {
+      "reference": "localhost:1/does-not-exist:latest",
+      "root_disk": {
+        "kind": "managed",
+        "size_mib": 16384
+      }
+    }
+  },
+  "resources": {
+    "cpus": 2,
+    "memory_mib": 2048,
+    "max_cpus": 2,
+    "max_memory_mib": 2048
+  },
+  "runtime": {
+    "workdir": "$PROJECT",
+    "shell": "/bin/sh",
+    "scripts": {},
+    "entrypoint": null,
+    "cmd": null,
+    "hostname": null,
+    "user": "$GUEST_UID:$GUEST_GID",
+    "log_level": null,
+    "metrics_sample_interval_ms": 1000,
+    "disable_metrics_sample": false
+  },
+  "env": [
+    {
+      "key": "PATH",
+      "value": "/usr/local/bin:/usr/bin:/usr/sbin:/bin"
+    },
+    {
+      "key": "HOME",
+      "value": "$HOME"
+    },
+    {
+      "key": "USER",
+      "value": "$GUEST_USER"
+    },
+    {
+      "key": "LOGNAME",
+      "value": "$GUEST_USER"
+    },
+    {
+      "key": "IS_SANDBOX",
+      "value": "1"
+    },
+    {
+      "key": "LANG",
+      "value": "C.UTF-8"
+    }
+  ],
+  "labels": {},
+  "rlimits": [],
+  "mounts": [
+    {
+      "type": "Bind",
+      "host": "$PROJECT",
+      "guest": "$PROJECT",
+      "options": {
+        "readonly": false,
+        "noexec": false,
+        "nosuid": false,
+        "nodev": false
+      },
+      "stat_virtualization": "strict",
+      "host_permissions": "private",
+      "follow_root_symlinks": false,
+      "quota_mib": null
+    },
+    {
+      "type": "Bind",
+      "host": "$STATE_DIR",
+      "guest": "/agent-vm-state",
+      "options": {
+        "readonly": false,
+        "noexec": false,
+        "nosuid": false,
+        "nodev": false
+      },
+      "stat_virtualization": "strict",
+      "host_permissions": "private",
+      "follow_root_symlinks": false,
+      "quota_mib": null
+    },
+    {
+      "type": "Bind",
+      "host": "$STATE_DIR/home",
+      "guest": "$HOME",
+      "options": {
+        "readonly": false,
+        "noexec": false,
+        "nosuid": false,
+        "nodev": false
+      },
+      "stat_virtualization": "strict",
+      "host_permissions": "private",
+      "follow_root_symlinks": false,
+      "quota_mib": null
+    }
+  ],
+  "patches": [
+    {
+      "Append": {
+        "path": "/etc/passwd",
+        "content": "$GUEST_USER:x:$GUEST_UID:$GUEST_GID::$HOME:/bin/bash\n"
+      }
+    }
+  ],
+  "network": {
+    "enabled": true,
+    "ports": [],
+    "max_connections": null,
+    "trust_host_cas": false
+  },
+  "init": null,
+  "pull_policy": "IfMissing",
+  "security_profile": "default",
+  "deployment_profile": "single_tenant",
+  "lifecycle": {
+    "ephemeral": false,
+    "max_duration_secs": null,
+    "idle_timeout_secs": null
+  },
+  "manifest_digest": null
+}
+--- state ---
+claude/.credentials.json	absent:entity not found
+codex/auth.json	absent:entity not found
+codex/config.toml	absent:entity not found
+copilot/config.json	absent:entity not found
+link:.bash_history	/agent-vm-state/bash_history
+link:.claude	/agent-vm-state/claude
+link:.claude.json	/agent-vm-state/claude.json
+link:.config/gh	/agent-vm-state/gh-config
+link:.config/opencode	/agent-vm-state/opencode-config
+link:.copilot	/agent-vm-state/copilot
+link:.gitconfig	/agent-vm-state/gitconfig
+link:.local/share/opencode	/agent-vm-state/opencode
+opencode-config/opencode.json	absent:entity not found
+secrets/anthropic	absent:entity not found
+secrets/copilot	absent:entity not found
+secrets/openai	absent:entity not found

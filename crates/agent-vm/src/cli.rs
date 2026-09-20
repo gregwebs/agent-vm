@@ -389,7 +389,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         expected.extend(
-            ["codex", "opencode", "claude", "copilot", "shell"]
+            ["pi", "codex", "opencode", "claude", "copilot", "shell"]
                 .iter()
                 .map(|s| s.to_string()),
         );
@@ -431,7 +431,7 @@ mod tests {
 
     /// Issue #84's `take_entry` ordering trap: a launch verb's `Dispatch` must
     /// carry the layers read from the catalog *before* the launched verb is
-    /// removed, so `claude` under the default config carries all four shipped
+    /// removed, so `claude` under the default config carries all five shipped
     /// layers in order (its own included).
     #[test]
     fn a_launch_carries_every_declared_layer_in_order() {
@@ -708,26 +708,40 @@ mod tests {
 
     /// The acceptance criterion "name no specific tool": neither footer nor
     /// the top-level help mentions a shipped tool by name.
+    ///
+    /// A **token** match, not `str::contains`: the help fixtures legitimately
+    /// contain ordinary words that *contain* a tool name as a substring (the
+    /// fixtures contain `copies`, which contains `pi`). The invariant is that
+    /// the help text does not *name* a tool, so split the haystack on every
+    /// non-name character and require no token to equal a tool name.
     #[test]
     fn the_help_text_names_no_specific_tool() {
-        for tool in ["claude", "codex", "opencode", "copilot"] {
-            assert!(
-                !TOP_AFTER_HELP.contains(tool),
-                "TOP_AFTER_HELP names {tool}"
-            );
-            assert!(
-                !run::launch_after_help("shell").contains(tool),
-                "the short launch footer names {tool}"
-            );
-            assert!(
-                !run::launch_after_long_help("shell").contains(tool),
-                "the long launch footer names {tool}"
-            );
-            for fixture in [
+        fn named_tool(haystack: &str) -> Option<&'static str> {
+            let tokens: Vec<&str> = haystack
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                .collect();
+            ["pi", "claude", "codex", "opencode", "copilot"]
+                .into_iter()
+                .find(|tool| tokens.contains(tool))
+        }
+
+        let short = run::launch_after_help("shell");
+        let long = run::launch_after_long_help("shell");
+        for (what, haystack) in [
+            ("TOP_AFTER_HELP", TOP_AFTER_HELP),
+            ("the short launch footer", short.as_str()),
+            ("the long launch footer", long.as_str()),
+            (
+                "shell-help-columns-100.txt",
                 include_str!("../tests/fixtures/shell-help-columns-100.txt"),
+            ),
+            (
+                "shell-short-help-columns-100.txt",
                 include_str!("../tests/fixtures/shell-short-help-columns-100.txt"),
-            ] {
-                assert!(!fixture.contains(tool), "a fixture names {tool}");
+            ),
+        ] {
+            if let Some(tool) = named_tool(haystack) {
+                panic!("{what} names {tool}");
             }
         }
     }

@@ -3,7 +3,7 @@
 #
 # Two images are built and published (issue #84): the tool-free
 # `agent-vm-base:latest` and the composed `agent-vm-template:latest` (the base
-# plus the four shipped tool layers, chained in declaration order). A launch
+# plus the five shipped tool layers, chained in declaration order). A launch
 # whose configured tool set differs from the default composes from the base.
 #
 # microsandbox pulls images from registries by reference, so we run a tiny
@@ -29,11 +29,11 @@ BASE_TAG="${AGENT_VM_BASE_IMAGE_TAG:-localhost:${REGISTRY_PORT}/agent-vm-base:la
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# The four shipped tool layers, in declaration order — matching
+# The five shipped tool layers, in declaration order — matching
 # crates/agent-vm/src/default-tools.toml, the launcher's chain order, and CI's
 # build order. The last one produces the composed template, so it is split out
 # (no negative array indexing, which macOS's bash 3.2 lacks).
-INTERMEDIATE_LAYERS=(codex opencode claude)
+INTERMEDIATE_LAYERS=(pi codex opencode claude)
 FINAL_LAYER=copilot
 
 # Returns 0 if /v2/ on the registry port answers within the timeout.

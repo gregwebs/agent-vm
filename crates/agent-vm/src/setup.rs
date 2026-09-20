@@ -421,6 +421,7 @@ mod tests {
         assert_eq!(
             summary(&verification_targets(&default_catalog(), &BTreeMap::new()).expect("targets")),
             vec![
+                ("pi".to_string(), "pi".to_string(), true),
                 ("codex".to_string(), "codex".to_string(), true),
                 ("opencode".to_string(), "opencode".to_string(), true),
                 ("claude".to_string(), "claude".to_string(), true),
@@ -558,7 +559,8 @@ mod tests {
     #[test]
     fn non_composing_roots_downgrade_nothing() {
         // Template: a default-shaped layer sequence boots the composed image.
-        let default_body = "[[tools]]\nname = \"codex\"\ncommand = \"codex\"\nlayer = { builtin = \"codex\" }\n\
+        let default_body = "[[tools]]\nname = \"pi\"\ncommand = \"pi\"\nlayer = { builtin = \"pi\" }\n\
+             [[tools]]\nname = \"codex\"\ncommand = \"codex\"\nlayer = { builtin = \"codex\" }\n\
              [[tools]]\nname = \"opencode\"\ncommand = \"opencode\"\nlayer = { builtin = \"opencode\" }\n\
              [[tools]]\nname = \"claude\"\ncommand = \"claude\"\nlayer = { builtin = \"claude\" }\n\
              [[tools]]\nname = \"copilot\"\ncommand = \"copilot\"\nlayer = { builtin = \"copilot\" }\n";

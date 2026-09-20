@@ -481,7 +481,7 @@ fn describe_tool(tool: &Tool, provisioned: ProviderSet) -> String {
         ToolOrigin::User(file) => format!("user:{}", crate::config::escape_path(file)),
         ToolOrigin::Project(file) => format!("project:{}", crate::config::escape_path(file)),
     };
-    // Only surfaced when true, so the default-config rows for the four agents
+    // Only surfaced when true, so the default-config rows for the five agents
     // are byte-identical to before (`interactive_shell` is `shell`-only).
     let interactive_shell = if tool.is_interactive_shell() {
         "; interactive_shell=true"
@@ -982,10 +982,14 @@ mod tests {
         assert!(text.contains("<no HOME; user tier unavailable>"), "{text}");
         assert!(text.contains("built-in defaults"), "{text}");
 
-        let codex = text.find("1. codex").expect("codex row");
-        let opencode = text.find("2. opencode").expect("opencode row");
-        let claude = text.find("3. claude").expect("claude row");
-        assert!(codex < opencode && opencode < claude, "{text}");
+        let pi = text.find("1. pi").expect("pi row");
+        let codex = text.find("2. codex").expect("codex row");
+        let opencode = text.find("3. opencode").expect("opencode row");
+        let claude = text.find("4. claude").expect("claude row");
+        assert!(
+            pi < codex && codex < opencode && opencode < claude,
+            "{text}"
+        );
 
         assert!(
             text.contains(

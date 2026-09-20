@@ -512,17 +512,20 @@ Docker engine with `fuse-overlayfs`, zellij, and the tool-layer facilities (the
 `agent-vm-install` helper, the host-CA shim, the `/opt/agent` prefix, an empty
 `/opt/agent-vm/seed.d/`). It carries **no** agent CLI.
 
-The four shipped agents live in standalone layers under `images/tools/`
-(`codex`, `opencode`, `claude`, `copilot`), each building `FROM` the base and
-installing through its canonical installer script so the layer tracks its
-upstream release channel. CI chains base plus these four (in declaration order)
+The five shipped agents live in standalone layers under `images/tools/`
+(`pi`, `codex`, `opencode`, `claude`, `copilot`), each building `FROM` the base
+and installing through its canonical installer script so the layer tracks its
+upstream release channel. CI chains base plus these five (in declaration order)
 and publishes the result as the composed default; a non-default tool set
-composes them locally. The claude layer also carries the four
-`claude-plugins-official` LSP servers. Chromium is *not* in the base: it is an
-opt-in `examples/layers/chrome-devtools` tooling layer, detected after boot via
-an image-capability marker.
+composes them locally. `pi` is the one exception to "installer script": it is
+pinned by a committed `package-lock.json` installed with `npm ci --ignore-scripts`,
+and it carries an agent-vm-owned wrapper (`/usr/local/bin/pi`) and a mandatory
+warning extension (see the third subtlety below). The claude layer also carries
+the four `claude-plugins-official` LSP servers. Chromium is *not* in the base: it
+is an opt-in `examples/layers/chrome-devtools` tooling layer, detected after boot
+via an image-capability marker.
 
-Two build-time subtleties are worth knowing:
+Three build-time subtleties are worth knowing:
 
 - Tool layers install under `HOME=/opt/agent` and make the tree world-readable,
   which is what lets the same `PATH` work for both guest-user modes. The prefix
@@ -538,6 +541,16 @@ Two build-time subtleties are worth knowing:
   `/opt/agent-vm/seed-claude-plugins.sh` when present, so an already-cached
   API-2 template still seeds; without that fallback the regression would be
   symptomless (an empty `claude plugin list`).
+- The `pi` layer installs Pi at `/opt/agent-vm/pi` but exposes it through an
+  agent-vm-owned wrapper at `/usr/local/bin/pi` that always passes
+  `--extension /opt/agent-vm/pi-extensions/guest-credential-warning.js` (an
+  explicit path, so `--no-extensions` cannot silence it) and forwards a Pi
+  subcommand verbatim (`pi list`, never `pi -e … list`, which would turn `list`
+  into a prompt). The warning is gated on Pi's own `ctx.hasUI` — `true` for
+  `tui`/`rpc`, `false` for `print`/`json` — so machine-readable output is
+  byte-clean with no second suppression mechanism. The installation and the
+  extension directory are replaceable; the wrapper is not — see
+  [ADR-0012](docs/adr/0012-stable-pi-image-customization-seam.md).
 
 ### Distribution: OCI references, not bind or disk images
 
@@ -918,6 +931,7 @@ directories the user never asked for.
 | Migrating 0.5.7 state to v0.6.15 | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md) |
 | Adopting `origin/main`'s network features | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
 | Wiring file-backed credential injection | [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
+| A stable wrapper around image-installed Pi | [ADR-0012](docs/adr/0012-stable-pi-image-customization-seam.md) |
 | Forked mounts and opaque exclusions (superseded for file forks and live exclusions) | [ADR-0013](docs/adr/0013-add-forked-mounts.md) |
 | Narrowing fork mounts to directories; files read-only | [ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md) |
 

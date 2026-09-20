@@ -1,0 +1,68 @@
+name: pi-layer-contract
+
+permissions:
+  contents: read
+
+# The pi layer's warning/fail-closed matrix against a built image. Triggers on
+# `images/**` (not only `images/tools/pi/**`): a change to the base (a Node bump,
+# an apt change, a PATH change) must re-run the matrix before merge, exactly as
+# chrome-layer-contract.yml already does for its layer. build-image.yml only runs
+# on push to main, so it is a post-merge backstop, not a PR gate.
+on:
+  push:
+    paths:
+      - 'images/**'
+      - 'script/test/pi-layer-runtime.sh'
+      - 'script/test/pi-wrapper.sh'
+      - 'script/test/pi-install.sh'
+      - '.github/workflows/pi-layer.yml'
+  pull_request:
+    paths:
+      - 'images/**'
+      - 'script/test/pi-layer-runtime.sh'
+      - 'script/test/pi-wrapper.sh'
+      - 'script/test/pi-install.sh'
+      - '.github/workflows/pi-layer.yml'
+
+jobs:
+  contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        # amd64 only: an arm64 leg would run under QEMU user-mode emulation on
+        # GitHub's free runners, which is exactly the flakiness
+        # chrome-layer-contract.yml dropped its arm64 leg for. The layer's
+        # arm64/amd64 parity is not asserted here (recorded in the PR body).
+        platform: [linux/amd64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      # Guard the shell this workflow runs (the repo's convention that each
+      # workflow guards its own scripts). shellcheck is installed rather than
+      # assumed, matching ci.yml/verus.yml.
+      - name: Install shellcheck and guard the runtime script
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          chmod +x script/test/pi-layer-runtime.sh
+          bash -n script/test/pi-layer-runtime.sh
+          shellcheck script/test/pi-layer-runtime.sh
+      # driver: docker (not the docker-container default) so `--load`ed images
+      # stay visible to the next `FROM $BASE_IMAGE` via the daemon's local store.
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        with:
+          driver: docker
+      - name: Build base and pi layer, then run the behaviour matrix
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          suffix=${PLATFORM//\//-}
+          base=agent-vm-pi-base-$suffix
+          layer=agent-vm-pi-layer-$suffix
+          docker buildx build --platform "$PLATFORM" --load -t "$base" -f images/Dockerfile images
+          docker buildx build --platform "$PLATFORM" --load -t "$layer" \
+            --build-arg BASE_IMAGE="$base" images/tools/pi
+          script/test/pi-layer-runtime.sh "$base" "$layer"

@@ -12,7 +12,7 @@
 //!
 //! ## E1 goldens
 //!
-//! `tests/fixtures/config-launch/<tool>.golden` records, for each of the five
+//! `tests/fixtures/config-launch/<tool>.golden` records, for each of the six
 //! default tools, the `SandboxConfig` JSON (normalized) and a snapshot of the
 //! per-project state dir. They now record each verb's **declared provisioning
 //! set** (#118): `codex` provisions `{openai}`, `claude` `{anthropic}`, and so
@@ -81,8 +81,8 @@ const BOGUS_IMAGE: &str = "localhost:1/does-not-exist:latest";
 const CONFIG_MARKER: &str = "[debug] sandbox config JSON: ";
 const GUEST_CMD_MARKER: &str = "[debug] guest command: ";
 
-/// The five shipped default tools, in `default-tools.toml` order.
-const DEFAULT_TOOLS: [&str; 5] = ["codex", "opencode", "claude", "copilot", "shell"];
+/// The six shipped default tools, in `default-tools.toml` order.
+const DEFAULT_TOOLS: [&str; 6] = ["pi", "codex", "opencode", "claude", "copilot", "shell"];
 
 /// The tool-independent guest `PATH` every default tool launches with. Pinned
 /// both by the goldens and by [`assert_tool_dependent_content`].
@@ -586,13 +586,18 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         "CODEX_HOME must be emitted only for the tools that declare it ({tool})"
     );
 
-    // The credential secret set follows the verb's provisioning set.
-    let secrets = config["network"]["secrets"]["secrets"].as_array().unwrap();
+    // The credential secret set follows the verb's provisioning set. `pi`
+    // provisions nothing, so the whole `secrets` object may be absent.
+    let secrets = config["network"]["secrets"]["secrets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let env_vars: Vec<&str> = secrets
         .iter()
         .map(|secret| secret["env_var"].as_str().unwrap())
         .collect();
     let expected_env_vars: &[&str] = match tool {
+        "pi" => &[],
         "codex" => &["MSB_AGENT_VM_OPENAI_UNUSED"],
         "opencode" => &[
             "MSB_AGENT_VM_OPENAI_UNUSED",
@@ -609,7 +614,7 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         other => panic!("unknown default tool {other}"),
     };
     assert_eq!(env_vars, expected_env_vars, "secret set changed for {tool}");
-    for secret in secrets {
+    for secret in &secrets {
         assert!(
             !secret["placeholder"].as_str().unwrap().is_empty(),
             "{tool}: empty secret placeholder"
@@ -644,7 +649,10 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
     // no-route launch is acceptable — the hook only fires on a matched route
     // (`InterceptConfig`'s docs), and the `--allowed-repo` push restriction
     // rides the GitHub-egress routes, which are unaffected.
-    let rules = config["network"]["intercept"]["rules"].as_array().unwrap();
+    let rules = config["network"]["intercept"]["rules"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let hook = &config["network"]["intercept"]["hook"];
     if rules.is_empty() {
         assert!(hook.is_null(), "hook present with no routes ({tool})");
@@ -672,6 +680,7 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         })
         .collect();
     let expected_rules: &[(&str, &str)] = match tool {
+        "pi" => &[],
         "codex" | "opencode" => &[("auth.openai.com", "/oauth/token")],
         "claude" => &[("platform.claude.com", "/v1/oauth/token")],
         "copilot" => &[],

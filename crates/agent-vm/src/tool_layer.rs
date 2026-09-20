@@ -25,7 +25,7 @@ use crate::config::{DeclaredLayer, ToolLayer};
 use crate::defaults;
 use crate::layer;
 
-/// The four shipped tool layer sources, embedded at compile time. The path
+/// The five shipped tool layer sources, embedded at compile time. The path
 /// resolves relative to `$CARGO_MANIFEST_DIR` (`crates/agent-vm`), so
 /// `../../images/tools` is the repo's tool-layer directory.
 static TOOL_LAYERS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../images/tools");
@@ -329,7 +329,8 @@ mod tests {
     #[test]
     fn renamed_tools_with_the_same_layer_sequence_still_boot_the_template() {
         let renamed = declared_from_config(
-            "[[tools]]\nname = \"codex-x\"\ncommand = \"codex\"\nlayer = { builtin = \"codex\" }\n\
+            "[[tools]]\nname = \"pi-x\"\ncommand = \"pi\"\nlayer = { builtin = \"pi\" }\n\
+             [[tools]]\nname = \"codex-x\"\ncommand = \"codex\"\nlayer = { builtin = \"codex\" }\n\
              [[tools]]\nname = \"opencode-x\"\ncommand = \"opencode\"\nlayer = { builtin = \"opencode\" }\n\
              [[tools]]\nname = \"claude-x\"\ncommand = \"claude\"\nlayer = { builtin = \"claude\" }\n\
              [[tools]]\nname = \"copilot-x\"\ncommand = \"copilot\"\nlayer = { builtin = \"copilot\" }\n",
@@ -349,7 +350,7 @@ mod tests {
     }
 
     /// The declaration order has one source of truth, `default-tools.toml`, but
-    /// CI's five build steps and `images/build.sh`'s layer variables transcribe
+    /// CI's six build steps and `images/build.sh`'s layer variables transcribe
     /// it by hand (a workflow and a shell script cannot import a Rust const).
     /// Nothing else ties them together, and the drift is silent: if CI composes
     /// the published template in a different order than the launcher believes,
@@ -398,6 +399,46 @@ mod tests {
         assert_eq!(
             script_order, shipped,
             "images/build.sh must chain the tool layers in the order default-tools.toml declares"
+        );
+
+        // Order is not enough. A step left building FROM `steps.base` (e.g. the
+        // `codex` step's `BASE_IMAGE` still pointing at the base digest instead
+        // of `steps.pi`) keeps every `context:` line in order and still passes
+        // the workflow's own prefix + `m > n` gate -- yet the published
+        // template then contains no `pi`. Assert the chain *edges* too: each
+        // tool builds FROM its predecessor step's digest, and the first builds
+        // FROM the base.
+        let mut current: Option<&str> = None;
+        let mut edges: Vec<(String, String)> = Vec::new();
+        for line in workflow.lines() {
+            let line = line.trim();
+            if let Some(tool) = line.strip_prefix("context: images/tools/") {
+                current = Some(tool.trim());
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("BASE_IMAGE=${{ env.BASE }}@${{ steps.")
+                && let Some(step) = rest.strip_suffix(".outputs.digest }}")
+            {
+                let tool = current.expect("every BASE_IMAGE edge follows a context line");
+                edges.push((tool.to_string(), step.to_string()));
+            }
+        }
+        let expected_edges: Vec<(String, String)> = shipped
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                let predecessor = if index == 0 {
+                    "base".to_string()
+                } else {
+                    shipped[index - 1].clone()
+                };
+                (tool.clone(), predecessor)
+            })
+            .collect();
+        assert_eq!(
+            edges, expected_edges,
+            "build-image.yml must chain each tool layer FROM its predecessor's step digest, \
+             starting from `steps.base` -- otherwise the published template omits a layer"
         );
     }
 
@@ -491,6 +532,182 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -- the pinned Pi layer: one home for the pin, and npm's one hole ----
+
+    fn embedded_json(relative: &str) -> serde_json::Value {
+        let text = TOOL_LAYERS
+            .get_file(relative)
+            .unwrap_or_else(|| panic!("{relative} is embedded"))
+            .contents_utf8()
+            .expect("the embedded file is UTF-8");
+        serde_json::from_str(text)
+            .unwrap_or_else(|error| panic!("{relative} is valid JSON: {error}"))
+    }
+
+    fn pi_pin() -> String {
+        embedded_json("pi/package.json")["dependencies"]["@earendil-works/pi-coding-agent"]
+            .as_str()
+            .expect("the manifest pins pi")
+            .to_string()
+    }
+
+    /// The pin has exactly two homes -- `images/tools/pi/package.json` and its
+    /// lockfile -- and `npm ci` is only as good as their agreement. Assert it
+    /// here rather than discovering it in the image build.
+    #[test]
+    fn the_pinned_pi_version_agrees_across_the_manifest_and_the_lockfile() {
+        let pinned = pi_pin();
+        let lock = embedded_json("pi/package-lock.json");
+        let root = lock["packages"][""]["dependencies"]["@earendil-works/pi-coding-agent"]
+            .as_str()
+            .expect("the lock's root records the pi dependency");
+        assert_eq!(
+            root, pinned,
+            "the lock's root dependency must equal the manifest's pin"
+        );
+        let locked = lock["packages"]["node_modules/@earendil-works/pi-coding-agent"]["version"]
+            .as_str()
+            .expect("pi is locked");
+        assert_eq!(
+            locked, pinned,
+            "npm ci would install {locked}, but the manifest pins {pinned}"
+        );
+    }
+
+    /// Every entry in the committed lock carries `integrity`. A freshly
+    /// generated lock does NOT: npm inherits Pi's published
+    /// `npm-shrinkwrap.json`, which omits the hashes for its five
+    /// `@earendil-works` siblings. They are filled by hand from the registry
+    /// (`images/tools/README.md`), so this test is what catches a regenerated
+    /// lock that silently dropped them again -- `install-pi.sh` would then have
+    /// nothing to verify against.
+    #[test]
+    fn every_locked_package_carries_integrity() {
+        let lock = embedded_json("pi/package-lock.json");
+        let packages = lock["packages"]
+            .as_object()
+            .expect("`packages` is an object");
+        let missing: Vec<&str> = packages
+            .iter()
+            .filter(|(key, value)| !key.is_empty() && value.get("integrity").is_none())
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these committed lock entries carry no `integrity` hash: {missing:?}\n\
+             A freshly generated lock omits it for pi's five @earendil-works siblings\n\
+             (npm inherits pi's published npm-shrinkwrap.json). Refill the five with:\n\
+             for p in chord pi-agent-core pi-ai pi-telemetry pi-tui; do \
+             npm view \"@earendil-works/$p@$(jq -r '.dependencies[\"@earendil-works/pi-coding-agent\"]' images/tools/pi/package.json)\" dist.integrity; done\n\
+             and paste each value into its lock entry -- see images/tools/README.md."
+        );
+    }
+
+    /// `install-pi.sh` verifies exactly the packages npm will not: the
+    /// `@earendil-works` siblings nested directly under pi-coding-agent's own
+    /// `node_modules`. Pin that set by name and version here, so a pin bump
+    /// that changes the nested layout fails in `cargo test` rather than turning
+    /// the layer's jq selector into a silent no-op. The selector is deliberately
+    /// direct-children-only: pi-ai carries its own nested deps (agent-base,
+    /// https-proxy-agent) one level deeper, and those DO carry npm-checked
+    /// integrity, so a looser substring match would over-match them.
+    #[test]
+    fn the_build_verified_sibling_set_is_exactly_the_five_nested_earendil_packages() {
+        const SIBLINGS: [&str; 5] = ["chord", "pi-agent-core", "pi-ai", "pi-telemetry", "pi-tui"];
+        let pinned = pi_pin();
+        let lock = embedded_json("pi/package-lock.json");
+        const PREFIX: &str =
+            "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/";
+        let mut matched: Vec<(String, String)> = Vec::new();
+        for (key, value) in lock["packages"].as_object().unwrap() {
+            let Some(name) = key.strip_prefix(PREFIX) else {
+                continue;
+            };
+            if name.contains('/') {
+                continue;
+            }
+            let version = value["version"].as_str().unwrap_or("<none>").to_string();
+            matched.push((name.to_string(), version));
+        }
+        matched.sort();
+        let mut expected: Vec<(String, String)> = SIBLINGS
+            .iter()
+            .map(|name| (name.to_string(), pinned.clone()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            matched, expected,
+            "install-pi.sh's selector must match exactly the five shrinkwrap-only siblings at the pin"
+        );
+    }
+
+    /// `write_tree` materialises every embedded file 0644, while
+    /// `layer::git_mode` folds an on-disk source file's mode to one execute
+    /// bit. A source file that is executable on disk (i.e. committed `100755`)
+    /// therefore hashes differently from the same bytes materialised into a
+    /// build context -- a silent double build. The execute bit a layer needs
+    /// (`pi.sh`, `seed-claude-plugins.sh`) comes from `COPY --chmod=0755` in
+    /// its Dockerfile, never from the source tree.
+    #[test]
+    fn embedded_layer_sources_are_committed_without_the_execute_bit() {
+        let root = repo_path("images/tools");
+        let mut offenders: Vec<PathBuf> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for item in fs::read_dir(&dir).expect("read images/tools") {
+                let item = item.expect("read dir entry");
+                let metadata = item.metadata().expect("stat a tool-layer source");
+                if metadata.is_dir() {
+                    stack.push(item.path());
+                } else if metadata.permissions().mode() & 0o111 != 0 {
+                    offenders.push(
+                        item.path()
+                            .strip_prefix(&root)
+                            .expect("under the root")
+                            .to_path_buf(),
+                    );
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these images/tools/ sources are executable on disk (committed 100755?): {offenders:?}\n\
+             `write_tree` materialises them 0644, so an executable source hashes differently \
+             from a locally composed layer. Grant the execute bit with COPY --chmod=0755 instead."
+        );
+    }
+
+    /// pi is the first shipped layer with a subdirectory (`extensions/`), so
+    /// exercise `write_tree` against the real layer rather than the synthetic
+    /// fixture `write_tree_preserves_nested_subdirectory_paths` uses (adding pi
+    /// does not touch that fixture).
+    #[test]
+    fn materialize_places_the_pi_extension_at_its_nested_path() {
+        let layers = declared_from_config(
+            "[[tools]]\nname = \"pi\"\ncommand = \"pi\"\nlayer = { builtin = \"pi\" }\n",
+        );
+        assert_eq!(layers.len(), 1);
+        let (dirs, guard) = materialize(&layers).expect("materialize");
+        let context = &dirs[0].dir;
+        for rel in [
+            "Dockerfile",
+            "package.json",
+            "package-lock.json",
+            "install-pi.sh",
+            "pi.sh",
+            "extensions/guest-credential-warning.js",
+        ] {
+            let path = context.join(rel);
+            assert!(
+                path.is_file(),
+                "{rel} must materialise at its path relative to the embed root"
+            );
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644, "{rel} must materialise 0644");
+        }
+        drop(guard);
     }
 
     fn dummy_step(name: &str) -> layer::ChainStep {

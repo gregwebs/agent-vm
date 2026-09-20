@@ -1,0 +1,10 @@
+{
+  "name": "agent-vm-guest-pi",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned Pi coding agent for the agent-vm guest image. The version below is the pin; images/tools/pi/Dockerfile installs it with `npm ci --ignore-scripts` and asserts `pi --version` matches it.",
+  "license": "MIT",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.86.1"
+  }
+}

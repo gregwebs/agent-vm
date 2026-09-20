@@ -52,6 +52,8 @@ if [[ "$guard_only" == false ]]; then
         -p msb-krun-compat-evidence --all-targets -- -D warnings
     "$REPO_ROOT/script/test/msb-krun-compat-contract.sh"
     bash "$REPO_ROOT/script/test/build-workflow.sh"
+    bash "$REPO_ROOT/script/test/pi-wrapper.sh"
+    bash "$REPO_ROOT/script/test/pi-install.sh"
     bash "$REPO_ROOT/script/test/rust-toolchain-consistency.sh"
 fi
 
@@ -68,6 +70,10 @@ syntax_check=(
     script/test/msb-krun-compat-contract.sh
     script/build/macos.sh
     script/test/build-workflow.sh
+    images/tools/pi/pi.sh
+    images/tools/pi/install-pi.sh
+    script/test/pi-wrapper.sh
+    script/test/pi-install.sh
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
@@ -86,6 +92,10 @@ shellcheck_files=(
     script/test/msb-krun-compat-contract.sh
     script/build/macos.sh
     script/test/build-workflow.sh
+    images/tools/pi/pi.sh
+    images/tools/pi/install-pi.sh
+    script/test/pi-wrapper.sh
+    script/test/pi-install.sh
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
