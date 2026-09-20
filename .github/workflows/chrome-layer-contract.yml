@@ -45,7 +45,7 @@ jobs:
         platform: [linux/amd64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -59,7 +59,7 @@ jobs:
       # daemon's local image store instead of an isolated buildkit
       # container that can't see a previous build's --load output and
       # falls through to pulling the plain tag from Docker Hub.
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           driver: docker
       - name: Build and inspect API-3 base and derived layer
