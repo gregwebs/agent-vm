@@ -72,6 +72,7 @@ syntax_check=(
     script/test/build-workflow.sh
     images/tools/pi/pi.sh
     images/tools/pi/install-pi.sh
+    images/tools/pi/verify-pi.sh
     script/test/pi-wrapper.sh
     script/test/pi-install.sh
     script/check-rust-toolchain.sh
@@ -94,6 +95,7 @@ shellcheck_files=(
     script/test/build-workflow.sh
     images/tools/pi/pi.sh
     images/tools/pi/install-pi.sh
+    images/tools/pi/verify-pi.sh
     script/test/pi-wrapper.sh
     script/test/pi-install.sh
     script/check-rust-toolchain.sh

@@ -696,6 +696,7 @@ mod tests {
             "package.json",
             "package-lock.json",
             "install-pi.sh",
+            "verify-pi.sh",
             "pi.sh",
             "extensions/guest-credential-warning.js",
         ] {

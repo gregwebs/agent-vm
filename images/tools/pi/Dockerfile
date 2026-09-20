@@ -43,59 +43,14 @@ RUN chmod -R a+rX /opt/agent-vm/pi-extensions
 # as images/tools/claude/Dockerfile's seed hook.
 COPY --chmod=0755 pi.sh /usr/local/bin/pi
 
-# Build-time gates, reached in BOTH outcomes of install-pi.sh: a hard failure
-# already aborted the build, and a soft failure exited 0 having deleted
-# /opt/agent-vm/pi entirely -- so the `! -x` branch below is what turns a
-# soft-failed install into "this image ships no pi", wrapper included.
+# Build-time gates. Bind-mounted (not COPYed), exactly like install-pi.sh
+# above: the script stays out of the shipped image and needs no execute bit, so
+# the 0644-materialisation rule the wrapper's `COPY --chmod=0755` works around
+# does not apply to it. See verify-pi.sh for the checks and their rationale.
 #
-# NOTE: no `#` comments inside the RUN body -- the Dockerfile parser strips the
-# backslash-newlines first, so a comment would swallow the rest of the command.
-#
-# `timeout` bounds every Pi invocation so a future version that decides to
-# prompt cannot hang the build. HOME/XDG point at a scratch dir and
-# PI_TELEMETRY=0 keeps the gate hermetic: --version and --help must not read or
-# write a config, and must not be the thing that creates /root/.pi in the image.
-RUN set -eu; \
-    if [ ! -x /opt/agent-vm/pi/node_modules/.bin/pi ]; then \
-        if [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then \
-            echo "  pi: MISSING (soft-fail mode); removing the wrapper so nothing claims to be pi"; \
-            rm -f /usr/local/bin/pi; rm -rf /opt/agent-vm/pi /opt/agent-vm/pi-extensions; exit 0; \
-        fi; \
-        echo "  pi: MISSING -- hard sanity failure" >&2; exit 1; \
-    fi; \
-    export HOME=/tmp/pi-gate XDG_CONFIG_HOME=/tmp/pi-gate/.config PI_TELEMETRY=0; \
-    mkdir -p /tmp/pi-gate; \
-    want=$(jq -r '.dependencies["@earendil-works/pi-coding-agent"]' /opt/agent-vm/pi/package.json); \
-    got=$(timeout 60 /usr/local/bin/pi --version); \
-    if [ "$got" != "$want" ]; then \
-        echo "  pi: /usr/local/bin/pi --version reported '$got', lockfile pins '$want'" >&2; exit 1; \
-    fi; \
-    echo "  pi: $got (pinned)"; \
-    helped=$(timeout 60 /usr/local/bin/pi --help | sed -n 's/^  pi \([a-z][a-z-]*\) .*/\1/p' | sort -u | tr '\n' ' '); \
-    declared=$(sed -n 's/^PI_SUBCOMMANDS="\(.*\)"$/\1/p' /usr/local/bin/pi | tr ' ' '\n' | sort -u | tr '\n' ' '); \
-    if [ "$helped" != "$declared" ]; then \
-        echo "  pi: wrapper subcommands [$declared] != pi --help [$helped]" >&2; exit 1; \
-    fi; \
-    echo "  pi: subcommand allowlist matches pi --help"; \
-    if [ ! -r /opt/agent-vm/pi-extensions/guest-credential-warning.js ]; then \
-        echo "  pi: the mandatory extension is missing" >&2; exit 1; \
-    fi; \
-    if ! timeout 60 /usr/local/bin/pi --mode rpc --no-session --no-approve </dev/null 2>/dev/null | grep -q 'agent-vm: signing in here'; then \
-        echo "  pi: a real invocation does not load the mandatory extension" >&2; exit 1; \
-    fi; \
-    echo "  pi: mandatory extension loads and warns"; \
-    rm -rf /tmp/pi-gate /tmp/jiti /tmp/node-compile-cache; \
-    for c7dir in /opt/agent-vm/pi /opt/agent-vm/pi-extensions; do \
-        [ -d "$c7dir" ] || { echo "  pi: $c7dir is missing (C7)" >&2; exit 1; }; \
-    done; \
-    if [ -n "$(find /opt/agent-vm/pi /opt/agent-vm/pi-extensions ! -perm -o+r -print -quit)" ]; then \
-        echo "  pi: something under /opt/agent-vm is not world-readable (C7)" >&2; exit 1; \
-    fi; \
-    if [ -n "$(find /opt/agent-vm/pi /opt/agent-vm/pi-extensions -type d ! -perm -o+x -print -quit)" ]; then \
-        echo "  pi: a directory under /opt/agent-vm is not world-searchable (C7)" >&2; exit 1; \
-    fi; \
-    for executable in /usr/local/bin/pi /opt/agent-vm/pi/node_modules/.bin/pi; do \
-        [ -r "$executable" ] && [ -x "$executable" ] || { \
-            echo "  pi: $executable is not a+rx (C7)" >&2; exit 1; }; \
-    done; \
-    echo "  pi: readable and executable by any uid"
+# Reached in BOTH outcomes of install-pi.sh: a hard failure already aborted the
+# build, and a soft failure exited 0 having deleted /opt/agent-vm/pi entirely --
+# so the gate's `! -x` branch is what turns a soft-failed install into "this
+# image ships no pi", wrapper included.
+RUN --mount=type=bind,source=verify-pi.sh,target=/tmp/verify-pi.sh,ro \
+    sh /tmp/verify-pi.sh
