@@ -160,8 +160,8 @@ The providers a tool names in `credentials = [...]`. This is the
 no usable host credential (`credential_provider::missing_credential_error`,
 consumed by `run::launch`). The requirement set is a subset of the provisioning
 set — being provisioned is not being required — and it is **equal** to it
-whenever the tool declares no `tools`, which is the common case (four of the
-five shipped verbs: `codex`, `opencode`, `claude`, `copilot`).
+whenever the tool declares no `tools`, which is the common case (five of the
+six shipped verbs: `pi`, `codex`, `opencode`, `claude`, `copilot`).
 
 ### Available tools
 
@@ -328,7 +328,7 @@ same base (see **Base link**). See
 
 The OCI **guest template** agent-vm boots verbatim when the declared tool set
 equals the shipped default: `ghcr.io/wirenboard/agent-vm-template:latest`
-(`defaults::DEFAULT_IMAGE_REF`), published by CI as the base plus the four
+(`defaults::DEFAULT_IMAGE_REF`), published by CI as the base plus the five
 shipped **tool layers** chained in declaration order. It is never rebuilt
 locally. With no project tooling layers the launch performs zero Docker calls;
 with project layers, they chain on top of it.
@@ -336,7 +336,7 @@ with project layers, they chain on top of it.
 ## Tool layer
 
 One tooling layer the catalog declares, via a `[[tools]]` entry's `layer` field:
-either `{ builtin = "codex"|"opencode"|"claude"|"copilot" }` (a source embedded
+either `{ builtin = "pi"|"codex"|"opencode"|"claude"|"copilot" }` (a source embedded
 in the binary from `images/tools/`, materialised into a throwaway build context
 on the compose path) or `{ path = "…" }` (a directory anchored on the declaring
 config file's directory). Distinguish from **Tooling layer**, which is

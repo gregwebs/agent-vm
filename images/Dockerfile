@@ -7,8 +7,8 @@
 # Contents: Debian 13 slim + the docker engine (docker.io + containerd
 # + runc + fuse-overlayfs), network/diagnostic CLIs, the
 # `agent-vm-install` helper, and the host-CA shim. It carries NO agent
-# CLI: the four shipped agents live in standalone tool layers under
-# images/tools/ (codex, opencode, claude, copilot), each building FROM
+# CLI: the five shipped agents live in standalone tool layers under
+# images/tools/ (pi, codex, opencode, claude, copilot), each building FROM
 # this base per ADR-0003's layer image contract. The WB C/C++
 # build-essentials family and armhf/arm64 cross toolchains live as an
 # opt-in example tooling layer at examples/layers/wirenboard-cpp/
@@ -16,7 +16,7 @@
 # docs/adr/0003-project-tooling-layers.md. Other heavy extras (LSPs,
 # additional MCP servers, docker-buildx) are deliberately deferred too.
 #
-# The tool layers are composed two ways. CI chains base + the four
+# The tool layers are composed two ways. CI chains base + the five
 # default layers and publishes the result as
 # ghcr.io/wirenboard/agent-vm-template (the "composed default image"),
 # which is what a default-config launch boots verbatim. A launch whose

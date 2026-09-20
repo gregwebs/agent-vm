@@ -83,7 +83,7 @@ CI publishes two OCI images from one run:
   plus the docker engine, diagnostic CLIs and the tool-layer facilities, with
   **no** agent CLI.
 - `ghcr.io/wirenboard/agent-vm-template:latest` — the **composed default**: the
-  base plus the four shipped tool layers (codex, opencode, claude, copilot),
+  base plus the five shipped tool layers (pi, codex, opencode, claude, copilot),
   chained in declaration order.
 
 Both are rebuilt hourly, picking up the latest Claude Code, Codex CLI, and
@@ -540,10 +540,10 @@ interactive_shell = false            # optional; join trailing args into `-c`
   **count**, never the values, so a secret accidentally placed here is not
   echoed. Args are not shell-split or expanded.
 - `layer` — optional; a table with **exactly one** of `builtin` (one of
-  `codex`, `opencode`, `claude`, `copilot`) or `path`. It **selects the tool
+  `pi`, `codex`, `opencode`, `claude`, `copilot`) or `path`. It **selects the tool
   layer composed onto the base** for a launch whose tool set differs from the
   shipped default (see [Image release cadence](#image-release-cadence)):
-  `builtin` names one of the four layers embedded in the binary, `path` a
+  `builtin` names one of the five layers embedded in the binary, `path` a
   directory (relative to the declaring config file, or absolute) holding a
   `Dockerfile` that builds `FROM` the base per
   [ADR-0003](docs/adr/0003-project-tooling-layers.md). A tool with no `layer`
@@ -839,7 +839,7 @@ A launch only captures, injects and proxies the credentials its verb
 `tools`, transitively. `agent-vm codex` never captures your Anthropic token;
 `agent-vm claude` never captures your OpenAI one. `agent-vm shell` provisions
 all four, because in the shipped catalog the built-in `shell`'s wildcard closes
-over `default-tools.toml`'s four agents. `agent-vm doctor` prints each verb's
+over `default-tools.toml`'s five agents. `agent-vm doctor` prints each verb's
 resolved set as `provisions=…` next to its `credentials=…` requirement set.
 
 The guest's `~/.claude`, `~/.copilot` and `~/.config/opencode` symlinks are

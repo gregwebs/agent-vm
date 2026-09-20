@@ -1,4 +1,4 @@
-# The five tools agent-vm ships a definition for, used only when BOTH the
+# The six tools agent-vm ships a definition for, used only when BOTH the
 # user and project config files declare zero tools (see src/config.rs).
 #
 # This is the single shipped source of the launch-verb catalog: it is embedded
@@ -11,7 +11,7 @@
 # Order matters. The declaration order below is the order `agent-vm --help`
 # and `agent-vm doctor` show the verbs, and the order the tool layers are
 # composed in (#84). The image build keeps the same cache-motivated ordering
-# (codex first, then opencode, then claude) — see images/tools/README.md.
+# (pi first, then codex, then opencode, then claude) — see images/tools/README.md.
 #
 # `args` holds the flags prepended before the user's own args (`run::inner_argv`
 # drops any the user already passed). The microVM is the security boundary, so
@@ -34,16 +34,29 @@
 # symlink at ~/.codex would shadow the binary itself (ARCHITECTURE.md,
 # credential_provider::guest_home_links). `shell` carries the same pair
 # because its omitted `tools` defaults to the wildcard, and in the shipped
-# default catalog that wildcard closes over this file's four agents (see
+# default catalog that wildcard closes over this file's five agents (see
 # ADR-0017), so codex/auth.json is provisioned on a shell launch and dropping
 # the pointer would leave a fully-provisioned, unreachable credential. The
-# other three agents never read CODEX_HOME.
+# other four agents never read CODEX_HOME.
 #
 # `shell` declares no `credentials`: it is not an agent and must not inherit
 # any provider's hard bail (Anthropic's and Copilot's would make `agent-vm
 # shell` fail for any user without both host logins). Its omitted `tools`
 # defaults to `["*"]`, so it *provisions* every provider the catalog's tools
 # declare without *requiring* any of them. See ADR-0017.
+
+# `pi` declares no `credentials`: Pi supports many providers, enrolls more during
+# a session, and must start with none configured, so it must not inherit any
+# provider's hard bail. Host-credential import is issue #94/#91; the guest-state
+# mapping, PI_SKIP_VERSION_CHECK / PI_TELEMETRY and the `--approve` default are
+# issue #96. Its layer is first in the chain because it is the largest and the
+# least frequently changed -- see images/tools/README.md.
+[[tools]]
+name = "pi"
+command = "pi"
+args = []
+layer = { builtin = "pi" }
+persist = []
 
 [[tools]]
 name = "codex"
