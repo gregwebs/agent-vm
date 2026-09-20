@@ -330,11 +330,13 @@ impl ProtectedHostFiles {
         })
     }
 
-    /// Re-measure the host state, keeping every identity and route this
-    /// snapshot already holds (see [`Self::union`]). The fork copier takes this
-    /// under the per-fork lock, so a root or credential created since the
-    /// launch's first measurement is seen, while an inode or route the first
-    /// measurement positively identified is never forgotten.
+    /// Re-measure the host state and union it with this snapshot (see
+    /// [`Self::union`]). The fork copier takes this under the per-fork lock, so
+    /// a root or credential created since the launch's first measurement is
+    /// seen. Retention is **identity-only**: a positively identified inode is
+    /// never forgotten, but the routes, the configured Pi home and the resolved
+    /// Pi home come from the fresh measurement, so a historical *pathname* is
+    /// deliberately not retained (R3.5).
     pub(crate) fn refreshed(&self) -> Result<Self> {
         Ok(self.union(&Self::measure(self.host_home.as_deref())?))
     }
@@ -1046,6 +1048,28 @@ mod tests {
             Some(Path::new("/other/pi"))
         );
         assert_eq!(unioned.severity, Severity::Refuse);
+    }
+
+    /// Anti-over-omission control with the relative set: 50 `refreshed`
+    /// rounds over unchanged host state must not grow the relatives. A union
+    /// that accumulated routes or Pi-home spellings instead of taking the fresh
+    /// ones would drift here (§7.7.4).
+    #[test]
+    fn refreshes_do_not_grow_the_relative_set() {
+        let (_home, home) = home();
+        write(&home.join(".pi/agent/auth.json"), "{}");
+        let root = resolve_root(&home.join(".pi"));
+        let mut snapshot = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        let first = snapshot.relatives_under(&root);
+        assert!(!first.is_empty(), "the fixture must name the credential");
+        for _ in 0..50 {
+            snapshot = snapshot.refreshed().unwrap();
+        }
+        assert_eq!(
+            snapshot.relatives_under(&root),
+            first,
+            "refreshed grew the relative set"
+        );
     }
 
     /// Construct a genuine [`ResolvedRoot`] through its only constructor

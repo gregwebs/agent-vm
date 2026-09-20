@@ -246,8 +246,12 @@ fork-root-relative path, so a hardlink under another name, a
 `fork:follow-links` materialized target, and a file created between
 measurement and the copy are all omitted. The copier resolves the root it is
 about to open and measures Pi's home **at that point**, so a root spelled
-through any alias decides identically: a route is a hit by `(dev, ino)`
-identity as well as by pathname containment.
+through an alias the kernel folds decides identically: a route is a hit by
+`(dev, ino)` identity as well as by pathname containment. That identity fold
+holds only for an association the single measurement actually captured — a
+Pi-home relationship lost between the root resolve and that measurement, or a
+renamed alias of a Pi-home *subdirectory*, is outside it; ADR-0020's *Accepted
+gaps* name both.
 
 ```text
 prepare()
