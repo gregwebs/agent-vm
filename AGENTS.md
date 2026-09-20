@@ -1,5 +1,11 @@
 # AGENTS.md — conventions for coding agents working on this repo
 
+If AGENTS.local.md exists, read and follow it.
+
+# Important Documentation
+
+* README.md is a starting point
+* Discover additional applicable standards documents when they apply such as `CONTRIBUTING.md` and `CODING_STANDARDS.md`.
 
 ## Versioning
 
