@@ -14,14 +14,16 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "semiannually"
     open-pull-requests-limit: 5
-    # Give a newly published action release a week to surface breakage or
-    # get yanked before we pull it in — Dependabot's implicit default is
-    # only 3 days.
+    # Give a newly published action release time to surface breakage or get
+    # yanked before we pull it in — Dependabot's implicit default is only 3
+    # days. Majors wait longest; patch releases are least likely to break us.
     cooldown:
-      default-days: 7
+      default-days: 30
+      semver-major-days: 30
+      semver-minor-days: 15
+      semver-patch-days: 7
     commit-message:
       prefix: "ci"
     labels:

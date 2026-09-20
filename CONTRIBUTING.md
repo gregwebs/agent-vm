@@ -222,6 +222,34 @@ needs a real registry. These tests are `#[ignore]`d, so **CI never runs them**.
 | `script/test/build-workflow.sh` | yes (macOS leg of `ci.yml`) | fake-plutil seam, no VM |
 | `script/test/ci-contracts.sh`, `image-promotion-gate.sh`, `verus-verification.sh` | yes | static / contract gates |
 
+## CI action pins
+
+Every `uses:` in `.github/workflows/` pins a 40-character commit hash
+([CODING_STANDARDS.md](CODING_STANDARDS.md) — *Version pinning*), so the trailing
+comment is the only human-readable record of what that hash actually is. Label it
+with the **exact release the hash is** (`# v5.1.0`), never a moving major (`# v5`):
+a moving tag's label is true the day it is written and becomes a lie the next time
+the tag moves, and nothing in the build notices.
+
+`zizmor`'s `ref-version-mismatch` audit checks this, but it will not turn CI red
+for you — it is an online audit (so `--offline` skips it silently) and the `zizmor`
+job reports **success** while raising findings, which arrive as code-scanning
+alerts. To check by hand:
+
+```bash
+GH_TOKEN=<token with public read> zizmor .github/workflows/
+```
+
+One action has no exact release to name: `dtolnay/rust-toolchain` publishes only
+the moving `v1` tag — its per-release `1.x`/`1.x.y` refs are branches, not tags.
+Label those pins `# v1 (<commit date of the pinned hash>)`. The parenthesised form
+is deliberately not a parseable version string, because there is no version claim
+that could be checked; it tells a reader which `v1` this is and nothing more.
+
+Relabelling a stale comment is not the same operation as bumping a pin. Moving a
+hash changes what CI runs, so decide that on its own and let Dependabot's cooldown
+do it where it can.
+
 ## Commit message style
 
 Commits on this branch use a multi-paragraph "Why / How" style.
