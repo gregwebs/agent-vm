@@ -145,10 +145,15 @@ The only tolerated difference is the sibling's own nested dependency directories
 as the committed lock declares them (`pi-ai`'s
 `node_modules/{agent-base,https-proxy-agent}`, derived from the lock, not
 hard-coded), which npm itself authenticated because they carry `integrity` in
-Pi's shrinkwrap. So the bytes that ship are the bytes the hash was reviewed
-against, for every path outside those declared nested directories. A mismatch —
-an extra file, directory or symlink, a tampered file, or a missing one — is a
-**hard** build failure that `AGENT_INSTALL_SOFT_FAIL` may not downgrade. Two
+Pi's shrinkwrap and are folded wholesale from the installed tree. So for every
+path **inside one of the five siblings' own trees** and outside the sibling's
+lock-declared nested dependency directories, the bytes that ship are the bytes
+the hash was reviewed against. There, a mismatch — an extra file, directory or
+symlink, a tampered file, or a missing one — is a **hard** build failure that
+`AGENT_INSTALL_SOFT_FAIL` may not downgrade. (A path placed *beside* one of the
+five, anywhere under `node_modules/@earendil-works/`, is outside every compared
+sibling tree and is not looked at; npm extracts each sibling into its own
+directory, so the unauthenticated sibling fetch cannot create one.) Two
 `cargo test` guards
 (`every_locked_package_carries_integrity`,
 `the_build_verified_sibling_set_is_exactly_the_five_nested_earendil_packages`)

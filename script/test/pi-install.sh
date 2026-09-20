@@ -235,9 +235,22 @@ new_realcase() {
     for name in "${SIBLINGS[@]}"; do
         mkdir -p "$CASE/src/$name/package"
         printf 'sibling %s\n' "$name" >"$CASE/src/$name/package/$name.js"
+        # pi-ai really ships a dist/ directory, and a shadow planted inside
+        # pi-ai/dist/node_modules/<pkg> is what Node resolves from inside
+        # pi-ai/dist. Ship dist/ in BOTH the tarball and the installed tree so
+        # the shadow-dist case below isolates the nested exclusion -- without
+        # it the diff would trip on the top-level `dist` alone (see F2).
+        if [[ "$name" == pi-ai ]]; then
+            mkdir -p "$CASE/src/$name/package/dist"
+            printf 'pi-ai dist\n' >"$CASE/src/$name/package/dist/index.js"
+        fi
         tar -czf "$CASE/tarballs/$name.tgz" -C "$CASE/src/$name" package
         mkdir -p "$CASE/prefix/$REAL_BASE/$name"
         printf 'sibling %s\n' "$name" >"$CASE/prefix/$REAL_BASE/$name/$name.js"
+        if [[ "$name" == pi-ai ]]; then
+            mkdir -p "$CASE/prefix/$REAL_BASE/$name/dist"
+            printf 'pi-ai dist\n' >"$CASE/prefix/$REAL_BASE/$name/dist/index.js"
+        fi
     done
     for name in agent-base https-proxy-agent; do
         mkdir -p "$CASE/prefix/$REAL_BASE/pi-ai/node_modules/$name"
@@ -268,7 +281,7 @@ SH
 }
 
 write_real_lock() {
-    local name integrity=sha512-AAAA
+    local name integrity=sha512-AAAA extra
     {
         printf '{\n  "name": "agent-vm-guest-pi",\n  "version": "0.0.0",\n  "lockfileVersion": 3,\n  "packages": {\n'
         for name in "${SIBLINGS[@]}"; do
@@ -278,6 +291,12 @@ write_real_lock() {
         for name in agent-base https-proxy-agent; do
             printf '    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/node_modules/%s": {"version": "0.0.0", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"},\n' \
                 "$name" "$name" "$integrity"
+        done
+        # Optional extra declared dirs, e.g. a dependency nested inside an
+        # already-declared one (F1). $1 is its root-relative path under pi-ai.
+        for extra in "$@"; do
+            printf '    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/node_modules/%s": {"version": "0.0.0", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"},\n' \
+                "$extra" "${extra##*/}" "$integrity"
         done
         printf '    "node_modules/@earendil-works/pi-coding-agent": {"version": "0.86.1"}\n  }\n}\n'
     } >"$CASE/prefix/package-lock.json"
@@ -320,7 +339,9 @@ for soft in "" 1; do
 done
 
 # (b) a shadow planted in a node_modules nested under pi-ai/dist, which Node
-# resolves from inside pi-ai/dist.
+# resolves from inside pi-ai/dist. pi-ai's tarball ships dist/index.js (see
+# new_realcase), so the ONLY difference the diff sees is the nested shadow --
+# this case fails against a reintroduced `-x node_modules` AND against `-x dist`.
 for soft in "" 1; do
     new_realcase shadow-dist
     write_real_lock
@@ -331,6 +352,30 @@ for soft in "" 1; do
     [[ $RUN_STATUS -ne 0 ]] || fail "a shadow under pi-ai/dist/node_modules must fail (soft='${soft:-unset}')"
     assert_contains "$RUN_OUTPUT" "differs from its verified tarball"
 done
+
+# (d) a lock declaring a dependency nested inside an already-declared one must
+# fold without the spurious "tarball already contains" error: the shallowest
+# declared dir (agent-base) is copied wholesale, which covers agent-base's own
+# declared child (F1).
+new_realcase nested-declared
+write_real_lock agent-base/node_modules/deep-dep
+mkdir -p "$CASE/prefix/$REAL_BASE/pi-ai/node_modules/agent-base/node_modules/deep-dep"
+: >"$CASE/prefix/$REAL_BASE/pi-ai/node_modules/agent-base/node_modules/deep-dep/index.js"
+run_real_installer
+[[ $RUN_STATUS -eq 0 ]] \
+    || fail "a lock declaring a dep nested in another declared one must fold cleanly: $RUN_OUTPUT"
+assert_contains "$RUN_OUTPUT" "5/5 shrinkwrap-only tarballs verified"
+
+# ... while the genuine guard is intact: a verified tarball that itself ships a
+# lock-declared path is still a hard failure, not something the fold masks.
+new_realcase tarball-ships-declared
+write_real_lock
+mkdir -p "$CASE/src/pi-ai/package/node_modules/agent-base"
+: >"$CASE/src/pi-ai/package/node_modules/agent-base/index.js"
+tar -czf "$CASE/tarballs/pi-ai.tgz" -C "$CASE/src/pi-ai" package
+run_real_installer
+[[ $RUN_STATUS -ne 0 ]] || fail "a tarball shipping a lock-declared path must fail"
+assert_contains "$RUN_OUTPUT" "already contains"
 
 # --- the test seam cannot become the production default ----------------------
 

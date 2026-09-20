@@ -83,13 +83,24 @@ while IFS="$(printf '\t')" read -r key name resolved integrity; do
     # transitive dependencies under its `node_modules`; those are exactly the
     # root-relative nested dependency directories the committed lock declares
     # for this sibling, and npm authenticated them (they carry `integrity` in
-    # Pi's shrinkwrap). Fold each declared directory into the extraction from
+    # Pi's shrinkwrap). Fold the declared directories into the extraction from
     # the installed tree, then require a plain `diff -r` to be empty. Any other
     # extra file, directory or symlink -- a shadow `node_modules` at a path the
     # lock does not declare, a tampered shipped file, a missing one -- fails.
-    jq -r --arg key "${key}" \
-        '.packages | keys[] | select(startswith($key + "/")) | ltrimstr($key + "/")' \
-        "${PREFIX}/package-lock.json" > /tmp/pi-nested.tsv
+    # Only the SHALLOWEST declared directories are folded. A lock can declare
+    # a dependency nested inside another declared one (npm's shrinkwrap layout
+    # can nest), and folding the ancestor copies its whole subtree -- including
+    # any declared descendant -- from the installed tree. Folding the descendant
+    # again would find it already present in the extraction and trip the
+    # "tarball already contains" guard below with a misleading message. Drop any
+    # rel that has an ancestor in the declared set; the ancestor's wholesale
+    # `cp -a` covers it and `diff -r` still compares the whole subtree.
+    jq -r --arg key "${key}" '
+        [ .packages | keys[] | select(startswith($key + "/")) | ltrimstr($key + "/") ] as $all
+        | $all[] as $rel
+        | select([ $all[] as $o | select($rel | startswith($o + "/")) ] | length == 0)
+        | $rel
+    ' "${PREFIX}/package-lock.json" > /tmp/pi-nested.tsv
     while IFS= read -r rel; do
         [ -n "${rel}" ] || continue
         if [ ! -e "${NESTED}/${name}/${rel}" ] && [ ! -L "${NESTED}/${name}/${rel}" ]; then

@@ -307,13 +307,18 @@ EOF
     "$REPO_ROOT/images/tools/pi/package.json")"
 
   local out
+  # `timeout 60` on every guest pi invocation mirrors the layer build gate: a
+  # future pi that decides to prompt must not hang the run. print_rc bounds
+  # print_bytes so an empty stdout from a broken pi cannot satisfy it vacuously.
   out="$(cd "$proj" && avm shell --yes --base-image "$BASE_IMAGE" -- bash -c '
     printf "which=%s\n" "$(command -v pi)"
-    printf "version=%s\n" "$(pi --version)"
-    printf "warn=%s\n" "$(printf "" | pi --mode rpc --no-session --no-approve 2>/dev/null | grep -c "agent-vm: signing in here")"
-    printf "warn_ne=%s\n" "$(printf "" | pi -ne --mode rpc --no-session --no-approve 2>/dev/null | grep -c "agent-vm: signing in here")"
-    printf "print_bytes=%s\n" "$(printf "" | pi -p --no-session 2>/dev/null | wc -c | tr -d " ")"
-    printf "list=%s\n" "$(pi list)"
+    printf "version=%s\n" "$(timeout 60 pi --version)"
+    printf "warn=%s\n" "$(printf "" | timeout 60 pi --mode rpc --no-session --no-approve 2>/dev/null | grep -c "agent-vm: signing in here")"
+    printf "warn_ne=%s\n" "$(printf "" | timeout 60 pi -ne --mode rpc --no-session --no-approve 2>/dev/null | grep -c "agent-vm: signing in here")"
+    pi_print="$(printf "" | timeout 60 pi -p --no-session 2>/dev/null)"; pi_print_rc=$?
+    printf "print_bytes=%s\n" "$(printf %s "$pi_print" | wc -c | tr -d " ")"
+    printf "print_rc=%s\n" "$pi_print_rc"
+    printf "list=%s\n" "$(timeout 60 pi list)"
   ' 2>&1)" || {
     echo "$out" | tail -20
     return 1
@@ -324,6 +329,7 @@ EOF
   assert_match "the mandatory warning fires" "^warn=1$" "$out" || return 1
   assert_match "--no-extensions cannot silence it" "^warn_ne=1$" "$out" || return 1
   assert_match "print mode stdout is empty" "^print_bytes=0$" "$out" || return 1
+  assert_match "print mode exits cleanly" "^print_rc=0$" "$out" || return 1
   assert_match "pi list is a subcommand, not a prompt" "^list=No packages installed\.$" "$out"
 }
 
