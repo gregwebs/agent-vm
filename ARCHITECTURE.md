@@ -244,7 +244,10 @@ placeholder, because that would be a mask, and ADR-0014 removed mask
 machinery. The copier consults the node's `fstat` identity *and* its
 fork-root-relative path, so a hardlink under another name, a
 `fork:follow-links` materialized target, and a file created between
-measurement and the copy are all omitted.
+measurement and the copy are all omitted. The copier resolves the root it is
+about to open and measures Pi's home **at that point**, so a root spelled
+through any alias decides identically: a route is a hit by `(dev, ino)`
+identity as well as by pathname containment.
 
 ```text
 prepare()
@@ -256,7 +259,7 @@ prepare()
   build volumes
   enforce_protected_files(expanded)                           [refuse a live bind; collect advisories]
   validate_plan
-  prepare_forks -> copy_opened(CopyPolicy { protected ids + paths })  [omit, notice]
+  prepare_forks -> copy_root resolves the root, then copy_opened(NodePolicy { identities + relatives })  [omit, notice]
 ```
 
 Both new passes run before `prepare_forks` — the first state mutation — so a
