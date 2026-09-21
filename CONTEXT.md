@@ -83,7 +83,13 @@ Both modes share one symlink mapping,
 drift (see **Credential provider** → **Guest home link**). Under both modes
 `~/.pi` is project-scoped persistent state at `/agent-vm-state/pi`
 ([#96](https://github.com/gregwebs/agent-vm/issues/96)), and a guest-created Pi
-credential inside it is warned about on every Pi session start.
+credential inside it is reported two ways (see ADR-0011): a host-side,
+field-only advisory on **every launch** (and the same facts from
+`agent-vm doctor`) reports *existing* guest-managed state, while the in-guest Pi
+extension separately warns about a *future* sign-in. A **Guest-managed Pi
+credential** is one created inside the guest and persisted here; a **Known
+placeholder** is an exact agent-vm placeholder constant (whole-value match, not
+a prefix), which the launch scanner stays quiet about.
 
 ## Private MSB_HOME
 

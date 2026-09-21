@@ -489,6 +489,28 @@ thing to run when an in-VM agent comes up signed out. See
 It also prints the resolved [tool configuration](#tool-configuration) — the same
 verb list `agent-vm --help` shows.
 
+**Guest-managed Pi credentials.** The same run also reports the project's
+persistent Pi state (canonical `<state>/pi/agent/{auth,models}.json`, plus any
+real pre-#96 `<state>/home/.pi` that a launch has not yet moved). The report is
+**structural**: it names a provider ID, a credential kind (`api_key`/`oauth`/
+`configuration`/`unknown`) and field names such as `key`, `access`, `env` or
+`headers.Authorization` — never a value, command, environment reference or URL.
+An exact agent-vm placeholder is quiet; anything else, or a malformed/unsafe/
+oversized file, is reported as potentially sensitive. Only `auth.json` and
+`models.json` are inspected — settings, sessions and installed packages are not.
+
+`doctor` never resolves `!command` values, expands environment references,
+refreshes OAuth, or writes, rewrites or removes anything; it only reads those two
+files. Ordinary `doctor` also performs **no** initialization at all — it is
+dispatched before microsandbox bootstrap, so it works even when the bundled
+`msb` is missing or unpatched, and it reports the computed paths rather than
+validating that binary. The explicit `agent-vm doctor --reset-msb-db` is the
+mutating exception and keeps its existing behaviour.
+
+The report is advisory, not enforcement: it neither blocks a launch nor promises
+that a host substitution exists. Your decision whether to remove or rotate a
+guest-managed credential.
+
 ## Tool configuration
 
 The launch verbs are generated from a tool configuration resolved on every
@@ -709,6 +731,18 @@ guest-side — a tool's config `env`, or an `export` inside `agent-vm shell`.
 existing pre-release `<state>/home/.pi` directory to `<state>/pi`
 automatically. If `<state>/pi` already holds Pi state the launch stops and names
 both paths; the fix is a host-side `mv` of one of them.
+
+**Credential warnings.** Because a guest can leave a Pi credential in the
+project's persistent state that any later tool in that project can read, every
+launch (`claude`, `codex`, `opencode`, `copilot`, `pi`, `shell`, and any custom
+tool) prints a field-only advisory on stderr **before** the guest runs when it
+finds a non-placeholder or unrecognized entry — for example
+`auth.json: provider=anthropic type=api_key fields=key`. Placeholder-only state
+is quiet. `agent-vm doctor` shows the same facts without starting Pi. This
+advisory is **separate** from the in-guest Pi extension's own warning about a
+future sign-in; the two are complementary and the launcher warning is emitted
+regardless of whether Pi itself starts. It never prints a value, command or
+environment reference, and it never blocks the launch.
 
 The built-in `shell` declares **no** `credentials` and omits `tools`, so in the
 shipped catalog it *provisions* every provider `default-tools.toml`'s tools

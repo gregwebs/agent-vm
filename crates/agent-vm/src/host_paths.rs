@@ -89,6 +89,27 @@ impl GuestStateDir {
         })
     }
 
+    /// Like [`Self::open`], but a *missing* state root is `Ok(None)` rather
+    /// than an error, so a read-only scanner can treat "no project state yet"
+    /// as a normal absent result without matching on a formatted error. Any
+    /// other failure — a symlinked, non-directory or unreadable root — still
+    /// fails closed with the same no-follow open.
+    pub(crate) fn open_if_present(root: &Path) -> Result<Option<Self>> {
+        match rfs::open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => Ok(Some(Self {
+                root: fd,
+                display_root: root.to_path_buf(),
+            })),
+            Err(Errno::NOENT) => Ok(None),
+            Err(error) => Err(anyhow!(error))
+                .with_context(|| format!("opening guest state root {}", root.display())),
+        }
+    }
+
     pub(crate) fn read(&self, relative: &Path) -> Result<Option<Vec<u8>>> {
         self.read_with_checkpoints(relative, || {}, || {})
     }
@@ -852,6 +873,28 @@ mod tests {
 
         assert_eq!(fs::read(moved.join("auth.json")).unwrap(), b"replaced");
         assert_eq!(fs::read(&canary).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn open_if_present_reports_a_missing_root_and_refuses_a_symlinked_one() {
+        // The read-only Pi scanner (#93) treats "no project state yet" as a
+        // normal absent result, but must still fail closed on a root that is
+        // not a real directory.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            GuestStateDir::open_if_present(&dir.path().join("absent"))
+                .unwrap()
+                .is_none()
+        );
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        assert!(GuestStateDir::open_if_present(&real).unwrap().is_some());
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            GuestStateDir::open_if_present(&link).is_err(),
+            "a symlinked state root must not be followed"
+        );
     }
 
     #[test]

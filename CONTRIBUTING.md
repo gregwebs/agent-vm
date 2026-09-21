@@ -164,7 +164,9 @@ but not its layer blobs there. It falls through to a registry pull of a local
 tag and fails with `Not authorized … index.docker.io/.../agent-vm-template`.
 An existing state dir is consistent because its `config.json` was written before
 the import; `script/test/e2e.sh` also seeds a fresh dir by running a non-booting
-builtin (`agent-vm doctor`) first, so it works either way. A follow-up should
+builtin that still initialises the cache (`agent-vm msb --version`) first, so it
+works either way. (Not `doctor`: since #93 ordinary `doctor` is observational
+and deliberately writes nothing.) A follow-up should
 teach `import-image.sh` the same shared-cache redirect so the raw recipe above
 also works from scratch.
 

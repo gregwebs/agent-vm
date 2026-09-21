@@ -114,6 +114,17 @@ fn write_fake_msb(dir: &Path) -> PathBuf {
     path
 }
 
+/// Write an executable script. Used for the credential sentinel (S-2): if it
+/// runs, it appends to its marker file, so an empty marker after a launch is
+/// proof that nothing resolved the `!command` values in guest Pi state.
+fn write_executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).unwrap();
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("failed to spawn agent-vm");
@@ -2368,5 +2379,274 @@ fn a_guest_planted_symlinked_ancestor_is_refused_before_boot() {
     assert!(
         std::fs::read_dir(&planted).unwrap().next().is_none(),
         "provisioning followed the planted symlink"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #93 — every launch reports guest-managed Pi credentials, read-only
+// ---------------------------------------------------------------------------
+
+/// The fixed launch warning header, and the exact placeholder constant the
+/// built-in `pi`/`claude` provisioners write (`secrets.rs`).
+const PI_WARN_HEADER: &str = "==> WARNING: potentially sensitive guest-managed Pi credentials";
+const GUEST_PLACEHOLDER: &str = "msb-anthropic-placeholder-a-v2";
+
+/// Seed the project-scoped guest Pi `auth.json` (and optionally `models.json`).
+fn seed_pi(state_dir: &Path, auth: &str, models: Option<&str>) {
+    let agent = state_dir.join("pi/agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(agent.join("auth.json"), auth).unwrap();
+    if let Some(models) = models {
+        std::fs::write(agent.join("models.json"), models).unwrap();
+    }
+}
+
+/// Learn the project state dir from a launch banner. The banner is emitted
+/// before the scan, so a probe with no seeded Pi state is also a quiet control.
+fn probe_state_dir(harness: &Harness, tool: &str) -> PathBuf {
+    let probe = harness.launch_default(tool);
+    let stderr = stderr_of(&probe);
+    assert!(
+        !stderr.contains(PI_WARN_HEADER),
+        "unseeded state must be quiet:\n{stderr}"
+    );
+    state_dir(&stderr)
+}
+
+/// V4: one shared `run::launch` hook covers every tool and both guest modes.
+/// The warning must be emitted **before** the image build/host resolution, so
+/// the inspection is reached even when the launch later fails on the bogus
+/// image (this is not "assert nonzero and hope").
+#[test]
+fn every_launch_warns_on_guest_managed_pi_credentials() {
+    let harness = Harness::new();
+    let state = probe_state_dir(&harness, "shell");
+    seed_pi(
+        &state,
+        r#"{"anthropic":{"type":"api_key","key":"guest-managed"}}"#,
+        None,
+    );
+
+    for tool in DEFAULT_TOOLS {
+        let out = harness.launch_default(tool);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(PI_WARN_HEADER),
+            "{tool} must warn:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("auth.json: provider=anthropic type=api_key fields=key"),
+            "{tool} must name the field:\n{stderr}"
+        );
+        let warn_at = stderr.find(PI_WARN_HEADER).expect("warning");
+        let build_at = stderr
+            .find(CONFIG_MARKER)
+            .unwrap_or_else(|| panic!("{tool} never reached the build seam:\n{stderr}"));
+        assert!(
+            warn_at < build_at,
+            "{tool}: the warning must precede host resolution/build:\n{stderr}"
+        );
+    }
+
+    // Root-mode Pi is covered by the same hook.
+    let root = harness.launch("pi", &["--root"]);
+    let root_stderr = stderr_of(&root);
+    assert!(
+        root_stderr.contains(PI_WARN_HEADER),
+        "root-mode pi must warn:\n{root_stderr}"
+    );
+
+    // A second invocation is not suppressed or cached.
+    let again = harness.launch_default("pi");
+    assert!(stderr_of(&again).contains(PI_WARN_HEADER));
+}
+
+/// V4 quiet controls: placeholder-only state, and a tool with no Pi relevance,
+/// must produce no new structural warning in either guest mode.
+#[test]
+fn quiet_pi_state_produces_no_structural_warning() {
+    let harness = Harness::new();
+    let state = probe_state_dir(&harness, "pi");
+    std::fs::create_dir_all(state.join("pi/agent")).unwrap();
+    std::fs::write(
+        state.join("pi/agent/auth.json"),
+        format!(r#"{{"anthropic":{{"type":"api_key","key":"{GUEST_PLACEHOLDER}"}}}}"#),
+    )
+    .unwrap();
+
+    for (tool, extra) in [("pi", vec![]), ("pi", vec!["--root"]), ("shell", vec![])] {
+        let out = harness.launch(tool, &extra);
+        let stderr = stderr_of(&out);
+        assert!(
+            !stderr.contains(PI_WARN_HEADER),
+            "{tool} {extra:?} must be quiet with placeholder-only state:\n{stderr}"
+        );
+    }
+}
+
+/// V4: a malformed auth file becomes one fixed potentially-sensitive line
+/// (never the raw input), and a models-only credential is still reported.
+#[test]
+fn malformed_and_models_only_pi_state_still_warn() {
+    let harness = Harness::new();
+    let state = probe_state_dir(&harness, "pi");
+    seed_pi(
+        &state,
+        "not json at all",
+        Some(r#"{"providers":{"demo":{"apiKey":"guest-managed"}}}"#),
+    );
+
+    let out = harness.launch_default("pi");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(PI_WARN_HEADER), "{stderr}");
+    assert!(
+        stderr.contains("auth.json: potentially sensitive; unrecognized or malformed structure"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("models.json: provider=demo type=configuration fields=apiKey"),
+        "{stderr}"
+    );
+    // The raw input is not echoed.
+    assert!(!stderr.contains("not json at all"), "{stderr}");
+}
+
+/// V4: #96's migration runs before the scan, so a real pre-#96 `home/.pi`
+/// directory is reported at its canonical location, not as legacy state.
+#[test]
+fn legacy_pi_home_is_migrated_before_the_scan() {
+    let harness = Harness::new();
+    let state = probe_state_dir(&harness, "pi");
+    // The probe provisioned the compiled `<state>/home/.pi` symlink; rewind to
+    // the pre-#96 shape (a real directory a previous guest left behind).
+    std::fs::remove_file(state.join("home/.pi")).unwrap();
+    let legacy = state.join("home/.pi/agent");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(
+        legacy.join("auth.json"),
+        r#"{"anthropic":{"type":"api_key","key":"guest-managed"}}"#,
+    )
+    .unwrap();
+
+    let out = harness.launch_default("pi");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(PI_WARN_HEADER), "{stderr}");
+    assert!(
+        stderr.contains("auth.json: provider=anthropic type=api_key fields=key"),
+        "canonical location expected after migration:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("legacy pre-#96"),
+        "a launch migrates, so it must not report legacy state:\n{stderr}"
+    );
+    assert!(
+        !state.join("home/.pi").exists(),
+        "migration left the legacy dir"
+    );
+    assert!(state.join("pi/agent/auth.json").exists());
+}
+
+/// S-2: the acceptance criterion names *both* surfaces — "sentinel resolvers
+/// to prove doctor **and warning scans** execute nothing". The doctor half
+/// lives in `pi_credential_reporting.rs`; this is the launch half. A live
+/// sentinel is placed on the launch's `PATH` (and referenced by absolute path,
+/// so a resolver that bypassed `PATH` would still be caught) and named from a
+/// `!command` in guest `auth.json`/`models.json`. The launch reaches the build
+/// seam and then fails on the bogus image, but the credential sentinel must
+/// never have appended its marker.
+#[test]
+fn every_launch_scan_resolves_nothing() {
+    let harness = Harness::new();
+    let state = probe_state_dir(&harness, "shell");
+
+    let sentinel_dir = harness.home_root.join("credential-sentinels");
+    std::fs::create_dir_all(&sentinel_dir).unwrap();
+    let marker = harness.home_root.join(".credential-sentinel-marker");
+    let sentinel = sentinel_dir.join("credential-sentinel");
+    write_executable(
+        &sentinel,
+        "#!/bin/sh\nprintf 'ran\\n' >> \"$CREDENTIAL_SENTINEL_MARKER\"\nexit 1\n",
+    );
+
+    // Prove the sentinel is live before relying on its silence: without this
+    // control, a non-executable or off-PATH sentinel would make the launch
+    // assertion vacuous.
+    let control = Command::new(&sentinel)
+        .env("CREDENTIAL_SENTINEL_MARKER", &marker)
+        .status()
+        .expect("sentinel should spawn");
+    assert!(!control.success(), "the sentinel must exit nonzero");
+    assert!(
+        marker.exists(),
+        "the live sentinel did not append its marker"
+    );
+    std::fs::remove_file(&marker).unwrap();
+
+    seed_pi(
+        &state,
+        &format!(
+            r#"{{"anthropic":{{"type":"api_key","key":"!{sentinel} --auth"}},
+                 "envprov":{{"type":"api_key","key":"","env":{{"TOKEN":"$SECRET"}}}}}}"#,
+            sentinel = sentinel.display(),
+        ),
+        Some(&format!(
+            r#"{{"providers":{{"demo":{{"apiKey":"!{sentinel} --models"}}}}}}"#,
+            sentinel = sentinel.display(),
+        )),
+    );
+
+    let mut cmd = harness.base_command();
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            sentinel_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    )
+    .env("CREDENTIAL_SENTINEL_MARKER", &marker)
+    .env("SECRET", "should-not-be-read")
+    .arg("shell")
+    .args(["--image", BOGUS_IMAGE]);
+    let out = run_with_timeout(cmd, Duration::from_secs(20));
+    let stderr = stderr_of(&out);
+
+    // The scan ran on the critical path and classified the guest files
+    // field-only: the `!command` is a non-placeholder `key`, and the signed-in
+    // `env` map warns. Reaching the build seam proves the hook was reached.
+    assert!(stderr.contains(PI_WARN_HEADER), "{stderr}");
+    assert!(
+        stderr.contains("auth.json: provider=anthropic type=api_key fields=key"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("auth.json: provider=envprov type=api_key fields=env"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("models.json: provider=demo type=configuration fields=apiKey"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+
+    // Nothing resolved the command or read the environment, and no command,
+    // path or env name reached either stream.
+    assert!(
+        !marker.exists(),
+        "the launch executed a guest credential command: {:?}",
+        std::fs::read_to_string(&marker)
+    );
+    let combined = format!("{}{}", stdout_of(&out), stderr);
+    assert!(
+        !combined.contains("credential-sentinel"),
+        "the sentinel path leaked:\n{combined}"
+    );
+    assert!(
+        !combined.contains("--auth"),
+        "a command leaked:\n{combined}"
+    );
+    assert!(
+        !combined.contains("SECRET"),
+        "an env name leaked:\n{combined}"
     );
 }

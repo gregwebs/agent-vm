@@ -48,6 +48,7 @@ use crate::config::{
     ConfigConflict, ConfigReport, TierReport, TierStatus, Tool, ToolLayer, ToolOrigin,
 };
 use crate::credential_provider::{CredentialProvider, ProviderSet};
+use crate::pi_credential_inspection::{PiCredentialReport, inspect_project};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -180,6 +181,9 @@ struct ProjectCreds {
     captured: Vec<&'static str>,
     /// Whether the guest still holds a Claude placeholder cred file.
     guest_claude_placeholder: bool,
+    /// The read-only structural report of guest-managed Pi state. It already
+    /// holds only sanitized data; rendering it is pure.
+    pi_credentials: PiCredentialReport,
 }
 
 /// Read every host credential source agent-vm knows about, plus the
@@ -295,6 +299,7 @@ fn gather_project_creds() -> Option<ProjectCreds> {
         state_dir: session.state_dir.display().to_string(),
         captured,
         guest_claude_placeholder: session.state_dir.join("claude/.credentials.json").exists(),
+        pi_credentials: inspect_project(&session.state_dir),
     })
 }
 
@@ -343,14 +348,19 @@ fn describe_credentials(report: &CredReport) -> String {
                     "absent"
                 },
             ));
+            out.push('\n');
+            out.push_str(&project.pi_credentials.doctor_section());
         }
     }
 
     out.push_str(
-        "\nThe guest never receives a real token: it gets a placeholder that the\n\
-         TLS proxy swaps for the host token on the way out. So sign in ON THE HOST\n\
-         (`claude login`, `codex login`, `gh auth login`) - running `/login` inside\n\
-         the VM cannot work and fails with an OAuth 400.",
+        "\nFor the host-captured Claude/Codex/GitHub credentials above, the guest never\n\
+         receives a real token: it gets a placeholder that the TLS proxy swaps for the\n\
+         host token on the way out. So sign in ON THE HOST (`claude login`,\n\
+         `codex login`, `gh auth login`): running `/login` inside the VM cannot work and fails with an OAuth 400.\n\
+         Pi guest-managed state is different: a credential created inside the guest\n\
+         lives in the project's persistent Pi home and is reported above, not\n\
+         substituted.",
     );
     out
 }
@@ -903,6 +913,7 @@ mod tests {
                 state_dir: "/s/abc".into(),
                 captured: vec!["claude"],
                 guest_claude_placeholder: true,
+                pi_credentials: PiCredentialReport::uninspected(),
             }),
             now_ms: 0,
         }

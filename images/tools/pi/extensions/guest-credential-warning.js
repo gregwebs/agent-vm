@@ -17,6 +17,12 @@
 // precedence or host import -- #94/#91 still owe those clauses to this message
 // and to script/test/pi-layer-runtime.sh's assertions, which will restore them
 // together with their behaviour.
+//
+// #93 added a *separate*, host-side surface: `agent-vm` reports EXISTING
+// guest-managed Pi state on every launch, and `agent-vm doctor` shows the same
+// facts. That report is complementary to this future-sign-in advisory, runs
+// whether or not Pi starts, and does not inherit this `hasUI` gate -- so the
+// two must not be merged into one message.
 
 const WARNING = [
   "agent-vm: signing in here (for example with /login) writes a credential into",
