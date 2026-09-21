@@ -30,7 +30,9 @@ fail() {
 
 # A container that writes nothing durable into the image and does not read the
 # host's Pi config. `-e HOME=/tmp` and PI_TELEMETRY=0 keep Pi from touching a
-# real config; the container's own filesystem is discarded anyway.
+# real config; the container's own filesystem is discarded anyway. This is the
+# harness's own environment, not the wrapper's behaviour: the wrapper forces no
+# telemetry default (see the env-stub cases below).
 run() {
     docker run --rm -e HOME=/tmp -e PI_TELEMETRY=0 "$@"
 }
@@ -133,45 +135,61 @@ capture "$layer" pi auth check --provider anthropic
 [[ $CAP_STATUS -eq 1 ]] || fail "pi auth check must exit 1 credential-free, got $CAP_STATUS"
 [[ "$CAP_OUT" = "not_ready" ]] || fail "pi auth check output was '$CAP_OUT'"
 
-# --- #96: the checkout's own .pi/ resources load because of the wrapper's
-# --- --approve default, and are dropped when the user opts out -------------
+# --- #96 parity: the wrapper forces no trust, so a project's own .pi/
+# --- resources follow Pi's own project-trust decision -- dropped while the
+# --- project is untrusted (the default: no stored answer, and rpc has no trust
+# --- prompt UI), loaded under an explicit --approve, and dropped under an
+# --- explicit --no-approve. A user's answer is remembered in the persistent
+# --- ~/.pi/agent/trust.json.
 marker_js="export default function(pi){pi.on('session_start',(_e,ctx)=>{if(ctx.hasUI)ctx.ui.notify('PROJECT-EXTENSION-LOADED','warning')})}"
 # shellcheck disable=SC2016  # $MARKER_JS must expand in the CONTAINER, not here
 project_setup='mkdir -p /tmp/pi-project/.pi/extensions && printf %s "$MARKER_JS" > /tmp/pi-project/.pi/extensions/marker.js && cd /tmp/pi-project'
 
+# No --approve: the wrapper injects no trust default, and Pi's trust store is
+# empty, so the checkout is untrusted and its .pi/extensions are dropped.
 capture -e "MARKER_JS=$marker_js" "$layer" sh -c "$project_setup && pi --mode rpc --no-session"
-[[ $CAP_STATUS -eq 0 ]] || fail "project-extension run exited $CAP_STATUS: $CAP_ERR"
-[[ "$CAP_OUT" == *PROJECT-EXTENSION-LOADED* ]] \
-    || fail "the project .pi/extensions were not trusted by default: $CAP_OUT"
+[[ $CAP_STATUS -eq 0 ]] || fail "untrusted-default run exited $CAP_STATUS: $CAP_ERR"
+[[ "$CAP_OUT" != *PROJECT-EXTENSION-LOADED* ]] \
+    || fail "the project .pi/extensions loaded while untrusted; the wrapper must force no trust: $CAP_OUT"
 
+# An explicit --approve is Pi's own flag, forwarded verbatim, and loads them.
+capture -e "MARKER_JS=$marker_js" "$layer" sh -c "$project_setup && pi --approve --mode rpc --no-session"
+[[ $CAP_STATUS -eq 0 ]] || fail "--approve run exited $CAP_STATUS: $CAP_ERR"
+[[ "$CAP_OUT" == *PROJECT-EXTENSION-LOADED* ]] \
+    || fail "an explicit --approve did not load the project .pi/extensions: $CAP_OUT"
+
+# An explicit --no-approve drops them.
 capture -e "MARKER_JS=$marker_js" "$layer" sh -c "$project_setup && pi --no-approve --mode rpc --no-session"
 [[ $CAP_STATUS -eq 0 ]] || fail "--no-approve run exited $CAP_STATUS: $CAP_ERR"
 [[ "$CAP_OUT" != *PROJECT-EXTENSION-LOADED* ]] \
-    || fail "--no-approve did not win over the wrapper's default: $CAP_OUT"
+    || fail "--no-approve did not drop the project .pi/extensions: $CAP_OUT"
 
-# --- #96: the wrapper's env decisions, observed inside the real image ------
-# A stub entry point that prints its environment. `pi` still runs the real
-# wrapper, so this observes exactly what the wrapper exports.
+# --- #96 parity: the wrapper forces no telemetry policy; the only env it
+# --- enforces is PI_SKIP_VERSION_CHECK. A stub entry point prints its
+# --- environment; `pi` still runs the real wrapper, so this observes exactly
+# --- what the wrapper exports.
 env_stub='printf "#!/bin/sh\nenv\n" > /tmp/entry && chmod 0755 /tmp/entry && AGENT_VM_PI_ENTRY=/tmp/entry pi'
 
 out="$(docker run --rm -e HOME=/tmp "$layer" sh -c "$env_stub")"
 grep -qx 'PI_SKIP_VERSION_CHECK=1' <<<"$out" \
     || fail "the wrapper did not enforce PI_SKIP_VERSION_CHECK=1"
-grep -qx 'PI_TELEMETRY=0' <<<"$out" \
-    || fail "the wrapper did not default PI_TELEMETRY=0"
+if grep -q '^PI_TELEMETRY=' <<<"$out"; then
+    fail "the wrapper set PI_TELEMETRY; Pi's telemetry policy is Pi's own"
+fi
 
 out="$(docker run --rm -e HOME=/tmp -e PI_TELEMETRY=1 "$layer" sh -c "$env_stub")"
 grep -qx 'PI_TELEMETRY=1' <<<"$out" \
-    || fail "an explicit PI_TELEMETRY did not survive the wrapper"
+    || fail "an explicit PI_TELEMETRY did not pass through the wrapper"
 grep -qx 'PI_SKIP_VERSION_CHECK=1' <<<"$out" \
     || fail "PI_SKIP_VERSION_CHECK must stay enforced even with PI_TELEMETRY set"
 
 # --- the seam ADR-0012 promises: a replaced install keeps the wrapper ---------
 # A later layer replaces the Pi installation and leaves the wrapper and the
 # mandatory extension alone. The wrapper (which that layer must not replace)
-# still routes the mandatory --extension to WHATEVER entry point is installed.
-# We assert that routing with a stub entry point that echoes its argv; the
-# warning frame itself is proven by the rpc cases above against the real Pi.
+# still routes the mandatory --extension to WHATEVER entry point is installed,
+# and injects NO trust flag of its own; an explicit approve flag is forwarded
+# verbatim. We assert that routing with a stub entry point that echoes its argv;
+# the warning frame itself is proven by the rpc cases above against the real Pi.
 replacement="${layer}-replacement"
 ctx="${TMP}/replacement"
 mkdir -p "$ctx"
@@ -193,8 +211,14 @@ capture "$replacement" pi --mode rpc
 [[ "$CAP_OUT" == *"--extension"* ]] || fail "the wrapper did not pass --extension to the replacement: $CAP_OUT"
 [[ "$CAP_OUT" == *"$MANDATORY"* ]] \
     || fail "the wrapper stopped routing the mandatory --extension after a replacement: $CAP_OUT"
+[[ "$CAP_OUT" != *"--approve"* ]] \
+    || fail "the wrapper injected a trust flag; it must forward none: $CAP_OUT"
+
+# An explicit --approve is Pi's own flag and is forwarded verbatim.
+capture "$replacement" pi --approve --mode rpc
+[[ $CAP_STATUS -eq 0 ]] || fail "replacement explicit --approve run exited $CAP_STATUS: $CAP_ERR"
 [[ "$CAP_OUT" == *"--approve"* ]] \
-    || fail "the wrapper stopped injecting the project-trust default: $CAP_OUT"
+    || fail "an explicit --approve was not forwarded to the replacement entry point: $CAP_OUT"
 
 # The mandatory extension lives outside /opt/agent-vm/pi, so replacing the
 # installation must not have removed it.

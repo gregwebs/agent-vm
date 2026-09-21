@@ -173,7 +173,7 @@ pub struct HomeLink {
 /// `credentials` (Pi enrols providers in-session), so there is no
 /// `ProviderSpec` to hang it off. Unconditional like the rest of this list,
 /// because a bare `pi` typed into `agent-vm shell` must persist too. Issue
-/// #96; see `docs/adr/0021-project-scoped-pi-home-and-trust-defaults.md`, and
+/// #96; see `docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md`, and
 /// [`crate::session::ProjectSession::migrate_legacy_pi_home`] for the one-shot
 /// upgrade from the pre-#96 real directory.
 pub const GENERIC_HOME_LINKS: &[HomeLink] = &[

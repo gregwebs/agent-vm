@@ -161,7 +161,7 @@ separate mounts:
   var because it has no install prefix under `~/.pi` to shadow — its binary
   lives under `/opt/agent-vm/pi`
   ([agent-vm #96](https://github.com/gregwebs/agent-vm/issues/96),
-  [ADR-0021](docs/adr/0021-project-scoped-pi-home-and-trust-defaults.md)).
+  [ADR-0021](docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md)).
 - Codex instead gets `CODEX_HOME=/agent-vm-state/codex`, because
   `<install-prefix>/.codex/packages/…` contains the codex binary itself and a
   symlink there would shadow it. That variable is declared by the `codex` (and
@@ -172,7 +172,7 @@ separate mounts:
 A state dir created before #96 may already hold a real `<state>/home/.pi`
 directory. The launcher moves it into `<state>/pi` once, before provisioning,
 in both guest modes, rather than refusing — see
-[ADR-0021](docs/adr/0021-project-scoped-pi-home-and-trust-defaults.md).
+[ADR-0021](docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md).
 
 This shape originally fell out of a hard virtio-IRQ ceiling (below). The
 ceiling is lifted and the shape stayed, because it is better on its own terms:
@@ -552,20 +552,21 @@ Three build-time subtleties are worth knowing:
   API-2 template still seeds; without that fallback the regression would be
   symptomless (an empty `claude plugin list`).
 - The `pi` layer installs Pi at `/opt/agent-vm/pi` but exposes it through an
-  agent-vm-owned wrapper at `/usr/local/bin/pi` that makes three decisions and
-  then execs: it enforces `PI_SKIP_VERSION_CHECK=1` and defaults
-  `PI_TELEMETRY=0` (honouring a non-empty guest value), it forwards a Pi
+  agent-vm-owned wrapper at `/usr/local/bin/pi` that makes two decisions plus
+  the mandatory extension: it enforces `PI_SKIP_VERSION_CHECK=1` (agent-vm owns
+  the binary, so Pi's update check is unactionable noise), and it forwards a Pi
   subcommand verbatim (`pi list`, never `pi -e … list`, which would turn `list`
-  into a prompt), and otherwise it passes
+  into a prompt); otherwise it passes
   `--extension /opt/agent-vm/pi-extensions/guest-credential-warning.js` (an
-  explicit path, so `--no-extensions` cannot silence it) plus a `--approve`
-  project-trust default that an explicit approve-family flag suppresses. The
-  warning is gated on Pi's own `ctx.hasUI` — `true` for `tui`/`rpc`, `false`
-  for `print`/`json` — so machine-readable output is byte-clean with no second
-  suppression mechanism. The installation and the extension directory are
-  replaceable; the wrapper is not — see
+  explicit path, so `--no-extensions` cannot silence it). Following the parity
+  principle it injects no other default — no `--approve` and no `PI_TELEMETRY`
+  — so `--approve`/`--no-approve` and telemetry are Pi's own and are forwarded
+  untouched. The warning is gated on Pi's own `ctx.hasUI` — `true` for
+  `tui`/`rpc`, `false` for `print`/`json` — so machine-readable output is
+  byte-clean with no second suppression mechanism. The installation and the
+  extension directory are replaceable; the wrapper is not — see
   [ADR-0012](docs/adr/0012-stable-pi-image-customization-seam.md) and
-  [ADR-0021](docs/adr/0021-project-scoped-pi-home-and-trust-defaults.md).
+  [ADR-0021](docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md).
 
 ### Distribution: OCI references, not bind or disk images
 

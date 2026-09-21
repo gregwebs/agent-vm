@@ -229,7 +229,7 @@ so nothing real is ever at a link path there. The compiled `.pi` link is a
 `~/.pi`, `ProjectSession::migrate_legacy_pi_home` runs one named, deletable
 one-shot move of a pre-#96 real `<state>/home/.pi` into `<state>/pi` before
 provisioning; `force_symlink`'s own contract is unchanged
-([ADR-0021](docs/adr/0021-project-scoped-pi-home-and-trust-defaults.md)).
+([ADR-0021](docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md)).
 
 ## Tool
 

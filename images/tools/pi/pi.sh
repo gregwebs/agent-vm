@@ -7,12 +7,19 @@
 # credential warning is loaded for every normal Pi invocation, including a bare
 # `pi` typed into `agent-vm shell`.
 #
-# It makes three decisions and then execs:
-#   1. the Pi env defaults (PI_SKIP_VERSION_CHECK, PI_TELEMETRY);
+# It makes two decisions and then execs:
+#   1. the Pi env enforcement (PI_SKIP_VERSION_CHECK);
 #   2. subcommand dispatch (forwarded verbatim);
-#   3. the mandatory extension plus the project-trust default.
-# This amends ADR-0012's "exactly one decision" framing; see
-# docs/adr/0021-project-scoped-pi-home-and-trust-defaults.md.
+# plus the mandatory extension below.
+#
+# agent-vm intervenes in Pi's behaviour only where agent-vm introduced the
+# condition (the parity principle; see ADR-0021). It deliberately injects NO
+# project-trust default and NO telemetry default: --approve / --no-approve /
+# --extension and PI_TELEMETRY are forwarded untouched, so a user gets Pi's own
+# policy. Pi's project-trust prompt appears on its own terms, and the answer a
+# user gives is remembered in the now-persistent ~/.pi/agent/trust.json. ADR-0012's
+# wrapper counted its one decision as the mandatory extension; counting the
+# extension the same way, this wrapper makes three.
 set -eu
 
 # agent-vm owns the Pi binary: it is a root-owned image layer, `pi update self`
@@ -21,14 +28,6 @@ set -eu
 # network call the guest did not ask for. Enforced, not defaulted: Pi treats any
 # non-empty value as "skip" (dist/utils/version-check.js).
 export PI_SKIP_VERSION_CHECK=1
-
-# Install telemetry is off unless the user asked otherwise. `:=` assigns only
-# when unset or empty, so an explicit PI_TELEMETRY already in the guest
-# environment (from a tool's config `env`, or from the guest shell) reaches Pi
-# untouched -- this is a default, not a policy. agent-vm does not forward the
-# HOST's PI_TELEMETRY into the guest; see USAGE.md for the supported override.
-: "${PI_TELEMETRY:=0}"
-export PI_TELEMETRY
 
 # Overridable only so the black-box test in script/test/pi-wrapper.sh can point
 # at a fake. It is not a protection: the warning is advisory (the microVM is the
@@ -56,38 +55,10 @@ fi
 # path, throw, or syntax error all exit 1 before session startup, verified in
 # every mode), so there is deliberately no existence check here to duplicate --
 # and diverge from -- that message.
-# Pi's project-trust prompt has no good answer inside agent-vm: the microVM is
-# the boundary, the checkout is the thing the guest was booted to work on, and a
-# non-interactive guest cannot answer at all (Pi returns "not trusted" and
-# silently drops the project's .pi/ extensions and skills). So the checkout's own
-# resources are trusted by default -- the same reasoning that gives claude
-# `--dangerously-skip-permissions`.
-#
-# NOT `args = ["--approve"]` in default-tools.toml: a prepended flag displaces
-# argv[1] and would turn `pi list` into a prompt (see the subcommand note above
-# and ADR-0012). The wrapper is also the only place that reaches a bare `pi`
-# typed into `agent-vm shell`.
-#
-# Pi's own parse is last-wins, so the user's explicit flag beats this default
-# whatever the scan does; the scan exists so the guest command line does not
-# carry a contradictory pair. `--` ends option parsing for Pi, so it ends the
-# scan too: after it, `--no-approve` is a message, not a flag.
-#
-# The scan deliberately does not model option VALUES (Pi has ~20 value-taking
-# options and nothing here could keep a copy of that list honest against the
-# pin). Two bounded consequences, both pinned by script/test/pi-wrapper.sh:
-# `pi --name -a` drops the default without setting an override (fails toward
-# LESS trust), and `pi --name -- --no-approve` still emits the pair (Pi's
-# last-wins then resolves it in the user's favour). See ADR-0021.
-approve=--approve
-for argument in "$@"; do
-    case "${argument}" in
-        --) break ;;
-        --approve|-a|--no-approve|-na) approve=""; break ;;
-    esac
-done
-
-if [ -n "${approve}" ]; then
-    exec "${PI_ENTRY}" --extension "${MANDATORY_EXTENSION}" "${approve}" "$@"
-fi
+# The extension is agent-vm-introduced: agent-vm persists guest credentials in
+# project-scoped state readable by any guest process, so agent-vm is the one
+# that must warn about it. Nothing else is injected: no --approve default (Pi's
+# project-trust prompt is Pi's own, and a user's answer now sticks because
+# ~/.pi/agent/trust.json is persistent), and no PI_TELEMETRY default (Pi's
+# telemetry policy is Pi's own).
 exec "${PI_ENTRY}" --extension "${MANDATORY_EXTENSION}" "$@"

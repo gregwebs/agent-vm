@@ -686,25 +686,24 @@ The other three agents never read `CODEX_HOME`. See
 packages under `~/.pi/agent`) is **project-scoped persistent state** at
 `/agent-vm-state/pi`, in both guest modes — a `/login` inside a throwaway VM
 survives a relaunch. The checkout's own `.pi/` resources are a separate path on
-a separate mount, and agent-vm trusts them by default: the wrapper injects
-`--approve` so your project's `.pi/extensions` and `.pi/skills` load without an
-interactive trust prompt (the microVM is the boundary). Pass `--no-approve` (or
-`-na`) to opt out; an explicit flag always wins. Note that agent-vm's own parser
+a separate mount. Agent-vm forces **no** project-trust policy: Pi's own trust
+prompt appears when it would under vanilla Pi, and the answer you give is
+remembered in the now-persistent `~/.pi/agent/trust.json`, so you decide once.
+An explicit `--approve`/`--no-approve` (or `-a`/`-na`) is honoured because it is
+simply Pi's own flag, forwarded untouched. Note that agent-vm's own parser
 consumes the **first** `--` on the outer command line, so deliver a literal `--`
 to Pi with a second one: `agent-vm pi -- -- …`. `pi <subcommand>` (`pi list`,
-`pi auth`, …) is forwarded **verbatim**, so it gets neither the warning nor the
-trust default, and subcommands stay subcommands. `pi` also ships with empty
-`args`, like `codex`/`opencode` — its default flag lives in the wrapper, not in
-a config `args` list, because a prepended flag would displace a subcommand.
+`pi auth`, …) is forwarded **verbatim**, so the wrapper injects no `--extension`
+there and subcommands stay subcommands. `pi` also ships with empty `args`,
+like `codex`/`opencode` — any default flag would belong in the wrapper, not in a
+config `args` list, because a prepended flag would displace a subcommand.
 
-**Env defaults.** The wrapper forces `PI_SKIP_VERSION_CHECK=1` (agent-vm owns
-the binary, so Pi's "newer version" fetch is pure noise) and defaults
-`PI_TELEMETRY=0`. The telemetry default is overridable **from inside the
-guest**: a tool's `env = { PI_TELEMETRY = "1" }` in your config, or
-`export PI_TELEMETRY=1` in `agent-vm shell` before running `pi`. agent-vm does
-**not** forward the host's `PI_TELEMETRY`, so `PI_TELEMETRY=1 agent-vm pi` has no
-effect — set it guest-side. An empty `PI_TELEMETRY` counts as unset and becomes
-`0`.
+**Env.** The wrapper forces `PI_SKIP_VERSION_CHECK=1`, because agent-vm owns the
+binary (a root-owned image layer) and Pi's "newer version" fetch can only ever be
+noise. It forces **no** telemetry policy: `PI_TELEMETRY` is left exactly as the
+**guest** environment sets it, and Pi's own default applies when it is unset.
+agent-vm does not forward the host's value, so the supported override is
+guest-side — a tool's config `env`, or an `export` inside `agent-vm shell`.
 
 **Upgrading (`pi` state).** The first launch after this release moves an
 existing pre-release `<state>/home/.pi` directory to `<state>/pi`

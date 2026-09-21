@@ -90,7 +90,7 @@ impl ProjectSession {
     /// every ancestor opened `O_NOFOLLOW`, so a guest that left `<state>/home`
     /// as a symlink to the host `$HOME` cannot make this move the host's real
     /// `~/.pi`; a redirected ancestor is a hard error. See
-    /// `docs/adr/0021-project-scoped-pi-home-and-trust-defaults.md`.
+    /// `docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md`.
     ///
     /// Root mode never wrote a host-side `~/.pi` (`/root` is rebaked per
     /// boot), but this runs in both modes on purpose: a user who upgrades and
