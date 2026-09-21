@@ -1779,6 +1779,90 @@ mod tests {
     }
 
     #[test]
+    fn canonical_and_legacy_locations_are_both_reported() {
+        // A real pre-#96 `home/.pi` directory can coexist with the canonical
+        // `pi/` tree (migration then refuses to merge them), so neither
+        // location may hide the other: the report must name both.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_at(
+            root,
+            "pi/agent/auth.json",
+            r#"{"canonicalprov":{"type":"api_key","key":"real"}}"#,
+        );
+        write_at(
+            root,
+            "home/.pi/agent/models.json",
+            r#"{"providers":{"legacyprov":{"apiKey":"real"}}}"#,
+        );
+        let report = inspect_project(root);
+        let warning = report.launch_warning().expect("must warn");
+        assert!(
+            warning.contains("auth.json: provider=canonicalprov type=api_key fields=key"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(
+                "legacy pre-#96 models.json: provider=legacyprov type=configuration fields=apiKey"
+            ),
+            "{warning}"
+        );
+        let doctor = report.doctor_section();
+        assert!(
+            doctor.contains("auth.json: provider=canonicalprov type=api_key fields=key"),
+            "{doctor}"
+        );
+        assert!(
+            doctor.contains(
+                "legacy pre-#96 models.json: provider=legacyprov type=configuration fields=apiKey"
+            ),
+            "{doctor}"
+        );
+        assert!(doctor.contains("has not been moved"), "{doctor}");
+    }
+
+    #[test]
+    fn an_unsafe_legacy_node_is_uninspectable_not_clean() {
+        // Only a **real directory** at `home/.pi` is legacy state. Any other
+        // final node (here a regular file) must fail closed as uninspectable,
+        // never as absent/clean.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::write(root.join("home/.pi"), b"not a directory").unwrap();
+        let report = inspect_project(root);
+        let warning = report.launch_warning().expect("must warn");
+        assert!(
+            warning.contains(
+                "legacy pre-#96 auth.json: potentially sensitive; structural inspection unavailable"
+            ),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(
+                "legacy pre-#96 models.json: potentially sensitive; structural inspection unavailable"
+            ),
+            "{warning}"
+        );
+
+        // An unsafe *ancestor* (a symlinked `home`) is the shape a guest can
+        // plant; the no-follow check must fail closed for the legacy location
+        // too, not silently skip it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("realhome/.pi/agent")).unwrap();
+        std::os::unix::fs::symlink(root.join("realhome"), root.join("home")).unwrap();
+        let report = inspect_project(root);
+        let warning = report.launch_warning().expect("must warn");
+        assert!(
+            warning.contains(
+                "legacy pre-#96 auth.json: potentially sensitive; structural inspection unavailable"
+            ),
+            "{warning}"
+        );
+    }
+
+    #[test]
     fn an_oversized_file_is_uninspectable_not_clean() {
         // The spec names "oversized" explicitly. A file past the read bound is
         // rejected by the reader before the scanner sees any bytes, so it must
