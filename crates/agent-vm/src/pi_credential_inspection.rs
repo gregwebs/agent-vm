@@ -42,17 +42,17 @@ verus! {
 /// The longest provider identifier this module will echo back. A longer or
 /// otherwise malformed identifier is rendered as `<unrecognized-provider>`
 /// rather than escaped and printed.
-pub const MAX_PROVIDER_ID_LEN: usize = 64;
+pub(crate) const MAX_PROVIDER_ID_LEN: usize = 64;
 
 /// How many findings a report retains before it collapses the rest into one
 /// fixed truncation notice. Named so the launch notice can never grow without
 /// bound on a hostile 8 MiB file.
-pub const MAX_RETAINED_FINDINGS: usize = 128;
+pub(crate) const MAX_RETAINED_FINDINGS: usize = 128;
 
 /// Bytes an accepted provider identifier may contain: ASCII lowercase
 /// letters, digits, `-`, `_` and `.`. Anything else — uppercase, whitespace,
 /// or a byte that could look like a secret — fails the whole-value check.
-pub open spec fn provider_id_byte_allowed(byte: u8) -> bool {
+pub(crate) open spec fn provider_id_byte_allowed(byte: u8) -> bool {
     (b'a' <= byte && byte <= b'z')
         || (b'0' <= byte && byte <= b'9')
         || byte == b'-' || byte == b'_' || byte == b'.'
@@ -61,7 +61,7 @@ pub open spec fn provider_id_byte_allowed(byte: u8) -> bool {
 /// The whole provider-identifier decision: accepted iff the byte sequence is
 /// non-empty, at most [`MAX_PROVIDER_ID_LEN`] bytes, and every byte is
 /// allowed.
-pub open spec fn provider_id_is_safe_spec(bytes: Seq<u8>) -> bool {
+pub(crate) open spec fn provider_id_is_safe_spec(bytes: Seq<u8>) -> bool {
     1 <= bytes.len() && bytes.len() <= MAX_PROVIDER_ID_LEN
         && forall|i: int| 0 <= i < bytes.len() ==> provider_id_byte_allowed(bytes[i])
 }
@@ -110,7 +110,7 @@ fn provider_id_is_safe_bytes(bytes: &[u8]) -> (ok: bool)
 
 /// The finding-budget predicate: one more finding may be appended iff the
 /// number already retained is strictly below [`MAX_RETAINED_FINDINGS`].
-pub open spec fn finding_budget_allows(retained: usize) -> bool {
+pub(crate) open spec fn finding_budget_allows(retained: usize) -> bool {
     retained < MAX_RETAINED_FINDINGS
 }
 
@@ -118,6 +118,25 @@ fn finding_budget_allows_impl(retained: usize) -> (ok: bool)
     ensures ok == finding_budget_allows(retained),
 {
     retained < MAX_RETAINED_FINDINGS
+}
+
+/// The most members any single JSON object may hold. Named so the *parse* of
+/// a guest-controlled document is bounded: past this many members the whole
+/// document is rejected as malformed before another member is read, so an
+/// 8 MiB file cannot grow the retained member list (or the duplicate check)
+/// without limit.
+pub(crate) const MAX_OBJECT_MEMBERS: usize = 4096;
+
+/// The per-object member-limit predicate: one more member may be parsed iff
+/// the number already seen is strictly below [`MAX_OBJECT_MEMBERS`].
+pub(crate) open spec fn object_member_budget_allows(retained: usize) -> bool {
+    retained < MAX_OBJECT_MEMBERS
+}
+
+fn object_member_budget_allows_impl(retained: usize) -> (ok: bool)
+    ensures ok == object_member_budget_allows(retained),
+{
+    retained < MAX_OBJECT_MEMBERS
 }
 
 } // verus!
@@ -178,6 +197,25 @@ pub(crate) struct PiCredentialReport {
 }
 
 impl PiCredentialReport {
+    /// A report that inspected nothing (every file absent, no findings).
+    /// Test-only: production always goes through [`inspect_project`], and this
+    /// exists so `doctor`'s pure-rendering tests can build a report without
+    /// reading the real filesystem.
+    #[cfg(test)]
+    pub(crate) fn uninspected() -> Self {
+        Self {
+            files: PiFile::ALL
+                .iter()
+                .map(|&file| PiFileState {
+                    location: Location::Canonical,
+                    file,
+                    status: PiFileStatus::Absent,
+                })
+                .collect(),
+            findings: Vec::new(),
+        }
+    }
+
     /// The stderr notice for a launch, or `None` when there is nothing to say
     /// (absent or clean files). A warning is advisory: it never denies the
     /// launch, and "no findings" is not a security guarantee.
@@ -716,11 +754,28 @@ impl<'de> Deserialize<'de> for Json {
             {
                 let mut entries: Vec<(String, Json)> = Vec::new();
                 while let Some(key) = map.next_key::<String>()? {
-                    if entries.iter().any(|(existing, _)| existing == &key) {
-                        return Err(de::Error::custom("duplicate object member"));
+                    // Bound the parse before reading another value: a
+                    // guest-controlled 8 MiB document must not make the member
+                    // list grow without bound. Past the cap the whole document
+                    // is malformed (a fixed potentially-sensitive line).
+                    if !object_member_budget_allows_impl(entries.len()) {
+                        return Err(de::Error::custom("too many object members"));
                     }
                     let value = map.next_value::<Json>()?;
                     entries.push((key, value));
+                }
+                // Duplicate detection through a set, not a scan: this keeps
+                // the check O(n log n) in the member count. The prior linear
+                // scan inside the loop was O(n^2) and let a hostile ~1.4M
+                // member file take ~40 minutes on the every-launch path (the
+                // blocker in the #93 review).
+                {
+                    let mut seen: BTreeSet<&str> = BTreeSet::new();
+                    for (key, _) in &entries {
+                        if !seen.insert(key.as_str()) {
+                            return Err(de::Error::custom("duplicate object member"));
+                        }
+                    }
                 }
                 Ok(Json::Object(entries))
             }
@@ -730,8 +785,16 @@ impl<'de> Deserialize<'de> for Json {
     }
 }
 
-fn parse_document(bytes: &[u8]) -> Result<Json, ()> {
-    serde_json::from_slice::<Json>(bytes).map_err(|_| ())
+fn parse_document(bytes: &[u8]) -> Option<Json> {
+    // `None` means "the whole document was not one well-formed JSON value".
+    // The serde error itself is deliberately discarded: it can carry a
+    // fragment of the raw guest input, which must never reach a report.
+    //
+    // Recursion depth is not a separate hole: `serde_json`'s default
+    // 128-level limit rejects deeply nested input before this visitor
+    // recurses, so the parse cannot blow the stack. The member bound in
+    // `visit_map` is the resource limit this module adds itself.
+    serde_json::from_slice::<Json>(bytes).ok()
 }
 
 fn member<'a>(members: &'a [(String, Json)], name: &str) -> Option<&'a Json> {
@@ -768,40 +831,63 @@ fn credential_field(name: &str) -> Option<Field> {
     }
 }
 
+/// The state one models walk carries: the closed field labels it has seen and
+/// whether it met an unrecognized shape or unknown member. Both travel
+/// together through every level of the walk, so they are one value rather than
+/// two `&mut` out-params at each call.
+#[derive(Default)]
+struct FieldAccumulator {
+    fields: BTreeSet<Field>,
+    unrecognized: bool,
+}
+
+impl FieldAccumulator {
+    /// Record a credential-bearing field.
+    fn flag(&mut self, field: Field) {
+        self.fields.insert(field);
+    }
+
+    /// Record an unrecognized shape or unknown member: report the field *and*
+    /// mark the whole entry unrecognized.
+    fn flag_unrecognized(&mut self, field: Field) {
+        self.fields.insert(field);
+        self.unrecognized = true;
+    }
+}
+
 /// Conservative credential-name walk for non-secret nested config containers
 /// (`samplingParams`, `cost`, `compat`, arbitrary extension objects). Ordinary
 /// parameter names and values stay quiet and are never printed; a
 /// credential-looking member with a non-placeholder value warns.
-fn walk_credential_names(value: &Json, fields: &mut BTreeSet<Field>, unrecognized: &mut bool) {
+fn walk_credential_names(value: &Json, acc: &mut FieldAccumulator) {
     match value {
         Json::Object(entries) => {
             for (name, child) in entries {
                 if let Some(field) = credential_field(name) {
                     if !string_is_placeholder(child) {
-                        fields.insert(field);
+                        acc.flag(field);
                     }
                 } else if name.eq_ignore_ascii_case("headers") {
-                    scan_headers(child, fields, unrecognized);
+                    scan_headers(child, acc);
                 } else {
-                    walk_credential_names(child, fields, unrecognized);
+                    walk_credential_names(child, acc);
                 }
             }
         }
         Json::Array(items) => {
             for item in items {
-                walk_credential_names(item, fields, unrecognized);
+                walk_credential_names(item, acc);
             }
         }
         _ => {}
     }
 }
 
-fn scan_headers(value: &Json, fields: &mut BTreeSet<Field>, unrecognized: &mut bool) {
+fn scan_headers(value: &Json, acc: &mut FieldAccumulator) {
     let Some(entries) = value.as_object() else {
         // A non-object header container has a shape Pi never writes, so it is
         // treated conservatively as unrecognized rather than as an empty map.
-        *unrecognized = true;
-        fields.insert(Field::Other);
+        acc.flag_unrecognized(Field::Other);
         return;
     };
     for (name, header) in entries {
@@ -813,7 +899,7 @@ fn scan_headers(value: &Json, fields: &mut BTreeSet<Field>, unrecognized: &mut b
         match header {
             Json::String(text) if is_known_placeholder(text) || is_bearer_placeholder(text) => {}
             _ => {
-                fields.insert(field);
+                acc.flag(field);
             }
         }
     }
@@ -824,9 +910,9 @@ fn scan_headers(value: &Json, fields: &mut BTreeSet<Field>, unrecognized: &mut b
 
 fn inspect_auth(bytes: &[u8], location: Location, sink: &mut FindingSink) {
     let json = match parse_document(bytes) {
-        Ok(json) => json,
-        Err(()) => {
-            sink.push(finding(
+        Some(json) => json,
+        None => {
+            sink.push(Finding::new(
                 location,
                 PiFile::Auth,
                 SafeProviderId::Unknown,
@@ -838,7 +924,7 @@ fn inspect_auth(bytes: &[u8], location: Location, sink: &mut FindingSink) {
         }
     };
     let Some(entries) = json.as_object() else {
-        sink.push(finding(
+        sink.push(Finding::new(
             location,
             PiFile::Auth,
             SafeProviderId::Unknown,
@@ -858,7 +944,7 @@ fn inspect_auth(bytes: &[u8], location: Location, sink: &mut FindingSink) {
 fn classify_auth_entry(location: Location, name: &str, entry: &Json) -> Option<Finding> {
     let provider = SafeProviderId::new(name);
     let Some(members) = entry.as_object() else {
-        return Some(finding(
+        return Some(Finding::new(
             location,
             PiFile::Auth,
             provider,
@@ -957,7 +1043,7 @@ fn classify_auth_entry(location: Location, name: &str, entry: &Json) -> Option<F
     } else {
         FindingReason::GuestManaged
     };
-    Some(finding(
+    Some(Finding::new(
         location,
         PiFile::Auth,
         provider,
@@ -972,8 +1058,8 @@ fn classify_auth_entry(location: Location, name: &str, entry: &Json) -> Option<F
 
 fn inspect_models(bytes: &[u8], location: Location, sink: &mut FindingSink) {
     let json = match parse_document(bytes) {
-        Ok(json) => json,
-        Err(()) => {
+        Some(json) => json,
+        None => {
             sink.push(configuration_finding(
                 location,
                 SafeProviderId::Unknown,
@@ -1055,74 +1141,61 @@ fn inspect_provider(
         ));
         return;
     };
-    let mut fields: BTreeSet<Field> = BTreeSet::new();
-    let mut unrecognized = false;
+    let mut acc = FieldAccumulator::default();
     for (key, child) in members {
         match key.as_str() {
             // Ordinary, non-credential provider fields from the pinned schema.
             "name" | "api" | "authHeader" => {}
             "baseUrl" => {
                 if base_url_warns(child) {
-                    fields.insert(Field::BaseUrl);
+                    acc.flag(Field::BaseUrl);
                 }
             }
             "apiKey" => {
                 if !string_is_placeholder(child) {
-                    fields.insert(Field::ApiKey);
+                    acc.flag(Field::ApiKey);
                 }
             }
             // `oauth` here is a selector, not a stored token; the only quiet
             // value is the exact literal `radius`.
             "oauth" => {
                 if child.as_str() != Some("radius") {
-                    fields.insert(Field::Other);
-                    unrecognized = true;
+                    acc.flag_unrecognized(Field::Other);
                 }
             }
-            "headers" => scan_headers(child, &mut fields, &mut unrecognized),
-            "models" => inspect_models_array(child, &mut fields, &mut unrecognized),
-            "modelOverrides" => inspect_model_overrides(child, &mut fields, &mut unrecognized),
-            "compat" => walk_credential_names(child, &mut fields, &mut unrecognized),
-            _ => {
-                fields.insert(Field::Other);
-                unrecognized = true;
-            }
+            "headers" => scan_headers(child, &mut acc),
+            "models" => inspect_models_array(child, &mut acc),
+            "modelOverrides" => inspect_model_overrides(child, &mut acc),
+            "compat" => walk_credential_names(child, &mut acc),
+            _ => acc.flag_unrecognized(Field::Other),
         }
     }
-    push_if_findings(location, provider, fields, unrecognized, sink);
+    push_if_findings(location, provider, acc, sink);
 }
 
-fn inspect_models_array(value: &Json, fields: &mut BTreeSet<Field>, unrecognized: &mut bool) {
+fn inspect_models_array(value: &Json, acc: &mut FieldAccumulator) {
     let Some(items) = as_array(value) else {
-        *unrecognized = true;
-        fields.insert(Field::Other);
+        acc.flag_unrecognized(Field::Other);
         return;
     };
     for item in items {
-        inspect_model_object(item, true, fields, unrecognized);
+        inspect_model_object(item, true, acc);
     }
 }
 
-fn inspect_model_overrides(value: &Json, fields: &mut BTreeSet<Field>, unrecognized: &mut bool) {
+fn inspect_model_overrides(value: &Json, acc: &mut FieldAccumulator) {
     let Some(entries) = value.as_object() else {
-        *unrecognized = true;
-        fields.insert(Field::Other);
+        acc.flag_unrecognized(Field::Other);
         return;
     };
     for (_, item) in entries {
-        inspect_model_object(item, false, fields, unrecognized);
+        inspect_model_object(item, false, acc);
     }
 }
 
-fn inspect_model_object(
-    value: &Json,
-    is_model: bool,
-    fields: &mut BTreeSet<Field>,
-    unrecognized: &mut bool,
-) {
+fn inspect_model_object(value: &Json, is_model: bool, acc: &mut FieldAccumulator) {
     let Some(members) = value.as_object() else {
-        *unrecognized = true;
-        fields.insert(Field::Other);
+        acc.flag_unrecognized(Field::Other);
         return;
     };
     for (key, child) in members {
@@ -1141,25 +1214,21 @@ fn inspect_model_object(
             continue;
         }
         match key.as_str() {
-            "headers" => scan_headers(child, fields, unrecognized),
-            "samplingParams" => walk_credential_names(child, fields, unrecognized),
+            "headers" => scan_headers(child, acc),
+            "samplingParams" => walk_credential_names(child, acc),
             "baseUrl" => {
                 if is_model {
                     if base_url_warns(child) {
-                        fields.insert(Field::BaseUrl);
+                        acc.flag(Field::BaseUrl);
                     }
                 } else {
-                    fields.insert(Field::Other);
-                    *unrecognized = true;
+                    acc.flag_unrecognized(Field::Other);
                 }
             }
             "compat" | "cost" | "promptCache" | "thinkingLevelMap" => {
-                walk_credential_names(child, fields, unrecognized)
+                walk_credential_names(child, acc)
             }
-            _ => {
-                fields.insert(Field::Other);
-                *unrecognized = true;
-            }
+            _ => acc.flag_unrecognized(Field::Other),
         }
     }
 }
@@ -1193,19 +1262,20 @@ fn base_url_warns(value: &Json) -> bool {
 fn push_if_findings(
     location: Location,
     provider: SafeProviderId,
-    fields: BTreeSet<Field>,
-    unrecognized: bool,
+    acc: FieldAccumulator,
     sink: &mut FindingSink,
 ) {
-    if fields.is_empty() {
+    if acc.fields.is_empty() {
         return;
     }
-    let reason = if unrecognized {
+    let reason = if acc.unrecognized {
         FindingReason::Unrecognized
     } else {
         FindingReason::GuestManaged
     };
-    sink.push(configuration_finding(location, provider, fields, reason));
+    sink.push(configuration_finding(
+        location, provider, acc.fields, reason,
+    ));
 }
 
 fn configuration_finding(
@@ -1214,7 +1284,7 @@ fn configuration_finding(
     fields: BTreeSet<Field>,
     reason: FindingReason,
 ) -> Finding {
-    finding(
+    Finding::new(
         location,
         PiFile::Models,
         provider,
@@ -1222,17 +1292,6 @@ fn configuration_finding(
         fields,
         reason,
     )
-}
-
-fn finding(
-    location: Location,
-    file: PiFile,
-    provider: SafeProviderId,
-    kind: CredentialKind,
-    fields: BTreeSet<Field>,
-    reason: FindingReason,
-) -> Finding {
-    Finding::new(location, file, provider, kind, fields, reason)
 }
 
 #[cfg(test)]
@@ -1541,6 +1600,65 @@ mod tests {
     }
 
     #[test]
+    fn an_object_past_the_member_limit_is_rejected_as_malformed() {
+        // S-1 regression. A hostile member count must be rejected by the parse
+        // bound, so the duplicate check and the retained member list stay
+        // bounded on the every-launch path. This test fails if
+        // `MAX_OBJECT_MEMBERS` is removed: the over-limit object would then be
+        // fully parsed and produce many truncated findings instead of one
+        // malformed one.
+        let mut oversized = String::from("{");
+        for index in 0..=MAX_OBJECT_MEMBERS {
+            if index > 0 {
+                oversized.push(',');
+            }
+            oversized.push_str(&format!(r#""p{index}":{{"type":"api_key","key":"real"}}"#));
+        }
+        oversized.push('}');
+        let findings = auth_findings(&oversized);
+        assert_eq!(
+            findings.len(),
+            1,
+            "an over-limit object is one file-wide malformed finding"
+        );
+        assert_eq!(findings[0].reason, FindingReason::Malformed);
+
+        // An object exactly at the limit is still scanned, not rejected.
+        let mut at_limit = String::from("{");
+        for index in 0..MAX_OBJECT_MEMBERS {
+            if index > 0 {
+                at_limit.push(',');
+            }
+            at_limit.push_str(&format!(r#""p{index}":{{"type":"api_key","key":"real"}}"#));
+        }
+        at_limit.push('}');
+        let findings = auth_findings(&at_limit);
+        assert!(
+            findings.len() > 1,
+            "an object at the member limit must still be scanned"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.reason != FindingReason::Malformed),
+            "the at-limit object must not be rejected as malformed"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_input_is_rejected_without_a_stack_overflow() {
+        // The member bound does not have to double as a depth bound:
+        // `serde_json`'s default 128-level recursion limit rejects this before
+        // the visitor recurses, so the result is the fixed malformed line.
+        let depth = 200;
+        let nested = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let body = format!(r#"{{"p":{{"type":"api_key","key":{nested}}}}}"#);
+        let findings = auth_findings(&body);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].reason, FindingReason::Malformed);
+    }
+
+    #[test]
     fn duplicate_findings_are_deduplicated() {
         // The same provider appearing twice is already rejected as a duplicate
         // key; a duplicate *finding* would come from the same entry being
@@ -1657,6 +1775,33 @@ mod tests {
             report.launch_warning().is_none(),
             "a final symlink must not be followed: {:?}",
             report.launch_warning()
+        );
+    }
+
+    #[test]
+    fn an_oversized_file_is_uninspectable_not_clean() {
+        // The spec names "oversized" explicitly. A file past the read bound is
+        // rejected by the reader before the scanner sees any bytes, so it must
+        // render the fixed uninspectable finding rather than a clean report.
+        // A sparse file pins the size check without writing 8 MiB of bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("pi/agent/auth.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(crate::host_paths::MAX_GUEST_STATE_FILE_BYTES + 1)
+            .unwrap();
+        drop(file);
+        let report = inspect_project(root);
+        let warning = report.launch_warning().expect("oversized must warn");
+        assert!(
+            warning.contains("auth.json: potentially sensitive; structural inspection unavailable"),
+            "{warning}"
+        );
+        assert!(
+            report.doctor_section().contains("models.json: not present"),
+            "{}",
+            report.doctor_section()
         );
     }
 

@@ -179,7 +179,7 @@ verus! {
 /// therefore is not treated as a placeholder. Byte-level because that is the
 /// pure decision; the `&str` → bytes measurement is the trusted adapter
 /// ([`is_known_placeholder`]).
-pub fn exact_bytes_equal(a: &[u8], b: &[u8]) -> (result: bool)
+pub(crate) fn exact_bytes_equal(a: &[u8], b: &[u8]) -> (result: bool)
     ensures result == (a@ =~= b@),
 {
     let alen = a.len();

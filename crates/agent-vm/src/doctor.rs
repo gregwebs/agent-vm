@@ -913,7 +913,7 @@ mod tests {
                 state_dir: "/s/abc".into(),
                 captured: vec!["claude"],
                 guest_claude_placeholder: true,
-                pi_credentials: inspect_project(Path::new("/s/abc")),
+                pi_credentials: PiCredentialReport::uninspected(),
             }),
             now_ms: 0,
         }

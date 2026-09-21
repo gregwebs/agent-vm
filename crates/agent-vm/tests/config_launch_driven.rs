@@ -114,6 +114,17 @@ fn write_fake_msb(dir: &Path) -> PathBuf {
     path
 }
 
+/// Write an executable script. Used for the credential sentinel (S-2): if it
+/// runs, it appends to its marker file, so an empty marker after a launch is
+/// proof that nothing resolved the `!command` values in guest Pi state.
+fn write_executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).unwrap();
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("failed to spawn agent-vm");
@@ -2533,4 +2544,109 @@ fn legacy_pi_home_is_migrated_before_the_scan() {
         "migration left the legacy dir"
     );
     assert!(state.join("pi/agent/auth.json").exists());
+}
+
+/// S-2: the acceptance criterion names *both* surfaces — "sentinel resolvers
+/// to prove doctor **and warning scans** execute nothing". The doctor half
+/// lives in `pi_credential_reporting.rs`; this is the launch half. A live
+/// sentinel is placed on the launch's `PATH` (and referenced by absolute path,
+/// so a resolver that bypassed `PATH` would still be caught) and named from a
+/// `!command` in guest `auth.json`/`models.json`. The launch reaches the build
+/// seam and then fails on the bogus image, but the credential sentinel must
+/// never have appended its marker.
+#[test]
+fn every_launch_scan_resolves_nothing() {
+    let harness = Harness::new();
+    let state = probe_state_dir(&harness, "shell");
+
+    let sentinel_dir = harness.home_root.join("credential-sentinels");
+    std::fs::create_dir_all(&sentinel_dir).unwrap();
+    let marker = harness.home_root.join(".credential-sentinel-marker");
+    let sentinel = sentinel_dir.join("credential-sentinel");
+    write_executable(
+        &sentinel,
+        "#!/bin/sh\nprintf 'ran\\n' >> \"$CREDENTIAL_SENTINEL_MARKER\"\nexit 1\n",
+    );
+
+    // Prove the sentinel is live before relying on its silence: without this
+    // control, a non-executable or off-PATH sentinel would make the launch
+    // assertion vacuous.
+    let control = Command::new(&sentinel)
+        .env("CREDENTIAL_SENTINEL_MARKER", &marker)
+        .status()
+        .expect("sentinel should spawn");
+    assert!(!control.success(), "the sentinel must exit nonzero");
+    assert!(
+        marker.exists(),
+        "the live sentinel did not append its marker"
+    );
+    std::fs::remove_file(&marker).unwrap();
+
+    seed_pi(
+        &state,
+        &format!(
+            r#"{{"anthropic":{{"type":"api_key","key":"!{sentinel} --auth"}},
+                 "envprov":{{"type":"api_key","key":"","env":{{"TOKEN":"$SECRET"}}}}}}"#,
+            sentinel = sentinel.display(),
+        ),
+        Some(&format!(
+            r#"{{"providers":{{"demo":{{"apiKey":"!{sentinel} --models"}}}}}}"#,
+            sentinel = sentinel.display(),
+        )),
+    );
+
+    let mut cmd = harness.base_command();
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            sentinel_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    )
+    .env("CREDENTIAL_SENTINEL_MARKER", &marker)
+    .env("SECRET", "should-not-be-read")
+    .arg("shell")
+    .args(["--image", BOGUS_IMAGE]);
+    let out = run_with_timeout(cmd, Duration::from_secs(20));
+    let stderr = stderr_of(&out);
+
+    // The scan ran on the critical path and classified the guest files
+    // field-only: the `!command` is a non-placeholder `key`, and the signed-in
+    // `env` map warns. Reaching the build seam proves the hook was reached.
+    assert!(stderr.contains(PI_WARN_HEADER), "{stderr}");
+    assert!(
+        stderr.contains("auth.json: provider=anthropic type=api_key fields=key"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("auth.json: provider=envprov type=api_key fields=env"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("models.json: provider=demo type=configuration fields=apiKey"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+
+    // Nothing resolved the command or read the environment, and no command,
+    // path or env name reached either stream.
+    assert!(
+        !marker.exists(),
+        "the launch executed a guest credential command: {:?}",
+        std::fs::read_to_string(&marker)
+    );
+    let combined = format!("{}{}", stdout_of(&out), stderr);
+    assert!(
+        !combined.contains("credential-sentinel"),
+        "the sentinel path leaked:\n{combined}"
+    );
+    assert!(
+        !combined.contains("--auth"),
+        "a command leaked:\n{combined}"
+    );
+    assert!(
+        !combined.contains("SECRET"),
+        "an env name leaked:\n{combined}"
+    );
 }

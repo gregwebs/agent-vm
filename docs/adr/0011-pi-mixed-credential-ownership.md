@@ -39,14 +39,17 @@ overwrite or delete guest state.
 
 **Read-only, and observational `doctor`.** The acceptance criterion "file bytes
 and metadata unchanged" is satisfied **as amended** (the amendment is published
-on #93 and in `docs/…`): the scan performs no explicit mutation and preserves
-bytes, size, inode, mode, uid, gid, link count, mtime and ctime; kernel-managed
-**access-time** effects are excluded, because an ordinary read updates atime on
-the supported hosts and restoring timestamps afterwards would itself mutate
-metadata (moving ctime) and race concurrent writers. Where atime preservation is
-asserted, the test runs on a noatime filesystem; atime is reported separately.
-This metadata class already exists on every current launch (`secrets.rs` reads
-the same state through `GuestStateDir::read`). Linux `O_NOATIME` could suppress
+as a comment on
+[#93](https://github.com/gregwebs/agent-vm/issues/93)): the scan performs no
+explicit mutation and preserves bytes, size, inode, mode, uid, gid, link count,
+mtime and ctime; kernel-managed **access-time** effects are excluded, because an
+ordinary read updates atime on the supported hosts and restoring timestamps
+afterwards would itself mutate metadata (moving ctime) and race concurrent
+writers. This branch asserts **no** atime preservation — the scan tests compare
+mtime and ctime only, on whatever filesystem the host provides — and therefore
+reports **no** atime. This metadata class already exists on every current launch
+(`secrets.rs` reads the same state through `GuestStateDir::read`). Linux
+`O_NOATIME` could suppress
 access-time effects for owned files but does not exist on Darwin, so adopting it
 would add a platform-specific acquisition path to a portable advisory without
 closing the criterion — the trade-off is recorded here rather than presented as
