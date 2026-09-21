@@ -10,18 +10,18 @@
 // that wants to can invoke the Pi entry point directly. See issue #94 for the
 // mixed-ownership rationale the text summarises.
 //
-// The text is scoped to what issue #95 actually delivers: signing in writes a
-// credential any process in this guest can read, and the microVM is the
-// boundary. It deliberately does NOT claim persistence, host-credential
-// precedence, or host import -- none of those behaviours exist yet. #96 lands
-// the ~/.pi persistence mapping (and the root-mode case), #94/#91 land
-// host-Pi reconciliation; each of those tickets restores the matching clause
-// to this message and to script/test/pi-layer-runtime.sh's assertions.
+// The text is scoped to what #95 and #96 deliver: signing in writes a
+// credential into THIS project's persistent guest state (the project-scoped
+// <state>/pi mapping from #96), any process in this guest can read it, and the
+// microVM is the boundary. It deliberately does NOT claim host-credential
+// precedence or host import -- #94/#91 still owe those clauses to this message
+// and to script/test/pi-layer-runtime.sh's assertions, which will restore them
+// together with their behaviour.
 
 const WARNING = [
-  "agent-vm: signing in here (for example with /login) writes a credential that",
-  "any process in this guest can read. The microVM -- not this warning -- is the",
-  "boundary.",
+  "agent-vm: signing in here (for example with /login) writes a credential into",
+  "THIS project's persistent guest state, where any process in this guest can",
+  "read it. The microVM -- not this warning -- is the boundary.",
 ].join(" ");
 
 export default function (pi) {

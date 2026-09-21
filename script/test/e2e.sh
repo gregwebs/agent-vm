@@ -6,7 +6,9 @@
 # It boots real microVMs through the agent-vm CLI and asserts the behaviours
 # CI cannot observe: the tool-free base, the fast path (a default launch boots
 # the published template with **zero** `docker` invocations), per-tool-layer
-# composition, the project-layer chain, and the legacy API-1/2 seed fallback.
+# composition, the project-layer chain, the legacy API-1/2 seed fallback, and
+# (#96) `~/.pi` resolving to project state and surviving an independent boot in
+# both guest modes.
 # See CONTRIBUTING.md#end-to-end-vm-boot-tests-optional for the background and the
 # per-check acceptance criteria.
 #
@@ -333,6 +335,47 @@ EOF
   assert_match "pi list is a subcommand, not a prompt" "^list=No packages installed\.$" "$out"
 }
 
+# E1c / #96: ~/.pi resolves to /agent-vm-state/pi, the target is a real
+# directory Pi's `mkdir -p ~/.pi/agent` can write into, Pi's own global-package
+# path under it is writable, and the bytes survive an INDEPENDENT boot. Run for
+# both guest modes: they provision the link through completely different code
+# paths (rootfs .patch() vs host-side provision_guest_home). Separate project
+# dirs per mode, so root-owned files from the root boot cannot poison the
+# non-root one.
+pi_home_persists() {
+  local mode="$1"
+  local -a root_flag=()
+  [[ "$mode" == root ]] && root_flag=(--root)
+  local proj="$WORK/pi-home-$mode-$RUN_ID"
+  mkdir -p "$proj/.agent-vm"
+  cat >"$proj/.agent-vm/config.toml" <<'EOF'
+[[tools]]
+name = "pi"
+command = "pi"
+layer = { builtin = "pi" }
+EOF
+
+  local first second
+  # ${arr[@]+"${arr[@]}"} is the empty-array-safe expansion (macOS bash 3.2).
+  first="$(cd "$proj" && avm shell --yes ${root_flag[@]+"${root_flag[@]}"} \
+    --base-image "$BASE_IMAGE" -- bash -c '
+      printf "link=%s\n" "$(readlink "$HOME/.pi")"
+      printf "isdir=%s\n" "$([ -d "$HOME/.pi" ] && echo yes)"
+      mkdir -p "$HOME/.pi/agent/npm/node_modules" \
+        && printf "sentinel-96" > "$HOME/.pi/agent/npm/node_modules/e2e-marker"
+      printf "wrote=%s\n" "$?"
+    ' 2>&1)" || { echo "$first" | tail -20; return 1; }
+  assert_match "$mode: ~/.pi points at the state dir" "^link=/agent-vm-state/pi$" "$first" || return 1
+  assert_match "$mode: ~/.pi resolves to a real directory" "^isdir=yes$" "$first" || return 1
+  assert_match "$mode: Pi's global-package dir is writable" "^wrote=0$" "$first" || return 1
+
+  second="$(cd "$proj" && avm shell --yes ${root_flag[@]+"${root_flag[@]}"} \
+    --base-image "$BASE_IMAGE" -- bash -c '
+      printf "survived=%s\n" "$(cat "$HOME/.pi/agent/npm/node_modules/e2e-marker" 2>&1)"
+    ' 2>&1)" || { echo "$second" | tail -20; return 1; }
+  assert_match "$mode: state survives an independent boot" "^survived=sentinel-96$" "$second"
+}
+
 # E4: a project layer chains on the template in one step, not five.
 check_project_layer_chains_on_template() {
   local proj="$WORK/layer-$RUN_ID"
@@ -449,6 +492,8 @@ run_check "template-has-all-tools" check_template_has_all_tools
 run_check "fast-path-zero-docker" check_fast_path_zero_docker
 run_check "tools-claude-composes" check_tools_claude_composes
 run_check "tools-pi-composes" check_tools_pi_composes
+run_check "pi-home-persists-nonroot" pi_home_persists non-root
+run_check "pi-home-persists-root" pi_home_persists root
 run_check "project-layer-chains-on-template" check_project_layer_chains_on_template
 run_optional "old-launcher-rejects-api3" AGENT_VM_E2E_OLD_LAUNCHER check_old_launcher_rejects
 run_optional "legacy-seed-fallback" AGENT_VM_E2E_LEGACY_IMAGE check_legacy_seed

@@ -195,7 +195,7 @@ stays readable.
 - **Refresh single-flight** — `RefreshLock` (`oauth_refresh.rs:803-836`) takes
   an exclusive `flock` per provider before any host CLI runs, with a 30 s
   attempt-damping stamp so a late waiter skips its own CLI, and a
-  launcher-side `ProjectRefreshLock` (`secrets.rs:1612`).
+  launcher-side `ProjectLock` (`secrets.rs:1695`).
 
 ### Won't do (confirmed non-goals)
 

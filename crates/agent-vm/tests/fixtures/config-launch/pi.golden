@@ -140,6 +140,7 @@ link:.config/opencode	/agent-vm-state/opencode-config
 link:.copilot	/agent-vm-state/copilot
 link:.gitconfig	/agent-vm-state/gitconfig
 link:.local/share/opencode	/agent-vm-state/opencode
+link:.pi	/agent-vm-state/pi
 opencode-config/opencode.json	absent:entity not found
 secrets/anthropic	absent:entity not found
 secrets/copilot	absent:entity not found

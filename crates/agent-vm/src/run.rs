@@ -1108,6 +1108,13 @@ pub(crate) async fn launch(
     // See src/msb_preflight.rs and issue #30.
     crate::msb_preflight::ensure_db_not_ahead().await?;
     crate::msb_install::ensure_socket_paths_fit(&session.sandbox_name)?;
+    // Pre-#96 projects hold a real `<state>/home/.pi` directory that the new
+    // compiled link would refuse to replace. Runs before ensure_dirs so the
+    // rename lands on a free name, and in BOTH guest modes. It is
+    // descriptor-anchored (every ancestor opened no-follow) and fails closed on
+    // a redirected ancestor, so a guest-planted `<state>/home` symlink cannot
+    // make it move the host's real `~/.pi`. See #96 and ADR-0021.
+    session.migrate_legacy_pi_home()?;
     session.ensure_dirs(&home_links)?;
     if !root_mode {
         session
@@ -2731,6 +2738,30 @@ mod tests {
         assert_eq!(
             inner_argv(tool(&catalog, "shell"), vec![]),
             args(&["-O", "histappend"]),
+        );
+    }
+
+    /// V7 (#96): `pi` declares neither default `args` nor `credentials`, so a
+    /// user subcommand stays at argv[1] and the launch cannot hard-bail on a
+    /// missing credential. Adding `args = ["--approve"]` here would displace
+    /// `list` and run an agent turn instead (ADR-0012, ADR-0021); this test
+    /// exists so that regression cannot slip back in.
+    #[test]
+    fn pi_declares_no_args_and_no_credentials() {
+        let catalog = default_catalog();
+        let pi = tool(&catalog, "pi");
+        assert!(pi.argv().is_empty(), "pi must declare no default args");
+        assert!(
+            pi.credentials().is_empty(),
+            "pi must declare no credentials"
+        );
+        assert_eq!(
+            pi.credential_providers(),
+            crate::credential_provider::ProviderSet::new(std::iter::empty())
+        );
+        assert_eq!(
+            inner_argv(pi, vec!["list".into()]),
+            vec!["list".to_string()]
         );
     }
 

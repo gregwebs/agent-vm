@@ -372,10 +372,11 @@ pub fn gh_token_path(state_dir: &Path) -> PathBuf {
 /// rewrites.
 ///
 /// Note: the launcher's [`refresh`] uses a *different*, single shared
-/// lock ([`ProjectRefreshLock`]) because it does read-modify-write on
-/// per-project state files shared across all providers (`claude.json`,
-/// `claude/settings.json`, `opencode-config/opencode.json`), so its
-/// critical section genuinely spans every provider.
+/// lock ([`ProjectLock`] with [`REFRESH_LOCK_PROJECT`]) because it does
+/// read-modify-write on per-project state files shared across all
+/// providers (`claude.json`, `claude/settings.json`,
+/// `opencode-config/opencode.json`), so its critical section genuinely
+/// spans every provider.
 pub fn refresh_lock_path_for(state_dir: &Path, name: &str) -> PathBuf {
     host_secret_dir_path(state_dir).join(name)
 }
@@ -384,34 +385,17 @@ pub fn refresh_lock_path_for(state_dir: &Path, name: &str) -> PathBuf {
 pub const REFRESH_LOCK_ANTHROPIC: &str = ".refresh.anthropic.lock";
 /// Lock basename for the OpenAI in-guest refresh single-flight.
 pub const REFRESH_LOCK_OPENAI: &str = ".refresh.openai.lock";
+/// Lock basename for the launcher's per-project guest-state read-modify-write
+/// transactions (see [`refresh`]).
+pub(crate) const REFRESH_LOCK_PROJECT: &str = ".refresh.project.lock";
 
 fn with_provider_lock<T>(
     state_dir: &Path,
     name: &str,
     work: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    use std::os::fd::AsRawFd as _;
-    let path = refresh_lock_path_for(state_dir, name);
-    ensure_host_secret_dir(&path)?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
-    loop {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            break;
-        }
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return Err(anyhow::Error::new(std::io::Error::last_os_error()));
-        }
-    }
-    let result = work();
-    unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-    }
-    result
+    let _lock = ProjectLock::acquire(state_dir, name)?;
+    work()
 }
 
 #[cfg(test)]
@@ -490,8 +474,8 @@ pub fn refresh(
     project_guest_path: &str,
     provisioning: &CredentialProvisioning,
 ) -> Result<CredsState> {
-    let _lock =
-        ProjectRefreshLock::acquire(state_dir).context("acquiring per-project refresh lock")?;
+    let _lock = ProjectLock::acquire(state_dir, REFRESH_LOCK_PROJECT)
+        .context("acquiring per-project refresh lock")?;
     // The token files hold the host's *real* access tokens, so their
     // directory must never be bind-mounted into the guest. Create it
     // 0700 in the host-only sibling location (see `host_secret_dir`).
@@ -1590,7 +1574,7 @@ fn refresh_openai(state_dir: &Path, guest: &GuestStateDir) -> Result<Option<Path
 
 /// Synchronize the launcher-owned Chrome MCP entry without changing user MCPs.
 pub fn sync_chrome_mcp(state_dir: &Path, enabled: bool) -> Result<()> {
-    let _lock = ProjectRefreshLock::acquire(state_dir)
+    let _lock = ProjectLock::acquire(state_dir, REFRESH_LOCK_PROJECT)
         .context("acquiring per-project refresh lock for Chrome MCP")?;
     let guest = GuestStateDir::open(state_dir)?;
     let relative = Path::new("claude.json");
@@ -1669,7 +1653,7 @@ pub fn write_guest_gh_config(
     has_gh_token: bool,
     identity: Option<&HostGitIdentity>,
 ) -> Result<()> {
-    let _lock = ProjectRefreshLock::acquire(state_dir)?;
+    let _lock = ProjectLock::acquire(state_dir, REFRESH_LOCK_PROJECT)?;
     let guest = GuestStateDir::open(state_dir)?;
     let mut gitconfig = String::from("[safe]\n\tdirectory = *\n");
     if let Some(id) = identity {
@@ -1695,77 +1679,58 @@ pub fn write_guest_gh_config(
     Ok(())
 }
 
-/// Write the GitHub Copilot CLI's `~/.copilot/config.json`. Two
-/// purposes, both mirroring the original Bash agent-vm's
-/// `_copilot_vm_setup_home`:
+/// Advisory, host-only project lock: an exclusive `flock(2)` on
+/// `<state>.secrets/<basename>`, blocking until it is available.
 ///
-///  - `trusted_folders = ["/"]` so the CLI never prompts "do you
-///    trust this folder?" — the microVM is the sandbox, so trusting
-///    every path inside it is correct.
-///  - the token field carries [`COPILOT_TOKEN_PLACEHOLDER`], which
-///    the proxy substitutes for the real token on outbound traffic.
-///    The CLI also honours the `COPILOT_GITHUB_TOKEN` env var (set by
-///    the launcher); writing it here too covers config-first reads.
+/// The lock file lives in the sibling `<state>.secrets/` directory, which is
+/// never bind-mounted into the guest, so a guest can neither delete nor
+/// replace the synchronization point. The lock is released when the returned
+/// guard is dropped — or by the kernel on process death — so a crashed
+/// launcher cannot wedge a project.
 ///
-/// Merge-on-existing so a user's own settings survive across launches;
-/// only the fields we manage are force-set.
-/// Host-only project lock used for guest-state read-modify-write transactions.
-/// It is a sibling of the guest mount so a guest cannot delete or replace the
-/// synchronization point.
-struct ProjectRefreshLock {
+/// One primitive serves all three callers: [`refresh`] /
+/// [`sync_chrome_mcp`] (guest-state read-modify-write, [`REFRESH_LOCK_PROJECT`]),
+/// the per-provider refresh single-flight ([`with_provider_lock`], the
+/// `REFRESH_LOCK_*` basenames), and the one-shot #96 Pi-home migration.
+pub(crate) struct ProjectLock {
     file: std::fs::File,
 }
 
-impl ProjectRefreshLock {
-    fn acquire(state_dir: &Path) -> Result<Self> {
-        use std::os::unix::io::AsRawFd;
-        let secret_dir = host_secret_dir_path(state_dir);
-        std::fs::create_dir_all(&secret_dir)
-            .with_context(|| format!("creating {}", secret_dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&secret_dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let lock_path = secret_dir.join(".refresh.project.lock");
+impl ProjectLock {
+    /// Acquire the exclusive project lock named `basename` for `state_dir`,
+    /// creating the host-only secrets directory if needed.
+    pub(crate) fn acquire(state_dir: &Path, basename: &str) -> Result<Self> {
+        let lock_path = refresh_lock_path_for(state_dir, basename);
+        ensure_host_secret_dir(&lock_path)?;
         let file = std::fs::OpenOptions::new()
-            .create(true)
+            .read(true)
             .write(true)
+            .create(true)
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("opening {}", lock_path.display()))?;
-        // LOCK_EX blocks until exclusive ownership is acquired. Loop
-        // on EINTR (signal during the wait). No timeout — a peer that
-        // truly hangs inside the locked section is a bug we want
-        // surfaced as a stuck launcher, not silently bypassed.
+        // LOCK_EX blocks until exclusive ownership is acquired. Loop on EINTR
+        // (signal during the wait). No timeout — a peer that truly hangs
+        // inside the locked section is a bug we want surfaced as a stuck
+        // launcher, not silently bypassed.
         loop {
-            // SAFETY: file owns the fd for the duration of the call;
-            // LOCK_EX is a valid `flock(2)` operation; errno is read
-            // immediately on failure.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc == 0 {
-                break;
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => {
+                    return Err(anyhow::anyhow!(error))
+                        .context(format!("flock(LOCK_EX) on {}", lock_path.display()));
+                }
             }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(anyhow::Error::from(err)
-                .context(format!("flock(LOCK_EX) on {}", lock_path.display())));
         }
         Ok(Self { file })
     }
 }
 
-impl Drop for ProjectRefreshLock {
+impl Drop for ProjectLock {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: file still owns the fd; LOCK_UN can't fail in a way
-        // that warrants action here (close on Drop releases the lock
-        // either way).
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        // Best-effort unlock; closing the fd on Drop releases the lock anyway.
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
     }
 }
 
@@ -1933,7 +1898,7 @@ mod tests {
     fn project_refresh_lock_blocks_second_acquire() {
         use std::os::unix::io::AsRawFd;
         let dir = tempfile::tempdir().expect("tempdir");
-        let guard = ProjectRefreshLock::acquire(dir.path()).expect("first acquire");
+        let guard = ProjectLock::acquire(dir.path(), REFRESH_LOCK_PROJECT).expect("first acquire");
         // Open a second fd on the lock file from a different File
         // (same process, but flock(2) on Linux is per-open-file-
         // description, so this is the right way to model a second

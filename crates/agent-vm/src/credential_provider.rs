@@ -166,8 +166,16 @@ pub struct HomeLink {
 }
 
 /// Links that are not owned by any provider (`.gitconfig`, `.config/gh`,
-/// `.bash_history`) — unconditional, and deliberately kept apart from the
-/// tool-specific ones (#81 acceptance criterion).
+/// `.bash_history`, `.pi`) — unconditional, and deliberately kept apart from
+/// the tool-specific ones (#81 acceptance criterion).
+///
+/// `.pi` is here rather than on a provider because the `pi` tool declares no
+/// `credentials` (Pi enrols providers in-session), so there is no
+/// `ProviderSpec` to hang it off. Unconditional like the rest of this list,
+/// because a bare `pi` typed into `agent-vm shell` must persist too. Issue
+/// #96; see `docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md`, and
+/// [`crate::session::ProjectSession::migrate_legacy_pi_home`] for the one-shot
+/// upgrade from the pre-#96 real directory.
 pub const GENERIC_HOME_LINKS: &[HomeLink] = &[
     // gh/git config: [`secrets::write_guest_gh_config`] writes both into the
     // state dir; these symlinks expose them at the standard paths. The
@@ -187,6 +195,13 @@ pub const GENERIC_HOME_LINKS: &[HomeLink] = &[
     HomeLink {
         home_relative: ".bash_history",
         state_relative: "bash_history",
+    },
+    // Pi's user-scoped home (#96). Pi reads project resources from `<cwd>/.pi`
+    // and user state from `~/.pi/agent` -- two different resolvers, two
+    // different mounts, so this link cannot shadow the checkout's `.pi/`.
+    HomeLink {
+        home_relative: ".pi",
+        state_relative: "pi",
     },
 ];
 
@@ -210,12 +225,19 @@ pub fn guest_home_links() -> Vec<HomeLink> {
     links
 }
 
+/// Eager state dirs owned by no provider. `<state>/pi` is here because Pi
+/// does `mkdir -p ~/.pi/agent` on startup, and `mkdir` through a DANGLING
+/// symlink fails with EEXIST rather than creating the target -- `ensure_dirs`
+/// otherwise creates only a link target's *parent*.
+pub const GENERIC_EAGER_STATE_DIRS: &[&str] = &["pi"];
+
 /// Directories created under the per-project state dir before boot.
 pub fn eager_state_dirs() -> Vec<&'static str> {
     let mut dirs = Vec::new();
     for provider in CredentialProvider::ALL {
         dirs.extend_from_slice(provider.spec().eager_state_dirs);
     }
+    dirs.extend_from_slice(GENERIC_EAGER_STATE_DIRS);
     dirs
 }
 
@@ -379,9 +401,23 @@ fn write_opencode_bypass(guest: &GuestStateDir) -> Result<()> {
     Ok(())
 }
 
-/// Write Copilot's guest config. Called by [`crate::secrets::refresh`] **only
-/// when the Copilot token was captured this launch**, because `github_token`
-/// holds the proxy placeholder.
+/// Write the GitHub Copilot CLI's `~/.copilot/config.json`.
+///
+/// Called by [`crate::secrets::refresh`] **only when the Copilot token was
+/// captured this launch**, because `github_token` holds the proxy placeholder.
+/// Two fields are set, mirroring the original Bash agent-vm's
+/// `_copilot_vm_setup_home`:
+///
+///  - `trusted_folders = ["/"]` so the CLI never prompts "do you trust this
+///    folder?" — the microVM is the sandbox, so trusting every path inside it
+///    is correct.
+///  - `github_token` carries [`crate::secrets::COPILOT_TOKEN_PLACEHOLDER`],
+///    which the proxy substitutes for the real token on outbound traffic. The
+///    CLI also honours the `COPILOT_GITHUB_TOKEN` env var (set by the
+///    launcher); writing it here too covers config-first reads.
+///
+/// Merge-on-existing so a user's own settings survive across launches; only
+/// the fields we manage are force-set.
 pub(crate) fn write_copilot_guest_config(guest: &GuestStateDir) -> Result<()> {
     let mut copilot = secrets::read_guest_json_object(guest, Path::new("copilot/config.json"));
     copilot.insert("trusted_folders".into(), serde_json::json!(["/"]));
@@ -667,15 +703,83 @@ mod tests {
                 home_relative: ".bash_history",
                 state_relative: "bash_history",
             },
+            HomeLink {
+                home_relative: ".pi",
+                state_relative: "pi",
+            },
         ];
         assert_eq!(guest_home_links().as_slice(), golden);
     }
 
-    /// V12: exactly the three per-tool state subdirectories are eagerly
-    /// created (the state root itself is created separately by `ensure_dirs`).
+    /// #96: no two compiled links may overlap component-wise, and no generic
+    /// eager state dir may collide with a provider's eager dir or with a
+    /// *different* link's state entry. Catches a future `.pi/agent` link that
+    /// would shadow or alias `~/.pi`.
+    #[test]
+    fn compiled_links_and_eager_dirs_do_not_collide() {
+        let links = guest_home_links();
+        for (position, link) in links.iter().enumerate() {
+            for other in &links[position + 1..] {
+                assert!(
+                    !crate::config::guest_paths_overlap(
+                        Path::new(link.home_relative),
+                        Path::new(other.home_relative)
+                    ),
+                    "{} overlaps {}",
+                    link.home_relative,
+                    other.home_relative
+                );
+            }
+        }
+
+        let provider_eager: Vec<&str> = CredentialProvider::ALL
+            .iter()
+            .flat_map(|provider| provider.spec().eager_state_dirs.iter().copied())
+            .collect();
+        for generic in GENERIC_EAGER_STATE_DIRS {
+            assert!(
+                !provider_eager.contains(generic),
+                "generic eager dir {generic} collides with a provider's"
+            );
+            // The eager dir must be backed by exactly one compiled link --
+            // otherwise `ensure_dirs` creates a directory nothing maps to, or
+            // a second link aliases it -- and no *other* link's state entry
+            // may nest under it or contain it. This is the check that fails
+            // for a future `.pi/agent` link.
+            let backing = links
+                .iter()
+                .filter(|link| link.state_relative == *generic)
+                .count();
+            assert_eq!(
+                backing, 1,
+                "generic eager dir {generic} must be backed by exactly one link, found {backing}"
+            );
+            for link in &links {
+                if link.state_relative == *generic {
+                    continue;
+                }
+                assert!(
+                    !crate::config::guest_paths_overlap(
+                        Path::new(link.state_relative),
+                        Path::new(generic)
+                    ),
+                    "generic eager dir {generic} overlaps link {}'s state entry {}",
+                    link.home_relative,
+                    link.state_relative
+                );
+            }
+        }
+    }
+
+    /// V12: the three per-tool state subdirectories plus the generic `pi` dir
+    /// are eagerly created (the state root itself is created separately by
+    /// `ensure_dirs`).
     #[test]
     fn eager_state_dirs_match_legacy() {
-        assert_eq!(eager_state_dirs(), vec!["claude", "codex", "opencode"]);
+        assert_eq!(
+            eager_state_dirs(),
+            vec!["claude", "codex", "opencode", "pi"]
+        );
     }
 
     /// V3: the four host credential paths, transcribed from the pre-refactor

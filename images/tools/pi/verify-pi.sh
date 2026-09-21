@@ -11,8 +11,10 @@
 #
 # `timeout` bounds every Pi invocation so a future version that decides to
 # prompt cannot hang the build. HOME/XDG point at a scratch dir and
-# PI_TELEMETRY=0 keeps the gate hermetic: --version and --help must not read or
+# PI_TELEMETRY=0 keeps THIS GATE hermetic: --version and --help must not read or
 # write a config, and must not be the thing that creates /root/.pi in the image.
+# This is the gate's OWN environment, not the wrapper's behaviour -- the wrapper
+# deliberately sets no telemetry default (see images/tools/pi/pi.sh).
 #
 # This body used to live inline in the Dockerfile's RUN. There the Dockerfile
 # parser pre-expands a base image's `ENV` values, so the plan's `mkdir -p

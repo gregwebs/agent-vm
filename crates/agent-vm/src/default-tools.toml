@@ -48,9 +48,11 @@
 # `pi` declares no `credentials`: Pi supports many providers, enrolls more during
 # a session, and must start with none configured, so it must not inherit any
 # provider's hard bail. Host-credential import is issue #94/#91; the guest-state
-# mapping, PI_SKIP_VERSION_CHECK / PI_TELEMETRY and the `--approve` default are
-# issue #96. Its layer is first in the chain because it is the largest and the
-# least frequently changed -- see images/tools/README.md.
+# mapping and PI_SKIP_VERSION_CHECK are issue #96. It deliberately declares no
+# `--approve` (or any trust/telemetry) default: agent-vm forces no trust or
+# telemetry policy, so Pi's own project-trust flag and telemetry are forwarded
+# -- see ADR-0021. Its layer is first in the chain because it is the largest and
+# the least frequently changed -- see images/tools/README.md.
 [[tools]]
 name = "pi"
 command = "pi"

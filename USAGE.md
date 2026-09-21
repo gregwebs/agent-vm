@@ -578,8 +578,8 @@ interactive_shell = false            # optional; join trailing args into `-c`
   — are a hard error whether they are two entries of the same tool, two
   different tools, or a `persist` path against one of the dotfiles agent-vm
   itself links into the state dir (the credential/config links `agent-vm
-  doctor` lists, e.g. `.claude`, `.config/gh`); one would silently shadow the
-  other. `.cache` and `.cachex` do **not** overlap (components, not string
+  doctor` lists, e.g. `.claude`, `.config/gh`, `.pi`); one would silently
+  shadow the other. `.cache` and `.cachex` do **not** overlap (components, not string
   prefixes). Which paths a launch gets follows the same `tools` closure as its
   credentials, so a `shell` (whose omitted `tools` is `["*"]`) sees every
   declared path in its own file. A `persist` path that would collide with the
@@ -664,7 +664,7 @@ fire on an unparseable config (see *Errors and recovery*). `doctor` labels the
 row with a note when the fallback is in use.
 
 Only when **both** files declare zero tools (missing, empty, or `tools = []`)
-does the compiled-in defaults list apply: `codex`, `opencode`, `claude`,
+does the compiled-in defaults list apply: `pi`, `codex`, `opencode`, `claude`,
 `copilot`, `shell`, in that order. They are defined once in
 [`crates/agent-vm/src/default-tools.toml`](crates/agent-vm/src/default-tools.toml),
 embedded into the binary (never written to disk). **`codex` and `opencode`
@@ -681,6 +681,34 @@ OpenAI credential is provisioned into that state dir on a shell launch;
 dropping the pointer would leave a fully-provisioned, unreachable credential.
 The other three agents never read `CODEX_HOME`. See
 [ADR-0016](docs/adr/0016-tool-declared-guest-env.md).
+
+**`pi`.** Pi's user state (`~/.pi`, i.e. auth, settings, sessions, and global
+packages under `~/.pi/agent`) is **project-scoped persistent state** at
+`/agent-vm-state/pi`, in both guest modes — a `/login` inside a throwaway VM
+survives a relaunch. The checkout's own `.pi/` resources are a separate path on
+a separate mount. Agent-vm forces **no** project-trust policy: Pi's own trust
+prompt appears when it would under vanilla Pi, and the answer you give is
+remembered in the now-persistent `~/.pi/agent/trust.json`, so you decide once.
+An explicit `--approve`/`--no-approve` (or `-a`/`-na`) is honoured because it is
+simply Pi's own flag, forwarded untouched. Note that agent-vm's own parser
+consumes the **first** `--` on the outer command line, so deliver a literal `--`
+to Pi with a second one: `agent-vm pi -- -- …`. `pi <subcommand>` (`pi list`,
+`pi auth`, …) is forwarded **verbatim**, so the wrapper injects no `--extension`
+there and subcommands stay subcommands. `pi` also ships with empty `args`,
+like `codex`/`opencode` — any default flag would belong in the wrapper, not in a
+config `args` list, because a prepended flag would displace a subcommand.
+
+**Env.** The wrapper forces `PI_SKIP_VERSION_CHECK=1`, because agent-vm owns the
+binary (a root-owned image layer) and Pi's "newer version" fetch can only ever be
+noise. It forces **no** telemetry policy: `PI_TELEMETRY` is left exactly as the
+**guest** environment sets it, and Pi's own default applies when it is unset.
+agent-vm does not forward the host's value, so the supported override is
+guest-side — a tool's config `env`, or an `export` inside `agent-vm shell`.
+
+**Upgrading (`pi` state).** The first launch after this release moves an
+existing pre-release `<state>/home/.pi` directory to `<state>/pi`
+automatically. If `<state>/pi` already holds Pi state the launch stops and names
+both paths; the fix is a host-side `mv` of one of them.
 
 The built-in `shell` declares **no** `credentials` and omits `tools`, so in the
 shipped catalog it *provisions* every provider `default-tools.toml`'s tools
@@ -787,9 +815,10 @@ on top of the microVM boundary itself; matching the host uid is also
 required to keep write access to the project/state bind mounts (a
 non-root guest uid only gets owner bits on those when it equals the real
 host uid). `whoami`/`id` inside the guest report a user named `agent`
-resolving to your host uid/gid; `$HOME` is `/agent-vm-state/home` (a
-directory inside the per-project state dir), with the same
-`.claude`/`.gitconfig`/`.config/gh`/etc. dotfile symlinks root mode has
+resolving to your host uid/gid; `$HOME` is your **host home path** (for example
+`/Users/alice`), backed by the host directory `<state>/home` inside the
+per-project state dir, with the same
+`.claude`/`.gitconfig`/`.config/gh`/`.pi`/etc. dotfile symlinks root mode has
 always had, just rooted there instead of at `/root`.
 
 Pass `--root` (or set `AGENT_VM_ROOT=1`) to restore the previous

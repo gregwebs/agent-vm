@@ -214,6 +214,106 @@ impl GuestStateDir {
         }
     }
 
+    /// The type of the entry at `relative` (relative to the opened state
+    /// root), without following a symlink in *any* component -- the final
+    /// entry is `lstat`ed, and every ancestor is opened `O_NOFOLLOW`. `None`
+    /// when the entry is absent; a symlinked ancestor is an error (never
+    /// silently resolved through it).
+    pub(crate) fn entry_type(&self, relative: &Path) -> Result<Option<EntryType>> {
+        let parts = validated_components(relative)?;
+        let Some((parent, name)) = self.parent_for(&parts, false)? else {
+            return Ok(None);
+        };
+        match rfs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some(EntryType::from_file_type(FileType::from_raw_mode(
+                stat.st_mode,
+            )))),
+            Err(Errno::NOENT) => Ok(None),
+            Err(error) => {
+                Err(anyhow!(error)).with_context(|| self.operation_path("stating", relative))
+            }
+        }
+    }
+
+    /// Whether the directory at `relative` is empty, opened no-follow. Errors
+    /// when it is absent or not a directory, so a caller that has already
+    /// confirmed [`EntryType::Directory`] never has to guess.
+    pub(crate) fn dir_is_empty(&self, relative: &Path) -> Result<bool> {
+        let parts = validated_components(relative)?;
+        let (parent, name) = self
+            .parent_for(&parts, false)?
+            .ok_or_else(|| anyhow!("{} does not exist", self.display_path(relative)))?;
+        let fd = rfs::openat(
+            &parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| anyhow!(error))
+        .with_context(|| self.operation_path("opening directory", relative))?;
+        let mut entries = rfs::Dir::read_from(&fd)
+            .map_err(|error| anyhow!(error))
+            .with_context(|| self.operation_path("reading directory", relative))?;
+        for entry in &mut entries {
+            let entry = entry
+                .map_err(|error| anyhow!(error))
+                .with_context(|| self.operation_path("reading directory", relative))?;
+            let name = entry.file_name().to_bytes();
+            if name != b"." && name != b".." {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Rename `from` onto `to` within the state root. Both parent directories
+    /// are opened `O_NOFOLLOW` (so a symlinked ancestor is refused, and the
+    /// rename is performed against the pinned descriptors rather than a
+    /// pathname re-resolved after validation).
+    pub(crate) fn rename_entry(&self, from: &Path, to: &Path) -> Result<()> {
+        self.rename_entry_impl(from, to, || {})
+    }
+
+    fn rename_entry_impl(
+        &self,
+        from: &Path,
+        to: &Path,
+        after_parents_pinned: impl FnOnce(),
+    ) -> Result<()> {
+        let from_parts = validated_components(from)?;
+        let to_parts = validated_components(to)?;
+        let (from_parent, from_name) = self
+            .parent_for(&from_parts, false)?
+            .ok_or_else(|| anyhow!("{} does not exist", self.display_path(from)))?;
+        let (to_parent, to_name) = self
+            .parent_for(&to_parts, false)?
+            .ok_or_else(|| anyhow!("{} does not exist", self.display_path(to)))?;
+        after_parents_pinned();
+        rfs::renameat(&from_parent, from_name, &to_parent, to_name)
+            .map_err(|error| anyhow!(error))
+            .with_context(|| {
+                format!(
+                    "renaming {} to {}",
+                    self.display_path(from),
+                    self.display_path(to)
+                )
+            })
+    }
+
+    /// Test-only seam: `after_parents_pinned` fires once both parent
+    /// directories are opened (no-follow), immediately before `renameat`.
+    /// Tests swap a guest-controlled ancestor in that window to prove the
+    /// rename stays anchored to the pinned descriptors.
+    #[cfg(test)]
+    pub(crate) fn rename_entry_with_checkpoint(
+        &self,
+        from: &Path,
+        to: &Path,
+        after_parents_pinned: impl FnOnce(),
+    ) -> Result<()> {
+        self.rename_entry_impl(from, to, after_parents_pinned)
+    }
+
     fn parent_for<'a>(
         &self,
         parts: &'a [OsString],
@@ -266,6 +366,25 @@ impl GuestStateDir {
 
     fn operation_path(&self, operation: &str, relative: &Path) -> String {
         format!("{operation} guest state {}", self.display_path(relative))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryType {
+    Directory,
+    RegularFile,
+    Symlink,
+    Other,
+}
+
+impl EntryType {
+    fn from_file_type(file_type: FileType) -> Self {
+        match file_type {
+            FileType::Directory => Self::Directory,
+            FileType::RegularFile => Self::RegularFile,
+            FileType::Symlink => Self::Symlink,
+            _ => Self::Other,
+        }
     }
 }
 
@@ -733,6 +852,83 @@ mod tests {
 
         assert_eq!(fs::read(moved.join("auth.json")).unwrap(), b"replaced");
         assert_eq!(fs::read(&canary).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn entry_checks_refuse_a_symlinked_ancestor() {
+        // A previous guest can leave a state-internal ancestor as a symlink to
+        // a host directory. Every check must open that ancestor `O_NOFOLLOW`
+        // rather than resolve through it.
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(outside.path().join(".pi/agent")).unwrap();
+        fs::write(outside.path().join(".pi/agent/auth.json"), b"host").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("home")).unwrap();
+
+        let guest = GuestStateDir::open(root.path()).unwrap();
+        assert!(guest.entry_type(Path::new("home/.pi")).is_err());
+        assert!(guest.dir_is_empty(Path::new("home/.pi")).is_err());
+        assert!(
+            guest
+                .rename_entry(Path::new("home/.pi"), Path::new("pi"))
+                .is_err()
+        );
+        assert!(!root.path().join("pi").exists());
+        assert!(outside.path().join(".pi/agent/auth.json").is_file());
+    }
+
+    #[test]
+    fn entry_type_reports_a_dangling_symlink_as_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/agent-vm-state/pi", root.path().join("legacy")).unwrap();
+        let guest = GuestStateDir::open(root.path()).unwrap();
+        assert_eq!(
+            guest.entry_type(Path::new("legacy")).unwrap(),
+            Some(EntryType::Symlink)
+        );
+        assert_eq!(guest.entry_type(Path::new("missing")).unwrap(), None);
+        assert!(guest.dir_is_empty(Path::new("legacy")).is_err());
+    }
+
+    #[test]
+    fn dir_is_empty_ignores_dot_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let guest = GuestStateDir::open(root.path()).unwrap();
+        fs::create_dir(root.path().join("empty")).unwrap();
+        assert!(guest.dir_is_empty(Path::new("empty")).unwrap());
+        fs::write(root.path().join("empty/kept"), b"x").unwrap();
+        assert!(!guest.dir_is_empty(Path::new("empty")).unwrap());
+    }
+
+    #[test]
+    fn rename_checkpoint_after_parent_open_moves_inside_original_directory() {
+        // Same TOCTOU shape as the write checkpoint above, but for the rename
+        // path: swap the `home` ancestor for a symlink to an outside directory
+        // in the window between the parent descriptors being pinned and
+        // `renameat`. The rename must land in the original (renamed-aside)
+        // directory, never through the attacker's symlink.
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        fs::create_dir_all(state.join("home/.pi/agent")).unwrap();
+        fs::write(state.join("home/.pi/agent/auth.json"), b"legacy").unwrap();
+        let guest = GuestStateDir::open(&state).unwrap();
+        let moved = root.path().join("home-moved");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+
+        guest
+            .rename_entry_with_checkpoint(Path::new("home/.pi"), Path::new("pi"), || {
+                fs::rename(state.join("home"), &moved).unwrap();
+                std::os::unix::fs::symlink(&outside, state.join("home")).unwrap();
+            })
+            .unwrap();
+
+        assert_eq!(
+            fs::read(state.join("pi/agent/auth.json")).unwrap(),
+            b"legacy"
+        );
+        assert!(!moved.join(".pi").exists());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
     }
 
     #[test]
