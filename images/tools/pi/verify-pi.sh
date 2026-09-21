@@ -55,6 +55,16 @@ if [ "$helped" != "$declared" ]; then
 fi
 echo "  pi: subcommand allowlist matches pi --help"
 
+# The wrapper injects --approve by default (#96). A pin bump that renamed or
+# dropped the approve flags would otherwise break every launch at runtime
+# instead of at build time.
+helptext=$(timeout 60 /usr/local/bin/pi --help)
+printf '%s' "$helptext" | grep -q -- '--approve' || {
+    echo "  pi: pi --help no longer documents --approve (the wrapper injects it)" >&2; exit 1; }
+printf '%s' "$helptext" | grep -q -- '--no-approve' || {
+    echo "  pi: pi --help no longer documents --no-approve" >&2; exit 1; }
+echo "  pi: approve flags still documented by pi --help"
+
 # The extension is image-owned and mandatory: a real invocation must load it and
 # emit the credential warning. Both halves are checked -- it is present, and it
 # actually runs.

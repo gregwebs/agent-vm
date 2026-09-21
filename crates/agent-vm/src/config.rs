@@ -3473,6 +3473,31 @@ mod tests {
         );
     }
 
+    /// V6 (#96): the new compiled `.pi` link turns both `.pi` and `.pi/agent`
+    /// into hard errors, component-wise. `.pix` shares only a string prefix
+    /// and must still load.
+    #[test]
+    fn persist_claiming_the_compiled_pi_link_is_rejected() {
+        for path in [".pi", ".pi/agent"] {
+            let fixture = Fixture::new();
+            fixture.user(&format!(
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\"{path}\"]\n"
+            ));
+            let rendered = format!("{:#}", fixture.load().unwrap_err());
+            assert!(
+                rendered.contains("overlaps the reserved guest HOME path .pi"),
+                "persist={path:?}: {rendered}"
+            );
+        }
+
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\".pix\"]\n");
+        assert!(
+            fixture.load().is_ok(),
+            ".pix must not overlap .pi (component-wise, not string-prefix)"
+        );
+    }
+
     /// **V3.** `provisioned()` is unchanged for every embedded default entry by
     /// the `launch_closure` refactor.
     #[test]

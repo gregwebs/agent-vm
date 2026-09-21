@@ -1126,6 +1126,218 @@ fn a_shadowed_shipped_tool_does_not_inherit_the_shipped_env() {
 }
 
 // ---------------------------------------------------------------------------
+// #96 — `pi` launches with no host credential
+// ---------------------------------------------------------------------------
+
+/// #96: `pi` declares no `credentials`, so a host with NO agent logins at all
+/// must still launch it. The shared harness seeds fake credentials for every
+/// provider, so this test removes them first -- otherwise it proves nothing.
+#[test]
+fn pi_launches_with_no_host_credentials_while_claude_still_bails() {
+    let harness = Harness::new();
+    // Deleting the seeds must be *checked*: a silently-failed removal would
+    // let this test pass on a host that still has a credential.
+    for relative in [
+        ".claude/.credentials.json",
+        ".cache/claude-vm/copilot-token.json",
+        ".codex/auth.json",
+        ".local/share/opencode/auth.json",
+    ] {
+        let path = harness.home_root.join(relative);
+        std::fs::remove_file(&path)
+            .unwrap_or_else(|error| panic!("removing seeded credential {relative}: {error}"));
+        assert!(!path.exists(), "{relative} must be gone before the launch");
+    }
+
+    let out = harness.launch_default("pi");
+    let pi_stderr = stderr_of(&out);
+    assert!(
+        pi_stderr.contains(CONFIG_MARKER),
+        "pi must launch with no host credential: {pi_stderr}"
+    );
+
+    // The contrast that makes the assertion meaningful: a tool that DOES
+    // declare `credentials` still hard-bails on the same host. Assert the
+    // *specific* missing-credential diagnostic and that the debug-config seam
+    // was never reached, so this cannot pass via the harness's inevitable
+    // bogus-image pull failure alone (S2).
+    let claude = harness.launch_default("claude");
+    let claude_stderr = stderr_of(&claude);
+    assert!(
+        !claude.status.success(),
+        "claude must still bail without its credential"
+    );
+    assert!(
+        claude_stderr.contains("no usable Claude credential found on the host"),
+        "claude must bail with its missing-credential diagnostic: {claude_stderr}"
+    );
+    assert!(
+        !claude_stderr.contains(CONFIG_MARKER),
+        "claude must not reach the debug-config seam without its credential: {claude_stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Q1 (#96) — the migration must never follow a guest-planted HOME ancestor
+// ---------------------------------------------------------------------------
+
+/// Q1: a previous guest can leave `<state>/home` as a symlink to the host HOME.
+/// Driving the *real* root-mode launch path (the mode where the HOME bind is
+/// absent from `core_host_sources`, so the mount preflight cannot catch this)
+/// must refuse at the migration instead of renaming the host's real `~/.pi`
+/// into guest-visible state.
+#[test]
+fn root_launch_refuses_a_guest_planted_home_symlink() {
+    let harness = Harness::new();
+
+    // A first root-mode launch learns the exact state dir from the banner and
+    // creates it, without provisioning `<state>/home` (root mode has no guest
+    // HOME bind).
+    let probe = harness.launch("pi", &["--root"]);
+    let state = state_dir(&stderr_of(&probe));
+
+    // The fake host HOME a previous guest pointed `<state>/home` at.
+    let fake_host = tempfile::tempdir().unwrap();
+    let fake_host = fake_host.path().canonicalize().unwrap();
+    write(&fake_host.join(".pi/agent/auth.json"), "HOST-AUTH-SENTINEL");
+    write(
+        &fake_host.join(".pi/agent/models.json"),
+        "HOST-MODELS-SENTINEL",
+    );
+    std::os::unix::fs::symlink(&fake_host, state.join("home")).unwrap();
+
+    let attacked = harness.launch("pi", &["--root"]);
+    let stderr = stderr_of(&attacked);
+    assert!(
+        !attacked.status.success(),
+        "a guest-planted HOME symlink must fail the launch: {stderr}"
+    );
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "the refusal must happen before the debug-config/boot seam: {stderr}"
+    );
+    assert!(
+        stderr.contains(&state.join("home").display().to_string()),
+        "the refusal must name the redirected ancestor: {stderr}"
+    );
+
+    // The host home is unchanged and still in place.
+    assert_eq!(
+        std::fs::read(fake_host.join(".pi/agent/auth.json")).unwrap(),
+        b"HOST-AUTH-SENTINEL"
+    );
+    assert_eq!(
+        std::fs::read(fake_host.join(".pi/agent/models.json")).unwrap(),
+        b"HOST-MODELS-SENTINEL"
+    );
+    assert!(fake_host.join(".pi").is_dir());
+    assert_eq!(std::fs::read_link(state.join("home")).unwrap(), fake_host);
+    // No sentinel entered guest state.
+    assert!(!state.join("pi/agent/auth.json").exists());
+    assert!(!state.join("pi/agent/models.json").exists());
+}
+
+/// Root-first upgrade rehearsal (verifications item 4): a pre-#96 real
+/// `<state>/home/.pi` is moved by a `--root` launch, and a later non-root
+/// launch finds the same bytes and materializes the compiled link.
+#[test]
+fn root_first_upgrade_moves_the_legacy_pi_home() {
+    let harness = Harness::new();
+
+    let probe = harness.launch("pi", &["--root"]);
+    let state = state_dir(&stderr_of(&probe));
+
+    // A pre-#96 non-root guest left a real `.pi` directory in the persistent
+    // guest HOME.
+    let legacy = state.join("home/.pi/agent");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("auth.json"), b"pre-96-sentinel").unwrap();
+
+    // A root-mode launch must move it (and bake `/root/.pi`), even though root
+    // mode never wrote the host-side directory itself.
+    let root_out = harness.launch("pi", &["--root"]);
+    let root_stderr = stderr_of(&root_out);
+    assert!(
+        root_stderr.contains(CONFIG_MARKER),
+        "the root launch must reach the debug dump: {root_stderr}"
+    );
+    assert_eq!(
+        std::fs::read(state.join("pi/agent/auth.json")).unwrap(),
+        b"pre-96-sentinel"
+    );
+    assert!(!state.join("home/.pi").exists());
+    let root_config = normalized_config(&harness, &root_out).to_string();
+    assert!(
+        root_config.contains("/agent-vm-state/pi"),
+        "the root launch must bake /root/.pi -> /agent-vm-state/pi: {root_config}"
+    );
+
+    // An independent, later non-root launch migrates nothing new and
+    // materializes the compiled link over the same bytes.
+    let nonroot_out = harness.launch_default("pi");
+    assert!(
+        stderr_of(&nonroot_out).contains(CONFIG_MARKER),
+        "the non-root launch must reach the debug dump: {}",
+        stderr_of(&nonroot_out)
+    );
+    assert_eq!(
+        std::fs::read_link(state.join("home/.pi")).unwrap(),
+        PathBuf::from("/agent-vm-state/pi")
+    );
+    assert_eq!(
+        std::fs::read(state.join("pi/agent/auth.json")).unwrap(),
+        b"pre-96-sentinel"
+    );
+}
+
+/// Non-root-first upgrade rehearsal (#96 verification pass). Unlike
+/// [`root_first_upgrade_moves_the_legacy_pi_home`], which only reaches the
+/// non-root launch path *after* a root launch already migrated, this drives a
+/// real non-root launch as the first migrator: it owns the persistent
+/// `<state>/home`, so it is the mode the migration exists for. The unit tests
+/// call `migrate_legacy_pi_home` directly; this proves the launch path wires it
+/// before `<state>/home/.pi` provisioning, which would otherwise abort on the
+/// real directory `force_symlink` refuses to replace.
+#[test]
+fn nonroot_first_upgrade_moves_the_legacy_pi_home() {
+    let harness = Harness::new();
+
+    // A first non-root launch materializes `<state>/home` and the compiled
+    // `.pi` symlink (provisioning runs before the bogus-image pull fails).
+    let probe = harness.launch_default("pi");
+    let state = state_dir(&stderr_of(&probe));
+    assert_eq!(
+        std::fs::read_link(state.join("home/.pi")).unwrap(),
+        PathBuf::from("/agent-vm-state/pi")
+    );
+
+    // Rewind to the pre-#96 shape: a real `<state>/home/.pi` directory holding
+    // the bytes a previous guest left behind, as it would be before the first
+    // launch on the new version.
+    std::fs::remove_file(state.join("home/.pi")).unwrap();
+    let legacy = state.join("home/.pi/agent");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("auth.json"), b"nonroot-pre-96").unwrap();
+
+    // The next non-root launch must move the directory and re-provision the
+    // compiled link over it, without aborting on the real directory.
+    let migrated = harness.launch_default("pi");
+    let stderr = stderr_of(&migrated);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "the non-root launch must reach the debug dump: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_link(state.join("home/.pi")).unwrap(),
+        PathBuf::from("/agent-vm-state/pi")
+    );
+    assert_eq!(
+        std::fs::read(state.join("pi/agent/auth.json")).unwrap(),
+        b"nonroot-pre-96"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // E5–E8 — the broken-config behaviour table (plan D1)
 // ---------------------------------------------------------------------------
 

@@ -1,7 +1,7 @@
 {
   "name": "@wirenboard/agent-vm",
   "version": "0.0.0",
-  "description": "Sandboxed VMs for AI coding agents (Claude Code, Codex CLI, OpenCode), built on microsandbox.",
+  "description": "Sandboxed VMs for AI coding agents (Claude Code, Codex CLI, OpenCode, Copilot, Pi), built on microsandbox.",
   "homepage": "https://github.com/wirenboard/agent-vm",
   "repository": {
     "type": "git",

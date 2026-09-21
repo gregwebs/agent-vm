@@ -51,15 +51,16 @@ assert_warns() {
     local label="$1" text="$2"
     grep -q '"method":"notify"' <<<"$text" || fail "${label}: no notify frame"
     grep -q 'agent-vm: signing in here' <<<"$text" || fail "${label}: warning text missing"
-    # The warning is scoped to what #95 delivers (a readable credential plus the
-    # microVM boundary); #96/#94/#91 restore the persistence / host-precedence /
-    # host-import clauses together with their behaviour. The positive greps pin
-    # the current literal and the negative grep fails the day a removed clause
-    # is written back ahead of its implementation.
+    # #96 landed the ~/.pi persistence mapping, so the persistence clause is
+    # back. #94/#91 still owe the host-precedence / host-import clauses, and
+    # the negative grep fails the day either is written back ahead of its
+    # implementation.
     grep -q 'any process in this guest can read' <<<"$text" || fail "${label}: warning scope missing"
     grep -q 'microVM' <<<"$text" || fail "${label}: boundary clause missing"
-    if grep -Eq 'persistent guest state|takes precedence|imported from your host' <<<"$text"; then
-        fail "${label}: warning still claims unimplemented #96/#94/#91 behaviour"
+    grep -q 'persistent guest state' <<<"$text" \
+        || fail "${label}: persistence clause missing (#96 restored it)"
+    if grep -Eq 'takes precedence|imported from your host' <<<"$text"; then
+        fail "${label}: warning still claims unimplemented #94/#91 behaviour"
     fi
     grep -q '"notifyType":"warning"' <<<"$text" || fail "${label}: notifyType is not warning"
 }
@@ -132,6 +133,39 @@ capture "$layer" pi auth check --provider anthropic
 [[ $CAP_STATUS -eq 1 ]] || fail "pi auth check must exit 1 credential-free, got $CAP_STATUS"
 [[ "$CAP_OUT" = "not_ready" ]] || fail "pi auth check output was '$CAP_OUT'"
 
+# --- #96: the checkout's own .pi/ resources load because of the wrapper's
+# --- --approve default, and are dropped when the user opts out -------------
+marker_js="export default function(pi){pi.on('session_start',(_e,ctx)=>{if(ctx.hasUI)ctx.ui.notify('PROJECT-EXTENSION-LOADED','warning')})}"
+# shellcheck disable=SC2016  # $MARKER_JS must expand in the CONTAINER, not here
+project_setup='mkdir -p /tmp/pi-project/.pi/extensions && printf %s "$MARKER_JS" > /tmp/pi-project/.pi/extensions/marker.js && cd /tmp/pi-project'
+
+capture -e "MARKER_JS=$marker_js" "$layer" sh -c "$project_setup && pi --mode rpc --no-session"
+[[ $CAP_STATUS -eq 0 ]] || fail "project-extension run exited $CAP_STATUS: $CAP_ERR"
+[[ "$CAP_OUT" == *PROJECT-EXTENSION-LOADED* ]] \
+    || fail "the project .pi/extensions were not trusted by default: $CAP_OUT"
+
+capture -e "MARKER_JS=$marker_js" "$layer" sh -c "$project_setup && pi --no-approve --mode rpc --no-session"
+[[ $CAP_STATUS -eq 0 ]] || fail "--no-approve run exited $CAP_STATUS: $CAP_ERR"
+[[ "$CAP_OUT" != *PROJECT-EXTENSION-LOADED* ]] \
+    || fail "--no-approve did not win over the wrapper's default: $CAP_OUT"
+
+# --- #96: the wrapper's env decisions, observed inside the real image ------
+# A stub entry point that prints its environment. `pi` still runs the real
+# wrapper, so this observes exactly what the wrapper exports.
+env_stub='printf "#!/bin/sh\nenv\n" > /tmp/entry && chmod 0755 /tmp/entry && AGENT_VM_PI_ENTRY=/tmp/entry pi'
+
+out="$(docker run --rm -e HOME=/tmp "$layer" sh -c "$env_stub")"
+grep -qx 'PI_SKIP_VERSION_CHECK=1' <<<"$out" \
+    || fail "the wrapper did not enforce PI_SKIP_VERSION_CHECK=1"
+grep -qx 'PI_TELEMETRY=0' <<<"$out" \
+    || fail "the wrapper did not default PI_TELEMETRY=0"
+
+out="$(docker run --rm -e HOME=/tmp -e PI_TELEMETRY=1 "$layer" sh -c "$env_stub")"
+grep -qx 'PI_TELEMETRY=1' <<<"$out" \
+    || fail "an explicit PI_TELEMETRY did not survive the wrapper"
+grep -qx 'PI_SKIP_VERSION_CHECK=1' <<<"$out" \
+    || fail "PI_SKIP_VERSION_CHECK must stay enforced even with PI_TELEMETRY set"
+
 # --- the seam ADR-0012 promises: a replaced install keeps the wrapper ---------
 # A later layer replaces the Pi installation and leaves the wrapper and the
 # mandatory extension alone. The wrapper (which that layer must not replace)
@@ -159,6 +193,8 @@ capture "$replacement" pi --mode rpc
 [[ "$CAP_OUT" == *"--extension"* ]] || fail "the wrapper did not pass --extension to the replacement: $CAP_OUT"
 [[ "$CAP_OUT" == *"$MANDATORY"* ]] \
     || fail "the wrapper stopped routing the mandatory --extension after a replacement: $CAP_OUT"
+[[ "$CAP_OUT" == *"--approve"* ]] \
+    || fail "the wrapper stopped injecting the project-trust default: $CAP_OUT"
 
 # The mandatory extension lives outside /opt/agent-vm/pi, so replacing the
 # installation must not have removed it.

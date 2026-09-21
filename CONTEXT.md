@@ -80,7 +80,10 @@ The in-guest `$HOME` for the current guest user mode:
 
 Both modes share one symlink mapping,
 `credential_provider::guest_home_links()`, so the two provisioning paths can't
-drift (see **Credential provider** → **Guest home link**).
+drift (see **Credential provider** → **Guest home link**). Under both modes
+`~/.pi` is project-scoped persistent state at `/agent-vm-state/pi`
+([#96](https://github.com/gregwebs/agent-vm/issues/96)), and a guest-created Pi
+credential inside it is warned about on every Pi session start.
 
 ## Private MSB_HOME
 
@@ -212,7 +215,7 @@ A `(home_relative, state_relative)` pair mapping a guest `$HOME` dotfile to an
 entry under the per-project state dir (`credential_provider::HomeLink`).
 Provider-owned links come first, in `CredentialProvider::ALL` order, then the
 `GENERIC_HOME_LINKS` that no provider owns (`.gitconfig`, `.config/gh`,
-`.bash_history`), then one link per `persist` path in the launch's
+`.bash_history`, `.pi`), then one link per `persist` path in the launch's
 **provisioning closure**, under `<state>/persist/`
 (`guest_home::links(persist)`). Both guest-user modes consume the single
 `guest_home::links` list, so root mode's `.patch()` symlinks and non-root mode's
@@ -221,7 +224,12 @@ are compiled-in and which are config-declared; the non-root site reads it (only
 a **declared** link may replace real content by migrating it — a compiled one
 keeps `force_symlink`'s refuse-a-directory contract), while root mode
 force-symlinks both, because `/root` is rebaked into a fresh rootfs every boot
-so nothing real is ever at a link path there.
+so nothing real is ever at a link path there. The compiled `.pi` link is a
+**bounded exception**: because the persistent non-root guest HOME predates
+`~/.pi`, `ProjectSession::migrate_legacy_pi_home` runs one named, deletable
+one-shot move of a pre-#96 real `<state>/home/.pi` into `<state>/pi` before
+provisioning; `force_symlink`'s own contract is unchanged
+([ADR-0021](docs/adr/0021-project-scoped-pi-home-and-trust-defaults.md)).
 
 ## Tool
 

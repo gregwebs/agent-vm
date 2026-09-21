@@ -1,7 +1,7 @@
 # @wirenboard/agent-vm
 
-Sandboxed VMs for AI coding agents — Claude Code, Codex CLI, OpenCode
-— running inside per-project libkrun microVMs built on
+Sandboxed VMs for AI coding agents — Claude Code, Codex CLI, OpenCode,
+Copilot, Pi — running inside per-project libkrun microVMs built on
 [microsandbox](https://github.com/wirenboard/microsandbox).
 
 This package is a thin launcher; the actual native binaries
@@ -25,7 +25,7 @@ group) and Node 18+. macOS and Windows aren't supported yet.
 ```bash
 agent-vm setup            # pull the latest image, verify it boots
 cd ~/your-project
-agent-vm claude           # or codex / opencode / shell
+agent-vm claude           # or codex / opencode / copilot / pi / shell
 ```
 
 Full docs, subcommand reference, and source:

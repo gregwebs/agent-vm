@@ -1,6 +1,6 @@
 # agent-vm
 
-Run Claude Code / Codex / OpenCode / Copilot inside a per-project libkrun
+Run Claude Code / Codex / OpenCode / Copilot / Pi inside a per-project libkrun
 microVM,
 booting in ~2 seconds, with:
 
