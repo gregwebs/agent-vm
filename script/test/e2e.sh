@@ -119,11 +119,13 @@ mkdir -p "$STATE_DIR/msb-home"
 # ~/.microsandbox/cache, but import-image.sh runs `msb image load` directly and
 # never applies that redirect. On a *fresh* state dir the imported blobs land
 # in the private msb-home/cache and the boot then looks in the shared cache and
-# falls through to a registry pull. Initialising through any non-Launch builtin
-# first writes the same config.json the boot will use, so import and boot agree.
+# falls through to a registry pull. Initialising through a non-Launch builtin
+# that still runs normal msb setup (`msb`, not `doctor` - doctor is deliberately
+# observational and writes nothing) first writes the same config.json the boot
+# will use, so import and boot agree.
 if [[ ! -f "$STATE_DIR/msb-home/config.json" ]]; then
   echo "==> Initializing $STATE_DIR/msb-home (so import and boot share one cache)"
-  AGENT_VM_STATE_DIR="$STATE_DIR" "$AGENT_VM" doctor >/dev/null 2>&1 || true
+  AGENT_VM_STATE_DIR="$STATE_DIR" "$AGENT_VM" msb --version >/dev/null 2>&1 || true
 fi
 
 # ------------------------------------------------------------- host helpers --

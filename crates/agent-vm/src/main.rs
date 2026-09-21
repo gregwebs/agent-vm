@@ -22,6 +22,7 @@ mod msb_install;
 mod msb_preflight;
 mod msb_schema;
 mod network;
+mod pi_credential_inspection;
 mod protected_host_files;
 mod pull;
 mod pull_progress;
@@ -49,6 +50,23 @@ fn main() -> Result<()> {
     // `cli::parse_from`.
     let config = config::ConfigPaths::discover().and_then(|paths| config::load(&paths));
     let dispatch = cli::parse_from(std::env::args_os(), config)?;
+
+    // `doctor` is a **diagnostic** and must not depend on a healthy runtime to
+    // inspect state (issue #93): dispatching it here, before `point_at_msb` /
+    // `ensure_msb_home`, means ordinary doctor no longer spawns `msb --version`
+    // nor creates or rewrites MSB_HOME. `doctor::run` needs only the pure
+    // `msb_home_dir()` path calculation, so it now works on a missing or
+    // unpatched msb, and it no longer validates that binary. It is also pure
+    // sync fs work (no VM/network I/O), so it is dispatched before the runtime
+    // for the same reason as `Msb` below.
+    if let Dispatch::Builtin {
+        cmd: Cmd::Doctor(args),
+        ..
+    } = dispatch
+    {
+        doctor::run(args)?;
+        return Ok(());
+    }
 
     // Locate and pin our patched msb binary via MSB_PATH so a user's
     // separate `~/.microsandbox/bin/msb` can't shadow ours. The hook
@@ -89,22 +107,13 @@ fn main() -> Result<()> {
     // `msb_cmd::run` is fully synchronous (just spawns a child and waits);
     // dispatch it before paying for a tokio runtime we'd otherwise spin up
     // and immediately block on for a single `Command::status()` call.
+    // doctor is dispatched pre-runtime and pre-msb-setup, above.
     if let Dispatch::Builtin {
         cmd: Cmd::Msb(args),
         ..
     } = dispatch
     {
         return exit_with(msb_cmd::run(args)?);
-    }
-    // doctor is also pure sync fs work (no VM/network I/O); dispatch it
-    // before the runtime for the same reason as Msb above.
-    if let Dispatch::Builtin {
-        cmd: Cmd::Doctor(args),
-        ..
-    } = dispatch
-    {
-        doctor::run(args)?;
-        return Ok(());
     }
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     runtime.block_on(async move {

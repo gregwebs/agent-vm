@@ -1316,4 +1316,34 @@ mod tests {
         );
         std::fs::remove_dir_all(&session.project_dir).ok();
     }
+
+    /// The launch scanner and the session's computed state path must agree on
+    /// where project-scoped Pi state lives. `session.rs` owns the path
+    /// (`state_dir` → the `pi/agent` tree); `pi_credential_inspection` derives
+    /// the same files from `ProtectedFile`. This pins the agreement without
+    /// adding a one-line forwarding method merely to touch the path.
+    #[test]
+    fn scanner_reads_the_session_state_dir_pi_home() {
+        let session = throwaway_session();
+        session
+            .ensure_dirs(&guest_home::links(&[]))
+            .expect("ensure_dirs");
+        let pi_agent = session.state_dir.join("pi/agent");
+        std::fs::create_dir_all(&pi_agent).unwrap();
+        std::fs::write(
+            pi_agent.join("auth.json"),
+            br#"{"anthropic":{"type":"api_key","key":"guest-managed"}}"#,
+        )
+        .unwrap();
+
+        let report = crate::pi_credential_inspection::inspect_project(&session.state_dir);
+        let warning = report
+            .launch_warning()
+            .expect("a real credential must warn");
+        assert!(
+            warning.contains("auth.json: provider=anthropic type=api_key fields=key"),
+            "{warning}"
+        );
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
 }

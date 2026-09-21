@@ -55,9 +55,10 @@ impl ProtectedFile {
 
     /// The same path relative to the Pi home (`~/.pi`) rather than `$HOME` —
     /// used by the static fork-omission signal, which positions the file under
-    /// a *resolved* `~/.pi` target as well as under `$HOME`. Derived from
-    /// [`Self::home_relative`] so the two spellings cannot drift.
-    fn pi_home_relative(self) -> PathBuf {
+    /// a *resolved* `~/.pi` target as well as under `$HOME`, and by the
+    /// project-scoped guest Pi scanner (#93), which derives `pi/<relative>`.
+    /// Derived from [`Self::home_relative`] so the two spellings cannot drift.
+    pub(crate) fn pi_home_relative(self) -> PathBuf {
         Path::new(self.home_relative())
             .strip_prefix(PI_HOME_NAME)
             .expect("home_relative is always under ~/.pi")

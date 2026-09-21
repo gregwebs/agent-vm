@@ -1115,6 +1115,20 @@ pub(crate) async fn launch(
     // a redirected ancestor, so a guest-planted `<state>/home` symlink cannot
     // make it move the host's real `~/.pi`. See #96 and ADR-0021.
     session.migrate_legacy_pi_home()?;
+    // Report existing guest-managed Pi state *before* provisioning, and before
+    // any later operation that could fail: the migration above has just put
+    // real state at its canonical location, and a caller must see unsafe state
+    // even when provisioning or image setup later bails. One unconditional
+    // scan covers every resolved tool (including custom tools), because the
+    // compiled Pi home is unconditional. The banner supplies project/state
+    // context; the findings themselves stay field-only. Advisory: this never
+    // denies the launch.
+    let mut notices = LaunchNotices::to_stderr();
+    notices.emit(launch_banner(&session))?;
+    let pi_report = crate::pi_credential_inspection::inspect_project(&session.state_dir);
+    if let Some(warning) = pi_report.launch_warning() {
+        notices.emit(warning)?;
+    }
     session.ensure_dirs(&home_links)?;
     if !root_mode {
         session
@@ -1140,9 +1154,6 @@ pub(crate) async fn launch(
     // this same project before we boot. See
     // `reap_stale_project_sandboxes` for the full rationale.
     reap_stale_project_sandboxes(&session.project_hash).await;
-    let mut notices = LaunchNotices::to_stderr();
-    notices.emit(launch_banner(&session))?;
-    let _ = &session.project_hash;
 
     // The chain root: which published tag this launch builds FROM and boots,
     // and whether the declared tool layers must be composed onto it. Pure, and
@@ -3196,6 +3207,28 @@ mod tests {
         let chain = format!("{error:#}");
         assert!(
             chain.contains("writing the launch notice \"==> hello\""),
+            "chain: {chain}"
+        );
+        assert!(chain.contains("broken output"), "chain: {chain}");
+    }
+
+    #[test]
+    fn notice_write_failure_propagates_a_multi_line_pi_warning() {
+        // The launch warning is a multi-line string carried by one `emit`.
+        // Its write failure must be the same contextual `Result`, not a panic
+        // (the EPIPE/`head` case behind issue #70).
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let output = ScriptedOutput {
+            log: log.clone(),
+            fault: Fault::Write,
+        };
+        let mut notices = LaunchNotices::new(output);
+        let error = notices
+            .emit("==> WARNING: potentially sensitive\n    auth.json: provider=anthropic")
+            .expect_err("write failure must propagate");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("writing the launch notice"),
             "chain: {chain}"
         );
         assert!(chain.contains("broken output"), "chain: {chain}");

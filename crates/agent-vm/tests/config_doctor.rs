@@ -534,8 +534,8 @@ fn doctor_never_executes_the_command_or_creates_layer_or_persist_paths() {
 
     // Persist paths are guest-HOME-relative, so a per-project state dir —
     // not the project root — is where a materialized `cache/never` would
-    // appear. The state root also gains `msb-home/` from the pre-existing
-    // main prologue (unrelated to config), so the snapshot ignores it.
+    // appear. `doctor` is now dispatched before msb setup, so it creates
+    // nothing at all under the state dir; the whole tree must match.
     let state_before = snapshot_tree(h.state.path());
 
     let out = h.run_doctor();
@@ -553,9 +553,8 @@ fn doctor_never_executes_the_command_or_creates_layer_or_persist_paths() {
 }
 
 /// Every entry under `root`, as paths relative to `root`, sorted — used to
-/// prove a run created nothing there. The `msb-home/` subtree is skipped:
-/// the pre-existing main prologue creates it for every msb-backed command
-/// (including `doctor`) and it is unrelated to tool config.
+/// prove a run created nothing there. `doctor` no longer runs any msb
+/// bootstrap, so the entire tree must be unchanged.
 fn snapshot_tree(root: &Path) -> Vec<PathBuf> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -566,9 +565,6 @@ fn snapshot_tree(root: &Path) -> Vec<PathBuf> {
             let Ok(relative) = path.strip_prefix(root) else {
                 continue;
             };
-            if relative == Path::new("msb-home") {
-                continue;
-            }
             out.push(relative.to_path_buf());
             if path.is_dir() {
                 walk(root, &path, out);

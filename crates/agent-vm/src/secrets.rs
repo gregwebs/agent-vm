@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use vstd::prelude::*;
 
 use crate::credential_provider::{self, CredentialProvider, ProviderSet};
 use crate::host_paths::{
@@ -150,7 +151,6 @@ pub const OPENCODE_API_PROVIDERS: [OpencodeApiProvider; 7] = [
     },
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub const ALL_PLACEHOLDERS: &[&str] = &[
     ANTHROPIC_ACCESS_PLACEHOLDER,
     ANTHROPIC_REFRESH_PLACEHOLDER,
@@ -169,6 +169,63 @@ pub const ALL_PLACEHOLDERS: &[&str] = &[
     "msb-moonshot-placeholder-k-v1",
     "msb-moonshot-cn-placeholder-k-v1",
 ];
+
+verus! {
+
+/// The exact-placeholder kernel: whole-value byte equality, and nothing else.
+///
+/// A copied placeholder is not a secret, so it may stay quiet; a prefix,
+/// suffix, substring, or placeholder-embedded value is *not* equal and
+/// therefore is not treated as a placeholder. Byte-level because that is the
+/// pure decision; the `&str` → bytes measurement is the trusted adapter
+/// ([`is_known_placeholder`]).
+pub fn exact_bytes_equal(a: &[u8], b: &[u8]) -> (result: bool)
+    ensures result == (a@ =~= b@),
+{
+    let alen = a.len();
+    let blen = b.len();
+    assert(alen == a@.len());
+    assert(blen == b@.len());
+    if alen != blen {
+        assert(a@ != b@);
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < alen
+        invariant
+            i <= alen,
+            alen == blen,
+            alen == a@.len(),
+            blen == b@.len(),
+            forall|j: int| 0 <= j < i ==> a@[j] == b@[j],
+        decreases alen - i,
+    {
+        if a[i] != b[i] {
+            assert(a@ != b@);
+            return false;
+        }
+        i += 1;
+    }
+    assert(forall|j: int| 0 <= j < alen ==> a@[j] == b@[j]);
+    assert(a@ =~= b@);
+    true
+}
+
+} // verus!
+
+/// Whether `value` is *exactly* one of agent-vm's known placeholder constants
+/// — whole-value equality, never a prefix/substring/reg-exp match, and never a
+/// lookup in a live substitution set. A copied known placeholder is not a
+/// secret even when it is not wired into this launch, so quiet reporting here
+/// does not assert that requests authenticate.
+///
+/// Trusted adapter for [`exact_bytes_equal`]: the `&str` → bytes measurement
+/// and the inventory iteration are outside the proof.
+pub(crate) fn is_known_placeholder(value: &str) -> bool {
+    ALL_PLACEHOLDERS
+        .iter()
+        .any(|placeholder| exact_bytes_equal(value.as_bytes(), placeholder.as_bytes()))
+}
 
 // Hostnames the secret-substitution proxy + interceptor key off. Kept
 // here so the launcher (`run.rs`), the hook (`intercept_hook`), and any
@@ -1756,6 +1813,22 @@ mod tests {
             }
         }
         assert_eq!(OPENCODE_API_PROVIDERS.len(), 7);
+    }
+
+    /// Every OpenCode provider placeholder must be present in the shared
+    /// inventory the exact-placeholder predicate reads — otherwise a wired
+    /// placeholder would be reported as a guest-managed credential once the
+    /// scanner consumes the inventory (see `pi_credential_inspection`).
+    #[test]
+    fn all_placeholders_include_every_opencode_provider_placeholder() {
+        for provider in OPENCODE_API_PROVIDERS {
+            assert!(
+                is_known_placeholder(provider.placeholder),
+                "{} placeholder {} missing from ALL_PLACEHOLDERS",
+                provider.id,
+                provider.placeholder,
+            );
+        }
     }
 
     #[test]
