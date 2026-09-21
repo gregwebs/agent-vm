@@ -120,23 +120,35 @@ fn finding_budget_allows_impl(retained: usize) -> (ok: bool)
     retained < MAX_RETAINED_FINDINGS
 }
 
-/// The most members any single JSON object may hold. Named so the *parse* of
-/// a guest-controlled document is bounded: past this many members the whole
-/// document is rejected as malformed before another member is read, so an
-/// 8 MiB file cannot grow the retained member list (or the duplicate check)
-/// without limit.
-pub(crate) const MAX_OBJECT_MEMBERS: usize = 4096;
+/// The most items any single JSON container may hold — object members or array
+/// elements. Named so the *parse* of a guest-controlled document is bounded
+/// *per container*: past this many items the whole document is rejected as
+/// malformed, so no single container can grow the retained member/element list
+/// (or the duplicate-member check) without limit. Objects and arrays share the
+/// one number deliberately: the decision is the same one, and two literals
+/// could drift apart. A legitimate file is never expected to reach 4096 items
+/// in one container — an assumption about Pi's schema, not a measurement — so
+/// reporting a larger container as malformed rather than truncating it is the
+/// safe direction.
+///
+/// This is per container, not a total-value budget: the total a document may
+/// retain is still bounded by the 8 MiB read
+/// ([`crate::host_paths::MAX_GUEST_STATE_FILE_BYTES`]), because JSON spends at
+/// least one input byte per value. A proved *global* bound is not claimed here
+/// and remains the read bound's job (#146).
+pub(crate) const MAX_CONTAINER_ITEMS: usize = 4096;
 
-/// The per-object member-limit predicate: one more member may be parsed iff
-/// the number already seen is strictly below [`MAX_OBJECT_MEMBERS`].
-pub(crate) open spec fn object_member_budget_allows(retained: usize) -> bool {
-    retained < MAX_OBJECT_MEMBERS
+/// The per-container item-limit predicate: one more object member or array
+/// element may be parsed iff the number already seen is strictly below
+/// [`MAX_CONTAINER_ITEMS`].
+pub(crate) open spec fn container_item_budget_allows(retained: usize) -> bool {
+    retained < MAX_CONTAINER_ITEMS
 }
 
-fn object_member_budget_allows_impl(retained: usize) -> (ok: bool)
-    ensures ok == object_member_budget_allows(retained),
+fn container_item_budget_allows_impl(retained: usize) -> (ok: bool)
+    ensures ok == container_item_budget_allows(retained),
 {
-    retained < MAX_OBJECT_MEMBERS
+    retained < MAX_CONTAINER_ITEMS
 }
 
 } // verus!
@@ -743,6 +755,14 @@ impl<'de> Deserialize<'de> for Json {
             {
                 let mut items = Vec::new();
                 while let Some(item) = seq.next_element()? {
+                    // Bound the parse before retaining another element:
+                    // `next_element` parses the over-limit element then drops
+                    // it — it can be a large subtree, so the cap bounds the
+                    // retained list, not peak memory — and the document is then
+                    // malformed (the object/array contrast is in ADR-0018).
+                    if !container_item_budget_allows_impl(items.len()) {
+                        return Err(de::Error::custom("too many array elements"));
+                    }
                     items.push(item);
                 }
                 Ok(Json::Array(items))
@@ -758,7 +778,7 @@ impl<'de> Deserialize<'de> for Json {
                     // guest-controlled 8 MiB document must not make the member
                     // list grow without bound. Past the cap the whole document
                     // is malformed (a fixed potentially-sensitive line).
-                    if !object_member_budget_allows_impl(entries.len()) {
+                    if !container_item_budget_allows_impl(entries.len()) {
                         return Err(de::Error::custom("too many object members"));
                     }
                     let value = map.next_value::<Json>()?;
@@ -792,8 +812,9 @@ fn parse_document(bytes: &[u8]) -> Option<Json> {
     //
     // Recursion depth is not a separate hole: `serde_json`'s default
     // 128-level limit rejects deeply nested input before this visitor
-    // recurses, so the parse cannot blow the stack. The member bound in
-    // `visit_map` is the resource limit this module adds itself.
+    // recurses, so the parse cannot blow the stack. The per-container item
+    // bound in `visit_map` and `visit_seq` is the resource limit this module
+    // adds itself.
     serde_json::from_slice::<Json>(bytes).ok()
 }
 
@@ -1321,6 +1342,22 @@ mod tests {
         assert!(findings.is_empty(), "expected quiet, got {findings:#?}");
     }
 
+    /// A JSON array of `count` scalar elements — the smallest input that can
+    /// retain `count` values, so it isolates the element budget from everything
+    /// else the scanner looks at.
+    fn scalar_array(count: usize) -> String {
+        let mut body = String::with_capacity(count * 2 + 2);
+        body.push('[');
+        for index in 0..count {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push('1');
+        }
+        body.push(']');
+        body
+    }
+
     // -- auth.json ---------------------------------------------------------
 
     #[test]
@@ -1604,11 +1641,11 @@ mod tests {
         // S-1 regression. A hostile member count must be rejected by the parse
         // bound, so the duplicate check and the retained member list stay
         // bounded on the every-launch path. This test fails if
-        // `MAX_OBJECT_MEMBERS` is removed: the over-limit object would then be
+        // `MAX_CONTAINER_ITEMS` is removed: the over-limit object would then be
         // fully parsed and produce many truncated findings instead of one
         // malformed one.
         let mut oversized = String::from("{");
-        for index in 0..=MAX_OBJECT_MEMBERS {
+        for index in 0..=MAX_CONTAINER_ITEMS {
             if index > 0 {
                 oversized.push(',');
             }
@@ -1625,7 +1662,7 @@ mod tests {
 
         // An object exactly at the limit is still scanned, not rejected.
         let mut at_limit = String::from("{");
-        for index in 0..MAX_OBJECT_MEMBERS {
+        for index in 0..MAX_CONTAINER_ITEMS {
             if index > 0 {
                 at_limit.push(',');
             }
@@ -1646,8 +1683,61 @@ mod tests {
     }
 
     #[test]
+    fn an_array_past_the_element_limit_rejects_the_whole_document() {
+        // S-1 regression, array half (#146): this test fails if the `visit_seq`
+        // check is removed, because the over-limit array would then parse.
+        assert!(
+            parse_document(scalar_array(MAX_CONTAINER_ITEMS).as_bytes()).is_some(),
+            "an array exactly at the element limit must still parse"
+        );
+        assert!(
+            parse_document(scalar_array(MAX_CONTAINER_ITEMS + 1).as_bytes()).is_none(),
+            "one element past the limit must reject the document"
+        );
+
+        // Every array at every depth goes through `visit_seq`, so a nested
+        // over-limit array rejects the whole document too, not only a root one.
+        let nested = format!(
+            r#"{{"providers":{{"demo":{{"models":[{{"id":"m","input":{}}}]}}}}}}"#,
+            scalar_array(MAX_CONTAINER_ITEMS + 1)
+        );
+        assert!(
+            parse_document(nested.as_bytes()).is_none(),
+            "a nested over-limit array must reject the whole document"
+        );
+    }
+
+    #[test]
+    fn an_over_limit_array_in_a_scanned_file_is_one_fixed_malformed_finding() {
+        // End to end: the rejection must reach the report as the one fixed
+        // potentially-sensitive line, never as a stream of per-element
+        // findings.
+        let over_limit = format!(
+            r#"{{"anthropic":{{"type":"api_key","key":{}}}}}"#,
+            scalar_array(MAX_CONTAINER_ITEMS + 1)
+        );
+        let findings = auth_findings(&over_limit);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            line_of(&findings[0]),
+            "auth.json: potentially sensitive; unrecognized or malformed structure"
+        );
+
+        // An array exactly at the limit is still scanned: a non-string `key` is
+        // a credential-bearing field, so the entry classifies normally.
+        let at_limit = format!(
+            r#"{{"anthropic":{{"type":"api_key","key":{}}}}}"#,
+            scalar_array(MAX_CONTAINER_ITEMS)
+        );
+        assert_eq!(
+            line_of(&auth_findings(&at_limit)[0]),
+            "auth.json: provider=anthropic type=api_key fields=key"
+        );
+    }
+
+    #[test]
     fn deeply_nested_input_is_rejected_without_a_stack_overflow() {
-        // The member bound does not have to double as a depth bound:
+        // The item bound does not have to double as a depth bound:
         // `serde_json`'s default 128-level recursion limit rejects this before
         // the visitor recurses, so the result is the fixed malformed line.
         let depth = 200;
