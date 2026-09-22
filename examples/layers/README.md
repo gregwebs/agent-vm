@@ -73,7 +73,88 @@ lint half is kept true by
 | Example | Adds |
 |---|---|
 | [`wirenboard-cpp`](wirenboard-cpp/) | WB C/C++ build-essentials (debhelper, clang-format/clang-tidy, libcurl/libgtest/libmodbus/libsystemd-dev, cmake/ninja, ...) plus the armhf/arm64 cross toolchains, qemu-user-static, and the sbuild/schroot/debootstrap path. |
+| [`rust-dev`](rust-dev/) | The Rust toolchain this repo pins (via `rust-toolchain.toml`, with clippy and rustfmt), the host musl target, the native build libraries `ci.yml` installs, shellcheck, and the pinned Verus release — enough to build, test, lint and verify agent-vm's Rust code in the guest. |
 | [`chrome-devtools`](chrome-devtools/) | Chromium, Chrome DevTools MCP wrapper, scoped NSS CA trust, and the Chrome capability marker. |
+
+## Rust development
+
+`rust-dev` is the layer that lets an in-VM agent iterate on agent-vm's own
+Rust code. It installs, all under the world-readable `/opt` (contract C7):
+
+- the **pinned Rust toolchain** from `rust-toolchain.toml` (`1.98.1` at the
+time of writing) with the `clippy` and `rustfmt` components, plus the host
+`*-unknown-linux-musl` target the guest `agentd` cross-build needs;
+- the native libraries `ci.yml` installs — `build-essential`, `pkg-config`,
+`libcap-ng-dev`, `libdbus-1-dev`, `musl-tools` — and `shellcheck` for
+`script/test/ci-contracts.sh`;
+- the **pinned Verus release** CI verifies with, on `linux/amd64` (see the
+Apple Silicon note below).
+
+Copy it into a numbered step and launch, or try it first without copying:
+
+```sh
+cp -r examples/layers/rust-dev .agent-vm/layers/10-rust-dev
+agent-vm claude --yes
+# or:
+agent-vm shell --layer examples/layers/rust-dev --yes
+```
+
+Once booted, the guest can run the repo's Rust gates the way CI does. The
+guest `agentd` has to be built first — the microsandbox SDK's build script
+embeds it, and a host (macOS) copy is not a Linux binary:
+
+```sh
+# Build the guest agentd the SDK embeds. The musl target is derived from the
+# active host triple, so this works on x86_64 and aarch64 alike:
+musl="$(rustc -vV | sed -n 's/^host: \(.*\)-unknown-linux-gnu$/\1/p')-unknown-linux-musl"
+cargo build --release \
+  --manifest-path vendor/microsandbox/crates/agentd/Cargo.toml \
+  --target-dir vendor/microsandbox/target \
+  --target "$musl"
+mkdir -p vendor/microsandbox/build
+cp "vendor/microsandbox/target/$musl/release/agentd" \
+   vendor/microsandbox/build/agentd
+touch vendor/microsandbox/build/agentd
+
+# Then the workspace gates:
+cargo build --release -p agent-vm
+cargo test -p agent-vm
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+bash script/test/ci-contracts.sh
+CARGO_TARGET_DIR=target/verus cargo verus verify --locked -p agent-vm
+```
+
+The toolchain lives under `RUSTUP_HOME=/opt/rustup` and the shims under
+`/opt/cargo/bin`; both are read-only and shared by every guest uid. `cargo`'s
+registry and build cache still land in the guest's own writable
+`$HOME/.cargo`, so what the layer shares is only the toolchain. Because
+`RUSTUP_HOME` is read-only, `rustup component add` and toolchain installs are
+not available in the guest — the layer pre-provisions exactly the pinned
+toolchain instead.
+
+### Apple Silicon (no Verus asset)
+
+Upstream publishes Verus for `linux/amd64` and `macos/arm64`, but **not**
+`linux/arm64`. On an Apple Silicon host the guest is `linux/arm64`, so the
+layer skips Verus; run the host's `arm64-macos` Verus there instead
+(`CONTRIBUTING.md` § *Verifying contracts locally*). Everything else in the
+layer works on both architectures.
+
+### Keeping the pins in lockstep
+
+The Dockerfile's `ARG RUST_TOOLCHAIN` is checked against
+`rust-toolchain.toml`'s canonical channel, and its `ARG VERUS_RELEASE` /
+`ARG VERUS_SHA256` against `.github/workflows/verus.yml`, by
+`script/check-rust-toolchain.sh` — the same check that enforces the repo's
+toolchain copies elsewhere. The checker also refuses a build whose Verus
+install script stopped verifying the digest. A pin bump edits the source of
+truth, then this directory, then runs the checker.
+
+The layer's build steps are committed as standalone scripts beside the
+Dockerfile — `install-rust.sh`, `install-verus.sh` and `verify-toolchain.sh`
+— and bind-mounted in at build time, so each can be read, reviewed and run on
+its own. They are covered by the CI shell guard in `script/test/ci-contracts.sh`.
 
 ## Chrome DevTools
 

@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
-VSTD_PIN='=0.0.0-2026-09-16-0054'
+VSTD_PIN='=0.0.0-2026-09-20-0158'
 RESULTS_OK='verification results:: [1-9][0-9]* verified, 0 errors'
 
 fail() {

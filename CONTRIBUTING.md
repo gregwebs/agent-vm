@@ -86,10 +86,10 @@ there if this section ever looks stale.
 To run the same check locally, install the pinned release. On Linux:
 
 ```bash
-release=0.2026.09.16.7325eee
+release=0.2026.09.20.aef82ed
 zip="verus-$release-x86-linux.zip"
-curl -fSLO "https://github.com/verus-lang/verus/releases/download/release/rolling/$release/$zip"
-echo "5e386d253a29bdac7d475a43b6f58dbcc9099c77953cb16180c9ef5832c50038  $zip" | sha256sum -c -
+curl -fSLO "https://github.com/verus-lang/verus/releases/download/release/$release/$zip"
+echo "7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  $zip" | sha256sum -c -
 unzip -q "$zip"                     # unpack anywhere; creates verus-x86-linux/
 export PATH="$PWD/verus-x86-linux:$PATH"
 ```
@@ -108,6 +108,10 @@ CARGO_TARGET_DIR=target/verus cargo verus verify -p agent-vm
 `CARGO_TARGET_DIR` matters: `cargo verus` sets `RUSTC_WRAPPER`, which is part of
 cargo's fingerprint, so sharing one `target/` with ordinary builds makes every switch
 a full rebuild. Expect a few minutes the first time and a few seconds thereafter.
+
+The `rust-dev` example tooling layer (`examples/layers/rust-dev`) pre-installs this
+same pinned release for an in-VM agent on `linux/amd64`; see
+[`examples/layers/README.md`](examples/layers/README.md#rust-development).
 
 `bash script/test/verus-verification.sh` runs exactly what CI runs: the verification
 plus the assertion that it actually verified something, then a pair of throwaway
