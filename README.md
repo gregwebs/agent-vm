@@ -1,26 +1,24 @@
 # agent-vm
 
-Run Claude Code / Codex / OpenCode / Copilot / Pi inside a per-project libkrun
-microVM,
-booting in ~2 seconds, with:
+Run inside a per-project [microsandbox](https://docs.microsandbox.dev/) (libkrun microVM), booting in ~2 seconds.
 
-- **Host OAuth tokens never enter the VM.** The TLS-intercept proxy in
-  [microsandbox](https://github.com/wirenboard/microsandbox) substitutes
-  the real bearer for a placeholder on the way out. OAuth refresh is
-  fail-closed; see [USAGE.md](USAGE.md#credentials) for OpenCode static
-  provider support and rotation behavior.
+- **Secure sandbox with convenience.**
+  The guest runs as your host user (--root is available when needed).
+  The working directory is bind-mounted at its host path and you can mount other directories.
+  Provide your own Dockerfile and configuration files to specify whats in your VM.
+- **Network allow list**
+  Disable or enable networking, enforce allow lists 
+- **Built-in support for common AI harnesses**
+  Claude Code / Codex / OpenCode / Copilot / Pi
+  Run with `--yolo`, `--dangerously-skip-permissions`, etc- agent-vm instead provides the security.
+- **Host OAuth tokens never enter the VM.**
+  A TLS-intercept proxy in
+  [microsandbox](https://github.com/gregwebs/microsandbox) substitutes
+  the real bearer for a placeholder on the way out.
 - **Per-launch GitHub repo allow-list.** Auto-detected from
   `git remote -v`; extend with `--repo OWNER/NAME`. `gh pr create`,
   `git push` etc. are filtered at the proxy — off-list calls get a 403
   before they reach GitHub.
-- **Sandbox is the boundary.** The guest runs as your host user by
-  default (`--root` for the old root-guest behavior), project bind-mounted
-  at its host path, `--dangerously-skip-permissions` set by default
-  (the microVM is the only thing actually keeping the agent on rails).
-
-This is the Rust rewrite of the original Bash
-[`wirenboard/agent-vm`](https://github.com/wirenboard/agent-vm) on
-top of microsandbox, and it is what lives on `main`.
 
 ## Requirements
 
@@ -31,7 +29,7 @@ top of microsandbox, and it is what lives on `main`.
 ## Quick start
 
 ```bash
-npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm <cmd>
+cargo build
 
 agent-vm setup            # pulls the image this config boots from and verifies it boots
 
