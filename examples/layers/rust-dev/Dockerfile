@@ -102,8 +102,10 @@ ENV PATH=/opt/cargo/bin:/opt/verus/verus-x86-linux:${PATH}
 # instead of surfacing as command-not-found in the guest. `set -e` propagates
 # the first failure. The toolchain equality check is exact, so a rustup that
 # silently resolved a different version cannot ship. On amd64 the Verus check
-# goes beyond `--version`: it verifies a trivial contract, so a Verus tree
-# that cannot actually reach its bundled vstd + z3 fails the build.
+# goes beyond `--version`: it verifies a trivial contract and requires the
+# `N verified, 0 errors` line, so a Verus tree that cannot reach its bundled
+# vstd + z3 -- or that exits 0 while verifying nothing (ADR-0018) -- fails the
+# build.
 RUN set -eux; \
     test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN"; \
     cargo --version; \
@@ -125,7 +127,9 @@ RUN set -eux; \
             '}' \
             '}' \
             > "$smoke/smoke.rs"; \
-        (cd "$smoke" && "$verus" --crate-type=lib smoke.rs); \
+        smoke_out="$( (cd "$smoke" && "$verus" --crate-type=lib smoke.rs) 2>&1 )"; \
+        printf '%s\n' "$smoke_out"; \
+        printf '%s\n' "$smoke_out" | grep -Eq 'verification results:: [1-9][0-9]* verified, 0 errors'; \
         rm -rf "$smoke"; \
     fi; \
     echo "== rust-dev layer sanity OK =="
