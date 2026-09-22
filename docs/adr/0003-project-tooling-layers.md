@@ -19,8 +19,9 @@ the layer image contract) is unchanged and now applies per chain step; msb's
 per-platform manifest digest remains the identity anchor for step 0's hash.
 
 Extended by [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) (issue #84):
-the layer contract now also governs the five shipped per-tool layers under
-`images/tools/`, and a launch's chain may begin with the catalog's tool steps
+the layer contract now also governs the shipped per-tool layers under
+`images/tools/` (five when this ADR was written; six since issue #149 added
+`dsh`), and a launch's chain may begin with the catalog's tool steps
 before the project's own.
 
 ## Context

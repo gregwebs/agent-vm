@@ -71,7 +71,7 @@ A launch is one pass, and the ordering is load-bearing:
 and `<cwd>/.agent-vm/config.toml` — validates each strictly, and resolves a
 whole-definition union (user definitions win; the project may only add names
 the user did not write). When both declare zero tools it falls back to the
-five compiled-in defaults embedded from `default-tools.toml`. The resolved
+seven compiled-in defaults embedded from `default-tools.toml`. The resolved
 catalog is what the CLI builds its launch verbs from (#82), and
 `run::launch` reads back each entry's provisioning set — the credential
 providers *and*, since #83, the `persist` paths that become guest-HOME
@@ -523,15 +523,17 @@ Docker engine with `fuse-overlayfs`, zellij, and the tool-layer facilities (the
 `agent-vm-install` helper, the host-CA shim, the `/opt/agent` prefix, an empty
 `/opt/agent-vm/seed.d/`). It carries **no** agent CLI.
 
-The five shipped agents live in standalone layers under `images/tools/`
-(`pi`, `codex`, `opencode`, `claude`, `copilot`), each building `FROM` the base
-and installing through its canonical installer script so the layer tracks its
-upstream release channel. CI chains base plus these five (in declaration order)
-and publishes the result as the composed default; a non-default tool set
-composes them locally. `pi` is the one exception to "installer script": it is
-pinned by a committed `package-lock.json` installed with `npm ci --ignore-scripts`,
-and it carries an agent-vm-owned wrapper (`/usr/local/bin/pi`) and a mandatory
-warning extension (see the third subtlety below). The claude layer also carries
+The six shipped agents live in standalone layers under `images/tools/`
+(`dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`), each building `FROM`
+the base and installing through its canonical installer script so the layer
+tracks its upstream release channel. CI chains base plus these six (in
+declaration order) and publishes the result as the composed default; a
+non-default tool set composes them locally. `dsh` and `pi` are the two
+exceptions to "installer script": each is pinned by a committed
+`package-lock.json` installed with `npm ci`, so neither tracks a moving channel
+(`dsh` needs the lock to freeze a working dependency layout). `pi` additionally
+carries an agent-vm-owned wrapper (`/usr/local/bin/pi`) and a mandatory warning
+extension (see the third subtlety below). The claude layer also carries
 the four `claude-plugins-official` LSP servers. Chromium is *not* in the base: it
 is an opt-in `examples/layers/chrome-devtools` tooling layer, detected after boot
 via an image-capability marker.

@@ -54,6 +54,7 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/build-workflow.sh"
     bash "$REPO_ROOT/script/test/pi-wrapper.sh"
     bash "$REPO_ROOT/script/test/pi-install.sh"
+    bash "$REPO_ROOT/script/test/dsh-verify.sh"
     bash "$REPO_ROOT/script/test/rust-toolchain-consistency.sh"
 fi
 
@@ -76,6 +77,8 @@ syntax_check=(
     images/tools/pi/pi.sh
     images/tools/pi/install-pi.sh
     images/tools/pi/verify-pi.sh
+    images/tools/dsh/verify-dsh.sh
+    script/test/dsh-verify.sh
     script/test/pi-wrapper.sh
     script/test/pi-install.sh
     script/check-rust-toolchain.sh
@@ -106,6 +109,8 @@ shellcheck_files=(
     images/tools/pi/pi.sh
     images/tools/pi/install-pi.sh
     images/tools/pi/verify-pi.sh
+    images/tools/dsh/verify-dsh.sh
+    script/test/dsh-verify.sh
     script/test/pi-wrapper.sh
     script/test/pi-install.sh
     script/check-rust-toolchain.sh

@@ -45,19 +45,20 @@ clipboard {get,put} [--sys]         exchange a string with the project sandbox
 ```
 
 The launch verbs are generated from your tool configuration (see *Tool
-configuration* below). With no config files you get the five shipped defaults
-`codex`, `opencode`, `claude`, `copilot`, `shell`; if your config declares only
-`claude`, then only `agent-vm claude` (plus the built-ins and a `shell`
-fallback) exists. `agent-vm --help` and `agent-vm doctor` always show the same
-list, in the same order.
+configuration* below). With no config files you get the seven shipped defaults
+`dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`, `shell`; if your config
+declares only `claude`, then only `agent-vm claude` (plus the built-ins and a
+`shell` fallback) exists. `agent-vm --help` and `agent-vm doctor` always show
+the same list, in the same order.
 
 `agent-vm setup` pulls the selected image and, unless `--no-verify` is given,
 boots a throwaway sandbox and verifies **every configured tool** by running its
 `command` with `--version` (a direct argv exec, never a shell string — a
 present-but-broken binary fails rather than passing an `exists` check). A
 tool whose `command` is one the shipped image must carry
-(`codex`/`opencode`/`claude`/`copilot`/`shell`), or one whose `--version` exits
-non-zero, is fatal — including when a user or project config declares it. Any
+(`pi`/`codex`/`opencode`/`claude`/`copilot`/`dsh`/`shell`), or one whose
+`--version` exits non-zero, is fatal — including when a user or project config
+declares it. Any
 other `command` only warns, because `setup` does not build the project's
 `.agent-vm/layers/` chain and cannot tell whether a tooling layer supplies it.
 `setup` executes the configured commands inside the throwaway VM — the same
@@ -83,12 +84,13 @@ CI publishes two OCI images from one run:
   plus the docker engine, diagnostic CLIs and the tool-layer facilities, with
   **no** agent CLI.
 - `ghcr.io/wirenboard/agent-vm-template:latest` — the **composed default**: the
-  base plus the five shipped tool layers (pi, codex, opencode, claude, copilot),
-  chained in declaration order.
+  base plus the six shipped tool layers (dsh, pi, codex, opencode, claude,
+  copilot), chained in declaration order.
 
-Both are rebuilt hourly, picking up the latest Claude Code, Codex CLI, and
-OpenCode releases automatically, and both accept a pinned
-`…:YYYY-MM-DDTHH` tag (immutable; the last 14 days are retained).
+Both are rebuilt hourly, picking up the latest Claude Code, Codex CLI,
+OpenCode, GitHub Copilot and DeepSeek Harness releases automatically, and both
+accept a pinned `…:YYYY-MM-DDTHH` tag (immutable; the last 14 days are
+retained).
 
 **Which image a launch uses** depends on your configured tool set:
 
@@ -562,10 +564,10 @@ interactive_shell = false            # optional; join trailing args into `-c`
   **count**, never the values, so a secret accidentally placed here is not
   echoed. Args are not shell-split or expanded.
 - `layer` — optional; a table with **exactly one** of `builtin` (one of
-  `pi`, `codex`, `opencode`, `claude`, `copilot`) or `path`. It **selects the tool
+  `dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`) or `path`. It **selects the tool
   layer composed onto the base** for a launch whose tool set differs from the
   shipped default (see [Image release cadence](#image-release-cadence)):
-  `builtin` names one of the five layers embedded in the binary, `path` a
+  `builtin` names one of the six layers embedded in the binary, `path` a
   directory (relative to the declaring config file, or absolute) holding a
   `Dockerfile` that builds `FROM` the base per
   [ADR-0003](docs/adr/0003-project-tooling-layers.md). A tool with no `layer`
@@ -686,8 +688,8 @@ fire on an unparseable config (see *Errors and recovery*). `doctor` labels the
 row with a note when the fallback is in use.
 
 Only when **both** files declare zero tools (missing, empty, or `tools = []`)
-does the compiled-in defaults list apply: `pi`, `codex`, `opencode`, `claude`,
-`copilot`, `shell`, in that order. They are defined once in
+does the compiled-in defaults list apply: `dsh`, `pi`, `codex`, `opencode`,
+`claude`, `copilot`, `shell`, in that order. They are defined once in
 [`crates/agent-vm/src/default-tools.toml`](crates/agent-vm/src/default-tools.toml),
 embedded into the binary (never written to disk). **`codex` and `opencode`
 have empty `args` on purpose** — their non-interactive configuration is
@@ -902,7 +904,7 @@ A launch only captures, injects and proxies the credentials its verb
 `tools`, transitively. `agent-vm codex` never captures your Anthropic token;
 `agent-vm claude` never captures your OpenAI one. `agent-vm shell` provisions
 all four, because in the shipped catalog the built-in `shell`'s wildcard closes
-over `default-tools.toml`'s five agents. `agent-vm doctor` prints each verb's
+over `default-tools.toml`'s six agents. `agent-vm doctor` prints each verb's
 resolved set as `provisions=…` next to its `credentials=…` requirement set.
 
 The guest's `~/.claude`, `~/.copilot` and `~/.config/opencode` symlinks are
@@ -940,6 +942,30 @@ host bearer. GraphQL mutations are denied until they have a sound
 repository-scoped authorization design; use an allow-listed REST route where
 available. Copilot has no in-session refresh path: relaunch to recapture an
 expired Copilot token.
+
+### Credential-free agents (`pi`, `dsh`)
+
+`pi` and `dsh` declare no `credentials` on purpose: both are multi-provider
+agents that enroll or configure providers **inside** the guest, so neither
+inherits a provider's pre-boot hard bail. Sign in (or paste an API key) in the
+guest instead, and it persists per project:
+
+- `pi` keeps user state under `~/.pi/agent`.
+- `dsh` keeps its whole home under `~/.dsh` (profiles, sessions, and the
+  `~/.dsh/.credentials.yaml` document the Models UI writes). Its shipped
+  default command is `dsh web`, so reach the UI with `--publish` or
+  `--auto-publish`:
+
+  ```sh
+  agent-vm dsh --auto-publish --yes
+  ```
+
+  Anthropic and OpenAI support needs no extra plugin: the harness mounts its
+  built-in `llm-pi-ai` multi-provider adapter dormant, so pick the provider in
+  the Models UI and store its key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
+  `DEEPSEEK_API_KEY` for the default DeepSeek provider). Community plugins are
+  not baked into the image; add one in the guest with
+  `dsh plugin --profile web add <package>` (pnpm is installed).
 
 ## Project hook
 

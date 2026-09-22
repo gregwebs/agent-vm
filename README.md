@@ -9,7 +9,7 @@ Run inside a per-project [microsandbox](https://docs.microsandbox.dev/) (libkrun
 - **Network allow list**
   Disable or enable networking, enforce allow lists 
 - **Built-in support for common AI harnesses**
-  Claude Code / Codex / OpenCode / Copilot / Pi
+  Claude Code / Codex / OpenCode / Copilot / Pi / DeepSeek Harness (`dsh`)
   Run with `--yolo`, `--dangerously-skip-permissions`, etc- agent-vm instead provides the security.
 - **Host OAuth tokens never enter the VM.**
   A TLS-intercept proxy in

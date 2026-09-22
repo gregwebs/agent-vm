@@ -334,6 +334,7 @@ link:.claude.json	/agent-vm-state/claude.json
 link:.config/gh	/agent-vm-state/gh-config
 link:.config/opencode	/agent-vm-state/opencode-config
 link:.copilot	/agent-vm-state/copilot
+link:.dsh	/agent-vm-state/persist/.dsh
 link:.gitconfig	/agent-vm-state/gitconfig
 link:.local/share/opencode	/agent-vm-state/opencode
 link:.pi	/agent-vm-state/pi

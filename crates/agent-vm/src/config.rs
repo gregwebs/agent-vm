@@ -14,7 +14,7 @@
 //! add whole tool definitions the user did not write; a name the user did
 //! write is authoritative and the entire user definition wins (never a
 //! field-by-field merge). Resolved order is user declarations first, then
-//! project-only declarations. Only when **both** lists are empty do the six
+//! project-only declarations. Only when **both** lists are empty do the seven
 //! compiled-in defaults (embedded from `default-tools.toml`) apply.
 //!
 //! ```
@@ -643,7 +643,7 @@ pub(crate) enum DeclaredTools {
     Named(Vec<ToolName>),
 }
 
-/// A tool's optional tooling layer. `builtin` selects one of the five layer
+/// A tool's optional tooling layer. `builtin` selects one of the six layer
 /// sources embedded in the binary (`images/tools/`); `path` names a directory
 /// anchored on the declaring config file (D7). [`LaunchCatalog::declared_layers`]
 /// projects the ordered, deduplicated sequence that [`crate::tool_layer`]
@@ -662,10 +662,12 @@ pub(crate) enum BuiltinLayer {
     Opencode,
     Claude,
     Copilot,
+    Dsh,
 }
 
 impl BuiltinLayer {
-    pub(crate) const ALL: [BuiltinLayer; 5] = [
+    pub(crate) const ALL: [BuiltinLayer; 6] = [
+        BuiltinLayer::Dsh,
         BuiltinLayer::Pi,
         BuiltinLayer::Codex,
         BuiltinLayer::Opencode,
@@ -684,6 +686,7 @@ impl BuiltinLayer {
             BuiltinLayer::Opencode => "opencode",
             BuiltinLayer::Claude => "claude",
             BuiltinLayer::Copilot => "copilot",
+            BuiltinLayer::Dsh => "dsh",
         }
     }
 
@@ -1165,7 +1168,7 @@ fn launch_closure(tools: &[Tool], index: &HashMap<String, usize>, start: usize) 
             // `"*"` closes over the declaring tool's **own configuration
             // file** — the tools whose origin equals this tool's. In the
             // shipped default catalog every tool is `BuiltIn` (the embedded
-            // `default-tools.toml`), so this is all six; when a user config
+            // `default-tools.toml`), so this is all seven; when a user config
             // replaces the defaults the appended fallback shell is the only
             // `BuiltIn` tool, so it closes over itself alone and provisions
             // only its own (empty) `credentials`.
@@ -2014,7 +2017,7 @@ mod tests {
     // -- defaults and schema ----------------------------------------------
 
     #[test]
-    fn absent_tiers_yield_the_six_defaults_in_order() {
+    fn absent_tiers_yield_the_seven_defaults_in_order() {
         let fixture = Fixture::new();
         let report = fixture.load().unwrap();
 
@@ -2027,14 +2030,17 @@ mod tests {
         ));
 
         let tools = report.resolved().as_slice();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         let names: Vec<_> = tools.iter().map(Tool::name).collect();
         assert_eq!(
             names,
-            ["pi", "codex", "opencode", "claude", "copilot", "shell"]
+            [
+                "dsh", "pi", "codex", "opencode", "claude", "copilot", "shell"
+            ]
         );
 
         let expected = [
+            ("dsh", "dsh", 1, vec![], 1, Some("dsh")),
             ("pi", "pi", 0, vec![], 0, Some("pi")),
             ("codex", "codex", 0, vec!["openai"], 0, Some("codex")),
             (
@@ -2097,7 +2103,7 @@ mod tests {
             fixture.user(user).project(project);
             let report = fixture.load().unwrap();
             assert!(report.uses_defaults(), "user={user:?} project={project:?}");
-            assert_eq!(report.resolved().as_slice().len(), 6);
+            assert_eq!(report.resolved().as_slice().len(), 7);
             assert_eq!(
                 report.user().status(),
                 &TierStatus::Found { declared_tools: 0 }
@@ -2150,7 +2156,8 @@ mod tests {
             bool,
         );
         let tools = default_tools().unwrap();
-        let cases: [Case; 6] = [
+        let cases: [Case; 7] = [
+            ("dsh", "dsh", &["web"], &[], false),
             ("pi", "pi", &[], &[], false),
             ("codex", "codex", &[], &[OpenAi], false),
             (
@@ -2198,14 +2205,15 @@ mod tests {
     }
 
     /// The projection `tool_layer::chain_root` compares a configured catalog
-    /// against: exactly the five builtin layers, in `default-tools.toml` order.
+    /// against: exactly the six builtin layers, in `default-tools.toml` order.
     /// Derived, never hand-copied, so a reordered or re-typed default is caught
     /// here rather than by a wrong-image boot.
     #[test]
-    fn shipped_tool_layers_are_the_five_builtins_in_declaration_order() {
+    fn shipped_tool_layers_are_the_six_builtins_in_declaration_order() {
         assert_eq!(
             shipped_tool_layers().unwrap(),
             vec![
+                ToolLayer::Builtin(BuiltinLayer::Dsh),
                 ToolLayer::Builtin(BuiltinLayer::Pi),
                 ToolLayer::Builtin(BuiltinLayer::Codex),
                 ToolLayer::Builtin(BuiltinLayer::Opencode),
@@ -2228,8 +2236,9 @@ mod tests {
             .unwrap()
             .into_launch_catalog()
             .unwrap();
-        let expected: [(&str, &[CredentialProvider], &[CredentialProvider]); 6] = [
+        let expected: [(&str, &[CredentialProvider], &[CredentialProvider]); 7] = [
             //  verb        credentials (required)     provisioned
+            ("dsh", &[], &[]),
             ("pi", &[], &[]),
             ("codex", &[OpenAi], &[OpenAi]),
             (
@@ -2326,7 +2335,9 @@ mod tests {
                 .collect();
             assert_eq!(
                 names,
-                ["pi", "codex", "opencode", "claude", "copilot", "shell"]
+                [
+                    "dsh", "pi", "codex", "opencode", "claude", "copilot", "shell"
+                ]
             );
         }
     }
@@ -2567,12 +2578,12 @@ mod tests {
     }
 
     /// **T3 / §A1.** In the shipped default catalog every tool is BuiltIn, so
-    /// `shell`'s wildcard still closes over all six — the spec table is
+    /// `shell`'s wildcard still closes over all seven — the spec table is
     /// unchanged by the file-scoped rule. This pins the *reason* (origin
     /// equality), so a change to `default-tools.toml` or the fallback's origin
     /// is caught here.
     #[test]
-    fn the_shipped_default_wildcard_covers_all_six_builtin_tools() {
+    fn the_shipped_default_wildcard_covers_all_seven_builtin_tools() {
         use CredentialProvider::*;
         let catalog = Fixture::new()
             .load()
@@ -2909,7 +2920,7 @@ mod tests {
                     "{}",
                     tool.name()
                 ),
-                "pi" | "opencode" | "claude" | "copilot" => {
+                "pi" | "opencode" | "claude" | "copilot" | "dsh" => {
                     assert!(pairs.is_empty(), "{} must declare no env", tool.name())
                 }
                 other => panic!("unexpected default tool {other}"),
@@ -3516,6 +3527,7 @@ mod tests {
         assert_eq!(
             observed,
             vec![
+                ("dsh", vec![]),
                 ("pi", vec![]),
                 ("codex", vec![OpenAi]),
                 ("opencode", vec![OpenAi, OpencodeStatic]),
