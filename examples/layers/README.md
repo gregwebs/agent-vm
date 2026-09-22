@@ -201,30 +201,20 @@ Module downloads and build output stay in the guest's own writable, persistent
 home (`$HOME/go/pkg/mod` and `$HOME/.cache/go-build`), so a second launch
 reuses them — the layer shares only the toolchain, never a cache.
 
-### `GOTOOLCHAIN=local`, and the module proxy
+### `GOTOOLCHAIN=local`, and module downloads
 
 The image sets `GOTOOLCHAIN=local`, so `go` never silently downloads a second
 toolchain when a project's `go.mod` asks for a newer one: it fails with a
 message naming both versions. Bump `GO_VERSION` (and its two digests) in
 the layer's `Dockerfile` and rebuild the layer. To opt out for one command
-where the guest's allow list permits it, run `GOTOOLCHAIN=auto go …`.
+where the network permits it, run `GOTOOLCHAIN=auto go …`.
 
-Resolving modules needs the guest network allow list to include the Go module
-proxy and checksum database:
-
-```sh
-agent-vm claude \
-  --allow-host proxy.golang.org \
-  --allow-host sum.golang.org \
-  --allow-host storage.googleapis.com \
-  --yes
-```
-
-(`storage.googleapis.com` is where `proxy.golang.org` redirects module
-blobs.) Add the source host too when a module is fetched directly —
-`--allow-host github.com`, for example, for `GOPROXY=direct` or a private
-module. The layer *build* itself runs with unrestricted network access; the
-allow list governs only what the guest does at runtime.
+Module and checksum downloads need no extra flags: the default network policy
+already reaches the public internet, which covers `proxy.golang.org` and
+`sum.golang.org`. (`--allow-host` is unrelated — despite the name it opens the
+*host's* loopback gateway for reaching a dev server, not a hostname allow
+list.) A project that must not depend on the network can `go mod vendor` and
+build with `-mod=vendor`.
 
 ### Keeping the pins in lockstep
 
@@ -232,9 +222,12 @@ Unlike `rust-dev`'s toolchain pin — which is checked against
 `rust-toolchain.toml` and `verus.yml` by `script/check-rust-toolchain.sh`
 because those are the repo's elsewhere sources of truth — this layer is the
 *only* place agent-vm pins a Go toolchain, so there is nothing to
-cross-check. Instead each `install-*.sh` script verifies its download against
-the digest declared beside the version in `Dockerfile`, so a bumped version
-left beside a stale digest fails the build rather than shipping.
+cross-check. Instead the version and, for the two prebuilt downloads, the
+per-architecture digest are declared together in `Dockerfile`, and each
+`install-*.sh` verifies what it downloaded against them, so a bumped version
+left beside a stale digest fails the build rather than shipping. `gopls` has
+nothing to digest: it is pinned by module version and verified against the
+signed checksum database, as described above.
 
 ## Chrome DevTools
 

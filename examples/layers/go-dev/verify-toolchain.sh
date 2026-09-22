@@ -27,9 +27,18 @@ set -euo pipefail
 : "${GOPLS_VERSION:?GOPLS_VERSION must be set to the pinned module version}"
 
 test "$(go version | cut -d' ' -f3)" = "go${GO_VERSION}"
-gofmt -h 2>&1 | grep -q 'usage: gofmt'
-golangci-lint version | grep -q "golangci-lint has version ${GOLANGCI_LINT_VERSION} "
-gopls version | grep -q "gopls ${GOPLS_VERSION}"
+
+# Each tool's output is captured before it is matched, never piped into
+# `grep -q`: grep exits at the first match, the tool's remaining writes get
+# SIGPIPE, and `pipefail` would turn that into a failed build -- a false
+# failure whose rate depends only on how much the tool prints (gofmt's help is
+# long enough to hit it reliably).
+gofmt_help="$(gofmt -h 2>&1 || true)"
+grep -q 'usage: gofmt' <<<"$gofmt_help"
+golangci_lint_version="$(golangci-lint version)"
+grep -q "golangci-lint has version ${GOLANGCI_LINT_VERSION} " <<<"$golangci_lint_version"
+gopls_version="$(gopls version)"
+grep -q "gopls ${GOPLS_VERSION}" <<<"$gopls_version"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

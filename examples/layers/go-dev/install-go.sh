@@ -30,8 +30,12 @@ case "$arch" in
 esac
 
 asset="go${GO_VERSION}.linux-${arch}.tar.gz"
-archive="/tmp/${asset}"
-trap 'rm -f "$archive"' EXIT
+# mktemp, not a fixed /tmp path: a predictable name in a world-writable
+# directory is a pre-planted symlink waiting for curl -o to follow it, and it
+# also lets two builds share a host without colliding.
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+archive="$work/$asset"
 
 echo "==> install-go: go${GO_VERSION} into $GO_PREFIX"
 curl -fSL --retry 3 -o "$archive" "https://go.dev/dl/${asset}"

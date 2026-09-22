@@ -29,18 +29,22 @@ case "$arch" in
 esac
 
 asset="golangci-lint-${GOLANGCI_LINT_VERSION}-linux-${arch}.tar.gz"
-archive="/tmp/${asset}"
-unpacked="/tmp/golangci-lint-${GOLANGCI_LINT_VERSION}-linux-${arch}"
-trap 'rm -f "$archive"; rm -rf "$unpacked"' EXIT
+# mktemp, not a fixed /tmp path: a predictable name in a world-writable
+# directory is a pre-planted symlink waiting for curl -o to follow it, and it
+# also lets two builds share a host without colliding.
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+archive="$work/$asset"
 
 echo "==> install-golangci-lint: ${GOLANGCI_LINT_VERSION} into $GO_TOOLS_BIN"
 curl -fSL --retry 3 -o "$archive" \
     "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_LINT_VERSION}/${asset}"
 echo "${checksum}  ${archive}" | sha256sum -c -
 
-tar -xzf "$archive" -C /tmp
+tar -xzf "$archive" -C "$work"
 mkdir -p "$GO_TOOLS_BIN"
-install -m 0755 "${unpacked}/golangci-lint" "${GO_TOOLS_BIN}/golangci-lint"
+install -m 0755 "$work/golangci-lint-${GOLANGCI_LINT_VERSION}-linux-${arch}/golangci-lint" \
+    "${GO_TOOLS_BIN}/golangci-lint"
 
 chmod -R a+rX "$GO_TOOLS_BIN"
 echo "==> install-golangci-lint: done"
