@@ -964,7 +964,7 @@ pub struct Args {
         default_value_t = false,
         help_heading = "Image"
     )]
-    yes: bool,
+    pub(crate) yes: bool,
 
     /// Run the guest as root (uid 0) instead of the default host user.
     ///
