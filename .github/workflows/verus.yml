@@ -8,13 +8,17 @@ permissions:
   contents: read
 
 env:
-  VERUS_RELEASE: "0.2026.09.16.7325eee"
-  # sha256 of verus-0.2026.09.16.7325eee-x86-linux.zip (485510601 bytes),
-  # measured twice: on the planning host and independently by the plan
-  # reviewer. A Verus bump is a deliberate change: move the release, this
-  # digest, the `vstd` pin in crates/agent-vm/Cargo.toml and the copy in
-  # CONTRIBUTING.md together.
-  VERUS_SHA256: "5e386d253a29bdac7d475a43b6f58dbcc9099c77953cb16180c9ef5832c50038"
+  # A durable tagged release, not a `release/rolling/...` one. The previous pin
+  # (`0.2026.09.16.7325eee`) was a rolling build that upstream withdrew, so a
+  # cold cache could not download it at all; tagged releases are retained
+  # (the release list reaches back six months). A Verus bump is a deliberate
+  # change: move the release, this digest, the `vstd` pin in
+  # crates/agent-vm/Cargo.toml, the copy in CONTRIBUTING.md and the
+  # `examples/layers/rust-dev` pin together. `script/check-rust-toolchain.sh`
+  # enforces the last of those against this file.
+  VERUS_RELEASE: "0.2026.09.20.aef82ed"
+  # sha256 of verus-0.2026.09.20.aef82ed-x86-linux.zip (485678212 bytes).
+  VERUS_SHA256: "7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33"
 
 jobs:
   verify:
@@ -69,7 +73,7 @@ jobs:
           set -euo pipefail
           zip="verus-${VERUS_RELEASE}-x86-linux.zip"
           curl -fSL --retry 3 -o "$zip" \
-            "https://github.com/verus-lang/verus/releases/download/release/rolling/${VERUS_RELEASE}/${zip}"
+            "https://github.com/verus-lang/verus/releases/download/release/${VERUS_RELEASE}/${zip}"
           echo "${VERUS_SHA256}  ${zip}" | sha256sum -c -
           mkdir -p "$HOME/.verus"
           unzip -q "$zip" -d "$HOME/.verus"

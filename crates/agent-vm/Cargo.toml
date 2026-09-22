@@ -17,7 +17,7 @@ verify = true
 [dependencies]
 # Verus's standard library, for the in-place `verus!` contracts.
 # See docs/adr/0018-machine-checked-boundary-contracts.md.
-vstd = "=0.0.0-2026-09-16-0054"
+vstd = "=0.0.0-2026-09-20-0158"
 # default-features = false drops the SDK's `prebuilt` feature, so building
 # agent-vm never downloads the upstream msb+libkrunfw bundle — we ship our own
 # from-source msb. Keep net + keyring (the SDK's other defaults).

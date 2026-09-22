@@ -25,6 +25,16 @@
 #   - macos-build.md: contributor-facing copy-paste install/run commands. A
 #     stale one actively misleads a contributor, so every occurrence of the
 #     three anchor commands is checked, not merely their presence.
+#   - examples/layers/rust-dev/Dockerfile: the `ARG RUST_TOOLCHAIN` the Rust
+#     development tooling layer pre-installs. A stale copy there builds an
+#     image that cannot compile the repo it is meant for, so it is enforced
+#     like every other consumer.
+#
+# Verus pin (a different pinned tool, same lockstep rule):
+#   - the same layer Dockerfile's `ARG VERUS_RELEASE` / `ARG VERUS_SHA256`
+#     are checked against .github/workflows/verus.yml, which owns the pinned
+#     Verus release and its digest. CONTRIBUTING.md's copy is not enforced
+#     (documented, like the workflow's own comment).
 #
 # Deliberately NOT enforced (see the implementation plan for issue #59):
 #   - script/test/build-workflow.sh's fake rustc/cargo/rustup fixtures --
@@ -207,6 +217,68 @@ check_macos_build_md() {
     [[ "$mismatch" == true ]] || ok "$file install/run commands match $channel (${#occurrences[@]} occurrences)"
 }
 
+check_layer_rust_dockerfile() {
+    local file=examples/layers/rust-dev/Dockerfile found
+    found="$(sed -n 's/^ARG RUST_TOOLCHAIN=\(.*\)$/\1/p' "$file")"
+    if [[ -z "$found" ]]; then
+        fail_missing_anchor "$file" 'ARG RUST_TOOLCHAIN=...'
+        return
+    fi
+    if [[ "$found" == "$channel" ]]; then
+        ok "$file RUST_TOOLCHAIN = $found"
+        return
+    fi
+    fail "$file RUST_TOOLCHAIN is $found but canonical channel is $channel"
+    printf '       fix: set ARG RUST_TOOLCHAIN=%s in %s, or update rust-toolchain.toml if %s was intended.\n' \
+        "$channel" "$file" "$found"
+}
+
+check_layer_verus_dockerfile() {
+    local dockerfile=examples/layers/rust-dev/Dockerfile
+    local workflow=.github/workflows/verus.yml
+    local df_release wf_release df_sha wf_sha
+
+    df_release="$(sed -n 's/^ARG VERUS_RELEASE=\(.*\)$/\1/p' "$dockerfile")"
+    df_sha="$(sed -n 's/^ARG VERUS_SHA256=\(.*\)$/\1/p' "$dockerfile")"
+    wf_release="$(sed -n 's/^[[:space:]]*VERUS_RELEASE: "\(.*\)"$/\1/p' "$workflow")"
+    wf_sha="$(sed -n 's/^[[:space:]]*VERUS_SHA256: "\(.*\)"$/\1/p' "$workflow")"
+
+    if [[ -z "$df_release" || -z "$df_sha" ]]; then
+        fail_missing_anchor "$dockerfile" 'ARG VERUS_RELEASE=... / ARG VERUS_SHA256=...'
+        return
+    fi
+    if [[ -z "$wf_release" || -z "$wf_sha" ]]; then
+        fail_missing_anchor "$workflow" 'VERUS_RELEASE: "..." / VERUS_SHA256: "..."'
+        return
+    fi
+
+    local mismatch=false
+    if [[ "$df_release" != "$wf_release" ]]; then
+        mismatch=true
+        fail "$dockerfile VERUS_RELEASE is $df_release but $workflow pins $wf_release"
+        printf '       fix: set ARG VERUS_RELEASE=%s in %s, or update %s if %s was intended.\n' \
+            "$wf_release" "$dockerfile" "$workflow" "$df_release"
+    fi
+    if [[ "$df_sha" != "$wf_sha" ]]; then
+        mismatch=true
+        fail "$dockerfile VERUS_SHA256 does not match $workflow"
+        printf '       fix: copy the sha256 out of %s into ARG VERUS_SHA256 in %s.\n' \
+            "$workflow" "$dockerfile"
+    fi
+    # A pin is only load-bearing if the build checks it. Deleting the
+    # `sha256sum` step would leave the value matching verus.yml while the
+    # download went unverified, so require a real (non-comment) checksum
+    # instruction to remain. Whole-line comments are stripped first, and the
+    # check keys on `sha256sum` alone (not the exact `-c -` spelling or line
+    # layout) so an ordinary reformat cannot make a present check look absent.
+    if ! grep -v '^[[:space:]]*#' "$dockerfile" | grep -q 'sha256sum'; then
+        mismatch=true
+        fail "$dockerfile no longer verifies the Verus digest with sha256sum"
+        printf '       fix: keep the sha256sum check that consumes VERUS_SHA256; an unchecked digest is decorative.\n'
+    fi
+    [[ "$mismatch" == true ]] || ok "$dockerfile Verus release/digest match $workflow"
+}
+
 main() {
     local repo_root print_only=false
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -270,6 +342,8 @@ main() {
     check_release_npm
     check_macos_rust_toolchain_var
     check_macos_build_md
+    check_layer_rust_dockerfile
+    check_layer_verus_dockerfile
 
     if ((failures > 0)); then
         echo "error: $failures rust-toolchain consumer(s) drifted from $toolchain_toml" >&2

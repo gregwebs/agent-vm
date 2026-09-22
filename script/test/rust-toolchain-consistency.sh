@@ -29,7 +29,7 @@ assert_contains() {
 make_tree() {
     local name="$1" dir
     dir="$TEST_ROOT/$name"
-    mkdir -p "$dir/.github/workflows" "$dir/script/build"
+    mkdir -p "$dir/.github/workflows" "$dir/script/build" "$dir/examples/layers/rust-dev"
     cp "$REPO_ROOT/rust-toolchain.toml" "$dir/rust-toolchain.toml"
     cp "$REPO_ROOT/Cargo.toml" "$dir/Cargo.toml"
     cp "$REPO_ROOT/.github/workflows/ci.yml" "$dir/.github/workflows/ci.yml"
@@ -37,6 +37,8 @@ make_tree() {
     cp "$REPO_ROOT/.github/workflows/release-npm.yml" "$dir/.github/workflows/release-npm.yml"
     cp "$REPO_ROOT/script/build/macos.sh" "$dir/script/build/macos.sh"
     cp "$REPO_ROOT/macos-build.md" "$dir/macos-build.md"
+    cp "$REPO_ROOT/examples/layers/rust-dev/Dockerfile" \
+        "$dir/examples/layers/rust-dev/Dockerfile"
     printf '%s\n' "$dir"
 }
 
@@ -215,5 +217,42 @@ rm -f "$tree/.github/workflows/verus.yml.bak"
 output="$(expect_fail "$tree" 1)"
 assert_contains "$output" "verus.yml"
 assert_contains "$output" "$other_channel"
+
+# Case 14: the rust-dev layer Dockerfile's RUST_TOOLCHAIN copy drifts.
+tree="$(make_tree case14-layer-rust)"
+sed -i.bak "s/^ARG RUST_TOOLCHAIN=$current_channel\$/ARG RUST_TOOLCHAIN=$other_channel/" \
+    "$tree/examples/layers/rust-dev/Dockerfile"
+rm -f "$tree/examples/layers/rust-dev/Dockerfile.bak"
+output="$(expect_fail "$tree" 1)"
+assert_contains "$output" "examples/layers/rust-dev/Dockerfile"
+assert_contains "$output" "$other_channel"
+
+# Case 15: the layer's Verus release drifts from verus.yml (the owner of the
+# Verus pin), even though verus.yml itself is untouched.
+tree="$(make_tree case15-layer-verus-release)"
+sed -i.bak "s/^ARG VERUS_RELEASE=.*\$/ARG VERUS_RELEASE=9.9.9/" \
+    "$tree/examples/layers/rust-dev/Dockerfile"
+rm -f "$tree/examples/layers/rust-dev/Dockerfile.bak"
+output="$(expect_fail "$tree" 1)"
+assert_contains "$output" "VERUS_RELEASE is 9.9.9"
+assert_contains "$output" "verus.yml"
+
+# Case 16: the layer's Verus *digest* drifts while the release matches, so a
+# release-only comparison would miss it.
+tree="$(make_tree case16-layer-verus-sha)"
+sed -i.bak "s/^ARG VERUS_SHA256=.*\$/ARG VERUS_SHA256=deadbeef/" \
+    "$tree/examples/layers/rust-dev/Dockerfile"
+rm -f "$tree/examples/layers/rust-dev/Dockerfile.bak"
+output="$(expect_fail "$tree" 1)"
+assert_contains "$output" "VERUS_SHA256 does not match"
+assert_contains "$output" "verus.yml"
+
+# Case 17: the layer stops checking the digest at all. The ARG value still
+# matches verus.yml, so only the usage check can catch this -- without it the
+# verified "hard failure" property would be decorative.
+tree="$(make_tree case17-layer-verus-sha-unused)"
+delete_first_matching_line "$tree/examples/layers/rust-dev/Dockerfile" 'sha256sum -c -'
+output="$(expect_fail "$tree" 1)"
+assert_contains "$output" "no longer verifies the Verus digest"
 
 echo "rust-toolchain consistency seam tests passed"
