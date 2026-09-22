@@ -64,7 +64,7 @@ don't touch `/etc/agent-vm-image-version` or `/opt/agent/**`, and write
 `/etc/agent-vm-capabilities/<name>` only after your own build-time checks
 pass. Two conventions: expose environment through `ENV` (not an `env.d`-style
 file the base does not read), and leave `ENTRYPOINT`/`CMD` inert — agentd
-execs the agent directly. Both shipped examples satisfy all eight; the C1
+execs the agent directly. Every shipped example satisfies all eight; the C1
 lint half is kept true by
 `layer::contract::tests::shipped_example_layers_pass_the_dockerfile_lint`.
 
@@ -74,6 +74,7 @@ lint half is kept true by
 |---|---|
 | [`wirenboard-cpp`](wirenboard-cpp/) | WB C/C++ build-essentials (debhelper, clang-format/clang-tidy, libcurl/libgtest/libmodbus/libsystemd-dev, cmake/ninja, ...) plus the armhf/arm64 cross toolchains, qemu-user-static, and the sbuild/schroot/debootstrap path. |
 | [`rust-dev`](rust-dev/) | The Rust toolchain this repo pins (via `rust-toolchain.toml`, with clippy and rustfmt), the host musl target, the native build libraries `ci.yml` installs, shellcheck, and the pinned Verus release — enough to build, test, lint and verify agent-vm's Rust code in the guest. |
+| [`go-dev`](go-dev/) | The pinned Go toolchain (go, gofmt, go vet) plus the two tools a Go project's editor and CI loop expect beyond it, `golangci-lint` and the `gopls` language server — enough to build, test, lint and navigate a Go code base in the guest. |
 | [`chrome-devtools`](chrome-devtools/) | Chromium, Chrome DevTools MCP wrapper, scoped NSS CA trust, and the Chrome capability marker. |
 
 ## Rust development
@@ -155,6 +156,85 @@ The layer's build steps are committed as standalone scripts beside the
 Dockerfile — `install-rust.sh`, `install-verus.sh` and `verify-toolchain.sh`
 — and bind-mounted in at build time, so each can be read, reviewed and run on
 its own. They are covered by the CI shell guard in `script/test/ci-contracts.sh`.
+
+## Go development
+
+`go-dev` is the layer that lets an in-VM agent iterate on a Go code base. It
+installs, under the world-readable `/opt` (contract C7):
+
+- the **pinned Go toolchain** from go.dev (`1.27.1` at the time of writing),
+  verified against its per-architecture SHA-256 — `go`, `gofmt`, `go vet`,
+  `go test`, and the rest of the standard distribution;
+- **`build-essential`**, so cgo and `go test -race` work: with no C compiler
+  present the Go command silently defaults `CGO_ENABLED=0`, and `-race` then
+  fails with "requires cgo";
+- the **pinned golangci-lint release** from its GitHub release tarball,
+  likewise digest-verified;
+- the **pinned `gopls` language server**, compiled from its module at build
+  time (upstream ships no binary) with the go command verifying every module
+  against the signed `sum.golang.org` checksum database.
+
+Copy it into a numbered step and launch, or try it first without copying:
+
+```sh
+cp -r examples/layers/go-dev .agent-vm/layers/10-go-dev
+agent-vm claude --yes
+# or:
+agent-vm shell --layer examples/layers/go-dev --yes
+```
+
+Once booted, the usual Go loop works:
+
+```sh
+go version
+go build ./...
+go test ./...
+go test -race ./...
+golangci-lint run
+gofmt -l .
+gopls check main.go      # or just point your editor's LSP at `gopls`
+```
+
+The toolchain lives under `/opt/go` and the two extra tools in
+`/opt/go-tools/bin`; both are on `PATH` and read-only for every guest uid.
+Module downloads and build output stay in the guest's own writable, persistent
+home (`$HOME/go/pkg/mod` and `$HOME/.cache/go-build`), so a second launch
+reuses them — the layer shares only the toolchain, never a cache.
+
+### `GOTOOLCHAIN=local`, and the module proxy
+
+The image sets `GOTOOLCHAIN=local`, so `go` never silently downloads a second
+toolchain when a project's `go.mod` asks for a newer one: it fails with a
+message naming both versions. Bump `GO_VERSION` (and its two digests) in
+the layer's `Dockerfile` and rebuild the layer. To opt out for one command
+where the guest's allow list permits it, run `GOTOOLCHAIN=auto go …`.
+
+Resolving modules needs the guest network allow list to include the Go module
+proxy and checksum database:
+
+```sh
+agent-vm claude \
+  --allow-host proxy.golang.org \
+  --allow-host sum.golang.org \
+  --allow-host storage.googleapis.com \
+  --yes
+```
+
+(`storage.googleapis.com` is where `proxy.golang.org` redirects module
+blobs.) Add the source host too when a module is fetched directly —
+`--allow-host github.com`, for example, for `GOPROXY=direct` or a private
+module. The layer *build* itself runs with unrestricted network access; the
+allow list governs only what the guest does at runtime.
+
+### Keeping the pins in lockstep
+
+Unlike `rust-dev`'s toolchain pin — which is checked against
+`rust-toolchain.toml` and `verus.yml` by `script/check-rust-toolchain.sh`
+because those are the repo's elsewhere sources of truth — this layer is the
+*only* place agent-vm pins a Go toolchain, so there is nothing to
+cross-check. Instead each `install-*.sh` script verifies its download against
+the digest declared beside the version in `Dockerfile`, so a bumped version
+left beside a stale digest fails the build rather than shipping.
 
 ## Chrome DevTools
 

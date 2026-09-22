@@ -1319,12 +1319,12 @@ mod tests {
                 );
             }
         }
-        // The repo ships exactly three today (`chrome-devtools`,
+        // The repo ships exactly four today (`chrome-devtools`, `go-dev`,
         // `rust-dev`, `wirenboard-cpp`). If a future change leaves only one,
         // lower this bound deliberately rather than deleting the assertion.
         assert!(
-            count >= 3,
-            "expected at least three shipped example layers, found {count}"
+            count >= 4,
+            "expected at least four shipped example layers, found {count}"
         );
     }
 
