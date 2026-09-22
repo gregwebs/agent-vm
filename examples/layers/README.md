@@ -224,10 +224,10 @@ because those are the repo's elsewhere sources of truth — this layer is the
 *only* place agent-vm pins a Go toolchain, so there is nothing to
 cross-check. Instead the version and, for the two prebuilt downloads, the
 per-architecture digest are declared together in `Dockerfile`, and each
-`install-*.sh` verifies what it downloaded against them, so a bumped version
-left beside a stale digest fails the build rather than shipping. `gopls` has
-nothing to digest: it is pinned by module version and verified against the
-signed checksum database, as described above.
+installer that fetches a prebuilt tarball verifies it against the digest
+declared there, so a bumped version left beside a stale digest fails the build
+rather than shipping. `gopls` has nothing to digest: it is pinned by module
+version and verified against the signed checksum database, as described above.
 
 ## Chrome DevTools
 

@@ -37,10 +37,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Pins. There is no second copy of these in the repo (this layer is the only
-# place agent-vm pins a Go toolchain), so each install script verifying its
-# download against the digest beside it is the whole lockstep rule: a bumped
-# version with a stale digest fails the build instead of shipping a different
-# tool. Bump the version and both architecture digests together.
+# place agent-vm pins a Go toolchain), so the pin and its verification sitting
+# together is the whole lockstep rule: install-go.sh and
+# install-golangci-lint.sh each check their prebuilt tarball against the digest
+# declared here, so a bumped version left beside a stale digest fails the build
+# instead of shipping a different tool. gopls has no tarball to digest;
+# install-gopls.sh pins its module version and the go command verifies it
+# against the checksum database. Bump a version and its digests together.
 ARG GO_VERSION=1.27.1
 ARG GO_AMD64_SHA256=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
 ARG GO_ARM64_SHA256=3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec
