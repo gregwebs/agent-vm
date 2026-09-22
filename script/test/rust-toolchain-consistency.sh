@@ -39,6 +39,7 @@ make_tree() {
     cp "$REPO_ROOT/macos-build.md" "$dir/macos-build.md"
     cp "$REPO_ROOT/examples/layers/rust-dev/Dockerfile" \
         "$dir/examples/layers/rust-dev/Dockerfile"
+    cp "$REPO_ROOT"/examples/layers/rust-dev/*.sh "$dir/examples/layers/rust-dev/"
     printf '%s\n' "$dir"
 }
 
@@ -247,11 +248,11 @@ output="$(expect_fail "$tree" 1)"
 assert_contains "$output" "VERUS_SHA256 does not match"
 assert_contains "$output" "verus.yml"
 
-# Case 17: the layer stops checking the digest at all. The ARG value still
-# matches verus.yml, so only the usage check can catch this -- without it the
-# verified "hard failure" property would be decorative.
+# Case 17: the Verus install script stops checking the digest. The ARG value
+# still matches verus.yml, so only the usage check can catch this -- without it
+# the verified "hard failure" property would be decorative.
 tree="$(make_tree case17-layer-verus-sha-unused)"
-delete_first_matching_line "$tree/examples/layers/rust-dev/Dockerfile" 'sha256sum -c -'
+delete_first_matching_line "$tree/examples/layers/rust-dev/install-verus.sh" 'sha256sum -c -'
 output="$(expect_fail "$tree" 1)"
 assert_contains "$output" "no longer verifies the Verus digest"
 

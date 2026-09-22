@@ -61,7 +61,9 @@ fi
 # Guard rail for the shell this workflow runs: every script the commands above
 # execute, the scripts those invoke in turn, scripts other jobs in this workflow
 # run, and the fixtures they use belong in both lists. Scripts only other
-# workflows run are guarded there.
+# workflows run are guarded there. The examples/layers/rust-dev build scripts
+# are guarded here too: no workflow runs them (they are bind-mounted into that
+# layer's Dockerfile at image-build time), so this is their only shell guard.
 syntax_check=(
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     script/check-runtime-provenance.sh
@@ -78,6 +80,9 @@ syntax_check=(
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
+    examples/layers/rust-dev/install-rust.sh
+    examples/layers/rust-dev/install-verus.sh
+    examples/layers/rust-dev/verify-toolchain.sh
     "$self_relative"
 )
 
@@ -101,6 +106,9 @@ shellcheck_files=(
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
+    examples/layers/rust-dev/install-rust.sh
+    examples/layers/rust-dev/install-verus.sh
+    examples/layers/rust-dev/verify-toolchain.sh
     "$self_relative"
 )
 

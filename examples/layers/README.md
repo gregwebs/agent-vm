@@ -147,8 +147,14 @@ The Dockerfile's `ARG RUST_TOOLCHAIN` is checked against
 `rust-toolchain.toml`'s canonical channel, and its `ARG VERUS_RELEASE` /
 `ARG VERUS_SHA256` against `.github/workflows/verus.yml`, by
 `script/check-rust-toolchain.sh` — the same check that enforces the repo's
-toolchain copies elsewhere. A pin bump edits the source of truth, then this
-Dockerfile, then runs the checker.
+toolchain copies elsewhere. The checker also refuses a build whose Verus
+install script stopped verifying the digest. A pin bump edits the source of
+truth, then this directory, then runs the checker.
+
+The layer's build steps are committed as standalone scripts beside the
+Dockerfile — `install-rust.sh`, `install-verus.sh` and `verify-toolchain.sh`
+— and bind-mounted in at build time, so each can be read, reviewed and run on
+its own. They are covered by the CI shell guard in `script/test/ci-contracts.sh`.
 
 ## Chrome DevTools
 

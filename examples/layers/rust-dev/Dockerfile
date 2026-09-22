@@ -14,6 +14,11 @@
 # Verus release CI verifies with. See examples/layers/README.md and
 # docs/adr/0003-project-tooling-layers.md.
 #
+# The three steps that need real shell live as standalone, independently
+# runnable scripts beside this file and are bind-mounted in at build time:
+# install-rust.sh, install-verus.sh, verify-toolchain.sh. This file only wires
+# the pins and locations into them.
+#
 # Layer image contract: C1 is the two lines below; C2 is satisfied because
 # every ENV writes PATH=<new>:${PATH}; C3 by staying root; C7 by installing
 # under world-readable /opt rather than a mode-0700 home.
@@ -53,83 +58,25 @@ RUN apt-get update \
         shellcheck \
  && rm -rf /var/lib/apt/lists/*
 
-# Rust toolchain. `--profile minimal` installs rustc/cargo/rust-std; the
-# components add clippy + rustfmt (the two rust-toolchain.toml declares), and
-# the host musl target is added for the guest agentd cross-build. The official
-# rustup installer is used, as macos-build.md does, because only the toolchain
-# version is part of the build identity.
-RUN set -eux; \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh; \
-    sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
-        --default-toolchain "$RUST_TOOLCHAIN" \
-        --component clippy,rustfmt; \
-    rm -f /tmp/rustup-init.sh; \
-    case "$(dpkg --print-architecture)" in \
-        amd64) musl_target=x86_64-unknown-linux-musl ;; \
-        arm64) musl_target=aarch64-unknown-linux-musl ;; \
-        *) echo "unexpected architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
-    esac; \
-    "$CARGO_HOME/bin/rustup" target add "$musl_target"; \
-    chmod -R a+rX "$RUSTUP_HOME" "$CARGO_HOME"
+# Rust toolchain: pinned channel with clippy/rustfmt and the host musl target,
+# installed world-readable under /opt for the arbitrary-uid guest.
+RUN --mount=type=bind,source=install-rust.sh,target=/tmp/install-rust.sh,ro \
+    bash /tmp/install-rust.sh
 
-# Verus, the SMT-backed verifier for the verus! contracts (ADR-0018).
-# Upstream publishes no linux-arm64 asset, so on an Apple Silicon guest this is
-# skipped: run the host's arm64-macos Verus there instead (CONTRIBUTING.md).
-# The digest check is a hard failure, never soft-failable.
+# Verus, the SMT-backed verifier for the verus! contracts (ADR-0018). Pinned
+# release + digest on linux/amd64; a clean no-op where upstream publishes no
+# asset (run the host's arm64-macos Verus there instead; see CONTRIBUTING.md).
 ARG VERUS_DIR=/opt/verus
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    if [ "$arch" = amd64 ]; then \
-        asset="verus-${VERUS_RELEASE}-x86-linux.zip"; \
-        curl -fSL --retry 3 -o "/tmp/$asset" \
-            "https://github.com/verus-lang/verus/releases/download/release/${VERUS_RELEASE}/${asset}"; \
-        echo "${VERUS_SHA256}  /tmp/${asset}" | sha256sum -c -; \
-        mkdir -p "$VERUS_DIR"; \
-        unzip -q "/tmp/$asset" -d "$VERUS_DIR"; \
-        rm -f "/tmp/$asset"; \
-        chmod -R a+rX "$VERUS_DIR"; \
-    else \
-        echo "==> no Verus linux-${arch} release; run Verus on the host instead"; \
-    fi
+RUN --mount=type=bind,source=install-verus.sh,target=/tmp/install-verus.sh,ro \
+    bash /tmp/install-verus.sh
 
 # PATH stays additive (contract C2): the base's entries are preserved via
 # ${PATH}, and the Verus directory is harmless on a host that skipped it.
 ENV RUSTUP_HOME=/opt/rustup
 ENV PATH=/opt/cargo/bin:/opt/verus/verus-x86-linux:${PATH}
 
-# Build-time sanity: invoke tools directly so a present-but-broken binary
-# (truncated download, missing libc symbol, absent component) fails the build
-# instead of surfacing as command-not-found in the guest. `set -e` propagates
-# the first failure. The toolchain equality check is exact, so a rustup that
-# silently resolved a different version cannot ship. On amd64 the Verus check
-# goes beyond `--version`: it verifies a trivial contract and requires the
-# `N verified, 0 errors` line, so a Verus tree that cannot reach its bundled
-# vstd + z3 -- or that exits 0 while verifying nothing (ADR-0018) -- fails the
-# build.
-RUN set -eux; \
-    test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN"; \
-    cargo --version; \
-    cargo clippy --version; \
-    rustfmt --version; \
-    if [ "$(dpkg --print-architecture)" = amd64 ]; then \
-        verus="$VERUS_DIR/verus-x86-linux/verus"; \
-        "$verus" --version; \
-        "$VERUS_DIR/verus-x86-linux/z3" --version; \
-        smoke=/tmp/verus-layer-smoke; \
-        rm -rf "$smoke"; mkdir -p "$smoke"; \
-        printf '%s\n' \
-            'use vstd::prelude::*;' \
-            '' \
-            'verus! {' \
-            'proof fn layer_smoke()' \
-            '    ensures true,' \
-            '{' \
-            '}' \
-            '}' \
-            > "$smoke/smoke.rs"; \
-        smoke_out="$( (cd "$smoke" && "$verus" --crate-type=lib smoke.rs) 2>&1 )"; \
-        printf '%s\n' "$smoke_out"; \
-        printf '%s\n' "$smoke_out" | grep -Eq 'verification results:: [1-9][0-9]* verified, 0 errors'; \
-        rm -rf "$smoke"; \
-    fi; \
-    echo "== rust-dev layer sanity OK =="
+# Post-install sanity: a present-but-broken binary fails the build here instead
+# of surfacing as command-not-found in the guest, and the amd64 Verus check
+# verifies a real contract rather than only `--version`.
+RUN --mount=type=bind,source=verify-toolchain.sh,target=/tmp/verify-toolchain.sh,ro \
+    bash /tmp/verify-toolchain.sh

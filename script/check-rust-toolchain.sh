@@ -235,6 +235,7 @@ check_layer_rust_dockerfile() {
 
 check_layer_verus_dockerfile() {
     local dockerfile=examples/layers/rust-dev/Dockerfile
+    local verus_script=examples/layers/rust-dev/install-verus.sh
     local workflow=.github/workflows/verus.yml
     local df_release wf_release df_sha wf_sha
 
@@ -268,15 +269,18 @@ check_layer_verus_dockerfile() {
     # A pin is only load-bearing if the build checks it. Deleting the
     # `sha256sum` step would leave the value matching verus.yml while the
     # download went unverified, so require a real (non-comment) checksum
-    # instruction to remain. Whole-line comments are stripped first, and the
-    # check keys on `sha256sum` alone (not the exact `-c -` spelling or line
-    # layout) so an ordinary reformat cannot make a present check look absent.
-    if ! grep -v '^[[:space:]]*#' "$dockerfile" | grep -q 'sha256sum'; then
+    # instruction to remain in the Verus install script the Dockerfile runs.
+    # Whole-line comments are stripped first, and the check keys on
+    # `sha256sum` alone (not the exact `-c -` spelling or line layout) so an
+    # ordinary reformat cannot make a present check look absent.
+    if [[ ! -f "$verus_script" ]]; then
+        fail_missing_anchor "$verus_script" 'the Verus install script the Dockerfile bind-mounts'
+    elif ! grep -v '^[[:space:]]*#' "$verus_script" | grep -q 'sha256sum'; then
         mismatch=true
-        fail "$dockerfile no longer verifies the Verus digest with sha256sum"
+        fail "$verus_script no longer verifies the Verus digest with sha256sum"
         printf '       fix: keep the sha256sum check that consumes VERUS_SHA256; an unchecked digest is decorative.\n'
     fi
-    [[ "$mismatch" == true ]] || ok "$dockerfile Verus release/digest match $workflow"
+    [[ "$mismatch" == true ]] || ok "$dockerfile Verus release/digest match $workflow, and $verus_script checks the digest"
 }
 
 main() {
