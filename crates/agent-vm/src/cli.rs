@@ -453,6 +453,62 @@ mod tests {
 
     // -- T9: dispatch to a launch verb and to a built-in ------------------
 
+    /// Issue #144: the non-interactive tooling-layer error tells the user to
+    /// "Re-run with --yes", so *every* launch verb — not just `shell` — must
+    /// register and consume that flag. An unregistered `--`-flag is not
+    /// rejected here: the trailing `agent_args` positional has
+    /// `allow_hyphen_values`, so clap would silently forward it to the agent.
+    /// Asserting `agent_args` stays empty therefore distinguishes "consumed as
+    /// a flag" from "swallowed as an agent argument".
+    #[test]
+    fn every_launch_verb_consumes_yes_as_a_flag() {
+        let catalog = default_catalog();
+        // Read from the catalog rather than a literal list, so a tool added to
+        // `default-tools.toml` inherits this guarantee instead of escaping it.
+        let verbs: Vec<String> = catalog
+            .as_slice()
+            .iter()
+            .map(|entry| entry.tool().name().to_owned())
+            .collect();
+        // Issue #144 names `pi` and `shell`; a vacuous catalog must not make
+        // the loop below pass by iterating nothing.
+        for required in ["pi", "shell"] {
+            assert!(
+                verbs.iter().any(|verb| verb == required),
+                "the shipped catalog must still declare {required}: {verbs:?}"
+            );
+        }
+        let command = build_command(&Catalog::Ready(catalog));
+
+        for verb in &verbs {
+            let matches = command
+                .clone()
+                .try_get_matches_from(["agent-vm", verb, "--yes"])
+                .unwrap_or_else(|error| panic!("{verb} must accept --yes: {error}"));
+            let (_, sub) = matches.subcommand().expect("a launch subcommand");
+            let args = <run::Args as clap::FromArgMatches>::from_arg_matches(sub)
+                .expect("launch args parse");
+            assert!(args.yes, "{verb}: --yes parsed but did not set the flag");
+            assert!(
+                args.agent_args.is_empty(),
+                "{verb}: --yes leaked into agent_args: {:?}",
+                args.agent_args
+            );
+        }
+
+        // Control for the `agent_args` assertion: an *unregistered* hyphen flag
+        // is swallowed into `agent_args` rather than rejected, so an empty
+        // `agent_args` above proves `--yes` was matched as a flag.
+        let matches = command
+            .try_get_matches_from(["agent-vm", "pi", "--not-a-flag"])
+            .expect("the trailing positional accepts hyphen values");
+        let (_, sub) = matches.subcommand().expect("a launch subcommand");
+        let args =
+            <run::Args as clap::FromArgMatches>::from_arg_matches(sub).expect("launch args parse");
+        assert_eq!(args.agent_args, ["--not-a-flag"]);
+        assert!(!args.yes, "an unregistered flag must not set --yes");
+    }
+
     #[test]
     fn parse_from_dispatches_a_project_tool_and_a_builtin() {
         let body = "[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\nargs = [\"--fast\"]\n";
