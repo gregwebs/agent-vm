@@ -52,20 +52,11 @@ ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
 FROM ${BASE_IMAGE}
 ```
 
-Four clauses are **enforced at build time** (a violation is a hard error):
-C1 build on the previous step; C2 keep `PATH` additive (never drop a
-directory the previous step had); C3 end the chain's last step as root
-(`USER root`, or no trailing `USER` at all); C4 don't pin `--platform` on
-your final `FROM`.
-
-C5–C8 are documented-only — see the ADR for all eight. Keep `/bin/bash` and
-`/etc/passwd`/`/etc/group` appendable, install tools world-readable (`a+rX`),
-don't touch `/etc/agent-vm-image-version` or `/opt/agent/**`, and write
-`/etc/agent-vm-capabilities/<name>` only after your own build-time checks
-pass. Two conventions: expose environment through `ENV` (not an `env.d`-style
-file the base does not read), and leave `ENTRYPOINT`/`CMD` inert — agentd
-execs the agent directly. Every shipped example satisfies all eight; the C1
-lint half is kept true by
+Four clauses are enforced at build time and four (C5–C8) are documented-only;
+the ADR is normative. Two conventions the checker cannot see: expose
+environment through `ENV` (not an `env.d`-style file the base does not read),
+and leave `ENTRYPOINT`/`CMD` inert — agentd execs the agent directly. Every
+shipped example satisfies all eight; the C1 lint half is kept true by
 `layer::contract::tests::shipped_example_layers_pass_the_dockerfile_lint`.
 
 ## Index
@@ -218,26 +209,21 @@ build with `-mod=vendor`.
 
 ### Keeping the pins in lockstep
 
-Unlike `rust-dev`'s toolchain pin — which is checked against
-`rust-toolchain.toml` and `verus.yml` by `script/check-rust-toolchain.sh`
-because those are the repo's elsewhere sources of truth — this layer is the
-*only* place agent-vm pins a Go toolchain, so there is nothing to
-cross-check. Instead the version and, for the two prebuilt downloads, the
+This layer is the *only* place agent-vm pins a Go toolchain, so there is
+nothing to cross-check. The version and, for the two prebuilt downloads, the
 per-architecture digest are declared together in `Dockerfile`, and each
-installer that fetches a prebuilt tarball verifies it against the digest
-declared there, so a bumped version left beside a stale digest fails the build
-rather than shipping. `gopls` has nothing to digest: it is pinned by module
-version and verified against the signed checksum database, as described above.
+installer verifies its tarball against that digest, so a bumped version left
+beside a stale digest fails the build. `gopls` is pinned by module version and
+verified against the signed checksum database.
 
 ## Chrome DevTools
 
 Copy `examples/layers/chrome-devtools` to `.agent-vm/layers/10-chrome-devtools`
 (or any numbered step) and run `agent-vm claude --yes` — or skip the copy and
-try it directly: `agent-vm claude --layer examples/layers/chrome-devtools
---yes`. It installs Chromium and the Chrome DevTools MCP integration. Root
-guests use the dedicated `chrome` account; non-root guests run Chromium as
-their guest user. The layer pre-warms the npm cache for root mode only:
-arbitrary non-root guest homes remain persistent but download on first use.
+use `--layer`. It installs Chromium and the Chrome DevTools MCP integration;
+see [USAGE.md](../../USAGE.md#chrome-devtools-mcp) for the runtime behavior.
+The layer pre-warms the npm cache for root mode only: arbitrary non-root guest
+homes remain persistent but download on first use.
 
 ## Composing several layers
 
@@ -254,14 +240,11 @@ cp -r examples/layers/wirenboard-cpp   .agent-vm/layers/10-wirenboard-cpp
 cp -r examples/layers/chrome-devtools  .agent-vm/layers/20-chrome-devtools
 ```
 
-The `NN-` numbering is what fixes the build order — steps are sorted
-byte-lexicographically by directory name, so `10-` always builds before
-`20-`. Number with gaps (`10`, `20`, `30`, ...) so a step can be inserted
-later without renaming its neighbors. Each step's `Dockerfile` must still
-start `ARG BASE_IMAGE=...` / `FROM ${BASE_IMAGE}` — the launcher rewrites
-`BASE_IMAGE` per step (the base image for the first step, the previous
-step's built image for every step after it), so a step's own Dockerfile
-never names a fixed base or its neighbors directly.
+The `NN-` numbering fixes the build order (steps sort byte-lexicographically).
+Number with gaps (`10`, `20`, `30`, ...) so a step can be inserted later. Each
+`Dockerfile` starts `ARG BASE_IMAGE=...` / `FROM ${BASE_IMAGE}`; the launcher
+rewrites `BASE_IMAGE` per step, so a step never names a fixed base or its
+neighbors directly.
 
 **Project steps plus `--layer`.** A project's own `.agent-vm/layers/*` steps
 build first, in the usual sorted order; every `--layer DIR` given on the

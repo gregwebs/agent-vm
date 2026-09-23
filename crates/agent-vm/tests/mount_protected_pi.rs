@@ -370,10 +370,10 @@ fn fork_of_the_host_pi_home_boots_with_credentials_omitted() {
     );
 }
 
-/// `$HOME` unset does **not** make the home unknowable (finding MF1):
-/// `run.rs` falls back to the account record (`getpwuid_r(geteuid()).pw_dir`),
-/// so a declared `--mount` is no longer refused merely because the environment
-/// did not carry `$HOME`. The dumped config proves the launch got past
+/// `$HOME` unset does **not** make the home unknowable: `run.rs` falls back
+/// to the account record (`getpwuid_r(geteuid()).pw_dir`), so the launch has a
+/// home to compare a declared `--mount` against even when the environment does
+/// not carry `$HOME`. The dumped config proves the launch got past
 /// `mount::prepare` and `builder.build()` ran.
 #[test]
 fn unset_home_with_a_mount_uses_the_account_record() {

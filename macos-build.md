@@ -121,7 +121,7 @@ To use a different cache tag, pass both the Docker source and destination tag:
 
 A project with tooling layers (`.agent-vm/layers/*/`) also needs its base
 addressed *inside Docker*, under the same reference the launcher builds step 0
-`FROM`. `import-image.sh` now creates that Docker **base link**
+`FROM`. `import-image.sh` creates that Docker **base link**
 (`agent-vm-base:<msb-manifest-digest-hex>`) automatically at import time —
 reading the digest back from the freshly loaded destination and tagging the
 Docker **source** image (so the renamed form above works too). This is why the
@@ -132,7 +132,7 @@ The script accepts zero to two positional arguments. The Docker source defaults 
 
 ### Composing from a local tool-free base (`--base-image`)
 
-Issue #84 split the image into a tool-free base plus one layer per tool. A launch
+The image is a tool-free base plus one layer per shipped tool. A launch
 whose configured tool set differs from the shipped default composes those layers
 onto the base locally; `--base-image` (env `AGENT_VM_BASE_IMAGE`) points that
 composition at a local base. To build the base and the six tool layers by hand

@@ -436,8 +436,7 @@ fn state_root_overridden() -> bool {
 // 108 on Linux — the raw buffer size, not the usable string length).
 //
 // Wrapped in `verus!` (D5: Verus cannot read a const declared outside the
-// macro), which also means rustdoc no longer documents it — it is private
-// either way.
+// macro); the const is private either way.
 #[cfg(target_os = "macos")]
 verus! {
 const SUN_PATH_USABLE_LEN: usize = 104 - 1;

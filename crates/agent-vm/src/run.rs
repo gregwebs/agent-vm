@@ -1259,7 +1259,7 @@ pub(crate) async fn launch(
         // not just future ones) and probe the registry in the background.
         // The banner prints if the ~0.9s ghcr.io round-trip resolves
         // during boot; otherwise it's simply skipped and the next launch
-        // catches up. Previously this was awaited and blocked every boot.
+        // catches up.
         //
         // Deliberately `root.reference()`, not `image`: when a tooling layer
         // reassigned `image` to the registry-less derived tag
@@ -1796,16 +1796,14 @@ pub(crate) async fn launch(
     // PWD set to the project dir; non-zero exit aborts the launch
     // with the same exit code.
     // Importing the microsandbox MITM CA into the `chrome` user's NSS
-    // DB — needed because chromium on Linux ignores the system CA bundle
-    // and honours only its per-user NSS DB, so the chrome-devtools MCP
-    // would otherwise fail every HTTPS page with ERR_CERT_AUTHORITY_INVALID
-    // — used to run here, a ~270ms `certutil` fork on *every* launch's
-    // critical path. It now lives in the in-image `agent-vm-chrome-mcp`
-    // wrapper, so it runs once when the chrome MCP actually starts: off
-    // the launch path, and skipped entirely when chrome is unused. The CA
-    // is per-install (not bakeable into the shared image); see the opt-in
-    // Chrome DevTools layer wrapper. So no chrome prelude is injected here anymore —
-    // we pass an empty string for it.
+    // DB (chromium on Linux ignores the system CA bundle and honours only
+    // its per-user NSS DB, so the chrome-devtools MCP would otherwise fail
+    // every HTTPS page with ERR_CERT_AUTHORITY_INVALID) lives in the in-image
+    // `agent-vm-chrome-mcp` wrapper: it runs once when the chrome MCP starts,
+    // off the launch path, and is skipped when chrome is unused. The CA is
+    // per-install (not bakeable into the shared image); see the opt-in Chrome
+    // DevTools layer wrapper. No chrome prelude is injected here, so we pass
+    // an empty string.
     //
     // Assemble the in-guest `bash -c` line via `build_agent_shell_line`,
     // which is unit-tested directly. The IPv6-nameserver strip is the

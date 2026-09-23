@@ -1,6 +1,5 @@
 //! Boot-free end-to-end proof that the **tool catalog drives the CLI** (issue
-//! #82), replacing #80's `config_launch_unchanged.rs` (whose premise — "config
-//! is inert on every launch path" — #82 inverts).
+//! #82).
 //!
 //! `mount_follow_links.rs` established the technique: drive the real binary
 //! with a controlled `HOME`/`AGENT_VM_STATE_DIR`/cwd, a fake version-only

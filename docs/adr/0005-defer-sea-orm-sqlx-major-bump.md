@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Superseded — the sea-orm/sqlx bump landed with the v0.6.15 cutover (ADR-0006, ADR-0008).
 
 ## Context
 

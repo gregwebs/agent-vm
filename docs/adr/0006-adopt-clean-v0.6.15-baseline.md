@@ -3,7 +3,7 @@
 ## Status
 
 Accepted. Superseded in part by ADR-0009 and ADR-0010: all four
-previously deferred network capabilities are now active.
+fork-only network capabilities are now active.
 
 ## Context
 
@@ -55,21 +55,13 @@ executes a command with zero libkrun compatibility patches — the
 single biggest risk this migration carried (issue #40's Q2) did not
 materialize.
 
-**Fail closed, not silently drop or half-port, every fork-only feature
-minimal boot doesn't need.** `--auto-publish`, `--allow-lan`,
-`--allow-host`, `--allow-egress`, a set guest-proxy env var, and
-host-credential injection (when a launch actually needs it — see
-`fail_closed.rs`'s doc comments for the exact per-guard criteria) each
-refuse with an actionable error naming the option and this issue,
+**Fork-only features were fail-closed rather than silently dropped or
+half-ported.** Each refused with an actionable error naming the option,
 rather than either being silently ignored (weakening the security
-behavior the flag implied) or crudely adapted (e.g. baking a credential
-file's current contents into baseline's static `SecretBuilder::value()`,
-which would silently drop the fork's per-connection token-rotation
-guarantee). `intercept_hook.rs` and `secrets.rs` keep compiling
-(`#[allow(dead_code)]` on what's now unreachable) rather than being
-deleted, since re-porting credential injection onto baseline's
-differently-shaped secrets API is follow-up work, not something minimal
-boot needs to solve.
+behaviour the flag implied) or crudely adapted (e.g. baking a credential
+file's current contents into the baseline's static `SecretBuilder::value()`,
+which would drop per-connection token rotation). All four are now wired;
+ADR-0009 and ADR-0010 record the integrations.
 
 **Replace the `+agent-vm` patched-build version marker with an
 official-identity check.** `msb_install.rs::verify_official_identity`
@@ -78,17 +70,12 @@ compares `msb --version`'s reported version against
 `vendor/microsandbox/Cargo.toml` at compile time so the check can never
 drift from the gitlink a given build actually compiled against.
 
-**Shorten the default macOS `MSB_HOME`.** See ADR-0004 for the prior
-socket-path history; this migration found that ADR's "well under the
-limit again" claim held only for short home directories (as little as
-~21 bytes of headroom under the pre-#40 default, for macOS's 104-byte
-`sun_path`) — not a real fix for every user. `msb_home_dir()` now
-defaults to `$HOME/.agent-vm-msb` on macOS (was
-`$HOME/.local/state/agent-vm/msb-home`) absent an explicit override,
+**The default macOS `MSB_HOME` is shortened.** `msb_home_dir()`
+defaults to `$HOME/.agent-vm-msb` on macOS absent an explicit override,
 plus a preflight (`ensure_socket_paths_fit`, reusing the runtime's own
 `ipc::sandbox_socket_paths` derivation) that fails closed — never
 truncates — on any path, default or overridden, that would still
-overflow.
+overflow. See ADR-0004 for the socket-path rationale.
 
 ## Consequences
 
@@ -99,15 +86,10 @@ overflow.
 - Guest-egress-via-proxy, auto-publish, egress overrides, and credential
   injection are consumed through the baseline APIs. ADR-0010 records the
   host-only file-source and request-policy constraints for credentials.
-- A worktree building this baseline's newer sea-orm migration set
-  (`m20260824_000001`, was `m20260606_000001`) must not share a
-  `msb.db` with a worktree still building the pre-#40 fork (one-way
-  migration; see ADR-0004 and `AGENTS.md`'s `AGENT_VM_STATE_DIR`
-  guidance) — but note this collision can no longer happen via the
-  *macOS default* alone, since the two now resolve to disjoint default
-  `MSB_HOME` locations (`~/.agent-vm-msb` vs.
-  `~/.local/state/agent-vm/msb-home`). It remains possible if either
-  side sets an explicit `AGENT_VM_STATE_DIR` shared with the other.
+- Worktrees with different vendored schemas must not share a `msb.db`
+  (one-way migration; see ADR-0004 and `AGENTS.md`'s
+  `AGENT_VM_STATE_DIR` guidance). Explicitly sharing an
+  `AGENT_VM_STATE_DIR` makes that collision possible.
 - Issue #43 statically checks both Cargo resolution roots for the official
   crates.io `msb_krun*` 0.1.32 cohort, equal checksums, and the pinned
   firmware source gitlink. This is source identity, not binary/release

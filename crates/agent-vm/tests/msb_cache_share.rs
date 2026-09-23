@@ -186,10 +186,9 @@ fn opt_in_writes_expected_config_and_shares_default_location() {
     );
 }
 
-/// End-to-end proof (issue #65) that the widened `env_flag` truthy set
-/// reaches the real binary through `point_at_msb_home`: `On` was a no-op
-/// before this change (`msb_install`'s old `parse_flag` only accepted
-/// `1`/`true`) and now opts the user in, same as `"1"` above.
+/// End-to-end proof (issue #65) that the shared `env_flag` truthy set reaches
+/// the real binary through `point_at_msb_home`: `On` opts the user in, same as
+/// `"1"` above.
 #[test]
 fn opt_in_accepts_the_shared_truthy_set() {
     let h = Harness::new();

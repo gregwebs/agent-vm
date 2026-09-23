@@ -4,8 +4,6 @@
 
 Accepted. Implementation decision for [agent-vm #124](https://github.com/gregwebs/agent-vm/issues/124). Builds on the terms **Boundary contract** in [CONTEXT.md](../../CONTEXT.md) and **Layer image contract**, and pairs with the pinned-toolchain invariant enforced by `script/check-rust-toolchain.sh`.
 
-ADR-0017 is reserved for agent-vm #118 (tool-declared provisioning), which is in flight on its own branch; this ADR takes 0018 to avoid a collision. The number is 0018 everywhere — the file name, the reference in `CONTRIBUTING.md`, the `CONTEXT.md` glossary entry and the `Cargo.toml` comment.
-
 ## Context
 
 A handful of **pure** functions in `crates/agent-vm` decide what the sandbox boundary allows:
@@ -15,7 +13,7 @@ A handful of **pure** functions in `crates/agent-vm` decide what the sandbox bou
 - which Chrome-MCP capability policy applies to a booted image;
 - how an untrusted byte stream is parsed into a request, and where its body starts.
 
-Until now those decisions were guarded by hand-written unit tests and prose comments. A test samples the input space; the property that actually matters for all of them is *for all inputs*. Commit `00cc994` is the worked example of the failure mode: provisioning invariants existed, were asserted in comments, and a boot test found them unverified.
+Those decisions are pure, so the property that matters is *for all inputs* — something a sampling test cannot establish.
 
 [Verus](https://verus-lang.github.io/verus/guide/) verifies Rust. A `verus! { ... }` block holds ordinary Rust plus `requires`/`ensures`/`invariant`/`decreases` annotations. Under a plain `cargo build` the macro **erases** every annotation and emits ordinary Rust, so `cargo build`/`test`/`clippy` keep working with no Verus installed; under `cargo verus verify` the same source is checked by an SMT solver. That asymmetry is what makes verification possible as an optional, CI-only tool rather than a build prerequisite.
 
@@ -41,7 +39,7 @@ A pure predicate that cannot be verified usually cannot be verified because it d
 | `oauth_refresh::path_is_exact(&[u8])` | `validated_target` — `url::Url::parse` and the scheme/host/port/userinfo checks |
 | `http::header_block_end` / `is_token_bytes` / `has_no_crlf` | `Request::parse` — `anyhow` context, `String`/`Vec` assembly, `str::from_utf8` |
 
-The narrow interface is deliberately preserved: `contains_escaped_path_escape` still takes `&str`, so none of its four call sites changed and no verification detail leaked into unrelated code.
+The interface stays narrow: `contains_escaped_path_escape` takes `&str`, so no verification detail leaks into its call sites.
 
 ### Syntax: `verus!` only
 
@@ -98,14 +96,13 @@ The gate therefore lives in `script/test/verus-verification.sh`, which CI runs:
 
 ## Consequences
 
-- **The plain build is unchanged in behaviour and only slightly more expensive.** `cargo build`, `cargo test` and `cargo clippy` work with no Verus on `PATH`, and the 49 pre-existing `intercept_hook::` unit tests keep passing unchanged (the suite runs 51; the extra two are this ADR's proptests). The `vstd` dependency stack costs a one-off, per-target-dir **10.1 s** for `cargo build` and **49.4 s** for `cargo build --release`, and zero for crates with no Verus code. Three paths pay the release figure on a cold build: `ci.yml`'s `cargo build --release -p agent-vm`, `release-npm.yml`'s two release legs, and `script/build/macos.sh`.
-- **The property is stated twice, on purpose.** Each predicate is asserted as a `#[test]`/proptest on the erased build *and* as a Verus spec. Tests complement the proofs rather than being replaced by them, and the existing tests are the regression check that the in-place contract preserved behaviour. The escape scanner's proptest compares the verified rewrite against the pre-Verus implementation verbatim.
+- **The plain build is only slightly more expensive.** `cargo build`, `cargo test` and `cargo clippy` work with no Verus on `PATH`. The `vstd` dependency stack costs a one-off, per-target-dir **10.1 s** for `cargo build` and **49.4 s** for `cargo build --release`, and zero for crates with no Verus code. Three paths pay the release figure on a cold build: `ci.yml`'s `cargo build --release -p agent-vm`, `release-npm.yml`'s two release legs, and `script/build/macos.sh`.
+- **The property is stated twice, on purpose.** Each predicate is asserted as a `#[test]`/proptest on the erased build *and* as a Verus spec. Tests complement the proofs rather than being replaced by them, and the existing tests are the regression check that the in-place contract preserved behaviour. The escape scanner's proptest pins the verified rewrite against an independent oracle.
 - **Measured evidence is recorded**, not remembered: `docs/research/verus-build-cost.md` (the write-up, plus a dated note on the 1.98.1 pin and the two plain-build figures above) and the verification figures in *Context*.
 - **Verification cost is bounded per-contract, not per-edit.** Warm re-verification after an edit is ~5 s. The cold first run (2–4 min) is the ~440-crate graph plus `vstd`, both cached. Use `CARGO_TARGET_DIR=target/verus` locally: `cargo verus` sets `RUSTC_WRAPPER`, which is part of cargo's fingerprint, so sharing one `target/` with ordinary builds makes every switch a full rebuild.
 - **How the verifier reaches CI.** `.github/workflows/verus.yml` downloads the pinned release asset, checks it against its sha256 before unpacking, and caches the **unpacked** tree (measured 1.63 GB / 4617 files, *larger* than the ~1.0 GB the issue estimated) under a key containing both the release and the digest. A restored tree is therefore by construction the tree that digest names, so a Verus bump can never restore a stale verifier. `actions/cache` is the one action this repo did not already pin; it is pinned by commit SHA like every other, because `zizmor` audits the workflows.
 - **Accepted risk: the cache entry shares GitHub's 10 GB per-repo cache budget** with `ci.yml`'s `Swatinem/rust-cache` entries. This workspace's Rust cache is on the order of 1–2 GB, so the budget has room; the eviction concern is speculative. The inverse trigger, for a future maintainer, is measured rather than guessed: if runs show near-constant cache misses (restores failing while the cache is cold each time), or a restore measurably slower than download plus unpack, delete the `Cache Verus` step, remove the `if:` guard from `Install Verus`, and record the measurement here. Do not drop it on speculation.
 - **`verus.yml` cannot be a step in `ci.yml`.** `script/check-rust-toolchain.sh`'s `check_ci_yml` collects *every* `toolchain: "…"` line in `ci.yml` into one value and compares it to the channel; a second copy there fails the checker. A separate workflow also keeps the ~450-crate verification build off `ci.yml`'s critical path.
-- **ADR-0017 may stay a gap.** It is reserved for #118; if #118 is abandoned, `main` keeps a permanent gap at 0017. Accepted: ADR numbers are identifiers, not a dense sequence, and an explained gap costs less than renumbering an in-flight branch's ADR.
 
 ## Alternatives
 

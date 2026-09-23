@@ -1399,9 +1399,9 @@ pub fn docker_base_tag(manifest_digest: &str) -> Result<String> {
 /// The immutable registry reference used to *establish* a Docker base link
 /// ([`pin_docker_base`]): `<registry>/<repository>@<manifest_digest>`.
 ///
-/// This is no longer buildx's step-0 `FROM` value (that is the local
-/// [`docker_base_tag`] link); its job now is to name the exact digest
-/// `docker pull` may fetch for a registry-origin base, so Docker resolves the
+/// The step-0 `FROM` value is the local [`docker_base_tag`] link; this
+/// names the exact digest `docker pull` may fetch for a registry-origin base,
+/// so Docker resolves the
 /// same manifest msb cached & hashed rather than independently re-resolving a
 /// moving tag (`FROM ghcr.io/.../agent-vm-template:latest`) that could race
 /// the registry and silently build FROM a different base than the one the
@@ -1683,10 +1683,9 @@ fn buildx_driver() -> Option<String> {
 /// which would make [`execute_chain`]'s cache-hit path indistinguishable
 /// from a genuinely broken docker install.
 ///
-/// One `--format '{{json .}}'` call replaces the previous `{{.Id}}` one: the
-/// presence answer the chain's backward walk needs and the facts the contract
-/// needs come from the same process, so enforcement costs no extra docker
-/// invocation. `contract::ImageFacts::from_docker_inspect` validates the
+/// One `--format '{{json .}}'` call answers both the presence question the
+/// chain's backward walk needs and the facts the contract needs, from the same
+/// process, so enforcement costs no extra docker invocation. `contract::ImageFacts::from_docker_inspect` validates the
 /// document (a malformed/renamed one is a named error, never a silent empty
 /// fact set).
 ///
@@ -1758,9 +1757,9 @@ pub async fn docker_image_present(tag: &str) -> Result<bool> {
 /// Silicon are both first-class). The host arch is also exactly the platform
 /// msb resolved and cached for the base image, so the local
 /// `agent-vm-base:<hex>` link buildx's step-0 `FROM` resolves points at the
-/// same-platform base manifest the layer hash covers (before issue #98 the
-/// `FROM` was a digest-pinned registry pull; it is now a local link, but the
-/// platform-matching argument is unchanged).
+/// same-platform base manifest the layer hash covers (the step-0 `FROM` is the
+/// local `agent-vm-base:<hex>` link, and the platform-matching argument is
+/// unchanged).
 fn host_oci_platform() -> String {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
@@ -4684,8 +4683,8 @@ mod tests {
     // closes the narrow window where two tests draw the same nonce and the
     // loser's guard `docker rmi -f`s a tag the winner still holds.
     //
-    // The C1–C4 contract e2e tests moved to `layer/contract.rs` (issue #102);
-    // this section keeps the six build/load/chain tests.
+    // The C1–C4 contract e2e tests live in `layer/contract.rs`; this section
+    // keeps the six build/load/chain tests.
     //
     // This exercises the novel, riskiest part of this ticket for real —
     // `docker buildx build --output type=oci` with an msb-digest-identified

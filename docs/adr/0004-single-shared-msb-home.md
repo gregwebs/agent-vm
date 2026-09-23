@@ -37,23 +37,17 @@ time; they only hit it by deliberately rolling back to an older
 version after a newer one has touched the shared DB — rare, and
 already fully recoverable.
 
-The recovery path already exists and predates namespacing: #30
-(`msb_preflight.rs`) fails fast with a named, actionable error the
-moment an older build detects a DB a newer build already forward-
-migrated, and #28 (`agent-vm doctor --reset-msb-db`) moves the stale DB
-aside non-destructively so the next run recreates it at the bundled
-schema. Verified: reverting `d6ac848` leaves both fully intact and
-already tested (`msb_preflight.rs`, `tests/preflight_boot.rs`,
-`tests/doctor_reset.rs`, `tests/msb_passthrough.rs` all pass unchanged),
-because nothing was built on top of `d6ac848` — it was the tip of its
-line of history.
+The recovery path is #30 (`msb_preflight.rs`), which fails fast with a
+named, actionable error the moment an older build detects a DB a newer
+build already forward-migrated, plus #28 (`agent-vm doctor
+--reset-msb-db`), which moves the stale DB aside non-destructively so the
+next run recreates it at the bundled schema.
 
 ## Decision
 
-**Revert `d6ac848` outright.** `MSB_HOME` goes back to a single flat
-`<state_root>/msb-home`, unconditionally. This fixes #36 directly (the
-default path is well under the socket-path limit again) with no new
-naming scheme, no fork patch, and no adoption logic to maintain.
+**`MSB_HOME` is a single flat `<state_root>/msb-home`, unconditionally.**
+This fixes #36 directly with no schema-id suffix, no new naming scheme, no
+fork patch, and no adoption logic to maintain.
 
 **Rely on #30 + #28 as the collision safety net, not prevention.** A
 cross-build DB-ahead collision remains possible, but it is never
@@ -93,11 +87,8 @@ unaffected.
 
 ## Consequences
 
-- End users get a materially better outcome than either the pre-#36
-  state (crash, misleading remediation) or the shortened-namespacing
-  plan (silent side-by-side coexistence, more moving parts to get
-  subtly wrong): a rollback-triggered collision is rare, and when hit,
-  is a named error with a one-command, non-destructive fix.
+- A rollback-triggered collision is rare, and when hit, is a named error
+  with a one-command, non-destructive fix.
 - Developers running multiple schema-divergent agent-vm builds against
   the *default* (unset) `$AGENT_VM_STATE_DIR` will hit the guard and
   pay a `--reset-msb-db` (re-pull images, no project-data loss) each
@@ -106,9 +97,8 @@ unaffected.
   the documented "hack that works well enough for the dev flow" this
   ADR deliberately chose over building general-purpose prevention
   machinery.
-- `msb_schema::bundled_schema_version()` (#29) is retained — its
-  namespacing consumer is gone, but it is now the source of the schema
-  id surfaced in the guard's message.
+- `msb_schema::bundled_schema_version()` is the source of the schema id
+  surfaced in the guard's message.
 - Should the frequency of dev-time collisions become a real drag even
   with the `AGENT_VM_STATE_DIR` convention documented, revisit
   namespacing then, informed by the shortened-naming design this ADR

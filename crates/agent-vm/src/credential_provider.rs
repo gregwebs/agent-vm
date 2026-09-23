@@ -2,8 +2,7 @@
 //! depend on.
 //!
 //! A **credential provider** is the unit of "what a tool needs in order to be
-//! signed in". Before this module existed that unit was implicit — a set of
-//! `bool`s derived from the launched subcommand and spread over six files.
+//! signed in".
 //! The set of variants is a *code* fact (each needs Rust to capture / rotate /
 //! inject); which tool uses which is configuration (#80/#82). Do not confuse
 //! this with [`crate::secrets::OpencodeApiProvider`] — that is a *dynamic*,
