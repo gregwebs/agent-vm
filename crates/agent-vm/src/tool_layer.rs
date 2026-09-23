@@ -25,7 +25,7 @@ use crate::config::{DeclaredLayer, ToolLayer};
 use crate::defaults;
 use crate::layer;
 
-/// The five shipped tool layer sources, embedded at compile time. The path
+/// The six shipped tool layer sources, embedded at compile time. The path
 /// resolves relative to `$CARGO_MANIFEST_DIR` (`crates/agent-vm`), so
 /// `../../images/tools` is the repo's tool-layer directory.
 static TOOL_LAYERS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../images/tools");
@@ -329,7 +329,8 @@ mod tests {
     #[test]
     fn renamed_tools_with_the_same_layer_sequence_still_boot_the_template() {
         let renamed = declared_from_config(
-            "[[tools]]\nname = \"pi-x\"\ncommand = \"pi\"\nlayer = { builtin = \"pi\" }\n\
+            "[[tools]]\nname = \"dsh-x\"\ncommand = \"dsh\"\nlayer = { builtin = \"dsh\" }\n\
+             [[tools]]\nname = \"pi-x\"\ncommand = \"pi\"\nlayer = { builtin = \"pi\" }\n\
              [[tools]]\nname = \"codex-x\"\ncommand = \"codex\"\nlayer = { builtin = \"codex\" }\n\
              [[tools]]\nname = \"opencode-x\"\ncommand = \"opencode\"\nlayer = { builtin = \"opencode\" }\n\
              [[tools]]\nname = \"claude-x\"\ncommand = \"claude\"\nlayer = { builtin = \"claude\" }\n\
@@ -350,7 +351,7 @@ mod tests {
     }
 
     /// The declaration order has one source of truth, `default-tools.toml`, but
-    /// CI's six build steps and `images/build.sh`'s layer variables transcribe
+    /// CI's seven build steps and `images/build.sh`'s layer variables transcribe
     /// it by hand (a workflow and a shell script cannot import a Rust const).
     /// Nothing else ties them together, and the drift is silent: if CI composes
     /// the published template in a different order than the launcher believes,
@@ -640,6 +641,77 @@ mod tests {
         assert_eq!(
             matched, expected,
             "install-pi.sh's selector must match exactly the five shrinkwrap-only siblings at the pin"
+        );
+    }
+
+    // -- the pinned dsh layer: one home for the pin, and full integrity ----
+
+    fn dsh_pin() -> String {
+        embedded_json("dsh/package.json")["dependencies"]["@deepseek-ai/dsh"]
+            .as_str()
+            .expect("the dsh manifest pins @deepseek-ai/dsh")
+            .to_string()
+    }
+
+    /// The dsh pin has exactly two homes -- `images/tools/dsh/package.json` and
+    /// its lockfile -- and `npm ci` is only as good as their agreement, so
+    /// assert it in `cargo test` rather than discovering a mismatch in the
+    /// image build. `verify-dsh.sh` asserts the *running* binary equals the
+    /// manifest pin; this asserts the manifest equals the lock.
+    #[test]
+    fn the_pinned_dsh_version_agrees_across_the_manifest_and_the_lockfile() {
+        let pinned = dsh_pin();
+        let lock = embedded_json("dsh/package-lock.json");
+        let root = lock["packages"][""]["dependencies"]["@deepseek-ai/dsh"]
+            .as_str()
+            .expect("the lock's root records the dsh dependency");
+        assert_eq!(
+            root, pinned,
+            "the lock's root dependency must equal the manifest's pin"
+        );
+        let locked = lock["packages"]["node_modules/@deepseek-ai/dsh"]["version"]
+            .as_str()
+            .expect("dsh is locked");
+        assert_eq!(
+            locked, pinned,
+            "npm ci would install {locked}, but the manifest pins {pinned}"
+        );
+        // `dsh plugin` needs pnpm, and the Dockerfile links it out of this same
+        // lock, so a dropped pnpm dependency must fail here rather than as a
+        // still-green build that ships a plugin command that cannot run.
+        let pnpm = embedded_json("dsh/package.json")["dependencies"]["pnpm"]
+            .as_str()
+            .expect("the dsh manifest pins pnpm")
+            .to_string();
+        assert!(
+            lock["packages"]["node_modules/pnpm"]["version"].as_str() == Some(pnpm.as_str()),
+            "the lock must install the pinned pnpm ({pnpm})"
+        );
+    }
+
+    /// Every entry in the committed dsh lock carries `integrity`, so `npm ci`
+    /// authenticates the whole tree it installs. A regenerated lock that drops
+    /// a hash must fail here, not silently widen what the build trusts.
+    #[test]
+    fn every_dsh_locked_package_carries_integrity() {
+        let lock = embedded_json("dsh/package-lock.json");
+        let packages = lock["packages"]
+            .as_object()
+            .expect("`packages` is an object");
+        // An empty/truncated lock would vacuously satisfy the loop below.
+        assert!(
+            packages.contains_key("node_modules/@deepseek-ai/dsh"),
+            "the dsh lock must actually carry the dsh package"
+        );
+        let missing: Vec<&str> = packages
+            .iter()
+            .filter(|(key, value)| !key.is_empty() && value.get("integrity").is_none())
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these committed dsh lock entries carry no `integrity` hash: {missing:?}\n\
+             Regenerate with `cd images/tools/dsh && npm install --package-lock-only`."
         );
     }
 

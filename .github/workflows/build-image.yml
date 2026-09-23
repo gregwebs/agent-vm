@@ -7,8 +7,8 @@ name: build-image
 #
 # Two repositories are published from one run (issue #84):
 # - `agent-vm-base`     — the tool-free base (images/Dockerfile).
-# - `agent-vm-template` — the composed default: base + the five shipped tool
-#                         layers (images/tools/{pi,codex,opencode,claude,copilot}),
+# - `agent-vm-template` — the composed default: base + the six shipped tool
+#                         layers (images/tools/{dsh,pi,codex,opencode,claude,copilot}),
 #                         chained in declaration order.
 # Each carries `latest` / `YYYY-MM-DDTHH` / `sha-<gitsha>`. Building both in the
 # same run is what makes the template provably base + layers (asserted below on
@@ -130,6 +130,8 @@ jobs:
           #               cadence (e.g. stable != latest), so keying on
           #               npm would miss native releases / rebuild for
           #               npm-only bumps.
+          # `dsh` is deliberately absent: it is a committed-lockfile layer
+          # (like pi), so its cache key is the lockfile's bytes, not a lookup.
           # Any lookup failure fails the build (vs shipping a stale key
           # that would skip a real agent update).
           codex=$(gh api repos/openai/codex/releases/latest --jq .tag_name) \
@@ -223,16 +225,36 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      # The `AGENT_VERSION_*`-keyed tool layers, preceded by the pinned Pi layer.
+      # The `AGENT_VERSION_*`-keyed tool layers, preceded by the two pinned
+      # lockfile layers (dsh, then pi).
       # Each builds FROM the previous step's digest and pushes its result by digest
       # (no tag), so the next step can resolve a `FROM` the docker-container driver
       # can see while leaving nothing in the registry for the retention regex to
       # protect.
       #
+      # The pinned dsh layer. Like pi, no AGENT_VERSION_* key and no version
+      # lookup: the pin is images/tools/dsh/package-lock.json, so this layer is
+      # a cache hit until that pin moves. It is the chain's first step because
+      # it is the largest committed-lockfile layer (images/tools/README.md).
+      - name: Build and push dsh tool layer
+        id: dsh
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.ts.outputs.epoch }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: images/tools/dsh
+          build-args: |
+            BASE_IMAGE=${{ env.BASE }}@${{ steps.base.outputs.digest }}
+          outputs: type=image,name=${{ env.BASE }},push-by-digest=true,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
+          cache-from: type=gha,scope=dsh
+          cache-to: type=gha,mode=max,scope=dsh
+          provenance: false
+          sbom: false
+
       # The pinned Pi layer. No AGENT_VERSION_* key and no version lookup: the
       # pin is images/tools/pi/package-lock.json, so this layer is a cache hit
-      # until the pin moves. It is the chain's first step because it is the
-      # largest and least frequently changed (images/tools/README.md).
+      # until the pin moves. It sits just above dsh, the other large pinned
+      # layer (images/tools/README.md).
       - name: Build and push pi tool layer
         id: pi
         env:
@@ -241,7 +263,7 @@ jobs:
         with:
           context: images/tools/pi
           build-args: |
-            BASE_IMAGE=${{ env.BASE }}@${{ steps.base.outputs.digest }}
+            BASE_IMAGE=${{ env.BASE }}@${{ steps.dsh.outputs.digest }}
           outputs: type=image,name=${{ env.BASE }},push-by-digest=true,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
           cache-from: type=gha,scope=pi
           cache-to: type=gha,mode=max,scope=pi
@@ -297,7 +319,7 @@ jobs:
           sbom: false
 
       # The final tool layer produces the published composed template.
-      - name: Build and push template (copilot tool layer)
+      - name: Build and push copilot tool layer (template)
         id: build
         env:
           SOURCE_DATE_EPOCH: ${{ steps.ts.outputs.epoch }}
@@ -376,7 +398,7 @@ jobs:
           # for real when a tool Dockerfile's default `ARG BASE_IMAGE=` wins
           # because a `build-args:` key was dropped — the final step then builds
           # FROM yesterday's published base and its diff_ids still prefix-match.
-          # The point of this step is to prove five layers were ADDED, so require
+          # The point of this step is to prove six layers were ADDED, so require
           # strictly more layers than the base has.
           if [ "$m" -le "$n" ]; then
             echo "::error::the template has no rootfs layers beyond the base ($m <= $n); a tool-layer build was dropped or chained FROM the wrong base"
@@ -396,12 +418,12 @@ jobs:
     # matched by no protected tag and so are age-pruned like any other version.
     #
     # Expected steady state, so a future reader does not read this as a leak:
-    # each hourly run creates four untagged intermediate versions (pi, codex,
-    # opencode, claude) in `agent-vm-base` — ~96/day — plus one tagged version
-    # per repository. At a 14-day horizon that is ~1,300 untagged versions in
-    # `agent-vm-base`, pruned only by age. The listing is paginated at 100/page,
-    # and this job now walks two packages; ~1,300 versions is the number the
-    # pagination must stay comfortable with.
+    # each hourly run creates five untagged intermediate versions (dsh, pi,
+    # codex, opencode, claude) in `agent-vm-base` — ~120/day — plus one tagged
+    # version per repository. At a 14-day horizon that is ~1,680 untagged
+    # versions in `agent-vm-base`, pruned only by age. The listing is paginated
+    # at 100/page, and this job now walks two packages; ~1,680 versions is the
+    # number the pagination must stay comfortable with.
     needs: build
     runs-on: ubuntu-latest
     permissions:

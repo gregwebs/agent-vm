@@ -135,18 +135,18 @@ The script accepts zero to two positional arguments. The Docker source defaults 
 Issue #84 split the image into a tool-free base plus one layer per tool. A launch
 whose configured tool set differs from the shipped default composes those layers
 onto the base locally; `--base-image` (env `AGENT_VM_BASE_IMAGE`) points that
-composition at a local base. To build the base and the five tool layers by hand
+composition at a local base. To build the base and the six tool layers by hand
 and exercise the composed path:
 
 ```bash
 set -euo pipefail
-# 1. base + the five tool layers, chained. Every step is `--load`ed into the
+# 1. base + the six tool layers, chained. Every step is `--load`ed into the
 #    daemon (as `images/build.sh` does) so the next step's `FROM` resolves;
 #    that needs a `docker`-driver builder (`docker buildx create --driver
 #    docker --use`).
 docker buildx build --platform linux/arm64 --load -t agent-vm-base:dev -f images/Dockerfile images
 prev=agent-vm-base:dev
-for t in pi codex opencode claude copilot; do
+for t in dsh pi codex opencode claude copilot; do
   docker buildx build --platform linux/arm64 --load \
     --build-arg BASE_IMAGE="$prev" -t "agent-vm-$t:dev" "images/tools/$t"
   prev="agent-vm-$t:dev"

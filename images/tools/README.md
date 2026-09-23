@@ -67,11 +67,17 @@ and both `/opt/agent-vm` trees** — so a soft-failed build ships no `pi` at all
 rather than a broken one. An **integrity mismatch is never soft-failable** (the
 same rule `images/install-zellij.sh` applies).
 
+The `dsh` layer declares the arg too, but installs with a hard-failing
+`npm ci`: a partial `node_modules` is a broken agent, not an absent one, so a
+soft-fail there would ship exactly the silently-cached hole the policy exists
+to prevent. Its gate never soft-fails the empty-`--version` case either — see
+*The pinned lockfile layers* below.
+
 ## Declaration and cache ordering
 
 The declaration order — and therefore the chain order, the order
 `agent-vm doctor` lists the verbs in, and CI's build order — is
-`pi, codex, opencode, claude, copilot`, matching
+`dsh, pi, codex, opencode, claude, copilot`, matching
 `crates/agent-vm/src/default-tools.toml`. That file is the single source of
 truth: `config::shipped_tool_layers()` derives the launcher's order from it,
 and `tool_layer::tests::tool_order_matches_the_ci_and_build_script_literals`
@@ -86,34 +92,54 @@ on essentially every build that changes anything, while the **bottom** layer is
 re-emitted only when it itself bumps. The agent that is both largest and least
 frequently changed belongs at the bottom:
 
-- `pi` ~150 MiB (`node_modules`), only when this repo bumps the pin → bottom (first)
+- `dsh` ~324 MiB (`node_modules`), only when this repo bumps the pin → bottom (first)
+- `pi` ~150 MiB (`node_modules`), only when this repo bumps the pin → next
 - `codex` ~95 MiB, multiple stable cuts/day → next
 - `opencode` ~50 MiB, several per week → middle
-- `claude` ~68 MiB, ~daily → top (of the three installer layers)
-- `copilot` ~installed via npm, no upstream version key → last
+- `claude` ~68 MiB, ~daily → middle
+- `copilot` ~installed via npm, no upstream version key → top (last)
 
-`pi` is the extreme case of "large and rarely changing": a ~150 MiB tree whose
-only input is the committed pin, so at the bottom it is re-emitted only when the
-pin moves — never on the daily claude churn above it. (Inserting it at position
-zero invalidates the four existing layers' caches once and re-pushes the
-template once; that one-time cost is worth the steady state.) CI resolves each
-*installer* agent's current upstream version and feeds it in as a per-agent
-`AGENT_VERSION_*` build arg, so a layer is rebuilt only when that agent actually
-released — an unchanged hourly build is a pure cache hit. `pi` has no
-`AGENT_VERSION_*` key and needs none: its cache key is the lockfile's content.
-This is the policy that used to live in `images/Dockerfile`; it moved here with
-the installs.
+`dsh` and `pi` are the two "large and rarely changing" layers, and they sit
+below every installer layer for the same reason: a **committed lockfile** is
+their only input, so each is re-emitted only when its pin moves — never on the
+daily claude/codex churn above it. `dsh` is the larger of the two (~324 MiB vs
+~150 MiB) and so goes first; each pin bump rebuilds the layers above it, which
+is the accepted cost of keeping ~324 MiB out of every unrelated rebuild.
+(Inserting dsh at position zero invalidates the five existing layers' caches
+once and re-pushes the template once; that one-time cost is worth the steady
+state.) CI resolves each *installer* agent's current upstream version and feeds
+it in as a per-agent `AGENT_VERSION_*` build arg, so a layer is rebuilt only
+when that agent actually released — an unchanged hourly build is a pure cache
+hit. `dsh` and `pi` have no `AGENT_VERSION_*` key and need none: their cache key
+is the lockfile's content. This is the policy that used to live in
+`images/Dockerfile`; it moved here with the installs.
 
-## The `pi` layer: a committed lockfile, not an installer
+## The pinned lockfile layers: `dsh` and `pi`
 
-No other layer works this way. The installer layers resolve their version at
-build time; `pi`'s version lives in a **committed** `package.json` +
-`package-lock.json` (`images/tools/pi/`), and the layer runs
-`npm ci --ignore-scripts`, which by construction resolves nothing. The build then
-asserts `pi --version` equals the pin, so there is no moving-version lookup for
-Pi anywhere. The installation is fronted by an agent-vm-owned wrapper at
-`/usr/local/bin/pi` — see
-[ADR-0012](../../docs/adr/0012-stable-pi-image-customization-seam.md).
+The installer layers resolve their version at build time; `dsh` and `pi` do not.
+Their version lives in a **committed** `package.json` + `package-lock.json`
+(each beside its Dockerfile), and the layer runs `npm ci`, which by construction
+resolves nothing. The build then asserts `dsh --version` / `pi --version` equals
+the pin, so there is no moving-version lookup for either. `pi` additionally
+fronts the install with an agent-vm-owned wrapper at `/usr/local/bin/pi` and a
+mandatory warning extension — see
+[ADR-0012](../../docs/adr/0012-stable-pi-image-customization-seam.md); `dsh`
+needs no wrapper because its bin is linked straight onto `PATH`.
+
+For `dsh`, the lock is not merely reproducibility. `npm install -g
+@deepseek-ai/dsh` resolves the app at the current `latest` (0.1.5-rc.2), whose
+`^0.1.5-rc.2` range pulls `dsh-base` 0.1.5-rc.3, and npm may then nest
+`dsh-sandbox-local` under `dsh-base/node_modules`. dsh's plugin loader cannot
+resolve that package from the app root, so `dsh web` aborts at boot. The lock
+freezes the working layout — the package under the app's own `node_modules` —
+as well as every transitive integrity hash. `images/tools/dsh/verify-dsh.sh`
+is therefore stricter than a bare `--version`: dsh dispatches on
+`import.meta.main`, undefined below Node 22.19, so on an old Node its CLI exits
+0 having printed nothing — a broken agent that every exit-code-only check
+(including `agent-vm setup`) would accept. The gate fails the build on empty
+output and on a version that differs from the pin.
+
+## Bumping the `pi` pin
 
 **Bumping the pin** means editing `package.json` and regenerating the lock:
 
@@ -158,3 +184,37 @@ directory, so the unauthenticated sibling fetch cannot create one.) Two
 (`every_locked_package_carries_integrity`,
 `the_build_verified_sibling_set_is_exactly_the_five_nested_earendil_packages`)
 fail loudly if a regenerated lock drops the hashes or the nested layout moves.
+
+## The `dsh` layer: persistence and credentials
+
+The tool definition (`crates/agent-vm/src/default-tools.toml`) gives `dsh` the
+default argv `web` and `persist = [".dsh"]`. dsh keeps its entire user state —
+profiles, sessions, and the `~/.dsh/.credentials.yaml` credentials document —
+under its home, so persisting the tree is what makes an API key stored once in
+the Models UI survive the next launch. That is the config-driven equivalent of
+`pi`'s generic `.pi` link.
+
+The layer also pins `pnpm` in the same lock and links it onto `PATH`, because
+`dsh plugin --profile … add …` forwards to pnpm and the base image has none.
+Pinning it there (rather than `npm install -g pnpm`) gives it the same
+integrity-checked install as the rest of the tree.
+
+Bumping the pin is the plain lockfile flow (dsh's tree has no shrinkwrap
+integrity quirks, so no hand-editing), run with `--ignore-scripts` exactly as
+the layer's `npm ci` is so regenerating never runs lifecycle scripts either:
+
+```bash
+cd images/tools/dsh
+npm install --ignore-scripts --package-lock-only --no-audit --no-fund
+```
+
+Like `pi`, `dsh` declares **no** `credentials` and gets no credential provider:
+it is a multi-provider harness that must start with none configured, so it
+never inherits a provider's pre-boot hard bail. Anthropic/OpenAI support does
+not need a plugin: `@deepseek-ai/dsh-base`'s `cordis.patch.yml` already mounts
+the `llm-pi-ai` multi-provider adapter dormant, so a user stores an API key in
+the credentials document or the environment and configures the provider in the
+Models UI. Community OAuth/subscription plugins are deliberately **not** baked
+in — they are unreviewed third-party code that would hold the user's
+credentials, and `dsh plugin` is available in-guest for a user who wants one.
+

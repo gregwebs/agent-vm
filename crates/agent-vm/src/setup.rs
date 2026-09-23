@@ -414,13 +414,14 @@ mod tests {
             .collect()
     }
 
-    // -- V9: the default catalog verifies copilot, in catalog order ---------
+    // -- V9: the default catalog verifies every shipped tool, in catalog order --
 
     #[test]
-    fn default_catalog_verifies_every_shipped_tool_including_copilot() {
+    fn default_catalog_verifies_every_shipped_tool_including_dsh() {
         assert_eq!(
             summary(&verification_targets(&default_catalog(), &BTreeMap::new()).expect("targets")),
             vec![
+                ("dsh".to_string(), "dsh".to_string(), true),
                 ("pi".to_string(), "pi".to_string(), true),
                 ("codex".to_string(), "codex".to_string(), true),
                 ("opencode".to_string(), "opencode".to_string(), true),
@@ -559,7 +560,8 @@ mod tests {
     #[test]
     fn non_composing_roots_downgrade_nothing() {
         // Template: a default-shaped layer sequence boots the composed image.
-        let default_body = "[[tools]]\nname = \"pi\"\ncommand = \"pi\"\nlayer = { builtin = \"pi\" }\n\
+        let default_body = "[[tools]]\nname = \"dsh\"\ncommand = \"dsh\"\nlayer = { builtin = \"dsh\" }\n\
+             [[tools]]\nname = \"pi\"\ncommand = \"pi\"\nlayer = { builtin = \"pi\" }\n\
              [[tools]]\nname = \"codex\"\ncommand = \"codex\"\nlayer = { builtin = \"codex\" }\n\
              [[tools]]\nname = \"opencode\"\ncommand = \"opencode\"\nlayer = { builtin = \"opencode\" }\n\
              [[tools]]\nname = \"claude\"\ncommand = \"claude\"\nlayer = { builtin = \"claude\" }\n\

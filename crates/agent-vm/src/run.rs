@@ -2480,7 +2480,7 @@ const RUN_IMAGE_SEED_HOOKS: &str = concat!(
 /// already passed), then the user's own args — or, for an interactive shell, a
 /// single `-c` with those args joined and escaped.
 ///
-/// Pure and string-only so the six default tools' guest command lines are
+/// Pure and string-only so the seven default tools' guest command lines are
 /// unit-tested without booting, mirroring [`build_agent_shell_line`] below.
 /// This is the *only* oracle for "identical to `main`": the guest command
 /// line travels over the exec request after boot and never appears in the
@@ -2670,7 +2670,7 @@ mod tests {
             .to_path_buf()
     }
 
-    /// The six compiled-in `default-tools.toml` tools, for the argv tests
+    /// The seven compiled-in `default-tools.toml` tools, for the argv tests
     /// below. Parsed via the same validated path as user input.
     fn default_catalog() -> crate::config::LaunchCatalog {
         let dir = tempfile::tempdir().unwrap();

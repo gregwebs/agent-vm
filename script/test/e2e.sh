@@ -207,7 +207,7 @@ run_optional() {
 check_base_is_tool_free() {
   local out
   out="$(avm shell --no-git --image "$BASE_IMAGE" -- bash -c '
-    for b in pi claude codex opencode copilot; do
+    for b in dsh pi claude codex opencode copilot; do
       if command -v "$b" >/dev/null 2>&1; then echo "PRESENT:$b"; else echo "absent:$b"; fi
     done
     echo "api=$(cat /etc/agent-vm-image-version)"
@@ -216,16 +216,21 @@ check_base_is_tool_free() {
     return 1
   }
   assert_no_match "no agent CLI on PATH" "^PRESENT:" "$out" || return 1
-  assert_eq "all five absent" "5" "$(grep -c '^absent:' <<<"$out")" || return 1
+  assert_eq "all six absent" "6" "$(grep -c '^absent:' <<<"$out")" || return 1
   assert_match "image API 3" "^api=3$" "$out" || return 1
 }
 
-# E1: all five --version checks pass in the composed template guest.
+# E1: all six --version checks pass in the composed template guest.
 check_template_has_all_tools() {
   local out
   out="$(avm shell --no-git --image "$TEMPLATE_IMAGE" -- bash -c '
-    for t in pi codex opencode claude copilot; do
-      "$t" --version >/dev/null 2>&1 || { echo "MISSING:$t"; exit 1; }
+    for t in dsh pi codex opencode claude copilot; do
+      if [ "$t" = dsh ]; then
+        # dsh exits 0 with no output on a too-old Node, so assert the string.
+        [ -n "$(dsh --version 2>/dev/null)" ] || { echo "MISSING:$t"; exit 1; }
+      else
+        "$t" --version >/dev/null 2>&1 || { echo "MISSING:$t"; exit 1; }
+      fi
     done
     echo "api=$(cat /etc/agent-vm-image-version)"
   ' 2>&1)" || {

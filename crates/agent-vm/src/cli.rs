@@ -389,9 +389,11 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         expected.extend(
-            ["pi", "codex", "opencode", "claude", "copilot", "shell"]
-                .iter()
-                .map(|s| s.to_string()),
+            [
+                "dsh", "pi", "codex", "opencode", "claude", "copilot", "shell",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
         );
         expected.push("help".to_string());
         assert_eq!(names, expected);
@@ -431,7 +433,7 @@ mod tests {
 
     /// Issue #84's `take_entry` ordering trap: a launch verb's `Dispatch` must
     /// carry the layers read from the catalog *before* the launched verb is
-    /// removed, so `claude` under the default config carries all five shipped
+    /// removed, so `claude` under the default config carries all six shipped
     /// layers in order (its own included).
     #[test]
     fn a_launch_carries_every_declared_layer_in_order() {
@@ -776,7 +778,7 @@ mod tests {
             let tokens: Vec<&str> = haystack
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
                 .collect();
-            ["pi", "claude", "codex", "opencode", "copilot"]
+            ["dsh", "pi", "claude", "codex", "opencode", "copilot"]
                 .into_iter()
                 .find(|tool| tokens.contains(tool))
         }

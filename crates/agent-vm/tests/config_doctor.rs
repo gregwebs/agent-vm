@@ -200,14 +200,20 @@ fn reports_defaults_and_preserves_the_pre_existing_sections() {
     );
     assert!(stdout.contains("resolved: built-in defaults"), "{stdout}");
 
-    let pi = stdout.find("1. pi").expect("pi row");
-    let codex = stdout.find("2. codex").expect("codex row");
-    let opencode = stdout.find("3. opencode").expect("opencode row");
-    let claude = stdout.find("4. claude").expect("claude row");
-    let copilot = stdout.find("5. copilot").expect("copilot row");
-    let shell = stdout.find("6. shell").expect("shell row");
+    let dsh = stdout.find("1. dsh").expect("dsh row");
+    let pi = stdout.find("2. pi").expect("pi row");
+    let codex = stdout.find("3. codex").expect("codex row");
+    let opencode = stdout.find("4. opencode").expect("opencode row");
+    let claude = stdout.find("5. claude").expect("claude row");
+    let copilot = stdout.find("6. copilot").expect("copilot row");
+    let shell = stdout.find("7. shell").expect("shell row");
     assert!(
-        pi < codex && codex < opencode && opencode < claude && claude < copilot && copilot < shell,
+        dsh < pi
+            && pi < codex
+            && codex < opencode
+            && opencode < claude
+            && claude < copilot
+            && copilot < shell,
         "{stdout}"
     );
 
@@ -244,7 +250,7 @@ fn found_empty_tier_is_distinct_from_absent_and_still_uses_defaults() {
         stdout.contains(&format!("{} (absent)", h.project_config().display())),
         "{stdout}"
     );
-    assert!(stdout.contains("1. pi"), "{stdout}");
+    assert!(stdout.contains("1. dsh"), "{stdout}");
 }
 
 #[test]
@@ -259,7 +265,7 @@ fn a_user_only_catalog_adds_the_shell_fallback_but_no_defaults() {
     assert!(stdout.contains("resolved: declared tools"), "{stdout}");
     assert!(stdout.contains("1. solo"), "{stdout}");
     // No default agent is added...
-    assert!(!stdout.contains("1. pi"), "{stdout}");
+    assert!(!stdout.contains("1. dsh"), "{stdout}");
     assert!(!stdout.contains("codex ->"), "{stdout}");
     // ...but the built-in `shell` fallback is, and it is labelled.
     assert!(stdout.contains("2. shell"), "{stdout}");

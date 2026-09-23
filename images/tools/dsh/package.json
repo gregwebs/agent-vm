@@ -1,0 +1,9 @@
+{
+  "name": "agent-vm-dsh-layer",
+  "private": true,
+  "description": "Committed dependency pin for the dsh tool layer (see README.md). npm ci installs exactly this tree.",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.5-rc.2",
+    "pnpm": "11.7.0"
+  }
+}

@@ -7,7 +7,7 @@
 use vstd::prelude::*;
 
 /// Default OCI image reference. This is the **composed default guest
-/// template**: the tool-free base plus the five built-in tool layers,
+/// template**: the tool-free base plus the six built-in tool layers,
 /// chained in declaration order by CI (`images/Dockerfile` +
 /// `images/tools/`). agent-vm boots it *verbatim* — no local build, no
 /// Docker — when the resolved tool set's declared layer sequence equals
