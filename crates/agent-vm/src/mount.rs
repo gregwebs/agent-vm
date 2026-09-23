@@ -132,21 +132,14 @@ fn segment_is_guest_path(seg: &str) -> bool {
 /// "unknown mode". `ro`+`rw` together, and any keyword `MountMode` doesn't
 /// recognize, are hard parse-time errors.
 ///
-/// Known, deliberate deviation from the pre-mode-suffix grammar: previously
-/// `HOST:GUEST` split on the *first* colon only, so a `GUEST` could contain
-/// literal trailing colons (e.g. `/h:/g:x` kept `guest = "/g:x"`). The new
-/// grammar splits on every colon, so trailing colon-separated tokens are
-/// now interpreted as mode keywords instead — `/h:/g:x` now fails as
-/// "unknown mode keyword \"x\"". Colon-bearing guest paths were
-/// undocumented/pathological; this change is intentional and pinned by
-/// `parse_extra_mounts_colon_in_guest_now_mode_error`.
-///
-/// Second deliberate deviation, same bucket: a relative `GUEST` with no
-/// leading `/` or `.` (e.g. `/abs-host:relative-guest`) used to fail with
-/// "guest path must be absolute". Since a bare trailing segment is now
-/// classified as a mode keyword rather than a guest path, it instead fails
-/// as "unknown mode keyword \"relative-guest\"" — still a hard error, just a
-/// different message. Pinned by `parse_extra_mounts_rejects_relative_paths`.
+/// Colon-bearing guest paths are undocumented/pathological: the grammar splits
+/// on every colon, so a trailing token is read as a mode keyword and fails as
+/// "unknown mode keyword \"x\"" (`/h:/g:x`). A relative `GUEST` segment is
+/// likewise classified as a mode keyword and fails as "unknown mode keyword
+/// \"relative-guest\"" rather than "guest path must be absolute" — still a hard
+/// error, just a different message. Both are pinned by
+/// `parse_extra_mounts_colon_in_guest_now_mode_error` and
+/// `parse_extra_mounts_rejects_relative_paths`.
 pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
     let mut out = Vec::with_capacity(raw.len());
     for entry in raw {
@@ -2935,8 +2928,7 @@ impl<'a> CopyPolicy<'a> {
 
 impl NodePolicy<'_> {
     /// The two signals, in one place: `fstat` identity first, then the
-    /// fork-root-relative path. This replaces `CopyPolicy::protected_ids` and
-    /// `protected_file_at` (R4.4.2).
+    /// fork-root-relative path.
     fn omits(&self, dev: u64, ino: u64, relative: &Path) -> Option<ProtectedFile> {
         self.protected.identities().matched(dev, ino).or_else(|| {
             self.protected_relative

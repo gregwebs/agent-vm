@@ -15,9 +15,8 @@
 //! The sandbox *name* additionally carries the launcher PID
 //! (`agent-vm-<hash>-<pid>`) so two concurrent `agent-vm` invocations
 //! from the same project boot independent VMs. Without this, the second
-//! launch's `Sandbox::create` would SIGTERM/SIGKILL the first one's VMM
-//! (we used to set `.replace()` to handle the same-name collision; now
-//! there is no collision to handle). Per-project bind-mounted state
+//! launch's `Sandbox::create` would SIGTERM/SIGKILL the first one's VMM.
+//! Per-project bind-mounted state
 //! (claude/, codex/, opencode/, bash_history) is still shared between
 //! the two — running two agents that mutate the same session files at
 //! once is the user's call.

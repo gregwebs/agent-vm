@@ -105,14 +105,11 @@ their only input, so each is re-emitted only when its pin moves — never on the
 daily claude/codex churn above it. `dsh` is the larger of the two (~324 MiB vs
 ~150 MiB) and so goes first; each pin bump rebuilds the layers above it, which
 is the accepted cost of keeping ~324 MiB out of every unrelated rebuild.
-(Inserting dsh at position zero invalidates the five existing layers' caches
-once and re-pushes the template once; that one-time cost is worth the steady
-state.) CI resolves each *installer* agent's current upstream version and feeds
+CI resolves each *installer* agent's current upstream version and feeds
 it in as a per-agent `AGENT_VERSION_*` build arg, so a layer is rebuilt only
 when that agent actually released — an unchanged hourly build is a pure cache
 hit. `dsh` and `pi` have no `AGENT_VERSION_*` key and need none: their cache key
-is the lockfile's content. This is the policy that used to live in
-`images/Dockerfile`; it moved here with the installs.
+is the lockfile's content.
 
 ## The pinned lockfile layers: `dsh` and `pi`
 

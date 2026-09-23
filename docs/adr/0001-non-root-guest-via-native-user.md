@@ -59,14 +59,14 @@ reasons, neither a substitute for the other:
 Because `/agent-vm-state` is a *runtime bind mount* that shadows the
 rootfs upper layer where `.patch()` writes (patches bake into `upper.ext4`
 before the VM boots; the bind mount then covers whatever a patch wrote at
-that path), the non-root guest's `HOME=/agent-vm-state/home` and its
-dotfile symlinks are provisioned **host-side**, in the project's state
-dir, not via `.patch()`. Root mode is unaffected: its `/root/...` symlinks
+that path), the non-root guest's `$HOME` (the mirrored host home, ADR-0002)
+and its dotfile symlinks are provisioned **host-side**, in the project's
+state dir, not via `.patch()`. Root mode is unaffected: its `/root/...` symlinks
 target un-shadowed rootfs, so `.patch()` remains correct there. Only
 `/etc/passwd`/`/etc/group` (real rootfs, not under the bind) are still
 patched, to give the appended uid a resolvable passwd entry.
 
-`--root` / `AGENT_VM_ROOT` restores the legacy root guest for cases that
+`--root` / `AGENT_VM_ROOT` selects the root guest for cases that
 need it.
 
 ## Consequences

@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted. Feature 4's deferral is superseded by ADR-0010; the other
-historical decisions remain accepted.
+Accepted. All four fork-only capabilities are now wired (ADR-0010
+supersedes feature 4's deferral).
 
 ## Context
 
@@ -40,23 +40,17 @@ branch was built from:
 
 The vendored gitlink (on `integration/v0.6.15-agent-vm`) and
 `origin/main` diverged at the v0.6.15 release merge-base; neither is a
-superset. The integration line alone carries the agentd exit-on-shutdown
+superset. The integration line carries the agentd exit-on-shutdown
 fix and issue #41's heartbeat keep-alive, both load-bearing for
-agent-vm's boot/teardown behavior and absent from `origin/main`.
-`origin/main` alone carries `#9`-`#16` above. A trial no-fast-forward
-merge of `origin/main` into the integration line completed cleanly
-during planning (zero conflicts, auto-resolved in
-`crates/agentd/lib/agent.rs`, `crates/runtime/lib/vm.rs`,
-`sdk/rust/lib/sandbox/mod.rs`).
+agent-vm's boot/teardown behavior; `origin/main` carries `#9`-`#16`
+above.
 
 ## Decision
 
-**Integrate `gregwebs/microsandbox` `origin/main` into the vendored
-`integration/v0.6.15-agent-vm` line** with a no-fast-forward merge (done
-by the maintainer directly on `origin`, landing at `a7487bb4`; this PR
-records the resulting gitlink bump in the superproject). The merged tip
-carries both the agentd exit fix / keepalive and `#9`-`#16`'s feature
-ports — supersedes neither line, combines them.
+**The vendored `integration/v0.6.15-agent-vm` line integrates
+`origin/main`.** It carries both the agentd exit fix / keepalive and
+`#9`-`#16`'s feature ports — neither line is superseded; they are
+combined.
 
 **Wire features 1, 2, and 3 in agent-vm** through
 `crates/agent-vm/src/network.rs`'s `network::Plan`, while `run.rs` retains
@@ -84,9 +78,8 @@ defaults `enabled: true`, so calling it unconditionally would switch on
 MITM interception for a pure egress-override or auto-publish launch that
 asked for none of that).
 
-**Feature 4 was deferred to follow-up #51.** ADR-0010 supersedes this
-feature-4 deferral: agent-vm now wires the file-backed secret and
-interceptor primitives with per-connection rotation and GitHub scoping.
+**Feature 4 (file-backed credential injection) is wired per ADR-0010**,
+with per-connection rotation and GitHub scoping.
 
 **Protocol generation 7 -> 8.** `#16` bumps the msb wire protocol so a
 deployed gen-7 agentd cannot falsely claim auto-publish support. agentd
@@ -101,31 +94,20 @@ produced by `crates/filesystem/build.rs`. This PR does not touch
 gen-7 copy fails loud via the SDK send-gate's `UnsupportedOperation`,
 not silently, so this needed no split from features 1/3.
 
-**#47 stays addressed, not closed.** Once features 1-3 land and #51 is
-filed, #47 has no remaining unassigned work, but whether to retitle it
-to track only feature 4 or close it outright is a maintainer call this
-PR doesn't make.
-
-This explicitly **supersedes ADR-0006's fail-closed stance for features
-1, 2, and 3**, and ADR-0006's Consequences bullet that tracked all four
-features generically under issue #40 in the `fail_closed.rs` error
-messages — #47 resolves that as adopt-origin-main + wire(1,2,3) +
-defer(4, now tracked at #51).
+This **supersedes ADR-0006's fail-closed stance for features 1, 2, and
+3**: all three are wired, and feature 4 is wired per ADR-0010.
 
 ## Consequences
 
-- `vendor/microsandbox` carries substantially more vendored surface
-  (`#9`-`#16`, roughly 8k lines) than ADR-0006's minimal-boot baseline
-  did. This PR does not modify that vendored code, only integrates and
-  consumes it; each of `#9`-`#16` is a separately merged, upstream-tested
-  PR.
+- `vendor/microsandbox` carries `#9`-`#16` (roughly 8k lines), each a
+  separately merged, upstream-tested PR; agent-vm consumes it without
+  modifying that vendored code.
 - `--auto-publish`, guest-proxy-via-env, and `--allow-lan`/
   `--allow-host`/`--allow-egress` are functional rather than fail-closed.
 - Feature 4's credential-injection deferral is superseded by ADR-0010,
   which wires Anthropic/OpenAI/GitHub/Copilot file-backed substitution to
   the baseline `SecretSource`/`intercept()` APIs.
 - V-P (proxy-env reaches the in-process netstack) and V-AP (auto-publish
-  end-to-end, gen-8 embedded agentd) are e2e verifications this PR's
-  code review establishes architecturally but could not run live in a
-  macOS sandbox that can't boot Linux VMs; see the PR body / verification
-  notes for what ran live vs. code-review-only.
+  end-to-end, gen-8 embedded agentd) are established by code review, not
+  a live run: the review host was a macOS sandbox that cannot boot Linux
+  VMs.

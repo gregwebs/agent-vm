@@ -8,8 +8,7 @@ Accepted. Superseded by [ADR-0014](0014-narrow-fork-mounts-to-directories.md) fo
 
 A live bind mount is useful for a working tree but unsuitable for a reusable
 writable import: it leaves guest and host coupled. Users need to seed
-configuration once, then let project state evolve independently. They also need
-to hide mount-local paths without allowing a nested mount to reveal them again.
+configuration once, then let project state evolve independently.
 
 ## Decision
 
@@ -19,11 +18,8 @@ list. Its first successful launch copies a regular file or directory into
 host-managed project state; later launches mount the committed `data` entry and
 do not inspect the source.
 
-`exclude=REL` is repeatable on all valid modes. `REL` is a nonempty normal
-relative path. Live exclusions use readonly opaque masks: an empty tmpfs masks a
-directory and a shared readonly zero-byte regular file masks a file. Fork
-initialization omits excluded content. The complete mount plan rejects a core,
-explicit, or followed mount that would pierce a mask.
+`exclude=REL` is repeatable on a fork, and `REL` is a nonempty normal
+relative path. Fork initialization omits excluded content.
 
 Nested symlinks are copied as links by default. `:fork:follow-links` explicitly
 materializes their targets in owned fork data instead of adding a live external
@@ -54,5 +50,4 @@ Forks consume space equivalent to their initial copy and deliberately do not
 synchronize in either direction. A user resets one by stopping every launch
 using it, removing the exact reset directory printed by the launcher, and
 launching the same declaration again. Changing an identity input creates a new
-fork. File and directory exclusions on a live mount require existing regular
-file/directory targets and are rejected through unresolved symlink ancestors.
+fork.

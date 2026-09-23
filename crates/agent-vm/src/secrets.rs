@@ -500,7 +500,7 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
 }
 
 /// What this launch provisions. `github_egress` is orthogonal to the tool
-/// (`--no-git` / detected repos) and deliberately no longer feeds capture.
+/// (`--no-git` / detected repos) and deliberately does not feed capture.
 #[derive(Debug, Clone, Copy)]
 pub struct CredentialProvisioning {
     pub provisioned: ProviderSet,
@@ -858,8 +858,7 @@ fn parse_gh_user_json(bytes: &[u8]) -> Option<HostGitIdentity> {
     }
     let login = login_raw.to_string();
     // GitHub user ids are u64 on the wire; `as_u64` handles the full
-    // range. (Previously used `as_i64` with a comment claiming a 2^53
-    // limit, conflating JSON-as-double with i64.) Used to synthesize
+    // range (an i64/2^53 reading would truncate large ids). Used to synthesize
     // the noreply email when `email` is private.
     let id = json.get("id").and_then(|v| v.as_u64());
     let name_raw = json
@@ -2239,10 +2238,8 @@ mod tests {
     //
     // Exercises the real production entry point (through
     // `GuestStateDir`), not a parallel plain-filesystem implementation:
-    // the previous version of these tests called a `#[cfg(test)]`-only
-    // `write_default_opencode_config` helper that duplicated (and had
-    // drifted from) `write_opencode_model_default`'s actual pin/retire
-    // rule, so passing tests proved nothing about production behavior.
+    // passing tests must prove the actual pin/retire rule in
+    // `write_opencode_model_default`.
 
     fn opencode_model_value(guest: &GuestStateDir) -> Value {
         serde_json::from_slice(

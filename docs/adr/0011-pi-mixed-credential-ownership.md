@@ -9,17 +9,15 @@ Implemented by [#93](https://github.com/gregwebs/agent-vm/issues/93); the
 [#94](https://github.com/gregwebs/agent-vm/issues/94) and
 [#91](https://github.com/gregwebs/agent-vm/issues/91).
 
-**Two complementary advisories, not one.** Before the report landed, the only
-surface was the mandatory Pi image extension
-(`images/tools/pi/extensions/guest-credential-warning.js`), which warns about a
-*future* in-guest sign-in and is gated on Pi's own `hasUI`. #93 adds a host-side
-report of *existing* state that runs on **every** launch (`claude`, `codex`,
+**Two complementary advisories, not one.** The mandatory Pi image extension
+(`images/tools/pi/extensions/guest-credential-warning.js`) warns about a
+*future* in-guest sign-in and is gated on Pi's own `hasUI`. A host-side
+report of *existing* state runs on **every** launch (`claude`, `codex`,
 `opencode`, `copilot`, `pi`, `shell`, and any custom tool) and shows the same
 facts from `agent-vm doctor` without starting Pi. The two do not contradict each
-other and neither suppresses the other: the extension's text and its negative
-greps are unchanged, and its `hasUI` gate is not inherited by the launcher
-warning. Clauses about host *precedence* or host *import* remain deliberately
-reserved for #94/#91.
+other and neither suppresses the other: the extension's `hasUI` gate is not
+inherited by the launcher warning. Clauses about host *precedence* or host
+*import* remain deliberately reserved for #94/#91.
 
 **Structure, not resolution.** `pi_credential_inspection` classifies the shape
 of project-scoped `pi/agent/auth.json` and `pi/agent/models.json` (plus any real
@@ -55,10 +53,8 @@ would add a platform-specific acquisition path to a portable advisory without
 closing the criterion — the trade-off is recorded here rather than presented as
 a mechanism that does not exist.
 
-Meeting "keep doctor observational" also required fixing a pre-existing side
-effect: ordinary `doctor` used to run msb discovery and bootstrap (spawning
-`msb --version`, creating and possibly rewriting `MSB_HOME`) *before* it
-reported anything. `doctor` is now dispatched before msb setup, so it works on a
-missing or unpatched `msb` and no longer validates that binary; it reports
-computed paths and state, not runtime health. `agent-vm doctor --reset-msb-db`
-keeps its deliberate, explicit mutation.
+`doctor` is dispatched before msb setup, so it performs no initialization: it
+neither spawns `msb --version` nor creates or rewrites `MSB_HOME`. It therefore
+works on a missing or unpatched `msb`, reports computed paths and state rather
+than runtime health, and never validates that binary. `agent-vm doctor
+--reset-msb-db` keeps its deliberate, explicit mutation.

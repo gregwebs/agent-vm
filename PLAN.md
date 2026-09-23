@@ -1,25 +1,16 @@
 # agent-vm — PLAN
 
 Roadmap for the Rust + [microsandbox](https://github.com/wirenboard/microsandbox)
-`agent-vm`. The phase-by-phase roadmap (Phases 0–9) was retired once the
-rewrite became feature-usable; per-phase history lives in `git log`, the
-design rationale in `ARCHITECTURE.md`, and the individual decisions in
-`docs/adr/` (ADR-0001 … ADR-0010). This file tracks only **what is left to
-do** to reach v1.
+`agent-vm`. Design rationale lives in `ARCHITECTURE.md` and the individual
+decisions in `docs/adr/`. This file tracks only **what is left to do** to
+reach v1.
 
-`main` *is* the Rust rewrite — the original Bash `agent-vm` (`claude-vm.sh`)
-is no longer in any branch of this repo. Where an item below refers to
-"the original", it means that retired script; the behaviour is described
-rather than cited by line, since the file is not here to cite.
-
-## Where the rewrite stands today
+## Shipped capabilities
 
 Everything below is working and verified for daily use. This file does not
-describe these features — that is what the other two docs are for, and
-duplicating them here is how this section went stale before. **How to use it**
-lives in [USAGE.md](USAGE.md); **why it is built that way** lives in
-[ARCHITECTURE.md](ARCHITECTURE.md) and [docs/adr/](docs/adr/). This table is
-only an index, so the roadmap below has a fixed starting point.
+describe these features — **how to use it** lives in [USAGE.md](USAGE.md) and
+**why it is built that way** in [ARCHITECTURE.md](ARCHITECTURE.md) and
+[docs/adr/](docs/adr/). This table is only an index.
 
 | Capability | How to use it | Why it works that way |
 |---|---|---|
@@ -39,17 +30,9 @@ only an index, so the roadmap below has a fixed starting point.
 | Image distribution: `setup`, `pull`, opt-in update check, image-API-version lock | [Image release cadence](USAGE.md#image-release-cadence) | [The base image](ARCHITECTURE.md#the-base-image) |
 | Opt-in shared OCI image cache | [Shared microsandbox image cache](USAGE.md#shared-microsandbox-image-cache) | [Shared OCI image cache](ARCHITECTURE.md#shared-oci-image-cache-opt-in) |
 | Official crates.io `msb_krun` 0.1.32 runtime (no fork), provenance-checked | — | [ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md), [runtime proof](ARCHITECTURE.md#runtime-provenance-and-platform-profiles) |
-| microsandbox v0.6.15 + one-way state migration + forward-migration preflight | [Recovering from a forward-migrated db](USAGE.md#recovering-from-a-forward-migrated-microsandbox-db), [Upgrading older state](USAGE.md#upgrading-from-an-older-agent-vm-pre-0615-state) | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md), [ADR-0004](docs/adr/0004-single-shared-msb-home.md) |
+| microsandbox v0.6.15 + one-way state migration + forward-migration preflight | [Recovering from a forward-migrated db](USAGE.md#recovering-from-a-forward-migrated-microsandbox-db) | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md), [ADR-0004](docs/adr/0004-single-shared-msb-home.md) |
 | Sandbox liveness: idle detection, runtime-exit handling | — | [Sandbox liveness](ARCHITECTURE.md#sandbox-liveness-idle-detection-and-runtime-exits), [ADR-0007](docs/adr/0007-heartbeat-keep-alive-and-runtime-exit-reporting.md) |
 | macOS / Apple Silicon as a build and run host | [Requirements](USAGE.md#requirements), [macos-build.md](macos-build.md) | [runtime proof](ARCHITECTURE.md#runtime-provenance-and-platform-profiles) |
-
-Two things about that list matter to the roadmap rather than to a user:
-
-- **Network egress already exceeds the original**, which had no per-launch
-  egress controls at all.
-- Both the original and the rewrite are **fresh-VM-per-launch**. The rewrite is
-  *not* missing a persistent-VM lifecycle the original had — see C1, which is a
-  new capability, not a regression.
 
 Two carve-outs inside the credential story are tracked as open items, not
 documented as finished behaviour: Copilot has no in-session refresh (A5) and
@@ -58,13 +41,6 @@ GitHub GraphQL mutations are denied (A4).
 ## A. In-scope work to finish
 
 These are within the agreed v1 scope and either unverified or incomplete.
-(Onboarding config and the `.agent-vm.runtime.sh` hook were once on this list
-and are **implemented**: `secrets.rs:1029-1086` force-sets
-`hasCompletedOnboarding` / `hasTrustDialogAccepted` /
-`hasCompletedProjectOnboarding` / per-folder trust, and `run.rs:2148-2152`
-sources the project hook before exec. The refresh single-flight, the
-`copilot` agent, and the in-image LSP plugins are likewise done — see
-"Shipped since the last plan revision" below.)
 
 - **A1 — Codex/OpenAI rotation coverage.** Claude's side is covered: the
   near-expiry rotation branch has an end-to-end test
@@ -74,24 +50,19 @@ sources the project hook before exec. The refresh single-flight, the
   test reaches `openai_refresh`
   (`crates/agent-vm/src/intercept_hook/oauth_refresh.rs:738`) — only its
   missing/malformed 503 paths are exercised — and no session has crossed a
-  real ChatGPT expiry (~24 h). Note that `0f301a1` once had direct rotation
-  unit tests for both providers and the #54 refactor (`7d5efb5`) dropped them,
-  so this is a coverage regression, not a never-written test. Effort: S for
-  the test, M for the live run.
+  real ChatGPT expiry (~24 h). Effort: S for the test, M for the live run.
 - **A2 — Project-integrity security snapshot.** `snapshot_host_creds` /
   `verify_snapshot` (`crates/agent-vm/src/secrets.rs:964,977`) fingerprint
   **only the three credential files** (`HostCredsSnapshot` has three fields,
-  `secrets.rs:265-269`). The original also fingerprinted the **project repo** —
+  `secrets.rs:265-269`). Extend it to the **project repo** —
   `.git/config`, `.git/hooks/*`, `CLAUDE.md`, `Makefile`, the runtime hook —
-  to catch an off-rails agent tampering with git hooks or build files. Extend
-  the snapshot to cover those and warn on unexpected change. Effort: M.
-- **A3 — Push-access probe.** No `git push --dry-run` anywhere in the rewrite;
-  the allow-list is built from static remote parsing
-  (`run.rs:1933` `parse_dir_remote_github_slugs`, `run.rs:1975`
-  `parse_gitmodules_github_slugs`). The original probed with
-  `git push --dry-run` to confirm real push rights before trusting a remote.
-  Decide whether to add the live probe (it costs a network round-trip per
-  launch). Effort: S.
+  to catch an off-rails agent tampering with git hooks or build files, and
+  warn on unexpected change. Effort: M.
+- **A3 — Push-access probe.** The allow-list is built from static remote
+  parsing (`run.rs:1933` `parse_dir_remote_github_slugs`, `run.rs:1975`
+  `parse_gitmodules_github_slugs`), so it cannot confirm real push rights
+  before trusting a remote. Decide whether to add a live `git push --dry-run`
+  probe (it costs a network round-trip per launch). Effort: S.
 - **A4 — Repository-scoped GraphQL mutations.** The proxy currently denies
   every GitHub GraphQL mutation, because none of them can yet be bound
   soundly to an allow-listed repository (ADR-0010). This intentionally breaks
@@ -110,14 +81,12 @@ sources the project hook before exec. The refresh single-flight, the
   scripts, runs `actionlint`, and exercises `script/build/macos.sh` against
   fixture toolchains — but nothing boots a VM. Add: build the image, run
   `agent-vm setup --no-verify`, then `agent-vm shell -- -c 'echo ok'`, green on
-  at least linux-amd64. The clippy half of the "while in there" decision is
-  settled: `cargo clippy --locked --workspace --all-targets -- -D warnings` is
-  now a gating step, not advisory, so a lint regression fails CI. `cargo fmt`
+  at least linux-amd64. `cargo clippy --locked --workspace --all-targets -- -D
+  warnings` is a gating step, so a lint regression fails CI; `cargo fmt`
   remains `continue-on-error: true`.
-- **B2 — Finish cross-arch packaging.** Per-platform npm packaging now exists
+- **B2 — Finish cross-arch packaging.** Per-platform npm packaging exists
   (`npm-dist/agent-vm-linux-x64`, `npm-dist/agent-vm-linux-arm64`, dispatched
-  from `npm-dist/agent-vm/bin/agent-vm.js`), so the old "bundles one
-  linux-x86_64 binary" framing is retired. Two gaps remain:
+  from `npm-dist/agent-vm/bin/agent-vm.js`). Two gaps remain:
   - **linux-arm64 is not shippable.** All four cross legs are
     `continue-on-error` (`.github/workflows/release-npm.yml:81,213,344,438`)
     because the libkrunfw kernel-config seed hasn't been ported and the arm64
@@ -127,14 +96,13 @@ sources the project hook before exec. The refresh single-flight, the
     dispatch entries are commented out, and the "dedicated macOS release job"
     referenced at `release-npm.yml:498` does not exist — every matrix runner is
     `ubuntu-latest`. macOS is source-build-only today.
-- **B3 — IPv6 DNS workaround → upstream fix.** Still a per-launch `sed`:
+- **B3 — IPv6 DNS workaround → upstream fix.** A per-launch `sed`:
   `STRIP_IPV6_NAMESERVERS` (`crates/agent-vm/src/run.rs:2114-2115`) runs first
-  in every guest prelude. `9676f6d` only extracted it into a documented,
-  unit-tested const — it did not remove it. Replace with either a real fix to
+  in every guest prelude. Replace it with either a real fix to
   the v6 gateway DNS path in microsandbox or a `network.dns(disable_ipv6)`
   knob (no such knob exists in `vendor/` today; upstream issue #5).
 
-## C. Improvements beyond the original (optional, product call)
+## C. Optional product improvements
 
 - **C1 — Detached / persistent-VM fast launch.** Boot once per project, attach
   per invocation: ~1.5 s → ~10–50 ms.
@@ -170,32 +138,9 @@ sources the project hook before exec. The refresh single-flight, the
   Also needs an in-VM-state-persistence policy call (what survives between
   attaches). Effort: L.
 
-## D. Original-only features — decisions made
+## D. Decisions and non-goals
 
 Decided 2026-05-30 with the user, per-feature.
-
-### Shipped since the last plan revision
-
-These were roadmap items and are now done; kept here so the decision record
-stays readable.
-
-- **`copilot` agent + Copilot token** — `agent-vm copilot`
-  (`main.rs:74-75`), `Agent::Copilot` (`run.rs:514`), the token routed
-  through the same host-rooted / proxy-substituted flow
-  (`credential_injection.rs:143-152`, `secrets.rs:202-204`), and
-  `@github/copilot` installed in the image (`images/Dockerfile:428`).
-  Caveat carried forward as A5.
-- **LSP plugins in the image** — `clangd-lsp`, `pyright-lsp`,
-  `typescript-lsp`, `gopls-lsp@claude-plugins-official` installed at build
-  time (`images/Dockerfile:389-396`), plus a seeding step the plan never
-  anticipated: the running guest symlinks `$HOME/.claude` to persistent state
-  and shadows the baked plugin tree, so the build stashes it and the launcher
-  re-seeds it (`images/Dockerfile:406-421`, `SEED_CLAUDE_PLUGINS` in
-  `run.rs:2145`).
-- **Refresh single-flight** — `RefreshLock` (`oauth_refresh.rs:803-836`) takes
-  an exclusive `flock` per provider before any host CLI runs, with a 30 s
-  attempt-damping stamp so a late waiter skips its own CLI, and a
-  launcher-side `ProjectLock` (`secrets.rs:1695`).
 
 ### Won't do (confirmed non-goals)
 
@@ -215,11 +160,8 @@ to the balloon).
 
 ## Discovered upstream issues (still open)
 
-Carried over from the old plan. These were all found against 0.5.7-era
-microsandbox and predate the v0.6.15 cutover, so each is worth re-testing
-against the current baseline before investing in a fix — but every workaround
-is still load-bearing in the tree today. (The old list skipped #3, the
-IRQ/split-irqchip issue, which is resolved; the rest are renumbered here.)
+Every workaround below is still load-bearing in the tree today; each is worth
+re-testing against the current baseline before investing in a fix.
 
 1. `PullPolicy::Always` doesn't refresh the cached manifest digest — worked
    around with our own marker file (`pulled_marker.rs`, `pull.rs:9-19`).

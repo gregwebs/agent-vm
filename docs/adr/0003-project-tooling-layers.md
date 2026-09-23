@@ -2,26 +2,18 @@
 
 ## Status
 
-Accepted. The single-layer decision is superseded by ordered layer chains
-(issue #79) — see "Amendment: ordered layer chains" below, which also
-records the removal of `--layer` / `$AGENT_VM_LAYER`. A follow-on amendment,
-"Amendment: `--layer` returns, additive and repeatable", redefines `--layer`
-as a repeatable flag appended after the project's own chain and records that
-`$AGENT_VM_LAYER` stays removed and is now rejected outright if set. A third
-amendment, "Amendment: msb-owned base with a Docker base link (issue #98)",
-supersedes only the way the base is *addressed by Docker* — the historical
-direct digest-pinned `BASE_IMAGE` cannot name an archive-imported base. A
-fourth, "Amendment: the layer image contract is enforced (issue #97)", turns
-this file's informal prose contract into a named, checked one — four of its
-eight clauses are enforced against each *built* image at build time. Every
-other decision here (registry-less ingest, hash-as-staleness-check, hard-fail,
-the layer image contract) is unchanged and now applies per chain step; msb's
-per-platform manifest digest remains the identity anchor for step 0's hash.
+Accepted. A project declares an ordered **chain** of layers; `--layer` is a
+repeatable flag appended after the project's own chain; `$AGENT_VM_LAYER` is
+rejected outright if set; the base is addressed through a Docker base link
+(issue #98); and the layer image contract is enforced — four of its eight
+clauses are checked against each *built* image at build time (issue #97).
+Registry-less ingest, hash-as-staleness-check, hard-fail, and msb's
+per-platform manifest digest as the identity anchor for step 0's hash apply
+per chain step.
 
 Extended by [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) (issue #84):
-the layer contract now also governs the shipped per-tool layers under
-`images/tools/` (five when this ADR was written; six since issue #149 added
-`dsh`), and a launch's chain may begin with the catalog's tool steps
+the layer contract also governs the shipped per-tool layers under
+`images/tools/`, and a launch's chain may begin with the catalog's tool steps
 before the project's own.
 
 ## Context
@@ -84,8 +76,8 @@ space in which the registry-less tag could resolve some other way.
 ### The base / tooling-layer / derived split (glossary — see CONTEXT.md)
 
 - **Base image**: the guest template agent-vm boots today, unchanged.
-- **Tooling layer**: the project's `.agent-vm/layer/Dockerfile` + build
-  context.
+- **Tooling layer**: the project's `.agent-vm/layers/<step>/Dockerfile` +
+  build context.
 - **Derived image**: base + layer, tagged `agent-vm-layer:<slug>-<hash>`,
   content-hash-identified. The hash — not a state file — is the staleness
   check: nothing to forget to write, nothing that can disagree with the
@@ -195,9 +187,9 @@ predecessor's entries, such as a tool layer's `/opt/agent/.local/bin`,
 `/opt/agent/.claude/local/bin`, `/opt/agent/.opencode/bin`, or the base's
 `/usr/sbin` — breaks the in-VM agents (and, in `--root` launches, dockerd's own
 PATH lookups for helper binaries) with no launch-time error; it just silently
-produces broken tool resolution inside the guest. Originally a contract
-requirement only; issue #97 now **enforces** it (clause C2 of the layer image
-contract below), so the trade-off is closed for the four enforced clauses.
+produces broken tool resolution inside the guest. Issue #97 **enforces** it
+(clause C2 of the layer image contract below), so the trade-off is closed for
+the four enforced clauses.
 (After [#84](https://github.com/gregwebs/agent-vm/issues/84) the tool prefixes
 come from the tool layers stacked above the base, not from the base itself —
 see [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) — but the C2 rule is
@@ -243,9 +235,8 @@ link is literally the ref buildx resolved. msb's record of the base answers
 a *different* question (whether the link still points at the base msb
 cached), which the issue-#98 amendment already decided not to police.
 
-Two conventions are kept from this file's earlier, informal contract,
-deliberately **not** clause-numbered — they are inert rather than
-load-bearing, and nothing can check them:
+Two further conventions are deliberately **not** clause-numbered — they
+are inert rather than load-bearing, and nothing can check them:
 
 - Expose environment through `ENV`, not an `env.d`-style file the base does
   not read.
@@ -275,28 +266,15 @@ existing per-image flock already prevents a torn cache write.
 
 ### Amendment: ordered layer chains (issue #79)
 
-This ADR originally supported exactly one project tooling layer. That
-blocked both per-tool layers and the ordinary case of combining a shipped
-example layer (e.g. `examples/layers/chrome-devtools/`) with a project's own
-toolchain. A project now declares an **ordered chain** of layers, each built
-`FROM` the previous one, with only the final step registry-lessly ingested.
+A project declares an **ordered chain** of layers, each built `FROM` the
+previous one, with only the final step registry-lessly ingested. This is what
+lets a project combine a shipped example layer
+(e.g. `examples/layers/chrome-devtools/`) with its own toolchain.
 
-**Location.** `.agent-vm/layers/` is now the *only* location a chain can
+**Location.** `.agent-vm/layers/` is the *only* location a chain can
 live. Its immediate subdirectories are the chain, in byte-lexicographic
 order by directory name (`10-toolchain` before `20-chrome`); each must hold
-a `Dockerfile`. `layer::resolve_layer_dirs` replaces `layer::resolve_layer_dir`
-(itself later renamed `layer::resolve_layer_chain` by the follow-on amendment
-below, which also takes back part of this paragraph's claim).
-
-**`--layer` and `$AGENT_VM_LAYER` are removed. There is no override.**
-*(Superseded in part — see "Amendment: `--layer` returns, additive and
-repeatable" below: `--layer` comes back as a repeatable, additive flag;
-`$AGENT_VM_LAYER` stays removed.)* A chain expresses something a
-single-directory *override* cannot (a whole ordered sequence of steps), and
-a project's tooling layout is a property of the project's checkout, not of
-an invocation — so there is nothing left for a flag to usefully *override*.
-There is, however, still room for a flag to *add* to the chain, which is
-exactly what the follow-on amendment does.
+a `Dockerfile`. `layer::resolve_layer_chain` is the resolver.
 
 **No compatibility with the singular `.agent-vm/layer/`.** A leftover
 `.agent-vm/layer/` — in any form, whether or not `.agent-vm/layers/` also
@@ -418,11 +396,7 @@ uncommon transition.
 
 ### Amendment: `--layer` returns, additive and repeatable (issue #79, follow-on)
 
-The previous amendment removed `--layer` / `$AGENT_VM_LAYER` outright,
-reasoning that a chain has no single directory left for a flag to override.
-After reviewing that, the user asked whether a flag could instead *add* a
-layer not under `.agent-vm/layers/` — appended to whatever is already there,
-repeatable — and approved doing so. So `--layer` comes back, but redefined:
+`--layer` *adds* to the chain rather than overriding it:
 
 - **`--layer DIR` is repeatable and additive**, never an override. Its
   directories are appended *after* `.agent-vm/layers/*`, in command-line
@@ -588,17 +562,15 @@ the exact pull used to establish the link, not as buildx's step-0 `FROM`.
 
 ### Amendment: the layer image contract is enforced (issue #97)
 
-The section "The layer image contract" above replaced an informal eight-bullet
-prose list that **nothing checked**. Issue #97 named the three failures that
-cost in practice — a hardcoded `FROM` making the chain silently do nothing; a
+Issue #97 fixed the layer contract as four **enforced** clauses (C1–C4) plus
+four **documented** ones (C5–C8). The failures that motivated each:
+a hardcoded `FROM` making the chain silently do nothing; a
 wrong-platform base (or a final `FROM` pinned to a foreign `--platform`)
 producing `Exec format error` (or, for the final step, `load_archive`'s
 "OCI layout contains no image manifests for the host platform"); and a final
 `USER <non-root>` silently demoting every `--root` launch through
-`SandboxConfig::merge_image_defaults` — and fixed the contract as four
-**enforced** clauses (C1–C4) plus four **documented** ones (C5–C8). This
-amendment records how the enforced four are checked and every decision behind
-it.
+`SandboxConfig::merge_image_defaults`. This amendment records how the
+enforced four are checked and every decision behind it.
 
 **Two fact sources, no layer decompressed.** C1–C4 need only the image
 *config* and *manifest*, both tiny JSON blobs already flowing past the build
@@ -741,30 +713,18 @@ child present locally) is a named hard error naming the link and
 `./script/build/import-image.sh`, never a silently skipped C4a — that state is
 precisely what C4a exists to catch.
 
-### Amendment: the contract's e2e proof moves in-tree (issue #102)
+### Amendment: the contract's e2e proof lives in-tree (issue #102)
 
-The "The layer image contract" narrative above says the checks are "pure
-policy: facts in, violation out" and leaves the suite that proves them in
-`layer.rs`. Issue #102 moved that suite — the eight `#[ignore]`d,
-`#[cfg(test)]`-only tests that build a real derived image over the fixture's
-base link and check C1–C4 against the facts both producers report — into
-`crates/agent-vm/src/layer/contract.rs`, directly beneath the policy it
-proves, promoting the fixtures it shares with `layer`'s own e2e harness into
-`layer::test_support`.
+The eight `#[ignore]`d, `#[cfg(test)]`-only tests that build a real derived
+image over the fixture's base link and check C1–C4 against the facts both
+producers report live in `crates/agent-vm/src/layer/contract.rs`, directly
+beneath the policy they prove; the fixtures they share with `layer`'s own e2e
+harness live in `layer::test_support`.
 
 **The qualification, made explicit.** "Pure policy" is a claim about the
-checks that **ship**, and it stays true: `contract.rs` is a production module
-with no I/O of its own. The moved suite sits inside `mod tests`, compiled only
-under `cfg(test)`, so a `--release` build carries the checks without it. The
-suite *does* drive real Docker, which is why the module doc and the sentence
-above now name the `#[cfg(test)]`-only half rather than leaving "pure policy"
-unqualified beside a Docker-driving file.
-
-**No clause, grade or enforcement point changes.** C1–C8, the
-enforced/documented split, the enforcement points and every decision D1–D9 are
-exactly as the issue-#97 amendment left them; the moved tests *assert* the
-contract, they do not redefine it. `layer::execute_chain` and the two fact
-producers are unchanged, and no production line moved.
+checks that **ship**: `contract.rs` is a production module with no I/O of its
+own, and the suite sits inside `mod tests`, compiled only under `cfg(test)`,
+so a `--release` build carries the checks without it.
 
 **Accepted consequence.** The file a reader opens to audit the contract now
 also carries eight Docker-requiring tests. They stay `#[ignore]`d and never run
@@ -807,20 +767,13 @@ follow-up (issue #107), not addressed here.
   reassigned) `image` for exactly this reason.
 - Non-layer projects are unaffected: `resolve_boot_image_with_layer` returns
   `Ok(None)` when `.agent-vm/layers/` isn't declared and no `--layer` is
-  given, and `launch()` boots `base_image` exactly as it did before this ADR.
-- **Cross-arch correctness (resolved in this PR, after a live `aarch64`
-  reproduction).** An earlier revision hardcoded `--platform linux/amd64`
-  as the originating plan specified; a real `docker buildx build` +
-  `load_archive` round-trip on an `aarch64` host proved that fails
-  (`OCI layout contains no image manifests for the host platform`), because
-  `load_archive` materializes the manifest for the *running host's* arch
-  (`Platform::host_linux()`). The build platform is now derived from the
-  host (`layer::host_oci_platform()`), keeping the built image, the
-  `load_archive` materialization, and the boot in lockstep on both
-  supported host families. Every other mechanism in this ADR —
-  content-hash identity, cache-hit reuse, registry-less ingest, PATH
-  propagation, edit-invalidates-cache — was verified working in that same
-  round-trip once the platform matched.
+  given, and `launch()` boots `base_image`.
+- **Cross-arch correctness.** The build platform is derived from the host
+  (`layer::host_oci_platform()`), and `load_archive` materializes the manifest
+  for the *running host's* arch (`Platform::host_linux()`), keeping the built
+  image, the materialization, and the boot in lockstep on both supported host
+  families. Pinning the final `FROM` to a foreign `--platform` instead fails
+  with `OCI layout contains no image manifests for the host platform`.
 
 ### Optional image capabilities (API 2)
 

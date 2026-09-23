@@ -58,7 +58,7 @@ Full flag, subcommand, networking, and troubleshooting reference:
 - [CONTRIBUTING.md](CONTRIBUTING.md) — building from source, the release
   version-bump, and repo conventions.
 - [macos-build.md](macos-build.md) — the Apple Silicon source-build guide.
-- [PLAN.md](PLAN.md) — phased roadmap, what's done, what's deferred.
+- [PLAN.md](PLAN.md) — what is left to do for v1.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
   the way they do.
 - [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) —

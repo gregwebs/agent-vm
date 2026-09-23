@@ -45,16 +45,15 @@ Resolved env-first (`resolve_guest_username`/`choose_guest_username` in
 checked against a safe `/etc/passwd` charset and skipped on failure.
 Env-first because on this project's reference dev host `getpwuid(uid)`
 returns no entry at all for the real host uid while `$USER` is reliably
-set. Default in non-root mode: the host user's own username (`agent`
-no more). See `docs/adr/0002-mirror-host-home-and-username.md`.
+set. Default in non-root mode: the host user's own username. See
+`docs/adr/0002-mirror-host-home-and-username.md`.
 
 ## Root mode
 
 The opt-out, enabled by the `--root` flag or a truthy `AGENT_VM_ROOT` env
 var (parsed by the shared `env_flag` module — `1|true|yes|on`, trimmed and
 ASCII-case-insensitive, the same parser behind every value-parsing boolean
-`AGENT_VM_*` variable). Runs the guest as uid 0 with `HOME=/root` — the
-pre-non-root-default behavior.
+`AGENT_VM_*` variable). Runs the guest as uid 0 with `HOME=/root`.
 Required for docker-in-VM (dockerd needs root); when the Chrome DevTools layer is installed, its MCP uses the `sudo -u chrome` path only in this mode.
 
 _Avoid_: "privileged mode" — the microVM boundary applies identically in
@@ -140,8 +139,7 @@ tool's config dir, so it lives on the `codex` (and `shell`) tool's own `env`
 Every provider-owned facet a launch can reach is gated on one predicate: the
 launch's **provisioning set** — host credential capture, the guest placeholder
 files, the proxy secret and its intercept route, the first-run bypass configs,
-and the provider guest env. There is no per-facet scope. The two pre-#118
-spellings of that gating (`Scope`, `CaptureScope`) are deleted. See
+and the provider guest env. There is no per-facet scope. See
 [ADR-0017](docs/adr/0017-tool-declared-provisioning.md). `Copilot` is the one
 provider whose placeholder lives in a *config* file written after capture, so
 its config is written and its env var exported only when its token was wired.
@@ -149,8 +147,8 @@ its config is written and its env var exported only when its token was wired.
 **GitHub egress is not a provider.** The `gh` token is gated by `--no-git` /
 detected repos, orthogonal to the launched tool, so it has no
 `CredentialProvider` variant; `credential_injection` keeps its own block and
-splices it into the proxy's fixed `WIRE_ORDER`. GitHub egress no longer feeds
-any provider's **capture** (the pre-#118 Copilot disjunction is gone).
+splices it into the proxy's fixed `WIRE_ORDER`. GitHub egress does not feed
+any provider's **capture**.
 
 _Avoid_ the `doctor_label` (`claude` / `codex` / `opencode` / `copilot`) as the
 provider's name: the label names the host CLI that owns the file (retained so
@@ -210,8 +208,7 @@ user with no Anthropic or Copilot login. (Under a *custom* catalog the fallback
 `shell` is a different file from the user's tools and provisions only its own
 `credentials`; see **Available tools**.)
 
-_Avoid_: "the selected tool's providers" / "when selected". That phrasing came
-from the pre-#118 `Scope`/`CaptureScope` fields, which are deleted: gating is
+_Avoid_: "the selected tool's providers" / "when selected". Gating is
 membership in the provisioning set, which is not the launched tool's own
 `credentials`. See [ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
 

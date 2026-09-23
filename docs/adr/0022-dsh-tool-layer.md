@@ -85,7 +85,6 @@ guest with `dsh plugin`.
 - The published default image grows by one ~360 MiB layer at its base. Every
   layer above it rebuilds when the dsh pin moves; a dsh bump is an explicit PR,
   not an hourly lookup, so that is bounded.
-- A new agent joins the shipped catalog: `shell`'s wildcard now also provisions
-  the `~/.dsh` persist link, and every count/order assertion and doc naming the
-  shipped tools moves from six to seven.
+- `shell`'s wildcard provisions the `~/.dsh` persist link, and the shipped tool
+  count is seven.
 - Subscribing dsh to agent-vm's host OAuth credentials is follow-up work.

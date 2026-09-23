@@ -50,7 +50,9 @@ Writing `args = ["--approve"]` on the `pi` tool is **wrong** on mechanics alone:
 - **The one agent-vm-specific reason to force trust is gone.** The reason a user's answer did not stick was agent-vm's own state loss: root mode rebaked `~/.pi` every boot, so `~/.pi/agent/trust.json` (`dist/core/trust-manager.js`) was lost too. Decision 1 makes the trust store persistent, so a one-time interactive "Trust" answer is remembered and Pi never has to ask again.
 - **No `PI_TELEMETRY` default.** Pi's telemetry policy is Pi's own; agent-vm introduces no telemetry condition. `PI_TELEMETRY` is left exactly as the environment sets it — unset stays unset, an explicit value passes through.
 
-Removing the injected pair also removes the reason to scan argv at all: there is no contradictory pair to keep off the guest command line, so both argv-scan imprecisions #143 accepted are gone with the scan. `pi <subcommand>` is still forwarded verbatim (ADR-0012), so a subcommand gets neither the `--extension` nor any flag.
+The wrapper does not scan argv: there is no injected flag pair to keep off the
+guest command line. `pi <subcommand>` is still forwarded verbatim (ADR-0012),
+so a subcommand gets neither the `--extension` nor any flag.
 
 ### 3. `PI_SKIP_VERSION_CHECK` and the mandatory extension are the only interventions
 
@@ -60,16 +62,16 @@ The wrapper makes two decisions and then execs — the `PI_SKIP_VERSION_CHECK` e
 - subcommand dispatch, forwarded verbatim, its allowlist pinned against the real `pi --help` at build time (ADR-0012).
 - `--extension /opt/agent-vm/pi-extensions/guest-credential-warning.js` on the non-subcommand path. agent-vm introduced the credential-persistence condition, so agent-vm is the one that warns.
 
-`verify-pi.sh` checks the version pin, the subcommand allowlist, and that the extension loads. The approve-flag grep #143 added is gone: there is no injected approve flag for a pin bump to break.
+`verify-pi.sh` checks the version pin, the subcommand allowlist, and that the extension loads.
 
 ## Consequences
 
-- **Root and non-root both persist `~/.pi`** at `/agent-vm-state/pi`. A guest-created Pi credential now genuinely survives a relaunch — which is why the credential warning's persistence clause is restored in the same change (`images/tools/pi/extensions/guest-credential-warning.js` and `script/test/pi-layer-runtime.sh` change together).
+- **Root and non-root both persist `~/.pi`** at `/agent-vm-state/pi`. A guest-created Pi credential survives a relaunch; the credential warning's persistence clause matches this (`images/tools/pi/extensions/guest-credential-warning.js` and `script/test/pi-layer-runtime.sh` change together).
 - **A project the user has not trusted loads nothing from the checkout's `.pi/`.** That is Pi's own default in every non-interactive mode, and the microVM is still the boundary. A user who wants the project's extensions either answers Pi's interactive trust prompt once — remembered in the now-persistent `~/.pi/agent/trust.json` — or passes Pi's own `--approve`.
-- **The wrapper no longer forces trust or telemetry, so it matches Pi's own behaviour in every mode.** There is no injected `--approve`/`--no-approve` pair, so the two argv-scan imprecisions #143 accepted no longer exist; the wrapper injects only `--extension`, and an explicit approve flag is forwarded exactly once, verbatim. The mandatory warning is unchanged.
+- **The wrapper forces neither trust nor telemetry, matching Pi's own behaviour in every mode.** It injects only `--extension`; an explicit approve flag is forwarded exactly once, verbatim. The mandatory warning is unchanged.
 - **The upgrade path is non-destructive and can halt.** A pre-#96 real `<state>/home/.pi` is moved automatically; if `<state>/pi` already holds Pi state the launch stops and names both paths, and the fix is a host-side `mv` of one of them. Documented in `USAGE.md`.
 - **`pi update self` still fails** on the root-owned `/opt/agent-vm/pi` prefix (ADR-0012, unchanged).
-- **The six launch goldens gained one row** (`link:.pi /agent-vm-state/pi`).
+- **The launch goldens include one `.pi` row** (`link:.pi /agent-vm-state/pi`).
 - **A project that *is* (or is inside) `$HOME`** could alias the checkout's `.pi/` with the state `.pi`. This is pre-existing for `.claude`/`.gitconfig`, and `guest_home::mount_conflicts` only inspects `Declared` links; widening it is out of scope here.
 
 ## Alternatives

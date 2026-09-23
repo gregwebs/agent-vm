@@ -868,16 +868,14 @@ fn follow_links_root_mode_enforces_home_guardrail() {
     );
 }
 
-/// `--root` with `$HOME` unset no longer hard-errors (finding MF1):
-/// `run.rs` resolves the launch's home from the account record
-/// (`user::host_home_dir` → `getpwuid_r(geteuid()).pw_dir`) when the
+/// `--root` with `$HOME` unset resolves the launch's home from the account
+/// record (`user::host_home_dir` → `getpwuid_r(geteuid()).pw_dir`) when the
 /// environment does not carry one, so the guardrail has a home to compare
-/// against instead of refusing. This still exercises `run.rs`'s `mount_home`
-/// wiring end to end — the dumped config proves the launch got past
-/// `expand_follow_links` and `builder.build()` with a home in hand. The
-/// `home: None` case (which is now reached only when the account record fails
-/// too) stays pinned by the `mount.rs` unit tests, and the guardrail's own
-/// refusal by the sibling test above.
+/// against. This exercises `run.rs`'s `mount_home` wiring end to end — the
+/// dumped config proves the launch got past `expand_follow_links` and
+/// `builder.build()` with a home in hand. The `home: None` case (reached only
+/// when the account record fails too) stays pinned by the `mount.rs` unit
+/// tests, and the guardrail's own refusal by the sibling test above.
 #[test]
 fn follow_links_root_mode_falls_back_to_the_account_record_when_home_is_unset() {
     let h = Harness::new();

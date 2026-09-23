@@ -559,8 +559,8 @@ fn doctor_never_executes_the_command_or_creates_layer_or_persist_paths() {
 }
 
 /// Every entry under `root`, as paths relative to `root`, sorted — used to
-/// prove a run created nothing there. `doctor` no longer runs any msb
-/// bootstrap, so the entire tree must be unchanged.
+/// prove a run created nothing there. `doctor` runs no msb bootstrap, so the
+/// entire tree must be unchanged.
 fn snapshot_tree(root: &Path) -> Vec<PathBuf> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {

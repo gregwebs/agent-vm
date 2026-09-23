@@ -12,9 +12,8 @@ Templates and tooling for distributing `agent-vm` via npm.
 - `agent-vm-linux-x64/`, `agent-vm-linux-arm64/` — per-platform
   subpackages. Each ships the prebuilt `bin/agent-vm`, `bin/msb`,
   and `lib/libkrunfw.so.<LIBKRUNFW_VERSION>` (`vendor/microsandbox/
-  justfile`'s `LIBKRUNFW_VERSION`, e.g. `5.6.1` on the v0.6.15
-  baseline — bumps independently of the msb version, so don't
-  hard-code it here). agent-vm finds `msb` and `libkrunfw` via
+  justfile`'s `LIBKRUNFW_VERSION`, e.g. `5.6.1` — it bumps
+  independently of the msb version, so don't hard-code it here). agent-vm finds `msb` and `libkrunfw` via
   `current_exe()`-relative paths so a user's separate microsandbox
   install never shadows them.
 - Future per-platform subpackages: `-darwin-arm64`, `-darwin-x64`,

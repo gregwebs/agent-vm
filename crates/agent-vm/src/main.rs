@@ -53,12 +53,11 @@ fn main() -> Result<()> {
 
     // `doctor` is a **diagnostic** and must not depend on a healthy runtime to
     // inspect state (issue #93): dispatching it here, before `point_at_msb` /
-    // `ensure_msb_home`, means ordinary doctor no longer spawns `msb --version`
-    // nor creates or rewrites MSB_HOME. `doctor::run` needs only the pure
-    // `msb_home_dir()` path calculation, so it now works on a missing or
-    // unpatched msb, and it no longer validates that binary. It is also pure
-    // sync fs work (no VM/network I/O), so it is dispatched before the runtime
-    // for the same reason as `Msb` below.
+    // `ensure_msb_home`, keeps it independent of MSB_HOME setup and the
+    // `msb --version` identity check. `doctor::run` needs only the pure
+    // `msb_home_dir()` path calculation, so it works on a missing or
+    // unpatched msb. It is also pure sync fs work (no VM/network I/O), so it
+    // is dispatched before the runtime for the same reason as `Msb` below.
     if let Dispatch::Builtin {
         cmd: Cmd::Doctor(args),
         ..

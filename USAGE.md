@@ -96,8 +96,7 @@ retained).
 
 - If your declared tool layers equal the shipped default and you have no
   project `.agent-vm/layers/`, the launch boots the composed template
-  **verbatim — no build, no Docker**. This is the fast path, and it is why an
-  unchanged config launches exactly as fast as before the split.
+  **verbatim — no build, no Docker**. This is the fast path.
 - Any other tool set composes the declared tool layers onto the base locally on
   the first launch (hash-cached thereafter).
 
@@ -289,7 +288,7 @@ included, enables it.
 | `AGENT_VM_ROOT` | same as `--root` (accepted: `1`/`true`/`yes`/`on`) |
 | `AGENT_VM_YES` | same as `--yes` (accepted: `1`/`true`/`yes`/`on`) |
 
-`AGENT_VM_LAYER` was removed; if set, launches fail with a pointer to
+`AGENT_VM_LAYER` is rejected; if set, launches fail with a pointer to
 `--layer`.
 
 ## Project tooling layers
@@ -306,8 +305,7 @@ step), in byte-lexicographic order by directory name:
 ```
 
 A single-step chain (just `.agent-vm/layers/10-tools/`) is the common case
-and is not a special case — it behaves exactly like the single layer this
-feature originally shipped as.
+and is not a special case.
 
 `--layer DIR` (repeatable) **appends** more steps after the project's own
 `.agent-vm/layers/*` chain, in the order given on the command line:
@@ -428,12 +426,8 @@ isolated `docker-container` builder can't see. If a step's build succeeds
 but the *next* step fails to resolve `FROM` it, run `docker buildx use
 default`, or create one with `docker buildx create --driver docker --use`.
 
-**Upgrading from a single `.agent-vm/layer/` directory** (the pre-chain
-layout): move it under `.agent-vm/layers/` as a numbered step —
-`git mv .agent-vm/layer .agent-vm/layers/10-tools` — and re-run. The layer
-hash covers the directory's contents, not its path, so the move does not
-invalidate an already-built image; a leftover `.agent-vm/layer/` is
-otherwise a hard error telling you to move it.
+A leftover singular `.agent-vm/layer/` directory is a hard error naming the
+path; the supported layout is `.agent-vm/layers/<step>/`.
 
 ## Shared microsandbox image cache
 
@@ -639,17 +633,6 @@ interactive_shell = false            # optional; join trailing args into `-c`
   command line instead of being appended as separate argv entries. The shipped
   `shell` tool sets it.
 
-> **Upgrading from a config that treated `layer` as metadata.** Before the
-> base/tool-layer split, `layer` was parsed but ignored, so a `[[tools]]` entry
-> that redeclared a shipped tool only to adjust its `args` worked without one.
-> The field now decides what the image composes: an entry that redeclares a
-> shipped tool must carry `layer = { builtin = … }` (or a `path`), or a
-> non-default tool set composes a chain with no layer for that tool and the
-> launch boots a guest without it. The symptom is a bare command-not-found in
-> the guest, or a `setup` failure naming the image it checked; adding the
-> `layer` restores the old behaviour by composing that layer on the first
-> launch. Nothing else about a redeclaration changed.
-
 Unknown keys, wrong types, malformed TOML, unknown `layer.builtin`, unknown
 provider names, duplicate tool names within one file, and **overlapping**
 `persist` entries (equal or one an ancestor of the other — within one tool,
@@ -729,11 +712,6 @@ noise. It forces **no** telemetry policy: `PI_TELEMETRY` is left exactly as the
 agent-vm does not forward the host's value, so the supported override is
 guest-side — a tool's config `env`, or an `export` inside `agent-vm shell`.
 
-**Upgrading (`pi` state).** The first launch after this release moves an
-existing pre-release `<state>/home/.pi` directory to `<state>/pi`
-automatically. If `<state>/pi` already holds Pi state the launch stops and names
-both paths; the fix is a host-side `mv` of one of them.
-
 **Credential warnings.** Because a guest can leave a Pi credential in the
 project's persistent state that any later tool in that project can read, every
 launch (`claude`, `codex`, `opencode`, `copilot`, `pi`, `shell`, and any custom
@@ -749,43 +727,16 @@ environment reference, and it never blocks the launch.
 The built-in `shell` declares **no** `credentials` and omits `tools`, so in the
 shipped catalog it *provisions* every provider `default-tools.toml`'s tools
 declare without *requiring* any of them: `agent-vm shell` still works for a user
-with no Anthropic or Copilot login, and an in-guest `copilot` now works too. The
+with no Anthropic or Copilot login, and an in-guest `copilot` works too. The
 wildcard is scoped to the file it is written in — if you replace the shipped
 catalog, your own `shell` gets the same name-based default but closes over
 **your** file. Add `tools = []` to opt out.
 
-**Upgrading (provisioning).** The built-in `shell` no longer declares
-`credentials`, and a tool's `tools = ["*"]` closes over the tools declared in
-**the same configuration file** — never another file's. So if your config
-declares tools, every `shell` in it — one you declared or the appended
-fallback — provisions only what its *own file* declares, and a file whose only
-tool is `shell` provisions nothing. Before this release such a `shell` still
-captured the host's Anthropic and OpenAI logins unconditionally. To restore
-that on your `shell`, declare one in **your own file** if you were relying on
-the appended fallback, and then either
-
-* **declare the agent tools in that same file**, so the wildcard closes over
-them again, or
-* **put providers on its `credentials`**:
-
-```toml
-[[tools]]
-name = "shell"
-command = "zsh"
-credentials = ["openai", "opencode-static"]   # safe: no hard bail
-```
-
-`credentials` is the **requirement** set, so adding `anthropic` or `copilot`
-there makes `agent-vm shell` hard-fail for a user without that host login —
-which is exactly why the shipped `shell` no longer carries them. Run `agent-vm
-doctor` to see the resolved set as `provisions=…`.
-
-**Upgrading:** `CODEX_HOME` used to be set on *every* launch. It is now
-declared by the shipped `codex` and `shell` tools. If you declare your own
-`codex` or `shell` tool in `~/.config/agent-vm/config.toml` or
-`.agent-vm/config.toml`, your definition wins wholesale and does **not**
-inherit the shipped `env` — add `env = { CODEX_HOME = "/agent-vm-state/codex" }`
-to it, or codex will start in the guest as signed out.
+If you declare your own `codex` or `shell` tool in
+`~/.config/agent-vm/config.toml` or `.agent-vm/config.toml`, your definition
+wins wholesale and does **not** inherit the shipped `env` — add
+`env = { CODEX_HOME = "/agent-vm-state/codex" }` to it, or codex will start in
+the guest as signed out.
 
 ### Errors and recovery
 
@@ -827,22 +778,6 @@ The next `agent-vm shell`/`run` finds no `db/` and lets the bundled `msb`
 recreate it fresh at its own schema, re-pulling images on first boot — no
 further action needed.
 
-## Upgrading from an older agent-vm (pre-0.6.15) state
-
-Upgrading agent-vm from a build that vendored an older Microsandbox
-(0.5.7 and earlier) to one vendoring v0.6.15+ needs no manual step: the
-next `agent-vm shell`/`run` forward-migrates `MSB_HOME/db/msb.db`
-automatically, in place, on first boot. Existing images, sandbox
-records, snapshots, and named volumes remain usable afterward, and
-re-running the same or a newer build again is a no-op (see
-`docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md` for how this was
-verified).
-
-If you roll **back** to an older agent-vm build after a newer one has
-already forward-migrated the db, you'll hit the named ahead-guard
-described above — recover the same way, with `agent-vm doctor
---reset-msb-db`.
-
 ## Guest user / `--root`
 
 By default the in-guest agent runs as **the host user** — the same
@@ -850,15 +785,16 @@ uid/gid that invoked `agent-vm` — instead of root. This is defense-in-depth
 on top of the microVM boundary itself; matching the host uid is also
 required to keep write access to the project/state bind mounts (a
 non-root guest uid only gets owner bits on those when it equals the real
-host uid). `whoami`/`id` inside the guest report a user named `agent`
-resolving to your host uid/gid; `$HOME` is your **host home path** (for example
+host uid). `whoami`/`id` inside the guest report your host username
+(resolved from `$USER`) with your host uid/gid; `$HOME` is your **host home
+path** (for example
 `/Users/alice`), backed by the host directory `<state>/home` inside the
-per-project state dir, with the same
-`.claude`/`.gitconfig`/`.config/gh`/`.pi`/etc. dotfile symlinks root mode has
-always had, just rooted there instead of at `/root`.
+per-project state dir, with the
+`.claude`/`.gitconfig`/`.config/gh`/`.pi`/etc. dotfile symlinks rooted there
+instead of at `/root`.
 
-Pass `--root` (or set `AGENT_VM_ROOT=1`) to restore the previous
-behavior: guest uid 0, `HOME=/root`. You need `--root` for:
+Pass `--root` (or set `AGENT_VM_ROOT=1`) to run the guest as uid 0 with
+`HOME=/root`. You need `--root` for:
 
 - **Docker-in-VM** — `dockerd` needs root; there's no non-root path for it.
 - Anything else that specifically expects to run as root inside the guest.

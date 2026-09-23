@@ -114,10 +114,9 @@ the fact that the runtime is vendored.
 across `Cargo.lock` and a patch table, and hides the vendoring. A path
 dependency on a sibling checkout works for one developer and for nobody else.
 
-The submodule is **not** a fork any more: agent-vm builds against the stock
-crates.io `msb_krun*` cohort, and the fork it used to carry was retired
-([ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md)). What remains
-vendored is the microsandbox source itself, at a pinned version.
+agent-vm builds against the stock crates.io `msb_krun*` cohort
+([ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md)); what is vendored
+is the microsandbox source itself, at a pinned version.
 
 ## Sandboxes and sessions
 
@@ -358,13 +357,6 @@ limit** — Linux x86_64 uses this IOAPIC path while Apple Silicon uses GIC — 
 it is recorded as conservative per-platform test profiles rather than promised
 as a CLI contract.
 
-Worth knowing if you go archaeology-hunting: the multi-mount boot failure that
-drove this work was not the KVM pin cap itself but a separate bug inside
-`msb_krun_devices`' userspace IOAPIC, only reachable *once* split irqchip was
-turned on (a `u32` IRR that silently dropped any IRQ on pin ≥ 32, and an
-unchecked redirection-table index that wrapped on any access below the table
-base). Both were fixed upstream in `msb_krun` 0.1.13.
-
 ### Runtime provenance and platform profiles
 
 `./script/check-runtime-provenance.sh` checks both independent Cargo roots (the
@@ -413,8 +405,8 @@ a pipe, a redirect, or CI. The launcher checks `stdin().is_terminal()`:
 - **No TTY** → `exec_stream_with(...)`, which streams stdout/stderr as they are
   produced and forwards the exit code.
 
-The streaming form matters: the SDK's buffer-until-exit `exec_with` made a long
-non-interactive run look hung, so there are no `.exec_with(` call sites left.
+The streaming form matters: the SDK's buffer-until-exit `exec_with` makes a long
+non-interactive run look hung.
 
 The exec loop races the event stream against `Sandbox::wait()` so a VMM that
 dies mid-stream produces a diagnostic rather than a hang on `recv()`; see
@@ -429,7 +421,7 @@ in play. The launcher reads `PATH` out of the booted image's OCI config
 assignments across base and derived `ENV` layers) and publishes it on the
 builder. `FALLBACK_GUEST_PATH` covers the cold-start case where image metadata
 is not cached yet, and is hand-synced with the **base** `images/Dockerfile`'s
-`ENV PATH` (after #84 it names no tool prefix; the tool layers append theirs).
+`ENV PATH` (it names no tool prefix; the tool layers append theirs).
 
 Agent binaries live under `/opt/agent` — a shared, world-readable prefix
 (`chmod -R a+rX`) rather than `/root` — so the same `PATH` resolves identically
@@ -489,12 +481,10 @@ consequences fall out:
 - **No heartbeat seen at all is `PendingBoot`, not death.** The monitor has no
   opinion about a guest that never came up.
 
-**Boot failure belongs to the relay, not the heartbeat.** The 180 s boot
-deadline that a heartbeat "boot grace" path used to own now lives where the
-information actually is: if the agent relay's `wait_ready` fails (or its task
-panics), `vm.rs` stores `EXIT_REASON_AGENT_UNRESPONSIVE` and triggers exit.
-That reason surfaces in the DB as `TerminationReason::AgentUnresponsive`.
-Moving it there is what let the heartbeat monitor become purely about idleness.
+**Boot failure belongs to the relay, not the heartbeat.** The agent relay's
+`wait_ready` owns the 180 s boot deadline: if it fails (or its task panics),
+`vm.rs` stores `EXIT_REASON_AGENT_UNRESPONSIVE` and triggers exit. That reason
+surfaces in the DB as `TerminationReason::AgentUnresponsive`.
 
 **Idle shutdown is graceful; teardown is bounded.** An `Idle` decision calls
 `request_guest_shutdown`, which is `request_guest_shutdown_with_timeout` at a
@@ -549,7 +539,7 @@ Three build-time subtleties are worth knowing:
   therefore stashes the plugins to `/opt/agent-vm/claude-seed` and installs a
   first-boot seed hook at `/opt/agent-vm/seed.d/10-claude-plugins`; the launcher
   prelude (`RUN_IMAGE_SEED_HOOKS` in `run.rs`) runs every executable under
-  `seed.d/`. Tool-agnostic: the launcher no longer names claude. While
+  `seed.d/` — tool-agnostic. While
   `MIN_SUPPORTED_IMAGE_API` is still 1 the prelude also runs the legacy
   `/opt/agent-vm/seed-claude-plugins.sh` when present, so an already-cached
   API-2 template still seeds; without that fallback the regression would be
@@ -709,11 +699,7 @@ Real token files therefore live in a *sibling* host-only directory,
 `secrets.rs` so the launcher and the hook agree on the path without passing it
 around. The proxy reads them host-side, so they never need mounting at all.
 
-This was a real leak, not a hypothetical: the first cut wrote tokens to
-`<state>/tokens/{anthropic,openai}` — inside the mount — so
-`cat /agent-vm-state/tokens/anthropic` in the guest returned the host's real
-bearer, silently defeating the whole guarantee. A
-`token_files_live_outside_the_guest_mount` unit test now pins the invariant.
+A `token_files_live_outside_the_guest_mount` unit test pins the invariant.
 
 ### File-backed secrets and per-connection re-read
 
@@ -910,8 +896,7 @@ socket-path length constraint that decision turns on.
 
 sea-orm migrations in microsandbox are one-way. If a newer, separately
 installed `msb` opens agent-vm's private `msb.db`, it forward-migrates the
-schema and the older bundled `msb` can never open it again — historically
-surfacing as an opaque raw sea-orm error on the next command.
+schema and the older bundled `msb` can never open it again.
 
 `msb_preflight` detects this up front, on both the boot path and the `msb`
 passthrough (any msb subcommand can open the db, so the guard cannot live only

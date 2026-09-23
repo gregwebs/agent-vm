@@ -2,60 +2,9 @@
 
 Host: AMD EPYC, 16 vCPU, nested virt (`/dev/kvm`, `kvm_amd.nested=1`). Image cached.
 All headline numbers are **wall-clock**, from interleaved A/Bs (host drift cancels),
-`drop_caches` between rounds where noted. Measured with `AGENT_VM_PROFILE=1` plus
-sub-timers added to `run.rs` (pre-boot phases + build/spawn+boot+relay) and the
-runtime's own `runtime.log` wall timestamps.
+`drop_caches` between rounds where noted. Measured with `AGENT_VM_PROFILE=1`.
 
-## TL;DR
-
-A launch in a GitHub-remote repo broke down (default 2 vCPU / 2 GiB) as:
-
-```
-pre: session+reap ............... 0.3 ms
-pre: update-check (ghcr HEAD) ... 886 ms   ← notify_if_update_available (banner only)
-pre: repo-detect ................   2 ms
-pre: secrets (gh auth token) ....  40 ms
-pre: gh api user ................ 1290 ms   ← v0.1.14 author identity  ← THE regression
-pre: TOTAL pre-boot ............. 2220 ms   ← LARGER than the actual VM boot
-create (guest kernel boot) ..... 1500 ms
-run (incl. chrome certutil) ....  270 ms
-stop / remove ..................   50 ms
-TOTAL ~4.1 s
-```
-
-**~2.2s of the launch happens before the kernel even starts, and it's two uncached
-blocking GitHub/registry network round-trips.** The original `[profile] create` timer
-started *after* all of this, which is why earlier profiling missed it entirely.
-
-## The regression: `gh api user` (pre-boot), not the kernel
-
-`discover_host_git_identity()` (added in commit `0c3bb51`, **v0.1.14** — "bake host
-gh/git identity into the guest gitconfig", the exact regression window) calls
-**`gh api user` first**, an HTTPS round-trip to api.github.com, falling back to the
-instant local gitconfig only if it fails. No cache. Measured ~1.26–1.31s here, every
-launch. Adding ~1.29s to a ~1.3s baseline ≈ the reported 2.5s.
-
-The ghcr.io **update-check** (`notify_if_update_available`, commit `bfab9d3`) is a second
-per-launch blocking HEAD (~0.89s) purely to print a "newer image available" banner.
-
-### Fixes (implemented on this branch, measured)
-
-1. **Cache the resolved git identity** (`secrets.rs`, 24h TTL, validated strings only,
-   never tokens; preserves the canonical `gh` identity incl. `gh_login`). Pays the
-   `gh api user` cost once per day instead of every launch.
-2. **Make the update-check non-blocking** (`run.rs`): spawn it concurrently with boot
-   instead of awaiting it. Banner still prints (during boot); never delays launch.
-
-| | pre-boot | total wall |
-|---|---|---|
-| before | ~2220 ms | ~4100 ms |
-| after, run 1 (cold identity cache) | ~1300 ms | ~3280 ms |
-| **after, warm cache** | **~32 ms** | **~1900 ms** |
-
-`gh api user` 1290ms → 22µs; update-check 886ms → ~0. **~2.19s off every launch after
-the first.** No downside, no kernel rebuild. This alone undoes the regression.
-
-## Secondary: the ~1.5s guest-kernel boot floor
+## Guest-kernel boot floor
 
 `create` ≈ guest kernel boot (`build()` is ~3µs; `entering VM → agentd core.ready`).
 The console (`hvc0`) attaches ~1.3s in, so early boot isn't visible in `kernel.log`;
@@ -72,7 +21,7 @@ the A/B below is the real attribution. Five+1 kernels built from one tree
 | heavy+deferred | heavy + DEFERRED_STRUCT_PAGE_INIT | 1.632 ± 0.03 s | no help |
 
 **The nested-virt kernel rebuild adds only ~190ms total to boot** (KVM ~100ms,
-conntrack/iptables ~62ms, nf_tables ~3ms). So it's a real but *minor* secondary cost:
+conntrack/iptables ~62ms, nf_tables ~3ms). So it's a real but *minor* cost:
 
 - **KVM (~100ms)** is *required* for nested virt — irremovable.
 - **conntrack/iptables-legacy (~62ms)** is the unavoidable cost of docker bridge+SNAT
@@ -97,32 +46,17 @@ conntrack/iptables ~62ms, nf_tables ~3ms). So it's a real but *minor* secondary 
 - **Guest memory** (real wall-clock, but EPT/page-materialization under nested virt, not
   struct-page init): create ≈ 1.49s @1G / 1.68–1.92s @2G / 2.9s @4G. Lower the default
   (`AGENT_VM_MEMORY_GIB`, currently 2) for sessions that don't need 2 GiB (~0.2s+).
-- **Chrome-MCP CA `certutil` (~270ms)** in the `run` phase — **fixed.**
-  The launcher used to import the CA synchronously before every agent exec. Chromium
-  honors its per-user NSS DB rather than only the system CA bundle, so the opt-in
+- **Chrome-MCP CA `certutil` (~270ms)** stays off the launch critical path: the opt-in
   `examples/layers/chrome-devtools/agent-vm-chrome-mcp` wrapper imports the per-install
-  CA when the MCP starts. This keeps the work off the launch critical path and skips it
-  entirely unless the Chrome DevTools layer is selected. Measured: `run` phase 310ms →
-  ~38ms.
-
-## Recommended order (by impact × safety)
-
-1. **Cache the git identity** + **non-blocking update-check** — ~2.19s, implemented here,
-   zero downside, no rebuild. This *is* the regression fix.
-2. **Chrome-MCP certutil moved into the opt-in layer wrapper** — ~270ms off the `run`
-   phase when the Chrome DevTools layer is selected.
-3. **Lower default guest memory** if 2 GiB is more than agents need — ~0.2s+.
-4. Kernel: leave it. The ~190ms it adds is mostly required (KVM, conntrack). Do **not**
-   enable deferred-page-init or chase split_irqchip. Optionally drop nf_tables/IPv6 NF to
-   shave ~3ms only if you also accept iptables-legacy.
+  CA when the MCP starts, rather than synchronously before every agent exec. Chromium
+  honours its per-user NSS DB rather than only the system CA bundle, so the work is
+  skipped entirely unless the Chrome DevTools layer is selected.
 
 ## Reproduce
 
 ```bash
 cd <github-remote repo>
 AGENT_VM_PROFILE=1 agent-vm shell true     # prints pre-boot phases + create/run/stop
-# pre-boot network cost, in isolation:
-time gh api user >/dev/null ; time curl -sI https://ghcr.io/v2/wirenboard/agent-vm-template/manifests/latest
 # kernel A/B: build variants from libkrunfw-src (one tree, grep each .config), swap the
 # .so next to msb, measure interleaved with drop_caches — see measure_variants.sh.
 ```

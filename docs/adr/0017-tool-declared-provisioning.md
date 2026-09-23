@@ -100,30 +100,29 @@ own synthetic row).
 
 Per-verb effect under the shipped default catalog:
 
-| verb | `credentials` (required) | provisioning set | before |
-|---|---|---|---|
-| `codex` | `["openai"]` | `{openai}` | anthropic+openai+opencode-static |
-| `opencode` | `["openai","opencode-static"]` | `{openai, opencode-static}` | same three |
-| `claude` | `["anthropic"]` | `{anthropic}` | same three |
-| `copilot` | `["copilot"]` | `{copilot}` | three + a *broken* copilot |
-| `shell` | *(none)* | `{anthropic, openai, opencode-static, copilot}` | three, copilot **broken** |
+| verb | `credentials` (required) | provisioning set |
+|---|---|---|
+| `codex` | `["openai"]` | `{openai}` |
+| `opencode` | `["openai","opencode-static"]` | `{openai, opencode-static}` |
+| `claude` | `["anthropic"]` | `{anthropic}` |
+| `copilot` | `["copilot"]` | `{copilot}` |
+| `shell` | *(none)* | `{anthropic, openai, opencode-static, copilot}` |
 
-- **`agent-vm shell` gains a *working* Copilot**: a substitution entry, a
+- **`agent-vm shell` provisions a *working* Copilot**: a substitution entry, a
   `copilot/config.json` placeholder and `COPILOT_GITHUB_TOKEN`, all together.
 - **A config that declares tools but no `shell` gets a fallback shell that
   provisions nothing.** The appended fallback is `BuiltIn`, so its wildcard
   closes over `default-tools.toml`'s tools *present in the catalog* — and when a
   user config replaces the defaults, the only one present is `shell` itself.
-  Today such a config gets the always-on `{anthropic, openai, opencode-static}`.
-  This is a user-visible narrowing and `USAGE.md` carries an `Upgrading:` note.
+  `USAGE.md` carries the resulting guidance.
 - **Network egress is not provider-scoped.** The policy is `default_egress:
   deny` plus a blanket `destination: { group: "public" }` allow, identical in
   all five goldens, so a `codex` guest can still *reach* `api.anthropic.com`; it
   simply has no token and no substitution entry, so every request 401s. That is
   the correct design — capture gating is the control — recorded so nobody reads
   "provisions `{openai}`" as "cannot talk to Anthropic".
-- **A zero-provisioning launch is newly reachable** (a declared `shell` with
-  `tools = []`) and boots with **no TLS overlay**: `Plan::apply_to` returns the
+- **A zero-provisioning launch** (a declared `shell` with
+  `tools = []`) boots with **no TLS overlay**: `Plan::apply_to` returns the
   builder untouched when `secrets` is empty, so `tls_overlay(enabled(true))` is
   never set. It also carries no explicit `policy` subdocument — the launch never
   calls `.network()` at all — but an unset policy materializes to

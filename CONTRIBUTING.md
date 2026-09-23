@@ -148,11 +148,10 @@ Set `AGENT_VM_E2E_OLD_LAUNCHER` (a pre-#84 binary),
 `AGENT_VM_E2E_LEGACY_IMAGE` (a cached API-1/2 image),
 `AGENT_VM_E2E_SETUP_BASE_REF` (a pullable `linux/arm64` base ref),
 `AGENT_VM_E2E_UPDATE_CHECK=1` and/or `AGENT_VM_E2E_RUST=1` to enable the opt-in
-checks; `./script/test/e2e.sh --help` lists them. Each check maps to an
-acceptance criterion in the issue that introduced it (#84): the tool-free base,
-the fast path (a default launch boots the published template with **zero**
-`docker` invocations), per-tool-layer composition, the project-layer chain, and
-the legacy API-1/2 seed fallback.
+checks; `./script/test/e2e.sh --help` lists them. Each check covers one of: the
+tool-free base, the fast path (a default launch boots the published template
+with **zero** `docker` invocations), per-tool-layer composition, the
+project-layer chain, and the legacy API-1/2 seed fallback.
 
 #### The shared-cache trap
 
@@ -169,8 +168,8 @@ tag and fails with `Not authorized … index.docker.io/.../agent-vm-template`.
 An existing state dir is consistent because its `config.json` was written before
 the import; `script/test/e2e.sh` also seeds a fresh dir by running a non-booting
 builtin that still initialises the cache (`agent-vm msb --version`) first, so it
-works either way. (Not `doctor`: since #93 ordinary `doctor` is observational
-and deliberately writes nothing.) A follow-up should
+works either way. (Not `doctor`, which is deliberately observational and writes
+nothing.) A follow-up should
 teach `import-image.sh` the same shared-cache redirect so the raw recipe above
 also works from scratch.
 
@@ -309,11 +308,6 @@ git commit -am "..."                   # lock alongside the bump
 ```
 
 `Cargo.lock` always moves with the version, so commit it alongside.
-
-(Older history used a separate post-merge `vX.Y.Z: bump for <feature>`
-commit on the retired `rewrite-microsandbox` branch — that's what
-`git log --oneline | grep "^[a-f0-9]* v"` is showing you. PRs now squash
-onto `main` and carry the bump inside.)
 
 ## Submodule merges
 

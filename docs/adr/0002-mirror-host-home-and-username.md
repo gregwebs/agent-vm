@@ -95,10 +95,9 @@ read — that one is a fallback for the unrelated *session state root*
 
 ## Consequences
 
-- `$HOME` unset on the host now surfaces as a `launch()` error in
+- `$HOME` unset on the host surfaces as a `launch()` error in
   non-root mode (`resolve_host_home`'s `Context` message), rather than
-  silently booting a guest with a broken `$HOME` — previously `$HOME` was
-  a hardcoded literal, so it always "worked" regardless of host env.
+  silently booting a guest with a broken `$HOME`.
   `--root` mode is unaffected: it never calls `resolve_host_home`.
 - Verbatim mirroring is now gated by `/etc/passwd`/`/etc/group`
   framing-safety validation (issue #57, `user::GuestHome`/`PasswdName`): a
