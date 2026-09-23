@@ -564,10 +564,9 @@ Three build-time subtleties are worth knowing:
 ### Distribution: OCI references, not bind or disk images
 
 microsandbox's `RootfsSource` supports an OCI reference, a host directory
-(`Bind`), or a qcow2/raw/vmdk file. agent-vm uses the OCI path. Two repositories
-are published: `ghcr.io/wirenboard/agent-vm-base` (the tool-free base) and
-`ghcr.io/wirenboard/agent-vm-template` (the composed default), the latter the
-default the fast path boots.
+(`Bind`), or a qcow2/raw/vmdk file. agent-vm uses the OCI path, booting the
+composed default on the fast path (see
+[USAGE](USAGE.md#image-release-cadence)).
 
 - **Standard OCI semantics.** microsandbox's layer cache, GC, snapshotting, and
   metadata DB all key off OCI references. Going through that path means getting
@@ -950,8 +949,8 @@ enabling sharing.
 ### Clipboard exchange
 
 `agent-vm clipboard {get,put}` (`clipboard.rs`) moves a string across the VM
-boundary through a per-project `<state>/clipboard.txt`, bind-mounted into the
-guest at `/agent-vm-state/clipboard.txt`.
+boundary through a per-project file on the state mount (see
+[USAGE](USAGE.md#clipboard)).
 
 **Why a file and not a channel.** The guest already has the state mount; a file
 needs no new device, no port, no protocol, and no guest-side agent-vm binary —
@@ -970,11 +969,11 @@ per-project agent-vm session dir under the state root and hands the combined
 list to `ccusage` via `CLAUDE_CONFIG_DIR`, so token/cost reporting covers host
 *and* sandbox sessions in one summary.
 
-It resolves the state root by the same precedence the launcher uses, and
-*skips* any directory whose path contains a comma: `CLAUDE_CONFIG_DIR` is
+It *skips* any directory whose path contains a comma: `CLAUDE_CONFIG_DIR` is
 comma-separated with no escape mechanism, so such a path would silently
 mis-tokenize into two wrong directories. Skipping with a warning beats merging
-directories the user never asked for.
+directories the user never asked for. The state-root precedence is in
+[USAGE](USAGE.md#token-usage-across-host-and-sandbox).
 
 ## Decision record index
 

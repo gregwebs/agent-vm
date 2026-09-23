@@ -118,12 +118,10 @@ to control that. This is the same behaviour every project tooling layer already
 has.
 
 On a host behind a TLS-intercept proxy, a locally composed chain cannot
-soft-fail a broken upstream installer (the launcher deliberately does not pass
-`AGENT_INSTALL_SOFT_FAIL` on the compose path — a silently cached
-"healthy-looking image missing its toolchain" is the one outcome the layer
-contract exists to prevent). Build the layer yourself with `images/build.sh`
-(which sets the soft-fail arg) and pass `--base-image`/`--layer`, or use the
-published template.
+soft-fail a broken upstream installer. Build the layer yourself with
+`images/build.sh` (which sets `AGENT_INSTALL_SOFT_FAIL`) and pass
+`--base-image`/`--layer`, or use the published template
+([ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md)).
 
 The agent-vm binary and the images are version-locked through an
 **image-API-version** integer
@@ -383,7 +381,8 @@ never boots the base, or a partially-built chain, in place of a step that
 failed.
 
 Each step's **built image** must satisfy the **layer image contract** — eight
-clauses, four enforced at build time. The normative text is
+clauses, four enforced at build time. The normative text and the full clause
+list are
 [`docs/adr/0003-project-tooling-layers.md`](docs/adr/0003-project-tooling-layers.md)
 ("The layer image contract").
 
@@ -392,13 +391,11 @@ What agent-vm rejects, and how to fix it:
 1. **C1** — build `FROM ${BASE_IMAGE}`: declare a global `ARG BASE_IMAGE=...` before the first `FROM`.
 2. **C2** — keep `PATH` additive: never remove a directory the previous step had.
 3. **C3** — end the last step as root: no trailing `USER <someone-else>`.
-4. **C4** — don't pin `--platform` on your final `FROM`; agent-vm also refuses to build on a base image of the wrong platform.
+4. **C4** — don't pin `--platform` on your final `FROM`.
 
-The other four clauses (C5–C8: not touching agent-vm's own files, keeping
-`/bin/bash` and `/etc/passwd`/`/etc/group` appendable, installing tools
-readable by any uid, advertising a capability only when it works) are
-documented-only — see the ADR. A `RUN` that installs foreign-architecture
-binaries **is not detected**: it fails at run time with `Exec format error`.
+The other four clauses (C5–C8) are documented-only. A `RUN` that installs
+foreign-architecture binaries **is not detected**: it fails at run time with
+`Exec format error`.
 
 A violation is a hard failure that aborts the launch, with no opt-out, and
 the offending image is discarded so the next launch rebuilds and re-checks it
