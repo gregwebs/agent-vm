@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 #[cfg(test)]
 use microsandbox::sandbox::MountBuilder;
 
+use crate::host_paths::flock_exclusive;
 #[cfg(test)]
 use crate::protected_host_files::CoreBind;
 use crate::protected_host_files::{
@@ -2503,7 +2504,7 @@ pub(crate) fn prepare_forks(
         ensure_store(mount_store)?;
         let lock_path = mount_store.join("locks").join(format!("{id}.lock"));
         let lock = open_regular_lock(&lock_path)?;
-        lock_exclusive(&lock)?;
+        flock_exclusive(&lock).context("locking fork initialization")?;
         if final_dir_exists(&final_dir)? {
             let kind = validate_ready(&final_dir, mount, &id)?;
             mount.host = final_dir.join("data");
@@ -2749,18 +2750,6 @@ fn open_regular_lock(path: &Path) -> Result<std::fs::File> {
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("securing fork lock {}", path.display()))?;
     Ok(file)
-}
-fn lock_exclusive(lock: &std::fs::File) -> Result<()> {
-    use rustix::fs::{FlockOperation, flock};
-    loop {
-        match flock(lock, FlockOperation::LockExclusive) {
-            Ok(()) => return Ok(()),
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(error) => {
-                return Err(anyhow::anyhow!(error)).context("locking fork initialization");
-            }
-        }
-    }
 }
 fn clean_stale_staging(staging: &Path, id: &str) -> Result<()> {
     for entry in fs::read_dir(staging)? {
@@ -4865,7 +4854,7 @@ mod prepare_tests {
         let launch = ProtectedHostFiles::measure(Some(home_for_measure)).unwrap();
         after_launch_measurement();
         let lock = open_regular_lock(&store.join("fork.lock")).unwrap();
-        lock_exclusive(&lock).unwrap();
+        flock_exclusive(&lock).unwrap();
         require_fork_directory(
             fork_source_kind(root_spelling).unwrap(),
             &root_spelling.display().to_string(),

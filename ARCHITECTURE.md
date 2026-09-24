@@ -615,6 +615,34 @@ on the way out.
 Current design of record:
 [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md).
 
+### Values you store yourself (`agent-vm secret`)
+
+Everything above reads a credential another tool wrote on the host. A credential
+the *user* gives agent-vm directly — an API key no agent CLI owns a file for —
+has its own home: agent-vm's namespace in the host OS credential store (macOS
+Keychain, Linux Secret Service), managed by the three `agent-vm secret` verbs.
+This is the **storage lifecycle only**; it is deliberately inert, nothing reads a
+stored value back, and nothing here reaches a guest. Authorization and injection
+are separate host configuration ([ADR-0024](docs/adr/0024-host-secret-inventory.md)).
+
+```text
+  user ── hidden prompt / piped stdin ──▶ agent-vm secret set SERVICE
+                                             │
+                    host OS credential store │ dev.agent-vm.credentials / SERVICE
+                    ◀── secret ls (names + storage status only) ───
+                    ◀── secret rm (delete one entry) ─────────────
+```
+
+The store's namespace is host-wide, so its **names-only inventory** lives in the
+user-scoped `~/.config/agent-vm/` rather than under the state dir — the OS
+credential store exposes no portable enumeration API, so `ls` probes one name
+per recorded entry. The inventory holds no bytes, which is what makes a listing
+structurally incapable of printing a value. The write ordering (inventory first),
+the `flock` around every mutation, the re-probe after a delete, and the closed
+error classification are all [ADR-0024](docs/adr/0024-host-secret-inventory.md),
+with the boundary predicates' machine-checked contracts in
+[ADR-0018](docs/adr/0018-machine-checked-boundary-contracts.md)'s list.
+
 ### Guest-managed Pi credentials
 
 Pi is the one agent that can *create* a credential inside the guest (its normal

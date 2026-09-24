@@ -1048,13 +1048,17 @@ mod tests {
     /// **V7 (D6).** An `env` *value* is never rendered — only its count is —
     /// so a credential a user pasted into `env` cannot leak through `doctor`.
     /// The suffix renders only when nonzero, and goes after `interactive_shell`.
+    ///
+    /// The tool is named `vault`, not `secret`: `secret` became a reserved
+    /// built-in name in #160, and the point of this fixture is the env-value
+    /// redaction, not the name.
     #[test]
     fn describe_tool_shows_only_the_env_count_never_a_value() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
         std::fs::write(
             &user,
-            "[[tools]]\nname = \"secret\"\ncommand = \"secret\"\nenv = { TOKEN = \"sk-secret\" }\n",
+            "[[tools]]\nname = \"vault\"\ncommand = \"vault\"\nenv = { TOKEN = \"sk-secret\" }\n",
         )
         .unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
@@ -1062,7 +1066,7 @@ mod tests {
         let (text, _) = describe_config(report);
         assert!(
             text.contains(
-                "secret -> \"secret\"; args=0; layer=none; credentials=none; provisions=none; persist=0; source=user:"
+                "vault -> \"vault\"; args=0; layer=none; credentials=none; provisions=none; persist=0; source=user:"
             ),
             "{text}"
         );

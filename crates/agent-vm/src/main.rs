@@ -28,6 +28,8 @@ mod pull;
 mod pull_progress;
 mod pulled_marker;
 mod run;
+mod secret;
+mod secret_store;
 mod secrets;
 mod session;
 mod setup;
@@ -65,6 +67,20 @@ fn main() -> Result<()> {
     {
         doctor::run(args)?;
         return Ok(());
+    }
+
+    // `secret` is dispatched here, for the same reasons as `doctor` and one
+    // more: it needs no msb, no catalog and no async, and it must keep working
+    // when msb setup is broken (a broken tool config already carries it
+    // through, see `cli::parse_from`). It reads no state that `point_at_msb`
+    // provides, and `secret_store::system_store` locates the OS credential
+    // store through `$HOME` only.
+    if let Dispatch::Builtin {
+        cmd: Cmd::Secret(args),
+        ..
+    } = dispatch
+    {
+        return exit_with(secret::run(args)?);
     }
 
     // Locate and pin our patched msb binary via MSB_PATH so a user's
@@ -150,6 +166,12 @@ fn main() -> Result<()> {
                 ..
             } => {
                 unreachable!("Cmd::Doctor is dispatched pre-runtime, see above")
+            }
+            Dispatch::Builtin {
+                cmd: Cmd::Secret(_),
+                ..
+            } => {
+                unreachable!("Cmd::Secret is dispatched pre-runtime, see above")
             }
         }
     })

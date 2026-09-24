@@ -59,6 +59,8 @@ Full flag, subcommand, networking, and troubleshooting reference:
   version-bump, and repo conventions.
 - [macos-build.md](macos-build.md) — the Apple Silicon source-build guide.
 - [PLAN.md](PLAN.md) — what is left to do for v1.
+- [Credential shielding specification](docs/specs/credential-shielding.md) —
+  agreed user contract and Docker-shaped YAML/CLI design (not yet implemented).
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
   the way they do.
 - [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) —

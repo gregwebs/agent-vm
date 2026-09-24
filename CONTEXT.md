@@ -78,6 +78,62 @@ installed `msb` uses is a different thing agent-vm deliberately does not point
 at (except the opt-in cache share); and when schema-scoping matters — the
 schema home is the concept, the env var just points at it.
 
+## Credential shielding
+
+The explicitly authorized use of a credential on behalf of an untrusted guest
+without exposing the credential's real value to that guest. This is not general
+secret detection or control of account usage; usage limits and detection belong
+to the remote credential issuer.
+
+_Avoid_: "credential masking", which can be confused with output redaction or
+file masking.
+
+## Credential source
+
+A host-side location from which a credential value is obtained, such as a named
+environment variable or a system keychain item. Its identity is distinct from
+the secret value, which can rotate without changing the source.
+
+## Credential authorization
+
+A user's permission to use a credential source at specified HTTPS destinations
+and in specified request headers. It is host-wide, not project-scoped;
+a project may request its use but cannot confer or broaden that permission.
+
+_Avoid_: "grant", when referring to this permission.
+
+## Credential request
+
+A tool or project's declaration that it needs an authorized credential and where
+its guest-facing placeholder should appear. A request is not authorization.
+
+## Secret store
+
+agent-vm's own namespace in the **host OS credential store** (macOS Keychain,
+Linux Secret Service): the reverse-DNS service name `dev.agent-vm.credentials`,
+under which every `agent-vm secret set` entry is an account named by the
+folded service name. Distinct from Docker's `com.docker.sandboxes` namespace and
+from microsandbox's own `dev.microsandbox.registry` entry, which agent-vm
+neither reads nor writes. Host-wide, not project-scoped: every agent-vm process
+on the machine addresses the same entries regardless of state dir.
+
+_Avoid_: "keychain" unqualified, which is both the macOS product and the
+cross-platform concept; and "vault", which implies a different storage model.
+
+## Secret inventory
+
+The **non-secret**, user-scoped record of which service names agent-vm has
+stored — `~/.config/agent-vm/secret-inventory.json`, names only, never bytes. It
+exists because the OS credential store is a key→value lookup with no portable
+enumeration API, so `agent-vm secret ls` probes one name per recorded entry. It
+is explicitly **not** an authorization list: storing a value does not authorize
+its use, and deleting the inventory loses only the listing, never a stored
+value. Its scope is user-scoped rather than state-scoped because the secret
+store it describes is host-wide.
+
+_Avoid_: "credential list", "allowlist", or any wording that reads as
+permission.
+
 ## Credential provider
 
 A **compiled-in credential subsystem** a launched tool can depend on. The four

@@ -64,6 +64,28 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     atomic_write_at(&parent_fd, name, data, mode, path.display().to_string())
 }
 
+/// Take a blocking exclusive `flock(2)` on `file`, looping on `EINTR` (a signal
+/// during the wait) and with no timeout: a peer that truly hangs inside the
+/// locked section is a bug to surface as a stuck command, not to bypass.
+///
+/// The lock is released when the caller drops `file` (the fd closes) or by the
+/// kernel on process death, so a crashed process cannot wedge the resource.
+/// This is the shared primitive behind the `secret` inventory lock
+/// (`secret_store.rs`); `secrets::ProjectLock` still carries its own copy,
+/// and migrating it here is a deliberate follow-up rather than part of this
+/// change.
+pub fn flock_exclusive(file: &std::fs::File) -> Result<()> {
+    loop {
+        match rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive) {
+            Ok(()) => return Ok(()),
+            Err(Errno::INTR) => continue,
+            Err(error) => {
+                return Err(anyhow!(error)).context("flock(LOCK_EX) failed");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CreateOutcome {
     Created,
