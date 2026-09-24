@@ -2,23 +2,55 @@
 
 Run inside a per-project [microsandbox](https://docs.microsandbox.dev/) (libkrun microVM), booting in ~2 seconds.
 
-- **Secure sandbox with convenience.**
-  The guest runs as your host user (--root is available when needed).
+- **Filesystem protection.**
   The working directory is bind-mounted at its host path and you can mount other directories.
-  Provide your own Dockerfile and configuration files to specify whats in your VM.
+  Choose read-only, write, or fork (copied) mounts.
 - **Network allow list**
   Disable or enable networking, enforce allow lists 
+- **Dropped User or root**
+  The guest runs as your host user uid without sudo (--root is available when needed).
+  Provide your own Dockerfile and configuration files to specify whats in your VM.
+- **Credential shielding.**
+  A TLS-intercept proxy in
+  [microsandbox](https://github.com/gregwebs/microsandbox) adds
+  the real credential on the way out- the guest doesn't see it.
+  Supports standard API key usage and Claude/Codex Oauth with refresh.
 - **Built-in support for common AI harnesses**
   Claude Code / Codex / OpenCode / Copilot / Pi / DeepSeek Harness (`dsh`)
   Run with `--yolo`, `--dangerously-skip-permissions`, etc- agent-vm instead provides the security.
-- **Host OAuth tokens never enter the VM.**
-  A TLS-intercept proxy in
-  [microsandbox](https://github.com/gregwebs/microsandbox) substitutes
-  the real bearer for a placeholder on the way out.
 - **Per-launch GitHub repo allow-list.** Auto-detected from
   `git remote -v`; extend with `--repo OWNER/NAME`. `gh pr create`,
   `git push` etc. are filtered at the proxy — off-list calls get a 403
   before they reach GitHub.
+
+Missing planned features:
+
+* MCP gateway
+* SSH agent socket
+* local port publishing
+
+## Similar tools
+
+Docker Sandbox is designed with the same security guarantees in mind.
+This project adopted some of the Docker Sandbox configuration schema.
+
+The main reasons someone might prefer this project is:
+
+* open source
+* no login required
+* doesn't run its own daemon
+* integrates with existing host VM systems via microsandbox (libkrun)
+
+The features differ in serveral ways:
+* fork mounts instead of a clone mode
+* shell / run usage
+* no shared skills repository
+* docker engine is only in the VM image if you put it there
+* doesn't write secrets to plain files in headless CI mode
+
+OpenShell from NVidia is an enterprise ready sandboxing tool.
+I found it difficult to use. It has a gateway-based design which I couldn't get working locally on my Mac.
+It seems more geared to datacenter/cloud usage. It has multiple backends and does support vm=libkrun.
 
 ## Status
 
