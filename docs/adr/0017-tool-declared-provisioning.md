@@ -98,10 +98,12 @@ own synthetic row).
 
 ## Consequences
 
-Per-verb effect under the shipped default catalog:
+Per-verb effect under the shipped default catalog (`pi`'s row was added later —
+see the Amendment at the end of this ADR):
 
 | verb | `credentials` (required) | provisioning set |
 |---|---|---|
+| `pi` | *(none)* | `{anthropic}` |
 | `codex` | `["openai"]` | `{openai}` |
 | `opencode` | `["openai","opencode-static"]` | `{openai, opencode-static}` |
 | `claude` | `["anthropic"]` | `{anthropic}` |
@@ -153,6 +155,38 @@ Per-verb effect under the shipped default catalog:
 - **`layer` is untouched** ([#84](https://github.com/gregwebs/agent-vm/issues/84));
   the provisioning closure now also folds each visited tool's `persist` paths
   ([#83](https://github.com/gregwebs/agent-vm/issues/83)).
+
+## Amendment: #164 exercises alternative 2 — `pi` provisions Anthropic
+
+[agent-vm #164](https://github.com/gregwebs/agent-vm/issues/164) gives the
+shipped `pi` the `tools = ["claude"]` edge, so **alternative 2 of this ADR** ("a
+tool that connects to another tool (`Pi` → `claude`)") is now exercised in the
+shipped catalog rather than only in a test. The motivation is in
+[ADR-0023](0023-image-owned-pi-extension-packages.md): the image-owned
+`pi-claude-bridge` extension spawns Claude Code as a child, and Claude Code
+needs *its own* credential — the Anthropic provider's placeholder/proxy dance is
+exactly that credential.
+
+This is the shape the Decision above was written for, and it needs no new rule:
+
+- **`pi` keeps `credentials = []`**, so it inherits no hard bail and still
+  launches for a user with no host Claude login. It is the one shipped verb whose
+  requirement set and provisioning set differ, which is the point of the
+  `credentials` / `provisioned` split.
+- **The inherited side effects are the Anthropic provider's, not `pi`'s.**
+  `write_bypass_configs` follows the provisioning set, so a `pi` launch now
+  writes `claude/settings.json` and `claude.json` even when capture failed; the
+  stale-placeholder clearer no longer deletes a `shell`-written placeholder on
+  the next `pi` launch (it is wired now); and when capture succeeds it overwrites
+  a guest-authored `~/.claude/.credentials.json` with the placeholder. All three
+  behaviours are pinned by `tests/config_launch_driven.rs`.
+- **The guest-HOME links stay unconditional**, as the "Deliberately unchanged"
+  section requires — nothing here narrows them.
+
+One non-DR change is recorded for honesty: the `ANTHROPIC_API_KEY` publication
+this ADR does not touch becomes reachable on a third verb. That pre-existing
+defect is tracked separately as
+[#165](https://github.com/gregwebs/agent-vm/issues/165).
 
 ## Alternatives
 

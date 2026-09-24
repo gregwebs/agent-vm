@@ -76,20 +76,40 @@ args = ["web"]
 layer = { builtin = "dsh" }
 persist = [".dsh"]
 
-# `pi` declares no `credentials` either: Pi supports many providers, enrolls
+# `pi` still declares no `credentials`: Pi supports many providers, enrolls
 # more during a session, and must start with none configured, so it must not
-# inherit any provider's hard bail. Host-credential import is issue #94/#91; the
-# guest-state mapping and PI_SKIP_VERSION_CHECK are issue #96. It deliberately
-# declares no `--approve` (or any trust/telemetry) default: agent-vm forces no
-# trust or telemetry policy, so Pi's own project-trust flag and telemetry are
-# forwarded -- see ADR-0021. Its layer sits just above dsh's: pinned and large,
-# but smaller than dsh, so it is re-emitted only on a pin bump too -- see
-# images/tools/README.md.
+# inherit any provider's hard bail.
+#
+# It DOES declare `tools = ["claude"]`. Pi reaches Anthropic through the
+# image-owned pi-claude-bridge extension, which spawns Claude Code as a child
+# process and therefore needs *Claude Code's* credential, not Pi's own
+# `auth.json`. Naming the `claude` tool provisions `anthropic` WITHOUT requiring
+# it (ADR-0017: named tools are provisioned, never required), so `agent-vm pi`
+# writes the Anthropic placeholder to `claude/.credentials.json`, registers the
+# proxy substitution, and still launches for a user with no host Claude login.
+# This is ADR-0017 alternative 2 ("a tool that connects to another tool
+# (Pi -> claude)"). Note the inherited side effect: the Anthropic bypass configs
+# (`claude/settings.json`, `claude.json`) are now written on a `pi` launch too,
+# because `write_bypass_configs` follows the provisioning set, not capture.
+#
+# Importing the host's *Pi* credential (~/.pi/agent/auth.json) into Pi's own
+# provider is a different credential in a different file. #94 (Anthropic through
+# host Pi) was closed as superseded by #164, which reaches Anthropic through the
+# `claude` tool edge above instead; #91 (OpenAI and Codex credentials through
+# host Pi) is still open and is not implemented here.
+#
+# The guest-state mapping and PI_SKIP_VERSION_CHECK are issue #96. It
+# deliberately declares no `--approve` (or any trust/telemetry) default:
+# agent-vm forces no trust or telemetry policy, so Pi's own project-trust flag
+# and telemetry are forwarded -- see ADR-0021. Its layer sits just above dsh's:
+# pinned and large, but smaller than dsh, so it is re-emitted only on a pin bump
+# too -- see images/tools/README.md.
 [[tools]]
 name = "pi"
 command = "pi"
 args = []
 layer = { builtin = "pi" }
+tools = ["claude"]
 persist = []
 
 [[tools]]

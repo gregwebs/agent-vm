@@ -644,6 +644,131 @@ mod tests {
         );
     }
 
+    // -- the pinned bridge packages: one home for the pin, full integrity, and
+    // -- no second Pi ---------------------------------------------
+
+    fn bridge_pin() -> String {
+        embedded_json("pi/bridge/package.json")["dependencies"]["pi-claude-bridge"]
+            .as_str()
+            .expect("the bridge manifest pins pi-claude-bridge")
+            .to_string()
+    }
+
+    /// Unlike pi's lock, the bridge tree has no shrinkwrap anywhere in its
+    /// chain, so every entry carries npm's own `integrity` with no hand-refilled
+    /// hashes -- which is exactly why `install-pi-packages.sh` carries no
+    /// bespoke verifier. This test is what keeps that true.
+    #[test]
+    fn every_bridge_locked_package_carries_integrity() {
+        let lock = embedded_json("pi/bridge/package-lock.json");
+        let packages = lock["packages"]
+            .as_object()
+            .expect("`packages` is an object");
+        let missing: Vec<&str> = packages
+            .iter()
+            .filter(|(key, value)| !key.is_empty() && value.get("integrity").is_none())
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these committed bridge lock entries carry no `integrity` hash: {missing:?}\n\
+             `install-pi-packages.sh` deliberately carries no bespoke verifier because every\n\
+             tarball here is npm-authenticated. Regenerate with:\n\
+             cd images/tools/pi/bridge && npm install --ignore-scripts --package-lock-only \\\n\
+               --no-audit --no-fund --legacy-peer-deps  (see images/tools/README.md)"
+        );
+    }
+
+    /// The bridge pin is exact, and the lock agrees with the manifest. There is
+    /// no shrinkwrap in this tree, so `npm ci` resolves nothing and the lock is
+    /// authoritative -- a range in the manifest would let a regenerated lock
+    /// move the installed version without this repo moving the pin.
+    #[test]
+    fn the_bridge_pin_is_exact_and_the_lock_agrees() {
+        let pinned = bridge_pin();
+        let range_characters = ['^', '~', '>', '<', '=', '*', '|', ' ', 'x', 'X'];
+        assert!(
+            pinned.split('.').count() >= 3
+                && !pinned.chars().any(|c| range_characters.contains(&c)),
+            "the pi-claude-bridge pin must be an exact version, not a range: {pinned:?}"
+        );
+        let lock = embedded_json("pi/bridge/package-lock.json");
+        let root = lock["packages"][""]["dependencies"]["pi-claude-bridge"]
+            .as_str()
+            .expect("the lock's root records the bridge dependency");
+        assert_eq!(
+            root, pinned,
+            "the lock's root dependency must equal the manifest's pin"
+        );
+        let locked = lock["packages"]["node_modules/pi-claude-bridge"]["version"]
+            .as_str()
+            .expect("pi-claude-bridge is locked");
+        assert_eq!(
+            locked, pinned,
+            "npm ci would install {locked}, but the manifest pins {pinned}"
+        );
+    }
+
+    /// `--legacy-peer-deps` was used on BOTH the lock and the layer's `npm ci`.
+    /// Without it npm solves the bridge's `@earendil-works/pi-*` and `typebox`
+    /// peer ranges and drags in a SECOND, version-skewed
+    /// `@earendil-works/pi-coding-agent` beside the image's own Pi. Pi's
+    /// extension loader aliases every one of those specifiers to its own copies
+    /// (`dist/core/extensions/loader.js`), so none may be installed. Assert the
+    /// whole loader-aliased set, not just `@earendil-works`.
+    #[test]
+    fn the_bridge_lock_installs_no_loader_aliased_pi_package() {
+        // The specifiers ADR-0023 names as loader-aliased: the three shipped Pi
+        // packages plus their typebox base. A regenerated lock must contain no
+        // package whose path matches any of them.
+        const ALIASED: [&str; 5] = [
+            "@earendil-works",
+            "typebox",
+            "pi-agent-core",
+            "pi-tui",
+            "pi-ai",
+        ];
+        let lock = embedded_json("pi/bridge/package-lock.json");
+        let offending: Vec<&str> = lock["packages"]
+            .as_object()
+            .expect("`packages` is an object")
+            .keys()
+            .map(String::as_str)
+            .filter(|key| ALIASED.iter().any(|aliased| key.contains(aliased)))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "the bridge lock installs a package Pi's loader aliases: {offending:?}\n\
+             It was generated without `--legacy-peer-deps`; regenerate it with that\n\
+             flag (see images/tools/README.md)."
+        );
+    }
+
+    /// `--omit=optional` and `--legacy-peer-deps` are mandatory on the layer's
+    /// `npm ci`. The lock carries the Claude Agent SDK's eight
+    /// `optionalDependencies` (one whole native Claude Code binary per
+    /// platform), so dropping `--omit=optional` silently adds ~197 MiB to the
+    /// image while every other guard -- and the runtime matrix -- stays green.
+    /// Pin the flags to the script that runs the install.
+    #[test]
+    fn the_bridge_install_passes_npm_ci_the_mandatory_flags() {
+        let script = TOOL_LAYERS
+            .get_file("pi/install-pi-packages.sh")
+            .expect("pi/install-pi-packages.sh is embedded")
+            .contents_utf8()
+            .expect("the install script is UTF-8");
+        let ci_line = script
+            .lines()
+            .find(|line| line.contains("npm ci --ignore-scripts"))
+            .expect("install-pi-packages.sh runs `npm ci --ignore-scripts`");
+        for flag in ["--omit=optional", "--legacy-peer-deps"] {
+            assert!(
+                ci_line.contains(flag),
+                "pi/install-pi-packages.sh's npm ci line dropped {flag}: {ci_line}"
+            );
+        }
+    }
+
     // -- the pinned dsh layer: one home for the pin, and full integrity ----
 
     fn dsh_pin() -> String {

@@ -565,7 +565,11 @@ interactive_shell = false            # optional; join trailing args into `-c`
   contributes nothing to the composed image, so **omitting it on a redeclared
   shipped tool boots a guest without that tool** — declare
   `layer = { builtin = "claude" }` if you meant to compose it (see the upgrade
-  note below).
+  note below). One pairing this matters for: the shipped `pi` layer always loads
+  the `claude-bridge` extension, whose Claude Code child is the `claude` layer's
+  binary — a catalog that declares `pi` but not `claude` builds an image with a
+  bridge that cannot spawn anything (see
+  [Credential-free agents](#credential-free-agents-pi-dsh)).
 - `credentials` — optional; provider **config names**, which differ from
   the `agent-vm doctor` row labels. Valid: `anthropic`, `openai`,
   `opencode-static`, `copilot`. Note `opencode` (the doctor label) is **not**
@@ -701,6 +705,25 @@ to Pi with a second one: `agent-vm pi -- -- …`. `pi <subcommand>` (`pi list`,
 there and subcommands stay subcommands. `pi` also ships with empty `args`,
 like `codex`/`opencode` — any default flag would belong in the wrapper, not in a
 config `args` list, because a prepended flag would displace a subcommand.
+
+**The `claude-bridge` provider.** The image ships
+[`pi-claude-bridge`](https://github.com/elidickinson/pi-claude-bridge), pinned,
+under `/opt/agent-vm/pi-packages/`, and the wrapper loads it on every
+non-subcommand `pi` invocation — so `/model` offers a `claude-bridge/…` entry
+with no install step. It is **not** a Pi-managed package: `pi list` does not show
+it, `pi update` and `pi uninstall` cannot see it, and its pin moves only when
+this repo moves it
+([ADR-0023](docs/adr/0023-image-owned-pi-extension-packages.md)). Its settings
+live in `~/.pi/agent/claude-bridge.json` — `provider.plan`,
+`askClaude.enabled`, and `provider.pathToClaudeCodeExecutable`. agent-vm seeds
+exactly that last key so the bridge runs the image's own `claude` rather than the
+Agent SDK's own platform package — guest-platform size in
+[ADR-0023](docs/adr/0023-image-owned-pi-extension-packages.md). There is no
+once-marker: the hook runs on **every** launch and re-adds the key whenever it is
+absent, so **changing** the value is honoured but **removing** it is not (the
+bridge needs it). Set `AGENT_VM_PI_NO_BRIDGE=1` (any non-empty value) to take the
+bridge out of the picture entirely — the recovery hatch if it ever throws, or if
+you installed your own copy.
 
 **Env.** The wrapper forces `PI_SKIP_VERSION_CHECK=1`, because agent-vm owns the
 binary (a root-owned image layer) and Pi's "newer version" fetch can only ever be
@@ -899,6 +922,39 @@ guest instead, and it persists per project:
   `DEEPSEEK_API_KEY` for the default DeepSeek provider). Community plugins are
   not baked into the image; add one in the guest with
   `dsh plugin --profile web add <package>` (pnpm is installed).
+
+"Declares no `credentials`" is not the whole story for `pi`, though: it also
+declares `tools = ["claude"]`, so a `pi` launch **provisions** the Anthropic
+credential **without requiring** it
+([ADR-0017](docs/adr/0017-tool-declared-provisioning.md) alternative 2). That is
+what makes the shipped `claude-bridge` provider work with no in-guest login:
+`agent-vm pi` writes the Anthropic placeholder into the project's
+`~/.claude/.credentials.json` and registers the proxy substitution, so the
+Claude Code child the bridge spawns reaches Anthropic with your **host**
+credential. Three consequences are worth knowing:
+
+- **A host `ANTHROPIC_API_KEY` wins over all of it.** agent-vm publishes a
+  host-set `ANTHROPIC_API_KEY` into the guest as the **real, unsubstituted**
+  value (`OPENAI_API_KEY` likewise); Claude Code prefers the environment
+  variable over `~/.claude/.credentials.json`, so it bypasses the placeholder
+  proxy entirely and, if the key is unusable, every bridge turn fails with an
+  Anthropic auth error. `unset ANTHROPIC_API_KEY` before starting `pi`. This is a
+  pre-existing defect that also affects `agent-vm claude` and `agent-vm shell`
+  ([#165](https://github.com/gregwebs/agent-vm/issues/165)); `agent-vm pi` does
+  not introduce it, it adds a third verb it bites.
+- **An in-guest `claude login` cannot complete once the host has a credential.**
+  The launch registers the `POST platform.claude.com/v1/oauth/token` intercept
+  route, and the hook answers token *refresh* grants only: an authorization-code
+  exchange is rejected and Claude Code reports a bare `OAuth error … status code
+  400`. With **no** host credential nothing is registered, so `claude login`
+  works — that is exactly the case where you would want it.
+- **A custom catalog must keep the `pi`/`claude` pairing.** The bridge is loaded
+  by the `pi` layer; the Claude Code binary it spawns comes from the `claude`
+  layer. Declare `pi` with `layer = { builtin = "pi" }` and no `claude` tool and
+  you get an image with the bridge and no `claude`: the seed hook no-ops and
+  every turn fails with `Native CLI binary … not found`. Copy the built-in `pi`
+  definition *without* `claude` and the launch fails earlier and more clearly, on
+  a dangling-`tools` diagnostic naming your file.
 
 ## Project hook
 

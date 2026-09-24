@@ -112,7 +112,114 @@
   ],
   "network": {
     "enabled": true,
+    "interface": {},
     "ports": [],
+    "policy": {
+      "default_egress": "deny",
+      "default_ingress": "allow",
+      "rules": [
+        {
+          "direction": "egress",
+          "destination": {
+            "group": "host"
+          },
+          "protocols": [
+            "udp",
+            "tcp"
+          ],
+          "ports": [
+            {
+              "start": 53,
+              "end": 53
+            }
+          ],
+          "action": "allow"
+        },
+        {
+          "direction": "egress",
+          "destination": {
+            "group": "public"
+          },
+          "protocols": [],
+          "ports": [],
+          "action": "allow"
+        }
+      ]
+    },
+    "dns": {
+      "rebind_protection": true,
+      "nameservers": [],
+      "query_timeout_ms": 5000
+    },
+    "tls": {
+      "enabled": true,
+      "intercepted_ports": [
+        443
+      ],
+      "bypass": [],
+      "verify_upstream": true,
+      "block_quic_on_intercept": true,
+      "upstream_ca_cert": [],
+      "scoped_upstream_ca_cert": [],
+      "scoped_verify_upstream": [],
+      "intercept_ca": {
+        "cert_path": null,
+        "key_path": null
+      },
+      "cache": {
+        "capacity": 1000,
+        "validity_hours": 24
+      }
+    },
+    "intercept": {
+      "rules": [
+        {
+          "host": "platform.claude.com",
+          "method": "POST",
+          "path_prefix": "/v1/oauth/token",
+          "dispatch_on_headers": false
+        }
+      ],
+      "hook": [
+        "$AGENT_VM_BIN",
+        "_intercept-hook",
+        "--state-dir",
+        "$STATE_DIR"
+      ],
+      "max_request_bytes": 2097152
+    },
+    "secrets": {
+      "secrets": [
+        {
+          "env_var": "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+          "value": "",
+          "source": {
+            "kind": "file",
+            "path": "$STATE_DIR.secrets/anthropic"
+          },
+          "placeholder": "msb-anthropic-placeholder-a-v2",
+          "allowed_hosts": [
+            {
+              "exact": "api.anthropic.com"
+            },
+            {
+              "exact": "platform.claude.com"
+            },
+            {
+              "exact": "mcp-proxy.anthropic.com"
+            }
+          ],
+          "injection": {
+            "headers": true,
+            "basic_auth": false,
+            "query_params": false,
+            "body": false
+          },
+          "require_tls_identity": true
+        }
+      ],
+      "on_violation": "block-and-log"
+    },
     "max_connections": null,
     "trust_host_cas": false
   },
@@ -128,7 +235,7 @@
   "manifest_digest": null
 }
 --- state ---
-claude/.credentials.json	absent:entity not found
+claude/.credentials.json	[123, 34, 99, 108, 97, 117, 100, 101, 65, 105, 79, 97, 117, 116, 104, 34, 58, 123, 34, 97, 99, 99, 101, 115, 115, 84, 111, 107, 101, 110, 34, 58, 34, 109, 115, 98, 45, 97, 110, 116, 104, 114, 111, 112, 105, 99, 45, 112, 108, 97, 99, 101, 104, 111, 108, 100, 101, 114, 45, 97, 45, 118, 50, 34, 44, 34, 114, 101, 102, 114, 101, 115, 104, 84, 111, 107, 101, 110, 34, 58, 34, 109, 115, 98, 45, 97, 110, 116, 104, 114, 111, 112, 105, 99, 45, 112, 108, 97, 99, 101, 104, 111, 108, 100, 101, 114, 45, 114, 45, 118, 50, 34, 44, 34, 101, 120, 112, 105, 114, 101, 115, 65, 116, 34, 58, 110, 117, 108, 108, 44, 34, 115, 99, 111, 112, 101, 115, 34, 58, 110, 117, 108, 108, 44, 34, 115, 117, 98, 115, 99, 114, 105, 112, 116, 105, 111, 110, 84, 121, 112, 101, 34, 58, 110, 117, 108, 108, 44, 34, 114, 97, 116, 101, 76, 105, 109, 105, 116, 84, 105, 101, 114, 34, 58, 110, 117, 108, 108, 125, 125]
 codex/auth.json	absent:entity not found
 codex/config.toml	absent:entity not found
 copilot/config.json	absent:entity not found
@@ -142,6 +249,6 @@ link:.gitconfig	/agent-vm-state/gitconfig
 link:.local/share/opencode	/agent-vm-state/opencode
 link:.pi	/agent-vm-state/pi
 opencode-config/opencode.json	absent:entity not found
-secrets/anthropic	absent:entity not found
+secrets/anthropic	[102, 97, 107, 101]
 secrets/copilot	absent:entity not found
 secrets/openai	absent:entity not found

@@ -119,7 +119,8 @@ The providers a tool names in `credentials = [...]`. This is the
 **requirement** set: a launch hard-fails before boot when one yields no usable
 host credential (`credential_provider::missing_credential_error`). It is a
 subset of the provisioning set, and **equal** to it whenever the tool declares
-no `tools` — the common case (six of the seven shipped verbs).
+no `tools` — the common case (five of the seven shipped verbs; `pi` and `shell`
+are the two whose provisioning set is wider).
 
 ### Available tools
 
@@ -243,6 +244,15 @@ One tooling layer a catalog `[[tools]]` entry declares via `layer`: either
 directory). Resolved by `tool_layer::chain_root` → `tool_layer::materialize`.
 Distinct from **Tooling layer**. See
 [ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md).
+
+## Image-owned Pi package
+
+A pinned Pi extension the image installs as a real npm project root under
+`/opt/agent-vm/pi-packages/` and activates with an explicit wrapper
+`--extension` — as opposed to a bare `.js` file under
+`/opt/agent-vm/pi-extensions/`, or a package Pi manages itself in per-project
+guest state. Invisible to `pi list` / `pi update`. See
+[ADR-0023](docs/adr/0023-image-owned-pi-extension-packages.md).
 
 ## Base link
 

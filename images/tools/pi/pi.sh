@@ -7,9 +7,11 @@
 # credential warning is loaded for every normal Pi invocation, including a bare
 # `pi` typed into `agent-vm shell`.
 #
-# It makes two decisions and then execs:
+# It makes three decisions and then execs:
 #   1. the Pi env enforcement (PI_SKIP_VERSION_CHECK);
 #   2. subcommand dispatch (forwarded verbatim);
+#   3. whether the optional image-owned bridge extension is loadable and not
+#      opted out;
 # plus the mandatory extension below.
 #
 # agent-vm intervenes in Pi's behaviour only where agent-vm introduced the
@@ -19,7 +21,7 @@
 # policy. Pi's project-trust prompt appears on its own terms, and the answer a
 # user gives is remembered in the now-persistent ~/.pi/agent/trust.json. ADR-0012's
 # wrapper counted its one decision as the mandatory extension; counting the
-# extension the same way, this wrapper makes three.
+# extensions the same way, this wrapper makes four.
 set -eu
 
 # agent-vm owns the Pi binary: it is a root-owned image layer, `pi update self`
@@ -61,4 +63,26 @@ fi
 # project-trust prompt is Pi's own, and a user's answer now sticks because
 # ~/.pi/agent/trust.json is persistent), and no PI_TELEMETRY default (Pi's
 # telemetry policy is Pi's own).
+#
+# The image-owned pi-claude-bridge
+# (docs/adr/0023-image-owned-pi-extension-packages.md). Unlike
+# MANDATORY_EXTENSION, this one IS existence-checked. Pi treats an --extension
+# it cannot load as fatal before session startup (and a settings-listed or
+# discovered extension that fails is fatal too -- dist/main.js turns any
+# "Failed to load extension" diagnostic into exit 1), so an
+# AGENT_INSTALL_SOFT_FAIL build that deleted the tree would otherwise break
+# every `pi` invocation. An absent bridge must cost the bridge, not pi.
+#
+# AGENT_VM_PI_NO_BRIDGE is the recovery hatch: pinned third-party code runs
+# in-process in every non-subcommand invocation, so a bridge that throws -- or a
+# user-installed second copy (see the ADR's consequence) -- must be escapable
+# without knowing the internal entry point. The path override exists only so
+# script/test/pi-wrapper.sh can point at a fake, exactly like AGENT_VM_PI_ENTRY
+# above. It is not a protection.
+BRIDGE_EXTENSION="${AGENT_VM_PI_BRIDGE_EXTENSION:-/opt/agent-vm/pi-packages/node_modules/pi-claude-bridge/src/index.ts}"
+
+if [ -z "${AGENT_VM_PI_NO_BRIDGE:-}" ] && [ -r "${BRIDGE_EXTENSION}" ]; then
+    exec "${PI_ENTRY}" --extension "${MANDATORY_EXTENSION}" \
+                       --extension "${BRIDGE_EXTENSION}" "$@"
+fi
 exec "${PI_ENTRY}" --extension "${MANDATORY_EXTENSION}" "$@"

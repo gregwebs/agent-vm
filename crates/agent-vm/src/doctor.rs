@@ -1010,6 +1010,18 @@ mod tests {
             "{text}"
         );
 
+        // `pi` is the shipped catalog's one verb whose requirement and
+        // provisioning sets differ: `tools = ["claude"]` provisions anthropic
+        // without requiring it, so the row is the visible proof that naming a
+        // tool never inherits its hard bail. Rendered as `credentials=none;
+        // provisions=anthropic` (ADR-0017's `provisions=` column).
+        assert!(
+            text.contains(
+                "pi -> \"pi\"; args=0; layer=builtin:pi; credentials=none; provisions=anthropic; persist=0; source=built-in"
+            ),
+            "{text}"
+        );
+
         assert!(
             text.contains(
                 "shell -> \"bash\"; args=2; layer=none; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=0; source=built-in; interactive_shell=true; env=1"

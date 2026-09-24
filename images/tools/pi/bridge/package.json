@@ -1,0 +1,10 @@
+{
+  "name": "agent-vm-guest-pi-packages",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned Pi extension packages for the agent-vm guest image. images/tools/pi/Dockerfile installs this with `npm ci --ignore-scripts --omit=optional --legacy-peer-deps` into /opt/agent-vm/pi-packages, and the wrapper loads pi-claude-bridge from it with a second --extension. See images/tools/README.md for the bump recipe and why both npm flags are mandatory.",
+  "license": "MIT",
+  "dependencies": {
+    "pi-claude-bridge": "0.8.0"
+  }
+}

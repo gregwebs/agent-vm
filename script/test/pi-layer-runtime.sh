@@ -54,15 +54,19 @@ assert_warns() {
     grep -q '"method":"notify"' <<<"$text" || fail "${label}: no notify frame"
     grep -q 'agent-vm: signing in here' <<<"$text" || fail "${label}: warning text missing"
     # #96 landed the ~/.pi persistence mapping, so the persistence clause is
-    # back. #94/#91 still owe the host-precedence / host-import clauses, and
-    # the negative grep fails the day either is written back ahead of its
-    # implementation.
+    # back. The host-precedence / host-import clauses stay out: they would be
+    # about Pi's own `auth.json`. #94 (Anthropic through host Pi) was closed as
+    # superseded by #164 -- which imports a *different* credential (Claude
+    # Code's) into a different file -- but #91 (OpenAI/Codex credentials through
+    # host Pi) is still open, so the clause stays out until #91 lands it together
+    # with its behaviour. The negative grep is what fails the day this message
+    # claims behaviour it does not describe.
     grep -q 'any process in this guest can read' <<<"$text" || fail "${label}: warning scope missing"
     grep -q 'microVM' <<<"$text" || fail "${label}: boundary clause missing"
     grep -q 'persistent guest state' <<<"$text" \
         || fail "${label}: persistence clause missing (#96 restored it)"
     if grep -Eq 'takes precedence|imported from your host' <<<"$text"; then
-        fail "${label}: warning still claims unimplemented #94/#91 behaviour"
+        fail "${label}: warning claims host-import behaviour #91 has not implemented"
     fi
     grep -q '"notifyType":"warning"' <<<"$text" || fail "${label}: notifyType is not warning"
 }
@@ -123,8 +127,180 @@ capture "$layer" pi -e /opt/agent-vm/pi-extensions/definitely-absent.js --mode r
 [[ $CAP_STATUS -ne 0 ]] || fail "a missing user -e path must be fatal"
 [[ "$CAP_ERR" == *definitely-absent.js* ]] || fail "the error must name the missing path"
 
+# --- the image-owned bridge: registration, degradation, and its seed hook -----
+#
+# The build gate (verify-pi.sh) proves the bridge registers as root. This is the
+# case that actually exercises the interesting half of loading it: a NON-root uid
+# against the root-owned, read-only /opt tree, where jiti's transpile cache must
+# fall back to the OS temp dir. The build gate's root run cannot see that
+# difference, so this leg is not redundant. Keep the probe body in sync with the
+# copy in images/tools/pi/verify-pi.sh.
+out=$(docker run --rm --user 1000:1000 -e HOME=/tmp -e PI_TELEMETRY=0 "$layer" sh -ec '
+    mkdir -p /tmp/probe
+    cat > /tmp/probe/probe.js <<\PROBE
+export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    const p = ctx.modelRegistry.getProvider("claude-bridge");
+    const n = p && typeof p.getModels === "function" ? p.getModels().length
+            : p && Array.isArray(p.models) ? p.models.length : 0;
+    ctx.ui.notify(p ? `AGENT-VM-BRIDGE-REGISTERED models=${n}` : "AGENT-VM-BRIDGE-MISSING",
+                  "warning");
+  });
+}
+PROBE
+    pi -e /tmp/probe/probe.js --mode rpc --no-session --no-approve </dev/null
+')
+grep -q 'agent-vm: signing in here' <<<"$out" \
+    || fail "the non-root bridge run lost the mandatory warning: $out"
+case "$out" in
+    *AGENT-VM-BRIDGE-REGISTERED\ models=0*)
+        fail "as uid 1000 the bridge registered with an empty model catalog: $out" ;;
+    *AGENT-VM-BRIDGE-REGISTERED*)
+        : ;;
+    *)  fail "as uid 1000 the bridge did not register its provider: $out" ;;
+esac
+
+# The degradation contract: an AGENT_INSTALL_SOFT_FAIL build may ship without
+# the bridge tree (or a user may remove it). pi must still run and still warn --
+# the wrapper's existence check is what makes the bridge cost the bridge, not pi.
+capture "$layer" sh -c "rm -rf /opt/agent-vm/pi-packages; pi --mode rpc --no-session --no-approve </dev/null"
+[[ $CAP_STATUS -eq 0 ]] || fail "a removed pi-packages tree must not break pi, got $CAP_STATUS: $CAP_ERR"
+assert_warns "bridge-removed" "$CAP_OUT"
+
+# The seed hook points the bridge at the image's own claude. It is a plain shell
+# script with no Pi dependency, so these cases run it directly in the layer
+# container -- which is base + pi only, i.e. it has NO `claude`, exactly the
+# "custom catalog without the claude layer" case the hook has to survive.
+#
+# `seed_case` supplies the two things every case needs -- the state root a guest
+# would have, and a throwaway `claude` -- and runs `$1` under `set -e`. The
+# "no claude layer" case removes it again. `$1` reaches the container verbatim:
+# the host shell expands it once and does not re-parse its quotes or `$`.
+seed_case() {
+    docker run --rm "$layer" sh -ec "
+        mkdir -p /agent-vm-state/pi /opt/agent/.local/bin
+        touch /opt/agent/.local/bin/claude
+        chmod 0755 /opt/agent/.local/bin/claude
+        $1"
+}
+
+# Fresh state: exactly one key, and a trailing newline.
+out=$(seed_case '
+    /opt/agent-vm/seed.d/20-pi-claude-bridge
+    echo > /tmp/nl
+    tail -c 1 /agent-vm-state/pi/agent/claude-bridge.json | cmp -s - /tmp/nl
+    cat /agent-vm-state/pi/agent/claude-bridge.json
+')
+jq -e '.provider.pathToClaudeCodeExecutable == "/opt/agent/.local/bin/claude"' <<<"$out" >/dev/null \
+    || fail "the seed hook did not point the bridge at the image claude: $out"
+jq -e 'keys == ["provider"] and (.provider | keys) == ["pathToClaudeCodeExecutable"]' <<<"$out" >/dev/null \
+    || fail "the seed hook must merge exactly one key: $out"
+
+# An existing path is honoured, and an unrelated user key survives.
+out=$(seed_case '
+    mkdir -p /agent-vm-state/pi/agent
+    printf "%s" "{\"provider\":{\"pathToClaudeCodeExecutable\":\"/usr/bin/custom-claude\"},\"startupNoticeShown\":true}" \
+        > /agent-vm-state/pi/agent/claude-bridge.json
+    /opt/agent-vm/seed.d/20-pi-claude-bridge
+    cat /agent-vm-state/pi/agent/claude-bridge.json
+')
+jq -e '.provider.pathToClaudeCodeExecutable == "/usr/bin/custom-claude" and .startupNoticeShown == true' \
+    <<<"$out" >/dev/null \
+    || fail "the seed hook must not clobber a user's bridge settings: $out"
+
+out=$(seed_case '
+    mkdir -p /agent-vm-state/pi/agent
+    printf "%s" "{\"startupNoticeShown\":true}" > /agent-vm-state/pi/agent/claude-bridge.json
+    /opt/agent-vm/seed.d/20-pi-claude-bridge
+    cat /agent-vm-state/pi/agent/claude-bridge.json
+')
+jq -e '.startupNoticeShown == true and .provider.pathToClaudeCodeExecutable == "/opt/agent/.local/bin/claude"' \
+    <<<"$out" >/dev/null \
+    || fail "the seed hook must merge into, not replace, an existing file: $out"
+
+# An unparseable file is left byte-identical (never clobbered).
+out=$(seed_case '
+    mkdir -p /agent-vm-state/pi/agent
+    printf "%s" "{\"provider\": {" > /agent-vm-state/pi/agent/claude-bridge.json
+    cp /agent-vm-state/pi/agent/claude-bridge.json /tmp/before
+    /opt/agent-vm/seed.d/20-pi-claude-bridge
+    cmp -s /tmp/before /agent-vm-state/pi/agent/claude-bridge.json && printf "UNCHANGED\n"
+')
+[[ "$out" == "UNCHANGED" ]] \
+    || fail "an unparseable bridge config must be left byte-identical: $out"
+
+# A write that fails part-way must also leave the original byte-identical. The
+# hook writes a sibling temp file and renames it into place, so a truncated
+# write cannot clobber a parseable user config. `ulimit -f 1` caps a file at 512
+# bytes, forcing the write to fail mid-stream; before the atomic fix this left a
+# 512-byte CORRUPTED file behind (and still exited 0).
+out=$(seed_case '
+    mkdir -p /agent-vm-state/pi/agent
+    { printf "{\"startupNoticeShown\":true,\"padding\":\"";
+      head -c 10000 /dev/zero | tr "\0" x;
+      printf "\"}"; } > /agent-vm-state/pi/agent/claude-bridge.json
+    cp /agent-vm-state/pi/agent/claude-bridge.json /tmp/before
+    ( ulimit -f 1; /opt/agent-vm/seed.d/20-pi-claude-bridge )
+    cmp -s /tmp/before /agent-vm-state/pi/agent/claude-bridge.json && printf "INTACT\n"
+')
+[[ "$out" == "INTACT" ]] \
+    || fail "a failed seed-hook write must leave the config byte-identical: $out"
+
+# The atomic write swaps the inode (sibling temp file + rename), so the hook has
+# to carry the original file's mode across or a chmod'd config silently widens.
+# Every other case here writes a fresh 0644 file, so only a pre-chmod'd config
+# catches a rename that dropped the mode. Reproduction-only before this case
+# (code review §7 F2).
+out=$(seed_case '
+    mkdir -p /agent-vm-state/pi/agent
+    printf "%s" "{\"startupNoticeShown\":true}" > /agent-vm-state/pi/agent/claude-bridge.json
+    chmod 0600 /agent-vm-state/pi/agent/claude-bridge.json
+    /opt/agent-vm/seed.d/20-pi-claude-bridge
+    stat -c %a /agent-vm-state/pi/agent/claude-bridge.json
+')
+[[ "$out" == "600" ]] \
+    || fail "the seed hook's atomic write must preserve the config's mode (got '$out')"
+
+# The merge is per-key, not per-object: a sibling the user set inside `provider`
+# (the bridge's own `plan`) survives, and the seeded key is added. USAGE.md
+# documents exactly this asymmetry -- changing the value is honoured, removing
+# it is not, because the bridge cannot run without it.
+out=$(seed_case '
+    mkdir -p /agent-vm-state/pi/agent
+    printf "%s" "{\"provider\":{\"plan\":\"max\"},\"startupNoticeShown\":true}" \
+        > /agent-vm-state/pi/agent/claude-bridge.json
+    /opt/agent-vm/seed.d/20-pi-claude-bridge
+    cat /agent-vm-state/pi/agent/claude-bridge.json
+')
+jq -e '.provider.plan == "max"
+       and .provider.pathToClaudeCodeExecutable == "/opt/agent/.local/bin/claude"
+       and .startupNoticeShown == true' <<<"$out" >/dev/null \
+    || fail "the seed hook must merge one provider key, preserving its siblings: $out"
+
+# Without the claude layer the hook is a silent no-op (the custom-catalog case).
+out=$(seed_case '
+    rm -f /opt/agent/.local/bin/claude
+    /opt/agent-vm/seed.d/20-pi-claude-bridge
+    test ! -e /agent-vm-state/pi/agent/claude-bridge.json && printf "ABSENT\n"
+')
+[[ "$out" == "ABSENT" ]] \
+    || fail "with no claude layer the seed hook must write nothing at all: $out"
+
+# Running it twice is a no-op (it is a first-boot hook that may run every boot).
+out=$(seed_case '
+    /opt/agent-vm/seed.d/20-pi-claude-bridge
+    cp /agent-vm-state/pi/agent/claude-bridge.json /tmp/before
+    /opt/agent-vm/seed.d/20-pi-claude-bridge
+    cmp -s /tmp/before /agent-vm-state/pi/agent/claude-bridge.json && printf "IDEMPOTENT\n"
+')
+[[ "$out" == "IDEMPOTENT" ]] || fail "the seed hook must be idempotent: $out"
+
 # --- subcommand dispatch is positional: forwarded, never turned into a prompt -
 
+# `pi list` reports only Pi-managed packages, and the bridge is deliberately
+# NOT one: it is image-owned (an explicit wrapper --extension), so `pi list`,
+# `pi update` and `pi uninstall` do not see it and cannot move its pin. This
+# assertion is what records that -- see ADR-0023.
 capture "$layer" pi list
 [[ $CAP_STATUS -eq 0 ]] || fail "pi list exited $CAP_STATUS: $CAP_ERR"
 [[ "$CAP_OUT" = "No packages installed." ]] || fail "pi list output was '$CAP_OUT'"

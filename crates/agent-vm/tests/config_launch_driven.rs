@@ -599,13 +599,13 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         "CODEX_HOME must be emitted only for the tools that declare it ({tool})"
     );
 
-    // The credential secret set follows the verb's provisioning set. `pi` and
-    // `dsh` provision nothing, so the whole `secrets` object is absent for
-    // them; every other verb provisions at least one provider and must carry
+    // The credential secret set follows the verb's provisioning set. `dsh`
+    // provisions nothing, so the whole `secrets` object is absent for it; every
+    // other verb provisions at least one provider and must carry
     // it. Assert the presence explicitly rather than defaulting the array for
     // every verb (a structurally missing object would otherwise pass for an
     // empty-expectation verb such as `copilot`).
-    if matches!(tool, "pi" | "dsh") {
+    if matches!(tool, "dsh") {
         assert!(
             config["network"].get("secrets").is_none(),
             "{tool} provisions nothing, so it must not carry a `secrets` object"
@@ -625,13 +625,13 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         .map(|secret| secret["env_var"].as_str().unwrap())
         .collect();
     let expected_env_vars: &[&str] = match tool {
-        "pi" | "dsh" => &[],
+        "dsh" => &[],
         "codex" => &["MSB_AGENT_VM_OPENAI_UNUSED"],
         "opencode" => &[
             "MSB_AGENT_VM_OPENAI_UNUSED",
             "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
         ],
-        "claude" => &["MSB_AGENT_VM_ANTHROPIC_UNUSED"],
+        "pi" | "claude" => &["MSB_AGENT_VM_ANTHROPIC_UNUSED"],
         "copilot" => &["MSB_AGENT_VM_COPILOT_UNUSED"],
         "shell" => &[
             "MSB_AGENT_VM_ANTHROPIC_UNUSED",
@@ -677,12 +677,12 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
     // no-route launch is acceptable — the hook only fires on a matched route
     // (`InterceptConfig`'s docs), and the `--allowed-repo` push restriction
     // rides the GitHub-egress routes, which are unaffected.
-    // `pi` and `dsh` have no proxied route, so the whole `intercept` object is
-    // absent for them; every other verb keeps it (copilot keeps the
+    // `dsh` has no proxied route, so the whole `intercept` object is
+    // absent for it; every other verb keeps it (copilot keeps the
     // serde-default body).
     // Assert the object's presence explicitly rather than defaulting for every
     // verb, so a structurally missing object cannot pass.
-    if matches!(tool, "pi" | "dsh") {
+    if matches!(tool, "dsh") {
         assert!(
             config["network"].get("intercept").is_none(),
             "{tool} has no proxied route, so it must not carry an `intercept` object"
@@ -724,9 +724,9 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         })
         .collect();
     let expected_rules: &[(&str, &str)] = match tool {
-        "pi" | "dsh" => &[],
+        "dsh" => &[],
         "codex" | "opencode" => &[("auth.openai.com", "/oauth/token")],
-        "claude" => &[("platform.claude.com", "/v1/oauth/token")],
+        "pi" | "claude" => &[("platform.claude.com", "/v1/oauth/token")],
         "copilot" => &[],
         "shell" => &[
             ("platform.claude.com", "/v1/oauth/token"),
@@ -1189,6 +1189,151 @@ fn pi_launches_with_no_host_credentials_while_claude_still_bails() {
         !claude_stderr.contains(CONFIG_MARKER),
         "claude must not reach the debug-config seam without its credential: {claude_stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `pi -> claude` provisioning (the bridge's credential)
+// ---------------------------------------------------------------------------
+
+/// **V4.** A *real* credential a guest wrote into the project's persistent
+/// `~/.claude/.credentials.json` is untouched by a `pi` launch on a host with
+/// **no** Claude login. `pi` now provisions Anthropic, so capture is attempted
+/// and fails; the content-scoped clearer must then leave the real bytes alone.
+/// The unit half is `secrets::tests::the_stale_clearer_spares_a_guest_authored_credential`;
+/// this drives the same property through the real binary.
+#[test]
+fn a_pi_launch_spares_a_guest_authored_claude_credential() {
+    let harness = Harness::new();
+    // No host Claude login. Deleting the seed must be checked: a
+    // silently-failed removal would let this pass on a host that has one.
+    let host_credential = harness.home_root.join(".claude/.credentials.json");
+    std::fs::remove_file(&host_credential).unwrap();
+    assert!(
+        !host_credential.exists(),
+        "the host credential must be gone"
+    );
+
+    let state = probe_state_dir(&harness, "pi");
+    let guest_credential = r#"{"claudeAiOauth":{"accessToken":"sk-ant-guest-real-canary"}}"#;
+    write(&state.join("claude/.credentials.json"), guest_credential);
+
+    let out = harness.launch_default("pi");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "pi must still launch with no host credential: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("claude/.credentials.json")).unwrap(),
+        guest_credential,
+        "a guest-authored Claude credential must survive a pi launch"
+    );
+}
+
+/// **V7.** The one inherited side effect with real user impact and no direct
+/// test: when capture *succeeds* (the host has a Claude credential),
+/// `refresh_anthropic` **overwrites** a guest-authored
+/// `~/.claude/.credentials.json` with the placeholder -- so a user who logged
+/// Claude Code in inside the guest, then acquires a host credential, silently
+/// switches to the host one. `pi` now provisions Anthropic, so this is true of a
+/// `pi` launch too. (V4 above is the converse: capture *fails*, and the
+/// content-scoped clearer spares the same file.)
+#[test]
+fn a_pi_launch_overwrites_a_guest_authored_claude_credential_with_the_placeholder() {
+    let harness = Harness::new();
+    // The harness ships a usable host Claude credential; assert it, because a
+    // missing one would make capture fail and this test pass vacuously.
+    assert!(
+        harness.home_root.join(".claude/.credentials.json").exists(),
+        "this test needs the harness's host Claude credential"
+    );
+
+    let state = probe_state_dir(&harness, "pi");
+    let guest_credential = r#"{"claudeAiOauth":{"accessToken":"sk-ant-guest-real-canary"}}"#;
+    write(&state.join("claude/.credentials.json"), guest_credential);
+
+    let out = harness.launch_default("pi");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "pi must launch: {stderr}");
+
+    let after = std::fs::read_to_string(state.join("claude/.credentials.json")).unwrap();
+    assert!(
+        after.contains(GUEST_PLACEHOLDER),
+        "a pi launch must overwrite a guest-authored credential with the proxy placeholder: {after}"
+    );
+    assert!(
+        !after.contains("sk-ant-guest-real-canary"),
+        "the guest-authored credential must be gone after capture: {after}"
+    );
+}
+
+/// **V5.** The stale-placeholder ordering: before this change a `shell`-
+/// written Anthropic placeholder was deleted by the next launch that did not
+/// wire Anthropic (`clear_unwired_placeholders`), and `pi` was such a launch.
+/// `pi` now re-wires Anthropic, so the placeholder survives.
+#[test]
+fn a_shell_placeholder_survives_the_next_pi_launch() {
+    let harness = Harness::new();
+    let shell = harness.launch_default("shell");
+    let state = state_dir(&stderr_of(&shell));
+    let placeholder = std::fs::read(state.join("claude/.credentials.json"))
+        .expect("the shell launch writes the Anthropic placeholder");
+    assert!(
+        String::from_utf8_lossy(&placeholder).contains("msb-anthropic-placeholder"),
+        "expected the proxy placeholder, got: {placeholder:?}"
+    );
+
+    let pi = harness.launch_default("pi");
+    assert!(
+        stderr_of(&pi).contains(CONFIG_MARKER),
+        "pi must launch: {}",
+        stderr_of(&pi)
+    );
+    assert_eq!(
+        std::fs::read(state.join("claude/.credentials.json"))
+            .expect("a pi launch must not delete the placeholder it re-wires"),
+        placeholder,
+        "a pi launch must leave the shell-written placeholder in place"
+    );
+}
+
+/// **V6.** An inherited side effect of naming `claude`: `write_bypass_configs`
+/// follows the **provisioning set**, not capture, so a `pi` launch now writes
+/// the Anthropic onboarding/permission bypass files even on a host with no
+/// Claude login. The shared golden `snapshot()` deliberately does not list
+/// them (widening it would churn all seven goldens), so record the behaviour
+/// here rather than leaving it silent. They hold no credential bytes.
+#[test]
+fn a_pi_launch_writes_the_anthropic_bypass_configs_without_a_host_credential() {
+    let harness = Harness::new();
+    std::fs::remove_file(harness.home_root.join(".claude/.credentials.json")).unwrap();
+
+    let out = harness.launch_default("pi");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "pi must still launch: {stderr}"
+    );
+    let state = state_dir(&stderr);
+
+    let settings_text = std::fs::read_to_string(state.join("claude/settings.json"))
+        .expect("a pi launch writes claude/settings.json even without capture");
+    let settings: serde_json::Value = serde_json::from_str(&settings_text).unwrap();
+    assert_eq!(settings["hasCompletedOnboarding"], serde_json::json!(true));
+
+    let root_text = std::fs::read_to_string(state.join("claude.json"))
+        .expect("a pi launch writes claude.json even without capture");
+    let root: serde_json::Value = serde_json::from_str(&root_text).unwrap();
+    assert_eq!(root["hasCompletedOnboarding"], serde_json::json!(true));
+    assert_eq!(
+        root["bypassPermissionsModeAccepted"],
+        serde_json::json!(true)
+    );
+    // The bypass files carry onboarding/permission state only -- never a
+    // credential. The harness's host credential is the sentinel `fake`, so a
+    // leak would be visible here.
+    assert!(!settings_text.contains("fake"), "{settings_text}");
+    assert!(!root_text.contains("fake"), "{root_text}");
 }
 
 // ---------------------------------------------------------------------------
