@@ -16,7 +16,7 @@ Apple Silicon source builds assemble a self-contained local runtime bundle.
 ## Quick start
 
 ```bash
-npm install -g @wirenboard/agent-vm        # or: npx @wirenboard/agent-vm <cmd>
+cargo build
 
 agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
 
