@@ -7,16 +7,24 @@
 // file lives under a root-owned /opt).
 //
 // This is an advisory, not a boundary. The microVM is the boundary; a guest
-// that wants to can invoke the Pi entry point directly. See issue #94 for the
-// mixed-ownership rationale the text summarises.
+// that wants to can invoke the Pi entry point directly. The mixed-ownership
+// rationale the text summarises is [#93](https://github.com/gregwebs/agent-vm/issues/93);
+// the Pi-`auth.json` host-import half it reserves room for is
+// [#91](https://github.com/gregwebs/agent-vm/issues/91), still open.
 //
 // The text is scoped to what #95 and #96 deliver: signing in writes a
 // credential into THIS project's persistent guest state (the project-scoped
 // <state>/pi mapping from #96), any process in this guest can read it, and the
 // microVM is the boundary. It deliberately does NOT claim host-credential
-// precedence or host import -- #94/#91 still owe those clauses to this message
-// and to script/test/pi-layer-runtime.sh's assertions, which will restore them
-// together with their behaviour.
+// precedence or host import: those clauses would describe *Pi's own*
+// `~/.pi/agent/auth.json`, and #94 (Anthropic through host Pi) was closed as
+// superseded by #164 -- which imports a **different** credential (Claude Code's)
+// into a **different** file (`~/.claude/.credentials.json`) through the `pi ->
+// claude` provisioning edge. #91 (OpenAI and Codex credentials through host Pi)
+// is still open, so those clauses stay reserved for it. Since #164 a `pi`
+// launch does provision the Anthropic/Claude-Code credential, but this warning
+// is about Pi's own sign-in and says nothing about it; see
+// docs/adr/0023-image-owned-pi-extension-packages.md.
 //
 // #93 added a *separate*, host-side surface: `agent-vm` reports EXISTING
 // guest-managed Pi state on every launch, and `agent-vm doctor` shows the same

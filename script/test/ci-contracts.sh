@@ -76,7 +76,9 @@ syntax_check=(
     script/test/build-workflow.sh
     images/tools/pi/pi.sh
     images/tools/pi/install-pi.sh
+    images/tools/pi/install-pi-packages.sh
     images/tools/pi/verify-pi.sh
+    images/tools/pi/seed-claude-bridge-config.sh
     images/tools/dsh/verify-dsh.sh
     script/test/dsh-verify.sh
     script/test/pi-wrapper.sh
@@ -108,7 +110,9 @@ shellcheck_files=(
     script/test/build-workflow.sh
     images/tools/pi/pi.sh
     images/tools/pi/install-pi.sh
+    images/tools/pi/install-pi-packages.sh
     images/tools/pi/verify-pi.sh
+    images/tools/pi/seed-claude-bridge-config.sh
     images/tools/dsh/verify-dsh.sh
     script/test/dsh-verify.sh
     script/test/pi-wrapper.sh

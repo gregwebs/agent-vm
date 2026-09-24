@@ -29,7 +29,13 @@ if [ ! -x /opt/agent-vm/pi/node_modules/.bin/pi ]; then
     # a build ARG's value to the RUN, and the script inherits it.
     if [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then
         echo "  pi: MISSING (soft-fail mode); removing the wrapper so nothing claims to be pi"
-        rm -f /usr/local/bin/pi; rm -rf /opt/agent-vm/pi /opt/agent-vm/pi-extensions; exit 0
+        rm -f /usr/local/bin/pi
+        rm -rf /opt/agent-vm/pi /opt/agent-vm/pi-extensions /opt/agent-vm/pi-packages
+        # The bridge tree goes above, so its seed hook must go with it: left
+        # behind it would still write a claude-bridge.json on every launch,
+        # pointing at an extension this image does not ship.
+        rm -f /opt/agent-vm/seed.d/20-pi-claude-bridge
+        exit 0
     fi
     echo "  pi: MISSING -- hard sanity failure" >&2; exit 1
 fi
@@ -68,21 +74,77 @@ if ! timeout 60 /usr/local/bin/pi --mode rpc --no-session --no-approve </dev/nul
 fi
 echo "  pi: mandatory extension loads and warns"
 
+# The image-owned pi-claude-bridge extension (ADR-0023). Its absence is legal in
+# exactly one case -- an AGENT_INSTALL_SOFT_FAIL build whose `npm ci` failed and
+# deleted the tree -- and in that case the wrapper's own existence check skips
+# it, so the image degrades to "no bridge" rather than "no pi".
+BRIDGE=/opt/agent-vm/pi-packages/node_modules/pi-claude-bridge/src/index.ts
+if [ ! -r "$BRIDGE" ]; then
+    if [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then
+        echo "  pi: pi-claude-bridge MISSING (soft-fail mode); the wrapper will skip it"
+        bridge_shipped=
+    else
+        echo "  pi: pi-claude-bridge is missing -- hard sanity failure" >&2; exit 1
+    fi
+else
+    bridge_shipped=1
+    # A --extension Pi cannot load is fatal before session startup, so a run that
+    # exits 0 already proves every top-level import resolved (the Agent SDK, the
+    # MCP SDK, cc-session-io, change-case, and the loader-aliased typebox / pi
+    # peers). The probe adds the half that matters: the provider actually
+    # REGISTERED, and the model catalog is non-empty (the bridge registers even
+    # after printing "no models available from pi-ai's anthropic catalog",
+    # src/index.ts:2045-2048). Keep the probe body in sync with the non-root copy
+    # in script/test/pi-layer-runtime.sh.
+    cat > /tmp/pi-gate/probe.js <<'PROBE'
+export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    const p = ctx.modelRegistry.getProvider("claude-bridge");
+    // `Provider.getModels()` is the typed surface (pi-ai's models.d.ts); the
+    // raw `models` array the bridge passes to registerProvider may also be
+    // present, so accept either and fail closed on neither.
+    const n = p && typeof p.getModels === "function" ? p.getModels().length
+            : p && Array.isArray(p.models) ? p.models.length : 0;
+    ctx.ui.notify(p ? `AGENT-VM-BRIDGE-REGISTERED models=${n}` : "AGENT-VM-BRIDGE-MISSING",
+                  "warning");
+  });
+}
+PROBE
+    out=$(timeout 120 /usr/local/bin/pi -e /tmp/pi-gate/probe.js \
+              --mode rpc --no-session --no-approve </dev/null 2>/dev/null || true)
+    case "$out" in
+        *AGENT-VM-BRIDGE-REGISTERED\ models=0*)
+            echo "  pi: pi-claude-bridge registered but its model catalog is empty" >&2; exit 1 ;;
+        *AGENT-VM-BRIDGE-REGISTERED*)
+            echo "  pi: pi-claude-bridge registered the claude-bridge provider" ;;
+        *)  echo "  pi: pi-claude-bridge did not register its provider" >&2; exit 1 ;;
+    esac
+fi
+
 # Leavings from the gate runs above (Pi's own caches) are removed so they cannot
 # be baked into the shipped image.
 rm -rf /tmp/pi-gate /tmp/jiti /tmp/node-compile-cache
 
-# C7: every image as a whole must be used by an arbitrary uid, so both trees
-# exist, every file is world-readable, every directory is world-searchable, and
+# C7: every image as a whole must be used by an arbitrary uid, so each tree
+# exists, every file is world-readable, every directory is world-searchable, and
 # both entry points are a+rx.
-for c7dir in /opt/agent-vm/pi /opt/agent-vm/pi-extensions; do
-    [ -d "$c7dir" ] || { echo "  pi: $c7dir is missing (C7)" >&2; exit 1; }
-done
-if [ -n "$(find /opt/agent-vm/pi /opt/agent-vm/pi-extensions ! -perm -o+r -print -quit)" ]; then
-    echo "  pi: something under /opt/agent-vm is not world-readable (C7)" >&2; exit 1
-fi
-if [ -n "$(find /opt/agent-vm/pi /opt/agent-vm/pi-extensions -type d ! -perm -o+x -print -quit)" ]; then
-    echo "  pi: a directory under /opt/agent-vm is not world-searchable (C7)" >&2; exit 1
+assert_world_readable() {
+    [ -d "$1" ] || { echo "  pi: $1 is missing (C7)" >&2; exit 1; }
+    if [ -n "$(find "$1" ! -perm -o+r -print -quit)" ]; then
+        echo "  pi: something under $1 is not world-readable (C7)" >&2; exit 1
+    fi
+    if [ -n "$(find "$1" -type d ! -perm -o+x -print -quit)" ]; then
+        echo "  pi: a directory under $1 is not world-searchable (C7)" >&2; exit 1
+    fi
+}
+assert_world_readable /opt/agent-vm/pi
+assert_world_readable /opt/agent-vm/pi-extensions
+# The bridge tree is asserted only when it actually shipped: a permitted
+# soft-fail build deleted it, and a missing directory must not turn that
+# permitted outcome into a hard failure. It is deliberately NOT in the cleanup
+# list above -- that removes scratch, not shipped trees.
+if [ -n "${bridge_shipped:-}" ]; then
+    assert_world_readable /opt/agent-vm/pi-packages
 fi
 for executable in /usr/local/bin/pi /opt/agent-vm/pi/node_modules/.bin/pi; do
     if [ ! -r "$executable" ] || [ ! -x "$executable" ]; then

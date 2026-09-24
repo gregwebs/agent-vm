@@ -168,6 +168,62 @@ directory, so the unauthenticated sibling fetch cannot create one.) Two
 `the_build_verified_sibling_set_is_exactly_the_five_nested_earendil_packages`)
 fail loudly if a regenerated lock drops the hashes or the nested layout moves.
 
+### The bridge packages: `images/tools/pi/bridge/`
+
+The `pi` layer also ships **`pi-claude-bridge`**, a pinned Pi extension that
+registers a `claude-bridge/*` provider and answers requests by spawning Claude
+Code through the Claude Agent SDK. See
+[ADR-0023](../../docs/adr/0023-image-owned-pi-extension-packages.md). It is a
+**separate** npm project from the Pi install above — installed into
+`/opt/agent-vm/pi-packages` — so bumping either pin does not re-emit the other's
+tree. It is activated by the wrapper's second `--extension`, not by
+`pi install`, because every one of Pi's own activation mechanisms (`packages`,
+`extensions`, auto-discovery, `PI_CODING_AGENT_DIR`) writes into `$HOME/.pi`,
+which in the guest is per-project state rather than the image.
+
+**Bumping the pin** is the same lockfile flow, with two flags that are *not*
+optional:
+
+```bash
+cd images/tools/pi/bridge
+npm install --ignore-scripts --package-lock-only --no-audit --no-fund --legacy-peer-deps
+```
+
+- **`--legacy-peer-deps` — on both the lock generation and the layer's
+  `npm ci`.** The bridge declares `@earendil-works/pi-*` and `typebox` as peer
+  dependencies, but Pi's extension loader aliases those imports to its own
+  copies (`dist/core/extensions/loader.js`), so they must not be installed.
+  Without the flag npm solves those ranges and drags in a **second,
+  version-skewed `@earendil-works/pi-coding-agent`** beside the image's own Pi
+  (plus the AWS SDK, `@google/genai`, `openai`, … — 338 lock entries instead of
+  107), and the generated lock then loses npm's `integrity` on the five
+  `@earendil-works` siblings Pi's published shrinkwrap covers. The `npm ci`
+  refuses a lock generated without the flag (`EUSAGE … can only install packages
+  when your package.json and package-lock.json are in sync`), which is how that
+  mistake announces itself. This is the same policy Pi's own installer uses, for
+  the same reason.
+- **`--omit=optional` — on the layer's `npm ci`.**
+  `@anthropic-ai/claude-agent-sdk` has no `dependencies`; it has eight
+  `optionalDependencies`, one per platform, each carrying a whole native Claude
+  Code binary (ADR-0023 sizes the guest-platform one). The image already ships
+  `claude` at `/opt/agent/.local/bin/claude`, so the platform package is dropped
+  and the layer's `seed.d/20-pi-claude-bridge` first-boot hook writes
+  `provider.pathToClaudeCodeExecutable` into `~/.pi/agent/claude-bridge.json`.
+  Without that hook every bridge turn fails at SDK spawn with `Native CLI binary
+  … not found`.
+
+Unlike the `pi` lock, **no hand-refilled hashes are needed here**: this tree has
+no shrinkwrap anywhere in its chain, so `npm ci` authenticates every tarball
+itself and `install-pi-packages.sh` needs no bespoke verifier. Four `cargo test`
+guards keep that true — every entry carries `integrity`, the pin is exact and
+agrees with the manifest, the lock installs none of the packages Pi's loader
+aliases, and the layer's `npm ci` still carries `--omit=optional` and
+`--legacy-peer-deps`.
+
+`--ignore-scripts` matches `pi` and `dsh`: no upstream lifecycle script runs
+during the build. The install adds ~31 MiB to the layer (not a whole second
+Claude Code — see ADR-0023 for the platform-package size).
+
 ## The `dsh` layer: persistence and credentials
 
 The tool definition (`crates/agent-vm/src/default-tools.toml`) gives `dsh` the
@@ -195,5 +251,8 @@ Like `pi`, `dsh` declares **no** `credentials`: it is a multi-provider harness
 that must start with none configured. Community OAuth/subscription plugins are
 deliberately **not** baked in; `dsh plugin` is available in-guest. See
 [USAGE.md](../../USAGE.md#credential-free-agents-pi-dsh) and
-[ADR-0022](../../docs/adr/0022-dsh-tool-layer.md).
+[ADR-0022](../../docs/adr/0022-dsh-tool-layer.md). The `pi` layer's pinned
+`pi-claude-bridge` is a deliberate exception to that rule, justified narrowly in
+[ADR-0023](../../docs/adr/0023-image-owned-pi-extension-packages.md): it brings
+no new host-credential reader, and it is pinned and version-reviewed.
 

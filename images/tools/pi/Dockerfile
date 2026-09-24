@@ -31,6 +31,33 @@ COPY package.json package-lock.json /opt/agent-vm/pi/
 RUN --mount=type=bind,source=install-pi.sh,target=/tmp/install-pi.sh,ro \
     sh /tmp/install-pi.sh
 
+# Image-owned Pi extension packages (pi-claude-bridge). See
+# docs/adr/0023-image-owned-pi-extension-packages.md.
+#
+# A separate npm project from /opt/agent-vm/pi so a bridge pin bump does not
+# re-emit the ~150 MiB Pi install above it.
+#
+# `--legacy-peer-deps` on BOTH the committed lock and this `npm ci` (npm refuses
+# a legacy-peer lock without it): modern npm otherwise auto-installs the bridge's
+# @earendil-works peers, shipping a SECOND, version-skewed Pi inside this tree.
+# `--omit=optional` drops the Claude Agent SDK's platform packages, each of which
+# carries a whole second Claude Code binary -- the guest-platform size is in
+# docs/adr/0023-image-owned-pi-extension-packages.md. The image already ships one
+# at /opt/agent/.local/bin/claude and seed.d/20-pi-claude-bridge points the bridge
+# at it. `--ignore-scripts`: no upstream postinstall runs during the build.
+COPY bridge/package.json bridge/package-lock.json /opt/agent-vm/pi-packages/
+RUN --mount=type=bind,source=install-pi-packages.sh,target=/tmp/install-pi-packages.sh,ro \
+    sh /tmp/install-pi-packages.sh
+
+# First-boot seed hook (run.rs's RUN_IMAGE_SEED_HOOKS runs every executable
+# under /opt/agent-vm/seed.d/) pointing the bridge at the image's own `claude`.
+# The execute bit comes from `--chmod=0755`, NOT a `RUN chmod`: the embedded
+# copy of images/tools/ materialises every file mode 0644 (src/tool_layer.rs),
+# so a RUN chmod would make a locally composed layer hash differently from one
+# built from a git checkout of the same bytes. Same reason as pi.sh below and
+# the claude layer's seed hook.
+COPY --chmod=0755 seed-claude-bridge-config.sh /opt/agent-vm/seed.d/20-pi-claude-bridge
+
 # Image-owned extensions. The directory is the seam: a later customization layer
 # may add files here, and the wrapper keeps loading the mandatory one.
 COPY extensions/guest-credential-warning.js /opt/agent-vm/pi-extensions/

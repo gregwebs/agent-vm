@@ -4,8 +4,9 @@
 # No Docker and no real Pi: a fake entry point on AGENT_VM_PI_ENTRY records its
 # argv (one <token> per argument), its environment, and its stdin, so the
 # wrapper's decisions -- the PI_SKIP_VERSION_CHECK enforcement, subcommand
-# dispatch, and "inject the mandatory --extension on the non-subcommand path" --
-# are pinned without a 150 MiB install or a microVM.
+# dispatch, "inject the mandatory --extension on the non-subcommand path", and
+# "inject the image-owned bridge --extension only when it exists and is not
+# opted out" -- are pinned without a 150 MiB install or a microVM.
 #
 # agent-vm only intervenes where agent-vm introduced the condition, so the
 # wrapper injects NO --approve default and NO PI_TELEMETRY default: those, and
@@ -27,10 +28,15 @@ fail() {
 
 CASE=""
 CASE_EXTRA_ENV=""
+CASE_BRIDGE_EXTENSION=""
 
 new_case() {
     CASE="$TEST_ROOT/$1"
     CASE_EXTRA_ENV=""
+    # Default fixture: the bridge extension does not exist, so the wrapper must
+    # skip it. The bridge cases below plant a readable file via
+    # CASE_BRIDGE_EXTENSION and repoint this.
+    CASE_BRIDGE_EXTENSION="$CASE/no-such-bridge.ts"
     mkdir -p "$CASE"
     : >"$CASE/log"
     : >"$CASE/stdin"
@@ -60,6 +66,7 @@ run_wrapper() {
     local -a env_args=(
         "PATH=/usr/bin:/bin"
         "AGENT_VM_PI_ENTRY=$CASE/fake-pi"
+        "AGENT_VM_PI_BRIDGE_EXTENSION=$CASE_BRIDGE_EXTENSION"
         "FAKE_LOG=$CASE/log"
         "CASE_STDIN=$CASE/stdin"
         "CASE_ENV=$CASE/env"
@@ -148,6 +155,63 @@ assert_argv_is --extension "$MANDATORY_EXTENSION" listen
 new_case lookalike-auth-x
 run_wrapper auth-x
 assert_argv_is --extension "$MANDATORY_EXTENSION" auth-x
+
+# --- the image-owned bridge extension: existence-checked, and opt-out --------
+#
+# The mandatory extension is injected unconditionally (Pi fails closed on it);
+# the bridge is a convenience, so an absent one must cost the bridge, not pi.
+# Both states are explicit fixtures rather than relying on the host's
+# /opt/agent-vm/pi-packages being absent.
+
+new_case bridge-absent
+run_wrapper
+[[ -e "$CASE_BRIDGE_EXTENSION" ]] && fail "the bridge-absent fixture must not exist"
+assert_argv_is --extension "$MANDATORY_EXTENSION"
+
+new_case bridge-present
+CASE_BRIDGE_EXTENSION="$CASE/fake-bridge.ts"
+: >"$CASE_BRIDGE_EXTENSION"
+run_wrapper
+# Order matters: the mandatory extension first, then the bridge.
+assert_argv_is --extension "$MANDATORY_EXTENSION" --extension "$CASE_BRIDGE_EXTENSION"
+
+new_case bridge-present-prompt
+CASE_BRIDGE_EXTENSION="$CASE/fake-bridge.ts"
+: >"$CASE_BRIDGE_EXTENSION"
+run_wrapper "fix the tests"
+assert_argv_is --extension "$MANDATORY_EXTENSION" --extension "$CASE_BRIDGE_EXTENSION" "fix the tests"
+
+# A subcommand is forwarded verbatim: the bridge flag must NOT be injected on
+# that path either (it would displace argv[1]).
+new_case bridge-present-subcommand
+CASE_BRIDGE_EXTENSION="$CASE/fake-bridge.ts"
+: >"$CASE_BRIDGE_EXTENSION"
+run_wrapper install foo
+assert_argv_is install foo
+
+# The opt-out (ADR-0023): a bridge that throws, or a user-installed second copy,
+# must be escapable without knowing the internal entry point.
+new_case bridge-opt-out
+CASE_BRIDGE_EXTENSION="$CASE/fake-bridge.ts"
+: >"$CASE_BRIDGE_EXTENSION"
+CASE_EXTRA_ENV="AGENT_VM_PI_NO_BRIDGE=1"
+run_wrapper
+assert_argv_is --extension "$MANDATORY_EXTENSION"
+
+# Any non-empty value opts out; an empty one is not an opt-out.
+new_case bridge-opt-out-empty-is-not-an-opt-out
+CASE_BRIDGE_EXTENSION="$CASE/fake-bridge.ts"
+: >"$CASE_BRIDGE_EXTENSION"
+CASE_EXTRA_ENV="AGENT_VM_PI_NO_BRIDGE="
+run_wrapper
+assert_argv_is --extension "$MANDATORY_EXTENSION" --extension "$CASE_BRIDGE_EXTENSION"
+
+# A subcommand still bypasses the opt-out entirely (its own forward-verbatim
+# path runs first, so neither extension flag is added).
+new_case bridge-opt-out-subcommand
+CASE_EXTRA_ENV="AGENT_VM_PI_NO_BRIDGE=1"
+run_wrapper list
+assert_argv_is list
 
 # --- argv fidelity: an unquoted `$@` would break every one of these ----------
 
@@ -251,6 +315,8 @@ grep -Fq 'AGENT_VM_PI_ENTRY:-/opt/agent-vm/pi/node_modules/.bin/pi}"' "$WRAPPER"
     || fail "production default entry point is missing"
 grep -Fq "MANDATORY_EXTENSION=$MANDATORY_EXTENSION" "$WRAPPER" \
     || fail "production mandatory-extension path is missing"
+grep -Fq 'AGENT_VM_PI_BRIDGE_EXTENSION:-/opt/agent-vm/pi-packages/node_modules/pi-claude-bridge/src/index.ts}"' "$WRAPPER" \
+    || fail "production bridge-extension path is missing"
 grep -Fq 'PI_SUBCOMMANDS="auth config install list remove uninstall update"' "$WRAPPER" \
     || fail "the subcommand allowlist literal changed (the image build checks drift against pi --help)"
 # The wrapper must not reintroduce a trust or telemetry default. Match the code
