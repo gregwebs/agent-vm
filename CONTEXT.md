@@ -78,6 +78,35 @@ installed `msb` uses is a different thing agent-vm deliberately does not point
 at (except the opt-in cache share); and when schema-scoping matters — the
 schema home is the concept, the env var just points at it.
 
+## Credential shielding
+
+The explicitly authorized use of a credential on behalf of an untrusted guest
+without exposing the credential's real value to that guest. This is not general
+secret detection or control of account usage; usage limits and detection belong
+to the remote credential issuer.
+
+_Avoid_: "credential masking", which can be confused with output redaction or
+file masking.
+
+## Credential source
+
+A host-side location from which a credential value is obtained, such as a named
+environment variable or a system keychain item. Its identity is distinct from
+the secret value, which can rotate without changing the source.
+
+## Credential authorization
+
+A user's permission to use a credential source at specified HTTPS destinations
+and in specified request headers. It is host-wide, not project-scoped;
+a project may request its use but cannot confer or broaden that permission.
+
+_Avoid_: "grant", when referring to this permission.
+
+## Credential request
+
+A tool or project's declaration that it needs an authorized credential and where
+its guest-facing placeholder should appear. A request is not authorization.
+
 ## Credential provider
 
 A **compiled-in credential subsystem** a launched tool can depend on. The four
