@@ -28,6 +28,7 @@ const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "msb",
     "clipboard",
     "doctor",
+    "secret",
     "_intercept-hook",
     "help",
 ];

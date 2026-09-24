@@ -82,6 +82,20 @@ indicatif = "0.18"
 console = "0.16"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 libc = "0.2"
+# Self-pipe + signal registry for the hidden `secret set` reader (#160): a raw
+# read clears ISIG, so a typed Ctrl-C is a byte the reader handles itself, while
+# an externally delivered SIGINT/SIGTERM/SIGHUP/SIGQUIT needs a handler that can
+# wake the reader so it restores the terminal before the process exits. Chosen
+# over a hand-rolled `sigaction` because it provides the canonical self-pipe and
+# a registry that chains any prior handler; note that unregistering an action
+# does NOT restore the previous/default disposition (signal-hook-registry's own
+# `unregister` warning), so `SignalGuard` additionally saves each signal's prior
+# `sigaction` and restores it on drop (review finding R1). Only `flag`,
+# `low_level::pipe` and `low_level::unregister` are used, so
+# `default-features = false` asks for nothing else; the crate is already in the
+# graph (crossterm uses it, with its default features), so this only adds the
+# dependency edge and compiles nothing new. See `secret.rs`'s `SignalGuard`.
+signal-hook = { version = "0.3", default-features = false }
 ipnetwork = "0.21"
 rustix = { version = "1.1", features = ["fs"] }
 getrandom = "0.4"
@@ -101,6 +115,22 @@ tempfile = "3"
 # tool_layer::tests::embedded_sources_match_the_on_disk_tree catches the
 # added-file drift. See src/tool_layer.rs.
 include_dir = "0.7"
+
+# The host OS credential store behind `agent-vm secret` (#160). The vendored
+# SDK already depends on this exact version with these exact per-target
+# features (vendor/microsandbox/sdk/rust/Cargo.toml), so declaring it here only
+# names a crate already in the graph -- `cargo tree -p agent-vm -i keyring`
+# must keep resolving one 3.6.3 and add no `[[package]]` entry. A direct
+# declaration is needed because the SDK re-exports nothing: `secret_store.rs`
+# uses `Entry`, `Error` and the delete/probe methods, whose semantics the
+# SDK's registry-auth use does not certify. `linux-native-sync-persistent`
+# resolves to Secret Service (keyring's keyutils cache is not in the default
+# path), which is what the spec names on Linux.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", features = ["crypto-rust", "linux-native-sync-persistent"] }
 
 [dev-dependencies]
 # Property tests for `mount::lexical_link_path` (pure string surgery over

@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agent-vm"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -31,6 +31,7 @@ dependencies = [
  "include_dir",
  "indicatif",
  "ipnetwork",
+ "keyring",
  "libc",
  "microsandbox",
  "microsandbox-image",
@@ -45,6 +46,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "signal-hook",
  "sqlx 0.8.6",
  "tempfile",
  "tokio",
@@ -3381,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "msb-krun-compat-evidence"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "anyhow",
  "clap",

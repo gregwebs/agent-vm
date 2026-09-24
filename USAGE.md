@@ -42,6 +42,10 @@ doctor                              report host credentials + microsandbox state
                                     (--reset-msb-db recovers a forward-migrated db)
 msb <args...>                       forward to the bundled msb (e.g. msb ls, msb status)
 clipboard {get,put} [--sys]         exchange a string with the project sandbox
+secret set SERVICE                  store or replace one of your own values in the
+                                    host system keychain (hidden prompt, or pipe it on stdin)
+secret ls                           list the service names agent-vm has stored, and their status
+secret rm SERVICE                   remove one stored value
 ```
 
 The launch verbs are generated from your tool configuration (see *Tool
@@ -956,8 +960,82 @@ credential. Three consequences are worth knowing:
   definition *without* `claude` and the launch fails earlier and more clearly, on
   a dangling-`tools` diagnostic naming your file.
 
-## Project hook
+### Storing your own secret values
 
+`agent-vm secret` manages values **you** give agent-vm directly, for a
+credential no agent CLI keeps a file for. They live in the host OS credential
+store (macOS Keychain, Linux Secret Service) under agent-vm's own namespace,
+`dev.agent-vm.credentials` — separate from Docker's `com.docker.sandboxes` and
+from microsandbox's own registry entry. agent-vm never reads or writes those.
+
+```sh
+agent-vm secret set anthropic                       # hidden prompt
+printf '%s' "$ANTHROPIC_API_KEY" | agent-vm secret set anthropic
+agent-vm secret ls
+agent-vm secret rm anthropic
+```
+
+- **The value is never an argument.** `agent-vm secret set SERVICE VALUE` and
+  `--token VALUE` are **refused**, not warned about: the shell history and the
+  process argument list would both expose the value. Pipe it on stdin, or run
+  the command with no value for a hidden interactive prompt. Note that refusing
+  the value stops agent-vm from storing or printing it; it cannot un-type it —
+  if you typed it on the command line, the shell has already recorded it in its
+  history, so treat it as exposed and rotate it.
+- **A name is metadata, not a secret.** Names are shown by design (`secret ls`
+  lists them, `set`/`rm` echo the name on success), and the accepted alphabet is
+  a superset of the characters real API keys use. If you accidentally type a key
+  in the `SERVICE` position, agent-vm will *accept* it as a name and print it —
+  argv, shell history and listings are all on the record. A key typed on the
+  command line should be treated as exposed. (agent-vm does not try to guess
+  which names “look like” credentials: that would reject valid names, so the
+  responsibility stays with the operator.)
+- **Names are case-folded to ASCII lowercase.** A name is 1-64 characters from
+  `[a-zA-Z0-9._-]`, starting with a letter or digit; letters are folded, so
+  `Anthropic`, `ANTHROPIC` and `anthropic` are the **same** credential (keychain
+  accounts are case-sensitive, so folding is what stops three spellings becoming
+  three invisible entries). The folded name is what `secret ls` prints and what
+  the keychain stores, so type a name here and not a key.
+- **The accepted value shape is narrow, on purpose.** Printable ASCII
+  (`0x20`-`0x7E`), 1-4096 bytes, no leading or trailing space. A multi-line,
+  non-ASCII or NUL-containing credential is rejected at storage time rather than
+  stored and rejected later.
+- `ls` prints **names and storage status only** — never a value, not even part
+  of one. `stored` means the keychain answered; `missing` means it answered and
+  found nothing; `unavailable: …` means it could not be asked (locked, denied,
+  or no Secret Service running).
+- **An empty listing proves nothing about the keychain.** It exits zero and
+  means only "no names are tracked"; no probe ran. A listing with any
+  `unavailable:` row exits non-zero, so a script is never told everything is
+  fine when agent-vm could not see the store.
+- **Storing a value does not authorize its use.** `secret` is the storage
+  lifecycle only; nothing reads a stored value back, and nothing hands one to a
+  guest. Authorization, and any injection into a request, is separate host
+  configuration. See the
+  [credential shielding specification](docs/specs/credential-shielding.md).
+- **No fallback, ever.** If the platform credential store is unavailable, the
+  operation fails with a classified message. agent-vm never writes a value to a
+  plaintext file, and never degrades to an environment variable.
+
+agent-vm keeps a **names-only** record of what it has stored at
+`~/.config/agent-vm/secret-inventory.json` (mode 0600), beside a
+`.secret-inventory.lock` (0600). The file lists service names and nothing else;
+its own `note` field says so. It is not an authorization list. Deleting it
+loses only the *listing*: the stored values are untouched and
+`agent-vm secret rm NAME` still works by name. If you hand-edit it, a
+malformed file or an invalid name is a hard error on every verb, naming the
+file and telling you to delete it to reset the listing — agent-vm never
+silently resets a file you wrote.
+
+On macOS the keychain ACL is bound to the calling binary's code-signing
+identity, so a locally rebuilt unsigned `agent-vm` may be asked
+*"agent-vm wants to use your confidential information…"*, and `secret ls`
+probes once per listed name. That is possible and identity-dependent, not
+guaranteed — and if you deny the prompt, the row reads `unavailable: …` rather
+than crashing. This is also why overriding `$HOME` (and so the login keychain's
+path) makes every verb report the store as unavailable.
+
+## Project hook
 If the project root contains an executable `.agent-vm.runtime.sh`,
 the launcher sources it inside the guest before exec'ing the agent.
 Use for `npm install`, env exports, dev-server startup. Non-zero

@@ -92,20 +92,30 @@ use crate::credential_provider::{CredentialProvider, ProviderSet};
 /// file's limit.
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
-const USER_CONFIG_RELATIVE: &str = ".config/agent-vm/config.toml";
+const USER_CONFIG_RELATIVE: &str = concat!(".config/agent-vm", "/config.toml");
 const PROJECT_CONFIG_RELATIVE: &str = ".agent-vm/config.toml";
+
+/// The user-scoped agent-vm config directory under `$HOME` — the directory
+/// `USER_CONFIG_RELATIVE` sits in, and the one [`crate::secret_store`] and
+/// #161's `credentials.yaml` share. Deliberately **not** `XDG_CONFIG_HOME`
+/// overridable: host credential state is host-wide, so it must not move with a
+/// per-session environment variable.
+pub(crate) const USER_CONFIG_DIR_RELATIVE: &str = ".config/agent-vm";
 
 /// Subcommands `agent-vm` reserves for itself. A tool named after one would be
 /// unreachable through the CLI, so it is rejected at validation. The launch
 /// verbs **are** the tools (a tool named `claude` is the normal case), so the
 /// reserved set is exactly the fixed built-ins plus clap's synthesized
-/// `help`. `cli::BUILTIN_SUBCOMMANDS` must stay a superset of this list.
+/// `help`, and `cli::BUILTIN_SUBCOMMANDS` is asserted equal to it as a set
+/// (`cli.rs`'s `every_builtin_subcommand_is_reserved_from_tool_names`), so a
+/// name cannot be reserved-but-unreachable or reachable-but-shadowable.
 pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     "setup",
     "pull",
     "msb",
     "clipboard",
     "doctor",
+    "secret",
     "_intercept-hook",
     // clap synthesizes a `help` subcommand unconditionally. A second one
     // panics in debug builds and silently shadows clap's in release.
@@ -942,24 +952,36 @@ fn default_tools() -> Result<Vec<Tool>> {
 }
 
 fn discover_user_path() -> Result<Option<PathBuf>> {
+    let home = match host_home_dir() {
+        Ok(Some(home)) => home,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            return Err(anyhow!(
+                "config: {error}; cannot locate {}",
+                quoted_str(USER_CONFIG_RELATIVE)
+            ));
+        }
+    };
+    Ok(Some(home.join(USER_CONFIG_RELATIVE)))
+}
+
+/// `$HOME` as an absolute, non-empty path, or `None` when it is unset. The
+/// single statement of agent-vm's `$HOME` discipline — a *set but empty* or
+/// *relative* `$HOME` is a hard error rather than a silently wrong location —
+/// shared by the user config path here and [`crate::secret_store`]'s inventory
+/// path. Callers add their own context naming what could not be located.
+pub(crate) fn host_home_dir() -> Result<Option<PathBuf>> {
     let Some(home) = std::env::var_os("HOME") else {
         return Ok(None);
     };
     let home = PathBuf::from(home);
     if home.as_os_str().is_empty() {
-        return Err(anyhow!(
-            "config: $HOME is set but empty; cannot locate {}",
-            quoted_str(USER_CONFIG_RELATIVE)
-        ));
+        return Err(anyhow!("$HOME is set but empty"));
     }
     if !home.is_absolute() {
-        return Err(anyhow!(
-            "config: $HOME {} is not absolute; cannot locate {}",
-            quoted_path(&home),
-            quoted_str(USER_CONFIG_RELATIVE)
-        ));
+        return Err(anyhow!("$HOME {} is not absolute", quoted_path(&home)));
     }
-    Ok(Some(home.join(USER_CONFIG_RELATIVE)))
+    Ok(Some(home))
 }
 
 fn discover_project_path() -> Result<PathBuf> {

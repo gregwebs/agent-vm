@@ -107,6 +107,33 @@ _Avoid_: "grant", when referring to this permission.
 A tool or project's declaration that it needs an authorized credential and where
 its guest-facing placeholder should appear. A request is not authorization.
 
+## Secret store
+
+agent-vm's own namespace in the **host OS credential store** (macOS Keychain,
+Linux Secret Service): the reverse-DNS service name `dev.agent-vm.credentials`,
+under which every `agent-vm secret set` entry is an account named by the
+folded service name. Distinct from Docker's `com.docker.sandboxes` namespace and
+from microsandbox's own `dev.microsandbox.registry` entry, which agent-vm
+neither reads nor writes. Host-wide, not project-scoped: every agent-vm process
+on the machine addresses the same entries regardless of state dir.
+
+_Avoid_: "keychain" unqualified, which is both the macOS product and the
+cross-platform concept; and "vault", which implies a different storage model.
+
+## Secret inventory
+
+The **non-secret**, user-scoped record of which service names agent-vm has
+stored — `~/.config/agent-vm/secret-inventory.json`, names only, never bytes. It
+exists because the OS credential store is a key→value lookup with no portable
+enumeration API, so `agent-vm secret ls` probes one name per recorded entry. It
+is explicitly **not** an authorization list: storing a value does not authorize
+its use, and deleting the inventory loses only the listing, never a stored
+value. Its scope is user-scoped rather than state-scoped because the secret
+store it describes is host-wide.
+
+_Avoid_: "credential list", "allowlist", or any wording that reads as
+permission.
+
 ## Credential provider
 
 A **compiled-in credential subsystem** a launched tool can depend on. The four

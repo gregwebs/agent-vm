@@ -34,13 +34,96 @@
 //! the `about` line names only the verb.
 
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt as _;
 
 use anyhow::{Result, anyhow};
 use clap::{Args as _, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
+use vstd::prelude::*;
 
 use crate::config::{self, Catalog, CatalogEntry, ConfigReport, Tool};
 use crate::run;
-use crate::{clipboard, doctor, intercept_hook, msb_cmd, pull, setup};
+use crate::{clipboard, doctor, intercept_hook, msb_cmd, pull, secret, setup};
+
+verus! {
+
+/// The literal verb name, as bytes.
+pub(crate) open spec fn secret_word() -> Seq<u8> {
+    b"secret"@
+}
+
+/// The clap help-traversal keyword, as bytes.
+pub(crate) open spec fn help_word() -> Seq<u8> {
+    b"help"@
+}
+
+/// Whether `argv` addresses the `secret` subtree by either entry path: the verb
+/// (`agent-vm secret …`) or clap's help traversal (`agent-vm help secret …`).
+/// The decision is load-bearing: a `secret`-route parse error can carry a
+/// supplied value, and only this predicate decides whether the fixed scrub runs.
+pub(crate) open spec fn route_is_secret(argv: Seq<Seq<u8>>) -> bool {
+    (2 <= argv.len() && argv[1] =~= secret_word())
+        || (3 <= argv.len() && argv[1] =~= help_word() && argv[2] =~= secret_word())
+}
+
+/// Whole-token equality, never a prefix or a substring: a token that merely
+/// *starts* with `secret` must not select the scrub.
+fn token_equals(token: &[u8], word: &[u8]) -> (equal: bool)
+    ensures equal == (token@ =~= word@),
+{
+    if token.len() != word.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < token.len()
+        invariant
+            index <= token.len(),
+            token@.len() == word@.len(),
+            forall|j: int| 0 <= j < index ==> token@[j] == word@[j],
+        decreases token.len() - index,
+    {
+        if token[index] != word[index] {
+            return false;
+        }
+        index += 1;
+    }
+    assert(token@ =~= word@);
+    true
+}
+
+/// The route decision over already-measured argv tokens. The `OsString` → bytes
+/// measurement (`OsStrExt::as_bytes`) is the trusted adapter [`is_secret_route`],
+/// and it is faithful on Unix: an `OsString` is exactly its bytes, so no
+/// non-UTF-8 argument can be mistaken for `secret`.
+fn route_is_secret_tokens(argv: &[&[u8]]) -> (out: bool)
+    ensures
+        out == (
+            (2 <= argv@.len() && argv@[1]@ =~= secret_word())
+                || (3 <= argv@.len() && argv@[1]@ =~= help_word() && argv@[2]@ =~= secret_word())
+        ),
+{
+    let len = argv.len();
+    if len < 2 {
+        return false;
+    }
+    if token_equals(argv[1], &b"secret"[..]) {
+        assert(argv@[1]@ =~= secret_word());
+        return true;
+    }
+    if len < 3 {
+        return false;
+    }
+    let is_help = token_equals(argv[1], &b"help"[..]);
+    let is_secret = token_equals(argv[2], &b"secret"[..]);
+    if is_help {
+        assert(argv@[1]@ =~= help_word());
+    }
+    if is_secret {
+        assert(argv@[2]@ =~= secret_word());
+    }
+    is_help && is_secret
+}
+
+} // verus!
 
 // Shown under the top-level `agent-vm --help`, after the command list. Names
 // no specific tool: the verbs come from configuration, so a hard-coded name
@@ -95,6 +178,9 @@ pub(crate) enum Cmd {
     /// microsandbox state (e.g. --reset-msb-db).
     Doctor(doctor::Args),
 
+    /// Manage agent-vm's own values in the host system keychain.
+    Secret(secret::Args),
+
     /// Internal: invoked by msb's interceptor hook for matched OAuth
     /// and scoped GitHub requests. Reads stdin and writes the protocol
     /// response on stdout. Not meant for direct use.
@@ -135,9 +221,24 @@ pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "msb",
     "clipboard",
     "doctor",
+    "secret",
     "_intercept-hook",
     "help",
 ];
+
+/// The fixed replacement for any unparseable `agent-vm secret …` argv.
+///
+/// clap renders supplied values on some parse errors — `agent-vm secret set svc
+/// --help=SECRET` produces `unexpected value 'SECRET' for '--help'` — and
+/// `parse_from` hands those to `error.exit()`, where no downstream handler can
+/// intervene. So the whole `secret` subtree gets a value-free error instead.
+/// Help and version still render (see the kind whitelist in `parse_from`).
+const SECRET_ARGV_ERROR: &str = "\
+`agent-vm secret` could not parse its arguments. The arguments are not shown, \
+because a secret value may have been among them. Supported forms:
+  agent-vm secret set SERVICE     (hidden prompt, or pipe the value on stdin)
+  agent-vm secret ls
+  agent-vm secret rm SERVICE";
 
 /// Build the full command (built-ins + one subcommand per catalog entry) and
 /// parse `argv`.
@@ -164,9 +265,27 @@ where
         Err(error) => Catalog::Broken(error),
     };
 
+    // Collected so the `secret` scrub below can look at the verb without
+    // consuming the iterator twice; the bound is already `Into<OsString>`.
+    let argv: Vec<OsString> = argv.into_iter().map(Into::into).collect();
+    // Two entry paths reach the `secret` subtree: the verb itself
+    // (`agent-vm secret …`) and clap's synthesized help traversal
+    // (`agent-vm help secret …`). The second is not redundant: clap *validates*
+    // the names it is asked to explain and prints the offending token verbatim,
+    // exactly as it does on the direct path, so both must be scrubbed.
+    let secret_route = is_secret_route(&argv);
+
     let matches = match build_command(&catalog).try_get_matches_from(argv) {
         Ok(matches) => matches,
         Err(error) => {
+            // `secret` may have carried a value in any position on either entry
+            // path, and clap prints supplied values on some parse errors, so
+            // replace every non-help, non-version error in that subtree with a
+            // fixed value-free message. A whitelist of *kinds*, not of argv
+            // shapes, so a future clap error variant is scrubbed by default.
+            if secret_route && !clap_outcome_is_help_or_version(error.kind()) {
+                return Err(anyhow!(SECRET_ARGV_ERROR));
+            }
             // On the broken path `allow_external_subcommands` absorbs every
             // unknown verb, so the only `InvalidSubcommand` clap can raise is
             // its synthesized `help <x>` validating `x` against the tool-less
@@ -234,6 +353,32 @@ where
             }
         }
     }
+}
+
+/// Whether `argv` addresses the `secret` subtree by either entry path: the
+/// verb (`agent-vm secret …`) or clap's help traversal
+/// (`agent-vm help secret …`). `agent-vm secret help …` is already covered by
+/// the first arm. On both paths clap descends into the subtree's arguments and
+/// can render a supplied value on a parse error, so both get the fixed scrub.
+///
+/// The decision is the verified [`route_is_secret_tokens`]; this function is the
+/// trusted `OsString` → bytes adapter.
+fn is_secret_route(argv: &[OsString]) -> bool {
+    let tokens: Vec<&[u8]> = argv.iter().map(|arg| arg.as_bytes()).collect();
+    route_is_secret_tokens(&tokens)
+}
+
+/// Help and version are not failures: clap's own `exit()` writes them to
+/// stdout with status 0, so the `secret` scrub must not turn them into an
+/// error. Every other kind in that subtree is replaced by [`SECRET_ARGV_ERROR`]
+/// because clap renders supplied values on some of them.
+fn clap_outcome_is_help_or_version(kind: clap::error::ErrorKind) -> bool {
+    matches!(
+        kind,
+        clap::error::ErrorKind::DisplayHelp
+            | clap::error::ErrorKind::DisplayVersion
+            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    )
 }
 
 /// The clap command for a given catalog: `Ready` registers one subcommand per
@@ -403,13 +548,14 @@ mod tests {
 
     #[test]
     fn every_builtin_subcommand_is_reserved_from_tool_names() {
-        for builtin in BUILTIN_SUBCOMMANDS {
-            assert!(
-                RESERVED_TOOL_NAMES.contains(builtin),
-                "{builtin} is a built-in subcommand but not a reserved tool name; \
-                 a config could shadow it"
-            );
-        }
+        // Set equality, not just built-in ⊆ reserved: a reserved name with no
+        // built-in would silently forbid a tool name for no reason, which is
+        // the other half of the drift this test exists to catch.
+        let builtins: std::collections::BTreeSet<&str> =
+            BUILTIN_SUBCOMMANDS.iter().copied().collect();
+        let reserved: std::collections::BTreeSet<&str> =
+            RESERVED_TOOL_NAMES.iter().copied().collect();
+        assert_eq!(builtins, reserved);
     }
 
     // -- T8: a one-tool catalog registers only it plus the shell fallback --
@@ -813,10 +959,241 @@ mod tests {
             .write_long_help(&mut help)
             .expect("the broken-config help renders");
         let help = String::from_utf8(help).unwrap();
-        for builtin in ["setup", "pull", "msb", "clipboard", "doctor"] {
+        for builtin in ["setup", "pull", "msb", "clipboard", "doctor", "secret"] {
             assert!(help.contains(builtin), "missing builtin {builtin}: {help}");
         }
         assert!(help.contains("could not be read"), "{help}");
         assert!(help.contains("agent-vm doctor"), "{help}");
+    }
+
+    // -- P1/P2: the `secret` verbs dispatch -------------------------------
+
+    /// The parsed `Op` of a `Cmd::Secret` dispatch, so the tests below read the
+    /// same fields clap filled.
+    fn secret_set_parts(dispatch: Dispatch) -> (String, Vec<String>, Option<String>) {
+        match dispatch {
+            Dispatch::Builtin {
+                cmd: Cmd::Secret(secret::Args { op }),
+                ..
+            } => match op {
+                secret::Op::Set {
+                    service,
+                    rejected_positional,
+                    rejected_token,
+                } => (service, rejected_positional, rejected_token),
+                _ => panic!("expected `set`"),
+            },
+            _ => panic!("expected a `secret` built-in"),
+        }
+    }
+
+    fn secret_op(dispatch: &Dispatch) -> &'static str {
+        match dispatch {
+            Dispatch::Builtin {
+                cmd: Cmd::Secret(secret::Args { op }),
+                ..
+            } => match op {
+                secret::Op::Set { .. } => "set",
+                secret::Op::Ls => "ls",
+                secret::Op::Rm { .. } => "rm",
+            },
+            _ => panic!("expected a `secret` built-in"),
+        }
+    }
+
+    #[test]
+    fn secret_verbs_dispatch_with_their_service() {
+        let dispatch = parse_from(["agent-vm", "secret", "ls"], Ok(report_from("")))
+            .expect("`secret ls` parses");
+        assert_eq!(secret_op(&dispatch), "ls");
+
+        let dispatch = parse_from(
+            ["agent-vm", "secret", "set", "anthropic"],
+            Ok(report_from("")),
+        )
+        .expect("`secret set NAME` parses");
+        assert_eq!(secret_op(&dispatch), "set");
+        assert_eq!(secret_set_parts(dispatch).0, "anthropic");
+
+        let dispatch = parse_from(
+            ["agent-vm", "secret", "rm", "anthropic"],
+            Ok(report_from("")),
+        )
+        .expect("`secret rm NAME` parses");
+        assert_eq!(secret_op(&dispatch), "rm");
+    }
+
+    /// P2 — the deferred-config-error path builds a different clap command
+    /// (no tool subcommands, external subcommands enabled), so `secret` must
+    /// be exercised there too.
+    #[test]
+    fn secret_verbs_still_dispatch_on_the_broken_config_path() {
+        for argv in [
+            vec!["agent-vm", "secret", "ls"],
+            vec!["agent-vm", "secret", "set", "anthropic"],
+            vec!["agent-vm", "secret", "rm", "anthropic"],
+        ] {
+            let dispatch = parse_from(argv.clone(), Err(anyhow!("config: broken on purpose")))
+                .unwrap_or_else(|error| panic!("{argv:?} must parse: {error:#}"));
+            match dispatch {
+                Dispatch::Builtin {
+                    cmd: Cmd::Secret(_),
+                    ..
+                } => {}
+                _ => panic!("{argv:?} must dispatch as a secret built-in"),
+            }
+        }
+    }
+
+    // -- P5/P6: no `secret` argv shape can render a value ----------------
+
+    /// The shapes clap itself rejects inside the `secret` subtree. The scrub
+    /// replaces each with one fixed message, because clap prints supplied
+    /// values on some of them (its help flag's attached value, for one). The
+    /// needle is interpolated by `format!` and asserted by the same binding, so
+    /// a case whose argv no longer carries the needle cannot make the leak
+    /// assertion vacuous.
+    #[test]
+    fn clap_errors_in_the_secret_subtree_are_scrubbed() {
+        let needle = "sk-ant-REAL-VALUE";
+        let flag = format!("--{needle}");
+        let attached = format!("--help={needle}");
+        let argv = |parts: &[&str]| -> Vec<String> {
+            parts.iter().map(|part| (*part).to_owned()).collect()
+        };
+        let cases = vec![
+            argv(&["agent-vm", "secret", &flag]),
+            argv(&["agent-vm", "secret", &attached]),
+            argv(&["agent-vm", "secret", "rm", "svc", "extra"]),
+            argv(&["agent-vm", "secret", "set"]),
+            argv(&["agent-vm", "secret", "bogus-subcommand"]),
+            // Both help entry paths descend into the subtree and can render the
+            // token they were asked to explain (review finding 1).
+            argv(&["agent-vm", "help", "secret", needle]),
+            argv(&["agent-vm", "help", "secret", "set", needle]),
+            argv(&["agent-vm", "secret", "help", needle]),
+        ];
+        for argv in cases {
+            let error = parse_from(argv.clone(), Ok(report_from("")))
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must be refused"));
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("could not parse its arguments"),
+                "{argv:?}: {text}"
+            );
+            assert!(!text.contains(needle), "{argv:?} echoed the value: {text}");
+            assert!(
+                !text.contains("sk-ant"),
+                "{argv:?} echoed the value: {text}"
+            );
+        }
+    }
+
+    /// The shapes the declared refusal arguments swallow: parsing *succeeds*,
+    /// and the value can only have landed in the two refusal fields, which no
+    /// code path renders. `secret::run` refuses them (see `secret.rs`'s C3).
+    #[test]
+    fn swallowed_argument_shapes_confine_the_value_to_the_refusal_fields() {
+        const SECRET: &str = "sk-ant-REAL-VALUE";
+        let cases = vec![
+            vec!["agent-vm", "secret", "set", "svc", SECRET],
+            vec!["agent-vm", "secret", "set", "svc", "--token", SECRET],
+            vec!["agent-vm", "secret", "set", "svc", "--", SECRET],
+            vec!["agent-vm", "secret", "set", SECRET, "extra"],
+        ];
+        for argv in cases {
+            let dispatch = parse_from(argv.clone(), Ok(report_from("")))
+                .unwrap_or_else(|error| panic!("{argv:?} must parse: {error:#}"));
+            let (service, positional, token) = secret_set_parts(dispatch);
+            let value_bearing = std::iter::once(service.as_str())
+                .chain(positional.iter().map(String::as_str))
+                .chain(token.as_deref())
+                .filter(|text| text.contains(SECRET))
+                .count();
+            assert_eq!(
+                value_bearing, 1,
+                "{argv:?} must carry the value exactly once, in the fields nothing renders"
+            );
+            // The value can only sit in the *name* slot if a refusal field is
+            // also populated, so layer 1 still refuses it (see `secret.rs` C3)
+            // rather than storing a value the user never meant as a name.
+            assert!(
+                service.as_str() != SECRET || !positional.is_empty() || token.is_some(),
+                "{argv:?}: a value in the name slot must still be refused by layer 1"
+            );
+        }
+
+        // Extra positionals after a valid name need no value at all to be
+        // refused: they land in the same refusal field.
+        let dispatch = parse_from(
+            ["agent-vm", "secret", "set", "svc", "a", "b"],
+            Ok(report_from("")),
+        )
+        .expect("the refusal field swallows them");
+        let (service, positional, token) = secret_set_parts(dispatch);
+        assert_eq!(service, "svc");
+        assert_eq!(positional, ["a", "b"]);
+        assert!(token.is_none());
+    }
+
+    /// P6 — help and version are the scrub's whitelist, so `secret --help`,
+    /// `secret set --help` and `help secret` still render.
+    #[test]
+    fn secret_help_is_never_scrubbed() {
+        let command = build_command(&Catalog::Ready(default_catalog()));
+        for argv in [
+            vec!["agent-vm", "secret", "--help"],
+            vec!["agent-vm", "secret", "set", "--help"],
+            vec!["agent-vm", "help", "secret"],
+        ] {
+            let error = command
+                .clone()
+                .try_get_matches_from(argv.clone())
+                .expect_err("clap returns help as an Err");
+            assert!(
+                clap_outcome_is_help_or_version(error.kind()),
+                "{argv:?} must survive the scrub: {:?}",
+                error.kind()
+            );
+            let rendered = error.to_string();
+            assert!(rendered.contains("keychain"), "{argv:?}: {rendered}");
+        }
+    }
+
+    /// P6's other half — the whitelist is exactly help and version.
+    #[test]
+    fn the_scrub_whitelist_is_only_help_and_version() {
+        use clap::error::ErrorKind;
+        for kind in [
+            ErrorKind::DisplayHelp,
+            ErrorKind::DisplayVersion,
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+        ] {
+            assert!(clap_outcome_is_help_or_version(kind), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::InvalidSubcommand,
+            ErrorKind::TooManyValues,
+            ErrorKind::UnknownArgument,
+            ErrorKind::MissingRequiredArgument,
+            ErrorKind::InvalidValue,
+        ] {
+            assert!(!clap_outcome_is_help_or_version(kind), "{kind:?}");
+        }
+    }
+
+    /// The top-level help still lists `secret` with its one-line description.
+    #[test]
+    fn the_top_level_help_lists_the_secret_verb() {
+        let mut help = Vec::new();
+        build_command(&Catalog::Ready(default_catalog()))
+            .write_long_help(&mut help)
+            .expect("help renders");
+        let help = String::from_utf8(help).unwrap();
+        assert!(
+            help.contains("Manage agent-vm's own values in the host system keychain"),
+            "{help}"
+        );
     }
 }
