@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use rustix::{
-    fs::{self as rfs, AtFlags, FileType, Mode, OFlags},
+    fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawMode},
     io::{self as rio, Errno},
 };
 
@@ -51,7 +51,12 @@ pub(crate) fn read_bounded_regular_file(path: &Path, max: u64) -> Result<Vec<u8>
 pub(crate) struct HostFileFacts {
     pub(crate) uid: u32,
     /// Raw `st_mode`, including the file-type bits.
-    pub(crate) mode: u32,
+    ///
+    /// Typed as the platform's own raw mode (`u16` on macOS, `u32` on Linux),
+    /// which is also what [`FileType::from_raw_mode`] takes, so the value
+    /// crosses from `stat` without a conversion that `clippy` rejects as
+    /// redundant on the platform where it is already the wider type.
+    pub(crate) mode: RawMode,
     pub(crate) size: u64,
 }
 
@@ -88,7 +93,7 @@ pub(crate) fn read_bounded_regular_file_no_follow(
         .with_context(|| format!("stating {}", path.display()))?;
     let facts = HostFileFacts {
         uid: stat.st_uid,
-        mode: u32::from(stat.st_mode),
+        mode: stat.st_mode,
         size: stat.st_size.max(0) as u64,
     };
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {

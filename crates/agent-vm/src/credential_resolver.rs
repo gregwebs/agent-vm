@@ -67,8 +67,12 @@ use crate::config::USER_CONFIG_DIR_RELATIVE;
 use crate::credential_provider::CredentialProvider;
 use crate::credential_yaml::{self, AuthorizationSet, GuestEnvName};
 use crate::secret_store::{
-    KeychainFailure, Resolved, SecretStore, SecretValue, ServiceName, SystemKeychain, system_store,
+    KeychainFailure, Resolved, SecretStore, ServiceName, SystemKeychain, system_store,
 };
+// Named only by the debug-only seam below and by the tests, so a release build
+// (which compiles neither) would report it as an unused import.
+#[cfg(debug_assertions)]
+use crate::secret_store::SecretValue;
 
 /// The minimal read the resolver needs, and the `Send + Sync` boundary that
 /// keeps the SDK's trait bound away from the store's test-only `!Sync` fields.
