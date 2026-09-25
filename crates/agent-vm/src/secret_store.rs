@@ -4,11 +4,14 @@
 //! handed the guest placeholders (`secrets.rs`, `credential_provider.rs`).
 //! This module owns the second kind: a value the *user* gives agent-vm, kept in
 //! the host OS credential store under agent-vm's own namespace. It is the
-//! lifecycle only — **nothing here reads a stored value back out, resolves it
-//! against configuration, or gives it to a guest**. `get` is #161's job; the
-//! module is shaped for it (one added method) but deliberately does not have
-//! it. Storing a value does not authorize its use
-//! (`docs/specs/credential-shielding.md`, §Contract).
+//! lifecycle plus exactly one authorized read. The one way a stored value
+//! comes back out is [`SecretStore::resolve`], reachable only from the launch
+//! credential resolver (`credential_resolver.rs`) for a service that the user's
+//! `credentials.yaml` authorizes *and* the launch requests. `secret ls`,
+//! `doctor` and every diagnostic still cannot read a value: the only
+//! value-shaped things they can obtain are the two-valued [`Presence`] a probe
+//! returns and the index/label-only refusals. Storing a value does not
+//! authorize its use (`docs/specs/credential-shielding.md`, §Contract).
 //!
 //! # The awkward fact: the credential store is not enumerable
 //!
@@ -104,6 +107,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use vstd::prelude::*;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::config;
 use crate::host_paths::{atomic_write, flock_exclusive, read_bounded_regular_file};
@@ -443,9 +447,13 @@ impl fmt::Display for ServiceName {
 /// A secret value, validated at the boundary by [`SecretValue::parse`].
 ///
 /// Deliberately unprintable: no `Display`, no `Deref`, no public `as_str`. The
-/// only way out is [`Self::expose`], which is the single audited call site
-/// (`SystemKeychain::set`).
-pub(crate) struct SecretValue(String);
+/// only ways out are [`Self::expose`], which is the single audited *write*
+/// call site (`SystemKeychain::set`), and `credential_resolver.rs`'s read of an
+/// authorized value into the runtime's resolver — the only two places a stored
+/// value becomes a plain `&str`. The inner `String` is zeroized on drop as a
+/// best-effort reduction of the plaintext window (it cannot cover the copies
+/// listed in ADR-0025).
+pub(crate) struct SecretValue(Zeroizing<String>);
 
 impl SecretValue {
     /// The trusted adapter around the proved [`secret_value_is_acceptable_bytes`]:
@@ -453,31 +461,56 @@ impl SecretValue {
     /// predicate is the *decision*; [`value_rejection`] only labels which rule
     /// failed so the message is specific, and a test pins the two together.
     pub(crate) fn parse(bytes: Vec<u8>) -> Result<Self> {
-        if !secret_value_is_acceptable_bytes(&bytes) {
-            let message = value_rejection(&bytes).map_or_else(
-                || ValueRejection::NonPrintable.message(),
-                |rejection| rejection.message(),
-            );
-            return Err(anyhow!(message));
+        match Self::try_parse(bytes) {
+            Ok(value) => Ok(value),
+            Err(rejection) => Err(anyhow!(rejection.message())),
         }
-        let value = match String::from_utf8(bytes) {
-            Ok(value) => value,
-            // Unreachable: every byte that passes the predicate is printable
-            // ASCII, hence valid UTF-8. A fixed message rather than the error,
-            // because `FromUtf8Error`'s own `Debug` prints the bytes.
-            Err(_) => return Err(anyhow!("the value is not valid UTF-8; it was not stored")),
-        };
-        Ok(Self(value))
     }
 
-    /// The one audited path from a stored value to a plain `&str`. Every call
-    /// site is a write into the platform credential store.
+    /// The same decision as [`Self::parse`], with the label rather than a
+    /// message. A read path must distinguish "the stored bytes are not an
+    /// acceptable value" from "nothing is stored", so it takes this form.
+    ///
+    /// The buffer is zeroized on **every** path: a rejected value is wiped
+    /// before the `Vec` is freed, so no plaintext copy is left in allocator
+    /// memory (agent-vm #161 review, m2).
+    pub(crate) fn try_parse(mut bytes: Vec<u8>) -> std::result::Result<Self, ValueRejection> {
+        if !secret_value_is_acceptable_bytes(&bytes) {
+            let rejection = value_rejection(&bytes).unwrap_or(ValueRejection::NonPrintable);
+            bytes.zeroize();
+            return Err(rejection);
+        }
+        match String::from_utf8(bytes) {
+            Ok(value) => Ok(Self(Zeroizing::new(value))),
+            // Unreachable: every byte that passes the predicate is printable
+            // ASCII, hence valid UTF-8. The returned buffer is still wiped
+            // rather than dropped un-zeroized.
+            Err(error) => {
+                let mut rejected = error.into_bytes();
+                rejected.zeroize();
+                Err(ValueRejection::NonPrintable)
+            }
+        }
+    }
+
+    /// Consume the value into the runtime's own resolver at handoff. This is
+    /// the third and last audited path (write, phase-1 availability read, and
+    /// this move into `microsandbox::CredentialResolver`), and it hands over
+    /// the zeroizing buffer rather than a copy of its text.
+    pub(crate) fn into_zeroizing(self) -> Zeroizing<String> {
+        self.0
+    }
+
+    /// The two audited paths from a stored value to a plain `&str`: a write
+    /// into the platform credential store ([`SystemKeychain::set`]) and the
+    /// launch resolver's read of a *previously authorized* value. Nothing else
+    /// — not `secret ls`, not `doctor`, not any diagnostic — may call it.
     fn expose(&self) -> &str {
         &self.0
     }
 
     /// Test-only view of the stored bytes, so a test can assert acceptance
-    /// without a credential store. Production has exactly one reader,
+    /// without a credential store. Production has exactly two readers,
     /// [`Self::expose`].
     #[cfg(test)]
     pub(crate) fn expose_for_test(&self) -> &str {
@@ -493,8 +526,13 @@ impl fmt::Debug for SecretValue {
 
 /// Why [`secret_value_is_acceptable_bytes`] rejected a value, for the message
 /// only. Never carries any of the bytes.
+///
+/// `pub(crate)` because a *read* has to report "what is stored is not an
+/// acceptable value" as a distinct outcome from "nothing is stored":
+/// conflating the two would let a corrupt or truncated entry read as an
+/// unconfigured credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValueRejection {
+pub(crate) enum ValueRejection {
     Empty,
     TooLong,
     EdgeSpace,
@@ -502,7 +540,7 @@ enum ValueRejection {
 }
 
 impl ValueRejection {
-    fn message(self) -> String {
+    pub(crate) fn message(self) -> String {
         match self {
             Self::Empty => "no value was supplied".to_owned(),
             Self::TooLong => format!("the value is longer than {MAX_SECRET_VALUE_LEN} bytes"),
@@ -536,7 +574,9 @@ fn value_rejection(bytes: &[u8]) -> Option<ValueRejection> {
 }
 
 /// Whether a value is in the credential store — the only value-shaped thing any
-/// operation here returns.
+/// *diagnostic* operation here returns. (`SecretStore::resolve` also returns a
+/// value, but only to an authorized launch; nothing that renders a listing,
+/// `doctor`, or any error can reach a value.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Presence {
     Present,
@@ -627,13 +667,66 @@ pub(crate) enum RemoveOutcome {
     NotStored,
 }
 
-/// Everything the store needs from the platform credential store: three
+/// Raw bytes as they came out of the platform store, **before** the
+/// accepted-value predicate runs.
+///
+/// It exists so the read path can hand bytes across the `KeychainBackend` trait
+/// without handing out a `Vec<u8>` a caller might print: there is no `Display`,
+/// no `Deref`, and the `Debug` is redacting, and the bytes are zeroized on drop.
+/// The only way to a usable value is [`Self::into_value`], which applies the
+/// *same* predicate a write applies.
+pub(crate) struct StoredSecret(Zeroizing<Vec<u8>>);
+
+impl StoredSecret {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    fn into_value(self) -> std::result::Result<SecretValue, ValueRejection> {
+        // `mem::take` leaves an empty Vec behind for `Zeroizing` to wipe, so the
+        // bytes move into the (also zeroizing) `SecretValue` rather than being
+        // copied.
+        let mut inner = self.0;
+        let bytes = std::mem::take(&mut *inner);
+        SecretValue::try_parse(bytes)
+    }
+}
+
+impl fmt::Debug for StoredSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StoredSecret(<redacted>)")
+    }
+}
+
+/// The outcome of a read for one service. Four outcomes, not two, because the
+/// caller's behaviour differs for each and every conflation is a failure mode:
+/// `Missing` is "the probe worked and there is nothing there", `Unavailable`
+/// is "the read could not run" (a locked keychain, no Secret Service), and
+/// conflating those would let "locked" read as "not stored".
+#[derive(Debug)]
+pub(crate) enum Resolved {
+    Value(SecretValue),
+    Missing,
+    Unavailable(KeychainFailure),
+    /// A value *is* stored but its bytes fail the accepted-value predicate.
+    /// Never `Missing`: silently treating a corrupt entry as absent would boot
+    /// an uncredentialed sandbox that looks configured.
+    InvalidValue(ValueRejection),
+}
+
+/// Everything the store needs from the platform credential store: four
 /// methods and no logic. This is the untestable-in-CI surface, kept minimal.
 pub(crate) trait KeychainBackend {
     fn set(&self, service: &ServiceName, value: &SecretValue) -> Result<(), KeychainFailure>;
     /// Presence only. No value crosses into agent-vm code.
     fn probe(&self, service: &ServiceName) -> Result<Presence, KeychainFailure>;
     fn delete(&self, service: &ServiceName) -> Result<Presence, KeychainFailure>;
+    /// The one read path. Unreachable from any `agent-vm secret` verb: the
+    /// only caller is [`SecretStore::resolve`], which itself is reachable only
+    /// through launch resolution for an *authorized, requested* service
+    /// (`credential_resolver.rs`). Nothing here may be wired into `ls`,
+    /// `doctor`, or any diagnostic.
+    fn get(&self, service: &ServiceName) -> Result<Option<StoredSecret>, KeychainFailure>;
     /// Whether this backend is the debug-only *test recording* seam, which stores
     /// nothing (only a length and SHA-256). The verb layer uses this to keep its
     /// success message honest when the seam is active (review finding R5).
@@ -666,6 +759,17 @@ impl KeychainBackend for SystemKeychain {
         }
     }
 
+    fn get(&self, service: &ServiceName) -> Result<Option<StoredSecret>, KeychainFailure> {
+        // The only place agent-vm fetches a stored value. `get_secret` returns
+        // the **raw bytes**; `get_password` would decode UTF-8 inside `keyring`
+        // and surface invalid bytes as `BadEncoding`, which `classify` maps to
+        // the non-fatal `Unavailable` class. Reading raw bytes instead routes a
+        // malformed stored value through `StoredSecret`'s accepted-value
+        // predicate, where it is `InvalidValue` - fatal regardless of
+        // `required` (agent-vm #161 review, M3).
+        read_stored_secret(entry(service)?.get_secret())
+    }
+
     fn delete(&self, service: &ServiceName) -> Result<Presence, KeychainFailure> {
         match entry(service)?.delete_credential() {
             Ok(()) => Ok(Presence::Present),
@@ -685,6 +789,24 @@ fn entry_key(service: &ServiceName) -> (&str, &str) {
 fn entry(service: &ServiceName) -> Result<keyring::Entry, KeychainFailure> {
     let (service_name, account) = entry_key(service);
     keyring::Entry::new(service_name, account).map_err(classify)
+}
+
+/// The closed decision inside [`SystemKeychain::get`], split out so the
+/// adapter boundary is testable without an OS keychain: raw bytes stay raw
+/// (never decoded here, so invalid UTF-8 is not confused with an access
+/// failure), `NoEntry` is absence, and every other failure is the closed
+/// `Unavailable` class. The `keyring::Entry::get_secret` call that produces the
+/// result is the trusted adapter; `keyring`'s own `mock` backend cannot model a
+/// persistent store (it returns a fresh, independent credential per
+/// `Entry::new`), so the raw read is not exercised against the OS store in CI.
+fn read_stored_secret(
+    read: std::result::Result<Vec<u8>, keyring::Error>,
+) -> Result<Option<StoredSecret>, KeychainFailure> {
+    match read {
+        Ok(bytes) => Ok(Some(StoredSecret::new(bytes))),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(classify(error)),
+    }
 }
 
 /// The user-scoped inventory location. A directory plus two file names; kept as
@@ -863,6 +985,33 @@ impl<B: KeychainBackend> SecretStore<B> {
         })
     }
 
+    /// The one authorized read: resolve `service` to its stored value.
+    ///
+    /// Reachable only from the launch credential resolver, and only for a
+    /// service the *authorization file* names and the launch *requests*. It is
+    /// deliberately not part of `list`/`doctor`: the value never leaves this
+    /// module except through [`Self::resolve`].
+    ///
+    /// Runs under the same `flock` as the mutating verbs, so a resolution
+    /// never races a `secret set`/`secret rm` on the same host. A failure to
+    /// take the lock is reported as [`Resolved::Unavailable`]: from the
+    /// caller's point of view the source "could not be read", which is the
+    /// class that decides between warning and hard error.
+    pub(crate) fn resolve(&self, service: &ServiceName) -> Resolved {
+        let _lock = match self.lock() {
+            Ok(lock) => lock,
+            Err(_) => return Resolved::Unavailable(KeychainFailure::Unknown),
+        };
+        match self.backend.get(service) {
+            Ok(Some(stored)) => match stored.into_value() {
+                Ok(value) => Resolved::Value(value),
+                Err(rejection) => Resolved::InvalidValue(rejection),
+            },
+            Ok(None) => Resolved::Missing,
+            Err(failure) => Resolved::Unavailable(failure),
+        }
+    }
+
     /// Take the exclusive inventory lock, creating the directory and lock file
     /// if needed. Held until the returned guard is dropped.
     fn lock(&self) -> Result<InventoryLock> {
@@ -1039,6 +1188,14 @@ impl KeychainBackend for RecordingKeychain {
         Ok(Presence::Absent)
     }
 
+    /// **Not a value oracle.** This backend stores nothing (it writes a length
+    /// and SHA-256), so it has nothing to return and must never become a way to
+    /// read a value back out through the debug seam. `is_test_recording` stays
+    /// honest alongside it.
+    fn get(&self, _service: &ServiceName) -> Result<Option<StoredSecret>, KeychainFailure> {
+        Ok(None)
+    }
+
     fn delete(&self, _service: &ServiceName) -> Result<Presence, KeychainFailure> {
         Ok(Presence::Absent)
     }
@@ -1076,7 +1233,9 @@ pub(crate) mod fake {
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
 
-    use super::{KeychainBackend, KeychainFailure, Presence, SecretValue, ServiceName};
+    use super::{
+        KeychainBackend, KeychainFailure, Presence, SecretValue, ServiceName, StoredSecret,
+    };
 
     /// A stub for the three OS calls, **not** a mock of the logic under test:
     /// inventory handling, locking, drift repair, ordering, outcomes and
@@ -1085,7 +1244,7 @@ pub(crate) mod fake {
     /// cannot model a store that remembers anything.
     #[derive(Default)]
     pub(crate) struct FakeKeychain {
-        items: RefCell<BTreeMap<String, String>>,
+        items: RefCell<BTreeMap<String, Vec<u8>>>,
         fail_set: Cell<Option<KeychainFailure>>,
         fail_probe: Cell<Option<KeychainFailure>>,
         fail_delete: Cell<Option<KeychainFailure>>,
@@ -1103,11 +1262,22 @@ pub(crate) mod fake {
         pub(crate) fn seed(&self, service: &str, value: &str) {
             self.items
                 .borrow_mut()
-                .insert(service.to_owned(), value.to_owned());
+                .insert(service.to_owned(), value.as_bytes().to_vec());
+        }
+
+        /// Put **raw bytes** in the fake, including bytes a real `set` would
+        /// have refused (e.g. invalid UTF-8). The read path must classify them
+        /// through the accepted-value predicate, so a test can plant a
+        /// malformed stored value the String-only `seed` cannot express.
+        pub(crate) fn seed_bytes(&self, service: &str, bytes: Vec<u8>) {
+            self.items.borrow_mut().insert(service.to_owned(), bytes);
         }
 
         pub(crate) fn stored(&self, service: &str) -> Option<String> {
-            self.items.borrow().get(service).cloned()
+            self.items
+                .borrow()
+                .get(service)
+                .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
         }
 
         pub(crate) fn fail_set(&self, failure: KeychainFailure) {
@@ -1132,9 +1302,10 @@ pub(crate) mod fake {
             if let Some(failure) = self.fail_set.get() {
                 return Err(failure);
             }
-            self.items
-                .borrow_mut()
-                .insert(service.as_str().to_owned(), value.0.clone());
+            self.items.borrow_mut().insert(
+                service.as_str().to_owned(),
+                value.expose().as_bytes().to_vec(),
+            );
             Ok(())
         }
 
@@ -1147,6 +1318,21 @@ pub(crate) mod fake {
             } else {
                 Ok(Presence::Absent)
             }
+        }
+
+        /// Raw bytes, deliberately **not** run through the value predicate:
+        /// that the read path applies it is the property a test wants to
+        /// exercise, so `seed`/`seed_bytes` can plant a value a real `set`
+        /// would have refused.
+        fn get(&self, service: &ServiceName) -> Result<Option<StoredSecret>, KeychainFailure> {
+            if let Some(failure) = self.fail_probe.get() {
+                return Err(failure);
+            }
+            Ok(self
+                .items
+                .borrow()
+                .get(service.as_str())
+                .map(|bytes| StoredSecret::new(bytes.clone())))
         }
 
         fn delete(&self, service: &ServiceName) -> Result<Presence, KeychainFailure> {
@@ -1176,6 +1362,10 @@ impl KeychainBackend for std::rc::Rc<fake::FakeKeychain> {
 
     fn probe(&self, service: &ServiceName) -> Result<Presence, KeychainFailure> {
         (**self).probe(service)
+    }
+
+    fn get(&self, service: &ServiceName) -> Result<Option<StoredSecret>, KeychainFailure> {
+        (**self).get(service)
     }
 
     fn delete(&self, service: &ServiceName) -> Result<Presence, KeychainFailure> {
@@ -1614,6 +1804,164 @@ mod tests {
             text.contains("delete this file to reset the listing"),
             "{text}"
         );
+    }
+
+    // -- S17: the one authorized read ------------------------------------
+
+    /// The read path applies the *same* predicate a write does. A stored value
+    /// that violates it is `InvalidValue`, never `Missing`: a corrupt or
+    /// truncated entry must not silently read as an unconfigured credential.
+    #[test]
+    fn get_validates_reads_with_the_write_predicate() {
+        let harness = Harness::new();
+        let service = name("alpha");
+        // `seed` writes straight into the fake, so it can plant bytes a real
+        // `set` would have refused — which is exactly the corrupt-entry case.
+        harness.backend.seed("alpha", "has a  newline\n");
+        let store = harness.store();
+        match store.resolve(&service) {
+            Resolved::InvalidValue(rejection) => {
+                assert_eq!(rejection, ValueRejection::NonPrintable)
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        // The accepted shapes still come back, and byte for byte.
+        for acceptable in ["sk-REAL", "a", &"x".repeat(MAX_SECRET_VALUE_LEN)] {
+            harness.backend.seed("alpha", acceptable);
+            match store.resolve(&service) {
+                Resolved::Value(resolved) => assert_eq!(resolved.expose_for_test(), acceptable),
+                other => panic!("expected Value, got {other:?}"),
+            }
+        }
+
+        // Too long, an edge space and empty are the other three labels.
+        for (raw, expected) in [
+            (
+                "x".repeat(MAX_SECRET_VALUE_LEN + 1),
+                ValueRejection::TooLong,
+            ),
+            (" sk".to_owned(), ValueRejection::EdgeSpace),
+            (String::new(), ValueRejection::Empty),
+        ] {
+            harness.backend.seed("alpha", &raw);
+            match store.resolve(&service) {
+                Resolved::InvalidValue(rejection) => assert_eq!(rejection, expected),
+                other => panic!("expected InvalidValue({expected:?}), got {other:?}"),
+            }
+        }
+
+        // A value that is not a printable-ASCII string at all is not `Missing`
+        // and its bytes never reach a rendering.
+        harness.backend.seed("alpha", "\u{7f}");
+        let rendered = format!("{:?}", store.resolve(&service));
+        assert!(rendered.contains("InvalidValue"), "{rendered}");
+        assert!(
+            !rendered.contains("\u{7f}"),
+            "the stored bytes leaked: {rendered}"
+        );
+    }
+
+    /// A stored value that is not valid UTF-8 must be `InvalidValue`, never the
+    /// non-fatal `Unavailable` class. `get_secret` (raw bytes) makes this
+    /// distinguishable from a locked/absent keychain; `get_password` would have
+    /// surfaced it as `BadEncoding` -> `Unavailable` (agent-vm #161 review, M3).
+    #[test]
+    fn invalid_utf8_stored_bytes_are_an_invalid_value_not_unavailable() {
+        let harness = Harness::new();
+        let service = name("alpha");
+        harness.backend.seed_bytes("alpha", vec![0xff, 0xfe, b'x']);
+        match harness.store().resolve(&service) {
+            Resolved::InvalidValue(rejection) => {
+                assert_eq!(rejection, ValueRejection::NonPrintable)
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+        // An access failure is still `Unavailable`, so the two outcomes remain
+        // distinguishable at the adapter boundary.
+        harness.backend.fail_probe(KeychainFailure::AccessDenied);
+        match harness.store().resolve(&service) {
+            Resolved::Unavailable(KeychainFailure::AccessDenied) => {}
+            other => panic!("expected Unavailable(AccessDenied), got {other:?}"),
+        }
+    }
+
+    /// The adapter boundary: raw bytes (including invalid UTF-8) stay raw and
+    /// are classified by the accepted-value predicate, an access failure is the
+    /// closed `Unavailable` class, and `NoEntry` is absence. This is the
+    /// decision `SystemKeychain::get` makes around the trusted `get_secret`
+    /// call (agent-vm #161 review, M3).
+    #[test]
+    fn read_stored_secret_keeps_raw_bytes_and_distinguishes_access_failure() {
+        // Invalid UTF-8 arrives as raw bytes and becomes `InvalidValue`, not a
+        // decode failure routed to `Unavailable`.
+        let stored = read_stored_secret(Ok(vec![0xff, 0xfe, b'x']))
+            .expect("a raw read succeeds")
+            .expect("a value is present");
+        assert_eq!(
+            stored.into_value().unwrap_err(),
+            ValueRejection::NonPrintable
+        );
+        // `NoEntry` is "nothing is stored", not a failure.
+        assert!(
+            read_stored_secret(Err(keyring::Error::NoEntry))
+                .expect("absence is not a failure")
+                .is_none()
+        );
+        // An access failure is the closed class, distinguishable from the above.
+        let denied = read_stored_secret(Err(keyring::Error::NoStorageAccess(Box::new(
+            std::io::Error::other("os detail"),
+        ))))
+        .unwrap_err();
+        assert_eq!(denied, KeychainFailure::AccessDenied);
+    }
+
+    /// "Locked" must never read as "not stored".
+    #[test]
+    fn resolve_separates_missing_from_unavailable() {
+        let harness = Harness::new();
+        let store = harness.store();
+        let service = name("alpha");
+        assert!(matches!(store.resolve(&service), Resolved::Missing));
+
+        harness.backend.fail_probe(KeychainFailure::AccessDenied);
+        match store.resolve(&service) {
+            Resolved::Unavailable(failure) => assert_eq!(failure, KeychainFailure::AccessDenied),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        // The closed message says "locked or denied", never "not stored".
+        assert!(KeychainFailure::AccessDenied.message().contains("locked"));
+
+        // A backend with nothing to say still cannot be mistaken for absent
+        // while it is failing.
+        harness.backend.seed("alpha", "sk-REAL");
+        harness.backend.fail_probe(KeychainFailure::Unavailable);
+        assert!(matches!(
+            store.resolve(&service),
+            Resolved::Unavailable(KeychainFailure::Unavailable)
+        ));
+    }
+
+    /// The debug-only recording seam records a length and a digest of what was
+    /// set; it must never become a way to read that value back out.
+    #[test]
+    fn recording_keychain_is_not_a_value_oracle() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = dir.path().join("recorded.txt");
+        let backend = RecordingKeychain {
+            path: recorded.clone(),
+        };
+        let service = name("alpha");
+        backend
+            .set(&service, &value("sk-REAL"))
+            .expect("the seam accepts a set");
+        assert!(backend.is_test_recording());
+        match backend.get(&service) {
+            Ok(None) => {}
+            other => panic!("the recording seam must never return a value: {other:?}"),
+        }
+        let recorded_bytes = std::fs::read_to_string(&recorded).unwrap();
+        assert!(!recorded_bytes.contains("sk-REAL"));
     }
 
     #[test]

@@ -5,6 +5,8 @@ mod clipboard;
 mod config;
 mod credential_injection;
 mod credential_provider;
+mod credential_resolver;
+mod credential_yaml;
 mod defaults;
 mod doctor;
 mod env_flag;

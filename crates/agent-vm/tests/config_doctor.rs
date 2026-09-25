@@ -408,14 +408,18 @@ fn assert_report_with_config_error(h: &Harness) {
 
 #[test]
 fn unknown_provider_is_a_hard_error_still_prints_the_other_sections() {
+    // #161 widened the validator to any valid keychain service name, so the
+    // doctor label `opencode` is now a *request* launch resolution refuses
+    // rather than a config error. What is still a config error is a name that
+    // could not select a keychain item at all.
     let h = Harness::new();
-    h.write_user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"opencode\"]\n");
+    h.write_user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"opencode!\"]\n");
 
     let out = h.run_doctor();
     assert_failure(&out);
     let stderr = stderr_of(&out);
     assert!(stderr.contains("opencode-static"), "{stderr}");
-    assert!(stderr.contains("valid names"), "{stderr}");
+    assert!(stderr.contains("not a valid name"), "{stderr}");
     let stdout = stdout_of(&out);
     assert!(
         stdout.contains("==> tool configuration"),

@@ -109,7 +109,27 @@ fn agent_vm_bin() -> PathBuf {
 fn write_fake_msb(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("msb");
-    std::fs::write(&path, "#!/bin/sh\necho 'msb 0.6.15'\nexit 0\n").unwrap();
+    // A credential-bearing launch makes the SDK probe `<msb> __capabilities`
+    // and require exactly `header-credential-launch-v1` on stdout (microsandbox
+    // #175). Any other argv must still answer with the version line, BYTE FOR
+    // BYTE as before, or `msb_install`'s patched-build check would start
+    // refusing the fake and every launch golden here would fail for the wrong
+    // reason.
+    //
+    // Every invocation is appended to a sibling log so a test can assert the
+    // probe *actually happened* rather than inferring it from the absence of an
+    // error (agent-vm #161 review, M4).
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         echo \"$*\" >> \"$(dirname \"$0\")/msb-invocations.log\"\n\
+         if [ \"$1\" = \"__capabilities\" ]; then\n\
+         \x20 echo 'header-credential-launch-v1'\n\
+         \x20 exit 0\n\
+         fi\n\
+         echo 'msb 0.6.15'\nexit 0\n",
+    )
+    .unwrap();
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();
@@ -276,9 +296,32 @@ impl Harness {
     /// `--image` is passed *before* `extra` so a trailing `-- <agent args>`
     /// (absorbed by the tool's `trailing_var_arg`) cannot swallow it.
     fn launch(&self, tool: &str, extra: &[&str]) -> Output {
+        self.launch_with_env(tool, extra, &[])
+    }
+
+    /// [`Self::launch`] with extra host environment variables set for the
+    /// child (the base command starts from `env_clear`).
+    fn launch_with_env(&self, tool: &str, extra: &[&str], envs: &[(&str, &str)]) -> Output {
         let mut cmd = self.base_command();
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
         cmd.arg(tool).args(["--image", BOGUS_IMAGE]).args(extra);
         run_with_timeout(cmd, Duration::from_secs(20))
+    }
+
+    /// Every argv the fake `msb` was invoked with, in order. Empty when it was
+    /// never invoked.
+    fn msb_log(&self) -> String {
+        std::fs::read_to_string(self.fake_msb.with_file_name("msb-invocations.log"))
+            .unwrap_or_default()
+    }
+
+    /// Whether the fake `msb` was probed for the header-credential capability.
+    fn saw_capability_probe(&self) -> bool {
+        self.msb_log()
+            .lines()
+            .any(|line| line.starts_with("__capabilities"))
     }
 
     /// Launch a default tool with no extra args.
@@ -745,6 +788,193 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
             "copilot's intercept object must degrade to the serde default body"
         );
     }
+}
+
+// -- #161: credentials.yaml -------------------------------------------------
+
+/// Write a `~/.config/agent-vm/credentials.yaml` with 0600 mode (the loader
+/// warns above 0644 and refuses group/other *write*).
+fn write_credentials(home_root: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = home_root.join(".config/agent-vm/credentials.yaml");
+    write(&path, body);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+const ONE_YAML_TOOL: &str =
+    "[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"my-service\"]\n";
+
+#[test]
+fn requested_name_without_an_authorization_fails_the_launch() {
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    let out = harness.launch("t", &[]);
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("my-service"), "{stderr}");
+    assert!(stderr.contains("credentials.yaml"), "{stderr}");
+    assert!(stderr.contains("built-in credential provider"), "{stderr}");
+}
+
+#[test]
+fn a_launch_that_requests_no_credential_never_reads_the_authorization_file() {
+    // The file is read only when the launch's credential closure requests
+    // something, so a tool that requests none is unaffected by a broken one.
+    // `shell` is deliberately NOT that tool: its default `tools = ["*"]` pulls
+    // in every built-in provider, so it does request credentials.
+    let harness = Harness::new();
+    harness.write_user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = []\ncredentials = []\n");
+    write_credentials(
+        &harness.home_root,
+        "credentials: [this is not a list of entries\n",
+    );
+    let out = harness.launch("t", &[]);
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    assert!(
+        !rendered.contains("credentials.yaml"),
+        "the authorization file was read for a launch that requests nothing: {rendered}"
+    );
+    // Positive progress marker (agent-vm #161 review, N4/M4): silence about the
+    // file proves nothing unless the launch actually reached the phase-1
+    // resolution that would have read it (`resolve_credentials`). That runs
+    // before the debug `SandboxConfig` dump, so reaching the dump means a
+    // broken file *would* have been reported here. A launch that died earlier
+    // for an unrelated reason (a bad tool config, a pre-resolution failure)
+    // would otherwise also satisfy the absence assertion.
+    assert!(
+        rendered.contains(CONFIG_MARKER),
+        "the launch never reached the credential-resolution stage, so its silence \
+         about credentials.yaml proves nothing: {rendered}"
+    );
+}
+
+#[test]
+fn malformed_credentials_yaml_fails_the_launch_with_a_redacted_message() {
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    let canary = "sk-CANARY-6f2a1b3c4d5e6071829304a5b6c7d8e9";
+    write_credentials(
+        &harness.home_root,
+        &format!(
+            "credentials:\n  - service: my-service\n    apiKey:\n      name: MY_SERVICE_KEY\n      inject:\n        - domain: \"{canary}/x\"\n          header: x-api-key\n          format: \"%s\"\n"
+        ),
+    );
+    let out = harness.launch("t", &[]);
+    assert!(!out.status.success());
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    assert!(rendered.contains("credentials.yaml"), "{rendered}");
+    // A positive assertion, not "my-service or domain": the specific rule the
+    // canary tripped must be named, so ignoring the file entirely cannot
+    // satisfy this test (agent-vm #161 review, M4).
+    assert!(
+        rendered.contains("credentials[0].apiKey.inject[0].domain")
+            && rendered.contains("must not contain a path"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains(canary),
+        "the launch echoed file content: {rendered}"
+    );
+}
+
+#[test]
+fn a_credential_bearing_launch_runs_the_capability_probe() {
+    // A *genuinely* credential-bearing create (a durable `header_credentials`
+    // entry) must make the SDK run `<msb> __capabilities`. The subprocess has no
+    // fake OS keychain, so the credential is made ready through the debug-only
+    // `AGENT_VM_TEST_CREDENTIAL` seam. Two independent positive controls: the
+    // fake msb logged the probe, and the launch's outcome is the bogus-image
+    // failure rather than the capability refusal. Replacing the fake's
+    // capability answer with anything invalid flips the outcome and fails this
+    // test (agent-vm #161 review, M4).
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: my-service\n    apiKey:\n      name: MY_SERVICE_KEY\n      sentinelEnv: true\n      inject:\n        - domain: api.my-service.example\n          header: x-api-key\n          format: \"%s\"\n",
+    );
+    let out = harness.launch_with_env(
+        "t",
+        &[],
+        &[("AGENT_VM_TEST_CREDENTIAL", "my-service=sk-test-probe-value")],
+    );
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    assert!(
+        harness.saw_capability_probe(),
+        "a credential-bearing create never probed the runtime: {rendered}\nmsb log:\n{}",
+        harness.msb_log()
+    );
+    assert!(
+        !rendered.contains("does not support origin-scoped header credentials"),
+        "the fake msb failed the capability probe: {rendered}"
+    );
+}
+
+#[test]
+fn an_owned_credential_name_is_never_forwarded_from_the_host() {
+    // AC2: an authorized credential owns its guest variable, so the host's real
+    // `OPENAI_API_KEY` must not be forwarded into the guest - and the
+    // credential-owned sentinel must be what the guest sees. This pins the
+    // `run::launch` emission wiring, not only the ownership decision: if the
+    // raw-forwarding suppression or the sentinel publication were removed, the
+    // host canary would appear in the dumped environment (agent-vm #161 M1/M4).
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: my-service\n    apiKey:\n      name: OPENAI_API_KEY\n      sentinelEnv: true\n      inject: [{domain: api.my-service.example, header: x-api-key, format: \"%s\"}]\n",
+    );
+    let canary = "sk-host-real-canary-3f1a2b4c5d6e7f8091a2b3c4d5e6f708";
+    let out = harness.launch_with_env(
+        "t",
+        &[],
+        &[
+            ("AGENT_VM_TEST_CREDENTIAL", "my-service=sk-test-owned-value"),
+            ("OPENAI_API_KEY", canary),
+        ],
+    );
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    let env = env_pairs(&config);
+    assert!(
+        env.iter()
+            .any(|(key, value)| *key == "OPENAI_API_KEY" && *value == "proxy-managed"),
+        "the sentinel was not published last: {env:?}"
+    );
+    assert!(
+        !env.iter().any(|(_, value)| *value == canary),
+        "the host's real key was forwarded: {env:?}"
+    );
+    assert!(
+        !stderr.contains(canary),
+        "the value leaked to stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_sentinel_false_credential_fails_closed_when_image_metadata_is_unreadable() {
+    // Policy: when the boot image's own environment cannot be read, an
+    // authorization that must leave its variable *unset* is refused with a
+    // recovery instruction rather than warned about and continued - logging is
+    // not handling an error (CODING_STANDARDS, agent-vm #161 M1).
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: my-service\n    apiKey:\n      name: MY_SERVICE_KEY\n      inject:\n        - domain: api.my-service.example\n          header: x-api-key\n          format: \"%s\"\n",
+    );
+    let out = harness.launch("t", &[]);
+    assert!(!out.status.success());
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    // Assert the command it prints is *runnable*, not a substring of prose:
+    // the earlier assertion (`"Pull or inspect the image"`) passed while the
+    // printed command (`agent-vm pull {image}`) failed with "unexpected
+    // argument", because `pull` takes `--image REF` (agent-vm #161 review,
+    // N1). The exact ref must appear so the instruction is pasteable.
+    assert!(
+        rendered.contains(&format!("agent-vm pull --image {BOGUS_IMAGE}")),
+        "the launch did not offer a runnable pull command: {rendered}"
+    );
 }
 
 fn golden_path(tool: &str) -> PathBuf {

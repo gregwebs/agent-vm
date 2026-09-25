@@ -1332,6 +1332,10 @@ mod tests {
                 on_violation: None,
                 require_tls_identity: true,
             }],
+            // #175's new durable header-credential list. Empty here: this
+            // fixture exercises the file-backed secret pipeline, not the
+            // origin-scoped header channel.
+            header_credentials: Vec::new(),
             on_violation: Default::default(),
         }
     }

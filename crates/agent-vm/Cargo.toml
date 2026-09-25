@@ -70,6 +70,27 @@ base64 = "0.22"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# Parses `~/.config/agent-vm/credentials.yaml` (#161) — untrusted input that
+# decides which origins may receive a real credential, so the parser choice is
+# a security decision, not an ergonomic one. `serde-saphyr` is picked over the
+# archived `serde_yaml` (RUSTSEC-2024-0370) and the `serde_norway` fork because
+# it is pure Rust with `unsafe_code = "forbid"`, has no open advisories, and
+# exposes the exact deterministic controls this module needs: a pre-parse
+# `Budget` (documents, structural depth, nodes, events, anchors, aliases),
+# `DuplicateKeyPolicy::Error`, `MergeKeyPolicy::Error` and `strict_booleans`.
+# Only `deserialize` is enabled. Its own dependency `granit-parser` is used
+# directly (through the `serde_saphyr::granit_parser` re-export) by the
+# pre-parse guard, which rejects every tag and directive the options cannot
+# bound; see `credential_yaml.rs`. The `1.1` requirement is a caret range, not
+# a pin; the version tested and resolved in `Cargo.lock` is 1.3.0.
+serde-saphyr = { version = "1.1", default-features = false, features = ["deserialize"] }
+# Names `zeroize::Zeroizing<String>` in `credential_resolver`'s
+# `CredentialResolver` impl for microsandbox (#175's trait returns
+# `Zeroizing<String>` and the SDK re-exports neither the type nor the crate).
+# Already in the build graph at 1.8.2 via microsandbox/zstd, so this adds no
+# new compilation — it only makes the type nameable here. See
+# src/credential_resolver.rs.
+zeroize = "1"
 # Parses the user/project tool-config TOML (#80) and the compiled-in
 # `default-tools.toml`. Only the parser + serde features are wanted — no
 # `preserve_order` (key order is never load-bearing; tool order comes from
@@ -133,6 +154,15 @@ keyring = { version = "3.6.3", features = ["apple-native"] }
 keyring = { version = "3.6.3", features = ["crypto-rust", "linux-native-sync-persistent"] }
 
 [dev-dependencies]
+# Names the durable/resolved credential types a `credential_injection` unit
+# test constructs to drive the runtime's *config-level* fail-closed validation
+# (`SmoltcpNetwork::new_with_profile_and_credentials` via `microsandbox-network`,
+# already a direct dependency). That entry point takes `DeploymentProfile` and
+# the definition types from `microsandbox-types`, which `microsandbox-network`
+# uses in its public API but does not re-export. Already in the build graph
+# transitively via `microsandbox-network`; this only makes the types nameable
+# here and compiles nothing new. See src/credential_injection.rs.
+microsandbox-types = { path = "../../vendor/microsandbox/packages/microsandbox-types/rust" }
 # Property tests for `mount::lexical_link_path` (pure string surgery over
 # symlink target text -- the one total function in that module, so the
 # obvious quickcheck candidate per CODING_STANDARDS "Use property based

@@ -1008,11 +1008,12 @@ agent-vm secret rm anthropic
   means only "no names are tracked"; no probe ran. A listing with any
   `unavailable:` row exits non-zero, so a script is never told everything is
   fine when agent-vm could not see the store.
-- **Storing a value does not authorize its use.** `secret` is the storage
-  lifecycle only; nothing reads a stored value back, and nothing hands one to a
-  guest. Authorization, and any injection into a request, is separate host
-  configuration. See the
-  [credential shielding specification](docs/specs/credential-shielding.md).
+- **Storing a value does not authorize its use.** The only thing that reads a
+  stored value back is an *authorized launch* (see below); `secret` never prints
+  one, and `ls`/`doctor` remain structurally unable to. Authorization, and any
+  injection into a request, is separate host configuration. See the
+  [credential shielding specification](docs/specs/credential-shielding.md) and
+  [ADR-0025](docs/adr/0025-yaml-credential-shielding.md).
 - **No fallback, ever.** If the platform credential store is unavailable, the
   operation fails with a classified message. agent-vm never writes a value to a
   plaintext file, and never degrades to an environment variable.
@@ -1026,6 +1027,90 @@ loses only the *listing*: the stored values are untouched and
 malformed file or an invalid name is a hard error on every verb, naming the
 file and telling you to delete it to reset the listing — agent-vm never
 silently resets a file you wrote.
+
+### Authorizing a stored value for injection
+
+A stored value does nothing until you *authorize* it: name the exact HTTPS
+origin and the exact request header it may occupy, in
+`~/.config/agent-vm/credentials.yaml`. There is no approval registry and no
+generation CLI — editing the file **is** the authorization, and re-editing it is
+reauthorization.
+
+```yaml
+credentials:
+  - service: my-service          # the name you used with `agent-vm secret set`
+    required: true               # fail before boot if it is missing/unreadable
+    apiKey:
+      name: MY_SERVICE_KEY       # the guest environment variable this owns
+      sentinelEnv: true          # put `proxy-managed` there (default: false)
+      inject:
+        - domain: api.my-service.example   # bare host means HTTPS 443
+          header: x-api-key
+          format: "%s"                     # exactly one %s
+        - domain: api-2.my-service.example:8443
+          scheme: bearer                   # shorthand for authorization + "Bearer %s"
+```
+
+Then have a tool request it, in a user or project `config.toml`:
+
+```toml
+[[tools]]
+name = "my-agent"
+command = "my-agent"
+credentials = ["my-service"]
+```
+
+What to expect:
+
+- **The value never enters the guest.** The request to the authorized origin
+  carries it; the guest sees only the placeholder
+  (`sentinelEnv: true`) or nothing at all (`sentinelEnv: false`, the default).
+  Injection does not depend on `sentinelEnv`.
+- **Only the exact origin.** A bare `domain` means port 443; an explicit port is
+  exact. A request to another port, another host, or over cleartext is
+  *forwarded uninjected* — not blocked, and not an error.
+- **Each credential's port is declared as TLS-intercepted.** The runtime decides
+  TLS interception per **port**, so agent-vm adds the credential origin's port
+  to the launch's intercepted ports (unioning it with the default 443 and
+  anything already configured). Declaring a port intercepts TLS for **every**
+  host on that port, not only the credential's origin — that is the cost of a
+  per-port interception decision, so prefer the default 443 unless the service
+  really lives on another port.
+- **Egress policy is unchanged.** Authorizing an origin does not open egress to
+  it. If your policy denies the host, the request never reaches injection.
+- **Rotation is launch-scoped.** A value rotated with `agent-vm secret set`
+  while a sandbox runs is *not* picked up; the next launch uses the new value.
+- **Malformed authorization fails closed.** An unreadable, foreign-owned,
+  group/other-writable, symlinked or malformed `credentials.yaml` refuses a
+  launch that requests a credential, with a message naming the file but never
+  its contents. A launch that requests nothing is unaffected.
+- **Names owned by an authorization win.** If `apiKey.name` is
+  `OPENAI_API_KEY`, agent-vm stops forwarding the host's `OPENAI_API_KEY` for
+  that launch, suppresses any provider-forwarded variable of the same name, and
+  refuses a tool-declared `env` key of the same name. Names agent-vm itself must
+  publish (`IS_SANDBOX`, `LANG`, `PATH`, `HOME`/`USER`/`LOGNAME`, the `MSB_`
+  namespace) cannot be authorized as `apiKey.name` at all. A `sentinelEnv: false`
+  variable the boot image defines is refused, and unreadable image metadata
+  fails the launch closed rather than risking a value that should have been
+  unset.
+- **Same-named built-ins are not replaceable yet.** An entry named `anthropic`
+  (or `openai`, `opencode-static`, `copilot`) parses, but a launch that requests
+  that name is refused with a diagnostic naming
+  [#162](https://github.com/gregwebs/agent-vm/issues/162). Renaming the YAML
+  service is **not** a replacement: the built-in's capture and refresh stay in
+  place, so a differently-named credential is *additive*, not a substitute. No
+  permanent reserved-name rule exists.
+- **Unsupported, by name, never silently ignored.** `source` (an environment
+  source is #163), `permissions`/`permissions.network`, `oauth`, `basic`,
+  `username`, request signing, query/body injection, kit/hooks/images/mounts/
+  ports/composition, and wildcard, path, cleartext, userinfo, IP-literal or
+  non-ASCII destinations are all refused with the reason.
+- **macOS and Linux only.** Windows and the cloud backend refuse
+  credential-bearing launches upstream.
+- **A stale `msb` fails the capability probe.** The runtime is asked to report
+  `header-credential-launch-v1`; an `msb` built before this feature refuses the
+  launch before any sandbox record is written, and agent-vm tells you to rebuild
+  it from `vendor/microsandbox` (check `MSB_PATH`).
 
 On macOS the keychain ACL is bound to the calling binary's code-signing
 identity, so a locally rebuilt unsigned `agent-vm` may be asked

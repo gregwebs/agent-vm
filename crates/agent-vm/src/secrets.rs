@@ -161,6 +161,10 @@ pub const ALL_PLACEHOLDERS: &[&str] = &[
     OPENCODE_OPENAI_REFRESH_PLACEHOLDER,
     GH_TOKEN_PLACEHOLDER,
     COPILOT_TOKEN_PLACEHOLDER,
+    // The #161 credential sentinel: a guest tool that saves what agent-vm put
+    // in its owned variable must not be reported as an unshielded credential.
+    // Reused from its one definition rather than re-spelled.
+    crate::credential_yaml::SENTINEL_ENV_VALUE,
     "msb-zai-placeholder-k-v1",
     "msb-zai-coding-placeholder-k-v1",
     "msb-zhipuai-placeholder-k-v1",
@@ -1826,6 +1830,27 @@ mod tests {
                 "{} placeholder {} missing from ALL_PLACEHOLDERS",
                 provider.id,
                 provider.placeholder,
+            );
+        }
+    }
+
+    /// The #161 sentinel must be in the scanner's known-placeholder set, or a
+    /// guest tool that saved what agent-vm put in its owned variable produces a
+    /// false unshielded-credential finding. Equality stays whole-value: a
+    /// prefix or embedded sentinel is not a placeholder (agent-vm #161 review,
+    /// m3).
+    #[test]
+    fn the_credential_sentinel_is_a_known_placeholder_whole_value_only() {
+        let sentinel = crate::credential_yaml::SENTINEL_ENV_VALUE;
+        assert!(is_known_placeholder(sentinel), "{sentinel}");
+        for near in [
+            format!("{sentinel}-suffix"),
+            format!("prefix-{sentinel}"),
+            sentinel.to_uppercase(),
+        ] {
+            assert!(
+                !is_known_placeholder(&near),
+                "{near} must not read as a known placeholder"
             );
         }
     }
