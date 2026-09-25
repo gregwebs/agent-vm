@@ -45,6 +45,69 @@ pub(crate) fn read_bounded_regular_file(path: &Path, max: u64) -> Result<Vec<u8>
     read_regular_fd(fd, max, path.display().to_string())
 }
 
+/// Ownership and mode facts read off an **opened descriptor** — never a second
+/// path lookup, which could observe a different file than the bytes did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostFileFacts {
+    pub(crate) uid: u32,
+    /// Raw `st_mode`, including the file-type bits.
+    pub(crate) mode: u32,
+    pub(crate) size: u64,
+}
+
+/// [`read_bounded_regular_file`] with `O_NOFOLLOW`, returning the descriptor's
+/// own ownership/mode facts alongside the bytes.
+///
+/// The credential *authorization* file (`credentials.yaml`, #161) is the caller:
+/// a symlink at its final component would let whatever is on the other end
+/// decide which origins receive a real value, so `O_NOFOLLOW` refuses it
+/// outright (`ELOOP`) instead of stat-then-open, which races. The type, size and
+/// `after_fstat` checks are shared with the existing reader; only the flag and
+/// the returned facts are new, so the two paths cannot drift.
+pub(crate) fn read_bounded_regular_file_no_follow(
+    path: &Path,
+    max: u64,
+) -> Result<(Vec<u8>, HostFileFacts)> {
+    let fd = rfs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if error == Errno::LOOP {
+            anyhow!(
+                "{} is a symbolic link; refusing to follow it",
+                path.display()
+            )
+        } else {
+            anyhow!(error).context(format!("opening {}", path.display()))
+        }
+    })?;
+    let stat = rfs::fstat(&fd)
+        .map_err(|error| anyhow!(error))
+        .with_context(|| format!("stating {}", path.display()))?;
+    let facts = HostFileFacts {
+        uid: stat.st_uid,
+        mode: u32::from(stat.st_mode),
+        size: stat.st_size.max(0) as u64,
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(anyhow!("{} is not a regular file", path.display()));
+    }
+    if facts.size > max {
+        return Err(anyhow!("{} exceeds its size limit", path.display()));
+    }
+    let mut data = Vec::with_capacity(facts.size as usize);
+    fs::File::from(fd)
+        .take(max + 1)
+        .read_to_end(&mut data)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if data.len() as u64 > max {
+        return Err(anyhow!("{} exceeds its size limit", path.display()));
+    }
+    Ok((data, facts))
+}
+
 /// Writes trusted-host files atomically. The initial parent open intentionally
 /// follows trusted-host symlinks; guest-relative no-follow rules belong to
 /// `GuestStateDir` only.

@@ -74,7 +74,7 @@
 //! guest-user modes provision from.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -85,6 +85,7 @@ use serde::Deserialize;
 use vstd::prelude::*;
 
 use crate::credential_provider::{CredentialProvider, ProviderSet};
+use crate::secret_store::ServiceName;
 
 /// Ceiling on a config file read. A project config is possibly untrusted
 /// input, so a huge or special file must not be able to hang or exhaust
@@ -296,6 +297,11 @@ pub(crate) struct LaunchCatalog {
 pub(crate) struct CatalogEntry {
     tool: Tool,
     provisioned: ProviderSet,
+    /// Every credential name this entry's closure requests, folded and
+    /// deduplicated over the same closure as [`Self::provisioned`]. A request,
+    /// never an authorization: [`crate::credential_resolver`] decides which of
+    /// these the user has actually authorized.
+    requested_names: BTreeSet<ServiceName>,
     /// Every `persist` path this launch provisions: the union over its
     /// provisioning closure, in catalog then declaration order. Deterministic
     /// because it folds over the catalog, not the closure's traversal order.
@@ -312,6 +318,12 @@ impl CatalogEntry {
     /// requirement set — the pre-boot hard bail still reads `credentials`.
     pub(crate) fn provisioned(&self) -> ProviderSet {
         self.provisioned
+    }
+
+    /// Every credential name this launch requests, from its own `credentials`
+    /// and its `tools` closure.
+    pub(crate) fn requested_names(&self) -> &BTreeSet<ServiceName> {
+        &self.requested_names
     }
 
     /// Every `persist` path this launch provisions, as the guest-HOME link
@@ -464,7 +476,18 @@ pub(crate) struct Tool {
     command: String,
     argv: Vec<String>,
     layer: Option<ToolLayer>,
+    /// The **built-in** providers this tool requires, in declaration order.
+    /// Kept separate from [`Self::credential_names`] because every existing
+    /// consumer (the provisioning closure, `run::launch`'s hard bail, every
+    /// golden) is defined over built-ins only, and #161 must not change them.
     credentials: Vec<CredentialProvider>,
+    /// Every name this tool's `credentials = [...]` declared, folded to the
+    /// canonical [`ServiceName`] and deduplicated, in declaration order. A
+    /// *source-neutral request*: whether a name is a built-in provider or a
+    /// `credentials.yaml` authorization is a launch-resolution decision, not a
+    /// config-parse one, so that #162 can rework the taxonomy without moving
+    /// validation.
+    credential_names: Vec<ServiceName>,
     /// The catalog tools this tool wants available in its guest (a
     /// **provisioning** input), distinct from `credentials` (the
     /// **requirement** set).
@@ -533,6 +556,12 @@ impl Tool {
         &self.credentials
     }
 
+    /// Every credential name the tool declared, folded and deduplicated.
+    /// [`Self::credential_providers`] stays the built-in-only projection.
+    pub(crate) fn credential_names(&self) -> &[ServiceName] {
+        &self.credential_names
+    }
+
     /// The catalog tools this tool declares. Names are resolved against the
     /// **launch catalog** (which includes the appended `shell` fallback), not
     /// against the tier that declared them.
@@ -582,6 +611,7 @@ impl Tool {
             && self.argv == other.argv
             && self.layer == other.layer
             && self.credentials == other.credentials
+            && self.credential_names == other.credential_names
             && self.tools == other.tools
             && self.persist == other.persist
             && self.interactive_shell == other.interactive_shell
@@ -600,7 +630,8 @@ impl Tool {
         if self.layer != other.layer {
             fields.push(ToolField::Layer);
         }
-        if self.credentials != other.credentials {
+        if self.credentials != other.credentials || self.credential_names != other.credential_names
+        {
             fields.push(ToolField::Credentials);
         }
         if self.tools != other.tools {
@@ -1147,29 +1178,34 @@ fn resolve_provisioning(tools: Vec<Tool>) -> Result<Vec<CatalogEntry>> {
     let closures: Vec<Vec<bool>> = (0..tools.len())
         .map(|start| launch_closure(&tools, &index, start))
         .collect();
-    let facets: Vec<(ProviderSet, Vec<PersistPath>)> = closures
+    let facets: Vec<(ProviderSet, BTreeSet<ServiceName>, Vec<PersistPath>)> = closures
         .iter()
         .map(|visited| {
             let mut provisioned = ProviderSet::default();
+            let mut requested_names = BTreeSet::new();
             let mut persist = Vec::new();
             for (position, seen) in visited.iter().enumerate() {
                 if !*seen {
                     continue;
                 }
                 provisioned = provisioned.union(tools[position].credential_providers());
+                requested_names.extend(tools[position].credential_names().iter().cloned());
                 persist.extend(tools[position].persist().iter().cloned());
             }
-            (provisioned, persist)
+            (provisioned, requested_names, persist)
         })
         .collect();
     Ok(tools
         .into_iter()
         .zip(facets)
-        .map(|(tool, (provisioned, persist))| CatalogEntry {
-            tool,
-            provisioned,
-            persist,
-        })
+        .map(
+            |(tool, (provisioned, requested_names, persist))| CatalogEntry {
+                tool,
+                provisioned,
+                requested_names,
+                persist,
+            },
+        )
         .collect())
 }
 
@@ -1282,7 +1318,8 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
         let command = validate_command(&tool.command, file, index, &name)?;
         let argv = validate_argv(tool.args, file, index, &name)?;
         let layer = validate_layer(tool.layer, file, index, &name)?;
-        let credentials = validate_credentials(tool.credentials, file, index, &name)?;
+        let (credentials, credential_names) =
+            validate_credentials(tool.credentials, file, index, &name)?;
         let tools_field = validate_tool_refs(tool.tools, file, index, &name)?;
         let persist = validate_persist(tool.persist, file, index, &name)?;
         let env = validate_env(tool.env, file, index, &name)?;
@@ -1293,6 +1330,7 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
             argv,
             layer,
             credentials,
+            credential_names,
             tools: tools_field,
             persist,
             interactive_shell: tool.interactive_shell,
@@ -1461,28 +1499,49 @@ fn validate_layer(
     }
 }
 
+/// Validate `credentials = [...]` into (built-in providers, every declared
+/// name).
+///
+/// #161 widened what a name may be: it is accepted if it is a valid
+/// [`ServiceName`], which is the same rule the keychain uses, so a name can no
+/// longer be rejected at config time merely because no compiled-in provider
+/// claims it. Resolution (built-in vs. `credentials.yaml`, and the staged
+/// #162 same-name refusal) is a launch decision, deliberately not a parse one.
 fn validate_credentials(
     raw: Vec<String>,
     file: &Path,
     index: usize,
     name: &ToolName,
-) -> Result<Vec<CredentialProvider>> {
-    raw.into_iter()
-        .map(|provider_name| {
-            CredentialProvider::from_config_name(&provider_name).ok_or_else(|| {
-                tool_error(
-                    file,
-                    index,
-                    name,
-                    format!(
-                        "credentials: {} is not a known credential provider; valid names: {}",
-                        quoted_str(&provider_name),
-                        supported_provider_names()
-                    ),
-                )
-            })
-        })
-        .collect()
+) -> Result<(Vec<CredentialProvider>, Vec<ServiceName>)> {
+    let mut providers = Vec::new();
+    let mut names: Vec<ServiceName> = Vec::new();
+    for provider_name in raw {
+        let service = ServiceName::parse(&provider_name).map_err(|error| {
+            tool_error(
+                file,
+                index,
+                name,
+                // The supplied name is deliberately NOT echoed: this is a
+                // name slot and a realistic mistake is pasting the key into
+                // it (`ServiceName`'s own rule is careful for the same
+                // reason). The tool name and declaration index identify the
+                // entry.
+                format!(
+                    "credentials: an entry is not a valid name: {error:#}. A name must be 1-64 \
+                     characters from [a-zA-Z0-9._-] starting with a letter or digit (letters are \
+                     folded to lowercase), or one of the built-in providers: {}",
+                    supported_provider_names()
+                ),
+            )
+        })?;
+        if let Some(provider) = CredentialProvider::from_config_name(service.as_str()) {
+            providers.push(provider);
+        }
+        if !names.contains(&service) {
+            names.push(service);
+        }
+    }
+    Ok((providers, names))
 }
 
 /// Validate one tool's `tools` declaration *within its tier*. Reference
@@ -3102,24 +3161,68 @@ mod tests {
         }
     }
 
+    /// #161 widened this validator: a name is accepted if it is a valid
+    /// keychain service name, because whether it is a built-in provider or a
+    /// `credentials.yaml` authorization is a *launch* decision (and the staged
+    /// #162 same-name refusal lives there). What stays a config-parse error is
+    /// a name that could not select a keychain item at all.
     #[test]
-    fn provider_names_are_validated_against_the_registry() {
-        for valid in ["anthropic", "openai", "opencode-static", "copilot"] {
+    fn credential_names_are_validated_as_service_names() {
+        for valid in [
+            "anthropic",
+            "openai",
+            "opencode-static",
+            "copilot",
+            "my-service",
+        ] {
             let fixture = Fixture::new();
             fixture.user(&format!(
                 "[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"{valid}\"]\n"
             ));
-            assert!(fixture.load().is_ok(), "{valid} should be valid");
+            let report = fixture.load().unwrap_or_else(|error| {
+                panic!("{valid} should be valid: {error:#}");
+            });
+            let tool = &report.resolved().as_slice()[0];
+            // Every declared name is carried forward for launch resolution,
+            // whether or not a compiled-in provider claims it.
+            assert_eq!(
+                tool.credential_names()
+                    .iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![valid]
+            );
+            // The built-in projection is unchanged, and is what the
+            // provisioning closure still consumes.
+            assert_eq!(
+                tool.credential_providers()
+                    .iter()
+                    .map(|provider| provider.config_name())
+                    .collect::<Vec<_>>(),
+                crate::credential_provider::CredentialProvider::from_config_name(valid)
+                    .map(|provider| vec![provider.config_name()])
+                    .unwrap_or_default()
+            );
         }
-        for invalid in ["opencode", "gh", "Anthropic", "nope"] {
+        // The doctor label `opencode` is still not the config name; it is
+        // simply now a valid *request* that launch resolution will refuse with
+        // the both-lookup-locations message. What fails here is a name that
+        // cannot be a keychain item.
+        for invalid in ["opencode!", "-nope", "", "a b"] {
             let fixture = Fixture::new();
             fixture.user(&format!(
                 "[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"{invalid}\"]\n"
             ));
             let error = fixture.load().unwrap_err();
             let rendered = format!("{error:#}");
-            assert!(rendered.contains(invalid), "{rendered}");
-            assert!(rendered.contains("opencode-static"), "{rendered}");
+            assert!(
+                rendered.contains("not a valid name"),
+                "{invalid}: {rendered}"
+            );
+            assert!(
+                rendered.contains("opencode-static"),
+                "{invalid}: {rendered}"
+            );
         }
     }
 

@@ -197,10 +197,11 @@ pub(crate) enum Dispatch {
         cmd: Cmd,
         catalog: Catalog,
     },
-    // `args` is boxed so `Dispatch` does not carry the shared launch `Args`'s
-    // full size inline (clippy `large_enum_variant`).
+    // `entry` and `args` are boxed so `Dispatch` does not carry the two large
+    // launch-side values inline (clippy `large_enum_variant`); `entry` grew
+    // when #161 added the launch's requested credential names.
     Launch {
-        entry: CatalogEntry,
+        entry: Box<CatalogEntry>,
         /// The catalog's declared tool layers, read **before** `take_entry`
         /// removed the launched verb (issue #84). The booted image is a
         /// property of the whole catalog, not of the invoked verb, so reading
@@ -324,7 +325,7 @@ where
             let layers = catalog.declared_layers();
             match catalog.take_entry(name) {
                 Some(entry) => Ok(Dispatch::Launch {
-                    entry,
+                    entry: Box::new(entry),
                     layers,
                     args: Box::new(run::Args::from_arg_matches(sub)?),
                 }),

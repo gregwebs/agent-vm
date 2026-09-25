@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -5,6 +6,7 @@ use microsandbox::sandbox::SandboxBuilder;
 use microsandbox_network::builder::NetworkBuilder;
 
 use crate::credential_provider::{self, CredentialProvider, ProviderSet};
+use crate::credential_resolver::{LaunchCredentials, ReadyCredential};
 use crate::secrets::{self, CredsState};
 
 const MAX_BUFFERED_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -18,6 +20,9 @@ pub(crate) struct Inputs<'a> {
     /// The launch's provisioning set; a provider outside it is never
     /// registered.
     pub provisioned: ProviderSet,
+    /// The credentials this launch resolved (#161). Registered *after* every
+    /// legacy wire slot so the existing order stays byte-identical.
+    pub launch: &'a LaunchCredentials,
 }
 
 /// Registration order for the substituting proxy's secrets. Explicit because
@@ -43,6 +48,9 @@ const WIRE_ORDER: [WireSlot; 5] = [
 
 pub(crate) struct Plan {
     secrets: Vec<FileSecret>,
+    /// Origin-scoped named-header credentials (#161): a reference the runtime
+    /// resolves at spawn, never a value.
+    header_credentials: Vec<crate::credential_resolver::ReadyCredential>,
     hook_argv: Vec<String>,
     routes: Vec<Route>,
 }
@@ -168,23 +176,71 @@ impl Plan {
 
         Ok(Self {
             secrets,
+            header_credentials: inputs.launch.ready().to_vec(),
             hook_argv,
             routes,
         })
     }
 
-    pub(crate) fn apply_to(self, builder: SandboxBuilder) -> SandboxBuilder {
-        if self.secrets.is_empty() {
-            return builder;
-        }
-        builder.network(move |network| self.configure_network(network))
+    /// Whether this plan registers *anything* in the network overlay. A
+    /// YAML-only launch has an empty `secrets` list, so both guards below must
+    /// consider the header credentials too: otherwise
+    /// `builder.network(..)` is never called at all and a YAML-only launch
+    /// registers nothing (#161).
+    fn is_empty(&self) -> bool {
+        self.secrets.is_empty() && self.header_credentials.is_empty()
     }
 
-    fn configure_network(self, mut network: NetworkBuilder) -> NetworkBuilder {
-        if self.secrets.is_empty() {
-            return network;
+    pub(crate) fn apply_to(self, builder: SandboxBuilder) -> Result<SandboxBuilder> {
+        // An empty plan must leave the builder untouched: installing a default
+        // network overlay changes the durable config's shape for a launch that
+        // registers nothing, which the goldens pin.
+        if self.is_empty() {
+            return Ok(builder);
         }
+        // The closure signature is `FnOnce(NetworkBuilder) -> NetworkBuilder`,
+        // so a failure cannot be returned through it. Stash it and surface it
+        // after: the alternative would be a default that could silently drop a
+        // caller's intercepted port (agent-vm #161 review, m1).
+        let failure: std::cell::Cell<Option<anyhow::Error>> = std::cell::Cell::new(None);
+        let builder = builder.network(|network| match self.apply_to_network(network) {
+            Ok(network) => network,
+            Err(error) => {
+                failure.set(Some(error));
+                NetworkBuilder::new()
+            }
+        });
+        match failure.into_inner() {
+            Some(error) => Err(error),
+            None => Ok(builder),
+        }
+    }
+
+    /// The guard plus configuration `apply_to` actually runs. Split out so a
+    /// test can exercise the emptiness guard - the "YAML-only launch registers
+    /// nothing" regression - without an async `SandboxBuilder`.
+    pub(crate) fn apply_to_network(self, network: NetworkBuilder) -> Result<NetworkBuilder> {
+        if self.is_empty() {
+            return Ok(network);
+        }
+        self.configure_network(network)
+    }
+
+    fn configure_network(self, mut network: NetworkBuilder) -> Result<NetworkBuilder> {
+        // Interception is decided **per port** (#175's fail-closed rule): the
+        // runtime refuses a credential whose origin port is not in
+        // `tls.intercepted_ports`. The base config's own list (default `[443]`)
+        // is read here, before anything is added, and every credential origin's
+        // port is unioned in below — never replacing it, so 443 and any port a
+        // caller already intercepted survive.
+        let base_ports = intercepted_ports_of(&network)?;
         network = network.tls_overlay(|tls| tls.enabled(true));
+        // Every wire slot's `env_var` is `MSB_`-prefixed, and `GuestEnvName::parse`
+        // reserves that whole namespace, so a YAML credential can never *own*
+        // one and `assemble_guest_env` (which does not consult these slots) needs
+        // no filter for them. `every_wire_slot_env_var_is_in_the_reserved_msb_namespace`
+        // asserts the invariant so a future non-`MSB_` slot fails a test instead
+        // of silently bypassing ownership (agent-vm #161 review, N5).
         for secret in self.secrets {
             network = network.secret(|mut builder| {
                 builder = builder
@@ -202,6 +258,31 @@ impl Plan {
                 builder
             });
         }
+        // #161's origin-scoped named-header credentials, registered *after*
+        // every legacy wire slot so the existing order is untouched. No
+        // explicit TLS enable is needed: `header_credential` turns TLS
+        // interception on itself. Declaring the ports *is* needed now: the
+        // union keeps 443 and every credential origin's port intercepted, so a
+        // bare `domain` (which means 443) and an explicit `:port` both inject.
+        if !self.header_credentials.is_empty() {
+            let ports = intercepted_ports_with(base_ports, &self.header_credentials);
+            network = network.tls_overlay(|tls| tls.intercepted_ports(ports.clone()));
+        }
+        for credential in &self.header_credentials {
+            for rule in credential.inject() {
+                network = network.header_credential(|builder| {
+                    builder
+                        // `id` and `reference` are both the folded service name
+                        // today; kept explicit so a future divergence is a
+                        // deliberate edit here and not an accident.
+                        .id(credential.service().as_str())
+                        .reference(credential.service().as_str())
+                        .origin(rule.host(), rule.port())
+                        .header(rule.header())
+                        .format(rule.format())
+                });
+            }
+        }
         if !self.routes.is_empty() {
             network = network.intercept(|mut intercept| {
                 intercept = intercept
@@ -217,7 +298,7 @@ impl Plan {
                 intercept
             });
         }
-        network
+        Ok(network)
     }
 }
 
@@ -225,6 +306,49 @@ fn utf8_path(path: &Path, label: &str) -> Result<String> {
     path.to_str()
         .map(ToOwned::to_owned)
         .with_context(|| format!("{label} must be valid UTF-8: {}", path.display()))
+}
+
+/// The TLS-intercepted ports `network` already carries, read through the one
+/// lossless read available: `NetworkBuilder` exposes no getter, but it is
+/// `Clone`, and `build()` on a clone yields the assembled `NetworkConfig`.
+///
+/// A failed build is **propagated**, not papered over: the base is always a
+/// config the SDK itself already built successfully (`SandboxBuilder::network`
+/// installs only the config whose build passed), so a failure here is an
+/// invariant violation - and substituting the default `[443]` would silently
+/// drop any port a caller configured, which is exactly the data loss this
+/// function exists to avoid (agent-vm #161 review, m1).
+fn intercepted_ports_of(network: &NetworkBuilder) -> Result<Vec<u16>> {
+    let config = network.clone().build().map_err(|error| {
+        anyhow::anyhow!(
+            "the base network configuration could not be read ({error}); refusing to register \
+             credentialed interception because reading it could drop an already-configured \
+             intercepted port"
+        )
+    })?;
+    Ok(config.tls.intercepted_ports)
+}
+
+/// The intercepted-port set for a launch that registers `credentials`: `base`
+/// unioned with every credential origin's port, sorted and deduplicated.
+///
+/// Union, never replacement. A bare `domain` means 443 and must stay
+/// intercepted, and any port an existing network config already intercepts is
+/// preserved. Declaring a port intercepts TLS for **every** host on it, not only
+/// the credential's host — that is the honest cost of the runtime's per-port
+/// fail-closed decision, and why the widening is explicit here rather than
+/// derived upstream.
+fn intercepted_ports_with(
+    base: impl IntoIterator<Item = u16>,
+    credentials: &[ReadyCredential],
+) -> Vec<u16> {
+    let mut ports: BTreeSet<u16> = base.into_iter().collect();
+    for credential in credentials {
+        for rule in credential.inject() {
+            ports.insert(rule.port());
+        }
+    }
+    ports.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -238,16 +362,22 @@ mod tests {
     };
 
     use super::*;
+    use crate::credential_resolver::EnvDisposition;
 
     fn path(name: &str) -> PathBuf {
         PathBuf::from(format!("/host/{name}"))
     }
     fn inputs(creds: &CredsState, provisioned: ProviderSet) -> Inputs<'_> {
+        // No YAML-authorized credentials: every legacy ordering assertion must
+        // be byte-identical whether or not #161's list is empty.
+        static NONE: std::sync::LazyLock<LaunchCredentials> =
+            std::sync::LazyLock::new(LaunchCredentials::default);
         Inputs {
             creds,
             state_dir: Path::new("/state/project"),
             allowed_repos: &[],
             provisioned,
+            launch: &NONE,
         }
     }
 
@@ -255,10 +385,52 @@ mod tests {
     fn all() -> ProviderSet {
         ProviderSet::new(CredentialProvider::ALL)
     }
+    /// Exercise the guard `apply_to` actually runs (`apply_to_network`), not
+    /// `configure_network` directly, so a YAML-only launch that fails the
+    /// "nothing to register" guard is caught here (agent-vm #161 review, M4).
     fn network(plan: Plan) -> microsandbox_network::config::NetworkConfig {
-        plan.configure_network(NetworkBuilder::new())
+        plan.apply_to_network(NetworkBuilder::new())
+            .expect("a valid base network")
             .build()
             .unwrap()
+    }
+
+    /// #161 ownership: `assemble_guest_env` does not consult the legacy
+    /// wire-slot variables, so the only thing keeping a wire slot from
+    /// colliding with a YAML credential's owned guest variable is that every
+    /// one of them is `MSB_`-prefixed — and `GuestEnvName::parse` rejects the
+    /// whole `MSB_` namespace. This asserts that invariant over every slot the
+    /// module can register, so a future non-`MSB_` slot fails here instead of
+    /// silently bypassing ownership (agent-vm #161 review, N5).
+    #[test]
+    fn every_wire_slot_env_var_is_in_the_reserved_msb_namespace() {
+        use crate::credential_yaml::GuestEnvName;
+        let creds = CredsState {
+            anthropic_token_file: Some(path("anthropic")),
+            openai_token_file: Some(path("openai")),
+            opencode_openai_access_token_file: Some(path("openai")),
+            opencode_api_token_files: secrets::OPENCODE_API_PROVIDERS
+                .iter()
+                .map(|provider| (*provider, path(provider.id)))
+                .collect(),
+            gh_token_file: Some(path("gh")),
+            copilot_token_file: Some(path("copilot")),
+            ..CredsState::default()
+        };
+        let config = network(Plan::new(path("agent-vm"), inputs(&creds, all())).unwrap());
+        assert!(!config.secrets.secrets.is_empty());
+        for entry in &config.secrets.secrets {
+            assert!(
+                entry.env_var.starts_with("MSB_"),
+                "wire slot {:?} is not in the reserved `MSB_` namespace",
+                entry.env_var
+            );
+            assert!(
+                GuestEnvName::parse(&entry.env_var).is_err(),
+                "wire slot {:?} is a legal guest-env name, so a credential could own it",
+                entry.env_var
+            );
+        }
     }
 
     /// V6: the emitted secret registration order, captured on the
@@ -433,6 +605,7 @@ mod tests {
                     state_dir: Path::new("/state/project"),
                     allowed_repos: &allowed_repos,
                     provisioned: all(),
+                    launch: &LaunchCredentials::default(),
                 },
             )
             .unwrap(),
@@ -796,6 +969,7 @@ mod tests {
         )
         .unwrap()
         .configure_network(base)
+        .expect("a valid base network")
         .build()
         .unwrap();
         assert_eq!(config.ports.len(), 1);
@@ -805,5 +979,407 @@ mod tests {
         assert_eq!(config.policy.default_ingress, base_policy.default_ingress);
         assert_eq!(config.policy.rules.len(), base_policy.rules.len());
         assert!(config.tls.enabled);
+    }
+
+    // -- #161: origin-scoped named-header credentials ---------------------
+
+    /// A YAML-only launch has **no** legacy secrets, so the old `apply_to`
+    /// guard (`self.secrets.is_empty()`) returned early and registered nothing.
+    /// This exercises `apply_to_network` - the guard `apply_to` actually runs -
+    /// so reverting either half of the `secrets && header_credentials` fix
+    /// fails here (agent-vm #161 review, M4).
+    #[test]
+    fn yaml_only_launch_registers_the_credential_and_enables_tls() {
+        let launch = LaunchCredentials::for_test(
+            vec![(
+                "my-service",
+                vec![crate::credential_yaml::rule_for_test(
+                    "api.my-service.com",
+                    8443,
+                    "x-api-key",
+                    "%s",
+                )],
+            )],
+            vec![("MY_SERVICE_KEY", EnvDisposition::Sentinel)],
+        );
+        let creds = CredsState::default();
+        let config = network(
+            Plan::new(
+                path("agent-vm"),
+                Inputs {
+                    creds: &creds,
+                    state_dir: Path::new("/state/project"),
+                    allowed_repos: &[],
+                    provisioned: ProviderSet::default(),
+                    launch: &launch,
+                },
+            )
+            .unwrap(),
+        );
+        // No legacy secret was invented, and injection is independent of
+        // `sentinelEnv` (AC2): the header credential registers either way.
+        assert!(config.secrets.secrets.is_empty());
+        assert_eq!(config.secrets.header_credentials.len(), 1);
+        let entry = &config.secrets.header_credentials[0];
+        assert_eq!(entry.id, "my-service");
+        assert_eq!(entry.reference, "my-service");
+        assert_eq!(entry.origin.host, "api.my-service.com");
+        assert_eq!(entry.origin.port, 8443);
+        assert_eq!(entry.header, "x-api-key");
+        assert_eq!(entry.format, "%s");
+        // `header_credential` turns TLS interception on itself.
+        assert!(config.tls.enabled);
+        // Interception is per-port and the runtime now fails closed on an
+        // undeclared port, so the credential's port is unioned with the default
+        // 443 (which a bare `domain` means and must keep).
+        assert_eq!(config.tls.intercepted_ports, vec![443, 8443]);
+    }
+
+    /// A 443-only credential must not narrow the default interception set: the
+    /// port is already there, so the union is exactly `[443]`.
+    #[test]
+    fn a_443_only_credential_does_not_narrow_the_default() {
+        let launch = LaunchCredentials::for_test(
+            vec![(
+                "my-service",
+                vec![crate::credential_yaml::rule_for_test(
+                    "api.my-service.com",
+                    443,
+                    "authorization",
+                    "Bearer %s",
+                )],
+            )],
+            vec![],
+        );
+        let creds = CredsState::default();
+        let config = network(
+            Plan::new(
+                path("agent-vm"),
+                Inputs {
+                    creds: &creds,
+                    state_dir: Path::new("/state/project"),
+                    allowed_repos: &[],
+                    provisioned: ProviderSet::default(),
+                    launch: &launch,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(config.tls.intercepted_ports, vec![443]);
+    }
+
+    /// The port composition itself: union with the base, never replacement, so
+    /// 443 and any caller-configured port survive a credential's own port.
+    #[test]
+    fn declaring_a_credential_port_unions_with_the_base_ports() {
+        let launch = |port: u16| {
+            LaunchCredentials::for_test(
+                vec![(
+                    "my-service",
+                    vec![crate::credential_yaml::rule_for_test(
+                        "api.my-service.com",
+                        port,
+                        "x-api-key",
+                        "%s",
+                    )],
+                )],
+                vec![],
+            )
+        };
+        // Non-443: the port is added, 443 stays.
+        assert_eq!(
+            intercepted_ports_with([443], launch(8443).ready()),
+            vec![443, 8443]
+        );
+        // 443-only: no change.
+        assert_eq!(
+            intercepted_ports_with([443], launch(443).ready()),
+            vec![443]
+        );
+        // A caller's own interception is preserved (union, not replacement).
+        assert_eq!(
+            intercepted_ports_with([443, 9000], launch(8443).ready()),
+            vec![443, 8443, 9000]
+        );
+        // A credential-free plan adds nothing.
+        assert_eq!(intercepted_ports_with([443], &[]), vec![443]);
+    }
+
+    /// The composition that actually runs (`apply_to_network`, the path
+    /// `apply_to` delegates to): a caller's own intercepted port survives a
+    /// credential whose origin is on another port. This is the read the
+    /// old `[443]` fallback could erase (agent-vm #161 review, m1).
+    #[test]
+    fn a_custom_base_intercepted_port_survives_the_credential_overlay() {
+        let base = NetworkBuilder::new().tls_overlay(|tls| tls.intercepted_ports(vec![443, 9000]));
+        let launch = LaunchCredentials::for_test(
+            vec![(
+                "my-service",
+                vec![crate::credential_yaml::rule_for_test(
+                    "api.my-service.com",
+                    8443,
+                    "x-api-key",
+                    "%s",
+                )],
+            )],
+            vec![],
+        );
+        let creds = CredsState::default();
+        let plan = Plan::new(
+            path("agent-vm"),
+            Inputs {
+                creds: &creds,
+                state_dir: Path::new("/state/project"),
+                allowed_repos: &[],
+                provisioned: ProviderSet::default(),
+                launch: &launch,
+            },
+        )
+        .unwrap();
+        let config = plan
+            .apply_to_network(base)
+            .expect("a valid base composes")
+            .build()
+            .unwrap();
+        assert_eq!(config.tls.intercepted_ports, vec![443, 8443, 9000]);
+    }
+
+    /// The review's latent defect: a base whose `build()` fails (here a header
+    /// credential whose TLS was then disabled) must be **refused**, not
+    /// repaired by substituting `[443]` - which would have silently dropped the
+    /// caller's 9000 (agent-vm #161 review, m1).
+    #[test]
+    fn an_unbuildable_base_is_refused_rather_than_losing_a_port() {
+        let base = NetworkBuilder::new()
+            .tls_overlay(|tls| tls.intercepted_ports(vec![443, 9000]))
+            .header_credential(|c| {
+                c.id("prior")
+                    .reference("prior")
+                    .origin("prior.example", 443)
+                    .header("x-prior")
+                    .format("%s")
+            })
+            .tls_overlay(|tls| tls.enabled(false));
+        assert!(
+            base.clone().build().is_err(),
+            "the fixture base must be unbuildable"
+        );
+        let launch = LaunchCredentials::for_test(
+            vec![(
+                "my-service",
+                vec![crate::credential_yaml::rule_for_test(
+                    "api.my-service.com",
+                    8443,
+                    "x-api-key",
+                    "%s",
+                )],
+            )],
+            vec![],
+        );
+        let creds = CredsState::default();
+        let plan = Plan::new(
+            path("agent-vm"),
+            Inputs {
+                creds: &creds,
+                state_dir: Path::new("/state/project"),
+                allowed_repos: &[],
+                provisioned: ProviderSet::default(),
+                launch: &launch,
+            },
+        )
+        .unwrap();
+        let error = match plan.apply_to_network(base) {
+            Ok(_) => panic!("an unreadable base must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("could not be read"),
+            "{error:#}"
+        );
+    }
+
+    /// Negative control at agent-vm's own boundary: the registration alone,
+    /// with no port declaration, is refused by the runtime's fail-closed check.
+    /// This is why `configure_network` must declare the ports; without that,
+    /// `network()`'s `.build().unwrap()` would panic exactly as this asserts.
+    #[test]
+    fn an_undeclared_port_is_refused_without_the_declaration() {
+        let err = NetworkBuilder::new()
+            .header_credential(|c| {
+                c.id("my-service")
+                    .reference("my-service")
+                    .origin("api.my-service.com", 8443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                microsandbox_network::policy::BuildError::HeaderCredentialPortNotIntercepted {
+                    port: 8443,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Negative control at the engine's config-level re-validation: a stored or
+    /// hand-built config that bypasses `NetworkBuilder::build` is refused for
+    /// the same reason, proving the upstream guard agent-vm's ports satisfy is
+    /// real rather than assumed.
+    #[test]
+    fn an_undeclared_port_is_refused_by_the_engine_config_validation() {
+        use microsandbox_network::network::{NetworkInitError, SmoltcpNetwork};
+        use microsandbox_network::secrets::credential::ResolvedHeaderCredential;
+        use microsandbox_types::{DeploymentProfile, DurableHeaderCredential, HttpsOrigin};
+
+        let definition = DurableHeaderCredential {
+            id: "my-service".into(),
+            reference: "my-service".into(),
+            origin: HttpsOrigin {
+                host: "api.my-service.example".into(),
+                port: 8443,
+            },
+            header: "x-api-key".into(),
+            format: "%s".into(),
+        };
+        let resolved =
+            ResolvedHeaderCredential::from_definition(&definition, "not-a-real-value".to_owned());
+
+        let mut config = microsandbox_network::config::NetworkConfig::default();
+        config.tls.enabled = true;
+        // 8443 deliberately omitted: this is what an agent-vm launch would look
+        // like if it registered the credential without declaring the port.
+        config.tls.intercepted_ports = vec![443];
+        config.secrets.header_credentials.push(definition);
+
+        let err = match SmoltcpNetwork::new_with_profile_and_credentials(
+            config,
+            0,
+            DeploymentProfile::SingleTenant,
+            vec![resolved],
+        ) {
+            Ok(_) => panic!("an undeclared port must be refused by the engine"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                NetworkInitError::HeaderCredentialPortNotIntercepted { port: 8443, .. }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// AC2: header injection does not depend on `sentinelEnv`. A credential
+    /// whose guest variable must be left unset (`EnvDisposition::Unset`) still
+    /// registers its header credential.
+    #[test]
+    fn header_injection_is_independent_of_sentinel_env() {
+        let launch = LaunchCredentials::for_test(
+            vec![(
+                "my-service",
+                vec![crate::credential_yaml::rule_for_test(
+                    "api.my-service.com",
+                    443,
+                    "x-api-key",
+                    "%s",
+                )],
+            )],
+            vec![("MY_SERVICE_KEY", EnvDisposition::Unset)],
+        );
+        let creds = CredsState::default();
+        let config = network(
+            Plan::new(
+                path("agent-vm"),
+                Inputs {
+                    creds: &creds,
+                    state_dir: Path::new("/state/project"),
+                    allowed_repos: &[],
+                    provisioned: ProviderSet::default(),
+                    launch: &launch,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(config.secrets.header_credentials.len(), 1);
+    }
+
+    /// The registration is reference-only: the durable entry has exactly the
+    /// five non-secret fields, so no value can be carried by it (Decision 2),
+    /// and the serialized config has nowhere to put one. The value-carrying
+    /// half - a canary seeded through resolution and rendered out of the
+    /// *actual* durable config - is
+    /// `credential_resolver::tests::durable_config_carries_the_reference_and_never_a_value`,
+    /// where a `CredentialSource` exists to seed it.
+    #[test]
+    fn header_credential_registration_is_reference_only() {
+        let launch = LaunchCredentials::for_test(
+            vec![(
+                "my-service",
+                vec![crate::credential_yaml::rule_for_test(
+                    "api.my-service.com",
+                    443,
+                    "authorization",
+                    "Bearer %s",
+                )],
+            )],
+            vec![],
+        );
+        let creds = CredsState::default();
+        let config = network(
+            Plan::new(
+                path("agent-vm"),
+                Inputs {
+                    creds: &creds,
+                    state_dir: Path::new("/state/project"),
+                    allowed_repos: &[],
+                    provisioned: ProviderSet::default(),
+                    launch: &launch,
+                },
+            )
+            .unwrap(),
+        );
+        let entry = serde_json::to_value(&config.secrets.header_credentials[0]).unwrap();
+        let keys: Vec<&str> = entry
+            .as_object()
+            .expect("the durable entry is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["id", "reference", "origin", "header", "format"],
+            "the durable entry must have no value-shaped field"
+        );
+        let rendered = serde_json::to_string(&config).unwrap();
+        assert!(rendered.contains("my-service"), "{rendered}");
+    }
+
+    /// A credential the file authorizes but this launch does not request
+    /// registers nothing (AC8): resolution never puts it in `ready`.
+    #[test]
+    fn authorized_but_unrequested_credential_registers_nothing() {
+        let launch =
+            LaunchCredentials::for_test(vec![], vec![("MY_SERVICE_KEY", EnvDisposition::Unset)]);
+        let creds = CredsState::default();
+        let config = network(
+            Plan::new(
+                path("agent-vm"),
+                Inputs {
+                    creds: &creds,
+                    state_dir: Path::new("/state/project"),
+                    allowed_repos: &[],
+                    provisioned: ProviderSet::default(),
+                    launch: &launch,
+                },
+            )
+            .unwrap(),
+        );
+        assert!(config.secrets.header_credentials.is_empty());
+        assert!(config.secrets.secrets.is_empty());
     }
 }

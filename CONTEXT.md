@@ -107,6 +107,38 @@ _Avoid_: "grant", when referring to this permission.
 A tool or project's declaration that it needs an authorized credential and where
 its guest-facing placeholder should appear. A request is not authorization.
 
+## Authorized credential
+
+A **credential authorization** in effect: a named **secret store** service, the
+exact HTTPS origin it may be sent to, and the exact request header it may occupy,
+as declared in `~/.config/agent-vm/credentials.yaml`. It is host-wide and
+user-owned; a **credential request** can name one but cannot bring one into
+effect. Storing a value at the same service is not an authorization.
+
+_Avoid_: "the credential" (that is the value), or "configured credential" (a
+request is also configuration).
+
+## Header credential
+
+The runtime's durable form of an authorized credential: a non-secret
+`(id, reference, origin, header, format)` record with **no value field**. The
+value is resolved separately, host-side, immediately before the sandbox process
+is forked, and travels only on the runtime's private launch-config descriptor. A
+**header credential** is what appears in the sandbox config; a plaintext value
+never does.
+
+## Sentinel
+
+The non-secret placeholder published to a guest environment variable when an
+authorization sets `sentinelEnv: true`. It is `proxy-managed` (Docker's literal)
+and carries no substitution authority: the real value is substituted host-side
+into the authorized request header, so the sentinel's only job is to make the
+guest's variable non-empty and obviously not a credential. It is unrelated to
+the built-in providers' structurally valid JWT placeholders.
+
+_Avoid_: "placeholder" unqualified, which in this repo also means those built-in
+provider placeholders and the `!command` credential sentinels.
+
 ## Secret store
 
 agent-vm's own namespace in the **host OS credential store** (macOS Keychain,

@@ -286,3 +286,22 @@ be read as transactional durability.
 - **A pty-based test harness for the hidden prompt.** Not rejected on merit — it
   is a follow-up. It needs a new dev-dependency or a hand-rolled pty, which is
   more than this PR's scope.
+
+## Amendment: one authorized reader (agent-vm #161)
+
+This record's original claim was that **nothing** reads a stored value back out.
+[ADR-0025](0025-yaml-credential-shielding.md) adds exactly one reader, and this
+amendment records its shape rather than quietly widening the original claim:
+
+- `agent-vm secret ls`, `doctor`, and every diagnostic remain unable to reach a
+  value. The only value-shaped things they can obtain are the two-valued
+  `Presence` a probe returns and index/label-only refusals.
+- The one reader is the launch credential resolver, and only for a service the
+  user's `credentials.yaml` authorizes *and* the launch requests. It is scoped
+  per launch, and it hands the value to the runtime's resolver rather than
+  rendering it.
+- The `SecretValue` "one audited call site" comment now names all of them, and
+  the accepted-value predicate is applied on read exactly as on write: a stored
+  value that fails it is a distinct `InvalidValue` outcome, never `Missing`.
+
+No exception is added to this record's rule that a value is never rendered.

@@ -621,9 +621,14 @@ Everything above reads a credential another tool wrote on the host. A credential
 the *user* gives agent-vm directly — an API key no agent CLI owns a file for —
 has its own home: agent-vm's namespace in the host OS credential store (macOS
 Keychain, Linux Secret Service), managed by the three `agent-vm secret` verbs.
-This is the **storage lifecycle only**; it is deliberately inert, nothing reads a
-stored value back, and nothing here reaches a guest. Authorization and injection
-are separate host configuration ([ADR-0024](docs/adr/0024-host-secret-inventory.md)).
+This is the **storage lifecycle**. Nothing here prints or renders a value; the
+**one** thing that reads one back is an authorized launch, for a service the
+user's `credentials.yaml` names *and* the launch requests
+([ADR-0025](docs/adr/0025-yaml-credential-shielding.md)), and even that reads it
+through agent-vm's own store and per-launch resolver (both host-side code) and
+hands it to the runtime's resolver without writing it to any durable artifact.
+Authorization and injection are separate host configuration
+([ADR-0024](docs/adr/0024-host-secret-inventory.md)).
 
 ```text
   user ── hidden prompt / piped stdin ──▶ agent-vm secret set SERVICE
@@ -642,6 +647,33 @@ the `flock` around every mutation, the re-probe after a delete, and the closed
 error classification are all [ADR-0024](docs/adr/0024-host-secret-inventory.md),
 with the boundary predicates' machine-checked contracts in
 [ADR-0018](docs/adr/0018-machine-checked-boundary-contracts.md)'s list.
+
+### User-authorized YAML credentials (#161)
+
+The second kind of shielded credential is one the user authorizes in
+`~/.config/agent-vm/credentials.yaml`: a keychain `service`, the exact HTTPS
+origin, and the exact request header the value may occupy. A tool's
+`credentials = [...]` then *requests* it; the request cannot define or widen the
+authorization. Injection is host-side, into that header only, and the guest
+holds a non-secret placeholder (`sentinelEnv: true`) or nothing.
+
+```text
+  ~/.config/agent-vm/credentials.yaml ── authorization (origin + header) ──┐
+  tool config `credentials = [...]`   ── request ────────────────────────┤
+                                                                         ▼
+                      launch resolution (phase 1: availability, value dropped)
+                                                                         │
+  host keychain ──▶ per-launch resolver (phase 2, at fork) ──▶ private fd ──▶ HTTPS header
+                                                                         │
+                              guest: placeholder or unset ◀──────────────┘
+```
+
+The load path, the grammar, the guest-variable ownership rules and the exact
+guarantee (application-level only; OS swap and same-uid inspection are out of
+scope) are [ADR-0025](docs/adr/0025-yaml-credential-shielding.md). This path
+does **not** use `<state_root>/<hash>.secrets/`: no plaintext value about it is
+written to a file at all (the credential *reference* is durable in the sandbox
+record, and the store creates only a lock file — neither carries the value).
 
 ### Guest-managed Pi credentials
 
@@ -1031,6 +1063,7 @@ directories the user never asked for. The state-root precedence is in
 | A stable wrapper around image-installed Pi | [ADR-0012](docs/adr/0012-stable-pi-image-customization-seam.md) |
 | Forked mounts and opaque exclusions (superseded for file forks and live exclusions) | [ADR-0013](docs/adr/0013-add-forked-mounts.md) |
 | Narrowing fork mounts to directories; files read-only | [ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md) |
+| User-authorized YAML credentials (`credentials.yaml`) | [ADR-0025](docs/adr/0025-yaml-credential-shielding.md) |
 
 ## Deliberate non-goals
 

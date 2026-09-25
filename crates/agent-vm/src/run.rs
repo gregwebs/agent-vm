@@ -6,9 +6,11 @@
 //! Phase 3/4.
 
 use std::{
+    collections::BTreeSet,
     env,
     io::IsTerminal as _,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
@@ -18,6 +20,7 @@ use microsandbox::{Sandbox, sandbox::PullPolicy};
 
 use crate::config::{self, CatalogEntry, Tool};
 use crate::credential_provider;
+use crate::credential_resolver::{self, CredentialSource, LaunchCredentials};
 use crate::layer;
 use crate::mount;
 use crate::protected_host_files::CoreHostSource;
@@ -49,6 +52,13 @@ const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
 ///   exist in the guest image and would silently fall back to C). Also
 ///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
+
+/// Host environment variables agent-vm forwards into every guest verbatim. This
+/// is the pre-#161 behaviour: a host-set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`
+/// wins over the proxy placeholder. #161 suppresses the forwarding only for a
+/// name an authorization owns (see `assemble_guest_env`); removing the forwarding
+/// altogether is #163's scope. Listed here so the set is discoverable.
+const RAW_FORWARDED_ENV: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
 
 /// The launcher's baked fallback guest `PATH` — kept in sync by hand with the
 /// **base** `images/Dockerfile`'s `ENV PATH=…`. Used only when the booted
@@ -99,6 +109,104 @@ async fn image_config_path_and_digest_in(
             Some(md.manifest_digest),
         ),
         _ => (None, None),
+    }
+}
+
+/// The booted image's own OCI config `env` entries, or `None` when the
+/// metadata could not be read (best-effort, exactly like the PATH read above).
+/// The `env` vector is the "image-owned ENV" contract the layer tests pin.
+async fn image_config_env(image: &str) -> Option<Vec<String>> {
+    let cache_dir = crate::msb_install::effective_cache_dir().ok()?;
+    let cache = microsandbox_image::GlobalCache::new_async(&cache_dir)
+        .await
+        .ok()?;
+    let reference = image.parse::<microsandbox_image::Reference>().ok()?;
+    match cache.read_image_metadata_async(&reference).await {
+        Ok(Some(metadata)) => Some(metadata.config.env),
+        _ => None,
+    }
+}
+
+/// Resolve this launch's credential requests (#161), and keep the source the
+/// phase-2 resolver will use.
+///
+/// Split out of `launch` so the "no request means no dependency on the file"
+/// rule is one place rather than a conditional threaded through the body.
+fn resolve_credentials(
+    entry: &CatalogEntry,
+) -> Result<(LaunchCredentials, Option<Arc<dyn CredentialSource>>)> {
+    if entry.requested_names().is_empty() {
+        return Ok((LaunchCredentials::default(), None));
+    }
+    let authorizations = credential_resolver::load_authorizations()?;
+    // A keychain is constructed only when one of the requested names is
+    // actually authorized. A launch whose names are all built-in providers
+    // therefore touches no keychain and cannot fail on an unusable `$HOME` or a
+    // missing Secret Service, exactly as before #161.
+    let authorized_any = entry
+        .requested_names()
+        .iter()
+        .any(|name| authorizations.get(name).is_some());
+    let source = if authorized_any {
+        Some(credential_resolver::KeychainCredentialSource::system()?)
+    } else {
+        None
+    };
+    let phase_one: &dyn CredentialSource = match &source {
+        Some(source) => source.as_ref(),
+        None => &credential_resolver::NoKeychainSource,
+    };
+    let launch =
+        credential_resolver::resolve_launch(entry.requested_names(), &authorizations, phase_one)?;
+    Ok((launch, source))
+}
+
+/// Translate the runtime's closed header-credential refusals into an
+/// actionable message (#161).
+///
+/// Adds **no** reference, keychain text or service name: the runtime's error is
+/// index-and-fixed-label only, and agent-vm must not re-widen it. The realistic
+/// cause of a capability failure is a stale locally built `msb` that predates
+/// the feature, which is exactly what the message names.
+fn translate_create_error(error: anyhow::Error) -> anyhow::Error {
+    let hint: Option<String> = error.chain().find_map(|cause| {
+        let microsandbox::MicrosandboxError::HeaderCredential(inner) = cause.downcast_ref()? else {
+            return None;
+        };
+        Some(match inner {
+            microsandbox::HeaderCredentialError::RuntimeCapabilityMissing
+            | microsandbox::HeaderCredentialError::RuntimeProbeFailed => {
+                "the installed `msb` does \
+                 not support origin-scoped header credentials (it does not report \
+                 `header-credential-launch-v1`), so this credential-bearing launch was refused \
+                 before any sandbox record was written. Rebuild `msb` from this checkout's \
+                 `vendor/microsandbox` and make sure `MSB_PATH` points at it"
+                    .to_owned()
+            }
+            microsandbox::HeaderCredentialError::ResolveFailed { .. } => "a configured credential \
+                 could not be read at spawn time - the keychain may have been locked, or its item \
+                 changed, between the pre-boot check and the spawn. Re-run the launch; if it \
+                 repeats, check `agent-vm secret ls`"
+                .to_owned(),
+            microsandbox::HeaderCredentialError::UnsupportedPlatform
+            | microsandbox::HeaderCredentialError::UnsupportedBackend => "this platform or \
+                 backend does not support origin-scoped header credentials; agent-vm supports \
+                 Linux with KVM and Apple Silicon hosts"
+                .to_owned(),
+            microsandbox::HeaderCredentialError::MissingResolver { .. }
+            | microsandbox::HeaderCredentialError::ResolutionMismatch => "an internal agent-vm \
+                 error: the runtime refused a credential launch agent-vm had already authorized. \
+                 Please report it"
+                .to_owned(),
+            microsandbox::HeaderCredentialError::RestartRequiresResolver => "a credential-bearing \
+                 sandbox cannot be restarted by name; agent-vm always creates a fresh sandbox, so \
+                 this indicates an internal error. Please report it"
+                .to_owned(),
+        })
+    });
+    match hint {
+        Some(hint) => anyhow::anyhow!("{hint}"),
+        None => error,
     }
 }
 
@@ -1570,23 +1678,29 @@ pub(crate) async fn launch(
         }
     });
 
-    // Guest env, part 1 of 2: the launched tool's own `env` pairs. Published
-    // here — right after the root-mode `.patch()` — because
-    // `SandboxBuilder::env` appends to a `Vec<EnvVar>` and the guest applies
-    // that array last-wins (agentd's `Command::env` loop). Publishing the
-    // tool's config-declared env *first* stops a project config from
-    // *accidentally* redirecting PATH, IS_SANDBOX, LANG or a provider's
-    // variable — the launcher's own later emission wins. This is defence in
-    // depth, not a trust boundary: a config that can declare `env` can already
-    // declare `command`, so ADR-0015's rule stands — running in a directory
-    // means trusting its `.agent-vm/`. The ordering only helps for env the
-    // launcher *always* publishes: HOME/USER/LOGNAME are published only in
-    // non-root mode (`user::resolve_guest_identity`), so `config::check_env_key`
-    // rejects those three keys outright instead — see ADR-0016. Part 2
-    // (provider-owned) is published after `GUEST_ALWAYS_ENV`.
-    for (key, value) in tool.guest_env() {
-        builder = builder.env(key, value);
+    // #161: resolve this launch's `credentials = [...]` requests against the
+    // user's authorization file, before any guest env is published and long
+    // before a sandbox record is written.
+    //
+    // Loading is deferred until a launch actually requests a credential: a
+    // launch that requests none behaves exactly as before and does not depend
+    // on the file. A launch that *does* request one fails closed if the file
+    // cannot be read, rather than quietly booting without the credential it
+    // asked for.
+    let (launch_credentials, credential_source) = resolve_credentials(entry)?;
+    for note in launch_credentials.notes() {
+        notices.emit(format!("warning: {note}"))?;
     }
+    for withheld in launch_credentials.withheld() {
+        notices.emit(format!(
+            "warning: {}; continuing without it",
+            withheld.reason()
+        ))?;
+    }
+    // AC2: an authorized credential owns its guest variable, so a tool-declared
+    // `env` key for that name is refused and every other writer of the name is
+    // suppressed. That decision is made once, in `assemble_guest_env` below,
+    // rather than at each emission site; see `credential_resolver`.
 
     let network_plan = crate::network::Plan::from_args(args.network)?;
     network_plan
@@ -1602,22 +1716,27 @@ pub(crate) async fn launch(
             state_dir: &session.state_dir,
             allowed_repos: &allowed_repos,
             provisioned,
+            launch: &launch_credentials,
         },
     )?;
 
     builder = network_plan.apply_to(builder);
-    builder = credential_plan.apply_to(builder);
+    builder = credential_plan.apply_to(builder)?;
 
-    // Still honour ANTHROPIC_API_KEY / OPENAI_API_KEY if explicitly set
-    // by the user — that path stays a simple Bearer header, no
-    // placeholder substitution involved.
-    for var in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
-        if let Ok(val) = env::var(var)
-            && !val.is_empty()
-        {
-            builder = builder.env(var, val);
-        }
-    }
+    // Host variables agent-vm forwards verbatim. AC2 suppression happens in
+    // `assemble_guest_env` below — the one ownership-aware assembly — so a name
+    // a YAML authorization owns (including while the credential is withheld)
+    // never falls back to the host's real value. General removal of this
+    // forwarding remains #163's scope.
+    let forwarded: Vec<(&'static str, String)> = RAW_FORWARDED_ENV
+        .iter()
+        .filter_map(|&var| {
+            env::var(var)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| (var, value))
+        })
+        .collect();
     // The image's PATH was set inside the Dockerfile, but it lives in the
     // shell rc files of /root. attach() launches the agent directly via
     // execve, so re-publish the same PATH here.
@@ -1646,34 +1765,74 @@ pub(crate) async fn launch(
     // the PATH half of the tuple is bound.
     let (config_path, _) = image_config_path_and_digest(&image).await;
     let guest_path = config_path.unwrap_or_else(|| FALLBACK_GUEST_PATH.to_string());
-    builder = builder.env("PATH", guest_path);
 
-    // Non-root mode: mirror the host's own $HOME and username into the
-    // guest (ADR-0002) — HOME is the host's literal $HOME string, USER/
-    // LOGNAME the env-first-resolved username, both from
-    // guest_identity. agentd also derives HOME from the /etc/passwd
-    // entry appended above, but an explicit exec-env HOME wins over that
-    // and is unambiguous either way. Root mode needs none of this — the
-    // image's own ENV HOME=/root and the root passwd entry already do
-    // the job.
-    if let Some(gi) = &guest_identity {
-        for (key, value) in user::guest_identity_env(gi) {
-            builder = builder.env(key, value);
+    // #161: a `sentinelEnv: false` variable must end up *unset*, but the SDK
+    // builder cannot remove an `ENV` the image itself ships - guest env is
+    // last-wins, so agent-vm publishing nothing leaves the image's value in
+    // place. Such a collision is therefore refused rather than silently
+    // ignored. The metadata read must fail **closed**: logging is not handling
+    // an error (CODING_STANDARDS), and a cold cache is exactly when an
+    // image-defined value for an owned name would otherwise survive.
+    if launch_credentials.needs_image_env_check() {
+        match image_config_env(&image).await {
+            Some(image_env) => {
+                let image_env: BTreeSet<String> = image_env.into_iter().collect();
+                if let Some(name) = launch_credentials
+                    .unset_names_in_image_env(&image_env)
+                    .into_iter()
+                    .next()
+                {
+                    anyhow::bail!(
+                        "the boot image defines the environment variable `{name}`, which an \
+                         authorized credential declares `sentinelEnv: false` (it must be unset in \
+                         the guest). An image `ENV` cannot be removed through the sandbox builder; \
+                         rename the variable in credentials.yaml"
+                    );
+                }
+            }
+            None => anyhow::bail!(
+                "the boot image's environment could not be read, so agent-vm cannot verify that a \
+                 `sentinelEnv: false` variable is unset in the guest for `{image}`. Pull or inspect \
+                 the image (`agent-vm pull --image {image}`) so its metadata is cached, and re-run \
+                 the launch; alternatively declare `sentinelEnv: true` in credentials.yaml"
+            ),
         }
     }
 
-    // Environment injected into every guest regardless of agent/project.
-    // Kept as one list so the set is discoverable and guard-testable (see
-    // `guest_always_env_pins_utf8_locale_and_sandbox_flag`).
-    for (key, value) in GUEST_ALWAYS_ENV {
-        builder = builder.env(*key, *value);
-    }
+    // Non-root mode mirrors the host's own $HOME and username into the guest
+    // (ADR-0002); root mode contributes none. Built here as data so the single
+    // ownership-aware assembly below is what actually publishes it.
+    let identity: Vec<(&'static str, String)> = match &guest_identity {
+        Some(gi) => user::guest_identity_env(gi).into_iter().collect(),
+        None => Vec::new(),
+    };
+    let provider_env = credential_provider::provider_guest_env(launch_providers);
 
-    // Guest env, part 2 of 2: the *provider-owned* pairs. Today only Copilot
-    // contributes one — `COPILOT_GITHUB_TOKEN` — and only when this launch both
-    // provisions Copilot and captured its token. Published last, after
-    // `GUEST_ALWAYS_ENV`.
-    for (key, value) in credential_provider::provider_guest_env(launch_providers) {
+    // Guest env, the one emission point (#161, AC2). Every writer's
+    // contribution — the tool's own `env`, raw forwarding, PATH, the guest
+    // identity, the launcher constants and provider variables — is filtered or
+    // rejected in `assemble_guest_env`, so no writer can bypass ownership by
+    // not consulting it, and an owned name's sentinel is published last of all.
+    //
+    // The tool's own `env` is published *first* (inside the assembly) for the
+    // same reason as before: a project config cannot accidentally redirect
+    // PATH, IS_SANDBOX, LANG or a provider's variable, because the launcher's
+    // own later emission wins. This is defence in depth, not a trust boundary
+    // (a config that can declare `env` can already declare `command`; ADR-0015).
+    // HOME/USER/LOGNAME are published only in non-root mode, so
+    // `config::check_env_key` rejects those three keys outright at config time
+    // (ADR-0016).
+    let assembled = launch_credentials
+        .assemble_guest_env(crate::credential_resolver::GuestEnvSources {
+            tool_env: tool.guest_env(),
+            forwarded: &forwarded,
+            path: guest_path,
+            identity: &identity,
+            always: GUEST_ALWAYS_ENV,
+            provider: &provider_env,
+        })
+        .context("assembling the credential-owned guest environment")?;
+    for (key, value) in &assembled {
         builder = builder.env(key, value);
     }
 
@@ -1706,7 +1865,19 @@ pub(crate) async fn launch(
         };
         notices.emit(format!("[debug] guest command: {guest_command}"))?;
     }
-    let (progress, task) = Sandbox::create_with_pull_progress(config);
+    // The resolver variant is used exactly when this launch has a ready,
+    // authorized credential. The `render`/`await_render` dance below is
+    // unchanged: the two create entry points share the same
+    // `(PullProgressHandle, JoinHandle)` shape.
+    let (progress, task) = match credential_source {
+        Some(source) if !launch_credentials.ready().is_empty() => {
+            Sandbox::create_with_pull_progress_and_resolver(
+                config,
+                launch_credentials.resolver(source),
+            )
+        }
+        _ => Sandbox::create_with_pull_progress(config),
+    };
     let render_task = tokio::spawn(crate::pull_progress::render(progress));
     // See pull.rs: await render before propagating errors so finish()
     // clears the bars, and use the logging helper so render-task panics
@@ -1716,7 +1887,10 @@ pub(crate) async fn launch(
         .context("create-with-pull-progress join")
         .and_then(|inner| inner.context("creating sandbox"));
     crate::pull_progress::await_render(render_task).await;
-    let sandbox = result?;
+    let sandbox = match result {
+        Ok(sandbox) => sandbox,
+        Err(error) => return Err(translate_create_error(error)),
+    };
     if profile {
         notices.emit(format!("[profile] create: {:?}", t_create.elapsed()))?;
     }
@@ -4323,7 +4497,7 @@ mod tests {
         let plan = position("let network_plan = crate::network::Plan::from_args(args.network)?;");
         let notices = position(".emit_launch_notices()");
         let base_network = position("builder = network_plan.apply_to(builder);");
-        let credential_network = position("builder = credential_plan.apply_to(builder);");
+        let credential_network = position("builder = credential_plan.apply_to(builder)?;");
         let build = position("let config = builder.build().await");
         let create = position("Sandbox::create_with_pull_progress(config)");
         assert!(plan < notices);
@@ -4653,6 +4827,33 @@ options ndots:2 timeout:1";
             lang.to_ascii_lowercase().replace('-', "").contains("utf8"),
             "guest LANG must be a UTF-8 locale, got {lang:?}"
         );
+    }
+
+    #[test]
+    fn every_launcher_published_name_is_refused_for_a_credential() {
+        // AC2 fail-closed: the launcher-owned names an authorization may not
+        // own are exactly the ones the launcher itself publishes. Pinning the
+        // enumeration here means a new `GUEST_ALWAYS_ENV` entry that forgets
+        // `LAUNCHER_OWNED_ENV_NAMES` fails a test instead of silently emitting
+        // a value AC2 promised to leave unset. (It does not, by itself, notice
+        // a new launcher env *writer*; PATH and the identity triple are pinned
+        // separately below, and every other writer goes through
+        // `assemble_guest_env`.)
+        use crate::credential_yaml::{GuestEnvName, LAUNCHER_OWNED_ENV_NAMES};
+        for (name, _) in GUEST_ALWAYS_ENV {
+            assert!(
+                LAUNCHER_OWNED_ENV_NAMES.contains(name),
+                "{name} is launcher-published but not owned"
+            );
+            assert!(GuestEnvName::parse(name).is_err(), "{name}");
+        }
+        // PATH is published from the booted image's OCI config.
+        assert!(LAUNCHER_OWNED_ENV_NAMES.contains(&"PATH"));
+        assert!(GuestEnvName::parse("PATH").is_err());
+        // The guest-identity triple is refused as well.
+        for name in ["HOME", "USER", "LOGNAME"] {
+            assert!(GuestEnvName::parse(name).is_err(), "{name}");
+        }
     }
 
     #[test]
