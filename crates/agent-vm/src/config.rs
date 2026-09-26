@@ -485,8 +485,7 @@ pub(crate) struct Tool {
     /// canonical [`ServiceName`] and deduplicated, in declaration order. A
     /// *source-neutral request*: whether a name is a built-in provider or a
     /// `credentials.yaml` authorization is a launch-resolution decision, not a
-    /// config-parse one, so that #162 can rework the taxonomy without moving
-    /// validation.
+    /// config-parse one (#162 resolves it in `credential_resolver`).
     credential_names: Vec<ServiceName>,
     /// The catalog tools this tool wants available in its guest (a
     /// **provisioning** input), distinct from `credentials` (the
@@ -1505,8 +1504,8 @@ fn validate_layer(
 /// #161 widened what a name may be: it is accepted if it is a valid
 /// [`ServiceName`], which is the same rule the keychain uses, so a name can no
 /// longer be rejected at config time merely because no compiled-in provider
-/// claims it. Resolution (built-in vs. `credentials.yaml`, and the staged
-/// #162 same-name refusal) is a launch decision, deliberately not a parse one.
+/// claims it. Resolution (built-in vs. `credentials.yaml`, and #162's
+/// precedence between them) is a launch decision, deliberately not a parse one.
 fn validate_credentials(
     raw: Vec<String>,
     file: &Path,
@@ -3020,6 +3019,14 @@ mod tests {
             "[[tools]]\nname = \"t\"\n",                                // missing command
             "[[tools]]\ncommand = \"t\"\n",                             // missing name
             "[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = \"x\"\n", // wrong args type
+            // AC4 (#162): pins that `allow_missing_credentials` is not a
+            // config field at either level, so a config that tries to set it
+            // is refused as an unknown key. This is the schema half of
+            // "host-only"; it says nothing about any *other* way to reach the
+            // flag (`--allow-missing-credentials` is a launch flag on
+            // `run::Args`).
+            "allow_missing_credentials = true\n",
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nallow_missing_credentials = true\n",
         ] {
             let fixture = Fixture::new();
             fixture.user(body);
@@ -3163,9 +3170,9 @@ mod tests {
 
     /// #161 widened this validator: a name is accepted if it is a valid
     /// keychain service name, because whether it is a built-in provider or a
-    /// `credentials.yaml` authorization is a *launch* decision (and the staged
-    /// #162 same-name refusal lives there). What stays a config-parse error is
-    /// a name that could not select a keychain item at all.
+    /// `credentials.yaml` authorization is a *launch* decision (and #162's
+    /// precedence is resolved there, not here). What stays a config-parse error
+    /// is a name that could not select a keychain item at all.
     #[test]
     fn credential_names_are_validated_as_service_names() {
         for valid in [

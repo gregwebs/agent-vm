@@ -6,7 +6,7 @@
 //! Phase 3/4.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     io::IsTerminal as _,
     path::{Path, PathBuf},
@@ -20,7 +20,9 @@ use microsandbox::{Sandbox, sandbox::PullPolicy};
 
 use crate::config::{self, CatalogEntry, Tool};
 use crate::credential_provider;
-use crate::credential_resolver::{self, CredentialSource, LaunchCredentials};
+use crate::credential_resolver::{
+    self, CredentialSource, LaunchCredentials, MissingCredentialPolicy,
+};
 use crate::layer;
 use crate::mount;
 use crate::protected_host_files::CoreHostSource;
@@ -57,8 +59,11 @@ const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF
 /// is the pre-#161 behaviour: a host-set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`
 /// wins over the proxy placeholder. #161 suppresses the forwarding only for a
 /// name an authorization owns (see `assemble_guest_env`); removing the forwarding
-/// altogether is #163's scope. Listed here so the set is discoverable.
-const RAW_FORWARDED_ENV: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
+/// altogether is #163's scope. Listed here so the set is discoverable, and
+/// pinned against `CredentialProvider::raw_forwarded_env()` by a unit test in
+/// `credential_provider` so the two cannot drift (that mapping is what the
+/// #162 renamed-replacement notice reads).
+pub(crate) const RAW_FORWARDED_ENV: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
 
 /// The launcher's baked fallback guest `PATH` — kept in sync by hand with the
 /// **base** `images/Dockerfile`'s `ENV PATH=…`. Used only when the booted
@@ -134,6 +139,7 @@ async fn image_config_env(image: &str) -> Option<Vec<String>> {
 /// rule is one place rather than a conditional threaded through the body.
 fn resolve_credentials(
     entry: &CatalogEntry,
+    policy: MissingCredentialPolicy,
 ) -> Result<(LaunchCredentials, Option<Arc<dyn CredentialSource>>)> {
     if entry.requested_names().is_empty() {
         return Ok((LaunchCredentials::default(), None));
@@ -142,7 +148,9 @@ fn resolve_credentials(
     // A keychain is constructed only when one of the requested names is
     // actually authorized. A launch whose names are all built-in providers
     // therefore touches no keychain and cannot fail on an unusable `$HOME` or a
-    // missing Secret Service, exactly as before #161.
+    // missing Secret Service, exactly as before #161. It is also unchanged by
+    // #162's precedence: a requested built-in name that is *also* authorized
+    // makes `get` return `Some`, so the keychain is constructed for it.
     let authorized_any = entry
         .requested_names()
         .iter()
@@ -156,8 +164,12 @@ fn resolve_credentials(
         Some(source) => source.as_ref(),
         None => &credential_resolver::NoKeychainSource,
     };
-    let launch =
-        credential_resolver::resolve_launch(entry.requested_names(), &authorizations, phase_one)?;
+    let launch = credential_resolver::resolve_launch(
+        entry.requested_names(),
+        &authorizations,
+        phase_one,
+        policy,
+    )?;
     Ok((launch, source))
 }
 
@@ -946,6 +958,28 @@ pub struct Args {
     )]
     repo: Vec<String>,
 
+    /// Launch even when a requested YAML credential is missing or unreadable.
+    ///
+    /// Warns and continues for a `credentials = [...]` name that has no
+    /// authorization in `~/.config/agent-vm/credentials.yaml`, and for an
+    /// authorized `required: true` credential whose value cannot be read. The
+    /// guest gets neither the credential nor a fallback, so the in-guest tool may
+    /// still fail its own sign-in.
+    ///
+    /// It does not cover a compiled-in credential provider whose own host
+    /// credential is missing - that still refuses the launch (`agent-vm doctor`
+    /// lists the providers). Nor does it bypass a malformed or unsupported
+    /// `credentials.yaml`, a rejected stored value, a guest-variable conflict, or
+    /// any other configuration or security error. There is deliberately no
+    /// environment variable: skipping a credential is a per-launch decision the
+    /// user makes at the command line.
+    #[arg(
+        long = "allow-missing-credentials",
+        default_value_t = false,
+        help_heading = "Credentials"
+    )]
+    allow_missing_credentials: bool,
+
     /// Bind an extra host path into the guest, or seed a persistent fork (repeatable).
     ///
     /// Format `HOST[:GUEST][:MODE]...`; `GUEST` defaults to `HOST` (mirror at the same absolute
@@ -1108,6 +1142,14 @@ pub(crate) async fn launch(
 ) -> Result<i32> {
     let tool = entry.tool();
     let provisioned = entry.provisioned();
+    // `--allow-missing-credentials` moves the *availability* of a YAML
+    // credential and nothing else; see `MissingCredentialPolicy`. Derived once
+    // here so the flag is read in exactly one place.
+    let missing_credential_policy = if args.allow_missing_credentials {
+        MissingCredentialPolicy::Warn
+    } else {
+        MissingCredentialPolicy::Fail
+    };
     // The launch's guest-HOME link list: the compiled-in providers plus one
     // link per `persist` path in this launch's provisioning closure. Computed
     // once and threaded to both provisioning sites and the root-mode rootfs
@@ -1454,6 +1496,27 @@ pub(crate) async fn launch(
     let use_github = !allowed_repos.is_empty();
     notices.emit(repo_scope_notice(&allowed_repos))?;
 
+    // #161/#162: resolve this launch's `credentials = [...]` requests against
+    // the user's authorization file, before any guest env is published and long
+    // before a sandbox record is written.
+    //
+    // Loading is deferred until a launch actually requests a credential: a
+    // launch that requests none behaves exactly as before and does not depend
+    // on the file. A launch that *does* request one fails closed if the file
+    // cannot be read, rather than quietly booting without the credential it
+    // asked for.
+    //
+    // #162 moved this call *before* `secrets::refresh` because a same-named
+    // authorization suppresses that provider's capture; the resolved
+    // `replaced` set has to exist before anything is captured. The *notice*
+    // emission stays at its historical position below, so the launch's warning
+    // order is unchanged. This puts a malformed/unsatisfiable
+    // `credentials.yaml` ahead of host credential capture and the
+    // `==> host credentials` notice, and nothing else - the tooling-layer build
+    // and the session/guest-home provisioning already ran earlier.
+    let (launch_credentials, credential_source) =
+        resolve_credentials(entry, missing_credential_policy)?;
+
     // `provisioned` is the launch catalog's resolved closure (parameter).
     // The requirement set is the tool's own `credentials`, read by the bail
     // loop below; `github_egress` (`use_github`, driven by `--no-git` /
@@ -1463,6 +1526,7 @@ pub(crate) async fn launch(
         &project_guest_path,
         &crate::secrets::CredentialProvisioning {
             provisioned,
+            replaced: launch_credentials.replaced(),
             github_egress: use_github,
         },
     )
@@ -1475,6 +1539,12 @@ pub(crate) async fn launch(
         provisioned,
         wired: creds.wired(),
     };
+
+    // The built-ins a same-named authorization replaced. Read once here and
+    // reused by the requirement bail below and the raw-forwarding notice
+    // further down, so `replaced()` has exactly two readers in this file (this
+    // binding and the `CredentialProvisioning` above).
+    let replaced = launch_credentials.replaced();
 
     // When a *required* provider produced no usable credential, fail loudly
     // here rather than letting the guest send an unsubstituted placeholder
@@ -1495,6 +1565,14 @@ pub(crate) async fn launch(
     // *only*, so an authorization-code exchange is rejected and Claude Code
     // surfaces a bare "OAuth error ... status code 400".
     for provider in tool.credential_providers().iter() {
+        // A replaced provider's requirement is the authorization's `required`,
+        // already enforced in phase 1 (spec lines 207-208: "YAML entries use
+        // the YAML `required` semantics, rather than inheriting the old
+        // built-in requirement solely because their names appear in
+        // `credentials`").
+        if replaced.contains(provider) {
+            continue;
+        }
         if creds.token_file(provider).is_none()
             && let Some(message) = credential_provider::missing_credential_error(provider)
         {
@@ -1678,24 +1756,15 @@ pub(crate) async fn launch(
         }
     });
 
-    // #161: resolve this launch's `credentials = [...]` requests against the
-    // user's authorization file, before any guest env is published and long
-    // before a sandbox record is written.
-    //
-    // Loading is deferred until a launch actually requests a credential: a
-    // launch that requests none behaves exactly as before and does not depend
-    // on the file. A launch that *does* request one fails closed if the file
-    // cannot be read, rather than quietly booting without the credential it
-    // asked for.
-    let (launch_credentials, credential_source) = resolve_credentials(entry)?;
+    // #161/#162: emit the resolution's notes and withheld-credential warnings
+    // here, at their historical position, so the notice order stays
+    // byte-identical (`repo_scope_notice` → `creds_notice` → these). The
+    // *resolution* itself now runs before `secrets::refresh` above.
     for note in launch_credentials.notes() {
         notices.emit(format!("warning: {note}"))?;
     }
     for withheld in launch_credentials.withheld() {
-        notices.emit(format!(
-            "warning: {}; continuing without it",
-            withheld.reason()
-        ))?;
+        notices.emit(format!("warning: {}", withheld.notice()))?;
     }
     // AC2: an authorized credential owns its guest variable, so a tool-declared
     // `env` key for that name is refused and every other writer of the name is
@@ -1737,6 +1806,45 @@ pub(crate) async fn launch(
                 .map(|value| (var, value))
         })
         .collect();
+    // #162: a replacement only suppresses the raw forwarding of the *name it
+    // owns*. A differently-named `apiKey.name` leaves the host's real key
+    // flowing into the guest, which is the opposite of what the user asked for.
+    // Warn rather than fail: failing would refuse a launch that #161 accepted,
+    // and #163 removes the forwarding outright. The `owns_env` conjunct is what
+    // makes the warning exact: `forwarded` is the *raw* candidate list, and only
+    // `assemble_guest_env` (below) drops the owned names, so this fires exactly
+    // when the host value really does reach the guest.
+    //
+    // Grouped by variable, not one notice per provider: `openai` and
+    // `opencode-static` share `OPENAI_API_KEY`, so replacing both would
+    // otherwise emit two notices whose advice (`apiKey.name: OPENAI_API_KEY`)
+    // only one of the two entries could follow. One notice names the variable
+    // once and lists every replaced provider it belongs to.
+    let mut still_forwarded: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
+    for provider in replaced.iter() {
+        if let Some(var) = provider.raw_forwarded_env()
+            && forwarded.iter().any(|(name, _)| *name == var)
+            && !launch_credentials.owns_env(var)
+        {
+            still_forwarded
+                .entry(var)
+                .or_default()
+                .push(provider.config_name());
+        }
+    }
+    for (var, providers) in still_forwarded {
+        let subject = providers
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let verb = if providers.len() == 1 { "is" } else { "are" };
+        notices.emit(format!(
+            "warning: {subject} {verb} authorized in credentials.yaml, but the host's `{var}` is \
+             still forwarded into the guest because the authorization owns a different variable. Set \
+             `apiKey.name: {var}` to shield it, or unset `{var}` on the host",
+        ))?;
+    }
     // The image's PATH was set inside the Dockerfile, but it lives in the
     // shell rc files of /root. attach() launches the agent directly via
     // execve, so re-publish the same PATH here.

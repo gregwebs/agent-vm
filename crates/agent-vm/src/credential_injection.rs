@@ -545,6 +545,77 @@ mod tests {
         }
     }
 
+    /// D2 (#162): a provider is *provisioned* but was **replaced** by a
+    /// same-named YAML authorization, so this launch captured no token for it
+    /// (`replaced` suppresses capture; see `secrets.rs`). `credential_injection`
+    /// deliberately holds **no second `replaced` gate**: the
+    /// `(proxy_secret, creds.token_file(p))` tuple already registers nothing,
+    /// and a redundant gate reading the same `replaced` set would only mask a
+    /// capture-gate regression.
+    ///
+    /// So this test pins the *composition*: no `FileSecret` and no OAuth route
+    /// for the replaced provider, while the authorization's own header
+    /// credential is registered. It is what makes the end-to-end precedence
+    /// assertion in `config_launch_driven.rs` meaningful rather than incidental.
+    #[test]
+    fn a_replaced_provider_registers_no_secret_but_keeps_the_yaml_credential() {
+        // Provisioned Anthropic with no token file: exactly the state a
+        // same-named authorization leaves behind.
+        let creds = CredsState::default();
+        let launch = LaunchCredentials::for_test(
+            vec![(
+                "anthropic",
+                vec![crate::credential_yaml::rule_for_test(
+                    "api.anthropic.com",
+                    443,
+                    "x-api-key",
+                    "%s",
+                )],
+            )],
+            vec![("ANTHROPIC_API_KEY", EnvDisposition::Sentinel)],
+        );
+        let config = network(
+            Plan::new(
+                path("agent-vm"),
+                Inputs {
+                    creds: &creds,
+                    state_dir: Path::new("/state/project"),
+                    allowed_repos: &[],
+                    provisioned: ProviderSet::new([CredentialProvider::Anthropic]),
+                    launch: &launch,
+                },
+            )
+            .unwrap(),
+        );
+        let env_vars: Vec<&str> = config
+            .secrets
+            .secrets
+            .iter()
+            .map(|entry| entry.env_var.as_str())
+            .collect();
+        assert!(
+            !env_vars.contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+            "a replaced provider must register no substitution entry: {env_vars:?}"
+        );
+        let route_hosts: Vec<&str> = config
+            .intercept
+            .rules
+            .iter()
+            .map(|route| route.host.as_str())
+            .collect();
+        assert!(
+            !route_hosts.contains(&"platform.claude.com"),
+            "a replaced provider must register no OAuth route: {route_hosts:?}"
+        );
+        // The authorization's own credential is registered independently.
+        assert_eq!(config.secrets.header_credentials.len(), 1);
+        assert_eq!(config.secrets.header_credentials[0].reference, "anthropic");
+        assert_eq!(
+            config.secrets.header_credentials[0].origin.host,
+            "api.anthropic.com"
+        );
+    }
+
     /// V14: the hand-written `WIRE_ORDER` array covers every provider exactly
     /// once plus one GitHub slot. A fifth provider that is added to the enum
     /// but forgotten here then fails a test instead of silently vanishing

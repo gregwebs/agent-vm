@@ -40,6 +40,22 @@ GitHub access:
           The cwd's `git remote -v` GitHub entries are always included; use this to widen the
           allow-list for cross-repo work.
 
+Credentials:
+      --allow-missing-credentials
+          Launch even when a requested YAML credential is missing or unreadable.
+
+          Warns and continues for a `credentials = [...]` name that has no authorization in
+          `~/.config/agent-vm/credentials.yaml`, and for an authorized `required: true` credential
+          whose value cannot be read. The guest gets neither the credential nor a fallback, so the
+          in-guest tool may still fail its own sign-in.
+
+          It does not cover a compiled-in credential provider whose own host credential is missing -
+          that still refuses the launch (`agent-vm doctor` lists the providers). Nor does it bypass
+          a malformed or unsupported `credentials.yaml`, a rejected stored value, a guest-variable
+          conflict, or any other configuration or security error. There is deliberately no
+          environment variable: skipping a credential is a per-launch decision the user makes at the
+          command line.
+
 Mounts & ports:
       --mount <HOST[:GUEST][:MODE]...>
           Bind an extra host path into the guest, or seed a persistent fork (repeatable).

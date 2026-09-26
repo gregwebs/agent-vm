@@ -977,6 +977,646 @@ fn a_sentinel_false_credential_fails_closed_when_image_metadata_is_unreadable() 
     );
 }
 
+// -- #162: precedence and the availability override --------------------------
+
+/// A same-named authorization for the built-in `anthropic` provider: the
+/// `credentials.yaml` entry #162 makes precedence-setting.
+const YAML_ANTHROPIC: &str = "\
+credentials:
+  - service: anthropic
+    apiKey:
+      name: ANTHROPIC_API_KEY
+      sentinelEnv: true
+      inject:
+        - domain: api.anthropic.com
+          header: x-api-key
+          format: \"%s\"
+";
+
+/// A valid authorization for the `my-service` name `ONE_YAML_TOOL` requests,
+/// with `sentinelEnv: true` so the launch needs no image-metadata read.
+const VALID_MY_SERVICE_YAML: &str = "\
+credentials:
+  - service: my-service
+    apiKey:
+      name: MY_SERVICE_KEY
+      sentinelEnv: true
+      inject: [{domain: api.my-service.example, header: x-api-key, format: \"%s\"}]
+";
+
+/// The hosts of this launch's registered TLS-intercept rules.
+fn intercept_rule_hosts(config: &serde_json::Value) -> Vec<&str> {
+    config["network"]["intercept"]["rules"]
+        .as_array()
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|rule| rule["host"].as_str().unwrap())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// AC1 + AC2, end to end: a same-named authorization replaces the built-in's
+/// *credential* facets and leaves its *configuration and persistence* alone.
+#[test]
+fn a_same_named_authorization_replaces_the_built_in_but_not_its_configuration() {
+    let harness = Harness::new(); // seeds ~/.claude/.credentials.json
+    write_credentials(&harness.home_root, YAML_ANTHROPIC);
+    let out = harness.launch_with_env(
+        "claude",
+        &[],
+        &[
+            ("AGENT_VM_TEST_CREDENTIAL", "anthropic=sk-test-replacement"),
+            ("ANTHROPIC_API_KEY", "sk-host-raw-must-not-reach-the-guest"),
+        ],
+    );
+    let stderr = stderr_of(&out);
+    // Panics unless `CONFIG_MARKER` is present, so "the launch died early"
+    // cannot masquerade as a pass.
+    let config = debug_config_json(&stderr);
+    let state = state_dir(&stderr);
+
+    // -- credential facets: gone -------------------------------------------
+    assert!(
+        !registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "the built-in substitution entry must not be registered"
+    );
+    assert!(
+        !state.join("claude/.credentials.json").exists(),
+        "the built-in placeholder must not be provisioned"
+    );
+    assert!(
+        !intercept_rule_hosts(&config).contains(&"platform.claude.com"),
+        "the built-in OAuth refresh route must not be registered"
+    );
+
+    // -- the authorization's own facets: present ---------------------------
+    let creds = &config["network"]["secrets"]["header_credentials"];
+    assert_eq!(creds[0]["reference"], "anthropic");
+    assert_eq!(creds[0]["origin"]["host"], "api.anthropic.com");
+    assert_eq!(creds[0]["header"], "x-api-key");
+    let env = env_pairs(&config);
+    assert_eq!(
+        env.iter()
+            .find(|(key, _)| *key == "ANTHROPIC_API_KEY")
+            .map(|(_, value)| *value),
+        Some("proxy-managed"),
+        "D10: the sentinel, never the host's raw value"
+    );
+    assert!(
+        !env.iter()
+            .any(|(_, value)| *value == "sk-host-raw-must-not-reach-the-guest"),
+        "the host's raw key reached the guest env: {env:?}"
+    );
+    // §4.8 step 4, automated at the harness boundary: neither the
+    // authorization's value nor the host's raw key is observable anywhere
+    // under the project state dir or its host-only `<state>.secrets/` sibling.
+    // The sandbox DB and `ps auxww` are host-global and remain a manual sweep.
+    let host_secrets = PathBuf::from(format!("{}.secrets", state.display()));
+    for root in [&state, &host_secrets] {
+        assert_no_file_contains(root, "sk-test-replacement");
+        assert_no_file_contains(root, "sk-host-raw-must-not-reach-the-guest");
+    }
+
+    // -- configuration + persistence: untouched (AC2) ----------------------
+    assert!(read_json(&state.join("claude/settings.json")).is_some());
+    assert!(read_json(&state.join("claude.json")).is_some());
+    assert!(
+        std::fs::symlink_metadata(state.join("home/.claude"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the `.claude` guest-HOME link is furniture and must remain"
+    );
+}
+
+/// D4: the built-in placeholder a previous launch left is cleared once the
+/// authorization takes over (ADR-0017: no placeholder without its substitution
+/// entry). One shared state dir across both launches.
+#[test]
+fn replacing_a_built_in_clears_the_placeholder_an_earlier_launch_left() {
+    let harness = Harness::new();
+    let first = harness.launch_default("claude");
+    let state = state_dir(&stderr_of(&first));
+    assert!(
+        state.join("claude/.credentials.json").exists(),
+        "launch 1 wires the built-in placeholder: {}",
+        stderr_of(&first)
+    );
+    let host_secrets = PathBuf::from(format!("{}.secrets", state.display()));
+    assert!(
+        host_secrets.join("anthropic").exists(),
+        "launch 1 captured the real host credential to disk (S6/R8)"
+    );
+
+    write_credentials(&harness.home_root, YAML_ANTHROPIC);
+    let second = harness.launch_with_env(
+        "claude",
+        &[],
+        &[("AGENT_VM_TEST_CREDENTIAL", "anthropic=sk-test-replacement")],
+    );
+    let stderr = stderr_of(&second);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        !state.join("claude/.credentials.json").exists(),
+        "the stale built-in placeholder must be cleared (ADR-0017): {stderr}"
+    );
+    // S6/R8: the real host token copy is deliberately **left in place** —
+    // deleting it would be new destructive behaviour on data a concurrent
+    // launch may hold, so the guest-visible placeholder is cleared and the
+    // host copy is not. USAGE.md tells the user to remove the state dir.
+    assert!(
+        host_secrets.join("anthropic").exists(),
+        "a replacement must not delete the earlier launch's host token copy (S6): {stderr}"
+    );
+}
+
+/// AC2/AC5: an authorization nobody requests is inert. `codex` requests only
+/// `openai`, so an `anthropic` authorization changes nothing — the observed
+/// launch is byte-identical to the untouched `codex` golden.
+#[test]
+fn an_unrequested_authorization_leaves_the_built_in_alone() {
+    let harness = Harness::new();
+    write_credentials(&harness.home_root, YAML_ANTHROPIC);
+    let out = harness.launch_default("codex");
+    assert_matches_golden("codex", &observation(&harness, &out));
+}
+
+// -- #162: the override cannot bypass configuration or security errors ------
+
+/// Run the same input twice, with and without `--allow-missing-credentials`,
+/// and assert **both** refuse for the row's own stated reason. The reason must
+/// be specific to the row: a bare `contains("credentials.yaml")` would let two
+/// unrelated failures satisfy the pairing.
+fn assert_the_override_does_not_bypass(
+    harness: &Harness,
+    tool: &str,
+    envs: &[(&str, &str)],
+    reason: &str,
+) {
+    for extra in [&[][..], &["--allow-missing-credentials"][..]] {
+        let out = harness.launch_with_env(tool, extra, envs);
+        let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+        assert!(
+            !out.status.success(),
+            "flag={extra:?} must still refuse: {rendered}"
+        );
+        assert!(
+            rendered.contains(reason),
+            "flag={extra:?} did not name this row's reason {reason:?}: {rendered}"
+        );
+        assert!(
+            !rendered.contains(CONFIG_MARKER),
+            "flag={extra:?} booted anyway: {rendered}"
+        );
+    }
+}
+
+/// Row 1: an unsupported destination in the authorization file. Carries the
+/// positive control for the whole pairing template.
+#[test]
+fn the_override_does_not_bypass_a_malformed_authorization_file() {
+    let canary = "sk-CANARY-6f2a1b3c4d5e6071829304a5b6c7d8e9";
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(
+        &harness.home_root,
+        &format!(
+            "credentials:\n  - service: my-service\n    apiKey:\n      name: MY_SERVICE_KEY\n      inject:\n        - domain: \"{canary}/x\"\n          header: x-api-key\n          format: \"%s\"\n"
+        ),
+    );
+    assert_the_override_does_not_bypass(
+        &harness,
+        "t",
+        &[],
+        "credentials[0].apiKey.inject[0].domain",
+    );
+
+    // Positive control: the same harness with the problem removed boots all the
+    // way to the sandbox build, so "both runs refused" cannot be satisfied by a
+    // harness that could never boot at all.
+    let control = Harness::new();
+    control.write_user(ONE_YAML_TOOL);
+    write_credentials(&control.home_root, VALID_MY_SERVICE_YAML);
+    let out = control.launch_with_env(
+        "t",
+        &[],
+        &[("AGENT_VM_TEST_CREDENTIAL", "my-service=sk-control-value")],
+    );
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    assert!(
+        rendered.contains(CONFIG_MARKER),
+        "the positive control never booted: {rendered}"
+    );
+}
+
+/// Row 2: a recognized-but-unsupported field (`source`; #163 is not landed).
+#[test]
+fn the_override_does_not_bypass_an_unsupported_field() {
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: my-service\n    source: env\n    apiKey:\n      name: MY_SERVICE_KEY\n      inject: [{domain: api.my-service.example, header: x-api-key, format: \"%s\"}]\n",
+    );
+    assert_the_override_does_not_bypass(&harness, "t", &[], "`source` is not supported");
+}
+
+/// Row 3: a wildcard destination can never be expanded by the override.
+#[test]
+fn the_override_does_not_bypass_a_wildcard_destination() {
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: my-service\n    apiKey:\n      name: MY_SERVICE_KEY\n      inject: [{domain: \"*.example.com\", header: x-api-key, format: \"%s\"}]\n",
+    );
+    assert_the_override_does_not_bypass(&harness, "t", &[], "wildcards are not supported");
+}
+
+/// Row 4: a group-writable authorization file is a security refusal, not an
+/// availability one.
+#[test]
+fn the_override_does_not_bypass_a_group_writable_authorization_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(&harness.home_root, VALID_MY_SERVICE_YAML);
+    let path = harness.home_root.join(".config/agent-vm/credentials.yaml");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+    assert_the_override_does_not_bypass(
+        &harness,
+        "t",
+        &[],
+        "group- or other-writable; refusing to trust it",
+    );
+}
+
+/// Row 5: present-but-invalid is a configuration error, not an unavailable
+/// source. A trailing space is rejected by `SecretValue`.
+#[test]
+fn the_override_does_not_bypass_a_rejected_stored_value() {
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(&harness.home_root, VALID_MY_SERVICE_YAML);
+    assert_the_override_does_not_bypass(
+        &harness,
+        "t",
+        &[("AGENT_VM_TEST_CREDENTIAL", "my-service=sk-trailing-space ")],
+        "cannot be used",
+    );
+}
+
+/// Row 6: unreadable boot-image metadata for a `sentinelEnv: false` credential
+/// fails closed regardless of the flag.
+#[test]
+fn the_override_does_not_bypass_unreadable_image_metadata() {
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: my-service\n    apiKey:\n      name: MY_SERVICE_KEY\n      inject:\n        - domain: api.my-service.example\n          header: x-api-key\n          format: \"%s\"\n",
+    );
+    assert_the_override_does_not_bypass(
+        &harness,
+        "t",
+        &[],
+        &format!("agent-vm pull --image {BOGUS_IMAGE}"),
+    );
+}
+
+/// Row 7: a tool-declared `env` key for an owned name is a hard error under both
+/// policies. The value is ready so the launch reaches `assemble_guest_env`.
+#[test]
+fn the_override_does_not_bypass_a_tool_env_conflict() {
+    let harness = Harness::new();
+    harness.write_user(
+        "[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"my-service\"]\nenv = { MY_SERVICE_KEY = \"x\" }\n",
+    );
+    write_credentials(&harness.home_root, VALID_MY_SERVICE_YAML);
+    assert_the_override_does_not_bypass(
+        &harness,
+        "t",
+        &[("AGENT_VM_TEST_CREDENTIAL", "my-service=sk-value")],
+        "`MY_SERVICE_KEY`, which is owned by an authorized credential",
+    );
+}
+
+/// Row 8: the flag does **not** reach a built-in provider's own
+/// missing-credential bail (decision D). This pins the flag's scope as a
+/// contract rather than an unstated omission.
+#[test]
+fn the_override_does_not_bypass_a_built_in_missing_credential() {
+    let harness = Harness::new();
+    std::fs::remove_file(harness.home_root.join(".claude/.credentials.json")).unwrap();
+    assert_the_override_does_not_bypass(
+        &harness,
+        "claude",
+        &[],
+        "no usable Claude credential found on the host",
+    );
+}
+
+// -- #162: the override's positive paths, and built-in requirement semantics --
+
+/// The `NotAuthorized` path owns no guest variable, so it does not trip the
+/// image-env check and the launch really boots.
+#[test]
+fn the_override_skips_an_unauthorized_request_and_still_boots() {
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL); // `credentials = ["my-service"]`, no YAML file
+    let out = harness.launch("t", &["--allow-missing-credentials"]);
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    assert!(rendered.contains("my-service"), "{rendered}");
+    assert!(
+        rendered.contains("--allow-missing-credentials"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(CONFIG_MARKER),
+        "the launch must reach the sandbox build, not merely warn: {rendered}"
+    );
+}
+
+/// The authorized-but-unavailable override path. The launch owns a guest
+/// variable, so with `sentinelEnv: false` it stops at the image-metadata stage —
+/// which is exactly the proof that it got *past* credential resolution.
+#[test]
+fn the_override_warns_and_proceeds_for_an_unavailable_required_credential() {
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: my-service\n    required: true\n    apiKey:\n      name: MY_SERVICE_KEY\n      inject: [{domain: api.my-service.example, header: x-api-key, format: \"%s\"}]\n",
+    );
+    // `AGENT_VM_TEST_CREDENTIAL` names a *different* service, so
+    // `TestCredentialSource::resolve` returns `Missing` deterministically.
+    let out = harness.launch_with_env(
+        "t",
+        &["--allow-missing-credentials"],
+        &[("AGENT_VM_TEST_CREDENTIAL", "my-other-service=sk-x")],
+    );
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    // Assert the complete warning envelope, not the absence of the remediation
+    // text: `Withheld::notice()` wraps `reason()` verbatim, and `reason()`'s
+    // `Missing` arm contains exactly that instruction.
+    assert!(
+        rendered.contains("warning: no value is stored in the system keychain for `my-service`"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("; continuing without it because --allow-missing-credentials was passed"),
+        "the withheld credential must be rendered as a warning, not a fatal error: {rendered}"
+    );
+    assert!(
+        rendered.contains("agent-vm pull --image"),
+        "the launch must have got past credential resolution to the image-metadata stage: {rendered}"
+    );
+}
+
+/// D7: a replaced provider does not inherit the built-in requirement. Anthropic
+/// is `required` by the `claude` tool, but the authorization is not, so the
+/// launch proceeds instead of bailing.
+#[test]
+fn a_replaced_provider_does_not_inherit_the_built_in_requirement() {
+    let harness = Harness::new();
+    std::fs::remove_file(harness.home_root.join(".claude/.credentials.json")).unwrap();
+    write_credentials(&harness.home_root, YAML_ANTHROPIC);
+    let out = harness.launch_with_env(
+        "claude",
+        &[],
+        &[("AGENT_VM_TEST_CREDENTIAL", "anthropic=sk-test-replacement")],
+    );
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    assert!(
+        !rendered.contains("no usable Claude credential found on the host"),
+        "a replaced provider must not inherit the built-in requirement: {rendered}"
+    );
+    assert!(rendered.contains(CONFIG_MARKER), "{rendered}");
+}
+
+/// C6 (#162): a replacement that owns a *differently named* variable leaves the
+/// host's raw key forwarded. Warn, and never render the value.
+#[test]
+fn a_renamed_replacement_warns_that_the_hosts_raw_key_is_still_forwarded() {
+    let harness = Harness::new();
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: anthropic\n    apiKey:\n      name: MY_KEY\n      sentinelEnv: true\n      inject: [{domain: api.anthropic.example, header: x-api-key, format: \"%s\"}]\n",
+    );
+    let canary = "sk-host-real-canary-1a2b3c4d5e6f70819203a4b5c6d7e8f9";
+    let out = harness.launch_with_env(
+        "claude",
+        &[],
+        &[
+            ("AGENT_VM_TEST_CREDENTIAL", "anthropic=sk-test-replacement"),
+            ("ANTHROPIC_API_KEY", canary),
+        ],
+    );
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    assert!(
+        rendered.contains("the host's `ANTHROPIC_API_KEY` is still forwarded"),
+        "the silent security downgrade must be reported: {rendered}"
+    );
+    // The notice is about a *real* exposure: the host's raw value really is in
+    // the guest env, which is exactly why the warning exists.
+    let config = debug_config_json(&stderr_of(&out));
+    assert!(
+        env_pairs(&config)
+            .iter()
+            .any(|(key, value)| *key == "ANTHROPIC_API_KEY" && *value == canary),
+        "the warning must describe the actual environment: {:?}",
+        env_pairs(&config)
+    );
+    // The *authorization's* stored value is never rendered anywhere (ADR-0024).
+    assert!(
+        !rendered.contains("sk-test-replacement"),
+        "the stored value leaked: {rendered}"
+    );
+}
+
+/// The asymmetric partner of the test above: when the authorization owns the
+/// host's own variable name, nothing is forwarded and no notice fires.
+#[test]
+fn a_same_named_replacement_does_not_warn_about_raw_forwarding() {
+    let harness = Harness::new();
+    write_credentials(&harness.home_root, YAML_ANTHROPIC);
+    let out = harness.launch_with_env(
+        "claude",
+        &[],
+        &[
+            ("AGENT_VM_TEST_CREDENTIAL", "anthropic=sk-test-replacement"),
+            ("ANTHROPIC_API_KEY", "sk-host-canary-must-not-be-forwarded"),
+        ],
+    );
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    assert!(!rendered.contains("is still forwarded"), "{rendered}");
+    let config = debug_config_json(&stderr_of(&out));
+    assert_eq!(
+        env_pairs(&config)
+            .iter()
+            .find(|(key, _)| *key == "ANTHROPIC_API_KEY")
+            .map(|(_, value)| *value),
+        Some("proxy-managed")
+    );
+}
+
+/// **R5/S4 (#162).** `openai` and `opencode-static` both forward the *same*
+/// variable, `OPENAI_API_KEY`. When both are replaced and neither authorization
+/// owns that name, the raw-forwarding notice must fire **once**, naming the
+/// variable once and listing both providers — not twice with advice
+/// (`apiKey.name: OPENAI_API_KEY`) that only one of the two entries could
+/// follow.
+#[test]
+fn a_shared_forwarded_variable_is_warned_about_once() {
+    let harness = Harness::new();
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: openai\n    apiKey:\n      name: MY_OPENAI_KEY\n      sentinelEnv: true\n      inject: [{domain: api.openai.example, header: x-api-key, format: \"%s\"}]\n  - service: opencode-static\n    apiKey:\n      name: MY_OPENCODE_KEY\n      sentinelEnv: true\n      inject: [{domain: api.opencode.example, header: x-api-key, format: \"%s\"}]\n",
+    );
+    harness.write_project(
+        "[[tools]]\nname = \"dual\"\ncommand = \"/bin/echo\"\ncredentials = [\"openai\", \"opencode-static\"]\n",
+    );
+    let out = harness.launch_with_env("dual", &[], &[("OPENAI_API_KEY", "sk-host-canary")]);
+    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
+    let notices = rendered.matches("still forwarded").count();
+    assert_eq!(
+        notices, 1,
+        "the shared OPENAI_API_KEY must produce exactly one notice: {rendered}"
+    );
+    let notice = rendered
+        .lines()
+        .find(|line| line.contains("still forwarded"))
+        .expect("a notice");
+    assert!(notice.contains("`openai`"), "{notice}");
+    assert!(notice.contains("`opencode-static`"), "{notice}");
+    assert!(notice.contains("`OPENAI_API_KEY`"), "{notice}");
+    // The canary value is a real host value and must never be rendered.
+    assert!(
+        !rendered.contains("sk-host-canary"),
+        "a host value leaked: {rendered}"
+    );
+}
+
+/// **R3/S2 (#162).** The replacement shape ADR-0025's own examples use: an
+/// `opencode-static` authorization that names `OPENAI_API_KEY` and injects at
+/// `api.openai.com`. The guest *does* get a working OpenAI key through the proxy
+/// (the sentinel is published), yet agent-vm's capture gate captured no OpenAI
+/// host credential, so it retires the `model` pin. That is the open decision S2
+/// records; this test pins the observed behaviour so any change to the pin's
+/// gate has to update it deliberately rather than by accident.
+#[test]
+fn a_sentinel_opencode_replacement_publishes_the_key_but_retires_the_model_pin() {
+    let harness = Harness::new();
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: opencode-static\n    apiKey:\n      name: OPENAI_API_KEY\n      sentinelEnv: true\n      inject: [{domain: api.openai.com, header: authorization, format: \"Bearer %s\"}]\n",
+    );
+    harness.write_project(
+        "[[tools]]\nname = \"oc\"\ncommand = \"/bin/echo\"\ncredentials = [\"opencode-static\"]\n",
+    );
+    let out = harness.launch_with_env(
+        "oc",
+        &[],
+        &[(
+            "AGENT_VM_TEST_CREDENTIAL",
+            "opencode-static=sk-test-replacement",
+        )],
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let config = debug_config_json(&stderr);
+    // The sentinel really is published: the guest can use OpenAI through the
+    // proxy even though agent-vm captured no OpenAI host credential.
+    assert_eq!(
+        env_pairs(&config)
+            .iter()
+            .find(|(key, _)| *key == "OPENAI_API_KEY")
+            .map(|(_, value)| *value),
+        Some("proxy-managed"),
+        "the authorization owns OPENAI_API_KEY, so the sentinel must be published: {:?}",
+        env_pairs(&config)
+    );
+    // ... and yet the `model` pin is retired (the S2 open decision).
+    let state = state_dir(&stderr);
+    let opencode: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(state.join("opencode-config/opencode.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        opencode.get("model").is_none(),
+        "the pin is retired for a replaced provider: {opencode}"
+    );
+    assert_eq!(opencode["autoupdate"], serde_json::json!(false));
+}
+
+/// **D11 (#162).** The launch-side half of the fresh-state-dir Copilot trust
+/// behaviour, through the real binary: a same-named `copilot` authorization
+/// still gets the non-secret trust configuration (`trusted_folders`), so the
+/// CLI's first run is pre-approved, while every credential facet is
+/// suppressed — no `github_token` placeholder, no `COPILOT_GITHUB_TOKEN`, no
+/// substitution entry. The in-guest "do you trust this folder?" prompt itself
+/// needs a boot and a live CLI (§4.8 step 7); this pins the launch decision it
+/// depends on, which `secrets.rs`'s in-process test alone does not exercise
+/// end to end. `Harness::new()` seeds the host device-flow token, so the
+/// absence below is the replacement's doing, not a missing host credential.
+#[test]
+fn a_replaced_copilot_still_gets_its_trust_configuration_and_no_token() {
+    let harness = Harness::new();
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: copilot\n    apiKey:\n      name: COPILOT_TOKEN\n      sentinelEnv: true\n      inject: [{domain: api.githubcopilot.com, scheme: bearer}]\n",
+    );
+    let out = harness.launch_with_env(
+        "copilot",
+        &[],
+        &[("AGENT_VM_TEST_CREDENTIAL", "copilot=sk-test-replacement")],
+    );
+    let stderr = stderr_of(&out);
+    // Panics unless `CONFIG_MARKER` is present, so "the launch died early"
+    // cannot masquerade as a pass.
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let config = debug_config_json(&stderr);
+    let state = state_dir(&stderr);
+
+    // -- configuration facet: written on a fresh state dir (AC2, D11) -------
+    let copilot = read_json(&state.join("copilot/config.json"))
+        .expect("a replaced Copilot must still get its trust configuration");
+    assert_eq!(copilot["trusted_folders"], serde_json::json!(["/"]));
+    assert!(
+        copilot.get("github_token").is_none(),
+        "no placeholder may be written for a replaced provider: {copilot}"
+    );
+    // The guest-HOME link is furniture and survives, like every provider's.
+    assert!(
+        std::fs::symlink_metadata(state.join("home/.copilot"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the `.copilot` guest-HOME link must remain"
+    );
+
+    // -- credential facets: suppressed (AC1) --------------------------------
+    assert!(
+        !registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_COPILOT_UNUSED"),
+        "the built-in substitution entry must not be registered"
+    );
+    let env = env_pairs(&config);
+    assert!(
+        !env.iter().any(|(key, _)| *key == "COPILOT_GITHUB_TOKEN"),
+        "the built-in placeholder bearer must not be exported: {env:?}"
+    );
+    // The authorization's own sentinel is published instead.
+    assert_eq!(
+        env.iter()
+            .find(|(key, _)| *key == "COPILOT_TOKEN")
+            .map(|(_, value)| *value),
+        Some("proxy-managed"),
+        "the authorization owns COPILOT_TOKEN, so its sentinel must be published"
+    );
+}
+
 fn golden_path(tool: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/config-launch")
@@ -2042,6 +2682,29 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
+/// Assert no regular file under `root` contains `needle` (a value canary).
+/// Files are read as lossy UTF-8 so a binary blob (a sqlite DB, a JWT-shaped
+/// placeholder) never panics the scan.
+fn assert_no_file_contains(root: &Path, needle: &str) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = entry.file_type().unwrap();
+        if file_type.is_dir() {
+            assert_no_file_contains(&path, needle);
+        } else if file_type.is_file() {
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains(needle),
+                "canary {needle:?} leaked into {}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// **The #118 acceptance criterion.** A `codex` guest holds no Anthropic
 /// capability: no host secret, no intercept rule, no guest placeholder — while
 /// the `.claude` symlink is deliberately still there (furniture is not a
@@ -2469,6 +3132,11 @@ fn a_shell_launch_with_no_host_credentials_wires_nothing() {
         "an unwired Copilot must not export a placeholder bearer"
     );
     let state = state_dir(&stderr);
+    // AC2: with *no* `credentials.yaml`, built-in behaviour is unchanged, so a
+    // provisioned Copilot whose capture failed writes nothing — `copilot/
+    // config.json` did not exist here before #162 and must not now. (A replaced
+    // Copilot *does* get its non-secret `trusted_folders`; that case is covered
+    // by the unit tests in `credential_provider.rs` / `secrets.rs`.)
     for rel in [
         "claude/.credentials.json",
         "codex/auth.json",

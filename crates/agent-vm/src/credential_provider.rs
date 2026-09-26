@@ -26,10 +26,24 @@
 //! launch registers its substitution entry.** For Anthropic/OpenAI/
 //! OpenCode-static this holds by construction — their placeholders live in
 //! files written *by* capture. Copilot is the exception (its placeholder lives
-//! in `copilot/config.json`, a *config* file), which is why
-//! `write_copilot_guest_config` runs **after** `secrets::refresh_copilot` and
-//! why `COPILOT_GITHUB_TOKEN` is gated on wiring as well as membership. See
+//! in `copilot/config.json`, a *config* file), which is why the placeholder is
+//! written by [`write_copilot_guest_token`] **after** `secrets::refresh_copilot`
+//! and its non-secret `trusted_folders` by [`write_copilot_bypass`], both called
+//! from [`crate::secrets::refresh`] once capture is known — and why
+//! `COPILOT_GITHUB_TOKEN` is gated on wiring as well as membership. See
 //! ADR-0017.
+//!
+//! # Replaced providers (#162)
+//!
+//! A tool's `credentials = [...]` name that matches a `credentials.yaml`
+//! authorization **replaces** the same-named built-in's credential handling for
+//! that launch ([`crate::credential_resolver`]). The suppression is applied at
+//! the *capture* gate in [`crate::secrets`], not here: everything on this page
+//! is the provider's *configuration and persistence*, which a credential
+//! authorization does not speak for (AC2). So a replaced provider keeps its
+//! bypass files, its guest-HOME links, its eager state dirs and Copilot's
+//! `trusted_folders` — and loses only the captured token, the guest
+//! placeholder, the proxy substitution entry and the OAuth route.
 //!
 //! | Facet | Anthropic | OpenAI | OpenCode-static | Copilot |
 //! |---|---|---|---|---|
@@ -277,6 +291,25 @@ pub fn missing_credential_error(provider: CredentialProvider) -> Option<&'static
     provider.spec().missing_credential_error
 }
 
+impl CredentialProvider {
+    /// The host variable agent-vm still forwards verbatim for this provider.
+    /// `None` for a provider with no raw-forwarded variable. #163 removes the
+    /// forwarding entirely; until then this is how #162 can warn that a
+    /// replacement owning a *different* variable leaves the host's real key
+    /// flowing into the guest.
+    ///
+    /// Pinned against `run::RAW_FORWARDED_ENV` as a set by a unit test, so the
+    /// two cannot drift.
+    pub(crate) fn raw_forwarded_env(self) -> Option<&'static str> {
+        match self {
+            Self::Anthropic => Some("ANTHROPIC_API_KEY"),
+            // OpenCode authenticates against OpenAI the way Codex does.
+            Self::OpenAi | Self::OpencodeStatic => Some("OPENAI_API_KEY"),
+            Self::Copilot => None,
+        }
+    }
+}
+
 /// What the substituting proxy must register for `provider` — `None` when the
 /// provider has no proxied secret of its own.
 pub(crate) fn proxy_secret(provider: CredentialProvider) -> Option<ProxySecret> {
@@ -294,11 +327,19 @@ pub(crate) fn oauth_rotation(provider: CredentialProvider) -> Option<&'static OA
 /// the generic `bash_history` seed. Idempotent across launches; merges instead
 /// of overwriting so user tweaks survive.
 ///
-/// Copilot is deliberately absent: its `copilot/config.json` carries the
-/// proxy placeholder, so it is written *after* capture by
-/// [`write_copilot_guest_config`] — writing it here would provision a
-/// placeholder the launch may never register. Do **not** "fix" that by
-/// reordering this whole function: `secrets::write_opencode_model_default`
+/// This is the provider **configuration** path (AC2): it is gated on
+/// `provisioned`, never on capture, so a provider whose credential handling a
+/// same-named authorization replaced still gets its onboarding files. Copilot
+/// is deliberately absent: its `copilot/config.json` carries both the
+/// `github_token` placeholder and `trusted_folders`, and *neither* may be
+/// written for every provisioned launch — the placeholder would provision a
+/// substitution the launch may never register, and writing `trusted_folders`
+/// unconditionally breaches AC2's "without a YAML match, built-in behavior
+/// remains unchanged" (a launch with no `credentials.yaml` whose Copilot
+/// capture fails would create the file where it previously wrote nothing).
+/// Both halves are written post-capture by [`crate::secrets::refresh`] via
+/// [`write_copilot_bypass`] / [`write_copilot_guest_token`]. Do **not**
+/// "fix" this by reordering the whole function: `secrets::write_opencode_model_default`
 /// (post-capture) deliberately disagrees with `write_opencode_bypass`
 /// (pre-capture) about `opencode-config/opencode.json`.
 pub(crate) fn write_bypass_configs(
@@ -400,26 +441,47 @@ fn write_opencode_bypass(guest: &GuestStateDir) -> Result<()> {
     Ok(())
 }
 
-/// Write the GitHub Copilot CLI's `~/.copilot/config.json`.
+/// Write the GitHub Copilot CLI's non-secret first-run trust configuration:
+/// `trusted_folders = ["/"]` so the CLI never prompts "do you trust this
+/// folder?" — the microVM is the sandbox, so trusting every path inside it is
+/// correct regardless of credentials. Mirrors the original Bash agent-vm's
+/// `_copilot_vm_setup_home`.
 ///
-/// Called by [`crate::secrets::refresh`] **only when the Copilot token was
-/// captured this launch**, because `github_token` holds the proxy placeholder.
-/// Two fields are set, mirroring the original Bash agent-vm's
-/// `_copilot_vm_setup_home`:
-///
-///  - `trusted_folders = ["/"]` so the CLI never prompts "do you trust this
-///    folder?" — the microVM is the sandbox, so trusting every path inside it
-///    is correct.
-///  - `github_token` carries [`crate::secrets::COPILOT_TOKEN_PLACEHOLDER`],
-///    which the proxy substitutes for the real token on outbound traffic. The
-///    CLI also honours the `COPILOT_GITHUB_TOKEN` env var (set by the
-///    launcher); writing it here too covers config-first reads.
-///
-/// Merge-on-existing so a user's own settings survive across launches; only
-/// the fields we manage are force-set.
-pub(crate) fn write_copilot_guest_config(guest: &GuestStateDir) -> Result<()> {
+/// Carries no placeholder, so it is written for a *provisioned* Copilot even
+/// when a same-named credential authorization replaced it (#162, AC2). It is
+/// called from [`crate::secrets::refresh`] **after** capture, but only when the
+/// token was captured *or* the provider was replaced — never for an un-replaced
+/// launch whose capture failed, whose pre-#162 behaviour was to write nothing at
+/// all (`a_shell_launch_with_no_host_credentials_wires_nothing`).
+/// Merge-on-existing so a user's own keys survive.
+pub(crate) fn write_copilot_bypass(guest: &GuestStateDir) -> Result<()> {
     let mut copilot = secrets::read_guest_json_object(guest, Path::new("copilot/config.json"));
     copilot.insert("trusted_folders".into(), serde_json::json!(["/"]));
+    guest.atomic_write(
+        Path::new("copilot/config.json"),
+        &serde_json::to_vec(&Value::Object(copilot))?,
+        0o600,
+    )?;
+    Ok(())
+}
+
+/// Write the GitHub Copilot CLI's `github_token` field into
+/// `~/.copilot/config.json`.
+///
+/// Called by [`crate::secrets::refresh`] **only when the Copilot token was
+/// captured this launch**, because `github_token` holds
+/// [`crate::secrets::COPILOT_TOKEN_PLACEHOLDER`] — the proxy substitutes the
+/// real token for it on outbound traffic, so it is only safe once the proxy has
+/// something to substitute it with (ADR-0017). The CLI also honours the
+/// `COPILOT_GITHUB_TOKEN` env var (set by the launcher); writing it here too
+/// covers config-first reads.
+///
+/// Split from [`write_copilot_bypass`] along exactly the credential /
+/// configuration seam the rest of the design uses: the trust configuration is
+/// provisioned, the placeholder is captured.
+/// Merge-on-existing so a user's own settings survive across launches.
+pub(crate) fn write_copilot_guest_token(guest: &GuestStateDir) -> Result<()> {
+    let mut copilot = secrets::read_guest_json_object(guest, Path::new("copilot/config.json"));
     copilot.insert(
         "github_token".into(),
         Value::String(secrets::COPILOT_TOKEN_PLACEHOLDER.into()),
@@ -841,9 +903,11 @@ mod tests {
 
     /// **U1.** `write_bypass_configs` writes exactly the bypass configs for
     /// the **provisioned** providers (plus the generic `bash_history`), and
-    /// nothing else. The empty row proves the gate closes; the all-four row
-    /// catches a revert of the Copilot reorder — `copilot/config.json` holds a
-    /// placeholder and is written post-capture, never here.
+    /// nothing else. The empty row proves the gate closes; the Copilot-owning
+    /// row proves Copilot is deliberately absent: *both* halves of
+    /// `copilot/config.json` (the `github_token` placeholder and the non-secret
+    /// `trusted_folders`) are post-capture in [`crate::secrets::refresh`], so
+    /// this pre-capture pass writes that file for no provisioning set.
     #[test]
     fn write_bypass_configs_follows_the_provisioning_set() {
         use CredentialProvider::*;
@@ -920,21 +984,27 @@ mod tests {
                 expected.len(),
                 "an unexpected file was written for {provisioned:?}"
             );
+            // Copilot is deliberately absent from the pre-capture pass for
+            // every provisioning set: neither half of `copilot/config.json` may
+            // appear before capture is known, so a provisioned-but-uncaptured
+            // (and unreplaced) Copilot writes nothing at all.
             assert!(
-                !state.path().join("copilot").exists(),
-                "copilot/config.json must never be written by the pre-capture pass ({provisioned:?})"
+                !state.path().join("copilot/config.json").exists(),
+                "write_bypass_configs must not write copilot/config.json for {provisioned:?}"
             );
         }
     }
 
-    /// **U2.** Copilot's guest config is written by the post-capture writer
-    /// only, carries the placeholder at 0600, and its placeholder is removed
-    /// again when a later launch does not wire Copilot — without disturbing
-    /// keys we do not own.
+    /// **U2.** Copilot's guest config is written by the trust-config writer
+    /// ([`write_copilot_bypass`]) plus the placeholder writer
+    /// ([`write_copilot_guest_token`]), carries the placeholder at 0600, and
+    /// its placeholder is removed again when a later launch does not wire
+    /// Copilot — without disturbing keys we do not own.
     #[test]
     fn copilot_guest_config_round_trips_and_clears_only_our_placeholder() {
         let (state, guest) = guest();
-        write_copilot_guest_config(&guest).unwrap();
+        write_copilot_bypass(&guest).unwrap();
+        write_copilot_guest_token(&guest).unwrap();
         let bytes = guest
             .read(Path::new("copilot/config.json"))
             .unwrap()
@@ -1079,6 +1149,26 @@ mod tests {
         }
         assert_eq!(CredentialProvider::from_config_name("opencode"), None);
         assert_eq!(CredentialProvider::from_config_name(""), None);
+    }
+
+    /// #162: `raw_forwarded_env()` must cover exactly the host variables the
+    /// launcher forwards verbatim (`run::RAW_FORWARDED_ENV`). The #162
+    /// renamed-replacement notice reads this mapping, so a future provider with
+    /// a raw-forwarded variable that nobody added here would make the notice go
+    /// silently blind. Pin as a *set*: the mapping is per-provider, the const is
+    /// a flat list.
+    #[test]
+    fn raw_forwarded_env_covers_exactly_the_launchers_forward_set() {
+        let mut from_providers: Vec<&str> = CredentialProvider::ALL
+            .into_iter()
+            .filter_map(|provider| provider.raw_forwarded_env())
+            .collect();
+        from_providers.sort_unstable();
+        from_providers.dedup();
+        let mut expected: Vec<&str> = crate::run::RAW_FORWARDED_ENV.to_vec();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(from_providers, expected);
     }
 
     /// V10: property-style internal consistency of the table. Catches a

@@ -215,6 +215,33 @@ pub(crate) fn exact_bytes_equal(a: &[u8], b: &[u8]) -> (result: bool)
     true
 }
 
+/// The capture decision: agent-vm acquires a provider's host credential iff
+/// this launch provisions it and no same-named YAML authorization replaced it
+/// (#162). Stated as bools so the proof is about the decision, not the bitset.
+///
+/// The second `ensures` clause is the one that matters: *a replaced provider is
+/// never captured*, which is what keeps the ADR-0017 placeholder invariant true
+/// (no placeholder without a substitution entry, and no substitution entry
+/// without a captured token).
+///
+/// Stated plainly, as ADR-0018's *verified surface* does for its
+/// restated-comparison rows: the exec body restates this spec, so what is proved
+/// is that the decision **is** `provisioned && !replaced` — **not** that the
+/// facets downstream of capture are wired correctly. Those rest on
+/// [`CredsState::wired`] being derived from `token_file(p).is_some()`, on
+/// [`clear_unwired_placeholders`], on `credential_injection::Plan::new`'s
+/// `(proxy_secret, token_file)` match and on `provider_guest_env`, none of which
+/// is verified. The contract is real but narrow: it pins the capture gate, and
+/// the facets are trusted.
+pub(crate) fn capture_decision(provisioned: bool, replaced: bool) -> (capture: bool)
+    ensures
+        capture == (provisioned && !replaced),
+        replaced ==> !capture,
+        !provisioned ==> !capture,
+{
+    provisioned && !replaced
+}
+
 } // verus!
 
 /// Whether `value` is *exactly* one of agent-vm's known placeholder constants
@@ -298,8 +325,9 @@ pub struct CredsState {
     /// present, else falls back to the captured `gh auth token` (a gh
     /// login with the Copilot scope works against the Copilot API).
     ///
-    /// `Some` whenever a usable token was found **and** this launch provisions
-    /// Copilot (`CredentialProvisioning.provisioned`). Crucially
+    /// `Some` whenever a usable token was found **and** this launch captures
+    /// Copilot (provisioned, and not replaced by a same-named authorization;
+    /// see [`CredentialProvisioning::captures`]). Crucially
     /// this is NOT gated on `--no-git` for a Copilot launch: the Copilot
     /// API is not repo-scoped, so `agent-vm copilot` must work even in a
     /// non-GitHub project.
@@ -508,16 +536,27 @@ pub fn opencode_openai_token_path(state_dir: &Path) -> PathBuf {
 #[derive(Debug, Clone, Copy)]
 pub struct CredentialProvisioning {
     pub provisioned: ProviderSet,
+    /// Built-ins a same-named `credentials.yaml` authorization replaced for
+    /// this launch (#162). Subtracted from **capture** only: the bypass
+    /// configs, the guest-HOME links and the eager state dirs are this
+    /// provider's *configuration and persistence*, which a credential
+    /// authorization does not speak for (AC2).
+    ///
+    /// `replaced ⊆ provisioned` by construction (`config.rs:300-327`).
+    pub replaced: ProviderSet,
     pub github_egress: bool,
 }
 
 impl CredentialProvisioning {
-    /// Whether this launch provisions `provider` — the one predicate every
-    /// capture gate reads. Naming it keeps the four gates in [`refresh`]
-    /// identical instead of four differently-written copies of the same
-    /// membership test.
-    fn wants(&self, provider: CredentialProvider) -> bool {
-        self.provisioned.contains(provider)
+    /// Whether this launch acquires `provider`'s host credential. The one
+    /// predicate every capture gate reads. Trusted adapter for the verified
+    /// [`capture_decision`] below: the two `ProviderSet::contains` measurements
+    /// are outside the proof (ADR-0018 §"extract the decision, not the I/O").
+    fn captures(&self, provider: CredentialProvider) -> bool {
+        capture_decision(
+            self.provisioned.contains(provider),
+            self.replaced.contains(provider),
+        )
     }
 }
 
@@ -566,7 +605,7 @@ pub fn refresh(
     let bypass_ctx = credential_provider::BypassContext { project_guest_path };
     credential_provider::write_bypass_configs(&guest, &bypass_ctx, provisioning.provisioned)?;
 
-    let anthropic_token_file = if provisioning.wants(CredentialProvider::Anthropic) {
+    let anthropic_token_file = if provisioning.captures(CredentialProvider::Anthropic) {
         with_provider_lock(state_dir, REFRESH_LOCK_ANTHROPIC, || {
             refresh_anthropic(state_dir, &guest)
         })
@@ -577,7 +616,7 @@ pub fn refresh(
     } else {
         None
     };
-    let openai_token_file = if provisioning.wants(CredentialProvider::OpenAi) {
+    let openai_token_file = if provisioning.captures(CredentialProvider::OpenAi) {
         with_provider_lock(state_dir, REFRESH_LOCK_OPENAI, || {
             refresh_openai(state_dir, &guest)
         })
@@ -594,8 +633,8 @@ pub fn refresh(
     // proxy substitutes that placeholder for the same real OpenAI
     // access token on outbound traffic. So OpenCode shares the
     // `openai_token_file` with Codex.
-    let want_opencode = provisioning.wants(CredentialProvider::OpencodeStatic);
-    let opencode_oauth = if want_opencode && openai_token_file.is_some() {
+    let capture_opencode = provisioning.captures(CredentialProvider::OpencodeStatic);
+    let opencode_oauth = if capture_opencode && openai_token_file.is_some() {
         match opencode_oauth_entry() {
             Ok(entry) => entry,
             Err(error) => {
@@ -628,7 +667,7 @@ pub fn refresh(
     // login "still flowed through"; nothing consumed it (no substitution
     // entry, no `copilot/config.json`, no `COPILOT_GITHUB_TOKEN`), so it only
     // made `creds_notice` claim a provider the guest could not use.
-    let copilot_token_file = if provisioning.wants(CredentialProvider::Copilot) {
+    let copilot_token_file = if provisioning.captures(CredentialProvider::Copilot) {
         refresh_copilot(state_dir, gh_token_file.as_deref()).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "copilot credential capture failed; skipping");
             None
@@ -636,10 +675,21 @@ pub fn refresh(
     } else {
         None
     };
-    // The placeholder in `copilot/config.json` is only safe once the proxy has
-    // something to substitute it with, so this write is post-capture.
+    // Copilot's `copilot/config.json` is written here, after capture, in two
+    // halves because the two have different gates (AC2): the non-secret
+    // `trusted_folders` is written whenever the launch needs the CLI to boot
+    // unprompted — a captured token *or* a same-named authorization that
+    // replaced the provider — while the `github_token` placeholder is written
+    // only when the proxy actually captured a token to substitute it with
+    // (ADR-0017). Writing `trusted_folders` unconditionally instead would breach
+    // AC2's "without a YAML match, built-in behavior remains unchanged": a
+    // launch with no `credentials.yaml` whose Copilot capture fails would create
+    // the file where it previously wrote nothing.
+    if copilot_token_file.is_some() || provisioning.replaced.contains(CredentialProvider::Copilot) {
+        credential_provider::write_copilot_bypass(&guest)?;
+    }
     if copilot_token_file.is_some() {
-        credential_provider::write_copilot_guest_config(&guest)?;
+        credential_provider::write_copilot_guest_token(&guest)?;
     }
 
     // SHA-256 snapshot of host credential files for post-run mutation
@@ -651,7 +701,12 @@ pub fn refresh(
     let opencode_refresh = refresh_opencode_with_paths(
         state_dir,
         &guest,
-        want_opencode,
+        // Still *called* with `capture_opencode`, even when the provider was
+        // replaced: this function is also OpenCode's own stale-row clearer
+        // (`clear_unwired_placeholders` is a deliberate no-op for OpenCode), so
+        // skipping it would leave our synthetic `openai` row and the BYO host
+        // token files behind (ADR-0017).
+        capture_opencode,
         CredentialProvider::OpencodeStatic
             .host_credential_path()
             .as_deref(),
@@ -665,11 +720,19 @@ pub fn refresh(
         .openai_wired
         .then(|| opencode_openai_token_path(state_dir));
     let opencode_api_token_files = opencode_refresh.api_providers;
-    if want_opencode {
-        write_opencode_model_default(
-            &guest,
-            opencode_openai_access_token_file.is_some() || opencode_api_token_files.is_empty(),
-        )?;
+    // The gate is `provisioned`, not `captures`: a stale `model` pin written by
+    // an earlier un-replaced launch must still be retired. The *argument*
+    // conjoins capture, because both of its operands are capture results — a
+    // replaced provider wired no OpenAI credential, so pinning
+    // `openai/gpt-5.5` would assert a provider the guest has no key for
+    // (agent-vm #162, AC2).
+    if provisioning
+        .provisioned
+        .contains(CredentialProvider::OpencodeStatic)
+    {
+        let pin_openai_model = capture_opencode
+            && (opencode_openai_access_token_file.is_some() || opencode_api_token_files.is_empty());
+        write_opencode_model_default(&guest, pin_openai_model)?;
     }
 
     // Build the state first, then ask it which providers it actually wired
@@ -2047,8 +2110,19 @@ mod tests {
 
     /// Build a [`CredentialProvisioning`] for tests.
     fn provisioning(provisioned: ProviderSet, github_egress: bool) -> CredentialProvisioning {
+        provisioning_with_replaced(provisioned, ProviderSet::default(), github_egress)
+    }
+
+    /// [`provisioning`] with same-named replacements (#162). A sibling rather
+    /// than a changed signature, so the ten existing call sites stay untouched.
+    fn provisioning_with_replaced(
+        provisioned: ProviderSet,
+        replaced: ProviderSet,
+        github_egress: bool,
+    ) -> CredentialProvisioning {
         CredentialProvisioning {
             provisioned,
+            replaced,
             github_egress,
         }
     }
@@ -2556,6 +2630,346 @@ mod tests {
         // The bypass file still exists (U1's `{OpencodeStatic}` row).
         assert!(state.path().join("opencode-config/opencode.json").exists());
         assert_placeholder_invariant(state.path(), &creds);
+    }
+
+    /// **S5b (#162).** Replacing a provider suppresses its *credential* facets
+    /// and nothing else: the same provisioning set with and without
+    /// `replaced = {provider}`, against one identical host fixture, differs in
+    /// capture only. Parameterised over `CredentialProvider::ALL` so the whole
+    /// seam is covered cheaply, and a new provider cannot skip it.
+    #[test]
+    fn replacing_a_provider_suppresses_only_its_credential_facets() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        seed_host_credentials(home.path());
+        env.set_var("HOME", home.path());
+
+        for provider in CredentialProvider::ALL {
+            let provisioned = ProviderSet::new([provider]);
+            let plain = refresh_into_fresh_state(provisioned, ProviderSet::default());
+            let replaced = refresh_into_fresh_state(provisioned, provisioned);
+
+            // AC1: no capture, hence no token file and no wiring.
+            assert!(
+                replaced.creds.token_file(provider).is_none(),
+                "{provider:?}"
+            );
+            assert!(!replaced.creds.wired().contains(provider), "{provider:?}");
+            // BYO rows belong to `opencode-static` alone; asserting the empty
+            // list for the other three would be trivially true, since the list
+            // is only ever populated with OpenCode provisioned.
+            if provider == CredentialProvider::OpencodeStatic {
+                assert!(
+                    replaced.creds.opencode_api_token_files.is_empty(),
+                    "a replaced opencode-static must drop its BYO rows"
+                );
+            }
+            // Positive control: the un-replaced half really did capture *this
+            // provider's own* facet, so the silence above is not vacuous.
+            // Provider-specific rather than a disjunction — an `opencode-static`
+            // half with no BYO rows must not be rescued by a `token_file` that
+            // legitimately needs `OpenAi` too.
+            match provider {
+                CredentialProvider::Anthropic => {
+                    assert!(plain.creds.anthropic_token_file.is_some())
+                }
+                CredentialProvider::OpenAi => assert!(plain.creds.openai_token_file.is_some()),
+                CredentialProvider::OpencodeStatic => {
+                    assert!(!plain.creds.opencode_api_token_files.is_empty())
+                }
+                CredentialProvider::Copilot => assert!(plain.creds.copilot_token_file.is_some()),
+            }
+            // AC2: every file `configuration_files` compares is byte-identical.
+            assert_eq!(
+                configuration_files(replaced.state.path()),
+                configuration_files(plain.state.path()),
+                "a replacement changed a configuration file: {provider:?}"
+            );
+        }
+    }
+
+    /// D11, fresh state dir: a replaced Copilot still gets its first-run trust
+    /// configuration but no `github_token` placeholder. On a *stale* dir the
+    /// file survives anyway (the clearer removes only the token), so only a
+    /// fresh dir exposes a regression here.
+    #[test]
+    fn a_replaced_copilot_still_gets_its_trust_configuration() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        seed_host_credentials(home.path());
+        env.set_var("HOME", home.path());
+
+        let copilot = ProviderSet::new([CredentialProvider::Copilot]);
+        let Refreshed { state, creds } = refresh_into_fresh_state(copilot, copilot);
+        assert!(creds.copilot_token_file.is_none());
+        let config: Value = serde_json::from_slice(
+            &std::fs::read(state.path().join("copilot/config.json"))
+                .expect("the trust config must be written"),
+        )
+        .unwrap();
+        assert_eq!(config["trusted_folders"], serde_json::json!(["/"]));
+        assert!(config.get("github_token").is_none(), "{config}");
+    }
+
+    /// D11, stale state dir: the placeholder an earlier un-replaced launch left
+    /// is cleared while `trusted_folders` survives.
+    #[test]
+    fn a_replaced_copilot_keeps_trust_and_drops_a_stale_token() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        seed_host_credentials(home.path());
+        env.set_var("HOME", home.path());
+
+        let copilot = ProviderSet::new([CredentialProvider::Copilot]);
+        let state = tempfile::tempdir().unwrap();
+        GuestStateDir::open(state.path())
+            .unwrap()
+            .atomic_write(
+                Path::new("copilot/config.json"),
+                br#"{"trusted_folders":["/"],"github_token":"msb-copilot-placeholder-v2"}"#,
+                0o600,
+            )
+            .unwrap();
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &provisioning_with_replaced(copilot, copilot, false),
+        )
+        .unwrap();
+        assert!(creds.copilot_token_file.is_none());
+        let config: Value = serde_json::from_slice(
+            &std::fs::read(state.path().join("copilot/config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["trusted_folders"], serde_json::json!(["/"]));
+        assert!(config.get("github_token").is_none(), "{config}");
+    }
+
+    /// D12: replacing `opencode-static` retires the OpenAI model pin instead of
+    /// asserting one. With a BYO-only host the un-replaced launch already
+    /// retires it, so the two files are byte-identical — the whole AC2 property
+    /// for this facet.
+    #[test]
+    fn a_replaced_opencode_retires_the_model_pin() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        // A BYO-only OpenCode host: no OpenAI credential at all.
+        let auth = home.path().join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        std::fs::write(&auth, br#"{"zai":{"type":"api","key":"user-key"}}"#).unwrap();
+        env.set_var("HOME", home.path());
+
+        let opencode = ProviderSet::new([CredentialProvider::OpencodeStatic]);
+        let plain = refresh_into_fresh_state(opencode, ProviderSet::default());
+        let replaced = refresh_into_fresh_state(opencode, opencode);
+
+        let model_of = |state: &Path| {
+            let text = std::fs::read_to_string(state.join("opencode-config/opencode.json"))
+                .expect("the bypass config exists");
+            serde_json::from_str::<Value>(&text).unwrap()
+        };
+        let plain_config = model_of(plain.state.path());
+        let replaced_config = model_of(replaced.state.path());
+        assert!(
+            replaced_config.get("model").is_none(),
+            "a replaced provider must retire the pin: {replaced_config}"
+        );
+        assert_eq!(replaced_config["autoupdate"], serde_json::json!(false));
+        assert!(replaced_config.get("$schema").is_some());
+        assert_eq!(plain_config, replaced_config, "the pin is the only facet");
+
+        // No managed OpenCode row and no host token file survives.
+        let guest = GuestStateDir::open(replaced.state.path()).unwrap();
+        let auth: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("opencode/auth.json"))
+                .unwrap()
+                .unwrap_or_else(|| b"{}".to_vec()),
+        )
+        .unwrap();
+        assert!(auth.get("openai").is_none(), "{auth}");
+        assert!(replaced.creds.opencode_api_token_files.is_empty());
+        for provider in OPENCODE_API_PROVIDERS {
+            assert!(
+                !opencode_api_token_path(replaced.state.path(), provider).exists(),
+                "{}",
+                provider.id
+            );
+        }
+        // Positive control: the un-replaced half did install the BYO row.
+        assert!(!plain.creds.opencode_api_token_files.is_empty());
+    }
+
+    /// **N7/R2.** The same retirement, on the fixture that *separates* the two
+    /// halves: an OpenAI-capable host, where the un-replaced launch pins
+    /// `openai/gpt-5.5` and the replaced one does not. The BYO-only fixture
+    /// above cannot show that difference — both halves end with no `model` key
+    /// there — so this is the case that actually pins the capture gate.
+    #[test]
+    fn a_replaced_opencode_retires_the_pin_an_openai_capable_host_would_set() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        // An OpenAI-capable host (Codex auth) and no OpenCode BYO rows.
+        let codex = home.path().join(".codex/auth.json");
+        std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        std::fs::write(&codex, br#"{"tokens":{"access_token":"fake"}}"#).unwrap();
+        let auth = home.path().join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        std::fs::write(&auth, b"{}").unwrap();
+        env.set_var("HOME", home.path());
+
+        let provisioned = ProviderSet::new([
+            CredentialProvider::OpenAi,
+            CredentialProvider::OpencodeStatic,
+        ]);
+        let plain = refresh_into_fresh_state(provisioned, ProviderSet::default());
+        let replaced = refresh_into_fresh_state(
+            provisioned,
+            ProviderSet::new([CredentialProvider::OpencodeStatic]),
+        );
+
+        let model_of = |state: &Path| {
+            serde_json::from_str::<Value>(
+                &std::fs::read_to_string(state.join("opencode-config/opencode.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        // Positive control: the un-replaced launch really does pin, so the
+        // replaced assertion is not vacuous.
+        assert_eq!(
+            model_of(plain.state.path())["model"],
+            serde_json::json!("openai/gpt-5.5"),
+            "the un-replaced launch must pin the model"
+        );
+        assert!(
+            model_of(replaced.state.path()).get("model").is_none(),
+            "a replaced provider must retire the pin even when the host has an OpenAI credential"
+        );
+    }
+
+    /// D13: the OpenCode synthetic `openai` row is derived from the *same*
+    /// captured host token as `openai` itself, so replacing `openai` drops it
+    /// even though `opencode-static` was not replaced. One credential, one
+    /// handling.
+    #[test]
+    fn a_replaced_openai_also_drops_opencodes_openai_row() {
+        let mut env = crate::test_env::guard();
+        let home = tempfile::tempdir().unwrap();
+        seed_host_credentials(home.path());
+        env.set_var("HOME", home.path());
+
+        let provisioned = ProviderSet::new([
+            CredentialProvider::OpenAi,
+            CredentialProvider::OpencodeStatic,
+        ]);
+        let replaced = ProviderSet::new([CredentialProvider::OpenAi]);
+        let Refreshed { state, creds } = refresh_into_fresh_state(provisioned, replaced);
+        assert!(creds.openai_token_file.is_none());
+        assert!(
+            creds.opencode_openai_access_token_file.is_none(),
+            "the synthetic OpenCode row needs the OpenAI capture"
+        );
+        let guest = GuestStateDir::open(state.path()).unwrap();
+        let auth: Value = serde_json::from_slice(
+            &guest
+                .read(Path::new("opencode/auth.json"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            auth.get("openai").is_none(),
+            "the OpenCode OpenAI row must follow the OpenAI capture: {auth}"
+        );
+    }
+
+    /// Seed one `$HOME` with a usable host credential for every provider, plus
+    /// a BYO-only OpenCode `auth.json` (no synthetic `openai` row). The BYO-only
+    /// shape keeps the un-replaced and replaced halves of
+    /// `a_replaced_opencode_retires_the_model_pin` comparable.
+    fn seed_host_credentials(home: &Path) {
+        for (relative, bytes) in [
+            (
+                ".claude/.credentials.json",
+                &br#"{"claudeAiOauth":{"accessToken":"fake"}}"#[..],
+            ),
+            (
+                ".codex/auth.json",
+                &br#"{"tokens":{"access_token":"fake"}}"#[..],
+            ),
+            (
+                ".cache/claude-vm/copilot-token.json",
+                &br#"{"access_token":"fake"}"#[..],
+            ),
+            (
+                ".local/share/opencode/auth.json",
+                &br#"{"zai":{"type":"api","key":"user-key"}}"#[..],
+            ),
+        ] {
+            let path = home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+
+    /// One `refresh` against a fresh state dir with the given provisioning and
+    /// replacement sets. Named fields so a call site cannot swap the two halves
+    /// of the pair.
+    struct Refreshed {
+        state: tempfile::TempDir,
+        creds: CredsState,
+    }
+
+    fn refresh_into_fresh_state(provisioned: ProviderSet, replaced: ProviderSet) -> Refreshed {
+        let state = tempfile::tempdir().unwrap();
+        let creds = super::refresh(
+            state.path(),
+            "/workspace/p",
+            &provisioning_with_replaced(provisioned, replaced, false),
+        )
+        .unwrap();
+        Refreshed { state, creds }
+    }
+
+    /// The files whose *configuration* content the bypass writers decide, and
+    /// their exact bytes (absent ⇒ `None`), so a replacement must leave every
+    /// one of them untouched: `write_bypass_configs` (pre-capture) for the
+    /// generic onboarding files, and `write_copilot_bypass` (post-capture, from
+    /// `secrets::refresh`) for Copilot's `trusted_folders`.
+    ///
+    /// `copilot/config.json` is split: `write_copilot_bypass` writes its
+    /// non-secret `trusted_folders`, while capture writes the `github_token`
+    /// placeholder. Only the configuration half belongs to this comparison, so
+    /// the placeholder key is removed here; `github_token` is pinned directly
+    /// by `a_replaced_copilot_still_gets_its_trust_configuration` and
+    /// `a_replaced_copilot_keeps_trust_and_drops_a_stale_token`.
+    fn configuration_files(state: &Path) -> std::collections::BTreeMap<String, Option<String>> {
+        let mut files = std::collections::BTreeMap::new();
+        for relative in [
+            "claude/settings.json",
+            "claude.json",
+            "codex/config.toml",
+            "opencode-config/opencode.json",
+            "copilot/config.json",
+            "bash_history",
+        ] {
+            let text = std::fs::read(state.join(relative))
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            let text = match (relative, text) {
+                ("copilot/config.json", Some(raw)) => {
+                    let mut value: Value = serde_json::from_str(&raw).unwrap();
+                    value
+                        .as_object_mut()
+                        .expect("copilot config is an object")
+                        .remove("github_token");
+                    Some(value.to_string())
+                }
+                (_, text) => text,
+            };
+            files.insert(relative.to_owned(), text);
+        }
+        files
     }
 
     /// **S6.** `clear_unwired_placeholders` is idempotent and creates nothing:
