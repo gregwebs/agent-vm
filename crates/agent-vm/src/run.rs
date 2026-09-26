@@ -30,11 +30,6 @@ use crate::session::ProjectSession;
 use crate::tool_layer;
 use crate::user;
 
-/// Paths that the guest will tmpfs-mount at boot, wiping anything our
-/// `patch` builder baked into the rootfs underneath them. We refuse to mirror
-/// a host project rooted here and fall back to `/workspace` instead.
-const TMPFS_GUEST_PREFIXES: &[&str] = &["/tmp", "/run", "/dev/shm", "/var/run"];
-
 /// Environment variables agent-vm injects into *every* guest, regardless of
 /// agent or project. Listed in one place so the set is discoverable and
 /// guard-testable.
@@ -742,7 +737,7 @@ fn guest_path_is_safe(project: &Path) -> bool {
         Some(s) => s,
         None => return false,
     };
-    !TMPFS_GUEST_PREFIXES
+    !crate::guest_paths::TMPFS_GUEST_PREFIXES
         .iter()
         .any(|p| s == *p || s.starts_with(&format!("{p}/")))
 }

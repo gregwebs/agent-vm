@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod support;
+
 /// Never resolves; only used to drive execution far enough into `launch()` to
 /// prove `builder.build()` already ran (its debug JSON dump happens right
 /// before the pull, which is what fails here).
@@ -35,15 +37,6 @@ const BUILTIN_SUBCOMMANDS: &[&str] = &[
 
 fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
-}
-
-/// Base directory for harness `$HOME`/project dirs on the real workspace
-/// filesystem rather than under a guest tmpfs prefix: `run::guest_path_is_safe`
-/// remaps any project below `/tmp` to `/workspace`, which breaks tests that
-/// reason about the project's guest path. Cargo creates `CARGO_TARGET_TMPDIR`
-/// before running integration tests.
-fn harness_tmpdir() -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }
 
 fn write_fake_msb(dir: &Path) -> PathBuf {
@@ -106,11 +99,13 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         // The relay socket lives below the state directory, so keep that one
-        // under `/tmp` for the Unix socket-path limit. `$HOME` and the project
-        // dir stay on the workspace filesystem.
-        let home = tempfile::tempdir_in(harness_tmpdir()).unwrap();
+        // under `/tmp` for the Unix socket-path limit. `$HOME` stays on the
+        // workspace filesystem, and the project helper fails fast if
+        // `CARGO_TARGET_DIR` pushed the project under a guest tmpfs prefix
+        // (where the guest would remap it to `/workspace`).
+        let home = tempfile::tempdir_in(support::workspace_tmpdir()).unwrap();
         let state = tempfile::tempdir_in("/tmp").unwrap();
-        let project = tempfile::tempdir_in(harness_tmpdir()).unwrap();
+        let project = support::project_tempdir();
         let fake_msb = write_fake_msb(home.path());
         Self {
             home,

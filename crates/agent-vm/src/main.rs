@@ -12,6 +12,7 @@ mod doctor;
 mod env_flag;
 mod github_graphql;
 mod guest_home;
+mod guest_paths;
 mod host_paths;
 mod image_api_version;
 mod image_capabilities;

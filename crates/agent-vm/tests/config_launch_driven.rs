@@ -35,9 +35,12 @@
 //! The project's temp root lives under `CARGO_TARGET_TMPDIR` (inside `target/`),
 //! deliberately *off* the guest's tmpfs prefixes (`/tmp`, `/run`, …), so the
 //! guest mirrors the project path on macOS and Linux alike — the shape every
-//! real user gets. That is what lets the goldens pin `runtime.workdir` and the
-//! project mount's `guest` at the real `$PROJECT` value `main` produces,
-//! instead of collapsing two platform-dependent shapes to one token.
+//! real user gets. `support::project_tempdir` enforces that precondition,
+//! failing fast rather than letting a tmpfs-prefixed `CARGO_TARGET_DIR` surface
+//! here as a product-looking assertion failure. That is what lets the goldens
+//! pin `runtime.workdir` and the project mount's `guest` at the real `$PROJECT`
+//! value `main` produces, instead of collapsing two platform-dependent shapes
+//! to one token.
 //!
 //! The comparison is deliberately **not** byte-for-byte on every field. The
 //! remaining host-dependent values are normalized (or dropped) so the fixtures
@@ -72,6 +75,8 @@ use std::{
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
+
+mod support;
 
 /// Bogus-but-well-formed image ref: never resolves, so the run fails *after*
 /// the debug dumps (its pull is what fails), which is exactly the stage these
@@ -214,14 +219,14 @@ impl Harness {
     fn new() -> Self {
         let home = tempfile::tempdir_in("/tmp").unwrap();
         let state = tempfile::tempdir_in("/tmp").unwrap();
-        // The project root deliberately lives off the guest's tmpfs prefixes
-        // (`/tmp`, `/run`, `/dev/shm`, `/var/run`) so `run::resolve_project_guest_path`
-        // mirrors it in the guest on every platform — the shape every real user
-        // gets — instead of falling back to `/workspace`. Cargo sets
-        // `CARGO_TARGET_TMPDIR` (under `target/`) for exactly this. `HOME` and
-        // `AGENT_VM_STATE_DIR` stay under `/tmp`: a shorter state path keeps the
-        // sandbox's control socket inside the `sun_path` limit (CONTRIBUTING.md).
-        let project = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        // `support::project_tempdir` keeps the project off the guest's tmpfs
+        // prefixes so `run::resolve_project_guest_path` mirrors it in the guest
+        // on every platform — the shape every real user gets — instead of
+        // falling back to `/workspace`, and fails fast if `CARGO_TARGET_DIR`
+        // pushed it under one. `HOME` and `AGENT_VM_STATE_DIR` stay under
+        // `/tmp`: a shorter state path keeps the sandbox's control socket inside
+        // the `sun_path` limit (CONTRIBUTING.md).
+        let project = support::project_tempdir();
         let home_root = home.path().canonicalize().unwrap();
         let project_root = project.path().canonicalize().unwrap();
         let state_root = state.path().canonicalize().unwrap();
