@@ -120,6 +120,20 @@ impl Harness {
         self.project_root.join(".agent-vm/config.toml")
     }
 
+    fn credentials(&self) -> PathBuf {
+        self.home_root.join(".config/agent-vm/credentials.yaml")
+    }
+
+    /// Write `credentials.yaml` at the mode `credential_yaml::load` expects, so
+    /// the fixture exercises the launch path rather than the mode warning.
+    fn write_credentials(&self, contents: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = self.credentials();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     fn base_command(&self) -> Command {
         let mut cmd = Command::new(agent_vm_bin());
         cmd.env_clear()
@@ -661,4 +675,175 @@ fn a_fifo_config_does_not_hang_doctor() {
         "{}",
         stderr_of(&out)
     );
+}
+
+// -- #178: the launch-aware credential view ---------------------------------
+
+const ANTHROPIC_AUTHORIZATION: &str = "\
+credentials:
+  - service: anthropic
+    required: true
+    apiKey:
+      name: ANTHROPIC_API_KEY
+      sentinelEnv: true
+      inject:
+        - domain: api.anthropic.example
+          header: x-api-key
+          format: \"%s\"
+";
+
+/// A same-named authorization makes the built-in `anthropic` row's host file
+/// irrelevant, and doctor must say so rather than leaving a green/absent row to
+/// be read as "the launch reads this". The launch section is the positive
+/// signal that the authorization supplies the launch.
+#[test]
+fn a_replaced_provider_is_reported_as_not_read_and_authorized_from_yaml() {
+    let h = Harness::new();
+    h.write_credentials(ANTHROPIC_AUTHORIZATION);
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+
+    assert!(
+        stdout.contains(
+            "absent - replaced by credentials.yaml for pi, claude, shell (host file not read)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("==> credentials.yaml (launch credentials)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("anthropic  authorized for this launch (replaces the host built-in)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("`agent-vm secret ls` reports whether a value is stored"),
+        "{stdout}"
+    );
+    // The launch view comes after the tool list it is derived from, and before
+    // the operations footer.
+    let tools = stdout.find("==> tool configuration").unwrap();
+    let launch = stdout.find("==> credentials.yaml").unwrap();
+    let ops = stdout
+        .find("==> agent-vm doctor: available operations")
+        .unwrap();
+    assert!(tools < launch && launch < ops, "{stdout}");
+}
+
+/// **Read-only regression (#178 review).** The launch view must not read the
+/// credential store: `SecretStore::resolve` takes the exclusive inventory lock
+/// and creates `.secret-inventory.lock`, which would make `doctor` a writing
+/// command on a host whose only authorization is this file. `doctor` leaves the
+/// config directory exactly as it found it.
+#[test]
+fn doctor_leaves_no_inventory_lock_behind() {
+    let h = Harness::new();
+    h.write_credentials(ANTHROPIC_AUTHORIZATION);
+    let config_dir = h.credentials().parent().unwrap().to_path_buf();
+    let before: Vec<_> = std::fs::read_dir(&config_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+
+    let out = h.run_doctor();
+    assert_success(&out);
+
+    let after: Vec<_> = std::fs::read_dir(&config_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        before,
+        after,
+        "doctor must not create or remove anything in {}",
+        config_dir.display()
+    );
+    assert!(!config_dir.join(".secret-inventory.lock").exists());
+}
+
+/// A host with no `credentials.yaml` gets no launch section: the pre-#178
+/// output is unchanged when there is nothing launch-specific to say.
+#[test]
+fn no_credentials_file_adds_no_launch_section() {
+    let h = Harness::new();
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+
+    assert!(
+        !stdout.contains("==> credentials.yaml"),
+        "no authorization file must not grow a section: {stdout}"
+    );
+    assert!(!stdout.contains("replaced by credentials.yaml"), "{stdout}");
+}
+
+/// An authorization no configured launch requests is inert, so it produces no
+/// credential row and no host-row annotation.
+#[test]
+fn an_inert_authorization_is_not_reported() {
+    let h = Harness::new();
+    h.write_credentials(
+        "credentials:\n  - service: alpha\n    apiKey:\n      name: ALPHA\n      \
+         inject: [{domain: a.example, header: x-a, format: \"%s\"}]\n",
+    );
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+
+    assert!(
+        !stdout.contains("alpha  authorized"),
+        "an inert authorization changes nothing: {stdout}"
+    );
+    assert!(!stdout.contains("replaced by credentials.yaml"), "{stdout}");
+}
+
+/// A file diagnostic is about the file, not about one launch, so an inert-only
+/// authorization still reports a file-mode warning. The credential rows and
+/// host-row annotations stay absent.
+#[test]
+fn an_inert_authorization_still_reports_a_file_diagnostic() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let h = Harness::new();
+    h.write_credentials(
+        "credentials:\n  - service: alpha\n    apiKey:\n      name: ALPHA\n      \
+         inject: [{domain: a.example, header: x-a, format: \"%s\"}]\n",
+    );
+    let path = h.credentials();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+
+    assert!(stdout.contains("warning:"), "{stdout}");
+    assert!(stdout.contains("group- or other-readable"), "{stdout}");
+    assert!(!stdout.contains("alpha  authorized"), "{stdout}");
+    assert!(!stdout.contains("replaced by credentials.yaml"), "{stdout}");
+}
+
+/// A malformed authorization file is reported rather than hidden, and the rest
+/// of the report still renders.
+#[test]
+fn a_malformed_credentials_file_is_reported_in_band() {
+    let h = Harness::new();
+    h.write_credentials("credentials:\n  - service: anthropic\n    bogus: true\n");
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+
+    assert!(
+        stdout.contains("==> credentials.yaml (launch credentials)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("error:"), "{stdout}");
+    assert!(stdout.contains("unknown field"), "{stdout}");
+    // The sections that do not depend on the file still render.
+    assert!(stdout.contains("==> host agent credentials"), "{stdout}");
+    assert!(stdout.contains("==> tool configuration"), "{stdout}");
 }

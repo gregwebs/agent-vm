@@ -38,6 +38,7 @@
 //! passthrough, and its error message points here — closing the loop
 //! between "detect" (#30) and "recover" (this command, #28).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -45,10 +46,14 @@ use anyhow::{Context, Result, anyhow};
 use clap::Args as ClapArgs;
 
 use crate::config::{
-    ConfigConflict, ConfigReport, TierReport, TierStatus, Tool, ToolLayer, ToolOrigin,
+    ConfigConflict, ConfigReport, LaunchCatalog, TierReport, TierStatus, Tool, ToolLayer,
+    ToolOrigin,
 };
 use crate::credential_provider::{CredentialProvider, ProviderSet};
+use crate::credential_resolver;
+use crate::credential_yaml::AuthorizationSet;
 use crate::pi_credential_inspection::{PiCredentialReport, inspect_project};
+use crate::secret_store::ServiceName;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -88,6 +93,20 @@ pub fn run(args: Args) -> Result<()> {
         // print an error and still exit 0.
         let load_failure = config.as_ref().err().map(|error| anyhow!("{error:#}"));
 
+        // Build the resolved catalog once, before printing anything: the
+        // credential report and the launch view are both launch-aware (#178),
+        // so they read the same catalog the tool-configuration section
+        // renders, and a launch-verb list cannot diverge from `--help`.
+        let (config_section, catalog_failure, catalog) = match config {
+            Ok(report) => describe_config(report),
+            Err(error) => (
+                format!("==> tool configuration\nerror: {error:#}"),
+                load_failure,
+                None,
+            ),
+        };
+        let launch = gather_launch_view(catalog.as_ref());
+
         let db_exists = msb_home.join("db").join("msb.db").exists();
         println!(
             "{}",
@@ -98,24 +117,21 @@ pub fn run(args: Args) -> Result<()> {
             )
         );
         println!();
-        println!("{}", describe_credentials(&gather_credentials()));
+        println!("{}", describe_credentials(&gather_credentials(), &launch));
         println!();
-        let config_failure = match config {
-            Ok(report) => {
-                let (section, catalog_failure) = describe_config(report);
-                println!("{section}");
-                catalog_failure
-            }
-            Err(error) => {
-                println!("==> tool configuration\nerror: {error:#}");
-                load_failure
-            }
-        };
+        println!("{config_section}");
+        // Rendered only when there is something launch-specific to say, so a
+        // host with no `credentials.yaml` (or only inert authorizations) sees
+        // the pre-#178 output unchanged.
+        if !launch.is_empty() {
+            println!();
+            println!("{}", describe_launch_view(&launch));
+        }
         println!();
         println!("==> agent-vm doctor: available operations");
         println!("      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next");
         println!("                       agent-vm shell/run recreates it at the bundled schema");
-        if let Some(error) = config_failure {
+        if let Some(error) = catalog_failure {
             return Err(error);
         }
         return Ok(());
@@ -305,7 +321,11 @@ fn gather_project_creds() -> Option<ProjectCreds> {
 
 /// Render the credential report. Pure over its input so the wording is
 /// unit-tested without touching `$HOME` or the filesystem.
-fn describe_credentials(report: &CredReport) -> String {
+///
+/// `launch` supplies the launch-aware disposition of each host file (#178): a
+/// provider some configured launch replaces is annotated so a green/absent row
+/// is never read as "this launch will read this file".
+fn describe_credentials(report: &CredReport, launch: &LaunchView) -> String {
     let mut out = String::from("==> host agent credentials\n");
     let width = report
         .hosts
@@ -324,8 +344,9 @@ fn describe_credentials(report: &CredReport) -> String {
                 expires_at_ms: Some(exp),
             } => format!("ok ({})", describe_expiry(*exp, report.now_ms)),
         };
+        let disposition = launch.host_row_note(label);
         out.push_str(&format!(
-            "{label:<width$}  {path}\n{:width$}  {detail}\n",
+            "{label:<width$}  {path}\n{:width$}  {detail}{disposition}\n",
             ""
         ));
     }
@@ -365,14 +386,207 @@ fn describe_credentials(report: &CredReport) -> String {
     out
 }
 
+/// What `doctor` knows about the launch context a host-file listing alone
+/// cannot express (#178). Pure data so the wording is unit-tested without a
+/// keychain or a real `credentials.yaml`.
+///
+/// Replacement is a *name* fact: if the user authorizes `anthropic` and some
+/// configured launch requests `anthropic`, that launch never reads the host
+/// file — whichever verb it is. That is why the view can be built for the
+/// whole catalog without being told which verb the user has in mind, and why it
+/// needs the authorization file but never the credential store.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LaunchView {
+    /// Built-in `doctor_label` -> the launches that replace it. The host row
+    /// for that label is annotated from this.
+    replaced: BTreeMap<&'static str, Vec<String>>,
+    /// Built-in `doctor_label`s no configured launch requests at all, so the
+    /// host file is beside the point.
+    unrequested: Vec<&'static str>,
+    /// One row per authorized service some configured launch requests.
+    yaml: Vec<YamlRow>,
+    /// `credentials.yaml` mode warnings, rendered with a `warning:` prefix.
+    notes: Vec<String>,
+    /// Failures (a malformed or unreadable file), rendered with an `error:`
+    /// prefix.
+    problems: Vec<String>,
+}
+
+impl LaunchView {
+    /// Empty means `doctor` has nothing launch-specific to add: no requested
+    /// authorization and no problem. The pre-#178 output is then unchanged.
+    fn is_empty(&self) -> bool {
+        self.yaml.is_empty() && self.notes.is_empty() && self.problems.is_empty()
+    }
+
+    /// The suffix appended to one host credential row. Empty for a provider a
+    /// launch still reads — the ordinary built-in case.
+    fn host_row_note(&self, doctor_label: &str) -> String {
+        if let Some(tools) = self.replaced.get(doctor_label) {
+            format!(
+                " - replaced by credentials.yaml for {} (host file not read)",
+                tools.join(", ")
+            )
+        } else if self.unrequested.contains(&doctor_label) {
+            " - not requested by any configured launch".to_string()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// One authorized service a configured launch requests. Holds no value and no
+/// storage status: `doctor` reads the authorization file, never the credential
+/// store, so it cannot and does not claim whether a value is present.
+#[derive(Debug, PartialEq, Eq)]
+struct YamlRow {
+    service: String,
+    /// Whether the service name is also a built-in provider, so this launch
+    /// uses the authorization *instead of* the host file rather than as a
+    /// standalone credential.
+    replaces_builtin: bool,
+}
+
+/// Which launches request an authorization, and which host providers a launch
+/// replaces or ignores entirely. Pure: it reads no keychain, so it is the
+/// cheap half of [`gather_launch_view`] and is unit-tested directly.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LaunchSelection {
+    /// Authorized services some launch requests, in name order.
+    requested: BTreeSet<ServiceName>,
+    /// `doctor_label` -> launches that replace the built-in.
+    replaced: BTreeMap<&'static str, Vec<String>>,
+    /// `doctor_label`s no configured launch requests.
+    unrequested: Vec<&'static str>,
+}
+
+/// A replacement and a request are both *name* facts: whichever verb requests
+/// `anthropic` replaces it once the user authorizes that name, and a provider
+/// no verb requests is never read. So the selection is exact for the whole
+/// catalog without being told which verb the user has in mind.
+fn launch_selection(catalog: &LaunchCatalog, authorizations: &AuthorizationSet) -> LaunchSelection {
+    let mut selection = LaunchSelection::default();
+    let mut requested_providers = ProviderSet::default();
+    for entry in catalog.as_slice() {
+        for name in entry.requested_names() {
+            if let Some(provider) = CredentialProvider::from_config_name(name.as_str()) {
+                requested_providers = requested_providers.union(ProviderSet::new([provider]));
+            }
+            // An authorization nobody requests is inert and not reported.
+            if authorizations.get(name).is_some() {
+                selection.requested.insert(name.clone());
+            }
+        }
+        for provider in
+            credential_resolver::replaced_providers(entry.requested_names(), authorizations).iter()
+        {
+            let tools = selection
+                .replaced
+                .entry(provider.doctor_label())
+                .or_default();
+            let tool = entry.tool().name().to_string();
+            if !tools.contains(&tool) {
+                tools.push(tool);
+            }
+        }
+    }
+    selection.unrequested = CredentialProvider::ALL
+        .into_iter()
+        .filter(|provider| !requested_providers.contains(*provider))
+        .map(CredentialProvider::doctor_label)
+        .collect();
+    selection
+}
+
+/// Read the launch context `doctor` reports: which host files a launch
+/// replaces, which providers no configured launch requests, and which
+/// authorizations a configured launch requests.
+///
+/// This reads the authorization file and the resolved catalog only. It
+/// deliberately does **not** read the credential store: `SecretStore::resolve`
+/// takes the exclusive inventory lock (creating it if absent) and reads a
+/// value, neither of which belongs in a diagnostic that must stay read-only and
+/// must keep working when the keychain is locked or prompting. Whether a value
+/// is stored is `agent-vm secret ls`'s answer, and the section says so.
+///
+/// `catalog` is `None` when the tool configuration failed to load; the
+/// authorization file is still read so a malformed one is reported rather than
+/// hidden behind the config failure.
+fn gather_launch_view(catalog: Option<&LaunchCatalog>) -> LaunchView {
+    let mut view = LaunchView::default();
+    let authorizations = match credential_resolver::load_authorizations() {
+        Ok(set) => set,
+        Err(error) => {
+            view.problems.push(format!("{error:#}"));
+            return view;
+        }
+    };
+    view.notes = authorizations.warnings().to_vec();
+
+    let Some(catalog) = catalog else {
+        return view;
+    };
+    let selection = launch_selection(catalog, &authorizations);
+    view.replaced = selection.replaced;
+    view.unrequested = selection.unrequested;
+    view.yaml = selection
+        .requested
+        .iter()
+        .map(|service| YamlRow {
+            service: service.as_str().to_owned(),
+            replaces_builtin: CredentialProvider::from_config_name(service.as_str()).is_some(),
+        })
+        .collect();
+    view
+}
+
+/// Render the launch-aware credential section. Pure over its input.
+///
+/// Terse on success — one line per requested authorization — and explicit when
+/// something is wrong: a malformed authorization file or a file-mode warning is
+/// printed rather than folded into a terse status word. It never prints a
+/// storage status, because it never reads one.
+fn describe_launch_view(view: &LaunchView) -> String {
+    let mut out = String::from("==> credentials.yaml (launch credentials)\n");
+    for note in &view.notes {
+        out.push_str(&format!("warning: {note}\n"));
+    }
+    for problem in &view.problems {
+        out.push_str(&format!("error: {problem}\n"));
+    }
+    let width = view
+        .yaml
+        .iter()
+        .map(|row| row.service.len())
+        .max()
+        .unwrap_or(0);
+    for row in &view.yaml {
+        let what = if row.replaces_builtin {
+            "authorized for this launch (replaces the host built-in)"
+        } else {
+            "authorized for this launch"
+        };
+        out.push_str(&format!("{:<width$}  {what}\n", row.service));
+    }
+    if !view.yaml.is_empty() {
+        out.push_str(
+            "note: values are not read here; `agent-vm secret ls` reports whether a value is \
+             stored.\n",
+        );
+    }
+    out.truncate(out.trim_end_matches('\n').len());
+    out
+}
+
 /// Render the tool-configuration section. Consumes its input so it can build
 /// the owned [`crate::config::LaunchCatalog`] (the merge result plus the
 /// built-in `shell` fallback) that `--help` also renders — the two therefore
 /// cannot disagree about the verb list. Returns the section text plus the
 /// catalog-build failure, if any, so the caller can fail the exit code rather
-/// than print an error and still report success. Pure over its input so the
-/// wording is unit-tested without a real filesystem, mirroring
-/// [`describe_home`]/[`describe_credentials`].
+/// than print an error and still report success, and the resolved catalog
+/// (when it built) so the launch-aware credential view reads the same verbs.
+/// Pure over its input so the wording is unit-tested without a real
+/// filesystem, mirroring [`describe_home`]/[`describe_credentials`].
 ///
 /// The verb list is authoritative; the *layer chain* is rendered from each
 /// tool's declared `layer` as written — `doctor` never resolves an anchor,
@@ -380,7 +594,7 @@ fn describe_credentials(report: &CredReport) -> String {
 /// #84) — and it shows argument *counts* rather than values (a user may have
 /// mistakenly put a secret in `args`). Untrusted names/paths are escaped so a
 /// config file cannot inject terminal controls.
-fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>) {
+fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Option<LaunchCatalog>) {
     // Everything that needs a borrow is rendered before `report` is consumed
     // by `into_launch_catalog`.
     let tiers = format!(
@@ -400,7 +614,7 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>) {
     let mut out = String::from("==> tool configuration\n");
     out.push_str(&tiers);
     out.push_str(resolved_label);
-    let failure = match report.into_launch_catalog() {
+    let (failure, catalog) = match report.into_launch_catalog() {
         Ok(catalog) => {
             for (index, entry) in catalog.as_slice().iter().enumerate() {
                 out.push_str(&format!(
@@ -415,20 +629,20 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>) {
                      still have a way into the guest.\n",
                 );
             }
-            None
+            (None, Some(catalog))
         }
         // A dangling `tools` reference lands here, as does an internally broken
         // embedded default. Both are reported in-band so the rest of `doctor`
         // still renders.
         Err(error) => {
             out.push_str(&format!("error: {error:#}\n"));
-            Some(error)
+            (Some(error), None)
         }
     };
     out.push_str(&conflicts);
     // Drop the final newline: the caller adds one via `writeln!`.
     out.truncate(out.trim_end_matches('\n').len());
-    (out, failure)
+    (out, failure, catalog)
 }
 
 /// The `warning:` blocks for cross-tier shadows, in project declaration order.
@@ -921,16 +1135,19 @@ mod tests {
 
     #[test]
     fn render_flags_an_unusable_host_credential_and_always_names_the_host_login() {
-        let text = describe_credentials(&report(vec![
-            (
-                "claude",
-                "/h/.claude/.credentials.json".into(),
-                HostCred::Unreadable {
-                    why: "not valid JSON: x".into(),
-                },
-            ),
-            ("codex", "/h/.codex/auth.json".into(), HostCred::Missing),
-        ]));
+        let text = describe_credentials(
+            &report(vec![
+                (
+                    "claude",
+                    "/h/.claude/.credentials.json".into(),
+                    HostCred::Unreadable {
+                        why: "not valid JSON: x".into(),
+                    },
+                ),
+                ("codex", "/h/.codex/auth.json".into(), HostCred::Missing),
+            ]),
+            &LaunchView::default(),
+        );
 
         assert!(text.contains("UNUSABLE - not valid JSON: x"), "{text}");
         assert!(text.contains("absent"), "{text}");
@@ -955,7 +1172,7 @@ mod tests {
         r.project.as_mut().unwrap().captured.clear();
         r.project.as_mut().unwrap().guest_claude_placeholder = false;
 
-        let text = describe_credentials(&r);
+        let text = describe_credentials(&r, &LaunchView::default());
 
         assert!(text.contains("ok (expires in 1h00m)"), "{text}");
         assert!(
@@ -982,7 +1199,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let report = config_report(None, &dir.path().join("absent.toml"));
 
-        let (text, _) = describe_config(report);
+        let (text, _, _) = describe_config(report);
 
         // The verb list is authoritative now; the header must not claim it is
         // "diagnostic only" (the pre-#82 wording), and the default catalog
@@ -1063,7 +1280,7 @@ mod tests {
         .unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let (text, _) = describe_config(report);
+        let (text, _, _) = describe_config(report);
         assert!(
             text.contains(
                 "vault -> \"vault\"; args=0; layer=none; credentials=none; provisions=none; persist=0; source=user:"
@@ -1081,7 +1298,7 @@ mod tests {
         std::fs::write(&user, "").unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let (text, _) = describe_config(report);
+        let (text, _, _) = describe_config(report);
         assert!(text.contains("(found, 0 tools)"), "{text}");
         assert!(text.contains("(absent)"), "{text}");
         // The default catalog declares `shell`, so the fallback does not fire.
@@ -1097,7 +1314,7 @@ mod tests {
         std::fs::write(&user, "[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n").unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let (text, _) = describe_config(report);
+        let (text, _, _) = describe_config(report);
         assert!(text.contains("1. solo"), "{text}");
         assert!(text.contains("2. shell"), "{text}");
         assert!(text.contains("`shell` was not declared"), "{text}");
@@ -1120,7 +1337,7 @@ mod tests {
         .unwrap();
         let report = config_report(Some(&user), &project);
 
-        let (text, _) = describe_config(report);
+        let (text, _, _) = describe_config(report);
         assert!(text.contains("overrides"), "{text}");
         assert!(text.contains("tool \"t\" in"), "{text}");
         assert!(text.contains("differing fields: args"), "{text}");
@@ -1136,7 +1353,7 @@ mod tests {
         std::fs::write(&user, "").unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let (text, _) = describe_config(report);
+        let (text, _, _) = describe_config(report);
         assert!(!text.contains('\x1b'), "raw ESC leaked: {text:?}");
         assert!(text.contains("\\x1b"), "ESC should be escaped: {text:?}");
         assert!(
@@ -1161,7 +1378,7 @@ mod tests {
         .unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
 
-        let (text, _) = describe_config(report);
+        let (text, _, _) = describe_config(report);
         assert!(!text.contains('\x1b'), "raw ESC leaked: {text:?}");
         assert!(
             !text.contains("red\n"),
@@ -1169,5 +1386,229 @@ mod tests {
         );
         assert!(text.contains("evil\\x1b[31m\\x0ared"), "{text}");
         assert!(text.contains("layers/\\x1b[32m\\x0agrn"), "{text}");
+    }
+
+    // -- #178: the launch-aware credential view ----------------------------
+
+    /// Write a `credentials.yaml` in a fresh `$HOME` and load it, mirroring
+    /// `credential_resolver`'s fixture so the two test suites agree on the
+    /// file grammar and its mode/ownership rules.
+    fn authorizations(body: &str) -> (tempfile::TempDir, AuthorizationSet) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(crate::config::USER_CONFIG_DIR_RELATIVE);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(crate::credential_yaml::CREDENTIALS_FILE_NAME);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let set = crate::credential_yaml::load(home.path()).expect("the fixture loads");
+        (home, set)
+    }
+
+    /// The shipped catalog (all seven verbs), so a launch-selection test does
+    /// not depend on a real project directory.
+    fn default_catalog() -> LaunchCatalog {
+        let dir = tempfile::tempdir().unwrap();
+        config_report(None, &dir.path().join("absent.toml"))
+            .into_launch_catalog()
+            .expect("the default catalog builds")
+    }
+
+    /// A same-named authorization for the built-in `anthropic`, which the
+    /// `claude` and `pi` verbs request.
+    const ANTHROPIC: &str = "\
+credentials:
+  - service: anthropic
+    required: true
+    apiKey:
+      name: ANTHROPIC_API_KEY
+      sentinelEnv: true
+      inject: [{domain: api.anthropic.example, header: x-api-key, format: \"%s\"}]
+";
+
+    #[test]
+    fn launch_selection_names_the_verbs_that_replace_a_built_in() {
+        let (_home, set) = authorizations(ANTHROPIC);
+
+        let selection = launch_selection(&default_catalog(), &set);
+
+        // `anthropic` becomes doctor's `claude` row. `pi` (via `tools =
+        // ["claude"]`), `claude` (its own `credentials`) and `shell` (via its
+        // wildcard `tools`) all request it, so each replaces the host file — in
+        // catalog order.
+        assert_eq!(
+            selection.replaced.get("claude").map(Vec::as_slice),
+            Some(&["pi".to_string(), "claude".to_string(), "shell".to_string()][..]),
+        );
+        assert_eq!(
+            selection
+                .requested
+                .iter()
+                .map(ServiceName::as_str)
+                .collect::<Vec<_>>(),
+            vec!["anthropic"]
+        );
+        assert!(selection.unrequested.is_empty(), "{selection:?}");
+    }
+
+    #[test]
+    fn launch_selection_ignores_an_inert_authorization_and_flags_an_unrequested_provider() {
+        // `solo` requests nothing, so no built-in is requested and the
+        // authorized `anthropic` is inert.
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(&user, "[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n").unwrap();
+        let catalog = config_report(Some(&user), &dir.path().join("absent.toml"))
+            .into_launch_catalog()
+            .expect("the one-tool catalog builds");
+        let (_home, set) = authorizations(ANTHROPIC);
+
+        let selection = launch_selection(&catalog, &set);
+
+        assert!(selection.replaced.is_empty(), "{selection:?}");
+        assert!(selection.requested.is_empty(), "{selection:?}");
+        assert_eq!(
+            selection.unrequested,
+            vec!["claude", "codex", "opencode", "copilot"]
+        );
+    }
+
+    /// A requested authorization may be a YAML-only service *or* a built-in, and
+    /// an authorization no verb requests stays inert. This is the independent
+    /// oracle for the whole feature: one tool requesting three names, only two
+    /// of which are authorized.
+    #[test]
+    fn launch_selection_reports_requested_authorized_names_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\n\
+             credentials = [\"alpha\", \"anthropic\", \"gamma\"]\n",
+        )
+        .unwrap();
+        let catalog = config_report(Some(&user), &dir.path().join("absent.toml"))
+            .into_launch_catalog()
+            .expect("the one-tool catalog builds");
+        // `alpha` and `anthropic` are authorized; `gamma` is only requested.
+        let (_home, set) = authorizations(
+            "credentials:\n  - service: alpha\n    apiKey:\n      name: A\n      \
+             inject: [{domain: a.example, header: x-a, format: \"%s\"}]\n  \
+             - service: anthropic\n    apiKey:\n      name: ANTHROPIC_API_KEY\n      \
+             inject: [{domain: b.example, header: x-b, format: \"%s\"}]\n",
+        );
+
+        let selection = launch_selection(&catalog, &set);
+
+        assert_eq!(
+            selection
+                .requested
+                .iter()
+                .map(ServiceName::as_str)
+                .collect::<Vec<_>>(),
+            vec!["alpha", "anthropic"]
+        );
+        assert_eq!(
+            selection.replaced.get("claude").map(Vec::as_slice),
+            Some(&["t".to_string()][..]),
+        );
+        // `t` requests every provider the default catalog does not; the other
+        // three are unrequested.
+        assert_eq!(selection.unrequested, vec!["codex", "opencode", "copilot"]);
+    }
+
+    #[test]
+    fn describe_launch_view_names_each_requested_authorization_and_never_a_value() {
+        let view = LaunchView {
+            yaml: vec![
+                YamlRow {
+                    service: "alpha".into(),
+                    replaces_builtin: false,
+                },
+                YamlRow {
+                    service: "anthropic".into(),
+                    replaces_builtin: true,
+                },
+            ],
+            ..LaunchView::default()
+        };
+
+        let text = describe_launch_view(&view);
+
+        assert!(
+            text.starts_with("==> credentials.yaml (launch credentials)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("alpha      authorized for this launch\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("anthropic  authorized for this launch (replaces the host built-in)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`agent-vm secret ls` reports whether a value is stored"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn describe_launch_view_prints_warnings_and_errors_and_empty_is_silent() {
+        let view = LaunchView {
+            notes: vec!["the file is group-readable".into()],
+            problems: vec!["credentials.yaml could not be read".into()],
+            ..LaunchView::default()
+        };
+
+        let text = describe_launch_view(&view);
+
+        assert!(
+            text.contains("warning: the file is group-readable"),
+            "{text}"
+        );
+        assert!(
+            text.contains("error: credentials.yaml could not be read"),
+            "{text}"
+        );
+        assert!(!view.is_empty());
+        assert!(LaunchView::default().is_empty());
+    }
+
+    #[test]
+    fn describe_credentials_annotates_a_replaced_and_an_unrequested_provider() {
+        let mut launch = LaunchView::default();
+        launch
+            .replaced
+            .insert("claude", vec!["claude".into(), "pi".into()]);
+        launch.unrequested.push("copilot");
+
+        let text = describe_credentials(
+            &report(vec![
+                (
+                    "claude",
+                    "/h/.claude/.credentials.json".into(),
+                    HostCred::Missing,
+                ),
+                (
+                    "copilot",
+                    "/h/.copilot/config.json".into(),
+                    HostCred::Missing,
+                ),
+            ]),
+            &launch,
+        );
+
+        assert!(
+            text.contains(
+                "absent - replaced by credentials.yaml for claude, pi (host file not read)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("absent - not requested by any configured launch"),
+            "{text}"
+        );
     }
 }

@@ -128,6 +128,11 @@ authorization instead. The provider's guest configuration and persisted state
 directories) are untouched — a credential authorization does not speak for them.
 There is no fallback to the built-in when the authorization is unavailable.
 
+Because replacement is a *name* fact, `agent-vm doctor` reports it for the whole
+configured catalog without being told which verb is about to run: a provider a
+verb requests is replaced for that verb, and the host-credential row names the
+verbs (#178).
+
 _Avoid_: "overridden provider" (an override suggests a fallback; there is none).
 
 ## Header credential
