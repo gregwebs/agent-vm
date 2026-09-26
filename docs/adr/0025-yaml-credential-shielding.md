@@ -1,6 +1,6 @@
 # 0025. YAML credential shielding
 
-Status: Accepted (agent-vm #161).
+Status: Accepted (agent-vm #161; extended by #162).
 
 ## Context
 
@@ -136,19 +136,158 @@ resolution success:
 The sentinel is Docker's literal. It carries no substitution authority and no
 claim is made that it satisfies any consumer's key-shape validation.
 
-### Staged: same-named built-in replacement (#162)
+### Same-named built-in replacement (#162)
 
 A `credentials.yaml` entry named after a built-in provider (`anthropic`,
-`openai`, `opencode-static`, `copilot`) **parses**, and an unrelated launch is
-unaffected by its mere existence. But a launch that requests that name is
-refused with a diagnostic naming #162: replacing a built-in provider's
-credential handling is not supported in this release, and renaming the YAML
-service would not give replacement semantics — it would leave the built-in's
-capture and refresh in place. Resolution, not parsing, is what is staged.
+`openai`, `opencode-static`, `copilot`) is a precedence-setting authorization:
+for a launch that requests that name, the authorization **completely replaces**
+the built-in's *credential handling* — source acquisition, the guest
+placeholder, proxy injection, and OAuth capture/refresh. There is deliberately
+**no fallback**: an unavailable authorized value must never re-enable the
+built-in, because that would silently downgrade a shielded credential to a
+guest-visible placeholder the user never asked for. An authorization nobody
+requests remains inert.
 
-`source` is parsed only far enough to be *rejected by name*; `source: env` is
-#163. General removal of raw API-key forwarding is also #163; #161 suppresses it
-only where a YAML authorization owns the name.
+The rule is *credential facets vs. configuration and persistence facets*, not a
+per-facet table. Suppression is **one predicate** — the capture gate,
+`CredentialProvisioning::captures(provider) = provisioned && !replaced` — plus
+**three** facets that are not derived from a captured token file and are
+handled explicitly:
+
+| Facet | Anthropic | OpenAI | OpenCode-static | Copilot |
+|---|---|---|---|---|
+| host capture (placeholder file, token file) | suppressed | suppressed | suppressed | suppressed |
+| proxy `FileSecret` + OAuth `Route` | suppressed | suppressed | suppressed | suppressed |
+| required hard bail (`missing_credential_error`) | skipped; YAML `required` governs | n/a | n/a | skipped; YAML `required` governs |
+| raw-forwarded host variable | suppressed only if the authorization owns that exact `apiKey.name` (unchanged #161 rule — see the gap below) | same | same | n/a |
+| guest-HOME links, eager state dirs, `persist` | kept | kept | kept | kept |
+| onboarding bypass files | kept | kept | kept | kept |
+| the OpenCode `model` pin | — | — | **argument conjoined with capture** | — |
+| OpenCode BYO API-provider rows | — | **dropped with `openai`** | **dropped** | — |
+
+- **Identity across providers is derived, not assumed.** Everything downstream
+  of capture follows automatically, because `CredsState::wired()` is derived
+  from `token_file(provider).is_some()`, `clear_unwired_placeholders` then
+  removes a stale guest placeholder (ADR-0017), `Plan::new` registers neither a
+  secret nor an OAuth route without a token file, and `provider_guest_env`
+  conjoins wiring. That is why `credential_injection.rs` deliberately holds **no
+  second `replaced` gate**: both gates would read the same `replaced` set, so a
+  wrong `replaced` would defeat both, while the `token_file` gate already covers
+  a wrong *capture*; a redundant gate would only mask a capture-gate regression.
+  This is a deliberate trade against `CODING_STANDARDS.md` §Security *Defense in
+  depth* ("consider how to add security at different boundaries and
+  interfaces"). The second boundary the standard asks for is already here and it
+  is a *different* fact: `Plan::new`
+  (`crates/agent-vm/src/credential_injection.rs:99-118`) gates on
+  `token_file(provider)`, not on `replaced`, so the decision is
+  single-fact-*derived* from the captured token rather than unguarded. A second
+  `replaced` read would add no boundary — it reads the same bit — only the blind
+  spot the plan's §3 records.
+- **Copilot is split, not gated wholesale.** `copilot/config.json` carries both
+  the `github_token` placeholder and the non-secret `trusted_folders` trust
+  configuration. Neither half may be written for *every* provisioned launch, so
+  the writer was split into `write_copilot_bypass` (`trusted_folders`) and
+  `write_copilot_guest_token` (the placeholder). Both run post-capture in
+  `secrets::refresh`, with the gate each fact deserves: the placeholder only
+  when the proxy captured a token to substitute, the trust config when the token
+  was captured **or** a same-named authorization replaced the provider. Writing
+  `trusted_folders` unconditionally — e.g. from the pre-capture
+  `write_bypass_configs` pass — would breach AC2's "without a YAML match,
+  built-in behavior remains unchanged": a launch with no `credentials.yaml`
+  whose Copilot capture fails would create the file where it previously wrote
+  nothing. The split is still what lets a replaced Copilot greet a **fresh**
+  state dir without an interactive "do you trust this folder?" prompt.
+- **The OpenCode `model` pin follows capture.** `write_opencode_model_default`
+  keeps its `provisioned` gate so a stale pin from an earlier un-replaced launch
+  is still retired, but its argument now conjoins capture. The reason is scope,
+  stated honestly: agent-vm's capture gate has no visibility into the guest
+  credentials a *YAML* authorization wires (`secrets::refresh` is handed only
+  `provisioned`/`replaced`/`github_egress`, not the phase-1 `owned_env`
+  dispositions), so a launch that replaced `opencode-static` is treated as
+  having no OpenAI credential and the pin is retired. That is exact for a
+  replaced entry that names a different `apiKey.name`, and conservative for a
+  sentinel entry (`apiKey.name: OPENAI_API_KEY`, `inject: api.openai.com`), which
+  *does* give the guest a working OpenAI key through the proxy — the shape this
+  record's own examples use. For that shape the `openai/gpt-5.5` default is not
+  re-asserted, so the user sets `model` in their own `opencode.json`. Wiring the
+  pin to the real OpenAI-owned guest disposition instead of the capture bit is a
+  larger change and is recorded as an **open decision** (S2 in the #162 code
+  review; see `implementation-result.md`), not silently picked here.
+- **One credential, one handling.** Replacing `openai` also drops OpenCode's
+  synthetic `openai` row, because that row is derived from the same captured
+  host token. Replacing `opencode-static` drops **every** BYO API-provider row
+  and unlinks their host token files, because those rows are that provider's
+  credential handling, sourced from the same host `auth.json` — a large
+  consequence of one YAML line, hence documented in USAGE.md as well.
+- **The raw-forwarding gap.** Ownership is by *variable name*. A YAML `anthropic`
+  entry with `apiKey.name: MY_KEY` leaves the host's `ANTHROPIC_API_KEY`
+  raw-forwarded (`run::RAW_FORWARDED_ENV`), so the user's belief that they
+  shielded Anthropic is false. Before #162 that configuration was a hard error,
+  so this is a newly reachable state, and it is **not** silent: the launch emits
+  a notice naming the provider and the still-forwarded variable (never a value).
+  Removing the forwarding outright is #163. The mapping from provider to
+  forwarded variable is `CredentialProvider::raw_forwarded_env()`, pinned against
+  `RAW_FORWARDED_ENV` by a test so the two cannot drift.
+- **Ordering.** Phase-1 resolution now runs *before* host credential capture, so
+  the `replaced` set exists when capture is gated and the `==> host credentials`
+  notice reflects the post-replacement state. It does **not** move ahead of the
+  tooling-layer build/confirmation or session/guest-home provisioning, which
+  already ran earlier; the honest statement is that a malformed `credentials.yaml`
+  is now refused before host credentials are read.
+- **What is not deleted.** A host-only token file under `<state>.secrets/`
+  written by an earlier un-replaced launch is left in place. It is 0600, in the
+  never-bind-mounted host-only sibling directory, and unreferenced once the
+  provider is un-wired; deleting it would be new destructive behaviour on data a
+  concurrent launch may hold. The *guest-visible* placeholder **is** cleared.
+
+#### Availability: `--allow-missing-credentials`
+
+The host launch flag (never a project option, and deliberately with no
+environment variable) selects a `MissingCredentialPolicy::Warn` for phase-1
+resolution. It moves the availability of a **YAML** credential only — the case
+the spec calls "missing authorization" (the name matches neither a built-in nor
+an authorization) and "unavailable required credentials" (`required: true` whose
+source cannot be read). Both become a warning that names the withheld service
+and says the flag kept the launch alive, with the guest getting neither the
+credential nor a fallback.
+
+It cannot bypass, and both policies refuse identically for:
+
+- a malformed, unsupported or rejected `credentials.yaml`, and an integrity
+  refusal (foreign owner, group/other write);
+- a stored value `SecretValue` rejects — *present but invalid* is a
+  configuration error, not an unavailable source, so it is never a warning;
+- a `sentinelEnv: false` name the boot image defines, or unreadable image
+  metadata;
+- a tool-declared `env` key colliding with an owned name;
+- **the raw forwarding the spec's "forward raw values" clause names.** The flag
+  does not *cause* it — the forwarding is #161 behaviour #163 removes, and the
+  C6 notice above fires — but the *combination* is newly reachable: a
+  `required: true` `anthropic` entry with `apiKey.name: MY_KEY` whose value
+  cannot be read, plus the flag, skips the built-in bail (the name is in
+  `replaced`) and launches with the host's raw `ANTHROPIC_API_KEY` still
+  forwarded into the guest;
+- **a built-in provider's own missing-credential bail.** The override's scope is
+  the YAML authority. The built-in case degrades to agent-vm's own machinery
+  being half-wired — the guest comes up signed out and in-guest `/login` cannot
+  work, because the OAuth hook accepts only the placeholder refresh token — so a
+  flag that opts into a knowingly broken session with a misleading error would be
+  worse than a refusal. Widening it later is additive; narrowing it after it
+  ships would not be.
+
+#### The counted concurrency hazard
+
+Two concurrent launches of the *same* project and tool, one replacing a provider
+and one not, can have the non-replacing one write a built-in placeholder into the
+shared guest state while the replacing one runs with no substitution entry for
+it. The race is pre-existing in kind (`claude` and `codex` already race under
+`REFRESH_LOCK_PROJECT`), but #162 makes it reachable from a **single** tool by
+one YAML line, so it is recorded here rather than discovered later.
+
+`source` is still parsed only far enough to be *rejected by name*: `source: env`
+is #163, alongside the general removal of raw API-key forwarding (#162 suppresses
+it only where a YAML authorization owns the name, and warns where a renamed
+authorization leaves it in effect).
 
 ### Destination and header policy
 
@@ -238,6 +377,18 @@ rebuild-your-`msb` message naming `MSB_PATH`.
 - A launch whose requested names are all built-in providers constructs no
   keychain at all, so an unset `$HOME` or a missing Secret Service does not
   change its behaviour.
+- #162's capture gate carries the machine-checked contract ADR-0018 now requires
+  of it: `secrets::capture_decision(provisioned, replaced)` proves
+  `capture == (provisioned && !replaced)` and, specifically,
+  `replaced ==> !capture`. `CredentialProvisioning::captures` is its trusted
+  adapter; the two `ProviderSet::contains` measurements are the untranslatable
+  shell. Stated plainly, as ADR-0018's *verified surface* does for its
+  restated-comparison rows: what is proved is that the decision **is** that
+  comparison, **not** that the facets downstream of capture are wired correctly.
+  Those rest on `CredsState::wired()` being derived from
+  `token_file(p).is_some()`, on `clear_unwired_placeholders`, on `Plan::new`'s
+  `(proxy_secret, token_file)` match and on `provider_guest_env`, none of which
+  is verified. The contract is real but narrow: it pins the capture gate.
 - The store gained exactly one authorized reader;
   [ADR-0024](0024-host-secret-inventory.md) is amended accordingly, and no
   exception is added to its "never render a value" rule.

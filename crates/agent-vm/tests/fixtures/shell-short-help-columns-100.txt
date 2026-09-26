@@ -16,6 +16,10 @@ GitHub access:
       --no-git             Don't inject host gh/git credentials into the guest
       --repo <OWNER/REPO>  Add a repo to the GitHub allow-list (repeatable)
 
+Credentials:
+      --allow-missing-credentials  Launch even when a requested YAML credential is missing or
+                                   unreadable
+
 Mounts & ports:
       --mount <HOST[:GUEST][:MODE]...>
           Bind an extra host path into the guest, or seed a persistent fork (repeatable)

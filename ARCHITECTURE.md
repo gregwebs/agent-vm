@@ -675,6 +675,41 @@ does **not** use `<state_root>/<hash>.secrets/`: no plaintext value about it is
 written to a file at all (the credential *reference* is durable in the sandbox
 record, and the store creates only a lock file — neither carries the value).
 
+**Precedence (#162).** A requested name is resolved against the user's YAML
+first, then the compiled-in providers. A YAML entry named after a built-in
+provider (`anthropic` / `openai` / `opencode-static` / `copilot`) completely
+replaces that provider's **credential** handling — host capture, guest
+placeholder, proxy injection, OAuth capture/refresh — with no fallback. Its
+**configuration and persistence** (onboarding bypass files, `$HOME` links, state
+dirs, Copilot's `trusted_folders`) are untouched. The decision is one fact, a
+`ProviderSet` of replaced providers computed in `credential_resolver` and
+consumed by one capture predicate in `secrets`; everything downstream follows
+from `CredsState::wired()` being derived from the captured token files.
+
+```text
+  requested name N ──▶ authorized in credentials.yaml?
+                          │ yes                     │ no
+                          ▼                         ▼
+            YAML path                       N a built-in provider?
+            • N is "replaced"                 │ yes          │ no
+            • suppress the built-in's         ▼              ▼
+              credential facets          built-in path   --allow-missing-credentials?
+              (capture, placeholder,     (unchanged,       │ yes        │ no
+               proxy, OAuth)              incl. its       ▼            ▼
+            • register the header         hard bail)   warn+skip    hard error
+              credential host-side
+            • no fallback if unavailable
+```
+
+The availability override is a host-only launch flag
+(`--allow-missing-credentials`) selecting `MissingCredentialPolicy::Warn` for
+phase-1 resolution. It moves the availability of a *YAML* credential only, and
+cannot bypass a malformed authorization file, a rejected stored value, an
+owner/mode integrity refusal, a guest-variable conflict, an image-`ENV`
+collision, or a built-in provider's own missing-credential bail. `capture_decision
+(provisioned, replaced) = provisioned && !replaced` carries the machine-checked
+contract ([ADR-0018](docs/adr/0018-machine-checked-boundary-contracts.md)).
+
 ### Guest-managed Pi credentials
 
 Pi is the one agent that can *create* a credential inside the guest (its normal

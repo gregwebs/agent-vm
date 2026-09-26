@@ -145,6 +145,7 @@ Each launcher accepts:
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
+| `--allow-missing-credentials` | warn and launch when a requested YAML credential is missing or unreadable, instead of refusing — see [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection). Never covers a built-in provider's own missing host credential |
 | `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). A live bind that would expose a host Pi credential file is refused — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted). Capacity is host-specific. |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 | `--layer DIR` | append a tooling layer after the project's own `.agent-vm/layers/*` (repeatable, command-line order; relative to the project dir) — see [Project tooling layers](#project-tooling-layers) |
@@ -1093,13 +1094,63 @@ What to expect:
   variable the boot image defines is refused, and unreadable image metadata
   fails the launch closed rather than risking a value that should have been
   unset.
-- **Same-named built-ins are not replaceable yet.** An entry named `anthropic`
-  (or `openai`, `opencode-static`, `copilot`) parses, but a launch that requests
-  that name is refused with a diagnostic naming
-  [#162](https://github.com/gregwebs/agent-vm/issues/162). Renaming the YAML
-  service is **not** a replacement: the built-in's capture and refresh stay in
-  place, so a differently-named credential is *additive*, not a substitute. No
-  permanent reserved-name rule exists.
+- **A same-named built-in is replaced, completely.** An entry named `anthropic`,
+  `openai`, `opencode-static` or `copilot` is a precedence-setting
+  authorization: for a launch that *requests* that name, it takes over the
+  built-in provider's **credential handling**, and there is **no fallback** to
+  the built-in if the authorized value is unavailable — falling back would
+  downgrade a shielded credential to a guest-visible placeholder you never asked
+  for. The built-in's **configuration and persistence** are untouched. An entry
+  nothing requests changes nothing at all.
+
+| provider | credential handling the entry replaces | configuration/persistence kept |
+|---|---|---|
+| `anthropic` | host `~/.claude/.credentials.json` capture, the guest `claude/.credentials.json` placeholder, the proxy secret and its OAuth refresh route, the built-in's required-credential bail | `claude/settings.json` and `claude.json` onboarding bypasses, the `.claude` guest-HOME link, the state dir |
+| `openai` | host `~/.codex/auth.json` capture, the guest `codex/auth.json` placeholder, the proxy secret and its OAuth refresh route, OpenCode's synthetic `openai` row | `codex/config.toml`, the `.codex`/`CODEX_HOME` wiring |
+| `opencode-static` | every BYO API-provider row read from the host `~/.local/share/opencode/auth.json` and its host token file, OpenCode's synthetic guest rows, agent-vm's `model` pin | `opencode-config/opencode.json` (`$schema`, `autoupdate`), user-authored guest `auth.json` rows |
+| `copilot` | host device-flow capture, the `copilot/config.json` `github_token` placeholder, `COPILOT_GITHUB_TOKEN`, the proxy secret | `copilot/config.json` `trusted_folders` (so a fresh state dir does not prompt "do you trust this folder?") |
+
+  Two consequences deserve spelling out:
+  - replacing `openai` also drops OpenCode's synthetic `openai` row, because
+    that row is derived from the same captured host token — one credential, one
+    handling;
+  - replacing `opencode-static` also retires agent-vm's `model: openai/gpt-5.5`
+    default: agent-vm's capture gate sees no OpenAI credential for a replaced
+    provider, so it does not re-assert the default — even for a sentinel entry
+    (`apiKey.name: OPENAI_API_KEY`, `inject: api.openai.com`) that *does* give
+    the guest a working OpenAI key through the proxy. If your entry is an
+    OpenAI-compatible key, set `model` in your own
+    `opencode-config/opencode.json`.
+- **Switching to a shield leaves the old on-disk host copy.** A replacement
+  stops agent-vm *capturing* the built-in's host credential, but a host-only
+  token file an earlier un-replaced launch wrote under
+  `<state>.secrets/<provider>` (0600, in the never-bind-mounted host-only
+  directory) is left in place — deleting it would be new destructive behaviour
+  on data a concurrent launch may hold. The **guest-visible** placeholder *is*
+  cleared; the real host copy is not. Remove the state directory to clear it.
+- **A renamed authorization does not shield the built-in's variable.**
+  Ownership is by variable name: a YAML `anthropic` entry with
+  `apiKey.name: MY_KEY` leaves the host's `ANTHROPIC_API_KEY` forwarded into the
+  guest verbatim. agent-vm warns at launch (naming the provider and the still-
+  forwarded variable, never the value) and suggests `apiKey.name:
+  ANTHROPIC_API_KEY` or unsetting it on the host. Removing the raw forwarding
+  outright is [#163](https://github.com/gregwebs/agent-vm/issues/163).
+- **`--allow-missing-credentials` (host-only).** A per-launch flag that warns
+  and continues instead of refusing when a requested `credentials = [...]` name
+  has no authorization, and when an authorized `required: true` credential's
+  value cannot be read. The guest gets neither the credential nor a fallback, so
+  the in-guest tool may still fail its own sign-in. It cannot bypass a malformed,
+  unsupported or rejected `credentials.yaml`, an integrity refusal (foreign owner
+  or group/other write), a stored value the store rejects, a `sentinelEnv: false`
+  name the boot image defines (or unreadable image metadata), a tool-`env` name
+  conflict, or **a built-in provider's own missing host credential** — that last
+  one still refuses the launch. There is deliberately no environment variable: it
+  is a per-launch decision you make at the command line, and a project config has
+  no way to set it.
+- **`agent-vm doctor` is launch-unaware.** It reports *host* credential files per
+  provider and has no launch context, so for a provider a launch replaces it will
+  still report the host credential as present even though that launch never reads
+  it.
 - **Unsupported, by name, never silently ignored.** `source` (an environment
   source is #163), `permissions`/`permissions.network`, `oauth`, `basic`,
   `username`, request signing, query/body injection, kit/hooks/images/mounts/

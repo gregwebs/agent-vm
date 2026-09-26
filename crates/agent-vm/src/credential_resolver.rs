@@ -10,6 +10,29 @@
 //! - The authorization file *authorizes*. It does not force a launch to use
 //!   anything: an authorized service that no launch requests changes nothing.
 //!
+//! # Precedence: the authorization wins (#162)
+//!
+//! For a requested name, the YAML authorization is resolved **first**. When one
+//! exists it *completely replaces* the same-named built-in provider's
+//! credential handling — source acquisition, the guest placeholder, proxy
+//! injection, and OAuth capture/refresh — and there is deliberately **no
+//! fallback**: an unavailable authorized value must never re-enable the
+//! built-in, because that would silently downgrade a shielded credential to a
+//! guest-visible placeholder the user never asked for. The providers this
+//! launch replaced are recorded in [`LaunchCredentials::replaced`] and every
+//! built-in *credential* facet is gated on their complement; the built-in's
+//! guest *configuration* and persistence (onboarding bypass files, `$HOME`
+//! links, state dirs, Copilot's `trusted_folders`) are untouched — a credential
+//! authorization does not speak for them ([`crate::secrets`],
+//! `docs/adr/0025-yaml-credential-shielding.md`).
+//!
+//! # Availability is negotiable; configuration is not
+//!
+//! [`MissingCredentialPolicy`] moves the availability of a *YAML* credential
+//! only. A malformed authorization file, an unsupported field, a rejected
+//! stored value, any guest-env ownership conflict, and a *built-in* provider's
+//! own missing-credential bail stay hard errors under both variants.
+//!
 //! # Two phases, and why
 //!
 //! Resolution runs twice per launch. Phase 1 (this module, before any sandbox
@@ -64,7 +87,7 @@ use anyhow::{Result, anyhow};
 use zeroize::Zeroizing;
 
 use crate::config::USER_CONFIG_DIR_RELATIVE;
-use crate::credential_provider::CredentialProvider;
+use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::credential_yaml::{self, AuthorizationSet, GuestEnvName};
 use crate::secret_store::{
     KeychainFailure, Resolved, SecretStore, ServiceName, SystemKeychain, system_store,
@@ -231,6 +254,29 @@ impl ReadyCredential {
     }
 }
 
+/// Whether this launch may continue past a credential it asked for but cannot
+/// get. The host-only `--allow-missing-credentials` flag selects `Warn`.
+///
+/// It is deliberately *not* a `bool`: `resolve_launch` already takes three
+/// reference arguments, and this is the one that changes the outcome class of
+/// the whole function (CODING_STANDARDS, "strong typing").
+///
+/// It moves **availability of a YAML credential** only. A malformed
+/// authorization file, an unsupported field, a rejected stored value, any
+/// guest-env ownership conflict, and a *built-in* provider's own
+/// missing-credential bail all stay hard errors under both variants: the
+/// override "cannot bypass malformed configuration, expand destinations,
+/// forward raw values, or select a fallback source"
+/// (docs/specs/credential-shielding.md line 233).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingCredentialPolicy {
+    /// Default: a missing authorization, or an unavailable `required: true`
+    /// value, refuses the launch.
+    Fail,
+    /// `--allow-missing-credentials`: warn, withhold, and launch.
+    Warn,
+}
+
 /// What the guest variable named by `apiKey.name` must end up as.
 ///
 /// "Publish nothing" is not "leave it unset": the name is *owned* by this
@@ -281,23 +327,36 @@ pub(crate) struct LaunchCredentials {
     /// Non-fatal notices that are *not* about a withheld credential (the
     /// authorization file's mode, the `proxyManaged` alias).
     notes: Vec<String>,
+    /// Built-in providers a same-named authorization took over for this launch
+    /// (#162). Every built-in *credential* facet is gated on the complement of
+    /// this set; the built-in's configuration and persistence facets are not.
+    replaced: ProviderSet,
 }
 
-/// Why a requested, authorized service could not be read. A closed enum, not a
-/// string, so the message is composed at render time from the service name and
-/// a fixed label - never from anything a source returned.
+/// Why a requested service could not be used. A closed enum, not a string, so
+/// the message is composed at render time from the service name and a fixed
+/// label - never from anything a source returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WithheldCause {
     Missing,
     Unavailable(KeychainFailure),
+    /// The launch requested a name that is neither a built-in provider nor
+    /// authorized. Only reachable under `MissingCredentialPolicy::Warn`;
+    /// under `Fail` this is the hard error it has always been.
+    NotAuthorized,
 }
 
-/// A requested, authorized service whose source could not be read. Carries no
-/// value; the reason is built from the closed cause above.
+/// A requested service whose source could not be read. Carries no value; the
+/// reason is built from the closed cause above.
 #[derive(Debug)]
 pub(crate) struct Withheld {
     service: ServiceName,
     cause: WithheldCause,
+    /// True when only `--allow-missing-credentials` kept this launch alive, so
+    /// a warning that would otherwise have been fatal says so. Computed from
+    /// the policy at construction, never from `required` alone, so the field is
+    /// true for exactly the values it describes.
+    via_override: bool,
 }
 
 impl Withheld {
@@ -307,7 +366,7 @@ impl Withheld {
     pub(crate) fn reason(&self) -> String {
         match self.cause {
             WithheldCause::Missing => format!(
-                "no value is stored in the system keychain for `{}`; store it with                  `agent-vm secret set {}`",
+                "no value is stored in the system keychain for `{}`; store it with `agent-vm secret set {}`",
                 self.service, self.service
             ),
             WithheldCause::Unavailable(failure) => format!(
@@ -315,6 +374,25 @@ impl Withheld {
                 self.service,
                 failure.message()
             ),
+            WithheldCause::NotAuthorized => format!(
+                "`{}` is neither a built-in credential provider nor authorized in {}/{}",
+                self.service,
+                USER_CONFIG_DIR_RELATIVE,
+                credential_yaml::CREDENTIALS_FILE_NAME
+            ),
+        }
+    }
+
+    /// The complete launch warning line, so the module that knows *why* also
+    /// knows how it reads. `run.rs` emits `warning: {notice}`.
+    pub(crate) fn notice(&self) -> String {
+        let reason = self.reason();
+        if self.via_override {
+            format!(
+                "{reason}; continuing without it because --allow-missing-credentials was passed"
+            )
+        } else {
+            format!("{reason}; continuing without it")
         }
     }
 }
@@ -322,6 +400,13 @@ impl Withheld {
 impl LaunchCredentials {
     pub(crate) fn ready(&self) -> &[ReadyCredential] {
         &self.ready
+    }
+
+    /// The built-ins whose credential handling a same-named authorization
+    /// replaced. Empty for a launch with no same-named authorization, which is
+    /// why every pre-#162 launch is bit-for-bit unchanged.
+    pub(crate) fn replaced(&self) -> ProviderSet {
+        self.replaced
     }
 
     /// The owned-variable dispositions. Test-only: production code reads them
@@ -481,6 +566,7 @@ pub(crate) fn resolve_launch(
     requested: &BTreeSet<ServiceName>,
     authorization: &AuthorizationSet,
     source: &dyn CredentialSource,
+    policy: MissingCredentialPolicy,
 ) -> Result<LaunchCredentials> {
     let mut launch = LaunchCredentials::default();
     for note in authorization.warnings() {
@@ -489,86 +575,120 @@ pub(crate) fn resolve_launch(
 
     for service in requested {
         let built_in = CredentialProvider::from_config_name(service.as_str());
-        let authorized = authorization.get(service);
-        match (built_in, authorized) {
-            // A same-named YAML definition is parsed (so it can be diagnosed)
-            // but never resolved (#162). Refusing here rather than silently
-            // preferring one is the staged decision: renaming the YAML service
-            // would not give the user replacement semantics, because the
-            // built-in's capture and refresh stay in place.
-            (Some(_), Some(_)) => {
-                return Err(anyhow!(
-                    "`{service}` is authorized in credentials.yaml and is also a built-in \
-                     credential provider. Replacing a built-in provider's credential handling is \
-                     not supported in this release (agent-vm#162). Renaming the YAML service would \
-                     not give you the replacement semantics you asked for - it would leave the \
-                     built-in's capture and refresh in place."
-                ));
+        match (built_in, authorization.get(service)) {
+            // AC1: the authorization wins outright. The built-in's credential
+            // facets are suppressed through `replaced` (see `secrets.rs`); its
+            // configuration and persistence facets are untouched (AC2). There
+            // is deliberately no fallback arm: an unavailable authorized value
+            // does not re-enable the built-in, because that would silently
+            // downgrade a shielded credential to a guest-visible placeholder.
+            (built_in, Some(credential)) => {
+                if let Some(provider) = built_in {
+                    launch.replaced = launch.replaced.union(ProviderSet::new([provider]));
+                }
+                resolve_authorized(&mut launch, service, credential, source, policy)?;
             }
             (Some(_), None) => {}
-            (None, None) => {
-                return Err(anyhow!(
-                    "`{service}` is neither a built-in credential provider nor authorized in \
-                     {}/{}; add an entry for it there (see USAGE.md), or remove it from the \
-                     tool's `credentials` list",
-                    USER_CONFIG_DIR_RELATIVE,
-                    credential_yaml::CREDENTIALS_FILE_NAME
-                ));
-            }
-            (None, Some(credential)) => {
-                // Ownership comes from the authorization, not from resolution
-                // success: a withheld credential must still suppress every
-                // other writer of its variable.
-                let env_name = credential.env_name().clone();
-                launch
-                    .owned_env
-                    .insert(env_name.clone(), EnvDisposition::Unset);
-
-                let resolved = source.resolve(service);
-                match &resolved {
-                    Resolved::Value(_) => {
-                        // The value is dropped here. Phase 1 proves
-                        // availability; it does not carry the value forward.
-                        if credential.sentinel_env() {
-                            launch
-                                .owned_env
-                                .insert(env_name.clone(), EnvDisposition::Sentinel);
-                        }
-                        launch.ready.push(ReadyCredential {
-                            service: service.clone(),
-                            inject: credential.inject().to_vec(),
-                        });
-                    }
-                    Resolved::Missing | Resolved::Unavailable(_) => {
-                        let cause = match &resolved {
-                            Resolved::Unavailable(failure) => WithheldCause::Unavailable(*failure),
-                            _ => WithheldCause::Missing,
-                        };
-                        let withheld = Withheld {
-                            service: service.clone(),
-                            cause,
-                        };
-                        if credential.required() {
-                            return Err(anyhow!("{}", withheld.reason()));
-                        }
-                        launch.withheld.push(withheld);
-                    }
-                    Resolved::InvalidValue(rejection) => {
-                        // A hard error regardless of `required`: the stored
-                        // bytes are not a value this release will inject, and
-                        // treating that as merely withheld would hide a real
-                        // problem behind a warning.
-                        return Err(anyhow!(
-                            "the stored value for `{service}` cannot be used: {}. Remove and \
-                             re-store it with `agent-vm secret set {service}`",
-                            rejection.message()
-                        ));
-                    }
+            (None, None) => match policy {
+                MissingCredentialPolicy::Fail => {
+                    return Err(anyhow!(
+                        "`{service}` is neither a built-in credential provider nor authorized in \
+                         {}/{}; add an entry for it there (see USAGE.md), or remove it from the \
+                         tool's `credentials` list",
+                        USER_CONFIG_DIR_RELATIVE,
+                        credential_yaml::CREDENTIALS_FILE_NAME
+                    ));
                 }
-            }
+                MissingCredentialPolicy::Warn => launch.withheld.push(Withheld {
+                    service: service.clone(),
+                    cause: WithheldCause::NotAuthorized,
+                    via_override: true,
+                }),
+            },
         }
     }
     Ok(launch)
+}
+
+/// The YAML path: record the owned variable, prove the source is available, and
+/// either publish the credential or apply the availability policy. Extracted so
+/// the two `Some(credential)` match arms share exactly one copy.
+fn resolve_authorized(
+    launch: &mut LaunchCredentials,
+    service: &ServiceName,
+    credential: &credential_yaml::AuthorizedCredential,
+    source: &dyn CredentialSource,
+    policy: MissingCredentialPolicy,
+) -> Result<()> {
+    // Ownership comes from the authorization, not from resolution success: a
+    // withheld credential must still suppress every other writer of its
+    // variable.
+    let env_name = credential.env_name().clone();
+    launch
+        .owned_env
+        .insert(env_name.clone(), EnvDisposition::Unset);
+
+    let resolved = source.resolve(service);
+    match &resolved {
+        Resolved::Value(_) => {
+            // The value is dropped here. Phase 1 proves availability; it
+            // does not carry the value forward.
+            if credential.sentinel_env() {
+                launch
+                    .owned_env
+                    .insert(env_name.clone(), EnvDisposition::Sentinel);
+            }
+            launch.ready.push(ReadyCredential {
+                service: service.clone(),
+                inject: credential.inject().to_vec(),
+            });
+        }
+        Resolved::Missing | Resolved::Unavailable(_) => {
+            let cause = match &resolved {
+                Resolved::Unavailable(failure) => WithheldCause::Unavailable(*failure),
+                _ => WithheldCause::Missing,
+            };
+            // A `required: true` value that cannot be read is the one
+            // availability failure the host may override. `InvalidValue` below
+            // is NOT: the bytes are present and were rejected, which is a
+            // configuration error, not an unavailable source.
+            //
+            // `(required, policy)` is two bits, so the decision is stated once
+            // and the match is exhaustive: a future policy variant that reaches
+            // the `required: true` row is a compile error here rather than a
+            // silently-unsatisfied pair of complements. `via_override` is true
+            // only for a value the flag actually rescued — an *optional*
+            // credential is withheld with or without the flag, so its warning
+            // must not claim the flag did anything, and on the `fatal` row it
+            // would describe a value that was never kept.
+            let (fatal, via_override) = match (credential.required(), policy) {
+                (true, MissingCredentialPolicy::Fail) => (true, false),
+                (true, MissingCredentialPolicy::Warn) => (false, true),
+                (false, _) => (false, false),
+            };
+            let withheld = Withheld {
+                service: service.clone(),
+                cause,
+                via_override,
+            };
+            if fatal {
+                return Err(anyhow!("{}", withheld.reason()));
+            }
+            launch.withheld.push(withheld);
+        }
+        Resolved::InvalidValue(rejection) => {
+            // A hard error regardless of `required` and regardless of the
+            // policy: the stored bytes are not a value this release will
+            // inject, and treating that as merely withheld would hide a real
+            // problem behind a warning.
+            return Err(anyhow!(
+                "the stored value for `{service}` cannot be used: {}. Remove and \
+                 re-store it with `agent-vm secret set {service}`",
+                rejection.message()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The authorization file's name, for messages that name the location.
@@ -617,6 +737,7 @@ impl LaunchCredentials {
                 })
                 .collect(),
             notes: Vec::new(),
+            replaced: ProviderSet::default(),
         }
     }
 }
@@ -756,8 +877,20 @@ mod tests {
         requested: &[&str],
         source: &dyn CredentialSource,
     ) -> Result<LaunchCredentials> {
+        one_with_policy(body, requested, source, MissingCredentialPolicy::Fail)
+    }
+
+    /// [`one`] with an explicit availability policy. The default keeps the
+    /// ~20 existing call sites at `Fail` untouched (#162); the availability
+    /// matrix is the only caller that needs `Warn`.
+    fn one_with_policy(
+        body: &str,
+        requested: &[&str],
+        source: &dyn CredentialSource,
+        policy: MissingCredentialPolicy,
+    ) -> Result<LaunchCredentials> {
         let (home, set) = authorizations(body);
-        let result = resolve_launch(&names(requested), &set, source);
+        let result = resolve_launch(&names(requested), &set, source, policy);
         drop(home);
         result
     }
@@ -832,22 +965,12 @@ credentials:
     }
 
     #[test]
-    fn requested_same_named_credential_names_issue_162() {
-        let body = ALPHA
-            .replace("alpha", "anthropic")
-            .replace("ALPHA_KEY", "ANTHROPIC_API_KEY");
-        let source = TestSource::new();
-        let error = one(&body, &["anthropic"], &*source).unwrap_err();
-        let text = format!("{error:#}");
-        assert!(text.contains("agent-vm#162"), "{text}");
-        assert!(text.contains("built-in"), "{text}");
-    }
-
-    #[test]
     fn unrequested_same_named_definition_does_not_disturb_a_launch() {
         // The file authorizes BOTH the YAML-only `alpha` and a same-named
         // `anthropic`; this launch requests only `alpha`, so the same-named
-        // definition is inert (#162 staging, decisions.md #2).
+        // definition is inert. #162 makes an authorization *requested* by name
+        // precedence-setting; an authorization nobody requests still changes
+        // nothing (CONTEXT.md → "Authorized credential").
         let anthropic = "  - service: anthropic\n    apiKey:\n      name: ANTHROPIC_API_KEY\n      inject:\n        - domain: api.anthropic.example\n          header: x-api-key\n          format: \"%s\"\n";
         let body = format!(
             "credentials:\n{anthropic}{}",
@@ -856,6 +979,7 @@ credentials:
         let source = TestSource::new().script("alpha", Scripted::Value("sk-REAL".into()));
         let launch = one(&body, &["alpha"], &*source).expect("unrequested is inert");
         assert_eq!(launch.ready().len(), 1);
+        assert_eq!(launch.replaced(), ProviderSet::default());
         assert_eq!(source.lookups(), vec!["alpha"]);
     }
 
@@ -867,6 +991,146 @@ credentials:
         assert!(text.contains("gamma"), "{text}");
         assert!(text.contains("built-in credential provider"), "{text}");
         assert!(text.contains("credentials.yaml"), "{text}");
+    }
+
+    // -- #162: the availability matrix, driven by `MissingCredentialPolicy` --
+
+    /// A same-named authorization for the built-in `anthropic` provider.
+    const ANTHROPIC_AUTHORIZED: &str = "\
+credentials:
+  - service: anthropic
+    apiKey:
+      name: ANTHROPIC_API_KEY
+      sentinelEnv: true
+      inject: [{domain: api.anthropic.example, header: x-api-key, format: \"%s\"}]
+";
+
+    #[test]
+    fn a_same_named_authorization_wins_and_records_the_replacement() {
+        let source = TestSource::new().script("anthropic", Scripted::Value("sk-REAL".into()));
+        let launch = one(ANTHROPIC_AUTHORIZED, &["anthropic"], &*source).unwrap();
+        assert_eq!(launch.ready().len(), 1);
+        assert_eq!(launch.ready()[0].service().as_str(), "anthropic");
+        assert_eq!(
+            launch.replaced(),
+            ProviderSet::new([CredentialProvider::Anthropic])
+        );
+        // One read, no double-resolve: the YAML path was taken exactly once.
+        assert_eq!(source.lookups(), vec!["anthropic"]);
+    }
+
+    #[test]
+    fn a_built_in_without_an_authorization_is_not_replaced() {
+        let source = TestSource::new();
+        let launch = one(ALPHA, &["anthropic"], &*source).unwrap();
+        assert!(launch.ready().is_empty());
+        assert_eq!(launch.replaced(), ProviderSet::default());
+        assert!(source.lookups().is_empty());
+    }
+
+    #[test]
+    fn an_unavailable_replacement_does_not_fall_back_to_the_built_in() {
+        // The authorization is set *before* resolution is attempted, so an
+        // unavailable value still records the replacement. Falling back would
+        // silently downgrade a shielded credential to the built-in's
+        // guest-visible placeholder.
+        let source = TestSource::new(); // Missing
+        let launch = one(ANTHROPIC_AUTHORIZED, &["anthropic"], &*source).unwrap();
+        assert!(launch.ready().is_empty());
+        assert_eq!(
+            launch.replaced(),
+            ProviderSet::new([CredentialProvider::Anthropic])
+        );
+        assert_eq!(launch.withheld().len(), 1);
+    }
+
+    #[test]
+    fn a_required_replacement_fails_the_launch_by_default() {
+        let body = ANTHROPIC_AUTHORIZED.replace("    apiKey:", "    required: true\n    apiKey:");
+        let source = TestSource::new(); // Missing
+        let error = one(&body, &["anthropic"], &*source).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("anthropic"), "{text}");
+        assert!(text.contains("agent-vm secret set anthropic"), "{text}");
+    }
+
+    #[test]
+    fn a_required_replacement_is_skipped_under_the_override() {
+        let body = ANTHROPIC_AUTHORIZED.replace("    apiKey:", "    required: true\n    apiKey:");
+        let source = TestSource::new(); // Missing
+        let launch = one_with_policy(
+            &body,
+            &["anthropic"],
+            &*source,
+            MissingCredentialPolicy::Warn,
+        )
+        .expect("the override keeps the launch alive");
+        assert_eq!(launch.withheld().len(), 1);
+        let notice = launch.withheld()[0].notice();
+        assert!(notice.contains("--allow-missing-credentials"), "{notice}");
+        assert!(notice.contains("agent-vm secret set anthropic"), "{notice}");
+    }
+
+    #[test]
+    fn an_optional_withheld_credential_does_not_claim_the_override() {
+        // `alpha` is optional, so it is withheld with or without the flag. Its
+        // warning must not claim the flag rescued it (D9).
+        let source = TestSource::new(); // Missing
+        let launch =
+            one_with_policy(ALPHA, &["alpha"], &*source, MissingCredentialPolicy::Warn).unwrap();
+        assert_eq!(launch.withheld().len(), 1);
+        let notice = launch.withheld()[0].notice();
+        assert!(notice.ends_with("; continuing without it"), "{notice}");
+        assert!(!notice.contains("--allow-missing-credentials"), "{notice}");
+    }
+
+    #[test]
+    fn an_unauthorized_name_is_skipped_under_the_override() {
+        let source = TestSource::new();
+        let launch =
+            one_with_policy(ALPHA, &["gamma"], &*source, MissingCredentialPolicy::Warn).unwrap();
+        assert!(launch.ready().is_empty());
+        assert!(launch.owned_env().is_empty());
+        assert_eq!(launch.withheld().len(), 1);
+        let notice = launch.withheld()[0].notice();
+        assert!(notice.contains("gamma"), "{notice}");
+        assert!(
+            notice.contains("neither a built-in credential provider"),
+            "{notice}"
+        );
+        assert!(notice.contains("--allow-missing-credentials"), "{notice}");
+    }
+
+    #[test]
+    fn an_invalid_stored_value_is_a_hard_error_under_the_override() {
+        // Present-but-invalid is a configuration error, not an unavailable
+        // source, so the flag cannot swallow it (D5).
+        let source = TestSource::new().script("alpha", Scripted::Invalid);
+        let error = one_with_policy(ALPHA, &["alpha"], &*source, MissingCredentialPolicy::Warn)
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("cannot be used"), "{text}");
+    }
+
+    #[test]
+    fn a_withheld_replacement_still_owns_its_guest_variable() {
+        // Ownership comes from the authorization, not resolution success: a
+        // `sentinelEnv: true` name that could not be read stays *owned* with
+        // `Unset` (never `Sentinel`, which would claim a value is proxied).
+        let source = TestSource::new(); // Missing
+        let launch = one_with_policy(
+            ANTHROPIC_AUTHORIZED,
+            &["anthropic"],
+            &*source,
+            MissingCredentialPolicy::Warn,
+        )
+        .unwrap();
+        assert_eq!(
+            launch
+                .owned_env()
+                .get(&GuestEnvName::parse("ANTHROPIC_API_KEY").unwrap()),
+            Some(&EnvDisposition::Unset)
+        );
     }
 
     #[test]
@@ -943,10 +1207,21 @@ credentials:
         // gamma is scripted `Unavailable`, so phase 1 withholds it (optional)
         // and it never becomes ready; delta is Invalid, which phase 1 refuses.
         let (home, set) = authorizations(body);
-        let error = resolve_launch(&names(&["delta"]), &set, &*source).unwrap_err();
+        let error = resolve_launch(
+            &names(&["delta"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("cannot be used"));
-        let launch = resolve_launch(&names(&["alpha", "beta", "gamma"]), &set, &*source)
-            .expect("all optional");
+        let launch = resolve_launch(
+            &names(&["alpha", "beta", "gamma"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .expect("all optional");
         let resolver = launch.resolver(dyn_source(&source));
         assert_eq!(
             resolver.resolve("alpha").map(|v| v.to_string()),
@@ -1030,7 +1305,13 @@ credentials:
         let source = TestSource::new().script("alpha", Scripted::Value(canary.into()));
         let (home, set) = authorizations(ALPHA);
         let state = tempfile::tempdir().unwrap();
-        let launch = resolve_launch(&names(&["alpha"]), &set, &*source).unwrap();
+        let launch = resolve_launch(
+            &names(&["alpha"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .unwrap();
         // Prove the canary is live: the phase-2 resolver hands it over, so if
         // the durable config carried a value it would be this one.
         let resolver = launch.resolver(dyn_source(&source));
@@ -1058,7 +1339,13 @@ credentials:
         let state = tempfile::tempdir().unwrap();
         let before_home = directory_contents(home.path());
         let before_state = directory_contents(state.path());
-        let launch = resolve_launch(&names(&["alpha"]), &set, &*source).unwrap();
+        let launch = resolve_launch(
+            &names(&["alpha"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .unwrap();
         let resolver = launch.resolver(dyn_source(&source));
         let value = resolver.resolve("alpha").unwrap();
         assert_eq!(&*value, canary);
@@ -1356,23 +1643,36 @@ credentials:
             ["IMAGE_OWNED=1".to_owned(), "PATH=/bin".to_owned()].into();
         let owned = GuestEnvName::parse("IMAGE_OWNED").unwrap();
 
-        let ready = TestSource::new().script("alpha", Scripted::Value("sk-REAL".into()));
-        let launch = one(body, &["alpha"], &*ready).unwrap();
-        assert_eq!(
-            launch.unset_names_in_image_env(&image_env),
-            vec![owned.clone()]
-        );
+        // Both availability policies: an image-env collision is a security
+        // boundary, so `--allow-missing-credentials` must not move it.
+        for policy in [MissingCredentialPolicy::Fail, MissingCredentialPolicy::Warn] {
+            let ready = TestSource::new().script("alpha", Scripted::Value("sk-REAL".into()));
+            let launch = one_with_policy(body, &["alpha"], &*ready, policy).unwrap();
+            assert_eq!(
+                launch.unset_names_in_image_env(&image_env),
+                vec![owned.clone()],
+                "policy={policy:?}"
+            );
 
-        let withheld = TestSource::new(); // Missing
-        let launch = one(body, &["alpha"], &*withheld).unwrap();
-        assert!(launch.ready().is_empty());
-        assert_eq!(launch.unset_names_in_image_env(&image_env), vec![owned]);
+            let withheld = TestSource::new(); // Missing
+            let launch = one_with_policy(body, &["alpha"], &*withheld, policy).unwrap();
+            assert!(launch.ready().is_empty());
+            assert_eq!(
+                launch.unset_names_in_image_env(&image_env),
+                vec![owned.clone()],
+                "policy={policy:?}"
+            );
 
-        // A *sentinel* credential is not a collision: the sentinel is published
-        // last and overrides the image value.
-        let sentinel_body = body.replace("      inject:", "      sentinelEnv: true\n      inject:");
-        let launch = one(&sentinel_body, &["alpha"], &*ready).unwrap();
-        assert!(launch.unset_names_in_image_env(&image_env).is_empty());
+            // A *sentinel* credential is not a collision: the sentinel is
+            // published last and overrides the image value.
+            let sentinel_body =
+                body.replace("      inject:", "      sentinelEnv: true\n      inject:");
+            let launch = one_with_policy(&sentinel_body, &["alpha"], &*ready, policy).unwrap();
+            assert!(
+                launch.unset_names_in_image_env(&image_env).is_empty(),
+                "policy={policy:?}"
+            );
+        }
     }
 
     #[test]
@@ -1394,8 +1694,20 @@ credentials:
       inject: [{domain: b.example, header: x-b, format: \"%s\"}]
 ";
         let (home, set) = authorizations(body);
-        let first = resolve_launch(&names(&["alpha"]), &set, &*source).unwrap();
-        let second = resolve_launch(&names(&["beta"]), &set, &*source).unwrap();
+        let first = resolve_launch(
+            &names(&["alpha"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .unwrap();
+        let second = resolve_launch(
+            &names(&["beta"]),
+            &set,
+            &*source,
+            MissingCredentialPolicy::Fail,
+        )
+        .unwrap();
         let first = first.resolver(source.clone());
         let second = second.resolver(source.clone());
         assert_eq!(&*first.resolve("alpha").unwrap(), "first");

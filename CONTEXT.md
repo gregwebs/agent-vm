@@ -118,6 +118,18 @@ effect. Storing a value at the same service is not an authorization.
 _Avoid_: "the credential" (that is the value), or "configured credential" (a
 request is also configuration).
 
+## Replaced provider
+
+A **built-in credential provider** whose credential handling a same-named
+**authorized credential** has taken over for one launch: acquisition, guest
+placeholder, proxy injection and OAuth capture/refresh all come from the
+authorization instead. The provider's guest configuration and persisted state
+(onboarding bypass files, Copilot's `trusted_folders`, `$HOME` symlinks, state
+directories) are untouched — a credential authorization does not speak for them.
+There is no fallback to the built-in when the authorization is unavailable.
+
+_Avoid_: "overridden provider" (an override suggests a fallback; there is none).
+
 ## Header credential
 
 The runtime's durable form of an authorized credential: a non-secret

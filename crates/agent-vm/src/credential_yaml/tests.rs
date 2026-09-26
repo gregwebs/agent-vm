@@ -172,8 +172,9 @@ credentials:
 }
 
 /// The spec's own canonical block (`docs/specs/credential-shielding.md:57-71`)
-/// must parse. #162 stages same-*named* resolution, not parsing: an
-/// `anthropic` entry has to load so the diagnostic can be about resolution.
+/// must parse. #162 makes a same-*named* entry a precedence-setting
+/// authorization at resolution time, which only works because parsing accepts
+/// it: a built-in provider name is a legal `service` like any other.
 #[test]
 fn parent_spec_canonical_anthropic_block_parses_unchanged() {
     let home = Home::new();
