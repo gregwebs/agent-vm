@@ -3,7 +3,7 @@
 //!
 //! Pi (issue #90/#95/#96) keeps imported host credentials **host-side** and
 //! gives the guest placeholders — Pi's mixed credential ownership, an ADR in
-//! another workstream (see #91/#94). A mount that put Pi's real
+//! another workstream (see #91, still open). A mount that put Pi's real
 //! `~/.pi/agent/auth.json` in front of the guest would defeat that for the one
 //! tool agent-vm is about to launch, so this module owns the whole of "which
 //! host files must never reach the guest, and is this mount one of the ways
@@ -43,9 +43,9 @@ pub(crate) enum ProtectedFile {
 impl ProtectedFile {
     pub(crate) const ALL: [ProtectedFile; 2] = [Self::PiAuth, Self::PiModels];
 
-    /// The single source of truth for these paths. `#93`/`#94` spell the same
-    /// two files; when a host-Pi resolver lands there it should import this
-    /// table rather than re-spell the paths.
+    /// The single source of truth for these paths. The guest-side Pi scanner
+    /// (`#93`) derives `pi/<relative>` from them; a future host-Pi resolver
+    /// (`#91`) should import this table rather than re-spell the paths.
     fn home_relative(self) -> &'static str {
         match self {
             Self::PiAuth => ".pi/agent/auth.json",

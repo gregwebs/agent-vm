@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Implementation decision for [agent-vm #96](https://github.com/gregwebs/agent-vm/issues/96). It extends [ADR-0012](0012-stable-pi-image-customization-seam.md) (the `pi` wrapper gains a second decision and records what it deliberately does not do) and [ADR-0002](0002-mirror-host-home-and-username.md) (the one shared guest-HOME link table). It complements [ADR-0020](0020-protect-host-pi-credential-files.md), which keeps host Pi credential **files** out of the guest; the guest-managed credential this ADR persists, the every-launch warning about it, and the mixed ownership behind it, are [#93](https://github.com/gregwebs/agent-vm/issues/93)/[#91](https://github.com/gregwebs/agent-vm/issues/91)/[#94](https://github.com/gregwebs/agent-vm/issues/94).
+Accepted. Implementation decision for [agent-vm #96](https://github.com/gregwebs/agent-vm/issues/96). It extends [ADR-0012](0012-stable-pi-image-customization-seam.md) (the `pi` wrapper gains a second decision and records what it deliberately does not do) and [ADR-0002](0002-mirror-host-home-and-username.md) (the one shared guest-HOME link table). It complements [ADR-0020](0020-protect-host-pi-credential-files.md), which keeps host Pi credential **files** out of the guest; the guest-managed credential this ADR persists, the every-launch warning about it, and the mixed ownership behind it, are [#93](https://github.com/gregwebs/agent-vm/issues/93) and [#91](https://github.com/gregwebs/agent-vm/issues/91) (still open).
 
 ## Context
 
