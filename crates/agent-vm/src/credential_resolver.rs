@@ -84,6 +84,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
+use vstd::prelude::*;
 use zeroize::Zeroizing;
 
 use crate::config::USER_CONFIG_DIR_RELATIVE;
@@ -572,6 +573,7 @@ pub(crate) fn resolve_launch(
     for note in authorization.warnings() {
         launch.notes.push(note.clone());
     }
+    launch.replaced = replaced_providers(requested, authorization);
 
     for service in requested {
         let built_in = CredentialProvider::from_config_name(service.as_str());
@@ -582,10 +584,7 @@ pub(crate) fn resolve_launch(
             // is deliberately no fallback arm: an unavailable authorized value
             // does not re-enable the built-in, because that would silently
             // downgrade a shielded credential to a guest-visible placeholder.
-            (built_in, Some(credential)) => {
-                if let Some(provider) = built_in {
-                    launch.replaced = launch.replaced.union(ProviderSet::new([provider]));
-                }
+            (_, Some(credential)) => {
                 resolve_authorized(&mut launch, service, credential, source, policy)?;
             }
             (Some(_), None) => {}
@@ -608,6 +607,60 @@ pub(crate) fn resolve_launch(
         }
     }
     Ok(launch)
+}
+
+verus! {
+
+/// The per-name replacement decision (#162/#178), stated as bools so the proof
+/// is about the decision rather than the bitset. A built-in provider's
+/// credential handling is replaced for this launch iff all three hold: the
+/// launch requests the name, the name is a built-in provider, and the user
+/// authorized that exact name.
+///
+/// Stated plainly, as ADR-0018's *verified surface* does for its
+/// restated-comparison rows: the exec body restates this spec, so what is proved
+/// is that the decision **is** that conjunction — **not** that the facets
+/// downstream of `replaced` are wired correctly. The three measurements
+/// (`requested` by set iteration, `built_in` by `CredentialProvider::from_config_name`,
+/// `authorized` by `AuthorizationSet::get`) are the trusted adapter
+/// [`replaced_providers`].
+fn provider_replaced(requested: bool, built_in: bool, authorized: bool) -> (replaced: bool)
+    ensures
+        replaced == (requested && built_in && authorized),
+        replaced ==> requested && built_in && authorized,
+        !(requested && built_in && authorized) ==> !replaced,
+{
+    requested && built_in && authorized
+}
+
+} // verus!
+
+/// The built-ins a launch with these `requested` names replaces, given the
+/// authorizations. Pure — it reads no source — so `doctor` can report which
+/// host credential files a launch will never read without constructing a
+/// keychain (#178), while `resolve_launch` remains the launch's single
+/// authority for the same fact.
+///
+/// A replacement needs three things at once: the name is requested, it names a
+/// built-in provider, and the user authorized that exact name. Any one missing
+/// leaves the built-in's credential handling in place. The per-name decision is
+/// the machine-checked [`provider_replaced`]; this is its trusted adapter.
+pub(crate) fn replaced_providers(
+    requested: &BTreeSet<ServiceName>,
+    authorization: &AuthorizationSet,
+) -> ProviderSet {
+    let mut replaced = ProviderSet::default();
+    for service in requested {
+        let built_in = CredentialProvider::from_config_name(service.as_str());
+        let authorized = authorization.get(service).is_some();
+        // `requested` is true by construction: `service` comes from the set.
+        if provider_replaced(true, built_in.is_some(), authorized)
+            && let Some(provider) = built_in
+        {
+            replaced = replaced.union(ProviderSet::new([provider]));
+        }
+    }
+    replaced
 }
 
 /// The YAML path: record the owned variable, prove the source is available, and
@@ -1026,6 +1079,38 @@ credentials:
         assert!(launch.ready().is_empty());
         assert_eq!(launch.replaced(), ProviderSet::default());
         assert!(source.lookups().is_empty());
+    }
+
+    /// The pure predicate `doctor` reads (#178) is the same fact `resolve_launch`
+    /// records for a launch, over every combination of requested and authorized.
+    /// A drift here would make `doctor` annotate a host file a launch does read.
+    #[test]
+    fn replaced_providers_and_the_launch_agree_with_an_independent_oracle() {
+        let (_home, set) = authorizations(ANTHROPIC_AUTHORIZED);
+        // `(requested, expected)`, the expected set written from the rule
+        // "requested ∩ built-in ∩ authorized" rather than from the
+        // implementation, so a shared bug in `replaced_providers` cannot make
+        // both sides agree.
+        let cases: &[(&[&str], &[CredentialProvider])] = &[
+            (&["anthropic"], &[CredentialProvider::Anthropic]),
+            (&["anthropic", "openai"], &[CredentialProvider::Anthropic]),
+            (&["openai"], &[]),
+            (&["alpha"], &[]),
+            (&["copilot", "opencode-static"], &[]),
+        ];
+        for (requested, expected) in cases {
+            let requested = names(requested);
+            let expected = ProviderSet::new(expected.iter().copied());
+            assert_eq!(
+                replaced_providers(&requested, &set),
+                expected,
+                "predicate for {requested:?}"
+            );
+            let source = TestSource::new().script("anthropic", Scripted::Value("sk-x".into()));
+            let launch = resolve_launch(&requested, &set, &*source, MissingCredentialPolicy::Warn)
+                .expect("warn never bails");
+            assert_eq!(launch.replaced(), expected, "launch for {requested:?}");
+        }
     }
 
     #[test]

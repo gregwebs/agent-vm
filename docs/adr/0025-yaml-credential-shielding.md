@@ -289,6 +289,39 @@ is #163, alongside the general removal of raw API-key forwarding (#162 suppresse
 it only where a YAML authorization owns the name, and warns where a renamed
 authorization leaves it in effect).
 
+### Doctor resolves the launch context (#178)
+
+`agent-vm doctor` reports host credential files per provider, which alone cannot
+say that a launch replaces one. #162 left that as a known limitation because it
+is a new contract decision, not an implementation detail; the maintainer's
+decision on #178 is that `doctor` stays **terse on success** and prints **more,
+not a cleverer summary, when there is a problem**.
+
+The contract implemented by `doctor.rs`:
+
+- Replacement and request are **name** facts, so the whole configured catalog is
+  enough context: if `anthropic` is authorized and a verb requests it, that verb
+  replaces the host file. No "which verb am I about to run" argument is needed,
+  and the host row names the verbs (`replaced by credentials.yaml for pi, claude,
+  shell (host file not read)`). A provider no configured verb requests says so,
+  and a requested authorization that no verb requests is inert and omitted.
+- The pure predicate is `credential_resolver::replaced_providers`, the same fact
+  `resolve_launch` records, so `doctor` and a launch cannot drift. Its per-name
+  decision carries the ADR-0018 contract `provider_replaced(requested, built_in,
+  authorized)`; the set iteration and the name lookups are the trusted adapter.
+- It reads the authorization **file** only. It deliberately does **not** call
+  `SecretStore::resolve`: that takes the exclusive inventory lock (creating
+  `.secret-inventory.lock`) and reads a value, so a diagnostic would stop being
+  read-only, could block behind a concurrent `secret set`/`rm`, and would reach a
+  value ADR-0024 says no diagnostic may reach. Whether a value is stored is
+  `agent-vm secret ls`'s answer, and the section says so. A host with no
+  `credentials.yaml`, or with only inert authorizations, prints no credential
+  rows; the section still appears when the file itself needs a diagnostic (a
+  file-mode observation or a `proxyManaged` compatibility-alias warning).
+- A malformed `credentials.yaml` is reported in its own section and does not
+  suppress the other sections; the exit code stays zero, because `doctor`'s job
+  is to report, not to launch.
+
 ### Destination and header policy
 
 - A bare `domain` means HTTPS 443; an explicit `:port` is exact and in

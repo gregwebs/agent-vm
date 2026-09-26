@@ -487,6 +487,22 @@ thing to run when an in-VM agent comes up signed out. See
 It also prints the resolved [tool configuration](#tool-configuration) — the same
 verb list `agent-vm --help` shows.
 
+**Launch-aware credentials.** A `credentials.yaml` entry named after a built-in
+provider replaces that provider's credential handling for every launch that
+requests it (see [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection)). So
+the host-credential rows are annotated: a provider a configured launch replaces
+reads `replaced by credentials.yaml for <verbs> (host file not read)` rather
+than leaving a green/absent row to be misread, and a provider no configured
+launch requests reads `not requested by any configured launch`. When a
+configured launch requests an authorized service, `doctor` also prints a
+`==> credentials.yaml (launch credentials)` section naming it as `authorized for
+this launch`. This reads the authorization file only — **not** the credential
+store — so it never prompts and never writes; whether a value is actually stored
+is [`agent-vm secret ls`](#storing-your-own-secret-values)'s answer, and the
+section says so. A host with no `credentials.yaml`, or with only authorizations
+no launch requests, prints no credential rows; the section still appears when
+the file itself needs a diagnostic (a file-mode or compatibility-alias warning).
+
 **Guest-managed Pi credentials.** The same run also reports the project's
 persistent Pi state (canonical `<state>/pi/agent/{auth,models}.json`, plus any
 real pre-#96 `<state>/home/.pi` that a launch has not yet moved). The report is
@@ -498,12 +514,13 @@ oversized file, is reported as potentially sensitive. Only `auth.json` and
 `models.json` are inspected — settings, sessions and installed packages are not.
 
 `doctor` never resolves `!command` values, expands environment references,
-refreshes OAuth, or writes, rewrites or removes anything; it only reads those two
-files. Ordinary `doctor` also performs **no** initialization at all — it is
-dispatched before microsandbox bootstrap, so it works even when the bundled
-`msb` is missing or unpatched, and it reports the computed paths rather than
-validating that binary. The explicit `agent-vm doctor --reset-msb-db` is the
-mutating exception and keeps its existing behaviour.
+refreshes OAuth, or writes, rewrites or removes anything; it only reads: the host
+credential files above, the tool configuration, `credentials.yaml`, and the two
+Pi files. Ordinary `doctor` also performs **no** initialization at all — it is
+dispatched before microsandbox bootstrap, so it works even when the bundled `msb`
+is missing or unpatched, and it reports the computed paths rather than validating
+that binary. The explicit `agent-vm doctor --reset-msb-db` is the mutating
+exception and keeps its existing behaviour.
 
 The report is advisory, not enforcement: it neither blocks a launch nor promises
 that a host substitution exists. Your decision whether to remove or rotate a
@@ -1147,10 +1164,15 @@ What to expect:
   one still refuses the launch. There is deliberately no environment variable: it
   is a per-launch decision you make at the command line, and a project config has
   no way to set it.
-- **`agent-vm doctor` is launch-unaware.** It reports *host* credential files per
-  provider and has no launch context, so for a provider a launch replaces it will
-  still report the host credential as present even though that launch never reads
-  it.
+- **`agent-vm doctor` resolves the launch context from the configured verbs.**
+  It annotates each host credential row — a provider a configured launch
+  replaces reads `replaced by credentials.yaml for <verbs> (host file not
+  read)`, and a provider no configured launch requests reads `not requested by
+  any configured launch` — and names each requested authorization as
+  `authorized for this launch`. It reads the authorization file, never the
+  credential store, so it neither prompts nor writes; `agent-vm secret ls`
+  reports whether a value is stored. See
+  [Checking what agent-vm can see](#checking-what-agent-vm-can-see).
 - **Unsupported, by name, never silently ignored.** `source` (an environment
   source is #163), `permissions`/`permissions.network`, `oauth`, `basic`,
   `username`, request signing, query/body injection, kit/hooks/images/mounts/
