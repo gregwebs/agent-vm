@@ -4,7 +4,7 @@ The guest image installs Pi under `/opt/agent-vm/pi/`, stores repository- and im
 
 ## Status
 
-Accepted. Decision for [agent-vm #95](https://github.com/gregwebs/agent-vm/issues/95). The mixed credential-ownership rationale the warning text summarises is [#94](https://github.com/gregwebs/agent-vm/issues/94).
+Accepted. Decision for [agent-vm #95](https://github.com/gregwebs/agent-vm/issues/95). The mixed credential-ownership rationale the warning text summarises is [ADR-0011](0011-pi-mixed-credential-ownership.md).
 
 ## Decision
 

@@ -2,11 +2,11 @@
 
 ## Status
 
-Accepted. Implementation decision for [agent-vm #90](https://github.com/gregwebs/agent-vm/issues/90). Builds on Pi's mixed credential ownership ([ADR-0011](0011-pi-mixed-credential-ownership.md)); see [#91](https://github.com/gregwebs/agent-vm/issues/91)/[#94](https://github.com/gregwebs/agent-vm/issues/94) — narrows what [ADR-0013](0013-add-forked-mounts.md) and [ADR-0014](0014-narrow-fork-mounts-to-directories.md) left possible, and adds a contract to the surface [ADR-0018](0018-machine-checked-boundary-contracts.md) governs. Blocks [agent-vm #96](https://github.com/gregwebs/agent-vm/issues/96) (`agent-vm pi`).
+Accepted. Implementation decision for [agent-vm #90](https://github.com/gregwebs/agent-vm/issues/90). Builds on Pi's mixed credential ownership ([ADR-0011](0011-pi-mixed-credential-ownership.md)); see [#91](https://github.com/gregwebs/agent-vm/issues/91) (still open) — narrows what [ADR-0013](0013-add-forked-mounts.md) and [ADR-0014](0014-narrow-fork-mounts-to-directories.md) left possible, and adds a contract to the surface [ADR-0018](0018-machine-checked-boundary-contracts.md) governs. Blocks [agent-vm #96](https://github.com/gregwebs/agent-vm/issues/96) (`agent-vm pi`).
 
 ## Context
 
-Pi supports many model providers, so its credential ownership is split (#91/#94): a credential **imported from the host** stays host-side and reaches the guest only as a request-scoped placeholder, while a credential **created inside** the guest stays guest-managed in project state (warned about on every launch). That split is defeated the moment a host file reaches the guest as a file — a mount that put the host's real `~/.pi/agent/auth.json` in front of the guest hands a hostile dependency or a prompt-injected agent a working credential, and no placeholder discipline applies.
+Pi supports many model providers, so its credential ownership is split: a credential **imported from the host** stays host-side and reaches the guest only as a request-scoped placeholder, while a credential **created inside** the guest stays guest-managed in project state (warned about on every launch). That split is defeated the moment a host file reaches the guest as a file — a mount that put the host's real `~/.pi/agent/auth.json` in front of the guest hands a hostile dependency or a prompt-injected agent a working credential, and no placeholder discipline applies.
 
 `agent-vm` gives the guest three core binds (a per-project guest `$HOME`, the project, `<state> → /agent-vm-state`) plus whatever `--mount` asks for. Guest `$HOME` is *not* the host `$HOME`, but the **project** bind is the canonicalized cwd with no guard, so `cd ~ && agent-vm shell` writable-binds the host `$HOME`. Host Pi files therefore arrive by two routes: an explicit `--mount`, and the project bind itself.
 
@@ -21,7 +21,7 @@ Two forces decide the shape:
 
 ### The two protected files
 
-`~/.pi/agent/auth.json` (provider credentials) and `~/.pi/agent/models.json` (provider/endpoint configuration). `ProtectedFile::home_relative` is the single place they are spelled; a future host-Pi resolver in #93/#94 imports that table rather than re-spelling them. The path table assumes no `PI_HOME`/XDG override; if a pinned Pi release introduces one, the resolver changes in this one place.
+`~/.pi/agent/auth.json` (provider credentials) and `~/.pi/agent/models.json` (provider/endpoint configuration). `ProtectedFile::home_relative` is the single place they are spelled; the guest-side Pi scanner (`#93`) derives from that table, and a future host-Pi resolver (`#91`) should import it rather than re-spell them. The path table assumes no `PI_HOME`/XDG override; if a pinned Pi release introduces one, the resolver changes in this one place.
 
 ### Detection: identity **and** canonical containment
 
@@ -100,7 +100,7 @@ Verified code calls into, and trusts: all syscalls (`fs::metadata`, `fs::symlink
 
 ## References
 
-- Pi's mixed credential ownership — the host/guest split this protects — is [ADR-0011](0011-pi-mixed-credential-ownership.md); see [#91](https://github.com/gregwebs/agent-vm/issues/91) and [#94](https://github.com/gregwebs/agent-vm/issues/94).
+- Pi's mixed credential ownership — the host/guest split this protects — is [ADR-0011](0011-pi-mixed-credential-ownership.md); see [#91](https://github.com/gregwebs/agent-vm/issues/91) (still open).
 - [ADR-0013](0013-add-forked-mounts.md), [ADR-0014](0014-narrow-fork-mounts-to-directories.md) — fork identity, store, locking, publication, and the removal of opaque masks.
 - [ADR-0018](0018-machine-checked-boundary-contracts.md) — the `verus!` contract rule, the verified surface, and the trusted-boundary convention.
 - `crates/agent-vm/src/protected_host_files.rs`, `crates/agent-vm/tests/mount_protected_pi.rs`.
