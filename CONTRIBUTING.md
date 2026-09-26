@@ -117,6 +117,33 @@ same pinned release for an in-VM agent on `linux/amd64`; see
 plus the assertion that it actually verified something, then a pair of throwaway
 fixtures proving the verifier can both pass and fail.
 
+### `CARGO_TARGET_DIR` must not be on a tmpfs prefix
+
+Several boot-free integration tests (`config_launch_driven.rs`,
+`mount_fork.rs`, `mount_protected_pi.rs`) deliberately place their project root
+under `CARGO_TARGET_TMPDIR` so `run::resolve_project_guest_path` mirrors the
+host path into the guest instead of falling back to `/workspace`; the mirrored
+path is what they assert on. `CARGO_TARGET_TMPDIR` is `<CARGO_TARGET_DIR>/tmp`,
+so pointing `CARGO_TARGET_DIR` at `/tmp`, `/run`, `/dev/shm` or `/var/run` — a
+common container and CI pattern — puts that root under a guest tmpfs prefix, and
+the tests would fail on their mirrored-path assertions as if the product were
+broken. The shared harness helper `tests/support::project_tempdir` detects this
+and fails fast with a message naming the precondition. Run those tests with an
+off-tmpfs target dir:
+
+```bash
+CARGO_TARGET_DIR=/build/target cargo test -p agent-vm
+```
+
+The requirement is on the **canonicalized** project scratch path (the
+`CARGO_TARGET_TMPDIR` under `CARGO_TARGET_DIR`): it must avoid the guest
+prefixes `/tmp`, `/run`, `/dev/shm` and `/var/run`. The default
+`CARGO_TARGET_DIR=target` (inside the checkout) already satisfies this, provided
+the checkout is not itself under one of those prefixes — a checkout at
+`/tmp/agent-vm` would not. On macOS `/tmp` is only a symlink to `/private/tmp`;
+the check runs on the canonicalized path, which is off-prefix, so it passes
+there.
+
 ### End-to-end (VM-boot) tests (optional)
 
 These boot real microVMs and are the only way to observe the launcher, the

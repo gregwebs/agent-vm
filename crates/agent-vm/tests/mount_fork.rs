@@ -35,22 +35,10 @@ use std::{
 /// fails here).
 const BOGUS_IMAGE: &str = "localhost:1/does-not-exist:latest";
 
+mod support;
+
 fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
-}
-
-/// Base directory for harness `$HOME`/project dirs that is on the real
-/// workspace filesystem rather than a host path under a guest tmpfs prefix.
-///
-/// `run::guest_path_is_safe` remaps any project below `/tmp` (and the other
-/// `TMPFS_GUEST_PREFIXES`) to `/workspace`. On macOS `tempdir_in("/tmp")`
-/// canonicalizes to `/private/tmp`, which escapes that prefix, but on Linux
-/// `/tmp` is a real directory, so a `/tmp` project is remapped and its guest
-/// path stops equalling its host path. Cargo creates `CARGO_TARGET_TMPDIR`
-/// (`<target>/tmp`) before running integration tests, so dirs created there
-/// keep host and guest paths identical on both platforms.
-fn harness_tmpdir() -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }
 
 /// Write a fake `msb` that always reports the official version this
@@ -69,9 +57,9 @@ fn write_fake_msb(dir: &Path) -> PathBuf {
 
 /// Run `child` to completion, killing it if it doesn't exit within
 /// `timeout`. Reads stdout/stderr on separate threads so a full pipe can't
-/// deadlock the wait. Duplicated from `msb_cache_share.rs` rather than
-/// shared — Rust integration tests are separate binaries and there's no
-/// `tests/support/` module in this crate yet to hang a shared helper off.
+/// deadlock the wait. Duplicated from `msb_cache_share.rs` — Rust integration
+/// tests are separate binaries, and `tests/support/` currently holds only the
+/// project-tmpdir precondition the boot-free harnesses share.
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("failed to spawn agent-vm");
@@ -157,13 +145,14 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         // The relay socket lives below the state directory, so keep that one
-        // under `/tmp` to stay within Unix's socket-path limit. `$HOME` and
-        // the project dir live on the workspace filesystem instead: a project
-        // under `/tmp` is remapped to `/workspace` on Linux, breaking tests
-        // that reason about the project's guest path.
-        let home = tempfile::tempdir_in(harness_tmpdir()).unwrap();
+        // under `/tmp` to stay within Unix's socket-path limit. `$HOME` and the
+        // project dir live on the workspace filesystem instead; the project
+        // helper fails fast if `CARGO_TARGET_DIR` pushed it under a guest tmpfs
+        // prefix, where the guest would remap it to `/workspace` and break the
+        // assertions about the project's guest path.
+        let home = tempfile::tempdir_in(support::workspace_tmpdir()).unwrap();
         let state = tempfile::tempdir_in("/tmp").unwrap();
-        let project = tempfile::tempdir_in(harness_tmpdir()).unwrap();
+        let project = support::project_tempdir();
         let fake_msb = write_fake_msb(home.path());
         Self {
             home,

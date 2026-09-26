@@ -54,9 +54,9 @@ fn write_fake_msb(dir: &Path) -> PathBuf {
 
 /// Run `child` to completion, killing it if it doesn't exit within
 /// `timeout`. Reads stdout/stderr on separate threads so a full pipe can't
-/// deadlock the wait. Duplicated from `msb_cache_share.rs` rather than
-/// shared — Rust integration tests are separate binaries and there's no
-/// `tests/support/` module in this crate yet to hang a shared helper off.
+/// deadlock the wait. Duplicated from `msb_cache_share.rs` — Rust integration
+/// tests are separate binaries, and `tests/support/` currently holds only the
+/// project-tmpdir precondition the boot-free harnesses share.
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("failed to spawn agent-vm");
