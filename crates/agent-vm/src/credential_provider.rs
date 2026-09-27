@@ -502,7 +502,6 @@ pub(crate) struct ProxySecret {
     pub(crate) env_var: &'static str,
     pub(crate) placeholder: &'static str,
     pub(crate) hosts: &'static [&'static str],
-    pub(crate) basic_auth: bool,
     pub(crate) oauth_token_route: Option<(&'static str, &'static str)>,
 }
 
@@ -580,7 +579,6 @@ const SPECS: [ProviderSpec; 4] = [
                 secrets::ANTHROPIC_OAUTH_HOST,
                 secrets::ANTHROPIC_MCP_PROXY_HOST,
             ],
-            basic_auth: false,
             oauth_token_route: Some((
                 secrets::ANTHROPIC_OAUTH_HOST,
                 secrets::ANTHROPIC_OAUTH_TOKEN_PATH,
@@ -614,7 +612,6 @@ const SPECS: [ProviderSpec; 4] = [
                 secrets::OPENAI_CHATGPT_HOST,
                 secrets::OPENAI_OAUTH_HOST,
             ],
-            basic_auth: false,
             oauth_token_route: Some((secrets::OPENAI_OAUTH_HOST, secrets::OPENAI_OAUTH_TOKEN_PATH)),
         }),
         missing_credential_error: None,
@@ -653,7 +650,6 @@ const SPECS: [ProviderSpec; 4] = [
             env_var: "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
             placeholder: secrets::OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
             hosts: &[secrets::OPENAI_API_HOST, secrets::OPENAI_CHATGPT_HOST],
-            basic_auth: false,
             oauth_token_route: None,
         }),
         missing_credential_error: None,
@@ -692,7 +688,6 @@ const SPECS: [ProviderSpec; 4] = [
                 secrets::COPILOT_API_HOST,
                 secrets::COPILOT_API_INDIVIDUAL_HOST,
             ],
-            basic_auth: false,
             oauth_token_route: None,
         }),
         missing_credential_error: Some(COPILOT_MISSING),
@@ -1276,7 +1271,6 @@ mod tests {
                 assert!(!secret.env_var.is_empty());
                 assert!(!secret.placeholder.is_empty());
                 assert!(!secret.hosts.is_empty());
-                let _ = secret.basic_auth;
                 let _ = secret.oauth_token_route;
             }
             if let Some(rotation) = oauth_rotation(provider) {

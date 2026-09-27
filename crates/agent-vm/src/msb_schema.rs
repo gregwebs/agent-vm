@@ -92,7 +92,7 @@ mod tests {
     fn identifier_matches_pinned_bundled_schema() {
         assert_eq!(
             bundled_schema_version(),
-            "m20260824_000001",
+            "m20260922_000001",
             "bundled microsandbox schema id changed; if intended, \
              update this pinned value (see #31 for MSB_HOME namespacing)"
         );

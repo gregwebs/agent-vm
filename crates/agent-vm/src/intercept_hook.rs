@@ -1288,8 +1288,9 @@ mod tests {
     // `vendor/microsandbox/.../tls/proxy.rs:forward_plaintext`:
     //
     //   1. SecretsHandler.substitute(guest_bytes)
-    //         → inject_basic_auth base64-decodes the Authorization,
-    //           swaps GH_TOKEN_PLACEHOLDER for the real token, re-encodes.
+    //         → the header scope base64-decodes the Authorization,
+    //           swaps GH_TOKEN_PLACEHOLDER for the real token, re-encodes
+    //           (0.7.4 folds Basic-auth handling into the `headers` scope).
     //   2. github_smart_decision(substituted_bytes, allowed_repos)
     //         → Authenticated / Anonymous / Deny / Malformed.
     //   3. If Anonymous: strip_authorization_from_request(substituted_bytes)
@@ -1306,7 +1307,7 @@ mod tests {
         real_token: &str,
     ) -> microsandbox_network::secrets::config::SecretsConfig {
         use microsandbox_network::secrets::config::{
-            HostPattern, SecretEntry, SecretInjection, SecretsConfig,
+            HostPattern, SecretEntry, SecretSubstitution, SecretsConfig,
         };
         SecretsConfig {
             secrets: vec![SecretEntry {
@@ -1323,20 +1324,21 @@ mod tests {
                     HostPattern::Exact("raw.githubusercontent.com".into()),
                     HostPattern::Exact("objects.githubusercontent.com".into()),
                 ],
-                injection: SecretInjection {
+                substitution: SecretSubstitution {
                     headers: true,
-                    basic_auth: true,
-                    query_params: false,
+                    query: false,
                     body: false,
                 },
-                on_violation: None,
+                passthrough_hosts: Vec::new(),
+                violation_action: None,
                 require_tls_identity: true,
             }],
             // #175's new durable header-credential list. Empty here: this
             // fixture exercises the file-backed secret pipeline, not the
             // origin-scoped header channel.
             header_credentials: Vec::new(),
-            on_violation: Default::default(),
+            passthrough_hosts: None,
+            violation_action: Default::default(),
         }
     }
 

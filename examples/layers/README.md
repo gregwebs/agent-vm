@@ -75,10 +75,11 @@ Rust code. It installs, all under the world-readable `/opt` (contract C7):
 
 - the **pinned Rust toolchain** from `rust-toolchain.toml` (`1.98.1` at the
 time of writing) with the `clippy` and `rustfmt` components, plus the host
-`*-unknown-linux-musl` target the guest `agentd` cross-build needs;
+`*-unknown-linux-musl` target the guest `agentd` build needs when building
+the vendored `msb` (agent-vm's own gates do not);
 - the native libraries `ci.yml` installs — `build-essential`, `pkg-config`,
-`libcap-ng-dev`, `libdbus-1-dev`, `musl-tools` — and `shellcheck` for
-`script/test/ci-contracts.sh`;
+`libcap-ng-dev`, `libdbus-1-dev` — plus `musl-tools` for that musl target, and
+`shellcheck` for `script/test/ci-contracts.sh`;
 - the **pinned Verus release** CI verifies with, on `linux/amd64` (see the
 Apple Silicon note below).
 
@@ -91,24 +92,11 @@ agent-vm claude --yes
 agent-vm shell --layer examples/layers/rust-dev --yes
 ```
 
-Once booted, the guest can run the repo's Rust gates the way CI does. The
-guest `agentd` has to be built first — the microsandbox SDK's build script
-embeds it, and a host (macOS) copy is not a Linux binary:
+Once booted, the guest can run the repo's Rust gates the way CI does. These
+gates need no guest `agentd` build first: agent-vm drives an external `msb`,
+and only `msb` embeds `agentd`.
 
 ```sh
-# Build the guest agentd the SDK embeds. The musl target is derived from the
-# active host triple, so this works on x86_64 and aarch64 alike:
-musl="$(rustc -vV | sed -n 's/^host: \(.*\)-unknown-linux-gnu$/\1/p')-unknown-linux-musl"
-cargo build --release \
-  --manifest-path vendor/microsandbox/crates/agentd/Cargo.toml \
-  --target-dir vendor/microsandbox/target \
-  --target "$musl"
-mkdir -p vendor/microsandbox/build
-cp "vendor/microsandbox/target/$musl/release/agentd" \
-   vendor/microsandbox/build/agentd
-touch vendor/microsandbox/build/agentd
-
-# Then the workspace gates:
 cargo build --release -p agent-vm
 cargo test -p agent-vm
 cargo clippy --locked --workspace --all-targets -- -D warnings

@@ -378,7 +378,7 @@ assert_mode 644 "$fixture/target/macos/lib/libkrunfw.5.dylib"
 assert_file_contains "$fixture/calls.log" "docker build -f Dockerfile.agentd -t microsandbox-agentd-build ."
 assert_file_contains "$fixture/calls.log" "docker cp fake-container:/agentd build/.agentd.next"
 assert_file_contains "$fixture/calls.log" "docker rm fake-container"
-assert_file_contains "$fixture/calls.log" "--release --no-default-features --features net,ssh -p microsandbox-cli"
+assert_file_contains "$fixture/calls.log" "--release --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli"
 assert_file_contains "$fixture/calls.log" "codesign --entitlements msb-entitlements.plist --force -s - build/msb"
 assert_file_contains "$fixture/calls.log" "firmware docker build"
 assert_file_contains "$fixture/calls.log" "-DABI_VERSION=5"
@@ -387,7 +387,7 @@ assert_file_contains "$fixture/calls.log" "target=$fixture/vendor/microsandbox/t
 assert_file_contains "$fixture/calls.log" "target=$fixture/target"
 assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 rustc --version"
 assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 cargo --version"
-assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 cargo build --release --no-default-features --features net,ssh -p microsandbox-cli"
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 cargo build --release --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli"
 assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 cargo build --release -p agent-vm"
 
 # A present firmware output is reused on the next build.
@@ -439,7 +439,7 @@ run_build "$fixture" "$fakebin" -- --dev
 [[ -f "$fixture/target/macos-dev/lib/libkrunfw.5.dylib" ]]
 assert_file_contains "$fixture/target/macos-dev/bin/agent-vm" "fake-fresh"
 assert_file_contains "$fixture/target/macos-dev/bin/msb" "fake-fresh"
-assert_file_contains "$fixture/calls.log" "cargo build --no-default-features --features net,ssh -p microsandbox-cli"
+assert_file_contains "$fixture/calls.log" "cargo build --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli"
 assert_file_contains "$fixture/calls.log" "cargo build -p agent-vm"
 assert_file_contains "$fixture/calls.log" "codesign --entitlements msb-entitlements.plist --force -s - build/msb-dev"
 [[ -f "$fixture/vendor/microsandbox/build/msb-dev" ]]
@@ -457,7 +457,7 @@ run_build "$fixture" "$fakebin" env \
     FAKE_PINNED_RUST_VERSION='rustc 1.98.1 (fake)'
 assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 rustc --version"
 assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 cargo --version"
-assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 cargo build --release --no-default-features --features net,ssh -p microsandbox-cli"
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 cargo build --release --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli"
 assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 cargo build --release -p agent-vm"
 make_fixture old-pinned-rust
 # Open-coded rather than expect_build_failure so this case's own captured

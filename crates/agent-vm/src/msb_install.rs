@@ -148,13 +148,13 @@ fn missing_msb_diagnostic(layout: MissingMsbLayout) -> &'static str {
              The `vendor/microsandbox` submodule is initialized, but the runtime has not been built.\n\
              On Apple Silicon macOS, run:\n\
                ./script/build/macos.sh\n\
-             Other source builds: run `cd vendor/microsandbox && just build release`."
+             Other source builds: run `cd vendor/microsandbox && JUST_UNSTABLE=1 just build release`."
         }
         MissingMsbLayout::InstalledBundle => {
             "agent-vm could not find its bundled `msb` binary.\n\
              - Installed via npm? The platform subpackage is missing — try `npm install -g @wirenboard/agent-vm --force`.\n\
              - Running from source on Apple Silicon macOS? Run `./script/build/macos.sh`.\n\
-             - Other source builds? Run `cd vendor/microsandbox && just build release`."
+             - Other source builds? Run `cd vendor/microsandbox && JUST_UNSTABLE=1 just build release`."
         }
     }
 }
@@ -280,8 +280,8 @@ pub fn effective_cache_dir() -> Result<PathBuf> {
 ///
 /// Reads any existing config into a `serde_json::Value`, sets only
 /// `paths.cache`, and writes the document back. We merge into an untyped
-/// `Value` rather than round-tripping through microsandbox's `LocalConfig`
-/// on purpose: a full `LocalConfig` re-serialize would materialize every
+/// `Value` rather than round-tripping through microsandbox's `GlobalConfig`
+/// on purpose: a full `GlobalConfig` re-serialize would materialize every
 /// default field AND drop any keys a newer separately-installed msb wrote
 /// that agent-vm's pinned SDK doesn't model. Untyped merge keeps the file
 /// minimal and forward-compatible. Idempotent: re-running re-asserts the
@@ -363,9 +363,9 @@ const SHORT_MACOS_MSB_HOME_DIRNAME: &str = ".agent-vm-msb";
 /// returns the much shorter `$HOME/.agent-vm-msb` instead (AC#6, agent-vm
 /// issue #40).
 ///
-/// Why: v0.6.15's per-sandbox agent/control sockets live at
+/// Why: the vendored runtime's per-sandbox agent/control sockets live at
 /// `<MSB_HOME>/run/sandboxes/<24-hex-char-id>/{agent,control}.sock`
-/// (`vendor/microsandbox/crates/runtime/lib/ipc.rs::sandbox_socket_paths`).
+/// (`vendor/microsandbox/crates/runtime/lib/client/ipc.rs::sandbox_socket_paths`).
 /// The sandbox *name* itself is SHA-256-hashed to that fixed-length id
 /// before it ever reaches a socket path, so — unlike in the pre-#40 fork
 /// vintage this AC's wording was written against — the long, unbounded
@@ -481,13 +481,20 @@ fn socket_path_fits(len: usize) -> (ok: bool)
 /// hard error naming the offending path and the fix (a shorter
 /// `AGENT_VM_STATE_DIR`).
 pub fn ensure_socket_paths_fit(sandbox_name: &str) -> Result<()> {
-    // "run" mirrors `microsandbox_utils::RUN_SUBDIR` / `LocalConfig::run_dir()`
+    // "run" mirrors `microsandbox_utils::RUN_SUBDIR` / `GlobalConfig::run_dir()`
     // (vendor/microsandbox/sdk/rust/lib/config/mod.rs) — not worth an extra
     // direct dependency on microsandbox-utils just for this one literal.
     let run_dir = msb_home_dir()?.join("run");
     let paths = microsandbox_runtime::ipc::sandbox_socket_paths(&run_dir, sandbox_name);
-    // `control.sock` is always the longer of the two canonical socket
-    // names ("control" > "agent"), so checking it alone covers both.
+    // Checking the canonical `control.sock` alone covers every path whose
+    // overflow would fail boot. It is the longer canonical socket ("control"
+    // > "agent"), and it is longer than the legacy `agent/<32-hex>.sock`
+    // compatibility symlink the runtime also publishes, where an overflow is
+    // fatal. The one longer path, the legacy `agent/<32-hex>.control.sock`
+    // symlink, only logs a warning when it does not fit
+    // (`runner/vm.rs`, `publish_legacy_control_link`), and agent-vm never
+    // dials it. Pinned by
+    // `canonical_control_socket_bounds_every_boot_fatal_socket_path`.
     check_socket_path_len(&paths.control, sandbox_name)
 }
 
@@ -646,7 +653,7 @@ fn verify_official_identity_with_path_source(
     }
     let expected = expected_msb_version();
     // clap's default `--version` output is `"<bin-name> <version>"`
-    // (`msb 0.6.15`); the version is always the last whitespace-separated
+    // (`msb 0.7.4`); the version is always the last whitespace-separated
     // token, regardless of what a shadowing binary happens to call itself.
     let reported = stdout
         .trim()
@@ -723,7 +730,7 @@ mod tests {
         // bump that the vendored Cargo.toml's version didn't actually track,
         // which `include_str!` alone can't catch (it'd just read the new
         // value). Bump this literal by hand alongside the gitlink.
-        assert_eq!(expected_msb_version(), "0.6.15");
+        assert_eq!(expected_msb_version(), "0.7.4");
     }
 
     #[test]
@@ -816,6 +823,25 @@ mod tests {
     #[test]
     fn short_macos_msb_home_falls_through_without_home() {
         assert_eq!(short_macos_msb_home(true, false, None), None);
+    }
+
+    /// `ensure_socket_paths_fit` checks only the canonical control socket.
+    /// That is sound only while every socket path whose overflow fails boot is
+    /// no longer than it. Re-derived from the vendored runtime so a pin bump
+    /// that changes the layout fails here.
+    #[test]
+    fn canonical_control_socket_bounds_every_boot_fatal_socket_path() {
+        let run_dir = Path::new("/r/run");
+        let paths = microsandbox_runtime::ipc::sandbox_socket_paths(run_dir, "agent-vm-x");
+        let checked = paths.control.as_os_str().len();
+        for fatal in [&paths.agent, &paths.legacy_agent] {
+            assert!(
+                fatal.as_os_str().len() <= checked,
+                "{} is longer than the checked {}",
+                fatal.display(),
+                paths.control.display()
+            );
+        }
     }
 
     #[test]
@@ -944,7 +970,7 @@ mod tests {
              The `vendor/microsandbox` submodule is initialized, but the runtime has not been built.\n\
              On Apple Silicon macOS, run:\n\
                ./script/build/macos.sh\n\
-             Other source builds: run `cd vendor/microsandbox && just build release`."
+             Other source builds: run `cd vendor/microsandbox && JUST_UNSTABLE=1 just build release`."
         );
         assert!(!message.contains("uninitialized"));
     }
@@ -958,7 +984,7 @@ mod tests {
             "agent-vm could not find its bundled `msb` binary.\n\
              - Installed via npm? The platform subpackage is missing — try `npm install -g @wirenboard/agent-vm --force`.\n\
              - Running from source on Apple Silicon macOS? Run `./script/build/macos.sh`.\n\
-             - Other source builds? Run `cd vendor/microsandbox && just build release`."
+             - Other source builds? Run `cd vendor/microsandbox && JUST_UNSTABLE=1 just build release`."
         );
         assert!(!message.contains("submodule is uninitialized"));
     }
@@ -1129,10 +1155,10 @@ mod tests {
         );
     }
 
-    /// Contract test: proves microsandbox's own `LocalConfig` actually
+    /// Contract test: proves microsandbox's own `GlobalConfig` actually
     /// resolves the key/nesting this module writes. Without this, a silent
     /// mis-nesting would still pass the tests above (they only check our own
-    /// JSON shape) yet redirect nothing, because `LocalConfig` is
+    /// JSON shape) yet redirect nothing, because `GlobalConfig` is
     /// `#[serde(default)]` and tolerates unknown/misplaced keys.
     #[test]
     fn written_config_is_honoured_by_microsandbox_local_config() {
@@ -1143,7 +1169,7 @@ mod tests {
         write_shared_cache_config(msb_home.path(), &cache_dir).unwrap();
 
         let bytes = std::fs::read(msb_home.path().join(MSB_CONFIG_FILENAME)).unwrap();
-        let cfg: microsandbox::config::LocalConfig = serde_json::from_slice(&bytes).unwrap();
+        let cfg: microsandbox::config::GlobalConfig = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(cfg.cache_dir(), cache_dir);
     }
 

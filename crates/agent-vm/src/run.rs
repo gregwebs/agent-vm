@@ -2872,7 +2872,7 @@ async fn seed_pulled_marker_if_absent(image: &str) {
     // seed, and there's correctly nothing newer to flag: the imminent
     // IfMissing pull lands the current image.
     //
-    // Baseline v0.6.15's Image::get resolves the active local backend
+    // Baseline 0.7.x's Image::get resolves the active local backend
     // internally (crate::backend::default_backend()), so no separate
     // LocalBackend handle is needed here any more.
     if let Ok(handle) = microsandbox::Image::get(image).await

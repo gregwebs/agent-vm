@@ -13,7 +13,7 @@ COHORT = frozenset((
     "msb_krun_devices", "msb_krun_hvf", "msb_krun_kernel", "msb_krun_polly",
     "msb_krun_smbios", "msb_krun_utils", "msb_krun_vmm",
 ))
-VERSION = "0.1.32"
+VERSION = "0.1.39"
 FIRMWARE_VERSION = "5.6.1"
 FIRMWARE_ABI = "5"
 REGISTRY_PREFIX = "registry+https://github.com/rust-lang/crates.io-index"

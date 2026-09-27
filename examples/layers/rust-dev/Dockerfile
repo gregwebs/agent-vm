@@ -9,7 +9,7 @@
 #   agent-vm shell --layer examples/layers/rust-dev --yes
 #
 # It provides the toolchain the repo pins (rust-toolchain.toml) with clippy and
-# rustfmt, the musl target the guest agentd needs, the native libraries
+# rustfmt, the musl target a vendored agentd/msb build needs, the native libraries
 # ci.yml installs, shellcheck for script/test/ci-contracts.sh, and the pinned
 # Verus release CI verifies with. See examples/layers/README.md and
 # docs/adr/0003-project-tooling-layers.md.
@@ -48,7 +48,8 @@ ARG CARGO_HOME=/opt/cargo
 # already has build-essential; this slim base does not):
 #   - build-essential, pkg-config: cc/pkg-config for the -sys crates
 #     (libcap-ng, dbus) the microsandbox SDK links against;
-#   - musl-tools: the *-unknown-linux-musl target the guest agentd needs;
+#   - musl-tools: the *-unknown-linux-musl target the guest agentd needs
+#     when building the vendored msb (agent-vm itself does not need it);
 #   - shellcheck: script/test/ci-contracts.sh lints the repo's scripts.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \

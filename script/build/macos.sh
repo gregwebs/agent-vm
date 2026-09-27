@@ -199,7 +199,7 @@ build_and_sign_msb() {
         # shellcheck disable=SC2086
         CARGO_NET_GIT_FETCH_WITH_CLI="${CARGO_NET_GIT_FETCH_WITH_CLI:-true}" \
             CARGO_TARGET_DIR="$REPO_ROOT/vendor/microsandbox/target" \
-            run_rust_tool cargo build $cargo_release_flag --no-default-features --features net,ssh -p microsandbox-cli
+            run_rust_tool cargo build $cargo_release_flag --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli
         mkdir -p build
         install -m 0755 "target/$cargo_subdir/msb" "build/$msb_name"
         codesign --entitlements msb-entitlements.plist --force -s - "build/$msb_name"

@@ -361,7 +361,7 @@ as a CLI contract.
 
 `./script/check-runtime-provenance.sh` checks both independent Cargo roots (the
 outer workspace and `vendor/microsandbox`) for the identical official crates.io
-`msb_krun*` 0.1.32 cohort and checksum map, plus the pinned `vendor/libkrunfw`
+`msb_krun*` 0.1.39 cohort and checksum map, plus the pinned `vendor/libkrunfw`
 gitlink, firmware version/ABI, and the x86 source-configuration contract. This
 establishes **source identity**, not an attestation that a given executable came
 from that source; release provenance is separate, unfinished work.
@@ -1099,6 +1099,7 @@ directories the user never asked for. The state-root precedence is in
 | Forked mounts and opaque exclusions (superseded for file forks and live exclusions) | [ADR-0013](docs/adr/0013-add-forked-mounts.md) |
 | Narrowing fork mounts to directories; files read-only | [ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md) |
 | User-authorized YAML credentials (`credentials.yaml`) | [ADR-0025](docs/adr/0025-yaml-credential-shielding.md) |
+| Accepting Basic auth in the header substitution scope (microsandbox 0.7.4) | [ADR-0026](docs/adr/0026-accept-basic-auth-in-header-substitution-scope.md) |
 
 ## Deliberate non-goals
 

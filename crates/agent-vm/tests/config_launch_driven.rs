@@ -111,45 +111,45 @@ fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
 }
 
+#[path = "support/fake_msb.rs"]
+mod fake_msb;
+
 fn write_fake_msb(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("msb");
-    // A credential-bearing launch makes the SDK probe `<msb> __capabilities`
-    // and require exactly `header-credential-launch-v1` on stdout (microsandbox
-    // #175). Any other argv must still answer with the version line, BYTE FOR
-    // BYTE as before, or `msb_install`'s patched-build check would start
-    // refusing the fake and every launch golden here would fail for the wrong
-    // reason.
+    // A credential-bearing launch makes the SDK probe `<msb> __launch-protocol`
+    // and require `header_credentials: true` in the JSON reply (microsandbox
+    // 0.7.x replaced the 0.6.x `__capabilities` + `header-credential-launch-v1`
+    // line; see the vendored sdk/rust/lib/runtime/launch_contract.rs).
+    // `protocols` must contain 2 for a restore-backed launch. Any other argv
+    // must still answer with the version line, BYTE FOR BYTE as before, or
+    // `msb_install`'s patched-build check would start refusing the fake and
+    // every launch golden here would fail for the wrong reason.
     //
     // Every invocation is appended to a sibling log so a test can assert the
     // probe *actually happened* rather than inferring it from the absence of an
     // error (agent-vm #161 review, M4).
-    std::fs::write(
+    fake_msb::write_executable(
         &path,
-        "#!/bin/sh\n\
-         echo \"$*\" >> \"$(dirname \"$0\")/msb-invocations.log\"\n\
-         if [ \"$1\" = \"__capabilities\" ]; then\n\
-         \x20 echo 'header-credential-launch-v1'\n\
-         \x20 exit 0\n\
-         fi\n\
-         echo 'msb 0.6.15'\nexit 0\n",
-    )
-    .unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
+        &format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> \"$(dirname \"$0\")/msb-invocations.log\"\n\
+             if [ \"$1\" = \"__launch-protocol\" ]; then\n\
+             \x20 echo '{{\"protocols\":[1,2],\"required_restore_backing\":true,\"header_credentials\":true}}'\n\
+             \x20 exit 0\n\
+             fi\n\
+             echo '{}'\nexit 0\n",
+            fake_msb::VERSION_LINE
+        ),
+    );
+    // 0.7.4's runtime resolver refuses an `msb` with no adjacent libkrunfw
+    // ("has no matching libkrunfw"), so the fixture has to be a complete pair.
+    // The name is platform-specific (`libkrunfw.5.dylib` on macOS,
+    // `libkrunfw.so.<version>` elsewhere), hence the vendored helper rather
+    // than a literal. Nothing reads the file's contents here -- the resolver
+    // only checks that it exists.
+    let library = dir.join(microsandbox_utils::libkrunfw_filename(std::env::consts::OS));
+    std::fs::write(&library, b"fixture").unwrap();
     path
-}
-
-/// Write an executable script. Used for the credential sentinel (S-2): if it
-/// runs, it appends to its marker file, so an empty marker after a launch is
-/// proof that nothing resolved the `!command` values in guest Pi state.
-fn write_executable(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, body).unwrap();
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).unwrap();
 }
 
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
@@ -326,7 +326,7 @@ impl Harness {
     fn saw_capability_probe(&self) -> bool {
         self.msb_log()
             .lines()
-            .any(|line| line.starts_with("__capabilities"))
+            .any(|line| line.starts_with("__launch-protocol"))
     }
 
     /// Launch a default tool with no extra args.
@@ -885,7 +885,7 @@ fn malformed_credentials_yaml_fails_the_launch_with_a_redacted_message() {
 #[test]
 fn a_credential_bearing_launch_runs_the_capability_probe() {
     // A *genuinely* credential-bearing create (a durable `header_credentials`
-    // entry) must make the SDK run `<msb> __capabilities`. The subprocess has no
+    // entry) must make the SDK run `<msb> __launch-protocol`. The subprocess has no
     // fake OS keychain, so the credential is made ready through the debug-only
     // `AGENT_VM_TEST_CREDENTIAL` seam. Two independent positive controls: the
     // fake msb logged the probe, and the launch's outcome is the bogus-image
@@ -1630,7 +1630,11 @@ fn golden_path(tool: &str) -> PathBuf {
 
 /// `UPDATE_LAUNCH_GOLDENS=1` rewrites the fixtures instead of asserting, so a
 /// future intentional default change has a mechanical update path. The
-/// fixtures in-tree were regenerated for #118 (the provisioning-set change).
+/// fixtures in-tree were regenerated for #118 (the provisioning-set change)
+/// and again for the microsandbox 0.7.4 sync (`injection` -> `substitution`
+/// with `basic_auth` folded into `headers`, `on_violation` ->
+/// `violation_action`, and the new `network.strict` /
+/// `external_mount_policy` fields).
 fn assert_matches_golden(tool: &str, actual: &str) {
     let path = golden_path(tool);
     if std::env::var_os("UPDATE_LAUNCH_GOLDENS").is_some() {
@@ -1641,7 +1645,7 @@ fn assert_matches_golden(tool: &str, actual: &str) {
         .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
     assert_eq!(
         actual, expected,
-        "launch observation for {tool} changed vs the {tool} golden regenerated for #118\n\
+        "launch observation for {tool} changed vs the {tool} golden\n\
          (rerun with UPDATE_LAUNCH_GOLDENS=1 only if the change is intentional)"
     );
 }
@@ -3614,7 +3618,7 @@ fn every_launch_scan_resolves_nothing() {
     std::fs::create_dir_all(&sentinel_dir).unwrap();
     let marker = harness.home_root.join(".credential-sentinel-marker");
     let sentinel = sentinel_dir.join("credential-sentinel");
-    write_executable(
+    fake_msb::write_executable(
         &sentinel,
         "#!/bin/sh\nprintf 'ran\\n' >> \"$CREDENTIAL_SENTINEL_MARKER\"\nexit 1\n",
     );

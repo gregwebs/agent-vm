@@ -18,10 +18,11 @@ verify = true
 # Verus's standard library, for the in-place `verus!` contracts.
 # See docs/adr/0018-machine-checked-boundary-contracts.md.
 vstd = "=0.0.0-2026-09-20-0158"
-# default-features = false drops the SDK's `prebuilt` feature, so building
-# agent-vm never downloads the upstream msb+libkrunfw bundle — we ship our own
-# from-source msb. Keep net + keyring (the SDK's other defaults).
-microsandbox = { path = "../../vendor/microsandbox/sdk/rust", default-features = false, features = ["net", "keyring"] }
+# default-features = false drops the SDK's `download-binaries` feature, so
+# building agent-vm never downloads the upstream msb+libkrunfw bundle — we ship
+# our own from-source msb. Keep `local` (the in-process sandbox/SDK surface),
+# plus net + keyring.
+microsandbox = { path = "../../vendor/microsandbox/sdk/rust", default-features = false, features = ["local", "net", "keyring"] }
 # Direct dep (not re-exported by the SDK crate above) so run.rs/layer.rs can
 # read cached OCI image metadata (GlobalCache::read_image_metadata) and
 # import Reference/ImageConfig/CachedImageMetadata directly.
@@ -31,7 +32,7 @@ microsandbox-image = { path = "../../vendor/microsandbox/crates/image" }
 # build graph transitively via the microsandbox SDK crate; this just makes
 # Migrator nameable here. No new compilation.
 microsandbox-migration = { path = "../../vendor/microsandbox/crates/migration" }
-# Direct dep because the v0.6.15 baseline SDK no longer re-exports this crate
+# Direct dep because the vendored 0.7.x SDK does not re-export this crate
 # (the 0.5.7 gw fork's sdk/rust/lib/lib.rs did). network.rs uses policy types,
 # while credential_injection.rs and intercept_hook.rs actively configure and
 # test NetworkBuilder, file-backed secrets, and request interception.
@@ -43,10 +44,11 @@ microsandbox-network = { path = "../../vendor/microsandbox/crates/network" }
 # preflight (AC#6, agent-vm issue #40) — reusing it, instead of
 # re-implementing the hash/path template by hand, keeps the check from
 # silently drifting out of sync with the actual boot path. Already in the
-# build graph transitively via the "net"-enabled SDK; default-features=false
-# only opts this crate itself out of "prebuilt"/"net", which nothing here
-# needs. No new compilation.
-microsandbox-runtime = { path = "../../vendor/microsandbox/crates/runtime", default-features = false }
+# build graph transitively via the `local`-enabled SDK; `client` is the
+# runtime feature that exposes `ipc`, and default-features=false keeps this
+# crate itself off `download-binaries`/`runner`, which nothing here needs.
+# No new compilation.
+microsandbox-runtime = { path = "../../vendor/microsandbox/crates/runtime", default-features = false, features = ["client"] }
 # Direct dep only so src/msb_preflight.rs can name Database/Statement/query_all
 # to read applied seaql_migrations without going through the SDK's crashing
 # open path (Migrator::up). Already in the build graph transitively (SDK +
@@ -163,6 +165,12 @@ keyring = { version = "3.6.3", features = ["crypto-rust", "linux-native-sync-per
 # transitively via `microsandbox-network`; this only makes the types nameable
 # here and compiles nothing new. See src/credential_injection.rs.
 microsandbox-types = { path = "../../vendor/microsandbox/packages/microsandbox-types/rust" }
+# Dev-dependency only so tests can name the platform-specific libkrunfw
+# filename the SDK's runtime resolver looks for. `microsandbox-utils` is
+# already in the graph (every vendored crate depends on it), so this adds no
+# new compilation -- it only makes the function nameable. See
+# `tests/config_launch_driven.rs`'s fake-runtime fixture.
+microsandbox-utils = { path = "../../vendor/microsandbox/crates/utils" }
 # Property tests for `mount::lexical_link_path` (pure string surgery over
 # symlink target text -- the one total function in that module, so the
 # obvious quickcheck candidate per CODING_STANDARDS "Use property based

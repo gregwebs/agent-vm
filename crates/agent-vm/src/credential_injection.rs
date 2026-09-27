@@ -60,7 +60,6 @@ struct FileSecret {
     placeholder: String,
     path: PathBuf,
     hosts: Vec<&'static str>,
-    basic_auth: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -107,7 +106,6 @@ impl Plan {
                         placeholder: spec.placeholder.into(),
                         path: path.to_path_buf(),
                         hosts: spec.hosts.to_vec(),
-                        basic_auth: spec.basic_auth,
                     });
                     if let Some((host, path)) = spec.oauth_token_route {
                         routes.push(Route {
@@ -134,7 +132,6 @@ impl Plan {
                                 secrets::GITHUB_RAW_HOST,
                                 secrets::GITHUB_OBJECTS_HOST,
                             ],
-                            basic_auth: true,
                         });
                         for method in API_METHODS {
                             routes.push(Route {
@@ -170,7 +167,6 @@ impl Plan {
                 placeholder: provider.placeholder.into(),
                 path: path.clone(),
                 hosts: vec![provider.host],
-                basic_auth: false,
             });
         }
 
@@ -247,13 +243,18 @@ impl Plan {
                     .env(secret.env_var)
                     .file(secret.path)
                     .placeholder(secret.placeholder)
-                    .inject_headers(true)
-                    .inject_basic_auth(secret.basic_auth)
-                    .inject_query(false)
-                    .inject_body(false)
+                    // 0.7.4 folds Basic-auth substitution into the header
+                    // scope: `headers` now governs both a plain header and an
+                    // `Authorization: Basic ...` line. agent-vm's per-secret
+                    // `basic_auth` opt-in is gone with it; every secret here
+                    // substitutes in headers only on its allow-listed hosts
+                    // (ADR-0026).
+                    .substitute_in_headers(true)
+                    .substitute_in_query(false)
+                    .substitute_in_body(false)
                     .require_tls_identity(true);
                 for host in secret.hosts {
-                    builder = builder.allow_host(host);
+                    builder = builder.allow(host);
                 }
                 builder
             });
@@ -358,7 +359,7 @@ mod tests {
     use microsandbox_network::{
         builder::NetworkBuilder,
         policy::{NetworkPolicy, NetworkProfile},
-        secrets::config::{HostPattern, SecretSource, ViolationAction},
+        secrets::config::{HostPattern, SecretSource, SecretViolationAction},
     };
 
     use super::*;
@@ -686,7 +687,7 @@ mod tests {
             assert!(entry.value.is_empty());
             assert!(matches!(entry.source, Some(SecretSource::File { .. })));
             assert!(entry.require_tls_identity);
-            assert!(entry.on_violation.is_none());
+            assert!(entry.violation_action.is_none());
             assert!(
                 entry
                     .allowed_hosts
@@ -694,7 +695,7 @@ mod tests {
                     .all(|host| matches!(host, HostPattern::Exact(_)))
             );
             assert!(
-                entry.injection.headers && !entry.injection.query_params && !entry.injection.body
+                entry.substitution.headers && !entry.substitution.query && !entry.substitution.body
             );
         }
         let gh = config
@@ -703,8 +704,14 @@ mod tests {
             .iter()
             .find(|entry| entry.placeholder == secrets::GH_TOKEN_PLACEHOLDER)
             .unwrap();
-        assert!(gh.injection.basic_auth);
-        assert_eq!(config.secrets.on_violation, ViolationAction::BlockAndLog);
+        // 0.7.4 folded Basic-auth substitution into the header scope, so the
+        // per-secret flag agent-vm used to assert here no longer exists; the
+        // GitHub secret is now indistinguishable from every other one.
+        assert!(gh.substitution.headers);
+        assert_eq!(
+            config.secrets.violation_action,
+            SecretViolationAction::BlockAndLog
+        );
         assert!(config.tls.enabled);
         assert_eq!(
             config.intercept.max_request_bytes,
@@ -782,9 +789,8 @@ mod tests {
                 matches!(&entry.allowed_hosts[0], HostPattern::Exact(host) if host == provider.host)
             );
             assert!(entry.require_tls_identity);
-            assert!(entry.injection.headers);
-            assert!(!entry.injection.basic_auth);
-            assert!(!entry.injection.query_params && !entry.injection.body);
+            assert!(entry.substitution.headers);
+            assert!(!entry.substitution.query && !entry.substitution.body);
             assert!(
                 config
                     .intercept
@@ -793,6 +799,162 @@ mod tests {
                     .all(|route| route.host != provider.host)
             );
         }
+    }
+
+    /// A launch plan registering every built-in secret, each backed by a real
+    /// file holding a distinct sentinel value, so the vendored engine can
+    /// resolve it. Returns the tempdir (kept alive by the caller), the network
+    /// config, and each placeholder's sentinel.
+    fn engine_fixture() -> (
+        tempfile::TempDir,
+        microsandbox_network::config::NetworkConfig,
+        Vec<(String, String)>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("REAL-{name}-SENTINEL\n")).unwrap();
+            path
+        };
+        let creds = CredsState {
+            anthropic_token_file: Some(file("anthropic")),
+            openai_token_file: Some(file("openai")),
+            opencode_openai_access_token_file: Some(file("opencode-openai")),
+            opencode_api_token_files: secrets::OPENCODE_API_PROVIDERS
+                .iter()
+                .map(|provider| (*provider, file(&format!("opencode-{}", provider.id))))
+                .collect(),
+            gh_token_file: Some(file("gh")),
+            copilot_token_file: Some(file("copilot")),
+            ..CredsState::default()
+        };
+        let config = network(Plan::new(path("agent-vm"), inputs(&creds, all())).unwrap());
+        let sentinels = config
+            .secrets
+            .secrets
+            .iter()
+            .map(|entry| {
+                let Some(SecretSource::File { path }) = &entry.source else {
+                    panic!("{} is not file-backed", entry.env_var);
+                };
+                let value = std::fs::read_to_string(path).unwrap();
+                (entry.placeholder.clone(), value.trim_end().to_owned())
+            })
+            .collect();
+        (dir, config, sentinels)
+    }
+
+    fn basic_auth_request(host: &str, user_pass: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(user_pass);
+        format!("GET / HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {encoded}\r\n\r\n")
+            .into_bytes()
+    }
+
+    /// Run one request through the vendored engine's secret substitution, as
+    /// the TLS proxy does for a connection to `host`.
+    fn engine_outcome(
+        config: &microsandbox_network::config::NetworkConfig,
+        host: &str,
+        tls_intercepted: bool,
+        request: &[u8],
+    ) -> Result<String, SecretViolationAction> {
+        microsandbox_network::secrets::handler::SecretsHandler::new(
+            &config.secrets,
+            host,
+            tls_intercepted,
+        )
+        .substitute(request)
+        .map(|out| String::from_utf8(out.into_owned()).unwrap())
+    }
+
+    /// ADR-0026: 0.7.4 folds Basic-auth substitution into the `headers`
+    /// scope, so every built-in secret — not just GitHub's, as under 0.6.x —
+    /// is substituted inside a decoded `Authorization: Basic` value. Pin that
+    /// this widening stays confined to each secret's own exact hosts over an
+    /// intercepted TLS connection, driven through agent-vm's real `Plan`
+    /// output and the vendored `SecretsHandler`.
+    #[test]
+    fn basic_auth_placeholder_is_substituted_only_on_the_secrets_own_hosts() {
+        use base64::Engine as _;
+
+        let (_dir, config, sentinels) = engine_fixture();
+        assert!(!config.secrets.secrets.is_empty());
+        for entry in &config.secrets.secrets {
+            let real = &sentinels
+                .iter()
+                .find(|(placeholder, _)| *placeholder == entry.placeholder)
+                .unwrap()
+                .1;
+            let user_pass = format!("x-access-token:{}", entry.placeholder);
+            let substituted_user_pass = format!("x-access-token:{real}");
+            let substituted_b64 =
+                base64::engine::general_purpose::STANDARD.encode(&substituted_user_pass);
+
+            for host in &entry.allowed_hosts {
+                let HostPattern::Exact(host) = host else {
+                    panic!("{} has a non-exact host", entry.env_var);
+                };
+                let request = basic_auth_request(host, &user_pass);
+                let out = engine_outcome(&config, host, true, &request).unwrap_or_else(|action| {
+                    panic!(
+                        "{} blocked on its own host {host}: {action:?}",
+                        entry.env_var
+                    )
+                });
+                assert!(
+                    out.contains(&substituted_b64),
+                    "{} was not substituted in Basic auth on {host}:\n{out}",
+                    entry.env_var
+                );
+
+                // Same host without TLS interception: every built-in secret
+                // requires TLS identity, so the placeholder is refused.
+                assert_eq!(
+                    engine_outcome(&config, host, false, &request).map(|_| ()),
+                    Err(SecretViolationAction::BlockAndLog),
+                    "{} substituted on plain {host}",
+                    entry.env_var
+                );
+            }
+
+            let foreign = "attacker.example";
+            let request = basic_auth_request(foreign, &user_pass);
+            assert_eq!(
+                engine_outcome(&config, foreign, true, &request).map(|_| ()),
+                Err(SecretViolationAction::BlockAndLog),
+                "{} placeholder in Basic auth was not blocked on a foreign host",
+                entry.env_var
+            );
+        }
+    }
+
+    /// One secret's own host never releases another secret's value through
+    /// Basic auth: the host scoping is per secret, not per launch.
+    #[test]
+    fn basic_auth_placeholder_is_blocked_on_another_secrets_host() {
+        let (_dir, config, _sentinels) = engine_fixture();
+        let anthropic = config
+            .secrets
+            .secrets
+            .iter()
+            .find(|entry| entry.placeholder == secrets::ANTHROPIC_ACCESS_PLACEHOLDER)
+            .unwrap();
+        let github_host = secrets::GITHUB_HOST;
+        assert!(
+            anthropic
+                .allowed_hosts
+                .iter()
+                .all(|host| !matches!(host, HostPattern::Exact(host) if host == github_host))
+        );
+        let request = basic_auth_request(
+            github_host,
+            &format!("x-access-token:{}", anthropic.placeholder),
+        );
+        assert_eq!(
+            engine_outcome(&config, github_host, true, &request).map(|_| ()),
+            Err(SecretViolationAction::BlockAndLog)
+        );
     }
 
     #[test]
@@ -873,21 +1035,18 @@ mod tests {
                     "platform.claude.com",
                     "mcp-proxy.anthropic.com",
                 ],
-                false,
             ),
             (
                 "MSB_AGENT_VM_OPENAI_UNUSED",
                 secrets::OPENAI_ACCESS_PLACEHOLDER,
                 "/host/openai",
                 vec!["api.openai.com", "chatgpt.com", "auth.openai.com"],
-                false,
             ),
             (
                 "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
                 secrets::OPENCODE_OPENAI_ACCESS_PLACEHOLDER,
                 "/host/openai",
                 vec!["api.openai.com", "chatgpt.com"],
-                false,
             ),
             (
                 "MSB_AGENT_VM_GH_UNUSED",
@@ -900,17 +1059,15 @@ mod tests {
                     "raw.githubusercontent.com",
                     "objects.githubusercontent.com",
                 ],
-                true,
             ),
             (
                 "MSB_AGENT_VM_COPILOT_UNUSED",
                 secrets::COPILOT_TOKEN_PLACEHOLDER,
                 "/host/copilot",
                 vec!["api.githubcopilot.com", "api.individual.githubcopilot.com"],
-                false,
             ),
         ];
-        for (env_var, placeholder, source_path, hosts, basic_auth) in expected {
+        for (env_var, placeholder, source_path, hosts) in expected {
             let entry = config
                 .secrets
                 .secrets
@@ -924,7 +1081,11 @@ mod tests {
                     path: PathBuf::from(source_path)
                 })
             );
-            assert_eq!(entry.injection.basic_auth, basic_auth);
+            // Every secret substitutes in the header scope on its own hosts.
+            // The per-secret Basic-auth opt-in 0.6.x carried is gone
+            // (ADR-0026); its engine-level behaviour is pinned by the
+            // `basic_auth_placeholder_*` tests above.
+            assert!(entry.substitution.headers);
             assert_eq!(
                 entry
                     .allowed_hosts
@@ -1303,7 +1464,8 @@ mod tests {
     /// real rather than assumed.
     #[test]
     fn an_undeclared_port_is_refused_by_the_engine_config_validation() {
-        use microsandbox_network::network::{NetworkInitError, SmoltcpNetwork};
+        use microsandbox_network::ResolvedNetworkConfig;
+        use microsandbox_network::network::{HostIntegrations, NetworkInitError, SmoltcpNetwork};
         use microsandbox_network::secrets::credential::ResolvedHeaderCredential;
         use microsandbox_types::{DeploymentProfile, DurableHeaderCredential, HttpsOrigin};
 
@@ -1327,11 +1489,14 @@ mod tests {
         config.tls.intercepted_ports = vec![443];
         config.secrets.header_credentials.push(definition);
 
-        let err = match SmoltcpNetwork::new_with_profile_and_credentials(
-            config,
+        let err = match SmoltcpNetwork::with_host(
+            ResolvedNetworkConfig::new(config, None),
             0,
             DeploymentProfile::SingleTenant,
-            vec![resolved],
+            HostIntegrations {
+                resolved_header_credentials: vec![resolved],
+                ..HostIntegrations::default()
+            },
         ) {
             Ok(_) => panic!("an undeclared port must be refused by the engine"),
             Err(err) => err,

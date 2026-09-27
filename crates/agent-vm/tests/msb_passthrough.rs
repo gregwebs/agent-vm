@@ -82,6 +82,9 @@ fn seed_sqlite_db(path: &Path, versions: &[&str]) {
 const FUTURE_MIGRATION: &str = "m29990101_000001_future_thing";
 const BUNDLED_MIGRATION: &str = "m20260305_000001_create_image_tables";
 
+#[path = "support/fake_msb.rs"]
+mod fake_msb;
+
 /// Write a fake `msb` that:
 /// - answers a bare `--version` (exactly one arg) with the official
 ///   version this agent-vm build vendors, satisfying `point_at_msb()`'s
@@ -90,17 +93,18 @@ const BUNDLED_MIGRATION: &str = "m20260305_000001_create_image_tables";
 ///   `$MSB_HOME` to `$RECORD_FILE` (if set), prints a distinguishing
 ///   marker to stdout, and exits with `$FAKE_MSB_EXIT_CODE` (default 0).
 fn write_fake_msb(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("msb");
-    std::fs::write(
+    let version_line = fake_msb::VERSION_LINE;
+    fake_msb::write_executable(
         &path,
-        r#"#!/bin/sh
+        &format!(
+            r#"#!/bin/sh
 if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
-    echo 'msb 0.6.15'
+    echo '{version_line}'
     exit 0
 fi
 if [ -n "$RECORD_FILE" ]; then
-    {
+    {{
         printf 'MSB_HOME=%s\n' "$MSB_HOME"
         printf 'ARGC=%s\n' "$#"
         i=1
@@ -108,16 +112,13 @@ if [ -n "$RECORD_FILE" ]; then
             printf 'ARG%s=%s\n' "$i" "$a"
             i=$((i + 1))
         done
-    } > "$RECORD_FILE"
+    }} > "$RECORD_FILE"
 fi
 printf 'FAKE_MSB_STDOUT_MARKER:%s\n' "$*"
-exit "${FAKE_MSB_EXIT_CODE:-0}"
-"#,
-    )
-    .unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
+exit "${{FAKE_MSB_EXIT_CODE:-0}}"
+"#
+        ),
+    );
     path
 }
 

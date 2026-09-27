@@ -1,7 +1,7 @@
 //! Group A integration tests for issue #42 ("Migrate existing Microsandbox
 //! state safely"): prove the vendored forward migration from the 0.5.7
-//! schema (an exact 11-migration prefix of v0.6.15's 24) to the bundled
-//! v0.6.15 head is safe, idempotent across repeated restarts, and preserves
+//! schema (an exact 11-migration prefix of v0.7.4's 28) to the bundled
+//! v0.7.4 head is safe, idempotent across repeated restarts, and preserves
 //! representative image/sandbox/volume/snapshot state (AC 1-3, 6).
 //!
 //! Drives `microsandbox_migration::Migrator::up` directly against a
@@ -28,7 +28,7 @@ use sea_orm_migration::sea_orm::{
 
 /// The exact 11 migration ids that shipped in the 0.5.7 release (commit
 /// `4dbb712b`), name-identical to and an exact prefix of the vendored
-/// v0.6.15 `Migrator`'s 24 (`crates/migration/lib/lib.rs`). Hand-pinned
+/// v0.7.4 `Migrator`'s 28 (`crates/migration/lib/lib.rs`). Hand-pinned
 /// (mirroring `msb_schema.rs`'s pinned-literal-with-drift-guard style) so a
 /// future re-ordering or insertion ahead of this prefix in the vendored
 /// migration set is caught by `migration_ids_0_5_7_matches_the_bundled_prefix`
@@ -367,7 +367,7 @@ async fn upgraded_seeded_db(db_path: &Path) -> (DatabaseConnection, Fixture) {
 
     Migrator::up(&conn, None)
         .await
-        .expect("forward-migrate 0.5.7 -> the bundled v0.6.15 head");
+        .expect("forward-migrate 0.5.7 -> the bundled v0.7.4 head");
 
     (conn, fixture)
 }
@@ -388,8 +388,8 @@ async fn fresh_0_5_7_db_forward_migrates_once_to_bundled_head() {
         applied_versions(&conn).await.into_iter().collect();
     assert_eq!(
         applied.len(),
-        24,
-        "AC-1: exactly the bundled 24 migrations must be applied after one upgrade"
+        28,
+        "AC-1: exactly the bundled 28 migrations must be applied after one upgrade"
     );
     assert_eq!(
         applied,
@@ -408,7 +408,7 @@ async fn repeated_restarts_are_noops() {
     let (conn, _fixture) = upgraded_seeded_db(&dir.path().join("msb.db")).await;
 
     let after_first_upgrade = applied_versions(&conn).await;
-    assert_eq!(after_first_upgrade.len(), 24);
+    assert_eq!(after_first_upgrade.len(), 28);
     let sandboxes_after_first_upgrade = read_all_sandbox_configs(&conn).await;
 
     for restart in 2..=3 {
@@ -419,7 +419,7 @@ async fn repeated_restarts_are_noops() {
         let applied_now = applied_versions(&conn).await;
         assert_eq!(
             applied_now.len(),
-            24,
+            28,
             "restart {restart}: AC-2 -- no destructive or duplicate migration"
         );
         assert_eq!(
@@ -508,11 +508,14 @@ async fn representative_state_survives_upgrade() {
 
     // m20260708_000001_migrate_bind_rootfs_source: the real 0.5.7 bare
     // `image.bind` string must have been rewritten to the
-    // {path, follow_root_symlinks} object shape.
+    // {path, follow_root_symlinks} object shape, and
+    // m20260922_000001_migrate_secret_config's v0.6.5 compat pass renames the
+    // tag to its canonical `Bind` spelling (the shape `RootfsSource::Bind`
+    // actually serializes as).
     let web_bind_config = sandbox_config_json(&conn, "web-bind").await;
-    assert_eq!(web_bind_config["image"]["bind"]["path"], "/srv/rootfs");
+    assert_eq!(web_bind_config["image"]["Bind"]["path"], "/srv/rootfs");
     assert_eq!(
-        web_bind_config["image"]["bind"]["follow_root_symlinks"],
+        web_bind_config["image"]["Bind"]["follow_root_symlinks"],
         false
     );
 

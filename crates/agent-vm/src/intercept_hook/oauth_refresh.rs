@@ -1350,8 +1350,9 @@ mod tests {
 
     #[test]
     fn hook_timeout_contract_has_headroom() {
-        let handler =
-            include_str!("../../../../vendor/microsandbox/crates/network/lib/intercept/handler.rs");
+        let handler = include_str!(
+            "../../../../vendor/microsandbox/crates/network/lib/engine/intercept/handler.rs"
+        );
         assert!(handler.contains("Duration::from_secs(90)"));
         assert!(
             LOCK_CEILING
