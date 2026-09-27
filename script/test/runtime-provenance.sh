@@ -7,7 +7,7 @@ cd "$repo_root"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/agent-vm-runtime-provenance.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
-libkrunfw_version=1efc0dfd24f0f7cb4829735d3e5b97d298823afd
+libkrunfw_version=b5ff2425abd98c4d3bf409b057cf9d5852391657
 
 base=(python3 script/check-runtime-provenance.py
     --root-lock Cargo.lock --nested-lock vendor/microsandbox/Cargo.lock
@@ -35,9 +35,9 @@ cp Cargo.lock "$tmp/root.lock"
 python3 - "$tmp/root.lock" <<'PY'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1]); s = p.read_text(); start = s.index('name = "msb_krun"'); end = s.index('[[package]]', start + 1)
-p.write_text(s[:start] + s[start:end].replace('version = "0.1.32"', 'version = "0.1.31"', 1) + s[end:])
+p.write_text(s[:start] + s[start:end].replace('version = "0.1.39"', 'version = "0.1.38"', 1) + s[end:])
 PY
-expect_failure 'msb_krun is 0.1.31' --root-lock "$tmp/root.lock"
+expect_failure 'msb_krun is 0.1.38' --root-lock "$tmp/root.lock"
 
 cp Cargo.lock "$tmp/source.lock"
 python3 - "$tmp/source.lock" <<'PY'
@@ -60,7 +60,7 @@ PY
 expect_failure 'locks disagree' --root-lock "$tmp/checksum.lock"
 
 cp Cargo.toml "$tmp/patch.toml"
-printf '\n[patch.crates-io]\nmsb_krun = "0.1.32"\n' >>"$tmp/patch.toml"
+printf '\n[patch.crates-io]\nmsb_krun = "0.1.39"\n' >>"$tmp/patch.toml"
 expect_failure 'overrides cohort crate' --root-manifest "$tmp/patch.toml"
 expect_failure 'firmware gitlink mode is' --gitlink-mode 100644
 expect_failure 'expected gitlink deadbeef' --gitlink deadbeef

@@ -45,10 +45,13 @@ through its supported recipe, and then build agent-vm:
 
 ```bash
 sudo apt-get install -y libcap-ng-dev libdbus-1-dev pkg-config
-(cd vendor/microsandbox && just build release)
+(cd vendor/microsandbox && JUST_UNSTABLE=1 just build release)
 cargo build --release -p agent-vm
 ./target/release/agent-vm setup
 ```
+
+`JUST_UNSTABLE=1` is required because the vendored justfile uses `just`'s
+unstable `[script]` attribute.
 
 Source builds use the vendored recipe's `vendor/microsandbox/build/msb`
 artifact; `agent-vm setup` pulls and verifies the selected registry image but

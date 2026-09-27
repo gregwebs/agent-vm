@@ -20,19 +20,8 @@ fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
 }
 
-/// Fake `msb` that only needs to answer `--version` with the official
-/// version this agent-vm build vendors; the preflight guard must bail
-/// (ahead case) or fail past it before any real msb invocation happens
-/// on the boot path.
-fn write_fake_msb(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join("msb");
-    std::fs::write(&path, "#!/bin/sh\necho 'msb 0.6.15'\nexit 0\n").unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
-    path
-}
+#[path = "support/fake_msb.rs"]
+mod fake_msb;
 
 /// Build a real SQLite file at `path` with a `seaql_migrations` table
 /// holding `versions`. Uses sqlx directly (the same fixture approach as
@@ -170,7 +159,7 @@ impl Harness {
     fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
-        let fake_msb = write_fake_msb(home.path());
+        let fake_msb = fake_msb::write(home.path());
         let cwd = tempfile::tempdir().unwrap();
         Self {
             home,
@@ -263,7 +252,7 @@ fn ahead_db_blocks_boot_before_any_vm_work() {
 #[test]
 fn unsafe_state_dir_bails_before_any_db_is_created() {
     let home = tempfile::tempdir().unwrap();
-    let fake_msb = write_fake_msb(home.path());
+    let fake_msb = fake_msb::write(home.path());
     let cwd = tempfile::tempdir().unwrap();
     // Long enough to overflow both the 103-byte (macOS) and 107-byte
     // (Linux) `sun_path` limits regardless of the tempdir's own prefix

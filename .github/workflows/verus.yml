@@ -31,13 +31,13 @@ jobs:
           persist-credentials: false
 
       # Copied from ci.yml's "Install build dependencies" step, minus the
-      # actionlint install this job does not need. musl-tools is required by
-      # the agentd cross-build below; the rest are needed to compile agent-vm
-      # at all. Keep this list in step with ci.yml's.
+      # actionlint install this job does not need. The libraries are needed to
+      # compile agent-vm at all; shellcheck is for the shell guard below. Keep
+      # this list in step with ci.yml's.
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev musl-tools shellcheck
+          sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev shellcheck
 
       - name: Shell guard for this workflow's script
         run: |
@@ -91,22 +91,6 @@ jobs:
           dir="$(dirname "$bin")"
           cat "$dir/version.json"
           echo "$dir" >> "$GITHUB_PATH"
-
-      # The microsandbox SDK embeds the guest agentd binary:
-      # vendor/microsandbox/crates/filesystem/build.rs panics unless
-      # vendor/microsandbox/build/agentd exists and is newer than
-      # crates/agentd + crates/protocol. Mirrors ci.yml's step.
-      - name: Build guest agentd
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          cargo build --release \
-            --manifest-path vendor/microsandbox/crates/agentd/Cargo.toml \
-            --target-dir vendor/microsandbox/target \
-            --target x86_64-unknown-linux-musl
-          mkdir -p vendor/microsandbox/build
-          cp vendor/microsandbox/target/x86_64-unknown-linux-musl/release/agentd \
-            vendor/microsandbox/build/agentd
-          touch vendor/microsandbox/build/agentd
 
       # Gating, deliberately not `continue-on-error`. Verification is erased
       # from the ordinary build, so a weakened contract fails nothing locally:

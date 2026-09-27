@@ -10,7 +10,7 @@
 //! `msb_cache_share.rs`.
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Output},
 };
 
@@ -18,22 +18,8 @@ fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
 }
 
-/// Write a fake `msb` that always reports the official version this
-/// agent-vm build vendors, satisfying `point_at_msb`'s `--version`
-/// check (see `src/msb_install.rs::verify_official_identity`; the
-/// version literal here can't reference `expected_msb_version()`
-/// directly since this is a black-box test spawning the compiled
-/// binary, not linking the crate). Mirrors `msb_cache_share.rs`'s
-/// `write_fake_msb` test helper.
-fn write_fake_msb(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join("msb");
-    std::fs::write(&path, "#!/bin/sh\necho 'msb 0.6.15'\nexit 0\n").unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
-    path
-}
+#[path = "support/fake_msb.rs"]
+mod fake_msb;
 
 struct Harness {
     home: tempfile::TempDir,
@@ -45,7 +31,7 @@ impl Harness {
     fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
-        let fake_msb = write_fake_msb(home.path());
+        let fake_msb = fake_msb::write(home.path());
         Self {
             home,
             state,

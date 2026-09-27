@@ -23,7 +23,7 @@
 
 use std::{
     io::Read,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
@@ -38,19 +38,8 @@ fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
 }
 
-/// Write a fake `msb` that always reports the official version this
-/// agent-vm build vendors, satisfying `point_at_msb`'s `--version` check
-/// regardless of subcommand or args. Mirrors `msb_cache_share.rs`'s
-/// helper of the same name.
-fn write_fake_msb(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join("msb");
-    std::fs::write(&path, "#!/bin/sh\necho 'msb 0.6.15'\nexit 0\n").unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
-    path
-}
+#[path = "support/fake_msb.rs"]
+mod fake_msb;
 
 /// Run `child` to completion, killing it if it doesn't exit within
 /// `timeout`. Reads stdout/stderr on separate threads so a full pipe can't
@@ -115,7 +104,7 @@ impl Harness {
         let home = tempfile::tempdir_in("/tmp").unwrap();
         let state = tempfile::tempdir_in("/tmp").unwrap();
         let project = tempfile::tempdir_in("/tmp").unwrap();
-        let fake_msb = write_fake_msb(home.path());
+        let fake_msb = fake_msb::write(home.path());
         Self {
             home,
             state,
