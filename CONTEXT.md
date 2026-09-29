@@ -348,7 +348,34 @@ One tooling layer a catalog `[[tools]]` entry declares via `layer`: either
 `images/tools/`) or `{ path = "…" }` (anchored on the declaring config file's
 directory). Resolved by `tool_layer::chain_root` → `tool_layer::materialize`.
 Distinct from **Tooling layer**. See
-[ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md).
+[ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md). Decided, not
+yet built ([ADR-0029](docs/adr/0029-compose-tool-images-by-layer-stitching.md)):
+a tool layer builds `FROM` its **parent**, not its predecessor, and tool images
+are joined by **stitching**.
+
+## Parent
+
+What a tool layer builds `FROM`: the **base image**, or the one tool it
+explicitly declares. Its **tool image**'s own layers are the ones above its
+parent.
+_Avoid_: predecessor (that is a chain position).
+
+## Tool image
+
+One tool layer built `FROM` its parent. Its identity doesn't depend on which
+other tools a launch selects.
+
+## Stitching
+
+Joining tool images into a **composed tool image** by appending each tool's own
+layers onto the base's, in catalog order, without building anything. See
+[ADR-0029](docs/adr/0029-compose-tool-images-by-layer-stitching.md).
+_Avoid_: merge, flatten, squash.
+
+## Composed tool image
+
+The base plus one launch's tool images, joined by stitching. The **composed
+default image** is the composed tool image for the shipped tool set.
 
 ## Image-owned Pi package
 
