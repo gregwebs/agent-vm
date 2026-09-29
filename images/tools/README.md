@@ -83,7 +83,7 @@ frequently changed belongs at the bottom:
 - `codex` ~95 MiB, multiple stable cuts/day → next
 - `opencode` ~50 MiB, several per week → middle
 - `claude` ~68 MiB, ~daily → middle
-- `copilot` ~installed via npm, no upstream version key → top (last)
+- `copilot` installed via npm, keyed on its npm `latest` → top (last)
 
 `dsh` and `pi` are the two "large and rarely changing" layers, and they sit
 below every installer layer for the same reason: a **committed lockfile** is
@@ -94,8 +94,83 @@ is the accepted cost of keeping ~324 MiB out of every unrelated rebuild.
 CI resolves each *installer* agent's current upstream version and feeds
 it in as a per-agent `AGENT_VERSION_*` build arg, so a layer is rebuilt only
 when that agent actually released — an unchanged hourly build is a pure cache
-hit. `dsh` and `pi` have no `AGENT_VERSION_*` key and need none: their cache key
-is the lockfile's content.
+hit. The resolver is `script/build/agent-versions.sh`, shared by CI and
+`images/build.sh`, which documents each lookup's source. `dsh` and `pi` have no
+`AGENT_VERSION_*` key and need none: their cache key is the lockfile's content.
+
+## Upgrading a tool
+
+How you upgrade depends on whether the layer pins a version in this repo:
+
+| Layer | Version source | Upgrade |
+|---|---|---|
+| `pi` | committed lockfile | `bash images/tools/pi/upgrade-pi.sh [VERSION]` — see [`pi/README.md`](pi/README.md) |
+| `pi-claude-bridge` (in `pi`) | committed lockfile | `bash images/tools/pi/bridge/upgrade-bridge.sh [VERSION]` |
+| `dsh` (+ its `pnpm`) | committed lockfile | `bash images/tools/dsh/upgrade-dsh.sh [VERSION] [--pnpm VERSION]` |
+| `codex`, `opencode`, `claude`, `copilot` | upstream `latest` at build time | nothing to commit — rebuild with fresh `AGENT_VERSION_*` keys (below) |
+
+Each lockfile script defaults to the package's npm `latest`, and accepts any
+`VERSION` that is an exact version or a dist-tag (`latest`, `next`, ...), which
+is resolved to an exact pin. It runs `npm`
+with `--ignore-scripts` in a scratch directory and checks the same
+invariants as the `cargo test -p agent-vm tool_layer` guards, plus its layer's
+own constraints (listed below). It writes `package.json` and
+`package-lock.json` only if every check passes. Run the scripts with `bash`:
+like every file here they are committed without the execute bit. The Dockerfiles
+never copy them, so they never reach an image. Afterwards, run
+`cargo test -p agent-vm tool_layer` and review the diff.
+
+- `pi` regenerates its lock from scratch, which is safe because Pi's shrinkwrap
+  fixes every transitive version. It also refills the five sibling hashes
+  described in *Bumping the `pi` pin*.
+- `dsh` and the bridge update their locks **incrementally** from the committed
+  one. Neither tree has a shrinkwrap, so a fresh resolve would move hundreds of
+  unrelated transitive pins. The dsh script rejects a lock that nests
+  `dsh-sandbox-local` under `dsh-base/node_modules`. The bridge script passes
+  `--legacy-peer-deps` and rejects any package Pi's loader aliases.
+
+Only `pi` has a pre-merge build gate (`.github/workflows/pi-layer.yml` on pull
+requests). `build-image.yml` runs **only after merge**, so **build the `dsh`
+layer locally before opening a PR** — `verify-dsh.sh` in that build is the real
+gate:
+
+```bash
+docker buildx build --load --build-arg BASE_IMAGE=<a base image> images/tools/dsh
+```
+
+This matters more than usual here because dsh's npm `latest` is a release
+candidate.
+
+### Picking up a new version
+
+A default launch boots the published template as-is. CI rebuilds the template
+hourly, so an installer agent's release, or a merged pin bump, reaches it
+within the hour. To run a new version before that:
+
+- **`images/build.sh`** resolves the `AGENT_VERSION_*` keys itself, so a
+  re-run rebuilds exactly the installer layers whose agent released, plus
+  every layer above a changed one. If the lookup fails (offline, rate-limited),
+  it warns and builds without keys, which reuses cached agents.
+- **The manual Docker loop** in
+  [macos-build.md](../../macos-build.md#composing-from-a-local-tool-free-base---base-image)
+  passes the same keys from `script/build/agent-versions.sh`.
+- **The launcher's local compose** (`--base-image`, or a non-default tool set)
+  embeds `images/tools/` at compile time, so a pin bump needs a rebuilt
+  `agent-vm` binary. It passes no `AGENT_VERSION_*`, so installer agents stay
+  frozen at their first build until the base moves
+  ([ADR-0019](../../docs/adr/0019-tool-free-base-and-per-tool-layers.md) D8).
+  Force composition from the published base and check a pinned agent:
+
+  ```bash
+  agent-vm shell --base-image ghcr.io/wirenboard/agent-vm-base:latest -- bash -c 'pi --version'
+  ```
+
+  Use `bash -c`, not `bash -lc`: a login shell resets `PATH` and hides the
+  agent CLIs. The launcher's layer hash covers **every** file in the layer
+  directory, so any edit here — including these upgrade scripts and READMEs —
+  forces a rebuild of that layer and every layer above it the next time a
+  local-compose user launches. CI is unaffected: BuildKit hashes only the files
+  the Dockerfile references.
 
 ## The pinned lockfile layers: `dsh` and `pi`
 
@@ -110,8 +185,9 @@ mandatory warning extension — see
 needs no wrapper because its bin is linked straight onto `PATH`.
 
 For `dsh`, the lock is not merely reproducibility. `npm install -g
-@deepseek-ai/dsh` resolves the app at the current `latest` (0.1.5-rc.2), whose
-`^0.1.5-rc.2` range pulls `dsh-base` 0.1.5-rc.3, and npm may then nest
+@deepseek-ai/dsh` resolves the app at whatever `latest` points to (at the time
+of pinning, `0.1.5-rc.2`), whose `^0.1.5-rc.2` range pulls `dsh-base`
+0.1.5-rc.3, and npm may then nest
 `dsh-sandbox-local` under `dsh-base/node_modules`. dsh's plugin loader cannot
 resolve that package from the app root, so `dsh web` aborts at boot. The lock
 freezes the working layout — the package under the app's own `node_modules` —
@@ -184,8 +260,9 @@ tree. It is activated by the wrapper's second `--extension`, not by
 `extensions`, auto-discovery, `PI_CODING_AGENT_DIR`) writes into `$HOME/.pi`,
 which in the guest is per-project state rather than the image.
 
-**Bumping the pin** is the same lockfile flow, with two flags that are *not*
-optional:
+**Bumping the pin** is `bash images/tools/pi/bridge/upgrade-bridge.sh [VERSION]`
+(see *Upgrading a tool*). By hand, it is the same lockfile flow, with two flags
+that are *not* optional:
 
 ```bash
 cd images/tools/pi/bridge
@@ -241,9 +318,11 @@ The layer also pins `pnpm` in the same lock and links it onto `PATH`, because
 Pinning it there (rather than `npm install -g pnpm`) gives it the same
 integrity-checked install as the rest of the tree.
 
-Bumping the pin is the plain lockfile flow (dsh's tree has no shrinkwrap
-integrity quirks, so no hand-editing), run with `--ignore-scripts` exactly as
-the layer's `npm ci` is so regenerating never runs lifecycle scripts either:
+Bumping the pin is `bash images/tools/dsh/upgrade-dsh.sh [VERSION]` (see
+*Upgrading a tool*). By hand, it is the plain lockfile flow (dsh's tree has no
+shrinkwrap integrity quirks, so no hand-editing), run with `--ignore-scripts`
+exactly as the layer's `npm ci` is so regenerating never runs lifecycle scripts
+either:
 
 ```bash
 cd images/tools/dsh

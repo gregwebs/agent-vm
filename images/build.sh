@@ -218,34 +218,60 @@ build_base() {
     echo "==> Building ${BASE_TAG} (tool-free base, zstd layers)"
     docker buildx build \
         -t "${BASE_TAG}" \
-        "${EXTRA[@]}" \
+        ${EXTRA[@]+"${EXTRA[@]}"} \
         --output "${REGISTRY_OUTPUT}" \
         -f "${SCRIPT_DIR}/Dockerfile" \
         "${SCRIPT_DIR}"
+}
+
+# `tool=version` lines from script/build/agent-versions.sh, the resolver CI
+# shares. Each installer layer gets its version as its AGENT_VERSION_* build
+# arg: that arg is the layer's cache key, so without it a rebuild is a cache hit
+# that keeps whatever agent the layer first installed. A failed lookup (offline,
+# rate-limited) warns and builds without keys rather than blocking a local build.
+AGENT_VERSIONS=
+resolve_agent_versions() {
+    if AGENT_VERSIONS=$("${SCRIPT_DIR}/../script/build/agent-versions.sh"); then
+        echo "==> Agent versions: $(printf '%s\n' "${AGENT_VERSIONS}" | tr '\n' ' ')"
+    else
+        AGENT_VERSIONS=
+        echo "==> WARNING: agent version lookup failed; installer layers may reuse cached, older agents" >&2
+    fi
+}
+
+# The resolved version for ${1} from AGENT_VERSIONS (`tool=version` lines), or
+# empty for a lockfile layer (dsh, pi) or a failed lookup. An empty build arg is
+# harmless: buildx ignores an unused one without a warning.
+agent_version() {
+    printf '%s\n' "${AGENT_VERSIONS}" | sed -n "s/^$1=//p"
 }
 
 # One intermediate tool layer, `--load`ed into the daemon so the next step's
 # `FROM` can reference it. ${1} is the tool name (a directory under
 # images/tools/); ${2} is the reference this step builds FROM.
 build_intermediate() {
-    local tool="$1" from="$2"
+    local tool="$1" from="$2" arg
     echo "==> Building tool layer ${tool} FROM ${from}"
+    arg="AGENT_VERSION_$(printf '%s' "${tool}" | tr '[:lower:]' '[:upper:]')=$(agent_version "${tool}")"
     docker buildx build \
         -t "agent-vm-${tool}-build:latest" \
         --build-arg "BASE_IMAGE=${from}" \
-        "${EXTRA[@]}" \
+        --build-arg "${arg}" \
+        ${EXTRA[@]+"${EXTRA[@]}"} \
         --load \
         "${SCRIPT_DIR}/tools/${tool}"
 }
 
 # The final tool layer (copilot) produces the published composed template.
 build_template() {
-    local from="$1"
+    local from="$1" arg
     echo "==> Building ${IMAGE_TAG} (composed default: base + tool layers, zstd layers)"
+    arg="AGENT_VERSION_$(printf '%s' "${FINAL_LAYER}" | tr '[:lower:]' '[:upper:]')=$(agent_version "${FINAL_LAYER}")"
     docker buildx build \
         -t "${IMAGE_TAG}" \
         --build-arg "BASE_IMAGE=${from}" \
-        "${EXTRA[@]}" \
+        --build-arg "${arg}" \
+        ${EXTRA[@]+"${EXTRA[@]}"} \
         --output "${REGISTRY_OUTPUT}" \
         "${SCRIPT_DIR}/tools/${FINAL_LAYER}"
 }
@@ -273,6 +299,7 @@ main() {
     fi
     require_docker_driver
     ensure_registry
+    resolve_agent_versions
     build_and_push
     echo "==> ${BASE_TAG} and ${IMAGE_TAG} ready"
 }

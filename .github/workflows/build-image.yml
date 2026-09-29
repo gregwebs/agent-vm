@@ -27,6 +27,7 @@ on:
     paths:
       - 'images/**'
       - '.github/workflows/build-image.yml'
+      - 'script/build/agent-versions.sh'
   workflow_dispatch:
 
 permissions:
@@ -109,52 +110,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          fail() { echo "::error::$1"; exit 1; }
-          # Resolve each agent's current upstream version and feed it to
-          # the tool layer as a per-agent cache key (AGENT_VERSION_*), so
-          # an installer layer is rebuilt only when its agent actually
-          # released — not on every hourly cron run. Each source is the
-          # EXACT one the matching installer reads, so the key tracks
-          # what actually gets installed:
-          #   - codex:    openai/codex releases/latest tag — install.sh's
-          #               own resolver hits the same endpoint.
-          #   - opencode: anomalyco/opencode releases/latest tag — the
-          #               repo opencode.ai/install downloads from (it was
-          #               renamed from sst/opencode; sst/* only resolves
-          #               today via GitHub's rename redirect, so pin the
-          #               real repo).
-          #   - claude:   downloads.claude.ai native channel `/latest`
-          #               (a plain version string) — what claude.ai/
-          #               install.sh installs. NOT npm: the npm dist-tags
-          #               (@anthropic-ai/claude-code) move on a separate
-          #               cadence (e.g. stable != latest), so keying on
-          #               npm would miss native releases / rebuild for
-          #               npm-only bumps.
-          # `dsh` is deliberately absent: it is a committed-lockfile layer
-          # (like pi), so its cache key is the lockfile's bytes, not a lookup.
-          # Any lookup failure fails the build (vs shipping a stale key
-          # that would skip a real agent update).
-          codex=$(gh api repos/openai/codex/releases/latest --jq .tag_name) \
-            || fail "codex version lookup failed (openai/codex releases/latest)"
-          opencode=$(gh api repos/anomalyco/opencode/releases/latest --jq .tag_name) \
-            || fail "opencode version lookup failed (anomalyco/opencode releases/latest)"
-          claude=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest) \
-            || fail "claude version lookup failed (downloads.claude.ai/claude-code-releases/latest)"
-          # Guard against an HTTP-200-but-garbage response (empty body,
-          # jq 'null', or an HTML error page) silently becoming a key.
-          if [[ -z "$codex" || "$codex" == null ]]; then
-            fail "codex version empty/null"
-          fi
-          if [[ -z "$opencode" || "$opencode" == null ]]; then
-            fail "opencode version empty/null"
-          fi
-          case "$claude" in [0-9]*.[0-9]*.[0-9]*) : ;; *) fail "claude version implausible: '$claude'" ;; esac
-          {
-            echo "codex=$codex"
-            echo "opencode=$opencode"
-            echo "claude=$claude"
-          } >> "$GITHUB_OUTPUT"
-          echo "resolved agent versions: codex=$codex opencode=$opencode claude=$claude"
+          # Each installer layer's current upstream version, fed in below as
+          # its AGENT_VERSION_* cache key so a layer is rebuilt only when its
+          # agent actually released -- not on every hourly cron run. The
+          # sources, and why each is the one its installer reads, are
+          # documented in the script (shared with images/build.sh). A lookup
+          # failure exits non-zero, and the script emits its own `::error::`
+          # naming the failed tool.
+          versions=$(./script/build/agent-versions.sh)
+          echo "$versions" >> "$GITHUB_OUTPUT"
+          echo "resolved agent versions: $(echo "$versions" | tr '\n' ' ')"
 
       # The zstd registry exporter shared by the two published builds. The
       # benchmark in crates/agent-vm/examples/erofs_bench.rs showed gzip → zstd
@@ -328,6 +293,7 @@ jobs:
           context: images/tools/copilot
           build-args: |
             BASE_IMAGE=${{ env.BASE }}@${{ steps.claude.outputs.digest }}
+            AGENT_VERSION_COPILOT=${{ steps.ver.outputs.copilot }}
           outputs: type=registry,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
           cache-from: type=gha,scope=copilot
           cache-to: type=gha,mode=max,scope=copilot

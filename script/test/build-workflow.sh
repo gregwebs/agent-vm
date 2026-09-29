@@ -666,4 +666,61 @@ ln -s "$(command -v cat)" "$helpbin/cat"
 PATH="$helpbin" "$help_fixture/script/build/macos.sh" --help >/dev/null
 PATH="$helpbin" "$help_fixture/script/build/import-image.sh" --help >/dev/null
 
+# --- images/build.sh: agent_version and the AGENT_VERSION_* build arg --------
+# images/build.sh runs `main "$@"` at its bottom and has no sourceable entry
+# point, so drop that final call and source the rest in a subshell: the real
+# agent_version and the lower->upper build-arg naming in build_intermediate /
+# build_template then run against a stub agent-versions.sh and a capturing
+# `docker` shell function -- no daemon, no network, no registry.
+build_image_fixture="$TEST_ROOT/build-image"
+mkdir -p "$build_image_fixture/images" "$build_image_fixture/script/build"
+grep -v '^main "\$@"$' "$REPO_ROOT/images/build.sh" \
+    >"$build_image_fixture/images/build.defs.sh"
+cat >"$build_image_fixture/script/build/agent-versions.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${FAKE_AGENT_VERSIONS_FAIL:-}" == 1 ]]; then
+    echo "fake agent-versions lookup failed" >&2
+    exit 1
+fi
+printf 'codex=v9\nopencode=v8\nclaude=v7\ncopilot=v6\n'
+SH
+chmod +x "$build_image_fixture/script/build/agent-versions.sh"
+
+# A subshell: build.defs.sh's own `set -euo pipefail` and globals (SCRIPT_DIR,
+# EXTRA) must not leak into the rest of this test.
+run_build_image() {
+    (
+        AGENT_VM_BUILD_HOST_CA="$TEST_ROOT/absent-host-ca"
+        export AGENT_VM_BUILD_HOST_CA
+        # shellcheck source=/dev/null
+        . "$build_image_fixture/images/build.defs.sh"
+        # SCRIPT_DIR and the docker function below are read by the functions
+        # just sourced; shellcheck cannot see into build.defs.sh (SC2034 /
+        # SC2329).
+        # shellcheck disable=SC2034
+        SCRIPT_DIR="$build_image_fixture/images"
+        # shellcheck disable=SC2329
+        docker() { printf 'docker %s\n' "$*"; }
+        resolve_agent_versions
+        build_intermediate codex base:tag
+        build_intermediate dsh base:tag
+        build_template copilot:tag
+    ) 2>&1
+}
+
+build_image_out="$(run_build_image)"
+assert_contains "$build_image_out" "==> Agent versions: codex=v9 opencode=v8 claude=v7 copilot=v6"
+assert_contains "$build_image_out" "--build-arg AGENT_VERSION_CODEX=v9"
+# dsh is a lockfile layer: absent from `tool=version`, so its key is empty (and
+# buildx ignores an empty, unused build arg).
+assert_contains "$build_image_out" "--build-arg AGENT_VERSION_DSH="
+assert_contains "$build_image_out" "--build-arg AGENT_VERSION_COPILOT=v6"
+
+# A failed lookup warns and continues with empty keys rather than blocking a
+# local build.
+build_image_out="$(FAKE_AGENT_VERSIONS_FAIL=1 run_build_image)"
+assert_contains "$build_image_out" "WARNING: agent version lookup failed"
+assert_contains "$build_image_out" "--build-arg AGENT_VERSION_CODEX="
+
 echo "build workflow seam tests passed"

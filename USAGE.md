@@ -115,11 +115,12 @@ Flags:
   `--base-image` are mutually exclusive.
 
 A locally composed tool layer **freezes its agent version at build time**: the
-layer hash covers its directory, and no `AGENT_VERSION_*` is passed on a local
-build, so a non-default tool set keeps whatever upstream shipped the day it
-first built until the base moves. Pin the base with `--base-image …:YYYY-MM-DDTHH`
+layer hash covers its directory, and the launcher's local compose passes no
+`AGENT_VERSION_*`, so a non-default tool set keeps whatever upstream shipped the
+day it first built until the base moves. Pin the base with `--base-image …:YYYY-MM-DDTHH`
 to control that. This is the same behaviour every project tooling layer already
-has.
+has. (`images/build.sh` does pass `AGENT_VERSION_*`, so it can pick up new
+releases; the launcher's local compose cannot.)
 
 On a host behind a TLS-intercept proxy, a locally composed chain cannot
 soft-fail a broken upstream installer. Build the layer yourself with

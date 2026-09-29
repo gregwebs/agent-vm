@@ -144,11 +144,21 @@ set -euo pipefail
 #    daemon (as `images/build.sh` does) so the next step's `FROM` resolves;
 #    that needs a `docker`-driver builder (`docker buildx create --driver
 #    docker --use`).
+#    Each installer layer gets its upstream version as its AGENT_VERSION_*
+#    cache key (script/build/agent-versions.sh), so a re-run picks up new
+#    agent releases instead of reusing cached layers. dsh and pi have no key;
+#    their empty arg is ignored.
 docker buildx build --platform linux/arm64 --load -t agent-vm-base:dev -f images/Dockerfile images
+# A failed lookup (offline, rate-limited) is not fatal here, matching
+# images/build.sh: build with empty keys rather than aborting the chain.
+versions=$(./script/build/agent-versions.sh) || versions=
 prev=agent-vm-base:dev
 for t in dsh pi codex opencode claude copilot; do
+  v=$(printf '%s\n' "$versions" | sed -n "s/^$t=//p")
   docker buildx build --platform linux/arm64 --load \
-    --build-arg BASE_IMAGE="$prev" -t "agent-vm-$t:dev" "images/tools/$t"
+    --build-arg BASE_IMAGE="$prev" \
+    --build-arg "AGENT_VERSION_$(echo "$t" | tr '[:lower:]' '[:upper:]')=$v" \
+    -t "agent-vm-$t:dev" "images/tools/$t"
   prev="agent-vm-$t:dev"
 done
 docker tag "$prev" agent-vm-template:dev

@@ -55,6 +55,8 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/pi-wrapper.sh"
     bash "$REPO_ROOT/script/test/pi-install.sh"
     bash "$REPO_ROOT/script/test/dsh-verify.sh"
+    bash "$REPO_ROOT/script/test/upgrade-scripts.sh"
+    bash "$REPO_ROOT/script/test/agent-versions.sh"
     bash "$REPO_ROOT/script/test/rust-toolchain-consistency.sh"
 fi
 
@@ -73,16 +75,23 @@ syntax_check=(
     script/test/msb-krun-compat.sh
     script/test/msb-krun-compat-contract.sh
     script/build/macos.sh
+    script/build/agent-versions.sh
+    script/build/npm-pin.sh
     script/test/build-workflow.sh
     images/tools/pi/pi.sh
     images/tools/pi/install-pi.sh
     images/tools/pi/install-pi-packages.sh
     images/tools/pi/verify-pi.sh
     images/tools/pi/seed-claude-bridge-config.sh
+    images/tools/pi/upgrade-pi.sh
+    images/tools/pi/bridge/upgrade-bridge.sh
     images/tools/dsh/verify-dsh.sh
+    images/tools/dsh/upgrade-dsh.sh
     script/test/dsh-verify.sh
     script/test/pi-wrapper.sh
     script/test/pi-install.sh
+    script/test/upgrade-scripts.sh
+    script/test/agent-versions.sh
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
@@ -107,16 +116,23 @@ shellcheck_files=(
     script/test/msb-krun-compat.sh
     script/test/msb-krun-compat-contract.sh
     script/build/macos.sh
+    script/build/agent-versions.sh
+    script/build/npm-pin.sh
     script/test/build-workflow.sh
     images/tools/pi/pi.sh
     images/tools/pi/install-pi.sh
     images/tools/pi/install-pi-packages.sh
     images/tools/pi/verify-pi.sh
     images/tools/pi/seed-claude-bridge-config.sh
+    images/tools/pi/upgrade-pi.sh
+    images/tools/pi/bridge/upgrade-bridge.sh
     images/tools/dsh/verify-dsh.sh
+    images/tools/dsh/upgrade-dsh.sh
     script/test/dsh-verify.sh
     script/test/pi-wrapper.sh
     script/test/pi-install.sh
+    script/test/upgrade-scripts.sh
+    script/test/agent-versions.sh
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh

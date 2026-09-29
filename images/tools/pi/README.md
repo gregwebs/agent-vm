@@ -10,6 +10,7 @@ ordering. This file covers the one routine task: **upgrading Pi**.
 ```bash
 bash images/tools/pi/upgrade-pi.sh           # pin the registry's `latest`
 bash images/tools/pi/upgrade-pi.sh 0.87.1    # or an exact version
+bash images/tools/pi/upgrade-pi.sh next      # or any dist-tag
 ```
 
 The script requires `jq` and `npm` on the host. Run it with `bash`, because it
@@ -42,32 +43,6 @@ git diff images/tools/pi/package.json images/tools/pi/package-lock.json
 ```
 
 This bumps only Pi. The `pi-claude-bridge` extension in `bridge/` has its own
-pin and flow; see [`../README.md`](../README.md#the-bridge-packages-imagestoolspibridge).
-
-## Using the new version
-
-A launch with the default tool set boots the published template as-is, so a
-local pin bump has no effect until you build the layers yourself. Use one of
-these options:
-
-- **Compose locally with the launcher.** The `agent-vm` binary embeds
-  `images/tools/` at compile time, so rebuild it first (e.g.
-  `./script/build/macos.sh`). Then force local composition:
-
-  ```bash
-  agent-vm shell --base-image ghcr.io/wirenboard/agent-vm-base:latest -- bash -c 'pi --version'
-  ```
-
-  This rebuilds `pi` and every layer stacked above it (codex, opencode, claude,
-  copilot). The result is hash-cached for later launches.
-
-- **Build the template with Docker** and boot it with `--image`. No binary
-  rebuild is needed. See
-  [macos-build.md](../../../macos-build.md#composing-from-a-local-tool-free-base---base-image),
-  or `images/build.sh` behind a TLS-intercept proxy.
-
-Use `bash -c`, not `bash -lc`, for in-guest commands: a login shell resets
-`PATH` and hides the agent CLIs.
-
-Once the bump is merged, CI rebuilds the published template and a default
-launch picks it up with no local build.
+pin and script (`bash images/tools/pi/bridge/upgrade-bridge.sh [VERSION]`).
+[`../README.md`](../README.md#upgrading-a-tool) covers upgrading every tool
+layer and how to run a new version before CI publishes it.
