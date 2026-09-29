@@ -220,8 +220,10 @@ agent-vm shell --image agent-vm-template:dev -- bash -lc 'claude --version'
 
 `script/test/e2e.sh` always uses `bash -c` for exactly this reason. (A shell
 exported `AGENT_VM_IMAGE_TAG`/`AGENT_VM_BASE_IMAGE` is the same class of trap:
-they act as `--image`/`--base-image`, so a “default config” check silently boots
-the wrong image. The harness clears both.)
+they act as `--image`/`--base-image` whenever the corresponding flag is omitted,
+so a “default config” check silently boots the wrong image. An explicit flag
+does win over the *other* flag's variable, so the two are no longer mutually
+exclusive by accident (issue #189). The harness clears both.)
 
 #### The `#[ignore]`d Rust Docker e2e tests
 

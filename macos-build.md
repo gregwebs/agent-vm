@@ -244,9 +244,11 @@ This is **not** a registry-credentials problem, and there is nothing to log in
 to. `index.docker.io/v2/library/...` means the requested reference was
 **unqualified**, so `msb` resolved it against Docker Hub instead of GHCR — where
 no image of that name exists, so the lookup is reported as unauthorized. Check
-both `--image` and the `AGENT_VM_IMAGE_TAG` environment variable, because a
-value exported from a shell profile overrides what you pass on the command
-line:
+both `--image` and the `AGENT_VM_IMAGE_TAG` environment variable: a value
+exported from a shell profile acts as `--image` whenever no flag is passed, so
+it can silently select the wrong reference. (An explicit `--image` still wins
+over `AGENT_VM_IMAGE_TAG`, and an explicit `--base-image` wins over
+`AGENT_VM_IMAGE_TAG` — see `USAGE.md`.)
 
 - an unqualified `agent-vm-template:latest` resolves to
   `index.docker.io/library/agent-vm-template` — **not** to the local image cache

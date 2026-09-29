@@ -895,8 +895,8 @@ Networking (deny-by-default; flags compose):
 
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
-  AGENT_VM_IMAGE_TAG                    same as --image
-  AGENT_VM_BASE_IMAGE                   same as --base-image
+  AGENT_VM_IMAGE_TAG                    same as --image, unless --base-image is passed
+  AGENT_VM_BASE_IMAGE                   same as --base-image, unless --image is passed
   AGENT_VM_ROOT                         same as --root (1|true|yes|on)
   AGENT_VM_UPDATE_CHECK                 check the registry for a newer image (1|true|yes|on)
   AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls (1|true|yes|on)
@@ -1037,28 +1037,30 @@ pub struct Args {
     /// Boot this image verbatim, skipping tool-layer composition.
     ///
     /// The project's own `.agent-vm/layers/*` and any `--layer DIR` still
-    /// chain on top. Mutually exclusive with `--base-image`.
+    /// chain on top. Mutually exclusive with `--base-image`; an explicit flag
+    /// wins over the other flag's environment variable.
     #[arg(
         long,
         env = "AGENT_VM_IMAGE_TAG",
         value_name = "REF",
         help_heading = "Image"
     )]
-    image: Option<String>,
+    pub(crate) image: Option<String>,
 
     /// The tool-free base that tool layers are composed onto.
     ///
     /// Default `ghcr.io/wirenboard/agent-vm-base:latest`. Passing this always
     /// composes locally, even when your tool set matches the shipped default
     /// (which otherwise boots the published composed template). Mutually
-    /// exclusive with `--image`.
+    /// exclusive with `--image`; an explicit flag wins over the other flag's
+    /// environment variable.
     #[arg(
         long = "base-image",
         env = "AGENT_VM_BASE_IMAGE",
         value_name = "REF",
         help_heading = "Image"
     )]
-    base_image: Option<String>,
+    pub(crate) base_image: Option<String>,
 
     /// Check the registry for a newer image at launch (opt-in).
     ///

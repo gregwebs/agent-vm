@@ -64,6 +64,10 @@ impl ChainRoot {
 /// The one place the chain-root decision table is encoded. Pure, so the whole
 /// table is unit-tested without touching Docker or the environment.
 ///
+/// `image_flag` and `base_flag` arrive already reconciled by `cli`'s image-flag
+/// precedence rule (`ImageFlags::reconcile`), so the `(set, set)` row means a
+/// real conflict: both flags typed, or both environment variables set.
+///
 /// `declared` is the catalog's ordered, deduplicated layer sequence
 /// ([`crate::config::LaunchCatalog::declared_layers`] projected to its layers);
 /// `shipped` is [`crate::config::shipped_tool_layers`].
@@ -85,7 +89,8 @@ pub(crate) fn chain_root(
         (Some(_), Some(_)) => bail!(
             "--image and --base-image are mutually exclusive: --image boots an image verbatim \
              (no tool composition), --base-image chooses what tool layers are composed onto. \
-             Drop one. (AGENT_VM_IMAGE_TAG / AGENT_VM_BASE_IMAGE count as passing the flag.)"
+             Drop one. (An explicit flag wins over the other's environment variable; setting \
+             both AGENT_VM_IMAGE_TAG and AGENT_VM_BASE_IMAGE conflicts too.)"
         ),
         // `--image` boots verbatim; the caller composes nothing.
         (Some(image), None) => Ok(ChainRoot::Verbatim(image)),

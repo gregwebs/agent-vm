@@ -307,11 +307,23 @@ impl Harness {
     /// [`Self::launch`] with extra host environment variables set for the
     /// child (the base command starts from `env_clear`).
     fn launch_with_env(&self, tool: &str, extra: &[&str], envs: &[(&str, &str)]) -> Output {
+        // `--image` is passed *before* `extra` so a trailing `-- <agent args>`
+        // (absorbed by the tool's `trailing_var_arg`) cannot swallow it.
+        let mut argv: Vec<&str> = vec!["--image", BOGUS_IMAGE];
+        argv.extend_from_slice(extra);
+        self.launch_argv(tool, &argv, envs)
+    }
+
+    /// Run `tool` with exactly `argv` (after the verb) and `envs` set on top of
+    /// the cleared environment. [`Self::launch_with_env`] is the common case;
+    /// this is for a test that must choose the chain root itself, i.e. pass
+    /// `--base-image` or nothing at all (issue #189).
+    fn launch_argv(&self, tool: &str, argv: &[&str], envs: &[(&str, &str)]) -> Output {
         let mut cmd = self.base_command();
         for (key, value) in envs {
             cmd.env(key, value);
         }
-        cmd.arg(tool).args(["--image", BOGUS_IMAGE]).args(extra);
+        cmd.arg(tool).args(argv);
         run_with_timeout(cmd, Duration::from_secs(20))
     }
 
@@ -1783,6 +1795,111 @@ fn a_project_declared_tool_launches_its_own_command() {
         "/bin/echo --fast hi",
         "guest command line for the project-declared tool\nstderr:\n{stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #189 — an explicit image flag beats the other flag's environment variable
+// ---------------------------------------------------------------------------
+
+/// One tool that declares **no** layer, so the catalog's declared tool-layer
+/// sequence is empty. `--base-image` then composes nothing and the launch
+/// reaches `builder.build()` — with no Docker and no registry pull — which is
+/// what makes the chain-root choice observable here.
+const LAYER_FREE_TOOL: &str = "[[tools]]\nname = \"plain\"\ncommand = \"/bin/echo\"\n";
+
+/// A second bogus-but-well-formed reference, distinguishable from
+/// [`BOGUS_IMAGE`] in the dumped config.
+const OTHER_BOGUS_IMAGE: &str = "localhost:1/other-image:latest";
+
+/// Issue #189: `AGENT_VM_IMAGE_TAG` is exported by this repo's own dev setup
+/// (`macos-build.md`) and by CI images, and clap's `env = …` fallback writes it
+/// into the same slot as `--image` — so an explicit `--base-image` used to be
+/// rejected as "mutually exclusive" with a flag the user never typed. The
+/// explicit flag must win.
+#[test]
+fn an_explicit_base_image_beats_an_ambient_image_tag() {
+    for ambient in [BOGUS_IMAGE, ""] {
+        let harness = Harness::new();
+        harness.write_project(LAYER_FREE_TOOL);
+        let out = harness.launch_argv(
+            "plain",
+            &["--base-image", OTHER_BOGUS_IMAGE],
+            &[("AGENT_VM_IMAGE_TAG", ambient)],
+        );
+        let stderr = stderr_of(&out);
+        assert!(
+            !stderr.contains("mutually exclusive"),
+            "AGENT_VM_IMAGE_TAG={ambient:?} must not conflict with an explicit --base-image: {stderr}"
+        );
+        assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+        assert_eq!(
+            debug_config_json(&stderr)["image"]["Oci"]["reference"],
+            OTHER_BOGUS_IMAGE,
+            "{stderr}"
+        );
+    }
+}
+
+/// The mirror of [`an_explicit_base_image_beats_an_ambient_image_tag`], so the
+/// rule is pinned as symmetric rather than as a `--base-image` special case,
+/// and the empty ambient value is covered on this half too.
+#[test]
+fn an_explicit_image_beats_an_ambient_base_image() {
+    for ambient in [OTHER_BOGUS_IMAGE, ""] {
+        let harness = Harness::new();
+        harness.write_project(LAYER_FREE_TOOL);
+        let out = harness.launch_argv(
+            "plain",
+            &["--image", BOGUS_IMAGE],
+            &[("AGENT_VM_BASE_IMAGE", ambient)],
+        );
+        let stderr = stderr_of(&out);
+        assert!(
+            !stderr.contains("mutually exclusive"),
+            "AGENT_VM_BASE_IMAGE={ambient:?} must not conflict with an explicit --image: {stderr}"
+        );
+        assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+        assert_eq!(
+            debug_config_json(&stderr)["image"]["Oci"]["reference"],
+            BOGUS_IMAGE,
+            "{stderr}"
+        );
+    }
+}
+
+/// A pair supplied the *same* way (both typed, or both from the environment)
+/// is the one case reconciliation cannot resolve: there is no more explicit
+/// side to prefer, so the conflict must survive.
+#[test]
+fn an_image_choice_is_still_rejected_when_both_sides_are_equally_explicit() {
+    for (what, argv, envs) in [
+        (
+            "both typed",
+            vec!["--image", BOGUS_IMAGE, "--base-image", OTHER_BOGUS_IMAGE],
+            vec![],
+        ),
+        (
+            "both ambient",
+            vec![],
+            vec![
+                ("AGENT_VM_IMAGE_TAG", BOGUS_IMAGE),
+                ("AGENT_VM_BASE_IMAGE", OTHER_BOGUS_IMAGE),
+            ],
+        ),
+    ] {
+        let harness = Harness::new();
+        harness.write_project(LAYER_FREE_TOOL);
+        let out = harness.launch_argv("plain", &argv, &envs);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("mutually exclusive"),
+            "{what}: the pair must still be rejected: {stderr}"
+        );
+        assert!(
+            !stderr.contains(CONFIG_MARKER),
+            "{what}: the launch must not reach the sandbox build: {stderr}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,18 @@ PREFIX="${AGENT_VM_PI_PREFIX:-/opt/agent-vm/pi}"
 NESTED="${PREFIX}/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works"
 soft_fail="${AGENT_INSTALL_SOFT_FAIL:-}"
 
+# Scratch space for the verification below. Every path this script writes
+# outside PREFIX lives under here, so two runs at once -- two worktrees on one
+# host, or two CI steps -- cannot read each other's selector output or delete
+# each other's extraction. Override it to give a run its own directory; the
+# black-box harness does, per case.
+work="${AGENT_VM_PI_WORK_DIR:-/tmp/pi-verify}"
+mkdir -p "${work}"
+siblings="${work}/siblings.tsv"
+nested_list="${work}/nested.tsv"
+extract="${work}/x"
+diff_out="${work}/diff.out"
+
 # `npm ci` (not `npm install`): the lockfile is authoritative and the build
 # fails if package.json and the lock disagree. `--ignore-scripts`: no upstream
 # postinstall code runs during the image build (esbuild resolves its platform
@@ -44,19 +56,19 @@ verified=0
 jq -r '.packages | to_entries[]
        | select(.key | test("^node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/[^/]+$"))
        | [.key, (.key | split("/") | last), .value.resolved, .value.integrity] | @tsv' \
-    "${PREFIX}/package-lock.json" > /tmp/pi-siblings.tsv
+    "${PREFIX}/package-lock.json" > "${siblings}"
 while IFS="$(printf '\t')" read -r key name resolved integrity; do
     if [ -z "${integrity}" ] || [ "${integrity}" = "null" ]; then
         echo "==> pi: ${name} has no integrity in the committed lock -- refill it (images/tools/README.md)" >&2
         exit 1
     fi
-    tarball="/tmp/pi-verify/${name}.tgz"
-    mkdir -p /tmp/pi-verify/x
+    tarball="${work}/${name}.tgz"
+    mkdir -p "${extract}"
     if ! curl -fsSL --retry 5 --retry-all-errors --http1.1 "${resolved}" -o "${tarball}"; then
         # A download failure here is the same class as the npm one above.
         message="==> pi: could not fetch ${resolved} for integrity verification"
         if [ -n "${soft_fail}" ]; then
-            rm -rf "${PREFIX}" /tmp/pi-verify
+            rm -rf "${PREFIX}" "${work}"
             echo "${message} (soft-fail mode; image will ship without pi)"
             exit 0
         fi
@@ -70,9 +82,9 @@ while IFS="$(printf '\t')" read -r key name resolved integrity; do
         echo "    fetched   ${actual}" >&2
         exit 1
     fi
-    rm -rf /tmp/pi-verify/x && mkdir -p /tmp/pi-verify/x
-    tar -xzf "${tarball}" -C /tmp/pi-verify/x
-    extracted=/tmp/pi-verify/x/package
+    rm -rf "${extract}" && mkdir -p "${extract}"
+    tar -xzf "${tarball}" -C "${extract}"
+    extracted="${extract}/package"
 
     # Compare the verified extraction against what npm installed in FULL, with
     # NO basename exclusions. `-x node_modules` is a blind spot: it skips the
@@ -100,7 +112,7 @@ while IFS="$(printf '\t')" read -r key name resolved integrity; do
         | $all[] as $rel
         | select([ $all[] as $o | select($rel | startswith($o + "/")) ] | length == 0)
         | $rel
-    ' "${PREFIX}/package-lock.json" > /tmp/pi-nested.tsv
+    ' "${PREFIX}/package-lock.json" > "${nested_list}"
     while IFS= read -r rel; do
         [ -n "${rel}" ] || continue
         if [ ! -e "${NESTED}/${name}/${rel}" ] && [ ! -L "${NESTED}/${name}/${rel}" ]; then
@@ -118,15 +130,15 @@ while IFS="$(printf '\t')" read -r key name resolved integrity; do
             */*) mkdir -p "${extracted}/${rel%/*}" ;;
         esac
         cp -a "${NESTED}/${name}/${rel}" "${extracted}/${rel}"
-    done < /tmp/pi-nested.tsv
+    done < "${nested_list}"
 
-    if ! diff -r "${extracted}" "${NESTED}/${name}" > /tmp/pi-verify/diff.out; then
+    if ! diff -r "${extracted}" "${NESTED}/${name}" > "${diff_out}"; then
         echo "==> pi: ${name} as installed differs from its verified tarball:" >&2
-        sed -n '1,20p' /tmp/pi-verify/diff.out >&2
+        sed -n '1,20p' "${diff_out}" >&2
         exit 1
     fi
     verified=$((verified + 1))
-done < /tmp/pi-siblings.tsv
+done < "${siblings}"
 
 # A selector that matches nothing must not read as success: if a future pin
 # changes the nested layout, this is what says so.
@@ -136,5 +148,5 @@ if [ "${verified}" -ne 5 ]; then
 fi
 echo "==> pi: ${verified}/5 shrinkwrap-only tarballs verified against the committed integrity"
 
-rm -rf /tmp/pi-verify /tmp/pi-siblings.tsv /tmp/pi-nested.tsv "${HOME:-/root}/.npm"
+rm -rf "${work}" "${HOME:-/root}/.npm"
 chmod -R a+rX "${PREFIX}"
