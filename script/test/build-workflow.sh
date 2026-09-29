@@ -700,7 +700,7 @@ run_build_image() {
         # SC2329).
         # shellcheck disable=SC2034
         SCRIPT_DIR="$build_image_fixture/images"
-        # shellcheck disable=SC2329
+        # shellcheck disable=SC2317,SC2329
         docker() { printf 'docker %s\n' "$*"; }
         resolve_agent_versions
         build_intermediate codex base:tag
