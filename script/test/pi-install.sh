@@ -11,13 +11,18 @@
 # it plants a real shadow package in a real installed tree and uses the real
 # `tar` and `diff` (RQ1), so the bytes-comparison B1 turned on is covered by the
 # production commands, not a stub.
+#
+# Every case gets its own directory for the installer's scratch files
+# (`AGENT_VM_PI_WORK_DIR`), so two runs of this script at once -- two worktrees
+# on one host, or two CI steps -- cannot read each other's selector output or
+# delete each other's extraction. A fixed /tmp path was exactly that bug.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
 INSTALLER="$REPO_ROOT/images/tools/pi/install-pi.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pi-install-test.XXXXXX")"
-trap 'rm -rf "$TEST_ROOT" /tmp/pi-verify /tmp/pi-siblings.tsv /tmp/pi-nested.tsv' EXIT
+trap 'rm -rf "$TEST_ROOT"' EXIT
 
 REAL_JQ="$(command -v jq || true)"
 [[ -n "$REAL_JQ" ]] || { echo "FAIL: jq is required" >&2; exit 1; }
@@ -43,7 +48,7 @@ make_tool() {
 new_case() {
     unset NPM_FAIL CURL_FAIL FAKE_B64 DIFF_STATUS AGENT_INSTALL_SOFT_FAIL INTEGRITY
     CASE="$TEST_ROOT/$1"
-    mkdir -p "$CASE/bin" "$CASE/prefix" "$CASE/home"
+    mkdir -p "$CASE/bin" "$CASE/prefix" "$CASE/home" "$CASE/work"
     : >"$CASE/log"
 
     make_tool npm <<'SH'
@@ -98,20 +103,30 @@ write_lock() {
     printf '{"dependencies": {"@earendil-works/pi-coding-agent": "0.86.1"}}\n' >"$CASE/prefix/package.json"
 }
 
-run_installer() {
-    set +e
-    RUN_OUTPUT="$(env -i \
-        "PATH=$CASE/bin:$JQ_DIR:/usr/bin:/bin" \
-        "HOME=$CASE/home" \
-        "FAKE_LOG=$CASE/log" \
-        "AGENT_VM_PI_PREFIX=$CASE/prefix" \
-        "NESTED_DIR=$CASE/prefix/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works" \
+# Run the installer against `$1` (default `$CASE`) and print its merged output.
+# The explicit case argument, rather than always `$CASE`, is what lets the
+# concurrency case drive two cases at once: each case's scratch space is its own
+# `AGENT_VM_PI_WORK_DIR`, so the two share no file.
+installer_output() {
+    local case_dir="${1:-$CASE}"
+    env -i \
+        "PATH=$case_dir/bin:$JQ_DIR:/usr/bin:/bin" \
+        "HOME=$case_dir/home" \
+        "FAKE_LOG=$case_dir/log" \
+        "AGENT_VM_PI_PREFIX=$case_dir/prefix" \
+        "AGENT_VM_PI_WORK_DIR=$case_dir/work" \
+        "NESTED_DIR=$case_dir/prefix/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works" \
         "AGENT_INSTALL_SOFT_FAIL=${AGENT_INSTALL_SOFT_FAIL-}" \
         "NPM_FAIL=${NPM_FAIL-}" \
         "CURL_FAIL=${CURL_FAIL-}" \
         "FAKE_B64=${FAKE_B64-AAAA}" \
         "DIFF_STATUS=${DIFF_STATUS-0}" \
-        sh "$INSTALLER" 2>&1)"
+        sh "$INSTALLER" 2>&1
+}
+
+run_installer() {
+    set +e
+    RUN_OUTPUT="$(installer_output)"
     RUN_STATUS=$?
     set -e
 }
@@ -225,7 +240,7 @@ new_realcase() {
     unset AGENT_INSTALL_SOFT_FAIL
     CASE="$TEST_ROOT/real-$1"
     rm -rf "$CASE"
-    mkdir -p "$CASE/bin" "$CASE/prefix" "$CASE/home" "$CASE/tarballs" "$CASE/src"
+    mkdir -p "$CASE/bin" "$CASE/prefix" "$CASE/home" "$CASE/tarballs" "$CASE/src" "$CASE/work"
     : >"$CASE/log"
 
     # Real tarballs (package/<name>.js) and the real extracted installed tree
@@ -312,6 +327,7 @@ run_real_installer() {
         "FAKE_LOG=$CASE/log" \
         "CASE_TARBALLS=$CASE/tarballs" \
         "AGENT_VM_PI_PREFIX=$CASE/prefix" \
+        "AGENT_VM_PI_WORK_DIR=$CASE/work" \
         "AGENT_INSTALL_SOFT_FAIL=${AGENT_INSTALL_SOFT_FAIL-}" \
         sh "$INSTALLER" 2>&1)"
     RUN_STATUS=$?
@@ -377,9 +393,46 @@ run_real_installer
 [[ $RUN_STATUS -ne 0 ]] || fail "a tarball shipping a lock-declared path must fail"
 assert_contains "$RUN_OUTPUT" "already contains"
 
+# --- scratch space: one directory per run, so concurrent runs cannot collide -
+#
+# The installer used to hardcode /tmp/pi-verify, /tmp/pi-siblings.tsv and
+# /tmp/pi-nested.tsv, so two runs at once read each other's selector output and
+# deleted each other's extraction, each failing with a different assertion. All
+# three now live under AGENT_VM_PI_WORK_DIR; these two cases pin that.
+
+# The override is load-bearing, not decorative. This case stops at the integrity
+# mismatch, which is before the installer's own cleanup, so the selector output
+# it wrote is still there to be found -- and only under the override directory.
+new_case work-dir-override
+write_lock 5 sha512-WRONG
+FAKE_B64=AAAA
+run_installer
+[[ $RUN_STATUS -ne 0 ]] || fail "the integrity mismatch must fail: $RUN_OUTPUT"
+[[ -s "$CASE/work/siblings.tsv" ]] \
+    || fail "the installer must write its selector output under AGENT_VM_PI_WORK_DIR"
+
+# Two installers at once, each in its own case and scratch directory, both
+# succeed. Sharing one directory made at least one of them fail.
+new_case concurrent-a
+write_lock
+case_a="$CASE"
+new_case concurrent-b
+write_lock
+case_b="$CASE"
+set +e
+installer_output "$case_a" >"$case_a/out.log" 2>&1 & pid_a=$!
+installer_output "$case_b" >"$case_b/out.log" 2>&1 & pid_b=$!
+wait "$pid_a"; status_a=$?
+wait "$pid_b"; status_b=$?
+set -e
+[[ $status_a -eq 0 ]] || fail "concurrent run A must succeed: $(cat "$case_a/out.log")"
+[[ $status_b -eq 0 ]] || fail "concurrent run B must succeed: $(cat "$case_b/out.log")"
+
 # --- the test seam cannot become the production default ----------------------
 
 grep -Fq 'AGENT_VM_PI_PREFIX:-/opt/agent-vm/pi}"' "$INSTALLER" \
     || fail "production default install prefix is missing"
+grep -Fq 'AGENT_VM_PI_WORK_DIR:-/tmp/pi-verify}"' "$INSTALLER" \
+    || fail "production default scratch directory is missing"
 
 echo 'pi-install black-box tests passed'
