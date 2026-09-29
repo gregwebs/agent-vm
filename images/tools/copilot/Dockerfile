@@ -5,11 +5,16 @@ ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-base:latest
 FROM ${BASE_IMAGE}
 
 # Re-declared inside the stage: a global ARG is not visible to RUN.
+ARG AGENT_VERSION_COPILOT=
 ARG AGENT_INSTALL_SOFT_FAIL=
 
 # Copilot installs into the global npm prefix, which is already on the base's
 # PATH, so this layer needs no additive `ENV PATH`.
-RUN npm install -g @github/copilot
+#
+# AGENT_VERSION_COPILOT (script/build/agent-versions.sh) is both the cache key
+# and the installed version, so the two cannot disagree. Unset -- the
+# launcher's local compose passes only BASE_IMAGE -- installs `latest`.
+RUN npm install -g "@github/copilot@${AGENT_VERSION_COPILOT:-latest}"
 
 # Direct invocation, never `command -v`: a present-but-broken binary must fail
 # the build. Honors AGENT_INSTALL_SOFT_FAIL exactly as the old combined check.

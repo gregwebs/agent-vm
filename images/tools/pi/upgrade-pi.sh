@@ -28,8 +28,9 @@ usage() {
     cat <<EOF
 Usage: bash images/tools/pi/upgrade-pi.sh [VERSION]
 
-Pin ${PACKAGE} to VERSION (default: the registry's \`latest\` dist-tag) and
-regenerate package.json + package-lock.json beside this script.
+Pin ${PACKAGE} to VERSION, an exact version or a dist-tag (default: the
+registry's \`latest\` dist-tag), and regenerate package.json +
+package-lock.json beside this script.
 EOF
 }
 
@@ -44,26 +45,21 @@ if [ $# -gt 1 ]; then
     exit 2
 fi
 
-for tool in jq npm; do
-    command -v "$tool" >/dev/null || {
-        echo "error: $tool is required" >&2
-        exit 1
-    }
-done
-
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared prerequisite check and version resolution; see the helper's header for
+# why the copy is not inlined. source=/dev/null: shellcheck cannot follow a path
+# built from $DIR, and npm-pin.sh is linted on its own.
+# shellcheck source=/dev/null
+. "$DIR/../../../script/build/npm-pin.sh"
+
+require_tools jq npm
+
 current=$(jq -r --arg p "$PACKAGE" '.dependencies[$p]' "$DIR/package.json")
 
-version="${1:-}"
-if [ -z "$version" ]; then
-    version=$(npm view "$PACKAGE" dist-tags.latest)
+version_arg="${1:-}"
+version=$(resolve_npm_version "$PACKAGE" "$version_arg")
+if [ -z "$version_arg" ]; then
     echo "==> latest ${PACKAGE} is ${version}"
-fi
-# `npm view` of an exact version prints nothing (exit 0) when it does not
-# exist, so check the output rather than the status.
-if [ "$(npm view "${PACKAGE}@${version}" version 2>/dev/null)" != "$version" ]; then
-    echo "error: ${PACKAGE}@${version} is not a published version" >&2
-    exit 1
 fi
 
 echo "==> pinning ${PACKAGE}: ${current} -> ${version}"
