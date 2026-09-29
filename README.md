@@ -27,7 +27,6 @@ Missing planned features:
 
 * MCP gateway
 * SSH agent socket
-* local port publishing
 
 ## Similar tools
 
@@ -41,7 +40,7 @@ The main reasons someone might prefer this project is:
 * doesn't run its own daemon
 * integrates with existing host VM systems via microsandbox (libkrun)
 
-The features differ in serveral ways:
+The features of agent-vm differ in serveral ways:
 * fork mounts instead of a clone mode
 * shell / run usage
 * no shared skills repository
@@ -55,9 +54,9 @@ It seems more geared to datacenter/cloud usage. It has multiple backends and doe
 ## Status
 
 Although this is architected for security and every change is inspected for security, further security review is still needed.
-Currently a few major features are being worked on before intensive security review begins.
+This will happen afer completing testing of a few major features that have just landed.
 If you are currently not sandboxing, then using this tool would be much more secure than that.
-Please try out the project and give feedback or star it and and come back to it in a month.
+Please try out the project and give feedback or star it but don't rely on it for untrusted workloads yet.
 
 ## Requirements
 
