@@ -116,7 +116,9 @@ dependency on a sibling checkout works for one developer and for nobody else.
 
 agent-vm builds against the stock crates.io `msb_krun*` cohort
 ([ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md)); what is vendored
-is the microsandbox source itself, at a pinned version.
+is the microsandbox source itself, at a pinned version
+([ADR-0027](docs/adr/0027-adopt-v0.7.4-fork-baseline.md) records the current
+pin).
 
 ## Sandboxes and sessions
 
@@ -1089,10 +1091,10 @@ directories the user never asked for. The state-root precedence is in
 | Project tooling layers (`.agent-vm/layers/`, plus any `--layer DIR`) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
 | One shared `MSB_HOME`, not schema-namespaced | [ADR-0004](docs/adr/0004-single-shared-msb-home.md) |
 | Deferring the sea-orm / sqlx major bump | [ADR-0005](docs/adr/0005-defer-sea-orm-sqlx-major-bump.md) |
-| Adopting a clean microsandbox v0.6.15 baseline (dropping the fork) | [ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md) |
+| Adopting a clean microsandbox v0.6.15 baseline (dropping the libkrun fork; baseline superseded by ADR-0027) | [ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md) |
 | Heartbeat keep-alive and runtime-exit reporting | [ADR-0007](docs/adr/0007-heartbeat-keep-alive-and-runtime-exit-reporting.md) |
-| Migrating 0.5.7 state to v0.6.15 | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md) |
-| Adopting `origin/main`'s network features | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
+| Migrating 0.5.7 state to v0.6.15 (target restated as the v0.7.4 schema by ADR-0027) | [ADR-0008](docs/adr/0008-migrate-0.5.7-state-to-v0.6.15.md) |
+| Adopting `origin/main`'s network features (branch framing superseded by ADR-0027) | [ADR-0009](docs/adr/0009-adopt-origin-main-network-features.md) |
 | Wiring file-backed credential injection | [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) |
 | Pi uses mixed credential ownership (guest-managed report) | [ADR-0011](docs/adr/0011-pi-mixed-credential-ownership.md) |
 | A stable wrapper around image-installed Pi | [ADR-0012](docs/adr/0012-stable-pi-image-customization-seam.md) |
@@ -1100,6 +1102,7 @@ directories the user never asked for. The state-root precedence is in
 | Narrowing fork mounts to directories; files read-only | [ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md) |
 | User-authorized YAML credentials (`credentials.yaml`) | [ADR-0025](docs/adr/0025-yaml-credential-shielding.md) |
 | Accepting Basic auth in the header substitution scope (microsandbox 0.7.4) | [ADR-0026](docs/adr/0026-accept-basic-auth-in-header-substitution-scope.md) |
+| Adopting the v0.7.4 fork baseline (supersedes in part ADR-0006's baseline, ADR-0008's target and evidence base, and ADR-0009's branch framing) | [ADR-0027](docs/adr/0027-adopt-v0.7.4-fork-baseline.md) |
 
 ## Deliberate non-goals
 

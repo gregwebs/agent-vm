@@ -3,7 +3,11 @@
 ## Status
 
 Accepted. All four fork-only capabilities are now wired (ADR-0010
-supersedes feature 4's deferral).
+supersedes feature 4's deferral). Superseded in part by
+[ADR-0027](0027-adopt-v0.7.4-fork-baseline.md) for the two-branch framing: the
+vendored line is no longer `integration/v0.6.15-agent-vm` integrating
+`origin/main`, but the fork's `main` tip with the fork features re-applied onto
+upstream v0.7.4. The wiring decisions for features 1-4 remain applicable.
 
 ## Context
 

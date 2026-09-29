@@ -3,7 +3,17 @@
 ## Status
 
 Accepted. Superseded in part by ADR-0009 and ADR-0010: all four
-fork-only network capabilities are now active.
+fork-only network capabilities are now active. Superseded in part by
+[ADR-0027](0027-adopt-v0.7.4-fork-baseline.md) for the baseline itself: the
+vendored gitlink is now the `gregwebs/microsandbox` tip `4246606a` (upstream
+v0.7.4 with the fork features re-applied), not this ADR's
+`origin/baseline/v0.6.15` tip, its thin
+`integration/v0.6.15-agent-vm` branch, or its single re-ported commit; and the
+pinned `msb_krun*` cohort is 0.1.39, not the 0.1.32 this ADR's Decision and
+Consequences name. The deleted-`libkrun`-fork-pin decision,
+official-identity `msb` verification, and shortened-`MSB_HOME`
+socket-path-preflight decisions (whose checked-path scope ADR-0027 restates)
+remain applicable.
 
 ## Context
 
