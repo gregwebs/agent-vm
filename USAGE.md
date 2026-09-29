@@ -112,7 +112,10 @@ Flags:
 - `--base-image REF` (env `AGENT_VM_BASE_IMAGE`) chooses the tool-free base that
   tool layers are composed onto, and **always** composes locally — it is how a
   source-checkout user tests a locally built/imported base. `--image` and
-  `--base-image` are mutually exclusive.
+  `--base-image` are mutually exclusive, but an explicit flag wins over the
+  *other* flag's environment variable: an exported `AGENT_VM_IMAGE_TAG` does not
+  stop you passing `--base-image`, and vice versa. An empty environment variable
+  counts as unset.
 
 A locally composed tool layer **freezes its agent version at build time**: the
 layer hash covers its directory, and no `AGENT_VERSION_*` is passed on a local
@@ -285,7 +288,8 @@ included, enables it.
 | `AGENT_VM_PROFILE` | print per-phase wall-time (create/run/stop/remove) |
 | `AGENT_VM_DEBUG_CONFIG` | dump the SandboxConfig JSON before boot |
 | `AGENT_VM_NO_CHROME_MCP` | disable Chrome MCP auto-configuration for a Chrome-capable image/layer |
-| `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`) |
+| `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`; an explicit `--base-image` wins over it) |
+| `AGENT_VM_BASE_IMAGE` | override the tool-free base (same as `--base-image`; an explicit `--image` wins over it) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
 | `AGENT_VM_UPDATE_CHECK` | opt into the launch-time registry update check (accepted: `1`/`true`/`yes`/`on`) |
 | `AGENT_VM_ROOT` | same as `--root` (accepted: `1`/`true`/`yes`/`on`) |

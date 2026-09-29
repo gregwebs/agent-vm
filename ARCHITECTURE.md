@@ -1103,6 +1103,7 @@ directories the user never asked for. The state-root precedence is in
 | User-authorized YAML credentials (`credentials.yaml`) | [ADR-0025](docs/adr/0025-yaml-credential-shielding.md) |
 | Accepting Basic auth in the header substitution scope (microsandbox 0.7.4) | [ADR-0026](docs/adr/0026-accept-basic-auth-in-header-substitution-scope.md) |
 | Adopting the v0.7.4 fork baseline (supersedes in part ADR-0006's baseline, ADR-0008's target and evidence base, and ADR-0009's branch framing) | [ADR-0027](docs/adr/0027-adopt-v0.7.4-fork-baseline.md) |
+| An explicit `--image`/`--base-image` overrides the other flag's environment variable | [ADR-0028](docs/adr/0028-explicit-image-flag-beats-the-other-environment-variable.md) |
 
 ## Deliberate non-goals
 

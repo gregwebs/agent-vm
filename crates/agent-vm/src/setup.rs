@@ -55,17 +55,19 @@ pub struct Args {
     ///
     /// Defaults to the image this configuration would boot from — the composed
     /// default template for the shipped tool set, or the tool-free base when
-    /// the configured set differs. Mutually exclusive with `--base-image`.
+    /// the configured set differs. Mutually exclusive with `--base-image`; an
+    /// explicit flag wins over the other flag's environment variable.
     #[arg(long, env = "AGENT_VM_IMAGE_TAG", value_name = "REF")]
-    image: Option<String>,
+    pub(crate) image: Option<String>,
 
     /// Verify the tool-free base that tool layers are composed onto.
     ///
     /// Default `ghcr.io/wirenboard/agent-vm-base:latest`. Passing this always
     /// targets the base, even when the tool set matches the shipped default.
-    /// Mutually exclusive with `--image`.
+    /// Mutually exclusive with `--image`; an explicit flag wins over the
+    /// other flag's environment variable.
     #[arg(long = "base-image", env = "AGENT_VM_BASE_IMAGE", value_name = "REF")]
-    base_image: Option<String>,
+    pub(crate) base_image: Option<String>,
 }
 
 /// One in-guest command `setup` proves works. A newtype rather than

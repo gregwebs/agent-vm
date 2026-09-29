@@ -33,17 +33,19 @@ pub struct Args {
     /// default template `ghcr.io/wirenboard/agent-vm-template:latest` for the
     /// shipped default tool set, or the tool-free base when the configured set
     /// differs. Use a timestamped tag (`...:YYYY-MM-DDTHH`) to pin a specific
-    /// build. Mutually exclusive with `--base-image`.
+    /// build. Mutually exclusive with `--base-image`; an explicit flag wins
+    /// over the other flag's environment variable.
     #[arg(long, env = "AGENT_VM_IMAGE_TAG", value_name = "REF")]
-    image: Option<String>,
+    pub(crate) image: Option<String>,
 
     /// Pull the tool-free base that tool layers are composed onto.
     ///
     /// Default `ghcr.io/wirenboard/agent-vm-base:latest`. Passing this always
     /// targets the base, even when the tool set matches the shipped default.
-    /// Mutually exclusive with `--image`.
+    /// Mutually exclusive with `--image`; an explicit flag wins over the
+    /// other flag's environment variable.
     #[arg(long = "base-image", env = "AGENT_VM_BASE_IMAGE", value_name = "REF")]
-    base_image: Option<String>,
+    pub(crate) base_image: Option<String>,
 }
 
 pub async fn run(args: Args, catalog: Catalog) -> Result<()> {

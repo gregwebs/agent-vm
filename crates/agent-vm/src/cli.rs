@@ -324,35 +324,164 @@ where
             // launched verb first would drop its own layer (issue #84).
             let layers = catalog.declared_layers();
             match catalog.take_entry(name) {
-                Some(entry) => Ok(Dispatch::Launch {
-                    entry: Box::new(entry),
-                    layers,
-                    args: Box::new(run::Args::from_arg_matches(sub)?),
-                }),
+                Some(entry) => {
+                    let mut args = run::Args::from_arg_matches(sub)?;
+                    ImageFlags {
+                        image: &mut args.image,
+                        base_image: &mut args.base_image,
+                    }
+                    .reconcile(sub);
+                    Ok(Dispatch::Launch {
+                        entry: Box::new(entry),
+                        layers,
+                        args: Box::new(args),
+                    })
+                }
                 // Not a tool, so a fixed built-in: the two name sets are disjoint
                 // (`RESERVED_TOOL_NAMES`, asserted by a test) and external
                 // subcommands are off on this path, so clap could not have accepted
                 // anything else. The catalog (minus the taken launch entry, which
                 // only a launch verb would have matched) is carried to the built-in
                 // so `setup` can read it.
-                None => Ok(Dispatch::Builtin {
-                    cmd: Cli::from_arg_matches(&matches)?.cmd,
-                    catalog: Catalog::Ready(catalog),
-                }),
+                None => {
+                    let mut cmd = Cli::from_arg_matches(&matches)?.cmd;
+                    reconcile_builtin_image_flags(sub, &mut cmd);
+                    Ok(Dispatch::Builtin {
+                        cmd,
+                        catalog: Catalog::Ready(catalog),
+                    })
+                }
             }
         }
-        (Some((name, _)), Catalog::Broken(config_error)) => {
+        (Some((name, sub)), Catalog::Broken(config_error)) => {
             // A registered built-in still works; anything else is an unknown
             // verb clap accepted as an external subcommand, and carries the
             // config error.
             match Cli::from_arg_matches(&matches) {
-                Ok(cli) => Ok(Dispatch::Builtin {
-                    cmd: cli.cmd,
-                    catalog: Catalog::Broken(config_error),
-                }),
+                Ok(mut cli) => {
+                    reconcile_builtin_image_flags(sub, &mut cli.cmd);
+                    Ok(Dispatch::Builtin {
+                        cmd: cli.cmd,
+                        catalog: Catalog::Broken(config_error),
+                    })
+                }
                 Err(_) => Err(config_error_with_hint(&config_error, name)),
             }
         }
+    }
+}
+
+/// Which half of the `--image` / `--base-image` pair a rule is about.
+///
+/// Both halves are `Option<String>` with opposite meanings, so they are never
+/// passed as bare values — see [`ImageFlags`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageHalf {
+    /// `--image` / `AGENT_VM_IMAGE_TAG`: an image to boot verbatim.
+    Image,
+    /// `--base-image` / `AGENT_VM_BASE_IMAGE`: what the tool layers compose onto.
+    BaseImage,
+}
+
+impl ImageHalf {
+    /// Both halves, in help order.
+    const BOTH: [ImageHalf; 2] = [ImageHalf::Image, ImageHalf::BaseImage];
+
+    /// The clap argument id, which is the field name in every `Args` struct that
+    /// declares the pair (`run`, `pull`, `setup`).
+    fn id(self) -> &'static str {
+        match self {
+            ImageHalf::Image => "image",
+            ImageHalf::BaseImage => "base_image",
+        }
+    }
+
+    /// The other half of the pair.
+    fn other(self) -> Self {
+        match self {
+            ImageHalf::Image => ImageHalf::BaseImage,
+            ImageHalf::BaseImage => ImageHalf::Image,
+        }
+    }
+}
+
+/// A borrowed `--image` / `--base-image` pair. Named fields rather than two
+/// `&mut Option<String>` parameters, which are same-typed and swappable.
+struct ImageFlags<'a> {
+    image: &'a mut Option<String>,
+    base_image: &'a mut Option<String>,
+}
+
+impl ImageFlags<'_> {
+    /// Reconcile the pair after clap's `env = …` fallback has written
+    /// `AGENT_VM_IMAGE_TAG` / `AGENT_VM_BASE_IMAGE` into the same slots as the
+    /// flags (issue #189).
+    ///
+    /// clap already gives the command line precedence over the environment
+    /// *within* one argument (`--image X` beats `AGENT_VM_IMAGE_TAG`); this
+    /// extends that rule across the pair. Without it an ambient
+    /// `AGENT_VM_IMAGE_TAG` — from a shell profile, a CI job, or agent-vm's own
+    /// documented dev setup — makes `--base-image` unusable, because
+    /// [`crate::tool_layer::chain_root`] sees two supplied flags and rejects the
+    /// pair, blaming a flag the user never typed.
+    ///
+    /// Only environment-supplied values are dropped, so two *typed* flags still
+    /// conflict (the user must choose one) and two non-empty environment
+    /// variables still conflict (nothing says which was meant). An empty
+    /// environment value counts as unset: `AGENT_VM_IMAGE_TAG=` is a common CI or
+    /// `docker -e` passthrough and would otherwise select an empty image
+    /// reference.
+    fn reconcile(&mut self, matches: &clap::ArgMatches) {
+        let typed = |half: ImageHalf| {
+            matches.value_source(half.id()) == Some(clap::parser::ValueSource::CommandLine)
+        };
+        for half in ImageHalf::BOTH {
+            if typed(half) {
+                continue;
+            }
+            let value = match half {
+                ImageHalf::Image => &mut *self.image,
+                ImageHalf::BaseImage => &mut *self.base_image,
+            };
+            let empty_from_environment = matches.value_source(half.id())
+                == Some(clap::parser::ValueSource::EnvVariable)
+                && value.as_deref() == Some("");
+            if typed(half.other()) || empty_from_environment {
+                *value = None;
+            }
+        }
+    }
+}
+
+/// [`ImageFlags::reconcile`] on whichever built-in declares the pair.
+///
+/// Deliberately exhaustive rather than `_ => {}`: it forces whoever adds a
+/// `Cmd` variant to say whether that verb carries the pair. A wildcard would
+/// let a new `--image`/`--base-image` verb skip the rule silently, which is
+/// exactly the bug (issue #189).
+fn reconcile_builtin_image_flags(sub: &clap::ArgMatches, cmd: &mut Cmd) {
+    match cmd {
+        Cmd::Pull(args) => pull_image_flags(args).reconcile(sub),
+        Cmd::Setup(args) => setup_image_flags(args).reconcile(sub),
+        Cmd::Msb(_)
+        | Cmd::Clipboard(_)
+        | Cmd::Doctor(_)
+        | Cmd::Secret(_)
+        | Cmd::InterceptHook(_) => {}
+    }
+}
+
+fn pull_image_flags(args: &mut pull::Args) -> ImageFlags<'_> {
+    ImageFlags {
+        image: &mut args.image,
+        base_image: &mut args.base_image,
+    }
+}
+
+fn setup_image_flags(args: &mut setup::Args) -> ImageFlags<'_> {
+    ImageFlags {
+        image: &mut args.image,
+        base_image: &mut args.base_image,
     }
 }
 
@@ -597,6 +726,182 @@ mod tests {
                 assert_eq!(seq, crate::config::shipped_tool_layers().unwrap());
             }
             Dispatch::Builtin { .. } => panic!("claude is a launch verb"),
+        }
+    }
+
+    // -- #189: an explicit image flag beats the other's environment variable --
+
+    /// The full `--image` / `--base-image` precedence table, driven through
+    /// [`parse_from`] — the seam that can see clap's `ValueSource` — so a future
+    /// refactor that stops reconciling fails here. The environment is pinned
+    /// under [`crate::test_env::guard`] so the process-wide variables cannot
+    /// race a parallel test.
+    ///
+    /// The end-to-end halves of this rule are in
+    /// `tests/config_launch_driven.rs`; this table exists to cover the empty
+    /// environment row, which would need a registry pull to observe through a
+    /// real launch.
+    #[test]
+    fn an_explicit_image_flag_beats_the_others_environment_variable() {
+        #[derive(Debug)]
+        struct Case {
+            env_image: Option<&'static str>,
+            env_base: Option<&'static str>,
+            argv: &'static [&'static str],
+            image: Option<&'static str>,
+            base_image: Option<&'static str>,
+        }
+
+        let cases = [
+            // An explicit flag wins over the other flag's environment value.
+            Case {
+                env_image: Some("env:1"),
+                env_base: None,
+                argv: &["--base-image", "base:1"],
+                image: None,
+                base_image: Some("base:1"),
+            },
+            Case {
+                env_image: None,
+                env_base: Some("base:1"),
+                argv: &["--image", "img:1"],
+                image: Some("img:1"),
+                base_image: None,
+            },
+            // An empty environment value is unset, not an empty image
+            // reference — on both halves, whether or not the other is set. A
+            // wrong clap id would leave a `Some("")` here, so these rows also
+            // guard `ImageHalf::id` against a field rename.
+            Case {
+                env_image: Some(""),
+                env_base: None,
+                argv: &[],
+                image: None,
+                base_image: None,
+            },
+            Case {
+                env_image: None,
+                env_base: Some(""),
+                argv: &[],
+                image: None,
+                base_image: None,
+            },
+            Case {
+                env_image: Some(""),
+                env_base: Some("base:1"),
+                argv: &[],
+                image: None,
+                base_image: Some("base:1"),
+            },
+            Case {
+                env_image: Some("img:1"),
+                env_base: Some(""),
+                argv: &[],
+                image: Some("img:1"),
+                base_image: None,
+            },
+            // Same-argument precedence stays clap's own.
+            Case {
+                env_image: Some("env:1"),
+                env_base: None,
+                argv: &["--image", "cli:1"],
+                image: Some("cli:1"),
+                base_image: None,
+            },
+            // A pair supplied the same way is still ambiguous, and is left for
+            // `chain_root` to reject.
+            Case {
+                env_image: Some("env:1"),
+                env_base: Some("base:1"),
+                argv: &[],
+                image: Some("env:1"),
+                base_image: Some("base:1"),
+            },
+            Case {
+                env_image: None,
+                env_base: None,
+                argv: &["--image", "img:1", "--base-image", "base:1"],
+                image: Some("img:1"),
+                base_image: Some("base:1"),
+            },
+        ];
+
+        let mut env = crate::test_env::guard();
+        for case in cases {
+            for (name, value) in [
+                ("AGENT_VM_IMAGE_TAG", case.env_image),
+                ("AGENT_VM_BASE_IMAGE", case.env_base),
+            ] {
+                match value {
+                    Some(value) => env.set_var(name, value),
+                    None => env.remove_var(name),
+                }
+            }
+            let mut argv = vec!["agent-vm", "pull"];
+            argv.extend_from_slice(case.argv);
+            let dispatch = parse_from(argv, Ok(report_from("tools = []\n")))
+                .unwrap_or_else(|error| panic!("{case:?} must parse: {error}"));
+            match dispatch {
+                Dispatch::Builtin {
+                    cmd: Cmd::Pull(args),
+                    ..
+                } => {
+                    assert_eq!(args.image.as_deref(), case.image, "{case:?}");
+                    assert_eq!(args.base_image.as_deref(), case.base_image, "{case:?}");
+                }
+                _ => panic!("pull must dispatch as a built-in"),
+            }
+        }
+    }
+
+    /// Issue #189: every dispatch arm that carries the pair runs the same
+    /// reconciliation. The launch arm, the ready-catalog built-in arm (`pull`,
+    /// `setup`) and the broken-config built-in arm each call it separately, so
+    /// dropping any one of them would bring the bug back silently if a
+    /// per-verb case did not fail here.
+    #[test]
+    fn every_dispatch_arm_reconciles_the_image_pair() {
+        let mut env = crate::test_env::guard();
+        env.set_var("AGENT_VM_IMAGE_TAG", "env:1");
+
+        // The launch arm (a tool verb).
+        let dispatch = parse_from(
+            ["agent-vm", "shell", "--base-image", "base:1"],
+            Ok(report_from("tools = []\n")),
+        )
+        .expect("shell parses");
+        match dispatch {
+            Dispatch::Launch { args, .. } => {
+                assert_eq!(args.image, None);
+                assert_eq!(args.base_image.as_deref(), Some("base:1"));
+            }
+            Dispatch::Builtin { .. } => panic!("shell is a launch verb"),
+        }
+
+        // The ready-catalog built-in arm, and the deferred-config-error arm.
+        // `setup` and `pull` share one rule, so the two verbs plus the two
+        // catalog outcomes cover every arm that can carry the pair.
+        for verb in ["pull", "setup"] {
+            for catalog in [
+                Ok(report_from("tools = []\n")),
+                Err(anyhow::anyhow!("broken")),
+            ] {
+                let dispatch = parse_from(["agent-vm", verb, "--base-image", "base:1"], catalog)
+                    .unwrap_or_else(|error| panic!("{verb} must parse: {error}"));
+                let flags = match dispatch {
+                    Dispatch::Builtin {
+                        cmd: Cmd::Pull(args),
+                        ..
+                    } => (args.image, args.base_image),
+                    Dispatch::Builtin {
+                        cmd: Cmd::Setup(args),
+                        ..
+                    } => (args.image, args.base_image),
+                    _ => panic!("{verb} must dispatch as a built-in"),
+                };
+                assert_eq!(flags.0, None, "{verb}");
+                assert_eq!(flags.1.as_deref(), Some("base:1"), "{verb}");
+            }
         }
     }
 
