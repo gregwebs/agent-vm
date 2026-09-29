@@ -2,7 +2,15 @@
 
 ## Status
 
-Accepted.
+Accepted. Superseded in part by
+[ADR-0027](0027-adopt-v0.7.4-fork-baseline.md) for the migration target this
+ADR names: the bundled schema is now `m20260922_000001` (28 migrations, with
+0.7.4's `image.bind` -> `image.Bind` normalizer), not v0.6.15's 24 with its
+`m20260824_000001` head, and two further migrations flagged `affects_user_data`
+have been added since, so this ADR's "three of the thirteen pending" census no
+longer holds. The decision to rely on the SDK's forward migration and add no
+migration engine, and the ahead / unsafe-path / partial / locked layering
+below, remain applicable.
 
 ## Context
 
