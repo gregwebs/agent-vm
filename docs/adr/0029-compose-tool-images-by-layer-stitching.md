@@ -41,12 +41,19 @@ own layers above its parent, in catalog order, with no merge build.
   ordered tool identities), cached in msb and skipped when present. Stitching is
   deterministic (fixed timestamps, canonical JSON), so the same inputs give the
   same manifest digest.
-- **Driver and storage**: one generated `docker buildx bake` file covering only
-  the tools that aren't cached, with a declared parent passed as a
-  `target:`/`oci-layout://` context. Bake exports into one content-addressed
-  OCI layout in agent-vm's cache; the stitcher reads blobs from there, and the
-  result is ingested with `load_archive`, which reuses msb's per-`diff_id`
-  EROFS layers.
+- **Driver**: generated `docker buildx bake` files covering only the tools
+  that aren't cached, **one bake process per independent group** (a root tool
+  plus the tools that declare it as parent), run concurrently. A declared
+  parent is passed as a `target:` context (same group) or an `oci-layout://`
+  context (already cached). A single bake over every target won't do: when one
+  target fails, bake cancels the others and their exports never land.
+- **Storage**: one content-addressed OCI layout in agent-vm's cache, with
+  **agent-vm as its only writer**. Each bake target exports to its own staging
+  layout; agent-vm hardlinks the blobs in (skipping blobs already present) and
+  writes `index.json` itself. Concurrent exports into one shared layout race in
+  its `ingest/` directory when they share a blob. The stitcher reads blobs from
+  the layout, and the result is ingested with `load_archive`, which reuses msb's
+  per-`diff_id` EROFS layers.
 - **Failure**: if one tool fails to build, the launch fails and names it;
   images already built stay cached.
 - **One implementation**: CI produces the published composed default with the
@@ -62,6 +69,16 @@ own layers above its parent, in catalog order, with no merge build.
   back out, BuildKit can't use msb as a build context for a declared parent,
   and CI has no msb.
 
+## Evidence
+
+The prototype on branch `spike/tool-layer-stitching`
+(`spikes/tool-layer-stitching/`, one command: `spike.sh`) stitches the six
+builtin tools plus a user tool whose declared parent is claude. The result boots
+in agent-vm with a project tooling layer on top. It shows that a codex bump
+rebuilds one tool image (35 of 37 layers unchanged), that a different tool set
+rebuilds nothing, and that the output is byte-for-byte reproducible. It is also
+where the Driver and Storage corrections above came from.
+
 ## Consequences
 
 - A one-tool bump rebuilds one tool image and re-stitches in seconds.
@@ -69,5 +86,9 @@ own layers above its parent, in catalog order, with no merge build.
   build.
 - Compressed blobs are stored twice (the OCI layout and msb's cache), and
   neither store has garbage collection yet.
+- Re-ingesting into msb isn't incremental at the archive level: after a
+  one-tool bump, `load_archive` took about as long as the first ingest (~18 s
+  for a 1 GB image), because it re-reads every blob and rebuilds the per-image
+  metadata.
 - Rebasing onto a new base becomes a manifest edit, as long as tool diffs don't
   depend on the base (Rebasing tool layers onto an updated base).
