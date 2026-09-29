@@ -124,6 +124,9 @@ output and on a version that differs from the pin.
 
 ## Bumping the `pi` pin
 
+`bash images/tools/pi/upgrade-pi.sh [VERSION]` automates every step below; see
+[`pi/README.md`](pi/README.md). The manual flow it performs:
+
 **Bumping the pin** means editing `package.json` and regenerating the lock:
 
 ```bash
