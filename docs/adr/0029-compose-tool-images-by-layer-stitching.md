@@ -11,6 +11,11 @@ ended up was settled by [ADR-0032](0032-one-layer-kind.md): the layers/tools
 distinction is removed, so **every** layer is an independent node in this ADR's
 stitched DAG, and "project tooling layer" is no longer a kind of thing.
 
+The order this ADR stitched in was amended by
+[ADR-0032](0032-one-layer-kind.md): stitch order is now **derived** from the
+declared `parent` graph, with declaration order demoted to a tie-break among
+layers the graph does not order.
+
 ## Context
 
 Today every tool layer builds `FROM` the previous one. A tool image is therefore

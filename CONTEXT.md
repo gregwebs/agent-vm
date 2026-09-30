@@ -279,7 +279,8 @@ config file's directory — an optional `parent`, an optional guest `command`,
 and the tool fields below. Every entry contributes to the image; an entry with a
 `command` also offers a launch verb. Layers are **declared, never discovered**:
 there is no `.agent-vm/layers/` convention, and `--layer DIR` injects one at the
-command line. Declaration order is **stitch** order. Resolved by
+command line. Stitch order is **derived from `parent`**; declaration order only
+breaks ties among layers the graph does not order. Resolved by
 `tool_layer::chain_root` → `tool_layer::materialize`. See
 [ADR-0032](docs/adr/0032-one-layer-kind.md).
 
@@ -359,7 +360,8 @@ Resolved via `--base-image` / `AGENT_VM_BASE_IMAGE` /
 
 The OCI **guest template** booted verbatim when the declared layer set equals
 the shipped default (`ghcr.io/wirenboard/agent-vm-template:latest`): the base
-plus the shipped layers **stitched** in declaration order, published by CI and
+plus the shipped layers **stitched** in the order their `parent` declarations
+derive, published by CI and
 never rebuilt locally. With no layer declared beyond the shipped set the launch
 performs zero Docker calls.
 
@@ -367,7 +369,8 @@ performs zero Docker calls.
 
 What a layer builds `FROM`: the **composition root**, or the one layer it
 explicitly declares. Its **layer image**'s own layers are the ones above its
-parent, which is what makes a layer's identity independent of its position.
+parent, which is what makes a layer's identity independent of its position and
+what stitch order is derived from.
 _Avoid_: predecessor (that is a chain position).
 
 ## Layer image
@@ -394,7 +397,8 @@ _Avoid_: lockfile, latest tag.
 ## Stitching
 
 Joining layer images into one composed image by appending each layer's own
-layers onto the **composition root**'s, in declaration order, without building
+layers onto the **composition root**'s, in the order the layers' `parent`
+declarations derive, without building
 anything. See
 [ADR-0029](docs/adr/0029-compose-tool-images-by-layer-stitching.md).
 _Avoid_: merge, flatten, squash.
@@ -447,15 +451,20 @@ step 0's hash input, and the link is never consulted on a cache-hit launch.
 
 The graph a launch builds: the declared catalog's **layers**, each an
 independent build `FROM` its **parent** (the **composition root**, or a layer it
-declares), joined into the **derived image** by **stitching** in declaration
-order. Every layer image's **tool image contract** is checked when it is built;
-the **stitch check**s run across the set. `layer::plan_chain` computes the
-identities up front; `layer::execute_chain` drives the builds. A launch that
-declares no layer beyond the shipped set builds nothing and boots the
-composition root. A **`--layer DIR`** step is appended in command-line order and
-carries no provenance into its identity. There is no discovery: a leftover
-`.agent-vm/layers/` directory is a hard migration error naming the entries to
-declare instead. See [ADR-0032](docs/adr/0032-one-layer-kind.md).
+declares), joined into the **derived image** by **stitching** in an order
+**derived** from the `parent` relation — repeatedly place the earliest-declared
+layer whose ancestors are all placed. Declaration order is therefore only a
+**tie-break among layers the graph does not order** (roots, and siblings under
+one parent), and a child may be declared above its parent. A `parent` naming a
+layer outside the composition, or a cycle, is a hard error. Every layer image's
+**tool image contract** is checked when it is built; the **stitch check**s run
+across the set. `layer::plan_chain` computes the identities up front;
+`layer::execute_chain` drives the builds. A launch that declares no layer beyond
+the shipped set builds nothing and boots the composition root. A **`--layer
+DIR`** step declares no parent, so it is a root and command-line order is its
+tie-break; it carries no provenance into its identity. There is no discovery: a
+leftover `.agent-vm/layers/` directory is a hard migration error naming the
+entries to declare instead. See [ADR-0032](docs/adr/0032-one-layer-kind.md).
 
 _Avoid_: chain, step, predecessor — they name the position model the DAG
 replaced. An order-**dependent** layer is expressible by declaring `parent`.

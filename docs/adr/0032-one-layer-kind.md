@@ -13,6 +13,15 @@ its layer image contract (C1–C8). Extends
 [ADR-0016](0016-tool-declared-guest-env.md) (which env keys a layer may
 declare).
 
+**Amended in place, 2026-09-29.** Stitch order is now *derived* from the
+declared `parent` graph with declaration order demoted to a tie-break. It had
+been declaration order, authoritative, with a child required to follow its
+parent. The revision removes an error class instead of adding a rule: two
+relations cannot disagree when the graph is the only one. Adopted after reading
+Docker Sandbox Kits v3, which answers the same question with a derived order
+("Composition is a function, not a sequence") — see
+[../research/docker-sandbox-kits-v3.md](../research/docker-sandbox-kits-v3.md).
+
 ## Context
 
 Layers were built before tools, and the two never merged. ADR-0003 made project
@@ -77,13 +86,22 @@ error naming the entries to add — the same shape of guardrail, retargeted from
   repeatable and additive, and **provenance stays out of identity**, so
   `--layer`-ing a directory and later declaring the same directory in config
   produce the identical image: a cache hit, not a rebuild.
-- **Declaration order is stitch order.** `default-layers.toml`'s existing
-  "order matters" rule is the only order there is; byte-lexicographic directory
-  naming stops meaning anything.
-- **`parent` is declared in the entry** and defaults to the composition root. A
-  declared parent must precede its child in stitch order, which the stitcher
-  already checks. There is no in-directory `parent` file and no project-level
-  layer manifest.
+- **`parent` is declared in the entry** and defaults to the composition root.
+  There is no in-directory `parent` file and no project-level layer manifest.
+- **Stitch order is derived from `parent`, not authored.** The declared `parent`
+  relation is the composition graph, and stitch order is its topological order:
+  repeatedly place the earliest-declared layer whose ancestors are all already
+  placed (a stable topological sort keyed on declaration position). Declaration
+  order is therefore only a **tie-break among layers the graph does not order** —
+  roots, and siblings under one parent — and not an order the author has to keep
+  consistent with `parent`. A child declared above its parent is legal; it simply
+  sits outside the tie-break's reach. An injected `--layer DIR` declares no
+  parent, so it is a root and command-line order is its tie-break.
+- **A `parent` naming a layer outside the composition, and a cycle, are hard
+  errors.** The rule this replaces — "a declared parent must precede its child in
+  stitch order" — is gone: with one relation there is nothing left for it to
+  check, and the failure it was guarding against, a cycle, is now caught
+  directly.
 
 ### The composition root of a layered launch is composed locally
 
@@ -207,9 +225,8 @@ Accounts become data on the layer entry rather than a `RUN` step:
   with tools referencing a layer by name. Rejected: one concept behind two
   sections, and the drift between them is what the change exists to remove.
 - **Keep `.agent-vm/layers/` discovery as sugar synthesizing parentless
-  entries.** Rejected by the owner: two declaration sites can drift, and
-  directory order would keep implying a parent that stitch order no longer
-  honours.
+  entries.** Rejected by the owner: two declaration sites can drift, and a
+  directory's own order would compete with the config's as the tie-break.
 - **Chain project layers onto the composed root instead of stitching them.**
   Rejected: two composition mechanisms, a second contract family, and a second
   identity rule — for a reuse win that is admittedly smaller on the project half,
