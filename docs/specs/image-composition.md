@@ -1,6 +1,6 @@
 # Image composition: implementation handoff
 
-Status: draft handoff; four source gaps must be resolved before `/breakdown`.
+Status: draft handoff; six source gaps must be resolved before `/breakdown`.
 Not implemented. Source map:
 [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 This consolidates the handoff for `/breakdown`, not an implementation plan or a
@@ -41,7 +41,8 @@ name but governs every layer image.
 
 ## Readiness blockers
 
-Consolidation exposed four gaps not settled by later-decision precedence:
+Consolidation and draft review exposed six gaps not settled by later-decision
+precedence:
 
 1. **[Acyclic composition root and identity boundaries](https://github.com/gregwebs/agent-vm/issues/214).** ADR-0032 puts layer identities in
    the root hash while making that root their default parent. That is recursive;
@@ -63,8 +64,18 @@ Consolidation exposed four gaps not settled by later-decision precedence:
    Env-only or includes `User`, `WorkingDir`, `Entrypoint`, and `Cmd`; define
    S4's key domain and ancestor (not merely direct-parent) override rules.
 
-Until these are answered, the identity/reuse/config sections below record
-constraints, not an executable resolution of these gaps. Do not use the draft
+5. **[Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219).**
+   A floating locally built base digest is unknown until Docker runs. Decide how
+   a warm launch selects its existing base without running Docker merely to
+   compute identity, and when recipe/upstream/apt changes refresh that selection.
+6. **[Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220).**
+   Decide what `pull` and `--update-check` mean without a moving default tag,
+   whether custom base overrides remain supported, and the trusted metadata
+   that verifies archive bytes before ingest. A pinned release version alone
+   does not make a replaceable release asset immutable.
+
+Until these are answered, the identity/reuse/config/acquisition sections below
+record constraints, not an executable resolution of these gaps. Do not use the draft
 as authority to invent the missing policies.
 
 ## Observable paths
@@ -136,7 +147,8 @@ A built layer artifact is identified by `SCHEME_TAG`, its actual build-parent
 identity, its build-context bytes, and sorted `name=value` for **every build
 argument passed except `BASE_IMAGE`**. Context hashing retains existing
 normalization rules. Position and declaration provenance do not enter artifact
-identity. Bump `SCHEME_TAG` to v2 **once** for the combined change; no old-cache
+identity. Selecting the local base digest without rebuilding is unresolved as
+recorded above; do not assume a recipe hash equals its resulting manifest digest. Bump `SCHEME_TAG` to v2 **once** for the combined change; no old-cache
 contract grandfathering.
 
 Composition identities cover their base/root, generated account layer where
@@ -161,6 +173,10 @@ version. Record `org.agent-vm.version.*` labels. Cover both slots for dsh and pi
 when supplied; empty slots use committed locks without lookup. Preserve the
 identity distinction for `AGENT_INSTALL_SOFT_FAIL` if passed; it never waives
 contract violations or permits a failed image to be recorded as healthy.
+
+For tools the launcher cannot look up, preserve ADR-0030's launch notice that
+literal-`latest` selections stay frozen until context or current selection changes.
+This notice is in scope even though upgrade lookup semantics are not.
 
 For release/default builds, committed version defaults and lockfiles are the
 inputs: **do not pass resolver-generated `AGENT_VERSION_*` overrides**. Config
@@ -191,9 +207,17 @@ contexts when cached.
 - If a build fails, fail the launch and name the layer. Independently completed,
   validated artifacts remain cached. Failed artifacts receive neither an index
   entry nor a current tag.
-- Cache structural file information beside artifacts so a new composition need
-  not decompress unchanged layers again. A missing acceleration record must be
+- Include the base's file list in structural data; T3 cannot be checked from
+  layer file lists alone. Cache structural file information beside artifacts so
+  a new composition need not decompress unchanged layers again. A missing acceleration record must be
   reconstructed before checks that require it.
+
+Carry the prototype's driver details into implementation tests: scoped bake
+`--allow=fs.*` entitlements, unique staging-layout tags, and both
+`io.containerd.image.name` and `org.opencontainers.image.ref.name` annotations.
+The prototype confirmed the `docker` driver with the containerd image store,
+not the classic Docker image store; classic-store support must be validated or
+its limitation documented, not assumed.
 
 Deterministic stitching means identical artifact inputs produce identical
 assembly bytes. It does **not** mean rebuilding the floating Debian/apt base
@@ -204,6 +228,8 @@ reproduces a released image byte for byte.
 Implement [ADR-0031's contract](../adr/0031-tool-image-contract.md), incorporating
 ADR-0032's amendments rather than maintaining a second normative table here:
 
+- Run T5 against the shipped set before turning enforcement on; repair any
+  restrictive command/directory permissions rather than adding an exemption.
 - Enforce T1 parent build/prefix, widened T2 additive PATH/config merge, strict
   T3 base-path protection, T4 host platform, and T5 command resolution and
   permissions for any uid. T5 applies when a command exists. T6 capability
@@ -287,7 +313,9 @@ hourly publication, retention workflow, and moving-tag promotion gate.
   writes exact Dockerfile defaults. Keep lockfile-pinned layers' existing bump
   scripts. CI consumes committed inputs, never resolves latest on a schedule.
 - Download the pinned archive and ingest with registry-less `load_archive`.
-  Verify artifact integrity under repo security standards before ingest. Accept
+  Verify artifact integrity under repo security standards before ingest; the
+  trusted digest/metadata policy remains a readiness blocker, not permission to
+  treat a version string as a checksum. Accept
   the full download and full-blob ingest even on a warm-cache version change;
   no incremental protocol or runtime register-from-manifest API is required.
 - Move `MIN_SUPPORTED_IMAGE_API` from 1 to 3 and remove the legacy `seed.d`
@@ -327,7 +355,7 @@ launch sweep, size limit, or time-based eviction in this implementation.
 These are observable completion checks, not preselected build slices. Each
 implementation ticket should name which checks it delivers.
 
-0. **Readiness:** resolve the four blockers above, amend their owning ADRs and
+0. **Readiness:** resolve the six blockers above, amend their owning ADRs and
    glossary entries, and align this handoff before slicing implementation tickets.
 1. **Config:** commandless and launchable layers resolve consistently; child-first
    declarations sort correctly; cycles/missing parents fail before Docker;
@@ -342,7 +370,9 @@ implementation ticket should name which checks it delivers.
    another group's failure. No cached build requires Docker merely to identify it.
 4. **Builder portability:** compose successfully with `docker` and
    `docker-container`, including a cached declared parent and the local base,
-   without a registry push workaround. Concurrent exports cannot corrupt the
+   without a registry push workaround. Test the containerd-backed Docker store;
+   validate classic-store support separately or document its limitation.
+   Concurrent exports cannot corrupt the
    shared OCI index or blobs.
 5. **Assembly:** identical existing inputs produce identical archive/manifest
    bytes. Own-layer extraction does not duplicate parent prefixes. Negative
