@@ -238,7 +238,7 @@ reachable only by **naming it explicitly**. An omitted `tools` is `[]` for
 every other name. A name no catalog tool provides is a hard config error.
 
 _Avoid_: "dependencies" — a named tool is provisioned, not required, and
-nothing is installed or built for it (that is a **tooling layer**).
+nothing is installed or built for it (that is a **Layer** with a `command`).
 
 ### Provisioning set
 
@@ -270,21 +270,41 @@ one named, deletable one-shot move of a pre-#96 real `<state>/home/.pi` into
 `<state>/pi` before provisioning
 ([ADR-0021](docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md)).
 
+## Layer
+
+One validated catalog entry (`config::Layer`) in a `[[layers]]` section: a
+`name`, a `layer` source — `{ builtin = "dsh"|"pi"|"codex"|"opencode"|"claude"|"copilot" }`
+embedded from `images/tools/`, or `{ path = "…" }` anchored on the declaring
+config file's directory — an optional `parent`, an optional guest `command`,
+and the tool fields below. Every entry contributes to the image; an entry with a
+`command` also offers a launch verb. Layers are **declared, never discovered**:
+there is no `.agent-vm/layers/` convention, and `--layer DIR` injects one at the
+command line. Declaration order is **stitch** order. Resolved by
+`tool_layer::chain_root` → `tool_layer::materialize`. See
+[ADR-0032](docs/adr/0032-one-layer-kind.md).
+
+_Avoid_: tooling layer, step, chain — one kind of thing now replaces them.
+
 ## Tool
 
-A validated **declarative tool definition** (`config::Tool`): a guest
-`command`, its default `argv`, an optional **tooling layer**, a list of
-**credential providers** (`credentials`, the requirement set), a list of
-**available tools** (`tools`, driving the provisioning set), extra
-guest-HOME-relative `persist` paths, a guest `env` map, an `interactive_shell`
-flag, and the **tool config tier** it came from. A tool is **data**, not a
+A **Layer** that has a `command`, and therefore a launch verb: `agent-vm
+<name>` works because the resolved configuration declares it. A layer with no
+`command` contributes to the image and offers no verb. A tool is **data**, not a
 credential provider and not a command to execute on the host.
 
-A tool *is* the launch verb: `agent-vm <name>` works because the resolved
-configuration declares it. `env` is published into the guest **before** the
-launcher's own environment and cannot override `PATH`, `IS_SANDBOX` or `LANG`;
-`HOME`/`USER`/`LOGNAME` are **rejected** at the config seam in every mode. See
-[ADR-0016](docs/adr/0016-tool-declared-guest-env.md).
+It also carries its default `argv`, a list of **credential providers**
+(`credentials`, the requirement set), a list of **available tools** (`tools`,
+driving the provisioning set), extra guest-HOME-relative `persist` paths, a
+guest `env` map, an `interactive_shell` flag, and the **tool config tier** it
+came from.
+
+`env` is published into the guest **before** the launcher's own environment and
+cannot override `PATH`, `IS_SANDBOX` or `LANG`; `HOME`/`USER`/`LOGNAME` are
+**rejected** at the config seam in every mode. See
+[ADR-0016](docs/adr/0016-tool-declared-guest-env.md). Decided, not yet built:
+the same launcher-owned keys are rejected on layer declarations, and two
+unrelated layers may not declare different values for one key
+([ADR-0032](docs/adr/0032-one-layer-kind.md)).
 
 ### Launch catalog
 
@@ -302,30 +322,32 @@ before merging. Their merge is a **union of whole definitions**, not a field
 overlay: the user tier is authoritative for every name it declares, the
 project tier may only add names, and a differing project declaration yields a
 `doctor` warning (user definition wins). Only when both tiers declare **zero**
-tools do the compiled-in defaults apply.
+layers do the compiled-in defaults apply.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
 and the in-guest `clipboard`/`_intercept-hook` keep working, and a launch verb
 reports the config error rather than clap's "unrecognized subcommand".
 
-## Chain root
+## Composition root
 
-The published image reference a launch's chain builds `FROM` and boots when no
-project tooling layer is declared — resolved by the pure
-`tool_layer::chain_root`. It is one of: the **composed default image**
-verbatim (fast path), the **base image** (when the declared tool-layer
-sequence differs, or `--base-image` is given — both compose locally), or a
+The image a launch's layers build `FROM` — resolved by the pure
+`tool_layer::chain_root`. It is one of: the **composed default image** booted
+verbatim and with zero Docker calls, when no layer beyond the shipped set is
+declared; the **base image** plus the declared layers, stitched locally, when
+any layer beyond the shipped set is declared or `--base-image` is given; or a
 `--image` value booted verbatim. It is what `--update-check` probes and
 `agent-vm pull` fetches (always a published tag, never a local
 `agent-vm-layer:<hash>`). See
-[ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md).
+[ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md); renamed from
+**Chain root** and extended to every layer by
+[ADR-0032](docs/adr/0032-one-layer-kind.md).
 
-_Avoid_: calling the chain root "the base image" — under the fast path it is the
-composed default, not the base.
+_Avoid_: calling the composition root "the base image" — under the fast path it
+is the composed default, not the base.
 
 ## Base image
 
-The **tool-free** OCI base agent-vm composes from when a launch needs local tool
+The **tool-free** OCI base agent-vm composes from when a launch needs local
 layers (`ghcr.io/wirenboard/agent-vm-base:latest`) — Debian 13 plus the docker
 engine, diagnostic CLIs, and the tool-layer facilities, but **no agent CLI**.
 Resolved via `--base-image` / `AGENT_VM_BASE_IMAGE` /
@@ -335,42 +357,35 @@ Resolved via `--base-image` / `AGENT_VM_BASE_IMAGE` /
 
 ## Composed default image
 
-The OCI **guest template** booted verbatim when the declared tool set equals
+The OCI **guest template** booted verbatim when the declared layer set equals
 the shipped default (`ghcr.io/wirenboard/agent-vm-template:latest`): the base
-plus the shipped **tool layers** chained in declaration order, published by CI
-and never rebuilt locally. With no project tooling layers the launch performs
-zero Docker calls.
-
-## Tool layer
-
-One tooling layer a catalog `[[tools]]` entry declares via `layer`: either
-`{ builtin = "dsh"|"pi"|"codex"|"opencode"|"claude"|"copilot" }` (embedded from
-`images/tools/`) or `{ path = "…" }` (anchored on the declaring config file's
-directory). Resolved by `tool_layer::chain_root` → `tool_layer::materialize`.
-Distinct from **Tooling layer**. See
-[ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md). Decided, not
-yet built ([ADR-0029](docs/adr/0029-compose-tool-images-by-layer-stitching.md)):
-a tool layer builds `FROM` its **parent**, not its predecessor, and tool images
-are joined by **stitching**.
+plus the shipped layers **stitched** in declaration order, published by CI and
+never rebuilt locally. With no layer declared beyond the shipped set the launch
+performs zero Docker calls.
 
 ## Parent
 
-What a tool layer builds `FROM`: the **base image**, or the one tool it
-explicitly declares. Its **tool image**'s own layers are the ones above its
-parent.
+What a layer builds `FROM`: the **composition root**, or the one layer it
+explicitly declares. Its **layer image**'s own layers are the ones above its
+parent, which is what makes a layer's identity independent of its position.
 _Avoid_: predecessor (that is a chain position).
 
-## Tool image
+## Layer image
 
-One tool layer built `FROM` its parent. Its identity covers its parent, its
-build context and the build args passed (including its version), and doesn't
-depend on which other tools a launch selects. See
-[ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md).
+One layer built `FROM` its parent. Its identity covers its parent, its build
+context and the build args passed (including its version), and does not depend
+on its position or on which other layers a launch declares. See
+[ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md) and
+[ADR-0032](docs/adr/0032-one-layer-kind.md).
+
+_Avoid_: tool image — the tool-image ADRs predate one-kind layers; say layer
+image.
 
 ## Current tag
 
 A movable name in the shared OCI layout for the tool image the upgrade command
-last built for a tool. A launch reads that image's version labels, not the image
+last built for a tool. A layer that is not a tool has no current tag: version
+resolution is a tool-image concept. A launch reads that image's version labels, not the image
 itself, so the upgrade carries onto a new base. Dropped when the tool's shipped
 build context changes. An exact `version` in the tool's config outranks it. See
 [ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md).
@@ -378,29 +393,37 @@ _Avoid_: lockfile, latest tag.
 
 ## Stitching
 
-Joining tool images into a **composed tool image** by appending each tool's own
-layers onto the base's, in catalog order, without building anything. See
+Joining layer images into one composed image by appending each layer's own
+layers onto the **composition root**'s, in declaration order, without building
+anything. See
 [ADR-0029](docs/adr/0029-compose-tool-images-by-layer-stitching.md).
 _Avoid_: merge, flatten, squash.
 
 ## Composed tool image
 
-The base plus one launch's tool images, joined by stitching. The **composed
-default image** is the composed tool image for the shipped tool set.
+The **composition root** plus one launch's layers, joined by stitching. The
+**composed default image** is the composed image for the shipped layer set.
 
 ## Tool image contract
 
-The clauses every **tool image** must satisfy against its **parent**, checked
-once when it is built (T1–T7). A violation is a hard error, and the tool image
-is never recorded. See
-[ADR-0031](docs/adr/0031-tool-image-contract.md).
+The clauses every **layer image** must satisfy against its **parent**, checked
+once when it is built (T1–T7). A violation is a hard error, and the layer image
+is never recorded. [ADR-0031](docs/adr/0031-tool-image-contract.md) is
+canonical; [ADR-0032](docs/adr/0032-one-layer-kind.md) widens T2 to admit
+non-`PATH` config (merged in stitch order, last wins) and exempts the launcher's
+generated account layer from T3. The name is kept for continuity although it
+govers every layer, not only tools.
+
 _Avoid_: merged-image contract (nothing is merged).
 
 ## Stitch check
 
-A check across the tool images being stitched into one **composed tool image**:
-no file written by two unrelated tools, and no tool's command shadowed by
-another's (S1–S2). See [ADR-0031](docs/adr/0031-tool-image-contract.md).
+A check across the layers being stitched into one composed image: no file
+written by two layers when neither is the other's parent (**S1**), no layer's
+command shadowed by another's (**S2**), and — new in
+[ADR-0032](docs/adr/0032-one-layer-kind.md) — no **S4** env collision, meaning
+two unrelated layers may not declare different values for one config key. See
+[ADR-0031](docs/adr/0031-tool-image-contract.md).
 
 ## Image-owned Pi package
 
@@ -420,66 +443,68 @@ build-time `docker pull <repo>@<digest>` + `docker tag`). It is the *bridge*
 between the two image stores, not a second identity: the manifest digest stays
 step 0's hash input, and the link is never consulted on a cache-hit launch.
 
-## Tooling layer
+## Layer DAG
 
-A `Dockerfile` (plus its build context) that adds project-specific tools `FROM`
-the previous step in the chain. Not necessarily project-owned: a step is either
-a catalog **tool layer**, a `.agent-vm/layers/` subdirectory, or a `--layer
-DIR` directory. Every step's built image must satisfy the **Layer image
-contract**. There is no environment-variable override — `$AGENT_VM_LAYER` is
-rejected outright if set. See
-[ADR-0003](docs/adr/0003-project-tooling-layers.md).
+The graph a launch builds: the declared catalog's **layers**, each an
+independent build `FROM` its **parent** (the **composition root**, or a layer it
+declares), joined into the **derived image** by **stitching** in declaration
+order. Every layer image's **tool image contract** is checked when it is built;
+the **stitch check**s run across the set. `layer::plan_chain` computes the
+identities up front; `layer::execute_chain` drives the builds. A launch that
+declares no layer beyond the shipped set builds nothing and boots the
+composition root. A **`--layer DIR`** step is appended in command-line order and
+carries no provenance into its identity. There is no discovery: a leftover
+`.agent-vm/layers/` directory is a hard migration error naming the entries to
+declare instead. See [ADR-0032](docs/adr/0032-one-layer-kind.md).
 
-## Layer chain
-
-The chain a launch builds, in order: the catalog's **tool layers**, then the
-project's `.agent-vm/layers/*` (immediate subdirectories, sorted
-byte-lexicographically by name), then each `--layer DIR` in command-line order.
-Each step builds `FROM` the previous step (the **chain root** for step 0); only
-the **final** step is ingested into the msb cache. `layer::plan_chain` computes
-the chain's identities up front; `layer::execute_chain` drives the build. An
-empty chain boots the chain root with no build. A leftover singular
-`.agent-vm/layer/` is a hard migration error naming the path. See
-[ADR-0003](docs/adr/0003-project-tooling-layers.md).
+_Avoid_: chain, step, predecessor — they name the position model the DAG
+replaced. An order-**dependent** layer is expressible by declaring `parent`.
 
 ## Derived image
 
-Chain root + the **whole layer chain**, built one `docker buildx build` per
-step, tagged `agent-vm-layer:<project-slug>-<hash>`, and booted in place of the
-chain root whenever the project declares a chain. Ingested **registry-lessly**
-via `microsandbox_image::load_archive`. Only the final step is the derived
-image proper and only it is subject to the **Layer image contract**'s clause
-C3 ("ends as root"); C1/C2/C4 apply to every built step.
+The **composition root** plus every declared layer, stitched into one manifest
+and tagged `agent-vm-layer:<project-slug>-<hash>`. It is the only image ingested
+(**registry-lessly**, via `microsandbox_image::load_archive`) and the only one
+booted whenever a layer is declared. Its identity is
+`hash(composition root identity, ordered layer identities)` — order enters here
+and only here, because order is the manifest's layer order. See
+[ADR-0032](docs/adr/0032-one-layer-kind.md).
 
 ## Layer identity / hash
 
-The content hash `layer::resolve` computes over a step's `base_image_id` plus
-that step's whole tooling-layer directory tree (git-mode-normalized). For chain
-step 0, `base_image_id` is the base's resolved manifest digest; for every step
-after it, the *previous step's* content hash — never a docker-assigned image id
-or the **Base link** tag. The hash is transitive, so the tag itself is the
-staleness check: there is no separate state file recording what was last built.
-See [ADR-0003](docs/adr/0003-project-tooling-layers.md). Decided, not yet built:
-a **tool image**'s identity also covers the build args passed, so it names the
-versions installed, not only the inputs' files
+The content hash `layer::resolve` computes over a layer's `base_image_id` plus
+its whole build-context directory tree (git-mode-normalized). `base_image_id`
+is always the **parent's** identity — the **composition root**'s for a layer
+that declares none — never a docker-assigned image id or the **Base link** tag.
+A layer's identity is therefore independent of its position and of where it was
+declared. The hash is computed, not read from the stitched manifest, so the tag
+is itself the staleness check: there is no separate state file recording what
+was last built, and a cache-hit launch needs no Docker. See
+[ADR-0032](docs/adr/0032-one-layer-kind.md). Decided, not yet built: a layer
+image's identity also covers the build args passed, so it names the versions
+installed, not only the inputs' files
 ([ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md)).
+
+## Declared account
+
+A user or group a **Layer** declares in config (`users` / `groups`) instead of
+its `Dockerfile` appending to `/etc/passwd`, `/etc/group` or `/etc/shadow`.
+Declaring a user auto-creates a same-named group with its gid when nothing else
+claims it. The launcher generates **one append-only account layer** carrying the
+union of every declared account, placed in the **composition root** below every
+layer, so an account exists both during a layer's own build (`sudo -u`, a
+pre-warm) and in the booted guest. Collisions are hard errors — declared vs
+declared and vs the runtime host identity at plan time, vs the base image inside
+the generated stage's own build. Decided, not yet built
+([ADR-0032](docs/adr/0032-one-layer-kind.md)).
 
 ## Layer image contract
 
-The eight clauses every **project tooling layer** step's built image must
-satisfy. Tool images follow the **tool image contract** instead
-([ADR-0031](docs/adr/0031-tool-image-contract.md)). Four are
-enforced at build time against the built image's OCI config: C1 (builds on its
-predecessor), C2 (keeps `PATH` additive), C3 (ends as root, final step only),
-C4 (targets the host platform). Four are documented-only: C5 (doesn't touch
-agent-vm's own files), C6 (keeps `/bin/bash` and `/etc/passwd`/`/etc/group`
-appendable), C7 (installs tools readable by any uid), C8 (advertises a
-capability only when it works). A violation is a **hard error** (no opt-out),
-and the offending image is discarded so the next launch rebuilds and re-checks.
-[ADR-0003](docs/adr/0003-project-tooling-layers.md) is canonical.
-
-_Avoid_: "Dockerfile contract" — only a layer's *final* stage is exported, and
-the checks are on built images.
+**Retired name** ([ADR-0032](docs/adr/0032-one-layer-kind.md)). It named
+[ADR-0003](docs/adr/0003-project-tooling-layers.md)'s eight clauses (C1–C8) for
+project tooling layers, which no longer exist as a kind. Every layer image is
+govered by the **tool image contract** instead. Kept here so older notes and
+ADRs citing it still resolve.
 
 ## Boundary contract
 

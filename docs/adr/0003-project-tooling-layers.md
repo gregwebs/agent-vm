@@ -2,6 +2,16 @@
 
 ## Status
 
+**Superseded in part by [ADR-0032](0032-one-layer-kind.md)** (issue #207). This
+ADR's two load-bearing models are retired: the ordered **layer chain** (every
+layer now builds `FROM` a declared parent and is joined by stitching) and the
+**layer image contract** (C1–C8, now [ADR-0031](0031-tool-image-contract.md)'s
+T/S clauses governing every layer image). What survives and is still normative
+elsewhere in this file: registry-less ingest, hash-as-staleness-check, hard-fail,
+the `--layer` flag, the `$AGENT_VM_LAYER` rejection, and the `Base link`
+(ADR-0003 issue-#98 amendment). The text below is kept as the history of how
+layers were built, and its clause table is no longer normative for anything.
+
 Accepted. A project declares an ordered **chain** of layers; `--layer` is a
 repeatable flag appended after the project's own chain; `$AGENT_VM_LAYER` is
 rejected outright if set; the base is addressed through a Docker base link
@@ -196,6 +206,11 @@ see [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) — but the C2 rule i
 unchanged.)
 
 ### The layer image contract
+
+> **Retired by [ADR-0032](0032-one-layer-kind.md).** The table below governed
+> project tooling layers until layers and tools became one kind. It is kept for
+> history; the normative contract for every layer image is
+> [ADR-0031](0031-tool-image-contract.md)'s, as widened by ADR-0032.
 
 Each chain step's `Dockerfile` (`.agent-vm/layers/<NN-name>/Dockerfile`)
 MUST satisfy all eight clauses below. Four are **enforced** — checked

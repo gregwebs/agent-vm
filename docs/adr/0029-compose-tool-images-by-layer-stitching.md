@@ -6,8 +6,10 @@ Accepted (decision). Not yet implemented — the rest of the design is tracked b
 the map [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 Supersedes [ADR-0019](0019-tool-free-base-and-per-tool-layers.md)'s chaining of
 tool layers in declaration order, and removes tool layers from
-[ADR-0003](0003-project-tooling-layers.md)'s layer chain. Where project tooling
-layers end up is still open on the map.
+[ADR-0003](0003-project-tooling-layers.md)'s layer chain. Where project layers
+ended up was settled by [ADR-0032](0032-one-layer-kind.md): the layers/tools
+distinction is removed, so **every** layer is an independent node in this ADR's
+stitched DAG, and "project tooling layer" is no longer a kind of thing.
 
 ## Context
 

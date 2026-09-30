@@ -5,10 +5,13 @@
 Accepted (decision). Not yet implemented — tracked by the map
 [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 Replaces [ADR-0003](0003-project-tooling-layers.md)'s layer image contract
-(C1–C8) for **tool images**. ADR-0003's table still governs project tooling
-layers until Project tooling layers in the build DAG decides otherwise. Fills in
-the clause wording that [ADR-0029](0029-compose-tool-images-by-layer-stitching.md)
-deferred.
+(C1–C8) for **tool images**. ADR-0003's table was retired outright by
+[ADR-0032](0032-one-layer-kind.md), which makes layers and tools one kind: the
+table below governs **every** layer image, widened by that ADR — T2 admits
+non-`PATH` config merged in stitch order, T3 keeps its strictness but exempts
+the launcher's generated append-only account layer, and a new **S4** forbids
+sibling env collisions. Fills in the clause wording that
+[ADR-0029](0029-compose-tool-images-by-layer-stitching.md) deferred.
 
 ## Context
 
@@ -60,7 +63,9 @@ once per tool image, when it is built, against its parent. **S** clauses are
 
 - **Amend ADR-0003's table** with an "applies to" column. Rejected: the two
   contracts are checked at different moments, against different predecessors
-  (parent vs. previous step), and project layers' own contract is still open.
+  (parent vs. previous step), and project layers' own contract was still open.
+  ADR-0032 removed the second kind, so there is now one table and this option is
+  moot.
 - **Enforce C7 on every file.** Rejected: it would reject stray private files
   that nothing reads. T5 enforces the one case every user hits: the tool's own
   command. Every other build-time check, including ADR-0030's version check,
@@ -73,7 +78,10 @@ once per tool image, when it is built, against its parent. **S** clauses are
   mount and gain nothing at runtime.
 - **Let tool layers append accounts** (C6's allowance). Rejected: under
   stitching, two appenders lose one account. Accounts belong in the base or in a
-  project layer.
+  project layer. (ADR-0032 removed the "project layer" escape hatch by making
+them one kind, and replaced the allowance with **declared accounts** — a
+  generated, append-only account layer carrying the union below every layer, so
+  there is exactly one appender.)
 
 ## Consequences
 
