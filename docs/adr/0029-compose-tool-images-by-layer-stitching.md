@@ -30,11 +30,10 @@ own layers above its parent, in catalog order, with no merge build.
 
 - **Config** is derived, not declared: each tool's `PATH` entries that the
   base doesn't have are prepended in stitch order. Any other config change is a
-  contract violation (the clause wording is The composed tool image's
-  contract).
-- **Overlaps**: a path written by more than one tool is detected at stitch time
-  and flagged unless it's on an allow-list (e.g. shared directory entries). Later
-  tools still win, so the result is deterministic.
+  contract violation ([ADR-0031](0031-tool-image-contract.md) T2, S3).
+- **Overlaps**: a file written by more than one tool is detected at stitch time
+  and is a hard error; shared directory entries and paths under the guest's
+  tmpfs mounts are ignored ([ADR-0031](0031-tool-image-contract.md) S1).
 - **Identity** is computed from inputs. A tool image = hash(parent identity,
   build context, build args passed; see
   [ADR-0030](0030-tool-versions-in-identity-and-current-tags.md) for how the

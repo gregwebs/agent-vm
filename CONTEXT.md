@@ -388,6 +388,20 @@ _Avoid_: merge, flatten, squash.
 The base plus one launch's tool images, joined by stitching. The **composed
 default image** is the composed tool image for the shipped tool set.
 
+## Tool image contract
+
+The clauses every **tool image** must satisfy against its **parent**, checked
+once when it is built (T1–T7). A violation is a hard error, and the tool image
+is never recorded. See
+[ADR-0031](docs/adr/0031-tool-image-contract.md).
+_Avoid_: merged-image contract (nothing is merged).
+
+## Stitch check
+
+A check across the tool images being stitched into one **composed tool image**:
+no file written by two unrelated tools, and no tool's command shadowed by
+another's (S1–S2). See [ADR-0031](docs/adr/0031-tool-image-contract.md).
+
 ## Image-owned Pi package
 
 A pinned Pi extension the image installs as a real npm project root under
@@ -452,7 +466,9 @@ versions installed, not only the inputs' files
 
 ## Layer image contract
 
-The eight clauses every **chain step**'s built image must satisfy. Four are
+The eight clauses every **project tooling layer** step's built image must
+satisfy. Tool images follow the **tool image contract** instead
+([ADR-0031](docs/adr/0031-tool-image-contract.md)). Four are
 enforced at build time against the built image's OCI config: C1 (builds on its
 predecessor), C2 (keeps `PATH` additive), C3 (ends as root, final step only),
 C4 (targets the host platform). Four are documented-only: C5 (doesn't touch

@@ -217,6 +217,10 @@ before the prompt and gives an error the image check cannot phrase
 | **C7** | **Installs tools readable and executable by any uid** (`a+rX`; not inside a `0700` home). | Documented | — | The guest runs as an arbitrary host uid (ADR-0001), so mode-0700 tools are unusable |
 | **C8** | **Advertises a capability only when it works.** Write `/etc/agent-vm-capabilities/<name>` only after the layer's own build-time sanity checks pass (API 2; `chrome-devtools-mcp` is the worked example). | Documented | — | The launcher wires up an MCP that then fails at runtime |
 
+Decided, not yet built: **tool images** follow their own contract,
+[ADR-0031](0031-tool-image-contract.md)'s tool image contract and stitch
+checks. This table will then govern project tooling layers only.
+
 This table is the only normative copy of the contract. `CONTEXT.md`,
 `USAGE.md` and `examples/layers/README.md` link here; a clause change is an
 edit to this table plus, if the wording of an error changes,
