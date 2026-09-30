@@ -1,6 +1,6 @@
 # Image composition: implementation handoff
 
-Status: draft handoff; six source gaps must be resolved before `/breakdown`.
+Status: draft handoff; five source gaps must be resolved before `/breakdown`.
 Not implemented. Source map:
 [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 This consolidates the handoff for `/breakdown`, not an implementation plan or a
@@ -41,34 +41,29 @@ name but governs every layer image.
 
 ## Readiness blockers
 
-Consolidation and draft review exposed six gaps not settled by later-decision
-precedence:
+[Acyclic composition root and identity boundaries](https://github.com/gregwebs/agent-vm/issues/214)
+is resolved: the root is base plus generated union accounts, with no catalog
+layers. The five remaining gaps are:
 
-1. **[Acyclic composition root and identity boundaries](https://github.com/gregwebs/agent-vm/issues/214).** ADR-0032 puts layer identities in
-   the root hash while making that root their default parent. That is recursive;
-   its root/derived prose also risks counting layers twice. Decide whether the
-   root is just base plus union accounts and every catalog layer belongs to the
-   DAG above it. This preserves independent siblings but changes the historical
-   claim that a tool bump has the same rebuild cost as an account change.
-2. **[Selecting artifacts for a base-only rebase](https://github.com/gregwebs/agent-vm/issues/215).** New-parent identities miss the original build
+1. **[Selecting artifacts for a base-only rebase](https://github.com/gregwebs/agent-vm/issues/215).** New-parent identities miss the original build
    artifacts. Decide how a launch locates eligible old artifacts, establishes
    that only the base changed, and selects when both current-parent builds and
    older reusable artifacts exist. Retained project compositions are a possible
    lookup source; that policy has not been selected.
-3. **[Cross-project reuse of identical compositions](https://github.com/gregwebs/agent-vm/issues/216).** ADR-0029 reuses artifacts across tool sets, while
+2. **[Cross-project reuse of identical compositions](https://github.com/gregwebs/agent-vm/issues/216).** ADR-0029 reuses artifacts across tool sets, while
    ADR-0032 says identical layers in two projects build twice on purpose despite
    keeping the project slug out of identity. Decide whether project-specific
    references are handles/retained roots only or deliberately require work.
-4. **[Config merge fields and ancestor overrides](https://github.com/gregwebs/agent-vm/issues/217).** ADR-0032 widens T2 to “every other config key” but
+3. **[Config merge fields and ancestor overrides](https://github.com/gregwebs/agent-vm/issues/217).** ADR-0032 widens T2 to “every other config key” but
    ADR-0031 S3 retains only `org.agent-vm.*` labels. Decide whether widening is
    Env-only or includes `User`, `WorkingDir`, `Entrypoint`, and `Cmd`; define
    S4's key domain and ancestor (not merely direct-parent) override rules.
 
-5. **[Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219).**
+4. **[Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219).**
    A floating locally built base digest is unknown until Docker runs. Decide how
    a warm launch selects its existing base without running Docker merely to
    compute identity, and when recipe/upstream/apt changes refresh that selection.
-6. **[Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220).**
+5. **[Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220).**
    Decide what `pull` and `--update-check` mean without a moving default tag,
    whether custom base overrides remain supported, and the trusted metadata
    that verifies archive bytes before ingest. A pinned release version alone
@@ -84,7 +79,9 @@ as authority to invent the missing policies.
 pinned release asset ── download ── load_archive ──────────── boot default
                           (only if not already cached)
 
-embedded base recipe ── local base ── generated union accounts
+embedded base recipe ── local base + generated union accounts
+                                          │
+                                  composition root
                                           │
 layer catalog + selected versions ──────── DAG builds
                                           │
@@ -151,10 +148,15 @@ identity. Selecting the local base digest without rebuilding is unresolved as
 recorded above; do not assume a recipe hash equals its resulting manifest digest. Bump `SCHEME_TAG` to v2 **once** for the combined change; no old-cache
 contract grandfathering.
 
-Composition identities cover their base/root, generated account layer where
-present, and ordered participating artifacts as specified in ADR-0032, amended
-by ADR-0033 for rebase. Compute the identity before building; a stitched manifest
-digest is not a substitute for the pre-build cache key. Keep
+The composition root identity covers the base digest and generated union
+account-layer identity, when present, **never catalog-layer identities**. Every
+catalog layer, including shipped tools, builds above that root or its declared
+parent. The derived identity covers the root identity and ordered participating
+artifact identities; own layers are stitched once. Account-data changes affect
+all layers above the root; a tool bump affects only that tool and declared
+descendants, not independent siblings. ADR-0033 still governs base-only rebase.
+Compute composition identities before layer builds; a stitched manifest digest
+is not a substitute for the pre-build cache key. Keep
 `agent-vm-layer:<project-slug>-<hash>` handles, with the slug outside the hash.
 
 A plain launch never queries upstream for a version. Precedence is:
@@ -355,14 +357,17 @@ launch sweep, size limit, or time-based eviction in this implementation.
 These are observable completion checks, not preselected build slices. Each
 implementation ticket should name which checks it delivers.
 
-0. **Readiness:** resolve the six blockers above, amend their owning ADRs and
-   glossary entries, and align this handoff before slicing implementation tickets.
+0. **Readiness:** resolve the five remaining blockers above, amend their owning
+   ADRs and glossary entries, and align this handoff before slicing tickets.
 1. **Config:** commandless and launchable layers resolve consistently; child-first
    declarations sort correctly; cycles/missing parents fail before Docker;
    injected-to-declared identical sources retain identity; legacy authoring gets
    an actionable migration error.
-2. **Identity:** position alone does not change an artifact key; every passed
-   build argument does (except `BASE_IMAGE`); defaults/lock bytes do; pins outrank
+2. **Identity:** the root has no catalog-layer identity inputs; each artifact
+   appears once in the final composition; a tool bump leaves independent siblings
+   unchanged, while account changes affect the whole foundation. Position alone
+   does not change an artifact key; every passed build argument does (except
+   `BASE_IMAGE`); defaults/lock bytes do; pins outrank
    current selections; recipe changes invalidate selections with a notice;
    launches perform no upstream lookup.
 3. **Build reuse:** bumping an independent tool rebuilds only that artifact and

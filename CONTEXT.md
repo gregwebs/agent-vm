@@ -9,8 +9,8 @@ Mechanism and rationale live in [ARCHITECTURE.md](ARCHITECTURE.md) and
 ## Launcher
 
 The **host-side** `agent-vm` process for a single launch: it resolves the
-**catalog**, picks the **composition root**, acquires or composes the image,
-plumbs credentials and mounts, builds the guest env and the in-guest prelude,
+**catalog**, selects the **boot image** (using a **composition root** only
+when composing locally), acquires or composes it, plumbs credentials and mounts, builds the guest env and the in-guest prelude,
 then hands the sandbox config to microsandbox and supervises the session
 (`run.rs`). It is the host half of the pair whose other half is the **in-guest**
 side (`intercept_hook`, agentd).
@@ -361,39 +361,32 @@ reports the config error rather than clap's "unrecognized subcommand".
 
 ## Composition root
 
-The image a launch's layers build `FROM` — resolved by the pure
-`tool_layer::chain_root`. It is one of: the **composed default image** booted
-verbatim and with zero Docker calls, when no layer beyond the shipped set is
-declared; the **base image** plus the declared layers, stitched locally, when
-any layer beyond the shipped set is declared or `--base-image` is given; or a
-`--image` value booted verbatim. It is what `--update-check` probes and
-`agent-vm pull` fetches (always a published tag, never a local
-`agent-vm-layer:<hash>`). See
-[ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md); renamed from
-**Chain root** and extended to every layer by
-[ADR-0032](docs/adr/0032-one-layer-kind.md).
+The common foundation beneath the **Layer DAG**: the **base image** plus the
+generated union of **declared accounts**, when any are declared, before any
+catalog layer is added. It is the default **parent** of every layer, including
+shipped tools, not the finished **boot image**.
 
-_Avoid_: calling the composition root "the base image" — under the fast path it
-is the composed default, not the base.
+_Avoid_: using it for the composed default or an explicit image booted verbatim;
+calling it the base image when it includes declared accounts.
+
+## Boot image
+
+The finished image selected for a guest session: a **derived image**, a released
+**composed default image**, or an explicit image booted verbatim. It is distinct
+from the **composition root**, which is the foundation used during composition.
 
 ## Base image
 
-The **tool-free** OCI base agent-vm composes from when a launch needs local
-layers (`ghcr.io/wirenboard/agent-vm-base:latest`) — Debian 13 plus the docker
-engine, diagnostic CLIs, and the tool-layer facilities, but **no agent CLI**.
-Resolved via `--base-image` / `AGENT_VM_BASE_IMAGE` /
-`defaults::DEFAULT_BASE_IMAGE_REF`. Distinct from the unqualified, Docker-local
-`agent-vm-base:<hex>` links of **Base link**. See
-[ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md).
+The tool-free OS foundation beneath the **composition root**, before generated
+**declared accounts** or catalog layers are added. It is distinct from a
+**Base link**, which is a local reference to an image rather than the foundation
+concept.
 
 ## Composed default image
 
-The OCI **guest template** booted verbatim when the declared layer set equals
-the shipped default (`ghcr.io/wirenboard/agent-vm-template:latest`): the base
-plus the shipped layers **stitched** in the order their `parent` declarations
-derive, published by CI and
-never rebuilt locally. With no layer declared beyond the shipped set the launch
-performs zero Docker calls.
+The **composition root** plus the shipped default layer set, joined by
+**stitching**. Its released form is a finished **boot image**, not a parent
+containing shipped tools beneath another copy of those same tools.
 
 ## Parent
 
@@ -406,8 +399,8 @@ _Avoid_: predecessor (that is a chain position).
 ## Layer image
 
 One layer built `FROM` its parent. Its identity covers its parent, its build
-context and the build args passed (including its version), and does not depend
-on its position or on which other layers a launch declares. See
+context and the build args passed (including its version), not its position;
+changes to union accounts can still change its foundation. See
 [ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md) and
 [ADR-0032](docs/adr/0032-one-layer-kind.md).
 
@@ -436,7 +429,8 @@ _Avoid_: merge, flatten, squash.
 ## Composed tool image
 
 The **composition root** plus one launch's layers, joined by stitching. The
-**composed default image** is the composed image for the shipped layer set.
+**composed default image** is the composed image for the shipped layer set;
+neither is the foundation called the composition root.
 
 ## Tool image contract
 
@@ -497,8 +491,9 @@ one parent), and a child may be declared above its parent. A `parent` naming a
 layer outside the composition, or a cycle, is a hard error. Every layer image's
 **tool image contract** is checked when it is built; the **stitch check**s run
 across the set. `layer::plan_chain` computes the identities up front;
-`layer::execute_chain` drives the builds. A launch that declares no layer beyond
-the shipped set builds nothing and boots the composition root. A **`--layer
+`layer::execute_chain` drives the builds. The default release path boots the
+**composed default image** without local builds, not the composition root;
+explicit local-build selection composes the shipped set too. A **`--layer
 DIR`** step declares no parent, so it is a root and command-line order is its
 tie-break; it carries no provenance into its identity. There is no discovery: a
 leftover `.agent-vm/layers/` directory is a hard migration error naming the
@@ -509,13 +504,10 @@ replaced. An order-**dependent** layer is expressible by declaring `parent`.
 
 ## Derived image
 
-The **composition root** plus every declared layer, stitched into one manifest
-and tagged `agent-vm-layer:<project-slug>-<hash>`. It is the only image ingested
-(**registry-lessly**, via `microsandbox_image::load_archive`) and the only one
-booted whenever a layer is declared. Its identity is
-`hash(composition root identity, ordered layer identities)` — order enters here
-and only here, because order is the manifest's layer order. See
-[ADR-0032](docs/adr/0032-one-layer-kind.md).
+The locally composed **boot image**: the **composition root** plus each
+participating catalog layer's own layers, joined once in derived stitch order.
+It is the finished composition, not an input to the identity of its foundation
+or participating artifacts.
 
 ## Layer identity / hash
 
