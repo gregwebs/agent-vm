@@ -36,7 +36,9 @@ own layers above its parent, in catalog order, with no merge build.
   and flagged unless it's on an allow-list (e.g. shared directory entries). Later
   tools still win, so the result is deterministic.
 - **Identity** is computed from inputs. A tool image = hash(parent identity,
-  build context, resolved version); it doesn't depend on the tool's position,
+  build context, build args passed; see
+  [ADR-0030](0030-tool-versions-in-identity-and-current-tags.md) for how the
+  version is chosen); it doesn't depend on the tool's position,
   so it is reused across tool sets. The composed image = hash(base digest,
   ordered tool identities), cached in msb and skipped when present. Stitching is
   deterministic (fixed timestamps, canonical JSON), so the same inputs give the

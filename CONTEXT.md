@@ -362,8 +362,19 @@ _Avoid_: predecessor (that is a chain position).
 
 ## Tool image
 
-One tool layer built `FROM` its parent. Its identity doesn't depend on which
-other tools a launch selects.
+One tool layer built `FROM` its parent. Its identity covers its parent, its
+build context and the build args passed (including its version), and doesn't
+depend on which other tools a launch selects. See
+[ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md).
+
+## Current tag
+
+A movable name in the shared OCI layout for the tool image the upgrade command
+last built for a tool. A launch reads that image's version labels, not the image
+itself, so the upgrade carries onto a new base. Dropped when the tool's shipped
+build context changes. An exact `version` in the tool's config outranks it. See
+[ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md).
+_Avoid_: lockfile, latest tag.
 
 ## Stitching
 
@@ -434,7 +445,10 @@ step 0, `base_image_id` is the base's resolved manifest digest; for every step
 after it, the *previous step's* content hash — never a docker-assigned image id
 or the **Base link** tag. The hash is transitive, so the tag itself is the
 staleness check: there is no separate state file recording what was last built.
-See [ADR-0003](docs/adr/0003-project-tooling-layers.md).
+See [ADR-0003](docs/adr/0003-project-tooling-layers.md). Decided, not yet built:
+a **tool image**'s identity also covers the build args passed, so it names the
+versions installed, not only the inputs' files
+([ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md)).
 
 ## Layer image contract
 
