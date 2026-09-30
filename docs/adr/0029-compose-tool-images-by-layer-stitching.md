@@ -98,5 +98,7 @@ where the Driver and Storage corrections above came from.
   one-tool bump, `load_archive` took about as long as the first ingest (~18 s
   for a 1 GB image), because it re-reads every blob and rebuilds the per-image
   metadata.
-- Rebasing onto a new base becomes a manifest edit, as long as tool diffs don't
-  depend on the base (Rebasing tool layers onto an updated base).
+- [ADR-0033](0033-default-rebase-with-build-provenance.md) defaults to rebase
+  when only the base changes, with an explicit rebuild option and a compatibility
+  warning. Reused artifacts retain their build provenance; structural checks
+  run against the destination, but runtime/ABI dependency management is excluded.

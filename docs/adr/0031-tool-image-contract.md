@@ -13,6 +13,11 @@ the launcher's generated append-only account layer, and a new **S4** forbids
 sibling env collisions. Fills in the clause wording that
 [ADR-0029](0029-compose-tool-images-by-layer-stitching.md) deferred.
 
+[ADR-0033](0033-default-rebase-with-build-provenance.md) adds the rebase case:
+original T1 checks establish artifact build provenance, but fresh structural
+checks against the destination base are required for a newly rebased
+composition. The cache-hit exemption below does not waive these checks.
+
 ## Context
 
 C1 ("builds on its predecessor") and C2 ("keeps `PATH` additive") assume a chain

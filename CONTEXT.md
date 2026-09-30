@@ -6,6 +6,20 @@ the code is the bug — file it, don't silently reintroduce the old name.
 Mechanism and rationale live in [ARCHITECTURE.md](ARCHITECTURE.md) and
 [docs/adr/](docs/adr/); this file defines the terms.
 
+## Launcher
+
+The **host-side** `agent-vm` process for a single launch: it resolves the
+**catalog**, picks the **composition root**, acquires or composes the image,
+plumbs credentials and mounts, builds the guest env and the in-guest prelude,
+then hands the sandbox config to microsandbox and supervises the session
+(`run.rs`). It is the host half of the pair whose other half is the **in-guest**
+side (`intercept_hook`, agentd).
+
+_Avoid_: using it for the image builder alone (that is the **Layer DAG**, one
+phase of what the launcher does); for the `agent-vm` binary in its
+non-launching verbs (`doctor`, `pull`, `setup`), which share the binary but
+launch nothing; or for microsandbox.
+
 ## Guest user
 
 The numeric `uid:gid` the in-guest agent process runs as. `.user(...)` is set
@@ -270,6 +284,21 @@ one named, deletable one-shot move of a pre-#96 real `<state>/home/.pi` into
 `<state>/pi` before provisioning
 ([ADR-0021](docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md)).
 
+## Catalog
+
+The resolved, validated model of a configuration's declared **Layers** — what
+`config::load` produces, as one value so the catalog and a deferred
+configuration error cannot disagree about which state the process is in:
+`Catalog::Ready(LaunchCatalog)` or `Catalog::Broken(err)`. It is built from the
+**tool config tiers** (user, then project), merged as a union of whole
+definitions, and falls back to the compiled-in catalog when both tiers declare
+zero layers. It is **not** the config files themselves.
+
+_Avoid_: bare "catalog" when the distinction matters — say **declared layer
+catalog** for the resolved `[[layers]]` entries alone, and **Launch catalog**
+for those entries plus each one's resolved provisioning set plus the built-in
+`shell` fallback. The bare word must never stand in for a config file.
+
 ## Layer
 
 One validated catalog entry (`config::Layer`) in a `[[layers]]` section: a
@@ -312,7 +341,8 @@ unrelated layers may not declare different values for one key
 The verbs a launch actually offers (`config::LaunchCatalog`): the resolved
 merge result, plus the built-in `shell` appended when no declared tool claims
 that name. The catalog resolves each entry's provisioning set before dispatch,
-so `--help`, `doctor` and `run::launch` cannot disagree.
+so `--help`, `doctor` and `run::launch` cannot disagree. One arm of
+**Catalog**; see that entry for the declared-layer side.
 
 ### Tool config tier
 
@@ -428,6 +458,14 @@ command shadowed by another's (**S2**), and — new in
 [ADR-0032](docs/adr/0032-one-layer-kind.md) — no **S4** env collision, meaning
 two unrelated layers may not declare different values for one config key. See
 [ADR-0031](docs/adr/0031-tool-image-contract.md).
+
+## Rebased composition
+
+A composed image using a new base with existing installed layer artifacts,
+retaining their original build-parent provenance. Its identity is distinct from
+those artifacts and includes the destination base and the artifacts used; a
+rebuild instead produces artifacts built against the new parent. See
+[ADR-0033](docs/adr/0033-default-rebase-with-build-provenance.md).
 
 ## Image-owned Pi package
 

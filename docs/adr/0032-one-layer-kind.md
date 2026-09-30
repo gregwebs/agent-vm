@@ -22,6 +22,12 @@ Docker Sandbox Kits v3, which answers the same question with a derived order
 ("Composition is a function, not a sequence") — see
 [../research/docker-sandbox-kits-v3.md](../research/docker-sandbox-kits-v3.md).
 
+[ADR-0033](0033-default-rebase-with-build-provenance.md) amends base-change
+handling: build identities retain the original parent as provenance, while a
+rebased composition may reuse those artifacts on a new base with fresh
+structural checks. A parent change due solely to a base update no longer
+necessarily rebuilds every layer.
+
 ## Context
 
 Layers were built before tools, and the two never merged. ADR-0003 made project
