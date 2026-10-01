@@ -8,7 +8,7 @@ Replaces [ADR-0003](0003-project-tooling-layers.md)'s layer image contract
 (C1–C8) for **tool images**. ADR-0003's table was retired outright by
 [ADR-0032](0032-one-layer-kind.md), which makes layers and tools one kind: the
 table below governs **every** layer image, widened by that ADR — T2 admits
-non-`PATH` config merged in stitch order, T3 keeps its strictness but exempts
+non-`PATH` environment variables merged in stitch order, T3 keeps its strictness but exempts
 the launcher's generated append-only account layer, and a new **S4** forbids
 sibling env collisions. Fills in the clause wording that
 [ADR-0029](0029-compose-tool-images-by-layer-stitching.md) deferred.
@@ -35,25 +35,43 @@ facts change what is worth enforcing:
 
 ## Decision
 
+Config scope and transitive overrides were clarified by
+[Config merge fields and ancestor overrides](https://github.com/gregwebs/agent-vm/issues/217).
+The T2/S3/S4 wording below incorporates ADR-0032's amendments; its earlier
+“every other config key” wording is narrowed to environment variables.
+
 This table is the only normative copy of the contract. **T** clauses are checked
 once per tool image, when it is built, against its parent. **S** clauses are
 **stitch checks**, run across the tool images being stitched.
 
+For S3/S4, a layer's own Env/label changes are entries added or changed relative
+to its actual build parent's config, not its complete inherited config. Use this
+same attribution for merging and collision checks; unchanged inherited entries
+neither overwrite a composed value nor count as declarations. Retain these
+parent-relative changes with artifact provenance for rebase; do not recompute
+them against the destination root. An explicit assignment equal to the parent's
+value is indistinguishable from inheritance and contributes no change.
+
+For example, with root `X=0`, A setting `X=1`, and unrelated B merely inheriting
+`X=0`, stitching retains `X=1` without an S4 collision. The same principle
+prevents inherited labels from undoing another layer's label changes.
+
 | # | Clause | Checked |
 |---|---|---|
 | **T1** | **Builds on its parent.** The Dockerfile's final `FROM` resolves `${BASE_IMAGE}` (text check before the build), and the parent's `rootfs.diff_ids` are a prefix of the built image's. The stitcher identifies a tool's own layers by cutting off that prefix, so T1 is what makes stitching valid. | tool build |
-| **T2** | **Changes only `PATH` in the config.** `PATH` keeps every directory the parent has and may add new ones. Labels may be added (ADR-0030 requires `org.agent-vm.version.<name>`). Any other change is a violation: other `Env`, `User`, `WorkingDir`, `Entrypoint`, `Cmd`, and so on. "Ends as root" (C3) follows, because `User` stays the base's. | tool build |
-| **T3** | **Never replaces or deletes a base path.** The tool's own layers contain no whiteout, opaque marker or non-directory entry for any path that exists in the base. This covers `/etc/agent-vm-image-version`, `/bin/bash`, `/etc/passwd`/`/etc/group` and the base's files under `/opt/agent` (formerly C5/C6). A tool with a declared parent may change its parent's files. | tool build |
+| **T2** | **Changes only environment variables and adds labels.** `PATH` keeps every directory the parent has and may add new ones. Other `Env` variables may be added or overridden. Labels may be added (ADR-0030 requires `org.agent-vm.version.<name>`). All other config fields, including `User`, `WorkingDir`, `Entrypoint` and `Cmd`, must remain unchanged from the parent. "Ends as root" (C3) follows, because `User` stays the base's. Launcher-owned env declarations remain forbidden under ADR-0032. | layer build |
+| **T3** | **Never replaces or deletes a base path.** The tool's own layers contain no whiteout, opaque marker or non-directory entry for any path that exists in the base. This covers `/etc/agent-vm-image-version`, `/bin/bash`, `/etc/passwd`/`/etc/group` and the base's files under `/opt/agent` (formerly C5/C6). A layer may change files introduced by any declared ancestor, including transitive ancestors, but never files from the base or generated union account layer. Only that launcher-generated append-only account layer may write protected account files. | tool build |
 | **T4** | **Targets the host platform.** C4a/C4b/C4c from ADR-0003, unchanged, applied to each tool image. | tool build |
 | **T5** | **Its command runs for any uid.** The tool's `command` resolves on the tool image's own `PATH`, following symlinks. The resolved file must be executable by any uid, and every directory on the path to it must be enterable by any uid. | tool build |
 | **T6** | **Advertises a capability only when it works** (C8). | documented |
 | **T7** | **Installs everything else readable by any uid** (the rest of C7). | documented |
-| **S1** | **No cross-tool file overlaps.** No non-directory path may be written by two tool images when neither is the other's parent. Paths under the guest's tmpfs mounts (`TMPFS_GUEST_PREFIXES`: `/tmp`, `/run`, `/dev/shm`, `/var/run`) are ignored, since no running guest can see them. There is no other allow-list. | stitch |
+| **S1** | **No cross-tool file overlaps.** No non-directory path may be written by two tool images when neither is the other's ancestor (direct or transitive). Paths under the guest's tmpfs mounts (`TMPFS_GUEST_PREFIXES`: `/tmp`, `/run`, `/dev/shm`, `/var/run`) are ignored, since no running guest can see them. There is no other allow-list. | stitch |
 | **S2** | **No command shadowing.** Each tool's `command` resolves in the composed image to the same file it resolves to in its own tool image. | stitch |
-| **S3** | **Derived config.** The composed config is the base's config plus the derived `PATH` and each tool's `org.agent-vm.*` labels. Other labels are dropped. | stitch (by construction) |
+| **S3** | **Derived config.** Start with the composition root's config. Derive `PATH` as an additive union in stitch order; merge only each layer's own changes to other environment variables in that order, last wins subject to S4. Preserve base labels and merge only layers' own changes to `org.agent-vm.*` labels in stitch order, last wins; discard other layer labels. All non-Env, non-label config fields remain the root's. | stitch (by construction) |
+| **S4** | **No unrelated-layer env collisions.** Two layers with neither a direct nor transitive ancestor relationship may not contribute own changes with different values for the same environment variable. Identical values are allowed, `PATH` is exempt, and descendants may override ancestors. Labels and other config fields are not S4's key domain. | stitch |
 
 - **A violation is a hard error with no opt-out** (ADR-0003 D2/D6). The error
-  names the tool, and for S1 both tools and the path.
+  names the layer, and for S1/S4 both layers and the path/environment key.
 - **A failing tool image is never recorded.** It is not written into the OCI
   layout's `index.json` and gets no current tag, which replaces ADR-0003 D7's
   discard step. Tool images that already passed stay cached.
