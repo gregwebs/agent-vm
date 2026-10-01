@@ -1,6 +1,6 @@
 # Image composition: implementation handoff
 
-Status: draft handoff; two source gaps must be resolved before `/breakdown`.
+Status: draft handoff; one source gap must be resolved before `/breakdown`.
 Not implemented. Source map:
 [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 This consolidates the handoff for `/breakdown`, not an implementation plan or a
@@ -54,21 +54,19 @@ labels, and transitive ancestor overrides.
 [Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220)
 is resolved in ADR-0034: release-only prefetch, retired update/custom-base
 interfaces, launcher-pinned archive digests and a publication gate.
-The two remaining gaps are:
+[Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219)
+is resolved in ADR-0034: shared recipe-keyed base selection, no warm-launch
+Docker/network probe, recipe-change or explicit refresh, and atomic adoption.
+The remaining gap is:
 
 1. **[Selecting artifacts for a base-only rebase](https://github.com/gregwebs/agent-vm/issues/215).** New-parent identities miss the original build
    artifacts. Decide how a launch locates eligible old artifacts, establishes
    that only the base changed, and selects when both current-parent builds and
    older reusable artifacts exist. Retained project compositions are a possible
    lookup source; that policy has not been selected.
-2. **[Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219).**
-   A floating locally built base digest is unknown until Docker runs. Decide how
-   a warm launch selects its existing base without running Docker merely to
-   compute identity, and when recipe/upstream/apt changes refresh that selection.
-
-Until these are answered, the identity/reuse sections below record constraints,
-not an executable resolution of these gaps. Do not use the draft
-as authority to invent the missing policies.
+Until artifact selection is answered, the rebase/reuse sections below record
+constraints, not an executable resolution of that gap. Do not use the draft
+as authority to invent the missing policy.
 
 ## Observable paths
 
@@ -144,9 +142,11 @@ A built layer artifact is identified by `SCHEME_TAG`, its actual build-parent
 identity, its build-context bytes, and sorted `name=value` for **every build
 argument passed except `BASE_IMAGE`**. Context hashing retains existing
 normalization rules. Position and declaration provenance do not enter artifact
-identity. Selecting the local base digest without rebuilding is unresolved as
-recorded above; do not assume a recipe hash equals its resulting manifest digest. Bump `SCHEME_TAG` to v2 **once** for the combined change; no old-cache
-contract grandfathering.
+identity. Select the local base through ADR-0034's shared retained record keyed
+by base recipe/build-context bytes, platform, and build arguments; its selected
+manifest digest, not the recipe key, enters composition identity. Bump
+`SCHEME_TAG` to v2 **once** for the combined change; no old-cache contract
+grandfathering.
 
 The composition root identity covers the base digest and generated union
 account-layer identity, when present, **never catalog-layer identities**. Every
@@ -200,6 +200,18 @@ descendants), allowing independent groups to complete concurrently. Supply
 parents through `target:` contexts when built in the group and `oci-layout://`
 contexts when cached.
 
+- Share the retained **base selection** across matching projects. A warm local
+  launch reads its selected digest without Docker or network calls. Missing
+  selection requires a local build. If selected base data is unavailable,
+  rebuild with a notice that floating inputs may produce a different digest;
+  adopt it only after success. Changed recipe/build inputs select their own record,
+  reusing an available match without probing upstream. Refresh floating inputs
+  only on changed recipe/build inputs or explicit refresh, never on a timer or
+  ordinary launch. Explicit refresh and recipe-triggered builds on a selection
+  miss pull upstream and rerun apt-bearing build steps. Atomically
+  publish the digest only after successful build and validation; failure preserves
+  the previous selection. Successful refresh affects matching projects on their
+  next launch. Refresh command syntax remains with the sibling upgrade effort.
 - The locally built **base must also reach the builder through an OCI-layout
   named context**, not solely a Docker-local tag. Support both `docker` and
   `docker-container` buildx drivers; a Base link is not an identity or ABI promise.
@@ -272,6 +284,10 @@ is outside that proof. Shipped account declarations, if any, must also be presen
 in the released default.
 
 ### 5. Rebase and rebuild boundary
+
+A changed selected base manifest digest invokes the base transition; an
+unchanged digest does not. A failed destination check blocks the affected launch
+without replacing its retained working composition.
 
 When **only the base changes**, default to reusing installed artifacts and
 re-stitching onto the destination. Warn that major base changes can cause runtime
@@ -382,8 +398,8 @@ launch sweep, size limit, or time-based eviction in this implementation.
 These are observable completion checks, not preselected build slices. Each
 implementation ticket should name which checks it delivers.
 
-0. **Readiness:** resolve the two remaining blockers above, amend their owning
-   ADRs and glossary entries, and align this handoff before slicing tickets.
+0. **Readiness:** resolve the remaining artifact-selection blocker above, amend
+   its owning ADRs and glossary entries, and align this handoff before slicing tickets.
 1. **Config:** commandless and launchable layers resolve consistently; child-first
    declarations sort correctly; cycles/missing parents fail before Docker;
    injected-to-declared identical sources retain identity; legacy authoring gets
@@ -402,7 +418,15 @@ implementation ticket should name which checks it delivers.
    without builds; if its identical final composition is already ingested, it
    also skips stitching and ingest. Its own readable handle is registered without
    reading an archive. Releasing either project's GC root preserves the image
-   while the other retains it.
+   while the other retains it. Matching base recipes/platforms/build arguments
+   share a base selection; warm local launches invoke neither Docker nor network
+   probes. Recipe changes select the corresponding record, reusing an available
+   match; builds on a miss pull upstream and rerun apt-bearing steps, as does
+   explicit refresh. Missing selected base data triggers a recovery build with a
+   notice that the resulting digest may differ, adopted only after success.
+   Failure leaves the prior selection intact. Successful refresh is adopted by
+   matching projects on their next launch; an unchanged digest causes no base
+   transition.
 4. **Builder portability:** compose successfully with `docker` and
    `docker-container`, including a cached declared parent and the local base,
    without a registry push workaround. Test the containerd-backed Docker store;
@@ -427,7 +451,8 @@ implementation ticket should name which checks it delivers.
    seams. Verify the pure predicate with Verus.
 7. **Rebase:** base-only updates skip installers, preserve original provenance,
    regenerate accounts, warn, and run destination checks. A destination collision
-   fails even with cached artifacts. Explicit rebuild produces new-parent build
+   fails even with cached artifacts and preserves the project's retained working
+   composition. Explicit rebuild produces new-parent build
    provenance. A structural pass makes no ABI guarantee.
 8. **Fast path/acquisition:** a cold default launch downloads the pinned asset
    and ingests without Docker; a warm same-version launch does neither; an

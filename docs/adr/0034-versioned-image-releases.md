@@ -5,6 +5,8 @@ Accepted (decision), not yet implemented. Resolved by
 on [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 Acquisition and integrity amended by
 [Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220).
+Local base selection amended by
+[Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219).
 
 The image is **released**, not published. One artifact — the composed default
 image — is cut as a versioned GitHub Release asset (an OCI archive, one per
@@ -127,6 +129,47 @@ Three facts made the alternative cheap:
   every user whose builder is `docker-container`, i.e. the default
   `docker buildx create` setup. That is a defect in the existing compose path,
   not only in `--build`.
+
+### Local base selection and refresh
+
+- **Retain a shared base selection**, keyed by the embedded base recipe and
+  build-context bytes, target platform, and build arguments. It points to the
+  successfully built and validated base's actual manifest digest in the local
+  OCI layout. Matching projects share this selection. The recipe identity is
+  a lookup key, not an image digest: floating Debian/apt inputs can produce
+  different images from identical recipes.
+- **A warm launch reads the selection without Docker or network calls.**
+  Missing selection requires a local base build. If a selection exists but
+  its base data is unavailable, rebuild with a notice: floating inputs may yield
+  a different digest, which becomes the selection after success. This is cache
+  recovery, not a routine refresh or a promise of exact digest recovery.
+  A changed recipe/build input selects its own record rather than silently
+  continuing to use the old recipe's base; reuse an available matching selection
+  without probing upstream.
+- **Refresh only for changed recipe/build inputs or an explicit refresh.**
+  Ordinary launches do not check upstream, refresh apt, or expire a selection
+  on a timer. Explicit refresh and recipe-triggered builds on a selection miss
+  both pull upstream and rerun apt-bearing build steps; an ordinary cached Docker
+  build is not sufficient to promise fresh packages. An available matching
+  selection remains reusable after a recipe change. Command syntax remains with
+  Upgrade pattern for tool images.
+- **Publish the selected digest atomically after build and validation succeed.**
+  A failed refresh preserves the previous selection. A successful refresh is
+  adopted by matching projects on their next launch, not by changing running
+  guests. If the digest is unchanged, no base transition occurs; if changed,
+  ADR-0033's default base-only rebase policy applies when layer inputs are
+  unchanged. Failed destination checks block the affected launch without
+  replacing that project's retained working composition.
+
+```text
+recipe/context + platform + build args ── shared selection ── base digest
+                                              │
+                          explicit refresh ── build + validate
+                                              │ success
+                                     atomically select digest
+                                              │ changed
+                                    next launch: rebase checks
+```
 
 ### Acquisition interfaces and trusted bytes
 
