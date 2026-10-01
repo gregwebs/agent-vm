@@ -139,14 +139,20 @@ Three facts made the alternative cheap:
   a lookup key, not an image digest: floating Debian/apt inputs can produce
   different images from identical recipes.
 - **A warm launch reads the selection without Docker or network calls.**
-  Missing selection or unavailable base data requires a local base build;
-  a changed recipe/build input selects its own record rather than silently
-  continuing to use the old recipe's base.
+  Missing selection requires a local base build. If a selection exists but
+  its base data is unavailable, rebuild with a notice: floating inputs may yield
+  a different digest, which becomes the selection after success. This is cache
+  recovery, not a routine refresh or a promise of exact digest recovery.
+  A changed recipe/build input selects its own record rather than silently
+  continuing to use the old recipe's base; reuse an available matching selection
+  without probing upstream.
 - **Refresh only for changed recipe/build inputs or an explicit refresh.**
   Ordinary launches do not check upstream, refresh apt, or expire a selection
-  on a timer. Explicit refresh pulls upstream and reruns apt-bearing build
-  steps; an ordinary cached Docker build is not sufficient to promise fresh
-  packages. Command syntax remains with Upgrade pattern for tool images.
+  on a timer. Explicit refresh and recipe-triggered builds on a selection miss
+  both pull upstream and rerun apt-bearing build steps; an ordinary cached Docker
+  build is not sufficient to promise fresh packages. An available matching
+  selection remains reusable after a recipe change. Command syntax remains with
+  Upgrade pattern for tool images.
 - **Publish the selected digest atomically after build and validation succeed.**
   A failed refresh preserves the previous selection. A successful refresh is
   adopted by matching projects on their next launch, not by changing running

@@ -202,10 +202,13 @@ contexts when cached.
 
 - Share the retained **base selection** across matching projects. A warm local
   launch reads its selected digest without Docker or network calls. Missing
-  selection or unavailable base data requires a local build; changed recipe/build
-  inputs select their own record. Refresh floating inputs only on changed
-  recipe/build inputs or explicit refresh, never on a timer or ordinary launch.
-  Explicit refresh pulls upstream and reruns apt-bearing build steps. Atomically
+  selection requires a local build. If selected base data is unavailable,
+  rebuild with a notice that floating inputs may produce a different digest;
+  adopt it only after success. Changed recipe/build inputs select their own record,
+  reusing an available match without probing upstream. Refresh floating inputs
+  only on changed recipe/build inputs or explicit refresh, never on a timer or
+  ordinary launch. Explicit refresh and recipe-triggered builds on a selection
+  miss pull upstream and rerun apt-bearing build steps. Atomically
   publish the digest only after successful build and validation; failure preserves
   the previous selection. Successful refresh affects matching projects on their
   next launch. Refresh command syntax remains with the sibling upgrade effort.
@@ -417,10 +420,13 @@ implementation ticket should name which checks it delivers.
    reading an archive. Releasing either project's GC root preserves the image
    while the other retains it. Matching base recipes/platforms/build arguments
    share a base selection; warm local launches invoke neither Docker nor network
-   probes. Recipe changes select the corresponding record, building on a miss.
-   Explicit refresh pulls upstream and reruns apt-bearing steps; failure leaves
-   the prior selection intact. Successful refresh is adopted by matching projects
-   on their next launch; an unchanged digest causes no base transition.
+   probes. Recipe changes select the corresponding record, reusing an available
+   match; builds on a miss pull upstream and rerun apt-bearing steps, as does
+   explicit refresh. Missing selected base data triggers a recovery build with a
+   notice that the resulting digest may differ, adopted only after success.
+   Failure leaves the prior selection intact. Successful refresh is adopted by
+   matching projects on their next launch; an unchanged digest causes no base
+   transition.
 4. **Builder portability:** compose successfully with `docker` and
    `docker-container`, including a cached declared parent and the local base,
    without a registry push workaround. Test the containerd-backed Docker store;
