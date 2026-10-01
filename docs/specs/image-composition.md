@@ -1,6 +1,6 @@
 # Image composition: implementation handoff
 
-Status: draft handoff; five source gaps must be resolved before `/breakdown`.
+Status: draft handoff; four source gaps must be resolved before `/breakdown`.
 Not implemented. Source map:
 [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 This consolidates the handoff for `/breakdown`, not an implementation plan or a
@@ -29,6 +29,7 @@ trade-offs. Later amendments override historical wording:
 | [ADR-0034](../adr/0034-versioned-image-releases.md) | Release assets, pinned image version, shared composition entry point, `--build`, image-API migration |
 | [Acquisition cost of a versioned image release](https://github.com/gregwebs/agent-vm/issues/212#issuecomment-5919942194) | Full download/ingest accepted; no repeated acquisition of a cached image |
 | [Eviction and GC for the local image caches](https://github.com/gregwebs/agent-vm/issues/213#issuecomment-5920203490) | Explicit cleanup, retained roots, persistent selections, ownership and lifetime guards |
+| [Cross-project reuse of identical compositions](https://github.com/gregwebs/agent-vm/issues/216) | Shared validated artifacts and ingested compositions; project handles are independent retained roots |
 
 In particular, declaration order is **not** authoritative over parents, T2 is
 **not** PATH-only, base changes do **not** always rebuild, CI does **not** resolve
@@ -43,27 +44,26 @@ name but governs every layer image.
 
 [Acyclic composition root and identity boundaries](https://github.com/gregwebs/agent-vm/issues/214)
 is resolved: the root is base plus generated union accounts, with no catalog
-layers. The five remaining gaps are:
+layers.
+[Cross-project reuse of identical compositions](https://github.com/gregwebs/agent-vm/issues/216)
+is also resolved: project handles retain shared images, without redundant builds,
+stitching, or ingest. The four remaining gaps are:
 
 1. **[Selecting artifacts for a base-only rebase](https://github.com/gregwebs/agent-vm/issues/215).** New-parent identities miss the original build
    artifacts. Decide how a launch locates eligible old artifacts, establishes
    that only the base changed, and selects when both current-parent builds and
    older reusable artifacts exist. Retained project compositions are a possible
    lookup source; that policy has not been selected.
-2. **[Cross-project reuse of identical compositions](https://github.com/gregwebs/agent-vm/issues/216).** ADR-0029 reuses artifacts across tool sets, while
-   ADR-0032 says identical layers in two projects build twice on purpose despite
-   keeping the project slug out of identity. Decide whether project-specific
-   references are handles/retained roots only or deliberately require work.
-3. **[Config merge fields and ancestor overrides](https://github.com/gregwebs/agent-vm/issues/217).** ADR-0032 widens T2 to “every other config key” but
+2. **[Config merge fields and ancestor overrides](https://github.com/gregwebs/agent-vm/issues/217).** ADR-0032 widens T2 to “every other config key” but
    ADR-0031 S3 retains only `org.agent-vm.*` labels. Decide whether widening is
    Env-only or includes `User`, `WorkingDir`, `Entrypoint`, and `Cmd`; define
    S4's key domain and ancestor (not merely direct-parent) override rules.
 
-4. **[Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219).**
+3. **[Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219).**
    A floating locally built base digest is unknown until Docker runs. Decide how
    a warm launch selects its existing base without running Docker merely to
    compute identity, and when recipe/upstream/apt changes refresh that selection.
-5. **[Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220).**
+4. **[Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220).**
    Decide what `pull` and `--update-check` mean without a moving default tag,
    whether custom base overrides remain supported, and the trusted metadata
    that verifies archive bytes before ingest. A pinned release version alone
@@ -157,7 +157,12 @@ all layers above the root; a tool bump affects only that tool and declared
 descendants, not independent siblings. ADR-0033 still governs base-only rebase.
 Compute composition identities before layer builds; a stitched manifest digest
 is not a substitute for the pre-build cache key. Keep
-`agent-vm-layer:<project-slug>-<hash>` handles, with the slug outside the hash.
+`agent-vm-layer:<project-slug>-<hash>` project image handles, with the slug outside
+the hash. Within the same local cache, reuse validated layer artifacts across
+projects with identical resolved build inputs. If an identical final composition
+is already ingested into msb, skip stitching and ingest; registering another
+project handle is metadata-only, with no archive read. Each project independently
+retains its handle as a GC root, so releasing one cannot evict another's image.
 
 A plain launch never queries upstream for a version. Precedence is:
 
@@ -357,7 +362,7 @@ launch sweep, size limit, or time-based eviction in this implementation.
 These are observable completion checks, not preselected build slices. Each
 implementation ticket should name which checks it delivers.
 
-0. **Readiness:** resolve the five remaining blockers above, amend their owning
+0. **Readiness:** resolve the four remaining blockers above, amend their owning
    ADRs and glossary entries, and align this handoff before slicing tickets.
 1. **Config:** commandless and launchable layers resolve consistently; child-first
    declarations sort correctly; cycles/missing parents fail before Docker;
@@ -373,6 +378,11 @@ implementation ticket should name which checks it delivers.
 3. **Build reuse:** bumping an independent tool rebuilds only that artifact and
    declared dependents, then re-stitches; unrelated validated artifacts survive
    another group's failure. No cached build requires Docker merely to identify it.
+   A second project with identical resolved inputs reuses validated artifacts
+   without builds; if its identical final composition is already ingested, it
+   also skips stitching and ingest. Its own readable handle is registered without
+   reading an archive. Releasing either project's GC root preserves the image
+   while the other retains it.
 4. **Builder portability:** compose successfully with `docker` and
    `docker-container`, including a cached declared parent and the local base,
    without a registry push workaround. Test the containerd-backed Docker store;
