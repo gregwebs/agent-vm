@@ -36,11 +36,19 @@ compatibility risk in exchange for a simpler design and avoiding reinstalls.
   prefix matches the new base. Runtime ABI compatibility is not inferred from
   any structural check or command-path resolution.
 
-No runtime/build base split is introduced. The Docker-local
-`agent-vm-base:<manifest-digest-hex>` Base link continues to refer to the actual
-base used for a build, not to an ABI promise. Published-default launches still
-boot the published template verbatim. Pull/update-check targeting is unchanged;
-a locally composed launch with an updated base uses this rebase policy.
+No runtime/build base split is introduced. A **Base link**, where used, refers
+to the actual base used for a build, not to an ABI promise. ADR-0034 supersedes
+this ADR's historical registry/template and pull/update-check interfaces:
+released-default launches boot the pinned composed default verbatim, while
+local composition supplies the base through an OCI-layout named context.
+
+ADR-0034's **base selection** policy defines when a locally composed launch sees
+an updated base: changed recipe/build inputs or a successful explicit refresh,
+never an ordinary launch-time upstream check. A changed selected manifest digest
+invokes this rebase policy when layer inputs are unchanged; an unchanged digest
+does not. Failed destination checks block that launch without replacing its
+retained working composition. Artifact lookup and precedence remain with
+[Selecting artifacts for a base-only rebase](https://github.com/gregwebs/agent-vm/issues/215).
 
 Exact option syntax and rebuild targeting remain with Upgrade pattern for tool
 images. CI/published-surface integration remains with CI, published surface, and

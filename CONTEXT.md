@@ -382,6 +382,15 @@ The tool-free OS foundation beneath the **composition root**, before generated
 **Base link**, which is a local reference to an image rather than the foundation
 concept.
 
+## Base selection
+
+The shared local choice of a **base image** for a particular base recipe,
+platform, and build arguments. Its recipe identity names the selection; the
+selected manifest digest identifies the resulting image.
+
+_Avoid_: base identity for the recipe identity — floating build inputs can yield
+multiple image digests from the same recipe.
+
 ## Composed default image
 
 The **composition root** plus the shipped default layer set, joined by
