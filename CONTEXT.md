@@ -437,20 +437,21 @@ neither is the foundation called the composition root.
 The clauses every **layer image** must satisfy against its **parent**, checked
 once when it is built (T1–T7). A violation is a hard error, and the layer image
 is never recorded. [ADR-0031](docs/adr/0031-tool-image-contract.md) is
-canonical; [ADR-0032](docs/adr/0032-one-layer-kind.md) widens T2 to admit
-non-`PATH` config (merged in stitch order, last wins) and exempts the launcher's
-generated account layer from T3. The name is kept for continuity although it
-govers every layer, not only tools.
+canonical, incorporating [ADR-0032](docs/adr/0032-one-layer-kind.md)'s
+Env-only widening of T2 and generated-account-layer exemption from T3. The
+name is kept for continuity although it governs every layer, not only tools.
 
 _Avoid_: merged-image contract (nothing is merged).
 
 ## Stitch check
 
 A check across the layers being stitched into one composed image: no file
-written by two layers when neither is the other's parent (**S1**), no layer's
-command shadowed by another's (**S2**), and — new in
+written by two unrelated layers (**S1**; direct or transitive ancestry permits
+overrides of ancestor-introduced files, never protected base/account files),
+no layer's command shadowed by another's (**S2**), and — new in
 [ADR-0032](docs/adr/0032-one-layer-kind.md) — no **S4** env collision, meaning
-two unrelated layers may not declare different values for one config key. See
+two unrelated layers may not declare different values for one environment
+variable (`PATH` exempt; descendants may override ancestors). See
 [ADR-0031](docs/adr/0031-tool-image-contract.md).
 
 ## Rebased composition

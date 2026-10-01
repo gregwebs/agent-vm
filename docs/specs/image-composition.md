@@ -1,6 +1,6 @@
 # Image composition: implementation handoff
 
-Status: draft handoff; four source gaps must be resolved before `/breakdown`.
+Status: draft handoff; three source gaps must be resolved before `/breakdown`.
 Not implemented. Source map:
 [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 This consolidates the handoff for `/breakdown`, not an implementation plan or a
@@ -23,7 +23,7 @@ trade-offs. Later amendments override historical wording:
 | --- | --- |
 | [ADR-0029](../adr/0029-compose-tool-images-by-layer-stitching.md) | Stitching, DAG driver, single-writer OCI layout, deterministic assembly |
 | [ADR-0030](../adr/0030-tool-versions-in-identity-and-current-tags.md) | Version selection, exact installs, build-argument identity, current tags |
-| [ADR-0031](../adr/0031-tool-image-contract.md) | Tool image contract T1–T7 and stitch checks S1–S3 |
+| [ADR-0031](../adr/0031-tool-image-contract.md) | Tool image contract T1–T7 and stitch checks S1–S4 |
 | [ADR-0032](../adr/0032-one-layer-kind.md) | One layer kind, derived order, accounts, widened T2, S4, configuration migration |
 | [ADR-0033](../adr/0033-default-rebase-with-build-provenance.md) | Default rebase, original build provenance, destination checks |
 | [ADR-0034](../adr/0034-versioned-image-releases.md) | Release assets, pinned image version, shared composition entry point, `--build`, image-API migration |
@@ -47,23 +47,21 @@ is resolved: the root is base plus generated union accounts, with no catalog
 layers.
 [Cross-project reuse of identical compositions](https://github.com/gregwebs/agent-vm/issues/216)
 is also resolved: project handles retain shared images, without redundant builds,
-stitching, or ingest. The four remaining gaps are:
+stitching, or ingest.
+[Config merge fields and ancestor overrides](https://github.com/gregwebs/agent-vm/issues/217)
+is resolved in ADR-0031's canonical contract: Env-only widening, filtered layer
+labels, and transitive ancestor overrides. The three remaining gaps are:
 
 1. **[Selecting artifacts for a base-only rebase](https://github.com/gregwebs/agent-vm/issues/215).** New-parent identities miss the original build
    artifacts. Decide how a launch locates eligible old artifacts, establishes
    that only the base changed, and selects when both current-parent builds and
    older reusable artifacts exist. Retained project compositions are a possible
    lookup source; that policy has not been selected.
-2. **[Config merge fields and ancestor overrides](https://github.com/gregwebs/agent-vm/issues/217).** ADR-0032 widens T2 to “every other config key” but
-   ADR-0031 S3 retains only `org.agent-vm.*` labels. Decide whether widening is
-   Env-only or includes `User`, `WorkingDir`, `Entrypoint`, and `Cmd`; define
-   S4's key domain and ancestor (not merely direct-parent) override rules.
-
-3. **[Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219).**
+2. **[Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219).**
    A floating locally built base digest is unknown until Docker runs. Decide how
    a warm launch selects its existing base without running Docker merely to
    compute identity, and when recipe/upstream/apt changes refresh that selection.
-4. **[Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220).**
+3. **[Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220).**
    Decide what `pull` and `--update-check` mean without a moving default tag,
    whether custom base overrides remain supported, and the trusted metadata
    that verifies archive bytes before ingest. A pinned release version alone
@@ -237,13 +235,13 @@ ADR-0032's amendments rather than maintaining a second normative table here:
 
 - Run T5 against the shipped set before turning enforcement on; repair any
   restrictive command/directory permissions rather than adding an exemption.
-- Enforce T1 parent build/prefix, widened T2 additive PATH/config merge, strict
+- Enforce T1 parent build/prefix, widened T2 additive PATH/Env-only merge, strict
   T3 base-path protection, T4 host platform, and T5 command resolution and
   permissions for any uid. T5 applies when a command exists. T6 capability
   honesty and T7 other-file readability remain documented requirements.
 - Enforce S1 unrelated-layer file collisions (only guest tmpfs prefixes exempt),
-  S2 command shadowing, amended S3 derived config, and S4 conflicting config
-  declarations by unrelated layers. Ancestor/descendant overrides are permitted
+  S2 command shadowing, amended S3 derived config, and S4 conflicting environment
+  declarations by unrelated layers. Direct and transitive ancestor overrides are permitted
   where the contract allows them; identical values and additive PATH are not
   sibling conflicts.
 - Reject layer declarations of launcher-owned `LANG`, `IS_SANDBOX`,
@@ -362,7 +360,7 @@ launch sweep, size limit, or time-based eviction in this implementation.
 These are observable completion checks, not preselected build slices. Each
 implementation ticket should name which checks it delivers.
 
-0. **Readiness:** resolve the four remaining blockers above, amend their owning
+0. **Readiness:** resolve the three remaining blockers above, amend their owning
    ADRs and glossary entries, and align this handoff before slicing tickets.
 1. **Config:** commandless and launchable layers resolve consistently; child-first
    declarations sort correctly; cycles/missing parents fail before Docker;
@@ -393,7 +391,11 @@ implementation ticket should name which checks it delivers.
    bytes. Own-layer extraction does not duplicate parent prefixes. Negative
    fixtures exercise T1–T5 and S1–S4, including symlink command resolution,
    restrictive directory modes, descendant overrides, whiteouts, and tmpfs-only
-   overlap exemptions. Contract failures never become indexed healthy images.
+   overlap exemptions. Test rejection of changes to `User`, `WorkingDir`,
+   `Entrypoint`, and `Cmd`; Env-only merging; base-label preservation and layer
+   label filtering; and `A → B → C` overrides with unrelated-layer conflicts
+   still rejected and base/account files protected. Contract failures never
+   become indexed healthy images.
 6. **Accounts:** multiple declarations create one deterministic union visible
    during each build and in the guest. Locked shadow data is stable; collisions
    with declarations, base accounts, and host identity fail at their intended

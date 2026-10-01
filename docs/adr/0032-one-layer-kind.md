@@ -185,21 +185,25 @@ order. Only the derived image is ingested into the msb cache.
 
 ### One contract
 
-ADR-0031's contract governs every layer image, with two widenings and one
-replacement:
+[ADR-0031's contract table](0031-tool-image-contract.md#decision) is the sole
+normative contract for every layer image. This section records the rationale
+for its amendments, clarified by
+[Config merge fields and ancestor overrides](https://github.com/gregwebs/agent-vm/issues/217):
 
-- **T2 widens.** `PATH` stays additive (it is derived as the union in stitch
-  order, ADR-0029); every other config key may be added, merged in stitch order,
-  last wins. Forced by `go-dev` and `rust-dev` above.
+- **T2 widens to Env, not arbitrary config.** `go-dev` and `rust-dev` need
+  environment variables, not control of the guest's user or entry point.
+  Non-Env config fields stay unchanged; labels retain their separate allowance.
+  S3 preserves base labels and admits only `org.agent-vm.*` layer labels.
 - **T3 stays strict for layer content.** No layer may replace or delete a base
   path. The **only** permitted write to a base-path file is the launcher's own
   generated, append-only account layer below.
-- **S4 is new — no sibling env collisions.** Two layers that are not each other's
-  parent may not declare different values for the same config key; identical
-  values are allowed, `PATH` is exempt, and an override by a *descendant* is
-  legitimate. This is S1's rule in a different medium: under a DAG, siblings have
-  no order that means anything except stitch order, so a silent winner would drop
-  one layer's declaration exactly as an overlap drops one layer's file.
+- **S4 is new — no unrelated-layer env collisions.** This is S1's rule in
+  a different medium: unrelated layers have no meaningful override order, so a
+  silent winner would drop one layer's environment declaration exactly as an
+  overlap drops one layer's file. Labels are not environment declarations.
+- **Ancestry is transitive for S1/T3/S4.** In `A → B → C`, C may override
+  A's introduced files or environment variables; a direct edge is not required.
+  Base and generated account files remain protected at every depth.
 - **Launcher-owned env keys are rejected as layer declarations**: `LANG` and
   `IS_SANDBOX` (published on every launch by `run::GUEST_ALWAYS_ENV`),
   `HOME`/`USER`/`LOGNAME` (owned by `user::guest_identity_env`), and the `MSB_`
