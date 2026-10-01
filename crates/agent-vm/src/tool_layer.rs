@@ -1086,4 +1086,702 @@ mod tests {
         };
         assert!(format!("{err:#}").contains("mytool"), "{err:#}");
     }
+
+    // -- exact shipped tool slots: ARGs, labels, contracts, vendored patches --
+
+    /// The eight version slots: the label suffix, the recipe directory that
+    /// owns the label, and the single-line `ARG` that selects the slot. The
+    /// single-slot recipes carry an exact nonempty default; dsh/pnpm and
+    /// pi/bridge are the two lock-backed recipes whose ARG defaults are EMPTY
+    /// (an empty slot reuses the committed lock byte-for-byte).
+    const VERSION_SLOTS: [(&str, &str, &str); 8] = [
+        ("codex", "codex", "AGENT_VERSION_CODEX"),
+        ("opencode", "opencode", "AGENT_VERSION_OPENCODE"),
+        ("claude", "claude", "AGENT_VERSION_CLAUDE"),
+        ("copilot", "copilot", "AGENT_VERSION_COPILOT"),
+        ("dsh", "dsh", "AGENT_VERSION_DSH"),
+        ("pnpm", "dsh", "AGENT_VERSION_PNPM"),
+        ("pi", "pi", "AGENT_VERSION_PI"),
+        ("pi-claude-bridge", "pi", "AGENT_VERSION_PI_CLAUDE_BRIDGE"),
+    ];
+
+    fn embedded_text(relative: &str) -> String {
+        TOOL_LAYERS
+            .get_file(relative)
+            .unwrap_or_else(|| panic!("{relative} is embedded"))
+            .contents_utf8()
+            .expect("the embedded file is UTF-8")
+            .to_string()
+    }
+
+    fn embedded_files() -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        collect_embedded(&TOOL_LAYERS, &mut out);
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The one `ARG NAME=<value>` line's value (panics unless exactly one).
+    fn dockerfile_arg(text: &str, name: &str) -> String {
+        let prefix = format!("ARG {name}=");
+        let matches: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with(&prefix))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one `ARG {name}=` line, found {}: {matches:?}",
+            matches.len()
+        );
+        matches[0][prefix.len()..].to_string()
+    }
+
+    /// The active `LABEL` key=value pairs of a Dockerfile, parsed the way a
+    /// build would see them. Comment lines (first non-blank character `#`) are
+    /// dropped before instruction joining, and a trailing `\\` joins the next
+    /// line, so a commented-out or continued label is resolved exactly as the
+    /// built image resolves it (review E2).
+    fn active_label_values(text: &str) -> Vec<(String, String)> {
+        // Drop comment lines first: a `#`-prefixed LABEL is not an instruction
+        // and must never satisfy a guard even inside a continuation block.
+        let stripped: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect();
+        let mut logical: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut continuing = false;
+        for line in stripped {
+            let line = line.trim();
+            if continuing {
+                current.push(' ');
+            } else {
+                current.clear();
+            }
+            current.push_str(line);
+            if current.ends_with('\\') {
+                current.pop();
+                continuing = true;
+            } else {
+                logical.push(std::mem::take(&mut current));
+                continuing = false;
+            }
+        }
+        if !current.is_empty() {
+            logical.push(current);
+        }
+        let mut pairs = Vec::new();
+        for instruction in logical {
+            let (verb, rest) = match instruction.split_once(char::is_whitespace) {
+                Some(parts) => parts,
+                None => continue,
+            };
+            if !verb.eq_ignore_ascii_case("LABEL") {
+                continue;
+            }
+            pairs.extend(label_pairs(rest));
+        }
+        pairs
+    }
+
+    /// Split a `LABEL` body into `key=value` pairs; a quoted value keeps its
+    /// bytes, an unquoted value runs to the next whitespace.
+    fn label_pairs(body: &str) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        let mut chars = body.chars().peekable();
+        while chars.peek().is_some() {
+            while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                chars.next();
+            }
+            let mut key = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == '=' || c.is_whitespace() {
+                    break;
+                }
+                key.push(c);
+                chars.next();
+            }
+            if key.is_empty() {
+                break;
+            }
+            if chars.peek() != Some(&'=') {
+                continue;
+            }
+            chars.next();
+            let mut value = String::new();
+            if chars.peek() == Some(&'"') {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '"' {
+                        break;
+                    }
+                    if c == '\\' {
+                        if let Some(escaped) = chars.next() {
+                            value.push(escaped);
+                        }
+                    } else {
+                        value.push(c);
+                    }
+                }
+            } else {
+                while let Some(&c) = chars.peek() {
+                    if c.is_whitespace() {
+                        break;
+                    }
+                    value.push(c);
+                    chars.next();
+                }
+            }
+            pairs.push((key, value));
+        }
+        pairs
+    }
+
+    /// The value of the single ACTIVE `LABEL KEY="..."`, or `None` when absent.
+    /// A duplicate active label is a failure (there is no defensible selection).
+    fn find_label_value(text: &str, key: &str) -> Option<String> {
+        let values: Vec<String> = active_label_values(text)
+            .into_iter()
+            .filter(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value)
+            .collect();
+        match values.len() {
+            0 => None,
+            1 => Some(values.into_iter().next().expect("one value")),
+            n => panic!("the {key} label must appear exactly once, found {n}"),
+        }
+    }
+
+    /// The quoted value of an active `LABEL KEY="..."` (must appear once).
+    fn label_value(text: &str, key: &str) -> String {
+        find_label_value(text, key).unwrap_or_else(|| panic!("the {key} label is present"))
+    }
+
+    /// The active `org.agent-vm.version.*` keys of a Dockerfile.
+    fn active_version_labels(text: &str) -> Vec<String> {
+        active_label_values(text)
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|key| key.starts_with("org.agent-vm.version."))
+            .collect()
+    }
+
+    /// Canonical semver 2.0.0 parsing of the exact slot the owning hook accepts
+    /// (review E2): each core identifier is numeric with no leading zero; a
+    /// pre-release identifier is numeric (no leading zero) or alphanumeric; a
+    /// build identifier is digits (leading zeros allowed) or alphanumeric.
+    fn is_exact_semver(body: &str) -> bool {
+        fn numeric(s: &str) -> bool {
+            !s.is_empty()
+                && s.chars().all(|c| c.is_ascii_digit())
+                && (s == "0" || !s.starts_with('0'))
+        }
+        fn digits(s: &str) -> bool {
+            !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+        }
+        fn alphanumeric(s: &str) -> bool {
+            !s.is_empty()
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && s.chars().any(|c| !c.is_ascii_digit())
+        }
+        let (core_and_pre, build) = match body.split_once('+') {
+            Some((head, build)) => (head, Some(build)),
+            None => (body, None),
+        };
+        let (core, pre) = match core_and_pre.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (core_and_pre, None),
+        };
+        let core_ids: Vec<&str> = core.split('.').collect();
+        if core_ids.len() != 3 || !core_ids.iter().all(|id| numeric(id)) {
+            return false;
+        }
+        if pre.is_some_and(|p| {
+            p.is_empty() || !p.split('.').all(|id| numeric(id) || alphanumeric(id))
+        }) {
+            return false;
+        }
+        if build
+            .is_some_and(|b| b.is_empty() || !b.split('.').all(|id| digits(id) || alphanumeric(id)))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// A structural proxy for the exact-input grammar the owning hooks enforce:
+    /// nonempty, an exact canonical semver body, and no range/URL/floating
+    /// marker.
+    fn assert_exact_slot(value: &str, prefix: &str) {
+        assert!(!value.is_empty(), "a selected slot must not be empty");
+        let body = value
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("the slot must start with {prefix:?}: {value:?}"));
+        assert!(
+            is_exact_semver(body),
+            "the slot must be an exact semver version: {value:?}"
+        );
+        for forbidden in ['^', '~', '>', '<', '=', '*', '|', ' ', 'x', 'X', '@', '/'] {
+            assert!(
+                !value.contains(forbidden),
+                "the slot must be exact, not a range/tag/URL: {value:?}"
+            );
+        }
+    }
+
+    /// Each single-slot recipe commits an exact nonempty default and its label
+    /// names that same slot (the ARG is the label's only source).
+    #[test]
+    fn single_slot_recipes_pin_an_exact_default_and_reference_it_in_the_label() {
+        for (label, recipe, arg) in &VERSION_SLOTS[..4] {
+            let text = embedded_text(&format!("{recipe}/Dockerfile"));
+            let value = dockerfile_arg(&text, arg);
+            match *label {
+                "codex" => assert_exact_slot(&value, "rust-v"),
+                "opencode" => assert_exact_slot(&value, "v"),
+                _ => assert_exact_slot(&value, ""),
+            }
+            assert_eq!(
+                label_value(&text, &format!("org.agent-vm.version.{label}")),
+                format!("${{{arg}}}"),
+                "{recipe}: the version label must reference {arg}"
+            );
+        }
+    }
+
+    /// The two lock-backed recipes keep both ARGs EMPTY, and the label fallbacks
+    /// mirror the committed manifests exactly -- the Dockerfile must never
+    /// duplicate a pin as a nonempty ARG default, and a stale fallback must fail
+    /// here rather than silently labelling the wrong selection.
+    #[test]
+    fn multi_slot_args_are_empty_and_label_fallbacks_mirror_the_manifests() {
+        let dsh = embedded_text("dsh/Dockerfile");
+        assert_eq!(dockerfile_arg(&dsh, "AGENT_VERSION_DSH"), "");
+        assert_eq!(dockerfile_arg(&dsh, "AGENT_VERSION_PNPM"), "");
+        let pnpm_pin = embedded_json("dsh/package.json")["dependencies"]["pnpm"]
+            .as_str()
+            .expect("the dsh manifest pins pnpm")
+            .to_string();
+        assert_eq!(
+            label_value(&dsh, "org.agent-vm.version.dsh"),
+            format!("${{AGENT_VERSION_DSH:-{}}}", dsh_pin()),
+            "the dsh label fallback must mirror images/tools/dsh/package.json"
+        );
+        assert_eq!(
+            label_value(&dsh, "org.agent-vm.version.pnpm"),
+            format!("${{AGENT_VERSION_PNPM:-{pnpm_pin}}}"),
+            "the pnpm label fallback must mirror images/tools/dsh/package.json"
+        );
+
+        let pi = embedded_text("pi/Dockerfile");
+        assert_eq!(dockerfile_arg(&pi, "AGENT_VERSION_PI"), "");
+        assert_eq!(dockerfile_arg(&pi, "AGENT_VERSION_PI_CLAUDE_BRIDGE"), "");
+        assert_eq!(
+            label_value(&pi, "org.agent-vm.version.pi"),
+            format!("${{AGENT_VERSION_PI:-{}}}", pi_pin()),
+            "the pi label fallback must mirror images/tools/pi/package.json"
+        );
+        assert_eq!(
+            label_value(&pi, "org.agent-vm.version.pi-claude-bridge"),
+            format!("${{AGENT_VERSION_PI_CLAUDE_BRIDGE:-{}}}", bridge_pin()),
+            "the bridge label fallback must mirror images/tools/pi/bridge/package.json"
+        );
+    }
+
+    /// All eight version labels are present exactly once across the six
+    /// recipes: a missing or duplicated label silently breaks the selection
+    /// tag/replay contract #228 consumes.
+    #[test]
+    fn every_shipped_version_label_is_present_exactly_once() {
+        let mut seen: Vec<String> = Vec::new();
+        for builtin in BuiltinLayer::ALL {
+            let name = builtin.as_str();
+            let text = embedded_text(&format!("{name}/Dockerfile"));
+            seen.extend(active_version_labels(&text));
+        }
+        let mut expected: Vec<String> = VERSION_SLOTS
+            .iter()
+            .map(|(label, _, _)| format!("org.agent-vm.version.{label}"))
+            .collect();
+        seen.sort();
+        expected.sort();
+        assert_eq!(
+            seen, expected,
+            "the shipped version labels drifted from the eight-slot contract"
+        );
+    }
+
+    /// The label guards must read ACTIVE `LABEL` instructions, not arbitrary
+    /// substrings: commenting the label out of the real Dockerfile must fail the
+    /// guard, and the uncommented control must pass (review E2).
+    #[test]
+    fn commented_out_version_labels_fail_the_guards() {
+        // Control: the active fixture labels parse.
+        assert_eq!(
+            active_label_values("FROM scratch\nLABEL a=1 b=\"2\"\n"),
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string())
+            ],
+            "active LABEL pairs must parse"
+        );
+        assert_eq!(
+            label_value(
+                "FROM scratch\nLABEL org.agent-vm.version.copilot=\"${AGENT_VERSION_COPILOT}\"\n",
+                "org.agent-vm.version.copilot"
+            ),
+            "${AGENT_VERSION_COPILOT}",
+            "the active copilot label value must parse"
+        );
+
+        // Negative: a commented-out label is invisible to every guard.
+        let commented =
+            "FROM scratch\n# LABEL org.agent-vm.version.copilot=\"${AGENT_VERSION_COPILOT}\"\n";
+        assert!(
+            active_label_values(commented).is_empty(),
+            "a commented LABEL must not be read: {commented:?}"
+        );
+        assert_eq!(
+            find_label_value(commented, "org.agent-vm.version.copilot"),
+            None,
+            "a commented LABEL must fail the guard"
+        );
+
+        // The exact reviewer mutation, applied to the embedded Dockerfile: all
+        // shipped-label guards must notice the missing active label.
+        let copilot = embedded_text("copilot/Dockerfile");
+        assert_eq!(
+            label_value(&copilot, "org.agent-vm.version.copilot"),
+            "${AGENT_VERSION_COPILOT}"
+        );
+        let mutated = copilot.replace(
+            "LABEL org.agent-vm.version.copilot=",
+            "# LABEL org.agent-vm.version.copilot=",
+        );
+        assert_ne!(mutated, copilot, "the mutation must change the text");
+        assert_eq!(
+            find_label_value(&mutated, "org.agent-vm.version.copilot"),
+            None,
+            "commenting out the copilot label must fail the guard"
+        );
+        assert!(
+            !active_version_labels(&mutated).contains(&"org.agent-vm.version.copilot".to_string()),
+            "the shipped-label set must notice the commented label"
+        );
+    }
+
+    /// A LABEL continued across lines is joined before parsing, and the exact
+    /// slot grammar rejects a non-numeric default that the old dot-count proxy
+    /// accepted (review E2).
+    #[test]
+    fn continuations_join_and_the_exact_slot_grammar_rejects_bad_defaults() {
+        let continued = "FROM scratch\nLABEL org.agent-vm.version.pi=\"x\" \\\n      org.agent-vm.version.pi-claude-bridge=\"y\"\n";
+        assert_eq!(
+            active_label_values(continued),
+            vec![
+                ("org.agent-vm.version.pi".to_string(), "x".to_string()),
+                (
+                    "org.agent-vm.version.pi-claude-bridge".to_string(),
+                    "y".to_string()
+                )
+            ],
+            "a continued LABEL must be joined"
+        );
+
+        for good in ["1.2.3", "0.159.3-alpha.1.2", "1.2.3-rc.1+build.01"] {
+            assert!(is_exact_semver(good), "{good:?} is exact semver");
+        }
+        for bad in ["a.b.c", "01.2.3", "1.2.3-01", "1.2.3-a.", "1.2", "latest"] {
+            assert!(!is_exact_semver(bad), "{bad:?} is NOT exact semver");
+        }
+    }
+
+    /// Every per-recipe `contract/` copy is byte-identical to the canonical
+    /// `images/recipe-contract/` source; `script/build/sync-recipe-contracts.sh
+    /// --check` asserts the same, here so a `cargo test` catches a drifted copy.
+    #[test]
+    fn per_recipe_contract_copies_are_byte_identical_to_the_canonical_contract() {
+        const CANONICAL: [&str; 6] = [
+            "download.sh",
+            "run-install.sh",
+            "run-npm.sh",
+            "run-report.sh",
+            "check-tool-access.py",
+            "install-status.py",
+        ];
+        for builtin in BuiltinLayer::ALL {
+            let name = builtin.as_str();
+            for file in CANONICAL {
+                let canonical = fs::read(repo_path(&format!("images/recipe-contract/{file}")))
+                    .unwrap_or_else(|error| panic!("read images/recipe-contract/{file}: {error}"));
+                let copy = TOOL_LAYERS
+                    .get_file(format!("{name}/contract/{file}"))
+                    .unwrap_or_else(|| panic!("{name}/contract/{file} is embedded"))
+                    .contents();
+                assert_eq!(
+                    canonical, copy,
+                    "{name}/contract/{file} drifted from images/recipe-contract/{file}; \
+                     run script/build/sync-recipe-contracts.sh --write"
+                );
+            }
+        }
+    }
+
+    /// The base ships a blanket `agent-vm-install` download/run helper for
+    /// compatibility; no shipped recipe may call it, because the exact-input,
+    /// classified-transport and per-slot status contract lives in the recipe's
+    /// own mounted `contract/` seam.
+    #[test]
+    fn no_shipped_recipe_calls_the_base_agent_vm_install_helper() {
+        let mut offenders = Vec::new();
+        for (path, contents) in embedded_files() {
+            if !is_recipe_source(&path) {
+                continue;
+            }
+            if String::from_utf8_lossy(&contents).contains("agent-vm-install") {
+                offenders.push(path);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these shipped recipes still call the base agent-vm-install helper: {offenders:?}"
+        );
+    }
+
+    /// A shipped recipe must not resolve an upstream "latest": no floating
+    /// default, no `releases/latest`/`dist-tags.latest`/`@latest` lookup. The
+    /// upstream `.upstream.sh` snapshots are display-only provenance (never run)
+    /// and are excluded; only the runnable recipe sources are scanned, and only
+    /// their non-comment lines.
+    #[test]
+    fn no_shipped_recipe_resolves_upstream_latest() {
+        const FORBIDDEN: [&str; 6] = [
+            "releases/latest",
+            "/latest/download",
+            "dist-tags.latest",
+            "@latest",
+            ":-latest",
+            "claude-code-releases/latest",
+        ];
+        let mut offenders = Vec::new();
+        for (path, contents) in embedded_files() {
+            if !is_recipe_source(&path) || is_provenance_snapshot(&path) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&contents);
+            for (index, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with('#') {
+                    continue;
+                }
+                for needle in FORBIDDEN {
+                    if line.contains(needle) {
+                        offenders.push(format!("{}:{}: {needle}", path.display(), index + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these shipped recipes still resolve upstream latest: {offenders:?}"
+        );
+    }
+
+    /// A recipe Dockerfile/hook/contract/JSON source (not docs, not the
+    /// `install.upstream.sh` provenance snapshots).
+    fn is_recipe_source(path: &Path) -> bool {
+        if is_provenance_snapshot(path) {
+            return false;
+        }
+        matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("Dockerfile")
+        ) || matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("sh" | "js" | "py")
+        )
+    }
+
+    fn is_provenance_snapshot(path: &Path) -> bool {
+        path.to_string_lossy().ends_with("install.upstream.sh")
+    }
+
+    /// The vendored runnable installers are the upstream snapshot plus a patch
+    /// that enforces exact selection; the patch MUST reproduce the runnable copy
+    /// from the snapshot byte-for-byte, or the reviewed diff and the shipped
+    /// script have diverged. `script/test/*-installer.sh` cross-checks this with
+    /// real `git apply`; this is the same guard in `cargo test`.
+    #[test]
+    fn vendored_installer_patches_reproduce_the_runnable_scripts() {
+        for recipe in ["codex", "opencode", "claude"] {
+            let upstream = embedded_text(&format!("{recipe}/vendor/install.upstream.sh"));
+            let patch = embedded_text(&format!("{recipe}/vendor/install.patch"));
+            let runnable = embedded_text(&format!("{recipe}/vendor/install.sh"));
+            let applied = apply_unified_patch(&upstream, &patch);
+            assert_eq!(
+                applied, runnable,
+                "{recipe}: vendor/install.patch no longer reproduces vendor/install.sh from \
+                 vendor/install.upstream.sh"
+            );
+        }
+    }
+
+    /// Apply a `diff -u` patch to `original`; test-only (committed, reviewed
+    /// fixture bytes -- not untrusted input). See
+    /// `vendored_installer_patches_reproduce_the_runnable_scripts`.
+    fn apply_unified_patch(original: &str, patch: &str) -> String {
+        let orig: Vec<&str> = original.lines().collect();
+        let patch_lines: Vec<&str> = patch.lines().collect();
+        let mut out: Vec<&str> = Vec::new();
+        let mut cursor = 0usize;
+        let mut i = 0usize;
+        while i < patch_lines.len() {
+            let line = patch_lines[i];
+            i += 1;
+            let Some(header) = line.strip_prefix("@@ ") else {
+                continue;
+            };
+            let ranges = header.split(" @@").next().expect("hunk header ranges");
+            let mut fields = ranges.split(' ');
+            let old = fields
+                .next()
+                .expect("old range")
+                .strip_prefix('-')
+                .expect("old range starts with -");
+            let new = fields
+                .next()
+                .expect("new range")
+                .strip_prefix('+')
+                .expect("new range starts with +");
+            let (a_start, a_count) = parse_hunk_range(old);
+            let (_, c_count) = parse_hunk_range(new);
+            let target = a_start.saturating_sub(1);
+            while cursor < target {
+                out.push(orig[cursor]);
+                cursor += 1;
+            }
+            let (mut old_used, mut new_used) = (0usize, 0usize);
+            while old_used < a_count || new_used < c_count {
+                let hunk_line = patch_lines
+                    .get(i)
+                    .copied()
+                    .unwrap_or_else(|| panic!("{header}: the hunk body ran out"));
+                i += 1;
+                let (tag, content) = hunk_line.split_at(1);
+                match tag {
+                    " " => {
+                        assert_eq!(
+                            content,
+                            orig[cursor],
+                            "context mismatch at old line {}",
+                            cursor + 1
+                        );
+                        out.push(orig[cursor]);
+                        cursor += 1;
+                        old_used += 1;
+                        new_used += 1;
+                    }
+                    "-" => {
+                        assert_eq!(
+                            content,
+                            orig[cursor],
+                            "deletion mismatch at old line {}",
+                            cursor + 1
+                        );
+                        cursor += 1;
+                        old_used += 1;
+                    }
+                    "+" => {
+                        out.push(content);
+                        new_used += 1;
+                    }
+                    other => panic!("unexpected hunk line tag {other:?}: {hunk_line:?}"),
+                }
+            }
+        }
+        while cursor < orig.len() {
+            out.push(orig[cursor]);
+            cursor += 1;
+        }
+        let mut result = out.join("\n");
+        if original.ends_with('\n') {
+            result.push('\n');
+        }
+        result
+    }
+
+    fn parse_hunk_range(range: &str) -> (usize, usize) {
+        match range.split_once(',') {
+            Some((start, count)) => (
+                start.parse().expect("hunk start"),
+                count.parse().expect("hunk count"),
+            ),
+            // An omitted count defaults to 1 (e.g. `@@ -5 +5 @@`).
+            None => (range.parse().expect("hunk start"), 1),
+        }
+    }
+
+    /// The exact-install hooks and vendored runnable installers are shipped and
+    /// materialise 0644 (the execute bit is granted with `COPY --chmod=0755`,
+    /// never from the source tree -- see
+    /// `embedded_layer_sources_are_committed_without_the_execute_bit`).
+    #[test]
+    fn the_exact_install_hooks_are_shipped_and_materialise_at_0644() {
+        let expected = [
+            "codex/install-codex.sh",
+            "codex/verify-codex.sh",
+            "codex/vendor/install.sh",
+            "opencode/install-opencode.sh",
+            "opencode/verify-opencode.sh",
+            "opencode/vendor/install.sh",
+            "claude/install-claude.sh",
+            "claude/verify-claude.sh",
+            "claude/vendor/install.sh",
+            "copilot/install-copilot.sh",
+            "copilot/verify-copilot.sh",
+            "dsh/install-dsh.sh",
+            "dsh/verify-dsh.sh",
+            "dsh/prepare-lock.sh",
+            "dsh/check-lock-update.js",
+            "pi/install-pi.sh",
+            "pi/install-pi-packages.sh",
+            "pi/verify-pi.sh",
+            "pi/prepare-lock.sh",
+            "pi/bridge/prepare-lock.sh",
+        ];
+        for rel in expected {
+            assert!(
+                TOOL_LAYERS.get_file(rel).is_some(),
+                "{rel} must be embedded in the shipped tool layers"
+            );
+        }
+
+        let catalog =
+            crate::config::default_launch_catalog().expect("the default catalog resolves");
+        let (dirs, _guard) =
+            materialize(&catalog.declared_layers()).expect("materialize the shipped set");
+        let mut seen = 0usize;
+        for dir in &dirs {
+            let mut stack = vec![dir.dir.clone()];
+            while let Some(current) = stack.pop() {
+                for entry in fs::read_dir(&current).expect("read a materialised context") {
+                    let entry = entry.expect("read a dir entry");
+                    if entry.file_type().expect("file type").is_dir() {
+                        stack.push(entry.path());
+                        continue;
+                    }
+                    let mode = entry.metadata().expect("stat").permissions().mode() & 0o777;
+                    assert_eq!(
+                        mode,
+                        0o644,
+                        "{} must materialise 0644",
+                        entry.path().display()
+                    );
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen > 0, "the shipped layers materialise files");
+    }
 }

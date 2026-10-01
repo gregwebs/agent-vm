@@ -233,13 +233,13 @@ RUN --mount=type=bind,source=install-zellij.sh,target=/tmp/install-zellij.sh,ro 
 # Docker layer-cache behaviour.
 
 ARG AGENT_INSTALL_SOFT_FAIL=
-# Shared helper for the three agent installer RUNs below. Downloads
-# the upstream `install.sh`, runs it under the requested shell, and
-# emits a uniform soft-fail or hard-fail diagnostic depending on
-# `AGENT_INSTALL_SOFT_FAIL`. Keeping the policy in one place means
-# any future tweak (extra retries, log format, soft-fail discrimina-
-# tion) lives in exactly one spot — the three RUNs that call it are
-# trivial one-liners.
+# Legacy shared helper (kept for compatibility). Downloads the upstream
+# `install.sh`, runs it under the requested shell, and emits a uniform
+# soft-fail or hard-fail diagnostic depending on `AGENT_INSTALL_SOFT_FAIL`.
+# The shipped tool recipes no longer call it: each owning layer has its own
+# bind-mounted `contract/` copy and classified install hooks, which is the
+# authoritative policy (see images/recipe-contract/ and images/tools/README.md).
+# This helper's blanket soft-fail is NOT that contract.
 #
 # Why curl-only (no python3-urllib fallback): both curl and python3's
 # `ssl` module link against the same system OpenSSL, so a real TLS-
@@ -290,9 +290,10 @@ RUN printf '%s\n' \
 RUN mkdir -p /opt/agent && chmod 755 /opt/agent
 
 # The `agent-vm-install` helper above and the host-CA shim near the top of
-# this file are inherited by every tool layer that builds FROM this base; a
-# tool layer must not re-declare them or thread `CA_SHIM_CACHEBUST` into its
-# own build. See images/tools/README.md.
+# this file are still present in the base. Shipped tool layers no longer call
+# the helper (they bind-mount their own contract/ hooks); a layer must not
+# re-declare the helper or thread `CA_SHIM_CACHEBUST` into its own build. See
+# images/tools/README.md.
 #
 # First-boot seed hooks. A tool layer that bakes state which the guest's
 # runtime persistence symlinks would shadow (e.g. the claude LSP plugin tree

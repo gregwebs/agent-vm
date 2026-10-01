@@ -3,16 +3,21 @@
 One standalone tooling layer per shipped agent CLI. Each directory holds a
 `Dockerfile` that builds `FROM` the tool-free base
 (`ghcr.io/wirenboard/agent-vm-base:latest`, produced by `images/Dockerfile`)
-and installs exactly one agent. The directories are embedded into the
-`agent-vm` binary at compile time (`crates/agent-vm/src/tool_layer.rs`) so a
-launch whose configured tool set differs from the shipped default can compose
-them locally without a repo checkout.
+and installs **one exact, audited** selection of that agent, together with its
+own copy of the small recipe/install contract. The directories are embedded
+into the `agent-vm` binary at compile time
+(`crates/agent-vm/src/tool_layer.rs`) so a launch whose configured tool set
+differs from the shipped default can compose them locally without a repo
+checkout.
 
 ## The layer image contract
 
-Every `Dockerfile` here obeys [ADR-0003](../../docs/adr/0003-project-tooling-layers.md)'s
-**layer image contract** (C1–C8), checked on every built step by
-`crates/agent-vm/src/layer/contract.rs`. The only tool-layer-specific rule:
+The **normative** contract for tool images is
+[ADR-0031](../../docs/adr/0031-tool-image-contract.md) (the T/S clauses). It
+replaced ADR-0003's retired C1–C8 table. The legacy C1–C4 chain checks still run
+on the ordered-build path in `crates/agent-vm/src/layer/contract.rs` (C5–C8 are
+documented-only there); treat that as the historical implementation, not the
+tool-image contract. The only tool-layer-specific legacy rule worth stating:
 **C2 is satisfied by writing prefixes as `ENV PATH=<new>:${PATH}`**, so a layer
 can never remove a directory the base put there.
 
@@ -20,9 +25,6 @@ can never remove a directory the base put there.
 
 A tool layer builds `FROM` `images/Dockerfile` and therefore inherits:
 
-- the **`agent-vm-install` helper** (`/usr/local/bin/agent-vm-install`), the
-  repo's uniform "fetch-an-upstream-installer with a soft-fail policy" wrapper.
-  A tool layer calls it; it must not re-declare it.
 - the **host-CA shim**: the build-time CA (when `images/build.sh` detects a
   TLS-intercept proxy) is baked into the base rootfs, so every layer inherits
   host trust with no extra build arg. Do **not** thread `CA_SHIM_CACHEBUST`
@@ -30,34 +32,75 @@ A tool layer builds `FROM` `images/Dockerfile` and therefore inherits:
 - the **`/opt/agent` prefix** (`RUN mkdir -p /opt/agent && chmod 755 /opt/agent`)
   and the empty `/opt/agent-vm/seed.d/` hook directory.
 
-## `AGENT_INSTALL_SOFT_FAIL`
+The base still ships the legacy `/usr/local/bin/agent-vm-install` helper for
+compatibility, but **no shipped recipe calls it**: its blanket soft-fail policy
+is not this contract. Instead each recipe carries its own copy of the shared
+mechanics under `images/tools/<tool>/contract/` (`run-install.sh`,
+`download.sh`, `run-npm.sh`, `run-report.sh`, `check-tool-access.py`). The
+canonical sources live in `images/recipe-contract/` and every copy is
+byte-identical; edit the canonical file, run
+`bash script/build/sync-recipe-contracts.sh --write`, and commit the copies.
+`script/build/sync-recipe-contracts.sh --check` (run by ci-contracts) fails on
+drift. The contract files are **bind-mounted** into a recipe's `RUN`
+(`--mount=type=bind,…`), never `COPY`ed, so no helper becomes a shipped entry
+point and the base gains no new prerequisite.
 
-The base's `agent-vm-install` helper honors `AGENT_INSTALL_SOFT_FAIL`: when
-non-empty, a download/install failure becomes a warning instead of a hard
-failure. `images/build.sh` auto-sets it on TLS-intercept dev hosts, and CI
-never sets it. Each tool Dockerfile re-declares the `ARG` so those two paths
-keep the policy.
+## Exact versions, explicit slots, soft-fail and status records
 
-The **launcher's** local-compose path deliberately does **not** pass this arg
-(`layer.rs` passes exactly one build arg, `BASE_IMAGE=`); see
-[ADR-0003](../../docs/adr/0003-project-tooling-layers.md). A source-checkout
-user behind a TLS-intercept proxy can build the tool layer with
-`images/build.sh` (which sets the arg) and pass `--base-image` / `--layer`, or
-use the published composed template.
+Every shipped recipe selects an **exact** version. There is no build-time
+`latest`/dist-tag/channel lookup anywhere: an ordinary or release build consumes
+the committed value, and an override must use the same exact spelling (a
+floating/range/tag/URL value is rejected before any network call).
 
-The `pi` layer honours the arg differently from the installer layers: because a
-half-installed Pi (an executable that execs into a missing entry point) is worse
-than an absent one, its `install-pi.sh` catches the `npm ci` / fetch failure at
-the failure, deletes the partial tree, and the layer then **removes the wrapper
-and both `/opt/agent-vm` trees** — so a soft-failed build ships no `pi` at all,
-rather than a broken one. An **integrity mismatch is never soft-failable** (the
-same rule `images/install-zellij.sh` applies).
+| Recipe | label suffix → build ARG | accepted spelling |
+|---|---|---|
+| `codex` | `codex` → `AGENT_VERSION_CODEX` | `rust-v<semver>` |
+| `opencode` | `opencode` → `AGENT_VERSION_OPENCODE` | `v<semver>` |
+| `claude` | `claude` → `AGENT_VERSION_CLAUDE` | `<semver>` |
+| `copilot` | `copilot` → `AGENT_VERSION_COPILOT` | `<semver>` |
+| `dsh` | `dsh` → `AGENT_VERSION_DSH` | `<semver>` |
+| `dsh` | `pnpm` → `AGENT_VERSION_PNPM` | `<semver>` |
+| `pi` | `pi` → `AGENT_VERSION_PI` | `<semver>` |
+| `pi` | `pi-claude-bridge` → `AGENT_VERSION_PI_CLAUDE_BRIDGE` | `<semver>` |
 
-The `dsh` layer declares the arg too, but installs with a hard-failing
-`npm ci`: a partial `node_modules` is a broken agent, not an absent one, so a
-soft-fail there would ship exactly the silently-cached hole the policy exists
-to prevent. Its gate never soft-fails the empty-`--version` case either — see
-*The pinned lockfile layers* below.
+The four single-slot recipes (`codex`, `opencode`, `claude`, `copilot`) commit
+the exact default as the `ARG` value and label it. The two lockfile recipes
+(`dsh`, `pi`) leave both `ARG`s **empty** so an omitted/empty slot reuses the
+committed `package.json` + `package-lock.json` byte-for-byte with no registry
+lookup; their `LABEL`s carry literal fallback mirrors of the committed pins
+(Docker cannot run `jq` inside a `LABEL` and an empty `ARG` cannot expand to the
+pin). `cargo test -p agent-vm --bin agent-vm tool_layer` fails if a fallback
+lags its manifest.
+
+**The labels are selection, not health.** `org.agent-vm.version.<suffix>`
+records what the layer was asked to install; whether the command actually works
+is the T5 audit's decision. To reuse them, read every
+`org.agent-vm.version.*` label (`docker image inspect`) and pass the values back
+as explicit ARGs — `script/test/shipped-tool-recipes.sh` replays a default/mixed
+image's labels onto a second tool-free base and requires identical normalized
+reports, labels and statuses plus the preserved base labels.
+
+**Failure classification (installation time).** A recipe install hook runs
+through `contract/run-install.sh NAME RESULT_FILE INTERPRETER SCRIPT [ARG …]`,
+which reserves exit 75 plus a matching fresh transport receipt for a positively
+classified transport failure (`download.sh` allowlists the curl transport codes,
+`run-npm.sh` allowlists the npm `error.code`s). Only the owning hook may soften
+that: with a nonempty `AGENT_INSTALL_SOFT_FAIL` it deletes the recipe's own
+partial artifacts, writes `absent-transport CODE` to
+`/opt/agent-vm/install-status/NAME`, and exits 0. A soft input never accepts
+anything else — a checksum mismatch, `EINTEGRITY`, an unknown installer or npm
+failure and a post-install nonzero are always **hard**, even with soft input.
+`dsh` and `copilot` are never soft-failable: a partial tree is a broken agent,
+not a missing one.
+
+On success the owning `verify-<tool>.sh` gate runs a bounded, status-checked
+version report, requires the exact expected format, audits T5
+(`check-tool-access.py`), and only then writes `installed` to
+`/opt/agent-vm/install-status/NAME`. `pi` writes both `pi` and
+`pi-claude-bridge`; a bridge-only transport degradation leaves a working `pi`
+`installed` and the bridge `absent-transport CODE` (never `installed`), and an
+external audit rejects that state. External certification requires `installed`
+for every requested slot plus the reports/T5 — a record alone is never proof.
 
 ## Declaration and cache ordering
 
@@ -83,7 +126,7 @@ frequently changed belongs at the bottom:
 - `codex` ~95 MiB, multiple stable cuts/day → next
 - `opencode` ~50 MiB, several per week → middle
 - `claude` ~68 MiB, ~daily → middle
-- `copilot` installed via npm, keyed on its npm `latest` → top (last)
+- `copilot` installed via npm from its committed exact version → top (last)
 
 `dsh` and `pi` are the two "large and rarely changing" layers, and they sit
 below every installer layer for the same reason: a **committed lockfile** is
@@ -91,12 +134,11 @@ their only input, so each is re-emitted only when its pin moves — never on the
 daily claude/codex churn above it. `dsh` is the larger of the two (~324 MiB vs
 ~150 MiB) and so goes first; each pin bump rebuilds the layers above it, which
 is the accepted cost of keeping ~324 MiB out of every unrelated rebuild.
-CI resolves each *installer* agent's current upstream version and feeds
-it in as a per-agent `AGENT_VERSION_*` build arg, so a layer is rebuilt only
-when that agent actually released — an unchanged hourly build is a pure cache
-hit. The resolver is `script/build/agent-versions.sh`, shared by CI and
-`images/build.sh`, which documents each lookup's source. `dsh` and `pi` have no
-`AGENT_VERSION_*` key and need none: their cache key is the lockfile's content.
+Ordinary and release builds consume the committed exact defaults; they never
+resolve an upstream version and never pass an empty `AGENT_VERSION_*` that would
+erase a default. `script/build/agent-versions.sh --write` is the explicit
+developer tool that bumps the four installer defaults (see *Upgrading a tool*).
+The lockfile layers additionally key on their committed lockfile content.
 
 ## Upgrading a tool
 
@@ -107,16 +149,18 @@ How you upgrade depends on whether the layer pins a version in this repo:
 | `pi` | committed lockfile | `bash images/tools/pi/upgrade-pi.sh [VERSION]` — see [`pi/README.md`](pi/README.md) |
 | `pi-claude-bridge` (in `pi`) | committed lockfile | `bash images/tools/pi/bridge/upgrade-bridge.sh [VERSION]` |
 | `dsh` (+ its `pnpm`) | committed lockfile | `bash images/tools/dsh/upgrade-dsh.sh [VERSION] [--pnpm VERSION]` |
-| `codex`, `opencode`, `claude`, `copilot` | upstream `latest` at build time | nothing to commit — rebuild with fresh `AGENT_VERSION_*` keys (below) |
+| `codex`, `opencode`, `claude`, `copilot` | committed exact `ARG` | `bash script/build/agent-versions.sh --write`, then review the Dockerfile diff |
 
-Each lockfile script defaults to the package's npm `latest`, and accepts any
-`VERSION` that is an exact version or a dist-tag (`latest`, `next`, ...), which
-is resolved to an exact pin. It runs `npm`
-with `--ignore-scripts` in a scratch directory and checks the same
+Each lockfile script defaults to the package's npm `latest` as the *developer
+convenience* and accepts any `VERSION` that is an exact version or a dist-tag
+(`latest`, `next`, …), which is resolved to an exact pin at the host seam. It
+runs `npm` with `--ignore-scripts` in a scratch directory and checks the same
 invariants as the `cargo test -p agent-vm tool_layer` guards, plus its layer's
-own constraints (listed below). It writes `package.json` and
-`package-lock.json` only if every check passes. Run the scripts with `bash`:
-like every file here they are committed without the execute bit. The Dockerfiles
+own constraints (listed below). It writes `package.json`, `package-lock.json`
+**and the owning `Dockerfile`'s literal `LABEL` fallback** only if every check
+passes. Build mode never runs these scripts and never resolves a tag:
+`prepare-lock.sh` only accepts exact slots. Run the scripts with `bash`: like
+every file here they are committed without the execute bit. The Dockerfiles
 never copy them, so they never reach an image. Afterwards, run
 `cargo test -p agent-vm tool_layer` and review the diff.
 
@@ -129,35 +173,37 @@ never copy them, so they never reach an image. Afterwards, run
   `dsh-sandbox-local` under `dsh-base/node_modules`. The bridge script passes
   `--legacy-peer-deps` and rejects any package Pi's loader aliases.
 
-Only `pi` has a pre-merge build gate (`.github/workflows/pi-layer.yml` on pull
-requests). `build-image.yml` runs **only after merge**, so **build the `dsh`
-layer locally before opening a PR** — `verify-dsh.sh` in that build is the real
-gate:
+Two pre-merge build gates cover the recipes: `.github/workflows/pi-layer.yml`
+runs the deep pi runtime matrix, and `.github/workflows/shipped-tool-recipes.yml`
+builds each recipe independently from the committed tool-free base, audits it as
+a numeric uid, and replays its labels. `build-image.yml` runs **only after
+merge**. Any recipe can also be built by hand:
 
 ```bash
-docker buildx build --load --build-arg BASE_IMAGE=<a base image> images/tools/dsh
+docker buildx build --load --build-arg BASE_IMAGE=<a base image> images/tools/<tool>
 ```
-
-This matters more than usual here because dsh's npm `latest` is a release
-candidate.
 
 ### Picking up a new version
 
-A default launch boots the published template as-is. CI rebuilds the template
-hourly, so an installer agent's release, or a merged pin bump, reaches it
-within the hour. To run a new version before that:
+A default launch boots the published template as-is; a source build uses the
+committed defaults. There is **no automatic upstream refresh**: a bumped
+installer pin is an explicit, reviewed commit
+(`script/build/agent-versions.sh --write` for codex/opencode/claude/copilot, the
+lockfile upgrade scripts for dsh/pi), and CI no longer resolves a tool
+`latest` — the hourly image cron rebuilds the committed sources only.
 
-- **`images/build.sh`** resolves the `AGENT_VERSION_*` keys itself, so a
-  re-run rebuilds exactly the installer layers whose agent released, plus
-  every layer above a changed one. If the lookup fails (offline, rate-limited),
-  it warns and builds without keys, which reuses cached agents.
+To run a bumped version before the template is rebuilt:
+
+- **`images/build.sh`** builds the chain from the committed defaults (and the
+  `BASE_IMAGE` it is given); it passes no `AGENT_VERSION_*`, so a version change
+  must already be committed.
 - **The manual Docker loop** in
   [macos-build.md](../../macos-build.md#composing-from-a-local-tool-free-base---base-image)
-  passes the same keys from `script/build/agent-versions.sh`.
+  builds from the committed defaults the same way.
 - **The launcher's local compose** (`--base-image`, or a non-default tool set)
   embeds `images/tools/` at compile time, so a pin bump needs a rebuilt
   `agent-vm` binary. It passes no `AGENT_VERSION_*`, so installer agents stay
-  frozen at their first build until the base moves
+  frozen at their committed defaults
   ([ADR-0019](../../docs/adr/0019-tool-free-base-and-per-tool-layers.md) D8).
   Force composition from the published base and check a pinned agent:
 
@@ -172,17 +218,41 @@ within the hour. To run a new version before that:
   local-compose user launches. CI is unaffected: BuildKit hashes only the files
   the Dockerfile references.
 
+  A soft-degraded image is **not** proof a tool works: an `absent-transport`
+  slot ships no command, so the external audit rejects the image.
+
 ## The pinned lockfile layers: `dsh` and `pi`
 
-The installer layers resolve their version at build time; `dsh` and `pi` do not.
-Their version lives in a **committed** `package.json` + `package-lock.json`
-(each beside its Dockerfile), and the layer runs `npm ci`, which by construction
-resolves nothing. The build then asserts `dsh --version` / `pi --version` equals
-the pin, so there is no moving-version lookup for either. `pi` additionally
-fronts the install with an agent-vm-owned wrapper at `/usr/local/bin/pi` and a
-mandatory warning extension — see
+The four installer layers install an exact committed `ARG`; `dsh` and `pi`
+install from a **committed** `package.json` + `package-lock.json`
+(each beside its Dockerfile) and run `npm ci`, which by construction resolves
+nothing. The build then asserts `dsh --version` / `pi --version` equals the pin,
+so there is no moving-version lookup for either. An explicit
+`AGENT_VERSION_DSH`/`AGENT_VERSION_PNPM` (or Pi/bridge) selects a different
+exact version for that slot and prepares a build-local lock; the committed
+lockers stay authoritative for empty/equal slots. `pi` additionally fronts the
+install with an agent-vm-owned wrapper at `/usr/local/bin/pi` and a mandatory
+warning extension — see
 [ADR-0012](../../docs/adr/0012-stable-pi-image-customization-seam.md); `dsh`
 needs no wrapper because its bin is linked straight onto `PATH`.
+
+**Explicit slots and the location freeze.** A nonempty `AGENT_VERSION_DSH` /
+`AGENT_VERSION_PNPM` (or `AGENT_VERSION_PI` / `AGENT_VERSION_PI_CLAUDE_BRIDGE`)
+that differs from the committed pin is a *build-local* override. For `dsh`,
+`prepare-lock.sh` rewrites only that slot's `dependencies` entry and
+`check-lock-update.js` (`dsh` only) then freezes the rest — every lock record
+outside the changed root's `node_modules/` prefix (including shared/hoisted
+records) must be recursively identical, so an incompatible pair is rejected with
+the moved paths rather than silently refreshing the empty slot. A changed Pi or
+bridge project is instead regenerated from its exact manifest and re-validated
+(pin/integrity/sibling and loader-alias invariants, with the five
+shrinkwrap-only Pi sibling hashes refilled from the registry); it has no
+location-freeze comparator. An omitted/empty or equal slot
+reuses the committed bytes exactly (no npm call). A changed root may re-resolve
+new exact transitives, so an override lock is exact for the *root* but is not
+registry-independent byte-for-byte reproducible; committing a reviewed bump lock
+is the reproducible default. Pi and the bridge are **separate** npm projects, so
+bumping one never touches the other's lock.
 
 For `dsh`, the lock is not merely reproducibility. `npm install -g
 @deepseek-ai/dsh` resolves the app at whatever `latest` points to (at the time

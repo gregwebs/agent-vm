@@ -1,0 +1,10 @@
+# tool<TAB>default<TAB>alternate
+# Committed exact selections for the restricted-egress gate and the recipe
+# audits. NEVER resolved from a live "latest": the default column mirrors the
+# Dockerfile ARG defaults and the alternate column is the captured exact
+# alternate (alternate-selection-capture.json). Update by running
+# `script/build/agent-versions.sh --write` / the lock bump tools, then the
+# tests, then commit -- never by a test fetching the current latest.
+codex	rust-v0.159.3	rust-v0.159.2
+opencode	v1.18.34	v1.18.33
+claude	2.1.286	2.1.285

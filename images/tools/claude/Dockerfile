@@ -1,20 +1,42 @@
 # Claude Code CLI tool layer. See docs/adr/0003-project-tooling-layers.md for
 # the layer image contract this file satisfies, and images/Dockerfile for the
-# `agent-vm-install` helper and the host-CA shim it inherits from the base.
+# facilities this layer inherits from the base (Node.js, curl, jq, coreutils
+# timeout).
 ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-base:latest
 FROM ${BASE_IMAGE}
 
 # Re-declared inside the stage: a global ARG is not visible to RUN.
-ARG AGENT_VERSION_CLAUDE=
+#
+# The default is the exact committed version (see images/tools/README.md,
+# "Exact versions"); ordinary and release builds install exactly this, never a
+# moving channel. script/build/agent-versions.sh --write is the reviewed
+# developer tool that bumps it.
+ARG AGENT_VERSION_CLAUDE=2.1.286
 ARG AGENT_INSTALL_SOFT_FAIL=
+
+# Selection, not health: this records the version the layer was asked to
+# install. Whether the command is usable is the T5 audit's decision.
+LABEL org.agent-vm.version.claude="${AGENT_VERSION_CLAUDE}"
 
 # Additive, per C2. `/opt/agent/.local/bin` also appears on the codex layer's
 # PATH; duplicating it is harmless because C2 checks membership, not order.
 ENV PATH=/opt/agent/.local/bin:/opt/agent/.claude/local/bin:${PATH}
 
-RUN : "claude ${AGENT_VERSION_CLAUDE}" \
- && HOME=/opt/agent agent-vm-install claude bash https://claude.ai/install.sh \
- && chmod -R a+rX /opt/agent
+# The install hook validates the exact version, then runs Anthropic's pinned
+# vendored installer (images/tools/claude/vendor/) through the shared
+# run-install.sh envelope. Only a positively classified transport failure with
+# a fresh receipt may degrade, and then only when AGENT_INSTALL_SOFT_FAIL is
+# non-empty; the hook removes the recipe's own partial artifacts and writes an
+# absence record. Everything else is hard. Bind-mounted, never COPYed, so no
+# helper becomes a shipped entry point.
+RUN --mount=type=bind,source=contract,target=/tmp/recipe-contract,ro \
+    --mount=type=bind,source=install-claude.sh,target=/tmp/install-claude.sh,ro \
+    --mount=type=bind,source=vendor,target=/opt/agent-vm/recipe-vendor,ro \
+    AGENT_VM_CONTRACT_DIR=/tmp/recipe-contract \
+    AGENT_VM_VENDOR_DIR=/opt/agent-vm/recipe-vendor \
+    AGENT_VM_VERSION_CLAUDE="${AGENT_VERSION_CLAUDE}" \
+    AGENT_VM_INSTALL_STATUS_DIR=/opt/agent-vm/install-status \
+    sh /tmp/recipe-contract/run-install.sh claude /opt/agent-vm/install-status/claude sh /tmp/install-claude.sh
 
 # Claude Code LSP plugins (C/C++, Python, TypeScript, Go) baked in so
 # in-VM Claude has code intelligence on first launch. Ports the four
@@ -100,8 +122,14 @@ RUN mkdir -p /opt/agent-vm/claude-seed \
 # differently from one built from a git checkout of the same bytes.
 COPY --chmod=0755 seed-claude-plugins.sh /opt/agent-vm/seed.d/10-claude-plugins
 
-# Direct invocation, never `command -v`: a present-but-broken binary must fail
-# the build. Honors AGENT_INSTALL_SOFT_FAIL exactly as the old combined check.
-RUN if claude --version; then :; \
-    elif [ -n "${AGENT_INSTALL_SOFT_FAIL:-}" ]; then echo "  claude: MISSING (soft-fail mode)"; \
-    else echo "  claude: MISSING — hard sanity failure" >&2; exit 1; fi
+# Build-time gate. Bind-mounted, not COPYed. A hard install failure already
+# aborted the build; a softened transport failure left an absence record and no
+# command. The gate accepts that degraded state only when the record is present,
+# and otherwise requires a bounded, status-checked `claude --version` report to
+# match the pin before auditing T5. See verify-claude.sh.
+RUN --mount=type=bind,source=contract,target=/tmp/recipe-contract,ro \
+    --mount=type=bind,source=verify-claude.sh,target=/tmp/verify-claude.sh,ro \
+    AGENT_VM_CONTRACT_DIR=/tmp/recipe-contract \
+    AGENT_VM_VERSION_CLAUDE="${AGENT_VERSION_CLAUDE}" \
+    AGENT_VM_INSTALL_STATUS_DIR=/opt/agent-vm/install-status \
+    sh /tmp/verify-claude.sh

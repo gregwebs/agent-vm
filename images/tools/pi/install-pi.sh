@@ -1,16 +1,26 @@
 #!/bin/sh
-# Installs the pinned Pi into /opt/agent-vm/pi from the committed lockfile, then
-# verifies the five tarballs npm does NOT integrity-check (see
+# Installs the pinned Pi into /opt/agent-vm/pi from the committed (or prepared)
+# lockfile, then verifies the five tarballs npm does NOT integrity-check (see
 # images/tools/pi/package-lock.json and images/tools/README.md).
 #
-# A download/registry failure is soft-failable under AGENT_INSTALL_SOFT_FAIL and
-# leaves NO partial installation behind. An integrity mismatch is never
-# soft-failable -- same rule as images/install-zellij.sh.
+# Runs inside the recipe-contract envelope (run-install.sh), so
+# AGENT_VM_TRANSPORT_RECEIPT names a fresh private receipt. `npm ci` and the
+# sibling re-fetches go through the classified adapters (run-npm.sh /
+# download.sh): only a positively classified transport failure with that fresh
+# receipt may be softened, and then only when AGENT_INSTALL_SOFT_FAIL is
+# non-empty -- the image then ships without pi and records the absence. An
+# integrity mismatch or a malformed lock is never soft-failable, and lock
+# preparation failures are always hard.
 set -eu
 
 PREFIX="${AGENT_VM_PI_PREFIX:-/opt/agent-vm/pi}"
 NESTED="${PREFIX}/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works"
+CONTRACT="${AGENT_VM_CONTRACT_DIR:-/tmp/recipe-contract}"
+PREPARE_LOCK="${AGENT_VM_PREPARE_LOCK:-/tmp/prepare-pi-lock.sh}"
+PI_VERSION="${AGENT_VM_VERSION_PI:-}"
 soft_fail="${AGENT_INSTALL_SOFT_FAIL:-}"
+receipt="${AGENT_VM_TRANSPORT_RECEIPT:-}"
+status_dir="${AGENT_VM_INSTALL_STATUS_DIR:-/opt/agent-vm/install-status}"
 
 # Scratch space for the verification below. Every path this script writes
 # outside PREFIX lives under here, so two runs at once -- two worktrees on one
@@ -24,18 +34,48 @@ nested_list="${work}/nested.tsv"
 extract="${work}/x"
 diff_out="${work}/diff.out"
 
-# `npm ci` (not `npm install`): the lockfile is authoritative and the build
-# fails if package.json and the lock disagree. `--ignore-scripts`: no upstream
-# postinstall code runs during the image build (esbuild resolves its platform
-# binary directly, verified).
-if ! (cd "${PREFIX}" && npm ci --ignore-scripts --no-audit --no-fund); then
-    message="==> pi: npm ci FAILED -- install in-VM with: npm ci in ${PREFIX}"
-    rm -rf "${PREFIX}/node_modules"
-    if [ -n "${soft_fail}" ]; then
-        rm -rf "${PREFIX}"
+# Soften a positively classified transport failure: remove the recipe's own
+# partial artifacts, record the absence outside the deleted prefix, and exit 0.
+# Anything else stays hard.
+soften() { # $1 = code, $2 = message
+    code=$1
+    message=$2
+    if [ -n "$soft_fail" ]; then
+        rm -rf "${PREFIX}" "${work}"
+        mkdir -p "${status_dir}"
+        printf 'absent-transport %s\n' "${code}" >"${status_dir}/pi"
         echo "${message} (soft-fail mode; image will ship without pi)"
         exit 0
     fi
+    echo "${message}" >&2
+    exit 1
+}
+
+# An explicit slot is unknown at this point; prepare-lock.sh validates its exact
+# syntax and either reuses or regenerates the committed lock. Preparation
+# failures (including registry failures) are hard: a prepared lock is a
+# precondition, not a transport-dependent install step.
+[ -r "${PREPARE_LOCK}" ] || {
+    echo "install-pi.sh: prepare-lock.sh not found at ${PREPARE_LOCK}" >&2
+    exit 1
+}
+sh "${PREPARE_LOCK}" "${PREFIX}" "${PI_VERSION}"
+
+# `npm ci` (not `npm install`): the lockfile is authoritative and the build
+# fails if package.json and the lock disagree. `--ignore-scripts`: no upstream
+# postinstall code runs during the image build (esbuild resolves its platform
+# binary directly, verified). The classified adapter bounds it and only softens
+# a genuine registry transport error.
+rc=0
+(cd "${PREFIX}" && sh "${CONTRACT}/run-npm.sh" "${work}/npm-ci.json" -- \
+    npm ci --ignore-scripts --no-audit --no-fund) || rc=$?
+if [ "$rc" -ne 0 ]; then
+    message="==> pi: npm ci FAILED -- install in-VM with: npm ci in ${PREFIX}"
+    if [ "$rc" -eq 75 ] && [ -n "$receipt" ] &&
+        grep -Eq '^transport npm [A-Za-z0-9_]+$' "$receipt"; then
+        soften "$(awk '{print $3}' "$receipt")" "$message"
+    fi
+    rm -rf "${PREFIX}/node_modules"
     echo "${message}" >&2
     exit 1
 fi
@@ -64,13 +104,13 @@ while IFS="$(printf '\t')" read -r key name resolved integrity; do
     fi
     tarball="${work}/${name}.tgz"
     mkdir -p "${extract}"
-    if ! curl -fsSL --retry 5 --retry-all-errors --http1.1 "${resolved}" -o "${tarball}"; then
-        # A download failure here is the same class as the npm one above.
+    rc=0
+    sh "${CONTRACT}/download.sh" "${resolved}" "${tarball}" || rc=$?
+    if [ "$rc" -ne 0 ]; then
         message="==> pi: could not fetch ${resolved} for integrity verification"
-        if [ -n "${soft_fail}" ]; then
-            rm -rf "${PREFIX}" "${work}"
-            echo "${message} (soft-fail mode; image will ship without pi)"
-            exit 0
+        if [ "$rc" -eq 75 ] && [ -n "$receipt" ] &&
+            grep -Eq '^transport download [0-9]+$' "$receipt"; then
+            soften "$(awk '{print $3}' "$receipt")" "$message"
         fi
         echo "${message}" >&2
         exit 1

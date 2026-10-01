@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # Bump the pinned dsh (and optionally pnpm) version: rewrite package.json's
-# pin and update package-lock.json. See images/tools/README.md ("The pinned
-# lockfile layers") for why the lock matters here.
+# pin, update package-lock.json, and move the Dockerfile's LABEL fallback in
+# lockstep. See images/tools/README.md ("The pinned lockfile layers") for why
+# the lock matters here.
 #
 # Host-side only. The Dockerfile neither COPYs nor bind-mounts this file, so it
 # never reaches the image. Run it as `bash upgrade-dsh.sh`: like every file under
 # images/tools/ it is committed 0644 (tool_layer.rs's
 # embedded_layer_sources_are_committed_without_the_execute_bit).
 #
-# The lock is updated INCREMENTALLY (the committed lock is the starting point),
-# not regenerated from scratch: dsh ships no shrinkwrap, so a fresh resolve
-# would move hundreds of unrelated transitive pins. It runs in a scratch
-# directory and is only copied over the committed files once every check below
-# passes, so a failed run leaves the working tree untouched.
+# This is the DEVELOPER-only path. It resolves a dist-tag at the host seam, then
+# calls the shared prepare-lock.sh with `--refresh-lock`, which keeps today's
+# INCREMENTAL update (the committed lock is the starting point, so unrelated
+# transitive pins do not move) and runs the pin/integrity/layout invariants but
+# deliberately skips the build-mode location freeze: a reviewed transitive
+# refresh is the point of a bump. Ordinary builds never pass that flag.
+#
+# Everything is staged in a scratch directory and only copied over the committed
+# files once every check below passes, so a failed run leaves the working tree
+# untouched.
 
 set -euo pipefail
 
@@ -66,6 +72,10 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # built from $DIR, and npm-pin.sh is linted on its own.
 # shellcheck source=/dev/null
 . "$DIR/../../../script/build/npm-pin.sh"
+# shellcheck source=/dev/null
+. "$DIR/../../../script/build/dockerfile-label.sh"
+# shellcheck source=/dev/null
+. "$DIR/../../../script/build/transactional-publish.sh"
 
 require_tools jq npm
 
@@ -84,63 +94,54 @@ echo "==> pinning pnpm: ${current_pnpm} -> ${pnpm_version}"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# Exact pins, never ranges: verify-dsh.sh asserts `dsh --version` equals it.
-jq --arg p "$PACKAGE" --arg v "$version" --arg pn "$pnpm_version" \
-    '.dependencies[$p] = $v | .dependencies.pnpm = $pn' \
-    "$DIR/package.json" >"$work/package.json"
-cp "$DIR/package-lock.json" "$work/package-lock.json"
+# Stage the manifest, lock and Dockerfile. prepare-lock.sh writes only the
+# staged copy; a failure leaves the committed files untouched.
+mkdir -p "$work/dsh"
+cp "$DIR/package.json" "$work/dsh/package.json"
+cp "$DIR/package-lock.json" "$work/dsh/package-lock.json"
+cp "$DIR/Dockerfile" "$work/Dockerfile"
 
 echo "==> updating package-lock.json"
-(cd "$work" && npm install --ignore-scripts --package-lock-only --no-audit --no-fund --loglevel=error)
+AGENT_VM_FIXTURE_ROOT="$work" sh "$DIR/prepare-lock.sh" "$work/dsh" \
+    "$version" "$pnpm_version" --refresh-lock
 
-# The tool_layer.rs cargo guards (pins agree, every entry carries integrity),
-# plus the layout the lock exists to freeze: dsh's plugin loader resolves
-# dsh-sandbox-local from the app, so it must sit at the root or directly under
-# dsh's own node_modules -- never nested under dsh-base/node_modules, where
-# `dsh web` aborts at boot.
-jq -e --arg p "$PACKAGE" --arg v "$version" --arg pn "$pnpm_version" '
-    .packages as $pk
-    | ($pk[""].dependencies[$p] == $v)
-    and ($pk[""].dependencies.pnpm == $pn)
-    and ($pk["node_modules/" + $p].version == $v)
-    and ($pk["node_modules/pnpm"].version == $pn)
-    and ([$pk | to_entries[] | select(.key != "" and (.value.integrity | not))] | length == 0)
-' "$work/package-lock.json" >/dev/null || {
-    echo "error: the updated lock fails the pin/integrity checks; not writing it" >&2
+staged_dsh=$(jq -r --arg p "$PACKAGE" '.dependencies[$p]' "$work/dsh/package.json")
+staged_pnpm=$(jq -r '.dependencies.pnpm' "$work/dsh/package.json")
+[ "$staged_dsh" = "$version" ] || {
+    echo "error: staged manifest pins ${PACKAGE} ${staged_dsh}, expected ${version}" >&2
     exit 1
 }
-sandbox=$(jq -r '.packages | keys[] | select(endswith("/@deepseek-ai/dsh-sandbox-local"))' \
-    "$work/package-lock.json")
-# The one allowed location: directly under the root node_modules, or directly
-# under dsh's own. A copy anywhere else (including under dsh-base, below) is a
-# copy dsh's plugin loader never sees.
-allowed='^node_modules/(@deepseek-ai/dsh/node_modules/)?@deepseek-ai/dsh-sandbox-local$'
-if printf '%s\n' "$sandbox" | grep -q 'dsh-base/node_modules/'; then
-    echo "error: dsh-sandbox-local is nested under dsh-base/node_modules, which dsh's" >&2
-    echo "       plugin loader cannot resolve (see images/tools/README.md):" >&2
-    printf '         %s\n' "$sandbox" >&2
+[ "$staged_pnpm" = "$pnpm_version" ] || {
+    echo "error: staged manifest pins pnpm ${staged_pnpm}, expected ${pnpm_version}" >&2
     exit 1
-fi
-# EVERY copy must be in an allowed location, and at least one must exist: a lock
-# with one good copy plus a stray one still ships the stray, so a per-line match
-# on any line (`grep -q`) would accept it.
-if [ -z "$sandbox" ] || printf '%s\n' "$sandbox" | grep -qvE "$allowed"; then
-    echo "error: dsh-sandbox-local is not installed where dsh resolves it:" >&2
-    printf '         %s\n' "${sandbox:-<absent>}" >&2
-    exit 1
-fi
+}
 
-cp "$work/package.json" "$DIR/package.json"
-cp "$work/package-lock.json" "$DIR/package-lock.json"
+# Move the LABEL fallbacks in lockstep. set_version_label fails unless each
+# label appears exactly once.
+set_version_label "$work/Dockerfile" dsh AGENT_VERSION_DSH "$version"
+set_version_label "$work/Dockerfile" pnpm AGENT_VERSION_PNPM "$pnpm_version"
+grep -Fq "org.agent-vm.version.dsh=\"\${AGENT_VERSION_DSH:-${version}}\"" "$work/Dockerfile" || {
+    echo "error: the staged Dockerfile dsh label does not mirror ${version}" >&2
+    exit 1
+}
+grep -Fq "org.agent-vm.version.pnpm=\"\${AGENT_VERSION_PNPM:-${pnpm_version}}\"" "$work/Dockerfile" || {
+    echo "error: the staged Dockerfile pnpm label does not mirror ${pnpm_version}" >&2
+    exit 1
+}
+
+publish_transactional "$work/publish-backup" \
+    "$work/dsh/package.json" "$DIR/package.json" \
+    "$work/dsh/package-lock.json" "$DIR/package-lock.json" \
+    "$work/Dockerfile" "$DIR/Dockerfile"
 
 cat <<EOF
-==> pinned ${PACKAGE}@${version}
+==> pinned ${PACKAGE}@${version} (pnpm ${pnpm_version}); Dockerfile LABELs updated
 Next:
-  cargo test -p agent-vm tool_layer   # lock guards + embedded snapshot
-  Build the dsh layer locally BEFORE opening a PR: no PR workflow builds it
-  (.github/workflows/build-image.yml runs only after merge, and pi's PR gate
-  does not cover dsh). verify-dsh.sh in that build is the real gate, and npm's
-  \`latest\` for dsh is a release candidate:
+  cargo test -p agent-vm tool_layer   # lock guards + embedded snapshot + labels
+  The shipped-tool-recipes PR gate builds the dsh layer with a numeric-uid
+  report/T5 audit, and verify-dsh.sh in that build is the real gate; you can
+  also build it locally before opening a PR. npm's \`latest\` for dsh is a
+  release candidate:
     docker buildx build --load --build-arg BASE_IMAGE=<a base image> images/tools/dsh
   then rebuild the tool layers -- see images/tools/README.md ("Upgrading a tool")
 EOF

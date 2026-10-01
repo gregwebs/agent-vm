@@ -1,7 +1,9 @@
 name: build-image
 
 # Build the agent-vm OCI images and push to GHCR on:
-# - hourly schedule (picks up new claude-code/codex/opencode releases),
+# - hourly schedule (a periodic rebuild of the committed sources; it no longer
+#   picks up new claude-code/codex/opencode releases — those are explicit,
+#   reviewed developer bumps via script/build/agent-versions.sh --write),
 # - any push that touches images/ (Dockerfile, tool layers or related),
 # - manual dispatch (force a rebuild).
 #
@@ -27,7 +29,6 @@ on:
     paths:
       - 'images/**'
       - '.github/workflows/build-image.yml'
-      - 'script/build/agent-versions.sh'
   workflow_dispatch:
 
 permissions:
@@ -63,13 +64,14 @@ jobs:
           # the build steps), it clamps the image config's `created`
           # field and every history timestamp to a value that is
           # CONSTANT across the hourly cron builds of a given commit.
-          # So two builds with the same commit + same agent versions +
-          # same layers produce a byte-identical config → an identical
-          # linux/amd64 manifest digest. microsandbox keys its
+          # So two builds with the same commit, committed tool
+          # versions and layers produce a byte-identical config → an
+          # identical linux/amd64 manifest digest. microsandbox keys its
           # fsmeta/VMDK materialization on THAT digest, so an unchanged
           # `:latest` becomes a true no-op pull (0 bytes) instead of
-          # re-downloading the whole image. A new commit, or any changed
-          # agent layer, moves the digest as it should. Chrome DevTools is an
+          # re-downloading the whole image. A new commit or a deliberate
+          # tool-version bump (a changed committed default) moves the
+          # digest as it should. Chrome DevTools is an
           # opt-in layer and does not affect this base-image cache. Without this the
           # config carried a fresh build timestamp every hour, so every
           # cron `:latest` had a new manifest digest and consumers
@@ -103,23 +105,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Resolve agent versions
-        id: ver
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Each installer layer's current upstream version, fed in below as
-          # its AGENT_VERSION_* cache key so a layer is rebuilt only when its
-          # agent actually released -- not on every hourly cron run. The
-          # sources, and why each is the one its installer reads, are
-          # documented in the script (shared with images/build.sh). A lookup
-          # failure exits non-zero, and the script emits its own `::error::`
-          # naming the failed tool.
-          versions=$(./script/build/agent-versions.sh)
-          echo "$versions" >> "$GITHUB_OUTPUT"
-          echo "resolved agent versions: $(echo "$versions" | tr '\n' ' ')"
 
       # The zstd registry exporter shared by the two published builds. The
       # benchmark in crates/agent-vm/examples/erofs_bench.rs showed gzip → zstd
@@ -190,17 +175,20 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      # The `AGENT_VERSION_*`-keyed tool layers, preceded by the two pinned
-      # lockfile layers (dsh, then pi).
+      # The six shipped tool layers, preceded by the two pinned lockfile layers
+      # (dsh, then pi). Each layer consumes the committed exact `ARG
+      # AGENT_VERSION_*` default baked into its Dockerfile (or, for dsh/pi, its
+      # committed lock); no layer resolves upstream "latest" here, so a rebuild
+      # is a cache hit until a committed source moves.
       # Each builds FROM the previous step's digest and pushes its result by digest
       # (no tag), so the next step can resolve a `FROM` the docker-container driver
       # can see while leaving nothing in the registry for the retention regex to
       # protect.
       #
-      # The pinned dsh layer. Like pi, no AGENT_VERSION_* key and no version
-      # lookup: the pin is images/tools/dsh/package-lock.json, so this layer is
-      # a cache hit until that pin moves. It is the chain's first step because
-      # it is the largest committed-lockfile layer (images/tools/README.md).
+      # The pinned dsh layer. The pin is images/tools/dsh/package-lock.json, so
+      # this layer is a cache hit until that pin moves. It is the chain's first
+      # step because it is the largest committed-lockfile layer
+      # (images/tools/README.md).
       - name: Build and push dsh tool layer
         id: dsh
         env:
@@ -216,10 +204,9 @@ jobs:
           provenance: false
           sbom: false
 
-      # The pinned Pi layer. No AGENT_VERSION_* key and no version lookup: the
-      # pin is images/tools/pi/package-lock.json, so this layer is a cache hit
-      # until the pin moves. It sits just above dsh, the other large pinned
-      # layer (images/tools/README.md).
+      # The pinned Pi layer. The pin is images/tools/pi/package-lock.json, so
+      # this layer is a cache hit until the pin moves. It sits just above dsh,
+      # the other large pinned layer (images/tools/README.md).
       - name: Build and push pi tool layer
         id: pi
         env:
@@ -244,7 +231,6 @@ jobs:
           context: images/tools/codex
           build-args: |
             BASE_IMAGE=${{ env.BASE }}@${{ steps.pi.outputs.digest }}
-            AGENT_VERSION_CODEX=${{ steps.ver.outputs.codex }}
           outputs: type=image,name=${{ env.BASE }},push-by-digest=true,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
           cache-from: type=gha,scope=codex
           cache-to: type=gha,mode=max,scope=codex
@@ -260,7 +246,6 @@ jobs:
           context: images/tools/opencode
           build-args: |
             BASE_IMAGE=${{ env.BASE }}@${{ steps.codex.outputs.digest }}
-            AGENT_VERSION_OPENCODE=${{ steps.ver.outputs.opencode }}
           outputs: type=image,name=${{ env.BASE }},push-by-digest=true,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
           cache-from: type=gha,scope=opencode
           cache-to: type=gha,mode=max,scope=opencode
@@ -276,7 +261,6 @@ jobs:
           context: images/tools/claude
           build-args: |
             BASE_IMAGE=${{ env.BASE }}@${{ steps.opencode.outputs.digest }}
-            AGENT_VERSION_CLAUDE=${{ steps.ver.outputs.claude }}
           outputs: type=image,name=${{ env.BASE }},push-by-digest=true,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
           cache-from: type=gha,scope=claude
           cache-to: type=gha,mode=max,scope=claude
@@ -293,7 +277,6 @@ jobs:
           context: images/tools/copilot
           build-args: |
             BASE_IMAGE=${{ env.BASE }}@${{ steps.claude.outputs.digest }}
-            AGENT_VERSION_COPILOT=${{ steps.ver.outputs.copilot }}
           outputs: type=registry,push=true,compression=zstd,compression-level=3,force-compression=true,rewrite-timestamp=true
           cache-from: type=gha,scope=copilot
           cache-to: type=gha,mode=max,scope=copilot

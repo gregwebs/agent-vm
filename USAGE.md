@@ -91,10 +91,14 @@ CI publishes two OCI images from one run:
   base plus the six shipped tool layers (dsh, pi, codex, opencode, claude,
   copilot), chained in declaration order.
 
-Both are rebuilt hourly, picking up the latest Claude Code, Codex CLI,
-OpenCode, GitHub Copilot and DeepSeek Harness releases automatically, and both
-accept a pinned `…:YYYY-MM-DDTHH` tag (immutable; the last 14 days are
-retained).
+Both are rebuilt hourly from the **committed** sources. The hourly cron no
+longer resolves new upstream tool releases: a tool version changes only when a
+developer commits a bump (`script/build/agent-versions.sh --write` or a
+lockfile upgrade script). Both accept a pinned `…:YYYY-MM-DDTHH` tag
+(immutable; the last 14 days are retained). An image (or a locally composed
+layer) is only as new as the sources it was built from; a template published
+**before** a pin bump keeps the older tool until it is rebuilt or you build the
+new sources yourself.
 
 **Which image a launch uses** depends on your configured tool set:
 
@@ -117,19 +121,21 @@ Flags:
   stop you passing `--base-image`, and vice versa. An empty environment variable
   counts as unset.
 
-A locally composed tool layer **freezes its agent version at build time**: the
-layer hash covers its directory, and the launcher's local compose passes no
-`AGENT_VERSION_*`, so a non-default tool set keeps whatever upstream shipped the
-day it first built until the base moves. Pin the base with `--base-image …:YYYY-MM-DDTHH`
-to control that. This is the same behaviour every project tooling layer already
-has. (`images/build.sh` does pass `AGENT_VERSION_*`, so it can pick up new
-releases; the launcher's local compose cannot.)
+A locally composed tool layer installs the exact version **committed in this
+repo**: the `images/tools/<tool>/Dockerfile` default, or that recipe's committed
+`package.json` + `package-lock.json`. The launcher's local compose passes no
+`AGENT_VERSION_*`, so it always uses those committed defaults; running a bumped
+version needs a rebuilt `agent-vm` binary. The layer hash covers the **whole**
+layer directory, so any edit under `images/tools/<tool>/` invalidates that layer
+(and every layer chained above it) on the next local compose.
 
-On a host behind a TLS-intercept proxy, a locally composed chain cannot
-soft-fail a broken upstream installer. Build the layer yourself with
-`images/build.sh` (which sets `AGENT_INSTALL_SOFT_FAIL`) and pass
-`--base-image`/`--layer`, or use the published template
-([ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md)).
+On a host behind a TLS-intercept proxy, build the layer yourself with
+`images/build.sh` (which sets `AGENT_INSTALL_SOFT_FAIL` on such hosts); the
+recipe hooks then turn a **positively classified transport** failure into an
+`absent-transport` status instead of a hard build failure. That does **not**
+weaken the contract: a checksum/integrity mismatch, an unknown failure or a
+wrong version stays hard, and a soft-degraded image is not proof the tool works
+— it ships no command for that slot.
 
 The agent-vm binary and the images are version-locked through an
 **image-API-version** integer
