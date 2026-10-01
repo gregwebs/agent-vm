@@ -1,0 +1,17 @@
+# Vendored third-party notice — OpenCode installer snapshot
+
+The files in this directory (`install.upstream.sh`, `install.sh`, `install.patch`)
+are derived from OpenCode's published installer and are redistributed here under
+the upstream project's license.
+
+- upstream project: `anomalyco/opencode` (https://github.com/anomalyco/opencode)
+- installer source: `https://opencode.ai/install`
+- pinned release: `v1.18.34`
+- retrieved: 2026-10-01
+- snapshot SHA-256: `fc3c1b2123f49b6df545a7622e5127d21cd794b15134fc3b66e1ca49f7fb297e`
+- license: MIT License (SPDX: `MIT`)
+- copyright: Copyright (c) 2025 opencode
+
+The full license text is in `LICENSE` beside this notice. These snapshot files
+are provenance and a reviewable patched copy; they are not covered by this
+repository's own MIT license.

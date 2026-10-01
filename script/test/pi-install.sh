@@ -2,31 +2,35 @@
 # Black-box contract tests for the build-only Pi installer
 # (images/tools/pi/install-pi.sh).
 #
-# No Docker, no npm registry, no real tarballs: `npm`, `curl`, `openssl`, `tar`
-# and `diff` are faked on PATH, so every failure policy -- soft-fail at the
-# failure, integrity mismatch never soft-failable, a count check that cannot read
-# as success, no partial tree left behind -- is exercised hermetically and fast.
-# The lockfile parser (the `jq` selector) is the REAL one, against a synthetic
-# lock, so the selector itself is under test. The final section is the exception:
-# it plants a real shadow package in a real installed tree and uses the real
-# `tar` and `diff` (RQ1), so the bytes-comparison B1 turned on is covered by the
-# production commands, not a stub.
+# The installer now runs inside the recipe-contract envelope, so this harness
+# invokes the REAL run-install.sh (which owns the transport receipt and the
+# status record) with the REAL pi contract/ copies. `npm`, `curl`, `openssl`,
+# `tar` and `diff` are faked on PATH, so every failure policy -- transport-soft
+# only with a fresh classified receipt, integrity mismatch never soft-failable,
+# a count check that cannot read as success, no partial tree left behind -- is
+# exercised hermetically and fast. The lockfile parser (the `jq` selector) is the
+# REAL one, against a synthetic lock. The final section plants a real shadow
+# package in a real installed tree and uses the real `tar` and `diff` (RQ1).
 #
-# Every case gets its own directory for the installer's scratch files
-# (`AGENT_VM_PI_WORK_DIR`), so two runs of this script at once -- two worktrees
-# on one host, or two CI steps -- cannot read each other's selector output or
-# delete each other's extraction. A fixed /tmp path was exactly that bug.
+# The lock preparation step is stubbed here (a no-op script): prepare-lock.sh's
+# own behaviour is covered in script/test/pi-prepare-lock.sh, and these cases
+# are about the install/verify protocol.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
 INSTALLER="$REPO_ROOT/images/tools/pi/install-pi.sh"
+RUN_INSTALL="$REPO_ROOT/images/recipe-contract/run-install.sh"
+CONTRACT_DIR="$REPO_ROOT/images/tools/pi/contract"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pi-install-test.XXXXXX")"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 REAL_JQ="$(command -v jq || true)"
 [[ -n "$REAL_JQ" ]] || { echo "FAIL: jq is required" >&2; exit 1; }
 JQ_DIR="$(dirname "$REAL_JQ")"
+REAL_TIMEOUT="$(command -v timeout || true)"
+[[ -n "$REAL_TIMEOUT" ]] || { echo "FAIL: coreutils timeout is required" >&2; exit 1; }
+TIMEOUT_DIR="$(dirname "$REAL_TIMEOUT")"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -46,29 +50,54 @@ make_tool() {
 }
 
 new_case() {
-    unset NPM_FAIL CURL_FAIL FAKE_B64 DIFF_STATUS AGENT_INSTALL_SOFT_FAIL INTEGRITY
+    unset NPM_FAIL NPM_HARD CURL_FAIL FAKE_B64 DIFF_STATUS AGENT_INSTALL_SOFT_FAIL INTEGRITY
     CASE="$TEST_ROOT/$1"
-    mkdir -p "$CASE/bin" "$CASE/prefix" "$CASE/home" "$CASE/work"
+    mkdir -p "$CASE/bin" "$CASE/prefix" "$CASE/home" "$CASE/work" "$CASE/status"
     : >"$CASE/log"
+    # The lock-preparation step is exercised in pi-prepare-lock.sh; here it is a
+    # no-op so the fixture lock is exactly what the installer verifies.
+    printf '#!/bin/sh\nexit 0\n' >"$CASE/prepare-lock.sh"
 
     make_tool npm <<'SH'
 #!/usr/bin/env bash
 printf 'npm <%s>\n' "$*" >>"$FAKE_LOG"
-[[ "${NPM_FAIL:-}" == 1 ]] && exit 1
-mkdir -p "$NESTED_DIR"
-: >"$NESTED_DIR/.installed"
+case "${1:-}" in
+    ci)
+        if [[ "${NPM_HARD:-}" == 1 ]]; then
+            printf '{"error":{"code":"EINTEGRITY","summary":"integrity checksum failed","detail":""}}\n'
+            echo "npm error code EINTEGRITY" >&2
+            exit 1
+        fi
+        if [[ "${NPM_FAIL:-}" == 1 ]]; then
+            printf '{"error":{"code":"EAI_AGAIN","summary":"getaddrinfo EAI_AGAIN","detail":""}}\n'
+            echo "npm error code EAI_AGAIN" >&2
+            exit 1
+        fi
+        mkdir -p "$NESTED_DIR"
+        : >"$NESTED_DIR/.installed"
+        exit 0
+        ;;
+    *)
+        echo "stub npm: unhandled: $*" >&2
+        exit 3
+        ;;
+esac
 SH
     make_tool curl <<'SH'
 #!/usr/bin/env bash
 printf 'curl <%s>\n' "$*" >>"$FAKE_LOG"
-[[ "${CURL_FAIL:-}" == 1 ]] && exit 1
-: >"${@: -1}"
+[[ "${CURL_FAIL:-}" == 1 ]] && exit 7
+out=""
+prev=""
+for a in "$@"; do
+    [[ "$prev" == "-o" ]] && out="$a"
+    prev="$a"
+done
+: >"$out"
 SH
     make_tool openssl <<'SH'
 #!/usr/bin/env bash
 # `dgst` reads its file argument (never stdin); `base64` reads the pipe from it.
-# Keeping that split matters: a fake that slurps stdin on the `dgst` call would
-# eat the installer's `while read` input and hide later iterations.
 case "$1" in
     dgst) printf 'fake-digest' ;;
     base64) cat >/dev/null; printf '%s' "${FAKE_B64:-AAAA}" ;;
@@ -92,36 +121,40 @@ write_lock() {
     local count="${1:-5}" integrity="${2-sha512-AAAA}" name emitted=0
     {
         printf '{\n  "name": "agent-vm-guest-pi",\n  "version": "0.0.0",\n  "lockfileVersion": 3,\n  "packages": {\n'
+        printf '    "": {"dependencies": {"@earendil-works/pi-coding-agent": "0.86.1"}},\n'
+        printf '    "node_modules/@earendil-works/pi-coding-agent": {"version": "0.86.1", "integrity": "sha512-PI"}'
         for name in chord pi-agent-core pi-ai pi-telemetry pi-tui; do
             [[ $emitted -lt $count ]] || break
-            printf '    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/%s": {"version": "0.86.1", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"},\n' \
+            printf ',\n    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/%s": {"version": "0.86.1", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"}' \
                 "$name" "$name" "$integrity"
             emitted=$((emitted + 1))
         done
-        printf '    "node_modules/@earendil-works/pi-coding-agent": {"version": "0.86.1"}\n  }\n}\n'
+        printf '\n  }\n}\n'
     } >"$CASE/prefix/package-lock.json"
     printf '{"dependencies": {"@earendil-works/pi-coding-agent": "0.86.1"}}\n' >"$CASE/prefix/package.json"
 }
 
-# Run the installer against `$1` (default `$CASE`) and print its merged output.
-# The explicit case argument, rather than always `$CASE`, is what lets the
-# concurrency case drive two cases at once: each case's scratch space is its own
-# `AGENT_VM_PI_WORK_DIR`, so the two share no file.
+# Run the installer through the contract envelope against `$1` (default
+# `$CASE`) and print the merged output.
 installer_output() {
     local case_dir="${1:-$CASE}"
     env -i \
-        "PATH=$case_dir/bin:$JQ_DIR:/usr/bin:/bin" \
+        "PATH=$case_dir/bin:$TIMEOUT_DIR:$JQ_DIR:/usr/bin:/bin" \
         "HOME=$case_dir/home" \
         "FAKE_LOG=$case_dir/log" \
+        "AGENT_VM_CONTRACT_DIR=$CONTRACT_DIR" \
+        "AGENT_VM_PREPARE_LOCK=$case_dir/prepare-lock.sh" \
+        "AGENT_VM_INSTALL_STATUS_DIR=$case_dir/status" \
         "AGENT_VM_PI_PREFIX=$case_dir/prefix" \
         "AGENT_VM_PI_WORK_DIR=$case_dir/work" \
         "NESTED_DIR=$case_dir/prefix/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works" \
         "AGENT_INSTALL_SOFT_FAIL=${AGENT_INSTALL_SOFT_FAIL-}" \
         "NPM_FAIL=${NPM_FAIL-}" \
+        "NPM_HARD=${NPM_HARD-}" \
         "CURL_FAIL=${CURL_FAIL-}" \
         "FAKE_B64=${FAKE_B64-AAAA}" \
         "DIFF_STATUS=${DIFF_STATUS-0}" \
-        sh "$INSTALLER" 2>&1
+        sh "$RUN_INSTALL" pi "$case_dir/status/pi" sh "$INSTALLER" 2>&1
 }
 
 run_installer() {
@@ -131,7 +164,7 @@ run_installer() {
     set -e
 }
 
-# --- npm ci: hard by default, soft (and clean) under the flag ----------------
+# --- npm ci: hard by default, soft only for a classified transport error -----
 
 new_case npm-hard-failure
 write_lock
@@ -146,19 +179,33 @@ write_lock
 NPM_FAIL=1
 AGENT_INSTALL_SOFT_FAIL=1
 run_installer
-[[ $RUN_STATUS -eq 0 ]] || fail "soft npm failure must exit 0: $RUN_OUTPUT"
+[[ $RUN_STATUS -eq 0 ]] || fail "soft classified npm failure must exit 0: $RUN_OUTPUT"
 assert_contains "$RUN_OUTPUT" "soft-fail mode"
 [[ ! -e "$CASE/prefix" ]] || fail "soft-failed npm left a partial tree behind"
+[[ "$(cat "$CASE/status/pi")" == "absent-transport EAI_AGAIN" ]] \
+    || fail "the absence record is wrong: $(cat "$CASE/status/pi" 2>/dev/null)"
 
-# --- tarball fetch: same class as npm ---------------------------------------
+# An EINTEGRITY is NOT a transport error, so it is hard EVEN under soft-fail.
+new_case npm-integrity-hard
+write_lock
+NPM_HARD=1
+AGENT_INSTALL_SOFT_FAIL=1
+run_installer
+[[ $RUN_STATUS -ne 0 ]] || fail "an EINTEGRITY npm failure must be hard even under soft-fail"
+[[ ! -e "$CASE/status/pi" || "$(cat "$CASE/status/pi")" != absent-* ]] \
+    || fail "an integrity failure must not record a transport absence"
+
+# --- tarball fetch: same transport class ------------------------------------
 
 new_case fetch-soft-failure
 write_lock
 CURL_FAIL=1
 AGENT_INSTALL_SOFT_FAIL=1
 run_installer
-[[ $RUN_STATUS -eq 0 ]] || fail "soft fetch failure must exit 0: $RUN_OUTPUT"
+[[ $RUN_STATUS -eq 0 ]] || fail "soft transport fetch failure must exit 0: $RUN_OUTPUT"
 [[ ! -e "$CASE/prefix" ]] || fail "soft-failed fetch left a partial tree behind"
+[[ "$(cat "$CASE/status/pi")" == "absent-transport 7" ]] \
+    || fail "the fetch absence record is wrong: $(cat "$CASE/status/pi" 2>/dev/null)"
 
 new_case fetch-hard-failure
 write_lock
@@ -230,31 +277,18 @@ assert_contains "$RUN_OUTPUT" "5/5 shrinkwrap-only tarballs verified"
 SIBLINGS=(chord pi-agent-core pi-ai pi-telemetry pi-tui)
 REAL_BASE="node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works"
 
-make_real_tool() {
-    local name="$1"
-    cat >"$CASE/bin/$name"
-    chmod +x "$CASE/bin/$name"
-}
-
 new_realcase() {
     unset AGENT_INSTALL_SOFT_FAIL
     CASE="$TEST_ROOT/real-$1"
     rm -rf "$CASE"
-    mkdir -p "$CASE/bin" "$CASE/prefix" "$CASE/home" "$CASE/tarballs" "$CASE/src" "$CASE/work"
+    mkdir -p "$CASE/bin" "$CASE/prefix" "$CASE/home" "$CASE/tarballs" "$CASE/src" "$CASE/work" "$CASE/status"
     : >"$CASE/log"
+    printf '#!/bin/sh\nexit 0\n' >"$CASE/prepare-lock.sh"
 
-    # Real tarballs (package/<name>.js) and the real extracted installed tree
-    # npm would have produced: one file per sibling, plus pi-ai's two
-    # lock-declared nested dependencies.
     local name
     for name in "${SIBLINGS[@]}"; do
         mkdir -p "$CASE/src/$name/package"
         printf 'sibling %s\n' "$name" >"$CASE/src/$name/package/$name.js"
-        # pi-ai really ships a dist/ directory, and a shadow planted inside
-        # pi-ai/dist/node_modules/<pkg> is what Node resolves from inside
-        # pi-ai/dist. Ship dist/ in BOTH the tarball and the installed tree so
-        # the shadow-dist case below isolates the nested exclusion -- without
-        # it the diff would trip on the top-level `dist` alone (see F2).
         if [[ "$name" == pi-ai ]]; then
             mkdir -p "$CASE/src/$name/package/dist"
             printf 'pi-ai dist\n' >"$CASE/src/$name/package/dist/index.js"
@@ -272,21 +306,23 @@ new_realcase() {
         : >"$CASE/prefix/$REAL_BASE/pi-ai/node_modules/$name/index.js"
     done
 
-    make_real_tool npm <<'SH'
+    make_tool npm <<'SH'
 #!/usr/bin/env bash
 printf 'npm <%s>\n' "$*" >>"$FAKE_LOG"
 exit 0
 SH
-    # `curl ... --http1.1 <resolved> -o <tarball>`; serve the matching real tgz.
-    make_real_tool curl <<'SH'
+    make_tool curl <<'SH'
 #!/usr/bin/env bash
-url="${@: -3}"
-out="${@: -1}"
+out=""
+prev=""
+for a in "$@"; do
+    [[ "$prev" == "-o" ]] && out="$a"
+    prev="$a"
+done
+url="${@: -1}"
 cp "$CASE_TARBALLS/$(basename "$url")" "$out"
 SH
-    # Mirror the real openssl split: `dgst` reads its file argument; `base64`
-    # consumes the pipe. The lock commits sha512-AAAA and this returns it.
-    make_real_tool openssl <<'SH'
+    make_tool openssl <<'SH'
 #!/usr/bin/env bash
 case "$1" in
     dgst) : ;;
@@ -299,21 +335,21 @@ write_real_lock() {
     local name integrity=sha512-AAAA extra
     {
         printf '{\n  "name": "agent-vm-guest-pi",\n  "version": "0.0.0",\n  "lockfileVersion": 3,\n  "packages": {\n'
+        printf '    "": {"dependencies": {"@earendil-works/pi-coding-agent": "0.86.1"}},\n'
+        printf '    "node_modules/@earendil-works/pi-coding-agent": {"version": "0.86.1", "integrity": "sha512-PI"}'
         for name in "${SIBLINGS[@]}"; do
-            printf '    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/%s": {"version": "0.86.1", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"},\n' \
+            printf ',\n    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/%s": {"version": "0.86.1", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"}' \
                 "$name" "$name" "$integrity"
         done
         for name in agent-base https-proxy-agent; do
-            printf '    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/node_modules/%s": {"version": "0.0.0", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"},\n' \
+            printf ',\n    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/node_modules/%s": {"version": "0.0.0", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"}' \
                 "$name" "$name" "$integrity"
         done
-        # Optional extra declared dirs, e.g. a dependency nested inside an
-        # already-declared one (F1). $1 is its root-relative path under pi-ai.
         for extra in "$@"; do
-            printf '    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/node_modules/%s": {"version": "0.0.0", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"},\n' \
+            printf ',\n    "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/node_modules/%s": {"version": "0.0.0", "resolved": "https://registry.example.test/%s.tgz", "integrity": "%s"}' \
                 "$extra" "${extra##*/}" "$integrity"
         done
-        printf '    "node_modules/@earendil-works/pi-coding-agent": {"version": "0.86.1"}\n  }\n}\n'
+        printf '\n  }\n}\n'
     } >"$CASE/prefix/package-lock.json"
     printf '{"dependencies": {"@earendil-works/pi-coding-agent": "0.86.1"}}\n' >"$CASE/prefix/package.json"
 }
@@ -322,20 +358,22 @@ write_real_lock() {
 run_real_installer() {
     set +e
     RUN_OUTPUT="$(env -i \
-        "PATH=$CASE/bin:$JQ_DIR:/usr/bin:/bin" \
+        "PATH=$CASE/bin:$TIMEOUT_DIR:$JQ_DIR:/usr/bin:/bin" \
         "HOME=$CASE/home" \
         "FAKE_LOG=$CASE/log" \
         "CASE_TARBALLS=$CASE/tarballs" \
+        "AGENT_VM_CONTRACT_DIR=$CONTRACT_DIR" \
+        "AGENT_VM_PREPARE_LOCK=$CASE/prepare-lock.sh" \
+        "AGENT_VM_INSTALL_STATUS_DIR=$CASE/status" \
         "AGENT_VM_PI_PREFIX=$CASE/prefix" \
         "AGENT_VM_PI_WORK_DIR=$CASE/work" \
         "AGENT_INSTALL_SOFT_FAIL=${AGENT_INSTALL_SOFT_FAIL-}" \
-        sh "$INSTALLER" 2>&1)"
+        sh "$RUN_INSTALL" pi "$CASE/status/pi" sh "$INSTALLER" 2>&1)"
     RUN_STATUS=$?
     set -e
 }
 
-# (c) the legitimate tree passes, with real diff/tar and no
-# basename exclusions.
+# (c) the legitimate tree passes, with real diff/tar and no basename exclusions.
 new_realcase legit
 write_real_lock
 run_real_installer
@@ -354,10 +392,7 @@ for soft in "" 1; do
     assert_contains "$RUN_OUTPUT" "differs from its verified tarball"
 done
 
-# (b) a shadow planted in a node_modules nested under pi-ai/dist, which Node
-# resolves from inside pi-ai/dist. pi-ai's tarball ships dist/index.js (see
-# new_realcase), so the ONLY difference the diff sees is the nested shadow --
-# this case fails against a reintroduced `-x node_modules` AND against `-x dist`.
+# (b) a shadow planted in a node_modules nested under pi-ai/dist.
 for soft in "" 1; do
     new_realcase shadow-dist
     write_real_lock
@@ -370,9 +405,7 @@ for soft in "" 1; do
 done
 
 # (d) a lock declaring a dependency nested inside an already-declared one must
-# fold without the spurious "tarball already contains" error: the shallowest
-# declared dir (agent-base) is copied wholesale, which covers agent-base's own
-# declared child (F1).
+# fold without the spurious "tarball already contains" error.
 new_realcase nested-declared
 write_real_lock agent-base/node_modules/deep-dep
 mkdir -p "$CASE/prefix/$REAL_BASE/pi-ai/node_modules/agent-base/node_modules/deep-dep"
@@ -383,7 +416,7 @@ run_real_installer
 assert_contains "$RUN_OUTPUT" "5/5 shrinkwrap-only tarballs verified"
 
 # ... while the genuine guard is intact: a verified tarball that itself ships a
-# lock-declared path is still a hard failure, not something the fold masks.
+# lock-declared path is still a hard failure.
 new_realcase tarball-ships-declared
 write_real_lock
 mkdir -p "$CASE/src/pi-ai/package/node_modules/agent-base"
@@ -393,16 +426,8 @@ run_real_installer
 [[ $RUN_STATUS -ne 0 ]] || fail "a tarball shipping a lock-declared path must fail"
 assert_contains "$RUN_OUTPUT" "already contains"
 
-# --- scratch space: one directory per run, so concurrent runs cannot collide -
-#
-# The installer used to hardcode /tmp/pi-verify, /tmp/pi-siblings.tsv and
-# /tmp/pi-nested.tsv, so two runs at once read each other's selector output and
-# deleted each other's extraction, each failing with a different assertion. All
-# three now live under AGENT_VM_PI_WORK_DIR; these two cases pin that.
+# --- scratch space: one directory per run ------------------------------------
 
-# The override is load-bearing, not decorative. This case stops at the integrity
-# mismatch, which is before the installer's own cleanup, so the selector output
-# it wrote is still there to be found -- and only under the override directory.
 new_case work-dir-override
 write_lock 5 sha512-WRONG
 FAKE_B64=AAAA
@@ -411,8 +436,6 @@ run_installer
 [[ -s "$CASE/work/siblings.tsv" ]] \
     || fail "the installer must write its selector output under AGENT_VM_PI_WORK_DIR"
 
-# Two installers at once, each in its own case and scratch directory, both
-# succeed. Sharing one directory made at least one of them fail.
 new_case concurrent-a
 write_lock
 case_a="$CASE"
@@ -430,9 +453,9 @@ set -e
 
 # --- the test seam cannot become the production default ----------------------
 
-grep -Fq 'AGENT_VM_PI_PREFIX:-/opt/agent-vm/pi}"' "$INSTALLER" \
+grep -Fq 'AGENT_VM_PI_PREFIX:-/opt/agent-vm/pi}' "$INSTALLER" \
     || fail "production default install prefix is missing"
-grep -Fq 'AGENT_VM_PI_WORK_DIR:-/tmp/pi-verify}"' "$INSTALLER" \
+grep -Fq 'AGENT_VM_PI_WORK_DIR:-/tmp/pi-verify}' "$INSTALLER" \
     || fail "production default scratch directory is missing"
 
 echo 'pi-install black-box tests passed'

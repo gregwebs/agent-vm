@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Bump the pinned pi-claude-bridge version: rewrite package.json's pin and
-# update package-lock.json. See images/tools/README.md ("The bridge packages")
-# and docs/adr/0023-image-owned-pi-extension-packages.md.
+# Bump the pinned pi-claude-bridge version: rewrite package.json's pin, update
+# package-lock.json, and move the parent pi Dockerfile's LABEL fallback in
+# lockstep. See images/tools/README.md ("The bridge packages") and
+# docs/adr/0023-image-owned-pi-extension-packages.md.
 #
 # Host-side only. The Dockerfile COPYs only package.json and package-lock.json
 # from this directory, so this file never reaches the image. Run it as
@@ -9,12 +10,12 @@
 # 0644 (tool_layer.rs's
 # embedded_layer_sources_are_committed_without_the_execute_bit).
 #
-# The lock is updated INCREMENTALLY (the committed lock is the starting point)
-# so unrelated transitive pins do not move, and with `--legacy-peer-deps`, which
-# the layer's `npm ci` also passes: without it npm installs the bridge's
-# @earendil-works peers, a second version-skewed Pi. The update runs in a
-# scratch directory and is only copied over the committed files once every
-# check below passes, so a failed run leaves the working tree untouched.
+# The DEVELOPER-only path: it resolves a dist-tag at the host seam, then calls
+# the shared bridge prepare-lock.sh with `--refresh-lock`, which regenerates the
+# project with the mandatory `--legacy-peer-deps` (without it npm installs the
+# bridge's @earendil-works peers, a second version-skewed Pi). Everything is
+# staged in a scratch directory and only copied over the committed files once
+# every check below passes.
 
 set -euo pipefail
 
@@ -47,6 +48,10 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # built from $DIR, and npm-pin.sh is linted on its own.
 # shellcheck source=/dev/null
 . "$DIR/../../../../script/build/npm-pin.sh"
+# shellcheck source=/dev/null
+. "$DIR/../../../../script/build/dockerfile-label.sh"
+# shellcheck source=/dev/null
+. "$DIR/../../../../script/build/transactional-publish.sh"
 
 require_tools jq npm
 
@@ -63,37 +68,30 @@ echo "==> pinning ${PACKAGE}: ${current} -> ${version}"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# Exact pin, never a range (the_bridge_pin_is_exact_and_the_lock_agrees).
-jq --arg p "$PACKAGE" --arg v "$version" '.dependencies[$p] = $v' \
-    "$DIR/package.json" >"$work/package.json"
-cp "$DIR/package-lock.json" "$work/package-lock.json"
+mkdir -p "$work/bridge"
+cp "$DIR/package.json" "$work/bridge/package.json"
+cp "$DIR/package-lock.json" "$work/bridge/package-lock.json"
+cp "$DIR/../Dockerfile" "$work/Dockerfile"
 
 echo "==> updating package-lock.json"
-(cd "$work" && npm install --ignore-scripts --package-lock-only --no-audit --no-fund \
-    --legacy-peer-deps --loglevel=error)
+AGENT_VM_FIXTURE_ROOT="$work" sh "$DIR/prepare-lock.sh" "$work/bridge" "$version" --refresh-lock
 
-# The tool_layer.rs cargo guards: pins agree, every entry carries integrity (no
-# shrinkwrap in this tree, so nothing is refilled by hand), and no package Pi's
-# extension loader aliases is installed.
-jq -e --arg p "$PACKAGE" --arg v "$version" '
-    .packages as $pk
-    | ($pk[""].dependencies[$p] == $v)
-    and ($pk["node_modules/" + $p].version == $v)
-    and ([$pk | to_entries[] | select(.key != "" and (.value.integrity | not))] | length == 0)
-' "$work/package-lock.json" >/dev/null || {
-    echo "error: the updated lock fails the pin/integrity checks; not writing it" >&2
+staged=$(jq -r --arg p "$PACKAGE" '.dependencies[$p]' "$work/bridge/package.json")
+[ "$staged" = "$version" ] || {
+    echo "error: staged manifest pins ${staged}, expected ${version}" >&2
     exit 1
 }
-aliased=$(jq -r '.packages | keys[]
-    | select(test("@earendil-works|typebox|pi-agent-core|pi-tui|pi-ai"))' "$work/package-lock.json")
-if [ -n "$aliased" ]; then
-    echo "error: the lock installs packages Pi's extension loader aliases:" >&2
-    printf '%s\n' "$aliased" | sed 's/^/         /' >&2
-    exit 1
-fi
 
-cp "$work/package.json" "$DIR/package.json"
-cp "$work/package-lock.json" "$DIR/package-lock.json"
+set_version_label "$work/Dockerfile" pi-claude-bridge AGENT_VERSION_PI_CLAUDE_BRIDGE "$version"
+grep -Fq "org.agent-vm.version.pi-claude-bridge=\"\${AGENT_VERSION_PI_CLAUDE_BRIDGE:-${version}}\"" "$work/Dockerfile" || {
+    echo "error: the staged Dockerfile bridge label does not mirror ${version}" >&2
+    exit 1
+}
+
+publish_transactional "$work/publish-backup" \
+    "$work/bridge/package.json" "$DIR/package.json" \
+    "$work/bridge/package-lock.json" "$DIR/package-lock.json" \
+    "$work/Dockerfile" "$DIR/../Dockerfile"
 
 # The bridge declares the image's own Pi as a peer. --legacy-peer-deps is
 # mandatory on the install and hides a mismatch, so surface the new range here
@@ -104,9 +102,9 @@ peer=$(jq -r '.packages["node_modules/pi-claude-bridge"].peerDependencies["@eare
     "$DIR/package-lock.json")
 
 cat <<EOF
-==> pinned ${PACKAGE}@${version}
+==> pinned ${PACKAGE}@${version}; parent Dockerfile LABEL updated
 ==> peer @earendil-works/pi-coding-agent: ${peer:-<none>} (image pins ${pi_pin}; check compatibility)
 Next:
-  cargo test -p agent-vm tool_layer   # lock guards + embedded snapshot
+  cargo test -p agent-vm tool_layer   # lock guards + embedded snapshot + labels
   then rebuild the tool layers -- see images/tools/README.md ("Upgrading a tool")
 EOF

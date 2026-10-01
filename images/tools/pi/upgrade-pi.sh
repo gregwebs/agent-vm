@@ -1,28 +1,23 @@
 #!/usr/bin/env bash
 # Bump the pinned Pi version: rewrite package.json's pin, regenerate
-# package-lock.json from scratch, and refill the integrity hashes npm leaves
-# out. See images/tools/pi/README.md for usage and images/tools/README.md
-# ("Bumping the `pi` pin") for why the refill is needed.
+# package-lock.json (refilling the hashes npm leaves out), and move the owning
+# Dockerfile's LABEL fallback in lockstep. See images/tools/pi/README.md for
+# usage and images/tools/README.md ("Bumping the `pi` pin") for why the refill is
+# needed.
 #
 # Host-side only. The Dockerfile neither COPYs nor bind-mounts this file, so it
 # never reaches the image. Run it as `bash upgrade-pi.sh`: like every file under
 # images/tools/ it is committed 0644 (tool_layer.rs's
 # embedded_layer_sources_are_committed_without_the_execute_bit).
 #
-# The lock is generated in a scratch directory and only copied over the
-# committed one once every check below passes, so a failed run leaves the
-# working tree untouched.
+# The DEVELOPER-only path: it resolves a dist-tag at the host seam, then calls
+# the shared prepare-lock.sh with `--refresh-lock`. Everything is staged in a
+# scratch directory and only copied over the committed files once every check
+# below passes, so a failed run leaves the working tree untouched.
 
 set -euo pipefail
 
 PACKAGE=@earendil-works/pi-coding-agent
-# npm inherits Pi's published npm-shrinkwrap.json, which omits `integrity` for
-# exactly these siblings. install-pi.sh verifies them at build time against the
-# hashes this script writes, and tool_layer.rs's
-# the_build_verified_sibling_set_is_exactly_the_five_nested_earendil_packages
-# pins the same set.
-SIBLINGS="chord pi-agent-core pi-ai pi-telemetry pi-tui"
-NESTED="node_modules/${PACKAGE}/node_modules/@earendil-works"
 
 usage() {
     cat <<EOF
@@ -51,6 +46,10 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # built from $DIR, and npm-pin.sh is linted on its own.
 # shellcheck source=/dev/null
 . "$DIR/../../../script/build/npm-pin.sh"
+# shellcheck source=/dev/null
+. "$DIR/../../../script/build/dockerfile-label.sh"
+# shellcheck source=/dev/null
+. "$DIR/../../../script/build/transactional-publish.sh"
 
 require_tools jq npm
 
@@ -67,66 +66,34 @@ echo "==> pinning ${PACKAGE}: ${current} -> ${version}"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# Exact pin, never a range: verify-pi.sh asserts `pi --version` equals it.
-jq --arg p "$PACKAGE" --arg v "$version" '.dependencies[$p] = $v' \
-    "$DIR/package.json" >"$work/package.json"
+mkdir -p "$work/pi"
+cp "$DIR/package.json" "$work/pi/package.json"
+cp "$DIR/package-lock.json" "$work/pi/package-lock.json"
+cp "$DIR/Dockerfile" "$work/Dockerfile"
 
 echo "==> regenerating package-lock.json"
-(cd "$work" && npm install --ignore-scripts --package-lock-only --no-audit --no-fund --loglevel=error)
+AGENT_VM_FIXTURE_ROOT="$work" sh "$DIR/prepare-lock.sh" "$work/pi" "$version" --refresh-lock
 
-# Refill every entry npm left without `integrity`. Anything outside the known
-# sibling set is a layout change install-pi.sh does not verify, so refuse it
-# rather than paper over it.
-missing=$(jq -r '.packages | to_entries[] | select(.key != "" and (.value.integrity | not)) | .key' \
-    "$work/package-lock.json")
-for key in $missing; do
-    name=${key#"${NESTED}/"}
-    case " $SIBLINGS " in
-        *" $name "*) ;;
-        *)
-            echo "error: lock entry $key has no integrity and is not one of the known" >&2
-            echo "       shrinkwrap siblings ($SIBLINGS)." >&2
-            echo "       Pi's dependency layout changed; install-pi.sh and tool_layer.rs need review." >&2
-            exit 1
-            ;;
-    esac
-    entry_version=$(jq -r --arg k "$key" '.packages[$k].version' "$work/package-lock.json")
-    integrity=$(npm view "@earendil-works/${name}@${entry_version}" dist.integrity)
-    if [ -z "$integrity" ]; then
-        echo "error: registry has no dist.integrity for @earendil-works/${name}@${entry_version}" >&2
-        exit 1
-    fi
-    echo "    refilled @earendil-works/${name}@${entry_version}"
-    # Insert right after `resolved`, where npm itself writes it.
-    jq --arg k "$key" --arg i "$integrity" '
-        .packages[$k] |= (to_entries
-            | map(if .key == "resolved" then ., {key: "integrity", value: $i} else . end)
-            | from_entries)' \
-        "$work/package-lock.json" >"$work/lock.tmp"
-    mv "$work/lock.tmp" "$work/package-lock.json"
-done
-
-# The same invariants `cargo test -p agent-vm tool_layer` enforces, checked here
-# so a bad lock never lands in the working tree.
-jq -e --arg p "$PACKAGE" --arg v "$version" --arg n "$NESTED" --arg s "$SIBLINGS" '
-    .packages as $pk
-    | ($pk[""].dependencies[$p] == $v)
-    and ($pk["node_modules/" + $p].version == $v)
-    and ([$pk | to_entries[] | select(.key != "" and (.value.integrity | not))] | length == 0)
-    and ([$pk | keys[] | select(startswith($n + "/")) | ltrimstr($n + "/") | select(contains("/") | not)]
-         | sort == ($s | split(" ") | sort))
-    and ([$s | split(" ")[] | $pk[$n + "/" + .].version] | all(. == $v))
-' "$work/package-lock.json" >/dev/null || {
-    echo "error: the regenerated lock fails the pin/integrity/sibling checks; not writing it" >&2
+staged=$(jq -r --arg p "$PACKAGE" '.dependencies[$p]' "$work/pi/package.json")
+[ "$staged" = "$version" ] || {
+    echo "error: staged manifest pins ${staged}, expected ${version}" >&2
     exit 1
 }
 
-cp "$work/package.json" "$DIR/package.json"
-cp "$work/package-lock.json" "$DIR/package-lock.json"
+set_version_label "$work/Dockerfile" pi AGENT_VERSION_PI "$version"
+grep -Fq "org.agent-vm.version.pi=\"\${AGENT_VERSION_PI:-${version}}\"" "$work/Dockerfile" || {
+    echo "error: the staged Dockerfile pi label does not mirror ${version}" >&2
+    exit 1
+}
+
+publish_transactional "$work/publish-backup" \
+    "$work/pi/package.json" "$DIR/package.json" \
+    "$work/pi/package-lock.json" "$DIR/package-lock.json" \
+    "$work/Dockerfile" "$DIR/Dockerfile"
 
 cat <<EOF
-==> pinned ${PACKAGE}@${version}
+==> pinned ${PACKAGE}@${version}; Dockerfile LABEL updated
 Next:
-  cargo test -p agent-vm tool_layer   # lock guards + embedded snapshot
+  cargo test -p agent-vm tool_layer   # lock guards + embedded snapshot + label
   then rebuild the tool layers -- see images/tools/pi/README.md
 EOF

@@ -1,0 +1,577 @@
+--- a/install.sh
++++ b/install.sh
+@@ -2,17 +2,25 @@
+ 
+ set -eu
+ 
+-RELEASE="${CODEX_RELEASE:-latest}"
++# This is a build-time, exact-version installer. The owning hook
++# (install-codex.sh) validates and supplies CODEX_RELEASE; an empty or floating
++# value is rejected by validate_version below rather than defaulting to
++# `latest`. The releases.openai.com channel path is removed: builds install the
++# exact GitHub release tag.
++RELEASE="${CODEX_RELEASE:-}"
+ NON_INTERACTIVE="${CODEX_NON_INTERACTIVE:-false}"
+ DAEMON_ONLY="${CODEX_INSTALL_DAEMON_ONLY:-0}"
+-DEFAULT_PREFER_RELEASES_OPENAI_COM="true"
+-PREFER_RELEASES_OPENAI_COM="${CODEX_INSTALLER_USE_RELEASES_OPENAI_COM:-$DEFAULT_PREFER_RELEASES_OPENAI_COM}"
+-RELEASES_BASE_URL="https://releases.openai.com/codex"
+-RELEASES_CONNECT_TIMEOUT=10
+-RELEASES_METADATA_TIMEOUT=30
+-RELEASES_ASSET_TIMEOUT=300
+-release_source="github"
+ 
++# The classified download helper lives in the bind-mounted recipe contract.
++: "${AGENT_VM_CONTRACT_DIR:?the codex installer needs AGENT_VM_CONTRACT_DIR}"
++
++# Native subprocesses must never see the classified-transport receipt. A native
++# exit 75 -- or a native that happens to write the receipt path -- is a hard
++# failure, never a transport classification. Keep the path privately and hand it
++# only to the trusted download helper below.
++AGENT_VM_RECEIPT_PATH="${AGENT_VM_TRANSPORT_RECEIPT:-}"
++unset AGENT_VM_TRANSPORT_RECEIPT
++
+ BIN_DIR="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"
+ BIN_PATH="$BIN_DIR/codex"
+ CODE_MODE_HOST_BIN_PATH="$BIN_DIR/codex-code-mode-host"
+@@ -52,30 +60,17 @@
+ 
+ normalize_version() {
+   case "$1" in
+-    "" | latest)
+-      printf 'latest\n'
+-      ;;
+-    rust-v*)
+-      printf '%s\n' "${1#rust-v}"
+-      ;;
+-    v*)
+-      printf '%s\n' "${1#v}"
+-      ;;
+-    *)
+-      printf '%s\n' "$1"
+-      ;;
++    rust-v*) printf '%s\n' "${1#rust-v}" ;;
++    v*) printf '%s\n' "${1#v}" ;;
++    *) printf '%s\n' "$1" ;;
+   esac
+ }
+ 
+ validate_version() {
+   version="$1"
+ 
+-  if [ "$version" = "latest" ]; then
+-    return
+-  fi
+-
+   if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-alpha(\.[0-9]+){0,2}|-beta(\.[0-9]+)?)?$'; then
+-    echo "Invalid Codex release version: $version. Expected latest or x.y.z[-alpha[.N[.M]]|-beta[.N]]." >&2
++    echo "Invalid Codex release version: $version. Expected x.y.z[-alpha[.N[.M]]|-beta[.N]]." >&2
+     return 1
+   fi
+ }
+@@ -116,203 +111,110 @@
+   url="$1"
+   output="$2"
+ 
+-  if command -v curl >/dev/null 2>&1; then
+-    case "$url" in
+-      "$RELEASES_BASE_URL"/*)
+-        curl -fsSL --connect-timeout "$RELEASES_CONNECT_TIMEOUT" --max-time "$RELEASES_ASSET_TIMEOUT" "$url" -o "$output"
+-        ;;
+-      *)
+-        curl -fsSL "$url" -o "$output"
+-        ;;
+-    esac
+-    return
+-  fi
+-
+-  if command -v wget >/dev/null 2>&1; then
+-    case "$url" in
+-      "$RELEASES_BASE_URL"/*)
+-        wget -q -t 1 -T "$RELEASES_ASSET_TIMEOUT" -O "$output" "$url"
+-        ;;
+-      *)
+-        wget -q -O "$output" "$url"
+-        ;;
+-    esac
+-    return
+-  fi
+-
+-  echo "curl or wget is required to install Codex." >&2
+-  exit 1
++  AGENT_VM_TRANSPORT_RECEIPT="$AGENT_VM_RECEIPT_PATH" \
++    sh "${AGENT_VM_CONTRACT_DIR}/download.sh" "$url" "$output"
+ }
+ 
+ download_text() {
+   url="$1"
+ 
+-  if command -v curl >/dev/null 2>&1; then
+-    case "$url" in
+-      "$RELEASES_BASE_URL"/*)
+-        curl -fsSL --connect-timeout "$RELEASES_CONNECT_TIMEOUT" --max-time "$RELEASES_METADATA_TIMEOUT" "$url"
+-        ;;
+-      *)
+-        curl -fsSL "$url"
+-        ;;
+-    esac
+-    return
+-  fi
+-
+-  if command -v wget >/dev/null 2>&1; then
+-    case "$url" in
+-      "$RELEASES_BASE_URL"/*)
+-        wget -q -t 1 -T "$RELEASES_METADATA_TIMEOUT" -O - "$url"
+-        ;;
+-      *)
+-        wget -q -O - "$url"
+-        ;;
+-    esac
+-    return
+-  fi
+-
+-  echo "curl or wget is required to install Codex." >&2
+-  exit 1
++  # Download to a file and echo it, so a classified transport failure returns
++  # 75 (with the receipt) instead of being lost in a pipe. The caller must
++  # propagate that status immediately.
++  tmp="$(mktemp)"
++  AGENT_VM_TRANSPORT_RECEIPT="$AGENT_VM_RECEIPT_PATH" \
++    sh "${AGENT_VM_CONTRACT_DIR}/download.sh" "$url" "$tmp" || {
++    rc=$?
++    rm -f "$tmp"
++    return "$rc"
++  }
++  cat "$tmp"
++  rm -f "$tmp"
+ }
+ 
+ download_file_with_fallback() {
+-  primary_url="$1"
+-  fallback_url="$2"
+-  output="$3"
+-  expected_digest="$4"
+-  fallback_asset="$5"
+-  required_manifest_asset="${6:-}"
++  # Named for its call sites, but this build has no releases.openai.com
++  # fallback: there is exactly one exact GitHub asset. Any failure -- including
++  # a classified transport 75 -- propagates immediately, before any checksum or
++  # verification runs.
++  url="$1"
++  output="$2"
++  expected_digest="$3"
++  required_manifest_asset="${4:-}"
+ 
+-  if download_file "$primary_url" "$output" &&
+-    verify_archive_digest "$output" "$expected_digest" &&
+-    { [ -z "$required_manifest_asset" ] || package_archive_digest "$required_manifest_asset" "$output" >/dev/null; }; then
+-    return
+-  fi
+-
+-  if [ -z "$fallback_url" ]; then
+-    return 1
+-  fi
+-
+-  warn "Could not download or verify $primary_url; retrying from GitHub Releases."
+-  download_file "$fallback_url" "$output"
+-  if verify_archive_digest "$output" "$expected_digest" &&
+-    { [ -z "$required_manifest_asset" ] || package_archive_digest "$required_manifest_asset" "$output" >/dev/null; }; then
+-    return
+-  fi
+-
+-  resolve_release_from_github "$resolved_version"
+-  fallback_digest="$(release_asset_digest "$fallback_asset")"
+-  verify_archive_digest "$output" "$fallback_digest"
++  download_file "$url" "$output" || return $?
++  verify_archive_digest "$output" "$expected_digest"
+   if [ -n "$required_manifest_asset" ]; then
+     package_archive_digest "$required_manifest_asset" "$output" >/dev/null
+   fi
+ }
+ 
+ parse_release_metadata() {
+-  # Bound awk's record size so compact, single-line JSON stays fast on every
+-  # supported awk implementation. JSON strings cannot contain literal newlines,
+-  # so the record boundaries inserted by fold do not change the document.
+-  LC_ALL=C fold -b -w 4096 | LC_ALL=C awk '
+-    function finish_string(value) {
+-      if (object_depth == 1 && key == "tag_name") {
+-        print "tag_name\t" value
+-      } else if (object_depth == asset_object_depth) {
+-        if (key == "name") {
+-          asset_name = value
+-        } else if (key == "digest") {
+-          asset_digest = value
+-        }
+-      }
++  # Validate the release metadata as exactly one complete JSON document and
++  # reject duplicate or conflicting critical fields (tag_name and per-asset
++  # names/digests) before any value is used. This replaces a hand-written
++  # balance scanner that accepted missing commas, trailing garbage, a duplicate
++  # tag_name and conflicting/duplicate per-asset digest records. JSON decoding
++  # rejects missing commas and trailing garbage; object_pairs_hook rejects the
++  # duplicate keys a normal parse would silently collapse.
++  python3 -c '
++import json
++import sys
+ 
+-      expecting_value = 0
+-      key = ""
+-    }
++def reject_duplicate_keys(pairs):
++    seen = {}
++    for key, value in pairs:
++        if key in seen:
++            raise ValueError("duplicate key %r" % (key,))
++        seen[key] = value
++    return seen
+ 
+-    {
+-      for (i = 1; i <= length($0); i++) {
+-        char = substr($0, i, 1)
++try:
++    document = json.loads(sys.stdin.read(), object_pairs_hook=reject_duplicate_keys)
++except Exception as error:
++    sys.stderr.write("release metadata is not one complete JSON document: %s\n" % (error,))
++    sys.exit(1)
+ 
+-        if (in_string) {
+-          if (escaped) {
+-            token = token "\\" char
+-            escaped = 0
+-          } else if (char == "\\") {
+-            escaped = 1
+-          } else if (char == "\"") {
+-            in_string = 0
+-            if (string_is_value) {
+-              finish_string(token)
+-            } else {
+-              pending_key = token
+-            }
+-          } else {
+-            token = token char
+-          }
+-          continue
+-        }
++if not isinstance(document, dict):
++    sys.stderr.write("release metadata is not a JSON object\n")
++    sys.exit(1)
+ 
+-        if (char == "\"") {
+-          in_string = 1
+-          token = ""
+-          escaped = 0
+-          string_is_value = expecting_value
+-        } else if (char == ":" && pending_key != "") {
+-          key = pending_key
+-          pending_key = ""
+-          expecting_value = 1
+-        } else if (char == "{") {
+-          object_depth++
+-          if (assets_array_depth != 0 &&
+-              array_depth == assets_array_depth &&
+-              asset_object_depth == 0) {
+-            asset_object_depth = object_depth
+-            asset_name = ""
+-            asset_digest = ""
+-          }
+-          expecting_value = 0
+-          key = ""
+-        } else if (char == "}") {
+-          if (object_depth == asset_object_depth) {
+-            if (asset_name != "" && asset_digest != "") {
+-              print "asset\t" asset_name "\t" asset_digest
+-            }
+-            asset_object_depth = 0
+-            asset_name = ""
+-            asset_digest = ""
+-          }
+-          object_depth--
+-          expecting_value = 0
+-          key = ""
+-          pending_key = ""
+-        } else if (char == "[") {
+-          array_depth++
+-          if (expecting_value && key == "assets" && object_depth == 1) {
+-            assets_array_depth = array_depth
+-          }
+-          expecting_value = 0
+-          key = ""
+-        } else if (char == "]") {
+-          if (array_depth == assets_array_depth) {
+-            assets_array_depth = 0
+-          }
+-          array_depth--
+-          expecting_value = 0
+-          key = ""
+-          pending_key = ""
+-        } else if (char == ",") {
+-          expecting_value = 0
+-          key = ""
+-          pending_key = ""
+-        }
+-      }
+-    }
++tag = document.get("tag_name")
++if not isinstance(tag, str) or not tag:
++    sys.stderr.write("release metadata has no tag_name\n")
++    sys.exit(1)
++sys.stdout.write("tag_name\t%s\n" % (tag,))
+ 
+-    END {
+-      if (in_string || object_depth != 0 || array_depth != 0) {
+-        exit 1
+-      }
+-    }
+-  '
++assets = document.get("assets")
++if assets is None:
++    sys.exit(0)
++if not isinstance(assets, list):
++    sys.stderr.write("release metadata assets is not an array\n")
++    sys.exit(1)
++
++names = set()
++for entry in assets:
++    if not isinstance(entry, dict):
++        sys.stderr.write("release metadata asset is not an object\n")
++        sys.exit(1)
++    name = entry.get("name")
++    if not isinstance(name, str) or not name:
++        sys.stderr.write("release metadata asset has no name\n")
++        sys.exit(1)
++    if name in names:
++        sys.stderr.write("release metadata repeats asset %s\n" % (name,))
++        sys.exit(1)
++    names.add(name)
++    digest = entry.get("digest")
++    if digest is None:
++        continue
++    if not isinstance(digest, str):
++        sys.stderr.write("release metadata asset %s has a non-string digest\n" % (name,))
++        sys.exit(1)
++    if not digest:
++        continue
++    sys.stdout.write("asset\t%s\t%s\n" % (name, digest))
++'
+ }
+ 
+ release_url_for_asset() {
+@@ -322,13 +224,6 @@
+   printf 'https://github.com/openai/codex/releases/download/rust-v%s/%s\n' "$resolved_version" "$asset"
+ }
+ 
+-releases_url_for_asset() {
+-  asset="$1"
+-  resolved_version="$2"
+-
+-  printf '%s/releases/%s/%s\n' "$RELEASES_BASE_URL" "$resolved_version" "$asset"
+-}
+-
+ release_metadata_url() {
+   resolved_version="$1"
+ 
+@@ -351,7 +246,7 @@
+     *) metadata_version="" ;;
+   esac
+   if [ -z "$metadata_version" ]; then
+-    echo "Failed to resolve the latest Codex release version." >&2
++    echo "Could not read a rust-v tag from the Codex release metadata." >&2
+     return 1
+   fi
+   validate_version "$metadata_version"
+@@ -359,73 +254,29 @@
+ 
+ resolve_release_from_github() {
+   normalized_version="$1"
+-  if [ "$normalized_version" = "latest" ]; then
+-    requested_release="latest"
+-    metadata_url="https://api.github.com/repos/openai/codex/releases/latest"
+-  else
+-    resolved_version="$normalized_version"
+-    requested_release="$resolved_version"
+-    metadata_url="$(release_metadata_url "$resolved_version")"
+-  fi
++  resolved_version="$normalized_version"
++  requested_release="$resolved_version"
++  metadata_url="$(release_metadata_url "$resolved_version")"
+ 
+-  if ! release_json="$(download_text "$metadata_url")"; then
++  release_json="$(download_text "$metadata_url")" || {
++    rc=$?
++    [ "$rc" -eq 75 ] && exit 75
+     echo "Could not fetch GitHub release metadata for Codex $requested_release. GitHub API may be unavailable or rate limited." >&2
+     exit 1
+-  fi
++  }
+ 
+   parse_downloaded_release_metadata "$requested_release" "GitHub"
+-
+-  if [ "$normalized_version" = "latest" ]; then
+-    resolve_metadata_version
+-    resolved_version="$metadata_version"
++  resolve_metadata_version
++  if [ "$metadata_version" != "$resolved_version" ]; then
++    echo "Release metadata version did not match requested Codex version $resolved_version." >&2
++    exit 1
+   fi
+-
+-  release_source="github"
+ }
+ 
+-resolve_release_from_releases() {
+-  normalized_version="$1"
+-
+-  if [ "$normalized_version" = "latest" ]; then
+-    requested_release="latest"
+-    metadata_url="$RELEASES_BASE_URL/channels/latest"
+-  else
+-    requested_release="$normalized_version"
+-    metadata_url="$RELEASES_BASE_URL/releases/$normalized_version/release.json"
+-  fi
+-
+-  if ! release_json="$(download_text "$metadata_url")"; then
+-    return 1
+-  fi
+-
+-  if ! parse_downloaded_release_metadata "$requested_release" "releases.openai.com"; then
+-    return 1
+-  fi
+-  if ! resolve_metadata_version; then
+-    return 1
+-  fi
+-  if [ "$normalized_version" != "latest" ] && [ "$metadata_version" != "$normalized_version" ]; then
+-    echo "Release metadata version did not match requested Codex version $normalized_version." >&2
+-    return 1
+-  fi
+-  resolved_version="$metadata_version"
+-  release_source="releases.openai.com"
+-}
+-
+ resolve_release() {
+   normalized_version="$(normalize_version "$RELEASE")"
+   validate_version "$normalized_version"
+ 
+-  case "$PREFER_RELEASES_OPENAI_COM" in
+-    1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss])
+-      if resolve_release_from_releases "$normalized_version" &&
+-        select_release_assets; then
+-        return
+-      fi
+-      warn "releases.openai.com is unavailable; falling back to GitHub Releases."
+-      ;;
+-  esac
+-
+   resolve_release_from_github "$normalized_version"
+   select_release_assets
+ }
+@@ -475,8 +326,6 @@
+ select_release_assets() {
+   package_asset="codex-package-$vendor_target.tar.gz"
+   checksum_asset="codex-package_SHA256SUMS"
+-  download_fallback_url=""
+-  checksum_fallback_url=""
+ 
+   if release_asset_exists "$package_asset" &&
+     release_asset_exists "$checksum_asset"; then
+@@ -490,18 +339,9 @@
+     return 1
+   fi
+ 
+-  if [ "$release_source" = "releases.openai.com" ]; then
+-    download_url="$(releases_url_for_asset "$asset" "$resolved_version")"
+-    download_fallback_url="$(release_url_for_asset "$asset" "$resolved_version")"
+-    if [ "$install_layout" = "package" ]; then
+-      checksum_url="$(releases_url_for_asset "$checksum_asset" "$resolved_version")"
+-      checksum_fallback_url="$(release_url_for_asset "$checksum_asset" "$resolved_version")"
+-    fi
+-  else
+-    download_url="$(release_url_for_asset "$asset" "$resolved_version")"
+-    if [ "$install_layout" = "package" ]; then
+-      checksum_url="$(release_url_for_asset "$checksum_asset" "$resolved_version")"
+-    fi
++  download_url="$(release_url_for_asset "$asset" "$resolved_version")"
++  if [ "$install_layout" = "package" ]; then
++    checksum_url="$(release_url_for_asset "$checksum_asset" "$resolved_version")"
+   fi
+ }
+ 
+@@ -785,7 +625,23 @@
+     return 1
+   fi
+ 
+-  "$codex_path" --version 2>/dev/null | sed -n 's/.* \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -n 1
++  # Bound the native probe. An unbounded `--version` could hang the installer
++  # before the later verify gate runs; run-report.sh applies timeout
++  # --kill-after and preserves the probe exit status instead of discarding it
++  # in a pipeline.
++  probe_scratch="$(mktemp -d)"
++  probe_status=0
++  sh "${AGENT_VM_CONTRACT_DIR}/run-report.sh" 60 \
++    "$probe_scratch/out" "$probe_scratch/err" "$codex_path" --version ||
++    probe_status=$?
++  if [ "$probe_status" -ne 0 ]; then
++    rm -rf "$probe_scratch"
++    return 1
++  fi
++  version="$(sed -n 's/.* \([0-9][0-9A-Za-z.+-]*\)$/\1/p' "$probe_scratch/out" | head -n 1)"
++  rm -rf "$probe_scratch"
++  [ -n "$version" ] || return 1
++  printf '%s\n' "$version"
+ }
+ 
+ current_installed_version() {
+@@ -912,6 +768,7 @@
+   fi
+ 
+   conflict_manager="$manager"
++  # shellcheck disable=SC2034  # upstream assigns this for its own diagnostic use
+   conflict_path="$existing_path"
+   step "Detected existing $manager-managed Codex at $existing_path"
+   warn "Multiple managed Codex installs can be ambiguous because PATH order decides which one runs."
+@@ -1071,7 +928,15 @@
+ }
+ 
+ verify_visible_command() {
+-  "$BIN_PATH" --version >/dev/null
++  # Bound the visible-command probe so a hung or TERM-ignoring native cannot
++  # hang the installer; run-report.sh preserves the probe's exit status.
++  probe_scratch="$(mktemp -d)"
++  probe_status=0
++  sh "${AGENT_VM_CONTRACT_DIR}/run-report.sh" 60 \
++    "$probe_scratch/out" "$probe_scratch/err" "$BIN_PATH" --version ||
++    probe_status=$?
++  rm -rf "$probe_scratch"
++  [ "$probe_status" -eq 0 ] || return 1
+   if [ "$os" = "darwin" ] && [ "$install_layout" = "package" ]; then
+     [ -x "$CODE_MODE_HOST_BIN_PATH" ]
+   fi
+@@ -1240,12 +1105,12 @@
+   step "Downloading Codex CLI"
+   if [ "$install_layout" = "package" ]; then
+     checksum_digest="$(release_asset_digest "$checksum_asset")"
+-    download_file_with_fallback "$checksum_url" "$checksum_fallback_url" "$checksum_path" "$checksum_digest" "$checksum_asset" "$asset"
++    download_file_with_fallback "$checksum_url" "$checksum_path" "$checksum_digest" "$asset"
+     expected_digest="$(package_archive_digest "$asset" "$checksum_path")"
+   else
+     expected_digest="$(release_asset_digest "$asset")"
+   fi
+-  download_file_with_fallback "$download_url" "$download_fallback_url" "$archive_path" "$expected_digest" "$asset"
++  download_file_with_fallback "$download_url" "$archive_path" "$expected_digest"
+ 
+   step "Installing standalone package to $release_dir"
+   if [ "$install_layout" = "package" ]; then
+@@ -1269,12 +1134,7 @@
+   fi
+ fi
+ update_current_link "$release_dir"
+-if [ "$RELEASE" = "latest" ]; then
+-  printf '%s' "$release_name" > "$AUTO_UPDATE_VERSION.tmp.$$"
+-  mv -f "$AUTO_UPDATE_VERSION.tmp.$$" "$AUTO_UPDATE_VERSION"
+-else
+-  rm -f "$AUTO_UPDATE_VERSION"
+-fi
++rm -f "$AUTO_UPDATE_VERSION"
+ if [ "$DAEMON_ONLY" = "1" ]; then
+   release_install_lock
+   exit 0

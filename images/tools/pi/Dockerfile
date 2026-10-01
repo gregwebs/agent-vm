@@ -13,6 +13,19 @@ FROM ${BASE_IMAGE}
 # Re-declared inside the stage: a global ARG is not visible to RUN.
 ARG AGENT_INSTALL_SOFT_FAIL=
 
+# The two version slots. Both defaults are EMPTY: an empty slot reuses the
+# committed lock byte-for-byte with no registry lookup, and the Dockerfile must
+# never duplicate the pin as a nonempty ARG. The LABEL fallbacks are generated
+# mirrors of the committed manifests, kept in sync by the upgrade scripts and
+# asserted by the tool_layer.rs guards.
+ARG AGENT_VERSION_PI=
+ARG AGENT_VERSION_PI_CLAUDE_BRIDGE=
+
+# Selection, not health: these record the versions the layer was asked to
+# install. Whether the commands work is the T5 audit's decision.
+LABEL org.agent-vm.version.pi="${AGENT_VERSION_PI:-0.87.1}" \
+      org.agent-vm.version.pi-claude-bridge="${AGENT_VERSION_PI_CLAUDE_BRIDGE:-0.8.0}"
+
 # No `ENV PATH`: the wrapper lands in /usr/local/bin, already first on the
 # base's PATH (C2 is satisfied by adding nothing).
 
@@ -28,8 +41,14 @@ ARG AGENT_INSTALL_SOFT_FAIL=
 # COPYing) also keeps the script out of the shipped image and needs no execute
 # bit, so the 0644-materialisation rule below does not apply to it.
 COPY package.json package-lock.json /opt/agent-vm/pi/
-RUN --mount=type=bind,source=install-pi.sh,target=/tmp/install-pi.sh,ro \
-    sh /tmp/install-pi.sh
+RUN --mount=type=bind,source=contract,target=/tmp/recipe-contract,ro \
+    --mount=type=bind,source=install-pi.sh,target=/tmp/install-pi.sh,ro \
+    --mount=type=bind,source=prepare-lock.sh,target=/tmp/prepare-pi-lock.sh,ro \
+    AGENT_VM_CONTRACT_DIR=/tmp/recipe-contract \
+    AGENT_VM_PREPARE_LOCK=/tmp/prepare-pi-lock.sh \
+    AGENT_VM_VERSION_PI="${AGENT_VERSION_PI}" \
+    AGENT_VM_INSTALL_STATUS_DIR=/opt/agent-vm/install-status \
+    sh /tmp/recipe-contract/run-install.sh pi /opt/agent-vm/install-status/pi sh /tmp/install-pi.sh
 
 # Image-owned Pi extension packages (pi-claude-bridge). See
 # docs/adr/0023-image-owned-pi-extension-packages.md.
@@ -46,8 +65,14 @@ RUN --mount=type=bind,source=install-pi.sh,target=/tmp/install-pi.sh,ro \
 # at /opt/agent/.local/bin/claude and seed.d/20-pi-claude-bridge points the bridge
 # at it. `--ignore-scripts`: no upstream postinstall runs during the build.
 COPY bridge/package.json bridge/package-lock.json /opt/agent-vm/pi-packages/
-RUN --mount=type=bind,source=install-pi-packages.sh,target=/tmp/install-pi-packages.sh,ro \
-    sh /tmp/install-pi-packages.sh
+RUN --mount=type=bind,source=contract,target=/tmp/recipe-contract,ro \
+    --mount=type=bind,source=install-pi-packages.sh,target=/tmp/install-pi-packages.sh,ro \
+    --mount=type=bind,source=bridge/prepare-lock.sh,target=/tmp/prepare-bridge-lock.sh,ro \
+    AGENT_VM_CONTRACT_DIR=/tmp/recipe-contract \
+    AGENT_VM_PREPARE_LOCK=/tmp/prepare-bridge-lock.sh \
+    AGENT_VM_VERSION_PI_CLAUDE_BRIDGE="${AGENT_VERSION_PI_CLAUDE_BRIDGE}" \
+    AGENT_VM_INSTALL_STATUS_DIR=/opt/agent-vm/install-status \
+    sh /tmp/recipe-contract/run-install.sh pi-claude-bridge /opt/agent-vm/install-status/pi-claude-bridge sh /tmp/install-pi-packages.sh
 
 # First-boot seed hook (run.rs's RUN_IMAGE_SEED_HOOKS runs every executable
 # under /opt/agent-vm/seed.d/) pointing the bridge at the image's own `claude`.
@@ -79,5 +104,10 @@ COPY --chmod=0755 pi.sh /usr/local/bin/pi
 # build, and a soft failure exited 0 having deleted /opt/agent-vm/pi entirely --
 # so the gate's `! -x` branch is what turns a soft-failed install into "this
 # image ships no pi", wrapper included.
-RUN --mount=type=bind,source=verify-pi.sh,target=/tmp/verify-pi.sh,ro \
+RUN --mount=type=bind,source=contract,target=/tmp/recipe-contract,ro \
+    --mount=type=bind,source=verify-pi.sh,target=/tmp/verify-pi.sh,ro \
+    AGENT_VM_CONTRACT_DIR=/tmp/recipe-contract \
+    AGENT_VM_VERSION_PI="${AGENT_VERSION_PI}" \
+    AGENT_VM_VERSION_PI_CLAUDE_BRIDGE="${AGENT_VERSION_PI_CLAUDE_BRIDGE}" \
+    AGENT_VM_INSTALL_STATUS_DIR=/opt/agent-vm/install-status \
     sh /tmp/verify-pi.sh

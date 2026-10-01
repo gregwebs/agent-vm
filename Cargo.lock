@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agent-vm"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3467,7 +3467,7 @@ dependencies = [
 
 [[package]]
 name = "msb-krun-compat-evidence"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "clap",

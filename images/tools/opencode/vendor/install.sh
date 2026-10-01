@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+set -euo pipefail
+APP=opencode
+
+# The classified download helper lives in the bind-mounted recipe contract.
+: "${AGENT_VM_CONTRACT_DIR:?the opencode installer needs AGENT_VM_CONTRACT_DIR}"
+
+MUTED='\033[0;2m'
+RED='\033[0;31m'
+ORANGE='\033[38;5;214m'
+NC='\033[0m' # No Color
+
+usage() {
+    cat <<EOF
+OpenCode Installer
+
+Usage: install.sh [options]
+
+Options:
+    -h, --help              Display this help message
+    -v, --version <version> Install a specific version (e.g., 1.0.180)
+    -b, --binary <path>     Install from a local binary instead of downloading
+        --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
+
+Examples:
+    curl -fsSL https://opencode.ai/install | bash
+    curl -fsSL https://opencode.ai/install | bash -s -- --version 1.0.180
+    ./install --binary /path/to/opencode
+EOF
+}
+
+requested_version=${VERSION:-}
+no_modify_path=false
+binary_path=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            if [[ -n "${2:-}" ]]; then
+                requested_version="$2"
+                shift 2
+            else
+                echo -e "${RED}Error: --version requires a version argument${NC}"
+                exit 1
+            fi
+            ;;
+        -b|--binary)
+            if [[ -n "${2:-}" ]]; then
+                binary_path="$2"
+                shift 2
+            else
+                echo -e "${RED}Error: --binary requires a path argument${NC}"
+                exit 1
+            fi
+            ;;
+        --no-modify-path)
+            no_modify_path=true
+            shift
+            ;;
+        *)
+            echo -e "${ORANGE}Warning: Unknown option '$1'${NC}" >&2
+            shift
+            ;;
+    esac
+done
+
+INSTALL_DIR=$HOME/.opencode/bin
+mkdir -p "$INSTALL_DIR"
+
+# If --binary is provided, skip all download/detection logic
+if [ -n "$binary_path" ]; then
+    if [ ! -f "$binary_path" ]; then
+        echo -e "${RED}Error: Binary not found at ${binary_path}${NC}"
+        exit 1
+    fi
+    specific_version="local"
+else
+    raw_os=$(uname -s)
+    os=$(echo "$raw_os" | tr '[:upper:]' '[:lower:]')
+    case "$raw_os" in
+      Darwin*) os="darwin" ;;
+      Linux*) os="linux" ;;
+      MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+    esac
+
+    arch=$(uname -m)
+    if [[ "$arch" == "aarch64" ]]; then
+      arch="arm64"
+    fi
+    if [[ "$arch" == "x86_64" ]]; then
+      arch="x64"
+    fi
+
+    if [ "$os" = "darwin" ] && [ "$arch" = "x64" ]; then
+      rosetta_flag=$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)
+      if [ "$rosetta_flag" = "1" ]; then
+        arch="arm64"
+      fi
+    fi
+
+    combo="$os-$arch"
+    case "$combo" in
+      linux-x64|linux-arm64|darwin-x64|darwin-arm64|windows-x64)
+        ;;
+      *)
+        echo -e "${RED}Unsupported OS/Arch: $os/$arch${NC}"
+        exit 1
+        ;;
+    esac
+
+    archive_ext=".zip"
+    if [ "$os" = "linux" ]; then
+      archive_ext=".tar.gz"
+    fi
+
+    is_musl=false
+    if [ "$os" = "linux" ]; then
+      if [ -f /etc/alpine-release ]; then
+        is_musl=true
+      fi
+
+      if command -v ldd >/dev/null 2>&1; then
+        if ldd --version 2>&1 | grep -qi musl; then
+          is_musl=true
+        fi
+      fi
+    fi
+
+    needs_baseline=false
+    if [ "$arch" = "x64" ]; then
+      if [ "$os" = "linux" ]; then
+        if ! grep -qwi avx2 /proc/cpuinfo 2>/dev/null; then
+          needs_baseline=true
+        fi
+      fi
+
+      if [ "$os" = "darwin" ]; then
+        avx2=$(sysctl -n hw.optional.avx2_0 2>/dev/null || echo 0)
+        if [ "$avx2" != "1" ]; then
+          needs_baseline=true
+        fi
+      fi
+
+      if [ "$os" = "windows" ]; then
+        ps="(Add-Type -MemberDefinition \"[DllImport(\"\"kernel32.dll\"\")] public static extern bool IsProcessorFeaturePresent(int ProcessorFeature);\" -Name Kernel32 -Namespace Win32 -PassThru)::IsProcessorFeaturePresent(40)"
+        out=""
+        if command -v powershell.exe >/dev/null 2>&1; then
+          out=$(powershell.exe -NoProfile -NonInteractive -Command "$ps" 2>/dev/null || true)
+        elif command -v pwsh >/dev/null 2>&1; then
+          out=$(pwsh -NoProfile -NonInteractive -Command "$ps" 2>/dev/null || true)
+        fi
+        out=$(echo "$out" | tr -d '\r' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+        if [ "$out" != "true" ] && [ "$out" != "1" ]; then
+          needs_baseline=true
+        fi
+      fi
+    fi
+
+    target="$os-$arch"
+    if [ "$needs_baseline" = "true" ]; then
+      target="$target-baseline"
+    fi
+    if [ "$is_musl" = "true" ]; then
+      target="$target-musl"
+    fi
+
+    filename="$APP-$target$archive_ext"
+
+
+    if [ "$os" = "linux" ]; then
+        if ! command -v tar >/dev/null 2>&1; then
+             echo -e "${RED}Error: 'tar' is required but not installed.${NC}"
+             exit 1
+        fi
+    else
+        if ! command -v unzip >/dev/null 2>&1; then
+            echo -e "${RED}Error: 'unzip' is required but not installed.${NC}"
+            exit 1
+        fi
+    fi
+
+    if [ -z "$requested_version" ]; then
+        echo -e "${RED}Error: this build requires an exact version (VERSION)${NC}" >&2
+        exit 1
+    fi
+    # Strip a leading 'v' if present. The exact asset download is the authority,
+    # so there is no channel lookup and no existence HEAD probe.
+    requested_version="${requested_version#v}"
+    url="https://github.com/anomalyco/opencode/releases/download/v${requested_version}/$filename"
+    specific_version=$requested_version
+fi
+
+print_message() {
+    local level=$1
+    local message=$2
+    local color=""
+
+    case $level in
+        info) color="${NC}" ;;
+        warning) color="${NC}" ;;
+        error) color="${RED}" ;;
+    esac
+
+    echo -e "${color}${message}${NC}"
+}
+
+download_and_install() {
+    print_message info "\n${MUTED}Installing ${NC}opencode ${MUTED}version: ${NC}$specific_version"
+    # Private scratch with a trap covering failure/success/signals, so a
+    # classified transport failure (or any other error under set -e) cannot
+    # leave download leftovers behind for the degraded image to ship.
+    scratch_dir="$(mktemp -d "${TMPDIR:-/tmp}/opencode_install.XXXXXX")"
+    trap 'rm -rf "$scratch_dir"' EXIT INT TERM HUP
+    local tmp_dir="$scratch_dir"
+    mkdir -p "$tmp_dir"
+
+    # Classified exact-asset download: a transport failure is a receipt + 75
+    # (propagated by set -e to the owning hook); everything else is hard.
+    sh "${AGENT_VM_CONTRACT_DIR}/download.sh" "$url" "$tmp_dir/$filename"
+
+    if [ "$os" = "linux" ]; then
+        tar -xzf "$tmp_dir/$filename" -C "$tmp_dir"
+    else
+        unzip -q "$tmp_dir/$filename" -d "$tmp_dir"
+    fi
+
+    mv "$tmp_dir/opencode" "$INSTALL_DIR"
+    chmod 755 "${INSTALL_DIR}/opencode"
+}
+
+install_from_binary() {
+    print_message info "\n${MUTED}Installing ${NC}opencode ${MUTED}from: ${NC}$binary_path"
+    cp "$binary_path" "${INSTALL_DIR}/opencode"
+    chmod 755 "${INSTALL_DIR}/opencode"
+}
+
+if [ -n "$binary_path" ]; then
+    install_from_binary
+else
+    download_and_install
+fi
+
+
+add_to_path() {
+    local config_file=$1
+    local command=$2
+
+    if grep -Fxq "$command" "$config_file"; then
+        print_message info "Command already exists in $config_file, skipping write."
+    elif [[ -w $config_file ]]; then
+        echo -e "\n# opencode" >> "$config_file"
+        echo "$command" >> "$config_file"
+        print_message info "${MUTED}Successfully added ${NC}opencode ${MUTED}to \$PATH in ${NC}$config_file"
+    else
+        print_message warning "Manually add the directory to $config_file (or similar):"
+        print_message info "  $command"
+    fi
+}
+
+XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+
+current_shell=$(basename "$SHELL")
+case $current_shell in
+    fish)
+        config_files="$HOME/.config/fish/config.fish"
+    ;;
+    zsh)
+        config_files="${ZDOTDIR:-$HOME}/.zshrc ${ZDOTDIR:-$HOME}/.zshenv $XDG_CONFIG_HOME/zsh/.zshrc $XDG_CONFIG_HOME/zsh/.zshenv"
+    ;;
+    bash)
+        config_files="$HOME/.bashrc $HOME/.bash_profile $HOME/.profile $XDG_CONFIG_HOME/bash/.bashrc $XDG_CONFIG_HOME/bash/.bash_profile"
+    ;;
+    ash)
+        config_files="$HOME/.ashrc $HOME/.profile /etc/profile"
+    ;;
+    sh)
+        config_files="$HOME/.ashrc $HOME/.profile /etc/profile"
+    ;;
+    *)
+        # Default case if none of the above matches
+        config_files="$HOME/.bashrc $HOME/.bash_profile $XDG_CONFIG_HOME/bash/.bashrc $XDG_CONFIG_HOME/bash/.bash_profile"
+    ;;
+esac
+
+if [[ "$no_modify_path" != "true" ]]; then
+    config_file=""
+    for file in $config_files; do
+        if [[ -f $file ]]; then
+            config_file=$file
+            break
+        fi
+    done
+
+    if [[ -z $config_file ]]; then
+        print_message warning "No config file found for $current_shell. You may need to manually add to PATH:"
+        print_message info "  export PATH=$INSTALL_DIR:\$PATH"
+    elif [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+        case $current_shell in
+            fish)
+                add_to_path "$config_file" "fish_add_path $INSTALL_DIR"
+            ;;
+            zsh)
+                add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH"
+            ;;
+            bash)
+                add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH"
+            ;;
+            ash)
+                add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH"
+            ;;
+            sh)
+                add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH"
+            ;;
+            *)
+                export PATH=$INSTALL_DIR:$PATH
+                print_message warning "Manually add the directory to $config_file (or similar):"
+                print_message info "  export PATH=$INSTALL_DIR:\$PATH"
+            ;;
+        esac
+    fi
+fi
+
+if [ -n "${GITHUB_ACTIONS-}" ] && [ "${GITHUB_ACTIONS}" == "true" ]; then
+    echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+    print_message info "Added $INSTALL_DIR to \$GITHUB_PATH"
+fi
+
+echo -e ""
+echo -e "${MUTED}                    ${NC}             ▄     "
+echo -e "${MUTED}█▀▀█ █▀▀█ █▀▀█ █▀▀▄ ${NC}█▀▀▀ █▀▀█ █▀▀█ █▀▀█"
+echo -e "${MUTED}█░░█ █░░█ █▀▀▀ █░░█ ${NC}█░░░ █░░█ █░░█ █▀▀▀"
+echo -e "${MUTED}▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀  ▀ ${NC}▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀"
+echo -e ""
+echo -e ""
+echo -e "${MUTED}OpenCode includes free models, to start:${NC}"
+echo -e ""
+echo -e "cd <project>  ${MUTED}# Open directory${NC}"
+echo -e "opencode      ${MUTED}# Run command${NC}"
+echo -e ""
+echo -e "${MUTED}For more information visit ${NC}https://opencode.ai/docs"
+echo -e ""
+echo -e ""

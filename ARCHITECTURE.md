@@ -512,20 +512,21 @@ it carries what every agent session needs — base CLI utilities (`curl`, `wget`
 `git`, `jq`, `python3`, `ripgrep`, `fd-find`) plus network and process
 diagnostics, `gh` from the GitHub apt repo, Node.js 22 from NodeSource, the
 Docker engine with `fuse-overlayfs`, zellij, and the tool-layer facilities (the
-`agent-vm-install` helper, the host-CA shim, the `/opt/agent` prefix, an empty
-`/opt/agent-vm/seed.d/`). It carries **no** agent CLI.
+host-CA shim, the `/opt/agent` prefix, an empty `/opt/agent-vm/seed.d/`). It
+carries **no** agent CLI.
 
 The six shipped agents live in standalone layers under `images/tools/`
 (`dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`), each building `FROM`
-the base and installing through its canonical installer script so the layer
-tracks its upstream release channel. CI chains base plus these six (in
-declaration order) and publishes the result as the composed default; a
-non-default tool set composes them locally. `dsh` and `pi` are the two
-exceptions to "installer script": each is pinned by a committed
-`package-lock.json` installed with `npm ci`, so neither tracks a moving channel
-(`dsh` needs the lock to freeze a working dependency layout). `pi` additionally
-carries an agent-vm-owned wrapper (`/usr/local/bin/pi`) and a mandatory warning
-extension (see the third subtlety below). The claude layer also carries
+the base and installing **one exact, committed version** selected by a build
+`ARG` and recorded in an `org.agent-vm.version.*` image label. No shipped build
+resolves an upstream `latest`/channel: `codex`, `opencode` and `claude` carry a
+pinned vendored installer, `copilot` installs an exact npm pin, and `dsh`/`pi`
+are pinned by a committed `package-lock.json` installed with `npm ci` (`dsh`
+needs the lock to freeze a working dependency layout). Each recipe carries its own byte-identical copy of
+the shared recipe/install contract under `images/tools/<tool>/contract/` instead
+of the base's legacy `agent-vm-install` helper. `pi` additionally carries an
+agent-vm-owned wrapper (`/usr/local/bin/pi`) and a mandatory warning extension
+(see the third subtlety below). The claude layer also carries
 the four `claude-plugins-official` LSP servers. Chromium is *not* in the base: it
 is an opt-in `examples/layers/chrome-devtools` tooling layer, detected after boot
 via an image-capability marker.

@@ -228,7 +228,8 @@ exclusive by accident (issue #189). The harness clears both.)
 #### The `#[ignore]`d Rust Docker e2e tests
 
 The repo also carries `#[ignore]`d tests that drive a real `docker buildx` build
-(no VM boot). Run the whole set with a base image that has `agent-vm-install`:
+(no VM boot). Run the whole set with a tool-free base image (one with **no**
+agent CLI installed, so an inherited command cannot mask a failed install):
 
 ```bash
 AGENT_VM_E2E_BASE_IMAGE=agent-vm-base:dev \
@@ -256,8 +257,37 @@ needs a real registry. These tests are `#[ignore]`d, so **CI never runs them**.
 | `script/test/e2e.sh` | **no** | needs Apple Silicon + a VM boot |
 | `cargo test … -- --ignored` | **no** | needs docker/buildx |
 | `script/test/chrome-layer-contract.sh` / `chrome-layer-runtime.sh` | yes (`chrome-layer-contract.yml`) | docker-driver build + contract |
+| `script/test/shipped-tool-recipes.sh` | yes (`shipped-tool-recipes.yml`, native amd64) + manually on native arm64 | real docker-driver build + numeric-uid label/report/T5 audit + label replay. A `workflow_dispatch` run with `full_contract: true` adds `--overrides --chain`; the overrides/chain matrix is not part of the default PR gate |
+| `script/test/shipped-installer-network.sh` | **no** (default PR); yes on a dispatched `full_contract: true` native-amd64 run (`shipped-tool-recipes.yml`) | restricted-egress allowlist over the real vendored installers; the default PR gate never runs it |
+| `script/test/pi-layer-runtime.sh` | yes (`pi-layer.yml`) | deep pi runtime matrix |
 | `script/test/build-workflow.sh` | yes (macOS leg of `ci.yml`) | fake-plutil seam, no VM |
 | `script/test/ci-contracts.sh`, `image-promotion-gate.sh`, `verus-verification.sh` | yes | static / contract gates |
+
+Shipped tool versions are bumped **explicitly by a developer and committed**,
+never resolved by CI: `bash script/build/agent-versions.sh --write` rewrites the
+four installer defaults (`codex`, `opencode`, `claude`, `copilot`) and the
+lockfile upgrade scripts bump `dsh`/`pnpm` and `pi`/`pi-claude-bridge`. Ordinary
+and release builds consume only the committed values. The recipe/install
+contract is documented in [`images/tools/README.md`](images/tools/README.md);
+the normative tool-image contract is
+[ADR-0031](docs/adr/0031-tool-image-contract.md).
+
+The restricted-egress gate (`shipped-installer-network.sh`) runs on a
+**dispatched** native-amd64 `shipped-tool-recipes.yml` run with
+`full_contract: true`: that job runs the recipe audit with `--overrides --chain`
+and then the network gate with `--overrides`, producing real native-amd64
+evidence for the installed vendored installers against the deny-by-default
+proxy. The **default PR** run of the same workflow (no `full_contract`) runs
+only the default recipe audit and does **not** invoke the network gate, so a PR
+is not blocked on the restricted-egress matrix. Run the network gate locally
+before merging a version bump if you want that evidence before the dispatched
+run.
+
+The Docker gate (`shipped-tool-recipes.sh`, `pi-layer-runtime.sh`) needs no VM:
+it drives real `docker buildx`/`docker run`. The end-to-end VM smoke
+(`script/test/e2e.sh`) is separate and must be run manually on Apple Silicon
+before merge; a numeric uid in a container is **not** evidence of the
+launcher/MSB boot path.
 
 ## CI action pins
 
