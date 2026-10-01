@@ -47,8 +47,46 @@ an updated base: changed recipe/build inputs or a successful explicit refresh,
 never an ordinary launch-time upstream check. A changed selected manifest digest
 invokes this rebase policy when layer inputs are unchanged; an unchanged digest
 does not. Failed destination checks block that launch without replacing its
-retained working composition. Artifact lookup and precedence remain with
+retained working composition.
+
+## Artifact selection
+
+Resolved by
 [Selecting artifacts for a base-only rebase](https://github.com/gregwebs/agent-vm/issues/215).
+
+Select artifacts in parent-derived order before building:
+
+1. Prefer a validated shared-cache artifact with the exact build identity for
+   the selected destination parent.
+2. Otherwise, look for a validated, available artifact in **this project's
+   retained last composition**. Do not search other projects' histories or an
+   arbitrary shared index for older rebase candidates. A project without a prior
+   composition still shares exact build-identity hits, but builds on a miss.
+3. Reuse that prior artifact only when the base is the sole changed build input
+   for the layer and its declared ancestors. Compare normalized build contexts,
+   resolved versions and all passed build arguments except `BASE_IMAGE`, declared
+   parent relationships, and union account data. Retain the scheme/platform
+   identity boundaries too. Ignoring the parent hash alone is not proof: trace
+   retained provenance to establish that ancestor differences are base-only.
+4. Otherwise build normally. A missing prior artifact is a build miss, not a
+   reason to search another project's history.
+
+Eligibility is **per layer**, not all-or-nothing for the catalog. A simultaneous
+base change and tool-version change may rebase unchanged independent layers
+while normally building that tool and its descendants. A non-base ancestor
+change disqualifies its descendants; an unrelated layer change does not.
+Changed union account data affects every layer's foundation and disqualifies
+all prior artifacts. Current-parent and rebased artifacts may coexist in one
+composition, subject to the destination checks above.
+
+Record sufficient resolved-input and original build-parent metadata with the
+retained composition to make this comparison without Docker or an upstream
+lookup, including through repeated rebases. Compute the final identity from the
+destination composition root and the selected artifact identities in stitch
+order before layer builds; planned normal builds use their computed build
+identities. Reuse keeps original artifact identities rather than relabeling
+artifacts as current-parent builds. This preserves the no-Docker cache-hit path
+and shared reuse of an identical final composition.
 
 Exact option syntax and rebuild targeting remain with Upgrade pattern for tool
 images. CI/published-surface integration remains with CI, published surface, and
