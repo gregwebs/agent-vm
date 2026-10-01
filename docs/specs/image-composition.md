@@ -1,11 +1,11 @@
 # Image composition: implementation handoff
 
-Status: draft handoff; one source gap must be resolved before `/breakdown`.
+Status: decision-complete handoff, ready for `/breakdown`.
 Not implemented. Source map:
 [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 This consolidates the handoff for `/breakdown`, not an implementation plan or a
-claim that these interfaces exist today. The source gaps below are explicit
-prerequisites, not implementation discretion.
+claim that these interfaces exist today. The decisions below are settled
+requirements, not implementation discretion.
 
 ## Destination and authority
 
@@ -25,7 +25,7 @@ trade-offs. Later amendments override historical wording:
 | [ADR-0030](../adr/0030-tool-versions-in-identity-and-current-tags.md) | Version selection, exact installs, build-argument identity, current tags |
 | [ADR-0031](../adr/0031-tool-image-contract.md) | Tool image contract T1–T7 and stitch checks S1–S4 |
 | [ADR-0032](../adr/0032-one-layer-kind.md) | One layer kind, derived order, accounts, widened T2, S4, configuration migration |
-| [ADR-0033](../adr/0033-default-rebase-with-build-provenance.md) | Default rebase, original build provenance, destination checks |
+| [ADR-0033](../adr/0033-default-rebase-with-build-provenance.md) | Default rebase, project-local candidate selection, current-parent precedence, original build provenance, destination checks |
 | [ADR-0034](../adr/0034-versioned-image-releases.md) | Release assets, pinned image version, shared composition entry point, `--build`, image-API migration |
 | [Acquisition cost of a versioned image release](https://github.com/gregwebs/agent-vm/issues/212#issuecomment-5919942194) | Full download/ingest accepted; no repeated acquisition of a cached image |
 | [Eviction and GC for the local image caches](https://github.com/gregwebs/agent-vm/issues/213#issuecomment-5920203490) | Explicit cleanup, retained roots, persistent selections, ownership and lifetime guards |
@@ -40,7 +40,7 @@ Use [CONTEXT.md](../../CONTEXT.md)'s vocabulary. A **Tool** is a Layer with a
 command, not a second layer kind. “Tool image contract” retains its historical
 name but governs every layer image.
 
-## Readiness blockers
+## Readiness
 
 [Acyclic composition root and identity boundaries](https://github.com/gregwebs/agent-vm/issues/214)
 is resolved: the root is base plus generated union accounts, with no catalog
@@ -57,16 +57,11 @@ interfaces, launcher-pinned archive digests and a publication gate.
 [Local base identity, caching, and refresh policy](https://github.com/gregwebs/agent-vm/issues/219)
 is resolved in ADR-0034: shared recipe-keyed base selection, no warm-launch
 Docker/network probe, recipe-change or explicit refresh, and atomic adoption.
-The remaining gap is:
-
-1. **[Selecting artifacts for a base-only rebase](https://github.com/gregwebs/agent-vm/issues/215).** New-parent identities miss the original build
-   artifacts. Decide how a launch locates eligible old artifacts, establishes
-   that only the base changed, and selects when both current-parent builds and
-   older reusable artifacts exist. Retained project compositions are a possible
-   lookup source; that policy has not been selected.
-Until artifact selection is answered, the rebase/reuse sections below record
-constraints, not an executable resolution of that gap. Do not use the draft
-as authority to invent the missing policy.
+[Selecting artifacts for a base-only rebase](https://github.com/gregwebs/agent-vm/issues/215)
+is resolved in ADR-0033: exact current-parent artifacts win; otherwise eligible
+artifacts come from the project's retained last composition, with per-layer
+base-only eligibility and normal builds on a miss. No source decision gaps
+remain before `/breakdown`.
 
 ## Observable paths
 
@@ -301,9 +296,26 @@ change detection or ABI validation.
   old base account files forward.
 - Check destination base-file collisions, cross-layer collisions, command
   shadowing, and config conflicts even when source artifacts are cached.
-- Source, version, declared-parent, and other input changes still cause normal
-  builds. Explicit rebuild uses normal BuildKit caching and produces artifacts
-  built against the destination, not falsely relabeled reused files.
+- Select artifacts in parent-derived order: prefer validated shared-cache
+  artifacts with exact destination-parent build identities; otherwise inspect
+  this project's retained last composition, never other projects' histories or
+  arbitrary shared older-artifact indexes. No prior composition or missing prior
+  artifacts means normal builds on exact-cache misses.
+- Determine base-only eligibility per layer and its declared ancestors using
+  retained resolved inputs and original provenance: normalized contexts,
+  resolved versions, passed build arguments except `BASE_IMAGE`, parent
+  relationships, union account data, and scheme/platform boundaries. Ignoring
+  the parent hash alone is insufficient. Preserve metadata through repeated
+  rebases; selection and pre-build identity calculation need no Docker or
+  upstream lookup.
+- Source, version, declared-parent, and other non-base input changes cause normal
+  builds for affected layers and descendants; unrelated unchanged layers may
+  still rebase during the same launch. Changed union account data affects all
+  layers. Mixing exact current-parent artifacts and eligible prior artifacts is
+  permitted, subject to destination checks. The final key covers the destination
+  root and selected original or planned normal-build identities in stitch order.
+  Explicit rebuild uses normal BuildKit caching and produces artifacts built
+  against the destination, not falsely relabeled reused files.
 - Do not introduce compatibility epochs, per-layer rebase opt-ins, a runtime/build
   base split, or runtime dependency management.
 
@@ -398,8 +410,8 @@ launch sweep, size limit, or time-based eviction in this implementation.
 These are observable completion checks, not preselected build slices. Each
 implementation ticket should name which checks it delivers.
 
-0. **Readiness:** resolve the remaining artifact-selection blocker above, amend
-   its owning ADRs and glossary entries, and align this handoff before slicing tickets.
+0. **Readiness:** all source decisions are resolved; use the owning ADRs and
+   this aligned handoff when slicing tickets.
 1. **Config:** commandless and launchable layers resolve consistently; child-first
    declarations sort correctly; cycles/missing parents fail before Docker;
    injected-to-declared identical sources retain identity; legacy authoring gets
@@ -452,8 +464,17 @@ implementation ticket should name which checks it delivers.
 7. **Rebase:** base-only updates skip installers, preserve original provenance,
    regenerate accounts, warn, and run destination checks. A destination collision
    fails even with cached artifacts and preserves the project's retained working
-   composition. Explicit rebuild produces new-parent build
-   provenance. A structural pass makes no ABI guarantee.
+   composition. Exact current-parent artifacts beat older eligible artifacts.
+   Older candidates come only from the project's retained last composition; a
+   project without history shares exact-cache hits but builds on misses. Missing
+   prior artifacts also build normally. Repeated rebases retain enough input
+   metadata and provenance to select artifacts without Docker. A base change plus
+   an independent tool bump rebases unchanged siblings while normally building
+   the changed tool and descendants; account-data changes disqualify all prior
+   artifacts. Mixed current-parent/rebased compositions have pre-build keys based
+   on the destination root and selected artifact identities, never falsely
+   relabeled provenance. Explicit rebuild produces new-parent build provenance.
+   A structural pass makes no ABI guarantee.
 8. **Fast path/acquisition:** a cold default launch downloads the pinned asset
    and ingests without Docker; a warm same-version launch does neither; an
    image-version change performs full acquisition successfully. Download failure
