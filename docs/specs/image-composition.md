@@ -394,7 +394,10 @@ implementation ticket should name which checks it delivers.
    overlap exemptions. Test rejection of changes to `User`, `WorkingDir`,
    `Entrypoint`, and `Cmd`; Env-only merging; base-label preservation and layer
    label filtering; and `A → B → C` overrides with unrelated-layer conflicts
-   still rejected and base/account files protected. Contract failures never
+   still rejected and base/account files protected. Verify ADR-0031's
+   parent-relative Env/label attribution: unchanged inherited values neither
+   reset another layer's changes nor trigger S4, including after rebase.
+   Contract failures never
    become indexed healthy images.
 6. **Accounts:** multiple declarations create one deterministic union visible
    during each build and in the guest. Locked shadow data is stable; collisions

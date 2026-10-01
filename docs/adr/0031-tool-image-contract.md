@@ -44,6 +44,18 @@ This table is the only normative copy of the contract. **T** clauses are checked
 once per tool image, when it is built, against its parent. **S** clauses are
 **stitch checks**, run across the tool images being stitched.
 
+For S3/S4, a layer's own Env/label changes are entries added or changed relative
+to its actual build parent's config, not its complete inherited config. Use this
+same attribution for merging and collision checks; unchanged inherited entries
+neither overwrite a composed value nor count as declarations. Retain these
+parent-relative changes with artifact provenance for rebase; do not recompute
+them against the destination root. An explicit assignment equal to the parent's
+value is indistinguishable from inheritance and contributes no change.
+
+For example, with root `X=0`, A setting `X=1`, and unrelated B merely inheriting
+`X=0`, stitching retains `X=1` without an S4 collision. The same principle
+prevents inherited labels from undoing another layer's label changes.
+
 | # | Clause | Checked |
 |---|---|---|
 | **T1** | **Builds on its parent.** The Dockerfile's final `FROM` resolves `${BASE_IMAGE}` (text check before the build), and the parent's `rootfs.diff_ids` are a prefix of the built image's. The stitcher identifies a tool's own layers by cutting off that prefix, so T1 is what makes stitching valid. | tool build |
@@ -55,8 +67,8 @@ once per tool image, when it is built, against its parent. **S** clauses are
 | **T7** | **Installs everything else readable by any uid** (the rest of C7). | documented |
 | **S1** | **No cross-tool file overlaps.** No non-directory path may be written by two tool images when neither is the other's ancestor (direct or transitive). Paths under the guest's tmpfs mounts (`TMPFS_GUEST_PREFIXES`: `/tmp`, `/run`, `/dev/shm`, `/var/run`) are ignored, since no running guest can see them. There is no other allow-list. | stitch |
 | **S2** | **No command shadowing.** Each tool's `command` resolves in the composed image to the same file it resolves to in its own tool image. | stitch |
-| **S3** | **Derived config.** Start with the composition root's config. Derive `PATH` as an additive union in stitch order; merge other environment variables in that order, last wins subject to S4. Preserve base labels and merge only layers' `org.agent-vm.*` labels in stitch order, last wins; discard other layer labels. All non-Env, non-label config fields remain the root's. | stitch (by construction) |
-| **S4** | **No unrelated-layer env collisions.** Two layers with neither a direct nor transitive ancestor relationship may not declare different values for the same environment variable. Identical values are allowed, `PATH` is exempt, and descendants may override ancestors. Labels and other config fields are not S4's key domain. | stitch |
+| **S3** | **Derived config.** Start with the composition root's config. Derive `PATH` as an additive union in stitch order; merge only each layer's own changes to other environment variables in that order, last wins subject to S4. Preserve base labels and merge only layers' own changes to `org.agent-vm.*` labels in stitch order, last wins; discard other layer labels. All non-Env, non-label config fields remain the root's. | stitch (by construction) |
+| **S4** | **No unrelated-layer env collisions.** Two layers with neither a direct nor transitive ancestor relationship may not contribute own changes with different values for the same environment variable. Identical values are allowed, `PATH` is exempt, and descendants may override ancestors. Labels and other config fields are not S4's key domain. | stitch |
 
 - **A violation is a hard error with no opt-out** (ADR-0003 D2/D6). The error
   names the layer, and for S1/S4 both layers and the path/environment key.
