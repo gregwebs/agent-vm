@@ -1,0 +1,183 @@
+# ADR-0034: Versioned image releases instead of a continuously published registry
+
+Accepted (decision), not yet implemented. Resolved by
+[CI, published surface, and image-API migration](https://github.com/gregwebs/agent-vm/issues/209)
+on [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
+
+The image is **released**, not published. One artifact — the composed default
+image — is cut as a versioned GitHub Release asset (an OCI archive, one per
+architecture) and acquired by downloading it and ingesting it with the
+registry-less `microsandbox_image::load_archive` the compose path already uses.
+The GHCR packages `agent-vm-base` and `agent-vm-template`, the hourly publish,
+and the retention and promotion jobs that served them are retired. A launcher
+hardcodes the exact image version it was built against; image versions are their
+own sequence, decoupled from the launcher's. Tool versions become committed
+build inputs rather than something CI resolves, and a bump is an explicit,
+reviewable act.
+
+## Context
+
+The continuous-publish pipeline was not delivering the design it was built for.
+`defaults::DEFAULT_IMAGE_REF` points at `agent-vm-template:latest`, which is an
+**image-API 1** image built 2026-09-15 whose layer history still installs
+chromium, `chrome-devtools-mcp`, pip `black`/`isort` and a `codestyle` clone —
+all of which ADR-0032 makes Layers, not Base. `agent-vm-base` is private and
+401s to anonymous pulls, so every launch whose declared set differs from the
+shipped default fails on the base pull. `check-image-promotion-gate.sh` requires
+npm `main == x64 == arm64`, and `@wirenboard/agent-vm-linux-arm64` does not exist
+on npm, so `:latest` could never be promoted; the pipeline pushed ~240 tags of
+which the only user-visible one was stale. Separately, the owner's releases are
+mostly Rust-only changes with no image change at all, so coupling the two
+cadences was wrong on its own terms. The image CI jobs have been disabled.
+
+Three facts made the alternative cheap:
+
+- `images/tools/` is already compiled into the binary (`include_dir!`, with a
+  test asserting the snapshot equals the sources CI builds from), and the tool
+  layers are already rebuilt locally on the compose path. The registry's only
+  unique contribution was the **Base image** and the zero-Docker-call fast path.
+- The registry-less ingest path already exists: `load_archive` is what the
+  compose path uses for the derived image. Acquisition, by contrast, is
+  microsandbox's own registry pull (`PullPolicy`), so only acquisition changes.
+- With versioned builds, the layer Dockerfiles carry exact version defaults, so
+  **no `AGENT_VERSION_*` build args are passed at all**. That retires ADR-0019's
+  "the launcher's compose path passes exactly one build arg (`BASE_IMAGE`)"
+  constraint, and makes a CI build and a local build the same operation.
+
+## Decisions
+
+### One artifact, acquired without a registry
+
+- **The published surface is exactly one artifact: the composed default image.**
+  `agent-vm-base` and `agent-vm-template` stop being published, and the existing
+  GHCR packages are deleted rather than frozen.
+- **It is distributed as a GitHub Release asset**, one per architecture
+  (`< 2 GiB` per asset, no total limit), and acquired by downloading it and
+  calling `microsandbox_image::load_archive`. No registry pull, therefore no
+  registry to operate, no retention job, no promotion gate, and no private
+  package to make public.
+- **The Base image is not published either.** A composer builds it locally from
+  `images/Dockerfile`, which joins `images/tools/` in being embedded. This is
+  affordable because the base is only ever needed by someone who is already
+  composing, and therefore already running Docker.
+- **The published surface lives in this repo**, as a separate release namespace
+  and its own path-filtered workflow, not a separate repository. The image
+  sources are compiled into the binary, so moving them out would mean a
+  submodule and a two-step merge for every recipe change; the cadence problem
+  this solves is a release-namespace problem, not an ownership one.
+
+### Versioning
+
+- **A launcher hardcodes the exact image version it was built against**, and a
+  code-only release reuses the previous image version. Nothing is resolved at
+  runtime and no alias moves. This is what makes "most releases have no image
+  change" literally true: there is nothing to republish and nothing to look up.
+- **Image versions are their own sequence**, decoupled from the launcher
+  version. The two lineages have different cadences, so coupling them would
+  force either visible skew or an image rebuild on every code release.
+- **`images/min-agent-vm-version` becomes the cross-version interface**, now
+  asserting "this artifact requires launcher ≥ X" rather than gating a moving
+  tag.
+- **Tool versions are committed inputs.** `script/build/agent-versions.sh` stops
+  being a CI step and becomes a developer tool: resolve latest locally, write
+  the exact versions into the **Layer** Dockerfiles' defaults (ADR-0030's
+  "defaults are exact versions in each Dockerfile", now load-bearing rather than
+  aspirational), commit, and cut an image version when a **Layer identity**
+  actually changes. The lockfile-pinned layers keep their existing
+  `upgrade-*.sh` scripts.
+
+### Producing the artifact
+
+- **The release pipeline runs the same composition code the launcher runs** —
+  ADR-0029's "one implementation" taken literally — with three deliberate
+  differences, which are the only things that make it a release run rather than
+  a launch:
+  1. **composition is forced and the catalog is pinned to the shipped default.**
+     Otherwise `chain_root` returns `Template` and the launch tries to download
+     the very artifact being produced, and resolving config from the working
+     directory would compose the wrong set;
+  2. **the cache probe is bypassed** — a release run is a cold composition
+     (`final_is_cached` consults the msb cache, which CI does not have);
+  3. **it stops before the msb ingest**, emitting the OCI archive rather than
+     populating a boot cache.
+  Everything else is shared: the DAG driver, the contract and stitch checks, the
+  stitcher, and the manifest writer.
+- **It is a separate entry point, not a launch verb**, because it launches
+  nothing.
+
+### Building instead of downloading
+
+- **`--build` materialises the image by building rather than downloading**, and
+  is sticky via config. For the shipped default set it builds the Base locally
+  and composes the default Layers; a buildx user can therefore run agent-vm
+  without ever downloading the artifact.
+- **It produces a local composition, not a copy of the published image.** The
+  Base is `FROM debian:13-slim` with unpinned apt packages, so it cannot be
+  byte-identical to a published Base. `--build` is a composition choice, and
+  ADR-0019 D6 already keeps a locally composed root out of `--update-check`.
+- **There is no automatic fallback to building.** Silently replacing a verified
+  published artifact with a from-scratch build is too much surprise for a
+  multi-minute operation.
+- **A prerequisite:** the Base must reach the builder driver-independently, as
+  an OCI-layout named context — the mechanism ADR-0029 already uses for declared
+  parents. Today `pin_docker_base` puts it in Docker's image store, which pins
+  the whole compose path to the `docker` buildx driver and therefore excludes
+  every user whose builder is `docker-container`, i.e. the default
+  `docker buildx create` setup. That is a defect in the existing compose path,
+  not only in `--build`.
+
+### Migration
+
+- **No backwards compatibility, and no deprecation window.** No dual mechanism,
+  no GHCR fallback, and no image-API 4: nothing in this rework changes what the
+  launcher expects *inside* the image (declared accounts and stitching are
+  launcher-side, and the composed layer list is unchanged). The only cost to an
+  upgraded launcher is one re-download into the msb cache.
+- **`MIN_SUPPORTED_IMAGE_API` moves 1 → 3 and ADR-0019 D11's legacy `seed.d`
+  fallback is deleted.** D11 tied that removal to the `MIN` bump; it existed only
+  so a freshly upgraded launcher could keep booting a cached API-2 template, and
+  with a launcher-pinned versioned artifact there is no such template.
+- **`.agent-vm/layers/` is not special.** Directories there are no longer
+  discovered, per ADR-0032.
+- **Ordering requirement:** because the image CI is off and `:latest` is frozen
+  at API-1 content, a working pinned artifact must exist **before** the launcher
+  release that references it. This is the problem the old promotion gate
+  existed to solve, so its replacement must assert it.
+
+## Considered options
+
+- **Publish per-layer images.** Rejected by the owner while charting: Layers are
+  ephemeral build intermediates, and ADR-0029's DAG means a shipped Layer is
+  never another Layer's `FROM`, so there is nothing for a registry to serve.
+- **Keep GHCR and only change the tag scheme.** Rejected: it retains the
+  retention job, the promotion gate, the private-package problem and a moving
+  alias, while the complaint was the publishing model itself.
+- **Embed the Base and composed default in the binary**, the way the Layer
+  recipes are. Rejected on size: the composed default is ~1 GB compressed
+  against an npm tarball ceiling of roughly 193–210 MB, and the platform package
+  is already 107 MB. It would only buy an offline first run, which is not a goal.
+- **A separate image repository.** Rejected for now (see "One artifact"): it
+  costs a submodule and a two-step merge because the sources are compiled in.
+  Available later if the artifact ever needs its own maintainers or consumers.
+- **A build/download channel or alias resolved by the launcher.** Rejected: it
+  reintroduces the moving reference this ADR removes.
+- **Publishing only the Base and building Layers on first run.** Rejected: it
+  would make Docker mandatory for every user, including the default set, and
+  delete ADR-0019's zero-Docker-call fast path.
+
+## Consequences
+
+- The fast path gets simpler than before: first run is one pinned download plus
+  `load_archive` — no Docker, no registry, no moving tag.
+- `load_archive` moves onto the first-run path, so its non-incremental behaviour
+  (it re-reads every blob, ~18 s per 1 GB) becomes a first-run cost rather than
+  a rebuild cost.
+- Release assets are permanent, so the CI-side untagged-digit-accumulation
+  problem disappears, while the local OCI layout and msb cache still hold
+  compressed blobs twice with no eviction policy between them.
+- Layer-level reproducibility is real — the same committed inputs give the same
+  Layer identities — but whole-image reproducibility is not, because of the
+  floating Base. Rebuilding the published artifact to verify it is not offered.
+- The release pipeline depends on the same composition code as the launcher, so
+  a composition regression is caught by the release build, but a release-only
+  regression in the pinned-catalog or cold-cache path would not be.

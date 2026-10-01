@@ -2,6 +2,16 @@
 
 ## Status
 
+**Superseded in part by [ADR-0032](0032-one-layer-kind.md)** (issue #207). This
+ADR's two load-bearing models are retired: the ordered **layer chain** (every
+layer now builds `FROM` a declared parent and is joined by stitching) and the
+**layer image contract** (C1–C8, now [ADR-0031](0031-tool-image-contract.md)'s
+T/S clauses governing every layer image). What survives and is still normative
+elsewhere in this file: registry-less ingest, hash-as-staleness-check, hard-fail,
+the `--layer` flag, the `$AGENT_VM_LAYER` rejection, and the `Base link`
+(ADR-0003 issue-#98 amendment). The text below is kept as the history of how
+layers were built, and its clause table is no longer normative for anything.
+
 Accepted. A project declares an ordered **chain** of layers; `--layer` is a
 repeatable flag appended after the project's own chain; `$AGENT_VM_LAYER` is
 rejected outright if set; the base is addressed through a Docker base link
@@ -197,6 +207,11 @@ unchanged.)
 
 ### The layer image contract
 
+> **Retired by [ADR-0032](0032-one-layer-kind.md).** The table below governed
+> project tooling layers until layers and tools became one kind. It is kept for
+> history; the normative contract for every layer image is
+> [ADR-0031](0031-tool-image-contract.md)'s, as widened by ADR-0032.
+
 Each chain step's `Dockerfile` (`.agent-vm/layers/<NN-name>/Dockerfile`)
 MUST satisfy all eight clauses below. Four are **enforced** — checked
 against the *built image's* OCI config at build time, not against Dockerfile
@@ -216,6 +231,10 @@ before the prompt and gives an error the image check cannot phrase
 | **C6** | **Keeps `/bin/bash` present and `/etc/passwd`+`/etc/group` appendable.** A layer may *append* its own accounts (the `chrome` example does) but must not replace, lock or make either file immutable, and must not remove `/bin/bash`. | Documented | — | The guest-identity machinery (ADR-0001/0002) cannot append the launching host uid |
 | **C7** | **Installs tools readable and executable by any uid** (`a+rX`; not inside a `0700` home). | Documented | — | The guest runs as an arbitrary host uid (ADR-0001), so mode-0700 tools are unusable |
 | **C8** | **Advertises a capability only when it works.** Write `/etc/agent-vm-capabilities/<name>` only after the layer's own build-time sanity checks pass (API 2; `chrome-devtools-mcp` is the worked example). | Documented | — | The launcher wires up an MCP that then fails at runtime |
+
+Decided, not yet built: **tool images** follow their own contract,
+[ADR-0031](0031-tool-image-contract.md)'s tool image contract and stitch
+checks. This table will then govern project tooling layers only.
 
 This table is the only normative copy of the contract. `CONTEXT.md`,
 `USAGE.md` and `examples/layers/README.md` link here; a clause change is an
