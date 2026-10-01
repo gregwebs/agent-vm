@@ -28,6 +28,12 @@ rebased composition may reuse those artifacts on a new base with fresh
 structural checks. A parent change due solely to a base update no longer
 necessarily rebuilds every layer.
 
+**Composition-root boundary clarified** by
+[Acyclic composition root and identity boundaries](https://github.com/gregwebs/agent-vm/issues/214).
+The root is base plus generated union accounts, with no catalog layers. This
+replaces the circular root identity and the old root-as-finished-image wording;
+all catalog layers, shipped or project-declared, sit in the DAG above it.
+
 ## Context
 
 Layers were built before tools, and the two never merged. ADR-0003 made project
@@ -109,17 +115,30 @@ error naming the entries to add — the same shape of guardrail, retargeted from
   check, and the failure it was guarding against, a cycle, is now caught
   directly.
 
-### The composition root of a layered launch is composed locally
+### The composition root is the foundation, not the finished image
 
-Whenever a launch declares any layer beyond the shipped set, the root it
-composes from is the **locally stitched composed image** — base plus tool
-layers — and never the published template. The template stops being a layered
-launch's parent; a launch that declares no layers beyond the shipped default
-still boots it verbatim with zero Docker calls, unchanged.
+The **composition root** is the base image plus the generated union account
+layer, when accounts are declared. It contains **no catalog layers**. Every
+catalog layer — including every shipped tool — builds above this foundation
+or its declared layer parent. The final derived image stitches the foundation
+and each participating layer's own layers exactly once.
 
-This makes every stitch and contract check operate against a **local** parent
-rather than one pulled from a registry, which is what the stitching prototype had
-to work around with a local registry push.
+```text
+Base image + generated union accounts = Composition root
+                                           ├─ codex
+                                           ├─ claude ── claude-plugin
+                                           └─ rust-dev
+Root + ordered own layers = Derived image (boot image)
+```
+
+Composition uses a local foundation, never the released composed default as a
+parent. A released default or an explicit image booted verbatim is a finished
+**boot image**, not a composition root. ADR-0034's default release path retains
+zero Docker calls; selecting a local build composes even the shipped set.
+
+This separates build foundations from acquisition/boot selection, and removes
+the identity cycle caused by putting layer identities inside their own parent's
+identity.
 
 ### Everything is stitched
 
@@ -136,8 +155,10 @@ order. Only the derived image is ingested into the msb cache.
   ADR-0030's build-arg input. A layer whose parent is the composition root
   therefore anchors on the **root's identity**, not the base digest. Position
   does not enter; neither does provenance.
-- The **composition root** = `hash(base digest, ordered layer identities,
-  generated account layer identity when accounts are declared)`.
+- The **composition root** = `hash(base digest, generated account layer
+  identity when accounts are declared)`. Its identity contains no catalog-layer
+  identities. The generated accounts depend on the base and declared account
+  data, not on the build identities of the layers declaring them.
 - The **derived image** = `hash(composition root identity, ordered layer
   identities)`. Order enters here and only here, because order is the manifest's
   layer order.
@@ -254,10 +275,12 @@ Accounts become data on the layer entry rather than a `RUN` step:
   the error names them.
 - **Cold cache** on the v2 bump, for layer images, the composition root and
   derived images. No grandfathering.
-- **Changing a declared account rebuilds every layer above the composition
-  root** — the same cost as bumping a tool, which is already an input to their
-  identity. This is the price of the union layer sitting at the root instead of
-  per declaring layer.
+- **Changing a declared account changes the composition root and rebuilds
+  every layer above it.** This is the price of the union layer sitting at the
+  root instead of per declaring layer. A tool source/version change instead
+  rebuilds that tool and its declared descendants, not independent siblings;
+  no catalog layer is an input to the composition root. Base-only changes
+  remain subject to ADR-0033's rebase policy rather than this account-change rule.
 - **A shipped layer that declared an account would require CI to bake it into
   the published template**, because the shipped default set boots the published
   template verbatim. No shipped layer does today; the constraint lands on
