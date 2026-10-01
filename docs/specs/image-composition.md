@@ -1,6 +1,6 @@
 # Image composition: implementation handoff
 
-Status: draft handoff; three source gaps must be resolved before `/breakdown`.
+Status: draft handoff; two source gaps must be resolved before `/breakdown`.
 Not implemented. Source map:
 [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 This consolidates the handoff for `/breakdown`, not an implementation plan or a
@@ -50,7 +50,11 @@ is also resolved: project handles retain shared images, without redundant builds
 stitching, or ingest.
 [Config merge fields and ancestor overrides](https://github.com/gregwebs/agent-vm/issues/217)
 is resolved in ADR-0031's canonical contract: Env-only widening, filtered layer
-labels, and transitive ancestor overrides. The three remaining gaps are:
+labels, and transitive ancestor overrides.
+[Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220)
+is resolved in ADR-0034: release-only prefetch, retired update/custom-base
+interfaces, launcher-pinned archive digests and a publication gate.
+The two remaining gaps are:
 
 1. **[Selecting artifacts for a base-only rebase](https://github.com/gregwebs/agent-vm/issues/215).** New-parent identities miss the original build
    artifacts. Decide how a launch locates eligible old artifacts, establishes
@@ -61,21 +65,19 @@ labels, and transitive ancestor overrides. The three remaining gaps are:
    A floating locally built base digest is unknown until Docker runs. Decide how
    a warm launch selects its existing base without running Docker merely to
    compute identity, and when recipe/upstream/apt changes refresh that selection.
-3. **[Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220).**
-   Decide what `pull` and `--update-check` mean without a moving default tag,
-   whether custom base overrides remain supported, and the trusted metadata
-   that verifies archive bytes before ingest. A pinned release version alone
-   does not make a replaceable release asset immutable.
 
-Until these are answered, the identity/reuse/config/acquisition sections below
-record constraints, not an executable resolution of these gaps. Do not use the draft
+Until these are answered, the identity/reuse sections below record constraints,
+not an executable resolution of these gaps. Do not use the draft
 as authority to invent the missing policies.
 
 ## Observable paths
 
 ```text
-pinned release asset ── download ── load_archive ──────────── boot default
-                          (only if not already cached)
+pinned release asset ── download ── verify pinned SHA-256 ── load_archive
+                          (only if not already trusted/cached)       │
+                                                           record success
+                                                                    │
+                                                               boot default
 
 embedded base recipe ── local base + generated union accounts
                                           │
@@ -318,15 +320,35 @@ hourly publication, retention workflow, and moving-tag promotion gate.
   writes exact Dockerfile defaults. Keep lockfile-pinned layers' existing bump
   scripts. CI consumes committed inputs, never resolves latest on a schedule.
 - Download the pinned archive and ingest with registry-less `load_archive`.
-  Verify artifact integrity under repo security standards before ingest; the
-  trusted digest/metadata policy remains a readiness blocker, not permission to
-  treat a version string as a checksum. Accept
+  Pin each architecture's archive SHA-256 alongside the image version in the
+  launcher, and verify bytes before ingest; retain OCI descriptor/diff-id
+  verification. Trust the launcher release chain, not a checksum fetched with
+  the asset; this decision adds no separate image signing system. A mismatch
+  hard-fails without an override or fallback. Accept
   the full download and full-blob ingest even on a warm-cache version change;
   no incremental protocol or runtime register-from-manifest API is required.
 - Move `MIN_SUPPORTED_IMAGE_API` from 1 to 3 and remove the legacy `seed.d`
   fallback and its tests. No API-4 bump, dual-format window, or GHCR fallback.
-- Keep `pull`/`--update-check` away from locally derived image tags. Update their
-  release-facing references and messaging rather than restoring moving tags.
+- `pull` prefetches only the pinned release, without booting, independently of
+  project catalog or local-build settings. A verified, successfully ingested,
+  available image is a no-op. Remove `pull --image` and its image-selection env
+  handling. Locally derived and custom registry images are never targets.
+- Remove `--update-check` / `AGENT_VM_UPDATE_CHECK`, moving-tag probes and
+  pulled-digest markers, with no dedicated migration error or deprecation path.
+  Remove `--base-image` / `AGENT_VM_BASE_IMAGE` / `DEFAULT_BASE_IMAGE_REF` from
+  launch, pull and setup. Local composition uses the embedded base recipe;
+  explicit launch `--image` / `AGENT_VM_IMAGE_TAG` retains existing verbatim
+  boot-image acquisition, not composition or release overriding.
+- Warm launches trust a successful-ingest record bound to the pinned digest
+  and cached image identity while cache data is available, without network
+  checks or archive rehashing. Missing trust records or data trigger verified
+  reacquisition. Publish success only after verification and ingest; failed
+  acquisition must not overwrite a usable cached image or success record.
+- Before launcher publication, download every supported architecture's already
+  published asset, verify the embedded digest, validate architecture/image-API/
+  minimum-launcher compatibility, and smoke-test ingest and boot. Missing assets
+  or failed checks block publication, including code-only releases. Changed
+  artifact bytes require a new image version, never asset replacement.
 
 Update current user/contributor docs, examples, and test harnesses as the features
 land. Do not rewrite current usage documentation now to imply future support.
@@ -360,7 +382,7 @@ launch sweep, size limit, or time-based eviction in this implementation.
 These are observable completion checks, not preselected build slices. Each
 implementation ticket should name which checks it delivers.
 
-0. **Readiness:** resolve the three remaining blockers above, amend their owning
+0. **Readiness:** resolve the two remaining blockers above, amend their owning
    ADRs and glossary entries, and align this handoff before slicing tickets.
 1. **Config:** commandless and launchable layers resolve consistently; child-first
    declarations sort correctly; cycles/missing parents fail before Docker;
@@ -410,12 +432,21 @@ implementation ticket should name which checks it delivers.
 8. **Fast path/acquisition:** a cold default launch downloads the pinned asset
    and ingests without Docker; a warm same-version launch does neither; an
    image-version change performs full acquisition successfully. Download failure
-   never falls back to building. `--build` uses local composition.
+   never falls back to building. `--build` uses local composition. Wrong archive
+   bytes hard-fail before ingest; failed acquisition preserves usable cache.
+   Missing ingest records or cache data trigger verified reacquisition, while
+   trusted warm hits perform no network check or archive rehash. `pull` is a
+   boot-free, cached no-op or verified prefetch of the pinned release, unaffected
+   by catalog/build settings. Removed interfaces have no deprecation path;
+   explicit boot-image acquisition remains separate.
 9. **Release isolation:** hostile/local config cannot alter the release catalog;
    release mode neither probes msb nor ingests/boots/downloads itself. Artifact
    compatibility/integrity and existence are checked before its launcher release;
-   code-only releases keep the image version. Asset size stays within GitHub's
-   per-asset limit.
+   code-only releases keep the image version and pass the same gate. Check each
+   supported architecture's published bytes against the embedded SHA-256 and
+   require compatibility plus ingest/boot smoke success. Missing assets or
+   mismatches block publication; changed bytes require a new image version.
+   Asset size stays within GitHub's per-asset limit.
 10. **Cleanup:** dry-run is non-destructive; normal prune protects missing-project
     roots; deep prune frees inactive image roots without resetting selections;
     shared blobs/provenance needed by retained images survive. Busy builds/VMs
