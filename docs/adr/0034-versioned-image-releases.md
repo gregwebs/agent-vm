@@ -3,6 +3,8 @@
 Accepted (decision), not yet implemented. Resolved by
 [CI, published surface, and image-API migration](https://github.com/gregwebs/agent-vm/issues/209)
 on [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
+Acquisition and integrity amended by
+[Release acquisition interfaces and artifact integrity](https://github.com/gregwebs/agent-vm/issues/220).
 
 The image is **released**, not published. One artifact — the composed default
 image — is cut as a versioned GitHub Release asset (an OCI archive, one per
@@ -113,8 +115,8 @@ Three facts made the alternative cheap:
   without ever downloading the artifact.
 - **It produces a local composition, not a copy of the published image.** The
   Base is `FROM debian:13-slim` with unpinned apt packages, so it cannot be
-  byte-identical to a published Base. `--build` is a composition choice, and
-  ADR-0019 D6 already keeps a locally composed root out of `--update-check`.
+  byte-identical to a published Base. `--build` is a composition choice, not
+  release acquisition. Locally derived images are never acquisition targets.
 - **There is no automatic fallback to building.** Silently replacing a verified
   published artifact with a from-scratch build is too much surprise for a
   multi-minute operation.
@@ -125,6 +127,56 @@ Three facts made the alternative cheap:
   every user whose builder is `docker-container`, i.e. the default
   `docker buildx create` setup. That is a defect in the existing compose path,
   not only in `--build`.
+
+### Acquisition interfaces and trusted bytes
+
+- **`agent-vm pull` prefetches only the launcher-pinned release**, independently
+  of project catalog and local-build settings. It downloads, verifies and
+  ingests without booting a VM; an already verified, successfully ingested and
+  available image is a no-op. Remove `pull --image` and its image-selection env
+  handling. Neither custom registry images nor locally derived images are
+  targets of this verb.
+- **Remove `--update-check` and `AGENT_VM_UPDATE_CHECK`**, including moving-tag
+  probes and pulled-digest markers. No dedicated migration error or deprecation
+  path is required. A launcher has no newer image to discover within its fixed
+  selection; launcher-upgrade discovery is separate work.
+- **Remove `--base-image`, `AGENT_VM_BASE_IMAGE` and
+  `DEFAULT_BASE_IMAGE_REF`** from launch, pull and setup. Local composition uses
+  the embedded base recipe. Explicit launch `--image` / `AGENT_VM_IMAGE_TAG`
+  remains the separate verbatim boot-image path with its existing acquisition
+  semantics, not a composition foundation or a pinned-release override.
+- **The launcher pins an archive SHA-256 for every supported architecture
+  alongside its exact image version.** The launcher release chain is the trust
+  anchor; a checksum downloaded alongside a replaceable asset is not one.
+  No separate image signing system is added by this decision. Verify downloaded
+  archive bytes before `load_archive`, retaining OCI descriptor/diff-id checks
+  during ingest. Wrong bytes are a hard error: no checksum override, registry
+  fallback or automatic build fallback.
+- **Warm launches trust a successful-ingest record bound to the pinned archive
+  digest and cached image identity**, provided the cached image is available.
+  They do not contact the network or rehash an archive. Without that record or
+  available cache data, reacquire through the verified path. Publish success
+  only after verification and ingest finish; failed download, verification or
+  ingest must not overwrite a usable cached image or its success record.
+- **Release publication is gated on the assets already existing.** Before
+  publishing a launcher, download the published pinned asset for each supported
+  architecture, compare it against that launcher's embedded SHA-256, validate
+  architecture, image-API range and minimum-launcher compatibility, and
+  smoke-test ingest and boot. Any missing asset or failed check blocks
+  publication, including code-only releases that reuse an image version.
+  Changed artifact bytes require a new image version, never replacement under
+  an existing version. The digest pin still detects replacement if that policy
+  is violated.
+
+```text
+launcher: image version + architecture-specific SHA-256
+                       │
+           matching successful ingest + available cache ── boot
+                       │ miss
+             download ── verify SHA-256 ── load_archive ── record success
+                            │ mismatch
+                         hard error
+```
 
 ### Migration
 
@@ -141,8 +193,8 @@ Three facts made the alternative cheap:
   discovered, per ADR-0032.
 - **Ordering requirement:** because the image CI is off and `:latest` is frozen
   at API-1 content, a working pinned artifact must exist **before** the launcher
-  release that references it. This is the problem the old promotion gate
-  existed to solve, so its replacement must assert it.
+  release that references it. The acquisition release gate above replaces the
+  old promotion gate and asserts existence, integrity, compatibility and boot.
 
 ## Considered options
 
