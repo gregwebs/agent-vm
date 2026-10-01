@@ -418,7 +418,7 @@ image.
 
 ## Current tag
 
-A movable name in the shared OCI layout for the tool image the upgrade command
+A movable name in the shared OCI layout for the tool image the upgrade operation
 last built for a tool. A layer that is not a tool has no current tag: version
 resolution is a tool-image concept. A launch reads that image's version labels, not the image
 itself, so the upgrade carries onto a new base. Dropped when the tool's shipped
@@ -462,6 +462,19 @@ no layer's command shadowed by another's (**S2**), and — new in
 two unrelated layers may not declare different values for one environment
 variable (`PATH` exempt; descendants may override ancestors). See
 [ADR-0031](docs/adr/0031-tool-image-contract.md).
+
+## Rebuild
+
+Maintenance of a locally composed image at its selected versions, distinct from
+rebasing existing installed artifacts onto a new base. **Upgrade** is the mode
+that requests latest versions for eligible targets. See
+[the CLI decision](https://github.com/gregwebs/agent-vm/issues/234).
+
+## Upgrade
+
+The latest-version mode of a **rebuild**, not a separate command or an override
+of exact configuration pins. See
+[the CLI decision](https://github.com/gregwebs/agent-vm/issues/234).
 
 ## Rebased composition
 
