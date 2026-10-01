@@ -507,7 +507,17 @@ replaced. An order-**dependent** layer is expressible by declaring `parent`.
 The locally composed **boot image**: the **composition root** plus each
 participating catalog layer's own layers, joined once in derived stitch order.
 It is the finished composition, not an input to the identity of its foundation
-or participating artifacts.
+or participating artifacts. Identical composition inputs denote the same derived
+image across projects; a **project image handle** is a reference to it, not a
+separate image identity.
+
+## Project image handle
+
+A readable, project-specific reference to a **derived image**, distinct from the
+image's project-independent identity. Each project's retained handle is a GC
+root; several projects may retain the same image.
+
+_Avoid_: project image identity — the project names a reference, not its content.
 
 ## Layer identity / hash
 

@@ -162,9 +162,16 @@ order. Only the derived image is ingested into the msb cache.
 - The **derived image** = `hash(composition root identity, ordered layer
   identities)`. Order enters here and only here, because order is the manifest's
   layer order.
-- The derived tag stays `agent-vm-layer:<project-slug>-<hash>`, and the slug
-  stays **out** of the hash: two projects with byte-identical layers build twice
-  on purpose, so `docker image ls agent-vm-layer` stays a readable handle.
+- The **project image handle** stays
+  `agent-vm-layer:<project-slug>-<hash>`, with the slug **out** of identity.
+  Within the same local cache, projects with identical resolved build inputs
+  reuse validated layer artifacts. An identical derived composition already
+  ingested into msb is reused without stitching or ingesting again; registering
+  another project handle is metadata-only, not an archive read. Handles are
+  readable references and separately retained GC roots, not build or ingest
+  boundaries. Releasing one project's root cannot evict content retained by
+  another. This replaces the earlier "build twice on purpose" rule, as settled
+  by [Cross-project reuse of identical compositions](https://github.com/gregwebs/agent-vm/issues/216).
 - The tag stays a **computed hash, not the stitched manifest digest**. It has to
   be computable on the launch path before anything is built, which is what makes
   the hash the staleness check and keeps a cache-hit launch at zero Docker
