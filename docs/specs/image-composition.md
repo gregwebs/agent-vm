@@ -27,6 +27,7 @@ trade-offs. Later amendments override historical wording:
 | [ADR-0032](../adr/0032-one-layer-kind.md) | One layer kind, derived order, accounts, widened T2, S4, configuration migration |
 | [ADR-0033](../adr/0033-default-rebase-with-build-provenance.md) | Default rebase, project-local candidate selection, current-parent precedence, original build provenance, destination checks |
 | [ADR-0034](../adr/0034-versioned-image-releases.md) | Release assets, pinned image version, shared composition entry point, `--build`, image-API migration |
+| [ADR-0035](../adr/0035-declared-system-packages.md) | Declared system packages, generated union package foundation, snapshot pinning, **T3 ownership amendment** |
 | [Acquisition cost of a versioned image release](https://github.com/gregwebs/agent-vm/issues/212#issuecomment-5919942194) | Full download/ingest accepted; no repeated acquisition of a cached image |
 | [Eviction and GC for the local image caches](https://github.com/gregwebs/agent-vm/issues/213#issuecomment-5920203490) | Explicit cleanup, retained roots, persistent selections, ownership and lifetime guards |
 | [Cross-project reuse of identical compositions](https://github.com/gregwebs/agent-vm/issues/216) | Shared validated artifacts and ingested compositions; project handles are independent retained roots |
@@ -248,6 +249,10 @@ ADR-0032's amendments rather than maintaining a second normative table here:
   T3 base-path protection, T4 host platform, and T5 command resolution and
   permissions for any uid. T5 applies when a command exists. T6 capability
   honesty and T7 other-file readability remain documented requirements.
+  **T3 is amended by [ADR-0035](../adr/0035-declared-system-packages.md):** its
+  exemption is an **ownership** rule, so only launcher-generated foundation
+  layers may write package-manager state, and no layer runs `apt` at all. A path
+  allow-list is not an acceptable reading of T3.
 - Enforce S1 unrelated-layer file collisions (only guest tmpfs prefixes exempt),
   S2 command shadowing, amended S3 derived config, and S4 conflicting environment
   declarations by unrelated layers. Direct and transitive ancestor overrides are permitted
