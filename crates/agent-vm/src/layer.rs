@@ -38,13 +38,22 @@
 //! I/O/process-spawning code here — `docker buildx build` plus a
 //! registry-less `microsandbox_image::load_archive` ingest). `run.rs`
 //! orchestrates calling into all three from `launch()`.
+//!
+//! The identity section's enumeration rules are frozen as v1 (issue #228): the
+//! byte stream is pinned by the goldens in this module's `tests`, and the
+//! shared normalization now lives in `crate::composition::context`. The v2
+//! identity encoder in `crate::composition::identity` defines its own scheme
+//! tag and is not wired into `run.rs`; the active chain stays the only working
+//! model until the #228 cutover (CP10), which deletes this v1 path rather than
+//! re-recording its goldens.
 
 use std::{
     fs,
-    io::Read,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
+
+use crate::composition::{context::NormalizedContext, hex};
 
 use anyhow::{Context, Result, bail};
 // `microsandbox_image::Digest` (a content digest) and `sha2::Digest` (the
@@ -75,12 +84,13 @@ const REPO: &str = "agent-vm-layer";
 /// "msb-owned base with a Docker base link" amendment (issue #98).
 const BASE_REPO: &str = "agent-vm-base";
 
-/// Version tag for these enumeration rules. Exists so a future change to
-/// them deliberately invalidates every derived image instead of silently
-/// colliding with images hashed under the old rules — a collision there
-/// means running a toolchain that is not the one the layer describes, which
-/// is the single failure this module exists to prevent.
-const SCHEME_TAG: &[u8] = b"agent-vm-layer\x00v1\x00";
+/// Version tag for the v1 chain's enumeration rules. The bytes are frozen:
+/// v1 is the only encoder the launch path uses until CP10 deletes it, and the
+/// v2 encoder in `composition::identity` defines its own, separate tag. A
+/// future change to v1's rules would deliberately invalidate every derived
+/// image, but v1 is not changed — it is replaced, so the tag stays exactly
+/// as the goldens in this module's `tests` recorded it.
+const CHAIN_SCHEME_TAG_V1: &[u8] = b"agent-vm-layer\x00v1\x00";
 
 /// How much of the SHA-256 the tag carries, in hex characters. Truncating a
 /// digest at all follows the precedent elsewhere in this codebase of
@@ -147,207 +157,9 @@ pub struct LayerIdentity {
     pub position: ChainPosition,
 }
 
-/// Entry kinds. `Other` covers fifos, sockets and devices, which contribute
-/// a line and are never opened: reading a fifo blocks forever.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Dir,
-    File,
-    Symlink,
-    Other,
-}
-
-impl Kind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Kind::Dir => "dir",
-            Kind::File => "file",
-            Kind::Symlink => "symlink",
-            Kind::Other => "other",
-        }
-    }
-}
-
-/// One enumerated path's contribution to the canonical stream.
-///
-/// `rel` (and, transitively, `content` for a symlink) are raw bytes, not
-/// guaranteed UTF-8 — a relative path or symlink target on a Unix
-/// filesystem can be any byte sequence except NUL and `/`. Hashing via
-/// `OsStrExt::as_bytes()` rather than `to_string_lossy()` keeps the byte
-/// stream exact instead of silently mangling non-UTF-8 names into `\u{FFFD}`
-/// (which would make two different directory trees hash identically).
-struct Entry {
-    rel: Vec<u8>,
-    kind: Kind,
-    mode: &'static str,
-    size: String,
-    content: String,
-}
-
-/// Streams a file's contents through SHA-256 rather than reading it whole: a
-/// layer may legitimately vendor a large tarball, and the size guard below
-/// is informational (`file_count`/`hashed_bytes`) rather than a refusal, so
-/// this must stay bounded in memory.
-///
-/// Nothing here interprets `.dockerignore`. Implementing dockerignore
-/// matching (`!` negation, `**`, and the two runtimes' possibly-differing
-/// implementations) here would put build-context semantics in the launcher,
-/// where they could disagree with the runtime that applies them.
-/// Over-hashing's failure mode is a spurious rebuild, which is safe;
-/// under-hashing's is running a stale toolchain. A `.dockerignore` in the
-/// layer directory is therefore hashed like any other file.
-fn hash_file(path: &Path) -> Result<(String, u64)> {
-    let mut f = fs::File::open(path)
-        .with_context(|| format!("reading tooling layer context {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut n: u64 = 0;
-    loop {
-        let read = f
-            .read(&mut buf)
-            .with_context(|| format!("reading tooling layer context {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-        n += read as u64;
-    }
-    Ok((hex::encode(hasher.finalize()), n))
-}
-
-/// Normalizes a file's permissions to the one bit git tracks: `0755` when
-/// any execute bit is set, `0644` otherwise.
-///
-/// This is the least obvious line in the module and the reason it exists is
-/// portability, not tidiness. File permissions vary with the umask of
-/// whoever checked the repository out, so hashing the raw mode would give
-/// two developers on the same commit two different tags — and therefore two
-/// multi-minute builds of an identical image. Git tracks exactly one bit, so
-/// a checked-out layer hashes identically on every machine that checked it
-/// out, while `chmod +x build-helper.sh` still invalidates.
-///
-/// The accepted cost, worth stating because it narrows "a changed layer
-/// always rebuilds": a `chmod 0640` genuinely changes what a `COPY` puts in
-/// the image and does *not* change the tag.
-fn git_mode(mode: u32) -> &'static str {
-    if mode & 0o111 != 0 { "0755" } else { "0644" }
-}
-
-/// Recursively walks `dir` (never following symlinks), collecting one
-/// [`Entry`] per path below `dir` (`dir` itself is skipped — its own line
-/// would be a constant, and its relative path is empty, which would sort
-/// ahead of everything and say nothing).
-///
-/// Enumeration errors are fatal: over-hashing fails by rebuilding something
-/// that did not need it, which costs time; under-hashing fails by running a
-/// stale toolchain, which is the bug this module must not have.
-fn enumerate(dir: &Path) -> Result<(Vec<Entry>, u64)> {
-    let mut entries = Vec::new();
-    let mut hashed_bytes: u64 = 0;
-    enumerate_into(dir, dir, &mut entries, &mut hashed_bytes)?;
-    Ok((entries, hashed_bytes))
-}
-
-fn enumerate_into(
-    root: &Path,
-    dir: &Path,
-    entries: &mut Vec<Entry>,
-    hashed_bytes: &mut u64,
-) -> Result<()> {
-    let read_dir = fs::read_dir(dir)
-        .with_context(|| format!("reading tooling layer context {}", dir.display()))?;
-    for item in read_dir {
-        let item =
-            item.with_context(|| format!("reading tooling layer context {}", dir.display()))?;
-        let path = item.path();
-
-        // symlink_metadata (Lstat), never metadata/Stat: symlinks are not
-        // followed. Following them would let the declared context reach
-        // files outside itself, so the hash would depend on state the user
-        // never put in the layer; a symlink loop would hang the walk; and
-        // neither container runtime's symlink handling in a build context
-        // is something the launcher should pretend to model.
-        let meta = fs::symlink_metadata(&path)
-            .with_context(|| format!("reading tooling layer context {}", path.display()))?;
-
-        let rel = relative_bytes(root, &path)
-            .with_context(|| format!("reading tooling layer context {}", path.display()))?;
-        let file_type = meta.file_type();
-
-        if file_type.is_symlink() {
-            // Hashed by its target *string*, not the target's contents. A
-            // dangling symlink is therefore hashable and is not an error.
-            let target = fs::read_link(&path)
-                .with_context(|| format!("reading tooling layer context {}", path.display()))?;
-            let target_bytes = target.as_os_str().as_bytes();
-            let sum = Sha256::digest(target_bytes);
-            entries.push(Entry {
-                rel,
-                kind: Kind::Symlink,
-                mode: "",
-                size: target_bytes.len().to_string(),
-                content: hex::encode(sum),
-            });
-        } else if file_type.is_dir() {
-            // Directories contribute a line so that adding an empty
-            // directory changes the hash: a `COPY . .` makes an empty
-            // directory observable in the image. Their modes are
-            // deliberately *not* hashed — mkdir applies the process umask,
-            // so hashing them would give two developers on the same commit
-            // two different tags.
-            entries.push(Entry {
-                rel: rel.clone(),
-                kind: Kind::Dir,
-                mode: "",
-                size: String::new(),
-                content: String::new(),
-            });
-            enumerate_into(root, &path, entries, hashed_bytes)?;
-        } else if file_type.is_file() {
-            let (content, n) = hash_file(&path)?;
-            *hashed_bytes += n;
-            entries.push(Entry {
-                rel,
-                kind: Kind::File,
-                mode: git_mode(
-                    std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777,
-                ),
-                size: meta.len().to_string(),
-                content,
-            });
-        } else {
-            // fifos, sockets, devices: contribute a line, never opened.
-            // Reading a fifo blocks forever.
-            entries.push(Entry {
-                rel,
-                kind: Kind::Other,
-                mode: "",
-                size: String::new(),
-                content: String::new(),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// `path`'s slash-separated position relative to `root`, as raw bytes.
-///
-/// Hand-rolled rather than `Path::strip_prefix` + `to_string_lossy` so a
-/// non-UTF-8 relative path is carried through exactly (see [`Entry`]'s doc
-/// comment) instead of being lossily mangled. The platform separator (always
-/// `/` on the Unix targets this module runs on) needs no conversion, so this
-/// is a straight byte-slice copy after stripping the root prefix and any
-/// leading separator.
-fn relative_bytes(root: &Path, path: &Path) -> Result<Vec<u8>> {
-    let rel = path
-        .strip_prefix(root)
-        .map_err(|_| anyhow::anyhow!("{} is not under {}", path.display(), root.display()))?;
-    let bytes = rel.as_os_str().as_bytes();
-    Ok(bytes.to_vec())
-}
-
-/// Renders `(base_image_id, the directory tree under `dir`)` as one
-/// canonical, domain-separated, length-unambiguous byte stream:
+/// Wraps the frozen v1 chain header around the shared normalized
+/// enumeration ([`NormalizedContext`]), producing one canonical,
+/// domain-separated, length-unambiguous byte stream:
 ///
 /// ```text
 /// "agent-vm-layer\x00v1\x00"
@@ -356,16 +168,19 @@ fn relative_bytes(root: &Path, path: &Path) -> Result<Vec<u8>> {
 ///     <relPath> "\x00" <kind> "\x00" <mode> "\x00" <size> "\x00" <contentHash> "\x00"
 /// ```
 ///
+/// The enumeration and its normalization rules live in
+/// `composition::context`; this wrapper is all that is v1-specific about
+/// them. It is a separate function from [`hash_context`], and named, so the
+/// golden test in this module's `tests` submodule can pin the format against
+/// a literal expected byte string a human can read and argue with. An
+/// expected *digest* could be neither written nor reviewed by hand. The v1
+/// stream is **frozen**: CP1–CP9 forbid changing it and CP10 deletes the whole
+/// v1 encoder, so no future format change ever bumps [`CHAIN_SCHEME_TAG_V1`].
+/// A golden failure means investigate and revert — never re-record.
+///
 /// Every field is present on every entry; the ones a kind has no answer for
 /// are empty. That is what makes the stream unambiguous: no reading of it
 /// can be confused about where one entry ends.
-///
-/// This is a separate function from [`hash_context`], and named, so the
-/// golden test in this module's `tests` submodule can pin the format against
-/// a literal expected byte string a human can read and argue with. An
-/// expected *digest* could be neither written nor reviewed by hand — and it
-/// is precisely because the stream is pinned this legibly that a future
-/// format change only needs [`SCHEME_TAG`] bumped.
 ///
 /// The Dockerfile is not hashed separately from the rest. The layer
 /// directory *is* the build context, so `Dockerfile` is enumerated like
@@ -378,36 +193,14 @@ fn relative_bytes(root: &Path, path: &Path) -> Result<Vec<u8>> {
 /// healthy while missing its toolchain" is the exact outcome this design
 /// exists to prevent.
 fn canonical_stream(dir: &Path, base_image_id: &str) -> Result<(Vec<u8>, usize, u64)> {
-    let (mut entries, hashed_bytes) = enumerate(dir)?;
-
-    // Flat sort of the collected relative paths, not walk order. A
-    // per-directory (hierarchical) sort disagrees with a flat sort whenever
-    // a name containing '.' sorts differently against a sibling directory
-    // than their full paths would — "a.txt" before "a/b" flatly ('.' is
-    // 0x2E, '/' is 0x2F), after it hierarchically. A flat sort is the
-    // property that can be stated, tested, and reproduced regardless of
-    // readdir order.
-    entries.sort_by(|a, b| a.rel.cmp(&b.rel));
-
-    let count = entries.len();
+    let context = NormalizedContext::read(dir)?;
     let mut buf = Vec::new();
-    buf.extend_from_slice(SCHEME_TAG);
+    buf.extend_from_slice(CHAIN_SCHEME_TAG_V1);
     buf.extend_from_slice(b"base\x00");
     buf.extend_from_slice(base_image_id.as_bytes());
     buf.push(0);
-    for e in &entries {
-        buf.extend_from_slice(&e.rel);
-        buf.push(0);
-        buf.extend_from_slice(e.kind.as_str().as_bytes());
-        buf.push(0);
-        buf.extend_from_slice(e.mode.as_bytes());
-        buf.push(0);
-        buf.extend_from_slice(e.size.as_bytes());
-        buf.push(0);
-        buf.extend_from_slice(e.content.as_bytes());
-        buf.push(0);
-    }
-    Ok((buf, count, hashed_bytes))
+    context.write_entries(&mut buf);
+    Ok((buf, context.entry_count(), context.hashed_bytes()))
 }
 
 /// The SHA-256 of [`canonical_stream`], hex-encoded in full. [`resolve`]
@@ -2028,21 +1821,6 @@ pub async fn discard_step_image(
     }
 }
 
-// hex encode/decode without a new dependency: sha2 already gives us
-// GenericArray output, and the hex alphabet is trivial to hand-roll. Kept
-// tiny and private to this module rather than pulling in the `hex` crate for
-// two functions.
-mod hex {
-    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        let bytes = bytes.as_ref();
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            s.push_str(&format!("{b:02x}"));
-        }
-        s
-    }
-}
-
 /// Shared helpers for the crate's `#[cfg(test)]` suites: the Docker-dependent
 /// live-fixture machinery, plus the small builders the `layer` and
 /// `layer::contract` suites both need.
@@ -2416,6 +2194,167 @@ mod tests {
             dotted < nested,
             "a.txt must precede a/b: the enumeration sorts full relative paths flatly, not per directory"
         );
+    }
+
+    // --- v1 preservation goldens (issue #228 CP1 pivot) ---
+
+    /// The fixed base manifest digest the v1 goldens anchor on: `sha256:` plus
+    /// 64 lowercase `1`s. Fictional on purpose — it must never name a real
+    /// base, so a later encoder change cannot silently keep these green by
+    /// reading live state.
+    const GOLDEN_BASE_ID: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// The committed fixture directory plus the three entry kinds git cannot
+    /// store in one commit: an empty directory, a dangling symlink, and a
+    /// bound socket. The socket disappears when its listener drops, so it is
+    /// held for the fixture's lifetime.
+    struct GoldenContext {
+        dir: tempfile::TempDir,
+        _listener: std::os::unix::net::UnixListener,
+    }
+
+    /// Materializes the committed fixture at
+    /// `tests/fixtures/composition-v1-golden/`, setting modes explicitly
+    /// rather than trusting the umask (several entries are *about* what mode
+    /// contributes). `a.txt` is written 0640 and `a/b` 0664 so the golden
+    /// stream pins git-mode normalization, not the developer's checkout.
+    fn golden_context() -> GoldenContext {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (rel, bytes, mode) in [
+            (
+                "Dockerfile",
+                &include_bytes!("../tests/fixtures/composition-v1-golden/Dockerfile")[..],
+                0o644,
+            ),
+            (
+                "bin/run.sh",
+                &include_bytes!("../tests/fixtures/composition-v1-golden/bin/run.sh")[..],
+                0o755,
+            ),
+            (
+                "a.txt",
+                &include_bytes!("../tests/fixtures/composition-v1-golden/a.txt")[..],
+                0o640,
+            ),
+            (
+                "a/b",
+                &include_bytes!("../tests/fixtures/composition-v1-golden/a/b")[..],
+                0o664,
+            ),
+            (
+                "large.dat",
+                &include_bytes!("../tests/fixtures/composition-v1-golden/large.dat")[..],
+                0o644,
+            ),
+        ] {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        fs::create_dir(root.join("empty")).unwrap();
+        std::os::unix::fs::symlink("../outside", root.join("link")).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
+        GoldenContext {
+            dir,
+            _listener: listener,
+        }
+    }
+
+    // The v1 golden digest is recorded on 10afedb's unmodified hashing code
+    // and is never re-recorded: the extraction that follows must preserve it
+    // bit-for-bit until CP10 deletes v1 (see
+    // `docs/specs/image-composition.md` §2 and the CP1 preservation rule).
+    // It pins the flat sort, every trailing NUL, the empty-directory/symlink/
+    // socket lines, the execute-bit-only mode fold, and the 70,001-byte
+    // multi-read `large.dat`.
+    #[test]
+    fn v1_hash_context_golden_digest() {
+        let fixture = golden_context();
+        let (digest, count, bytes) = hash_context(fixture.dir.path(), GOLDEN_BASE_ID).unwrap();
+        assert_eq!(
+            digest,
+            "8a823c68753ba8cc06dc4edb00dfa9ad64998f28dd608b08d017f6cbe7ab5445"
+        );
+        assert_eq!((count, bytes), (10, 70052));
+    }
+
+    // The second golden anchors the *tag* pipeline end-to-end on the
+    // unmodified v1 code: `HASH_LEN` truncation, the project slug, and the
+    // predecessor anchoring that makes step 1 depend on step 0's hash. A
+    // recorded-once literal keeps the extraction honest even where the
+    // digest itself is already pinned above.
+    #[test]
+    fn v1_plan_chain_golden_tags() {
+        let first = golden_context();
+        let second = tempfile::tempdir().unwrap();
+        write_layer_file(
+            second.path(),
+            "Dockerfile",
+            "FROM scratch\nARG Y=2\n",
+            0o644,
+        );
+
+        let dirs = vec![
+            project_chain_dir(first.dir.path().to_path_buf()),
+            project_chain_dir(second.path().to_path_buf()),
+        ];
+        let plan = plan_chain(&dirs, Path::new("/work/my-app"), GOLDEN_BASE_ID).unwrap();
+
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan[0].id.tag,
+            "agent-vm-layer:my-app-8a823c68753ba8cc06dc4edb00dfa9ad"
+        );
+        assert_eq!(
+            plan[1].id.tag,
+            "agent-vm-layer:my-app-18ee14828fbce053de55f0e186a6cb21"
+        );
+    }
+
+    // The fixture above is deliberately ASCII-only, which leaves one v1
+    // normalization rule unpinned: `relative_bytes` carries a relative path's
+    // raw bytes, and a regression that switched to `to_string_lossy` would
+    // mangle every byte outside UTF-8 into U+FFFD while still passing every
+    // ASCII golden. This second golden holds that missing case. A non-UTF-8
+    // filename cannot be spelled in UTF-8 Rust source, so the entry is
+    // materialized here rather than committed, but its digest is recorded
+    // once from v1's raw-byte path handling (10afedb) exactly like the
+    // goldens above and is never re-recorded until CP10 deletes v1.
+    //
+    // APFS (macOS) refuses non-UTF-8 names at the VFS layer (EILSEQ), so the
+    // golden asserts on the platforms that allow them (the Linux CI job);
+    // `composition::context::tests::relative_bytes_preserves_non_utf8_bytes`
+    // pins the same behavior on every platform.
+    #[test]
+    fn v1_hash_context_golden_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_layer_file(root, "Dockerfile", "FROM scratch\n", 0o644);
+        // 0xE9 makes the name invalid UTF-8; `to_string_lossy` would replace it
+        // with U+FFFD (bytes EF BF BD) and change every following byte.
+        let raw_name = std::ffi::OsStr::from_bytes(b"caf\xE9.txt");
+        let path = root.join(raw_name);
+        match fs::write(&path, "x\n") {
+            Ok(()) => {}
+            // EILSEQ: 92 on macOS/APFS, 84 on Linux. Only the Linux CI job
+            // materializes this golden; on a refusing filesystem the
+            // cross-platform unit test is the guard.
+            Err(e) if matches!(e.raw_os_error(), Some(92) | Some(84)) => return,
+            Err(e) => panic!("writing the non-UTF-8 fixture failed unexpectedly: {e}"),
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (digest, count, bytes) = hash_context(root, GOLDEN_BASE_ID).unwrap();
+        assert_eq!(
+            digest,
+            "eb0d74907a7cdfb89c267256c309ca64b0172f99ca761c101ee6736f70223cea"
+        );
+        assert_eq!((count, bytes), (2, 15));
     }
 
     #[test]

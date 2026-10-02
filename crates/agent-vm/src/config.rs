@@ -662,6 +662,15 @@ impl ToolName {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Builds a fixture name through the same validator config uses, so a
+    /// composition test cannot invent a name the real grammar would reject.
+    /// Test-only: it exposes no production authoring surface.
+    #[cfg(test)]
+    pub(crate) fn for_test(raw: &str) -> Self {
+        validate_name(raw, Path::new("<composition fixture>"), 0)
+            .expect("composition fixture layer name is valid")
+    }
 }
 
 /// The catalog tools a tool wants available in its guest. These name **tools**,

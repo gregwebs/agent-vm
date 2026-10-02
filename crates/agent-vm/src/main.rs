@@ -2,6 +2,7 @@
 
 mod cli;
 mod clipboard;
+mod composition;
 mod config;
 mod credential_injection;
 mod credential_provider;

@@ -204,8 +204,8 @@ pub(crate) fn materialize(
 /// Write an embedded directory tree into `dest`.
 ///
 /// Every file is written mode `0o644` (no execute bit), explicitly, with **no**
-/// per-filename special cases. `layer::canonical_stream` folds a file's mode to
-/// a single execute bit (`layer::git_mode`), so a byte-identical git checkout of
+/// per-filename special cases. `composition::context` folds a file's mode to
+/// a single execute bit (`composition::context::git_mode`), so a byte-identical git checkout of
 /// these sources—also `100644`—must materialise identically or a local compose
 /// would build a different image than a `--layer`/example build of the same
 /// bytes. The execute bit a tool layer needs (`seed-claude-plugins.sh`) is
@@ -846,7 +846,7 @@ mod tests {
     }
 
     /// `write_tree` materialises every embedded file 0644, while
-    /// `layer::git_mode` folds an on-disk source file's mode to one execute
+    /// `composition::context::git_mode` folds an on-disk source file's mode to one execute
     /// bit. A source file that is executable on disk (i.e. committed `100755`)
     /// therefore hashes differently from the same bytes materialised into a
     /// build context -- a silent double build. The execute bit a layer needs
@@ -973,7 +973,7 @@ mod tests {
     /// root. The shipped layers are flat today, so the flat `materialize_*`
     /// tests above would still pass with that bug in place; this fixture tree
     /// is deliberately nested so the test fails without the fix. The
-    /// consequence is not cosmetic: `layer::canonical_stream` hashes
+    /// consequence is not cosmetic: `composition::context` hashes
     /// *relative* paths, so a hoisted entry hashes differently from a git
     /// checkout of the same bytes and the same layer builds twice.
     #[test]
