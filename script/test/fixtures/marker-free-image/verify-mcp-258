@@ -1,0 +1,74 @@
+#!/bin/bash
+# #258 fixture: prove the launcher actually configured the owned Chrome DevTools
+# MCP entry, then execute exactly the command/argv/env it configured. The
+# configured data is read back from the real state file; the literal oracle below
+# is independent of that read. jq captures are checked before mapfile so a failed
+# process substitution cannot silently look like an empty array.
+set -euo pipefail
+
+config=/agent-vm-state/claude.json
+expected_command=/usr/local/bin/agent-vm-chrome-mcp
+expected_args_json='["npx","-y","chrome-devtools-mcp@1.0.1","--headless=true","--isolated=true"]'
+expected_env_json='{"CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS":"1"}'
+
+[ -f "$config" ] || { echo "verify-mcp-258: $config is absent" >&2; exit 1; }
+
+# Exactly the launcher-owned entry must be present, with the expected shape.
+jq -e \
+  --arg command "$expected_command" \
+  --argjson args "$expected_args_json" \
+  --argjson env "$expected_env_json" \
+  '.mcpServers["chrome-devtools"] == {command: $command, args: $args, env: $env}' \
+  "$config" >/dev/null ||
+  { echo "verify-mcp-258: owned entry does not match the literal oracle" >&2; exit 1; }
+
+# Validate JSON types and counts before decoding lines, so a wrong type cannot
+# pass as an empty list.
+jq -e '.mcpServers["chrome-devtools"].args | type == "array" and length == 5' "$config" >/dev/null ||
+  { echo "verify-mcp-258: args is not a 5-element array" >&2; exit 1; }
+jq -e '.mcpServers["chrome-devtools"].env | type == "object" and length == 1' "$config" >/dev/null ||
+  { echo "verify-mcp-258: env is not a 1-entry object" >&2; exit 1; }
+
+configured_command="$(jq -r '.mcpServers["chrome-devtools"].command' "$config")" ||
+  { echo "verify-mcp-258: could not read configured command" >&2; exit 1; }
+args_text="$(jq -r '.mcpServers["chrome-devtools"].args[]' "$config")" ||
+  { echo "verify-mcp-258: could not read configured args" >&2; exit 1; }
+env_text="$(jq -r '.mcpServers["chrome-devtools"].env | to_entries[] | "\(.key)=\(.value)"' "$config")" ||
+  { echo "verify-mcp-258: could not read configured env" >&2; exit 1; }
+mapfile -t configured_args <<<"$args_text"
+mapfile -t configured_env <<<"$env_text"
+
+[ "${#configured_args[@]}" -eq 5 ] ||
+  { echo "verify-mcp-258: decoded ${#configured_args[@]} args" >&2; exit 1; }
+[ "${#configured_env[@]}" -eq 1 ] ||
+  { echo "verify-mcp-258: decoded ${#configured_env[@]} env entries" >&2; exit 1; }
+[ "$configured_command" = "$expected_command" ] ||
+  { echo "verify-mcp-258: command=$configured_command" >&2; exit 1; }
+[ "${configured_env[0]}" = "CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS=1" ] ||
+  { echo "verify-mcp-258: env=${configured_env[0]}" >&2; exit 1; }
+
+# Execute the *configured* command with the *configured* argv/env. A nonzero
+# status or missing sentinel is a failure, not something the caller can ignore.
+output="$(/usr/bin/env "${configured_env[@]}" "$configured_command" "${configured_args[@]}" 2>&1)" ||
+  { echo "verify-mcp-258: configured command failed: $output" >&2; exit 1; }
+
+grep -qx "exec_uid=$(id -u)" <<<"$output" ||
+  { echo "verify-mcp-258: exec uid mismatch: $output" >&2; exit 1; }
+grep -qx "exec_gid=$(id -g)" <<<"$output" ||
+  { echo "verify-mcp-258: exec gid mismatch: $output" >&2; exit 1; }
+
+expected_argv=(npx -y chrome-devtools-mcp@1.0.1 --headless=true --isolated=true)
+for i in "${!expected_argv[@]}"; do
+  want="${expected_argv[$i]}"
+  grep -qx "argv$((i + 1))=$want" <<<"$output" ||
+    { echo "verify-mcp-258: argv$((i + 1)) want $want: $output" >&2; exit 1; }
+done
+grep -qx "argc=5" <<<"$output" || { echo "verify-mcp-258: argc wrong: $output" >&2; exit 1; }
+grep -qx "statistics=1" <<<"$output" ||
+  { echo "verify-mcp-258: statistics env not forwarded: $output" >&2; exit 1; }
+grep -qx "sentinel=chrome-wrapper-258" <<<"$output" ||
+  { echo "verify-mcp-258: sentinel missing from stdout: $output" >&2; exit 1; }
+grep -qx "sentinel=chrome-wrapper-258" /agent-vm-state/mcp-executed-258 ||
+  { echo "verify-mcp-258: state execution file missing the sentinel" >&2; exit 1; }
+
+echo "verify-mcp-258: OK"

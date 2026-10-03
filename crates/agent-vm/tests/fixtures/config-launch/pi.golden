@@ -29,10 +29,6 @@
   },
   "env": [
     {
-      "key": "PATH",
-      "value": "/usr/local/bin:/usr/bin:/usr/sbin:/bin"
-    },
-    {
       "key": "HOME",
       "value": "$HOME"
     },

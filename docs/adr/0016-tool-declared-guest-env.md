@@ -28,6 +28,8 @@ Emission position therefore has a safety meaning, not just a cosmetic one.
 - **`env` is a `BTreeMap<String, String>`.** Key-sorted iteration is the emission order and the order definition equality compares, which keeps the emitted JSON deterministic for the goldens and makes version/conflict comparison order-insensitive. `env` is the **last** field in the `Tool` struct, the last `ToolField` variant, and the last `doctor` row suffix, so the fixed-order conflict warnings keep their ordering.
 - **Diagnostics are value-safe.** A validation error names the `env` **key** (a variable name, escaped by `quoted_str`) and never a value, because a value may be a credential a user pasted; `doctor` renders only the count (`; env=N`, and only when `N > 0`).
 
+_Amended by #258 (2026-10)._ `PATH` is image-owned and applied per exec by the launcher, and a tool-declared `PATH` is dropped at the env-assembly seam (`credential_resolver` omits it) — the same effect the old emission position gave it — so it stays **out** of the rejection set and `E2c` pins `IS_SANDBOX`/`LANG` only. The identity triple's single producer now runs in **both** modes (`--root` publishes `HOME=/root`, `USER=root`, `LOGNAME=root`), so the rejection rationale is that a declaration "would be inert", not that it "would win under `--root`". The rejection itself is unchanged.
+
 ## Consequences
 
 - **`CODEX_HOME` is now declared by the `codex` and `shell` tools only.** A `claude`, `opencode` or `copilot` guest no longer sees it. That is the point of the ticket. (`codex/auth.json` and `codex/config.toml` are provisioned only when the launch provisions OpenAI ([ADR-0017](0017-tool-declared-provisioning.md)); the eager **state dir** is created unconditionally: furniture, not capability.)

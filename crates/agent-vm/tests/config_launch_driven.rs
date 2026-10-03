@@ -647,10 +647,14 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
 
     let env = env_pairs(config);
     let env_of = |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+    // #258: the launcher no longer publishes `PATH` into the sandbox config. The
+    // acquired image's OCI `PATH` is preserved, and the effective value is read
+    // back from the created sandbox and applied as the per-exec override — the
+    // boot-free config dump stops before acquisition, so it carries no `PATH`.
     assert_eq!(
         env_of("PATH"),
-        Some(PATH_VALUE),
-        "PATH env changed for {tool}"
+        None,
+        "PATH must not be published by config for {tool}"
     );
     let expects_codex_home = matches!(tool, "codex" | "shell");
     assert_eq!(
@@ -1906,22 +1910,24 @@ fn an_image_choice_is_still_rejected_when_both_sides_are_equally_explicit() {
 // E2 / E2b / E2c / E3 — tool-declared guest env (#119)
 // ---------------------------------------------------------------------------
 
-/// **E2 (#119 D3a).** The launched tool's own `env` is published *before* the
-/// launcher's, and the guest applies the array last-wins, so a config that
-/// declares `PATH` cannot redirect the guest: the launcher's later emission
-/// wins. This is the footgun guard that stops a project config from
-/// *accidentally* redirecting the launcher's own env — defence in depth on top
-/// of ADR-0015's trust boundary (a declaration that sets `env` can already set
+/// **E2 (#119 D3a, amended #258).** `PATH` is launcher/image-owned, so a
+/// tool-declared `PATH` is dropped at the assembly seam and never reaches the
+/// guest env; the acquired image's OCI `PATH` (applied as the per-exec
+/// override) is the only default. The tool's other `env` is still published.
+/// This is the footgun guard that stops a project config from *accidentally*
+/// redirecting the launcher's own environment — defence in depth on top of
+/// ADR-0015's trust boundary (a declaration that sets `env` can already set
 /// `command` and `args`, i.e. run arbitrary guest code), not a substitute for
-/// it.
+/// it. Previously the launcher republished its own `PATH` after the tool's via
+/// guest last-wins; now it omits both and the OCI value stands (#258).
 ///
 /// Deliberately does **not** call [`assert_tool_dependent_content`] (M1): its
 /// `env_of` is a first-match `.find()`, so it would read the *first* `PATH`
-/// here — the declared `/evil` — and fail. E2 defines its own last-match helper
+/// here — the declared `/evil` — and fail. E2 defines its own assertions
 /// instead; the shared helper's `.find()` stays correct for the shipped tools,
 /// which declare no colliding key.
 #[test]
-fn project_tool_env_is_overridden_by_the_launchers_own_env() {
+fn project_tool_env_path_is_dropped_by_the_launcher() {
     let harness = Harness::new();
     harness.write_project(
         "[[tools]]\nname = \"envtool\"\ncommand = \"/bin/echo\"\nenv = { AVM_TEST = \"ok\", PATH = \"/evil\" }\n",
@@ -1941,17 +1947,11 @@ fn project_tool_env_is_overridden_by_the_launchers_own_env() {
         .expect("the tool's own AVM_TEST must be published");
     assert_eq!(env[avm_test].1, "ok");
 
-    let last_path = env
-        .iter()
-        .rposition(|(key, _)| *key == "PATH")
-        .expect("PATH must be published");
-    assert_eq!(
-        env[last_path].1, PATH_VALUE,
-        "the launcher's PATH must win over the tool's declaration"
-    );
+    // #258: the launcher drops the tool's `PATH` rather than republishing its
+    // own value after it; the acquired image's OCI `PATH` is the only default.
     assert!(
-        avm_test < last_path,
-        "the tool's env must be published before the launcher's PATH"
+        env.iter().all(|(key, _)| *key != "PATH"),
+        "a tool-declared PATH must not reach the guest env: {env:?}"
     );
 }
 
@@ -1995,14 +1995,16 @@ fn a_tool_declaring_the_guest_identity_is_refused_in_every_mode() {
     }
 }
 
-/// **E2c (#119 D3b).** The launcher's *unconditional* env — `PATH`,
-/// `IS_SANDBOX`, `LANG` (see `run::GUEST_ALWAYS_ENV`, `run.rs:49`) — really is
-/// published on every launch, root mode included. This is the premise that
-/// licenses leaving those three *out* of `check_env_key`'s rejection set:
-/// position, not validation, protects them. **If this test ever fails, either
-/// restore the unconditional emission or add that key to `check_env_key`'s
-/// rejection set — D3b.** Root mode is the case that removed
-/// `HOME`/`USER`/`LOGNAME` and so the case that could plausibly remove these.
+/// **E2c (#119 D3b, amended #258).** The launcher's *unconditional* env —
+/// `IS_SANDBOX`, `LANG` (see `run::GUEST_ALWAYS_ENV`) — really is published on
+/// every launch, root mode included. This is the premise that licenses leaving
+/// those keys *out* of `check_env_key`'s rejection set: position, not
+/// validation, protects them. **If this test ever fails, either restore the
+/// unconditional emission or add that key to `check_env_key`'s rejection set —
+/// D3b.** Root mode is the case that removed `HOME`/`USER`/`LOGNAME` and so the
+/// case that could plausibly remove these. `PATH` is deliberately *not*
+/// published here: it is image-owned and applied as the per-exec override
+/// (#258), so the debug dump carries no `PATH` in either mode.
 #[test]
 fn the_launchers_unconditional_env_is_published_in_both_modes() {
     for extra in [vec![], vec!["--root"]] {
@@ -2017,9 +2019,21 @@ fn the_launchers_unconditional_env_is_published_in_both_modes() {
         let config = debug_config_json(&stderr);
         let env = env_pairs(&config);
         let env_of = |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
-        assert_eq!(env_of("PATH"), Some(PATH_VALUE), "{extra:?}");
+        assert_eq!(env_of("PATH"), None, "PATH is image-owned now: {extra:?}");
         assert_eq!(env_of("IS_SANDBOX"), Some("1"), "{extra:?}");
         assert_eq!(env_of("LANG"), Some("C.UTF-8"), "{extra:?}");
+        // Root mode pins the numeric 0:0 identity and the root triple so an
+        // OCI `USER`/`ENV HOME` cannot leak in (#258).
+        if extra.contains(&"--root") {
+            assert_eq!(
+                config["runtime"]["user"].as_str(),
+                Some("0:0"),
+                "root mode must set the sandbox user to 0:0"
+            );
+            assert_eq!(env_of("HOME"), Some("/root"), "{extra:?}");
+            assert_eq!(env_of("USER"), Some("root"), "{extra:?}");
+            assert_eq!(env_of("LOGNAME"), Some("root"), "{extra:?}");
+        }
     }
 }
 

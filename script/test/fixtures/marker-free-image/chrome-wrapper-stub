@@ -1,0 +1,29 @@
+#!/bin/sh
+# #258 fixture: a deterministic, offline stand-in for the supplied Chrome
+# DevTools MCP wrapper. The launcher configures `npx -y chrome-devtools-mcp@…`;
+# this program asserts the forwarded argv/env inside itself (so broken forwarding
+# fails), then emits execution evidence. It performs no network or browser work.
+set -eu
+
+[ "$#" -eq 5 ] || { echo "chrome-wrapper-stub: expected 5 argv, got $#" >&2; exit 1; }
+[ "$1" = npx ] || { echo "chrome-wrapper-stub: argv1=$1" >&2; exit 1; }
+[ "$2" = -y ] || { echo "chrome-wrapper-stub: argv2=$2" >&2; exit 1; }
+[ "$3" = chrome-devtools-mcp@1.0.1 ] || { echo "chrome-wrapper-stub: argv3=$3" >&2; exit 1; }
+[ "$4" = --headless=true ] || { echo "chrome-wrapper-stub: argv4=$4" >&2; exit 1; }
+[ "$5" = --isolated=true ] || { echo "chrome-wrapper-stub: argv5=$5" >&2; exit 1; }
+[ "${CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS:-}" = 1 ] || {
+  echo "chrome-wrapper-stub: statistics env missing" >&2
+  exit 1
+}
+
+printf 'exec_uid=%s\n' "$(id -u)"
+printf 'exec_gid=%s\n' "$(id -g)"
+n=0
+for arg in "$@"; do
+  n=$((n + 1))
+  printf 'argv%s=%s\n' "$n" "$arg"
+done
+printf 'argc=%s\n' "$n"
+printf 'statistics=%s\n' "$CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"
+printf 'sentinel=chrome-wrapper-258\n'
+printf 'sentinel=chrome-wrapper-258\n' >>/agent-vm-state/mcp-executed-258

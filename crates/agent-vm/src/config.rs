@@ -585,9 +585,11 @@ impl Tool {
     /// declaration colliding with `PATH`/`IS_SANDBOX`/`LANG` is overridden
     /// rather than honoured; the guest applies the pairs last-wins.
     /// `HOME`/`USER`/`LOGNAME` cannot appear here at all — [`validate_env`]
-    /// rejects them, because the launcher publishes them only in non-root
-    /// mode and position would not protect them under `--root`. See
-    /// ADR-0016.
+    /// rejects them, because the launcher owns the whole identity triple and
+    /// publishes it *after* this map in both modes (`user::guest_identity_env`
+    /// in default mode, `user::root_identity_env` under `--root`), so a
+    /// declaration could only be silently inert. Validation cannot be
+    /// mode-aware, so the rejection is unconditional. See ADR-0016.
     pub(crate) fn guest_env(&self) -> &BTreeMap<String, String> {
         &self.env
     }
@@ -1850,13 +1852,12 @@ fn check_env_key(key: &str) -> std::result::Result<(), &'static str> {
     if key.starts_with("MSB_") {
         return Err("must not use the reserved MSB_ prefix (microsandbox owns it)");
     }
-    // The guest identity triple, and only it. `user::guest_identity_env` is the
-    // single producer, and it runs *only in non-root mode* — so unlike
-    // PATH/IS_SANDBOX/LANG, emission position cannot protect these: under
-    // `--root` a declaration here would reach execve unopposed and would also
-    // suppress agentd's passwd-derived /root fallback. Validation cannot be
-    // mode-aware (this module knows nothing about launch), so the rejection is
-    // unconditional; in non-root mode such a declaration was inert anyway. D3c.
+    // The guest identity triple, and only it. The launcher owns all three
+    // names in both modes and publishes the triple after the tool map
+    // (`user::guest_identity_env` in default mode, `user::root_identity_env`
+    // under `--root`), so a declaration here could only be silently inert.
+    // Validation cannot be mode-aware (this module knows nothing about
+    // launch), so the rejection is unconditional. D3c.
     if matches!(key, "HOME" | "USER" | "LOGNAME") {
         return Err(
             "must not be declared by a tool (agent-vm owns the guest identity environment)",

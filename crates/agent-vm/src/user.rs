@@ -425,6 +425,29 @@ pub fn guest_identity_env(identity: &GuestIdentity) -> [(&'static str, String); 
     ]
 }
 
+/// The root guest's numeric identity, used verbatim as the sandbox-builder
+/// and per-exec `.user()` in `--root` mode.
+///
+/// Explicit `0:0` rather than inheriting the image's `USER`: the guest must
+/// run as uid:gid 0:0 in **both** the passthroughfs bind identity map and the
+/// exec, so a usable app account in an OCI image cannot silently turn a
+/// `--root` launch into that account (#258). This is already the resolved
+/// identity of a shipped no-`USER` root image, so it is not a new bind-mapping
+/// exception.
+pub const ROOT_USER_SPEC: &str = "0:0";
+
+/// The root guest's identity trio, mirroring [`guest_identity_env`] for the
+/// `--root` mode. HOME is pinned to `/root` (never an image `ENV HOME`) so the
+/// root-mode rootfs patches, the per-exec env and the guest's own `$HOME`
+/// agree. `USER`/`LOGNAME` are the literal `root` account.
+pub fn root_identity_env() -> [(&'static str, String); 3] {
+    [
+        ("HOME", "/root".to_string()),
+        ("USER", "root".to_string()),
+        ("LOGNAME", "root".to_string()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +647,26 @@ mod tests {
                 ("LOGNAME", "claude".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn root_identity_env_pins_home_and_account() {
+        assert_eq!(ROOT_USER_SPEC, "0:0");
+        assert_eq!(
+            root_identity_env(),
+            [
+                ("HOME", "/root".to_string()),
+                ("USER", "root".to_string()),
+                ("LOGNAME", "root".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_guest_identity_is_none_in_root_mode() {
+        // Root mode still resolves to `None` (the distinct-identity path),
+        // so non-root account/HOME provisioning is unchanged.
+        assert!(resolve_guest_identity(true).unwrap().is_none());
     }
 
     #[test]

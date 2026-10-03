@@ -1,0 +1,130 @@
+#!/bin/sh
+# #258 fixture program: the selected program of a marker-free image. It is the
+# observable oracle for guest identity, HOME, PATH, persist links, bind-mount
+# ownership and multi-session persistence.
+#
+# `set -eu` plus an explicit `|| { ...; exit 1; }` on every capture means a
+# failed id/stat/readlink cannot hide behind a printed line and a missing
+# persisted file is a failed launch rather than an "absent" string. Nothing is
+# printed through a command substitution: `printf 'x=%s\n' "$(cmd)"` would
+# succeed even when `cmd` fails, so every captured value is checked first.
+set -eu
+
+DECLARED="$HOME/.hello-258.state"
+PLAIN="$HOME/.hello-258.plain"
+PROJECT=./project-258.state
+DIRECT=/agent-vm-state/direct-258.state
+DECLARED_LINK_TARGET=/agent-vm-state/persist/.hello-258.state
+GITCONFIG_LINK_TARGET=/agent-vm-state/gitconfig
+
+# `stat` the path named by $1 and print its numeric owner. The caller checks the
+# empty string, so a stat failure can never be reported as a valid owner.
+owner() {
+  stat -c '%u:%g' "$1" || exit 1
+}
+
+# Identity, resolved PATH, the image-stamp observation and the fallback-prefix
+# probes are printed in every mode so both the streaming and attach checks can
+# assert them on any probe.
+identity() {
+  uid="$(id -u)" || { printf 'identity=uid-failed\n'; exit 1; }
+  gid="$(id -g)" || { printf 'identity=gid-failed\n'; exit 1; }
+  printf 'uid=%s\n' "$uid"
+  printf 'gid=%s\n' "$gid"
+  printf 'home=%s\n' "$HOME"
+  printf 'path=%s\n' "$PATH"
+  bash_path="$(command -v bash 2>/dev/null)" || bash_path=none
+  printf 'bash=%s\n' "$bash_path"
+  # The selected program's own resolution, so the strict effective-PATH oracle
+  # can reject a runtime prefix shadowing Bash or the program itself.
+  hello_path="$(command -v hello-258 2>/dev/null)" || hello_path=none
+  printf 'hello=%s\n' "$hello_path"
+  if [ -e /bin/bash ]; then printf 'fallback_bin_bash=present\n'; else printf 'fallback_bin_bash=absent\n'; fi
+  if [ -e /usr/bin/bash ]; then printf 'fallback_usr_bin_bash=present\n'; else printf 'fallback_usr_bin_bash=absent\n'; fi
+  if [ -e /usr/local/bin/hello-258 ]; then printf 'fallback_hello=present\n'; else printf 'fallback_hello=absent\n'; fi
+  if [ -e /etc/agent-vm-image-version ]; then printf 'stamp=present\n'; else printf 'stamp=absent\n'; fi
+}
+
+# Links and bind ownership are validated on every program mode, including the
+# first no-argument launch where the declared target is still a dangling
+# symlink (stat follows links, so the still-dangling target is not stat'd here).
+links_and_owners() {
+  declared_link="$(readlink "$DECLARED")" || { printf 'declared_link=readlink-failed\n'; exit 1; }
+  if [ "$declared_link" != "$DECLARED_LINK_TARGET" ]; then
+    printf 'declared_link=%s\n' "$declared_link"
+    printf 'declared_link=unexpected-target\n'
+    exit 1
+  fi
+  printf 'declared_link=%s\n' "$declared_link"
+
+  gitconfig_link="$(readlink "$HOME/.gitconfig")" || { printf 'gitconfig_link=readlink-failed\n'; exit 1; }
+  if [ "$gitconfig_link" != "$GITCONFIG_LINK_TARGET" ]; then
+    printf 'gitconfig_link=%s\n' "$gitconfig_link"
+    printf 'gitconfig_link=unexpected-target\n'
+    exit 1
+  fi
+  printf 'gitconfig_link=%s\n' "$gitconfig_link"
+
+  project_owner="$(owner .)" || { printf 'project_owner=stat-failed\n'; exit 1; }
+  printf 'project_owner=%s\n' "$project_owner"
+  state_owner="$(owner /agent-vm-state)" || { printf 'state_owner=stat-failed\n'; exit 1; }
+  printf 'state_owner=%s\n' "$state_owner"
+  persist_owner="$(owner /agent-vm-state/persist)" || { printf 'persist_owner=stat-failed\n'; exit 1; }
+  printf 'persist_owner=%s\n' "$persist_owner"
+
+  # The provisioned gitconfig is written by the launcher as `[safe]` followed by
+  # `directory = *` (secrets.rs). Check that actual text; the minimal image has no
+  # git and no package manager, so the oracle is the file content itself.
+  if grep -q '^\[safe\]$' "$HOME/.gitconfig" \
+    && grep -qE '^[[:space:]]*directory[[:space:]]*=[[:space:]]*\*[[:space:]]*$' "$HOME/.gitconfig"; then
+    printf 'gitconfig_safe=yes\n'
+  else
+    printf 'gitconfig_safe=no\n'
+    exit 1
+  fi
+}
+
+case "${1:-}" in
+write)
+  value="${2:?hello-258 write needs a value}"
+  printf '%s' "$value" >"$DECLARED" || { printf 'write=declared-failed\n'; exit 1; }
+  printf '%s' "$value" >"$PLAIN" || { printf 'write=plain-failed\n'; exit 1; }
+  printf '%s' "$value" >"$PROJECT" || { printf 'write=project-failed\n'; exit 1; }
+  printf '%s' "$value" >"$DIRECT" || { printf 'write=direct-failed\n'; exit 1; }
+  declared_owner="$(owner "$DECLARED")" || { printf 'declared_owner=stat-failed\n'; exit 1; }
+  printf 'declared_owner=%s\n' "$declared_owner"
+  project_owner_after_write="$(owner "$PROJECT")" || { printf 'project_owner_after_write=stat-failed\n'; exit 1; }
+  printf 'project_owner_after_write=%s\n' "$project_owner_after_write"
+  direct_owner_after_write="$(owner "$DIRECT")" || { printf 'direct_owner_after_write=stat-failed\n'; exit 1; }
+  printf 'direct_owner_after_write=%s\n' "$direct_owner_after_write"
+  identity
+  links_and_owners
+  ;;
+read)
+  # Plain HOME files are ephemeral under --root, so only the nonroot readback
+  # requires them; the declared/state/project sentinels persist in both modes.
+  mode="${2:-nonroot}"
+  declared="$(cat "$DECLARED")" || { printf 'declared=read-failed\n'; exit 1; }
+  printf 'declared=%s\n' "$declared"
+  project="$(cat "$PROJECT")" || { printf 'project=read-failed\n'; exit 1; }
+  printf 'project=%s\n' "$project"
+  direct="$(cat "$DIRECT")" || { printf 'direct=read-failed\n'; exit 1; }
+  printf 'direct=%s\n' "$direct"
+  declared_owner="$(owner "$DECLARED")" || { printf 'declared_owner=stat-failed\n'; exit 1; }
+  printf 'declared_owner=%s\n' "$declared_owner"
+  if [ "$mode" = nonroot ]; then
+    plain="$(cat "$PLAIN")" || { printf 'plain=read-failed\n'; exit 1; }
+    printf 'plain=%s\n' "$plain"
+  fi
+  identity
+  links_and_owners
+  ;;
+*)
+  identity
+  links_and_owners
+  ;;
+esac
+
+# Completion sentinel: PTY (attach) checks cannot trust `script`'s exit status,
+# so a positive session is proven by this line the program itself printed.
+printf 'hello-258=ok\n'

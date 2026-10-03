@@ -174,14 +174,43 @@ export AGENT_VM_STATE_DIR="$HOME/.local/state/agent-vm"   # your usual state roo
 ./script/test/e2e.sh
 ```
 
-Set `AGENT_VM_E2E_OLD_LAUNCHER` (a pre-#84 binary),
-`AGENT_VM_E2E_LEGACY_IMAGE` (a cached API-1/2 image),
-`AGENT_VM_E2E_SETUP_BASE_REF` (a pullable `linux/arm64` base ref),
-`AGENT_VM_E2E_UPDATE_CHECK=1` and/or `AGENT_VM_E2E_RUST=1` to enable the opt-in
-checks; `./script/test/e2e.sh --help` lists them. Each check covers one of: the
-tool-free base, the fast path (a default launch boots the published template
-with **zero** `docker` invocations), per-tool-layer composition, the
-project-layer chain, and the legacy API-1/2 seed fallback.
+Set `AGENT_VM_E2E_LEGACY_IMAGE` (an image that supplies
+`/opt/agent-vm/seed-claude-plugins.sh`), `AGENT_VM_E2E_SETUP_BASE_REF` (a
+pullable `linux/arm64` base ref), `AGENT_VM_E2E_UPDATE_CHECK=1` and/or
+`AGENT_VM_E2E_RUST=1` to enable the opt-in checks; `./script/test/e2e.sh --help`
+lists them. Each check covers one of: the tool-free base, the fast path (a
+default launch boots the published template with **zero** `docker` invocations),
+per-tool-layer composition, the project-layer chain, and a supplied named seed
+entry point.
+
+`script/test/e2e.sh` takes an optional group: `all` (the default; the dev-image
+checks above plus the custom-image group) or `custom-image` (only the marker-free
+custom-image group). The custom-image group needs only Docker, the release
+bundle's `msb`, and a launcher binary — **no dev images** — plus network for the
+pinned fixture base/`apk add bash` and a digest-pinned local registry service. It
+builds the `script/test/fixtures/marker-free-image` targets, boots them through
+the real CLI, and asserts: a marker-free image runs a program as the host user
+and as `--root`; state/HOME persists across independent boots and under an OCI
+`USER`/`ENV HOME`; a missing program exits 127 with the contract message and a
+no-Bash image fails with the contract diagnostic and leaves no surviving VM or
+catalog entry; the configured Chrome MCP entry actually executes its configured
+command/argv/env while an unrelated user MCP entry survives; supplied
+`seed.d`/named seed scripts are idempotent; project-hook-exported `PATH` tools
+run; and genuinely uncached nonstandard-`PATH` refs boot cold against a local
+registry and again offline (warm). A file-backed Anthropic credential seeded
+under a private launcher HOME reaches the guest only as the documented
+non-secret placeholder (a missing host credential fails closed), and a present
+non-numeric image-version stamp is ignored. The guest's effective `PATH` for that
+nonstandard fixture (whose OCI `PATH` lacks `/.msb/scripts`) is
+`/.msb/scripts:` + its exact OCI `PATH`. A real PTY attach check covers the
+`--image`/attach branch. These checks are always-run in the custom group, not
+opt-in: a missing prerequisite is a failure, not a skip. The suite must run on a
+dedicated serial native host with no concurrent launches so process/catalog
+absence is meaningful. The custom group always runs against a fresh private
+cache under the default msb config sources: it neutralizes an inherited
+`AGENT_VM_SHARE_MSB_CACHE`, `AGENT_VM_MSB_CACHE_DIR` and `MSB_CONFIG_PATH`, so it
+does not exercise shared-cache mode. It makes no released-default or lineage
+claim.
 
 #### The shared-cache trap
 
@@ -254,7 +283,7 @@ needs a real registry. These tests are `#[ignore]`d, so **CI never runs them**.
 | Harness | Runs on CI | Notes |
 |---|---|---|
 | `cargo test --workspace` | yes (`ci.yml`) | `#[ignore]`d e2e excluded |
-| `script/test/e2e.sh` | **no** | needs Apple Silicon + a VM boot |
+| `script/test/e2e.sh` | **no** | needs Apple Silicon + a VM boot; `all` (dev images + custom) or `custom-image` (Docker + release `msb` + launcher, no dev images) |
 | `cargo test … -- --ignored` | **no** | needs docker/buildx |
 | `script/test/chrome-layer-contract.sh` / `chrome-layer-runtime.sh` | yes (`chrome-layer-contract.yml`) | docker-driver build + contract |
 | `script/test/shipped-tool-recipes.sh` | yes (`shipped-tool-recipes.yml`, native amd64) + manually on native arm64 | real docker-driver build + numeric-uid label/report/T5 audit + label replay. A `workflow_dispatch` run with `full_contract: true` adds `--overrides --chain`; the overrides/chain matrix is not part of the default PR gate |

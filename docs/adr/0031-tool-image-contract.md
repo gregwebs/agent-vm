@@ -70,6 +70,12 @@ prevents inherited labels from undoing another layer's label changes.
 | **S3** | **Derived config.** Start with the composition root's config. Derive `PATH` as an additive union in stitch order; merge only each layer's own changes to other environment variables in that order, last wins subject to S4. Preserve base labels and merge only layers' own changes to `org.agent-vm.*` labels in stitch order, last wins; discard other layer labels. All non-Env, non-label config fields remain the root's. | stitch (by construction) |
 | **S4** | **No unrelated-layer env collisions.** Two layers with neither a direct nor transitive ancestor relationship may not contribute own changes with different values for the same environment variable. Identical values are allowed, `PATH` is exempt, and descendants may override ancestors. Labels and other config fields are not S4's key domain. | stitch |
 
+_Amended by #258 (2026-10)._ The base no longer writes
+`/etc/agent-vm-image-version` and the launcher never reads it, so that path is
+no longer among the examples T3 protects; T3's rule itself (and every other
+clause here) is unchanged. Compatibility is the
+[boot image contract](../../USAGE.md#boot-image-contract).
+
 - **A violation is a hard error with no opt-out** (ADR-0003 D2/D6). The error
   names the layer, and for S1/S4 both layers and the path/environment key.
 - **A failing tool image is never recorded.** It is not written into the OCI

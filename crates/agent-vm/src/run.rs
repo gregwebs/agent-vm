@@ -11,7 +11,7 @@ use std::{
     io::IsTerminal as _,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -23,6 +23,7 @@ use crate::credential_provider;
 use crate::credential_resolver::{
     self, CredentialSource, LaunchCredentials, MissingCredentialPolicy,
 };
+use crate::image_contract;
 use crate::layer;
 use crate::mount;
 use crate::protected_host_files::CoreHostSource;
@@ -61,38 +62,43 @@ const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF
 pub(crate) const RAW_FORWARDED_ENV: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
 
 /// The launcher's baked fallback guest `PATH` — kept in sync by hand with the
-/// **base** `images/Dockerfile`'s `ENV PATH=…`. Used only when the booted
-/// image's own OCI config declares no `PATH` (e.g. the image metadata isn't
-/// cached yet on a cold first run, before the pull that happens later in
-/// `launch()`).
+/// **base** `images/Dockerfile`'s `ENV PATH=…`. It is an **exec-only**
+/// fallback for when the acquired image's own OCI config declares no `PATH`
+/// at all — never a substitute for the image PATH on a cold first
+/// acquisition. The real effective PATH is read back from the created
+/// sandbox's resolved config ([`resolved_exec_path`]); a cached-but-unpulled
+/// image therefore keeps its OCI PATH instead of silently dropping to this
+/// literal (#258).
 ///
 /// Deliberately names no tool prefix: which tool prefixes exist is a property
 /// of the composed image, read from its OCI config by
-/// [`image_config_path_and_digest`]. The tool layers append their own prefixes
-/// additively, so the base's value is the correct floor.
-/// See [`layer::contract::path_from_config_env`] and
-/// [`image_config_path_and_digest`].
+/// [`layer::contract::path_from_config_env`]. The tool layers append their own
+/// prefixes additively, so the base's value is the correct floor.
 const FALLBACK_GUEST_PATH: &str = "/usr/local/bin:/usr/bin:/usr/sbin:/bin";
 
-/// Best-effort read of the booted image's config `PATH`, plus the base
-/// image's manifest digest (fed to the tooling-layer hash in `layer.rs`).
-///
-/// Any miss — image metadata not cached yet on a first run, an unparseable
-/// image reference, or a cache I/O error — returns `(None, None)` so
-/// `launch()` stays on [`FALLBACK_GUEST_PATH`] and defers the layer hash.
-/// This is deliberately lenient: a PATH lookup failure must never abort a
-/// launch that would otherwise have worked identically to today.
-async fn image_config_path_and_digest(image: &str) -> (Option<String>, Option<String>) {
-    let Ok(cache_dir) = crate::msb_install::effective_cache_dir() else {
-        return (None, None);
-    };
-    image_config_path_and_digest_in(&cache_dir, image).await
+/// The effective `PATH` for the launch's `bash` spawn, read from the created
+/// sandbox's resolved config (the acquired image's OCI `PATH`, or a layer's
+/// additive override). The **last** `PATH` entry wins, matching guest env's
+/// last-wins semantics; an explicitly empty value is preserved (an image that
+/// truly sets `PATH=` means it), and only *absence* falls back to
+/// [`FALLBACK_GUEST_PATH`].
+fn resolved_exec_path(config: &microsandbox::sandbox::SandboxConfig) -> String {
+    config
+        .spec
+        .env
+        .iter()
+        .rev()
+        .find(|entry| entry.key == "PATH")
+        .map(|entry| entry.value.clone())
+        .unwrap_or_else(|| FALLBACK_GUEST_PATH.to_string())
 }
 
-/// The cache-explicit body of [`image_config_path_and_digest`], split out so
-/// the resolver can read metadata from an explicit cache (a test's tempdir)
-/// instead of the configured msb home — see
-/// `resolve_boot_image_with_layer`'s `cache_dir_override`.
+/// The cache-explicit `PATH`/digest read used by the layer-composition path:
+/// the resolver passes an explicit cache (a test's tempdir) instead of the
+/// configured msb home — see `resolve_boot_image_with_layer`'s
+/// `cache_dir_override`. The launch path no longer reads `PATH` from here: it
+/// uses the created sandbox's resolved config ([`resolved_exec_path`]), which
+/// already reflects the acquired image on a cold first run (#258).
 async fn image_config_path_and_digest_in(
     cache_dir: &Path,
     image: &str,
@@ -1659,9 +1665,16 @@ pub(crate) async fn launch(
     // real host uid, breaking write access. Neither this nor the
     // per-exec .user() below is a substitute for the other — both are
     // load-bearing (see ADR-0001's Decision section).
-    if let Some(gi) = &guest_identity {
-        builder = builder.user(gi.user_spec.clone());
-    }
+    //
+    // The identity is derived once and reused verbatim for the sandbox builder
+    // and both per-exec `.user()`s, so the bind identity map and the exec'd
+    // process always agree. Root mode is explicitly `0:0` even when the image
+    // `USER` names an app account (#258).
+    let exec_user = guest_identity
+        .as_ref()
+        .map_or(user::ROOT_USER_SPEC, |gi| gi.user_spec.as_str())
+        .to_owned();
+    builder = builder.user(exec_user.clone());
     // Prepared mount instructions carry the already-classified node kind;
     // file leaves get only their parents patched so agentd can safely create
     // the target without writing through a readonly parent.
@@ -1842,34 +1855,13 @@ pub(crate) async fn launch(
              `apiKey.name: {var}` to shield it, or unset `{var}` on the host",
         ))?;
     }
-    // The image's PATH was set inside the Dockerfile, but it lives in the
-    // shell rc files of /root. attach() launches the agent directly via
-    // execve, so re-publish the same PATH here.
-    //
-    // Agent binaries live under the shared, world-readable /opt/agent
-    // prefix (not /root) so both root and non-root guests resolve them
-    // identically. `/usr/sbin` is here because dockerd, runc, iptables and
-    // docker-proxy live there in debian, and dockerd does PATH lookups for
-    // its helper binaries at runtime (not just at exec).
-    //
-    // The value now comes from the booted image's own OCI config `Env`
-    // (`PATH=…`) rather than a hard-coded literal, so a tooling-layer's
-    // `ENV PATH=/project/bin:$PATH` actually reaches the guest exec
-    // environment. FALLBACK_GUEST_PATH — kept in sync by hand with the base
-    // `images/Dockerfile`'s `ENV PATH=…` — is used only when the image
-    // metadata isn't available (e.g. a cold cache on first run, before this
-    // launch's own pull completes); for the base image the two are
-    // byte-identical today, so this is behavior-identical in the common
-    // case.
-    // Reads the *derived* image's config once a tooling layer reassigned
-    // `image` above, so a layer's `ENV PATH=/project/bin:$PATH` actually
-    // reaches the guest exec environment (the whole point of #12's
-    // PATH-from-config change). The manifest digest this call also returns
-    // is unused here — `resolve_boot_image_with_layer` already fetched and
-    // used the *base* image's digest earlier, before any build — so only
-    // the PATH half of the tuple is bound.
-    let (config_path, _) = image_config_path_and_digest(&image).await;
-    let guest_path = config_path.unwrap_or_else(|| FALLBACK_GUEST_PATH.to_string());
+    // The guest `PATH` is owned by the booted image, and it is deliberately not
+    // resolved here (#258). Any pre-create cache read would miss the OCI config
+    // on a cold first acquisition and pin the launcher's fallback literal,
+    // silently overriding a nonstandard image prefix. `path: None` below leaves
+    // the sandbox env's OCI default in place; after create the effective value
+    // is read back from the created sandbox (`resolved_exec_path`) and applied
+    // as the per-exec override on both exec paths.
 
     // #161: a `sentinelEnv: false` variable must end up *unset*, but the SDK
     // builder cannot remove an `ENV` the image itself ships - guest env is
@@ -1905,11 +1897,13 @@ pub(crate) async fn launch(
     }
 
     // Non-root mode mirrors the host's own $HOME and username into the guest
-    // (ADR-0002); root mode contributes none. Built here as data so the single
-    // ownership-aware assembly below is what actually publishes it.
+    // (ADR-0002); root mode pins the literal root identity (HOME=/root,
+    // USER/LOGNAME=root) so an image's `ENV HOME`/`USER` cannot leak in (#258).
+    // Built here as data so the single ownership-aware assembly below is what
+    // actually publishes it.
     let identity: Vec<(&'static str, String)> = match &guest_identity {
         Some(gi) => user::guest_identity_env(gi).into_iter().collect(),
-        None => Vec::new(),
+        None => user::root_identity_env().into_iter().collect(),
     };
     let provider_env = credential_provider::provider_guest_env(launch_providers);
 
@@ -1924,14 +1918,14 @@ pub(crate) async fn launch(
     // PATH, IS_SANDBOX, LANG or a provider's variable, because the launcher's
     // own later emission wins. This is defence in depth, not a trust boundary
     // (a config that can declare `env` can already declare `command`; ADR-0015).
-    // HOME/USER/LOGNAME are published only in non-root mode, so
-    // `config::check_env_key` rejects those three keys outright at config time
-    // (ADR-0016).
+    // HOME/USER/LOGNAME are published by the launcher in both modes (the
+    // non-root account triple, or the root triple), so `config::check_env_key`
+    // rejects those three keys outright at config time (ADR-0016).
     let assembled = launch_credentials
         .assemble_guest_env(crate::credential_resolver::GuestEnvSources {
             tool_env: tool.guest_env(),
             forwarded: &forwarded,
-            path: guest_path,
+            path: None,
             identity: &identity,
             always: GUEST_ALWAYS_ENV,
             provider: &provider_env,
@@ -2021,17 +2015,20 @@ pub(crate) async fn launch(
         );
     }
 
-    // Confirm the image's API contract matches what this binary
-    // expects. Out-of-range → clear actionable error instead of
-    // mysterious mount-not-found / agent-crashing-on-startup
-    // failures inside the VM.
-    let image_api = crate::image_api_version::check(&sandbox)
-        .await
-        .context("verifying image-API contract version")?;
+    // The effective exec `PATH` now comes from the created sandbox's resolved
+    // config: the SDK merges the acquired image's OCI config before create
+    // returns, including on a cold first acquisition, so this is the image's
+    // real PATH rather than a cache-miss fallback (#258).
+    let exec_path = resolved_exec_path(sandbox.config());
+
+    // Optional capability resolution: an image that carries the Chrome
+    // DevTools marker, or supplies the wrapper, gets the launcher-owned MCP
+    // entry; anything else boots normally with the entry removed. There is no
+    // image-version gate — compatibility is the documented boot-image contract
+    // (USAGE.md#boot-image-contract), not an integer (#258).
     let chrome_mcp_enabled = crate::image_capabilities::chrome_mcp_enabled(
         &sandbox,
         &image,
-        image_api,
         env::var_os("AGENT_VM_NO_CHROME_MCP").is_some(),
     )
     .await;
@@ -2081,14 +2078,19 @@ pub(crate) async fn launch(
     // `agent-vm-chrome-mcp` wrapper: it runs once when the chrome MCP starts,
     // off the launch path, and is skipped when chrome is unused. The CA is
     // per-install (not bakeable into the shared image); see the opt-in Chrome
-    // DevTools layer wrapper. No chrome prelude is injected here, so we pass
-    // an empty string.
+    // DevTools layer wrapper. The wrapper owns that work off the launch path.
     //
-    // Assemble the in-guest `bash -c` line via `build_agent_shell_line`,
-    // which is unit-tested directly. The IPv6-nameserver strip is the
+    // Assemble the in-guest `bash -c` line via [`AgentShellLine`], which is
+    // unit-tested directly. The IPv6-nameserver strip is the
     // `STRIP_IPV6_NAMESERVERS` const (see its doc comment / PLAN.md B3).
-    let shell_line = build_agent_shell_line(&project_guest_path, "", inner_cmd, &inner_argv);
-    let cmd = "bash";
+    let shell_line = AgentShellLine {
+        project_guest_path: &project_guest_path,
+        image: &image,
+        command: inner_cmd,
+        args: &inner_argv,
+    }
+    .render();
+    let cmd = image_contract::LAUNCH_SHELL;
     let agent_args: Vec<String> = vec!["-c".into(), shell_line];
 
     let t_run = Instant::now();
@@ -2099,28 +2101,33 @@ pub(crate) async fn launch(
         // ASCII `/` placeholder for a non-ASCII project. `attach()` alone
         // leaves cwd unset, falling back to that placeholder; `attach_with`
         // lets us set it, matching the streaming path below.
-        sandbox
+        //
+        // PID 1 (agentd) must stay root to `setuid` per exec, so this per-exec
+        // `.user(...)` governs the exec'd process's actual uid. It's independent
+        // of the sandbox-builder `.user()` set above (MSB_USER →
+        // InitResolved.default_user → passthroughfs's BindIdentityMap, for
+        // bind-mounted file owner bits) — both calls are load-bearing, for
+        // different reasons; neither is a substitute for the other. The PATH
+        // override is the acquired image's resolved config value (#258).
+        match sandbox
             .attach_with(cmd, |a| {
-                // PID 1 (agentd) must stay root to `setuid` per exec, so
-                // this per-exec `.user(...)` governs the exec'd process's
-                // actual uid. It's independent of the sandbox-builder
-                // `.user()` set above (MSB_USER → InitResolved.default_user
-                // → passthroughfs's BindIdentityMap, for bind-mounted file
-                // owner bits) — both calls are load-bearing, for different
-                // reasons; neither is a substitute for the other.
-                let mut a = a.args(agent_args).cwd(project_guest_path.clone());
-                if let Some(gi) = &guest_identity {
-                    a = a.user(gi.user_spec.clone());
-                }
-                a
+                a.args(agent_args)
+                    .cwd(project_guest_path.clone())
+                    .user(exec_user.clone())
+                    .env("PATH", exec_path.clone())
             })
             .await
-            .with_context(|| {
-                format!(
-                    "attaching to {inner_cmd} (full logs: {})",
-                    sandbox_log_dir(&session.sandbox_name).display()
-                )
-            })?
+        {
+            Ok(code) => code,
+            Err(error) => {
+                let error = anyhow::Error::new(error);
+                let primary = exec_failure_primary(
+                    contract_spawn_diagnostic(&image, &error),
+                    error.context(format!("attaching to {inner_cmd}")),
+                );
+                return Err(finish_failed_exec(&sandbox, primary).await);
+            }
+        }
     } else {
         // No host TTY (piped, redirected, smoke-tested under `sg`/`sudo` etc.).
         // attach() needs a real /dev/tty for raw-mode stdin, so use the
@@ -2134,21 +2141,25 @@ pub(crate) async fn launch(
         ))?;
         use microsandbox::sandbox::exec::ExecEvent;
         use tokio::io::AsyncWriteExt as _;
-        let mut handle = sandbox
+        let mut handle = match sandbox
             .exec_stream_with(cmd, |e| {
-                let mut e = e.args(agent_args).cwd(project_guest_path.clone());
-                if let Some(gi) = &guest_identity {
-                    e = e.user(gi.user_spec.clone());
-                }
-                e
+                e.args(agent_args)
+                    .cwd(project_guest_path.clone())
+                    .user(exec_user.clone())
+                    .env("PATH", exec_path.clone())
             })
             .await
-            .with_context(|| {
-                format!(
-                    "running {inner_cmd} in sandbox (full logs: {})",
-                    sandbox_log_dir(&session.sandbox_name).display()
-                )
-            })?;
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                let error = anyhow::Error::new(error);
+                let primary = exec_failure_primary(
+                    contract_spawn_diagnostic(&image, &error),
+                    error.context(format!("running {inner_cmd} in sandbox")),
+                );
+                return Err(finish_failed_exec(&sandbox, primary).await);
+            }
+        };
         let mut stdout = tokio::io::stdout();
         let mut stderr = tokio::io::stderr();
         // Race the exec event stream against the sandbox's own runtime exit
@@ -2172,15 +2183,12 @@ pub(crate) async fn launch(
         // stream close, so the classification/log-write reliably happens
         // before we report anything.
         let mut runtime_exit: RuntimeExit = Box::pin(sandbox.wait());
-        // Track whether we actually saw an Exited event. The previous
-        // `let mut code = 1` conflated "stream closed without Exited"
-        // (infra failure) with "agent exited with 1" (real failure) —
-        // CI couldn't tell them apart. Review finding #9. Now we
-        // return Err on premature stream close so the launcher
-        // bubbles up an actionable error.
-        let mut exit_code: Option<i32> = None;
-        let mut stream_ended_without_exit = false;
-        loop {
+        // The loop classifies every exit explicitly: `Ok(0)` from a real
+        // `Exited`, or an `Err` carrying the primary diagnostic. No branch
+        // performs teardown here — the pending `runtime_exit` (which owns the
+        // child-handle mutex after polling) must be dropped first, on **every**
+        // path, or the following stop/wait deadlocks (#258).
+        let stream_result: anyhow::Result<i32> = loop {
             match next_exec_step(
                 &mut handle,
                 &mut runtime_exit,
@@ -2196,38 +2204,47 @@ pub(crate) async fn launch(
                     stderr.write_all(&b).await.ok();
                     stderr.flush().await.ok();
                 }
-                ExecStep::Event(ExecEvent::Exited { code: c }) => {
-                    exit_code = Some(c);
-                    break;
-                }
+                ExecStep::Event(ExecEvent::Exited { code: c }) => break Ok(c),
                 ExecStep::Event(ExecEvent::Failed(payload)) => {
-                    anyhow::bail!(
-                        "exec session failed: {payload:?} (full logs: {})",
-                        sandbox_log_dir(&session.sandbox_name).display()
+                    // A contract breach (missing/unrunnable `bash`) becomes the
+                    // image diagnostic; anything else keeps an escaped message
+                    // rather than the Rust `Debug` dump of the payload (#258).
+                    let primary = exec_failure_primary(
+                        image_contract::launch_shell_spawn_diagnostic(&image, &payload),
+                        anyhow::anyhow!(
+                            "exec session failed: {}",
+                            config::escape_str(&payload.message)
+                        ),
                     );
+                    break Err(primary);
                 }
                 ExecStep::Event(ExecEvent::Started { .. } | ExecEvent::StdinError(_)) => {}
                 ExecStep::StreamEnded => {
-                    stream_ended_without_exit = true;
-                    break;
+                    break Err(anyhow::anyhow!(
+                        "exec session event stream ended without Exited (agentd disconnect or \
+                     microsandbox bug; partial output above; full logs: {})",
+                        sandbox_log_dir(&session.sandbox_name).display()
+                    ));
                 }
                 ExecStep::RuntimeExited(detail) => {
-                    anyhow::bail!(
+                    break Err(anyhow::anyhow!(
                         "sandbox process exited unexpectedly while the exec stream was still \
-                         open ({detail}); partial output above; see msb-exit.log under {} for \
-                         the VMM's post-mortem record",
+                     open ({detail}); partial output above; see msb-exit.log under {} for \
+                     the VMM's post-mortem record",
                         sandbox_log_dir(&session.sandbox_name).display()
-                    );
+                    ));
                 }
             }
-        }
-        match exit_code {
-            Some(c) => c,
-            None if stream_ended_without_exit => anyhow::bail!(
-                "exec session event stream ended without Exited (agentd disconnect or microsandbox bug; partial output above; full logs: {})",
-                sandbox_log_dir(&session.sandbox_name).display()
-            ),
-            None => unreachable!("loop only exits via Exited, StreamEnded, or an Err bail!"),
+        };
+        // Cancels a future potentially holding the child-handle mutex. This is
+        // NOT conditional on a borrow error, and it precedes EVERY streaming
+        // teardown path (both the success continue and the `finish_failed_exec`
+        // return below).
+        drop(runtime_exit);
+        drop(handle);
+        match stream_result {
+            Ok(code) => code,
+            Err(primary) => return Err(finish_failed_exec(&sandbox, primary).await),
         }
     };
 
@@ -2237,14 +2254,15 @@ pub(crate) async fn launch(
 
     notices.emit("==> Stopping sandbox")?;
     let t_stop = Instant::now();
-    sandbox.stop_and_wait().await.ok();
+    let cleanup = cleanup_exec_sandbox(&sandbox).await;
     if profile {
-        notices.emit(format!("[profile] stop:   {:?}", t_stop.elapsed()))?;
+        notices.emit(format!("[profile] stop+remove: {:?}", t_stop.elapsed()))?;
     }
-    let t_remove = Instant::now();
-    Sandbox::remove(&session.sandbox_name).await.ok();
-    if profile {
-        notices.emit(format!("[profile] remove: {:?}", t_remove.elapsed()))?;
+    if let Err(error) = cleanup {
+        return Err(error.context(format!(
+            "guest command `{}` exited {exit}, but the sandbox could not be cleaned up",
+            config::escape_str(inner_cmd)
+        )));
     }
 
     // Phase 5 safety net (host-cred mutation check) runs via the
@@ -2252,6 +2270,124 @@ pub(crate) async fn launch(
     // any `?`-propagated error path.
 
     Ok(exit)
+}
+
+/// Bounded teardown deadlines for the exec lifecycle. Named and local: a wedged
+/// VMM must not hang the launcher, and a failed graceful stop must still reap
+/// and remove rather than leaking a hidden VM (#258).
+const EXEC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const EXEC_KILL_TIMEOUT: Duration = Duration::from_secs(5);
+const EXEC_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const EXEC_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The image-contract diagnostic for an SDK exec error whose cause is a failed
+/// spawn of the launch shell, or `None` when the failure is not the image's and
+/// the caller's contextual error applies (#258).
+fn contract_spawn_diagnostic(image: &str, error: &anyhow::Error) -> Option<String> {
+    error.chain().find_map(|cause| {
+        let microsandbox::MicrosandboxError::ExecFailed(failure) = cause.downcast_ref()? else {
+            return None;
+        };
+        image_contract::launch_shell_spawn_diagnostic(image, failure)
+    })
+}
+
+/// The primary failure for a launch whose exec setup or event stream failed:
+/// the image-contract diagnostic when a failed spawn of the launch shell caused
+/// it, otherwise the caller's contextual error. [`finish_failed_exec`] is the
+/// single owner of the `(full logs: …)` suffix, so none is added here (#258).
+fn exec_failure_primary(contract: Option<String>, fallback: anyhow::Error) -> anyhow::Error {
+    match contract {
+        Some(diagnostic) => anyhow::anyhow!("{diagnostic}"),
+        None => fallback,
+    }
+}
+
+/// Attempt every teardown step, collecting failures instead of swallowing them
+/// (CODING_STANDARDS: errors are returned, not logged and ignored). The
+/// graceful stop is tried first; only its failure escalates to a bounded
+/// kill+reap. The sandbox is removed either way, so a failed launch never
+/// leaves a hidden VM behind (#258).
+async fn cleanup_exec_sandbox_failures(sandbox: &Sandbox) -> Vec<String> {
+    let mut failures: Vec<String> = Vec::new();
+    let stopped = match tokio::time::timeout(EXEC_STOP_TIMEOUT, sandbox.stop_and_wait()).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            failures.push(format!("stop: {error}"));
+            false
+        }
+        Err(_) => {
+            failures.push(format!("stop: timed out after {EXEC_STOP_TIMEOUT:?}"));
+            false
+        }
+    };
+    if !stopped {
+        // Cancelling the timed-out stop future released the child-handle lock
+        // before this kill/reap runs: the outer timeout on `kill_with_timeout`
+        // bounds the dispatch itself, not just the kill it performs.
+        match tokio::time::timeout(
+            EXEC_KILL_TIMEOUT,
+            sandbox.kill_with_timeout(EXEC_KILL_TIMEOUT),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("kill: {error}")),
+            Err(_) => failures.push(format!("kill: timed out after {EXEC_KILL_TIMEOUT:?}")),
+        }
+        // Reap even if the kill failed, so no wedged process is left owned.
+        match tokio::time::timeout(EXEC_REAP_TIMEOUT, sandbox.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => failures.push(format!("reap: {error}")),
+            Err(_) => failures.push(format!("reap: timed out after {EXEC_REAP_TIMEOUT:?}")),
+        }
+    }
+    match tokio::time::timeout(EXEC_REMOVE_TIMEOUT, Sandbox::remove(sandbox.name())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => failures.push(format!("remove: {error}")),
+        Err(_) => failures.push(format!("remove: timed out after {EXEC_REMOVE_TIMEOUT:?}")),
+    }
+    failures
+}
+
+/// [`cleanup_exec_sandbox_failures`] as a `Result`: `Ok` only when every
+/// teardown step succeeded, otherwise one error listing the failures in
+/// operation order. A successful forced cleanup never hides a failed graceful
+/// stop.
+async fn cleanup_exec_sandbox(sandbox: &Sandbox) -> anyhow::Result<()> {
+    let failures = cleanup_exec_sandbox_failures(sandbox).await;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{}", failures.join("; ")))
+    }
+}
+
+/// Render a failed launch's teardown outcome. The primary contract diagnostic
+/// stays first, teardown failures follow in operation order, and the log
+/// directory is always named. Pure, so ordering and visibility are unit-tested
+/// without a sandbox.
+fn failed_exec_message(primary: &str, cleanup_failures: &[String], log_dir: &str) -> String {
+    if cleanup_failures.is_empty() {
+        format!("{primary} (full logs: {log_dir})")
+    } else {
+        format!(
+            "{primary}; cleanup failed: {} (full logs: {log_dir})",
+            cleanup_failures.join("; ")
+        )
+    }
+}
+
+/// Finish a failed exec by tearing the sandbox down and returning the primary
+/// failure with any teardown failures **appended**: the contract breach stays
+/// visible even when cleanup also fails (#258).
+async fn finish_failed_exec(sandbox: &Sandbox, primary: anyhow::Error) -> anyhow::Error {
+    let log_dir = sandbox_log_dir(sandbox.name()).display().to_string();
+    let failures = cleanup_exec_sandbox_failures(sandbox).await;
+    anyhow::anyhow!(
+        "{}",
+        failed_exec_message(&format!("{primary:#}"), &failures, &log_dir)
+    )
 }
 
 /// A pending [`Sandbox::wait`] call, boxed so `launch`'s streaming-exec
@@ -2732,21 +2868,18 @@ fn parse_github_slug(url: &str) -> Option<String> {
 const STRIP_IPV6_NAMESERVERS: &str =
     "sed -i '/^nameserver .*:/d' /etc/resolv.conf 2>/dev/null || true";
 
-/// Run the image's first-boot seed hooks. A tool layer that bakes state which
-/// the guest's runtime persistence symlinks would shadow (the claude LSP
-/// plugin tree under `~/.claude`, whose symlink into the state dir hides it)
-/// drops an executable under `/opt/agent-vm/seed.d/`; the claude tool layer
-/// installs `10-claude-plugins` there. Tool-agnostic by design: the launcher no
-/// longer names any tool (epic #78), and an image with no such layer runs
-/// nothing. Each hook must be idempotent — this runs on every boot.
+/// Run the image's seed entry points. A tool layer that bakes state which the
+/// guest's runtime persistence symlinks would shadow (the claude LSP plugin tree
+/// under `~/.claude`, whose symlink into the state dir hides it) drops an
+/// executable under `/opt/agent-vm/seed.d/`; the claude tool layer installs
+/// `10-claude-plugins` there. Tool-agnostic by design: the launcher names no
+/// tool (epic #78), and an image that supplies neither entry point runs nothing.
 ///
-/// The second clause is a compatibility fallback, NOT dead code:
-/// `MIN_SUPPORTED_IMAGE_API` is still 1, so this launcher must keep working
-/// against an already-cached API-2 template, which ships
-/// `/opt/agent-vm/seed-claude-plugins.sh` and has no `seed.d/`. Without it,
-/// upgrading the launcher without re-pulling would silently empty
-/// `claude plugin list` with no error anywhere.
-/// DELETE THIS CLAUSE when `MIN_SUPPORTED_IMAGE_API` reaches 3.
+/// Both clauses are optional image content, not lineage or migration promises:
+/// the `seed.d/*` loop and the named `/opt/agent-vm/seed-claude-plugins.sh`
+/// script run on **every** launch (the latter executes after the loop, so an
+/// image may supply either or both). Each hook must therefore be idempotent —
+/// it is re-run on every boot — and both are inert when absent.
 const RUN_IMAGE_SEED_HOOKS: &str = concat!(
     "for _h in /opt/agent-vm/seed.d/*; do [ -x \"$_h\" ] && \"$_h\"; done\n",
     "[ -x /opt/agent-vm/seed-claude-plugins.sh ] && /opt/agent-vm/seed-claude-plugins.sh",
@@ -2758,7 +2891,7 @@ const RUN_IMAGE_SEED_HOOKS: &str = concat!(
 /// single `-c` with those args joined and escaped.
 ///
 /// Pure and string-only so the seven default tools' guest command lines are
-/// unit-tested without booting, mirroring [`build_agent_shell_line`] below.
+/// unit-tested without booting, mirroring [`AgentShellLine`] below.
 /// This is the *only* oracle for "identical to `main`": the guest command
 /// line travels over the exec request after boot and never appears in the
 /// `SandboxConfig` an integration test can observe (see the
@@ -2795,38 +2928,87 @@ pub(crate) fn inner_argv(tool: &Tool, agent_args: Vec<String>) -> Vec<String> {
     inner_args
 }
 
-/// Build the `bash -c` line that runs inside the guest: the prelude
-/// (IPv6-nameserver strip, stdin redirect, optional chrome-CA install,
-/// optional project runtime hook) followed by `exec`'ing the chosen
-/// agent with its args. Pure and string-only so it can be unit-tested
-/// without booting a sandbox — the launch path calls exactly this, so
-/// the tested behavior and the live behavior cannot drift.
-fn build_agent_shell_line(
-    project_guest_path: &str,
-    chrome_mcp_prelude: &str,
-    inner_cmd: &str,
-    inner_args: &[String],
-) -> String {
-    let path = shell_escape(project_guest_path);
-    let prelude = format!(
-        "{STRIP_IPV6_NAMESERVERS}\n\
-         {RUN_IMAGE_SEED_HOOKS}\n\
-         [ -t 0 ] || exec < /dev/null\n\
-         {chrome_mcp_prelude}\
-         _hook={path}/.agent-vm.runtime.sh\n\
-         if [ -f \"$_hook\" ]; then\n\
-         \techo \"==> sourcing $_hook\" >&2\n\
-         \tcd {path} && . \"$_hook\" || {{ rc=$?; echo \"==> .agent-vm.runtime.sh failed (exit $rc)\" >&2; exit $rc; }}\n\
-         fi",
-    );
-    let mut shell_line = prelude;
-    shell_line.push_str("; exec ");
-    shell_line.push_str(&shell_escape(inner_cmd));
-    for a in inner_args {
-        shell_line.push(' ');
-        shell_line.push_str(&shell_escape(a));
+/// The in-guest `bash -c` line: the prelude (IPv6-nameserver strip, seed
+/// entry points, stdin redirect, project runtime hook), then the selected
+/// program's presence guard, then `exec` of that program with its args. Pure
+/// and string-only so it can be unit-tested without booting a sandbox — the
+/// launch path renders exactly this, so the tested behavior and the live
+/// behavior cannot drift.
+///
+/// Fields are named because all four are strings: a positional call would be
+/// easy to transpose invisibly (#258).
+struct AgentShellLine<'a> {
+    project_guest_path: &'a str,
+    image: &'a str,
+    command: &'a str,
+    args: &'a [String],
+}
+
+impl AgentShellLine<'_> {
+    /// Prelude, guard, then `exec` with the configured argv.
+    fn render(&self) -> String {
+        let path = shell_escape(self.project_guest_path);
+        let prelude = format!(
+            "{STRIP_IPV6_NAMESERVERS}\n\
+             {RUN_IMAGE_SEED_HOOKS}\n\
+             [ -t 0 ] || exec < /dev/null\n\
+             _hook={path}/.agent-vm.runtime.sh\n\
+             if [ -f \"$_hook\" ]; then\n\
+             \techo \"==> sourcing $_hook\" >&2\n\
+             \tcd {path} && . \"$_hook\" || {{ rc=$?; echo \"==> .agent-vm.runtime.sh failed (exit $rc)\" >&2; exit $rc; }}\n\
+             fi",
+        );
+        let mut shell_line = prelude;
+        shell_line.push('\n');
+        shell_line.push_str(&self.program_guard());
+        shell_line.push_str(&self.exec_line());
+        shell_line
     }
-    shell_line
+
+    /// The final `exec` of the configured command and argv. Split from
+    /// [`Self::render`] so tests can run the guard and this `exec` against a
+    /// real `/bin/bash` without the prelude editing the host's
+    /// `/etc/resolv.conf` (#258).
+    fn exec_line(&self) -> String {
+        let mut out = String::from("; exec -- ");
+        out.push_str(&shell_escape(self.command));
+        for a in self.args {
+            out.push(' ');
+            out.push_str(&shell_escape(a));
+        }
+        out
+    }
+
+    /// The external-program presence guard, placed **after** the project
+    /// runtime hook so a hook's `PATH` export counts, and immediately before
+    /// `exec`. `builtin type -P` searches the external `PATH` only — never a
+    /// function, alias or builtin — and the slash branch covers an
+    /// absolute/relative configured pathname (including spaces). A program that
+    /// is missing, not a regular file, or not executable by this guest user
+    /// exits through the normal teardown with the contract message and
+    /// [`image_contract::MISSING_PROGRAM_EXIT`] (#258).
+    fn program_guard(&self) -> String {
+        let command = shell_escape(self.command);
+        let message = shell_escape(&image_contract::missing_program_message(
+            self.image,
+            self.command,
+        ));
+        format!(
+            "_avm_command={command}\n\
+             _avm_external=\n\
+             case \"$_avm_command\" in\n\
+             \t*/*) _avm_external=$_avm_command ;;\n\
+             \t*) _avm_external=$(builtin type -P -- \"$_avm_command\") || _avm_external= ;;\n\
+             esac\n\
+             if [ -z \"$_avm_external\" ] || [ ! -f \"$_avm_external\" ] || [ ! -x \"$_avm_external\" ]; then\n\
+             \tprintf '%s\\n' {message} >&2\n\
+             \texit {exit}\n\
+             fi\n\
+             builtin hash -r\n\
+             unset _avm_command _avm_external",
+            exit = image_contract::MISSING_PROGRAM_EXIT,
+        )
+    }
 }
 
 /// Single-quote `s` for use as a single argv element in a `bash -c`
@@ -4476,6 +4658,107 @@ mod tests {
         drop(tx);
     }
 
+    /// Dropping the pending `runtime_exit` releases the child-handle lock it
+    /// took on its first poll. The streaming branch relies on this ordering
+    /// (drop before stop/wait) for **every** exit, including a `Failed` event —
+    /// the old inner-`bail!` shape left the future alive and deadlocked teardown.
+    /// Synthetic: it illustrates ownership, not SDK teardown.
+    #[tokio::test]
+    async fn dropping_the_pending_runtime_exit_releases_the_child_handle_lock() {
+        use microsandbox::protocol::exec::{ExecFailed, ExecFailureKind};
+        use microsandbox::sandbox::exec::ExecEvent;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut events = StubEvents(rx);
+
+        let handle_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let lock_for_future = handle_lock.clone();
+        let mut runtime_exit: RuntimeExit = Box::pin(async move {
+            // The first poll takes the lock, exactly as `sandbox.wait()` takes
+            // the child-handle mutex once polled.
+            let _guard = lock_for_future.lock().await;
+            std::future::pending().await
+        });
+
+        // Force the first poll with no event available, so the lock is really
+        // held (the select would otherwise be free to return the event without
+        // ever polling the runtime future).
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            next_exec_step(
+                &mut events,
+                &mut runtime_exit,
+                std::time::Duration::from_millis(10),
+            ),
+        )
+        .await;
+        assert!(waited.is_err(), "nothing is ready, so the step must wait");
+
+        tx.send(ExecEvent::Failed(ExecFailed {
+            kind: ExecFailureKind::NotFound,
+            errno: None,
+            errno_name: None,
+            message: "no bash".to_string(),
+            stage: None,
+        }))
+        .await
+        .unwrap();
+        let step = next_exec_step(
+            &mut events,
+            &mut runtime_exit,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(matches!(step, ExecStep::Event(ExecEvent::Failed(_))));
+
+        // Drop unconditionally, as the launch branch does before teardown.
+        drop(runtime_exit);
+        let _released = tokio::time::timeout(std::time::Duration::from_secs(1), handle_lock.lock())
+            .await
+            .expect("the child-handle lock must be released once runtime_exit is dropped");
+    }
+
+    fn sandbox_config_with_env(env: Vec<(&str, &str)>) -> microsandbox::sandbox::SandboxConfig {
+        let mut config = microsandbox::sandbox::SandboxConfig::default();
+        config.spec.env = env
+            .into_iter()
+            .map(|(key, value)| microsandbox_types::EnvVar::new(key, value))
+            .collect();
+        config
+    }
+
+    /// The exec PATH is the acquired image's own value, including a nonstandard
+    /// prefix and an explicitly empty value; only *absence* uses the fallback
+    /// (#258).
+    #[test]
+    fn resolved_exec_path_prefers_the_image_value_and_falls_back_only_when_absent() {
+        assert_eq!(
+            resolved_exec_path(&sandbox_config_with_env(vec![(
+                "PATH",
+                "/opt/e2e-258/bin:/usr/bin:/bin"
+            )])),
+            "/opt/e2e-258/bin:/usr/bin:/bin"
+        );
+        assert_eq!(
+            resolved_exec_path(&sandbox_config_with_env(vec![])),
+            FALLBACK_GUEST_PATH
+        );
+        assert_eq!(
+            resolved_exec_path(&sandbox_config_with_env(vec![("PATH", "")])),
+            "",
+            "an image that truly sets an empty PATH means it"
+        );
+        // Last wins, matching guest env's last-wins semantics.
+        assert_eq!(
+            resolved_exec_path(&sandbox_config_with_env(vec![
+                ("PATH", "/first"),
+                ("OTHER", "x"),
+                ("PATH", "/last"),
+            ])),
+            "/last"
+        );
+    }
+
     #[test]
     fn update_check_is_off_by_default_and_opt_in() {
         // Default: no flag, no env → no probe.
@@ -4666,48 +4949,360 @@ mod tests {
 
     // ── IPv6 resolv.conf strip (PLAN.md B3 / upstream issue #5) ───
 
+    fn shell_line(project: &str, image: &str, command: &str, args: &[String]) -> String {
+        AgentShellLine {
+            project_guest_path: project,
+            image,
+            command,
+            args,
+        }
+        .render()
+    }
+
     #[test]
-    fn build_agent_shell_line_starts_with_v6_strip_and_execs() {
-        let line = build_agent_shell_line("/work/proj", "", "claude", &[]);
+    fn agent_shell_line_starts_with_v6_strip_and_execs() {
+        let line = shell_line("/work/proj", "alpine:3.22", "claude", &[]);
         // The prelude opens with the IPv6-nameserver strip, sourced from
         // the single `STRIP_IPV6_NAMESERVERS` const so the live launch
         // path and this test can't drift.
         assert!(line.starts_with(STRIP_IPV6_NAMESERVERS), "got: {line}");
         assert!(line.starts_with("sed -i '/^nameserver .*:/d' /etc/resolv.conf"));
-        assert!(line.contains("exec 'claude'"));
+        assert!(line.contains("exec -- 'claude'"), "got: {line}");
     }
 
     #[test]
-    fn build_agent_shell_line_includes_chrome_prelude_and_args() {
-        let line = build_agent_shell_line("/p", "CHROME_CA_STUFF\n", "codex", &["exec".into()]);
-        assert!(line.contains("CHROME_CA_STUFF"));
-        assert!(line.contains("exec 'codex' 'exec'"));
+    fn agent_shell_line_forwards_args() {
+        let line = shell_line(
+            "/p",
+            "alpine:3.22",
+            "codex",
+            &["exec".into(), "don't".into()],
+        );
+        assert!(
+            line.contains("exec -- 'codex' 'exec' 'don'\\''t'"),
+            "got: {line}"
+        );
     }
 
     #[test]
-    fn build_agent_shell_line_runs_seed_hooks_before_exec() {
-        // The prelude runs the image's seed hooks before the agent execs. Both
-        // clauses are asserted: the generic `seed.d` loop AND the legacy
-        // `/opt/agent-vm/seed-claude-plugins.sh` fallback. A test that checked
-        // only the loop would let the silent-regression fix (D11) be reverted —
-        // on a cached API-2 image the legacy clause is the ONLY thing that
-        // seeds plugins, and its absence is symptomless.
-        let line = build_agent_shell_line("/work/proj", "", "claude", &[]);
+    fn agent_shell_line_runs_seed_entry_points_then_hook_then_guard_then_exec() {
+        // Ordering is load-bearing: the seed entry points and the project
+        // runtime hook run first (a hook's `PATH` export must count for the
+        // guard), then the external-program guard, then `exec`.
+        let line = shell_line("/work/proj", "alpine:3.22", "claude", &[]);
         let seed = line
             .find(RUN_IMAGE_SEED_HOOKS)
-            .expect("seed-hook step present");
-        let exec = line.find("exec 'claude'").expect("exec present");
-        assert!(seed < exec, "seed hooks must run before exec; got: {line}");
+            .expect("seed-entry-point step present");
+        let hook = line
+            .find(".agent-vm.runtime.sh")
+            .expect("project runtime hook present");
+        let guard = line.find("_avm_command=").expect("program guard present");
+        let exec = line.find("exec -- 'claude'").expect("exec present");
+        assert!(
+            seed < hook,
+            "seed entry points must precede the hook; got: {line}"
+        );
+        assert!(
+            hook < guard,
+            "the runtime hook must precede the guard; got: {line}"
+        );
+        assert!(guard < exec, "the guard must precede exec; got: {line}");
         assert!(
             line.contains("for _h in /opt/agent-vm/seed.d/*"),
             "the generic seed.d loop must be emitted; got: {line}"
         );
-        // The fallback's removal is tied to MIN_SUPPORTED_IMAGE_API reaching 3
-        // (see the const's doc comment); keep it until then.
         assert!(
             line.contains("/opt/agent-vm/seed-claude-plugins.sh"),
-            "the legacy seed fallback must be emitted while MIN_SUPPORTED_IMAGE_API < 3; got: {line}"
+            "the named seed entry point must be emitted; got: {line}"
         );
+    }
+
+    // ── external-program guard: the rendered guard + the ACTUAL exec (#258) ───
+
+    /// Run the exact guard + final `exec` [`AgentShellLine::render`] appends, in
+    /// a real `/bin/bash`. Never the full prelude: that would rewrite the host's
+    /// `/etc/resolv.conf`.
+    fn run_guard_tail(
+        command: &str,
+        args: &[String],
+        path: Option<&str>,
+        prefix: &str,
+        extra_env: &[(&str, &str)],
+    ) -> std::process::Output {
+        let line = AgentShellLine {
+            project_guest_path: "/work/proj",
+            image: "e2e-258/img with spaces",
+            command,
+            args,
+        };
+        // Mirror `render` exactly: the guard and the `exec` line are concatenated
+        // with no separator (`exec_line` opens with `; `), so a newline here would
+        // put `;` at the start of a line and make bash reject the script.
+        let tail = format!("{prefix}\n{}{}", line.program_guard(), line.exec_line());
+        let mut process = std::process::Command::new("/bin/bash");
+        process.arg("-c").arg(tail);
+        match path {
+            Some(value) => {
+                process.env("PATH", value);
+            }
+            None => {
+                process.env_remove("PATH");
+            }
+        }
+        for (key, value) in extra_env {
+            process.env(key, value);
+        }
+        process.output().expect("/bin/bash runs")
+    }
+
+    fn executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).expect("write fixture");
+        let mut perms = std::fs::metadata(path).expect("stat fixture").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).expect("chmod fixture");
+    }
+
+    /// The guard must actually `exec` the selected program: a sentinel, the
+    /// forwarded argv and the program's own exit status are the oracle, not the
+    /// guard's lookup alone.
+    #[test]
+    fn guard_execs_the_real_program_with_argv_and_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        executable(
+            &bin.join("hello-258"),
+            "#!/bin/sh\nprintf 'sentinel=%s\\n' \"$TEST_SENTINEL\"\nprintf 'arg1=[%s] arg2=[%s]\\n' \"$1\" \"$2\"\nexit 23\n",
+        );
+        let out = run_guard_tail(
+            "hello-258",
+            &["a b".to_string(), "c'd".to_string()],
+            Some(bin.to_str().unwrap()),
+            "",
+            &[("TEST_SENTINEL", "ok")],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(23),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "sentinel=ok\narg1=[a b] arg2=[c'd]\n"
+        );
+    }
+
+    #[test]
+    fn guard_refuses_a_missing_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_guard_tail(
+            "not-installed-258",
+            &[],
+            Some(dir.path().to_str().unwrap()),
+            "",
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(127));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("has no runnable external program"),
+            "got: {stderr}"
+        );
+        assert!(stderr.contains("not-installed-258"), "got: {stderr}");
+        assert!(
+            stderr.contains("e2e-258/img with spaces"),
+            "image must be named; got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn guard_refuses_builtin_only_and_function_or_alias_shadows() {
+        let dir = tempfile::tempdir().unwrap();
+        // `printf` is a builtin with no external binary on this PATH.
+        let out = run_guard_tail("printf", &[], Some(""), "", &[]);
+        assert_eq!(out.status.code(), Some(127));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("has no runnable external program"));
+
+        let prefix = "no-real-258() { echo function; }\nalias no-real-258='echo alias'\n";
+        let out = run_guard_tail(
+            "no-real-258",
+            &[],
+            Some(dir.path().to_str().unwrap()),
+            prefix,
+            &[],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(127),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("function"));
+    }
+
+    #[test]
+    fn guard_execs_a_real_program_even_when_a_function_shadows_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        executable(&bin.join("hello-258"), "#!/bin/sh\necho REAL\nexit 23\n");
+        let prefix = "hello-258() { echo FUNCTION; }\nalias hello-258='echo ALIAS'\n";
+        let out = run_guard_tail("hello-258", &[], Some(bin.to_str().unwrap()), prefix, &[]);
+        assert_eq!(out.status.code(), Some(23));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "REAL\n");
+    }
+
+    #[test]
+    fn guard_handles_quoted_names_and_pathnames_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        executable(&bin.join("we'ird"), "#!/bin/sh\necho QUOTED\nexit 23\n");
+        let out = run_guard_tail("we'ird", &[], Some(bin.to_str().unwrap()), "", &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(23),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "QUOTED\n");
+
+        let spaced = dir.path().join("bin dir").join("my prog");
+        std::fs::create_dir_all(spaced.parent().unwrap()).unwrap();
+        executable(&spaced, "#!/bin/sh\necho SPACED\nexit 23\n");
+        let out = run_guard_tail(spaced.to_str().unwrap(), &[], Some(""), "", &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(23),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "SPACED\n");
+    }
+
+    #[test]
+    fn guard_refuses_non_executable_files_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("not-executable-258");
+        std::fs::write(&plain, "data").unwrap();
+        let out = run_guard_tail(plain.to_str().unwrap(), &[], Some(""), "", &[]);
+        assert_eq!(out.status.code(), Some(127));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("has no runnable external program"));
+
+        let directory = dir.path().join("a-directory-258");
+        std::fs::create_dir_all(&directory).unwrap();
+        let out = run_guard_tail(directory.to_str().unwrap(), &[], Some(""), "", &[]);
+        assert_eq!(out.status.code(), Some(127));
+    }
+
+    #[test]
+    fn guard_honours_a_hook_exported_path_and_ignores_a_stale_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        let new = dir.path().join("new");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        executable(&old.join("moved-258"), "#!/bin/sh\necho OLD\nexit 1\n");
+        executable(&new.join("moved-258"), "#!/bin/sh\necho NEW\nexit 23\n");
+
+        // A hook-shaped script exports a PATH the launcher never set; the guard
+        // must see it because it runs after the hook.
+        let out = run_guard_tail(
+            "moved-258",
+            &[],
+            Some(""),
+            "export PATH=\"$HOOK_BIN\"\n",
+            &[("HOOK_BIN", new.to_str().unwrap())],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(23),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "NEW\n");
+
+        // An old hashed location must not win over the final PATH: run the old
+        // binary (hashing it), then change PATH before the guard + exec.
+        let prefix = format!(
+            "PATH=\"{old}\"\nmoved-258 >/dev/null 2>&1 || true\nexport PATH=\"{new}\"\n",
+            old = old.display(),
+            new = new.display()
+        );
+        let out = run_guard_tail("moved-258", &[], Some(old.to_str().unwrap()), &prefix, &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(23),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "NEW\n");
+    }
+
+    /// The teardown combination rule: the primary contract diagnostic survives,
+    /// stays first, keeps operation order, and always names the log directory.
+    #[test]
+    fn failed_exec_message_keeps_the_primary_diagnostic_first() {
+        let primary = "boot image `img` has no runnable `bash` on its guest PATH";
+        let clean = failed_exec_message(primary, &[], "/logs");
+        assert_eq!(clean, format!("{primary} (full logs: /logs)"));
+
+        let failures = vec![
+            "stop: timed out".to_string(),
+            "kill: hung".to_string(),
+            "remove: database locked".to_string(),
+        ];
+        let combined = failed_exec_message(primary, &failures, "/logs");
+        assert!(combined.starts_with(primary), "got: {combined}");
+        let stop = combined.find("stop: timed out").unwrap();
+        let kill = combined.find("kill: hung").unwrap();
+        let remove = combined.find("remove: database locked").unwrap();
+        assert!(
+            stop < kill && kill < remove,
+            "operation order must survive; got: {combined}"
+        );
+        assert!(combined.contains("/logs"));
+    }
+
+    /// #258: the three exec-failure call sites build the primary through
+    /// [`exec_failure_primary`] without a log path, so the single owner
+    /// ([`failed_exec_message`]) names the directory exactly once — a primary
+    /// that already carried the suffix used to duplicate it on every path.
+    #[test]
+    fn the_call_site_primary_names_the_log_directory_exactly_once() {
+        use microsandbox::protocol::exec::{ExecFailed, ExecFailureKind};
+
+        let diagnostic = image_contract::launch_shell_spawn_diagnostic(
+            "alpine:3.22",
+            &ExecFailed {
+                kind: ExecFailureKind::NotFound,
+                errno: None,
+                errno_name: None,
+                message: "no such file".to_string(),
+                stage: None,
+            },
+        )
+        .expect("NotFound maps to a contract diagnostic");
+        for primary in [
+            exec_failure_primary(Some(diagnostic), anyhow::anyhow!("unused fallback")),
+            exec_failure_primary(
+                None,
+                anyhow::anyhow!("attaching to hello-258").context("outer"),
+            ),
+        ] {
+            let rendered = failed_exec_message(&format!("{primary:#}"), &[], "/logs/session");
+            assert_eq!(
+                rendered.matches("(full logs:").count(),
+                1,
+                "the log directory must be named once: {rendered}"
+            );
+            assert!(
+                rendered.ends_with("(full logs: /logs/session)"),
+                "got: {rendered}"
+            );
+        }
     }
 
     /// Guard the hand-maintained tie to the base Dockerfile's `ENV PATH`.

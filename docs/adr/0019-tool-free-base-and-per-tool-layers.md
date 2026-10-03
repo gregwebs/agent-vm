@@ -45,9 +45,13 @@ Column reference for the root decision:
 
 **D9 — `MIN_SUPPORTED_IMAGE_API` stays 1; only `MAX` moves 2 → 3.** The new launcher must keep booting a cached, not-yet-repulled API-2 template. The base writes `3`; the composed template inherits it. D11 is the consequence.
 
+_Amended by #258 (2026-10)._ The launcher no longer requires or reads `/etc/agent-vm-image-version`, so `MIN_SUPPORTED_IMAGE_API`/`MAX_SUPPORTED_IMAGE_API` and the range check are deleted. Compatibility is the documented [boot image contract](../../USAGE.md#boot-image-contract).
+
 **D10 — `setup`'s `required` severity is narrowed, not blanket-downgraded.** `setup` verifies *the published image this configuration would boot from*. With `tools = ["claude"]` that is the bare base, which does not carry `claude`, so a naive `required` would make a correct configuration fail. The fix narrows the rule: when the root is the base, a shipped command loses `required` **iff some declared tool layer in the composed chain supplies its command**. Everything else — including a config that redeclares `claude` without a `layer` field — stays fatal, so ADR-0015's anti-downgrade rule and its pinning test survive unchanged. The residual downgrade (a user *can* soften `claude` by attaching a `layer` to it) is acceptable because the claim is checkable — the layer must exist and build, or the launch fails loudly — and a config that can set `command`/`args` can already run arbitrary guest code.
 
 **D11 — The generic seed prelude keeps a legacy fallback while `MIN_SUPPORTED_IMAGE_API < 3`.** Because `MIN` stays 1 (D9), a freshly upgraded launcher must keep working against an already-cached API-2 template, which ships `/opt/agent-vm/seed-claude-plugins.sh` and has no `seed.d/`. Emitting only the `seed.d` loop would turn plugin seeding into a silent no-op on every such image — a symptomless regression. The prelude runs `seed.d/*` **and** the legacy script when present; the const's doc comment ties the fallback's removal to the `MIN` bump. Rejected alternatives: bumping `MIN` to 3 (hard-fails every user whose cache holds today's template until they pull, for a plugin-seeding nicety); emitting only the loop (symptomless); detecting the image API and emitting one clause (the API is read after boot, the prelude is built before).
+
+_Amended by #258 (2026-10)._ `MIN_SUPPORTED_IMAGE_API` is gone. The prelude still runs `seed.d/*` and a supplied `/opt/agent-vm/seed-claude-plugins.sh`, now framed as ordinary **optional supplied image content** that runs on every launch and must be idempotent — not a lineage/migration fallback tied to a stamp. The launcher makes no claim about what the released default supplies.
 
 ## Consequences
 

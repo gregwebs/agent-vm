@@ -1,0 +1,11 @@
+#!/bin/sh
+# #258 fixture: an optional supplied seed entry point. Idempotent by contract:
+# it creates the persistent payload only when absent (so a guest edit survives),
+# and records a per-boot marker that must reappear on every launch.
+set -eu
+
+payload=/agent-vm-state/seed-258.payload
+if [ ! -e "$payload" ]; then
+  printf 'seed=initial-258' >"$payload"
+fi
+: >/tmp/seed-258-ran

@@ -48,14 +48,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin \
     LANG=C.UTF-8
 
-# Image-API contract version. Bump on BREAKING image changes only
-# (new required mount points, changed env-var contracts, removed
-# binaries, renamed in-VM paths). Routine agent-version refreshes
-# and tooling additions (build-essential, ssh, etc.) do NOT change
-# this — they're additive. See `crates/agent-vm/src/defaults.rs`
-# for the matching range in the binary.
-RUN echo 3 > /etc/agent-vm-image-version
-
 # Conditionally trust a host-supplied CA bundle. Only fires when
 # `images/build.sh` is invoked on a host that sits behind a TLS-
 # intercept proxy (e.g. agent-vm-inside-agent-vm during local dev,

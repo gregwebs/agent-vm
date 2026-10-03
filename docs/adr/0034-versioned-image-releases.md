@@ -204,8 +204,9 @@ recipe/context + platform + build args ── shared selection ── base diges
 - **Release publication is gated on the assets already existing.** Before
   publishing a launcher, download the published pinned asset for each supported
   architecture, compare it against that launcher's embedded SHA-256, validate
-  architecture, image-API range and minimum-launcher compatibility, and
-  smoke-test ingest and boot. Any missing asset or failed check blocks
+  architecture, image-API range (removed by #258 — see the amendment under
+  Migration) and minimum-launcher compatibility, and smoke-test ingest and
+  boot. Any missing asset or failed check blocks
   publication, including code-only releases that reuse an image version.
   Changed artifact bytes require a new image version, never replacement under
   an existing version. The digest pin still detects replacement if that policy
@@ -232,6 +233,12 @@ launcher: image version + architecture-specific SHA-256
   fallback is deleted.** D11 tied that removal to the `MIN` bump; it existed only
   so a freshly upgraded launcher could keep booting a cached API-2 template, and
   with a launcher-pinned versioned artifact there is no such template.
+
+  _Amended by #258 (2026-10)._ The stamp and range are deleted outright; the
+  launcher never reads `/etc/agent-vm-image-version`. A supplied
+  `/opt/agent-vm/seed-claude-plugins.sh` (and `seed.d/*`) remains optional
+  ordinary image content that runs each launch, with no lineage or retirement
+  promise. See the [boot image contract](../../USAGE.md#boot-image-contract).
 - **`.agent-vm/layers/` is not special.** Directories there are no longer
   discovered, per ADR-0032.
 - **Ordering requirement:** because the image CI is off and `:latest` is frozen
