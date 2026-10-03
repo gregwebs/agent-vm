@@ -1,6 +1,6 @@
-# GitHub Copilot CLI tool layer. See docs/adr/0003-project-tooling-layers.md
-# for the layer image contract this file satisfies, and images/Dockerfile for
-# the facilities this layer inherits from the base (Node.js 22, npm, jq).
+# GitHub Copilot CLI recipe. See images/tools/README.md for the recipe
+# conventions this file follows, and images/Dockerfile for the facilities this
+# recipe inherits from the base (Node.js 22, npm, jq).
 ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-base:latest
 FROM ${BASE_IMAGE}
 

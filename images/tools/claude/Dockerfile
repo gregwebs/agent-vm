@@ -1,7 +1,6 @@
-# Claude Code CLI tool layer. See docs/adr/0003-project-tooling-layers.md for
-# the layer image contract this file satisfies, and images/Dockerfile for the
-# facilities this layer inherits from the base (Node.js, curl, jq, coreutils
-# timeout).
+# Claude Code CLI recipe. See images/tools/README.md for the recipe conventions
+# this file follows, and images/Dockerfile for the facilities this recipe
+# inherits from the base (Node.js, curl, jq, coreutils timeout).
 ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-base:latest
 FROM ${BASE_IMAGE}
 
@@ -115,11 +114,9 @@ RUN mkdir -p /opt/agent-vm/claude-seed \
  && chmod -R a+rX /opt/agent-vm/claude-seed
 
 # First-boot seed hook (run.rs's RUN_IMAGE_SEED_HOOKS runs every executable
-# under /opt/agent-vm/seed.d/). The execute bit is granted here by
-# `--chmod=0755`, NOT by a `RUN chmod`: the embedded copy of this directory
-# in the agent-vm binary materialises every file mode 0644 (see
-# src/tool_layer.rs), so a RUN chmod would make the locally-built layer hash
-# differently from one built from a git checkout of the same bytes.
+# under /opt/agent-vm/seed.d/). The committed source is mode 0644, so the execute
+# bit is established here by `--chmod=0755` rather than inherited from the build
+# context; the hook must be executable.
 COPY --chmod=0755 seed-claude-plugins.sh /opt/agent-vm/seed.d/10-claude-plugins
 
 # Build-time gate. Bind-mounted, not COPYed. A hard install failure already

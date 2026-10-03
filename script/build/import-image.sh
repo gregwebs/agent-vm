@@ -151,16 +151,16 @@ main() {
         echo "error: msb reported a malformed manifest digest for $tag ('$digest'); expected sha256:<64 lowercase hex>. The Docker base link was not created." >&2
         exit 1
     fi
-    # The Docker-local repository below must match `layer::BASE_REPO` in
-    # `crates/agent-vm/src/layer.rs` (a Rust const a shell script can't
-    # import); `layer::tests::base_repo_constant_matches_the_import_script_literal`
-    # guards the tie. See issue #98's ADR-0003 amendment.
+    # The Docker-local repository below is agent-vm's own import tag. It is
+    # retained deliberately until #260 gives the launcher an explicit
+    # build/import CLI; it no longer corresponds to any Rust constant or
+    # launcher layer contract (issue #259).
     base_link="agent-vm-base:${digest#sha256:}"
     docker tag "$image" "$base_link" || {
         echo "error: imported $tag into msb, but 'docker tag $image $base_link' failed; the Docker base link is missing. Rerun to retry." >&2
         exit 1
     }
-    echo "==> Linked $image into Docker as $base_link (tooling-layer base)"
+    echo "==> Linked $image into Docker as $base_link (import tag)"
     printf 'Verify offline with:\n  %q shell --image %q -- uname -m\n' \
         "$REPO_ROOT/target/macos/bin/agent-vm" "$tag"
     echo "Note: msb stages the incoming archive in temporary storage, so keep roughly one archive's worth of disk free."

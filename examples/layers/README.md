@@ -1,63 +1,40 @@
-# Example tooling layers
+# Example Dockerfiles that extend a boot image
 
-A **tooling layer** is a project-owned `Dockerfile` (plus its build context)
-that adds project-specific tools on top of the previous step in the
-project's **layer chain** — compilers, cross-toolchains, anything the base
-doesn't carry. A project's chain lives under `.agent-vm/layers/`, one
-numbered subdirectory per step, built in order. See
-`docs/adr/0003-project-tooling-layers.md` and the "Tooling layer" / "Layer
-chain" / "Derived image" entries in `CONTEXT.md` for the full mechanism.
+These directories are worked examples of building a **custom boot image** with
+ordinary Docker. Each is a `Dockerfile` that starts `FROM ${BASE_IMAGE}` and
+adds tools the default image does not carry — compilers, cross-toolchains,
+Chromium, and so on. agent-vm does not build or compose them; you build one with
+`docker build`, import it, and select it. See
+[Selecting the boot image](../../USAGE.md#selecting-the-boot-image) and
+[ADR-0035](../../docs/adr/0035-consume-user-owned-boot-images.md).
 
-The directories under `examples/layers/` are worked examples, not activated
-by default. The six shipped tool layers under `images/tools/`
-(`dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`) are the repo's other worked examples —
-and the ones agent-vm composes first: a launch's chain is the catalog's tool
-layers, then the project's own `.agent-vm/layers/*` steps, then `--layer` flags,
-so a project layer always builds on top of them. Copy one into place as a
-numbered step to use it every time:
+The directories under `examples/layers/` are examples, not activated by
+default. The six shipped recipes under `images/tools/` are the repo's other
+worked examples — and the ones that produce the **default boot image** the
+launcher ships.
 
-```sh
-cp -r examples/layers/wirenboard-cpp .agent-vm/layers/10-wirenboard-cpp
-```
-
-Or try one without copying it, via the repeatable `--layer DIR` flag — it
-appends after whatever the project already declares under
-`.agent-vm/layers/` (or forms the whole chain by itself, if the project
-declares none):
+Build an example on top of the default boot image (or any image satisfying the
+[boot image contract](../../USAGE.md#boot-image-contract)):
 
 ```sh
-agent-vm shell --layer examples/layers/wirenboard-cpp --yes
+docker buildx build --platform linux/arm64 --load \
+  --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+  -t my-image:dev examples/layers/rust-dev
+./script/build/import-image.sh my-image:dev        # today; #260 adds a CLI
+agent-vm shell --image my-image:dev                # or: image = "my-image:dev"
 ```
 
-`--layer` can be given more than once, and combines with the project's own
-`.agent-vm/layers/*` steps rather than replacing them — see "Composing
-several layers" below. There is deliberately no environment variable for it
-(`$AGENT_VM_LAYER` is rejected outright if set).
-
-The first launch after a chain is declared (or a step is edited) prompts to
-build it: `Build project tooling layer '<tag>'? [y/N]` for a single-step
-chain, or a multi-line prompt listing every step for a longer one. Pass
-`--yes` (or set `AGENT_VM_YES=1`) for non-interactive/CI use. A later launch
-with an unchanged chain reuses the already-built derived image with no
-rebuild and no prompt.
-
-## Writing your own layer
-
-The **layer image contract** is normative in
-`docs/adr/0003-project-tooling-layers.md` ("The layer image contract"). Every
-step needs these two lines:
+Every example needs the two lines below; the `ARG` is what
+`--build-arg BASE_IMAGE=…` overrides:
 
 ```dockerfile
 ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
 FROM ${BASE_IMAGE}
 ```
 
-Four clauses are enforced at build time and four (C5–C8) are documented-only;
-the ADR is normative. Two conventions the checker cannot see: expose
-environment through `ENV` (not an `env.d`-style file the base does not read),
-and leave `ENTRYPOINT`/`CMD` inert — agentd execs the agent directly. Every
-shipped example satisfies all eight; the C1 lint half is kept true by
-`layer::contract::tests::shipped_example_layers_pass_the_dockerfile_lint`.
+Two conventions: expose environment through `ENV` (agent-vm reads the image's
+OCI `ENV`), and leave `ENTRYPOINT`/`CMD` inert — agentd execs the agent
+directly. Do not assume a particular base beyond the boot image contract.
 
 ## Index
 
@@ -71,7 +48,7 @@ shipped example satisfies all eight; the C1 lint half is kept true by
 ## Rust development
 
 `rust-dev` is the layer that lets an in-VM agent iterate on agent-vm's own
-Rust code. It installs, all under the world-readable `/opt` (contract C7):
+Rust code. It installs, all under the world-readable `/opt`:
 
 - the **pinned Rust toolchain** from `rust-toolchain.toml` (`1.98.1` at the
 time of writing) with the `clippy` and `rustfmt` components, plus the host
@@ -83,13 +60,14 @@ the vendored `msb` (agent-vm's own gates do not);
 - the **pinned Verus release** CI verifies with, on `linux/amd64` (see the
 Apple Silicon note below).
 
-Copy it into a numbered step and launch, or try it first without copying:
+Build it on top of the default boot image and select it:
 
 ```sh
-cp -r examples/layers/rust-dev .agent-vm/layers/10-rust-dev
-agent-vm claude --yes
-# or:
-agent-vm shell --layer examples/layers/rust-dev --yes
+docker buildx build --platform linux/arm64 --load \
+  --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+  -t agent-vm-rust-dev:dev examples/layers/rust-dev
+./script/build/import-image.sh agent-vm-rust-dev:dev
+agent-vm claude --image agent-vm-rust-dev:dev
 ```
 
 Once booted, the guest can run the repo's Rust gates the way CI does. These
@@ -139,7 +117,7 @@ its own. They are covered by the CI shell guard in `script/test/ci-contracts.sh`
 ## Go development
 
 `go-dev` is the layer that lets an in-VM agent iterate on a Go code base. It
-installs, under the world-readable `/opt` (contract C7):
+installs, under the world-readable `/opt`:
 
 - the **pinned Go toolchain** from go.dev (`1.27.1` at the time of writing),
   verified against its per-architecture SHA-256 — `go`, `gofmt`, `go vet`,
@@ -153,13 +131,14 @@ installs, under the world-readable `/opt` (contract C7):
   time (upstream ships no binary) with the go command verifying every module
   against the signed `sum.golang.org` checksum database.
 
-Copy it into a numbered step and launch, or try it first without copying:
+Build it on top of the default boot image and select it:
 
 ```sh
-cp -r examples/layers/go-dev .agent-vm/layers/10-go-dev
-agent-vm claude --yes
-# or:
-agent-vm shell --layer examples/layers/go-dev --yes
+docker buildx build --platform linux/arm64 --load \
+  --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+  -t agent-vm-go-dev:dev examples/layers/go-dev
+./script/build/import-image.sh agent-vm-go-dev:dev
+agent-vm claude --image agent-vm-go-dev:dev
 ```
 
 Once booted, the usual Go loop works:
@@ -206,45 +185,24 @@ verified against the signed checksum database.
 
 ## Chrome DevTools
 
-Copy `examples/layers/chrome-devtools` to `.agent-vm/layers/10-chrome-devtools`
-(or any numbered step) and run `agent-vm claude --yes` — or skip the copy and
-use `--layer`. It installs Chromium and the Chrome DevTools MCP integration;
-see [USAGE.md](../../USAGE.md#chrome-devtools-mcp) for the runtime behavior.
-The layer pre-warms the npm cache for root mode only: arbitrary non-root guest
+Build it on top of the default boot image and select it:
+
+```sh
+docker buildx build --platform linux/arm64 --load \
+  --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+  -t agent-vm-chrome:dev examples/layers/chrome-devtools
+./script/build/import-image.sh agent-vm-chrome:dev
+agent-vm claude --image agent-vm-chrome:dev
+```
+
+It installs Chromium and the Chrome DevTools MCP integration; see
+[USAGE.md](../../USAGE.md#chrome-devtools-mcp) for the runtime behavior. The
+Dockerfile pre-warms the npm cache for root mode only: arbitrary non-root guest
 homes remain persistent but download on first use.
 
-## Composing several layers
+## Combining examples
 
-A chain can combine `chrome-devtools` with a project's own toolchain — the
-motivating case for the chain in the first place — two ways, which also
-combine with each other:
-
-**Both as project steps.** Copy both examples into numbered steps, choosing
-the order that matches what each depends on (neither of these two depends on
-the other, so either order works):
-
-```sh
-cp -r examples/layers/wirenboard-cpp   .agent-vm/layers/10-wirenboard-cpp
-cp -r examples/layers/chrome-devtools  .agent-vm/layers/20-chrome-devtools
-```
-
-The `NN-` numbering fixes the build order (steps sort byte-lexicographically).
-Number with gaps (`10`, `20`, `30`, ...) so a step can be inserted later. Each
-`Dockerfile` starts `ARG BASE_IMAGE=...` / `FROM ${BASE_IMAGE}`; the launcher
-rewrites `BASE_IMAGE` per step, so a step never names a fixed base or its
-neighbors directly.
-
-**Project steps plus `--layer`.** A project's own `.agent-vm/layers/*` steps
-build first, in the usual sorted order; every `--layer DIR` given on the
-command line is appended after them, in the order given:
-
-```sh
-agent-vm claude \
-  --layer examples/layers/wirenboard-cpp \
-  --layer examples/layers/chrome-devtools \
-  --yes
-```
-
-`--layer` only ever appends — it can't reorder or replace a project's own
-steps, which is why project steps keep their cached images whether or not
-any `--layer` is passed on a given launch.
+To combine two examples, build one `FROM` the other with ordinary Docker (a
+multistage or chained `docker build`), or copy the steps you need into one
+Dockerfile. There is no launcher-side layering: the finished image is the one
+you select.

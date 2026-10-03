@@ -36,12 +36,12 @@ check that the committed lock is still reproducible.
 
 If the script reports an entry with no integrity that is **not** one of those
 five, Pi's dependency layout has changed. `install-pi.sh`'s sibling verifier and
-the `tool_layer.rs` guards need to be reviewed before the bump can land.
+the `image_sources` guards need to be reviewed before the bump can land.
 
 Afterwards:
 
 ```bash
-cargo test -p agent-vm tool_layer
+cargo test --locked -p agent-vm --test image_sources
 git diff images/tools/pi/package.json images/tools/pi/package-lock.json images/tools/pi/Dockerfile
 ```
 

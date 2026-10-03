@@ -3,6 +3,8 @@
 ## Status
 
 Accepted. Implementation decision for [agent-vm #149](https://github.com/gregwebs/agent-vm/issues/149).
+Amended by [ADR-0035](0035-consume-user-owned-boot-images.md): dsh is image
+content plus a runtime tool declaration; the launcher builds no dsh layer.
 Extends [ADR-0003](0003-project-tooling-layers.md) (layer chains and the layer
 image contract) and [ADR-0019](0019-tool-free-base-and-per-tool-layers.md)
 (the tool-free base plus per-tool layers). Follows

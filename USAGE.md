@@ -58,17 +58,20 @@ the same list, in the same order.
 `agent-vm setup` pulls the selected image and, unless `--no-verify` is given,
 boots a throwaway sandbox and verifies **every configured tool** by running its
 `command` with `--version` (a direct argv exec, never a shell string — a
-present-but-broken binary fails rather than passing an `exists` check). A
-tool whose `command` is one the shipped image must carry
-(`pi`/`codex`/`opencode`/`claude`/`copilot`/`dsh`/`shell`), or one whose
-`--version` exits non-zero, is fatal — including when a user or project config
-declares it. Any
-other `command` only warns, because `setup` does not build the project's
-`.agent-vm/layers/` chain and cannot tell whether a tooling layer supplies it.
-`setup` executes the configured commands inside the throwaway VM — the same
-trust as running any agent-vm command in a directory with a `.agent-vm/`. A
-broken config warns and falls back to the shipped defaults, so a config typo
-never blocks the pull/boot/verify recovery path.
+present-but-broken binary fails rather than passing an `exists` check).
+Severity follows the **image**, not the declaring tier: a shipped command
+(`pi`/`codex`/`opencode`/`claude`/`copilot`/`dsh`/`shell`) is fatal only when
+the verified image is the **default** boot image; for any image you selected
+(`--image`, `AGENT_VM_IMAGE_TAG`, or a config `image`) every missing command
+**warns**, because you own that image and agent-vm never installs software. A
+shipped command whose `--version` exits non-zero is fatal on the default image
+too. **This user-selected-image severity policy is the implemented behavior,
+but is proposed pending maintainer confirmation (issue #259); the default-image
+behavior is unchanged.** `setup` executes the configured commands inside the
+throwaway VM — the
+same trust as running any agent-vm command in a directory with a `.agent-vm/`.
+A broken config warns and falls back to the shipped defaults and the default
+boot image, so a config typo never blocks the pull/boot/verify recovery path.
 
 `agent-vm` keeps its sandbox registry under a private `MSB_HOME` —
 `~/.local/state/agent-vm/msb-home` on Linux, `~/.agent-vm-msb` on macOS
@@ -82,68 +85,77 @@ state, so it sees the same sandboxes agent-vm does.
 
 ## Image release cadence
 
-CI publishes two OCI images from one run:
+The production workflow publishes the maintained **base** image and the
+**template** built on it; the launcher consumes the template:
 
-- `ghcr.io/wirenboard/agent-vm-base:latest` — the **tool-free base**: Debian
-  plus the docker engine, diagnostic CLIs and the tool-layer facilities, with
-  **no** agent CLI.
-- `ghcr.io/wirenboard/agent-vm-template:latest` — the **composed default**: the
-  base plus the six shipped tool layers (dsh, pi, codex, opencode, claude,
-  copilot), chained in declaration order.
+- `ghcr.io/wirenboard/agent-vm-template:latest` — the **default boot image**:
+  Debian plus the docker engine, diagnostic CLIs, and the six shipped agent CLIs
+  (dsh, pi, codex, opencode, claude, copilot).
 
-Both are rebuilt hourly from the **committed** sources. The hourly cron no
-longer resolves new upstream tool releases: a tool version changes only when a
+It is rebuilt hourly from the **committed** sources. The hourly cron no longer
+resolves new upstream tool releases: a tool version changes only when a
 developer commits a bump (`script/build/agent-versions.sh --write` or a
-lockfile upgrade script). Both accept a pinned `…:YYYY-MM-DDTHH` tag
-(immutable; the last 14 days are retained). An image (or a locally composed
-layer) is only as new as the sources it was built from; a template published
-**before** a pin bump keeps the older tool until it is rebuilt or you build the
-new sources yourself.
+lockfile upgrade script). It accepts a pinned `…:YYYY-MM-DDTHH` tag
+(immutable; the last 14 days are retained). The image is only as new as the
+sources it was built from; a template published **before** a pin bump keeps the
+older tool until it is rebuilt.
 
-**Which image a launch uses** depends on your configured tool set:
-
-- If your declared tool layers equal the shipped default and you have no
-  project `.agent-vm/layers/`, the launch boots the composed template
-  **verbatim — no build, no Docker**. This is the fast path.
-- Any other tool set composes the declared tool layers onto the base locally on
-  the first launch (hash-cached thereafter).
-
-Flags:
-
-- `--image REF` boots an image **verbatim** and skips tool composition (project
-  layers still chain on top). For example
-  `--image ghcr.io/wirenboard/agent-vm-template:YYYY-MM-DDTHH`.
-- `--base-image REF` (env `AGENT_VM_BASE_IMAGE`) chooses the tool-free base that
-  tool layers are composed onto, and **always** composes locally — it is how a
-  source-checkout user tests a locally built/imported base. `--image` and
-  `--base-image` are mutually exclusive, but an explicit flag wins over the
-  *other* flag's environment variable: an exported `AGENT_VM_IMAGE_TAG` does not
-  stop you passing `--base-image`, and vice versa. An empty environment variable
-  counts as unset.
-
-A locally composed tool layer installs the exact version **committed in this
-repo**: the `images/tools/<tool>/Dockerfile` default, or that recipe's committed
-`package.json` + `package-lock.json`. The launcher's local compose passes no
-`AGENT_VERSION_*`, so it always uses those committed defaults; running a bumped
-version needs a rebuilt `agent-vm` binary. The layer hash covers the **whole**
-layer directory, so any edit under `images/tools/<tool>/` invalidates that layer
-(and every layer chained above it) on the next local compose.
-
-On a host behind a TLS-intercept proxy, build the layer yourself with
-`images/build.sh` (which sets `AGENT_INSTALL_SOFT_FAIL` on such hosts); the
-recipe hooks then turn a **positively classified transport** failure into an
-`absent-transport` status instead of a hard build failure. That does **not**
-weaken the contract: a checksum/integrity mismatch, an unknown failure or a
-wrong version stays hard, and a soft-degraded image is not proof the tool works
-— it ships no command for that slot.
-
-The agent-vm binary and the images it launches are not version-locked by any
+The agent-vm binary and the image it launches are not version-locked by any
 image-side stamp. What a boot image must provide is the **[boot image
 contract](#boot-image-contract)**.
 
+## Selecting the boot image
+
+One image per session, chosen **independently of the tool you launch** (the tool
+catalog never changes it). First present source wins:
+
+| source | how |
+|---|---|
+| command line | `--image REF` |
+| environment | `AGENT_VM_IMAGE_TAG=REF` (an empty value counts as unset) |
+| user config | top-level `image = "REF"` in `~/.config/agent-vm/config.toml` |
+| project config | top-level `image = "REF"` in `<cwd>/.agent-vm/config.toml` |
+| default | `ghcr.io/wirenboard/agent-vm-template:latest` |
+
+`agent-vm shell`, `agent-vm claude` and `agent-vm mytool` all boot the same
+image; so do `pull` and `setup`.
+
+**Config-file `image` values are OCI references only.** The runtime treats a
+leading `/`, `./`, `../`, `.` or `..` as a host rootfs bind or disk image, so a
+repository-supplied `.agent-vm/config.toml` with `image = "/"` would boot the
+host root filesystem as a writable guest rootfs. agent-vm refuses such a value
+with an error naming the file (never echoing the value).
+`--image`/`AGENT_VM_IMAGE_TAG` keep their permissive pass-through, so a local
+rootfs or disk image is still bootable **from the command line**, where you
+typed it.
+
+**No launch builds an image or runs Docker.** Selection and acquisition only. An
+image that fails to acquire is a launch failure — there is no fallback image and
+no local build.
+
+**A missing program fails; agent-vm never installs it.** If the selected image
+does not contain the tool's `command`, the launch prints a contract diagnostic
+and exits 127.
+
+### Customizing the image
+
+Build your own image with ordinary Docker `FROM` the default boot image (or any
+image satisfying the [boot image contract](#boot-image-contract)), then import
+and select it:
+
+```sh
+docker buildx build --platform linux/arm64 --load \
+  --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+  -t my-image:dev .
+./script/build/import-image.sh my-image:dev        # today; #260 adds a CLI
+agent-vm shell --image my-image:dev                # or: image = "my-image:dev"
+```
+
+See [`examples/layers/`](examples/layers/) for example Dockerfiles.
+
 ## Boot image contract
 
-Any image selected for a session (via `--image`, `--base-image` composition, or
+Any image selected for a session (via `--image`, a config `image`, or
 the default) must satisfy this contract. agent-vm **never** installs software,
 substitutes another image, or runs the guest command on the host, so a breach is
 a launch failure naming the image and the missing piece.
@@ -227,16 +239,13 @@ Each launcher accepts:
 |---|---|
 | `--memory N` | VM memory GiB (default 2) |
 | `--cpus N` | vCPUs (default 2) |
-| `--image REF` | boot this image verbatim, skipping tool-layer composition |
-| `--base-image REF` | the tool-free base tool layers are composed onto (always composes) |
+| `--image REF` | boot this image instead of the configured one (env `AGENT_VM_IMAGE_TAG`); see [Selecting the boot image](#selecting-the-boot-image) |
 | `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
 | `--allow-missing-credentials` | warn and launch when a requested YAML credential is missing or unreadable, instead of refusing — see [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection). Never covers a built-in provider's own missing host credential |
 | `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). A live bind that would expose a host Pi credential file is refused — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted). Capacity is host-specific. |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
-| `--layer DIR` | append a tooling layer after the project's own `.agent-vm/layers/*` (repeatable, command-line order; relative to the project dir) — see [Project tooling layers](#project-tooling-layers) |
-| `--yes` / `-y` | assume "yes" to the tooling-layer chain build confirmation (CI/non-interactive) — see [Project tooling layers](#project-tooling-layers) |
 
 ### Extra and forked mounts
 
@@ -371,153 +380,15 @@ included, enables it.
 | `RUST_LOG` | tracing filter; default `warn`. e.g. `RUST_LOG=agent_vm=debug` |
 | `AGENT_VM_PROFILE` | print per-phase wall-time (create/run/stop/remove) |
 | `AGENT_VM_DEBUG_CONFIG` | dump the SandboxConfig JSON before boot |
-| `AGENT_VM_NO_CHROME_MCP` | disable Chrome MCP auto-configuration for a Chrome-capable image/layer |
-| `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`; an explicit `--base-image` wins over it) |
-| `AGENT_VM_BASE_IMAGE` | override the tool-free base (same as `--base-image`; an explicit `--image` wins over it) |
+| `AGENT_VM_NO_CHROME_MCP` | disable Chrome MCP auto-configuration for a Chrome-capable image |
+| `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`; outranks any config `image`; an empty value counts as unset) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
 | `AGENT_VM_UPDATE_CHECK` | opt into the launch-time registry update check (accepted: `1`/`true`/`yes`/`on`) |
 | `AGENT_VM_ROOT` | same as `--root` (accepted: `1`/`true`/`yes`/`on`) |
-| `AGENT_VM_YES` | same as `--yes` (accepted: `1`/`true`/`yes`/`on`) |
 
-`AGENT_VM_LAYER` is rejected; if set, launches fail with a pointer to
-`--layer`.
-
-## Project tooling layers
-
-A project can add tools on top of the base image — compilers,
-cross-toolchains, whatever the base doesn't carry — by declaring an ordered
-**chain** of layers under `.agent-vm/layers/`. Each immediate subdirectory
-is one step, built `FROM` the previous step (the base image for the first
-step), in byte-lexicographic order by directory name:
-
-```
-.agent-vm/layers/10-toolchain/Dockerfile
-.agent-vm/layers/20-chrome/Dockerfile
-```
-
-A single-step chain (just `.agent-vm/layers/10-tools/`) is the common case
-and is not a special case.
-
-`--layer DIR` (repeatable) **appends** more steps after the project's own
-`.agent-vm/layers/*` chain, in the order given on the command line:
-
-```
-agent-vm shell --layer ../shared/debug-tools --layer examples/layers/chrome-devtools
-```
-
-It appends rather than prepends because content-hash chaining is
-*prefix-stable*: a step's hash depends only on the steps before it, so
-appending never moves any project step's tag — a project's own chain stays a
-pure cache hit whether or not a `--layer` is passed that launch. `--layer`
-also works with **no** `.agent-vm/layers/` at all, which is how you try a
-checked-in example without copying it into the project first:
-
-```
-agent-vm shell --layer examples/layers/chrome-devtools --yes
-```
-
-Relative `--layer` paths resolve against the project directory (unlike
-`--mount`, which requires absolute paths — trying an example by relative path
-is the point). There is deliberately no environment variable for `--layer`;
-see the `AGENT_VM_LAYER` note above. The first time a `--layer` is appended
-after a project chain whose last step was already built, that last step gets
-rebuilt once (re-exported into docker's local image store, since it was
-built as a final/OCI step and never landed there) — this is expected, not a
-bug, and buildx's own build cache usually makes it fast; dropping the flag
-again afterward is a pure cache hit, because the project's own tag never left
-the msb cache. Trying a layer via `--layer` and then adopting it into the
-project (copying it under `.agent-vm/layers/`) costs nothing either: the hash
-covers the directory's contents and every step before it, never how it was
-named on the command line, so the adopted layer is a cache hit too.
-
-When a chain is declared, any launch verb
-builds each step with `docker buildx build`, chaining every step `FROM` the
-previous one's tag, loads **only the final step's** result into the
-microsandbox image cache **registry-lessly** (no `registry:2` sidecar, no
-registry contact at boot), and boots that derived image instead of the base.
-Intermediate steps live in docker's own local image store, never booted and
-never ingested into the msb cache. Step 0 resolves its base through the
-Docker-local base link `agent-vm-base:<msb-manifest-digest-hex>` (created at
-import time by `./script/build/import-image.sh`; for a registry base, the
-first build instead pulls the exact digest and creates the link itself) — this
-resolution happens **only on an actual build**, never on a cached launch.
-
-Each step's identity is a content hash that transitively covers every step
-beneath it, so the tag itself is the staleness check — there is no separate
-state file. An unchanged chain boots straight from the cache on every launch
-after the first, with no docker process spawned at all. Editing a step's
-Dockerfile changes that step's hash and every later step's hash, so editing
-an early step rebuilds the whole suffix above it; editing the last step
-rebuilds only itself. Building requires the default `docker` buildx driver
-on the host (`docker buildx use default` if unsure — see below) and, unless
-every step's hash is already cached, one confirmation for the whole chain:
-
-```
-Build project tooling layer 'agent-vm-layer:my-app-1a2b3c...'? [y/N]
-```
-
-for a single-step chain, or for a multi-step chain (`--layer` steps are
-labeled with their flag, as typed, so it's clear which came from the project
-and which from the command line):
-
-```
-Build project tooling layer chain (3 steps)?
-  1/3  .agent-vm/layers/10-toolchain            agent-vm-layer:my-app-1a2b3c…
-  2/3  .agent-vm/layers/20-lint                 agent-vm-layer:my-app-9f8e7d…
-  3/3  --layer examples/layers/chrome-devtools  agent-vm-layer:my-app-2c1d9e…
- [y/N]
-```
-
-Pass `--yes` (or set `AGENT_VM_YES=1`) to skip the prompt — required for
-CI/non-interactive launches. A failure in any step is a hard stop: agent-vm
-never boots the base, or a partially-built chain, in place of a step that
-failed.
-
-Each step's **built image** must satisfy the **layer image contract** — eight
-clauses, four enforced at build time. The normative text and the full clause
-list are
-[`docs/adr/0003-project-tooling-layers.md`](docs/adr/0003-project-tooling-layers.md)
-("The layer image contract").
-
-What agent-vm rejects, and how to fix it:
-
-1. **C1** — build `FROM ${BASE_IMAGE}`: declare a global `ARG BASE_IMAGE=...` before the first `FROM`.
-2. **C2** — keep `PATH` additive: never remove a directory the previous step had.
-3. **C3** — end the last step as root: no trailing `USER <someone-else>`.
-4. **C4** — don't pin `--platform` on your final `FROM`.
-
-The other four clauses (C5–C8) are documented-only. A `RUN` that installs
-foreign-architecture binaries **is not detected**: it fails at run time with
-`Exec format error`.
-
-A violation is a hard failure that aborts the launch, with no opt-out, and
-the offending image is discarded so the next launch rebuilds and re-checks it
-instead of booting it from cache:
-
-```text
-Error: tooling layer step 1/1 (.agent-vm/layers/10-a) violates the layer image contract, clause C3 (ends as root): the built image's config sets User="chrome", so a --root launch would run every command as that user instead of root
-Fix: end the Dockerfile with `USER root`
-See docs/adr/0003-project-tooling-layers.md, "The layer image contract".
-```
-
-The four enforced clauses apply only to images **built after** this version:
-agent-vm does not revalidate an already-cached image (a pre-upgrade artifact, or
-one whose discard after a violation failed), so it keeps booting until a step
-is edited and its hash moves. See
-[`docs/adr/0003-project-tooling-layers.md`](docs/adr/0003-project-tooling-layers.md)
-for the full contract and design rationale, including why chaining hashes
-against each step's content hash rather than a docker image id, and why
-`FROM` takes the previous step's tag.
-
-Requires the default `docker` buildx driver, not `docker-container`
-(`docker buildx ls` shows the active builder's driver) — chain steps
-resolve `FROM <tag>` through docker's own local image store, which an
-isolated `docker-container` builder can't see. If a step's build succeeds
-but the *next* step fails to resolve `FROM` it, run `docker buildx use
-default`, or create one with `docker buildx create --driver docker --use`.
-
-A leftover singular `.agent-vm/layer/` directory is a hard error naming the
-path; the supported layout is `.agent-vm/layers/<step>/`.
+`AGENT_VM_BASE_IMAGE`, `AGENT_VM_LAYER` and `AGENT_VM_YES` are no longer read.
+They are ordinary unread environment variables now — a launch that still
+exports one boots normally.
 
 ## Shared microsandbox image cache
 
@@ -640,11 +511,13 @@ override are deliberately **not** honored.
 ### Schema
 
 ```toml
+# Top-level, optional: the boot image for every session (an OCI reference).
+image = "ghcr.io/wirenboard/agent-vm-template:latest"
+
 [[tools]]
 name = "mytool"                      # required; the `agent-vm <name>` verb
 command = "mytool"                   # required; the guest command name
 args = ["--flag"]                    # optional; default argv (array of strings)
-layer = { builtin = "codex" }        # optional; EXACTLY one of builtin/path
 credentials = ["openai"]             # optional; credential provider names
 tools = ["claude"]                   # optional; tools to provision (same file, or name one)
 persist = [".cache/mytool"]          # optional; guest-HOME-relative, kept under <state>/persist/
@@ -652,6 +525,12 @@ env = { VAR = "value" }              # optional; guest env pairs for this tool
 interactive_shell = false            # optional; join trailing args into `-c`
 ```
 
+- `image` — optional top-level; an OCI image reference selecting the **boot
+  image** for every session (see
+  [Selecting the boot image](#selecting-the-boot-image)). It is independent of
+  the tools: a file that sets only `image` declares zero tools and keeps the
+  shipped defaults. Only OCI references are accepted here; a local path is
+  rejected (use `--image` for a local rootfs).
 - `name` — required; a single command-name token: nonempty, no
   whitespace/control characters, no `/` (a name is not a path), not an
   all-dots spelling (`.`/`..`), no leading `-`, and not one of the reserved
@@ -664,22 +543,6 @@ interactive_shell = false            # optional; join trailing args into `-c`
   the user already passed the same flag. `doctor` shows only the argument
   **count**, never the values, so a secret accidentally placed here is not
   echoed. Args are not shell-split or expanded.
-- `layer` — optional; a table with **exactly one** of `builtin` (one of
-  `dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`) or `path`. It **selects the tool
-  layer composed onto the base** for a launch whose tool set differs from the
-  shipped default (see [Image release cadence](#image-release-cadence)):
-  `builtin` names one of the six layers embedded in the binary, `path` a
-  directory (relative to the declaring config file, or absolute) holding a
-  `Dockerfile` that builds `FROM` the base per
-  [ADR-0003](docs/adr/0003-project-tooling-layers.md). A tool with no `layer`
-  contributes nothing to the composed image, so **omitting it on a redeclared
-  shipped tool boots a guest without that tool** — declare
-  `layer = { builtin = "claude" }` if you meant to compose it (see the upgrade
-  note below). One pairing this matters for: the shipped `pi` layer always loads
-  the `claude-bridge` extension, whose Claude Code child is the `claude` layer's
-  binary — a catalog that declares `pi` but not `claude` builds an image with a
-  bridge that cannot spawn anything (see
-  [Credential-free agents](#credential-free-agents-pi-dsh)).
 - `credentials` — optional; provider **config names**, which differ from
   the `agent-vm doctor` row labels. Valid: `anthropic`, `openai`,
   `opencode-static`, `copilot`. Note `opencode` (the doctor label) is **not**
@@ -744,7 +607,7 @@ interactive_shell = false            # optional; join trailing args into `-c`
   command line instead of being appended as separate argv entries. The shipped
   `shell` tool sets it.
 
-Unknown keys, wrong types, malformed TOML, unknown `layer.builtin`, unknown
+Unknown keys, wrong types, malformed TOML, unknown
 provider names, duplicate tool names within one file, and **overlapping**
 `persist` entries (equal or one an ancestor of the other — within one tool,
 across tools, or against a path agent-vm itself links into the state dir) are
@@ -761,14 +624,30 @@ silent fallback to the defaults.
 The user file is authoritative for any tool name it contains; the project
 file may add whole tool definitions the user did not write. This is a union
 of whole definitions, **not** a field-by-field overlay: a repo cannot fill in
-an omitted `persist`, `layer`, `credentials`, or `tools` on a user-defined tool.
+an omitted `persist`, `credentials`, or `tools` on a user-defined tool.
 Resolved order is user declarations first, then project-only declarations (the
-order `--help` and `doctor` both use). When a project declaration of an
+order `--help` and `doctor` both use). The top-level `image` is **not** merged:
+the user tier's `image` wins over the project tier's, and a file that declares
+no tools (for example an image-only file) still keeps the shipped defaults —
+but a project that **declares tools** still replaces the shipped set, exactly
+as before (ADR-0015). When a project declaration of an
 existing name differs, `doctor` warns once and the user definition wins, e.g.:
 
 ```text
 warning: tool "claude" in /home/alice/.config/agent-vm/config.toml overrides
          /work/repo/.agent-vm/config.toml; differing fields: command, args
+```
+
+`doctor` also prints the selected boot image (excluding `--image`, which it does
+not accept), so you can see which source won:
+
+```text
+==> boot image
+AGENT_VM_IMAGE_TAG: <unset>
+user:    ghcr.io/wirenboard/agent-vm-template:latest [/home/alice/.config/agent-vm/config.toml]
+project: none
+default: ghcr.io/wirenboard/agent-vm-template:latest
+selected (without --image): ghcr.io/wirenboard/agent-vm-template:latest (from user config /home/alice/.config/agent-vm/config.toml)
 ```
 
 ### The `shell` fallback
@@ -934,13 +813,14 @@ for the full design rationale.
 
 ## Chrome DevTools MCP
 
-The base image does not include Chromium. Select the marker-bearing
-[`chrome-devtools` tooling layer](examples/layers/chrome-devtools/) to install
-it and have the launcher add its owned `mcpServers.chrome-devtools` entry —
-either copy it into the project as a numbered step
-(`.agent-vm/layers/NN-chrome-devtools/`) or try it without copying via
-`agent-vm claude --layer examples/layers/chrome-devtools --yes`. Removing the
-layer removes that stale owned entry while preserving other MCPs.
+The default boot image does not include Chromium. An image that provides the
+**[Chrome DevTools capability](#boot-image-contract)** — Chromium plus the
+`/etc/agent-vm-capabilities/chrome-devtools-mcp` marker or the
+`/usr/local/bin/agent-vm-chrome-mcp` wrapper — gets the launcher's owned
+`mcpServers.chrome-devtools` entry; any other image boots normally with the
+entry removed. Build and select such an image with ordinary Docker (see
+[`examples/layers/chrome-devtools/`](examples/layers/chrome-devtools/) for a
+Dockerfile that installs it `FROM` the default boot image).
 `AGENT_VM_NO_CHROME_MCP=1` removes the automatic entry but leaves Chromium
 available for manual use. The launcher adds its owned
 `mcpServers.chrome-devtools` entry when the boot image advertises the capability
@@ -1046,7 +926,7 @@ what makes the shipped `claude-bridge` provider work with no in-guest login:
 `agent-vm pi` writes the Anthropic placeholder into the project's
 `~/.claude/.credentials.json` and registers the proxy substitution, so the
 Claude Code child the bridge spawns reaches Anthropic with your **host**
-credential. Three consequences are worth knowing:
+credential. Four consequences are worth knowing:
 
 - **A host `ANTHROPIC_API_KEY` wins over all of it.** agent-vm publishes a
   host-set `ANTHROPIC_API_KEY` into the guest as the **real, unsubstituted**
@@ -1063,13 +943,24 @@ credential. Three consequences are worth knowing:
   exchange is rejected and Claude Code reports a bare `OAuth error … status code
   400`. With **no** host credential nothing is registered, so `claude login`
   works — that is exactly the case where you would want it.
-- **A custom catalog must keep the `pi`/`claude` pairing.** The bridge is loaded
-  by the `pi` layer; the Claude Code binary it spawns comes from the `claude`
-  layer. Declare `pi` with `layer = { builtin = "pi" }` and no `claude` tool and
-  you get an image with the bridge and no `claude`: the seed hook no-ops and
-  every turn fails with `Native CLI binary … not found`. Copy the built-in `pi`
-  definition *without* `claude` and the launch fails earlier and more clearly, on
-  a dangling-`tools` diagnostic naming your file.
+- **An image that ships the `pi-claude-bridge` provider must also carry a
+  working `claude` executable.** The default boot image ships Pi with the
+  image-owned `pi-claude-bridge` extension, whose Claude Code child is the same
+  image's `claude` binary. An image that ships that provider but omits the
+  `claude` **executable** ships a bridge that cannot spawn anything: the seed
+  hook no-ops and every turn fails with `Native CLI binary … not found`. That is
+  an image problem — installing software is the image's job, so rebuild the image
+  with `claude` (or select an image that already has it). A custom Pi image that
+  deliberately uses another provider does not need the bridge, so this does not
+  apply to it.
+- **The catalog declaration is separate from the image.** The shipped `pi` tool
+  declares `tools = ["claude"]`, which provisions Anthropic through Claude Code's
+  credential. A custom catalog that copies that declaration must also resolve a
+  `claude` tool (or its `credentials` requirement); otherwise the declaration
+  fails on a **dangling-tool error**, which is a *config* problem, not an image
+  one. Merely having `claude` installed in the image does **not** synthesize the
+  catalog entry or its provisioning edges — drop the reference or declare the
+  credential requirement directly if the catalog deliberately omits `claude`.
 
 ### Storing your own secret values
 

@@ -7,8 +7,8 @@
 # Host-side only. The Dockerfile COPYs only package.json and package-lock.json
 # from this directory, so this file never reaches the image. Run it as
 # `bash upgrade-bridge.sh`: like every file under images/tools/ it is committed
-# 0644 (tool_layer.rs's
-# embedded_layer_sources_are_committed_without_the_execute_bit).
+# 0644 and run with `bash` (the recipes bind-mount their scripts rather than
+# COPYing them with the execute bit).
 #
 # The DEVELOPER-only path: it resolves a dist-tag at the host seam, then calls
 # the shared bridge prepare-lock.sh with `--refresh-lock`, which regenerates the
@@ -105,6 +105,6 @@ cat <<EOF
 ==> pinned ${PACKAGE}@${version}; parent Dockerfile LABEL updated
 ==> peer @earendil-works/pi-coding-agent: ${peer:-<none>} (image pins ${pi_pin}; check compatibility)
 Next:
-  cargo test -p agent-vm tool_layer   # lock guards + embedded snapshot + labels
+  cargo test --locked -p agent-vm --test image_sources   # lock guards + label mirrors
   then rebuild the tool layers -- see images/tools/README.md ("Upgrading a tool")
 EOF

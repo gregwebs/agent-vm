@@ -6,19 +6,20 @@ the code is the bug — file it, don't silently reintroduce the old name.
 Mechanism and rationale live in [ARCHITECTURE.md](ARCHITECTURE.md) and
 [docs/adr/](docs/adr/); this file defines the terms.
 
+
 ## Launcher
 
 The **host-side** `agent-vm` process for a single launch: it resolves the
-**catalog**, selects the **boot image** (using a **composition root** only
-when composing locally), acquires or composes it, plumbs credentials and mounts, builds the guest env and the in-guest prelude,
-then hands the sandbox config to microsandbox and supervises the session
-(`run.rs`). It is the host half of the pair whose other half is the **in-guest**
-side (`intercept_hook`, agentd).
+**catalog**, selects the **boot image**, acquires it, plumbs credentials and
+mounts, builds the guest env and the in-guest prelude, then hands the sandbox
+config to microsandbox and supervises the session (`run.rs`). It is the host
+half of the pair whose other half is the **in-guest** side (`intercept_hook`,
+agentd).
 
-_Avoid_: using it for the image builder alone (that is the **Layer DAG**, one
-phase of what the launcher does); for the `agent-vm` binary in its
-non-launching verbs (`doctor`, `pull`, `setup`), which share the binary but
-launch nothing; or for microsandbox.
+_Avoid_: using it for the image builder alone (the launcher does not build
+images); for the `agent-vm` binary in its non-launching verbs (`doctor`,
+`pull`, `setup`), which share the binary but launch nothing; or for
+microsandbox.
 
 ## Guest user
 
@@ -50,9 +51,9 @@ charset-checked. See
 
 The opt-out, enabled by `--root` or a truthy `AGENT_VM_ROOT` (the shared
 `env_flag` parser, like every value-parsing boolean `AGENT_VM_*`). Runs the
-guest as uid 0 with `HOME=/root`. Required for docker-in-VM; when the Chrome
-DevTools layer is installed, its MCP uses the `sudo -u chrome` path only in
-this mode.
+guest as uid 0 with `HOME=/root`. Required for docker-in-VM; when the image
+provides the Chrome DevTools capability, its MCP uses the `sudo -u chrome` path
+only in this mode.
 
 _Avoid_: "privileged mode" — the microVM boundary applies identically in
 both modes; root mode only changes the *in-guest* uid.
@@ -252,7 +253,7 @@ reachable only by **naming it explicitly**. An omitted `tools` is `[]` for
 every other name. A name no catalog tool provides is a hard config error.
 
 _Avoid_: "dependencies" — a named tool is provisioned, not required, and
-nothing is installed or built for it (that is a **Layer** with a `command`).
+nothing is installed or built for it.
 
 ### Provisioning set
 
@@ -286,41 +287,27 @@ one named, deletable one-shot move of a pre-#96 real `<state>/home/.pi` into
 
 ## Catalog
 
-The resolved, validated model of a configuration's declared **Layers** — what
+The resolved, validated model of a configuration's declared **tools** — what
 `config::load` produces, as one value so the catalog and a deferred
 configuration error cannot disagree about which state the process is in:
 `Catalog::Ready(LaunchCatalog)` or `Catalog::Broken(err)`. It is built from the
 **tool config tiers** (user, then project), merged as a union of whole
 definitions, and falls back to the compiled-in catalog when both tiers declare
-zero layers. It is **not** the config files themselves.
+zero tools. It is **not** the config files themselves.
 
-_Avoid_: bare "catalog" when the distinction matters — say **declared layer
-catalog** for the resolved `[[layers]]` entries alone, and **Launch catalog**
-for those entries plus each one's resolved provisioning set plus the built-in
+_Avoid_: bare "catalog" when the distinction matters — say **Launch catalog**
+for the resolved tools plus each one's provisioning set plus the built-in
 `shell` fallback. The bare word must never stand in for a config file.
-
-## Layer
-
-One validated catalog entry (`config::Layer`) in a `[[layers]]` section: a
-`name`, a `layer` source — `{ builtin = "dsh"|"pi"|"codex"|"opencode"|"claude"|"copilot" }`
-embedded from `images/tools/`, or `{ path = "…" }` anchored on the declaring
-config file's directory — an optional `parent`, an optional guest `command`,
-and the tool fields below. Every entry contributes to the image; an entry with a
-`command` also offers a launch verb. Layers are **declared, never discovered**:
-there is no `.agent-vm/layers/` convention, and `--layer DIR` injects one at the
-command line. Stitch order is **derived from `parent`**; declaration order only
-breaks ties among layers the graph does not order. Resolved by
-`tool_layer::chain_root` → `tool_layer::materialize`. See
-[ADR-0032](docs/adr/0032-one-layer-kind.md).
-
-_Avoid_: tooling layer, step, chain — one kind of thing now replaces them.
 
 ## Tool
 
-A **Layer** that has a `command`, and therefore a launch verb: `agent-vm
-<name>` works because the resolved configuration declares it. A layer with no
-`command` contributes to the image and offers no verb. A tool is **data**, not a
-credential provider and not a command to execute on the host.
+A runtime declaration describing how to launch an already-installed program
+in the **boot image**, including its command and runtime needs. Declaring a
+tool neither installs software nor specifies how its image is built.
+
+_Avoid_: using tool and **Layer** interchangeably (there is no longer a Layer
+concept); a tool is not a credential provider or a command to execute on the
+host.
 
 It also carries its default `argv`, a list of **credential providers**
 (`credentials`, the requirement set), a list of **available tools** (`tools`,
@@ -331,10 +318,7 @@ came from.
 `env` is published into the guest **before** the launcher's own environment and
 cannot override `PATH`, `IS_SANDBOX` or `LANG`; `HOME`/`USER`/`LOGNAME` are
 **rejected** at the config seam in every mode. See
-[ADR-0016](docs/adr/0016-tool-declared-guest-env.md). Decided, not yet built:
-the same launcher-owned keys are rejected on layer declarations, and two
-unrelated layers may not declare different values for one key
-([ADR-0032](docs/adr/0032-one-layer-kind.md)).
+[ADR-0016](docs/adr/0016-tool-declared-guest-env.md).
 
 ### Launch catalog
 
@@ -342,7 +326,7 @@ The verbs a launch actually offers (`config::LaunchCatalog`): the resolved
 merge result, plus the built-in `shell` appended when no declared tool claims
 that name. The catalog resolves each entry's provisioning set before dispatch,
 so `--help`, `doctor` and `run::launch` cannot disagree. One arm of
-**Catalog**; see that entry for the declared-layer side.
+**Catalog**.
 
 ### Tool config tier
 
@@ -353,27 +337,22 @@ before merging. Their merge is a **union of whole definitions**, not a field
 overlay: the user tier is authoritative for every name it declares, the
 project tier may only add names, and a differing project declaration yields a
 `doctor` warning (user definition wins). Only when both tiers declare **zero**
-layers do the compiled-in defaults apply.
+tools do the compiled-in defaults apply.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
 and the in-guest `clipboard`/`_intercept-hook` keep working, and a launch verb
 reports the config error rather than clap's "unrecognized subcommand".
 
-## Composition root
-
-The common foundation beneath the **Layer DAG**: the **base image** plus the
-generated union of **declared accounts**, when any are declared, before any
-catalog layer is added. It is the default **parent** of every layer, including
-shipped tools, not the finished **boot image**.
-
-_Avoid_: using it for the composed default or an explicit image booted verbatim;
-calling it the base image when it includes declared accounts.
-
 ## Boot image
 
-The finished image selected for a guest session: a **derived image**, a released
-**composed default image**, or an explicit image booted verbatim. It is distinct
-from the **composition root**, which is the foundation used during composition.
+The finished image selected for a guest session, independently of **tool**
+declarations and how the image was built. It contains the software used in the
+guest; tool declarations do not install that software.
+
+## Default boot image
+
+The maintained **boot image** offered out of the box, containing the standard
+coding agents. A user can select a custom boot image instead.
 
 ## Boot image contract
 
@@ -383,101 +362,23 @@ on `PATH`, the selected program executable by the guest user,
 [USAGE.md#boot-image-contract](USAGE.md#boot-image-contract). Not a version
 stamp. _Avoid_: image API, image-API version.
 
+## Image selection
+
+The one image a session boots, chosen independently of the launched tool:
+`--image` (command line) > `AGENT_VM_IMAGE_TAG` (an empty value is unset) >
+user config `image` > project config `image` > the **default boot image**. The
+catalog is never an input, so changing a runtime tool declaration cannot change
+the image. A config-file `image` must be an OCI reference; `--image`
+additionally accepts whatever msb accepts (a local rootfs or disk image). No
+launch builds an image. See
+[USAGE.md#selecting-the-boot-image](USAGE.md#selecting-the-boot-image) and
+[ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md).
+
 ## Base image
 
-The tool-free OS foundation beneath the **composition root**, before generated
-**declared accounts** or catalog layers are added. It is distinct from a
-**Base link**, which is a local reference to an image rather than the foundation
-concept.
-
-## Base selection
-
-The shared local choice of a **base image** for a particular base recipe,
-platform, and build arguments. Its recipe identity names the selection; the
-selected manifest digest identifies the resulting image.
-
-_Avoid_: base identity for the recipe identity — floating build inputs can yield
-multiple image digests from the same recipe.
-
-## Composed default image
-
-The **composition root** plus the shipped default layer set, joined by
-**stitching**. Its released form is a finished **boot image**, not a parent
-containing shipped tools beneath another copy of those same tools.
-
-## Parent
-
-What a layer builds `FROM`: the **composition root**, or the one layer it
-explicitly declares. Its **layer image**'s own layers are the ones above its
-parent, which is what makes a layer's identity independent of its position and
-what stitch order is derived from.
-_Avoid_: predecessor (that is a chain position).
-
-## Layer image
-
-One layer built `FROM` its parent. Its identity covers its parent, its build
-context and the build args passed (including its version), not its position;
-changes to union accounts can still change its foundation. See
-[ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md) and
-[ADR-0032](docs/adr/0032-one-layer-kind.md).
-
-_Avoid_: tool image — the tool-image ADRs predate one-kind layers; say layer
-image.
-
-## Current tag
-
-A movable name in the shared OCI layout for the tool image the upgrade command
-last built for a tool. A layer that is not a tool has no current tag: version
-resolution is a tool-image concept. A launch reads that image's version labels, not the image
-itself, so the upgrade carries onto a new base. Dropped when the tool's shipped
-build context changes. An exact `version` in the tool's config outranks it. See
-[ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md).
-_Avoid_: lockfile, latest tag.
-
-## Stitching
-
-Joining layer images into one composed image by appending each layer's own
-layers onto the **composition root**'s, in the order the layers' `parent`
-declarations derive, without building
-anything. See
-[ADR-0029](docs/adr/0029-compose-tool-images-by-layer-stitching.md).
-_Avoid_: merge, flatten, squash.
-
-## Composed tool image
-
-The **composition root** plus one launch's layers, joined by stitching. The
-**composed default image** is the composed image for the shipped layer set;
-neither is the foundation called the composition root.
-
-## Tool image contract
-
-The clauses every **layer image** must satisfy against its **parent**, checked
-once when it is built (T1–T7). A violation is a hard error, and the layer image
-is never recorded. [ADR-0031](docs/adr/0031-tool-image-contract.md) is
-canonical, incorporating [ADR-0032](docs/adr/0032-one-layer-kind.md)'s
-Env-only widening of T2 and generated-account-layer exemption from T3. The
-name is kept for continuity although it governs every layer, not only tools.
-
-_Avoid_: merged-image contract (nothing is merged).
-
-## Stitch check
-
-A check across the layers being stitched into one composed image: no file
-written by two unrelated layers (**S1**; direct or transitive ancestry permits
-overrides of ancestor-introduced files, never protected base/account files),
-no layer's command shadowed by another's (**S2**), and — new in
-[ADR-0032](docs/adr/0032-one-layer-kind.md) — no **S4** env collision, meaning
-two unrelated layers may not declare different values for one environment
-variable (`PATH` exempt; descendants may override ancestors). See
-[ADR-0031](docs/adr/0031-tool-image-contract.md).
-
-## Rebased composition
-
-A composed image using a new base with existing installed layer artifacts,
-retaining their original build-parent provenance. Its identity is distinct from
-those artifacts and includes the destination base and the artifacts used; a
-rebuild instead produces artifacts built against the new parent. See
-[ADR-0033](docs/adr/0033-default-rebase-with-build-provenance.md).
+The tool-free foundation built from the image repository's sources, which the
+**default boot image** and user-owned images can extend with ordinary Dockerfiles.
+The launcher never builds it; it is source content for image authors.
 
 ## Image-owned Pi package
 
@@ -491,87 +392,22 @@ guest state. Invisible to `pi list` / `pi update`. See
 ## Base link
 
 The Docker-local name `agent-vm-base:<manifest-digest-hex>` for an msb-cached
-base image — what buildx's step-0 `FROM` resolves, created by
-`script/build/import-image.sh` at import time (or, for a registry base, by a
-build-time `docker pull <repo>@<digest>` + `docker tag`). It is the *bridge*
-between the two image stores, not a second identity: the manifest digest stays
-step 0's hash input, and the link is never consulted on a cache-hit launch.
+base image, created by `script/build/import-image.sh` at import time. The
+launcher no longer consumes it;
+[#260](https://github.com/gregwebs/agent-vm/issues/260) removes the import-time
+tagging.
 
-## Layer DAG
+## Retired terms
 
-The graph a launch builds: the declared catalog's **layers**, each an
-independent build `FROM` its **parent** (the **composition root**, or a layer it
-declares), joined into the **derived image** by **stitching** in an order
-**derived** from the `parent` relation — repeatedly place the earliest-declared
-layer whose ancestors are all placed. Declaration order is therefore only a
-**tie-break among layers the graph does not order** (roots, and siblings under
-one parent), and a child may be declared above its parent. A `parent` naming a
-layer outside the composition, or a cycle, is a hard error. Every layer image's
-**tool image contract** is checked when it is built; the **stitch check**s run
-across the set. `layer::plan_chain` computes the identities up front;
-`layer::execute_chain` drives the builds. The default release path boots the
-**composed default image** without local builds, not the composition root;
-explicit local-build selection composes the shipped set too. A **`--layer
-DIR`** step declares no parent, so it is a root and command-line order is its
-tie-break; it carries no provenance into its identity. There is no discovery: a
-leftover `.agent-vm/layers/` directory is a hard migration error naming the
-entries to declare instead. See [ADR-0032](docs/adr/0032-one-layer-kind.md).
+These named a system the launcher no longer has; they are kept here so older
+notes and ADRs still resolve. See
+[ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md).
 
-_Avoid_: chain, step, predecessor — they name the position model the DAG
-replaced. An order-**dependent** layer is expressible by declaring `parent`.
-
-## Derived image
-
-The locally composed **boot image**: the **composition root** plus each
-participating catalog layer's own layers, joined once in derived stitch order.
-It is the finished composition, not an input to the identity of its foundation
-or participating artifacts. Identical composition inputs denote the same derived
-image across projects; a **project image handle** is a reference to it, not a
-separate image identity.
-
-## Project image handle
-
-A readable, project-specific reference to a **derived image**, distinct from the
-image's project-independent identity. Each project's retained handle is a GC
-root; several projects may retain the same image.
-
-_Avoid_: project image identity — the project names a reference, not its content.
-
-## Layer identity / hash
-
-The content hash `layer::resolve` computes over a layer's `base_image_id` plus
-its whole build-context directory tree (git-mode-normalized). `base_image_id`
-is always the **parent's** identity — the **composition root**'s for a layer
-that declares none — never a docker-assigned image id or the **Base link** tag.
-A layer's identity is therefore independent of its position and of where it was
-declared. The hash is computed, not read from the stitched manifest, so the tag
-is itself the staleness check: there is no separate state file recording what
-was last built, and a cache-hit launch needs no Docker. See
-[ADR-0032](docs/adr/0032-one-layer-kind.md). Decided, not yet built: a layer
-image's identity also covers the build args passed, so it names the versions
-installed, not only the inputs' files
-([ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md)).
-
-## Declared account
-
-A user or group a **Layer** declares in config (`users` / `groups`) instead of
-its `Dockerfile` appending to `/etc/passwd`, `/etc/group` or `/etc/shadow`.
-Declaring a user auto-creates a same-named group with its gid when nothing else
-claims it. The launcher generates **one append-only account layer** carrying the
-union of every declared account, placed in the **composition root** below every
-layer, so an account exists both during a layer's own build (`sudo -u`, a
-pre-warm) and in the booted guest. Collisions are hard errors — declared vs
-declared and vs the runtime host identity at plan time, vs the base image inside
-the generated stage's own build. Decided, not yet built
-([ADR-0032](docs/adr/0032-one-layer-kind.md)).
-
-## Layer image contract
-
-**Retired name** ([ADR-0032](docs/adr/0032-one-layer-kind.md)). It named
-[ADR-0003](docs/adr/0003-project-tooling-layers.md)'s eight clauses (C1–C8) for
-project tooling layers, which no longer exist as a kind. Every layer image is
-govered by the **tool image contract** instead. Kept here so older notes and
-ADRs citing it still resolve.
+**Layer**, **Composition root**, **Base selection**, **Composed default
+image**, **Parent**, **Layer image**, **Current tag**, **Stitching**,
+**Composed tool image**, **Tool image contract**, **Stitch check**, **Rebased
+composition**, **Layer DAG**, **Derived image**, **Project image handle**,
+**Layer identity / hash**, **Declared account**, **Layer image contract**.
 
 ## Boundary contract
 

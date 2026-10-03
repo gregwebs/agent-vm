@@ -1,5 +1,11 @@
 # ADR-0034: Versioned image releases instead of a continuously published registry
 
+**Amended by [ADR-0035](0035-consume-user-owned-boot-images.md) / #257**:
+same-repository image sources, archive-only distribution, a shared launcher
+composer, and a launcher-fixed image selection are withdrawn (#263–#265 own
+release/distribution); independent image versioning and integrity verification
+stand.
+
 Accepted (decision), not yet implemented. Resolved by
 [CI, published surface, and image-API migration](https://github.com/gregwebs/agent-vm/issues/209)
 on [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).

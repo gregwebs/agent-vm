@@ -201,6 +201,13 @@ fn write(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
+/// The decoy directory prepended to the host `PATH`: the exact search path the
+/// launcher (and the wiring control) runs with.
+fn decoys_path(decoys: &Path) -> String {
+    let host = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{host}", decoys.display())
+}
+
 /// One isolated `$HOME`, state root, and project cwd, plus a fake `msb` and a
 /// usable host credential for every provider a default tool selects, so each
 /// tool reaches the debug dumps instead of its pre-boot "sign in on the host"
@@ -316,8 +323,9 @@ impl Harness {
 
     /// Run `tool` with exactly `argv` (after the verb) and `envs` set on top of
     /// the cleared environment. [`Self::launch_with_env`] is the common case;
-    /// this is for a test that must choose the chain root itself, i.e. pass
-    /// `--base-image` or nothing at all (issue #189).
+    /// this is for a test that must control image selection itself (e.g. pass
+    /// `--image` or nothing at all, so config/env/default precedence is
+    /// observable).
     fn launch_argv(&self, tool: &str, argv: &[&str], envs: &[(&str, &str)]) -> Output {
         let mut cmd = self.base_command();
         for (key, value) in envs {
@@ -410,6 +418,82 @@ impl Harness {
             mounts.sort_by_key(|mount| serde_json::to_string(mount).unwrap());
         }
         serde_json::to_string_pretty(&value).unwrap()
+    }
+
+    /// Run a fixed built-in verb (`doctor`, `pull`, `setup`, top-level `help`)
+    /// with `args` and `envs` on the base command.
+    fn builtin(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        let mut cmd = self.base_command();
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.args(args);
+        run_with_timeout(cmd, Duration::from_secs(20))
+    }
+
+    /// A fresh directory holding executable `docker` and `buildx` decoys that
+    /// append `basename argv` to `calls.log` and exit 97. The launcher must
+    /// never invoke either (issue #259: no launch builds an image).
+    ///
+    /// Wiring control: a decoy is evidence only if a child on the **exact PATH**
+    /// used for the launch reaches it, it logs the exact argv, and it exits 97.
+    /// Both are invoked once through that PATH and the log is checked, then
+    /// truncated, so a decoy that is unreachable or silently succeeds cannot
+    /// make every zero-builder observation vacuous (Spec S2).
+    fn builder_decoys(&self) -> PathBuf {
+        let dir = self.home_root.join("builder-decoys");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("calls.log");
+        std::fs::write(&log, "").unwrap();
+        for name in ["docker", "buildx"] {
+            let script = format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> '{}'\nexit 97\n",
+                log.display()
+            );
+            let path = dir.join(name);
+            fake_msb::write_executable(&path, &script);
+        }
+        for name in ["docker", "buildx"] {
+            let output = std::process::Command::new(name)
+                .arg("wiring-probe")
+                .env("PATH", decoys_path(&dir))
+                .output()
+                .unwrap_or_else(|error| panic!("run the {name} decoy: {error}"));
+            assert_eq!(
+                output.status.code(),
+                Some(97),
+                "the {name} decoy must exit 97, not {}",
+                output.status
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "docker wiring-probe\nbuildx wiring-probe\n",
+            "the decoys must log the exact argv through the launch PATH"
+        );
+        std::fs::write(&log, "").unwrap();
+        dir
+    }
+
+    /// The decoys' invocation log. A missing/unreadable log is a failure, never
+    /// a vacuous zero.
+    fn decoy_log(&self, decoys: &Path) -> String {
+        std::fs::read_to_string(decoys.join("calls.log"))
+            .unwrap_or_else(|error| panic!("read the decoy log: {error}"))
+    }
+
+    /// `base_command` with the decoy directory prepended to `PATH`.
+    fn command_with_decoys(&self, decoys: &Path) -> Command {
+        let mut cmd = self.base_command();
+        cmd.env("PATH", decoys_path(decoys));
+        cmd
+    }
+
+    /// Run a tool verb (with `argv`) or a built-in on a prepared command.
+    fn run_on(cmd: Command, args: &[&str]) -> Output {
+        let mut cmd = cmd;
+        cmd.args(args);
+        run_with_timeout(cmd, Duration::from_secs(20))
     }
 }
 
@@ -1735,8 +1819,7 @@ fn default_tools_emit_the_legacy_guest_command_line() {
 // ---------------------------------------------------------------------------
 
 const CLAUDE_ONLY: &str = "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\n\
-     args = [\"--dangerously-skip-permissions\"]\nlayer = { builtin = \"claude\" }\n\
-     credentials = [\"anthropic\"]\n";
+     args = [\"--dangerously-skip-permissions\"]\ncredentials = [\"anthropic\"]\n";
 
 #[test]
 fn claude_only_config_registers_claude_and_the_shell_fallback() {
@@ -1799,111 +1882,6 @@ fn a_project_declared_tool_launches_its_own_command() {
         "/bin/echo --fast hi",
         "guest command line for the project-declared tool\nstderr:\n{stderr}"
     );
-}
-
-// ---------------------------------------------------------------------------
-// #189 — an explicit image flag beats the other flag's environment variable
-// ---------------------------------------------------------------------------
-
-/// One tool that declares **no** layer, so the catalog's declared tool-layer
-/// sequence is empty. `--base-image` then composes nothing and the launch
-/// reaches `builder.build()` — with no Docker and no registry pull — which is
-/// what makes the chain-root choice observable here.
-const LAYER_FREE_TOOL: &str = "[[tools]]\nname = \"plain\"\ncommand = \"/bin/echo\"\n";
-
-/// A second bogus-but-well-formed reference, distinguishable from
-/// [`BOGUS_IMAGE`] in the dumped config.
-const OTHER_BOGUS_IMAGE: &str = "localhost:1/other-image:latest";
-
-/// Issue #189: `AGENT_VM_IMAGE_TAG` is exported by this repo's own dev setup
-/// (`macos-build.md`) and by CI images, and clap's `env = …` fallback writes it
-/// into the same slot as `--image` — so an explicit `--base-image` used to be
-/// rejected as "mutually exclusive" with a flag the user never typed. The
-/// explicit flag must win.
-#[test]
-fn an_explicit_base_image_beats_an_ambient_image_tag() {
-    for ambient in [BOGUS_IMAGE, ""] {
-        let harness = Harness::new();
-        harness.write_project(LAYER_FREE_TOOL);
-        let out = harness.launch_argv(
-            "plain",
-            &["--base-image", OTHER_BOGUS_IMAGE],
-            &[("AGENT_VM_IMAGE_TAG", ambient)],
-        );
-        let stderr = stderr_of(&out);
-        assert!(
-            !stderr.contains("mutually exclusive"),
-            "AGENT_VM_IMAGE_TAG={ambient:?} must not conflict with an explicit --base-image: {stderr}"
-        );
-        assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
-        assert_eq!(
-            debug_config_json(&stderr)["image"]["Oci"]["reference"],
-            OTHER_BOGUS_IMAGE,
-            "{stderr}"
-        );
-    }
-}
-
-/// The mirror of [`an_explicit_base_image_beats_an_ambient_image_tag`], so the
-/// rule is pinned as symmetric rather than as a `--base-image` special case,
-/// and the empty ambient value is covered on this half too.
-#[test]
-fn an_explicit_image_beats_an_ambient_base_image() {
-    for ambient in [OTHER_BOGUS_IMAGE, ""] {
-        let harness = Harness::new();
-        harness.write_project(LAYER_FREE_TOOL);
-        let out = harness.launch_argv(
-            "plain",
-            &["--image", BOGUS_IMAGE],
-            &[("AGENT_VM_BASE_IMAGE", ambient)],
-        );
-        let stderr = stderr_of(&out);
-        assert!(
-            !stderr.contains("mutually exclusive"),
-            "AGENT_VM_BASE_IMAGE={ambient:?} must not conflict with an explicit --image: {stderr}"
-        );
-        assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
-        assert_eq!(
-            debug_config_json(&stderr)["image"]["Oci"]["reference"],
-            BOGUS_IMAGE,
-            "{stderr}"
-        );
-    }
-}
-
-/// A pair supplied the *same* way (both typed, or both from the environment)
-/// is the one case reconciliation cannot resolve: there is no more explicit
-/// side to prefer, so the conflict must survive.
-#[test]
-fn an_image_choice_is_still_rejected_when_both_sides_are_equally_explicit() {
-    for (what, argv, envs) in [
-        (
-            "both typed",
-            vec!["--image", BOGUS_IMAGE, "--base-image", OTHER_BOGUS_IMAGE],
-            vec![],
-        ),
-        (
-            "both ambient",
-            vec![],
-            vec![
-                ("AGENT_VM_IMAGE_TAG", BOGUS_IMAGE),
-                ("AGENT_VM_BASE_IMAGE", OTHER_BOGUS_IMAGE),
-            ],
-        ),
-    ] {
-        let harness = Harness::new();
-        harness.write_project(LAYER_FREE_TOOL);
-        let out = harness.launch_argv("plain", &argv, &envs);
-        let stderr = stderr_of(&out);
-        assert!(
-            stderr.contains("mutually exclusive"),
-            "{what}: the pair must still be rejected: {stderr}"
-        );
-        assert!(
-            !stderr.contains(CONFIG_MARKER),
-            "{what}: the launch must not reach the sandbox build: {stderr}"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3835,4 +3813,1386 @@ fn every_launch_scan_resolves_nothing() {
         !combined.contains("SECRET"),
         "an env name leaked:\n{combined}"
     );
+}
+
+// ===========================================================================
+// #259 — boot-image selection
+// ===========================================================================
+//
+// One image per session, chosen independently of the launched tool:
+// `--image` > `AGENT_VM_IMAGE_TAG` (empty = unset) > user config `image` >
+// project config `image` > default boot image. These tests drive the real
+// binary through every boundary. `AGENT_VM_TEST_DEFAULT_IMAGE` (debug-only)
+// gives the default slot a distinct, immediately unreachable loopback ref so a
+// default fallthrough does not start a real multi-GB pull.
+
+const CLI_REF: &str = "localhost:1/cli:latest";
+const ENV_REF: &str = "localhost:1/env:latest";
+const USER_REF: &str = "localhost:1/user:latest";
+const PROJECT_REF: &str = "localhost:1/project:latest";
+const DEFAULT_REF: &str = "localhost:1/default:latest";
+
+/// A custom runtime tool the project can declare; its command exists as a guest
+/// command name only, so the launch reaches `builder.build()`.
+const PROBE_TOOL: &str = "[[tools]]\nname = \"probe\"\ncommand = \"/bin/echo\"\n";
+
+/// The `Oci` reference of the dumped `SandboxConfig`.
+fn oci_reference(config: &serde_json::Value) -> String {
+    config["image"]["Oci"]["reference"]
+        .as_str()
+        .unwrap_or("<none>")
+        .to_string()
+}
+
+/// The two tiers' `image` settings (and, when `declares_tool`, the project's
+/// `probe` tool). Named fields rather than two adjacent `Option<&str>`
+/// parameters, so a user/project swap cannot compile
+/// (`CODING_STANDARDS.md` → *Types*).
+struct ImageTiers<'a> {
+    user: Option<&'a str>,
+    project: Option<&'a str>,
+    declares_tool: bool,
+}
+
+/// Write the two tiers' `image` settings (and, when `declares_tool`, the
+/// project's `probe` tool).
+fn write_image_tiers(harness: &Harness, tiers: ImageTiers) {
+    let ImageTiers {
+        user,
+        project,
+        declares_tool,
+    } = tiers;
+    if let Some(user) = user {
+        harness.write_user(&format!("image = \"{user}\"\n"));
+    }
+    let mut body = String::new();
+    if let Some(project) = project {
+        body.push_str(&format!("image = \"{project}\"\n"));
+    }
+    if declares_tool {
+        body.push_str(PROBE_TOOL);
+    }
+    if !body.is_empty() {
+        harness.write_project(&body);
+    }
+}
+
+/// Every `[debug] sandbox config JSON:` dump in `stderr`, decoded as complete
+/// JSON objects. Trailing notice/progress text between dumps is tolerated.
+/// Malformed JSON after a marker is an error, never a silently dropped dump.
+fn acquisition_configs(stderr: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = Vec::new();
+    let mut rest = stderr;
+    while let Some(index) = rest.find(CONFIG_MARKER) {
+        let after = &rest[index + CONFIG_MARKER.len()..];
+        let mut stream = serde_json::Deserializer::from_str(after).into_iter::<serde_json::Value>();
+        let value = stream
+            .next()
+            .ok_or_else(|| "no JSON after a dump marker".to_string())?;
+        let value = value.map_err(|error| format!("malformed debug JSON: {error}"))?;
+        let offset = stream.byte_offset();
+        out.push(value);
+        rest = &after[offset..];
+    }
+    Ok(out)
+}
+
+/// The single config dump named `name`, or an error naming how many were found.
+fn acquisition_config<'a>(
+    configs: &'a [serde_json::Value],
+    name: &str,
+) -> Result<&'a serde_json::Value, String> {
+    let matches: Vec<&serde_json::Value> = configs
+        .iter()
+        .filter(|config| config["name"].as_str() == Some(name))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("no `{name}` config dump")),
+        1 => Ok(matches[0]),
+        n => Err(format!("{n} `{name}` config dumps")),
+    }
+}
+
+/// The whole pull oracle: exactly one `agent-vm-pull` dump whose reference is
+/// `expected`.
+fn check_pull_acquisition(stderr: &str, expected: &str) -> Result<(), String> {
+    let configs = acquisition_configs(stderr)?;
+    let config = acquisition_config(&configs, "agent-vm-pull")?;
+    let reference = oci_reference(config);
+    if reference != expected {
+        return Err(format!(
+            "the acquisition config boots {reference}, expected {expected}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn acquisition_config_oracle_rejects_notice_only_and_wrong_reference() {
+    // Control: a real pull run parses and names the exact reference.
+    let harness = Harness::new();
+    harness.write_project(&format!("image = \"{PROJECT_REF}\"\n"));
+    let out = harness.builtin(&["pull"], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+    let stderr = stderr_of(&out);
+    check_pull_acquisition(&stderr, PROJECT_REF).expect("the real pull config is observable");
+
+    // Rejected captures.
+    let notice_only = format!(
+        "==> {PROJECT_REF} (from project config /x) is the image this configuration boots from\n"
+    );
+    assert!(
+        check_pull_acquisition(&notice_only, PROJECT_REF).is_err(),
+        "a notice with no JSON dump must fail"
+    );
+
+    let wrong = format!(
+        "{CONFIG_MARKER}{{\"name\":\"agent-vm-pull\",\"image\":{{\"Oci\":{{\"reference\":\"localhost:1/wrong:latest\"}}}}}}\n==> {PROJECT_REF} (from project config /x) is the image this configuration boots from\n"
+    );
+    assert!(
+        check_pull_acquisition(&wrong, PROJECT_REF).is_err(),
+        "a config with the wrong reference must fail on equality"
+    );
+
+    let malformed = format!("{CONFIG_MARKER}{{not json\n");
+    assert!(
+        check_pull_acquisition(&malformed, PROJECT_REF).is_err(),
+        "malformed JSON after a marker must fail"
+    );
+
+    let duplicate = format!(
+        "{CONFIG_MARKER}{{\"name\":\"agent-vm-pull\",\"image\":{{\"Oci\":{{\"reference\":\"{PROJECT_REF}\"}}}}}}\n{CONFIG_MARKER}{{\"name\":\"agent-vm-pull\",\"image\":{{\"Oci\":{{\"reference\":\"{PROJECT_REF}\"}}}}}}\n"
+    );
+    assert!(
+        check_pull_acquisition(&duplicate, PROJECT_REF).is_err(),
+        "two dumps for one name must fail"
+    );
+}
+
+/// One precedence row. `source` is the prefix the launch/pull notice renders
+/// after `(from `; the file-backed sources carry a path suffix.
+struct Precedence {
+    name: &'static str,
+    cli: Option<&'static str>,
+    env: Option<&'static str>,
+    user: Option<&'static str>,
+    project: Option<&'static str>,
+    expected: &'static str,
+    source: &'static str,
+}
+
+fn precedence_rows() -> [Precedence; 10] {
+    [
+        Precedence {
+            name: "typed beats all",
+            cli: Some(CLI_REF),
+            env: Some(ENV_REF),
+            user: Some(USER_REF),
+            project: Some(PROJECT_REF),
+            expected: CLI_REF,
+            source: "command line",
+        },
+        Precedence {
+            name: "env beats user",
+            cli: None,
+            env: Some(ENV_REF),
+            user: Some(USER_REF),
+            project: Some(PROJECT_REF),
+            expected: ENV_REF,
+            source: "AGENT_VM_IMAGE_TAG",
+        },
+        Precedence {
+            name: "user beats project",
+            cli: None,
+            env: None,
+            user: Some(USER_REF),
+            project: Some(PROJECT_REF),
+            expected: USER_REF,
+            source: "user config",
+        },
+        Precedence {
+            name: "project beats default",
+            cli: None,
+            env: None,
+            user: None,
+            project: Some(PROJECT_REF),
+            expected: PROJECT_REF,
+            source: "project config",
+        },
+        Precedence {
+            name: "default fallthrough",
+            cli: None,
+            env: None,
+            user: None,
+            project: None,
+            expected: DEFAULT_REF,
+            source: "default",
+        },
+        Precedence {
+            name: "empty env is unset (user)",
+            cli: None,
+            env: Some(""),
+            user: Some(USER_REF),
+            project: Some(PROJECT_REF),
+            expected: USER_REF,
+            source: "user config",
+        },
+        Precedence {
+            name: "empty env does not mask project",
+            cli: None,
+            env: Some(""),
+            user: None,
+            project: Some(PROJECT_REF),
+            expected: PROJECT_REF,
+            source: "project config",
+        },
+        Precedence {
+            name: "empty env does not mask default",
+            cli: None,
+            env: Some(""),
+            user: None,
+            project: None,
+            expected: DEFAULT_REF,
+            source: "default",
+        },
+        Precedence {
+            name: "empty env cannot erase a typed flag",
+            cli: Some(CLI_REF),
+            env: Some(""),
+            user: Some(USER_REF),
+            project: Some(PROJECT_REF),
+            expected: CLI_REF,
+            source: "command line",
+        },
+        Precedence {
+            name: "typed beats whitespace env",
+            cli: Some(CLI_REF),
+            env: Some(" "),
+            user: Some(USER_REF),
+            project: Some(PROJECT_REF),
+            expected: CLI_REF,
+            source: "command line",
+        },
+    ]
+}
+
+#[test]
+fn image_precedence_at_every_cli_boundary() {
+    for row in precedence_rows() {
+        // --- launch (a declared custom verb and the shipped `shell`) ---
+        let harness = Harness::new();
+        write_image_tiers(
+            &harness,
+            ImageTiers {
+                user: row.user,
+                project: row.project,
+                declares_tool: true,
+            },
+        );
+        let decoys = harness.builder_decoys();
+        for tool in ["probe", "shell"] {
+            let mut cmd = harness.command_with_decoys(&decoys);
+            cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+            if let Some(env) = row.env {
+                cmd.env("AGENT_VM_IMAGE_TAG", env);
+            }
+            let mut argv: Vec<&str> = vec![tool];
+            if let Some(cli) = row.cli {
+                argv.push("--image");
+                argv.push(cli);
+            }
+            let out = Harness::run_on(cmd, &argv);
+            let stderr = stderr_of(&out);
+            assert!(
+                !out.status.success(),
+                "{} ({tool}): the bogus image must fail acquisition, stderr:\n{stderr}",
+                row.name
+            );
+            assert!(
+                stderr.contains(&format!(
+                    "==> Boot image {} (from {}",
+                    row.expected, row.source
+                )),
+                "{} ({tool}): notice missing/wrong:\n{stderr}",
+                row.name
+            );
+            assert_eq!(
+                oci_reference(&debug_config_json(&stderr)),
+                row.expected,
+                "{} ({tool})",
+                row.name
+            );
+            if tool == "probe" {
+                assert_eq!(debug_guest_command(&stderr), "/bin/echo", "{}", row.name);
+            }
+            assert!(
+                !stderr.contains("Build project tooling layer"),
+                "{} ({tool}): a confirmation prompt appeared:\n{stderr}",
+                row.name
+            );
+        }
+        assert_eq!(
+            harness.decoy_log(&decoys),
+            "",
+            "{}: no builder calls",
+            row.name
+        );
+
+        // --- pull and setup (initial acquisition) ---
+        for verb in ["pull", "setup"] {
+            let harness = Harness::new();
+            write_image_tiers(
+                &harness,
+                ImageTiers {
+                    user: row.user,
+                    project: row.project,
+                    declares_tool: false,
+                },
+            );
+            let decoys = harness.builder_decoys();
+            let mut cmd = harness.command_with_decoys(&decoys);
+            cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+            if let Some(env) = row.env {
+                cmd.env("AGENT_VM_IMAGE_TAG", env);
+            }
+            let mut argv: Vec<&str> = vec![verb];
+            if let Some(cli) = row.cli {
+                argv.push("--image");
+                argv.push(cli);
+            }
+            let out = Harness::run_on(cmd, &argv);
+            let stderr = stderr_of(&out);
+            let stdout = stdout_of(&out);
+            assert!(
+                !out.status.success(),
+                "{} ({verb}): the bogus image must fail, stderr:\n{stderr}",
+                row.name
+            );
+            if verb == "pull" {
+                assert!(
+                    stdout.contains(&format!("==> {} (from {}", row.expected, row.source)),
+                    "{} ({verb}): selection notice missing:\n{stdout}",
+                    row.name
+                );
+            } else {
+                assert!(
+                    stdout.contains(&format!(
+                        "==> Pulling {} into the microsandbox cache",
+                        row.expected
+                    )),
+                    "{} ({verb}): pull notice missing:\n{stdout}",
+                    row.name
+                );
+            }
+            check_pull_acquisition(&stderr, row.expected)
+                .unwrap_or_else(|problem| panic!("{} ({verb}): {problem}\n{stderr}", row.name));
+            // setup's unreachable ref fails at its initial pull, so there must
+            // be no verification dump.
+            let configs = acquisition_configs(&stderr).expect("dumps parse");
+            assert!(
+                acquisition_config(&configs, "agent-vm-setup-verify").is_err(),
+                "{} ({verb}): no verification dump may appear for an unreachable ref:\n{stderr}",
+                row.name
+            );
+            assert_eq!(
+                harness.decoy_log(&decoys),
+                "",
+                "{} ({verb}): no builder calls",
+                row.name
+            );
+        }
+
+        // --- doctor (no `--image`): rows without a typed override only ---
+        if row.cli.is_none() {
+            let harness = Harness::new();
+            write_image_tiers(
+                &harness,
+                ImageTiers {
+                    user: row.user,
+                    project: row.project,
+                    declares_tool: false,
+                },
+            );
+            let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)];
+            if let Some(env) = row.env {
+                envs.push(("AGENT_VM_IMAGE_TAG", env));
+            }
+            let out = harness.builtin(&["doctor"], &envs);
+            let stdout = stdout_of(&out);
+            assert!(
+                stdout.contains(&format!(
+                    "selected (without --image): {} (from {}",
+                    row.expected, row.source
+                )),
+                "{} (doctor): selected row missing:\n{stdout}",
+                row.name
+            );
+        }
+    }
+}
+
+#[test]
+fn image_whitespace_and_empty_values_do_not_fall_through() {
+    // Whitespace env values are PRESENT, not unset or trimmed: they are
+    // retained as the environment override, and acquisition/parsing may fail
+    // before a JSON dump. There must be no fallback to U/P/D and no builder.
+    for present in [" ", "\t", " localhost:1/env:latest "] {
+        let harness = Harness::new();
+        write_image_tiers(
+            &harness,
+            ImageTiers {
+                user: Some(USER_REF),
+                project: Some(PROJECT_REF),
+                declares_tool: true,
+            },
+        );
+        let decoys = harness.builder_decoys();
+        let mut cmd = harness.command_with_decoys(&decoys);
+        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)
+            .env("AGENT_VM_IMAGE_TAG", present);
+        let out = Harness::run_on(cmd, &["probe"]);
+        let stderr = stderr_of(&out);
+        assert!(
+            !out.status.success(),
+            "{present:?} must fail acquisition:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(USER_REF)
+                && !stderr.contains(PROJECT_REF)
+                && !stderr.contains(DEFAULT_REF),
+            "{present:?} fell through to a lower tier:\n{stderr}"
+        );
+        assert!(
+            harness.decoy_log(&decoys).is_empty(),
+            "{present:?}: no builder calls"
+        );
+
+        // pull and setup treat it the same way.
+        for verb in ["pull", "setup"] {
+            let harness = Harness::new();
+            write_image_tiers(
+                &harness,
+                ImageTiers {
+                    user: Some(USER_REF),
+                    project: Some(PROJECT_REF),
+                    declares_tool: false,
+                },
+            );
+            let decoys = harness.builder_decoys();
+            let mut cmd = harness.command_with_decoys(&decoys);
+            cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)
+                .env("AGENT_VM_IMAGE_TAG", present);
+            let out = Harness::run_on(cmd, &[verb]);
+            let stderr = stderr_of(&out);
+            assert!(
+                !out.status.success(),
+                "{present:?} ({verb}) must fail:\n{stderr}"
+            );
+            assert!(
+                harness.decoy_log(&decoys).is_empty(),
+                "{present:?} ({verb}): no builder calls"
+            );
+        }
+
+        // doctor reports the retained env override, not a lower tier.
+        let harness = Harness::new();
+        write_image_tiers(
+            &harness,
+            ImageTiers {
+                user: Some(USER_REF),
+                project: Some(PROJECT_REF),
+                declares_tool: false,
+            },
+        );
+        let out = harness.builtin(
+            &["doctor"],
+            &[
+                ("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF),
+                ("AGENT_VM_IMAGE_TAG", present),
+            ],
+        );
+        let stdout = stdout_of(&out);
+        assert!(
+            stdout.contains("(from AGENT_VM_IMAGE_TAG)"),
+            "{present:?} (doctor): env override not selected:\n{stdout}"
+        );
+    }
+
+    // A typed `--image ' ref '` retains the exact argument, not a trimmed ref.
+    let harness = Harness::new();
+    harness.write_project(&format!("image = \"{PROJECT_REF}\"\n{PROBE_TOOL}"));
+    let spaced = " localhost:1/cli:latest ";
+    let out = harness.launch_argv(
+        "probe",
+        &["--image", spaced],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(spaced),
+        "the typed value must be retained exactly:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("(from project config"),
+        "must not fall through:\n{stderr}"
+    );
+
+    // A typed empty `--image ''` fails at the override boundary even with valid
+    // lower tiers.
+    let harness = Harness::new();
+    write_image_tiers(
+        &harness,
+        ImageTiers {
+            user: Some(USER_REF),
+            project: Some(PROJECT_REF),
+            declares_tool: true,
+        },
+    );
+    let out = harness.launch_argv(
+        "probe",
+        &["--image", ""],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    assert!(!out.status.success(), "a typed empty --image must fail");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("must not be empty"), "{stderr}");
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "must fail before building a config:\n{stderr}"
+    );
+}
+
+#[test]
+fn config_images_reject_local_paths_and_empty_values() {
+    // The values are TOML literals, so a tab/newline is expressed with escapes.
+    let bad_values = [
+        "\"\"",
+        "\" \"",
+        "\"\\t\"",
+        "\" localhost:1/user:latest \"",
+        "\"/\"",
+        "\"./rootfs\"",
+        "\"../rootfs\"",
+        "\".\"",
+        "\"..\"",
+        "\"/tmp/img.disk\"",
+        "\"a\\nb\"",
+    ];
+    for value in bad_values {
+        // user tier
+        let harness = Harness::new();
+        harness.write_user(&format!("image = {value}\n"));
+        let out = harness.launch_argv("shell", &[], &[]);
+        let stderr = stderr_of(&out);
+        assert!(
+            !out.status.success(),
+            "user image {value} must fail:\n{stderr}"
+        );
+        assert!(stderr.contains("image"), "user image {value}: {stderr}");
+        assert!(
+            !stderr.contains("==> Boot image"),
+            "user image {value} must not select an image:\n{stderr}"
+        );
+
+        // project tier
+        let harness = Harness::new();
+        harness.write_project(&format!("image = {value}\n"));
+        let out = harness.launch_argv("shell", &[], &[]);
+        let stderr = stderr_of(&out);
+        assert!(
+            !out.status.success(),
+            "project image {value} must fail:\n{stderr}"
+        );
+        assert!(stderr.contains("image"), "project image {value}: {stderr}");
+
+        // doctor still renders its sections and exits nonzero.
+        let harness = Harness::new();
+        harness.write_project(&format!("image = {value}\n"));
+        let out = harness.builtin(&["doctor"], &[]);
+        let stdout = stdout_of(&out);
+        assert!(
+            !out.status.success(),
+            "doctor must exit nonzero for image {value}"
+        );
+        assert!(
+            stdout.contains("==> boot image"),
+            "doctor sections render for {value}:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("could not be read"),
+            "doctor explains the load failure for {value}:\n{stdout}"
+        );
+    }
+
+    // An invalid lower tier is still an error when a higher source is set:
+    // precedence is not permission to skip config validation.
+    let harness = Harness::new();
+    harness.write_project("image = \"/\"\n");
+    let out = harness.launch_argv(
+        "shell",
+        &["--image", CLI_REF],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    assert!(
+        !out.status.success(),
+        "an invalid project image must still fail with a higher source"
+    );
+}
+
+/// The tool rows `doctor` renders, in order (`  1. dsh -> "dsh"; …`).
+fn doctor_tool_order(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().split_once(". ")?.1;
+            let name = rest.split_whitespace().next()?;
+            rest.contains("->").then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// The launch verbs listed in a clap `Commands:` block, in order, excluding
+/// the fixed built-ins. Command entries start with exactly two spaces;
+/// wrapped description lines are indented further.
+fn help_tool_order(text: &str) -> Vec<String> {
+    const BUILTINS: [&str; 7] = [
+        "setup",
+        "pull",
+        "msb",
+        "clipboard",
+        "doctor",
+        "secret",
+        "help",
+    ];
+    let mut out = Vec::new();
+    let mut in_commands = false;
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed == "Commands:" {
+            in_commands = true;
+            continue;
+        }
+        if in_commands && trimmed == "Options:" {
+            break;
+        }
+        if !in_commands || !line.starts_with("  ") || line.starts_with("   ") {
+            continue;
+        }
+        let token = line.split_whitespace().next().unwrap_or("");
+        if !token.is_empty() && !BUILTINS.contains(&token) {
+            out.push(token.to_string());
+        }
+    }
+    out
+}
+
+#[test]
+fn image_only_config_keeps_all_shipped_runtime_tools() {
+    // Baseline: the shipped defaults, booting a named image via `--image`.
+    let baseline_harness = Harness::new();
+    let baseline_out = baseline_harness.launch_argv(
+        "claude",
+        &["--image", PROJECT_REF],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    let baseline = normalized_config(&baseline_harness, &baseline_out);
+    assert_eq!(oci_reference(&baseline), PROJECT_REF);
+
+    // Every image-only shape keeps the shipped tools and changes only the image.
+    let variants: [(&str, Option<&str>, Option<&str>, bool); 4] = [
+        ("user only", Some(PROJECT_REF), None, false),
+        ("project only", None, Some(PROJECT_REF), false),
+        ("both tiers", Some(PROJECT_REF), Some(PROJECT_REF), false),
+        ("project with tools=[]", None, Some(PROJECT_REF), true),
+    ];
+    for (name, user, project, explicit_empty) in variants {
+        let harness = Harness::new();
+        if let Some(user) = user {
+            harness.write_user(&format!("image = \"{user}\"\n"));
+        }
+        let mut body = String::new();
+        if let Some(project) = project {
+            body.push_str(&format!("image = \"{project}\"\n"));
+        }
+        if explicit_empty {
+            body.push_str("tools = []\n");
+        }
+        if !body.is_empty() {
+            harness.write_project(&body);
+        }
+
+        let out = harness.launch_argv(
+            "claude",
+            &[],
+            &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        );
+        let config = normalized_config(&harness, &out);
+        assert_eq!(oci_reference(&config), PROJECT_REF, "{name}");
+        assert_eq!(config, baseline, "{name}: only the image field may change");
+
+        // Help and doctor still list all seven shipped verbs, in order.
+        let help = harness.builtin(&["--help"], &[]);
+        assert_eq!(
+            help_tool_order(&stdout_of(&help)),
+            DEFAULT_TOOLS,
+            "{name}: help verb order"
+        );
+        let doctor = harness.builtin(&["doctor"], &[]);
+        assert_eq!(
+            doctor_tool_order(&stdout_of(&doctor)),
+            DEFAULT_TOOLS,
+            "{name}: doctor verb order"
+        );
+    }
+
+    // A user image-only tier plus project custom tools: the project tools still
+    // replace the shipped tools (ADR-0015), and the user image still wins.
+    let harness = Harness::new();
+    harness.write_user(&format!("image = \"{USER_REF}\"\n"));
+    harness.write_project(&format!(
+        "image = \"{PROJECT_REF}\"\n[[tools]]\nname = \"hello\"\ncommand = \"hello-258\"\n"
+    ));
+    let out = harness.launch_argv(
+        "hello",
+        &[],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    let config = normalized_config(&harness, &out);
+    assert_eq!(
+        oci_reference(&config),
+        USER_REF,
+        "the user image outranks the project's"
+    );
+    let claude = harness.launch_argv(
+        "claude",
+        &[],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    assert!(
+        stderr_of(&claude).contains("unrecognized subcommand"),
+        "project tools replace the shipped tools"
+    );
+}
+
+#[test]
+fn custom_catalog_and_tool_edits_do_not_change_the_boot_image() {
+    let harness = Harness::new();
+    harness.write_project(
+        "[[tools]]\nname = \"hello\"\ncommand = \"hello-258\"\nargs = [\"probe\", \"two words\"]\n",
+    );
+
+    // No image configured: both the custom verb and the shell fallback choose
+    // the default boot image.
+    for tool in ["hello", "shell"] {
+        let out = harness.launch_argv(tool, &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+        assert_eq!(
+            oci_reference(&debug_config_json(&stderr_of(&out))),
+            DEFAULT_REF,
+            "{tool}"
+        );
+    }
+    let hello = harness.launch_argv(
+        "hello",
+        &[],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    assert_eq!(
+        debug_guest_command(&stderr_of(&hello)),
+        "hello-258 probe two words"
+    );
+
+    // Select the project image: both verbs choose it.
+    harness.write_project(
+        "image = \"localhost:1/project:latest\"\n[[tools]]\nname = \"hello\"\ncommand = \"hello-258\"\nargs = [\"probe\", \"two words\"]\n",
+    );
+    for tool in ["hello", "shell"] {
+        let out = harness.launch_argv(tool, &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+        assert_eq!(
+            oci_reference(&debug_config_json(&stderr_of(&out))),
+            PROJECT_REF,
+            "{tool}"
+        );
+    }
+
+    // Edit the declaration (command/args/env), add and reorder tools: the
+    // selection stays P, and the changed tool behavior is observable.
+    harness.write_project(
+        "image = \"localhost:1/project:latest\"\n\
+         [[tools]]\nname = \"second\"\ncommand = \"second-258\"\n\
+         [[tools]]\nname = \"hello\"\ncommand = \"hello-edited\"\nargs = [\"one\"]\nenv = { AVM_EDIT = \"yes\" }\n",
+    );
+    let edited = harness.launch_argv(
+        "hello",
+        &[],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    let stderr = stderr_of(&edited);
+    assert_eq!(oci_reference(&debug_config_json(&stderr)), PROJECT_REF);
+    assert_eq!(debug_guest_command(&stderr), "hello-edited one");
+    let config = debug_config_json(&stderr);
+    assert!(
+        env_pairs(&config).contains(&("AVM_EDIT", "yes")),
+        "the edited env must be published"
+    );
+
+    // Remove the second tool; selection is unchanged.
+    harness.write_project(
+        "image = \"localhost:1/project:latest\"\n[[tools]]\nname = \"hello\"\ncommand = \"hello-edited\"\n",
+    );
+    let out = harness.launch_argv(
+        "hello",
+        &[],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    assert_eq!(
+        oci_reference(&debug_config_json(&stderr_of(&out))),
+        PROJECT_REF
+    );
+}
+
+#[test]
+fn help_doctor_pull_setup_and_launch_agree_on_image_selection() {
+    let harness = Harness::new();
+    harness.write_user(&format!("image = \"{USER_REF}\"\n"));
+    harness.write_project(&format!(
+        "image = \"{PROJECT_REF}\"\n[[tools]]\nname = \"hello\"\ncommand = \"hello-258\"\n"
+    ));
+
+    // The verb list agrees between `--help` and `doctor` (hello then shell, no
+    // shipped agent verbs, since the project replaced the defaults).
+    let help = stdout_of(&harness.builtin(&["--help"], &[]));
+    let doctor = stdout_of(&harness.builtin(&["doctor"], &[]));
+    assert_eq!(
+        help_tool_order(&help),
+        vec!["hello".to_string(), "shell".to_string()],
+        "help verbs"
+    );
+    assert_eq!(
+        doctor_tool_order(&doctor),
+        vec!["hello".to_string(), "shell".to_string()],
+        "doctor verbs"
+    );
+
+    // Every launch/builtin help path exposes the same precedence text and env
+    // binding, and none of the removed image/build flags.
+    let mut paths: Vec<(&str, Output)> = vec![
+        ("help hello", harness.builtin(&["help", "hello"], &[])),
+        (
+            "hello --help",
+            harness.launch_argv("hello", &["--help"], &[]),
+        ),
+        (
+            "shell --help",
+            harness.launch_argv("shell", &["--help"], &[]),
+        ),
+        ("pull --help", harness.builtin(&["pull", "--help"], &[])),
+        ("setup --help", harness.builtin(&["setup", "--help"], &[])),
+    ];
+    for (what, out) in paths.drain(..) {
+        let text = stdout_of(&out);
+        assert!(
+            out.status.success(),
+            "{what} must exit 0:\n{text}\n{}",
+            stderr_of(&out)
+        );
+        assert!(
+            text.contains("--image"),
+            "{what} must document --image:\n{text}"
+        );
+        assert!(
+            text.contains("AGENT_VM_IMAGE_TAG"),
+            "{what} must bind AGENT_VM_IMAGE_TAG:\n{text}"
+        );
+        for removed in ["--base-image", "--layer", "--yes"] {
+            assert!(
+                !text.contains(removed),
+                "{what} must not mention {removed}:\n{text}"
+            );
+        }
+    }
+}
+
+/// `doctor` reports the boot image but has no `--image` of its own: a launch's
+/// typed override must not become reachable through it, so the flag stays an
+/// ordinary clap usage error (exit 2) and neither `doctor --help` nor the
+/// doctor command advertises it. This pins the "no `doctor --image` API"
+/// boundary that the shared `ImageArgs` flatten would silently break if it were
+/// added to `doctor`.
+#[test]
+fn doctor_does_not_accept_an_image_flag() {
+    let harness = Harness::new();
+    let out = harness.builtin(&["doctor", "--image", CLI_REF], &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "doctor must reject --image as a usage error:\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let help = stdout_of(&harness.builtin(&["doctor", "--help"], &[]));
+    assert!(
+        !help.contains("--image"),
+        "doctor --help must not advertise --image:\n{help}"
+    );
+    assert!(
+        !help.contains("AGENT_VM_IMAGE_TAG"),
+        "doctor does not bind AGENT_VM_IMAGE_TAG through clap:\n{help}"
+    );
+}
+
+#[test]
+fn pull_and_setup_reject_removed_composition_flags_as_usage_errors() {
+    // `pull`/`setup` have no trailing positional, so every removed composition
+    // flag is an ordinary clap usage error (exit 2) on both builtins.
+    for verb in ["pull", "setup"] {
+        for argv in [
+            vec!["--layer", "/tmp/x"],
+            vec!["--base-image", "x"],
+            vec!["--yes"],
+            vec!["-y"],
+        ] {
+            let harness = Harness::new();
+            let mut full = vec![verb];
+            full.extend_from_slice(&argv);
+            let out = harness.builtin(&full, &[]);
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{verb} {argv:?} must exit 2:\n{}",
+                stderr_of(&out)
+            );
+            assert!(
+                stderr_of(&out).contains("unexpected argument"),
+                "{verb} {argv:?}: {}",
+                stderr_of(&out)
+            );
+        }
+    }
+}
+
+/// Pins the **forwarding** behavior, not a rejection: launch verbs carry a
+/// `trailing_var_arg` positional with `allow_hyphen_values`, so - like any
+/// unregistered hyphen token - the removed flags reach the tool as agent args
+/// rather than being rejected by clap. This is the pre-existing `agent_args`
+/// contract; the launcher registers no legacy handling and never probes a former
+/// `.agent-vm/layers/` directory (a documented deviation from the plan, which
+/// expected exit 2 here). The exact forwarded guest command is asserted, so a
+/// change that silently discards the args cannot pass as "forwarded".
+#[test]
+fn launch_forwards_removed_composition_flags_as_agent_args() {
+    // (argv after the verb, the exact forwarded guest command)
+    let cases: [(Vec<&str>, &str); 5] = [
+        (vec!["--layer", "/tmp/x"], "/bin/echo --layer /tmp/x"),
+        (vec!["--base-image", "x"], "/bin/echo --base-image x"),
+        (vec!["--yes"], "/bin/echo --yes"),
+        (vec!["-y"], "/bin/echo -y"),
+        // `--` is clap's escape: it is absorbed before the tool's
+        // `trailing_var_arg` positional, so the flags after it reach the tool
+        // identically. This pins that the escape is not silently dropped.
+        (vec!["--", "--layer", "/tmp/x"], "/bin/echo --layer /tmp/x"),
+    ];
+    for (argv, expected) in cases {
+        let harness = Harness::new();
+        harness.write_project(&format!("image = \"{PROJECT_REF}\"\n{PROBE_TOOL}"));
+        let decoys = harness.builder_decoys();
+        let mut cmd = harness.command_with_decoys(&decoys);
+        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+        let mut full = vec!["probe"];
+        full.extend_from_slice(&argv);
+        let out = Harness::run_on(cmd, &full);
+        let stderr = stderr_of(&out);
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "probe {argv:?} must not be a usage error:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("no longer supported") && !stderr.contains("migrat"),
+            "probe {argv:?} must emit no migration advice:\n{stderr}"
+        );
+        assert_eq!(oci_reference(&debug_config_json(&stderr)), PROJECT_REF);
+        assert_eq!(
+            debug_guest_command(&stderr),
+            expected,
+            "probe {argv:?} must forward its args verbatim to the tool:\n{stderr}"
+        );
+        assert!(
+            harness.decoy_log(&decoys).is_empty(),
+            "probe {argv:?}: no builder calls"
+        );
+    }
+}
+
+#[test]
+fn the_removed_layer_config_field_is_a_schema_error() {
+    // The removed `layer` config field fails ordinary schema parsing, with
+    // redacted guidance (no value echoed, no migration advice).
+    for body in [
+        "[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { builtin = \"claude\" }\n",
+        "[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { path = \"x\" }\n",
+    ] {
+        let harness = Harness::new();
+        harness.write_project(body);
+        let out = harness.launch_argv("t", &[], &[]);
+        let stderr = stderr_of(&out);
+        assert!(
+            !out.status.success(),
+            "a `layer` field must fail the launch"
+        );
+        assert!(
+            stderr.contains("invalid TOML or tool schema"),
+            "a `layer` field must fail as a schema error:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("migrat") && !stderr.contains("no longer supported"),
+            "no migration advice:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn broken_config_pull_and_setup_explain_the_image_fallback() {
+    // A malformed user config leaves the configured image tiers unknown. The
+    // recovery builtins select the explicit source or the default, warn, and
+    // never fabricate a user/project image.
+    let broken = "this is not = = toml\n";
+    for (cli, env, expected) in [
+        (Some(CLI_REF), None, CLI_REF),
+        (None, Some(ENV_REF), ENV_REF),
+        (None, None, DEFAULT_REF),
+    ] {
+        for verb in ["pull", "setup"] {
+            let harness = Harness::new();
+            harness.write_user(broken);
+            let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)];
+            if let Some(env) = env {
+                envs.push(("AGENT_VM_IMAGE_TAG", env));
+            }
+            let mut args: Vec<&str> = vec![verb];
+            if let Some(cli) = cli {
+                args.push("--image");
+                args.push(cli);
+            }
+            let out = harness.builtin(&args, &envs);
+            let stderr = stderr_of(&out);
+            let stdout = stdout_of(&out);
+            assert!(
+                stdout.contains("configured image settings could not be read"),
+                "{verb} must warn about the unreadable image config:\n{stdout}\n{stderr}"
+            );
+            check_pull_acquisition(&stderr, expected)
+                .unwrap_or_else(|problem| panic!("{verb}: {problem}\n{stderr}"));
+            assert!(
+                !stdout.contains(USER_REF) && !stdout.contains(PROJECT_REF),
+                "{verb} must not fabricate a configured image:\n{stdout}"
+            );
+        }
+    }
+
+    // A dangling `tools` reference is a catalog error, but a readable `image`
+    // must survive for pull/setup/doctor.
+    let harness = Harness::new();
+    harness.write_project(&format!(
+        "image = \"{PROJECT_REF}\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n"
+    ));
+    for verb in ["pull", "setup"] {
+        let out = harness.builtin(&[verb], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+        let stderr = stderr_of(&out);
+        check_pull_acquisition(&stderr, PROJECT_REF)
+            .unwrap_or_else(|problem| panic!("{verb}: {problem}\n{stderr}"));
+    }
+    let doctor =
+        stdout_of(&harness.builtin(&["doctor"], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]));
+    assert!(
+        doctor.contains(&format!("selected (without --image): {PROJECT_REF}")),
+        "doctor keeps the readable image:\n{doctor}"
+    );
+    // The launch still reports the tool-resolution error.
+    let launch = harness.launch_argv("t", &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+    let launch_stderr = stderr_of(&launch);
+    assert!(!launch.status.success());
+    assert!(
+        launch_stderr.contains("names no tool in the resolved catalog"),
+        "{launch_stderr}"
+    );
+}
+
+#[test]
+fn failed_image_acquisition_never_invokes_a_builder() {
+    // Each source selects a distinct bogus loopback ref; the launch exits
+    // nonzero after the config dump, the dump has the exact reference, and the
+    // builder decoys were never called.
+    struct ImgSource {
+        name: &'static str,
+        cli: Option<&'static str>,
+        env: Option<&'static str>,
+        user: Option<&'static str>,
+        project: Option<&'static str>,
+    }
+    let sources = [
+        ImgSource {
+            name: "command line",
+            cli: Some(CLI_REF),
+            env: None,
+            user: None,
+            project: None,
+        },
+        ImgSource {
+            name: "env",
+            cli: None,
+            env: Some(ENV_REF),
+            user: None,
+            project: None,
+        },
+        ImgSource {
+            name: "user",
+            cli: None,
+            env: None,
+            user: Some(USER_REF),
+            project: None,
+        },
+        ImgSource {
+            name: "project",
+            cli: None,
+            env: None,
+            user: None,
+            project: Some(PROJECT_REF),
+        },
+        ImgSource {
+            name: "default",
+            cli: None,
+            env: None,
+            user: None,
+            project: None,
+        },
+    ];
+    for ImgSource {
+        name,
+        cli,
+        env,
+        user,
+        project,
+    } in sources
+    {
+        let expected = cli.or(env).or(user).or(project).unwrap_or(DEFAULT_REF);
+        let harness = Harness::new();
+        write_image_tiers(
+            &harness,
+            ImageTiers {
+                user,
+                project,
+                declares_tool: true,
+            },
+        );
+        let decoys = harness.builder_decoys();
+        let mut cmd = harness.command_with_decoys(&decoys);
+        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+        if let Some(env) = env {
+            cmd.env("AGENT_VM_IMAGE_TAG", env);
+        }
+        let mut argv = vec!["probe"];
+        if let Some(cli) = cli {
+            argv.push("--image");
+            argv.push(cli);
+        }
+        let out = Harness::run_on(cmd, &argv);
+        let stderr = stderr_of(&out);
+        assert!(
+            !out.status.success(),
+            "{name}: must exit nonzero after the dump"
+        );
+        assert_eq!(
+            oci_reference(&debug_config_json(&stderr)),
+            expected,
+            "{name}"
+        );
+        // Absence of a prompt and of any fallback image are supplemental.
+        assert!(
+            !stderr.contains("Build project tooling layer"),
+            "{name}: no prompt"
+        );
+        assert!(
+            harness.decoy_log(&decoys).is_empty(),
+            "{name}: no builder calls"
+        );
+    }
+}
+
+#[test]
+fn former_layer_directories_are_inert() {
+    let harness = Harness::new();
+    harness.write_project(&format!("image = \"{PROJECT_REF}\"\n{PROBE_TOOL}"));
+    let decoys = harness.builder_decoys();
+
+    let run = |envs: &[(&str, &str)]| {
+        let mut cmd = harness.command_with_decoys(&decoys);
+        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        Harness::run_on(cmd, &["probe"])
+    };
+
+    let baseline = run(&[]);
+    assert_eq!(
+        oci_reference(&debug_config_json(&stderr_of(&baseline))),
+        PROJECT_REF
+    );
+    let baseline_config = normalized_config(&harness, &baseline);
+
+    // Deliberately invalid Dockerfiles: accidental parsing/discovery cannot
+    // silently succeed.
+    let poison = harness
+        .project_root
+        .join(".agent-vm/layers/10-poison/Dockerfile");
+    let nested = harness
+        .project_root
+        .join(".agent-vm/layers/10-poison/sub/deeper/Dockerfile");
+    let legacy = harness.project_root.join(".agent-vm/layer/Dockerfile");
+    write(&poison, "!! not a dockerfile\n");
+    write(&nested, "&& also not\n");
+    write(&legacy, "?? legacy\n");
+    let dangling = harness
+        .project_root
+        .join(".agent-vm/layers/10-poison/dangling");
+    std::os::unix::fs::symlink("nowhere-at-all", &dangling).unwrap();
+
+    let poisoned = run(&[]);
+    assert_eq!(
+        oci_reference(&debug_config_json(&stderr_of(&poisoned))),
+        PROJECT_REF
+    );
+    assert_eq!(
+        normalized_config(&harness, &poisoned),
+        baseline_config,
+        "former layer directories must not change the launch"
+    );
+    assert!(
+        harness.decoy_log(&decoys).is_empty(),
+        "former dirs: no builder calls"
+    );
+
+    // The former directory content is byte-identical afterward (no cleanup or
+    // migration ran).
+    assert_eq!(
+        std::fs::read_to_string(&poison).unwrap(),
+        "!! not a dockerfile\n"
+    );
+    assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "?? legacy\n");
+    assert!(dangling.is_symlink());
+
+    // Stale env vars no longer affect selection or error.
+    for (key, value) in [
+        ("AGENT_VM_BASE_IMAGE", "ghcr.io/x/y:z"),
+        ("AGENT_VM_LAYER", ""),
+        ("AGENT_VM_LAYER", "/tmp/x"),
+        ("AGENT_VM_YES", "1"),
+    ] {
+        let out = run(&[(key, value)]);
+        let stderr = stderr_of(&out);
+        assert_eq!(
+            oci_reference(&debug_config_json(&stderr)),
+            PROJECT_REF,
+            "{key}={value:?} must not change selection"
+        );
+        assert!(
+            !stderr.contains("no longer supported"),
+            "{key}={value:?} must not error:\n{stderr}"
+        );
+    }
+    assert!(
+        harness.decoy_log(&decoys).is_empty(),
+        "stale env: no builder calls"
+    );
+}
+
+/// Run one `pull`/`setup` precedence row and return its stderr, or an error if
+/// the actual acquisition config's reference is not the selected one. Used by
+/// the two independent mutation targets below (they run separately so a pull
+/// failure cannot hide a setup failure).
+fn run_builtin_acquisition(row: &Precedence, verb: &str) -> Result<String, String> {
+    let harness = Harness::new();
+    write_image_tiers(
+        &harness,
+        ImageTiers {
+            user: row.user,
+            project: row.project,
+            declares_tool: false,
+        },
+    );
+    let decoys = harness.builder_decoys();
+    let mut cmd = harness.command_with_decoys(&decoys);
+    cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+    if let Some(env) = row.env {
+        cmd.env("AGENT_VM_IMAGE_TAG", env);
+    }
+    let mut argv = vec![verb];
+    if let Some(cli) = row.cli {
+        argv.push("--image");
+        argv.push(cli);
+    }
+    let out = Harness::run_on(cmd, &argv);
+    let stderr = stderr_of(&out);
+    if out.status.success() {
+        return Err(format!("{verb} unexpectedly succeeded:\n{stderr}"));
+    }
+    check_pull_acquisition(&stderr, row.expected)?;
+    let log = harness.decoy_log(&decoys);
+    if !log.is_empty() {
+        return Err(format!("{verb} invoked a builder: {log}"));
+    }
+    Ok(stderr)
+}
+
+#[test]
+fn pull_uses_the_actual_selected_reference() {
+    for row in precedence_rows() {
+        run_builtin_acquisition(&row, "pull")
+            .unwrap_or_else(|problem| panic!("{} (pull): {problem}", row.name));
+    }
+}
+
+#[test]
+fn setup_pull_uses_the_actual_selected_reference() {
+    for row in precedence_rows() {
+        run_builtin_acquisition(&row, "setup")
+            .unwrap_or_else(|problem| panic!("{} (setup): {problem}", row.name));
+    }
+}
+
+/// A present but non-Unicode `AGENT_VM_IMAGE_TAG` is a real override value that
+/// no verb can interpret. `doctor` in particular must not report it as absence
+/// and print a selection launch would never make (Spec S1); the acquisition and
+/// launch verbs already fail through clap's `String` binding.
+#[cfg(unix)]
+#[test]
+fn a_non_unicode_image_override_fails_every_verb_that_reads_it() {
+    use std::os::unix::ffi::OsStrExt;
+    for verb in ["doctor", "pull", "setup", "shell"] {
+        let harness = Harness::new();
+        let mut cmd = harness.base_command();
+        cmd.env("AGENT_VM_IMAGE_TAG", std::ffi::OsStr::from_bytes(b"\xff"));
+        let out = Harness::run_on(cmd, &[verb]);
+        let stdout = stdout_of(&out);
+        let stderr = stderr_of(&out);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "{verb} must fail on a non-Unicode override:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("AGENT_VM_IMAGE_TAG: <unset>"),
+            "{verb}: an invalid override must not be reported as unset:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("selected (without --image):"),
+            "{verb}: no selection may be printed for an invalid override:\n{stdout}"
+        );
+        if verb == "doctor" {
+            // doctor must say *why* it refuses, naming the value as present but
+            // unreadable rather than pretending it is unset.
+            assert!(
+                stdout.contains("AGENT_VM_IMAGE_TAG: <present but not valid Unicode"),
+                "doctor must explain an unreadable override:\n{stdout}"
+            );
+        }
+    }
 }

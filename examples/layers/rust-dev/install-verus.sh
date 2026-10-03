@@ -36,6 +36,6 @@ echo "${VERUS_SHA256}  ${archive}" | sha256sum -c -
 mkdir -p "$VERUS_DIR"
 unzip -q "$archive" -d "$VERUS_DIR"
 
-# World-readable for the arbitrary-uid guest (contract C7).
+# World-readable for the arbitrary-uid guest.
 chmod -R a+rX "$VERUS_DIR"
 echo "==> install-verus: done"

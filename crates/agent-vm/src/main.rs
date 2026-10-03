@@ -1,5 +1,6 @@
 //! agent-vm — sandboxed microVMs for AI coding agents on microsandbox.
 
+mod boot_image;
 mod cli;
 mod clipboard;
 mod config;
@@ -7,6 +8,7 @@ mod credential_injection;
 mod credential_provider;
 mod credential_resolver;
 mod credential_yaml;
+mod debug_config;
 mod defaults;
 mod doctor;
 mod env_flag;
@@ -18,7 +20,6 @@ mod image_capabilities;
 mod image_check;
 mod image_contract;
 mod intercept_hook;
-mod layer;
 mod mount;
 mod msb_cmd;
 mod msb_install;
@@ -38,7 +39,6 @@ mod session;
 mod setup;
 #[cfg(test)]
 mod test_env;
-mod tool_layer;
 mod user;
 
 use anyhow::{Context, Result};
@@ -138,17 +138,19 @@ fn main() -> Result<()> {
         match dispatch {
             Dispatch::Launch {
                 entry,
-                layers,
+                images,
                 args,
-            } => exit_with(run::launch(&entry, &layers, *args).await?),
+            } => exit_with(run::launch(&entry, &images, *args).await?),
             Dispatch::Builtin {
                 cmd: Cmd::Setup(args),
                 catalog,
-            } => setup::run(args, catalog).await,
+                images,
+            } => setup::run(args, catalog, images).await,
             Dispatch::Builtin {
                 cmd: Cmd::Pull(args),
                 catalog,
-            } => pull::run(args, catalog).await,
+                images,
+            } => pull::run(args, catalog, images).await,
             Dispatch::Builtin {
                 cmd: Cmd::Clipboard(args),
                 ..

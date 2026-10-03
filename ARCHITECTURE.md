@@ -14,7 +14,7 @@ side, is [USAGE.md](USAGE.md); what is still unbuilt is [PLAN.md](PLAN.md).
 
 - [Shape of the system](#shape-of-the-system)
 - [Sandboxes and sessions](#sandboxes-and-sessions)
-- [The base image](#the-base-image)
+- [The default boot image](#the-default-boot-image)
 - [Credentials](#credentials)
 - [Runtime and state](#runtime-and-state)
 - [Host-side tools](#host-side-tools)
@@ -36,7 +36,7 @@ crates/agent-vm/src/
 │       └── oauth_refresh.rs#   OAuth validation, rotation, single-flight
 ├── network.rs              # egress policy and published ports
 ├── mount.rs                # --mount grammar and volume wiring
-├── layer.rs                # project tooling layers (.agent-vm/layers/, plus --layer)
+├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 ├── msb_install.rs          # locate + version-verify the bundled msb; MSB_HOME
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
 ├── doctor.rs               # operator diagnostics and db recovery
@@ -44,7 +44,7 @@ crates/agent-vm/src/
 ├── config.rs               # read-only tool config parse/merge/validate (doctor preview)
 └── …                       # clipboard, pull, setup, user, env_flag, …
 
-images/                     # the base OCI image and its build script
+images/                     # the default-boot-image sources and their build script
 vendor/microsandbox/        # git submodule: the runtime and its SDK
 bin/agent-vm-ccusage        # host-side token/cost reporting across sandboxes
 ```
@@ -91,11 +91,11 @@ project file -----> parse + validate --+    + conflicts       ownership
                                             doctor preview (read-only)
 ```
 
-This module resolves declarative config only: the `layer` each tool declares is
-resolved, anchored and built by `crates/agent-vm/src/tool_layer.rs`
-(`chain_root`, `materialize`) and `crates/agent-vm/src/layer.rs` at launch, not
-here — see [ADR-0019](docs/adr/0019-tool-free-base-and-per-tool-layers.md).
-Config warnings are never logged — doctor renders them explicitly.
+This module resolves declarative config only. It never builds an image: the
+**boot image** is selected separately by `crates/agent-vm/src/boot_image.rs`
+(one image per session, independent of the catalog), and no launch invokes
+Docker or composes anything. Config warnings are never logged — doctor renders
+them explicitly.
 `doctor --reset-msb-db` never reads config, so a broken file cannot block db
 recovery. There is still no arrow from this module to credential *capture*,
 Docker, or guest state; it resolves the provisioning set and the launch
@@ -506,22 +506,23 @@ EOFs essentially instantly on a real VMM kill, `recv() → None` wins the race
 almost every time, so `next_exec_step` gives the `wait()` future a bounded
 chance to finish *after* the stream closes rather than dropping it mid-flight.
 
-## The base image
+## The default boot image
 
 ### What is in it
 
-The Dockerfile (`images/Dockerfile`, Debian 13 slim) is the **tool-free base**:
-it carries what every agent session needs — base CLI utilities (`curl`, `wget`,
+The Dockerfile (`images/Dockerfile`, Debian 13 slim) is the **base**: it
+carries what every agent session needs — base CLI utilities (`curl`, `wget`,
 `git`, `jq`, `python3`, `ripgrep`, `fd-find`) plus network and process
 diagnostics, `gh` from the GitHub apt repo, Node.js 22 from NodeSource, the
 Docker engine with `fuse-overlayfs`, zellij, and the tool-layer facilities (the
 host-CA shim, the `/opt/agent` prefix, an empty `/opt/agent-vm/seed.d/`). It
 carries **no** agent CLI.
 
-The six shipped agents live in standalone layers under `images/tools/`
-(`dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`), each building `FROM`
-the base and installing **one exact, committed version** selected by a build
-`ARG` and recorded in an `org.agent-vm.version.*` image label. No shipped build
+The six shipped agents live in standalone recipes under `images/tools/`
+(`dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`). CI builds each `FROM`
+the base and installs **one exact, committed version** selected by a build
+`ARG` and recorded in an `org.agent-vm.version.*` image label; the finished
+template is the **default boot image** the launcher boots. No shipped build
 resolves an upstream `latest`/channel: `codex`, `opencode` and `claude` carry a
 pinned vendored installer, `copilot` installs an exact npm pin, and `dsh`/`pi`
 are pinned by a committed `package-lock.json` installed with `npm ci` (`dsh`
@@ -531,18 +532,20 @@ of the base's legacy `agent-vm-install` helper. `pi` additionally carries an
 agent-vm-owned wrapper (`/usr/local/bin/pi`) and a mandatory warning extension
 (see the third subtlety below). The claude layer also carries
 the four `claude-plugins-official` LSP servers. Chromium is *not* in the base: it
-is an opt-in `examples/layers/chrome-devtools` tooling layer, detected after boot
-by a supplied artifact: the image-capability marker, or the wrapper itself when
-no marker is present (see the boot image contract and #258).
+is an opt-in image capability, detected after boot by a supplied artifact (the
+image-capability marker, or the wrapper itself when no marker is present) — see
+[`examples/layers/chrome-devtools`](examples/layers/chrome-devtools/) and the
+boot image contract (#258).
 
 Three build-time subtleties are worth knowing:
 
-- Tool layers install under `HOME=/opt/agent` and make the tree world-readable,
-  which is what lets the same `PATH` work for both guest-user modes. The prefix
+- The image installs the tool recipes under `HOME=/opt/agent` and makes the
+  tree world-readable, which is what lets the same `PATH` work for both
+guest-user modes. The prefix
   itself is created by the base (`RUN mkdir -p /opt/agent && chmod 755
   /opt/agent`), so every layer inherits a `a+rX` (C7) starting point.
 - The running guest symlinks `$HOME/.claude` onto persistent state, which
-  **shadows** the LSP plugin tree baked at build time. The claude layer
+  **shadows** the LSP plugin tree baked at build time. The claude recipe
   therefore stashes the plugins to `/opt/agent-vm/claude-seed` and installs a
   first-boot seed hook at `/opt/agent-vm/seed.d/10-claude-plugins`; the launcher
   prelude (`RUN_IMAGE_SEED_HOOKS` in `run.rs`) runs every executable under
@@ -551,7 +554,7 @@ Three build-time subtleties are worth knowing:
   compatibility/lineage fallback. Both clauses run on every launch and must be
   idempotent; the launcher makes no claim that the released default supplies
   either (#258).
-- The `pi` layer installs Pi at `/opt/agent-vm/pi` but exposes it through an
+- The `pi` recipe installs Pi at `/opt/agent-vm/pi` but exposes it through an
   agent-vm-owned wrapper at `/usr/local/bin/pi` that makes three decisions plus
   the mandatory extension: it enforces `PI_SKIP_VERSION_CHECK=1` (agent-vm owns
   the binary, so Pi's update check is unactionable noise); it forwards a Pi
@@ -576,8 +579,8 @@ Three build-time subtleties are worth knowing:
 
 microsandbox's `RootfsSource` supports an OCI reference, a host directory
 (`Bind`), or a qcow2/raw/vmdk file. agent-vm uses the OCI path, booting the
-composed default on the fast path (see
-[USAGE](USAGE.md#image-release-cadence)).
+selected image verbatim (see
+[USAGE](USAGE.md#selecting-the-boot-image)).
 
 - **Standard OCI semantics.** microsandbox's layer cache, GC, snapshotting, and
   metadata DB all key off OCI references. Going through that path means getting
@@ -607,13 +610,8 @@ The Rust side does own the **verify** step (boot the pulled image, run the
 agents' `--version`), because that is exactly the SDK call the launcher makes —
 exercising it from `setup` catches image/SDK integration regressions before a
 user session depends on them. `--no-verify` skips it for Dockerfile iteration;
-`--image` / `AGENT_VM_IMAGE_TAG` points at an alternative tag without touching
-`build.sh`.
-
-Project tooling layers (`.agent-vm/layers/*/`, plus any `--layer DIR`
-appended after them) are an ordered chain, each step's Dockerfile built
-`FROM` the previous one; only the final image is booted, ingested
-registry-lessly. See [ADR-0003](docs/adr/0003-project-tooling-layers.md).
+`--image` / `AGENT_VM_IMAGE_TAG` / a config `image` selects an alternative
+tag without touching `build.sh`.
 
 ## Credentials
 
@@ -1096,7 +1094,7 @@ directories the user never asked for. The state-root precedence is in
 |---|---|
 | Non-root guest via a native user | [ADR-0001](docs/adr/0001-non-root-guest-via-native-user.md) |
 | Mirroring the host `$HOME` and username into the guest | [ADR-0002](docs/adr/0002-mirror-host-home-and-username.md) |
-| Project tooling layers (`.agent-vm/layers/`, plus any `--layer DIR`) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
+| Project tooling layers (`.agent-vm/layers/`, plus any `--layer DIR`; superseded by ADR-0035) | [ADR-0003](docs/adr/0003-project-tooling-layers.md) |
 | One shared `MSB_HOME`, not schema-namespaced | [ADR-0004](docs/adr/0004-single-shared-msb-home.md) |
 | Deferring the sea-orm / sqlx major bump | [ADR-0005](docs/adr/0005-defer-sea-orm-sqlx-major-bump.md) |
 | Adopting a clean microsandbox v0.6.15 baseline (dropping the libkrun fork; baseline superseded by ADR-0027) | [ADR-0006](docs/adr/0006-adopt-clean-v0.6.15-baseline.md) |
@@ -1111,7 +1109,14 @@ directories the user never asked for. The state-root precedence is in
 | User-authorized YAML credentials (`credentials.yaml`) | [ADR-0025](docs/adr/0025-yaml-credential-shielding.md) |
 | Accepting Basic auth in the header substitution scope (microsandbox 0.7.4) | [ADR-0026](docs/adr/0026-accept-basic-auth-in-header-substitution-scope.md) |
 | Adopting the v0.7.4 fork baseline (supersedes in part ADR-0006's baseline, ADR-0008's target and evidence base, and ADR-0009's branch framing) | [ADR-0027](docs/adr/0027-adopt-v0.7.4-fork-baseline.md) |
-| An explicit `--image`/`--base-image` overrides the other flag's environment variable | [ADR-0028](docs/adr/0028-explicit-image-flag-beats-the-other-environment-variable.md) |
+| An explicit `--image`/`--base-image` overrides the other flag's environment variable (superseded by ADR-0035) | [ADR-0028](docs/adr/0028-explicit-image-flag-beats-the-other-environment-variable.md) |
+| Compose tool images by layer stitching (superseded by ADR-0035) | [ADR-0029](docs/adr/0029-compose-tool-images-by-layer-stitching.md) |
+| Tool versions in identity and current tags (superseded by ADR-0035) | [ADR-0030](docs/adr/0030-tool-versions-in-identity-and-current-tags.md) |
+| The tool image contract and stitch checks (superseded by ADR-0035) | [ADR-0031](docs/adr/0031-tool-image-contract.md) |
+| One layer kind — a tool is a layer with a command (superseded by ADR-0035) | [ADR-0032](docs/adr/0032-one-layer-kind.md) |
+| Default to rebase, preserving build provenance (superseded by ADR-0035) | [ADR-0033](docs/adr/0033-default-rebase-with-build-provenance.md) |
+| Versioned image releases instead of a continuously published registry (amended by ADR-0035) | [ADR-0034](docs/adr/0034-versioned-image-releases.md) |
+| Consume user-owned boot images (supersedes ADR-0003/0019/0028–0033; amends ADR-0034/0015/0022) | [ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md) |
 
 ## Deliberate non-goals
 

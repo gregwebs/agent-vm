@@ -119,37 +119,30 @@ To use a different cache tag, pass both the Docker source and destination tag:
 ./script/build/import-image.sh my-local-image:dev agent-vm-template:dev
 ```
 
-A project with tooling layers (`.agent-vm/layers/*/`) also needs its base
-addressed *inside Docker*, under the same reference the launcher builds step 0
-`FROM`. `import-image.sh` creates that Docker **base link**
-(`agent-vm-base:<msb-manifest-digest-hex>`) automatically at import time —
-reading the digest back from the freshly loaded destination and tagging the
-Docker **source** image (so the renamed form above works too). This is why the
-import step is not optional for a layered project: without the link, the first
-build hard-fails and tells you to rerun this script.
+`import-image.sh` also creates a Docker **base link**
+(`agent-vm-base:<msb-manifest-digest-hex>`) at import time — reading the digest
+back from the freshly loaded destination and tagging the Docker **source** image.
+The launcher no longer consumes it; [#260](https://github.com/gregwebs/agent-vm/issues/260)
+removes the import-time tagging.
 
 The script accepts zero to two positional arguments. The Docker source defaults to `agent-vm-template:latest`, and the destination tag defaults to the source. It verifies the Docker image is exactly `linux/arm64`, resolves agent-vm's state directory, and pipes `docker save` into `msb image load`. It does not run a registry or create a caller-managed tar archive. `msb` currently stages stdin in a temporary file before ingesting it, so temporary free space roughly equal to the Docker archive is still required.
 
-### Composing from a local tool-free base (`--base-image`)
+### Building the template locally
 
-The image is a tool-free base plus one layer per shipped tool. A launch
-whose configured tool set differs from the shipped default composes those layers
-onto the base locally; `--base-image` (env `AGENT_VM_BASE_IMAGE`) points that
-composition at a local base. To build the base and the six tool layers by hand
-and exercise the composed path:
+The default boot image is the base plus the six shipped tool recipes. To build
+it from the committed sources and boot it without a registry, chain the recipes
+with `docker buildx` (as `images/build.sh` does), import the finished template,
+and select it with `--image` / `image =`:
 
 ```bash
 set -euo pipefail
-# 1. base + the six tool layers, chained. Every step is `--load`ed into the
-#    daemon (as `images/build.sh` does) so the next step's `FROM` resolves;
-#    that needs a `docker`-driver builder (`docker buildx create --driver
-#    docker --use`).
-#    Each recipe consumes its committed exact `ARG AGENT_VERSION_*` default
-#    (dsh/pi use their committed locks), so the chain is reproducible and a
-#    re-run is a cache hit until a committed source moves. Nothing resolves
-#    upstream "latest" in the build. To move a version, bump it in a separate,
-#    explicit step first (`script/build/agent-versions.sh --write`, or the
-#    owning `upgrade-*.sh`), review the diff, then run this loop.
+# Every step is `--load`ed into the daemon (as `images/build.sh` does) so the
+# next step's `FROM` resolves; that needs a `docker`-driver builder
+# (`docker buildx create --driver docker --use`). Each recipe consumes its
+# committed exact `ARG AGENT_VERSION_*` default (dsh/pi use their committed
+# locks), so the chain is reproducible. To move a version, run
+# `script/build/agent-versions.sh --write` (or the owning `upgrade-*.sh`),
+# review the diff, then rebuild.
 docker buildx build --platform linux/arm64 --load -t agent-vm-base:dev -f images/Dockerfile images
 prev=agent-vm-base:dev
 for t in dsh pi codex opencode claude copilot; do
@@ -160,19 +153,19 @@ for t in dsh pi codex opencode claude copilot; do
 done
 docker tag "$prev" agent-vm-template:dev
 
-# 2. Import BOTH tags into agent-vm's private cache.
+# Import the finished template and select it.
 ./script/build/import-image.sh agent-vm-template:dev
-./script/build/import-image.sh agent-vm-base:dev
-
-# 3. Compose from the local base (this always composes, even for the default set).
-./target/macos-dev/bin/agent-vm shell --base-image agent-vm-base:dev \
+./target/macos-dev/bin/agent-vm shell --image agent-vm-template:dev \
   -- 'for b in claude codex opencode copilot; do "$b" --version; done'
 ```
 
-The local tag `agent-vm-base:dev` shares its repository name with
-`layer::BASE_REPO`'s Docker-local base links (`agent-vm-base:<64-hex>`). That is
-a listing collision only: a link tag is always 64 hex characters, so no link can
-be shadowed.
+The launcher never builds or composes these sources itself; the loop above is an
+image-authoring step.
+
+The local tag `agent-vm-base:dev` shares its repository name with the import
+script's Docker-local base links (`agent-vm-base:<64-hex>`). That is a listing
+collision only: a link tag is always 64 hex characters, so no link can be
+shadowed.
 `images/build.sh` performs the same chain against a loopback registry and pushes
 both published tags (`agent-vm-base:latest`, `agent-vm-template:latest`); it
 requires the same `docker`-driver builder and checks for it up front.
@@ -254,8 +247,7 @@ no image of that name exists, so the lookup is reported as unauthorized. Check
 both `--image` and the `AGENT_VM_IMAGE_TAG` environment variable: a value
 exported from a shell profile acts as `--image` whenever no flag is passed, so
 it can silently select the wrong reference. (An explicit `--image` still wins
-over `AGENT_VM_IMAGE_TAG`, and an explicit `--base-image` wins over
-`AGENT_VM_IMAGE_TAG` — see `USAGE.md`.)
+over `AGENT_VM_IMAGE_TAG` — see `USAGE.md`.)
 
 - an unqualified `agent-vm-template:latest` resolves to
   `index.docker.io/library/agent-vm-template` — **not** to the local image cache

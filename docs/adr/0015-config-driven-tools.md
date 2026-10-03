@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Implementation decision for [agent-vm #82](https://github.com/gregwebs/agent-vm/issues/82), the consumption half of epic [#78](https://github.com/gregwebs/agent-vm/issues/78). Extends [ADR-0003](0003-project-tooling-layers.md) (a project's `.agent-vm/` is trusted executable surface) and completes the config work split across #80 (parse/merge/validate, read-only) and #81 (credential providers). Builds on the terms **Tool**, **Credential provider**, and **Tool config tier** in [CONTEXT.md](../../CONTEXT.md). Extended by [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) (`layer` is no longer declarative-only, and `setup`'s severity gains a layer-supplied exception).
+Accepted. Implementation decision for [agent-vm #82](https://github.com/gregwebs/agent-vm/issues/82), the consumption half of epic [#78](https://github.com/gregwebs/agent-vm/issues/78). Extends [ADR-0003](0003-project-tooling-layers.md) (a project's `.agent-vm/` is trusted executable surface) and completes the config work split across #80 (parse/merge/validate, read-only) and #81 (credential providers). Builds on the terms **Tool**, **Credential provider**, and **Tool config tier** in [CONTEXT.md](../../CONTEXT.md). Extended by [ADR-0019](0019-tool-free-base-and-per-tool-layers.md) (`layer` is no longer declarative-only, and `setup`'s severity gains a layer-supplied exception). Amended by [ADR-0035](0035-consume-user-owned-boot-images.md): the `layer` field is removed; a top-level `image` key selects the boot image independently of tools.
 
 ## Context
 

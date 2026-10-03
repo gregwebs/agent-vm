@@ -10,7 +10,7 @@
 #   RUSTUP_HOME     default /opt/rustup
 #   CARGO_HOME      default /opt/cargo
 #
-# The install is world-readable (contract C7): the guest may run as an
+# The install is world-readable: the guest may run as an
 # arbitrary non-root uid.
 set -euo pipefail
 

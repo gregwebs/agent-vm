@@ -22,58 +22,39 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
-use crate::config::{self, Catalog};
+use crate::boot_image;
+use crate::config::{Catalog, ConfiguredImages};
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Boot-verbatim override: pull this image and skip tool-layer
-    /// composition.
-    ///
-    /// Defaults to the image this configuration would boot from — the composed
-    /// default template `ghcr.io/wirenboard/agent-vm-template:latest` for the
-    /// shipped default tool set, or the tool-free base when the configured set
-    /// differs. Use a timestamped tag (`...:YYYY-MM-DDTHH`) to pin a specific
-    /// build. Mutually exclusive with `--base-image`; an explicit flag wins
-    /// over the other flag's environment variable.
-    #[arg(long, env = "AGENT_VM_IMAGE_TAG", value_name = "REF")]
-    pub(crate) image: Option<String>,
-
-    /// Pull the tool-free base that tool layers are composed onto.
-    ///
-    /// Default `ghcr.io/wirenboard/agent-vm-base:latest`. Passing this always
-    /// targets the base, even when the tool set matches the shipped default.
-    /// Mutually exclusive with `--image`; an explicit flag wins over the
-    /// other flag's environment variable.
-    #[arg(long = "base-image", env = "AGENT_VM_BASE_IMAGE", value_name = "REF")]
-    pub(crate) base_image: Option<String>,
+    /// The boot image to refresh. Defaults to the image this configuration
+    /// would boot. See "Selecting the boot image" in USAGE.md.
+    #[command(flatten)]
+    pub(crate) image: boot_image::ImageArgs,
 }
 
-pub async fn run(args: Args, catalog: Catalog) -> Result<()> {
+pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Result<()> {
     // pull also reaches connect_and_migrate (via Sandbox::create_with_pull_progress),
     // so it can hit the same forward-migrated-DB crash as the boot path. See
     // src/msb_preflight.rs and issue #30.
     crate::msb_preflight::ensure_db_not_ahead().await?;
 
-    // Resolve the same published root a launch would boot from (issue #84), so
-    // `pull` warms the image the next launch actually needs. A broken config
-    // has no declared tool set, so fall back to the shipped default (the
-    // historical behaviour).
-    let declared_layers = match &catalog {
-        Catalog::Ready(catalog) => catalog.declared_layers(),
-        Catalog::Broken(_) => config::default_launch_catalog()?.declared_layers(),
-    };
-    let declared: Vec<config::ToolLayer> =
-        declared_layers.iter().map(|l| l.layer().clone()).collect();
-    let root = crate::tool_layer::chain_root(
-        args.image.clone(),
-        args.base_image.clone(),
-        &declared,
-        &config::shipped_tool_layers()?,
-    )?;
-    let image = root.reference().to_string();
-    println!("==> {image} resolved as the image this configuration boots from");
-    pull_image(&image).await?;
-    println!("==> {image} pulled into the microsandbox cache");
+    // A broken config leaves the configured image tiers unknown (D7): warn and
+    // fall through to `--image`/env or the default boot image, so `pull` still
+    // recovers.
+    if let Catalog::Broken(error) = &catalog {
+        println!(
+            "==> WARNING: configured image settings could not be read: {error:#}; \
+             falling back to --image/AGENT_VM_IMAGE_TAG or the default boot image"
+        );
+    }
+    let boot = boot_image::select(args.image.requested()?, &images);
+    println!("==> {boot} is the image this configuration boots from");
+    pull_image(boot.reference().as_str()).await?;
+    println!(
+        "==> {} pulled into the microsandbox cache",
+        boot.reference().as_str()
+    );
     Ok(())
 }
 
@@ -91,6 +72,12 @@ pub async fn pull_image(image: &str) -> Result<()> {
         .build()
         .await
         .context("preparing pull config")?;
+    // The exact config handed to the SDK, behind AGENT_VM_DEBUG_CONFIG, so an
+    // integration test can assert the acquisition input (the selected image
+    // reference) rather than a selector notice or a connection error.
+    if let Some(dump) = crate::debug_config::sandbox_config(&config)? {
+        eprintln!("{dump}");
+    }
     let (progress, task) = Sandbox::create_with_pull_progress(config);
     let render = tokio::spawn(crate::pull_progress::render(progress));
     // Await render BEFORE propagating any error from `task`. Two reasons:

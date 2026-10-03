@@ -1,8 +1,7 @@
-# Pi coding agent tool layer. See docs/adr/0003-project-tooling-layers.md for
-# the layer image contract this file satisfies,
-# docs/adr/0012-stable-pi-image-customization-seam.md for why the wrapper is
-# separate from the installation, and images/Dockerfile for the facilities this
-# layer inherits from the base (Node.js 22, jq, the host-CA shim).
+# Pi coding agent recipe. See images/tools/README.md for the recipe conventions
+# this file follows, docs/adr/0012-stable-pi-image-customization-seam.md for why
+# the wrapper is separate from the installation, and images/Dockerfile for the
+# facilities this recipe inherits from the base (Node.js 22, jq, the host-CA shim).
 #
 # Unlike the other tool layers this one runs NO upstream installer and resolves
 # NO version: the pin is the committed package.json + package-lock.json beside
@@ -17,7 +16,7 @@ ARG AGENT_INSTALL_SOFT_FAIL=
 # committed lock byte-for-byte with no registry lookup, and the Dockerfile must
 # never duplicate the pin as a nonempty ARG. The LABEL fallbacks are generated
 # mirrors of the committed manifests, kept in sync by the upgrade scripts and
-# asserted by the tool_layer.rs guards.
+# asserted by the image_sources guards.
 ARG AGENT_VERSION_PI=
 ARG AGENT_VERSION_PI_CLAUDE_BRIDGE=
 
@@ -39,7 +38,7 @@ LABEL org.agent-vm.version.pi="${AGENT_VERSION_PI:-0.87.1}" \
 # can see it. An inline `npm ci && …` aborts the build on a nonzero exit, which
 # makes any later soft-fail branch unreachable. Bind-mounting (rather than
 # COPYing) also keeps the script out of the shipped image and needs no execute
-# bit, so the 0644-materialisation rule below does not apply to it.
+# bit.
 COPY package.json package-lock.json /opt/agent-vm/pi/
 RUN --mount=type=bind,source=contract,target=/tmp/recipe-contract,ro \
     --mount=type=bind,source=install-pi.sh,target=/tmp/install-pi.sh,ro \
@@ -76,11 +75,9 @@ RUN --mount=type=bind,source=contract,target=/tmp/recipe-contract,ro \
 
 # First-boot seed hook (run.rs's RUN_IMAGE_SEED_HOOKS runs every executable
 # under /opt/agent-vm/seed.d/) pointing the bridge at the image's own `claude`.
-# The execute bit comes from `--chmod=0755`, NOT a `RUN chmod`: the embedded
-# copy of images/tools/ materialises every file mode 0644 (src/tool_layer.rs),
-# so a RUN chmod would make a locally composed layer hash differently from one
-# built from a git checkout of the same bytes. Same reason as pi.sh below and
-# the claude layer's seed hook.
+# The committed source is mode 0644, so the execute bit is established here by
+# `--chmod=0755` rather than inherited from the build context; the seed hook must
+# be executable. Same reason as pi.sh below and the claude layer's seed hook.
 COPY --chmod=0755 seed-claude-bridge-config.sh /opt/agent-vm/seed.d/20-pi-claude-bridge
 
 # Image-owned extensions. The directory is the seam: a later customization layer
@@ -88,17 +85,14 @@ COPY --chmod=0755 seed-claude-bridge-config.sh /opt/agent-vm/seed.d/20-pi-claude
 COPY extensions/guest-credential-warning.js /opt/agent-vm/pi-extensions/
 RUN chmod -R a+rX /opt/agent-vm/pi-extensions
 
-# The execute bit comes from `--chmod=0755`, NOT a `RUN chmod`: the embedded
-# copy of images/tools/ in the agent-vm binary materialises every file mode 0644
-# (src/tool_layer.rs), so a RUN chmod would make a locally composed layer hash
-# differently from one built from a git checkout of the same bytes. Same reason
-# as images/tools/claude/Dockerfile's seed hook.
+# The committed source is mode 0644, so the execute bit is established here by
+# `--chmod=0755` rather than inherited from the build context; the wrapper must
+# be executable. Same reason as images/tools/claude/Dockerfile's seed hook.
 COPY --chmod=0755 pi.sh /usr/local/bin/pi
 
 # Build-time gates. Bind-mounted (not COPYed), exactly like install-pi.sh
-# above: the script stays out of the shipped image and needs no execute bit, so
-# the 0644-materialisation rule the wrapper's `COPY --chmod=0755` works around
-# does not apply to it. See verify-pi.sh for the checks and their rationale.
+# above: the script stays out of the shipped image and needs no execute bit. See
+# verify-pi.sh for the checks and their rationale.
 #
 # Reached in BOTH outcomes of install-pi.sh: a hard failure already aborted the
 # build, and a soft failure exited 0 having deleted /opt/agent-vm/pi entirely --

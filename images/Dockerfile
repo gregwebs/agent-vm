@@ -1,32 +1,30 @@
-# agent-vm TOOL-FREE BASE image — the OCI image that tool layers build
-# FROM and that the agent-vm tool boots *inside* its per-project
-# microVM when the configured tool set is composed locally. NOT the
-# agent-vm tool itself (that's the Rust binary published as
-# @wirenboard/agent-vm on npm).
+# agent-vm TOOL-FREE BASE image — the OCI image the six shipped recipe images
+# under images/tools/ build FROM. NOT the agent-vm tool itself (that's the Rust
+# binary published as @wirenboard/agent-vm on npm), and NOT a boot image the
+# launcher selects.
 #
 # Contents: Debian 13 slim + the docker engine (docker.io + containerd
 # + runc + fuse-overlayfs), network/diagnostic CLIs, the
 # `agent-vm-install` helper, and the host-CA shim. It carries NO agent
-# CLI: the six shipped agents live in standalone tool layers under
+# CLI: the six shipped agents live in standalone recipes under
 # images/tools/ (dsh, pi, codex, opencode, claude, copilot), each building FROM
-# this base per ADR-0003's layer image contract. The WB C/C++
+# this base. The WB C/C++
 # build-essentials family and armhf/arm64 cross toolchains live as an
-# opt-in example tooling layer at examples/layers/wirenboard-cpp/
+# opt-in example custom image at examples/layers/wirenboard-cpp/
 # instead of in this base image — see
-# docs/adr/0003-project-tooling-layers.md. Other heavy extras (LSPs,
+# examples/layers/README.md. Other heavy extras (LSPs,
 # additional MCP servers, docker-buildx) are deliberately deferred too.
 #
-# The tool layers are composed two ways. CI chains base + the six
-# default layers and publishes the result as
-# ghcr.io/wirenboard/agent-vm-template (the "composed default image"),
-# which is what a default-config launch boots verbatim. A launch whose
-# configured tool set differs composes from this base locally. Both are
-# published by the hourly CI workflow
+# CI chains this base + the six recipes and publishes the result as
+# ghcr.io/wirenboard/agent-vm-template (the default boot image), which the
+# launcher consumes. The launcher no longer composes images: a custom image is
+# built with ordinary Docker, imported, and selected (ADR-0035). Both the base
+# and the template are published by the hourly CI workflow
 # (.github/workflows/build-image.yml); source-checkout users can build
 # locally and push to a host-local registry via images/build.sh.
 #
-# Layer ordering (most frequently changed content last) is now the tool
-# layers' concern, not this file's — see images/tools/README.md. This
+# Layer ordering (most frequently changed content last) is the recipes'
+# concern, not this file's — see images/tools/README.md. This
 # base's own steps (Debian, docker engine, diag tooling) change rarely
 # and stay cached across rebuilds.
 

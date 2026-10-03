@@ -2,6 +2,10 @@
 
 ## Status
 
+**Superseded by [ADR-0035](0035-consume-user-owned-boot-images.md)**: the
+launcher no longer embeds or composes tool layers; the default boot image is
+booted verbatim. (The #258 amendment note below stands.)
+
 Accepted. Implementation decision for [agent-vm #84](https://github.com/gregwebs/agent-vm/issues/84), the image half of epic [#78](https://github.com/gregwebs/agent-vm/issues/78). Extends [ADR-0003](0003-project-tooling-layers.md) (layer chains and the layer image contract) and [ADR-0015](0015-config-driven-tools.md) (config-driven tools). Builds on **Chain root**, **Base image**, **Composed default image**, **Tool layer**, and **Tooling layer** in [CONTEXT.md](../../CONTEXT.md).
 
 ## Context

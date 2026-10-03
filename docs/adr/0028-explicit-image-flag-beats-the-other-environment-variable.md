@@ -2,6 +2,8 @@
 
 ## Status
 
+**Superseded by [ADR-0035](0035-consume-user-owned-boot-images.md)**: `--base-image` is gone; only "an empty `AGENT_VM_IMAGE_TAG` counts as unset" survives (recorded in ADR-0035).
+
 Accepted.
 
 ## Context

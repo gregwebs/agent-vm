@@ -1,16 +1,13 @@
 # examples/layers/wirenboard-cpp — WB C/C++ + armhf/arm64 cross toolchain
-# tooling layer. Copy this directory to a numbered step under your project's
-# .agent-vm/layers/ (e.g. .agent-vm/layers/10-wirenboard-cpp) to build it FROM
-# the base image (or the previous chain step, if you compose it with another)
-# — or point `agent-vm --layer <path>` at it directly, no copy needed.
-# See docs/adr/0003-project-tooling-layers.md for the layer contract.
+# custom boot image. Build it FROM the default boot image (or any image
+# satisfying the boot image contract) with ordinary Docker, import it, and
+# select it — there is no launcher-side layering (#259). See
+# examples/layers/README.md and
+# docs/adr/0035-consume-user-owned-boot-images.md.
 
-# Launcher overrides BASE_IMAGE at build time with a digest-derived Docker
-# base link (`agent-vm-base:<msb-manifest-digest-hex>`) for step 0, or with the
-# previous chain step's tag for later steps. The link does not replace msb's
-# digest as this layer's identity — that digest is still the hash input. The
-# default keeps a bare `docker build` of this directory working for
-# smoke-testing.
+# `BASE_IMAGE` lets a caller build this example FROM a different boot image
+# (any image satisfying the boot image contract); the default keeps a bare
+# `docker build` of this directory working for smoke-testing.
 ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
 FROM ${BASE_IMAGE}
 
@@ -53,12 +50,11 @@ RUN apt-get update \
 
 # No `ENV PATH` here: everything above installs into /usr/bin, which is
 # already on the base image's PATH. Omitting `ENV PATH` entirely is the
-# safest way to satisfy the layer contract's "keep PATH additive" rule
-# (docs/adr/0003-project-tooling-layers.md) — there is nothing to prepend,
-# and no way to accidentally clobber the base's agent/dockerd PATH entries.
+# safest way to keep PATH additive — there is nothing to prepend, and no way to
+# accidentally clobber the base's agent/dockerd PATH entries.
 
 # Build-time sanity probes (re-added per the note in the former DEFERRED block).
-# Each tool is invoked directly so a present-but-broken binary fails the layer
+# Each tool is invoked directly so a present-but-broken binary fails the image
 # build loudly instead of surfacing as command-not-found in the guest. set -e
 # propagates the first failure.
 RUN set -e \

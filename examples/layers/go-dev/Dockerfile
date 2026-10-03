@@ -1,26 +1,27 @@
-# examples/layers/go-dev — Go development toolchain tooling layer.
+# examples/layers/go-dev — Go development toolchain custom boot image.
 #
-# Install it into a project's chain, or try it directly, to build, test, lint
-# and navigate a Go code base inside the microVM:
+# Build it, import it, and select it to build, test, lint and navigate a Go
+# code base inside the microVM (there is no launcher-side layering, #259):
 #
-#   cp -r examples/layers/go-dev .agent-vm/layers/10-go-dev
-#   agent-vm claude --yes
-#   # or, without copying:
-#   agent-vm shell --layer examples/layers/go-dev --yes
+#   docker buildx build --load \
+#     --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+#     -t agent-vm-go-dev:dev examples/layers/go-dev
+#   ./script/build/import-image.sh agent-vm-go-dev:dev
+#   agent-vm claude --image agent-vm-go-dev:dev
 #
 # It provides the pinned Go toolchain (go, gofmt, go vet, ...) plus the two
 # tools a Go project's edit/CI loop expects beyond it: golangci-lint and the
 # gopls language server. See examples/layers/README.md and
-# docs/adr/0003-project-tooling-layers.md.
+# docs/adr/0035-consume-user-owned-boot-images.md.
 #
 # The four steps that need real shell live as standalone, independently
 # runnable scripts beside this file and are bind-mounted in at build time:
 # install-go.sh, install-golangci-lint.sh, install-gopls.sh and
 # verify-toolchain.sh. This file only wires the pins and locations into them.
 #
-# Layer image contract: C1 is the two lines below; C2 is satisfied because
-# every ENV writes PATH=<new>:${PATH}; C3 by staying root; C7 by installing
-# under world-readable /opt rather than a mode-0700 home.
+# The `ARG BASE_IMAGE`/`FROM ${BASE_IMAGE}` pair lets `--build-arg BASE_IMAGE=…`
+# retarget the build, and every `ENV` keeps `PATH` additive
+# (`PATH=<new>:${PATH}`) so the base's directories are never dropped.
 
 ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
 FROM ${BASE_IMAGE}
@@ -68,13 +69,13 @@ RUN --mount=type=bind,source=install-golangci-lint.sh,target=/tmp/install-golang
 RUN --mount=type=bind,source=install-gopls.sh,target=/tmp/install-gopls.sh,ro \
     bash /tmp/install-gopls.sh
 
-# PATH stays additive (contract C2): the base's entries are preserved via
-# ${PATH}. GOTOOLCHAIN=local makes the layer's pin the toolchain that actually
+# PATH stays additive: the base's entries are preserved via
+# ${PATH}. GOTOOLCHAIN=local makes the pin the toolchain that actually
 # runs: by default `go` would silently download a *different* toolchain
 # through the module proxy whenever a go.mod asks for a newer one, which both
 # defeats the pin and fails confusingly under the guest's network allow list.
 # The error for an out-of-range go.mod names both versions, so the fix (bump
-# GO_VERSION here and rebuild the layer) is discoverable. See the README.
+# GO_VERSION here and rebuild the image) is discoverable. See the README.
 ENV PATH=${GO_PREFIX}/bin:${GO_TOOLS_BIN}:${PATH}
 ENV GOTOOLCHAIN=local
 

@@ -91,7 +91,8 @@ fi
 # The selector is anchored to pi-coding-agent's OWN node_modules so it matches
 # only the shrinkwrap-only siblings. A looser substring match would also catch
 # pi-ai's own nested deps (agent-base, https-proxy-agent), which DO carry
-# integrity -- see the guard test in tool_layer.rs.
+# integrity -- see `image_sources`'
+# `the_build_verified_sibling_set_is_exactly_the_five_nested_earendil_packages`.
 verified=0
 jq -r '.packages | to_entries[]
        | select(.key | test("^node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/[^/]+$"))
