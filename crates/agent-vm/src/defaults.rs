@@ -1,10 +1,8 @@
 //! Module-level constants for distribution-shaped defaults.
 //!
 //! Kept in one place so a release can re-point the image registry,
-//! bump the image-API range, or change other distribution wiring
+//! or change other distribution wiring
 //! without grepping for string literals across subcommands.
-
-use vstd::prelude::*;
 
 /// Default OCI image reference. This is the **composed default guest
 /// template**: the tool-free base plus the six built-in tool layers,
@@ -35,41 +33,15 @@ pub const DEFAULT_IMAGE_REF: &str = "ghcr.io/wirenboard/agent-vm-template:latest
 /// but never collide: a link tag is always 64 hex characters.
 pub const DEFAULT_BASE_IMAGE_REF: &str = "ghcr.io/wirenboard/agent-vm-base:latest";
 
-/// Image-API contract version range this binary supports.
-///
-/// The image writes `/etc/agent-vm-image-version` containing a
-/// single integer N (see `images/Dockerfile`). On first connect
-/// agent-vm reads it and requires
-/// `MIN_SUPPORTED_IMAGE_API <= N <= MAX_SUPPORTED_IMAGE_API` —
-/// otherwise it refuses to launch with a clear "image
-/// too new / too old, update <one side>" message.
-///
-/// Bump on breaking changes only: new required mount points,
-/// changed env-var contracts, removed in-VM binaries, etc.
-/// Routine updates of agent versions don't bump this.
-///
-/// `MAX` moved 2 → 3 for #84: the base no longer carries the agent
-/// binaries, so an old launcher's `setup` verification loop and its
-/// `PATH` assumption are both wrong for the new image. An old launcher
-/// must reject it rather than boot and fail confusingly. `MIN` stays 1:
-/// the new launcher must keep booting a cached, not-yet-repulled API-2
-/// template.
-pub const MIN_SUPPORTED_IMAGE_API: u32 = 1;
-pub const MAX_SUPPORTED_IMAGE_API: u32 = 3;
-
-/// Path the image writes its API version to. Read by agent-vm
-/// from inside the guest immediately after boot.
-pub const IMAGE_API_VERSION_PATH: &str = "/etc/agent-vm-image-version";
-
-// Inside `verus!` because `image_capabilities::chrome_mcp_policy`'s contract
-// names it, and Verus refuses to read a const declared outside the macro.
-verus! {
-/// API 2 requires optional image features to advertise an explicit marker.
-pub const FIRST_ADVERTISED_CAPABILITIES_IMAGE_API: u32 = 2;
-}
-
 /// Marker written last by the Chrome DevTools tooling layer after its checks pass.
 pub const CHROME_MCP_CAPABILITY_PATH: &str = "/etc/agent-vm-capabilities/chrome-devtools-mcp";
+
+/// Path of the in-guest Chrome DevTools MCP wrapper an image supplies as an
+/// ordinary runtime capability. Unlike the capability marker, its presence is
+/// read as capability evidence on its own, not as image identity (#258). One
+/// source of truth: the capability probe (`image_capabilities`) and the entry
+/// the launcher writes (`secrets::chrome_mcp_entry`) must name the same path.
+pub const CHROME_MCP_WRAPPER_PATH: &str = "/usr/local/bin/agent-vm-chrome-mcp";
 
 /// Writable OCI-upper capacity for every sandbox, in mebibytes.
 ///

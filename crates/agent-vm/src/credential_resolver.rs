@@ -308,10 +308,14 @@ pub(crate) struct GuestEnvSources<'a> {
     /// Host variables forwarded verbatim (e.g. `ANTHROPIC_API_KEY`), already
     /// filtered to those actually set and non-empty by the caller.
     pub forwarded: &'a [(&'static str, String)],
-    /// The booted image's own `PATH` (or the launcher fallback).
-    pub path: String,
-    /// The non-root guest identity triple (`HOME`/`USER`/`LOGNAME`), empty in
-    /// root mode.
+    /// The booted image's own `PATH`, or `None` to leave `PATH` entirely
+    /// unset so the acquired OCI config supplies it. `None` never means "fall
+    /// back to a literal": the exec layer resolves the effective PATH from the
+    /// sandbox config after create (#258).
+    pub path: Option<String>,
+    /// The launcher-owned guest identity triple (`HOME`/`USER`/`LOGNAME`):
+    /// `user::guest_identity_env` in default mode, `user::root_identity_env`
+    /// under `--root`, never empty (#258).
     pub identity: &'a [(&'static str, String)],
     /// The launcher's always-env pairs.
     pub always: &'a [(&'static str, &'static str)],
@@ -530,6 +534,13 @@ impl LaunchCredentials {
         }
         let mut env: Vec<(String, String)> = Vec::new();
         for (key, value) in sources.tool_env {
+            // PATH is launcher/image-owned: a tool's own `env` never publishes
+            // it, so with `path: None` no writer can leak a PATH override and
+            // the acquired OCI default stands (#258). Previously the launcher
+            // always published PATH last and shadowed this anyway.
+            if key == "PATH" {
+                continue;
+            }
             env.push((key.clone(), value.clone()));
         }
         for (name, value) in sources.forwarded {
@@ -537,7 +548,9 @@ impl LaunchCredentials {
                 env.push(((*name).to_owned(), value.clone()));
             }
         }
-        env.push(("PATH".to_owned(), sources.path));
+        if let Some(path) = &sources.path {
+            env.push(("PATH".to_owned(), path.clone()));
+        }
         for (name, value) in sources.identity {
             env.push(((*name).to_owned(), value.clone()));
         }
@@ -901,7 +914,7 @@ mod tests {
                     ("ANTHROPIC_API_KEY", "host-anthropic".to_owned()),
                     ("OPENAI_API_KEY", "host-openai".to_owned()),
                 ],
-                path: "/image/bin".to_owned(),
+                path: Some("/image/bin".to_owned()),
                 identity: &[
                     ("HOME", "/host/home".to_owned()),
                     ("USER", "hostuser".to_owned()),
@@ -1567,7 +1580,7 @@ credentials:
             .assemble_guest_env(GuestEnvSources {
                 tool_env: &tool_env,
                 forwarded: &[],
-                path: String::new(),
+                path: None,
                 identity: &[],
                 always: &[],
                 provider: &[],
@@ -1576,6 +1589,45 @@ credentials:
         let text = format!("{error:#}");
         assert!(text.contains("ALPHA_KEY"), "{text}");
         assert!(text.contains("credentials.yaml"), "{text}");
+    }
+
+    /// A `None` path means the OCI default supplies `PATH`: neither the
+    /// launcher nor a tool-declared `env` may emit one. A `Some` path is the
+    /// only writer, and it wins over a tool-declared `PATH` (the pre-#258
+    /// precedence, now by omission rather than by last-wins).
+    #[test]
+    fn path_is_written_only_by_a_some_source() {
+        let source = TestSource::new();
+        let launch = one(ALPHA, &["alpha"], &*source).unwrap();
+        let tool_env: BTreeMap<String, String> =
+            [("PATH".to_owned(), "/tool/bin".to_owned())].into();
+
+        let none = launch
+            .assemble_guest_env(GuestEnvSources {
+                tool_env: &tool_env,
+                forwarded: &[],
+                path: None,
+                identity: &[],
+                always: &[],
+                provider: &[],
+            })
+            .unwrap();
+        assert!(
+            !contains_key(&none, "PATH"),
+            "path=None must let the acquired OCI PATH stand; got {none:?}"
+        );
+
+        let some = launch
+            .assemble_guest_env(GuestEnvSources {
+                tool_env: &tool_env,
+                forwarded: &[],
+                path: Some("/image/bin".to_owned()),
+                identity: &[],
+                always: &[],
+                provider: &[],
+            })
+            .unwrap();
+        assert_eq!(value_of(&some, "PATH"), Some("/image/bin"));
     }
 
     #[test]
@@ -1628,7 +1680,7 @@ credentials:
                     .assemble_guest_env(GuestEnvSources {
                         tool_env: &BTreeMap::new(),
                         forwarded: &[("OPENAI_API_KEY", "host-openai".to_owned())],
-                        path: "/image/bin".to_owned(),
+                        path: Some("/image/bin".to_owned()),
                         identity: &root_and_nonroot(identity),
                         always: &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")],
                         provider: &[("COPILOT_GITHUB_TOKEN", "msb-copilot")],
@@ -1648,7 +1700,7 @@ credentials:
                     .assemble_guest_env(GuestEnvSources {
                         tool_env: &BTreeMap::new(),
                         forwarded: &[("OPENAI_API_KEY", "host-openai".to_owned())],
-                        path: "/image/bin".to_owned(),
+                        path: Some("/image/bin".to_owned()),
                         identity: &root_and_nonroot(identity),
                         always: &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")],
                         provider: &[("COPILOT_GITHUB_TOKEN", "msb-copilot")],

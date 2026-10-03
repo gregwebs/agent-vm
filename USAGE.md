@@ -137,10 +137,87 @@ weaken the contract: a checksum/integrity mismatch, an unknown failure or a
 wrong version stays hard, and a soft-degraded image is not proof the tool works
 — it ships no command for that slot.
 
-The agent-vm binary and the images are version-locked through an
-**image-API-version** integer
-(`/etc/agent-vm-image-version` inside the image). Mismatch → clean
-error at launch instead of mysterious in-VM failures.
+The agent-vm binary and the images it launches are not version-locked by any
+image-side stamp. What a boot image must provide is the **[boot image
+contract](#boot-image-contract)**.
+
+## Boot image contract
+
+Any image selected for a session (via `--image`, `--base-image` composition, or
+the default) must satisfy this contract. agent-vm **never** installs software,
+substitutes another image, or runs the guest command on the host, so a breach is
+a launch failure naming the image and the missing piece.
+
+**Required:**
+
+1. A Linux image for the host's architecture (arm64 on Apple Silicon) whose
+   binaries execute there.
+2. **Bash on the image's `PATH`.** Every launch runs `bash -c` with a small
+   prelude: it strips IPv6 nameservers from `/etc/resolv.conf`, runs executable
+   `/opt/agent-vm/seed.d/*` hooks and the supplied
+   `/opt/agent-vm/seed-claude-plugins.sh` entry point when present, and sources
+   the project's `.agent-vm.runtime.sh`. The real acquired image OCI `PATH` is
+   preserved, in order, on first and warm launches; the launcher's fallback
+   (`/usr/local/bin:/usr/bin:/usr/sbin:/bin`) applies **only** when the image
+   declares no `PATH` at all, never merely because a cold launch had no cached
+   metadata. This is the per-exec *starting* `PATH`: microsandbox's agentd
+   prefixes its own `/.msb/scripts` directory only when that directory is absent
+   as a `:`-segment; otherwise it leaves the supplied value unchanged, and
+   existing values, order and duplicates are always preserved (an image `PATH`
+   without that segment therefore starts as `/.msb/scripts:<image PATH>`).
+   Runtime hooks run next and can change `PATH`.
+3. The selected tool's external `command` executable at its configured pathname,
+   or resolvable on the final hook-modified `PATH`, and executable by the guest
+   user — by default the host numeric `uid:gid` (not root, not an image account),
+   so install world-readable/executable.
+4. A runtime-initializable filesystem: regular `/etc/passwd` and `/etc/group`
+   (default mode appends the guest identity; boot fails with
+   `cannot append to '/etc/passwd'` otherwise), and root-mode dotfile links live
+   under `/root`.
+
+**Not required:** Debian, a package manager, a particular install prefix, a
+fixed image account, agentd installed in the image, or
+`/etc/agent-vm-image-version`.
+
+**Behaviour to know:** microsandbox's agentd is PID 1, so the image's
+`ENTRYPOINT`/`CMD` never run. Default mode overrides the image `USER`; `--root`
+consistently runs uid:gid 0:0 in the sandbox bind mapping and each exec. In
+default mode `$HOME` is your host home path, backed by `<state>/home`, which
+**hides** whatever the image put there. Under `--root`, HOME=/root and
+USER/LOGNAME=root even if the OCI `USER` or `ENV HOME` conflict; plain root HOME
+files stay ephemeral while declared/config links target persistent state. TLS:
+agentd adds the session CA to the system bundle
+(`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt` or
+`/etc/ssl/cert.pem`) and sets `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/
+`CURL_CA_BUNDLE`/`NODE_EXTRA_CA_CERTS`; software with its own trust store
+(Chromium/NSS, Java keystores, …) needs its own integration.
+
+**Optional integrations** (inert when absent, ordinary image content — not
+lineage/ABI/migration promises): executable `seed.d` hooks, the supplied
+`/opt/agent-vm/seed-claude-plugins.sh` entry point, and the Chrome capability
+marker/wrapper.
+
+**Failures:** a missing/unrunnable Bash yields an image-contract diagnostic; a
+missing selected program prints a contract message and exits **127**. There is
+never an install, a fallback image, or host execution.
+
+Minimal example:
+
+```dockerfile
+FROM alpine:3.22
+RUN apk add --no-cache bash
+COPY --chmod=0755 my-program /usr/local/bin/my-program
+```
+
+Build and launch on a macOS checkout:
+
+```sh
+docker buildx build --platform linux/arm64 --load -t my-image:dev .
+./script/build/import-image.sh my-image:dev
+agent-vm shell --image my-image:dev
+```
+
+Or push to a registry and use its reference directly with `--image`.
 
 ## Launch flags
 
@@ -865,7 +942,12 @@ either copy it into the project as a numbered step
 `agent-vm claude --layer examples/layers/chrome-devtools --yes`. Removing the
 layer removes that stale owned entry while preserving other MCPs.
 `AGENT_VM_NO_CHROME_MCP=1` removes the automatic entry but leaves Chromium
-available for manual use. The wrapper preserves Chromium's nested sandbox:
+available for manual use. The launcher adds its owned
+`mcpServers.chrome-devtools` entry when the boot image advertises the capability
+(`/etc/agent-vm-capabilities/chrome-devtools-mcp`) **or** supplies
+`/usr/local/bin/agent-vm-chrome-mcp` without the marker; otherwise it removes any
+stale owned entry and the launch proceeds. This is supplied-artifact detection,
+not image identity or lineage. The wrapper preserves Chromium's nested sandbox:
 non-root guests run it directly and root guests switch only to the dedicated
 `chrome` user. It imports the per-install microsandbox CA into that user's NSS
 database rather than using an insecure certificate flag, and disables MCP

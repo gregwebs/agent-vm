@@ -375,6 +375,14 @@ The finished image selected for a guest session: a **derived image**, a released
 **composed default image**, or an explicit image booted verbatim. It is distinct
 from the **composition root**, which is the foundation used during composition.
 
+## Boot image contract
+
+What any boot image must provide for a session — host-architecture Linux, Bash
+on `PATH`, the selected program executable by the guest user,
+`/etc/passwd`/`/etc/group` — defined in
+[USAGE.md#boot-image-contract](USAGE.md#boot-image-contract). Not a version
+stamp. _Avoid_: image API, image-API version.
+
 ## Base image
 
 The tool-free OS foundation beneath the **composition root**, before generated

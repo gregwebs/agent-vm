@@ -17,8 +17,8 @@ name: build-image
 # rootfs.diff_ids).
 #
 # The binary release pipeline (release-npm.yml) runs on a separate
-# cadence; image-API-version contract (images/Dockerfile + defaults.rs)
-# keeps them compatible.
+# cadence; what a launcher and an image must agree on is the boot image
+# contract (USAGE.md#boot-image-contract), not an image-side stamp.
 
 on:
   schedule:

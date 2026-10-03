@@ -239,18 +239,6 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
     crate::pull_progress::await_render(render_task).await;
     let sandbox = result?;
 
-    // Image-API-version range check: same path agent-vm run takes
-    // on every launch. Mismatch here = an actionable error at setup
-    // time rather than a mysterious failure on first `agent-vm claude`.
-    println!("==> Checking image-API contract version");
-    crate::image_api_version::check(&sandbox)
-        .await
-        .with_context(|| {
-            format!(
-                "image-API check during verify failed; {image} is not compatible with this agent-vm"
-            )
-        })?;
-
     // Per-tool `--version` checks, run independently so the error names which
     // one fails instead of a generic && short-circuit.
     println!("==> Checking in-VM agent versions");
@@ -307,7 +295,7 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
 /// died or agentd is unreachable — is indistinguishable here from an absent
 /// binary, so a non-required tool is warned about and `setup` continues. That
 /// is deliberate: `setup` cannot repair a dead sandbox by failing the run, and
-/// the image-API check has already passed by this point.
+/// the verify sandbox has already booted by this point.
 fn report(
     image: &str,
     target: &VerifyTarget,

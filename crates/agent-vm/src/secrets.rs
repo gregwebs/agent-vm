@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use vstd::prelude::*;
 
 use crate::credential_provider::{self, CredentialProvider, ProviderSet};
+use crate::defaults::CHROME_MCP_WRAPPER_PATH;
 use crate::host_paths::{
     GuestStateDir, MAX_HOST_CREDENTIAL_FILE_BYTES, atomic_write, read_bounded_regular_file,
 };
@@ -1711,7 +1712,7 @@ pub fn sync_chrome_mcp(state_dir: &Path, enabled: bool) -> Result<()> {
 
 fn chrome_mcp_entry() -> Value {
     serde_json::json!({
-        "command": "/usr/local/bin/agent-vm-chrome-mcp",
+        "command": CHROME_MCP_WRAPPER_PATH,
         "args": ["npx", "-y", "chrome-devtools-mcp@1.0.1", "--headless=true", "--isolated=true"],
         "env": {"CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS": "1"},
     })

@@ -416,18 +416,21 @@ dies mid-stream produces a diagnostic rather than a hang on `recv()`; see
 
 ### Guest `PATH`
 
-`attach()` and `exec()` both spawn via `execve` directly, so the image's `ENV
-PATH` — which only takes effect for a shell that sources the profile — is not
-in play. The launcher reads `PATH` out of the booted image's OCI config
-(`path_from_config_env`, last `PATH=` entry wins, matching successive shell
-assignments across base and derived `ENV` layers) and publishes it on the
-builder. `FALLBACK_GUEST_PATH` covers the cold-start case where image metadata
-is not cached yet, and is hand-synced with the **base** `images/Dockerfile`'s
-`ENV PATH` (it names no tool prefix; the tool layers append theirs).
+`attach()` and `exec()` both spawn the command directly, so the child receives
+only the environment carried by the exec request; the launcher must supply
+`PATH` explicitly. After the sandbox boots, the launcher takes the resolved
+`PATH` from the created sandbox's OCI config (the last `PATH` entry, matching
+successive shell assignments across base and derived `ENV` layers) and sets it
+per exec, on both the attach and streaming builders.
+`FALLBACK_GUEST_PATH` applies only when the acquired image declares no `PATH` at
+all — never merely because a cold launch had no cached metadata — and
+microsandbox's agentd prepends its own script directory at exec time.
 
 Agent binaries live under `/opt/agent` — a shared, world-readable prefix
 (`chmod -R a+rX`) rather than `/root` — so the same `PATH` resolves identically
-whether the guest runs non-root or as root.
+whether the guest runs non-root or as root. What the guest actually starts with
+is part of the **[boot image contract](USAGE.md#boot-image-contract)**; this
+section is orientation, not the contract.
 
 ### Guest user (non-root by default) / `--root`
 
@@ -529,7 +532,8 @@ agent-vm-owned wrapper (`/usr/local/bin/pi`) and a mandatory warning extension
 (see the third subtlety below). The claude layer also carries
 the four `claude-plugins-official` LSP servers. Chromium is *not* in the base: it
 is an opt-in `examples/layers/chrome-devtools` tooling layer, detected after boot
-via an image-capability marker.
+by a supplied artifact: the image-capability marker, or the wrapper itself when
+no marker is present (see the boot image contract and #258).
 
 Three build-time subtleties are worth knowing:
 
@@ -542,11 +546,11 @@ Three build-time subtleties are worth knowing:
   therefore stashes the plugins to `/opt/agent-vm/claude-seed` and installs a
   first-boot seed hook at `/opt/agent-vm/seed.d/10-claude-plugins`; the launcher
   prelude (`RUN_IMAGE_SEED_HOOKS` in `run.rs`) runs every executable under
-  `seed.d/` — tool-agnostic. While
-  `MIN_SUPPORTED_IMAGE_API` is still 1 the prelude also runs the legacy
-  `/opt/agent-vm/seed-claude-plugins.sh` when present, so an already-cached
-  API-2 template still seeds; without that fallback the regression would be
-  symptomless (an empty `claude plugin list`).
+  `seed.d/` and also runs a supplied `/opt/agent-vm/seed-claude-plugins.sh` when
+  present — tool-agnostic, optional supplied image content rather than a
+  compatibility/lineage fallback. Both clauses run on every launch and must be
+  idempotent; the launcher makes no claim that the released default supplies
+  either (#258).
 - The `pi` layer installs Pi at `/opt/agent-vm/pi` but exposes it through an
   agent-vm-owned wrapper at `/usr/local/bin/pi` that makes three decisions plus
   the mandatory extension: it enforces `PI_SKIP_VERSION_CHECK=1` (agent-vm owns
@@ -585,9 +589,12 @@ composed default on the fast path (see
   `debootstrap` + `mkfs.ext4` — a slower, less familiar loop than
   `docker build`.
 
-The binary and the image are version-locked by an **image-API-version** integer
-(`/etc/agent-vm-image-version`), so a mismatch is a clean launch-time error
-rather than a mysterious in-VM failure.
+The binary and the image are not locked by any image-side stamp. What an image
+must provide is the **[boot image contract](USAGE.md#boot-image-contract)**: a
+host-architecture Linux image with Bash on `PATH`, the selected program
+executable by the guest user, and a runtime-initializable `/etc/passwd`/
+`/etc/group`. A breach is a clean launch-time diagnostic, not a mysterious in-VM
+failure.
 
 `images/build.sh` builds and pushes through a loopback `registry:2` as a
 separate developer workflow; it is not called by `agent-vm setup`. Docker's CLI
