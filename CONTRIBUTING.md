@@ -112,7 +112,7 @@ CARGO_TARGET_DIR=target/verus cargo verus verify -p agent-vm
 cargo's fingerprint, so sharing one `target/` with ordinary builds makes every switch
 a full rebuild. Expect a few minutes the first time and a few seconds thereafter.
 
-The `rust-dev` example tooling layer (`examples/layers/rust-dev`) pre-installs this
+The `rust-dev` example custom image (`examples/layers/rust-dev`) pre-installs this
 same pinned release for an in-VM agent on `linux/amd64`; see
 [`examples/layers/README.md`](examples/layers/README.md#rust-development).
 
@@ -156,12 +156,12 @@ multiple GB of images. `script/test/e2e.sh` is the single entry point; it runs
 the checks described below and exits non-zero on any failure.
 
 Prerequisites: an Apple Silicon Mac with colima or Docker Desktop running, plus
-the locally built `linux/arm64` dev images (`agent-vm-base:dev`,
-`agent-vm-codex:dev`, … `agent-vm-template:dev`) from
-[Local image builds](macos-build.md). `script/build/import-image.sh` loads those
-into agent-vm's own cache; it needs the *release* bundle's `msb` at
+the locally built `linux/arm64` **template** image (`agent-vm-template:dev`)
+from [Local image builds](macos-build.md). `script/build/import-image.sh` loads
+it into agent-vm's own cache; it needs the *release* bundle's `msb` at
 `target/macos/bin/msb`, so run `./script/build/macos.sh` once even if you
-otherwise use the `--dev` loop.
+otherwise use the `--dev` loop. The custom-image group needs only Docker, the
+release `msb` and a launcher binary — no dev images.
 
 Use your **normal** state dir. Do not point `AGENT_VM_STATE_DIR` at a freshly
 created directory for no reason — an already-populated dir is what makes the
@@ -169,19 +169,17 @@ import and the boot agree (see *The shared-cache trap* below):
 
 ```bash
 export AGENT_VM_STATE_DIR="$HOME/.local/state/agent-vm"   # your usual state root
-./script/build/import-image.sh agent-vm-base:dev
 ./script/build/import-image.sh agent-vm-template:dev
 ./script/test/e2e.sh
 ```
 
 Set `AGENT_VM_E2E_LEGACY_IMAGE` (an image that supplies
-`/opt/agent-vm/seed-claude-plugins.sh`), `AGENT_VM_E2E_SETUP_BASE_REF` (a
-pullable `linux/arm64` base ref), `AGENT_VM_E2E_UPDATE_CHECK=1` and/or
-`AGENT_VM_E2E_RUST=1` to enable the opt-in checks; `./script/test/e2e.sh --help`
-lists them. Each check covers one of: the tool-free base, the fast path (a
-default launch boots the published template with **zero** `docker` invocations),
-per-tool-layer composition, the project-layer chain, and a supplied named seed
-entry point.
+`/opt/agent-vm/seed-claude-plugins.sh`) and/or `AGENT_VM_E2E_UPDATE_CHECK=1` to
+enable the opt-in checks; `./script/test/e2e.sh --help` lists them. Each check
+covers one of: the fast path (a default launch boots the published template with
+**zero** `docker` invocations), the finished-template tool set, Pi HOME
+persistence, inert former `.agent-vm/layers/` directories, and the custom-image
+group (a config/`--image` selected image and setup's verification input).
 
 `script/test/e2e.sh` takes an optional group: `all` (the default; the dev-image
 checks above plus the custom-image group) or `custom-image` (only the marker-free
@@ -248,35 +246,30 @@ agent-vm shell --image agent-vm-template:dev -- bash -lc 'claude --version'
 ```
 
 `script/test/e2e.sh` always uses `bash -c` for exactly this reason. (A shell
-exported `AGENT_VM_IMAGE_TAG`/`AGENT_VM_BASE_IMAGE` is the same class of trap:
-they act as `--image`/`--base-image` whenever the corresponding flag is omitted,
-so a “default config” check silently boots the wrong image. An explicit flag
-does win over the *other* flag's variable, so the two are no longer mutually
-exclusive by accident (issue #189). The harness clears both.)
+exported `AGENT_VM_IMAGE_TAG` is the same class of trap: it acts as `--image`
+whenever the typed flag is omitted, outranking any configured `image`, so a
+“default config” check silently boots the wrong image. The harness clears it.)
 
-#### The `#[ignore]`d Rust Docker e2e tests
+#### The `#[ignore]`d keychain test
 
-The repo also carries `#[ignore]`d tests that drive a real `docker buildx` build
-(no VM boot). Run the whole set with a tool-free base image (one with **no**
-agent CLI installed, so an inherited command cannot mask a failed install):
+One `#[ignore]`d test remains: `secret_store::tests::system_keychain_round_trip`
+writes and removes one synthetic item in the host OS credential store, so it is
+operator opt-in, never CI:
 
 ```bash
-AGENT_VM_E2E_BASE_IMAGE=agent-vm-base:dev \
-  cargo test -p agent-vm --bin agent-vm -- e2e_ --ignored --test-threads=1
+cargo test -p agent-vm --bin agent-vm secret_store::tests::system_keychain_round_trip \
+  -- --ignored --exact --test-threads=1
 ```
 
-The compose-path test alone (the one #84 added):
+There is no `--lib` target, so `--bin agent-vm` is required.
 
-```bash
-AGENT_VM_E2E_BASE_IMAGE=agent-vm-base:dev \
-  cargo test -p agent-vm --bin agent-vm -- \
-    e2e_builtin_tool_layer_composes_onto_an_imported_base --ignored --test-threads=1
-```
+#### Test seams
 
-There is no `--lib` target, so `--bin agent-vm` is required. The layer tests
-default to `alpine:latest` when `AGENT_VM_E2E_BASE_IMAGE` is unset (they skip if
-it is not resolvable), and `AGENT_VM_E2E_REGISTRY_BASE` gates the one test that
-needs a real registry. These tests are `#[ignore]`d, so **CI never runs them**.
+Two debug-only seams are compiled out of release builds: `AGENT_VM_TEST_CREDENTIAL`
+(credential provisioning) and `AGENT_VM_TEST_DEFAULT_IMAGE` (the boot-image
+default slot, so a boot-free CLI test that falls through to the default does not
+start a real multi-GB pull). Neither is read by a release build; a test pins the
+release exclusion.
 
 #### What runs where
 
@@ -284,7 +277,7 @@ needs a real registry. These tests are `#[ignore]`d, so **CI never runs them**.
 |---|---|---|
 | `cargo test --workspace` | yes (`ci.yml`) | `#[ignore]`d e2e excluded |
 | `script/test/e2e.sh` | **no** | needs Apple Silicon + a VM boot; `all` (dev images + custom) or `custom-image` (Docker + release `msb` + launcher, no dev images) |
-| `cargo test … -- --ignored` | **no** | needs docker/buildx |
+| `cargo test … -- --ignored` | **no** | the one keychain round-trip test; operator opt-in, writes one host keychain item |
 | `script/test/chrome-layer-contract.sh` / `chrome-layer-runtime.sh` | yes (`chrome-layer-contract.yml`) | docker-driver build + contract |
 | `script/test/shipped-tool-recipes.sh` | yes (`shipped-tool-recipes.yml`, native amd64) + manually on native arm64 | real docker-driver build + numeric-uid label/report/T5 audit + label replay. A `workflow_dispatch` run with `full_contract: true` adds `--overrides --chain`; the overrides/chain matrix is not part of the default PR gate |
 | `script/test/shipped-installer-network.sh` | **no** (default PR); yes on a dispatched `full_contract: true` native-amd64 run (`shipped-tool-recipes.yml`) | restricted-egress allowlist over the real vendored installers; the default PR gate never runs it |
@@ -298,8 +291,8 @@ four installer defaults (`codex`, `opencode`, `claude`, `copilot`) and the
 lockfile upgrade scripts bump `dsh`/`pnpm` and `pi`/`pi-claude-bridge`. Ordinary
 and release builds consume only the committed values. The recipe/install
 contract is documented in [`images/tools/README.md`](images/tools/README.md);
-the normative tool-image contract is
-[ADR-0031](docs/adr/0031-tool-image-contract.md).
+the boot-image ownership and selection contract is
+[ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md).
 
 The restricted-egress gate (`shipped-installer-network.sh`) runs on a
 **dispatched** native-amd64 `shipped-tool-recipes.yml` run with

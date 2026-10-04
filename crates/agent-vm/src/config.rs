@@ -2,10 +2,11 @@
 //! and the ordered user/project merge that `agent-vm doctor` previews.
 //!
 //! A **tool declaration** (`[[tools]]` in a config file) is *data*: a guest
-//! command, its default argv, an optional tooling layer, the credential
-//! providers it needs, extra guest-HOME-relative paths to persist, and guest
-//! env pairs. This module never executes a command, creates guest state,
-//! builds a layer, or captures a credential.
+//! command, its default argv, the credential providers it needs, extra
+//! guest-HOME-relative paths to persist, and guest env pairs. This module
+//! never executes a command, creates guest state, builds an image, or captures
+//! a credential. A top-level `image` key selects the **boot image**
+//! independently of the tools (see [`crate::boot_image`]).
 //!
 //! # Two ordered catalogs, not an overlay
 //!
@@ -64,14 +65,12 @@
 //! [`ConfigReport::into_launch_catalog`] is what `cli` (to register
 //! subcommands) and `doctor` (to render them) both start from: the resolved
 //! merge result plus the built-in `shell` fallback (see [`LaunchCatalog`]).
-//! [`LaunchCatalog::declared_layers`] projects the catalog's ordered,
-//! deduplicated `layer` sequence, which [`crate::tool_layer`] resolves —
-//! anchoring and existence-checking a `path`, materialising a `builtin` — and
-//! builds onto the chain root (#84). Persisted-path overlap safety is defined
-//! here (#83): [`guest_paths_overlap`] backs the
-//! within-tool, cross-tool and reserved-link checks, and `guest_home::links`
-//! turns the surviving paths into the one guest-HOME link list both
-//! guest-user modes provision from.
+//! [`ConfigReport::images`] carries the two tiers' boot-image settings, which
+//! `cli` reads before consuming the report so a catalog error cannot erase a
+//! readable image. Persisted-path overlap safety is defined here (#83):
+//! [`guest_paths_overlap`] backs the within-tool, cross-tool and reserved-link
+//! checks, and `guest_home::links` turns the surviving paths into the one
+//! guest-HOME link list both guest-user modes provision from.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -84,6 +83,7 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use vstd::prelude::*;
 
+use crate::boot_image::ImageRef;
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::secret_store::ServiceName;
 
@@ -160,6 +160,7 @@ pub(crate) struct ConfigReport {
     user: TierReport,
     project: TierReport,
     resolved: ResolvedTools,
+    images: ConfiguredImages,
     uses_defaults: bool,
     conflicts: Vec<ConfigConflict>,
 }
@@ -179,6 +180,13 @@ impl ConfigReport {
     #[cfg(test)]
     pub(crate) fn resolved(&self) -> &ResolvedTools {
         &self.resolved
+    }
+
+    /// The two tiers' `image` settings, read *before* the report is consumed by
+    /// [`ConfigReport::into_launch_catalog`] so a dangling `tools` reference (or
+    /// any catalog error) cannot erase a readable image choice.
+    pub(crate) fn images(&self) -> &ConfiguredImages {
+        &self.images
     }
 
     /// True when neither file declared a tool and the compiled-in defaults
@@ -245,17 +253,6 @@ pub(crate) fn shipped_tool_commands() -> Result<Vec<String>> {
     Ok(default_tools()?
         .iter()
         .map(|tool| tool.command().to_string())
-        .collect())
-}
-
-/// The shipped default layer sequence — the projection `tool_layer::chain_root`
-/// compares a configured catalog against to decide the chain root (issue #84's
-/// fast path). Derived from [`default_tools`], never hand-copied, in declaration
-/// order; tools with no `layer` (such as `shell`) contribute nothing.
-pub(crate) fn shipped_tool_layers() -> Result<Vec<ToolLayer>> {
-    Ok(default_tools()?
-        .into_iter()
-        .filter_map(|tool| tool.layer().cloned())
         .collect())
 }
 
@@ -360,44 +357,6 @@ impl LaunchCatalog {
             .position(|entry| entry.tool.name() == name)?;
         Some(self.entries.remove(index))
     }
-
-    /// Every tool layer this catalog declares, in catalog (declaration) order,
-    /// deduplicated by layer value (two tools naming the same `{ builtin = … }`
-    /// produce one chain step, not two identical installs).
-    ///
-    /// The image a launch boots is a property of the **whole catalog**, not of
-    /// the invoked verb, so this must be read *before* [`Self::take_entry`]
-    /// removes one — otherwise the launched tool's own layer is dropped.
-    pub(crate) fn declared_layers(&self) -> Vec<DeclaredLayer> {
-        let mut seen: Vec<&ToolLayer> = Vec::new();
-        let mut out = Vec::new();
-        for entry in &self.entries {
-            let tool = entry.tool();
-            let Some(layer) = tool.layer() else {
-                continue;
-            };
-            if seen.contains(&layer) {
-                continue;
-            }
-            seen.push(layer);
-            out.push(DeclaredLayer {
-                tool: tool.name().to_string(),
-                command: tool.command().to_string(),
-                layer: layer.clone(),
-                anchor: match tool.origin() {
-                    ToolOrigin::BuiltIn => None,
-                    // D7: a `path` layer anchors on the directory of the config
-                    // file that declared it — a user-tier config's cwd is
-                    // arbitrary, so the declaring file is the only well-defined
-                    // anchor.
-                    ToolOrigin::User(file) | ToolOrigin::Project(file) => {
-                        file.parent().map(Path::to_path_buf)
-                    }
-                },
-            });
-        }
-        out
-    }
 }
 
 /// The shipped `shell` definition, re-parsed from `default-tools.toml` so
@@ -475,7 +434,6 @@ pub(crate) struct Tool {
     name: ToolName,
     command: String,
     argv: Vec<String>,
-    layer: Option<ToolLayer>,
     /// The **built-in** providers this tool requires, in declaration order.
     /// Kept separate from [`Self::credential_names`] because every existing
     /// consumer (the provisioning closure, `run::launch`'s hard bail, every
@@ -547,10 +505,6 @@ impl Tool {
         self.interactive_shell
     }
 
-    pub(crate) fn layer(&self) -> Option<&ToolLayer> {
-        self.layer.as_ref()
-    }
-
     pub(crate) fn credentials(&self) -> &[CredentialProvider] {
         &self.credentials
     }
@@ -610,7 +564,6 @@ impl Tool {
     fn same_definition(&self, other: &Tool) -> bool {
         self.command == other.command
             && self.argv == other.argv
-            && self.layer == other.layer
             && self.credentials == other.credentials
             && self.credential_names == other.credential_names
             && self.tools == other.tools
@@ -627,9 +580,6 @@ impl Tool {
         }
         if self.argv != other.argv {
             fields.push(ToolField::Args);
-        }
-        if self.layer != other.layer {
-            fields.push(ToolField::Layer);
         }
         if self.credentials != other.credentials || self.credential_names != other.credential_names
         {
@@ -685,122 +635,76 @@ pub(crate) enum DeclaredTools {
     Named(Vec<ToolName>),
 }
 
-/// A tool's optional tooling layer. `builtin` selects one of the six layer
-/// sources embedded in the binary (`images/tools/`); `path` names a directory
-/// anchored on the declaring config file (D7). [`LaunchCatalog::declared_layers`]
-/// projects the ordered, deduplicated sequence that [`crate::tool_layer`]
-/// materialises and builds onto the chain root (#84).
+/// One config tier's `image`, with the file that declared it (for diagnostics
+/// and `doctor`). Both fields are private; the accessors are the only readers,
+/// so a caller cannot pair a reference with the wrong declaring file.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ToolLayer {
-    Builtin(BuiltinLayer),
-    Path(LayerPath),
+pub(crate) struct ConfiguredImage {
+    reference: ImageRef,
+    file: PathBuf,
 }
 
-/// The closed set of builtin layers agent-vm can `FROM`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BuiltinLayer {
-    Pi,
-    Codex,
-    Opencode,
-    Claude,
-    Copilot,
-    Dsh,
-}
-
-impl BuiltinLayer {
-    pub(crate) const ALL: [BuiltinLayer; 6] = [
-        BuiltinLayer::Dsh,
-        BuiltinLayer::Pi,
-        BuiltinLayer::Codex,
-        BuiltinLayer::Opencode,
-        BuiltinLayer::Claude,
-        BuiltinLayer::Copilot,
-    ];
-
-    fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|layer| layer.as_str() == name)
+impl ConfiguredImage {
+    pub(crate) fn reference(&self) -> &ImageRef {
+        &self.reference
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            BuiltinLayer::Pi => "pi",
-            BuiltinLayer::Codex => "codex",
-            BuiltinLayer::Opencode => "opencode",
-            BuiltinLayer::Claude => "claude",
-            BuiltinLayer::Copilot => "copilot",
-            BuiltinLayer::Dsh => "dsh",
+    pub(crate) fn file(&self) -> &Path {
+        &self.file
+    }
+
+    /// A configured image built for tests outside this module (which cannot
+    /// name the private fields). Uses the permissive override parser so a test
+    /// fixture need not be a fully valid OCI reference.
+    #[cfg(test)]
+    pub(crate) fn for_test(reference: &str, file: impl Into<PathBuf>) -> Self {
+        Self {
+            reference: ImageRef::from_override(reference.to_string())
+                .expect("valid test image reference"),
+            file: file.into(),
         }
     }
-
-    fn supported_names() -> String {
-        Self::ALL
-            .into_iter()
-            .map(BuiltinLayer::as_str)
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
 }
 
-/// A declared layer path, kept exactly as written (nonempty, NUL-free) at parse
-/// time; anchored and existence-checked by `tool_layer::materialize` (D7).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LayerPath(PathBuf);
+/// Both tiers' `image` settings. `Default` (neither set) is also what `pull`
+/// and `setup` use when the configuration could not be read at all: the
+/// configured tiers are then unknown, and the recovery builtins fall back to
+/// `--image`/env or the default boot image.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConfiguredImages {
+    user: Option<ConfiguredImage>,
+    project: Option<ConfiguredImage>,
+}
 
-impl LayerPath {
-    pub(crate) fn as_path(&self) -> &Path {
-        &self.0
+impl ConfiguredImages {
+    pub(crate) fn user(&self) -> Option<&ConfiguredImage> {
+        self.user.as_ref()
     }
 
-    /// Re-anchor this declared path against the directory of the config file
-    /// that declared it (D7). An absolute path is returned unchanged; a
-    /// relative one is joined onto `anchor`. The caller then canonicalises and
-    /// validates existence, so a missing anchor is a hard error rather than a
-    /// silent cwd-relative resolution.
-    pub(crate) fn anchored(&self, anchor: Option<&Path>) -> Result<PathBuf> {
-        if self.0.is_absolute() {
-            return Ok(self.0.clone());
+    pub(crate) fn project(&self) -> Option<&ConfiguredImage> {
+        self.project.as_ref()
+    }
+
+    /// A fixture for tests outside this module (which cannot name the private
+    /// fields). Named fields rather than two adjacent `Option<ConfiguredImage>`
+    /// parameters, so a user/project swap cannot compile
+    /// (`CODING_STANDARDS.md` → *Types*).
+    #[cfg(test)]
+    pub(crate) fn for_test(fixture: ImageTierFixture) -> Self {
+        Self {
+            user: fixture.user,
+            project: fixture.project,
         }
-        let anchor = anchor.ok_or_else(|| {
-            anyhow!(
-                "config: layer path {} is relative but its declaring config file has no \
-                 directory to anchor it against",
-                quoted_path(&self.0)
-            )
-        })?;
-        Ok(anchor.join(&self.0))
     }
 }
 
-/// One tool layer the catalog declares, with the anchor its `path` form resolves
-/// against (D7). Ordered and deduplicated by
-/// [`LaunchCatalog::declared_layers`]. Carries the tool's guest `command` so
-/// `setup` can decide which verification targets a not-yet-composed layer
-/// supplies (D10).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DeclaredLayer {
-    tool: String,
-    command: String,
-    layer: ToolLayer,
-    /// `dirname` of the declaring config file; `None` for the built-in tier.
-    anchor: Option<PathBuf>,
-}
-
-impl DeclaredLayer {
-    pub(crate) fn tool(&self) -> &str {
-        &self.tool
-    }
-
-    pub(crate) fn command(&self) -> &str {
-        &self.command
-    }
-
-    pub(crate) fn layer(&self) -> &ToolLayer {
-        &self.layer
-    }
-
-    pub(crate) fn anchor(&self) -> Option<&Path> {
-        self.anchor.as_deref()
-    }
+/// Named image tiers for test fixtures built through
+/// [`ConfiguredImages::for_test`].
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ImageTierFixture {
+    pub(crate) user: Option<ConfiguredImage>,
+    pub(crate) project: Option<ConfiguredImage>,
 }
 
 /// A validated, normalized guest-HOME-relative persist path. The inner path
@@ -828,7 +732,6 @@ impl PersistPath {
 pub(crate) enum ToolField {
     Command,
     Args,
-    Layer,
     Credentials,
     Tools,
     Persist,
@@ -843,7 +746,6 @@ impl ToolField {
         match self {
             ToolField::Command => "command",
             ToolField::Args => "args",
-            ToolField::Layer => "layer",
             ToolField::Credentials => "credentials",
             ToolField::Tools => "tools",
             ToolField::Persist => "persist",
@@ -890,25 +792,25 @@ impl ConfigConflict {
 /// ownership. Any read/parse/validation failure is a contextual hard error —
 /// there is no fallback to defaults.
 pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
-    let (user, user_tools) = match &paths.user {
+    let (user, user_contents) = match &paths.user {
         Some(path) => read_file_tier(path, TierKind::User)?,
         None => (
             TierReport {
                 path: None,
                 status: TierStatus::UnavailableHome,
             },
-            Vec::new(),
+            TierContents::empty(),
         ),
     };
-    let (project, project_tools) = read_file_tier(&paths.project, TierKind::Project)?;
+    let (project, project_contents) = read_file_tier(&paths.project, TierKind::Project)?;
 
-    let (resolved, uses_defaults, conflicts) = if user_tools.is_empty() && project_tools.is_empty()
-    {
-        (default_tools()?, true, Vec::new())
-    } else {
-        let (merged, conflicts) = merge(user_tools, project_tools);
-        (merged, false, conflicts)
-    };
+    let (resolved, uses_defaults, conflicts) =
+        if user_contents.tools.is_empty() && project_contents.tools.is_empty() {
+            (default_tools()?, true, Vec::new())
+        } else {
+            let (merged, conflicts) = merge(user_contents.tools, project_contents.tools);
+            (merged, false, conflicts)
+        };
 
     validate_persist_ownership(&resolved)?;
 
@@ -916,9 +818,30 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
         user,
         project,
         resolved: ResolvedTools(resolved),
+        images: ConfiguredImages {
+            user: user_contents.image,
+            project: project_contents.image,
+        },
         uses_defaults,
         conflicts,
     })
+}
+
+/// What one parsed tier supplied: its tools and its optional `image`. Kept as
+/// one value so the tool count and the image cannot be read from two different
+/// parses.
+struct TierContents {
+    tools: Vec<Tool>,
+    image: Option<ConfiguredImage>,
+}
+
+impl TierContents {
+    fn empty() -> Self {
+        Self {
+            tools: Vec::new(),
+            image: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -942,7 +865,7 @@ impl TierKind {
 /// the initial `symlink_metadata` means absent; a present-but-dangling
 /// symlink or a file that vanishes before the read is an error, not a quiet
 /// fallback.
-fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, Vec<Tool>)> {
+fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, TierContents)> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -951,7 +874,7 @@ fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, Vec<Tool>)
                     path: Some(path.to_path_buf()),
                     status: TierStatus::Absent,
                 },
-                Vec::new(),
+                TierContents::empty(),
             ));
         }
         Err(error) => return Err(safe_io_error("reading metadata for", path, &error)),
@@ -962,6 +885,7 @@ fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, Vec<Tool>)
     let text = std::str::from_utf8(&bytes).map_err(|_| utf8_error(path))?;
     let raw: RawConfig =
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
+    let image = validate_image(raw.image.as_deref(), path)?;
     let tools = validate_tools(raw.tools, path, kind)?;
 
     Ok((
@@ -971,8 +895,24 @@ fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, Vec<Tool>)
                 declared_tools: tools.len(),
             },
         },
-        tools,
+        TierContents { tools, image },
     ))
+}
+
+/// Validate one tier's top-level `image` into an [`ImageRef`]. The reason comes
+/// from [`ImageRef::from_config`] and names no value, so untrusted config text
+/// is never echoed (see the module's diagnostics policy).
+fn validate_image(raw: Option<&str>, file: &Path) -> Result<Option<ConfiguredImage>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match ImageRef::from_config(raw) {
+        Ok(reference) => Ok(Some(ConfiguredImage {
+            reference,
+            file: file.to_path_buf(),
+        })),
+        Err(reason) => Err(anyhow!("config: {}: image: {reason}", quoted_path(file))),
+    }
 }
 
 /// Parse the embedded fallback catalog through the same validated path.
@@ -1259,6 +1199,10 @@ fn launch_closure(tools: &[Tool], index: &HashMap<String, usize>, start: usize) 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    /// The session's **boot image**, an OCI reference (D4). Optional: an
+    /// image-only file declares no tools and keeps the shipped defaults.
+    #[serde(default)]
+    image: Option<String>,
     #[serde(default)]
     tools: Vec<RawTool>,
 }
@@ -1270,7 +1214,6 @@ struct RawTool {
     command: String,
     #[serde(default)]
     args: Vec<String>,
-    layer: Option<RawLayer>,
     #[serde(default)]
     credentials: Vec<String>,
     /// `None` (omitted) is **not** the same as `Some(vec![])`: omitted defaults
@@ -1287,18 +1230,10 @@ struct RawTool {
     env: BTreeMap<String, String>,
 }
 
-/// A small optional-fields struct plus exhaustive validation produces a
-/// clearer diagnosis than an untagged enum that would silently accept a
-/// second selector key.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLayer {
-    #[serde(default)]
-    builtin: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-}
-
+/// Validate the raw `[[tools]]` entries into a catalog, rejecting duplicate
+/// names and reporting the exact field that failed. Sequentially applying
+/// focused validators keeps each diagnosis specific instead of collapsing the
+/// whole entry into one generic parse error.
 fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<Tool>> {
     let mut tools = Vec::with_capacity(raw.len());
     let mut first_index: HashMap<String, usize> = HashMap::new();
@@ -1318,7 +1253,6 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
 
         let command = validate_command(&tool.command, file, index, &name)?;
         let argv = validate_argv(tool.args, file, index, &name)?;
-        let layer = validate_layer(tool.layer, file, index, &name)?;
         let (credentials, credential_names) =
             validate_credentials(tool.credentials, file, index, &name)?;
         let tools_field = validate_tool_refs(tool.tools, file, index, &name)?;
@@ -1329,7 +1263,6 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
             name,
             command,
             argv,
-            layer,
             credentials,
             credential_names,
             tools: tools_field,
@@ -1439,65 +1372,6 @@ fn validate_argv(
         }
     }
     Ok(raw)
-}
-
-fn validate_layer(
-    raw: Option<RawLayer>,
-    file: &Path,
-    index: usize,
-    name: &ToolName,
-) -> Result<Option<ToolLayer>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    match (raw.builtin, raw.path) {
-        (Some(builtin), None) => {
-            let layer = BuiltinLayer::parse(&builtin).ok_or_else(|| {
-                tool_error(
-                    file,
-                    index,
-                    name,
-                    format!(
-                        "layer.builtin {} is not a known layer; supported: {}",
-                        quoted_str(&builtin),
-                        BuiltinLayer::supported_names()
-                    ),
-                )
-            })?;
-            Ok(Some(ToolLayer::Builtin(layer)))
-        }
-        (None, Some(path)) => {
-            if path.is_empty() {
-                return Err(tool_error(
-                    file,
-                    index,
-                    name,
-                    "layer.path must not be empty",
-                ));
-            }
-            if path.contains('\0') {
-                return Err(tool_error(
-                    file,
-                    index,
-                    name,
-                    "layer.path must not contain NUL",
-                ));
-            }
-            Ok(Some(ToolLayer::Path(LayerPath(PathBuf::from(path)))))
-        }
-        (Some(_), Some(_)) => Err(tool_error(
-            file,
-            index,
-            name,
-            "layer must set exactly one of `builtin` or `path`, not both",
-        )),
-        (None, None) => Err(tool_error(
-            file,
-            index,
-            name,
-            "layer must set exactly one of `builtin` or `path`",
-        )),
-    }
 }
 
 /// Validate `credentials = [...]` into (built-in providers, every declared
@@ -1919,8 +1793,8 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
     anyhow!(
         "config: {}{location}: invalid TOML or tool schema; check syntax and field types. \
          Required: a string `name` and `command`; `args`, `credentials`, `tools`, and `persist` are \
-         arrays of strings; `env` is a table of string values; `layer` has exactly one \
-         string selector, `builtin` or `path`.",
+         arrays of strings; `env` is a table of string values; the top-level `image` and each \
+         tool's `command` are strings.",
         quoted_path(file)
     )
 }
@@ -2077,9 +1951,7 @@ mod tests {
     }
 
     fn one_tool(name: &str) -> String {
-        format!(
-            "[[tools]]\nname = \"{name}\"\ncommand = \"{name}\"\nlayer = {{ builtin = \"codex\" }}\ncredentials = [\"openai\"]\n"
-        )
+        format!("[[tools]]\nname = \"{name}\"\ncommand = \"{name}\"\ncredentials = [\"openai\"]\n")
     }
 
     fn tool_summary(tool: &Tool) -> (String, String, usize, Vec<&'static str>, usize) {
@@ -2121,24 +1993,21 @@ mod tests {
         );
 
         let expected = [
-            ("dsh", "dsh", 1, vec![], 1, Some("dsh")),
-            ("pi", "pi", 0, vec![], 0, Some("pi")),
-            ("codex", "codex", 0, vec!["openai"], 0, Some("codex")),
+            ("dsh", "dsh", 1, vec![], 1),
+            ("pi", "pi", 0, vec![], 0),
+            ("codex", "codex", 0, vec!["openai"], 0),
             (
                 "opencode",
                 "opencode",
                 0,
                 vec!["openai", "opencode-static"],
                 0,
-                Some("opencode"),
             ),
-            ("claude", "claude", 1, vec!["anthropic"], 0, Some("claude")),
-            ("copilot", "copilot", 1, vec!["copilot"], 0, Some("copilot")),
-            ("shell", "bash", 2, vec![], 0, None),
+            ("claude", "claude", 1, vec!["anthropic"], 0),
+            ("copilot", "copilot", 1, vec!["copilot"], 0),
+            ("shell", "bash", 2, vec![], 0),
         ];
-        for (tool, (name, command, arg_count, providers, persist, layer)) in
-            tools.iter().zip(expected)
-        {
+        for (tool, (name, command, arg_count, providers, persist)) in tools.iter().zip(expected) {
             assert_eq!(
                 tool_summary(tool),
                 (
@@ -2149,13 +2018,6 @@ mod tests {
                     persist
                 ),
             );
-            match layer {
-                Some(builtin) => assert_eq!(
-                    tool.layer(),
-                    Some(&ToolLayer::Builtin(BuiltinLayer::parse(builtin).unwrap()))
-                ),
-                None => assert_eq!(tool.layer(), None),
-            }
             assert_eq!(tool.origin(), &ToolOrigin::BuiltIn);
         }
     }
@@ -2283,25 +2145,6 @@ mod tests {
             assert_eq!(actual.len(), providers.len(), "{name}");
             assert_eq!(tool.is_interactive_shell(), interactive_shell, "{name}");
         }
-    }
-
-    /// The projection `tool_layer::chain_root` compares a configured catalog
-    /// against: exactly the six builtin layers, in `default-tools.toml` order.
-    /// Derived, never hand-copied, so a reordered or re-typed default is caught
-    /// here rather than by a wrong-image boot.
-    #[test]
-    fn shipped_tool_layers_are_the_six_builtins_in_declaration_order() {
-        assert_eq!(
-            shipped_tool_layers().unwrap(),
-            vec![
-                ToolLayer::Builtin(BuiltinLayer::Dsh),
-                ToolLayer::Builtin(BuiltinLayer::Pi),
-                ToolLayer::Builtin(BuiltinLayer::Codex),
-                ToolLayer::Builtin(BuiltinLayer::Opencode),
-                ToolLayer::Builtin(BuiltinLayer::Claude),
-                ToolLayer::Builtin(BuiltinLayer::Copilot),
-            ]
-        );
     }
 
     /// **T1.** The provisioning set of each shipped verb, transcribed from
@@ -3080,49 +2923,72 @@ mod tests {
         assert!(rendered.contains("not valid UTF-8"), "{rendered}");
     }
 
-    // -- layers ------------------------------------------------------------
+    // -- boot image --------------------------------------------------------
 
     #[test]
-    fn layer_requires_exactly_one_selector() {
-        for body in [
-            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = {}\n",
-            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { builtin = \"codex\", path = \"x\" }\n",
-            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { weird = \"x\" }\n",
+    fn a_top_level_image_is_parsed_in_each_tier_and_keeps_the_defaults() {
+        let fixture = Fixture::new();
+        fixture.user("image = \"localhost:1/user:latest\"\n");
+        let report = fixture.load().unwrap();
+        assert!(
+            report.uses_defaults(),
+            "an image-only file keeps the shipped tools"
+        );
+        assert_eq!(
+            report.images().user().unwrap().reference().as_str(),
+            "localhost:1/user:latest"
+        );
+        assert!(report.images().project().is_none());
+
+        let fixture = Fixture::new();
+        fixture.project("image = \"localhost:1/project:latest\"\ntools = []\n");
+        let report = fixture.load().unwrap();
+        assert!(
+            report.uses_defaults(),
+            "explicit tools=[] also keeps the defaults"
+        );
+        assert_eq!(
+            report.images().project().unwrap().reference().as_str(),
+            "localhost:1/project:latest"
+        );
+    }
+
+    #[test]
+    fn config_image_rejects_local_paths_naming_the_file_and_field() {
+        for value in [
+            "\"\"",
+            "\" \"",
+            "\"\\t\"",
+            "\"/\"",
+            "\"../rootfs\"",
+            "\".\"",
         ] {
             let fixture = Fixture::new();
-            fixture.user(body);
-            let error = fixture.load().unwrap_err();
-            let rendered = format!("{error:#}");
+            fixture.user(&format!("image = {value}\n"));
+            let rendered = format!("{:#}", fixture.load().unwrap_err());
+            assert!(rendered.contains("image"), "value={value}: {rendered}");
             assert!(
-                rendered.contains("exactly one") || rendered.contains("invalid TOML"),
-                "body={body:?} rendered={rendered}"
+                !rendered.contains("rootfs\"") && !rendered.contains("used value"),
+                "value must not be echoed: {rendered}"
             );
         }
     }
 
     #[test]
-    fn unknown_builtin_layer_names_the_supported_set() {
-        let fixture = Fixture::new();
-        fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { builtin = \"nope\" }\n");
-        let error = fixture.load().unwrap_err();
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("nope"), "{rendered}");
-        assert!(rendered.contains("codex"), "{rendered}");
-    }
-
-    #[test]
-    fn a_declared_layer_path_is_metadata_even_when_the_directory_does_not_exist() {
-        let fixture = Fixture::new();
-        fixture.user(
-            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { path = \"./does/not/exist\" }\n",
-        );
-        let report = fixture.load().unwrap();
-        assert_eq!(
-            report.resolved().as_slice()[0].layer(),
-            Some(&ToolLayer::Path(LayerPath(PathBuf::from(
-                "./does/not/exist"
-            ))))
-        );
+    fn a_removed_layer_field_is_an_ordinary_schema_error() {
+        for body in [
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { builtin = \"claude\" }\n",
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { path = \"x\" }\n",
+        ] {
+            let fixture = Fixture::new();
+            fixture.user(body);
+            let rendered = format!("{:#}", fixture.load().unwrap_err());
+            assert!(
+                rendered.contains("invalid TOML"),
+                "body={body:?}: {rendered}"
+            );
+            assert!(!rendered.contains("migrat"), "{rendered}");
+        }
     }
 
     // -- names, commands, providers ---------------------------------------
@@ -3320,11 +3186,10 @@ mod tests {
 
     #[test]
     fn each_differing_field_is_reported_individually_in_fixed_order() {
-        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\nlayer = { builtin = \"codex\" }\ncredentials = [\"openai\"]\ntools = [\"base\"]\npersist = [\"p\"]\ninteractive_shell = false\nenv = { A = \"1\" }\n";
+        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\ncredentials = [\"openai\"]\ntools = [\"base\"]\npersist = [\"p\"]\ninteractive_shell = false\nenv = { A = \"1\" }\n";
         let cases = [
             ("command = \"other\"", ToolField::Command),
             ("args = [\"b\"]", ToolField::Args),
-            ("layer = { builtin = \"claude\" }", ToolField::Layer),
             ("credentials = [\"anthropic\"]", ToolField::Credentials),
             ("tools = [\"other\"]", ToolField::Tools),
             ("persist = [\"q\"]", ToolField::Persist),
@@ -3336,7 +3201,6 @@ mod tests {
                 match expected {
                     ToolField::Command => "command = \"cmd\"",
                     ToolField::Args => "args = [\"a\"]",
-                    ToolField::Layer => "layer = { builtin = \"codex\" }",
                     ToolField::Credentials => "credentials = [\"openai\"]",
                     ToolField::Tools => "tools = [\"base\"]",
                     ToolField::Persist => "persist = [\"p\"]",
@@ -3399,19 +3263,15 @@ mod tests {
 
     #[test]
     fn a_repo_cannot_fill_in_an_omitted_user_field() {
-        // User omits layer/credentials/persist; the project supplying them is
+        // User omits credentials/persist; the project supplying them is
         // a conflict, not a merge — the user's empty values are authoritative.
         let fixture = Fixture::new();
         fixture
             .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\n")
-            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { builtin = \"codex\" }\ncredentials = [\"anthropic\"]\n");
+            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"anthropic\"]\n");
         let report = fixture.load().unwrap();
         assert_eq!(report.conflicts().len(), 1);
-        assert_eq!(
-            report.conflicts()[0].fields(),
-            &[ToolField::Layer, ToolField::Credentials]
-        );
-        assert_eq!(report.resolved().as_slice()[0].layer(), None);
+        assert_eq!(report.conflicts()[0].fields(), &[ToolField::Credentials]);
     }
 
     #[test]
@@ -3430,24 +3290,6 @@ mod tests {
             .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = [\"b\", \"a\"]\n");
         let report = fixture.load().unwrap();
         assert_eq!(report.conflicts()[0].fields(), &[ToolField::Args]);
-    }
-
-    #[test]
-    fn identical_relative_layer_paths_dedupe_without_touching_disk() {
-        let fixture = Fixture::new();
-        fixture
-            .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { path = \"layers/x\" }\n")
-            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { path = \"layers/x\" }\n");
-        let report = fixture.load().unwrap();
-        assert!(report.conflicts().is_empty());
-        assert!(report.resolved().as_slice()[0].layer().is_some());
-
-        let fixture = Fixture::new();
-        fixture
-            .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { path = \"layers/x\" }\n")
-            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\nlayer = { path = \"layers/y\" }\n");
-        let report = fixture.load().unwrap();
-        assert_eq!(report.conflicts()[0].fields(), &[ToolField::Layer]);
     }
 
     // -- persist ownership -------------------------------------------------

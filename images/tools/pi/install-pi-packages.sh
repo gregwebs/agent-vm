@@ -13,7 +13,7 @@
 # No bespoke integrity re-verification here, deliberately: install-pi.sh needs
 # one ONLY because npm ignores our lock for Pi's shrinkwrapped subtree. This
 # tree has no shrinkwrap anywhere in its chain, so `npm ci` authenticates every
-# tarball itself -- and tool_layer::tests::every_bridge_locked_package_carries_integrity
+# tarball itself -- and tests/image_sources.rs::every_bridge_locked_package_carries_integrity
 # fails the build if a regenerated lock ever loses that property.
 #
 # `--legacy-peer-deps` is not optional, on this `npm ci` and on the committed

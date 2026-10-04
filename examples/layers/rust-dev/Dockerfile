@@ -1,27 +1,29 @@
-# examples/layers/rust-dev — Rust development toolchain tooling layer.
+# examples/layers/rust-dev — Rust development toolchain custom boot image.
 #
-# Install it into a project's chain, or try it directly, to build, test, lint
-# and formally verify this repo's Rust code inside the microVM:
+# Build it, import it, and select it to build, test, lint and formally verify
+# this repo's Rust code inside the microVM (there is no launcher-side layering,
+# #259):
 #
-#   cp -r examples/layers/rust-dev .agent-vm/layers/10-rust-dev
-#   agent-vm claude --yes
-#   # or, without copying:
-#   agent-vm shell --layer examples/layers/rust-dev --yes
+#   docker buildx build --load \
+#     --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+#     -t agent-vm-rust-dev:dev examples/layers/rust-dev
+#   ./script/build/import-image.sh agent-vm-rust-dev:dev
+#   agent-vm claude --image agent-vm-rust-dev:dev
 #
 # It provides the toolchain the repo pins (rust-toolchain.toml) with clippy and
 # rustfmt, the musl target a vendored agentd/msb build needs, the native libraries
 # ci.yml installs, shellcheck for script/test/ci-contracts.sh, and the pinned
 # Verus release CI verifies with. See examples/layers/README.md and
-# docs/adr/0003-project-tooling-layers.md.
+# docs/adr/0035-consume-user-owned-boot-images.md.
 #
 # The three steps that need real shell live as standalone, independently
 # runnable scripts beside this file and are bind-mounted in at build time:
 # install-rust.sh, install-verus.sh, verify-toolchain.sh. This file only wires
 # the pins and locations into them.
 #
-# Layer image contract: C1 is the two lines below; C2 is satisfied because
-# every ENV writes PATH=<new>:${PATH}; C3 by staying root; C7 by installing
-# under world-readable /opt rather than a mode-0700 home.
+# The `ARG BASE_IMAGE`/`FROM ${BASE_IMAGE}` pair lets `--build-arg BASE_IMAGE=…`
+# retarget the build, and every `ENV` keeps `PATH` additive
+# (`PATH=<new>:${PATH}`) so the base's directories are never dropped.
 
 ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
 FROM ${BASE_IMAGE}
@@ -71,7 +73,7 @@ ARG VERUS_DIR=/opt/verus
 RUN --mount=type=bind,source=install-verus.sh,target=/tmp/install-verus.sh,ro \
     bash /tmp/install-verus.sh
 
-# PATH stays additive (contract C2): the base's entries are preserved via
+# PATH stays additive: the base's entries are preserved via
 # ${PATH}, and the Verus directory is harmless on a host that skipped it.
 ENV RUSTUP_HOME=/opt/rustup
 ENV PATH=/opt/cargo/bin:/opt/verus/verus-x86-linux:${PATH}

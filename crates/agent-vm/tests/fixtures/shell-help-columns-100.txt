@@ -168,23 +168,13 @@ Network egress:
 
 Image:
       --image <REF>
-          Boot this image verbatim, skipping tool-layer composition.
+          Boot this image instead of the configured one.
 
-          The project's own `.agent-vm/layers/*` and any `--layer DIR` still chain on top. Mutually
-          exclusive with `--base-image`; an explicit flag wins over the other flag's environment
-          variable.
+          Precedence: this flag (or `AGENT_VM_IMAGE_TAG`), then the user config `image`, then the
+          project config `image`, then the default boot image. See USAGE.md → "Selecting the boot
+          image".
 
           [env: AGENT_VM_IMAGE_TAG]
-
-      --base-image <REF>
-          The tool-free base that tool layers are composed onto.
-
-          Default `ghcr.io/wirenboard/agent-vm-base:latest`. Passing this always composes locally,
-          even when your tool set matches the shipped default (which otherwise boots the published
-          composed template). Mutually exclusive with `--image`; an explicit flag wins over the
-          other flag's environment variable.
-
-          [env: AGENT_VM_BASE_IMAGE]
 
       --update-check
           Check the registry for a newer image at launch (opt-in).
@@ -193,25 +183,6 @@ Image:
           the cached image is stale. Off by default so a normal launch makes no registry contact;
           run `agent-vm pull` to fetch an update. Can also be enabled persistently with a truthy
           `AGENT_VM_UPDATE_CHECK` (1|true|yes|on).
-
-      --layer <DIR>
-          Append a tooling layer to this launch's chain (repeatable).
-
-          Each DIR is one layer directory holding a Dockerfile that starts `ARG BASE_IMAGE` / `FROM
-          ${BASE_IMAGE}`. Flag layers are appended after the project's own `.agent-vm/layers/*`
-          steps, in the order given, so the project's steps keep their cached images; it works with
-          no `.agent-vm/layers/` at all. Relative paths resolve against the project directory (the
-          current directory) — unlike `--mount`, which requires absolute paths, because trying a
-          checked-in example by relative path is the point. There is deliberately no environment
-          variable; the removed `AGENT_VM_LAYER` is rejected if set.
-
-  -y, --yes
-          Assume "yes" to the tooling-layer build confirmation prompt.
-
-          Needed for CI/non-interactive launches whenever a chain step's hash doesn't already match
-          a previously built/loaded derived image (a new project, or an edited
-          `.agent-vm/layers/*/Dockerfile`). Can also be set persistently with a truthy
-          `AGENT_VM_YES` (1|true|yes|on).
 
 Guest user:
       --root
@@ -257,8 +228,7 @@ Networking (deny-by-default; flags compose):
 
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
-  AGENT_VM_IMAGE_TAG                    same as --image, unless --base-image is passed
-  AGENT_VM_BASE_IMAGE                   same as --base-image, unless --image is passed
+  AGENT_VM_IMAGE_TAG                    same as --image (outranks configured images)
   AGENT_VM_ROOT                         same as --root (1|true|yes|on)
   AGENT_VM_UPDATE_CHECK                 check the registry for a newer image (1|true|yes|on)
   AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls (1|true|yes|on)

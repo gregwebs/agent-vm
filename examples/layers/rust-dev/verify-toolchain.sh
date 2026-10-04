@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Post-install sanity for the rust-dev tooling layer. Runs both standalone and
+# Post-install sanity for the rust-dev image. Runs both standalone and
 # from examples/layers/rust-dev/Dockerfile.
 #
 # It invokes every tool directly (not `command -v`), so a present-but-broken

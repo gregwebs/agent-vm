@@ -10,7 +10,7 @@
 #   GO_ARM64_SHA256  required on arm64; sha256 of go<version>.linux-arm64.tar.gz
 #   GO_PREFIX        default /opt/go
 #
-# The install is world-readable (contract C7): the guest may run as an
+# The install is world-readable: the guest may run as an
 # arbitrary non-root uid. GOROOT is not set here or exported by the Dockerfile:
 # the toolchain's own layout is self-locating, and unsetting it keeps a
 # project-level `toolchain` directive from colliding with the environment.

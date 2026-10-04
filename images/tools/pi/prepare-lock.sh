@@ -111,7 +111,7 @@ lock="$PREFIX/package-lock.json"
 committed=$(jq -r --arg p "$PACKAGE" '.dependencies[$p]' "$manifest")
 effective=${PI_VERSION:-$committed}
 
-# The same invariants install-pi.sh, upgrade-pi.sh and the tool_layer.rs cargo
+# The same invariants install-pi.sh, upgrade-pi.sh and the `image_sources` cargo
 # guards enforce: the pin is the only home, every entry carries integrity, the
 # nested selector matches exactly the five known siblings, and they are all at
 # the pin.

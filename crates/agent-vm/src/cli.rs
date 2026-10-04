@@ -40,7 +40,9 @@ use anyhow::{Result, anyhow};
 use clap::{Args as _, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use vstd::prelude::*;
 
-use crate::config::{self, Catalog, CatalogEntry, ConfigReport, Tool};
+#[cfg(test)]
+use crate::boot_image::OverrideSource;
+use crate::config::{Catalog, CatalogEntry, ConfigReport, ConfiguredImages, Tool};
 use crate::run;
 use crate::{clipboard, doctor, intercept_hook, msb_cmd, pull, secret, setup};
 
@@ -130,7 +132,7 @@ fn route_is_secret_tokens(argv: &[&[u8]]) -> (out: bool)
 // would be wrong for a user who does not have it.
 pub(crate) const TOP_AFTER_HELP: &str = "\
 Getting started:
-  agent-vm setup       fetch and verify the base image (run once first)
+  agent-vm setup       fetch and verify the boot image (run once first)
   cd ~/your-project
   agent-vm <tool>      launch one of the tools listed above
 
@@ -160,10 +162,10 @@ struct Cli {
 /// they are generated per catalog entry (see [`launch_subcommand`]).
 #[derive(Subcommand)]
 pub(crate) enum Cmd {
-    /// Pull and verify the base image (run once first).
+    /// Pull and verify the boot image (run once first).
     Setup(setup::Args),
 
-    /// Refresh the cached base image.
+    /// Refresh the cached boot image.
     Pull(pull::Args),
 
     /// Forward arguments to the bundled `msb` with agent-vm's MSB_HOME/MSB_PATH
@@ -196,18 +198,18 @@ pub(crate) enum Dispatch {
     Builtin {
         cmd: Cmd,
         catalog: Catalog,
+        /// Both config tiers' `image` settings, read before the report was
+        /// consumed to build the catalog. Carried to `pull`/`setup` so they can
+        /// select the same image a launch would.
+        images: ConfiguredImages,
     },
     // `entry` and `args` are boxed so `Dispatch` does not carry the two large
     // launch-side values inline (clippy `large_enum_variant`); `entry` grew
     // when #161 added the launch's requested credential names.
     Launch {
         entry: Box<CatalogEntry>,
-        /// The catalog's declared tool layers, read **before** `take_entry`
-        /// removed the launched verb (issue #84). The booted image is a
-        /// property of the whole catalog, not of the invoked verb, so reading
-        /// this after `take_entry` would silently drop the launched tool's own
-        /// layer.
-        layers: Vec<config::DeclaredLayer>,
+        /// The two tiers' `image` settings (see the `Builtin` arm).
+        images: ConfiguredImages,
         args: Box<run::Args>,
     },
 }
@@ -255,15 +257,21 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let catalog = match config {
+    let (catalog, images) = match config {
         // A dangling `tools` reference is *user* input, so it must degrade to
         // the deferred-error path (ADR-0015) rather than `?`-propagate and take
-        // `doctor`/`--help`/`clipboard` down with it.
-        Ok(report) => match report.into_launch_catalog() {
-            Ok(catalog) => Catalog::Ready(catalog),
-            Err(error) => Catalog::Broken(error),
-        },
-        Err(error) => Catalog::Broken(error),
+        // `doctor`/`--help`/`clipboard` down with it. The readable `image` is
+        // captured first so a catalog error cannot erase it (§5.3).
+        Ok(report) => {
+            let images = report.images().clone();
+            match report.into_launch_catalog() {
+                Ok(catalog) => (Catalog::Ready(catalog), images),
+                Err(error) => (Catalog::Broken(error), images),
+            }
+        }
+        // The configured tiers are unknown, so the recovery builtins fall back
+        // to `--image`/env or the default boot image (D7).
+        Err(error) => (Catalog::Broken(error), ConfiguredImages::default()),
     };
 
     // Collected so the `secret` scrub below can look at the verb without
@@ -319,21 +327,13 @@ where
         // added without updating `RESERVED_TOOL_NAMES` fails a test rather
         // than silently shadowing a user's tool.
         (Some((name, sub)), Catalog::Ready(mut catalog)) => {
-            // Read the declared layers BEFORE `take_entry`: the image a launch
-            // boots is a property of the whole catalog, so removing the
-            // launched verb first would drop its own layer (issue #84).
-            let layers = catalog.declared_layers();
             match catalog.take_entry(name) {
                 Some(entry) => {
                     let mut args = run::Args::from_arg_matches(sub)?;
-                    ImageFlags {
-                        image: &mut args.image,
-                        base_image: &mut args.base_image,
-                    }
-                    .reconcile(sub);
+                    args.image.reconcile(sub);
                     Ok(Dispatch::Launch {
                         entry: Box::new(entry),
-                        layers,
+                        images,
                         args: Box::new(args),
                     })
                 }
@@ -345,10 +345,11 @@ where
                 // so `setup` can read it.
                 None => {
                     let mut cmd = Cli::from_arg_matches(&matches)?.cmd;
-                    reconcile_builtin_image_flags(sub, &mut cmd);
+                    reconcile_image_args(sub, &mut cmd);
                     Ok(Dispatch::Builtin {
                         cmd,
                         catalog: Catalog::Ready(catalog),
+                        images,
                     })
                 }
             }
@@ -359,10 +360,11 @@ where
             // config error.
             match Cli::from_arg_matches(&matches) {
                 Ok(mut cli) => {
-                    reconcile_builtin_image_flags(sub, &mut cli.cmd);
+                    reconcile_image_args(sub, &mut cli.cmd);
                     Ok(Dispatch::Builtin {
                         cmd: cli.cmd,
                         catalog: Catalog::Broken(config_error),
+                        images,
                     })
                 }
                 Err(_) => Err(config_error_with_hint(&config_error, name)),
@@ -371,117 +373,21 @@ where
     }
 }
 
-/// Which half of the `--image` / `--base-image` pair a rule is about.
-///
-/// Both halves are `Option<String>` with opposite meanings, so they are never
-/// passed as bare values — see [`ImageFlags`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ImageHalf {
-    /// `--image` / `AGENT_VM_IMAGE_TAG`: an image to boot verbatim.
-    Image,
-    /// `--base-image` / `AGENT_VM_BASE_IMAGE`: what the tool layers compose onto.
-    BaseImage,
-}
-
-impl ImageHalf {
-    /// Both halves, in help order.
-    const BOTH: [ImageHalf; 2] = [ImageHalf::Image, ImageHalf::BaseImage];
-
-    /// The clap argument id, which is the field name in every `Args` struct that
-    /// declares the pair (`run`, `pull`, `setup`).
-    fn id(self) -> &'static str {
-        match self {
-            ImageHalf::Image => "image",
-            ImageHalf::BaseImage => "base_image",
-        }
-    }
-
-    /// The other half of the pair.
-    fn other(self) -> Self {
-        match self {
-            ImageHalf::Image => ImageHalf::BaseImage,
-            ImageHalf::BaseImage => ImageHalf::Image,
-        }
-    }
-}
-
-/// A borrowed `--image` / `--base-image` pair. Named fields rather than two
-/// `&mut Option<String>` parameters, which are same-typed and swappable.
-struct ImageFlags<'a> {
-    image: &'a mut Option<String>,
-    base_image: &'a mut Option<String>,
-}
-
-impl ImageFlags<'_> {
-    /// Reconcile the pair after clap's `env = …` fallback has written
-    /// `AGENT_VM_IMAGE_TAG` / `AGENT_VM_BASE_IMAGE` into the same slots as the
-    /// flags (issue #189).
-    ///
-    /// clap already gives the command line precedence over the environment
-    /// *within* one argument (`--image X` beats `AGENT_VM_IMAGE_TAG`); this
-    /// extends that rule across the pair. Without it an ambient
-    /// `AGENT_VM_IMAGE_TAG` — from a shell profile, a CI job, or agent-vm's own
-    /// documented dev setup — makes `--base-image` unusable, because
-    /// [`crate::tool_layer::chain_root`] sees two supplied flags and rejects the
-    /// pair, blaming a flag the user never typed.
-    ///
-    /// Only environment-supplied values are dropped, so two *typed* flags still
-    /// conflict (the user must choose one) and two non-empty environment
-    /// variables still conflict (nothing says which was meant). An empty
-    /// environment value counts as unset: `AGENT_VM_IMAGE_TAG=` is a common CI or
-    /// `docker -e` passthrough and would otherwise select an empty image
-    /// reference.
-    fn reconcile(&mut self, matches: &clap::ArgMatches) {
-        let typed = |half: ImageHalf| {
-            matches.value_source(half.id()) == Some(clap::parser::ValueSource::CommandLine)
-        };
-        for half in ImageHalf::BOTH {
-            if typed(half) {
-                continue;
-            }
-            let value = match half {
-                ImageHalf::Image => &mut *self.image,
-                ImageHalf::BaseImage => &mut *self.base_image,
-            };
-            let empty_from_environment = matches.value_source(half.id())
-                == Some(clap::parser::ValueSource::EnvVariable)
-                && value.as_deref() == Some("");
-            if typed(half.other()) || empty_from_environment {
-                *value = None;
-            }
-        }
-    }
-}
-
-/// [`ImageFlags::reconcile`] on whichever built-in declares the pair.
+/// [`ImageArgs::reconcile`] on whichever built-in declares `--image`.
 ///
 /// Deliberately exhaustive rather than `_ => {}`: it forces whoever adds a
-/// `Cmd` variant to say whether that verb carries the pair. A wildcard would
-/// let a new `--image`/`--base-image` verb skip the rule silently, which is
-/// exactly the bug (issue #189).
-fn reconcile_builtin_image_flags(sub: &clap::ArgMatches, cmd: &mut Cmd) {
+/// `Cmd` variant to say whether that verb carries the image argument. A
+/// wildcard would let a new `--image` verb skip the origin/env-empty rule
+/// silently, which is exactly the bug (issue #189).
+fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
     match cmd {
-        Cmd::Pull(args) => pull_image_flags(args).reconcile(sub),
-        Cmd::Setup(args) => setup_image_flags(args).reconcile(sub),
+        Cmd::Pull(args) => args.image.reconcile(sub),
+        Cmd::Setup(args) => args.image.reconcile(sub),
         Cmd::Msb(_)
         | Cmd::Clipboard(_)
         | Cmd::Doctor(_)
         | Cmd::Secret(_)
         | Cmd::InterceptHook(_) => {}
-    }
-}
-
-fn pull_image_flags(args: &mut pull::Args) -> ImageFlags<'_> {
-    ImageFlags {
-        image: &mut args.image,
-        base_image: &mut args.base_image,
-    }
-}
-
-fn setup_image_flags(args: &mut setup::Args) -> ImageFlags<'_> {
-    ImageFlags {
-        image: &mut args.image,
-        base_image: &mut args.base_image,
     }
 }
 
@@ -707,260 +613,189 @@ mod tests {
         }
     }
 
-    /// Issue #84's `take_entry` ordering trap: a launch verb's `Dispatch` must
-    /// carry the layers read from the catalog *before* the launched verb is
-    /// removed, so `claude` under the default config carries all six shipped
-    /// layers in order (its own included).
     #[test]
-    fn a_launch_carries_every_declared_layer_in_order() {
+    fn parse_from_carries_the_image_tiers_without_the_catalog() {
+        // A project `image` and a tool declaration: the dispatch must carry both
+        // the tool entry and the readable image tiers (§5.3).
         let dir = tempfile::tempdir().unwrap();
-        let config = crate::config::load(&ConfigPaths {
+        let project = dir.path().join("config.toml");
+        std::fs::write(
+            &project,
+            "image = \"localhost:1/p:latest\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
+        )
+        .unwrap();
+        let report = crate::config::load(&ConfigPaths {
             user: Some(dir.path().join("no-user-config.toml")),
-            project: dir.path().join("no-project-config.toml"),
-        });
-        let dispatch = parse_from(["agent-vm", "claude"], config).expect("claude parses");
+            project,
+        })
+        .unwrap();
+        let images = report.images().clone();
+        let dispatch = parse_from(["agent-vm", "t"], Ok(report)).expect("t parses");
         match dispatch {
-            Dispatch::Launch { entry, layers, .. } => {
-                assert_eq!(entry.tool().name(), "claude");
-                let seq: Vec<_> = layers.iter().map(|l| l.layer().clone()).collect();
-                assert_eq!(seq, crate::config::shipped_tool_layers().unwrap());
+            Dispatch::Launch {
+                entry,
+                images: carried,
+                ..
+            } => {
+                assert_eq!(entry.tool().name(), "t");
+                assert_eq!(carried, images);
             }
-            Dispatch::Builtin { .. } => panic!("claude is a launch verb"),
+            Dispatch::Builtin { .. } => panic!("t is a launch verb"),
         }
     }
 
-    // -- #189: an explicit image flag beats the other's environment variable --
+    // -- image argument: typed beats env, empty env is unset --------------
 
-    /// The full `--image` / `--base-image` precedence table, driven through
-    /// [`parse_from`] — the seam that can see clap's `ValueSource` — so a future
-    /// refactor that stops reconciling fails here. The environment is pinned
-    /// under [`crate::test_env::guard`] so the process-wide variables cannot
-    /// race a parallel test.
-    ///
-    /// The end-to-end halves of this rule are in
-    /// `tests/config_launch_driven.rs`; this table exists to cover the empty
-    /// environment row, which would need a registry pull to observe through a
-    /// real launch.
+    /// The single `--image`/`AGENT_VM_IMAGE_TAG` precedence table, driven
+    /// through [`parse_from`] — the seam that can see clap's `ValueSource` — so a
+    /// future refactor that stops reconciling fails here. The environment is
+    /// pinned under [`crate::test_env::guard`] so the process-wide variable
+    /// cannot race a parallel test.
     #[test]
-    fn an_explicit_image_flag_beats_the_others_environment_variable() {
-        #[derive(Debug)]
+    fn an_empty_environment_image_tag_is_unset_and_a_typed_flag_wins() {
         struct Case {
-            env_image: Option<&'static str>,
-            env_base: Option<&'static str>,
+            env: Option<&'static str>,
             argv: &'static [&'static str],
-            image: Option<&'static str>,
-            base_image: Option<&'static str>,
+            expected: Option<(&'static str, OverrideSource)>,
         }
-
+        impl std::fmt::Debug for Case {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("Case")
+                    .field("env", &self.env)
+                    .field("argv", &self.argv)
+                    .field("expected", &self.expected.map(|(reference, _)| reference))
+                    .finish()
+            }
+        }
         let cases = [
-            // An explicit flag wins over the other flag's environment value.
             Case {
-                env_image: Some("env:1"),
-                env_base: None,
-                argv: &["--base-image", "base:1"],
-                image: None,
-                base_image: Some("base:1"),
-            },
-            Case {
-                env_image: None,
-                env_base: Some("base:1"),
-                argv: &["--image", "img:1"],
-                image: Some("img:1"),
-                base_image: None,
-            },
-            // An empty environment value is unset, not an empty image
-            // reference — on both halves, whether or not the other is set. A
-            // wrong clap id would leave a `Some("")` here, so these rows also
-            // guard `ImageHalf::id` against a field rename.
-            Case {
-                env_image: Some(""),
-                env_base: None,
+                env: Some("env:1"),
                 argv: &[],
-                image: None,
-                base_image: None,
+                expected: Some(("env:1", OverrideSource::Environment)),
             },
             Case {
-                env_image: None,
-                env_base: Some(""),
-                argv: &[],
-                image: None,
-                base_image: None,
-            },
-            Case {
-                env_image: Some(""),
-                env_base: Some("base:1"),
-                argv: &[],
-                image: None,
-                base_image: Some("base:1"),
-            },
-            Case {
-                env_image: Some("img:1"),
-                env_base: Some(""),
-                argv: &[],
-                image: Some("img:1"),
-                base_image: None,
-            },
-            // Same-argument precedence stays clap's own.
-            Case {
-                env_image: Some("env:1"),
-                env_base: None,
+                env: Some("env:1"),
                 argv: &["--image", "cli:1"],
-                image: Some("cli:1"),
-                base_image: None,
+                expected: Some(("cli:1", OverrideSource::CommandLine)),
             },
-            // A pair supplied the same way is still ambiguous, and is left for
-            // `chain_root` to reject.
+            // An empty environment value is unset, not an empty reference.
             Case {
-                env_image: Some("env:1"),
-                env_base: Some("base:1"),
+                env: Some(""),
                 argv: &[],
-                image: Some("env:1"),
-                base_image: Some("base:1"),
+                expected: None,
+            },
+            // An empty env does not mask a typed flag.
+            Case {
+                env: Some(""),
+                argv: &["--image", "cli:1"],
+                expected: Some(("cli:1", OverrideSource::CommandLine)),
+            },
+            // Whitespace is *present*, not unset (never trimmed).
+            Case {
+                env: Some(" "),
+                argv: &[],
+                expected: Some((" ", OverrideSource::Environment)),
             },
             Case {
-                env_image: None,
-                env_base: None,
-                argv: &["--image", "img:1", "--base-image", "base:1"],
-                image: Some("img:1"),
-                base_image: Some("base:1"),
+                env: None,
+                argv: &[],
+                expected: None,
             },
         ];
 
         let mut env = crate::test_env::guard();
         for case in cases {
-            for (name, value) in [
-                ("AGENT_VM_IMAGE_TAG", case.env_image),
-                ("AGENT_VM_BASE_IMAGE", case.env_base),
-            ] {
-                match value {
-                    Some(value) => env.set_var(name, value),
-                    None => env.remove_var(name),
-                }
+            match case.env {
+                Some(value) => env.set_var("AGENT_VM_IMAGE_TAG", value),
+                None => env.remove_var("AGENT_VM_IMAGE_TAG"),
             }
             let mut argv = vec!["agent-vm", "pull"];
             argv.extend_from_slice(case.argv);
             let dispatch = parse_from(argv, Ok(report_from("tools = []\n")))
-                .unwrap_or_else(|error| panic!("{case:?} must parse: {error}"));
-            match dispatch {
+                .unwrap_or_else(|error| panic!("case {case:?} must parse: {error}"));
+            let requested = match dispatch {
                 Dispatch::Builtin {
                     cmd: Cmd::Pull(args),
                     ..
-                } => {
-                    assert_eq!(args.image.as_deref(), case.image, "{case:?}");
-                    assert_eq!(args.base_image.as_deref(), case.base_image, "{case:?}");
-                }
+                } => args.image.requested().expect("a valid override or none"),
                 _ => panic!("pull must dispatch as a built-in"),
+            };
+            match case.expected {
+                Some((reference, source)) => {
+                    let override_ = requested.expect("an override is present");
+                    assert_eq!(override_.reference().as_str(), reference);
+                    assert_eq!(override_.source(), source);
+                }
+                None => assert!(requested.is_none(), "empty env must be unset"),
             }
         }
     }
 
-    /// Issue #189: every dispatch arm that carries the pair runs the same
+    /// Every dispatch arm that carries the image argument runs the same
     /// reconciliation. The launch arm, the ready-catalog built-in arm (`pull`,
     /// `setup`) and the broken-config built-in arm each call it separately, so
-    /// dropping any one of them would bring the bug back silently if a
-    /// per-verb case did not fail here.
+    /// dropping any one of them would bring the bug back silently.
     #[test]
-    fn every_dispatch_arm_reconciles_the_image_pair() {
+    fn every_dispatch_arm_reconciles_the_image_arg() {
         let mut env = crate::test_env::guard();
         env.set_var("AGENT_VM_IMAGE_TAG", "env:1");
 
-        // The launch arm (a tool verb).
+        let source_of = |requested: Option<crate::boot_image::ImageOverride>| {
+            requested.map(|override_| override_.source())
+        };
+
+        // The launch arm (a tool verb): env only.
+        let dispatch = parse_from(["agent-vm", "shell"], Ok(report_from("tools = []\n")))
+            .expect("shell parses");
+        match dispatch {
+            Dispatch::Launch { args, .. } => {
+                assert_eq!(
+                    source_of(args.image.requested().unwrap()),
+                    Some(OverrideSource::Environment)
+                );
+            }
+            Dispatch::Builtin { .. } => panic!("shell is a launch verb"),
+        }
+
+        // The launch arm with a typed flag beats the env.
         let dispatch = parse_from(
-            ["agent-vm", "shell", "--base-image", "base:1"],
+            ["agent-vm", "shell", "--image", "cli:1"],
             Ok(report_from("tools = []\n")),
         )
         .expect("shell parses");
         match dispatch {
             Dispatch::Launch { args, .. } => {
-                assert_eq!(args.image, None);
-                assert_eq!(args.base_image.as_deref(), Some("base:1"));
+                let requested = args.image.requested().unwrap().expect("present");
+                assert_eq!(requested.reference().as_str(), "cli:1");
+                assert_eq!(requested.source(), OverrideSource::CommandLine);
             }
             Dispatch::Builtin { .. } => panic!("shell is a launch verb"),
         }
 
         // The ready-catalog built-in arm, and the deferred-config-error arm.
-        // `setup` and `pull` share one rule, so the two verbs plus the two
-        // catalog outcomes cover every arm that can carry the pair.
         for verb in ["pull", "setup"] {
             for catalog in [
                 Ok(report_from("tools = []\n")),
                 Err(anyhow::anyhow!("broken")),
             ] {
-                let dispatch = parse_from(["agent-vm", verb, "--base-image", "base:1"], catalog)
+                let dispatch = parse_from(["agent-vm", verb, "--image", "cli:1"], catalog)
                     .unwrap_or_else(|error| panic!("{verb} must parse: {error}"));
-                let flags = match dispatch {
+                let requested = match dispatch {
                     Dispatch::Builtin {
                         cmd: Cmd::Pull(args),
                         ..
-                    } => (args.image, args.base_image),
+                    } => args.image.requested().unwrap(),
                     Dispatch::Builtin {
                         cmd: Cmd::Setup(args),
                         ..
-                    } => (args.image, args.base_image),
+                    } => args.image.requested().unwrap(),
                     _ => panic!("{verb} must dispatch as a built-in"),
                 };
-                assert_eq!(flags.0, None, "{verb}");
-                assert_eq!(flags.1.as_deref(), Some("base:1"), "{verb}");
+                let requested = requested.expect("present");
+                assert_eq!(requested.reference().as_str(), "cli:1", "{verb}");
+                assert_eq!(requested.source(), OverrideSource::CommandLine, "{verb}");
             }
         }
-    }
-
-    // -- T9: dispatch to a launch verb and to a built-in ------------------
-
-    /// Issue #144: the non-interactive tooling-layer error tells the user to
-    /// "Re-run with --yes", so *every* launch verb — not just `shell` — must
-    /// register and consume that flag. An unregistered `--`-flag is not
-    /// rejected here: the trailing `agent_args` positional has
-    /// `allow_hyphen_values`, so clap would silently forward it to the agent.
-    /// Asserting `agent_args` stays empty therefore distinguishes "consumed as
-    /// a flag" from "swallowed as an agent argument".
-    #[test]
-    fn every_launch_verb_consumes_yes_as_a_flag() {
-        let catalog = default_catalog();
-        // Read from the catalog rather than a literal list, so a tool added to
-        // `default-tools.toml` inherits this guarantee instead of escaping it.
-        let verbs: Vec<String> = catalog
-            .as_slice()
-            .iter()
-            .map(|entry| entry.tool().name().to_owned())
-            .collect();
-        // Issue #144 names `pi` and `shell`; a vacuous catalog must not make
-        // the loop below pass by iterating nothing.
-        for required in ["pi", "shell"] {
-            assert!(
-                verbs.iter().any(|verb| verb == required),
-                "the shipped catalog must still declare {required}: {verbs:?}"
-            );
-        }
-        let command = build_command(&Catalog::Ready(catalog));
-
-        for verb in &verbs {
-            let matches = command
-                .clone()
-                .try_get_matches_from(["agent-vm", verb, "--yes"])
-                .unwrap_or_else(|error| panic!("{verb} must accept --yes: {error}"));
-            let (_, sub) = matches.subcommand().expect("a launch subcommand");
-            let args = <run::Args as clap::FromArgMatches>::from_arg_matches(sub)
-                .expect("launch args parse");
-            assert!(args.yes, "{verb}: --yes parsed but did not set the flag");
-            assert!(
-                args.agent_args.is_empty(),
-                "{verb}: --yes leaked into agent_args: {:?}",
-                args.agent_args
-            );
-        }
-
-        // Control for the `agent_args` assertion: an *unregistered* hyphen flag
-        // is swallowed into `agent_args` rather than rejected, so an empty
-        // `agent_args` above proves `--yes` was matched as a flag.
-        let matches = command
-            .try_get_matches_from(["agent-vm", "pi", "--not-a-flag"])
-            .expect("the trailing positional accepts hyphen values");
-        let (_, sub) = matches.subcommand().expect("a launch subcommand");
-        let args =
-            <run::Args as clap::FromArgMatches>::from_arg_matches(sub).expect("launch args parse");
-        assert_eq!(args.agent_args, ["--not-a-flag"]);
-        assert!(!args.yes, "an unregistered flag must not set --yes");
     }
 
     #[test]

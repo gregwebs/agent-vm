@@ -2,6 +2,8 @@
 
 ## Status
 
+**Superseded by [ADR-0035](0035-consume-user-owned-boot-images.md) (#257). The launcher DAG/current-tag/version-identity system was not implemented; committed recipe/version pins and source integrity checks are implemented and retained.**
+
 Accepted (decision). Not yet implemented — the rest of the design is tracked by
 the map [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 Supersedes [ADR-0019](0019-tool-free-base-and-per-tool-layers.md)'s chaining of

@@ -50,7 +50,7 @@ conntrack/iptables ~62ms, nf_tables ~3ms). So it's a real but *minor* cost:
   `examples/layers/chrome-devtools/agent-vm-chrome-mcp` wrapper imports the per-install
   CA when the MCP starts, rather than synchronously before every agent exec. Chromium
   honours its per-user NSS DB rather than only the system CA bundle, so the work is
-  skipped entirely unless the Chrome DevTools layer is selected.
+  skipped entirely unless the Chrome DevTools image capability is present.
 
 ## Reproduce
 

@@ -2,6 +2,10 @@
 
 ## Status
 
+**Superseded by [ADR-0035](0035-consume-user-owned-boot-images.md)** (#259):
+project layer chains, `--layer`, derived images and the layer contract are
+removed.
+
 **Superseded in part by [ADR-0032](0032-one-layer-kind.md)** (issue #207). This
 ADR's two load-bearing models are retired: the ordered **layer chain** (every
 layer now builds `FROM` a declared parent and is joined by stitching) and the

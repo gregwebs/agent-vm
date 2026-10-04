@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Post-install sanity for the go-dev tooling layer. Runs both standalone and
+# Post-install sanity for the go-dev image. Runs both standalone and
 # from examples/layers/go-dev/Dockerfile.
 #
 # It invokes every tool as the guest PATH resolves it (bare name, not an

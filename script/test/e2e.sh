@@ -20,22 +20,19 @@
 #                                    else target/macos/bin/agent-vm.
 #   AGENT_VM_STATE_DIR               state root. Default: $HOME/.local/state/agent-vm.
 #   AGENT_VM_E2E_STATE_DIR           overrides AGENT_VM_STATE_DIR for this run only.
-#   AGENT_VM_E2E_TEMPLATE_IMAGE      composed template in docker. Default: agent-vm-template:dev.
-#   AGENT_VM_E2E_BASE_IMAGE          tool-free base in docker. Default: agent-vm-base:dev.
+#   AGENT_VM_E2E_TEMPLATE_IMAGE      finished template (the default boot image) in docker.
+#                                    Default: agent-vm-template:dev.
 #
 # Opt-in checks (skipped, with a notice, when the variable is unset):
 #   AGENT_VM_E2E_LEGACY_IMAGE=<ref>           an image that supplies
 #                                             /opt/agent-vm/seed-claude-plugins.sh (E8)
-#   AGENT_VM_E2E_SETUP_BASE_REF=<ref>         a pullable linux/arm64 base ref for `setup` (E10)
 #   AGENT_VM_E2E_UPDATE_CHECK=1               probe the registry (E9; needs network)
-#   AGENT_VM_E2E_RUST=1                       also run the #[ignore]d Rust Docker e2e
 #
-# State changes (all additive): the dev images are imported into
-# $AGENT_VM_STATE_DIR's msb cache, the dev template is also imported under its
-# published default ref (so the fast path resolves offline), and the custom
-# fixtures are imported into a fresh isolated under-$WORK state root. Undo with
-# `agent-vm doctor --reset-msb-db` plus `docker rmi agent-vm-base:<hex>` if you
-# want the state dir byte-identical.
+# State changes (all additive): the finished template is imported into
+# $AGENT_VM_STATE_DIR's msb cache under its dev tag and its published default
+# ref (so the default boot image resolves offline), and the custom fixtures are
+# imported into a fresh isolated under-$WORK state root. Undo with
+# `agent-vm doctor --reset-msb-db` if you want the state dir byte-identical.
 
 set -euo pipefail
 
@@ -83,7 +80,6 @@ else
 fi
 
 TEMPLATE_IMAGE="${AGENT_VM_E2E_TEMPLATE_IMAGE:-agent-vm-template:dev}"
-BASE_IMAGE="${AGENT_VM_E2E_BASE_IMAGE:-agent-vm-base:dev}"
 STATE_DIR="${AGENT_VM_E2E_STATE_DIR:-${AGENT_VM_STATE_DIR:-$HOME/.local/state/agent-vm}}"
 
 # ----------------------------------------------------------- preconditions --
@@ -102,12 +98,9 @@ needs the release bundle's msb at target/macos/bin/msb. Run ./script/build/macos
 (the --dev bundle does not provide it)."
 
 if [[ "$GROUP" == all ]]; then
-  for image in "$BASE_IMAGE" "$TEMPLATE_IMAGE"; do
-    docker image inspect "$image" >/dev/null 2>&1 ||
-      die "docker image '$image' is missing; build the dev images first — see
-  macos-build.md (and AGENT_VM_E2E_BASE_IMAGE / AGENT_VM_E2E_TEMPLATE_IMAGE to
-  point at different tags)."
-  done
+  docker image inspect "$TEMPLATE_IMAGE" >/dev/null 2>&1 ||
+    die "docker image '$TEMPLATE_IMAGE' is missing; build the dev image first — see
+  macos-build.md (and AGENT_VM_E2E_TEMPLATE_IMAGE to point at a different tag)."
 fi
 
 # The custom-image group is a serial native-VM run. Concurrent agent-vm/msb
@@ -131,11 +124,10 @@ cleanup_work() {
   rm -rf "$WORK"
 }
 trap cleanup_work EXIT
-# Derived images are tagged agent-vm-layer:<project-basename>-<content-hash>, so a
-# fresh basename per run forces the compose checks to build (and print their
-# plan) instead of silently reusing a cached step from an earlier run. Docker
-# repository names and the local-registry refs must be lowercase, and mktemp's
-# suffix is mixed-case, so normalize it once here.
+# A fresh basename per run keeps the per-run custom-image fixture refs (and the
+# locally published registry refs) distinct, so a check cannot silently reuse an
+# earlier run's tag. Docker repository names and the local-registry refs must be
+# lowercase, and mktemp's suffix is mixed-case, so normalize it once here.
 RUN_ID="$(printf '%s' "${WORK##*.}" | tr '[:upper:]' '[:lower:]')"
 
 # The developer's real state dir is only the dev-image groups' store. The
@@ -157,7 +149,7 @@ if [[ "$GROUP" == all ]]; then
 fi
 
 # A fresh, short, isolated state root for every custom-image boot. Never the
-# shared dev state dir above: these checks must not see dev-image derived tags.
+# shared dev state dir above: these checks must not see dev-image refs.
 # An override is allowed only when it is absent or empty: a populated override
 # could already carry a one-way `paths.cache` redirect (USAGE "The shared-cache
 # trap"), so it would measure a stale cache rather than this run's.
@@ -185,7 +177,7 @@ CUSTOM_CREDENTIAL_REFRESH='sk-ant-synthetic-e2e-258-refresh'
 # isolated import write one cache while a launch reads another and falls
 # through to a registry pull, so neutralise both here: the private
 # $CUSTOM_STATE/msb-home/cache is the only store this group exercises.
-CUSTOM_ENV=(env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_BASE_IMAGE -u AGENT_VM_ROOT -u AGENT_VM_SHARE_MSB_CACHE -u AGENT_VM_MSB_CACHE_DIR -u MSB_CONFIG_PATH AGENT_VM_STATE_DIR="$CUSTOM_STATE")
+CUSTOM_ENV=(env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u AGENT_VM_SHARE_MSB_CACHE -u AGENT_VM_MSB_CACHE_DIR -u MSB_CONFIG_PATH AGENT_VM_STATE_DIR="$CUSTOM_STATE")
 if [ -n "${AGENT_VM_SHARE_MSB_CACHE:-}" ]; then
   echo "e2e: neutralized inherited AGENT_VM_SHARE_MSB_CACHE=$AGENT_VM_SHARE_MSB_CACHE for the isolated custom root"
 fi
@@ -224,10 +216,10 @@ assert_custom_cache_isolated "after init" ||
 
 # ------------------------------------------------------------- host helpers --
 
-# agent-vm with the image env vars dropped, so a default-config check really
-# resolves the default rather than an inherited AGENT_VM_IMAGE_TAG / _BASE_IMAGE.
+# agent-vm with the image env var dropped, so a default-config check really
+# resolves the default rather than an inherited AGENT_VM_IMAGE_TAG.
 avm() {
-  env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_BASE_IMAGE \
+  env -u AGENT_VM_IMAGE_TAG \
     AGENT_VM_STATE_DIR="$STATE_DIR" "$AGENT_VM" "$@"
 }
 
@@ -413,6 +405,62 @@ assert_no_host_calls() {
     cat "$HOST_SHIM_LOG"
     return 1
   fi
+}
+
+# Zero docker/buildx invocations: the log must exist, be readable and be empty.
+# A missing or unreadable log is a failure, never a vacuous zero (Spec S2).
+assert_no_builder_calls() {
+  local desc="$1" log="$2"
+  if [ ! -e "$log" ]; then
+    echo "    FAIL: $desc: builder log $log is missing; absence not proven"
+    return 1
+  fi
+  if [ ! -r "$log" ]; then
+    echo "    FAIL: $desc: builder log $log is unreadable; absence not proven"
+    return 1
+  fi
+  if [ -s "$log" ]; then
+    echo "    FAIL: $desc: docker/buildx was invoked:"
+    cat "$log"
+    return 1
+  fi
+}
+
+# Create executable docker/buildx decoys in `$1` that log `basename argv` to `$2`
+# and exit 97, then prove the wiring: invoke each through the same child PATH the
+# launch uses and require exit 97 plus the two exact log entries before
+# truncating. A decoy that is unreachable, silent or successful would make every
+# later zero-builder observation vacuous, so the control is part of the setup
+# (Spec S2 / plan 7.2).
+make_builder_shims() {
+  local dir="$1" log="$2" tool status want got
+  mkdir -p "$dir" || return 1
+  for tool in docker buildx; do
+    cat >"$dir/$tool" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s %s\n' "$(basename "$0")" "$*" >>"$DOCKER_SHIM_LOG"
+exit 97
+SHIM
+    chmod +x "$dir/$tool" || return 1
+  done
+  : >"$log" || return 1
+  for tool in docker buildx; do
+    status=0
+    PATH="$dir:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" "$tool" wiring-probe >/dev/null 2>&1 ||
+      status=$?
+    if [ "$status" -ne 97 ]; then
+      echo "    FAIL: the $tool decoy did not exit 97 (got $status); the zero-builder evidence is void"
+      return 1
+    fi
+  done
+  want=$'docker wiring-probe\nbuildx wiring-probe'
+  got="$(cat "$log")"
+  if [ "$got" != "$want" ]; then
+    echo "    FAIL: the decoy wiring log does not match the two exact invocations:"
+    printf '%s\n' "$got"
+    return 1
+  fi
+  : >"$log" || return 1
 }
 
 # -------------------------------------------------- custom fixture images ----
@@ -1116,6 +1164,67 @@ check_harness_negative() {
     result=1
   fi
 
+  # (f) The acquisition-dump oracle and the zero-builder absence oracle. The
+  # accepted capture passes; every malformed capture fails. This is the
+  # permanent negative control for the substring-false-pass class (Standards S1)
+  # and the missing/unreadable-log class (Spec S2).
+  local pull_name='agent-vm-pull' verify_name='agent-vm-setup-verify'
+  local ref='localhost:1/project:latest'
+  local good=$'agent-vm-pull\tlocalhost:1/project:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
+  if ! assert_dump "$good" "$pull_name" "$ref" >/dev/null 2>&1; then
+    echo "    FAIL: assert_dump rejected the accepted capture"
+    result=1
+  fi
+  if ! assert_dump "$good" "$verify_name" "$ref" >/dev/null 2>&1; then
+    echo "    FAIL: assert_dump rejected the accepted capture (verify name)"
+    result=1
+  fi
+  local -a bad_dumps=(
+    $'agent-vm-pull\tlocalhost:1/project:latest-WRONG\nagent-vm-setup-verify\tlocalhost:1/project:latest-WRONG'
+    $'agent-vm-pull\tlocalhost:1/project:latest\nagent-vm-pull\tlocalhost:1/other:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
+    $'agent-vm-pull\tlocalhost:1/project:latest'
+    $'agent-vm-pull\tlocalhost:1/project:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest\nextra\tlocalhost:1/project:latest'
+    $'agent-vm-pull\tlocalhost:1/other:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
+  )
+  local bad
+  for bad in "${bad_dumps[@]}"; do
+    if assert_dump "$bad" "$pull_name" "$ref" >/dev/null 2>&1; then
+      echo "    FAIL: assert_dump accepted a malformed capture:"
+      printf '%s\n' "$bad"
+      result=1
+    fi
+  done
+
+  # The zero-builder oracle must reject a missing, unreadable and non-empty log,
+  # and accept a readable empty one.
+  local oracle_log="$probe_dir/builder.log"
+  : >"$oracle_log" || result=1
+  if ! assert_no_builder_calls "probe-empty" "$oracle_log" >/dev/null 2>&1; then
+    echo "    FAIL: assert_no_builder_calls rejected an empty readable log"
+    result=1
+  fi
+  rm -f "$oracle_log" || result=1
+  if assert_no_builder_calls "probe-missing" "$oracle_log" >/dev/null 2>&1; then
+    echo "    FAIL: assert_no_builder_calls accepted a missing log"
+    result=1
+  fi
+  printf 'docker build\n' >"$oracle_log" || result=1
+  if assert_no_builder_calls "probe-nonempty" "$oracle_log" >/dev/null 2>&1; then
+    echo "    FAIL: assert_no_builder_calls accepted a non-empty log"
+    result=1
+  fi
+  # Unreadable (skip as root, where the permission check is bypassed).
+  if [ "$(id -u)" -ne 0 ]; then
+    : >"$oracle_log" || result=1
+    chmod 000 "$oracle_log" || result=1
+    if assert_no_builder_calls "probe-unreadable" "$oracle_log" >/dev/null 2>&1; then
+      echo "    FAIL: assert_no_builder_calls accepted an unreadable log"
+      result=1
+    fi
+    chmod 600 "$oracle_log" || result=1
+  fi
+  rm -f "$oracle_log" || result=1
+
   local observed_pass="$PASSED" observed_fail="$FAILED"
   if [ "$observed_pass" -ne 0 ] || [ "$observed_fail" -ne 2 ]; then
     echo "    FAIL: harness negative expected 0 pass / 2 fail, got $observed_pass/$observed_fail"
@@ -1133,25 +1242,7 @@ check_harness_negative() {
 
 # ============================================================ dev checks ====
 
-# AC: the locally built base carries no agent CLI and no image-version stamp.
-check_base_is_tool_free() {
-  local out
-  out="$(avm shell --no-git --image "$BASE_IMAGE" -- bash -c '
-    for b in dsh pi claude codex opencode copilot; do
-      if command -v "$b" >/dev/null 2>&1; then echo "PRESENT:$b"; else echo "absent:$b"; fi
-    done
-    if [ -e /etc/agent-vm-image-version ]; then echo "stamp=present"; else echo "stamp=absent"; fi
-  ' 2>&1)" || {
-    echo "$out" | tail -20
-    return 1
-  }
-  assert_no_match "no agent CLI on PATH" "^PRESENT:" "$out" || return 1
-  assert_eq "all six absent" "6" "$(grep -c '^absent:' <<<"$out")" || return 1
-  assert_eq "the locally built base carries no stamp" "stamp=absent" \
-    "$(grep '^stamp=' <<<"$out")" || return 1
-}
-
-# E1: all six --version checks pass in the composed template guest.
+# E1: all six --version checks pass in the finished template guest.
 check_template_has_all_tools() {
   local out
   out="$(avm shell --no-git --image "$TEMPLATE_IMAGE" -- bash -c '
@@ -1169,102 +1260,53 @@ check_template_has_all_tools() {
   assert_no_match "no missing tool" "MISSING:" "$out"
 }
 
-# E2 / AC 7: a default config with no project layers boots the published
-# template with docker absent from PATH (and its invocation shim silent).
-check_fast_path_zero_docker() {
-  local proj="$WORK/fastpath" shim="$WORK/shim-dev" log="$WORK/docker-calls.log"
-  mkdir -p "$proj" "$shim"
-  cat >"$shim/docker" <<'SHIM'
-#!/usr/bin/env bash
-echo "docker $*" >>"$DOCKER_SHIM_LOG"
-exit 1
-SHIM
-  chmod +x "$shim/docker"
-  : >"$log"
+# E2 / AC 7: a default config boots the published default image with docker and
+# buildx absent from PATH (and their invocation shims silent).
+check_default_image_zero_docker() {
+  local proj="$WORK/default-image" shim="$WORK/shim-dev" log="$WORK/docker-calls.log"
+  mkdir -p "$proj" || return 1
+  make_builder_shims "$shim" "$log" || return 1
 
   local out
-  out="$(cd "$proj" && env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_BASE_IMAGE \
+  out="$(cd "$proj" && env -u AGENT_VM_IMAGE_TAG \
     PATH="$shim:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" AGENT_VM_STATE_DIR="$STATE_DIR" \
     "$AGENT_VM" shell --no-git -- bash -c 'true' 2>&1)" || {
     echo "$out" | tail -20
     return 1
   }
-  assert_match "boots the published default template" \
+  assert_match "boots the published default image" \
     "^==> Booting sandbox from $PUBLISHED_TEMPLATE_REF " "$out" || return 1
-  if [[ -s "$log" ]]; then
-    echo "    FAIL: docker was invoked on the fast path:"
-    cat "$log"
+  assert_no_builder_calls "default-image" "$log" || return 1
+}
+
+# #259: former `.agent-vm/layers/*` and `.agent-vm/layer/` directories are
+# ordinary data now — the default image still boots and no builder runs.
+check_former_layer_dir_is_inert() {
+  local proj="$WORK/former-layers" shim="$WORK/shim-dev" log="$WORK/docker-calls.log"
+  mkdir -p "$proj/.agent-vm/layers/10-poison/sub/deeper" "$proj/.agent-vm/layer" || return 1
+  printf '!! not a dockerfile\n' >"$proj/.agent-vm/layers/10-poison/Dockerfile"
+  printf '&& no\n' >"$proj/.agent-vm/layers/10-poison/sub/deeper/Dockerfile"
+  printf '?? legacy\n' >"$proj/.agent-vm/layer/Dockerfile"
+  make_builder_shims "$shim" "$log" || return 1
+
+  local out
+  out="$(cd "$proj" && env -u AGENT_VM_IMAGE_TAG \
+    PATH="$shim:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" AGENT_VM_STATE_DIR="$STATE_DIR" \
+    "$AGENT_VM" shell --no-git -- bash -c 'true' 2>&1)" || {
+    echo "$out" | tail -20
+    return 1
+  }
+  assert_match "boots the published default image despite former layer dirs" \
+    "^==> Booting sandbox from $PUBLISHED_TEMPLATE_REF " "$out" || return 1
+  assert_no_builder_calls "former-layer dirs" "$log" || return 1
+  if [[ ! -f "$proj/.agent-vm/layers/10-poison/Dockerfile" || ! -f "$proj/.agent-vm/layer/Dockerfile" ]]; then
+    echo "    FAIL: a former layer directory was removed (must be inert, not migrated)"
     return 1
   fi
 }
 
-# E3 / AC 8: tools = ["claude"] composes the claude layer onto the base, and
-# codex is genuinely absent from the guest PATH.
-check_tools_claude_composes() {
-  local proj="$WORK/claude-$RUN_ID"
-  mkdir -p "$proj/.agent-vm"
-  cat >"$proj/.agent-vm/config.toml" <<'EOF'
-[[tools]]
-name = "claude"
-command = "claude"
-args = ["--dangerously-skip-permissions"]
-layer = { builtin = "claude" }
-EOF
-
-  local out
-  out="$(cd "$proj" && avm shell --yes --base-image "$BASE_IMAGE" -- bash -c '
-    printf "codex "; command -v codex || echo "rc=$?"
-    printf "claude "; command -v claude || echo "rc=$?"
-  ' 2>&1)" || {
-    echo "$out" | tail -20
-    return 1
-  }
-  assert_match 'one builtin "claude" tool step' 'tool "claude" \(builtin layer claude\)' "$out" || return 1
-  assert_eq "codex absent from guest PATH" "codex rc=1" "$(grep -E '^codex ' <<<"$out")" || return 1
-  assert_match "claude present in guest" "^claude /opt/agent" "$out"
-}
-
-# E1b / #95: tools = ["pi"] composes the pi layer onto the base, and the
-# end-user pi experience works in the guest.
-check_tools_pi_composes() {
-  local proj="$WORK/pi-$RUN_ID"
-  mkdir -p "$proj/.agent-vm"
-  cat >"$proj/.agent-vm/config.toml" <<'EOF'
-[[tools]]
-name = "pi"
-command = "pi"
-layer = { builtin = "pi" }
-EOF
-
-  local pin
-  pin="$(jq -r '.dependencies["@earendil-works/pi-coding-agent"]' \
-    "$REPO_ROOT/images/tools/pi/package.json")"
-
-  local out
-  out="$(cd "$proj" && avm shell --yes --base-image "$BASE_IMAGE" -- bash -c '
-    printf "which=%s\n" "$(command -v pi)"
-    printf "version=%s\n" "$(timeout 60 pi --version)"
-    printf "warn=%s\n" "$(printf "" | timeout 60 pi --mode rpc --no-session --no-approve 2>/dev/null | grep -c "agent-vm: signing in here")"
-    printf "warn_ne=%s\n" "$(printf "" | timeout 60 pi -ne --mode rpc --no-session --no-approve 2>/dev/null | grep -c "agent-vm: signing in here")"
-    pi_print="$(printf "" | timeout 60 pi -p --no-session 2>/dev/null)"; pi_print_rc=$?
-    printf "print_bytes=%s\n" "$(printf %s "$pi_print" | wc -c | tr -d " ")"
-    printf "print_rc=%s\n" "$pi_print_rc"
-    printf "list=%s\n" "$(timeout 60 pi list)"
-  ' 2>&1)" || {
-    echo "$out" | tail -20
-    return 1
-  }
-  assert_match "one builtin pi tool step" 'tool "pi" \(builtin layer pi\)' "$out" || return 1
-  assert_match "the stable wrapper is on PATH" "^which=/usr/local/bin/pi$" "$out" || return 1
-  assert_match "the pinned version is installed" "^version=$pin$" "$out" || return 1
-  assert_match "the mandatory warning fires" "^warn=1$" "$out" || return 1
-  assert_match "--no-extensions cannot silence it" "^warn_ne=1$" "$out" || return 1
-  assert_match "print mode stdout is empty" "^print_bytes=0$" "$out" || return 1
-  assert_match "print mode exits cleanly" "^print_rc=0$" "$out" || return 1
-  assert_match "pi list is a subcommand, not a prompt" "^list=No packages installed\.$" "$out"
-}
-
 # E1c / #96: ~/.pi resolves to state and persists across an independent boot.
+# #259: consumes the already-finished template image; no launcher build.
 pi_home_persists() {
   local mode="$1"
   local -a root_flag=()
@@ -1275,12 +1317,11 @@ pi_home_persists() {
 [[tools]]
 name = "pi"
 command = "pi"
-layer = { builtin = "pi" }
 EOF
 
   local first second
-  first="$(cd "$proj" && avm shell --yes ${root_flag[@]+"${root_flag[@]}"} \
-    --base-image "$BASE_IMAGE" -- bash -c '
+  first="$(cd "$proj" && avm shell ${root_flag[@]+"${root_flag[@]}"} \
+    --image "$TEMPLATE_IMAGE" -- bash -c '
       printf "link=%s\n" "$(readlink "$HOME/.pi")"
       printf "isdir=%s\n" "$([ -d "$HOME/.pi" ] && echo yes)"
       mkdir -p "$HOME/.pi/agent/npm/node_modules" \
@@ -1291,31 +1332,11 @@ EOF
   assert_match "$mode: ~/.pi resolves to a real directory" "^isdir=yes$" "$first" || return 1
   assert_match "$mode: Pi's global-package dir is writable" "^wrote=0$" "$first" || return 1
 
-  second="$(cd "$proj" && avm shell --yes ${root_flag[@]+"${root_flag[@]}"} \
-    --base-image "$BASE_IMAGE" -- bash -c '
+  second="$(cd "$proj" && avm shell ${root_flag[@]+"${root_flag[@]}"} \
+    --image "$TEMPLATE_IMAGE" -- bash -c '
       printf "survived=%s\n" "$(cat "$HOME/.pi/agent/npm/node_modules/e2e-marker" 2>&1)"
     ' 2>&1)" || { echo "$second" | tail -20; return 1; }
   assert_match "$mode: state survives an independent boot" "^survived=sentinel-96$" "$second"
-}
-
-# E4: a project layer chains on the template in one step, not five.
-check_project_layer_chains_on_template() {
-  local proj="$WORK/layer-$RUN_ID"
-  mkdir -p "$proj/.agent-vm/layers/10-e2e"
-  cat >"$proj/.agent-vm/layers/10-e2e/Dockerfile" <<'EOF'
-ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
-FROM ${BASE_IMAGE}
-RUN echo "e2e marker" > /e2e-marker.txt
-EOF
-
-  local out
-  out="$(cd "$proj" && avm shell --yes -- bash -c 'cat /e2e-marker.txt' 2>&1)" || {
-    echo "$out" | tail -20
-    return 1
-  }
-  assert_match "exactly one layer step" "step 1/1" "$out" || return 1
-  assert_no_match "not a five-step tool chain" "step 1/5" "$out" || return 1
-  assert_match "layer applied in guest" "e2e marker" "$out"
 }
 
 # E8 / optional: an image that supplies /opt/agent-vm/seed-claude-plugins.sh is
@@ -1337,53 +1358,25 @@ check_legacy_seed() {
     "lsp@claude-plugins-official" "$out"
 }
 
-# E9: --update-check probes the published chain root, never a derived tag.
+# E9: --update-check probes the selected boot image (here a project-selected
+# image different from the published default), never a derived layer tag.
 check_update_check() {
   local proj="$WORK/update"
-  mkdir -p "$proj"
+  mkdir -p "$proj/.agent-vm"
+  cat >"$proj/.agent-vm/config.toml" <<EOF
+image = "$TEMPLATE_IMAGE"
+EOF
   local out
-  out="$(cd "$proj" && env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_BASE_IMAGE \
+  out="$(cd "$proj" && env -u AGENT_VM_IMAGE_TAG \
     AGENT_VM_UPDATE_CHECK=1 RUST_LOG=agent_vm=debug AGENT_VM_STATE_DIR="$STATE_DIR" \
     "$AGENT_VM" shell --no-git -- bash -c 'sleep 6' 2>&1)" || {
     echo "$out" | tail -20
     return 1
   }
-  assert_match "probes the published template ref" \
-    "registry update probe.*$PUBLISHED_TEMPLATE_REF" "$out" || return 1
+  assert_match "probes the selected boot image" \
+    "registry update probe.*$TEMPLATE_IMAGE" "$out" || return 1
   assert_no_match "never probes a derived layer tag" \
     "registry update probe.*agent-vm-layer:" "$out"
-}
-
-# E10 / D10: setup under tools = ["claude"] pulls the base, reports claude as
-# supplied by a not-yet-composed layer, and exits 0.
-check_setup_notice() {
-  local proj="$WORK/setup"
-  mkdir -p "$proj/.agent-vm"
-  cat >"$proj/.agent-vm/config.toml" <<'EOF'
-[[tools]]
-name = "claude"
-command = "claude"
-layer = { builtin = "claude" }
-EOF
-
-  local out
-  out="$(cd "$proj" && avm setup --base-image "$AGENT_VM_E2E_SETUP_BASE_REF" 2>&1)" || {
-    echo "$out" | tail -20
-    if grep -q 'Exec format error' <<<"$out"; then
-      echo "    hint: $AGENT_VM_E2E_SETUP_BASE_REF is not linux/arm64 (the published"
-      echo '          ghcr template is amd64 by design); serve a locally built base.'
-    fi
-    return 1
-  }
-  assert_match "D10 notice names the supplying layer" \
-    'claude is supplied by tool layer "claude"' "$out" || return 1
-  assert_match "setup reports the image ready" \
-    "$AGENT_VM_E2E_SETUP_BASE_REF ready" "$out"
-}
-
-check_rust_compose_e2e() {
-  AGENT_VM_E2E_BASE_IMAGE="$BASE_IMAGE" cargo test -p agent-vm --bin agent-vm -- \
-    e2e_builtin_tool_layer_composes_onto_an_imported_base --ignored --test-threads=1
 }
 
 # ==================================================== custom-image checks ====
@@ -2125,6 +2118,290 @@ custom_image_nonstandard_cold_warm() {
   return "$result"
 }
 
+# ---- #259 config-selected custom images ----
+
+# A project `image` selects the boot image with no flag; tool edits and former
+# `.agent-vm/layers/` + `.agent-vm/layer/` poison directories keep it fixed.
+custom_image_selected_by_project_config() {
+  local name="custom-selected-project" proj out
+  proj="$WORK/$name"
+  mkdir -p "$proj/.agent-vm" || return 1
+  cat >"$proj/.agent-vm/config.toml" <<EOF || return 1
+image = "$CUSTOM_MARKER"
+[[tools]]
+name = "hello-258"
+command = "hello-258"
+persist = [".hello-258.state"]
+EOF
+  capture_custom_launch "$name" "$proj" hello-258 --no-git || return 1
+  require_launch_ok "$name" || return 1
+  assert_no_host_calls || return 1
+  out="$(launch_output "$name")"
+  assert_single_boot_ref "project config selects the image" "$CUSTOM_MARKER" "$out" || return 1
+  assert_eq "project-config completion sentinel" "hello-258=ok" "$(grep '^hello-258=ok$' <<<"$out")" || return 1
+  assert_eq "project-config uid" "uid=$(id -u)" "$(grep '^uid=' <<<"$out")" || return 1
+  assert_eq "project-config HOME" "home=$CUSTOM_HOME" "$(grep '^home=' <<<"$out")" || return 1
+
+  # Changed tool args/catalog and former layer poison directories: selection is
+  # still the project image, and no builder ran.
+  mkdir -p "$proj/.agent-vm/layers/10-poison" "$proj/.agent-vm/layer" || return 1
+  printf '!! not a dockerfile\n' >"$proj/.agent-vm/layers/10-poison/Dockerfile"
+  printf '?? legacy\n' >"$proj/.agent-vm/layer/Dockerfile"
+  cat >"$proj/.agent-vm/config.toml" <<EOF || return 1
+image = "$CUSTOM_MARKER"
+[[tools]]
+name = "hello-258"
+command = "hello-258"
+args = ["extra"]
+persist = [".hello-258.state"]
+
+[[tools]]
+name = "second-258"
+command = "hello-258"
+EOF
+  capture_custom_launch "custom-selected-poisoned" "$proj" hello-258 --no-git || return 1
+  require_launch_ok "custom-selected-poisoned" || return 1
+  assert_no_host_calls || return 1
+  out="$(launch_output custom-selected-poisoned)"
+  assert_single_boot_ref "poisoned config still selects the image" "$CUSTOM_MARKER" "$out" || return 1
+}
+
+# An image-only user config keeps the shipped runtime tools and selects the
+# image for both a shipped shell and a project-declared tool. The user config is
+# removed afterward, including on failure.
+custom_image_user_image_only_config() {
+  local rc=0
+  _custom_image_user_image_only_body || rc=1
+  rm -f "$CUSTOM_HOME/.config/agent-vm/config.toml" || rc=1
+  return "$rc"
+}
+
+_custom_image_user_image_only_body() {
+  mkdir -p "$CUSTOM_HOME/.config/agent-vm" || return 1
+  cat >"$CUSTOM_HOME/.config/agent-vm/config.toml" <<EOF || return 1
+image = "$CUSTOM_MARKER"
+EOF
+  local empty_proj="$WORK/custom-user-image-empty"
+  mkdir -p "$empty_proj" || return 1
+
+  # Help and doctor expose the seven shipped runtime tools (an image-only file
+  # declares zero tools, so the shipped defaults apply).
+  local out tool
+  out="$(cd "$empty_proj" && "${CUSTOM_ENV[@]}" HOME="$CUSTOM_HOME" "$AGENT_VM" --help 2>&1)" || return 1
+  for tool in dsh pi codex opencode claude copilot shell; do
+    grep -qE "^  $tool " <<<"$out" || {
+      echo "    FAIL: help does not list $tool under an image-only user config"
+      return 1
+    }
+  done
+  out="$(cd "$empty_proj" && "${CUSTOM_ENV[@]}" HOME="$CUSTOM_HOME" "$AGENT_VM" doctor 2>&1)" || return 1
+  grep -qE '^  7\. shell -> ' <<<"$out" || {
+    echo "    FAIL: doctor does not list the seven shipped tools under an image-only user config"
+    return 1
+  }
+  grep -qF "selected (without --image): $CUSTOM_MARKER" <<<"$out" || {
+    echo "    FAIL: doctor does not show the image-only selection"
+    return 1
+  }
+
+  # The shipped `shell` boots the selected image; the image is allowed to lack
+  # the other shipped agents.
+  capture_custom_launch "custom-user-image-shell" "$empty_proj" shell --no-git -- \
+    bash -c 'command -v hello-258 && printf "image-only=ok\n"' || return 1
+  require_launch_ok "custom-user-image-shell" || return 1
+  assert_no_host_calls || return 1
+  out="$(launch_output custom-user-image-shell)"
+  assert_single_boot_ref "image-only user config selects the image" "$CUSTOM_MARKER" "$out" || return 1
+  assert_match "image-only shell completed" '^image-only=ok$' "$out" || return 1
+
+  # The same user image selection with a project that declares its own tool.
+  local proj
+  proj="$(custom_project custom-user-image-tools)" || return 1
+  capture_custom_launch "custom-user-image-tools" "$proj" hello-258 --no-git || return 1
+  require_launch_ok "custom-user-image-tools" || return 1
+  assert_no_host_calls || return 1
+  out="$(launch_output custom-user-image-tools)"
+  assert_single_boot_ref "user image with project tools" "$CUSTOM_MARKER" "$out" || return 1
+  assert_eq "user-image project tool sentinel" "hello-258=ok" "$(grep '^hello-258=ok$' <<<"$out")" || return 1
+}
+
+# Parse every `[debug] sandbox config JSON:` dump from a captured stream as a
+# complete JSON object (python3's decoder), printing one `name<TAB>Oci ref` per
+# dump. Malformed JSON after a marker is an error, never a dropped dump.
+parse_acquisition_dumps() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import json
+import sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+marker = "[debug] sandbox config JSON: "
+decoder = json.JSONDecoder()
+index = 0
+rows = []
+while True:
+    found = text.find(marker, index)
+    if found < 0:
+        break
+    start = found + len(marker)
+    while start < len(text) and text[start] in " \t\r\n":
+        start += 1
+    try:
+        obj, end = decoder.raw_decode(text, start)
+    except json.JSONDecodeError as error:
+        print(f"malformed debug JSON: {error}", file=sys.stderr)
+        sys.exit(1)
+    name = obj.get("name", "<none>")
+    try:
+        ref = obj["image"]["Oci"]["reference"]
+    except (KeyError, TypeError):
+        ref = "<none>"
+    rows.append(f"{name}\t{ref}")
+    index = end
+for row in rows:
+    print(row)
+PY
+}
+
+# Require the capture to be exactly the two acquisition dumps, one per name,
+# each carrying the expected reference. Fields are compared **whole**, never as a
+# substring: a wrong-reference suffix, a duplicated name, a missing name, an
+# extra name, or any other reference all fail. `$3` is the reference both dumps
+# must carry (the initial pull and the setup verification select the same
+# image); `$2` names the row this call is primarily asserting, for the message.
+assert_dump() {
+  local dumps="$1" expected_name="$2" ref="$3"
+  local -a rows=()
+  local line
+  while IFS= read -r line; do
+    rows+=("$line")
+  done <<<"$dumps"
+
+  if [ "${#rows[@]}" -ne 2 ]; then
+    echo "    FAIL: want exactly two acquisition dumps, found ${#rows[@]}"
+    printf '%s\n' "$dumps"
+    return 1
+  fi
+
+  local name dumped matched=0
+  local -a names=()
+  for line in "${rows[@]}"; do
+    name="${line%%	*}"
+    dumped="${line#*	}"
+    case "$name" in
+      agent-vm-pull | agent-vm-setup-verify) ;;
+      *)
+        echo "    FAIL: unexpected acquisition dump name: [$name]"
+        printf '%s\n' "$dumps"
+        return 1
+        ;;
+    esac
+    if [ "$dumped" != "$ref" ]; then
+      echo "    FAIL: the $name dump carries [$dumped], want exactly [$ref]"
+      printf '%s\n' "$dumps"
+      return 1
+    fi
+    if [ "$name" = "$expected_name" ]; then
+      matched=$((matched + 1))
+    fi
+    names+=("$name")
+  done
+  if [ "$matched" -ne 1 ]; then
+    echo "    FAIL: want exactly one $expected_name dump with reference [$ref], found $matched"
+    printf '%s\n' "$dumps"
+    return 1
+  fi
+  if [ "${names[0]}" = "${names[1]}" ]; then
+    echo "    FAIL: duplicate acquisition dump name: ${names[0]}"
+    printf '%s\n' "$dumps"
+    return 1
+  fi
+}
+
+# #259: a reachable selected image reaches setup's verification step. The two
+# built acquisition configs (initial pull, then verify) must each carry the
+# exact selected reference -- not the decoy or the default. The verify-only
+# mutation overrides verify_image's `.image(image)`, which this check then fails
+# on, while the initial pull stays correct.
+custom_image_setup_verification_uses_selected_ref() {
+  local name="custom-setup-verify" proj="$WORK/custom-setup-verify-proj"
+  mkdir -p "$proj/.agent-vm" || return 1
+  local reg="registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8"
+  local container port selected decoy suffix result=0
+  container="$(docker run -d --rm -p 127.0.0.1::5000 "$reg")" ||
+    { echo "    BLOCKER: could not start the local registry container"; return 1; }
+  [ -n "$container" ] || { echo "    BLOCKER: no registry container id"; return 1; }
+  port="$(docker port "$container" 5000/tcp | head -1 | sed 's/.*://')"
+  if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+    echo "    BLOCKER: no single numeric mapped registry port"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    return 1
+  fi
+  selected="localhost:$port/e2e-259-$RUN_ID:selected"
+  decoy="localhost:$port/e2e-259-$RUN_ID:decoy"
+  suffix="e2e-259-$RUN_ID:selected"
+
+  local deadline=$(( $(date +%s) + 30 )) ready=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo "    BLOCKER: registry not ready on 127.0.0.1:$port"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # Tag/push before any decoy can enter PATH.
+  docker tag "$CUSTOM_MARKER" "$selected" || result=1
+  docker tag "$CUSTOM_MARKER" "$decoy" || result=1
+  docker push "$selected" >/dev/null || result=1
+  docker push "$decoy" >/dev/null || result=1
+  if [ "$result" -ne 0 ]; then
+    echo "    BLOCKER: could not push the selected/decoy refs"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  cat >"$proj/.agent-vm/config.toml" <<EOF || result=1
+image = "$selected"
+[[tools]]
+name = "hello-258"
+command = "hello-258"
+EOF
+  image_catalog_has "$selected" "$suffix" absent || result=1
+
+  if [ "$result" -eq 0 ]; then
+    observe_launch "$name" "$proj" "$WORK/$name.out" -- \
+      "${CUSTOM_ENV[@]}" \
+      PATH="$SHIM_DIR:/usr/bin:/bin" \
+      HOME="$CUSTOM_HOME" \
+      HOST_SHIM_LOG="$HOST_SHIM_LOG" \
+      AGENT_VM_DEBUG_CONFIG=1 \
+      "$AGENT_VM" setup || result=1
+  fi
+  if [ "$result" -eq 0 ]; then
+    local dumps out
+    require_launch_ok "$name" || result=1
+    assert_no_host_calls || result=1
+    dumps="$(parse_acquisition_dumps "$WORK/$name.out")" || result=1
+    assert_dump "$dumps" "agent-vm-pull" "$selected" || result=1
+    assert_dump "$dumps" "agent-vm-setup-verify" "$selected" || result=1
+    out="$(launch_output "$name")"
+    assert_match "setup reports the selected image ready" "^==> $selected ready$" "$out" || result=1
+    assert_no_match "setup never selects the decoy" "$decoy" "$out" || result=1
+    image_catalog_has "$selected" "$suffix" present || result=1
+    assert_custom_cache_isolated "after setup verification" yes || result=1
+  fi
+
+  docker rm -f "$container" >/dev/null 2>&1 ||
+    { echo "    FAIL: registry container removal failed"; result=1; }
+  return "$result"
+}
+
 # ---- PTY attach checks (macOS BSD `script`) ----
 
 check_custom_no_bash_attach() {
@@ -2225,35 +2502,32 @@ echo "e2e: group=$GROUP"
 echo "e2e: launcher=$AGENT_VM"
 if [[ "$GROUP" == all ]]; then
   echo "e2e: state=$STATE_DIR"
-  echo "e2e: images=$BASE_IMAGE + $TEMPLATE_IMAGE"
+  echo "e2e: images=$TEMPLATE_IMAGE"
 fi
 
 make_host_shims
 run_check "harness-negative" check_harness_negative
 
 if [[ "$GROUP" == all ]]; then
-  import_image "$BASE_IMAGE"
   import_image "$TEMPLATE_IMAGE"
   import_image "$TEMPLATE_IMAGE" "$PUBLISHED_TEMPLATE_REF"
 
-  run_check "base-is-tool-free" check_base_is_tool_free
   run_check "template-has-all-tools" check_template_has_all_tools
-  run_check "fast-path-zero-docker" check_fast_path_zero_docker
-  run_check "tools-claude-composes" check_tools_claude_composes
-  run_check "tools-pi-composes" check_tools_pi_composes
+  run_check "default-image-zero-docker" check_default_image_zero_docker
+  run_check "former-layer-dir-inert" check_former_layer_dir_is_inert
   run_check "pi-home-persists-nonroot" pi_home_persists non-root
   run_check "pi-home-persists-root" pi_home_persists root
-  run_check "project-layer-chains-on-template" check_project_layer_chains_on_template
   run_optional "supplied-named-seed" AGENT_VM_E2E_LEGACY_IMAGE check_legacy_seed
-  run_optional "update-check-probes-published" AGENT_VM_E2E_UPDATE_CHECK check_update_check
-  run_optional "setup-notice-under-claude" AGENT_VM_E2E_SETUP_BASE_REF check_setup_notice
-  run_optional "rust-compose-e2e" AGENT_VM_E2E_RUST check_rust_compose_e2e
+  run_optional "update-check-probes-selected" AGENT_VM_E2E_UPDATE_CHECK check_update_check
 fi
 
 prepare_custom_fixtures || die "could not build/import the custom-image fixtures"
 run_check "custom-image-fixtures-imported" check_custom_fixtures_imported
 run_check "custom-image-env-isolation-audit" check_custom_env_isolation
 run_check "custom-image-cache-isolated" check_custom_cache_isolation
+run_check "custom-image-selected-by-project-config" custom_image_selected_by_project_config
+run_check "custom-image-user-image-only-config" custom_image_user_image_only_config
+run_check "custom-image-setup-verification-selected-ref" custom_image_setup_verification_uses_selected_ref
 
 run_check "custom-image-runs-program" custom_image_runs_program
 run_check "custom-image-stamp-present-nonnumeric" custom_image_stamp_present

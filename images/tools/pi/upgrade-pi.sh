@@ -7,8 +7,8 @@
 #
 # Host-side only. The Dockerfile neither COPYs nor bind-mounts this file, so it
 # never reaches the image. Run it as `bash upgrade-pi.sh`: like every file under
-# images/tools/ it is committed 0644 (tool_layer.rs's
-# embedded_layer_sources_are_committed_without_the_execute_bit).
+# images/tools/ it is committed 0644 and run with `bash` (the recipes
+# bind-mount their scripts rather than COPYing them with the execute bit).
 #
 # The DEVELOPER-only path: it resolves a dist-tag at the host seam, then calls
 # the shared prepare-lock.sh with `--refresh-lock`. Everything is staged in a
@@ -94,6 +94,6 @@ publish_transactional "$work/publish-backup" \
 cat <<EOF
 ==> pinned ${PACKAGE}@${version}; Dockerfile LABEL updated
 Next:
-  cargo test -p agent-vm tool_layer   # lock guards + embedded snapshot + label
+  cargo test --locked -p agent-vm --test image_sources   # lock guards + label mirrors
   then rebuild the tool layers -- see images/tools/pi/README.md
 EOF

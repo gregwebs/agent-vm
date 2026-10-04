@@ -18,17 +18,16 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
-use crate::config::{self, CatalogEntry, Tool};
+use crate::boot_image::{self, ImageArgs};
+use crate::config::{self, CatalogEntry, ConfiguredImages, Tool};
 use crate::credential_provider;
 use crate::credential_resolver::{
     self, CredentialSource, LaunchCredentials, MissingCredentialPolicy,
 };
 use crate::image_contract;
-use crate::layer;
 use crate::mount;
 use crate::protected_host_files::CoreHostSource;
 use crate::session::ProjectSession;
-use crate::tool_layer;
 use crate::user;
 
 /// Environment variables agent-vm injects into *every* guest, regardless of
@@ -71,9 +70,7 @@ pub(crate) const RAW_FORWARDED_ENV: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API
 /// literal (#258).
 ///
 /// Deliberately names no tool prefix: which tool prefixes exist is a property
-/// of the composed image, read from its OCI config by
-/// [`layer::contract::path_from_config_env`]. The tool layers append their own
-/// prefixes additively, so the base's value is the correct floor.
+/// of the boot image's OCI config. The image's own value is the correct floor.
 const FALLBACK_GUEST_PATH: &str = "/usr/local/bin:/usr/bin:/usr/sbin:/bin";
 
 /// The effective `PATH` for the launch's `bash` spawn, read from the created
@@ -93,34 +90,9 @@ fn resolved_exec_path(config: &microsandbox::sandbox::SandboxConfig) -> String {
         .unwrap_or_else(|| FALLBACK_GUEST_PATH.to_string())
 }
 
-/// The cache-explicit `PATH`/digest read used by the layer-composition path:
-/// the resolver passes an explicit cache (a test's tempdir) instead of the
-/// configured msb home — see `resolve_boot_image_with_layer`'s
-/// `cache_dir_override`. The launch path no longer reads `PATH` from here: it
-/// uses the created sandbox's resolved config ([`resolved_exec_path`]), which
-/// already reflects the acquired image on a cold first run (#258).
-async fn image_config_path_and_digest_in(
-    cache_dir: &Path,
-    image: &str,
-) -> (Option<String>, Option<String>) {
-    let Ok(cache) = microsandbox_image::GlobalCache::new_async(cache_dir).await else {
-        return (None, None);
-    };
-    let Ok(reference) = image.parse::<microsandbox_image::Reference>() else {
-        return (None, None);
-    };
-    match cache.read_image_metadata_async(&reference).await {
-        Ok(Some(md)) => (
-            layer::contract::path_from_config_env(&md.config.env),
-            Some(md.manifest_digest),
-        ),
-        _ => (None, None),
-    }
-}
-
 /// The booted image's own OCI config `env` entries, or `None` when the
 /// metadata could not be read (best-effort, exactly like the PATH read above).
-/// The `env` vector is the "image-owned ENV" contract the layer tests pin.
+/// The `env` vector is the "image-owned ENV" contract this check pins.
 async fn image_config_env(image: &str) -> Option<Vec<String>> {
     let cache_dir = crate::msb_install::effective_cache_dir().ok()?;
     let cache = microsandbox_image::GlobalCache::new_async(&cache_dir)
@@ -221,160 +193,6 @@ fn translate_create_error(error: anyhow::Error) -> anyhow::Error {
         Some(hint) => anyhow::anyhow!("{hint}"),
         None => error,
     }
-}
-
-/// `$AGENT_VM_LAYER` was removed in issue #79: it used to *replace* the
-/// project's layer directory, and a chain has no single directory to
-/// replace. Any value, even an empty one, means a configuration somewhere
-/// still references it, and silently ignoring it would boot without the
-/// toolchain the user expects — the exact failure the layer design exists to
-/// prevent (the likeliest source of an empty value is `AGENT_VM_LAYER=
-/// "$LAYER_DIR"` with `LAYER_DIR` unset, which is exactly that silent-boot
-/// case). Only unset is OK. Pure over the value so tests never need
-/// `setenv()`.
-///
-/// Read with `env::var_os` at the call site, not `var`, so a non-UTF-8 value
-/// still trips this guard instead of reading as "unset". `OsStr` has no
-/// `Display`, so the value is interpolated with `{:?}`, and the
-/// copy-pasteable `--layer <value>` line is only emitted when the value is
-/// non-empty valid UTF-8 — a lossy value would make that line wrong.
-fn reject_removed_layer_env(value: Option<&std::ffi::OsStr>) -> Result<()> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let how = match value.to_str() {
-        Some(s) if !s.is_empty() => format!("Pass the layer on the command line instead:\n  --layer {s}\n(repeatable; flag layers are appended after the project's .agent-vm/layers/*),"),
-        _ => "Pass the directory with --layer DIR instead (repeatable; flag layers are appended after the project's .agent-vm/layers/*),".to_string(),
-    };
-    anyhow::bail!(
-        "AGENT_VM_LAYER is set ({value:?}) but is no longer supported. {how} or move it into \
-         the project as .agent-vm/layers/NN-name/. Then unset AGENT_VM_LAYER."
-    );
-}
-
-/// Mirrors [`should_check_update`]'s flag-or-truthy-env pattern: the
-/// `--yes` flag OR a truthy `AGENT_VM_YES` skips the interactive
-/// tooling-layer-build confirmation, for CI/non-interactive callers. Truthy
-/// values match the shared `env_flag` convention (`1|true|yes|on`).
-fn should_auto_confirm(flag: bool, env_val: Option<&str>) -> bool {
-    flag || env_val.is_some_and(crate::env_flag::is_truthy)
-}
-
-/// The user's answer to a y/N question. An enum rather than a `bool` so the
-/// call site reads as a decision instead of a flag.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Confirmation {
-    Confirmed,
-    Declined,
-}
-
-/// The single-step prompt wording pinned by ADR-0003. A function (not an
-/// inline `format!`) so `prompt_wording_matches_the_adr` renders the
-/// *production* string instead of a copy that could drift from it. Used
-/// as-is for a one-step chain, so that common case stays byte-identical to
-/// the pre-chain single-layer prompt.
-fn layer_build_question(tag: &str) -> String {
-    format!("Build project tooling layer '{tag}'?")
-}
-
-/// The multi-step prompt wording — a fn, like its single-step sibling, so a
-/// test renders production text rather than a copy that can drift. Each
-/// step's label (`.agent-vm/layers/10-toolchain` for a project step,
-/// `--layer <as typed>` for a flag step — see [`layer::ChainDir::label`]) is
-/// padded to the widest one so tags align even when a `--layer` label runs
-/// long.
-///
-/// ```text
-/// Build project tooling layer chain (3 steps)?
-///   1/3  .agent-vm/layers/10-toolchain            agent-vm-layer:my-app-1a2b3c…
-///   2/3  .agent-vm/layers/20-chrome               agent-vm-layer:my-app-9f8e7d…  (cached)
-///   3/3  --layer examples/layers/chrome-devtools  agent-vm-layer:my-app-9f8e7d…
-/// ```
-fn layer_chain_build_question(steps: &[layer::PlannedStep]) -> String {
-    // chars(), not len(): len() counts bytes, so a non-ASCII label (a
-    // `--layer` path with a multi-byte character in it) would pad by the
-    // wrong amount and misalign the tag column `{:label_width$}` targets.
-    let label_width = steps
-        .iter()
-        .map(|s| s.label.chars().count())
-        .max()
-        .unwrap_or(0);
-    let mut question = format!("Build project tooling layer chain ({} steps)?", steps.len());
-    for step in steps {
-        question.push_str(&format!(
-            "\n  {}  {:label_width$}  {}",
-            step.position.human(),
-            step.label,
-            step.tag,
-        ));
-        if !step.pending {
-            question.push_str("  (cached)");
-        }
-    }
-    question
-}
-
-/// The decline error. Also a fn, for the same reason as
-/// [`layer_chain_build_question`]. The one-step case matches the pre-chain
-/// wording exactly.
-fn layer_declined_error(steps: &[layer::PlannedStep]) -> String {
-    match steps {
-        [only] => format!(
-            "tooling layer {} not built (declined). Re-run and confirm, or pass --yes.",
-            only.tag
-        ),
-        _ => format!(
-            "tooling layer chain ({} steps) not built (declined). Re-run and confirm, or pass --yes.",
-            steps.len()
-        ),
-    }
-}
-
-/// Ask a y/N question and read the answer.
-///
-/// Delivery is checked before input is requested: a failed write or flush
-/// returns and never falls through to `read_line`, so the launcher cannot end
-/// up blocked on a question the user never received (issue #58) — the same
-/// silent-hang failure the non-tty branch of [`confirm_layer_build`] exists to
-/// prevent. Anything other than `y`/`yes` (case- and whitespace-insensitive),
-/// including EOF, declines: the safe direction for a minutes-long network
-/// build.
-///
-/// Generic over the sink so the failure paths are testable without a
-/// terminal. Note that std's `Stderr` — today's only production sink — is
-/// unbuffered and its `flush` cannot fail; the flush arm is the contract for
-/// any future buffered sink, not a reachable production branch.
-fn ask_yes_no(
-    question: &str,
-    output: &mut impl std::io::Write,
-    input: &mut impl std::io::BufRead,
-) -> Result<Confirmation> {
-    // A single `write_all` call, not `write!(output, "{question} [y/N] ")`:
-    // that macro form calls the sink's `write` once per format-string
-    // fragment (the interpolated `question` first, then the literal
-    // `" [y/N] "` segment), so a write failure partway through could
-    // deliver a truncated prompt before returning `Err`. One call keeps
-    // "the prompt" atomic on std's `Stderr` specifically, whose `write_all`
-    // forwards to a single locked call — not a guarantee for every
-    // `impl Write` sink, since `write_all`'s default impl loops over
-    // `write` on short writes.
-    let prompt = format!("{question} [y/N] ");
-    output
-        .write_all(prompt.as_bytes())
-        .with_context(|| format!("writing the {question:?} prompt"))?;
-    output
-        .flush()
-        .with_context(|| format!("flushing the {question:?} prompt"))?;
-    let mut line = String::new();
-    input
-        .read_line(&mut line)
-        .with_context(|| format!("reading the answer to {question:?}"))?;
-    let answer = line.trim().to_ascii_lowercase();
-    Ok(if answer == "y" || answer == "yes" {
-        Confirmation::Confirmed
-    } else {
-        Confirmation::Declined
-    })
 }
 
 /// stderr sink for `launch()`'s `==> …` progress notices.
@@ -506,236 +324,6 @@ fn git_identity_notice(identity: Option<&crate::secrets::HostGitIdentity>) -> St
                   user.name/email; in-VM `git commit` will refuse until you set one)"
             .to_string(),
     }
-}
-
-/// Interactive y/N confirmation before building a tooling layer chain (F3 in
-/// the plan/ADR-0003).
-///
-/// `subject` names the thing in the non-TTY error (e.g. `"tooling layer
-/// <tag>"` or `"tooling layer chain (2 steps)"`); `question` is what's
-/// actually asked. Splitting them out of a single `tag` parameter is what
-/// lets one function serve both the one-step and multi-step wording without
-/// either caller building the other's error text by hand.
-///
-/// `auto` (`--yes` / `$AGENT_VM_YES`) confirms without prompting and without
-/// touching stdin or stderr at all — a CI caller must not depend on a
-/// terminal. Otherwise, when stdin isn't a terminal, this returns an
-/// actionable error rather than hanging on a `read_line` that will never
-/// receive input.
-///
-/// Do not write a test that calls this with `auto = false`: under a developer
-/// shell `cargo test`'s fd 0 *is* a tty, so it would block forever. Test
-/// [`ask_yes_no`] instead.
-fn confirm_layer_build(subject: &str, question: &str, auto: bool) -> Result<Confirmation> {
-    if auto {
-        return Ok(Confirmation::Confirmed);
-    }
-    if !std::io::stdin().is_terminal() {
-        anyhow::bail!(
-            "{subject} needs to be built, but stdin is not a terminal to confirm \
-             interactively. Re-run with --yes, or set AGENT_VM_YES=1."
-        );
-    }
-    ask_yes_no(
-        question,
-        &mut std::io::stderr(),
-        &mut std::io::stdin().lock(),
-    )
-}
-
-/// [`layer::ChainRuntime`] wired to real docker + the msb cache. `run.rs`'s
-/// only implementation of the seam; tests use a recording fake
-/// (`layer.rs`'s `FakeRuntime`) instead.
-struct LaunchChainRuntime<'a, W: std::io::Write> {
-    notices: &'a mut LaunchNotices<W>,
-    cache_dir: PathBuf,
-    auto_confirm: bool,
-}
-
-impl<W: std::io::Write> layer::ChainRuntime for LaunchChainRuntime<'_, W> {
-    fn notice(&mut self, message: &str) -> Result<()> {
-        self.notices.emit(message)
-    }
-
-    fn lint_step(&mut self, step: &layer::ChainStep) -> Result<()> {
-        layer::lint_step_file(step)
-    }
-
-    async fn confirm_build(&mut self, plan: &[layer::PlannedStep]) -> Result<()> {
-        // The buildx preflight runs *before* asking, so a broken docker
-        // install surfaces as one clear error instead of wasting the user's
-        // answer to a question that can't be honored anyway.
-        layer::ensure_docker_buildx().await?;
-        let (subject, question) = match plan {
-            [only] => (
-                format!("tooling layer {}", only.tag),
-                layer_build_question(&only.tag),
-            ),
-            _ => (
-                format!("tooling layer chain ({} steps)", plan.len()),
-                layer_chain_build_question(plan),
-            ),
-        };
-        if confirm_layer_build(&subject, &question, self.auto_confirm)? == Confirmation::Declined {
-            anyhow::bail!(layer_declined_error(plan));
-        }
-        Ok(())
-    }
-
-    async fn image_facts(&mut self, tag: &str) -> Result<Option<layer::contract::ImageFacts>> {
-        layer::docker_image_facts(tag).await
-    }
-
-    async fn pin_base(&mut self, base: layer::BaseImage<'_>) -> Result<String> {
-        layer::pin_docker_base(base).await
-    }
-
-    async fn final_is_cached(&mut self, tag: &str) -> Result<bool> {
-        layer::derived_is_cached(&self.cache_dir, tag).await
-    }
-
-    async fn build_intermediate(
-        &mut self,
-        id: &layer::LayerIdentity,
-        from_ref: &str,
-    ) -> Result<layer::contract::ImageFacts> {
-        layer::build_derived_docker(id, from_ref).await
-    }
-
-    async fn build_and_load_final(
-        &mut self,
-        id: &layer::LayerIdentity,
-        from_ref: &str,
-    ) -> Result<layer::contract::ImageFacts> {
-        // Under `cache_dir`, not the system tmp (AGENTS.md) — RAII-cleaned
-        // via NamedTempFile's Drop regardless of how build/load below
-        // returns.
-        let tar = tempfile::Builder::new()
-            .prefix("agent-vm-layer-")
-            .suffix(".tar")
-            .tempfile_in(&self.cache_dir)
-            .context("creating tooling-layer OCI archive tempfile")?;
-        layer::build_derived_oci(id, from_ref, tar.path())
-            .await
-            .with_context(|| format!("building tooling layer {}", id.tag))?;
-        let metadata = layer::load_derived_image(&self.cache_dir, tar.path(), &id.tag)
-            .await
-            .with_context(|| format!("loading tooling layer {} into the msb cache", id.tag))?;
-        layer::final_image_facts(&self.cache_dir, &id.tag, &metadata).await
-    }
-
-    async fn discard_step(
-        &mut self,
-        step: &layer::ChainStep,
-        role: layer::contract::StepRole,
-    ) -> Result<()> {
-        layer::discard_step_image(&self.cache_dir, step, role).await
-    }
-}
-
-/// If the catalog declares tool layers (via `root`), the project declares a
-/// tooling-layer chain, and/or `layer_flags` is non-empty, build+load the
-/// composed chain (lazily, hash-cached per step, with one confirmation for the
-/// whole chain on a miss — see ADR-0003) and return the final derived tag to
-/// boot instead of `root.reference()`. Returns `Ok(None)` when no source
-/// declares anything, so `launch()` boots `root.reference()` unchanged — a
-/// non-layer project's behavior is byte-identical to before tooling layers
-/// existed (issue #84's fast path).
-///
-/// `tool_steps` are the catalog's materialised tool layers, in declaration
-/// order, ahead of the project's own steps. They are prepended rather than
-/// routed through `layer::resolve_layer_chain`, so they deliberately bypass
-/// that function's project-local rules (reject-the-project-dir,
-/// reject-duplicate-flags): those rules are about user-named directories, and
-/// a temp build context cannot violate them.
-///
-/// Extracted out of `launch()` so the orchestration reads top-to-bottom
-/// without the surrounding ~150 lines of mount/credential/network setup
-/// interleaved with it, and so each step (resolve, plan, execute) is a
-/// single `?`-propagated call a reader can follow in order.
-async fn resolve_boot_image_with_layer<W: std::io::Write>(
-    root: &tool_layer::ChainRoot,
-    tool_steps: &[layer::ChainDir],
-    layer_flags: &[PathBuf],
-    project_dir: &Path,
-    auto_confirm: bool,
-    notices: &mut LaunchNotices<W>,
-    cache_dir_override: Option<&Path>,
-) -> Result<Option<String>> {
-    let mut chain = tool_steps.to_vec();
-    chain.extend(layer::resolve_layer_chain(project_dir, layer_flags)?);
-    if chain.is_empty() {
-        return Ok(None);
-    }
-    let base_image = root.reference();
-
-    // The cache that owns the base metadata and receives the final ingest.
-    // A test overrides it with a tempdir; production uses the configured msb
-    // home for both reads and writes so they can never disagree.
-    let cache_dir = match cache_dir_override {
-        Some(dir) => dir.to_path_buf(),
-        None => crate::msb_install::effective_cache_dir()?,
-    };
-
-    // 1. Read the base's manifest digest from the selected cache — it is the
-    //    sole input anchoring step 0's content hash (ADR-0003). The base is
-    //    pulled only on the production path and only if it isn't cached yet
-    //    (F4). An override cache is *preloaded-only*: a miss there is a test
-    //    setup defect, and failing here (before any `pull_image`) guarantees
-    //    an ignored-test mistake can never mutate the user's configured
-    //    cache. (The base's Docker-local link is established later, lazily,
-    //    by `execute_chain` — never here.)
-    let (_path, mut base_digest) = image_config_path_and_digest_in(&cache_dir, base_image).await;
-    if base_digest.is_none() {
-        if cache_dir_override.is_some() {
-            anyhow::bail!(
-                "test seam: base image {base_image} is not preloaded in the override cache {}",
-                cache_dir.display()
-            );
-        }
-        notices.emit(format!(
-            "==> Composing tool layers; pulling the chain root {base_image} first…"
-        ))?;
-        crate::pull::pull_image(base_image)
-            .await
-            .context("pulling base image to build the tooling layer FROM")?;
-        base_digest = image_config_path_and_digest_in(&cache_dir, base_image)
-            .await
-            .1;
-    }
-    let base_digest = base_digest.context(
-        "could not resolve base image digest after pull; cannot build a reproducible tooling layer",
-    )?;
-
-    // 2. Plan the whole chain — pure, no I/O beyond hashing each step's
-    //    directory tree. Every tag is known up front (see layer.rs's
-    //    plan_chain doc comment), which is what lets execute_chain decide
-    //    the cache check, the prompt, and the build set without spawning a
-    //    process on a pure cache hit. `base_image` and `base_digest` stay
-    //    separate: the digest anchors the hash, the ref is only what
-    //    `pin_base` may pull to establish the Docker base link.
-    let plan = layer::plan_chain(&chain, project_dir, &base_digest)?;
-
-    // 3. Execute: cache-hit fast path, or confirm-then-build-forward. Any
-    //    failure past this point is a hard fail — launch() must never
-    //    silently fall back to booting the plain base with a missing
-    //    toolchain (F2 in the plan/ADR-0003; a partially-composed chain
-    //    must never boot).
-    let mut rt = LaunchChainRuntime {
-        notices,
-        cache_dir,
-        auto_confirm,
-    };
-    let tag = layer::execute_chain(
-        &plan,
-        layer::BaseImage {
-            reference: base_image,
-            manifest_digest: &base_digest,
-        },
-        &mut rt,
-    )
-    .await?;
-    Ok(Some(tag))
 }
 
 fn guest_path_is_safe(project: &Path) -> bool {
@@ -901,8 +489,7 @@ Networking (deny-by-default; flags compose):
 
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
-  AGENT_VM_IMAGE_TAG                    same as --image, unless --base-image is passed
-  AGENT_VM_BASE_IMAGE                   same as --base-image, unless --image is passed
+  AGENT_VM_IMAGE_TAG                    same as --image (outranks configured images)
   AGENT_VM_ROOT                         same as --root (1|true|yes|on)
   AGENT_VM_UPDATE_CHECK                 check the registry for a newer image (1|true|yes|on)
   AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls (1|true|yes|on)
@@ -1040,33 +627,11 @@ pub struct Args {
     #[command(flatten)]
     network: crate::network::Args,
 
-    /// Boot this image verbatim, skipping tool-layer composition.
-    ///
-    /// The project's own `.agent-vm/layers/*` and any `--layer DIR` still
-    /// chain on top. Mutually exclusive with `--base-image`; an explicit flag
-    /// wins over the other flag's environment variable.
-    #[arg(
-        long,
-        env = "AGENT_VM_IMAGE_TAG",
-        value_name = "REF",
-        help_heading = "Image"
-    )]
-    pub(crate) image: Option<String>,
-
-    /// The tool-free base that tool layers are composed onto.
-    ///
-    /// Default `ghcr.io/wirenboard/agent-vm-base:latest`. Passing this always
-    /// composes locally, even when your tool set matches the shipped default
-    /// (which otherwise boots the published composed template). Mutually
-    /// exclusive with `--image`; an explicit flag wins over the other flag's
-    /// environment variable.
-    #[arg(
-        long = "base-image",
-        env = "AGENT_VM_BASE_IMAGE",
-        value_name = "REF",
-        help_heading = "Image"
-    )]
-    pub(crate) base_image: Option<String>,
+    /// The image this session boots. See "Selecting the boot image" in
+    /// USAGE.md for the full precedence (flag/env > user config > project
+    /// config > default).
+    #[command(flatten)]
+    pub(crate) image: ImageArgs,
 
     /// Check the registry for a newer image at launch (opt-in).
     ///
@@ -1077,39 +642,6 @@ pub struct Args {
     /// `AGENT_VM_UPDATE_CHECK` (1|true|yes|on).
     #[arg(long = "update-check", default_value_t = false, help_heading = "Image")]
     update_check: bool,
-
-    /// Append a tooling layer to this launch's chain (repeatable).
-    ///
-    /// Each DIR is one layer directory holding a Dockerfile that starts
-    /// `ARG BASE_IMAGE` / `FROM ${BASE_IMAGE}`. Flag layers are appended
-    /// after the project's own `.agent-vm/layers/*` steps, in the order
-    /// given, so the project's steps keep their cached images; it works with
-    /// no `.agent-vm/layers/` at all. Relative paths resolve against the
-    /// project directory (the current directory) — unlike `--mount`, which
-    /// requires absolute paths, because trying a checked-in example by
-    /// relative path is the point. There is deliberately no environment
-    /// variable; the removed `AGENT_VM_LAYER` is rejected if set.
-    #[arg(
-        long = "layer",
-        value_name = "DIR",
-        action = clap::ArgAction::Append,
-        help_heading = "Image"
-    )]
-    layer: Vec<PathBuf>,
-
-    /// Assume "yes" to the tooling-layer build confirmation prompt.
-    ///
-    /// Needed for CI/non-interactive launches whenever a chain step's hash
-    /// doesn't already match a previously built/loaded derived image (a new
-    /// project, or an edited `.agent-vm/layers/*/Dockerfile`). Can also be
-    /// set persistently with a truthy `AGENT_VM_YES` (1|true|yes|on).
-    #[arg(
-        long = "yes",
-        short = 'y',
-        default_value_t = false,
-        help_heading = "Image"
-    )]
-    pub(crate) yes: bool,
 
     /// Run the guest as root (uid 0) instead of the default host user.
     ///
@@ -1140,11 +672,17 @@ pub struct Args {
 /// mismatched here.
 pub(crate) async fn launch(
     entry: &CatalogEntry,
-    layers: &[config::DeclaredLayer],
+    images: &ConfiguredImages,
     args: Args,
 ) -> Result<i32> {
     let tool = entry.tool();
     let provisioned = entry.provisioned();
+    // The one image selection for this session — a property of the session,
+    // not of the launched tool. Resolved first, before any side effect:
+    // an invalid override (a typed empty `--image`) or an unreadable
+    // configured image must not create state. `args.image.requested()` also
+    // applies the empty-`AGENT_VM_IMAGE_TAG`-is-unset rule.
+    let boot = boot_image::select(args.image.requested()?, images);
     // `--allow-missing-credentials` moves the *availability* of a YAML
     // credential and nothing else; see `MissingCredentialPolicy`. Derived once
     // here so the flag is read in exactly one place.
@@ -1158,13 +696,6 @@ pub(crate) async fn launch(
     // once and threaded to both provisioning sites and the root-mode rootfs
     // patch, so they cannot drift (CONTEXT.md → *Guest HOME*).
     let home_links = crate::guest_home::links(entry.persist());
-    // First effectful statement, deliberately: a still-set $AGENT_VM_LAYER is
-    // rejected before anything else runs — state dirs, guest HOME provisioning,
-    // stale sandbox reaping, or the msb-db preflight below — because the hazard
-    // is "no project layers + env var set ⇒ silent base boot", and none of that
-    // setup should happen on the way to a launch that's about to be rejected.
-    // (The bindings above are pure: `entry` and `home_links` touch no state.)
-    reject_removed_layer_env(env::var_os("AGENT_VM_LAYER").as_deref())?;
 
     // Resolve root vs. non-root guest mode up front — it gates dir
     // provisioning, the rootfs patch block, and the guest env/exec wiring
@@ -1278,6 +809,9 @@ pub(crate) async fn launch(
     // denies the launch.
     let mut notices = LaunchNotices::to_stderr();
     notices.emit(launch_banner(&session))?;
+    // The selected boot image, once, before the session provisions any state
+    // (D10). `boot` was resolved before the first side effect above.
+    notices.emit(format!("==> Boot image {boot}"))?;
     let pi_report = crate::pi_credential_inspection::inspect_project(&session.state_dir);
     if let Some(warning) = pi_report.launch_warning() {
         notices.emit(warning)?;
@@ -1308,68 +842,17 @@ pub(crate) async fn launch(
     // `reap_stale_project_sandboxes` for the full rationale.
     reap_stale_project_sandboxes(&session.project_hash).await;
 
-    // The chain root: which published tag this launch builds FROM and boots,
-    // and whether the declared tool layers must be composed onto it. Pure, and
-    // the one place the `--image` / `--base-image` / default-set decision lives
-    // (see `tool_layer::chain_root`).
-    //
-    // `root.reference()` stays a separate binding from the possibly-reassigned
-    // `image` for the lifetime of `launch()`: the opt-in registry update-check
-    // below must keep probing a *published* tag, never a locally composed
-    // tooling-layer tag, which has no registry to probe (see the call site's
-    // comment there).
-    let declared: Vec<crate::config::ToolLayer> = layers
-        .iter()
-        .map(config::DeclaredLayer::layer)
-        .cloned()
-        .collect();
-    let root = crate::tool_layer::chain_root(
-        args.image.clone(),
-        args.base_image.clone(),
-        &declared,
-        &config::shipped_tool_layers()?,
-    )?;
-    let mut image = root.reference().to_string();
+    // The selected boot image, used by the notices, the update check and the
+    // boot builder. No launch invokes Docker or builds an image; a custom
+    // image is selected with `--image`/`AGENT_VM_IMAGE_TAG`/config and booted
+    // verbatim (`boot_image::select` above is the sole selection owner).
+    let image = boot.reference().as_str().to_string();
 
-    // Materialise the builtin tool layers into throwaway build contexts (D2).
-    // Only the compose path touches the filesystem; the template fast path and
-    // `--image` create no temp directory. The guard is bound *here*, at launch
-    // scope, so it outlives the whole chain resolution and build — dropping it
-    // earlier would delete the build context out from under `docker buildx`.
-    let (tool_steps, _materialized) = if root.composes_tool_layers() {
-        let (steps, guard) = crate::tool_layer::materialize(layers)?;
-        (steps, Some(guard))
-    } else {
-        (Vec::new(), None)
-    };
     let memory_mib: u32 = args
         .memory
         .checked_mul(1024)
         .context("--memory in GiB overflows u32 MiB")?;
     let cpus = args.cpus;
-
-    // Tooling-layer resolution (issue #13, extended to an ordered chain by
-    // #79, then to an additive repeatable `--layer` by amendment A1, then to
-    // the catalog's tool steps by #84): the chain is the catalog's declared
-    // tool layers (empty unless `root` composes), then the project's
-    // `.agent-vm/layers/*` steps, then any `--layer DIR`. It is built and
-    // loaded now (lazily, hash-cached per step, with one confirmation for the
-    // whole chain on a miss) and booted instead of the root. An empty chain
-    // leaves `image` as `root.reference()` — the zero-build fast path.
-    let auto_confirm = should_auto_confirm(args.yes, env::var("AGENT_VM_YES").ok().as_deref());
-    if let Some(derived) = resolve_boot_image_with_layer(
-        &root,
-        &tool_steps,
-        &args.layer,
-        &session.project_dir,
-        auto_confirm,
-        &mut notices,
-        None,
-    )
-    .await?
-    {
-        image = derived;
-    }
 
     // Mount the host project at the *same* absolute path inside the guest so
     // that anything the agent emits (compiler errors, stack traces, git
@@ -1414,12 +897,10 @@ pub(crate) async fn launch(
         // during boot; otherwise it's simply skipped and the next launch
         // catches up.
         //
-        // Deliberately `root.reference()`, not `image`: when a tooling layer
-        // reassigned `image` to the registry-less derived tag
-        // (`agent-vm-layer:<hash>`), probing it would HEAD a nonexistent
-        // registry ref and always miss. The pulled-marker + update banner are
-        // a property of the published image the chain builds FROM.
-        let img = root.reference().to_string();
+        // Probes the **selected** boot image (D10), which is the only image a
+        // session can boot. There is no separate published/composed tag to
+        // prefer.
+        let img = image.clone();
         tokio::spawn(async move {
             seed_pulled_marker_if_absent(&img).await;
             // Detached task: there is no launch error boundary to reach
@@ -1950,11 +1431,8 @@ pub(crate) async fn launch(
     let inner_cmd = tool.command();
     let inner_argv = inner_argv(tool, args.agent_args);
     let config = builder.build().await.context("preparing sandbox config")?;
-    if env::var("AGENT_VM_DEBUG_CONFIG").is_ok() {
-        notices.emit(format!(
-            "[debug] sandbox config JSON: {}",
-            serde_json::to_string_pretty(&config).unwrap_or_default()
-        ))?;
+    if let Some(dump) = crate::debug_config::sandbox_config(&config)? {
+        notices.emit(dump)?;
         // No trailing space when the argv is empty (codex/opencode), so the
         // line is exactly the guest command line an integration test asserts.
         let guest_command = if inner_argv.is_empty() {
@@ -3114,7 +2592,6 @@ const UPDATE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layer::test_support::{DockerTagGuard, docker_tag_exists, e2e_nonce};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -3252,152 +2729,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reject_removed_layer_env_accepts_unset() {
-        assert!(reject_removed_layer_env(None).is_ok());
-    }
-
-    #[test]
-    fn reject_removed_layer_env_rejects_an_empty_value() {
-        let err = reject_removed_layer_env(Some(std::ffi::OsStr::new(""))).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("AGENT_VM_LAYER"), "{msg}");
-        assert!(
-            !msg.contains("--layer \"\"") && !msg.lines().any(|l| l.trim() == "--layer"),
-            "an empty value has nothing to suggest as a copy-pasteable --layer line: {msg}"
-        );
-    }
-
-    #[test]
-    fn reject_removed_layer_env_rejects_a_set_value() {
-        let err = reject_removed_layer_env(Some(std::ffi::OsStr::new("x"))).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("AGENT_VM_LAYER"), "{msg}");
-        assert!(msg.contains('x'), "{msg}");
-        assert!(msg.contains("--layer x"), "{msg}");
-    }
-
-    #[test]
-    fn reject_removed_layer_env_rejects_non_utf8() {
-        use std::os::unix::ffi::OsStrExt;
-        let value = std::ffi::OsStr::from_bytes(b"\xff");
-        let err = reject_removed_layer_env(Some(value)).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("AGENT_VM_LAYER"), "{msg}");
-        assert!(
-            !msg.contains("--layer \u{fffd}")
-                && !msg.lines().any(|l| l.trim().starts_with("--layer ")),
-            "a lossy value must not be offered as a copy-pasteable --layer line: {msg}"
-        );
-    }
-
-    #[test]
-    fn should_auto_confirm_flag_or_env() {
-        // Default: neither set → prompt.
-        assert!(!should_auto_confirm(false, None));
-        assert!(!should_auto_confirm(false, Some("")));
-        assert!(!should_auto_confirm(false, Some("0")));
-        // Flag opt-in.
-        assert!(should_auto_confirm(true, None));
-        // Env opt-in, same shared truthy set (`env_flag`) as should_check_update.
-        assert!(should_auto_confirm(false, Some("1")));
-        assert!(should_auto_confirm(false, Some("true")));
-        assert!(should_auto_confirm(false, Some("yes")));
-        assert!(should_auto_confirm(false, Some("on")));
-        // Either input enables (flag OR env).
-        assert!(should_auto_confirm(true, Some("0")));
-    }
-
-    #[test]
-    fn yes_flag_parses_via_clap() {
-        #[derive(clap::Parser)]
-        struct TestCli {
-            #[command(flatten)]
-            args: Args,
-        }
-        use clap::Parser as _;
-
-        let cli = TestCli::try_parse_from(["agent-vm"]).expect("parses with no flags");
-        assert!(!cli.args.yes);
-
-        let cli = TestCli::try_parse_from(["agent-vm", "--yes"]).expect("parses --yes");
-        assert!(cli.args.yes);
-
-        // Short form.
-        let cli = TestCli::try_parse_from(["agent-vm", "-y"]).expect("parses -y");
-        assert!(cli.args.yes);
-    }
-
-    #[test]
-    fn layer_flag_is_repeatable_and_keeps_order() {
-        #[derive(clap::Parser)]
-        struct TestCli {
-            #[command(flatten)]
-            args: Args,
-        }
-        use clap::Parser as _;
-
-        let cli = TestCli::try_parse_from(["agent-vm"]).expect("parses with no flags");
-        assert!(cli.args.layer.is_empty());
-
-        let cli = TestCli::try_parse_from(["agent-vm", "--layer", "b", "--layer", "a"])
-            .expect("--layer is repeatable");
-        assert_eq!(
-            cli.args.layer,
-            vec![PathBuf::from("b"), PathBuf::from("a")],
-            "command-line order must survive, since resolve_layer_chain appends flags in that order"
-        );
-    }
-
-    #[test]
-    fn layer_flag_has_no_env_binding() {
-        // Pins "flag-only": $AGENT_VM_LAYER must not silently satisfy
-        // --layer, since it's rejected outright by reject_removed_layer_env.
-        // Introspects clap's Arg rather than setenv() + parse, per the ADR
-        // amendment's "flag-only" contract.
-        use clap::CommandFactory as _;
-        #[derive(clap::Parser)]
-        struct TestCli {
-            #[command(flatten)]
-            args: Args,
-        }
-        let command = TestCli::command();
-        let arg = command
-            .get_arguments()
-            .find(|a| a.get_id() == "layer")
-            .expect("--layer is a registered arg");
-        assert!(arg.get_env().is_none(), "{arg:?}");
-    }
-
-    // Test doubles for `ask_yes_no`'s io seam (issue #58), now shared by
-    // `LaunchNotices::emit`'s tests too (issue #70). One shared, ordered
-    // event log so "delivery happens before the read" and "no read after a
-    // failed delivery" are asserted directly rather than inferred from side
-    // effects. Test-local duplication of the spirit of `network.rs`'s
-    // `SharedWriter`/`FailingWriter` — deliberate, per CODING_STANDARDS'
-    // DRY note (wait for a third instance).
+    // Test doubles for `LaunchNotices`' output seam (issue #70). One ordered
+    // event log so "these bytes were delivered, in this step order" is asserted
+    // directly rather than inferred from side effects. Test-local duplication of
+    // the spirit of `network.rs`'s `SharedWriter`/`FailingWriter` — deliberate,
+    // per CODING_STANDARDS' DRY note (wait for a third instance).
     #[derive(Debug, PartialEq, Eq)]
-    enum PromptIo {
+    enum NoticeIo {
         Wrote(String),
-        Flushed,
-        Read,
     }
 
     /// Collapses consecutive `Wrote` entries in `log`, concatenating their
     /// payloads, so a test can assert "these bytes were delivered, in this
     /// step order" without pinning how many `write()` calls the sink saw.
     /// The production sink (`write_all` on std's `Stderr`) makes one call,
-    /// but `ask_yes_no`'s `impl Write` bound makes no such promise for a
+    /// but `LaunchNotices`' `impl Write` bound makes no such promise for a
     /// future sink — asserting exact-call-count would couple the test to an
     /// implementation detail the acceptance criteria don't care about.
-    fn folded_prompt_log(log: &[PromptIo]) -> Vec<PromptIo> {
-        let mut folded: Vec<PromptIo> = Vec::new();
+    fn folded_notice_log(log: &[NoticeIo]) -> Vec<NoticeIo> {
+        let mut folded: Vec<NoticeIo> = Vec::new();
         for event in log {
             match (folded.last_mut(), event) {
-                (Some(PromptIo::Wrote(acc)), PromptIo::Wrote(next)) => acc.push_str(next),
-                (_, PromptIo::Wrote(s)) => folded.push(PromptIo::Wrote(s.clone())),
-                (_, PromptIo::Flushed) => folded.push(PromptIo::Flushed),
-                (_, PromptIo::Read) => folded.push(PromptIo::Read),
+                (Some(NoticeIo::Wrote(acc)), NoticeIo::Wrote(next)) => acc.push_str(next),
+                (_, NoticeIo::Wrote(s)) => folded.push(NoticeIo::Wrote(s.clone())),
             }
         }
         folded
@@ -3408,11 +2762,10 @@ mod tests {
     enum Fault {
         None,
         Write,
-        Flush,
     }
 
     struct ScriptedOutput {
-        log: Rc<RefCell<Vec<PromptIo>>>,
+        log: Rc<RefCell<Vec<NoticeIo>>>,
         fault: Fault,
     }
 
@@ -3423,218 +2776,18 @@ mod tests {
             }
             self.log
                 .borrow_mut()
-                .push(PromptIo::Wrote(String::from_utf8_lossy(bytes).into_owned()));
+                .push(NoticeIo::Wrote(String::from_utf8_lossy(bytes).into_owned()));
             Ok(bytes.len())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            if matches!(self.fault, Fault::Flush) {
-                return Err(std::io::Error::other("broken flush"));
-            }
-            self.log.borrow_mut().push(PromptIo::Flushed);
             Ok(())
         }
     }
 
-    struct ScriptedInput {
-        log: Rc<RefCell<Vec<PromptIo>>>,
-        cursor: std::io::Cursor<Vec<u8>>,
-        fail: bool,
-    }
-
-    impl ScriptedInput {
-        fn from(log: Rc<RefCell<Vec<PromptIo>>>, answer: &str) -> Self {
-            Self {
-                log,
-                cursor: std::io::Cursor::new(answer.as_bytes().to_vec()),
-                fail: false,
-            }
-        }
-
-        fn failing(log: Rc<RefCell<Vec<PromptIo>>>) -> Self {
-            Self {
-                log,
-                cursor: std::io::Cursor::new(Vec::new()),
-                fail: true,
-            }
-        }
-    }
-
-    impl std::io::Read for ScriptedInput {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            std::io::Read::read(&mut self.cursor, buffer)
-        }
-    }
-
-    impl std::io::BufRead for ScriptedInput {
-        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-            self.log.borrow_mut().push(PromptIo::Read);
-            if self.fail {
-                return Err(std::io::Error::other("broken input"));
-            }
-            std::io::BufRead::fill_buf(&mut self.cursor)
-        }
-
-        fn consume(&mut self, amount: usize) {
-            std::io::BufRead::consume(&mut self.cursor, amount);
-        }
-    }
-
-    #[test]
-    fn prompt_delivery_precedes_the_answer_read() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut output = ScriptedOutput {
-            log: log.clone(),
-            fault: Fault::None,
-        };
-        let mut input = ScriptedInput::from(log.clone(), "y\n");
-        let answer = ask_yes_no(
-            &layer_build_question("agent-vm-layer:demo-abc123"),
-            &mut output,
-            &mut input,
-        )
-        .expect("scripted success");
-        assert_eq!(answer, Confirmation::Confirmed);
-        assert_eq!(
-            folded_prompt_log(&log.borrow()),
-            vec![
-                PromptIo::Wrote(
-                    "Build project tooling layer 'agent-vm-layer:demo-abc123'? [y/N] ".to_string()
-                ),
-                PromptIo::Flushed,
-                PromptIo::Read,
-            ]
-        );
-    }
-
-    #[test]
-    fn prompt_answers_are_case_and_whitespace_insensitive() {
-        for confirmed_answer in ["y\n", "Y\n", "yes\n", " YES \r\n"] {
-            let log = Rc::new(RefCell::new(Vec::new()));
-            let mut output = ScriptedOutput {
-                log: log.clone(),
-                fault: Fault::None,
-            };
-            let mut input = ScriptedInput::from(log.clone(), confirmed_answer);
-            assert_eq!(
-                ask_yes_no(&layer_build_question("t"), &mut output, &mut input)
-                    .expect("scripted success"),
-                Confirmation::Confirmed,
-                "expected {confirmed_answer:?} to confirm"
-            );
-        }
-        for declined_answer in ["n\n", "no\n", "\n", "", "yep\n", "ye s\n"] {
-            let log = Rc::new(RefCell::new(Vec::new()));
-            let mut output = ScriptedOutput {
-                log: log.clone(),
-                fault: Fault::None,
-            };
-            let mut input = ScriptedInput::from(log.clone(), declined_answer);
-            assert_eq!(
-                ask_yes_no(&layer_build_question("t"), &mut output, &mut input)
-                    .expect("scripted success"),
-                Confirmation::Declined,
-                "expected {declined_answer:?} to decline"
-            );
-        }
-    }
-
-    #[test]
-    fn prompt_write_failure_is_reported_and_input_is_not_read() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut output = ScriptedOutput {
-            log: log.clone(),
-            fault: Fault::Write,
-        };
-        let mut input = ScriptedInput::from(log.clone(), "y\n");
-        let error = ask_yes_no(&layer_build_question("t"), &mut output, &mut input)
-            .expect_err("write failure must propagate");
-        let chain = format!("{error:#}");
-        assert!(chain.contains("writing"), "chain: {chain}");
-        assert!(chain.contains("broken output"), "chain: {chain}");
-        assert!(!log.borrow().contains(&PromptIo::Flushed));
-        assert!(!log.borrow().contains(&PromptIo::Read));
-    }
-
-    #[test]
-    fn prompt_flush_failure_is_reported_and_input_is_not_read() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut output = ScriptedOutput {
-            log: log.clone(),
-            fault: Fault::Flush,
-        };
-        let mut input = ScriptedInput::from(log.clone(), "y\n");
-        let error = ask_yes_no(
-            &layer_build_question("agent-vm-layer:demo-abc123"),
-            &mut output,
-            &mut input,
-        )
-        .expect_err("flush failure must propagate");
-        let chain = format!("{error:#}");
-        assert!(chain.contains("flushing"), "chain: {chain}");
-        assert!(chain.contains("broken flush"), "chain: {chain}");
-        assert_eq!(
-            folded_prompt_log(&log.borrow()),
-            vec![PromptIo::Wrote(
-                "Build project tooling layer 'agent-vm-layer:demo-abc123'? [y/N] ".to_string()
-            )],
-            "write must complete and the read must never happen"
-        );
-    }
-
-    #[test]
-    fn prompt_answer_read_failure_is_reported() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut output = ScriptedOutput {
-            log: log.clone(),
-            fault: Fault::None,
-        };
-        let mut input = ScriptedInput::failing(log.clone());
-        let error = ask_yes_no(&layer_build_question("t"), &mut output, &mut input)
-            .expect_err("read failure must propagate");
-        let chain = format!("{error:#}");
-        assert!(chain.contains("reading the answer"), "chain: {chain}");
-        assert!(chain.contains("broken input"), "chain: {chain}");
-    }
-
-    #[test]
-    fn confirm_layer_build_auto_confirms_without_touching_stdin_or_stderr() {
-        // Safe through the real entry point: the `auto` early return
-        // precedes both `is_terminal()` and `ask_yes_no`, so this cannot
-        // block on a tty even under `cargo test`'s real fd 0/2 — no scripted
-        // io double is needed because none is ever touched.
-        assert_eq!(
-            confirm_layer_build("subject", "question", true).expect("auto confirms"),
-            Confirmation::Confirmed
-        );
-    }
-
-    #[test]
-    fn prompt_wording_matches_the_adr() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut output = ScriptedOutput {
-            log: log.clone(),
-            fault: Fault::None,
-        };
-        let mut input = ScriptedInput::from(log.clone(), "\n");
-        ask_yes_no(&layer_build_question("<tag>"), &mut output, &mut input)
-            .expect("scripted success");
-        let rendered = match &log.borrow()[0] {
-            PromptIo::Wrote(text) => text.clone(),
-            other => panic!("expected a Wrote entry first, got {other:?}"),
-        };
-        assert_eq!(rendered, "Build project tooling layer '<tag>'? [y/N] ");
-        let adr = include_str!("../../../docs/adr/0003-project-tooling-layers.md");
-        assert_eq!(
-            adr.matches(rendered.trim_end()).count(),
-            1,
-            "ADR-0003 must state the prompt wording exactly once"
-        );
-    }
-
-    // Tests for `LaunchNotices::emit` (issue #70), reusing the `ask_yes_no`
-    // io test doubles above (D8: no new test-support module for a second
-    // consumer in the same file).
+    // Tests for `LaunchNotices::emit` (issue #70), reusing the output test
+    // doubles above (D8: no new test-support module for a second consumer in
+    // the same file).
 
     #[test]
     fn notice_is_delivered_as_one_write_without_a_flush() {
@@ -3646,8 +2799,8 @@ mod tests {
         let mut notices = LaunchNotices::new(output);
         notices.emit("==> hello").expect("scripted success");
         assert_eq!(
-            folded_prompt_log(&log.borrow()),
-            vec![PromptIo::Wrote("==> hello\n".to_string())],
+            folded_notice_log(&log.borrow()),
+            vec![NoticeIo::Wrote("==> hello\n".to_string())],
             "one atomic write, no flush"
         );
     }
@@ -3839,649 +2992,6 @@ mod tests {
                 hit.unwrap_or_default(),
             );
         }
-    }
-
-    // `resolve_boot_image_with_layer` is only exercised end-to-end by the
-    // opt-in docker+registry e2e paths (see `layer.rs`'s and
-    // `layer/contract.rs`'s `#[ignore]`d `e2e_*` tests and the manual
-    // verification recorded for issue #13/#79),
-    // but its "no chain declared" short circuit is pure and network-free:
-    // `layer::resolve_layer_chain` returns an empty chain on a missing
-    // `.agent-vm/layers/` before this function's first `.await`, so this
-    // is safe to pin as an ordinary fast unit test. It locks in the
-    // guarantee that a non-layer project's boot path is byte-identical to
-    // before tooling layers existed: no base-digest read, no docker, no
-    // msb-cache touch, `image` stays the base unchanged.
-    #[tokio::test]
-    async fn resolve_boot_image_with_layer_returns_none_for_a_project_with_no_layer() {
-        let project = tempfile::tempdir().unwrap();
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let output = ScriptedOutput {
-            log: log.clone(),
-            fault: Fault::None,
-        };
-        let mut notices = LaunchNotices::new(output);
-        let got = resolve_boot_image_with_layer(
-            &tool_layer::ChainRoot::Verbatim(
-                "ghcr.io/wirenboard/agent-vm-template:latest".to_string(),
-            ),
-            &[],
-            &[],
-            project.path(),
-            false,
-            &mut notices,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(got, None);
-        assert!(
-            log.borrow().is_empty(),
-            "the no-layer fast path must stay silent"
-        );
-    }
-
-    /// New for #79: a leftover singular `.agent-vm/layer/` must fail before
-    /// any `.await` on docker/msb — the migration guardrail (D2) applies
-    /// uniformly, whether or not a chain is *also* declared.
-    #[tokio::test]
-    async fn resolve_boot_image_with_layer_errors_on_a_legacy_layer_dir() {
-        let project = tempfile::tempdir().unwrap();
-        let legacy = project.path().join(".agent-vm/layer");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("Dockerfile"), "FROM scratch\n").unwrap();
-
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let output = ScriptedOutput {
-            log: log.clone(),
-            fault: Fault::None,
-        };
-        let mut notices = LaunchNotices::new(output);
-        let err = resolve_boot_image_with_layer(
-            &tool_layer::ChainRoot::Verbatim(
-                "ghcr.io/wirenboard/agent-vm-template:latest".to_string(),
-            ),
-            &[],
-            &[],
-            project.path(),
-            false,
-            &mut notices,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(format!("{err:?}").contains(".agent-vm/layer"));
-        assert!(
-            log.borrow().is_empty(),
-            "the legacy-directory error must fire before any notice is emitted"
-        );
-    }
-
-    /// A declared chain whose base is absent from an explicit override cache
-    /// must fail at the preload guard — before the pull path, confirmation,
-    /// base pinning, or any build/load. This locks in that the override is
-    /// preloaded-only: a missing ignored-test fixture can never fall through
-    /// to `pull_image` against the user's configured msb home.
-    #[tokio::test]
-    async fn resolve_boot_image_with_layer_override_missing_base_fails_before_pulling() {
-        let project = tempfile::tempdir().unwrap();
-        let layer = project.path().join(".agent-vm/layers/10-a");
-        std::fs::create_dir_all(&layer).unwrap();
-        std::fs::write(
-            layer.join("Dockerfile"),
-            "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n",
-        )
-        .unwrap();
-
-        let override_cache = tempfile::tempdir().unwrap();
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let output = ScriptedOutput {
-            log: log.clone(),
-            fault: Fault::None,
-        };
-        let mut notices = LaunchNotices::new(output);
-        let err = resolve_boot_image_with_layer(
-            &tool_layer::ChainRoot::Verbatim(
-                "ghcr.io/wirenboard/agent-vm-template:latest".to_string(),
-            ),
-            &[],
-            &[],
-            project.path(),
-            true,
-            &mut notices,
-            Some(override_cache.path()),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            format!("{err:?}").contains("not preloaded in the override cache"),
-            "{err:?}"
-        );
-        assert!(
-            log.borrow().is_empty(),
-            "the preload guard must fire before any notice (no pull banner, no confirm)"
-        );
-    }
-
-    // --- issue #98: real resolver regression through an imported base link ---
-
-    /// The full issue-#98 path through the real resolver: a base imported as
-    /// a `docker save` archive into an isolated temp cache (so msb
-    /// synthesizes its manifest digest), linked into Docker as
-    /// `agent-vm-base:<hex>` exactly as `import-image.sh` does, then a
-    /// one-step project layer built FROM that link and ingested back into the
-    /// temp cache. Needs docker/buildx and a host-platform parent image;
-    /// skipped otherwise. Never touches the configured msb home (the override
-    /// is preloaded-only and receives the final ingest).
-    #[tokio::test]
-    #[ignore = "needs docker buildx + a local single-platform base image"]
-    async fn resolve_boot_image_with_layer_builds_an_imported_base_through_its_docker_link() {
-        if layer::ensure_docker_buildx().await.is_err() {
-            eprintln!("skipping: `docker buildx` not available on PATH");
-            return;
-        }
-
-        let parent = std::env::var("AGENT_VM_E2E_BASE_IMAGE")
-            .unwrap_or_else(|_| "alpine:latest".to_string());
-        if !docker_tag_exists(&parent)
-            && !std::process::Command::new("docker")
-                .args(["pull", "-q", &parent])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        {
-            eprintln!("skipping: no base image available locally or via network pull");
-            return;
-        }
-
-        let nonce = e2e_nonce();
-        let source = format!("agent-vm-e2e-base:{nonce}");
-        if docker_tag_exists(&source) {
-            eprintln!("skipping: disposable source tag {source} already exists");
-            return;
-        }
-
-        // Build a uniquely marked disposable child so its bytes — and hence
-        // the archive-imported msb manifest digest — are unique per run.
-        let ctx = tempfile::tempdir().unwrap();
-        std::fs::write(
-            ctx.path().join("Dockerfile"),
-            format!("ARG PARENT={parent}\nFROM ${{PARENT}}\nLABEL agent-vm-e2e-nonce={nonce}\n"),
-        )
-        .unwrap();
-        assert!(
-            std::process::Command::new("docker")
-                .args([
-                    "build",
-                    "--build-arg",
-                    &format!("PARENT={parent}"),
-                    "-t",
-                    &source,
-                    ctx.path().to_str().unwrap(),
-                ])
-                .status()
-                .unwrap()
-                .success(),
-            "disposable child build must succeed"
-        );
-
-        let mut guard = DockerTagGuard::default();
-        guard.own(&source);
-
-        // Save the disposable source and load it as an archive into an
-        // isolated temp cache under a unique local base ref — this is the
-        // exact archive-import path whose synthesized digest breaks #98.
-        let archive = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
-        assert!(
-            std::process::Command::new("docker")
-                .args(["save", &source, "-o", archive.path().to_str().unwrap()])
-                .status()
-                .unwrap()
-                .success(),
-            "docker save must succeed"
-        );
-        let cache = tempfile::tempdir().unwrap();
-        let local_base_ref = format!("agent-vm-e2e-local:{nonce}");
-        microsandbox_image::load_archive(
-            cache.path(),
-            archive.path(),
-            microsandbox_image::ImageLoadOptions {
-                tags: vec![local_base_ref.clone()],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("load_archive into the temp cache");
-
-        // Read msb's synthesized manifest digest back and create the Docker
-        // base link from the *source* image, mirroring import-image.sh.
-        let reference: microsandbox_image::Reference = local_base_ref.parse().unwrap();
-        let cache_handle = microsandbox_image::GlobalCache::new_async(cache.path())
-            .await
-            .unwrap();
-        let metadata = cache_handle
-            .read_image_metadata_async(&reference)
-            .await
-            .unwrap()
-            .expect("imported base metadata must be present");
-        let digest = metadata.manifest_digest;
-        let link = layer::docker_base_tag(&digest).expect("valid sha256 manifest digest");
-        if docker_tag_exists(&link) {
-            eprintln!("skipping: base link {link} already exists");
-            return;
-        }
-        assert!(
-            std::process::Command::new("docker")
-                .args(["tag", &source, &link])
-                .status()
-                .unwrap()
-                .success(),
-            "docker tag must succeed"
-        );
-        guard.own(&link);
-
-        // A one-step project layer using the normal BASE_IMAGE contract.
-        let project = tempfile::tempdir().unwrap();
-        let step = project.path().join(".agent-vm/layers/10-a");
-        std::fs::create_dir_all(&step).unwrap();
-        std::fs::write(
-            step.join("Dockerfile"),
-            "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nENV MARKER_E2E=present\n",
-        )
-        .unwrap();
-
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let output = ScriptedOutput {
-            log: log.clone(),
-            fault: Fault::None,
-        };
-        let mut notices = LaunchNotices::new(output);
-        let got = resolve_boot_image_with_layer(
-            &tool_layer::ChainRoot::Verbatim(local_base_ref.clone()),
-            &[],
-            &[],
-            project.path(),
-            true,
-            &mut notices,
-            Some(cache.path()),
-        )
-        .await
-        .expect("resolution through an imported base link")
-        .expect("a derived tag");
-
-        // The returned tag must equal a plan computed with the *msb manifest
-        // digest* — pinning the link did not move step 0's hash input.
-        let dirs = layer::resolve_layer_chain(project.path(), &[]).unwrap();
-        let plan = layer::plan_chain(&dirs, project.path(), &digest).unwrap();
-        assert_eq!(got, plan[0].id.tag);
-        assert!(
-            layer::derived_is_cached(cache.path(), &got).await.unwrap(),
-            "the derived image must be materialized in the temp cache"
-        );
-        // `guard` (and the temp cache/archive/project tempdirs) drop here,
-        // removing only the disposable source/link tags this test created.
-        drop(guard);
-    }
-
-    // --- issue #84: the builtin tool-layer compose path, end to end -------
-
-    /// The declared layers of a one-tool config, as `launch` reads them from
-    /// the catalog (before `take_entry`).
-    fn declared_layers_of(body: &str) -> Vec<crate::config::DeclaredLayer> {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("config.toml");
-        std::fs::write(&project, body).unwrap();
-        crate::config::load(&crate::config::ConfigPaths {
-            user: Some(dir.path().join("no-user.toml")),
-            project,
-        })
-        .expect("fixture config parses")
-        .into_launch_catalog()
-        .expect("fixture catalog resolves")
-        .declared_layers()
-    }
-
-    /// Issue-#84 review, Finding 6: the *compose* path —
-    /// `tool_layer::materialize`'s temp build context feeding
-    /// `plan_chain`/`execute_chain` — was exercised by nothing. This runs it
-    /// for real for one builtin layer (`claude`, whose Dockerfile does
-    /// `COPY --chmod=0755 seed-claude-plugins.sh`, so it also covers the
-    /// materialised-0644-plus-Dockerfile-chmod rule) against an imported
-    /// tool-free base, and asserts the result is a genuine composition:
-    ///
-    /// * the boot tag is the plan computed from the same materialised dirs
-    ///   (the tool step was built, not skipped or substituted);
-    /// * the plan's label names the tool and the builtin layer;
-    /// * the composed image is ingested into the msb cache;
-    /// * its `rootfs.diff_ids` **strictly extend** the base's, in order — the
-    ///   same identity CI's `build-image.yml` prefix-asserts for the published
-    ///   template;
-    /// * its `PATH` is a superset of the base's (contract C2 on a real build;
-    ///   the unit test is only a text proxy).
-    ///
-    /// Needs docker/buildx, network for the agent installer, and a **tool-free
-    /// base** in Docker's local store — it carries `agent-vm-install`, which
-    /// the tool layer's Dockerfile calls. Point `AGENT_VM_E2E_BASE_IMAGE` at
-    /// one (`agent-vm-base:dev` from macos-build.md) and run:
-    /// `AGENT_VM_E2E_BASE_IMAGE=agent-vm-base:dev \
-    ///  cargo test -p agent-vm --bin agent-vm -- e2e_builtin_tool_layer --ignored --test-threads=1`
-    #[tokio::test]
-    #[ignore = "needs docker buildx, network, and AGENT_VM_E2E_BASE_IMAGE=<tool-free base>"]
-    async fn e2e_builtin_tool_layer_composes_onto_an_imported_base() {
-        if layer::ensure_docker_buildx().await.is_err() {
-            eprintln!("skipping: `docker buildx` not available on PATH");
-            return;
-        }
-        let parent = match std::env::var("AGENT_VM_E2E_BASE_IMAGE") {
-            Ok(parent) => parent,
-            Err(_) => {
-                eprintln!(
-                    "skipping: set AGENT_VM_E2E_BASE_IMAGE to a tool-free base build (e.g. \
-                     agent-vm-base:dev); a tool layer's Dockerfile calls the base's \
-                     `agent-vm-install`"
-                );
-                return;
-            }
-        };
-        if !docker_tag_exists(&parent) {
-            eprintln!("skipping: base {parent} is not in docker's local image store");
-            return;
-        }
-
-        // A uniquely marked disposable child, so the `docker save`-imported msb
-        // manifest digest — and therefore the Docker base link — is unique per
-        // run. Mirrors `import-image.sh` and the #98 test above.
-        let nonce = e2e_nonce();
-        let source = format!("agent-vm-e2e-base:{nonce}");
-        if docker_tag_exists(&source) {
-            eprintln!("skipping: disposable source tag {source} already exists");
-            return;
-        }
-        let ctx = tempfile::tempdir().unwrap();
-        std::fs::write(
-            ctx.path().join("Dockerfile"),
-            format!("ARG PARENT={parent}\nFROM ${{PARENT}}\nLABEL agent-vm-e2e-nonce={nonce}\n"),
-        )
-        .unwrap();
-        assert!(
-            std::process::Command::new("docker")
-                .args([
-                    "build",
-                    "--build-arg",
-                    &format!("PARENT={parent}"),
-                    "-t",
-                    &source,
-                    ctx.path().to_str().unwrap(),
-                ])
-                .status()
-                .unwrap()
-                .success(),
-            "disposable child build must succeed"
-        );
-        let mut guard = DockerTagGuard::default();
-        guard.own(&source);
-
-        // Import the disposable base into an isolated msb cache, then create
-        // the Docker base link from the docker source image exactly as
-        // `import-image.sh` does.
-        let archive = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
-        assert!(
-            std::process::Command::new("docker")
-                .args(["save", &source, "-o", archive.path().to_str().unwrap()])
-                .status()
-                .unwrap()
-                .success(),
-            "docker save must succeed"
-        );
-        let cache = tempfile::tempdir().unwrap();
-        let local_base_ref = format!("agent-vm-e2e-local:{nonce}");
-        microsandbox_image::load_archive(
-            cache.path(),
-            archive.path(),
-            microsandbox_image::ImageLoadOptions {
-                tags: vec![local_base_ref.clone()],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("load_archive into the temp cache");
-        let reference: microsandbox_image::Reference = local_base_ref.parse().unwrap();
-        let cache_handle = microsandbox_image::GlobalCache::new_async(cache.path())
-            .await
-            .unwrap();
-        let digest = cache_handle
-            .read_image_metadata_async(&reference)
-            .await
-            .unwrap()
-            .expect("imported base metadata must be present")
-            .manifest_digest;
-        let link = layer::docker_base_tag(&digest).expect("valid sha256 manifest digest");
-        if docker_tag_exists(&link) {
-            eprintln!("skipping: base link {link} already exists");
-            return;
-        }
-        assert!(
-            std::process::Command::new("docker")
-                .args(["tag", &source, &link])
-                .status()
-                .unwrap()
-                .success(),
-            "docker tag must succeed"
-        );
-        guard.own(&link);
-
-        // The real compose path: a builtin layer materialised into a temp
-        // build context, fed to the resolver as the tool steps.
-        let declared = declared_layers_of(
-            "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\n\
-             layer = { builtin = \"claude\" }\ncredentials = [\"anthropic\"]\n",
-        );
-        assert_eq!(declared.len(), 1);
-        let (tool_steps, _materialized) = tool_layer::materialize(&declared).expect("materialize");
-        assert_eq!(tool_steps.len(), 1, "one builtin layer, one chain step");
-
-        let project = tempfile::tempdir().unwrap();
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let output = ScriptedOutput {
-            log: log.clone(),
-            fault: Fault::None,
-        };
-        let mut notices = LaunchNotices::new(output);
-        let got = resolve_boot_image_with_layer(
-            &tool_layer::ChainRoot::Base(local_base_ref.clone()),
-            &tool_steps,
-            &[],
-            project.path(),
-            true,
-            &mut notices,
-            Some(cache.path()),
-        )
-        .await
-        .expect("composing a builtin tool layer onto an imported base")
-        .expect("a derived tag");
-
-        let plan = layer::plan_chain(&tool_steps, project.path(), &digest).unwrap();
-        assert_eq!(plan.len(), 1);
-        assert_eq!(
-            got, plan[0].id.tag,
-            "the boot tag must be the plan computed from the materialised tool step"
-        );
-        assert_eq!(plan[0].label, "tool \"claude\" (builtin layer claude)");
-        assert!(
-            layer::derived_is_cached(cache.path(), &got).await.unwrap(),
-            "the composed image must be ingested into the msb cache"
-        );
-
-        // The composed image really extends the base.
-        let composed_ref: microsandbox_image::Reference = got.parse().unwrap();
-        let composed_md = cache_handle
-            .read_image_metadata_async(&composed_ref)
-            .await
-            .unwrap()
-            .expect("composed image metadata must be present");
-        let composed = layer::contract::ImageFacts::from_cached_metadata(&composed_md)
-            .expect("composed image facts");
-        let base = layer::docker_image_facts(&source)
-            .await
-            .unwrap()
-            .expect("base image facts");
-        assert!(
-            composed.diff_ids.len() > base.diff_ids.len(),
-            "the template must add rootfs layers beyond the base: {} vs {}",
-            composed.diff_ids.len(),
-            base.diff_ids.len()
-        );
-        assert_eq!(
-            &composed.diff_ids[..base.diff_ids.len()],
-            &base.diff_ids[..],
-            "the composed image's diff_ids must begin with the base's, in order"
-        );
-
-        // C2 on a real build: the layer's `ENV PATH=<new>:${PATH}` must leave
-        // every base entry reachable.
-        let path_entries = |facts: &layer::contract::ImageFacts| -> Vec<String> {
-            facts
-                .env
-                .iter()
-                .rev()
-                .find_map(|entry| entry.strip_prefix("PATH="))
-                .map(|value| value.split(':').map(str::to_string).collect())
-                .unwrap_or_default()
-        };
-        let base_path = path_entries(&base);
-        let composed_path = path_entries(&composed);
-        for entry in &base_path {
-            assert!(
-                composed_path.contains(entry),
-                "C2: {entry:?} must remain on PATH; got {composed_path:?}"
-            );
-        }
-        assert!(
-            composed_path.iter().any(|e| e == "/opt/agent/.local/bin"),
-            "the claude layer's prefix must be on PATH; got {composed_path:?}"
-        );
-
-        drop(guard);
-    }
-
-    #[test]
-    fn layer_chain_build_question_lists_every_step() {
-        let steps = vec![
-            layer::PlannedStep {
-                position: layer::ChainPosition { index: 0, total: 2 },
-                label: ".agent-vm/layers/10-a".to_string(),
-                tag: "agent-vm-layer:proj-aaa".to_string(),
-                pending: true,
-            },
-            layer::PlannedStep {
-                position: layer::ChainPosition { index: 1, total: 2 },
-                label: ".agent-vm/layers/20-b".to_string(),
-                tag: "agent-vm-layer:proj-bbb".to_string(),
-                pending: true,
-            },
-        ];
-        let question = layer_chain_build_question(&steps);
-        assert!(question.starts_with("Build project tooling layer chain (2 steps)?"));
-        assert!(question.contains("1/2"));
-        assert!(question.contains(".agent-vm/layers/10-a"));
-        assert!(question.contains("agent-vm-layer:proj-aaa"));
-        assert!(question.contains("2/2"));
-        assert!(question.contains(".agent-vm/layers/20-b"));
-        assert!(question.contains("agent-vm-layer:proj-bbb"));
-    }
-
-    #[test]
-    fn layer_chain_question_marks_cached_steps() {
-        let steps = vec![
-            layer::PlannedStep {
-                position: layer::ChainPosition { index: 0, total: 2 },
-                label: ".agent-vm/layers/10-a".to_string(),
-                tag: "agent-vm-layer:proj-aaa".to_string(),
-                pending: false,
-            },
-            layer::PlannedStep {
-                position: layer::ChainPosition { index: 1, total: 2 },
-                label: ".agent-vm/layers/20-b".to_string(),
-                tag: "agent-vm-layer:proj-bbb".to_string(),
-                pending: true,
-            },
-        ];
-        let question = layer_chain_build_question(&steps);
-        let cached_line = question.lines().find(|l| l.contains("10-a")).unwrap();
-        let pending_line = question.lines().find(|l| l.contains("20-b")).unwrap();
-        assert!(cached_line.contains("(cached)"), "{cached_line}");
-        assert!(!pending_line.contains("(cached)"), "{pending_line}");
-    }
-
-    #[test]
-    fn layer_chain_build_question_marks_flag_layers() {
-        let steps = vec![
-            layer::PlannedStep {
-                position: layer::ChainPosition { index: 0, total: 2 },
-                label: ".agent-vm/layers/10-a".to_string(),
-                tag: "agent-vm-layer:proj-aaa".to_string(),
-                pending: true,
-            },
-            layer::PlannedStep {
-                position: layer::ChainPosition { index: 1, total: 2 },
-                label: "--layer examples/layers/chrome-devtools".to_string(),
-                tag: "agent-vm-layer:proj-bbb".to_string(),
-                pending: true,
-            },
-        ];
-        let question = layer_chain_build_question(&steps);
-        let flag_line = question
-            .lines()
-            .find(|l| l.contains("examples/layers/chrome-devtools"))
-            .unwrap();
-        assert!(
-            flag_line.contains("--layer examples/layers/chrome-devtools"),
-            "{flag_line}"
-        );
-        // Columns still align: both label cells are padded to the same width.
-        let project_line = question.lines().find(|l| l.contains("10-a")).unwrap();
-        let project_label_col = project_line.find(".agent-vm").unwrap();
-        let flag_label_col = flag_line.find("--layer").unwrap();
-        assert_eq!(project_label_col, flag_label_col, "{question}");
-        // The tag column must align too — the label-column check above only
-        // proves the padding starts at the same place, not that it's wide
-        // enough to push the *tag* into alignment as well.
-        let project_tag_col = project_line.find("agent-vm-layer:").unwrap();
-        let flag_tag_col = flag_line.find("agent-vm-layer:").unwrap();
-        assert_eq!(project_tag_col, flag_tag_col, "{question}");
-    }
-
-    #[test]
-    fn layer_declined_error_names_the_chain() {
-        let one = vec![layer::PlannedStep {
-            position: layer::ChainPosition { index: 0, total: 1 },
-            label: ".agent-vm/layers/10-a".to_string(),
-            tag: "agent-vm-layer:proj-aaa".to_string(),
-            pending: true,
-        }];
-        assert_eq!(
-            layer_declined_error(&one),
-            "tooling layer agent-vm-layer:proj-aaa not built (declined). \
-             Re-run and confirm, or pass --yes."
-        );
-
-        let two = vec![
-            layer::PlannedStep {
-                position: layer::ChainPosition { index: 0, total: 2 },
-                label: ".agent-vm/layers/10-a".to_string(),
-                tag: "agent-vm-layer:proj-aaa".to_string(),
-                pending: true,
-            },
-            layer::PlannedStep {
-                position: layer::ChainPosition { index: 1, total: 2 },
-                label: ".agent-vm/layers/20-b".to_string(),
-                tag: "agent-vm-layer:proj-bbb".to_string(),
-                pending: true,
-            },
-        ];
-        let msg = layer_declined_error(&two);
-        assert!(msg.contains("2 steps"), "{msg}");
-        assert!(msg.contains("--yes"), "{msg}");
     }
 
     /// Stub [`ExecEventSource`] backed by an mpsc channel: `send` pushes an

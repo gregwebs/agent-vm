@@ -1,7 +1,6 @@
-# DeepSeek Harness (dsh) tool layer. See
-# docs/adr/0003-project-tooling-layers.md for the layer image contract this
-# file satisfies, and images/Dockerfile for the facilities this layer inherits
-# from the base (Node.js 22, npm, jq, the host-CA shim).
+# DeepSeek Harness (dsh) recipe. See images/tools/README.md for the recipe
+# conventions this file follows, and images/Dockerfile for the facilities this
+# recipe inherits from the base (Node.js 22, npm, jq, the host-CA shim).
 #
 # Unlike the codex/claude/opencode installer layers, dsh is installed from a
 # COMMITTED lockfile, not a floating installer — the pi shape. That is
@@ -35,7 +34,7 @@ ARG AGENT_INSTALL_SOFT_FAIL=
 # Dockerfile must never duplicate the pin as a nonempty ARG. The LABEL fallbacks
 # below are generated mirrors of the committed manifest pins (a build cannot run
 # jq inside a LABEL), kept in sync by upgrade-dsh.sh and asserted by the
-# tool_layer.rs guards.
+# image_sources guards.
 ARG AGENT_VERSION_DSH=
 ARG AGENT_VERSION_PNPM=
 
@@ -81,8 +80,7 @@ RUN ln -s /opt/agent-vm/dsh/node_modules/.bin/dsh /usr/local/bin/dsh \
 
 # Build-time gate. Bind-mounted (not COPYed), exactly like the pi layer's
 # install/verify scripts: the script stays out of the shipped image and needs
-# no execute bit, so the 0644-materialisation rule the agent-vm binary applies
-# to embedded sources (src/tool_layer.rs) does not apply to it. It checks both
+# no execute bit. It checks both
 # slots, audits command access as an arbitrary uid, and records `installed`.
 RUN --mount=type=bind,source=contract,target=/tmp/recipe-contract,ro \
     --mount=type=bind,source=verify-dsh.sh,target=/tmp/verify-dsh.sh,ro \

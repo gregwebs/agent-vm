@@ -1,6 +1,6 @@
 # Image composition: implementation handoff
 
-Status: decision-complete handoff, ready for `/breakdown`.
+Status: **Abandoned** — superseded by [#257](https://github.com/gregwebs/agent-vm/issues/257) / [ADR-0035](../adr/0035-consume-user-owned-boot-images.md); kept as history.
 Not implemented. Source map:
 [Map: tool image composition architecture](https://github.com/gregwebs/agent-vm/issues/203).
 This consolidates the handoff for `/breakdown`, not an implementation plan or a

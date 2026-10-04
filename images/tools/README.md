@@ -1,34 +1,31 @@
-# Tool layers
+# Agent tool recipes
 
-One standalone tooling layer per shipped agent CLI. Each directory holds a
-`Dockerfile` that builds `FROM` the tool-free base
+One standalone recipe per shipped agent CLI. Each directory holds a
+`Dockerfile` that builds `FROM` the base
 (`ghcr.io/wirenboard/agent-vm-base:latest`, produced by `images/Dockerfile`)
 and installs **one exact, audited** selection of that agent, together with its
-own copy of the small recipe/install contract. The directories are embedded
-into the `agent-vm` binary at compile time
-(`crates/agent-vm/src/tool_layer.rs`) so a launch whose configured tool set
-differs from the shipped default can compose them locally without a repo
-checkout.
+own copy of the small recipe/install contract. CI builds these recipes into the
+default boot image; the launcher neither embeds nor composes them.
 
-## The layer image contract
+## The image contract
 
-The **normative** contract for tool images is
-[ADR-0031](../../docs/adr/0031-tool-image-contract.md) (the T/S clauses). It
-replaced ADR-0003's retired C1–C8 table. The legacy C1–C4 chain checks still run
-on the ordered-build path in `crates/agent-vm/src/layer/contract.rs` (C5–C8 are
-documented-only there); treat that as the historical implementation, not the
-tool-image contract. The only tool-layer-specific legacy rule worth stating:
-**C2 is satisfied by writing prefixes as `ENV PATH=<new>:${PATH}`**, so a layer
-can never remove a directory the base put there.
+[ADR-0031](../../docs/adr/0031-tool-image-contract.md)'s T/S clauses are the
+design intent for these tool images, but they are **superseded** by
+[ADR-0035](../../docs/adr/0035-consume-user-owned-boot-images.md): the launcher
+no longer checks any image contract at launch — it only consumes the finished
+image. The clauses guide CI's image production; they are not a runtime gate. One
+rule worth stating for maintainers: write prefixes as
+`ENV PATH=<new>:${PATH}`, so a recipe can never remove a directory the base put
+there.
 
 ## Inherited from the base — do not duplicate
 
-A tool layer builds `FROM` `images/Dockerfile` and therefore inherits:
+A tool recipe builds `FROM` `images/Dockerfile` and therefore inherits:
 
 - the **host-CA shim**: the build-time CA (when `images/build.sh` detects a
-  TLS-intercept proxy) is baked into the base rootfs, so every layer inherits
+  TLS-intercept proxy) is baked into the base rootfs, so every recipe inherits
   host trust with no extra build arg. Do **not** thread `CA_SHIM_CACHEBUST`
-  into a tool layer's Dockerfile.
+  into a tool recipe's Dockerfile.
 - the **`/opt/agent` prefix** (`RUN mkdir -p /opt/agent && chmod 755 /opt/agent`)
   and the empty `/opt/agent-vm/seed.d/` hook directory.
 
@@ -69,7 +66,7 @@ the exact default as the `ARG` value and label it. The two lockfile recipes
 committed `package.json` + `package-lock.json` byte-for-byte with no registry
 lookup; their `LABEL`s carry literal fallback mirrors of the committed pins
 (Docker cannot run `jq` inside a `LABEL` and an empty `ARG` cannot expand to the
-pin). `cargo test -p agent-vm --bin agent-vm tool_layer` fails if a fallback
+pin). `cargo test --locked -p agent-vm --test image_sources` fails if a fallback
 lags its manifest.
 
 **The labels are selection, not health.** `org.agent-vm.version.<suffix>`
@@ -104,20 +101,20 @@ for every requested slot plus the reports/T5 — a record alone is never proof.
 
 ## Declaration and cache ordering
 
-The declaration order — and therefore the chain order, the order
-`agent-vm doctor` lists the verbs in, and CI's build order — is
-`dsh, pi, codex, opencode, claude, copilot`, matching
-`crates/agent-vm/src/default-tools.toml`. That file is the single source of
-truth: `config::shipped_tool_layers()` derives the launcher's order from it,
-and `tool_layer::tests::tool_order_matches_the_ci_and_build_script_literals`
-asserts both this directory's build order (`images/build.sh`) and CI's
-(`.github/workflows/build-image.yml`) agree with it — including the chain
-*edges*, so a step left building `FROM` the base digest instead of its
+The declaration order — CI's build order, and the order
+`agent-vm doctor` lists the verbs in — is
+`dsh, pi, codex, opencode, claude, copilot`. Image production is deliberately
+**independent** of the runtime tool catalog: the launcher no longer chooses
+image sources, so `crates/agent-vm/src/default-tools.toml` is **not** an input to
+this order. `image_sources::image_build_order_and_ci_edges_agree` instead
+compares this directory's build order (`images/build.sh`) and CI's
+(`.github/workflows/build-image.yml`) against one literal list — including the
+build *edges*, so a step left building `FROM` the base digest instead of its
 predecessor's cannot slip through.
 
-The order is deliberate and is **not** by size. A change to any layer forces
-every layer stacked above it to rebuild, so the **topmost** layer is re-emitted
-on essentially every build that changes anything, while the **bottom** layer is
+The order is deliberate and is **not** by size. A change to any recipe forces
+every recipe stacked above it to rebuild, so the **topmost** recipe is re-emitted
+on essentially every build that changes anything, while the **bottom** recipe is
 re-emitted only when it itself bumps. The agent that is both largest and least
 frequently changed belongs at the bottom:
 
@@ -155,14 +152,14 @@ Each lockfile script defaults to the package's npm `latest` as the *developer
 convenience* and accepts any `VERSION` that is an exact version or a dist-tag
 (`latest`, `next`, …), which is resolved to an exact pin at the host seam. It
 runs `npm` with `--ignore-scripts` in a scratch directory and checks the same
-invariants as the `cargo test -p agent-vm tool_layer` guards, plus its layer's
+invariants as the `cargo test --locked -p agent-vm --test image_sources` guards, plus its recipe's
 own constraints (listed below). It writes `package.json`, `package-lock.json`
 **and the owning `Dockerfile`'s literal `LABEL` fallback** only if every check
 passes. Build mode never runs these scripts and never resolves a tag:
 `prepare-lock.sh` only accepts exact slots. Run the scripts with `bash`: like
 every file here they are committed without the execute bit. The Dockerfiles
 never copy them, so they never reach an image. Afterwards, run
-`cargo test -p agent-vm tool_layer` and review the diff.
+`cargo test --locked -p agent-vm --test image_sources` and review the diff.
 
 - `pi` regenerates its lock from scratch, which is safe because Pi's shrinkwrap
   fixes every transitive version. It also refills the five sibling hashes
@@ -198,25 +195,16 @@ To run a bumped version before the template is rebuilt:
   `BASE_IMAGE` it is given); it passes no `AGENT_VERSION_*`, so a version change
   must already be committed.
 - **The manual Docker loop** in
-  [macos-build.md](../../macos-build.md#composing-from-a-local-tool-free-base---base-image)
+  [macos-build.md](../../macos-build.md#building-the-template-locally)
   builds from the committed defaults the same way.
-- **The launcher's local compose** (`--base-image`, or a non-default tool set)
-  embeds `images/tools/` at compile time, so a pin bump needs a rebuilt
-  `agent-vm` binary. It passes no `AGENT_VERSION_*`, so installer agents stay
-  frozen at their committed defaults
-  ([ADR-0019](../../docs/adr/0019-tool-free-base-and-per-tool-layers.md) D8).
-  Force composition from the published base and check a pinned agent:
+- **The launcher does not compose or embed these sources.** `images/build.sh`
+  and the manual Docker loop above are the only consumers; a pin bump needs the
+  template rebuilt (and, for the release bundle, republished). To build a custom
+  image on top, see
+  [`examples/layers/README.md`](../../examples/layers/README.md).
 
-  ```bash
-  agent-vm shell --base-image ghcr.io/wirenboard/agent-vm-base:latest -- bash -c 'pi --version'
-  ```
-
-  Use `bash -c`, not `bash -lc`: a login shell resets `PATH` and hides the
-  agent CLIs. The launcher's layer hash covers **every** file in the layer
-  directory, so any edit here — including these upgrade scripts and READMEs —
-  forces a rebuild of that layer and every layer above it the next time a
-  local-compose user launches. CI is unaffected: BuildKit hashes only the files
-  the Dockerfile references.
+  Once you boot a built image, use `bash -c`, not `bash -lc`: a login shell
+  resets `PATH` and hides the agent CLIs.
 
   A soft-degraded image is **not** proof a tool works: an `absent-transport`
   slot ships no command, so the external audit rejects the image.
@@ -383,7 +371,7 @@ under its home, so persisting the tree is what makes an API key stored once in
 the Models UI survive the next launch. That is the config-driven equivalent of
 `pi`'s generic `.pi` link.
 
-The layer also pins `pnpm` in the same lock and links it onto `PATH`, because
+The recipe also pins `pnpm` in the same lock and links it onto `PATH`, because
 `dsh plugin --profile … add …` forwards to pnpm and the base image has none.
 Pinning it there (rather than `npm install -g pnpm`) gives it the same
 integrity-checked install as the rest of the tree.

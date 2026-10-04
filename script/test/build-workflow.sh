@@ -579,10 +579,8 @@ check_import() {
     assert_file_contains "$fixture/calls.log" "plutil extract digest input="
     # Docker tags the *source* image (which, for a renamed import, differs
     # from the msb destination) as the base link. The nested config digest
-    # must never be used.
-    # `agent-vm-base` must match `layer::BASE_REPO` in
-    # `crates/agent-vm/src/layer.rs`; the Rust test
-    # `base_repo_constant_matches_the_import_script_literal` guards that tie.
+    # must never be used. The base link is no longer consumed by the launcher;
+    # #260 removes it.
     assert_file_contains "$fixture/calls.log" "docker tag $expected_image agent-vm-base:$manifest_hex"
     assert_not_contains "$calls" "agent-vm-base:$config_hex"
     assert_contains "$output" "agent-vm-base:$manifest_hex"

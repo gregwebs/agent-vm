@@ -11,7 +11,7 @@
 #   GOLANGCI_LINT_ARM64_SHA256   required on arm64
 #   GO_TOOLS_BIN                 default /opt/go-tools/bin
 #
-# The install is world-readable (contract C7): the guest may run as an
+# The install is world-readable: the guest may run as an
 # arbitrary non-root uid.
 set -euo pipefail
 

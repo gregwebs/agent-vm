@@ -527,7 +527,7 @@ fn sentinel_secrets_never_reach_stdout_or_stderr() {
 }
 
 #[test]
-fn doctor_never_executes_the_command_or_creates_layer_or_persist_paths() {
+fn doctor_never_executes_the_command_or_creates_persist_paths() {
     let h = Harness::new();
     let marker = h.project_root.join("EXECUTED");
     let script = h.project_root.join("recorder.sh");
@@ -543,7 +543,7 @@ fn doctor_never_executes_the_command_or_creates_layer_or_persist_paths() {
         std::fs::set_permissions(&script, perms).unwrap();
     }
     h.write_user(&format!(
-        "[[tools]]\nname = \"evil\"\ncommand = \"{}\"\nlayer = {{ path = \"layers/never\" }}\npersist = [\"cache/never\"]\n",
+        "[[tools]]\nname = \"evil\"\ncommand = \"{}\"\npersist = [\"cache/never\"]\n",
         script.display()
     ));
 
@@ -556,10 +556,6 @@ fn doctor_never_executes_the_command_or_creates_layer_or_persist_paths() {
     let out = h.run_doctor();
     assert_success(&out);
     assert!(!marker.exists(), "doctor executed the declared command");
-    assert!(
-        !h.project_root.join("layers/never").exists(),
-        "doctor created a layer path"
-    );
     assert_eq!(
         snapshot_tree(h.state.path()),
         state_before,

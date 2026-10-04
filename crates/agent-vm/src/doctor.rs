@@ -5,16 +5,13 @@
 //! ## Ordinary run
 //!
 //! With no flag, doctor prints the active `MSB_HOME`/schema, the host
-//! credential sources, and the resolved tool configuration. The **verb list**
-//! this section renders is authoritative — it is the same [`crate::cli`]
-//! catalog `--help` shows. The *layer chain* is rendered from each tool's
-//! declared `layer` as written: `doctor` never resolves an anchor, checks a
-//! path's existence, or builds the chain — [`crate::tool_layer`] owns that at
-//! launch (#84). Argument *values* are still hidden (only their count is
-//! shown, so a secret in `args` is never echoed). A broken config still exits
-//! nonzero, but its failure is reported *inside* the config section so it
-//! never suppresses the sections above it — and never blocks recovery
-//! (below).
+//! credential sources, the resolved tool configuration, and the selected boot
+//! image. The **verb list** this section renders is authoritative — it is the
+//! same [`crate::cli`] catalog `--help` shows. It shows argument *counts*
+//! rather than values (a user may have mistakenly put a secret in `args`). A
+//! broken config still exits nonzero, but its failure is reported *inside* the
+//! config section so it never suppresses the sections above it — and never
+//! blocks recovery (below).
 //!
 //! ## `--reset-msb-db`
 //!
@@ -45,9 +42,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use clap::Args as ClapArgs;
 
+use crate::boot_image::{self, BootImage};
 use crate::config::{
-    ConfigConflict, ConfigReport, LaunchCatalog, TierReport, TierStatus, Tool, ToolLayer,
-    ToolOrigin,
+    ConfigConflict, ConfigReport, ConfiguredImage, ConfiguredImages, LaunchCatalog, TierReport,
+    TierStatus, Tool, ToolOrigin,
 };
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::credential_resolver;
@@ -97,15 +95,28 @@ pub fn run(args: Args) -> Result<()> {
         // credential report and the launch view are both launch-aware (#178),
         // so they read the same catalog the tool-configuration section
         // renders, and a launch-verb list cannot diverge from `--help`.
-        let (config_section, catalog_failure, catalog) = match config {
-            Ok(report) => describe_config(report),
+        let (config_section, catalog_failure, catalog, images) = match config {
+            Ok(report) => {
+                // Capture the readable image tiers before `describe_config`
+                // consumes the report (a catalog-build failure must not erase
+                // a readable image choice).
+                let images = report.images().clone();
+                let (section, failure, catalog) = describe_config(report);
+                (section, failure, catalog, Some(images))
+            }
             Err(error) => (
                 format!("==> tool configuration\nerror: {error:#}"),
                 load_failure,
                 None,
+                None,
             ),
         };
         let launch = gather_launch_view(catalog.as_ref());
+        // `doctor` has no `--image`; it reads the env through the same
+        // empty-is-unset rule the launch uses, so the two cannot disagree, while
+        // still telling an unset variable apart from one that is present but not
+        // valid Unicode (issue #259, Spec S1).
+        let env_slot = boot_image::doctor_env_override();
 
         let db_exists = msb_home.join("db").join("msb.db").exists();
         println!(
@@ -128,11 +139,19 @@ pub fn run(args: Args) -> Result<()> {
             println!("{}", describe_launch_view(&launch));
         }
         println!();
+        println!("{}", describe_boot_image(images.as_ref(), &env_slot));
+        println!();
         println!("==> agent-vm doctor: available operations");
         println!("      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next");
         println!("                       agent-vm shell/run recreates it at the bundled schema");
         if let Some(error) = catalog_failure {
             return Err(error);
+        }
+        if matches!(env_slot, boot_image::EnvOverride::Invalid) {
+            return Err(anyhow!(
+                "AGENT_VM_IMAGE_TAG is set but is not valid Unicode; doctor cannot report a \
+                 selected image"
+            ));
         }
         return Ok(());
     }
@@ -588,11 +607,9 @@ fn describe_launch_view(view: &LaunchView) -> String {
 /// Pure over its input so the wording is unit-tested without a real
 /// filesystem, mirroring [`describe_home`]/[`describe_credentials`].
 ///
-/// The verb list is authoritative; the *layer chain* is rendered from each
-/// tool's declared `layer` as written — `doctor` never resolves an anchor,
-/// checks existence, or builds it ([`crate::tool_layer`] does, at launch, per
-/// #84) — and it shows argument *counts* rather than values (a user may have
-/// mistakenly put a secret in `args`). Untrusted names/paths are escaped so a
+/// The verb list is authoritative; it shows argument *counts* rather than
+/// values (a user may have mistakenly put a secret in `args`) and never
+/// resolves a path or builds an image. Untrusted names/paths are escaped so a
 /// config file cannot inject terminal controls.
 fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Option<LaunchCatalog>) {
     // Everything that needs a borrow is rendered before `report` is consumed
@@ -603,11 +620,9 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
         describe_tier(report.project()),
     );
     let resolved_label = if report.uses_defaults() {
-        // The verb order is the catalog order, which is exactly the tool-layer
-        // chain order #84 composes (`LaunchCatalog::declared_layers`).
-        "resolved: built-in defaults; launch-verb / tool-layer order\n"
+        "resolved: built-in defaults; launch-verb order\n"
     } else {
-        "resolved: declared tools; launch-verb / tool-layer order\n"
+        "resolved: declared tools; launch-verb order\n"
     };
     let conflicts = render_conflicts(report.conflicts());
 
@@ -683,14 +698,78 @@ fn describe_tier(tier: &TierReport) -> String {
     }
 }
 
-fn describe_tool(tool: &Tool, provisioned: ProviderSet) -> String {
-    let layer = match tool.layer() {
-        None => "none".to_string(),
-        Some(ToolLayer::Builtin(builtin)) => format!("builtin:{}", builtin.as_str()),
-        Some(ToolLayer::Path(path)) => {
-            format!("path:{}", crate::config::escape_path(path.as_path()))
+fn describe_boot_image(images: Option<&ConfiguredImages>, env: &boot_image::EnvOverride) -> String {
+    // Read-only diagnostics: this uses the selection owner (whose default
+    // acquisition may read D9's env / later #261's state) so it cannot disagree
+    // with a launch. It is not a purity claim.
+    let mut out = String::from("==> boot image\n");
+    let env_override = match env {
+        boot_image::EnvOverride::Present(override_) => {
+            out.push_str(&format!(
+                "AGENT_VM_IMAGE_TAG: {}\n",
+                crate::config::escape_str(override_.reference().as_str())
+            ));
+            Some(override_.clone())
+        }
+        boot_image::EnvOverride::Unset => {
+            out.push_str("AGENT_VM_IMAGE_TAG: <unset>\n");
+            None
+        }
+        boot_image::EnvOverride::Invalid => {
+            // Never print a fictional selection from an override doctor could
+            // not read: say the value is present and unreadable, and stop. The
+            // caller exits nonzero after this section.
+            out.push_str(
+                "AGENT_VM_IMAGE_TAG: <present but not valid Unicode; refusing to select>\n",
+            );
+            return out;
         }
     };
+    let Some(images) = images else {
+        // The config could not be read, so the tiers are unknown.
+        out.push_str("unknown (configuration could not be read)");
+        return out;
+    };
+    out.push_str(&format!(
+        "user:    {}\n",
+        describe_configured_image(images.user())
+    ));
+    let project = describe_configured_image(images.project());
+    if images.user().is_some() && images.project().is_some() {
+        out.push_str(&format!(
+            "project: {project}  (overridden by the user image)\n"
+        ));
+    } else {
+        out.push_str(&format!("project: {project}\n"));
+    }
+    out.push_str(&format!(
+        "default: {}\n",
+        crate::config::escape_str(boot_image::default_image().as_str())
+    ));
+    // Doctor accepts no `--image`, so the selected row excludes the command
+    // line: it is the env slot, then config, then default.
+    let selected: BootImage = boot_image::select(env_override, images);
+    out.push_str(&format!(
+        "selected (without --image): {} (from {})",
+        crate::config::escape_str(selected.reference().as_str()),
+        selected.source().describe()
+    ));
+    out
+}
+
+/// `ghcr.io/owner/name:tag [/path/to/config.toml]` or `none`.
+fn describe_configured_image(image: Option<&ConfiguredImage>) -> String {
+    match image {
+        None => "none".to_string(),
+        Some(image) => format!(
+            "{} [{}]",
+            crate::config::escape_str(image.reference().as_str()),
+            crate::config::escape_path(image.file())
+        ),
+    }
+}
+
+fn describe_tool(tool: &Tool, provisioned: ProviderSet) -> String {
     // Both columns render through the same helper, in `CredentialProvider::ALL`
     // order. `credentials` is stored in *declaration* order
     // (`validate_credentials` — a plain map/collect), so rendering it directly
@@ -721,7 +800,7 @@ fn describe_tool(tool: &Tool, provisioned: ProviderSet) -> String {
         format!("; env={env_count}")
     };
     format!(
-        "{} -> \"{}\"; args={}; layer={layer}; credentials={credentials}; \
+        "{} -> \"{}\"; args={}; credentials={credentials}; \
          provisions={provisions}; persist={}; source={source}{interactive_shell}{env}",
         crate::config::escape_str(tool.name()),
         crate::config::escape_str(tool.command()),
@@ -1222,7 +1301,7 @@ mod tests {
 
         assert!(
             text.contains(
-                "dsh -> \"dsh\"; args=1; layer=builtin:dsh; credentials=none; provisions=none; persist=1; source=built-in"
+                "dsh -> \"dsh\"; args=1; credentials=none; provisions=none; persist=1; source=built-in"
             ),
             "{text}"
         );
@@ -1234,20 +1313,20 @@ mod tests {
         // provisions=anthropic` (ADR-0017's `provisions=` column).
         assert!(
             text.contains(
-                "pi -> \"pi\"; args=0; layer=builtin:pi; credentials=none; provisions=anthropic; persist=0; source=built-in"
+                "pi -> \"pi\"; args=0; credentials=none; provisions=anthropic; persist=0; source=built-in"
             ),
             "{text}"
         );
 
         assert!(
             text.contains(
-                "shell -> \"bash\"; args=2; layer=none; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=0; source=built-in; interactive_shell=true; env=1"
+                "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=0; source=built-in; interactive_shell=true; env=1"
             ),
             "{text}"
         );
         assert!(
             text.contains(
-                "codex -> \"codex\"; args=0; layer=builtin:codex; credentials=openai; provisions=openai; persist=0; source=built-in; env=1"
+                "codex -> \"codex\"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1"
             ),
             "{text}"
         );
@@ -1256,7 +1335,7 @@ mod tests {
         // no `; env=0` suffix. V7 (D6/D7).
         assert!(
             !text.contains(
-                "claude -> \"claude\"; args=1; layer=builtin:claude; credentials=anthropic; provisions=anthropic; persist=0; source=built-in; env"
+                "claude -> \"claude\"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in; env"
             ),
             "{text}"
         );
@@ -1283,7 +1362,7 @@ mod tests {
         let (text, _, _) = describe_config(report);
         assert!(
             text.contains(
-                "vault -> \"vault\"; args=0; layer=none; credentials=none; provisions=none; persist=0; source=user:"
+                "vault -> \"vault\"; args=0; credentials=none; provisions=none; persist=0; source=user:"
             ),
             "{text}"
         );
@@ -1362,18 +1441,17 @@ mod tests {
         );
     }
 
-    /// A *resolved row* is not only paths: `command` and `layer.path` accept
-    /// every byte except NUL, so they too can carry terminal controls. Both
-    /// are escaped the same way; this pins the renderer that a hostile project
-    /// config cannot inject an ANSI escape or split the report with a newline.
+    /// A *resolved row* is not only paths: `command` accepts every byte except
+    /// NUL, so it too can carry terminal controls and is escaped, so a hostile
+    /// project config cannot inject an ANSI escape or split the report with a
+    /// newline.
     #[test]
-    fn describe_config_escapes_control_bytes_in_a_command_and_layer_path() {
+    fn describe_config_escapes_control_bytes_in_a_command() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
         std::fs::write(
             &user,
-            "[[tools]]\nname = \"t\"\ncommand = \"evil\\u001b[31m\\nred\"\n\
-             layer = { path = \"layers/\\u001b[32m\\ngrn\" }\n",
+            "[[tools]]\nname = \"t\"\ncommand = \"evil\\u001b[31m\\nred\"\n",
         )
         .unwrap();
         let report = config_report(Some(&user), &dir.path().join("absent.toml"));
@@ -1385,7 +1463,6 @@ mod tests {
             "raw newline from the command leaked: {text:?}"
         );
         assert!(text.contains("evil\\x1b[31m\\x0ared"), "{text}");
-        assert!(text.contains("layers/\\x1b[32m\\x0agrn"), "{text}");
     }
 
     // -- #178: the launch-aware credential view ----------------------------

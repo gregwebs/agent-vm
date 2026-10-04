@@ -92,8 +92,11 @@ Full flag, subcommand, networking, and troubleshooting reference:
 - [PLAN.md](PLAN.md) — what is left to do for v1.
 - [Credential shielding specification](docs/specs/credential-shielding.md) —
   agreed user contract and Docker-shaped YAML/CLI design (not yet implemented).
-- [Image composition handoff](docs/specs/image-composition.md) — consolidated
-  decisions and acceptance criteria (draft; unresolved decisions, not implemented).
+- [ADR-0035: Consume user-owned boot images](docs/adr/0035-consume-user-owned-boot-images.md) —
+  why the launcher selects and acquires an image instead of building one; see
+  [Selecting the boot image](USAGE.md#selecting-the-boot-image). The superseded
+  [image composition handoff](docs/specs/image-composition.md) is kept as
+  abandoned history.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
   the way they do.
 - [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) —

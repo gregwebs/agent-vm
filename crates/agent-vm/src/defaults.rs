@@ -4,17 +4,12 @@
 //! or change other distribution wiring
 //! without grepping for string literals across subcommands.
 
-/// Default OCI image reference. This is the **composed default guest
-/// template**: the tool-free base plus the six built-in tool layers,
-/// chained in declaration order by CI (`images/Dockerfile` +
-/// `images/tools/`). agent-vm boots it *verbatim* — no local build, no
-/// Docker — when the resolved tool set's declared layer sequence equals
-/// the shipped default (`tool_layer::chain_root`'s fast path).
-///
-/// Overridable per-subcommand via `--image` or the `AGENT_VM_IMAGE_TAG`
-/// env var; `--image` boots an image verbatim and skips tool-layer
-/// composition. Pulled fresh on `agent-vm setup` / `agent-vm pull`; uses
-/// the cached copy otherwise.
+/// The **default boot image**: the maintained, finished image agent-vm boots
+/// verbatim when no `--image`, `AGENT_VM_IMAGE_TAG`, user config or project
+/// config `image` selects another. It is built by CI
+/// (`images/Dockerfile` + `images/tools/`); the launcher never composes or
+/// builds it. #261 replaces this fixed fallback with a retained, seeded
+/// selection behind [`crate::boot_image::default_image`].
 ///
 /// Tags published by CI:
 /// - `:latest` — moving tag, rebuilt hourly to pick up agent
@@ -23,17 +18,7 @@
 ///   reproducible setups.
 pub const DEFAULT_IMAGE_REF: &str = "ghcr.io/wirenboard/agent-vm-template:latest";
 
-/// The tool-free base every locally composed tool chain builds `FROM`.
-/// Overridable with `--base-image` / `AGENT_VM_BASE_IMAGE`; passing it
-/// always forces local composition, even for the shipped default tool set.
-///
-/// NOTE: a *published registry repository*, unrelated to `layer::BASE_REPO`,
-/// which is the Docker-local link namespace `agent-vm-base:<manifest-hex>`
-/// minted by `script/build/import-image.sh`. The names coincide by intent
-/// but never collide: a link tag is always 64 hex characters.
-pub const DEFAULT_BASE_IMAGE_REF: &str = "ghcr.io/wirenboard/agent-vm-base:latest";
-
-/// Marker written last by the Chrome DevTools tooling layer after its checks pass.
+/// Marker written last by the Chrome DevTools image after its checks pass.
 pub const CHROME_MCP_CAPABILITY_PATH: &str = "/etc/agent-vm-capabilities/chrome-devtools-mcp";
 
 /// Path of the in-guest Chrome DevTools MCP wrapper an image supplies as an

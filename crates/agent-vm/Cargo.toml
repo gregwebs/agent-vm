@@ -122,22 +122,16 @@ signal-hook = { version = "0.3", default-features = false }
 ipnetwork = "0.21"
 rustix = { version = "1.1", features = ["fs"] }
 getrandom = "0.4"
-# The tooling-layer build (layer.rs) needs a private, RAII-cleaned temp path
-# for the OCI archive `docker buildx build --output type=oci` writes before
-# `load_archive` ingests it — a runtime need, not just a test fixture, so
-# this is promoted out of dev-dependencies (see the crate's other runtime
-# deps for the pattern; `tempfile::Builder::tempfile_in` is used to keep the
-# file under the msb cache dir rather than the system tmp, per AGENTS.md).
+# A private, RAII-cleaned temp path. `oauth_refresh.rs`'s `isolated_work_dir`
+# uses `tempfile::Builder::tempdir_in` to keep an isolated OAuth work directory
+# under the host secret dir rather than the system tmp (per AGENTS.md); the
+# refresh lock uses its own separate persistent lock path.
 tempfile = "3"
-# Embeds `images/tools/` into the binary so a non-default tool set can be
-# composed by an npm-installed agent-vm, which has no repo checkout to read
-# the layer sources from (issue #84). `include_dir!` (rather than a
-# hand-written `include_str!` table) keeps "someone added a file to
-# images/tools/" from needing a matching Rust edit; build.rs registers the
-# directory as a rebuild input and
-# tool_layer::tests::embedded_sources_match_the_on_disk_tree catches the
-# added-file drift. See src/tool_layer.rs.
-include_dir = "0.7"
+# The SDK's own text classifier, used by `boot_image::ImageRef::from_config` to
+# refuse a config-file `image` that the runtime would treat as a host rootfs
+# bind or disk image (`ImageSource::into_rootfs_source`). Already in the graph
+# transitively via the SDK, so this only names it; it adds no compilation.
+microsandbox-utils = { path = "../../vendor/microsandbox/crates/utils" }
 
 # The host OS credential store behind `agent-vm secret` (#160). The vendored
 # SDK already depends on this exact version with these exact per-target
