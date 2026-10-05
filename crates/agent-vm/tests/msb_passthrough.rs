@@ -354,3 +354,40 @@ fn msb_ls_reaches_child_when_db_is_behind_or_in_sync() {
     let record = h.read_record();
     assert!(record.contains("ARG1=ls"), "record:\n{record}");
 }
+
+#[test]
+fn finished_archive_load_is_verbatim_and_docker_free_even_on_child_failure() {
+    let harness = Harness::new();
+    let poison_log = harness.home.path().join("docker-calls");
+    for tool in ["docker", "buildx"] {
+        fake_msb::write_executable(
+            &harness.home.path().join(tool),
+            &format!(
+                "#!/bin/sh\nprintf invoked >> '{}'\nexit 91\n",
+                poison_log.display()
+            ),
+        );
+    }
+    let archive = harness.home.path().join("finished image.tar");
+    std::fs::write(&archive, b"finished archive").unwrap();
+    for expected in [0, 23] {
+        let status = expected.to_string();
+        let path = harness.home.path().to_str().unwrap();
+        let output = harness.run_msb(
+            &[
+                "image",
+                "load",
+                "--input",
+                archive.to_str().unwrap(),
+                "--tag",
+                "app:dev",
+            ],
+            &[("FAKE_MSB_EXIT_CODE", &status), ("PATH", path)],
+        );
+        assert_eq!(output.status.code(), Some(expected));
+        let record = harness.read_record();
+        assert!(record.contains(&format!("ARG4={}\n", archive.display())));
+        assert!(record.contains("ARG5=--tag\nARG6=app:dev\n"));
+        assert!(!poison_log.exists());
+    }
+}

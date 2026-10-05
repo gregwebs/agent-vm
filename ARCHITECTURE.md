@@ -38,6 +38,7 @@ crates/agent-vm/src/
 ├── mount.rs                # --mount grammar and volume wiring
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   └── default_selection.rs#   the retained digest record: read-only load, write-once adopt
+├── image_build.rs          # explicit user Dockerfile export + cache-only native import
 ├── msb_install.rs          # locate + version-verify the bundled msb; MSB_HOME
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
 ├── doctor.rs               # operator diagnostics and db recovery
@@ -623,8 +624,20 @@ failure.
 separate developer workflow; it is not called by `agent-vm setup`. Docker's CLI
 stays the right interface for it — that keeps volume, port-forwarding, and
 `docker inspect` details out of the Rust binary, and means rebuilding the image
-does not recompile the binary or vice versa. Apple Silicon developers can skip
-the registry entirely with `script/build/import-image.sh`.
+does not recompile the binary or vice versa. Users can explicitly build/import through `image_build::run`:
+
+```text
+main prologue → resolved local backend cache → private completed OCI export
+  → native materialization → atomic single-reference metadata publication
+```
+
+The anonymous host-platform export has one result reference, supplied only to
+native `load_archive`. A failed exporter never imports, even if it emitted
+complete bytes. Cache-only import avoids a fallible database persist after
+publication: launch later persists cached metadata normally, so `msb image ls`
+need not show the build immediately. No selection/default writes or fallible
+postcommit checks follow publication. See [the canonical user contract](USAGE.md#explicit-builds-and-archive-import)
+for driver limitations, archive workflows and host-build trust.
 
 The Rust side does own the **verify** step (boot the pulled image, run the
 agents' `--version`), because that is exactly the SDK call the launcher makes —

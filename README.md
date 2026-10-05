@@ -82,10 +82,19 @@ shows which config files were found and what they resolved to.
 Full flag, subcommand, networking, and troubleshooting reference:
 **[USAGE.md](USAGE.md)**.
 
+Build and select your own finished image; launches never run Docker:
+
+```sh
+agent-vm build --tag my-image:dev --builder native-oci .
+agent-vm shell --image my-image:dev -- my-program
+```
+
+See [Explicit builds and archive import](USAGE.md#explicit-builds-and-archive-import)
+for builder prerequisites and host-build trust.
+
 ## Documentation
 
-- [USAGE.md](USAGE.md) — running agent-vm: subcommands, flags, tooling
-  layers, networking, credentials, troubleshooting.
+- [USAGE.md](USAGE.md) — running agent-vm: subcommands, flags, explicit image builds, networking, credentials, troubleshooting.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — building from source, the release
   version-bump, and repo conventions.
 - [macos-build.md](macos-build.md) — the Apple Silicon source-build guide.

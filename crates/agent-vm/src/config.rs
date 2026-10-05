@@ -117,6 +117,7 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     "clipboard",
     "doctor",
     "secret",
+    "build",
     "_intercept-hook",
     // clap synthesizes a `help` subcommand unconditionally. A second one
     // panics in debug builds and silently shadows clap's in release.

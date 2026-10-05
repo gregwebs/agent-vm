@@ -16,6 +16,7 @@ mod github_graphql;
 mod guest_home;
 mod guest_paths;
 mod host_paths;
+mod image_build;
 mod image_capabilities;
 mod image_check;
 mod image_contract;
@@ -152,6 +153,12 @@ fn main() -> Result<()> {
                 catalog,
                 images,
             } => pull::run(args, catalog, images).await,
+            // Explicit user-owned build + import (#260). Reads no catalog and
+            // no image selection; `args` is self-contained.
+            Dispatch::Builtin {
+                cmd: Cmd::Build(args),
+                ..
+            } => exit_with(image_build::run(args).await?),
             Dispatch::Builtin {
                 cmd: Cmd::Clipboard(args),
                 ..

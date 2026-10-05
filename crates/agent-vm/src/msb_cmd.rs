@@ -74,7 +74,10 @@ fn run_with_path(msb_path: Option<OsString>, args: &[String]) -> Result<i32> {
 
 /// Map a child `ExitStatus` to a process exit code. Normal exit → its code;
 /// signal death → 128 + signo (shell convention) so it is never 0.
-fn exit_code_from_status(status: ExitStatus) -> i32 {
+///
+/// Shared with `image_build`'s Docker child so both subprocesses report a
+/// signal death the same way.
+pub(crate) fn exit_code_from_status(status: ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }

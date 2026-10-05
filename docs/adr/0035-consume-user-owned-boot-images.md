@@ -134,9 +134,7 @@ source-integrity gates in `images/` and `.github/workflows/`. Those stay.
   validating the production multiarch recommendation against real artifact
   consumption. The interim value is Linux/amd64-only, which is safe precisely
   because a failed acquisition retains nothing.
-- Follow-ups: [#260](https://github.com/gregwebs/agent-vm/issues/260) (explicit
-  build/import CLI and the base-link import tag),
-  [#262](https://github.com/gregwebs/agent-vm/issues/262) (explicit upgrade /
+- Follow-ups: [#262](https://github.com/gregwebs/agent-vm/issues/262) (explicit upgrade /
   replacement of a working retained default),
   [#265](https://github.com/gregwebs/agent-vm/issues/265) (production
   recommendation), #263–#264 (image repo, release).
@@ -156,3 +154,23 @@ source-integrity gates in `images/` and `.github/workflows/`. Those stay.
   tell a user what must work. The configuration declares the required commands,
   so the declared set — not which tier named the image — is the honest scope,
   and a declared command is fatal on every image.
+
+## Accepted explicit build/import decision (#260)
+
+`agent-vm build` explicitly runs a user-owned Dockerfile with bounded native
+buildx arguments, exports one anonymous host-Linux image with attestations off,
+then imports the completed archive under one mutable result reference. Docker
+owns semantics and caching; launch still consumes finished images only.
+The ambient SDK backend supplies the cache, including persisted redirects.
+Native materialization precedes atomic reference publication; no fallible
+catalog persistence or validation follows that commit. First launch normally
+persists cached metadata into the catalog. Build never selects/adopts a default
+or writes tool configuration. The obsolete standalone importer/base-link tag is
+removed, without deleting existing user cache or Docker data.
+
+OCI driver support and daemon-only parent visibility are native limitations,
+not automatic parent transport/push/fallback mechanisms. Finished Docker-save
+and OCI archives retain the existing `msb image load --input` workflow.
+See [USAGE](../../USAGE.md#explicit-builds-and-archive-import) for the canonical
+option surface and trust boundary. Docker, async ingestion and I/O are not
+formally proved by the small result-reference acceptance kernel.

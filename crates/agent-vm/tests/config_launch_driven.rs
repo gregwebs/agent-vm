@@ -4508,13 +4508,14 @@ fn doctor_tool_order(text: &str) -> Vec<String> {
 /// the fixed built-ins. Command entries start with exactly two spaces;
 /// wrapped description lines are indented further.
 fn help_tool_order(text: &str) -> Vec<String> {
-    const BUILTINS: [&str; 7] = [
+    const BUILTINS: [&str; 8] = [
         "setup",
         "pull",
         "msb",
         "clipboard",
         "doctor",
         "secret",
+        "build",
         "help",
     ];
     let mut out = Vec::new();

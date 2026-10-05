@@ -4,10 +4,9 @@
 # this repo's Rust code inside the microVM (there is no launcher-side layering,
 # #259):
 #
-#   docker buildx build --load \
+#   agent-vm build --builder native-oci \
 #     --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
-#     -t agent-vm-rust-dev:dev examples/layers/rust-dev
-#   ./script/build/import-image.sh agent-vm-rust-dev:dev
+#     --tag agent-vm-rust-dev:dev examples/layers/rust-dev
 #   agent-vm claude --image agent-vm-rust-dev:dev
 #
 # It provides the toolchain the repo pins (rust-toolchain.toml) with clippy and

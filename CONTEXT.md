@@ -412,21 +412,13 @@ A pinned Pi extension the image installs as a real npm project root under
 guest state. Invisible to `pi list` / `pi update`. See
 [ADR-0023](docs/adr/0023-image-owned-pi-extension-packages.md).
 
-## Base link
-
-The Docker-local name `agent-vm-base:<manifest-digest-hex>` for an msb-cached
-base image, created by `script/build/import-image.sh` at import time. The
-launcher no longer consumes it;
-[#260](https://github.com/gregwebs/agent-vm/issues/260) removes the import-time
-tagging.
-
 ## Retired terms
 
 These named a system the launcher no longer has; they are kept here so older
 notes and ADRs still resolve. See
 [ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md).
 
-**Layer**, **Composition root**, **Base selection**, **Composed default
+**Base link** (the retired Docker-local import tag), **Layer**, **Composition root**, **Base selection**, **Composed default
 image**, **Parent**, **Layer image**, **Current tag**, **Stitching**,
 **Composed tool image**, **Tool image contract**, **Stitch check**, **Rebased
 composition**, **Layer DAG**, **Derived image**, **Project image handle**,

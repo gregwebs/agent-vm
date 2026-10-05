@@ -35,6 +35,7 @@ bundled build.
 <tool>                              launch a configured tool in a per-project sandbox
                                     (the verbs come from your tool configuration;
                                     run `agent-vm --help` for the exact list)
+build --tag REF [OPTIONS] [CONTEXT]  explicitly build + import a user Dockerfile
 pull                                refresh the cached image
 setup                               pull base image + verify boot
 doctor                              report host credentials + microsandbox state
@@ -220,19 +221,82 @@ deliberate move-aside above is the recovery.
 
 ### Customizing the image
 
-Build your own image with ordinary Docker `FROM` the default boot image (or any
-image satisfying the [boot image contract](#boot-image-contract)), then import
-and select it:
+Build user-owned software with an ordinary Dockerfile, then explicitly select it.
+Directory names never activate composition; see [`examples/layers/`](examples/layers/).
 
-```sh
-docker buildx build --platform linux/arm64 --load \
-  --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
-  -t my-image:dev .
-./script/build/import-image.sh my-image:dev        # today; #260 adds a CLI
-agent-vm shell --image my-image:dev                # or: image = "my-image:dev"
+#### Explicit builds and archive import
+
+```text
+Dockerfile/context → Docker buildx cache → completed anonymous OCI archive
+                                          ↓ native cache import
+                                      result reference
+                                          ↓ shell --image REF
+                                       guest execution
 ```
 
-See [`examples/layers/`](examples/layers/) for example Dockerfiles.
+```sh
+agent-vm build --tag my-image:dev --builder native-oci .
+agent-vm shell --image my-image:dev -- my-program
+```
+
+The bounded option surface is:
+
+```text
+agent-vm build --tag REF [-f|--file DOCKERFILE]
+  [--build-arg KEY[=VALUE]]... [--target STAGE] [--builder NAME]
+  [--pull] [--no-cache] [--progress MODE] [CONTEXT]
+```
+
+`--tag`/`-t` is required: a mutable OCI reference, not a digest or local path.
+Bare names use native `latest` semantics. Context defaults to `.`; file/context
+paths remain relative to the caller, and build arguments are verbatim argv
+values (including spaces, empty values and bare keys). Docker owns `FROM`,
+multistage semantics and caching. No `BASE_IMAGE` is injected; supplying that
+build argument is an ordinary user Dockerfile choice. Platform is always host
+Linux architecture, with one anonymous OCI output and attestations disabled.
+Unsupported buildx flags, including `--platform`, `--output`, `--load` and
+`--push`, are usage errors; use an external build for other controls.
+
+An OCI-capable builder is required. Classic Docker image-store drivers may
+reject OCI export. An isolated `docker-container` builder can export OCI but
+may not see daemon-only local `FROM` tags. Select your builder explicitly;
+agent-vm never creates/changes one, transports parents, pushes or retries a
+failed build. For daemon-only workflows, save the completed image and import
+**only after save succeeds**:
+
+```sh
+docker image save --output image.tar SOURCE &&
+  agent-vm msb image load --input image.tar --tag my-image:dev
+```
+
+A finished archive can be imported without Docker:
+
+```sh
+agent-vm msb image load --input image.tar --tag my-image:dev
+agent-vm shell --image my-image:dev -- my-program
+```
+
+Build imports into the same resolved native cache launch reads, including a
+persisted shared redirect or `MSB_CONFIG_PATH`. The result is not tagged in the
+Docker store and may not appear in `msb image ls` until first launch persists
+cached metadata. Export must succeed before native ingestion; failed export or
+single-image ingestion preserves the old result reference. Native blobs can
+remain after failed ingestion. Concurrent updates retain native semantics.
+Build never reads image selection/defaults, writes configuration or adopts a
+default, boots a guest, installs runtime tools or triggers automatic launch
+builds. Successful import is **not** proof of the boot image contract;
+`shell`/`setup` diagnose unusable software.
+
+Allow space for the completed staged archive under private `MSB_HOME/tmp`,
+native import staging, materialized content and Docker's own builder cache.
+Ordinary return paths clean only this invocation's staging; interruption may
+leave staging, but never imports before exporter success.
+
+Host builds are **not credential-shielded guest execution**: trust the
+Dockerfile/context/builder. Docker inherits ordinary host environment,
+credentials and stdin; agent-vm does not invoke runtime credential capture or
+provisioning. Avoid sensitive CLI values: ordinary clap usage errors can echo
+rejected values. Fixed parser reason strings are not redaction.
 
 ## Boot image contract
 
@@ -305,8 +369,7 @@ COPY --chmod=0755 my-program /usr/local/bin/my-program
 Build and launch on a macOS checkout:
 
 ```sh
-docker buildx build --platform linux/arm64 --load -t my-image:dev .
-./script/build/import-image.sh my-image:dev
+agent-vm build --tag my-image:dev --builder native-oci .
 agent-vm shell --image my-image:dev
 ```
 
@@ -615,7 +678,7 @@ interactive_shell = false            # optional; join trailing args into `-c`
 - `name` — required; a single command-name token: nonempty, no
   whitespace/control characters, no `/` (a name is not a path), not an
   all-dots spelling (`.`/`..`), no leading `-`, and not one of the reserved
-  subcommands `setup`, `pull`, `msb`, `clipboard`, `doctor`,
+  subcommands `build`, `setup`, `pull`, `msb`, `clipboard`, `doctor`, `secret`,
   `_intercept-hook`, `help`. Names are case-sensitive. Naming a tool `claude`
   is normal — that is the point.
 - `command` — required, nonempty, NUL-free. The guest command name; it is

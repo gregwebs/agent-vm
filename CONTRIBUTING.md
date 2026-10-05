@@ -57,10 +57,11 @@ Source builds use the vendored recipe's `vendor/microsandbox/build/msb`
 artifact; `agent-vm setup` pulls and verifies the selected registry image but
 does not build `msb`.
 
-On macOS, `./script/build/import-image.sh` loads an existing local
-`linux/arm64` Docker image directly into agent-vm's private cache without a
-registry. See [the macOS guide](macos-build.md) for the exact workflow.
-`images/build.sh` remains the separate registry-backed build-and-push option.
+Use packaged `agent-vm build --tag REF --builder NAME CONTEXT` for explicit
+Dockerfile builds, or `agent-vm msb image load --input archive.tar --tag REF`
+for completed Docker-save/OCI archives. Both initialize the same cache as
+launch; no prewarming builtin or source importer is needed. `images/build.sh`
+remains the separate registry-backed production workflow.
 
 The pinned Rust toolchain (`rust-toolchain.toml`) is copied by hand into a
 few other files (Cargo's MSRV, CI, the release workflow, the macOS build
@@ -157,21 +158,47 @@ the checks described below and exits non-zero on any failure.
 
 Prerequisites: an Apple Silicon Mac with colima or Docker Desktop running, plus
 the locally built `linux/arm64` **template** image (`agent-vm-template:dev`)
-from [Local image builds](macos-build.md). `script/build/import-image.sh` loads
-it into agent-vm's own cache; it needs the *release* bundle's `msb` at
-`target/macos/bin/msb`, so run `./script/build/macos.sh` once even if you
-otherwise use the `--dev` loop. The custom-image group needs only Docker, the
-release `msb` and a launcher binary — no dev images.
-
-Use your **normal** state dir. Do not point `AGENT_VM_STATE_DIR` at a freshly
-created directory for no reason — an already-populated dir is what makes the
-import and the boot agree (see *The shared-cache trap* below):
+from [Local image builds](macos-build.md). Build signed release and dev bundles
+with `./script/build/macos.sh` and `./script/build/macos.sh --dev`.
+The custom-image group needs Docker/buildx with OCI-capable docker-container
+builder support, both validated launchers, and network for pinned fixtures:
 
 ```bash
-export AGENT_VM_STATE_DIR="$HOME/.local/state/agent-vm"   # your usual state root
-./script/build/import-image.sh agent-vm-template:dev
-./script/test/e2e.sh
+./script/test/e2e.sh custom-image
+./script/test/e2e.sh all     # uses caller HOME/state; requires the maintained dev template
 ```
+
+The custom-image group uses fresh private HOME/state and a separate owned
+shared cache, never a cache-prewarming workaround. Plain `all` also runs dev-image
+checks in the caller's HOME and normal state; it does not isolate those checks.
+To isolate `all`, supply a fresh HOME/state and disable ambient cache sharing,
+while preserving the caller's Docker configuration (resolve relative overrides
+against the caller's working directory first):
+
+```bash
+E2E_ROOT="$(mktemp -d /tmp/av-e2e.XXXXXX)"
+mkdir "$E2E_ROOT/home"
+env -u MSB_CONFIG_PATH HOME="$E2E_ROOT/home" AGENT_VM_STATE_DIR="$E2E_ROOT/state" \
+  AGENT_VM_E2E_STATE_DIR="$E2E_ROOT/state" AGENT_VM_SHARE_MSB_CACHE=0 \
+  DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}" \
+  BUILDX_CONFIG="${BUILDX_CONFIG:-${DOCKER_CONFIG:-$HOME/.docker}/buildx}" \
+  XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
+  ./script/test/e2e.sh all
+```
+
+Keep that test-owned root for failure diagnosis; remove it only when no test VM
+is running. The preserved XDG path is operator configuration, not private state.
+The custom-image harness captures absolute effective
+`DOCKER_CONFIG`, `BUILDX_CONFIG`, `XDG_CONFIG_HOME` and the real Docker executable
+before isolation, preserving them for every build/store/save and owned-builder
+cleanup. Custom-image launch probes remove operator Docker connection/config
+overrides and use fresh test-owned XDG config plus calibrated failure shims. It never restores
+operator HOME or copies credentials into agent-vm state. The #260 checks cover
+real explicit-build stdout shape/integrity, actual shell/root/persistent guest
+execution, Docker-free finished archive imports, shared/persisted redirects,
+retained selection and working-reference preservation/replacement.
+`tests/image_build.rs` exercises the actual native importer under fake Docker
+without a VM; native e2e is manual, never a substitute for those CLI tests.
 
 Set `AGENT_VM_E2E_LEGACY_IMAGE` (an image that supplies
 `/opt/agent-vm/seed-claude-plugins.sh`) and/or `AGENT_VM_E2E_UPDATE_CHECK=1` to
@@ -221,29 +248,8 @@ opt-in: a missing prerequisite is a failure, not a skip. The suite must run on a
 dedicated serial native host with no concurrent launches so process/catalog
 absence is meaningful. The custom group always runs against a fresh private
 cache under the default msb config sources: it neutralizes an inherited
-`AGENT_VM_SHARE_MSB_CACHE`, `AGENT_VM_MSB_CACHE_DIR` and `MSB_CONFIG_PATH`, so it
-does not exercise shared-cache mode. It makes no released-default or lineage
+`AGENT_VM_SHARE_MSB_CACHE`, `AGENT_VM_MSB_CACHE_DIR` and `MSB_CONFIG_PATH`, while #260 uses a separate fresh shared cache. It makes no released-default or lineage
 claim.
-
-#### The shared-cache trap
-
-A fresh `AGENT_VM_STATE_DIR` with `AGENT_VM_SHARE_MSB_CACHE` enabled is the one
-state that does **not** work out of the box, and the failure is confusing, so it
-is worth naming. `agent-vm`'s boot rewrites `<state>/msb-home/config.json` to
-point `paths.cache` at the shared `~/.microsandbox/cache`, but
-`script/build/import-image.sh` runs `msb image load` directly and never applies
-that redirect. So on a fresh dir the imported blobs land in the private
-`<state>/msb-home/cache`, the first boot then repoints `paths.cache` at the
-shared cache, and msb finds the image in its database — `msb image ls` lists it —
-but not its layer blobs there. It falls through to a registry pull of a local
-tag and fails with `Not authorized … index.docker.io/.../agent-vm-template`.
-An existing state dir is consistent because its `config.json` was written before
-the import; `script/test/e2e.sh` also seeds a fresh dir by running a non-booting
-builtin that still initialises the cache (`agent-vm msb --version`) first, so it
-works either way. (Not `doctor`, which is deliberately observational and writes
-nothing.) A follow-up should
-teach `import-image.sh` the same shared-cache redirect so the raw recipe above
-also works from scratch.
 
 #### `bash -c`, not `bash -lc`, for in-guest commands
 

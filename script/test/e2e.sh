@@ -45,6 +45,8 @@
 
 set -euo pipefail
 
+CALLER_CWD="$PWD"
+OPERATOR_HOME="$HOME"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -97,6 +99,20 @@ AGENT_VM_RELEASE_BIN="${AGENT_VM_RELEASE_BIN:-$REPO_ROOT/target/macos/bin/agent-
 TEMPLATE_IMAGE="${AGENT_VM_E2E_TEMPLATE_IMAGE:-agent-vm-template:dev}"
 STATE_DIR="${AGENT_VM_E2E_STATE_DIR:-${AGENT_VM_STATE_DIR:-$HOME/.local/state/agent-vm}}"
 
+# Save native connection/plugin configuration before disposable HOME isolation.
+absolute_override() {
+  case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$CALLER_CWD" "$1" ;; esac
+}
+REAL_DOCKER="$(command -v docker)" || die "docker missing"
+REAL_DOCKER="$(absolute_override "$REAL_DOCKER")"
+BUILD_DOCKER_CONFIG="$(absolute_override "${DOCKER_CONFIG:-$OPERATOR_HOME/.docker}")"
+BUILD_BUILDX_CONFIG="$(absolute_override "${BUILDX_CONFIG:-$BUILD_DOCKER_CONFIG/buildx}")"
+BUILD_XDG_CONFIG="$(absolute_override "${XDG_CONFIG_HOME:-$OPERATOR_HOME/.config}")"
+BUILD_ENV=(env DOCKER_CONFIG="$BUILD_DOCKER_CONFIG" BUILDX_CONFIG="$BUILD_BUILDX_CONFIG" XDG_CONFIG_HOME="$BUILD_XDG_CONFIG")
+OFFLINE_ENV=(env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH -u DOCKER_API_VERSION -u DOCKER_CONFIG -u BUILDX_CONFIG -u BUILDX_BUILDER)
+docker() { "${BUILD_ENV[@]}" "$REAL_DOCKER" "$@"; }
+OWNED_BUILDER=""
+
 # ----------------------------------------------------------- preconditions --
 
 [[ -x "$AGENT_VM" ]] || die "launcher not found at $AGENT_VM; build it with
@@ -105,12 +121,6 @@ or point AGENT_VM_BIN at one."
 
 command -v docker >/dev/null 2>&1 || die "docker is required but not on PATH"
 docker info >/dev/null 2>&1 || die "the docker daemon is unreachable; start colima or Docker Desktop"
-
-# `script/build/import-image.sh` hardcodes the release bundle's msb. The --dev
-# bundle alone cannot import images, so say so up front rather than half-way in.
-[[ -x "$REPO_ROOT/target/macos/bin/msb" ]] || die "script/build/import-image.sh
-needs the release bundle's msb at target/macos/bin/msb. Run ./script/build/macos.sh
-(the --dev bundle does not provide it)."
 
 if [[ "$GROUP" == all ]]; then
   docker image inspect "$TEMPLATE_IMAGE" >/dev/null 2>&1 ||
@@ -132,9 +142,14 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/agent-vm-e2e.XXXXXX")"
 # to this run's own $WORK.
 cleanup_work() {
   local status=$?
+  if [ -n "$OWNED_BUILDER" ]; then
+    if ! docker buildx rm "$OWNED_BUILDER"; then
+      [ "$status" -ne 0 ] || status=1
+    fi
+  fi
   if [ "$status" -ne 0 ]; then
     echo "e2e: preserving $WORK for failure evidence (exit $status)" >&2
-    return 0
+    exit "$status"
   fi
   rm -rf "$WORK"
 }
@@ -151,16 +166,7 @@ RUN_ID="$(printf '%s' "${WORK##*.}" | tr '[:upper:]' '[:lower:]')"
 if [[ "$GROUP" == all ]]; then
   mkdir -p "$STATE_DIR/msb-home"
 
-  # The cache-config trap (agent-vm #84 verification, CONTRIBUTING.md): with
-  # AGENT_VM_SHARE_MSB_CACHE enabled, agent-vm's boot rewrites msb-home/config.json
-  # to redirect paths.cache at the shared ~/.microsandbox/cache, but
-  # import-image.sh runs `msb image load` directly and never applies that redirect.
-  # Initialising through a non-Launch builtin first writes the same config.json the
-  # boot will use, so import and boot agree.
-  if [[ ! -f "$STATE_DIR/msb-home/config.json" ]]; then
-    echo "==> Initializing $STATE_DIR/msb-home (so import and boot share one cache)"
-    AGENT_VM_STATE_DIR="$STATE_DIR" "$AGENT_VM" msb --version >/dev/null 2>&1 || true
-  fi
+
 fi
 
 # A fresh, short, isolated state root for every custom-image boot. Never the
@@ -224,18 +230,13 @@ assert_custom_cache_isolated() {
 }
 
 mkdir -p "$CUSTOM_STATE/msb-home" "$CUSTOM_HOME"
-"${CUSTOM_ENV[@]}" "$AGENT_VM" msb --version >/dev/null 2>&1 ||
-  die "could not initialize the custom-image state root at $CUSTOM_STATE"
-assert_custom_cache_isolated "after init" ||
-  die "the custom msb-home is not isolated (see above)"
-
 # ------------------------------------------------------------- host helpers --
 
 # agent-vm with the image env var dropped, so a default-config check really
 # resolves the default rather than an inherited AGENT_VM_IMAGE_TAG.
 avm() {
-  env -u AGENT_VM_IMAGE_TAG \
-    AGENT_VM_STATE_DIR="$STATE_DIR" "$AGENT_VM" "$@"
+  "${OFFLINE_ENV[@]}" env -u AGENT_VM_IMAGE_TAG \
+    XDG_CONFIG_HOME="$WORK/offline-config" AGENT_VM_STATE_DIR="$STATE_DIR" "$AGENT_VM" "$@"
 }
 
 # agent-vm against the isolated custom state root (only ever used off the shim).
@@ -246,10 +247,13 @@ avm_custom_state() {
 import_image() {
   local source="$1" dest="${2:-$1}" state="${3:-$STATE_DIR}"
   echo "==> Importing $source as $dest"
+  local archive
+  archive="$(mktemp "$WORK/docker-save.XXXXXX")" || return 1
+  docker image save --output "$archive" "$source" || return 1
   if [ "$state" = "$CUSTOM_STATE" ]; then
-    "${CUSTOM_ENV[@]}" "$REPO_ROOT/script/build/import-image.sh" "$source" "$dest" >/dev/null
+    "${CUSTOM_ENV[@]}" "$AGENT_VM" msb image load --input "$archive" --tag "$dest" >/dev/null
   else
-    AGENT_VM_STATE_DIR="$state" "$REPO_ROOT/script/build/import-image.sh" "$source" "$dest" >/dev/null
+    AGENT_VM_STATE_DIR="$state" "$AGENT_VM" msb image load --input "$archive" --tag "$dest" >/dev/null
   fi
 }
 
@@ -461,7 +465,7 @@ SHIM
   : >"$log" || return 1
   for tool in docker buildx; do
     status=0
-    PATH="$dir:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" "$tool" wiring-probe >/dev/null 2>&1 ||
+    env PATH="$dir:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" "$tool" wiring-probe >/dev/null 2>&1 ||
       status=$?
     if [ "$status" -ne 97 ]; then
       echo "    FAIL: the $tool decoy did not exit 97 (got $status); the zero-builder evidence is void"
@@ -878,8 +882,8 @@ capture_custom_launch() {
   local name="$1" proj="$2"
   shift 2
   observe_launch "$name" "$proj" "$WORK/$name.out" -- \
-    "${CUSTOM_ENV[@]}" \
-    PATH="$SHIM_DIR:/usr/bin:/bin" \
+    "${CUSTOM_ENV[@]}" "${OFFLINE_ENV[@]}" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
     HOME="$CUSTOM_HOME" \
     HOST_SHIM_LOG="$HOST_SHIM_LOG" \
     "$AGENT_VM" "$@"
@@ -893,8 +897,8 @@ capture_custom_attach() {
   shift 2
   rm -f "$pty" "$log" || return 1
   observe_launch "$name" "$proj" "$log" -- \
-    "${CUSTOM_ENV[@]}" \
-    PATH="$SHIM_DIR:/usr/bin:/bin" \
+    "${CUSTOM_ENV[@]}" "${OFFLINE_ENV[@]}" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
     HOME="$CUSTOM_HOME" \
     HOST_SHIM_LOG="$HOST_SHIM_LOG" \
     /usr/bin/script -q "$pty" "$AGENT_VM" "$@"
@@ -1285,8 +1289,8 @@ check_selected_image_zero_docker() {
   make_builder_shims "$shim" "$log" || return 1
 
   local out
-  out="$(cd "$proj" && env -u AGENT_VM_IMAGE_TAG \
-    PATH="$shim:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" AGENT_VM_STATE_DIR="$STATE_DIR" \
+  out="$(cd "$proj" && "${OFFLINE_ENV[@]}" env -u AGENT_VM_IMAGE_TAG \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$shim:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" AGENT_VM_STATE_DIR="$STATE_DIR" \
     "$AGENT_VM" shell --no-git --image "$TEMPLATE_IMAGE" -- bash -c 'true' 2>&1)" || {
     echo "$out" | tail -20
     return 1
@@ -1307,8 +1311,8 @@ check_former_layer_dir_is_inert() {
   make_builder_shims "$shim" "$log" || return 1
 
   local out
-  out="$(cd "$proj" && env -u AGENT_VM_IMAGE_TAG \
-    PATH="$shim:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" AGENT_VM_STATE_DIR="$STATE_DIR" \
+  out="$(cd "$proj" && "${OFFLINE_ENV[@]}" env -u AGENT_VM_IMAGE_TAG \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$shim:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" AGENT_VM_STATE_DIR="$STATE_DIR" \
     "$AGENT_VM" shell --no-git --image "$TEMPLATE_IMAGE" -- bash -c 'true' 2>&1)" || {
     echo "$out" | tail -20
     return 1
@@ -2403,8 +2407,8 @@ EOF
 
   if [ "$result" -eq 0 ]; then
     observe_launch "$name" "$proj" "$WORK/$name.out" -- \
-      "${CUSTOM_ENV[@]}" \
-      PATH="$SHIM_DIR:/usr/bin:/bin" \
+      "${CUSTOM_ENV[@]}" "${OFFLINE_ENV[@]}" \
+      XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
       HOME="$CUSTOM_HOME" \
       HOST_SHIM_LOG="$HOST_SHIM_LOG" \
       AGENT_VM_DEBUG_CONFIG=1 \
@@ -2456,8 +2460,8 @@ name = "absent-258"
 command = "not-in-this-image-258"
 EOF
   observe_launch "$name" "$proj" "$WORK/$name.out" -- \
-    "${CUSTOM_ENV[@]}" \
-    PATH="$SHIM_DIR:/usr/bin:/bin" \
+    "${CUSTOM_ENV[@]}" "${OFFLINE_ENV[@]}" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
     HOME="$CUSTOM_HOME" \
     HOST_SHIM_LOG="$HOST_SHIM_LOG" \
     "$AGENT_VM" setup || result=1
@@ -2482,8 +2486,8 @@ name = "noexec-258"
 command = "noexec-258"
 EOF
   observe_launch "$name" "$proj" "$WORK/$name.out" -- \
-    "${CUSTOM_ENV[@]}" \
-    PATH="$SHIM_DIR:/usr/bin:/bin" \
+    "${CUSTOM_ENV[@]}" "${OFFLINE_ENV[@]}" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
     HOME="$CUSTOM_HOME" \
     HOST_SHIM_LOG="$HOST_SHIM_LOG" \
     "$AGENT_VM" setup || result=1
@@ -2653,8 +2657,8 @@ retained_launch() {
   local name="$1" proj="$2"
   shift 2
   observe_launch "$name" "$proj" "$WORK/$name.out" -- \
-    "${LAUNCH_ENV[@]}" \
-    PATH="$SHIM_DIR:/usr/bin:/bin" \
+    "${LAUNCH_ENV[@]}" "${OFFLINE_ENV[@]}" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
     HOST_SHIM_LOG="$HOST_SHIM_LOG" \
     "$AGENT_VM_RETAINED_BIN" "$@"
 }
@@ -2960,6 +2964,172 @@ if [[ "$GROUP" == all ]]; then
   run_optional "supplied-named-seed" AGENT_VM_E2E_LEGACY_IMAGE check_legacy_seed
   run_optional "update-check-probes-selected" AGENT_VM_E2E_UPDATE_CHECK check_update_check
 fi
+
+# #260 uses a separate short HOME/state, never the #258 fixture store.
+setup_explicit_builder() {
+  BUILDER="${AGENT_VM_E2E_BUILDER:-agent-vm-e2e-260-$RUN_ID}"
+  mkdir -p "$WORK/build-bin" "$WORK/offline-config" || return 1
+  cp "$REPO_ROOT/script/test/fixtures/build-archive-tee.sh" "$WORK/build-bin/docker" || return 1
+  chmod 755 "$WORK/build-bin/docker" || return 1
+  printf '#!/bin/bash\nprintf calibration-260\nexit 23\n' > "$WORK/calibration-docker"
+  chmod 755 "$WORK/calibration-docker"
+  local status=0
+  REAL_DOCKER="$WORK/calibration-docker" BUILD_CAPTURE="$WORK/calibration.tar" \
+    "$WORK/build-bin/docker" buildx build > "$WORK/calibration.out" || status=$?
+  [ "$status" = 23 ] && [ "$(cat "$WORK/calibration.out")" = calibration-260 ] || return 1
+  cmp "$WORK/calibration.out" "$WORK/calibration.tar" || return 1
+  [ ! -e "$WORK/calibration.tar.error" ] || return 1
+  if [ -z "${AGENT_VM_E2E_BUILDER:-}" ]; then
+    docker buildx create --name "$BUILDER" --driver docker-container || return 1
+    OWNED_BUILDER="$BUILDER"
+  fi
+  "${BUILD_ENV[@]}" HOME="$WORK/bh" "$REAL_DOCKER" buildx version || return 1
+  local inspection
+  inspection="$("${BUILD_ENV[@]}" HOME="$WORK/bh" "$REAL_DOCKER" buildx inspect "$BUILDER" --bootstrap)" || return 1
+  grep -q 'Driver:.*docker-container' <<< "$inspection" || return 1
+}
+
+explicit_build() {
+  local target="$2" capture="$WORK/$1.oci.tar"
+  (cd "$BUILD_PROJECT" && "${BUILD_ENV[@]}" \
+    env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u MSB_CONFIG_PATH \
+    HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
+    AGENT_VM_SHARE_MSB_CACHE="$BUILD_SHARE" AGENT_VM_MSB_CACHE_DIR="$BUILD_CACHE" \
+    REAL_DOCKER="$REAL_DOCKER" BUILD_CAPTURE="$capture" PATH="$WORK/build-bin:$PATH" \
+    "$AGENT_VM" build --tag "$BUILD_REF" --builder "$BUILDER" \
+    --file "$FIXTURE_DIR/Dockerfile" --target "$target" "$FIXTURE_DIR") || return 1
+  [ ! -e "$capture.error" ] || return 1
+  python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" "$capture" > "$capture.report.json" || return 1
+  [ ! -e "$BUILD_HOME/.config/agent-vm/default-image.json" ] || return 1
+  if docker image inspect "$BUILD_REF" >/dev/null 2>&1; then return 1; fi
+}
+
+explicit_offline() {
+  "${OFFLINE_ENV[@]}" env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u MSB_CONFIG_PATH \
+    HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
+    AGENT_VM_SHARE_MSB_CACHE="$BUILD_SHARE" AGENT_VM_MSB_CACHE_DIR="$BUILD_CACHE" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" "$AGENT_VM" "$@"
+}
+
+explicit_boot() {
+  local name="$1" stamp="$2"
+  shift 2
+  observe_launch "$name" "$BUILD_PROJECT" "$WORK/$name.out" -- \
+    "${OFFLINE_ENV[@]}" env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u MSB_CONFIG_PATH \
+    HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
+    AGENT_VM_SHARE_MSB_CACHE="$BUILD_SHARE" AGENT_VM_MSB_CACHE_DIR="$BUILD_CACHE" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" "$AGENT_VM" "$@" || return 1
+  require_launch_ok "$name" || return 1
+  local out
+  out="$(launch_output "$name")" || return 1
+  assert_eq "$name program" hello-258=ok "$(grep '^hello-258=ok$' <<< "$out")" || return 1
+  assert_eq "$name stamp" "stamp=$stamp" "$(grep '^stamp=' <<< "$out")" || return 1
+  assert_no_host_calls || return 1
+}
+
+explicit_project() {
+  mkdir -p "$BUILD_PROJECT/.agent-vm" "$BUILD_HOME" || return 1
+  cat > "$BUILD_PROJECT/.agent-vm/config.toml" <<'CONFIG'
+[[tools]]
+name = "shell"
+command = "bash"
+tools = []
+credentials = []
+interactive_shell = true
+persist = [".hello-258.state"]
+CONFIG
+}
+
+custom_explicit_build_workflow() {
+  setup_explicit_builder || return 1
+  BUILD_HOME="$WORK/bh" BUILD_STATE="$WORK/bs" BUILD_PROJECT="$WORK/bp"
+  BUILD_SHARE=0 BUILD_CACHE="$WORK/unused-cache"
+  BUILD_REF="agent-vm-e2e-260-$RUN_ID:dev"
+  explicit_project || return 1
+  local source_before
+  source_before="$(shasum -a 256 "$FIXTURE_DIR"/*)" || return 1
+  explicit_build build260 marker-free || return 1
+  [ "$source_before" = "$(shasum -a 256 "$FIXTURE_DIR"/*)" ] || return 1
+  python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" --controls "$WORK/build260.oci.tar" || return 1
+  explicit_boot build260-first absent shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
+  local out
+  out="$(launch_output build260-first)" || return 1
+  assert_eq uid "uid=$(id -u)" "$(grep '^uid=' <<< "$out")" || return 1
+  assert_eq gid "gid=$(id -g)" "$(grep '^gid=' <<< "$out")" || return 1
+  assert_eq home "home=$BUILD_HOME" "$(grep '^home=' <<< "$out")" || return 1
+  explicit_boot build260-root absent shell --no-git --root --image "$BUILD_REF" -- hello-258 || return 1
+  out="$(launch_output build260-root)" || return 1
+  assert_eq root uid=0 "$(grep '^uid=' <<< "$out")" || return 1
+  explicit_boot build260-write absent shell --no-git --image "$BUILD_REF" -- hello-258 write sentinel260 || return 1
+  explicit_boot build260-read absent shell --no-git --image "$BUILD_REF" -- hello-258 read || return 1
+  out="$(launch_output build260-read)" || return 1
+  for field in declared plain project direct; do
+    assert_eq "persist $field" "$field=sentinel260" "$(grep "^$field=" <<< "$out")" || return 1
+  done
+  local format
+  for format in docker oci; do
+    explicit_offline msb image save "$BUILD_REF" --format "$format" --output "$WORK/saved260.$format.tar" || return 1
+  done
+  local original_home="$BUILD_HOME" original_state="$BUILD_STATE" original_project="$BUILD_PROJECT"
+  for format in docker oci; do
+    BUILD_HOME="$WORK/bh-$format" BUILD_STATE="$WORK/bs-$format" BUILD_PROJECT="$WORK/bp-$format"
+    explicit_project || return 1
+    explicit_offline msb image load --input "$WORK/saved260.$format.tar" --tag "$BUILD_REF" || return 1
+    explicit_boot "build260-import-$format" absent shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
+  done
+  BUILD_HOME="$WORK/bh-sh" BUILD_STATE="$WORK/bs-sh" BUILD_PROJECT="$WORK/bp-sh"
+  BUILD_SHARE=1 BUILD_CACHE="$WORK/shared260"
+  explicit_project || return 1
+  explicit_build build260-shared marker-free || return 1
+  [ -d "$BUILD_CACHE/layers" ] || return 1
+  [ ! -d "$BUILD_STATE/msb-home/cache/layers" ] || return 1
+  explicit_boot build260-shared absent shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
+  BUILD_SHARE=0
+  explicit_boot build260-shared-persisted absent shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
+  BUILD_HOME="$original_home" BUILD_STATE="$original_state" BUILD_PROJECT="$original_project"
+  BUILD_CACHE="$WORK/unused-cache"
+  # Native archive save can reconstruct transport: derive the pin AFTER reimport.
+  explicit_offline msb image load --input "$WORK/saved260.oci.tar" --tag "$BUILD_REF" || return 1
+  local digest pin record
+  digest="$(explicit_offline msb image inspect --format json "$BUILD_REF" | jq -er '.digest')" || return 1
+  pin="${BUILD_REF%:*}@$digest"
+  explicit_offline msb image load --input "$WORK/saved260.oci.tar" --tag "$pin" || return 1
+  record="$BUILD_HOME/.config/agent-vm/default-image.json"
+  mkdir -p "${record%/*}" || return 1
+  jq -n --arg image "$pin" '{version:1,image:$image}' > "$record" || return 1
+  explicit_boot build260-default absent shell --no-git -- hello-258 || return 1
+  cp "$record" "$WORK/record260.before" || return 1
+  cp "$BUILD_PROJECT/.agent-vm/config.toml" "$WORK/config260.before" || return 1
+  [ ! -e "$BUILD_STATE/msb-home/config.json" ] || return 1
+  if (cd "$BUILD_PROJECT" && "${BUILD_ENV[@]}" env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u MSB_CONFIG_PATH \
+      HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
+      AGENT_VM_SHARE_MSB_CACHE="$BUILD_SHARE" AGENT_VM_MSB_CACHE_DIR="$BUILD_CACHE" \
+      "$AGENT_VM" build --tag "$BUILD_REF" --builder "$BUILDER" --target nonexistent260 "$FIXTURE_DIR"); then return 1; fi
+  printf broken > "$WORK/broken260.tar"
+  if explicit_offline msb image load --input "$WORK/broken260.tar" --tag "$BUILD_REF"; then return 1; fi
+  explicit_boot build260-failure-result absent shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
+  explicit_boot build260-failure-default absent shell --no-git -- hello-258 || return 1
+  cmp "$record" "$WORK/record260.before" || return 1
+  cmp "$BUILD_PROJECT/.agent-vm/config.toml" "$WORK/config260.before" || return 1
+  [ ! -e "$BUILD_STATE/msb-home/config.json" ] || return 1
+  # Success must replace the mutable result without adopting the replacement.
+  (cd "$BUILD_PROJECT" && "${BUILD_ENV[@]}" env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u MSB_CONFIG_PATH \
+      HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
+      AGENT_VM_SHARE_MSB_CACHE="$BUILD_SHARE" AGENT_VM_MSB_CACHE_DIR="$BUILD_CACHE" \
+    REAL_DOCKER="$REAL_DOCKER" BUILD_CAPTURE="$WORK/rebuild260.oci.tar" PATH="$WORK/build-bin:$PATH" \
+    "$AGENT_VM" build --tag "$BUILD_REF" --builder "$BUILDER" --target stamp-present "$FIXTURE_DIR") || return 1
+  [ ! -e "$WORK/rebuild260.oci.tar.error" ] || return 1
+  python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" "$WORK/rebuild260.oci.tar" > "$WORK/rebuild260.report.json" || return 1
+  explicit_boot build260-replaced present shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
+  explicit_boot build260-retained absent shell --no-git -- hello-258 || return 1
+  cmp "$record" "$WORK/record260.before" || return 1
+  cmp "$BUILD_PROJECT/.agent-vm/config.toml" "$WORK/config260.before" || return 1
+  [ ! -e "$BUILD_STATE/msb-home/config.json" ] || return 1
+}
+
+run_check "explicit-build-archive-workflow" custom_explicit_build_workflow
 
 prepare_custom_fixtures || die "could not build/import the custom-image fixtures"
 run_check "custom-image-fixtures-imported" check_custom_fixtures_imported

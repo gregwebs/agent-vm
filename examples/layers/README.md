@@ -3,8 +3,8 @@
 These directories are worked examples of building a **custom boot image** with
 ordinary Docker. Each is a `Dockerfile` that starts `FROM ${BASE_IMAGE}` and
 adds tools the default image does not carry — compilers, cross-toolchains,
-Chromium, and so on. agent-vm does not build or compose them; you build one with
-`docker build`, import it, and select it. See
+Chromium, and so on. The explicit `agent-vm build` operation builds and imports one; launches never
+build or compose these directories. Select the finished result separately. See
 [Selecting the boot image](../../USAGE.md#selecting-the-boot-image) and
 [ADR-0035](../../docs/adr/0035-consume-user-owned-boot-images.md).
 
@@ -17,10 +17,9 @@ Build an example on top of the default boot image (or any image satisfying the
 [boot image contract](../../USAGE.md#boot-image-contract)):
 
 ```sh
-docker buildx build --platform linux/arm64 --load \
+agent-vm build --builder native-oci \
   --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
-  -t my-image:dev examples/layers/rust-dev
-./script/build/import-image.sh my-image:dev        # today; #260 adds a CLI
+  --tag my-image:dev examples/layers/rust-dev
 agent-vm shell --image my-image:dev                # or: image = "my-image:dev"
 ```
 
@@ -63,10 +62,9 @@ Apple Silicon note below).
 Build it on top of the default boot image and select it:
 
 ```sh
-docker buildx build --platform linux/arm64 --load \
+agent-vm build --builder native-oci \
   --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
-  -t agent-vm-rust-dev:dev examples/layers/rust-dev
-./script/build/import-image.sh agent-vm-rust-dev:dev
+  --tag agent-vm-rust-dev:dev examples/layers/rust-dev
 agent-vm claude --image agent-vm-rust-dev:dev
 ```
 
@@ -134,10 +132,9 @@ installs, under the world-readable `/opt`:
 Build it on top of the default boot image and select it:
 
 ```sh
-docker buildx build --platform linux/arm64 --load \
+agent-vm build --builder native-oci \
   --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
-  -t agent-vm-go-dev:dev examples/layers/go-dev
-./script/build/import-image.sh agent-vm-go-dev:dev
+  --tag agent-vm-go-dev:dev examples/layers/go-dev
 agent-vm claude --image agent-vm-go-dev:dev
 ```
 
@@ -188,10 +185,9 @@ verified against the signed checksum database.
 Build it on top of the default boot image and select it:
 
 ```sh
-docker buildx build --platform linux/arm64 --load \
+agent-vm build --builder native-oci \
   --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
-  -t agent-vm-chrome:dev examples/layers/chrome-devtools
-./script/build/import-image.sh agent-vm-chrome:dev
+  --tag agent-vm-chrome:dev examples/layers/chrome-devtools
 agent-vm claude --image agent-vm-chrome:dev
 ```
 
