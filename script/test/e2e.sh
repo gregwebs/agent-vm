@@ -18,6 +18,13 @@
 # Inputs (all optional; `env -u` if your shell exports the image vars):
 #   AGENT_VM_BIN                     launcher binary. Default: target/macos-dev/bin/agent-vm,
 #                                    else target/macos/bin/agent-vm.
+#   AGENT_VM_DEV_BIN                 debug launcher for the retained-default check's
+#                                    recommendation-seam runs. Default: $AGENT_VM; must be a
+#                                    debug build (the seam is compiled out of release builds,
+#                                    which the check verifies).
+#   AGENT_VM_RELEASE_BIN             release launcher for the retained-default check.
+#                                    Default: target/macos/bin/agent-vm. Required: the check
+#                                    fails, never skips, when it is absent.
 #   AGENT_VM_STATE_DIR               state root. Default: $HOME/.local/state/agent-vm.
 #   AGENT_VM_E2E_STATE_DIR           overrides AGENT_VM_STATE_DIR for this run only.
 #   AGENT_VM_E2E_TEMPLATE_IMAGE      finished template (the default boot image) in docker.
@@ -29,17 +36,18 @@
 #   AGENT_VM_E2E_UPDATE_CHECK=1               probe the registry (E9; needs network)
 #
 # State changes (all additive): the finished template is imported into
-# $AGENT_VM_STATE_DIR's msb cache under its dev tag and its published default
-# ref (so the default boot image resolves offline), and the custom fixtures are
-# imported into a fresh isolated under-$WORK state root. Undo with
-# `agent-vm doctor --reset-msb-db` if you want the state dir byte-identical.
+# $AGENT_VM_STATE_DIR's msb cache under its dev tag, and the custom fixtures are
+# imported into a fresh isolated under-$WORK state root. The `all` group's
+# template checks select the dev tag explicitly: the *default* image is now the
+# user-scoped retained record (#261), which the custom-image group's
+# retained-default check owns. Undo with `agent-vm doctor --reset-msb-db` if you
+# want the state dir byte-identical.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-PUBLISHED_TEMPLATE_REF="ghcr.io/wirenboard/agent-vm-template:latest"
 FIXTURE_DIR="$REPO_ROOT/script/test/fixtures/marker-free-image"
 
 usage() {
@@ -78,6 +86,13 @@ elif [[ -x "$REPO_ROOT/target/macos-dev/bin/agent-vm" ]]; then
 else
   AGENT_VM="$REPO_ROOT/target/macos/bin/agent-vm"
 fi
+
+# The retained-default check needs *two* launchers: a debug build (the
+# AGENT_VM_TEST_DEFAULT_IMAGE recommendation seam is compiled out of release)
+# and a release build (to prove the seam is not an override). Respect the
+# advertised AGENT_VM_BIN as the debug candidate; both are validated where used.
+AGENT_VM_DEV_BIN="${AGENT_VM_DEV_BIN:-$AGENT_VM}"
+AGENT_VM_RELEASE_BIN="${AGENT_VM_RELEASE_BIN:-$REPO_ROOT/target/macos/bin/agent-vm}"
 
 TEMPLATE_IMAGE="${AGENT_VM_E2E_TEMPLATE_IMAGE:-agent-vm-template:dev}"
 STATE_DIR="${AGENT_VM_E2E_STATE_DIR:-${AGENT_VM_STATE_DIR:-$HOME/.local/state/agent-vm}}"
@@ -1260,9 +1275,11 @@ check_template_has_all_tools() {
   assert_no_match "no missing tool" "MISSING:" "$out"
 }
 
-# E2 / AC 7: a default config boots the published default image with docker and
-# buildx absent from PATH (and their invocation shims silent).
-check_default_image_zero_docker() {
+# E2 / AC 7: a launch whose image is the dev template boots it with docker and
+# buildx absent from PATH (and their invocation shims silent). The template is
+# selected explicitly: the *default* image is the user-scoped retained record
+# (#261), covered by the custom-image group's retained-default check.
+check_selected_image_zero_docker() {
   local proj="$WORK/default-image" shim="$WORK/shim-dev" log="$WORK/docker-calls.log"
   mkdir -p "$proj" || return 1
   make_builder_shims "$shim" "$log" || return 1
@@ -1270,17 +1287,17 @@ check_default_image_zero_docker() {
   local out
   out="$(cd "$proj" && env -u AGENT_VM_IMAGE_TAG \
     PATH="$shim:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" AGENT_VM_STATE_DIR="$STATE_DIR" \
-    "$AGENT_VM" shell --no-git -- bash -c 'true' 2>&1)" || {
+    "$AGENT_VM" shell --no-git --image "$TEMPLATE_IMAGE" -- bash -c 'true' 2>&1)" || {
     echo "$out" | tail -20
     return 1
   }
-  assert_match "boots the published default image" \
-    "^==> Booting sandbox from $PUBLISHED_TEMPLATE_REF " "$out" || return 1
-  assert_no_builder_calls "default-image" "$log" || return 1
+  assert_match "boots the selected dev template" \
+    "^==> Booting sandbox from $TEMPLATE_IMAGE " "$out" || return 1
+  assert_no_builder_calls "selected-image" "$log" || return 1
 }
 
 # #259: former `.agent-vm/layers/*` and `.agent-vm/layer/` directories are
-# ordinary data now — the default image still boots and no builder runs.
+# ordinary data now — the selected image still boots and no builder runs.
 check_former_layer_dir_is_inert() {
   local proj="$WORK/former-layers" shim="$WORK/shim-dev" log="$WORK/docker-calls.log"
   mkdir -p "$proj/.agent-vm/layers/10-poison/sub/deeper" "$proj/.agent-vm/layer" || return 1
@@ -1292,12 +1309,12 @@ check_former_layer_dir_is_inert() {
   local out
   out="$(cd "$proj" && env -u AGENT_VM_IMAGE_TAG \
     PATH="$shim:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" AGENT_VM_STATE_DIR="$STATE_DIR" \
-    "$AGENT_VM" shell --no-git -- bash -c 'true' 2>&1)" || {
+    "$AGENT_VM" shell --no-git --image "$TEMPLATE_IMAGE" -- bash -c 'true' 2>&1)" || {
     echo "$out" | tail -20
     return 1
   }
-  assert_match "boots the published default image despite former layer dirs" \
-    "^==> Booting sandbox from $PUBLISHED_TEMPLATE_REF " "$out" || return 1
+  assert_match "boots the selected image despite former layer dirs" \
+    "^==> Booting sandbox from $TEMPLATE_IMAGE " "$out" || return 1
   assert_no_builder_calls "former-layer dirs" "$log" || return 1
   if [[ ! -f "$proj/.agent-vm/layers/10-poison/Dockerfile" || ! -f "$proj/.agent-vm/layer/Dockerfile" ]]; then
     echo "    FAIL: a former layer directory was removed (must be inert, not migrated)"
@@ -2496,6 +2513,348 @@ check_custom_nonstandard_attach() {
   return "$result"
 }
 
+# ------------------------------------------- retained default (#261) -------
+
+# The registry's own `docker-content-digest` for a pushed tag: the digest-pinned
+# reference a record must carry comes from the registry, never from a guess.
+registry_manifest_digest() {
+  local port="$1" repo="$2" tag="$3" headers digest
+  headers="$(curl -fsS -o /dev/null -D - \
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+    -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+    "http://127.0.0.1:$port/v2/$repo/manifests/$tag")" || return 1
+  digest="$(awk 'tolower($1)=="docker-content-digest:"{ gsub(/\r/,""); print $2 }' <<<"$headers")"
+  [ -n "$digest" ] || return 1
+  printf '%s' "$digest"
+}
+
+# Manifest/blob read requests the registry served, from its own access log. A
+# `docker logs` failure is a failure, never a vacuous zero.
+registry_read_count() {
+  local container="$1" logs count
+  logs="$(docker logs "$container" 2>&1)" || return 1
+  count="$(grep -cE '"(GET|HEAD) /v2/[^ ]*/(manifests|blobs)/' <<<"$logs")" || count=0
+  printf '%s' "$count"
+}
+
+# The retained-default check's own private HOME/state (never the shared custom
+# root): its record must be invisible to every other check. `retained_env`
+# rebuilds LAUNCH_ENV with or without the debug-only initial-recommendation
+# seam; `AGENT_VM_DEBUG_CONFIG=1` reveals the acquisition config (the default
+# tier's reference is redacted there, so the guest stamp below is the oracle).
+RETAINED_HOME=""
+RETAINED_STATE=""
+AGENT_VM_RETAINED_BIN=""
+LAUNCH_ENV=()
+
+retained_env() {
+  local seam="${1:-}" shared=(
+    env
+    -u AGENT_VM_IMAGE_TAG
+    -u AGENT_VM_ROOT
+    -u AGENT_VM_SHARE_MSB_CACHE
+    -u AGENT_VM_MSB_CACHE_DIR
+    -u MSB_CONFIG_PATH
+    -u AGENT_VM_TEST_DEFAULT_IMAGE
+    AGENT_VM_STATE_DIR="$RETAINED_STATE"
+    HOME="$RETAINED_HOME"
+    AGENT_VM_DEBUG_CONFIG=1
+  )
+  if [ -n "$seam" ]; then
+    LAUNCH_ENV=("${shared[@]}" AGENT_VM_TEST_DEFAULT_IMAGE="$seam")
+  else
+    LAUNCH_ENV=("${shared[@]}")
+  fi
+}
+
+retained_launch() {
+  local name="$1" proj="$2"
+  shift 2
+  observe_launch "$name" "$proj" "$WORK/$name.out" -- \
+    "${LAUNCH_ENV[@]}" \
+    PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" \
+    "$AGENT_VM_RETAINED_BIN" "$@"
+}
+
+retained_record() {
+  printf '%s' "$RETAINED_HOME/.config/agent-vm/default-image.json"
+}
+
+# `agent-vm msb ...` against the retained check's private state/HOME.
+avm_retained_state() {
+  env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u AGENT_VM_SHARE_MSB_CACHE \
+    -u AGENT_VM_MSB_CACHE_DIR -u MSB_CONFIG_PATH -u AGENT_VM_TEST_DEFAULT_IMAGE \
+    AGENT_VM_STATE_DIR="$RETAINED_STATE" HOME="$RETAINED_HOME" \
+    "$AGENT_VM_DEV_BIN" "$@"
+}
+
+# Run `doctor` against a private, empty HOME/state with an optional initial
+# recommendation seam; return its exit status (2 for a probe-setup failure). An
+# *absent* record is required so the seam, not a retained record, decides.
+retained_probe_doctor() {
+  local bin="$1" seam="$2" probe_home="$3" probe_state="$4"
+  mkdir -p "$probe_home" "$probe_state/msb-home" || return 2
+  local base=(env
+    -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u AGENT_VM_SHARE_MSB_CACHE
+    -u AGENT_VM_MSB_CACHE_DIR -u MSB_CONFIG_PATH -u AGENT_VM_TEST_DEFAULT_IMAGE
+    HOME="$probe_home" AGENT_VM_STATE_DIR="$probe_state")
+  if [ -n "$seam" ]; then
+    "${base[@]}" AGENT_VM_TEST_DEFAULT_IMAGE="$seam" "$bin" doctor >/dev/null 2>&1
+  else
+    "${base[@]}" "$bin" doctor >/dev/null 2>&1
+  fi
+}
+
+# 0 = a debug build (a tag-only seam is rejected, so `doctor` exits nonzero);
+# 1 = a release build (the seam is compiled out, so `doctor` exits 0); 2 = the
+# healthy no-seam baseline itself failed, so the probe proves nothing.
+retained_bin_honors_seam() {
+  local bin="$1"
+  retained_probe_doctor "$bin" "" "$WORK/seam-base-h" "$WORK/seam-base-s" || return 2
+  retained_probe_doctor "$bin" "localhost:1/seam-probe:latest" \
+    "$WORK/seam-debug-h" "$WORK/seam-debug-s" && return 1
+  return 0
+}
+
+# The complement: 0 = a release build ignores the seam; 1 = a debug build (or an
+# inconclusive probe). Both slots are classified so a debug binary in the release
+# slot is refused, not merely tolerated.
+retained_bin_ignores_seam() {
+  local bin="$1"
+  retained_probe_doctor "$bin" "" "$WORK/seam-base-rh" "$WORK/seam-base-rs" || return 2
+  retained_probe_doctor "$bin" "localhost:1/seam-probe:latest" \
+    "$WORK/seam-release-h" "$WORK/seam-release-s" && return 0
+  return 1
+}
+
+# 11. #261: the default is a digest bookmark, adopted only after a successful
+# default-tier acquisition; it survives a changed launcher recommendation, is
+# not probed from the registry on a warm launch, and is never substituted by
+# the recommendation or lost when a cache is cold.
+custom_image_retained_default() {
+  local result=0 container="" port repo ref_a ref_b digest_a digest_b
+  local proj out host_uid host_gid dev_bin rel_bin
+  local cold_state="$WORK/rst" empty_state="$WORK/rest"
+  local reg="registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8"
+
+  proj="$(custom_project "retained-default")" || return 1
+  # Two explicit, validated candidates: a missing one is a failure, never a
+  # silent skip (CONTRIBUTING: native prerequisites are required).
+  dev_bin="$AGENT_VM_DEV_BIN"
+  rel_bin="$AGENT_VM_RELEASE_BIN"
+  if [ ! -x "$dev_bin" ]; then
+    echo "    BLOCKER: the debug launcher $dev_bin is absent (set AGENT_VM_DEV_BIN)"
+    return 1
+  fi
+  if [ ! -x "$rel_bin" ]; then
+    echo "    BLOCKER: the release launcher $rel_bin is absent (set AGENT_VM_RELEASE_BIN);"
+    echo "             the retained-default check requires a debug *and* a release launcher"
+    return 1
+  fi
+  if ! retained_bin_honors_seam "$dev_bin"; then
+    echo "    BLOCKER: the debug candidate $dev_bin does not honour"
+    echo "             AGENT_VM_TEST_DEFAULT_IMAGE (release build, or an inconclusive probe);"
+    echo "             set AGENT_VM_DEV_BIN to a debug launcher"
+    return 1
+  fi
+  if ! retained_bin_ignores_seam "$rel_bin"; then
+    echo "    BLOCKER: the release candidate $rel_bin honours the debug seam"
+    echo "             (a debug build is in the release slot, or the probe was inconclusive);"
+    echo "             set AGENT_VM_RELEASE_BIN to a release launcher"
+    return 1
+  fi
+
+  RETAINED_HOME="$WORK/rh"
+  RETAINED_STATE="$cold_state"
+  AGENT_VM_RETAINED_BIN="$dev_bin"
+  mkdir -p "$RETAINED_HOME" "$RETAINED_STATE/msb-home" || return 1
+  retained_env
+  "${LAUNCH_ENV[@]}" "$dev_bin" msb --version >/dev/null 2>&1 ||
+    { echo "    BLOCKER: could not initialize the private state root at $RETAINED_STATE"; return 1; }
+
+  container="$(docker run -d --rm -p 127.0.0.1::5000 "$reg")" ||
+    { echo "    BLOCKER: could not start the local registry container"; return 1; }
+  port="$(docker port "$container" 5000/tcp | head -1 | sed 's/.*://')"
+  if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+    echo "    BLOCKER: no single numeric mapped registry port"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  local deadline=$(( $(date +%s) + 30 )) ready=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo "    BLOCKER: registry not ready on 127.0.0.1:$port"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  repo="e2e-261-$RUN_ID"
+  # A and B differ in the guest-visible image stamp, so the *guest* proves which
+  # image booted (A prints stamp=absent, B stamp=present); both still supply the
+  # same hello-258 program.
+  docker tag "$CUSTOM_MARKER" "localhost:$port/$repo:default-a" || result=1
+  docker tag "$CUSTOM_STAMP" "localhost:$port/$repo:default-b" || result=1
+  docker push "localhost:$port/$repo:default-a" >/dev/null || result=1
+  docker push "localhost:$port/$repo:default-b" >/dev/null || result=1
+  digest_a="$(registry_manifest_digest "$port" "$repo" default-a)" || result=1
+  digest_b="$(registry_manifest_digest "$port" "$repo" default-b)" || result=1
+  if [ "$result" -ne 0 ] || [ -z "$digest_a" ] || [ -z "$digest_b" ]; then
+    echo "    BLOCKER: could not publish the recommendation refs to the registry"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    return 1
+  fi
+  ref_a="localhost:$port/$repo@$digest_a"
+  ref_b="localhost:$port/$repo@$digest_b"
+  [ "$ref_a" != "$ref_b" ] || { echo "    FAIL: the two recommendations are the same digest"; result=1; }
+
+  # (1) A genuinely cold first launch through the debug recommendation seam
+  # acquires A and *adopts* it: the record names exactly A.
+  retained_env "$ref_a"
+  retained_launch "retained-cold" "$proj" hello-258 --no-git write cold-acquire
+  require_launch_ok "retained-cold" || result=1
+  assert_no_host_calls || result=1
+  out="$(launch_output retained-cold)"
+  host_uid="$(id -u)"
+  host_gid="$(id -g)"
+  assert_eq "retained cold: uid" "uid=$host_uid" "$(grep '^uid=' <<<"$out")" || result=1
+  assert_eq "retained cold: gid" "gid=$host_gid" "$(grep '^gid=' <<<"$out")" || result=1
+  assert_eq "retained cold: HOME" "home=$RETAINED_HOME" "$(grep '^home=' <<<"$out")" || result=1
+  assert_eq "retained cold: completion sentinel" "hello-258=ok" "$(grep '^hello-258=ok$' <<<"$out")" || result=1
+  assert_eq "retained cold: the recommendation booted (stamp absent)" "stamp=absent" \
+    "$(grep '^stamp=' <<<"$out")" || result=1
+  if [ ! -f "$(retained_record)" ]; then
+    echo "    FAIL: a successful default-tier acquisition did not adopt a record"
+    result=1
+  fi
+  local record_before
+  record_before="$(cat "$(retained_record)" 2>/dev/null || true)"
+  if ! grep -qF "$ref_a" <<<"$record_before"; then
+    echo "    FAIL: the retained record does not name the acquired digest: $record_before"
+    result=1
+  fi
+
+  # (2) A launcher whose recommendation changed (B) still boots the retained A,
+  # and a warm ordinary launch makes NO registry manifest/blob request: the
+  # default is not tag-polled or re-probed.
+  local reads_before reads_after
+  reads_before="$(registry_read_count "$container")" || result=1
+  retained_env "$ref_b"
+  retained_launch "retained-warm-b" "$proj" hello-258 --no-git
+  require_launch_ok "retained-warm-b" || result=1
+  assert_no_host_calls || result=1
+  out="$(launch_output retained-warm-b)"
+  assert_eq "retained warm: still boots A, not recommendation B (stamp absent)" "stamp=absent" \
+    "$(grep '^stamp=' <<<"$out")" || result=1
+  assert_eq "retained warm: completion sentinel" "hello-258=ok" "$(grep '^hello-258=ok$' <<<"$out")" || result=1
+  assert_eq "retained warm: record unchanged" "$record_before" "$(cat "$(retained_record)")" || result=1
+  reads_after="$(registry_read_count "$container")" || result=1
+  assert_eq "retained warm launch makes zero registry manifest/blob reads" "$reads_before" "$reads_after" || result=1
+
+  # (3) A *fresh* private cache under the same HOME cannot substitute the
+  # recommendation: A is re-acquired from the registry and B never executes.
+  RETAINED_STATE="$empty_state"
+  mkdir -p "$RETAINED_STATE/msb-home" || result=1
+  retained_env "$ref_b"
+  retained_launch "retained-cold-cache-b" "$proj" hello-258 --no-git
+  require_launch_ok "retained-cold-cache-b" || result=1
+  assert_no_host_calls || result=1
+  out="$(launch_output retained-cold-cache-b)"
+  assert_eq "cold cache: A is re-acquired, not recommendation B (stamp absent)" "stamp=absent" \
+    "$(grep '^stamp=' <<<"$out")" || result=1
+  assert_eq "cold cache: completion sentinel" "hello-258=ok" "$(grep '^hello-258=ok$' <<<"$out")" || result=1
+  assert_eq "cold cache: record unchanged" "$record_before" "$(cat "$(retained_record)")" || result=1
+
+  # (4) Post-acquisition adoption failure: the image *is* acquired (registry
+  # up), but the record cannot be written (a directory stands in for the lock).
+  # The guest command must not run and the sandbox must be torn down.
+  local fail_home="$WORK/rh-fail" fail_state="$WORK/rst-fail" sandboxes
+  RETAINED_HOME="$fail_home"
+  RETAINED_STATE="$fail_state"
+  mkdir -p "$fail_home/.config/agent-vm/default-image.lock" "$fail_state/msb-home" || result=1
+  retained_env "$ref_a"
+  retained_launch "retained-adopt-fail" "$proj" hello-258 --no-git
+  if [ "$CAPTURE_STATUS" -eq 0 ]; then
+    echo "    FAIL: an adoption failure after a successful acquisition must fail the launch"
+    result=1
+  fi
+  out="$(launch_output retained-adopt-fail)"
+  assert_no_match "adopt-fail: the guest command must not run" "hello-258=ok" "$out" || result=1
+  # The failure must be the *retention/lock* stage, not an acquisition failure:
+  # assert both the retention context and the lock reason are named.
+  assert_match "adopt-fail: names the retention stage" \
+    "retaining the selected default boot image" "$out" || result=1
+  assert_match "adopt-fail: names the lock failure" \
+    "could not be opened for locking" "$out" || result=1
+  if [ -f "$fail_home/.config/agent-vm/default-image.json" ]; then
+    echo "    FAIL: a failed adoption must leave the record absent"
+    result=1
+  fi
+  sandboxes="$(avm_retained_state msb list --format json 2>/dev/null)" ||
+    { echo "    FAIL: could not list the sandbox catalog after the failed adoption"; result=1; sandboxes='[]'; }
+  if ! printf '%s' "$sandboxes" | jq -e 'type == "array" and length == 0' >/dev/null; then
+    echo "    FAIL: a sandbox lingered after a failed adoption: $sandboxes"
+    result=1
+  fi
+
+  # (5) Offline from the warm cache: the retained image and its persisted state
+  # survive with the registry gone.
+  docker rm -f "$container" >/dev/null 2>&1 ||
+    { echo "    FAIL: registry container removal failed"; result=1; }
+  container=""
+  RETAINED_HOME="$WORK/rh"
+  RETAINED_STATE="$cold_state"
+  retained_env "$ref_b"
+  retained_launch "retained-offline" "$proj" hello-258 --no-git read nonroot
+  require_launch_ok "retained-offline" || result=1
+  assert_no_host_calls || result=1
+  out="$(launch_output retained-offline)"
+  assert_eq "offline: persisted sentinel read back" "declared=cold-acquire" \
+    "$(grep '^declared=' <<<"$out")" || result=1
+  assert_eq "offline: completion sentinel" "hello-258=ok" "$(grep '^hello-258=ok$' <<<"$out")" || result=1
+  assert_eq "offline: record unchanged" "$record_before" "$(cat "$(retained_record)")" || result=1
+
+  # (6) The release binary must use the retained record too (the debug-only seam
+  # is compiled out), still booting A offline. Release coverage is required, not
+  # skipped; both candidates were validated up front.
+  AGENT_VM_RETAINED_BIN="$rel_bin"
+  retained_env "$ref_b"
+  retained_launch "retained-release" "$proj" hello-258 --no-git
+  require_launch_ok "retained-release" || result=1
+  assert_no_host_calls || result=1
+  out="$(launch_output retained-release)"
+  assert_eq "release: the debug seam is not an override; A is booted (stamp absent)" "stamp=absent" \
+    "$(grep '^stamp=' <<<"$out")" || result=1
+  assert_eq "release: completion sentinel" "hello-258=ok" "$(grep '^hello-258=ok$' <<<"$out")" || result=1
+  AGENT_VM_RETAINED_BIN="$dev_bin"
+
+  # (7) Registry gone and a cold private cache: the retained A cannot be
+  # acquired, the launch fails, record A survives, and nothing substitutes it.
+  rm -rf "$empty_state" || result=1
+  RETAINED_STATE="$empty_state"
+  mkdir -p "$RETAINED_STATE/msb-home" || result=1
+  retained_env "$ref_b"
+  retained_launch "retained-unreachable" "$proj" hello-258 --no-git
+  if [ "$CAPTURE_STATUS" -eq 0 ]; then
+    echo "    FAIL: an unreachable retained digest must fail the launch"
+    result=1
+  fi
+  out="$(launch_output retained-unreachable)"
+  assert_no_match "unreachable: no substitute program ran" "hello-258=ok" "$out" || result=1
+  assert_eq "unreachable: record still A" "$record_before" "$(cat "$(retained_record)")" || result=1
+
+  [ -n "$container" ] || return "$result"
+  docker rm -f "$container" >/dev/null 2>&1 || { echo "    FAIL: registry container removal failed"; result=1; }
+  return "$result"
+}
+
 # --------------------------------------------------------------- run all ----
 
 echo "e2e: group=$GROUP"
@@ -2510,10 +2869,9 @@ run_check "harness-negative" check_harness_negative
 
 if [[ "$GROUP" == all ]]; then
   import_image "$TEMPLATE_IMAGE"
-  import_image "$TEMPLATE_IMAGE" "$PUBLISHED_TEMPLATE_REF"
 
   run_check "template-has-all-tools" check_template_has_all_tools
-  run_check "default-image-zero-docker" check_default_image_zero_docker
+  run_check "selected-image-zero-docker" check_selected_image_zero_docker
   run_check "former-layer-dir-inert" check_former_layer_dir_is_inert
   run_check "pi-home-persists-nonroot" pi_home_persists non-root
   run_check "pi-home-persists-root" pi_home_persists root
@@ -2543,6 +2901,7 @@ run_check "custom-image-hook-path" custom_image_hook_path
 run_check "custom-image-credential-injection" custom_image_credential_injection
 run_check "custom-image-nonstandard-imported" custom_image_nonstandard_imported
 run_check "custom-image-nonstandard-cold-warm" custom_image_nonstandard_cold_warm
+run_check "custom-image-retained-default" custom_image_retained_default
 run_check "custom-image-no-bash-attach" check_custom_no_bash_attach
 run_check "custom-image-user-home-attach-nonroot" check_custom_user_home_attach nonroot
 run_check "custom-image-user-home-attach-root" check_custom_user_home_attach root

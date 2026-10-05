@@ -682,7 +682,11 @@ pub(crate) async fn launch(
     // an invalid override (a typed empty `--image`) or an unreadable
     // configured image must not create state. `args.image.requested()` also
     // applies the empty-`AGENT_VM_IMAGE_TAG`-is-unset rule.
-    let boot = boot_image::select(args.image.requested()?, images);
+    let boot = boot_image::select(args.image.requested()?, images)?;
+    // The one output policy for this selection: explicit sources render their
+    // escaped reference; the default tier renders a fixed label and redacts the
+    // reference from every notice, debug dump, progress line and error chain.
+    let label = boot.label();
     // `--allow-missing-credentials` moves the *availability* of a YAML
     // credential and nothing else; see `MissingCredentialPolicy`. Derived once
     // here so the flag is read in exactly one place.
@@ -810,8 +814,9 @@ pub(crate) async fn launch(
     let mut notices = LaunchNotices::to_stderr();
     notices.emit(launch_banner(&session))?;
     // The selected boot image, once, before the session provisions any state
-    // (D10). `boot` was resolved before the first side effect above.
-    notices.emit(format!("==> Boot image {boot}"))?;
+    // (D10). `boot` was resolved before the first side effect above; `label`
+    // redacts a default-tier reference.
+    notices.emit(format!("==> Boot image: {label}"))?;
     let pi_report = crate::pi_credential_inspection::inspect_project(&session.state_dir);
     if let Some(warning) = pi_report.launch_warning() {
         notices.emit(warning)?;
@@ -901,8 +906,9 @@ pub(crate) async fn launch(
         // session can boot. There is no separate published/composed tag to
         // prefer.
         let img = image.clone();
+        let redact_reference = label.is_redacted();
         tokio::spawn(async move {
-            seed_pulled_marker_if_absent(&img).await;
+            seed_pulled_marker_if_absent(&img, redact_reference).await;
             // Detached task: there is no launch error boundary to reach
             // from here (the launch may finish first), and an undeliverable
             // *informational* banner must not kill an otherwise-healthy
@@ -911,7 +917,11 @@ pub(crate) async fn launch(
             // to stderr, so on a fully broken stderr this is silent; that
             // is the accepted floor for a background banner (issue #70).
             let mut notices = LaunchNotices::to_stderr();
-            if let Err(error) = notify_if_update_available(&img, &mut notices).await {
+            if let Err(error) =
+                notify_if_update_available(&img, redact_reference, &mut notices).await
+            {
+                // The banner error is agent-vm's own fixed text (never the
+                // reference); a trace of it is not record data.
                 tracing::debug!(error = %format!("{error:#}"), "update banner not delivered");
             }
         });
@@ -1418,7 +1428,8 @@ pub(crate) async fn launch(
 
     let profile = env::var("AGENT_VM_PROFILE").is_ok();
     notices.emit(format!(
-        "==> Booting sandbox from {image} ({memory_mib} MiB, {cpus} vCPU; first run pulls layers, otherwise ~3s)"
+        "==> Booting sandbox from {} ({memory_mib} MiB, {cpus} vCPU; first run pulls layers, otherwise ~3s)",
+        label.text()
     ))?;
     let t_create = Instant::now();
     // The resolved guest command line is computed here (rather than at its use
@@ -1431,7 +1442,7 @@ pub(crate) async fn launch(
     let inner_cmd = tool.command();
     let inner_argv = inner_argv(tool, args.agent_args);
     let config = builder.build().await.context("preparing sandbox config")?;
-    if let Some(dump) = crate::debug_config::sandbox_config(&config)? {
+    if let Some(dump) = crate::debug_config::sandbox_config(&config, label.is_redacted())? {
         notices.emit(dump)?;
         // No trailing space when the argv is empty (codex/opencode), so the
         // line is exactly the guest command line an integration test asserts.
@@ -1455,7 +1466,8 @@ pub(crate) async fn launch(
         }
         _ => Sandbox::create_with_pull_progress(config),
     };
-    let render_task = tokio::spawn(crate::pull_progress::render(progress));
+    let reference_label = label.is_redacted().then(|| label.text().to_string());
+    let render_task = tokio::spawn(crate::pull_progress::render(progress, reference_label));
     // See pull.rs: await render before propagating errors so finish()
     // clears the bars, and use the logging helper so render-task panics
     // are visible instead of silently swallowed.
@@ -1466,8 +1478,29 @@ pub(crate) async fn launch(
     crate::pull_progress::await_render(render_task).await;
     let sandbox = match result {
         Ok(sandbox) => sandbox,
-        Err(error) => return Err(translate_create_error(error)),
+        // A redacted (default-tier) failure must not chain the registry URL
+        // that embeds the reference; the fixed reason still names the stage. An
+        // explicit source keeps its error unchanged.
+        Err(error) => {
+            return Err(label.redact_error("booting a sandbox from", translate_create_error(error)));
+        }
     };
+    // Success-before-adoption (#261): the image's content is now materialized,
+    // so a default-tier selection may be retained. This is write-once and a
+    // no-op for every higher source or an already-retained default. If it
+    // cannot be recorded we do NOT run the guest command on an unretained
+    // default; the sandbox is torn down rather than leaked.
+    if let Err(error) = boot_image::adopt_default_selection(&boot) {
+        // A sandbox exists but must not run the guest command: report both the
+        // retention failure and any teardown failure rather than dropping one.
+        return Err(match cleanup_exec_sandbox(&sandbox).await {
+            Ok(()) => error.context("retaining the selected default boot image"),
+            Err(cleanup_error) => error.context(format!(
+                "retaining the selected default boot image; the sandbox could not be cleaned up \
+                 ({cleanup_error:#})"
+            )),
+        });
+    }
     if profile {
         notices.emit(format!("[profile] create: {:?}", t_create.elapsed()))?;
     }
@@ -1506,7 +1539,7 @@ pub(crate) async fn launch(
     // (USAGE.md#boot-image-contract), not an integer (#258).
     let chrome_mcp_enabled = crate::image_capabilities::chrome_mcp_enabled(
         &sandbox,
-        &image,
+        label.text(),
         env::var_os("AGENT_VM_NO_CHROME_MCP").is_some(),
     )
     .await;
@@ -2526,7 +2559,7 @@ fn shell_escape(s: &str) -> String {
 /// per-platform digest `image_check::fetch_remote_digest` returns, so the
 /// comparison is apples-to-apples. Only ever *seed* — never overwrite an
 /// existing marker, which is the authoritative record of our last pull.
-async fn seed_pulled_marker_if_absent(image: &str) {
+async fn seed_pulled_marker_if_absent(image: &str, redact_reference: bool) {
     if crate::pulled_marker::read(image).is_some() {
         return;
     }
@@ -2541,7 +2574,13 @@ async fn seed_pulled_marker_if_absent(image: &str) {
         && let Some(digest) = handle.manifest_digest()
     {
         match crate::pulled_marker::write(image, digest) {
-            Ok(()) => tracing::debug!(image, digest, "seeded pulled-digest baseline from cache"),
+            Ok(()) => {
+                if redact_reference {
+                    tracing::debug!(digest, "seeded pulled-digest baseline from cache");
+                } else {
+                    tracing::debug!(image, digest, "seeded pulled-digest baseline from cache");
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "failed to seed pulled-digest marker"),
         }
     }
@@ -2549,6 +2588,7 @@ async fn seed_pulled_marker_if_absent(image: &str) {
 
 async fn notify_if_update_available<W: std::io::Write>(
     image: &str,
+    redact_reference: bool,
     notices: &mut LaunchNotices<W>,
 ) -> Result<()> {
     use crate::image_check::{UpdateState, check_for_update};
@@ -2559,7 +2599,10 @@ async fn notify_if_update_available<W: std::io::Write>(
     // flaky registry must never delay launch by more than a single
     // request's worth of wait. The banner is best-effort — on timeout we
     // simply stay quiet and continue with the cached image.
-    let probe = tokio::time::timeout(UPDATE_PROBE_BUDGET, check_for_update(image));
+    let probe = tokio::time::timeout(
+        UPDATE_PROBE_BUDGET,
+        check_for_update(image, redact_reference),
+    );
     // Every other outcome is deliberately silent:
     //   UpToDate / NotCached: nothing to say.
     //   Ok(Err)/None: registry unreachable etc. — stay quiet.

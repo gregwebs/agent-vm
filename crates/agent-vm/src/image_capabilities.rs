@@ -69,11 +69,11 @@ fn chrome_mcp_policy(advertised: bool, wrapper_present: bool, opted_out: bool)
 /// production helper logs the error, and the resolver returns a disabled
 /// decision without probing further, so a "disabling" warning is never followed
 /// by an enabled result.
-pub async fn chrome_mcp_enabled(sandbox: &Sandbox, image: &str, opted_out: bool) -> bool {
+pub async fn chrome_mcp_enabled(sandbox: &Sandbox, image_label: &str, opted_out: bool) -> bool {
     resolve_chrome_mcp_probes(
         opted_out,
-        || guest_file_present(sandbox, image, CHROME_MCP_CAPABILITY_PATH),
-        || guest_file_present(sandbox, image, CHROME_MCP_WRAPPER_PATH),
+        || guest_file_present(sandbox, image_label, CHROME_MCP_CAPABILITY_PATH),
+        || guest_file_present(sandbox, image_label, CHROME_MCP_WRAPPER_PATH),
     )
     .await
 }
@@ -114,12 +114,14 @@ where
 /// to `false` here would hide it from the caller's disable decision.
 async fn guest_file_present(
     sandbox: &Sandbox,
-    image: &str,
+    image_label: &str,
     path: &str,
 ) -> microsandbox::MicrosandboxResult<bool> {
     sandbox.fs().exists(path).await.map_err(|error| {
+        // `image_label` is the selection's safe name (an escaped explicit
+        // reference, or the fixed default-tier label), never a raw record value.
         tracing::warn!(
-            image,
+            image = image_label,
             capability_path = path,
             error = %error,
             "unable to probe optional image capability; disabling launcher-owned MCP entry"

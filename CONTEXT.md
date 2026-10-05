@@ -351,8 +351,11 @@ guest; tool declarations do not install that software.
 
 ## Default boot image
 
-The maintained **boot image** offered out of the box, containing the standard
-coding agents. A user can select a custom boot image instead.
+The **boot image** a session boots when neither the command line, nor the
+environment, nor the user config, nor the project config selects another: the
+**retained default boot image** when this host has one, otherwise the
+launcher's **initial recommendation**. A user can select a custom boot image
+instead.
 
 ## Boot image contract
 
@@ -373,6 +376,26 @@ additionally accepts whatever msb accepts (a local rootfs or disk image). No
 launch builds an image. See
 [USAGE.md#selecting-the-boot-image](USAGE.md#selecting-the-boot-image) and
 [ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md).
+
+## Retained default boot image
+
+The digest-pinned image a host keeps as its default after acquiring it, in the
+user-scoped `$HOME/.config/agent-vm/default-image.json`. A *bookmark* naming
+exact content, not a download cache: it is independent of the msb image cache,
+`AGENT_VM_STATE_DIR` and any project, and it is written **only after** the image
+was acquired (success-before-adoption), write-once, so no failed or concurrent
+first launch overwrites it. Distinguished from the **initial recommendation**
+below. See
+[USAGE.md#the-retained-default](USAGE.md#the-retained-default). _Avoid_: cache
+entry, default config, pinned layer.
+
+## Initial recommendation
+
+The immutable `@sha256:…` reference a launcher offers when no retained default
+exists yet, compiled into the binary (interim development value; a release may
+change it). Reading it never writes; only a successful acquisition adopts it. A
+release that changes this value changes what a *new* host is offered, never an
+existing retained default. _Avoid_: default image (unqualified), tag default.
 
 ## Base image
 
