@@ -315,6 +315,7 @@ positive explicit-source control.
 | Harness | Runs on CI | Notes |
 |---|---|---|
 | `cargo test --workspace` | yes (`ci.yml`) | `#[ignore]`d e2e excluded |
+| `cargo check --release -p agent-vm --tests` | yes (`ci.yml`) | type-check only; pins that the release test profile still compiles under the test cfg, since CI's run is the debug profile |
 | `script/test/e2e.sh` | **no** | needs Apple Silicon + a VM boot; `all` (dev images + custom) or `custom-image` (Docker + release `msb` + launcher, no dev images; the retained-default check also needs `AGENT_VM_RELEASE_BIN`) |
 | `cargo test … -- --ignored` | **no** | the one keychain round-trip test; operator opt-in, writes one host keychain item |
 | `script/test/chrome-layer-contract.sh` / `chrome-layer-runtime.sh` | yes (`chrome-layer-contract.yml`) | docker-driver build + contract |
