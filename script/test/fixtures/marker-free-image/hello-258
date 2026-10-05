@@ -85,6 +85,13 @@ links_and_owners() {
 }
 
 case "${1:-}" in
+--version)
+  # `setup` probes every declared tool with `--version` (the declared-tool
+  # contract), so answer it before the identity/link checks: those need a
+  # provisioned launch HOME and persist links that the bare verification
+  # sandbox does not create.
+  printf 'hello-258 1.0\n'
+  ;;
 write)
   value="${2:?hello-258 write needs a value}"
   printf '%s' "$value" >"$DECLARED" || { printf 'write=declared-failed\n'; exit 1; }

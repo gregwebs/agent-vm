@@ -19,11 +19,6 @@ Supersedes [ADR-0003](0003-project-tooling-layers.md),
 [ADR-0015](0015-config-driven-tools.md) and
 [ADR-0022](0022-dsh-tool-layer.md).
 
-**Proposed, pending maintainer confirmation:** the `setup` severity change for a
-user-selected image (D6 below) is implemented, but the maintainer has not yet
-confirmed the exit-status policy. It is recorded here as a proposal that the
-implementation follows, not as an accepted decision.
-
 ## Context
 
 The image a session boots was a **consequence of the tool catalog**. Whenever a
@@ -53,6 +48,14 @@ source-integrity gates in `images/` and `.github/workflows/`. Those stay.
 - **Tools are runtime declarations and never install software.** A tool names a
   guest command, its default argv, credential providers, available tools,
   persist paths and env — nothing about how the image is built.
+- **`setup` verifies exactly the declared tools, and treats every one as
+  required on any image.** The scope is the resolved configuration catalog (the
+  shipped defaults only when both tiers declare zero tools, otherwise the
+  declared tools); an undeclared command is not checked at all. The synthesized
+  `shell` fallback is a launch affordance, not a declaration, so it is not a
+  verification target. There is no per-command or per-image severity downgrade:
+  a declared command is fatal on the default boot image and on any image the
+  user selected.
 - **One image per session**, chosen independently of the launched tool, by the
   precedence:
   `--image` > `AGENT_VM_IMAGE_TAG` (empty = unset) > user config `image` >
@@ -99,11 +102,20 @@ source-integrity gates in `images/` and `.github/workflows/`. Those stay.
   `AGENT_VM_BASE_IMAGE`/`AGENT_VM_LAYER`/`AGENT_VM_YES`, `DEFAULT_BASE_IMAGE_REF`,
   the launcher's `include_dir!` image embed, and the composition machinery
   (`layer.rs`, `layer/contract.rs`, `tool_layer.rs`).
-- **`setup` severity follows image ownership (proposed, pending maintainer
-  confirmation).** A missing shipped command is fatal only when the verified
-  image is the default boot image; for any user-selected image every missing
-  command warns. The user owns the image, and `setup` never installs software.
-  Launch still fails for a missing program.
+- **`setup` verifies declared tools only, and is fatal on any image.** The
+  verification targets are exactly the tools the configuration declares (the
+  synthesized `shell` fallback is not among them); a command the configuration
+  does not name is never checked. Every declared
+  target is required, on the default boot image and on any image the user
+  selected, because the configuration says the command must work and `setup`
+  never installs software. `--version` stays the gate, and a failure is
+  classified as no entry found on the guest `PATH` (a bare command name) or at
+  the configured path (a command that names one), present but not a runnable
+  executable (a non-executable file or a directory), or present-and-executable
+  but `--version` failed. A presence/executability-only
+  mode may be offered later as an alternative to the version probe; it is not
+  implemented. `--no-verify` skips the step. Launch still fails for a missing
+  program.
 - A project can recommend an image but cannot override the user's selection
   (the user tier outranks the project tier, exactly as it does for tool
   declarations, ADR-0015). It still cannot bind host paths through `image`.
@@ -140,6 +152,7 @@ source-integrity gates in `images/` and `.github/workflows/`. Those stay.
   tool-config merge already makes the user tier authoritative.
 - **Allow local paths in the config `image`.** Rejected as a sandbox escape: a
   repo-supplied `image = "/"` would boot the host root filesystem.
-- **Keep a marker-based "supplied tool" downgrade in `setup`.** Rejected: with
-  no composition there is no layer to supply a command, so D6 keys severity on
-  image ownership instead.
+- **Keep image-provenance-based `setup` severity.** Rejected: provenance cannot
+  tell a user what must work. The configuration declares the required commands,
+  so the declared set — not which tier named the image — is the honest scope,
+  and a declared command is fatal on every image.

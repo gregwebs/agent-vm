@@ -2340,6 +2340,14 @@ assert_dump() {
 # exact selected reference -- not the decoy or the default. The verify-only
 # mutation overrides verify_image's `.image(image)`, which this check then fails
 # on, while the initial pull stays correct.
+#
+# setup verifies exactly the *declared* tools and fails on any of them, on any
+# image. The synthesized `shell` fallback is not a declaration, so this config
+# declares only `hello-258` (which answers `--version`); `bash` is deliberately
+# not verified. A config that declared nothing would fall back to the seven
+# shipped tools and fail, which is the separate point of the `custom-user-image-*`
+# checks below (they never call setup). After the positive assertions this check
+# also runs `custom_image_setup_verification_negative`, reusing its pushed image.
 custom_image_setup_verification_uses_selected_ref() {
   local name="custom-setup-verify" proj="$WORK/custom-setup-verify-proj"
   mkdir -p "$proj/.agent-vm" || return 1
@@ -2383,6 +2391,8 @@ custom_image_setup_verification_uses_selected_ref() {
     return 1
   fi
 
+  # Only `hello-258` is declared, and every declared tool must answer
+  # `--version`; the `shell` fallback is not verified.
   cat >"$proj/.agent-vm/config.toml" <<EOF || result=1
 image = "$selected"
 [[tools]]
@@ -2414,8 +2424,80 @@ EOF
     assert_custom_cache_isolated "after setup verification" yes || result=1
   fi
 
+  # F5: the two failure diagnoses, with real guest evidence, against the same
+  # pushed image.
+  if [ "$result" -eq 0 ]; then
+    custom_image_setup_verification_negative "$selected" || result=1
+  fi
+
   docker rm -f "$container" >/dev/null 2>&1 ||
     { echo "    FAIL: registry container removal failed"; result=1; }
+  return "$result"
+}
+
+# F5: the setup verification diagnostic's failure cases, each against a real
+# guest. `$1` is a registry-hosted image already pushed by the caller.
+#
+# (a) A declared bare command name the image does not carry on `PATH` must fail
+# as "not found on the guest `PATH`". (b) A declared command that is present on
+# `PATH` but not executable (the `marker-free` fixture installs `noexec-258` mode
+# 0644) must fail as "not executable". Each must exit non-zero and must not claim
+# the other case.
+custom_image_setup_verification_negative() {
+  local selected="$1" result=0 name proj out
+
+  name="custom-setup-absent"
+  proj="$WORK/$name-proj"
+  mkdir -p "$proj/.agent-vm" || return 1
+  cat >"$proj/.agent-vm/config.toml" <<EOF || return 1
+image = "$selected"
+[[tools]]
+name = "absent-258"
+command = "not-in-this-image-258"
+EOF
+  observe_launch "$name" "$proj" "$WORK/$name.out" -- \
+    "${CUSTOM_ENV[@]}" \
+    PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOME="$CUSTOM_HOME" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" \
+    "$AGENT_VM" setup || result=1
+  if [ "$CAPTURE_STATUS" -eq 0 ]; then
+    echo "    FAIL: setup must fail when a declared command is not found on the guest PATH"
+    result=1
+  fi
+  assert_no_host_calls || result=1
+  out="$(launch_output "$name")"
+  assert_match "absent declared command names the command" "not-in-this-image-258" "$out" || result=1
+  assert_match "absent declared command reports the missing case" "not found on the guest" "$out" || result=1
+  assert_no_match "absent declared command is not called non-executable" "not executable" "$out" || result=1
+  assert_no_match "absent declared command is not called broken" "broken in this image" "$out" || result=1
+
+  name="custom-setup-noexec"
+  proj="$WORK/$name-proj"
+  mkdir -p "$proj/.agent-vm" || return 1
+  cat >"$proj/.agent-vm/config.toml" <<EOF || return 1
+image = "$selected"
+[[tools]]
+name = "noexec-258"
+command = "noexec-258"
+EOF
+  observe_launch "$name" "$proj" "$WORK/$name.out" -- \
+    "${CUSTOM_ENV[@]}" \
+    PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOME="$CUSTOM_HOME" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" \
+    "$AGENT_VM" setup || result=1
+  if [ "$CAPTURE_STATUS" -eq 0 ]; then
+    echo "    FAIL: setup must fail when a declared command is present but not executable"
+    result=1
+  fi
+  assert_no_host_calls || result=1
+  out="$(launch_output "$name")"
+  assert_match "non-executable declared command names the command" "noexec-258" "$out" || result=1
+  assert_match "non-executable declared command reports the case" "not executable" "$out" || result=1
+  assert_no_match "non-executable declared command is not called missing" "not found on the guest" "$out" || result=1
+  assert_no_match "non-executable declared command is not called broken" "broken in this image" "$out" || result=1
+
   return "$result"
 }
 

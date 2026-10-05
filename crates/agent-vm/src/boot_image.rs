@@ -236,9 +236,7 @@ impl BootImage {
         &self.source
     }
 
-    /// True when no user source chose the image. `setup` uses this to decide
-    /// whether a missing shipped command is fatal (the default image is
-    /// agent-vm's to keep working) or a warning (the user owns their image).
+    /// True when no user source chose the image.
     pub(crate) fn is_default(&self) -> bool {
         matches!(self.source, ImageSource::Default)
     }
