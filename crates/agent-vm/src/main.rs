@@ -19,6 +19,7 @@ mod host_paths;
 mod image_capabilities;
 mod image_check;
 mod image_contract;
+mod image_log_guard;
 mod intercept_hook;
 mod mount;
 mod msb_cmd;
@@ -185,14 +186,28 @@ fn main() -> Result<()> {
 /// Wire `tracing` so `RUST_LOG=agent_vm=debug,microsandbox=info` works.
 /// Default level is `warn` — keeps normal output clean, but anything from
 /// the microsandbox stack surfaces when you ask for it.
+///
+/// A second, per-layer filter ([`crate::image_log_guard`]) suppresses all
+/// non-agent-vm dependency events once this invocation has selected the default
+/// boot image. The dependency image stack logs the record-sourced reference at
+/// debug/trace and cannot be audited field by field; agent-vm's own events (and
+/// any explicit-source invocation's dependency logging) are untouched.
 fn init_tracing() {
-    use tracing_subscriber::{EnvFilter, fmt};
+    use tracing_subscriber::{
+        EnvFilter, Layer as _, filter::FilterFn, fmt, layer::SubscriberExt as _,
+        util::SubscriberInitExt as _,
+    };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_target(true)
-        .compact()
+    let default_tier_guard = FilterFn::new(crate::image_log_guard::dependency_event_allowed);
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(true)
+                .compact()
+                .with_filter(filter)
+                .with_filter(default_tier_guard),
+        )
         .init();
 }
 

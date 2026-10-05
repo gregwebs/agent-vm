@@ -33,9 +33,15 @@ pub enum UpdateState {
 /// Compare the marker for the last successful pull against the registry.
 /// Returns `Ok(None)` when we can't decide (registry unreachable,
 /// malformed reference, etc.).
-pub async fn check_for_update(image_ref: &str) -> Result<Option<UpdateState>> {
+///
+/// `redact_reference` suppresses the reference in debug tracing; the probe still
+/// uses the real reference to talk to the registry.
+pub async fn check_for_update(
+    image_ref: &str,
+    redact_reference: bool,
+) -> Result<Option<UpdateState>> {
     let cached = crate::pulled_marker::read(image_ref);
-    let Some(remote) = fetch_remote_digest(image_ref).await else {
+    let Some(remote) = fetch_remote_digest(image_ref, redact_reference).await else {
         return Ok(None);
     };
     let state = match cached {
@@ -51,29 +57,46 @@ pub async fn check_for_update(image_ref: &str) -> Result<Option<UpdateState>> {
 
 /// Best-effort fetch of the per-platform manifest digest. Returns None
 /// on any failure so callers can decide what to do with the silence.
-pub async fn fetch_remote_digest(image_ref: &str) -> Option<String> {
+///
+/// Debug tracing omits the reference (and, on failure, the request error, whose
+/// URL embeds it) when `redact_reference` is set: the default tier's reference
+/// is record-sourced. The probe itself still uses the real reference.
+pub async fn fetch_remote_digest(image_ref: &str, redact_reference: bool) -> Option<String> {
     let parsed = ParsedRef::parse(image_ref)?;
-    match remote_manifest_digest(&parsed).await {
+    match remote_manifest_digest(&parsed, redact_reference).await {
         Ok(Some(d)) => {
-            tracing::debug!(image = %image_ref, digest = %d, "registry update probe");
+            if redact_reference {
+                tracing::debug!(digest = %d, "registry update probe");
+            } else {
+                tracing::debug!(image = %image_ref, digest = %d, "registry update probe");
+            }
             Some(d)
         }
         Ok(None) => {
             // Reachable registry, but we couldn't pin a comparable
             // digest (no matching platform entry, private image we
             // can't auth to, etc.). Stay quiet at launch.
-            tracing::debug!(image = %image_ref, "registry update probe: no comparable digest");
+            if !redact_reference {
+                tracing::debug!(image = %image_ref, "registry update probe: no comparable digest");
+            }
             None
         }
         Err(e) => {
             // Offline / DNS / TLS — expected sometimes; never fatal.
-            tracing::debug!(image = %image_ref, error = %e, "registry update probe failed");
+            if redact_reference {
+                tracing::debug!("registry update probe failed");
+            } else {
+                tracing::debug!(image = %image_ref, error = %e, "registry update probe failed");
+            }
             None
         }
     }
 }
 
-async fn remote_manifest_digest(parsed: &ParsedRef) -> Result<Option<String>> {
+async fn remote_manifest_digest(
+    parsed: &ParsedRef,
+    redact_reference: bool,
+) -> Result<Option<String>> {
     // Microsandbox stores the *per-platform* manifest digest, not the
     // multi-arch index digest. If we naively HEAD the tag we get the
     // index digest, which churns every push even when the underlying
@@ -96,7 +119,7 @@ async fn remote_manifest_digest(parsed: &ParsedRef) -> Result<Option<String>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
-    let resp = get_manifest_with_auth(&client, &url).await?;
+    let resp = get_manifest_with_auth(&client, &url, redact_reference).await?;
     let Some(resp) = resp else {
         return Ok(None);
     };
@@ -162,13 +185,18 @@ const MANIFEST_ACCEPT: &str = concat!(
 async fn get_manifest_with_auth(
     client: &reqwest::Client,
     url: &str,
+    redact_url: bool,
 ) -> Result<Option<reqwest::Response>> {
     let first = client
         .get(url)
         .header("Accept", MANIFEST_ACCEPT)
         .send()
         .await?;
-    tracing::debug!(%url, status = %first.status(), "manifest GET (unauthenticated)");
+    // The URL embeds the reference; a redacted (default-tier) probe must not
+    // log it, and the status alone would be misleading, so stay silent.
+    if !redact_url {
+        tracing::debug!(%url, status = %first.status(), "manifest GET (unauthenticated)");
+    }
     if first.status().is_success() {
         return Ok(Some(first));
     }
@@ -323,6 +351,64 @@ fn short(digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A writer a `tracing_subscriber` fmt layer can append to, so a test can
+    /// assert exactly what a probe would log.
+    #[derive(Clone)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The reference the probe would otherwise log: a private-looking name.
+    const SENSITIVE_REF: &str = "localhost:1/private-retained-token@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// Run the real probe with an isolated tracing subscriber and return
+    /// everything it logged. The connection to `localhost:1` is refused, which
+    /// exercises the failure branch (the one that would chain the URL/error).
+    fn probe_logs(redact: bool) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = Captured(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let _ = fetch_remote_digest(SENSITIVE_REF, redact).await;
+            });
+        });
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    /// RUST_LOG-focused redaction: agent-vm's own probe tracing must not emit a
+    /// default-tier reference. The non-redacted control proves the oracle can
+    /// see the leak, so the assertion is discriminating.
+    #[test]
+    fn a_redacted_probe_never_logs_the_reference_but_the_control_does() {
+        let redacted = probe_logs(true);
+        assert!(
+            !redacted.contains("private-retained-token") && !redacted.contains(SENSITIVE_REF),
+            "a redacted probe leaked the reference: {redacted}"
+        );
+        let control = probe_logs(false);
+        assert!(
+            control.contains("private-retained-token"),
+            "the control did not log the reference, so the test proves nothing: {control}"
+        );
+    }
 
     #[test]
     fn parses_localhost_with_port() {

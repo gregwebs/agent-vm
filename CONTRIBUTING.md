@@ -183,7 +183,8 @@ group (a config/`--image` selected image and setup's verification input).
 
 `script/test/e2e.sh` takes an optional group: `all` (the default; the dev-image
 checks above plus the custom-image group) or `custom-image` (only the marker-free
-custom-image group). The custom-image group needs only Docker, the release
+custom-image group; its retained-default check is described below). The
+custom-image group needs only Docker, the release
 bundle's `msb`, and a launcher binary — **no dev images** — plus network for the
 pinned fixture base/`apk add bash` and a digest-pinned local registry service. It
 builds the `script/test/fixtures/marker-free-image` targets, boots them through
@@ -201,7 +202,21 @@ non-secret placeholder (a missing host credential fails closed), and a present
 non-numeric image-version stamp is ignored. The guest's effective `PATH` for that
 nonstandard fixture (whose OCI `PATH` lacks `/.msb/scripts`) is
 `/.msb/scripts:` + its exact OCI `PATH`. A real PTY attach check covers the
-`--image`/attach branch. These checks are always-run in the custom group, not
+`--image`/attach branch. Its retained-default check boots the digest-pinned
+fixture against a fresh private HOME, asserts the first successful boot *adopts*
+the fixture digest into `$HOME/.config/agent-vm/default-image.json`, that a
+launcher-recommendation change does not move it, that a warm ordinary launch
+makes **zero** registry manifest/tag/blob requests, and that an offline launch
+from a cold private cache fails while the record survives. The two
+default-recommendation fixtures differ in their guest-visible image stamp, so
+the *guest* (not an echoed reference) proves which image booted. This check
+requires **two validated launchers**: `AGENT_VM_DEV_BIN` (defaults to
+`AGENT_VM_BIN`/the debug bundle; the recommendation seam is debug-only) and
+`AGENT_VM_RELEASE_BIN` (default `target/macos/bin/agent-vm`); a missing or
+seam-ignoring candidate is a failure, and the release run is required, not
+skipped. It also drives a post-acquisition adoption failure (a directory where
+the record lock belongs) to prove the guest command does not run and the
+sandbox is torn down. These checks are always-run in the custom group, not
 opt-in: a missing prerequisite is a failure, not a skip. The suite must run on a
 dedicated serial native host with no concurrent launches so process/catalog
 absence is meaningful. The custom group always runs against a fresh private
@@ -271,12 +286,36 @@ default slot, so a boot-free CLI test that falls through to the default does not
 start a real multi-GB pull). Neither is read by a release build; a test pins the
 release exclusion.
 
+`AGENT_VM_TEST_DEFAULT_IMAGE` is an **initial recommendation**, not an override:
+it is parsed with the same immutable-reference rule as production (an
+`@sha256:…` OCI reference), it is consulted only when no retained default exists
+(never to replace one), and selecting it never persists it — only a successful
+acquisition adopts it (issue #261). It is also *display-redacted*: the default
+tier never renders its reference in a notice, `doctor`, the
+`AGENT_VM_DEBUG_CONFIG` dump, progress or an acquisition error, so a CLI default
+test asserts the fixed label/redacted dump plus the record bytes and the
+acquisition boundary, while the exact SDK reference is asserted in-memory in the
+`boot_image` unit tests (both the selected reference and the built
+`SandboxConfig`). A test that wants an *initialized* host writes the record
+directly at `$HOME/.config/agent-vm/default-image.json`
+(`{"version":1,"image":"<digest ref>"}`).
+
+The default tier is also **tracing-redacted**: the dependency image stack
+(`oci_client`, `microsandbox`, `reqwest`, `hyper`, …) logs the reference,
+repository name and manifest URL at debug/trace, so `image_log_guard` arms a
+process-global filter once the default tier is selected and suppresses every
+non-`agent_vm` event for the rest of that invocation. Explicit-source
+invocations keep dependency logging unchanged. The CLI regression
+(`a_default_tier_invocation_suppresses_dependency_image_tracing`) asserts a
+default-tier `RUST_LOG=trace pull` leaks no repository marker and includes a
+positive explicit-source control.
+
 #### What runs where
 
 | Harness | Runs on CI | Notes |
 |---|---|---|
 | `cargo test --workspace` | yes (`ci.yml`) | `#[ignore]`d e2e excluded |
-| `script/test/e2e.sh` | **no** | needs Apple Silicon + a VM boot; `all` (dev images + custom) or `custom-image` (Docker + release `msb` + launcher, no dev images) |
+| `script/test/e2e.sh` | **no** | needs Apple Silicon + a VM boot; `all` (dev images + custom) or `custom-image` (Docker + release `msb` + launcher, no dev images; the retained-default check also needs `AGENT_VM_RELEASE_BIN`) |
 | `cargo test … -- --ignored` | **no** | the one keychain round-trip test; operator opt-in, writes one host keychain item |
 | `script/test/chrome-layer-contract.sh` / `chrome-layer-runtime.sh` | yes (`chrome-layer-contract.yml`) | docker-driver build + contract |
 | `script/test/shipped-tool-recipes.sh` | yes (`shipped-tool-recipes.yml`, native amd64) + manually on native arm64 | real docker-driver build + numeric-uid label/report/T5 audit + label replay. A `workflow_dispatch` run with `full_contract: true` adds `--overrides --chain`; the overrides/chain matrix is not part of the default PR gate |

@@ -88,9 +88,12 @@ state, so it sees the same sandboxes agent-vm does.
 The production workflow publishes the maintained **base** image and the
 **template** built on it; the launcher consumes the template:
 
-- `ghcr.io/wirenboard/agent-vm-template:latest` — the **default boot image**:
-  Debian plus the docker engine, diagnostic CLIs, and the six shipped agent CLIs
-  (dsh, pi, codex, opencode, claude, copilot).
+- `ghcr.io/wirenboard/agent-vm-template:latest` — the **maintained template**: Debian
+  plus the docker engine, diagnostic CLIs, and the six shipped agent CLIs
+  (dsh, pi, codex, opencode, claude, copilot). This is the production image a
+  *new* release will recommend; the launcher's current interim initial
+  recommendation is the older digest-pinned template (see
+  [The retained default](#the-retained-default)).
 
 It is rebuilt hourly from the **committed** sources. The hourly cron no longer
 resolves new upstream tool releases: a tool version changes only when a
@@ -115,7 +118,7 @@ catalog never changes it). First present source wins:
 | environment | `AGENT_VM_IMAGE_TAG=REF` (an empty value counts as unset) |
 | user config | top-level `image = "REF"` in `~/.config/agent-vm/config.toml` |
 | project config | top-level `image = "REF"` in `<cwd>/.agent-vm/config.toml` |
-| default | `ghcr.io/wirenboard/agent-vm-template:latest` |
+| default | your retained digest (see [The retained default](#the-retained-default)), or the interim initial recommendation when nothing is retained |
 
 `agent-vm shell`, `agent-vm claude` and `agent-vm mytool` all boot the same
 image; so do `pull` and `setup`.
@@ -136,6 +139,78 @@ no local build.
 **A missing program fails; agent-vm never installs it.** If the selected image
 does not contain the tool's `command`, the launch prints a contract diagnostic
 and exits 127.
+
+### The retained default
+
+The last row of the precedence table is a **retained default**: a bookmark you
+acquired once, kept in the user-scoped file
+`$HOME/.config/agent-vm/default-image.json`:
+
+```json
+{"version":1,"image":"ghcr.io/wirenboard/agent-vm-template@sha256:…"}
+```
+
+It *names exact image content* (a digest, never a moving tag); microsandbox
+separately downloads and caches that content. So the default is independent of
+the msb cache and of every project: clearing the cache, enabling the shared
+cache, changing `AGENT_VM_STATE_DIR` or working in another directory does not
+move it. It is deliberately a separate file from `config.toml` — writing a
+top-level `image =` there would make the *user config* tier win over the
+*project* tier, which is a precedence change, not a bookmark.
+
+The launcher also carries an **initial recommendation** (an immutable
+`@sha256:…` reference compiled into the binary; it is the interim development
+value, and a newer release may change it). How the two interact:
+
+- **Selection is lazy and read-only.** A higher source wins without reading the
+  record; `help`, `doctor`, `--help` and `pull/setup --help` never write one.
+- **An absent record uses the launcher's recommendation — but only *acquires*
+  it.** The record is written **only after that image was actually acquired**
+  (success-before-adoption). If the acquisition fails, nothing is retained: no
+  half-written record, no substitute image.
+- **A failed first acquisition can still be rescued.** Because a failed attempt
+  retains nothing, a later release whose recommendation your host *can* acquire
+  (for example a future multiarch image) becomes your default on its next
+  successful launch. Nothing is stranded on bytes your host cannot boot.
+- **A retained default is never silently replaced.** A different recommendation,
+  a launcher upgrade, a project image, or a cache loss leaves the retained
+  digest alone. `adopt` is write-once (first writer wins), so concurrent first
+  launches cannot overwrite each other.
+- **The digest must resolve.** A retained digest whose content is unavailable
+  (registry gone, content deleted) fails the launch with the same error a
+  user-typed reference would; it is not silently redirected to another image.
+  Restore network access and retry.
+
+`pull` refreshes *the selected reference*; it is **not** an upgrade of the
+default's identity. `pull --image REF` refreshes `REF` and never adopts it as
+your default. Use `--image`/`AGENT_VM_IMAGE_TAG`/config `image` to boot a
+different image for one session, or to point a fresh host at another one.
+
+**Mutable tags vs. digests.** A mutable tag (`:latest`) names *whatever the
+registry serves now*: after a cache loss a `:latest` launch may fetch different
+bytes than before. A digest names exact content. That is why the retained record
+and the initial recommendation are digest-pinned, and why the launcher never
+polls a tag to "refresh" your default (the opt-in `--update-check`/
+`AGENT_VM_UPDATE_CHECK` freshness banner is unrelated and stays opt-in).
+
+**Observing and recovering.** `agent-vm doctor` prints a fixed label —
+`retained default` or `not selected; initial recommendation` — and the record
+path; it never prints the reference itself. The default tier is host state (an
+untrusted, user-writable file whose reference may name a private registry), so
+notices, `agent-vm doctor`, the opt-in `AGENT_VM_DEBUG_CONFIG` dump and
+acquisition errors name `the default boot image` and redact its reference rather
+than echoing it. Your own `--image`/`AGENT_VM_IMAGE_TAG`/config `image` values
+are unaffected: they are your inputs, and they are still shown. It is strictly
+observational — it creates nothing. If the record is
+corrupt, unreadable (a symlink, FIFO, directory, oversized or non-UTF-8 file)
+or names a non-digest reference, every verb that needs the default fails and
+names the escaped path with a fixed reason; nothing is auto-reset. To recover,
+restore the intended digest record from backup, or deliberately move the file
+aside to reinitialize from the current recommendation.
+
+Replacing an *already working* retained default is not implemented yet
+(issue [#262](https://github.com/gregwebs/agent-vm/issues/262)); until then the
+deliberate move-aside above is the recovery.
 
 ### Customizing the image
 
@@ -377,7 +452,7 @@ included, enables it.
 
 | var | what |
 |---|---|
-| `RUST_LOG` | tracing filter; default `warn`. e.g. `RUST_LOG=agent_vm=debug` |
+| `RUST_LOG` | tracing filter; default `warn`. e.g. `RUST_LOG=agent_vm=debug`. Once an invocation selects the *default* boot image, dependency events are suppressed (the image stack would log the record-sourced reference); explicit-image invocations are unchanged |
 | `AGENT_VM_PROFILE` | print per-phase wall-time (create/run/stop/remove) |
 | `AGENT_VM_DEBUG_CONFIG` | dump the SandboxConfig JSON before boot |
 | `AGENT_VM_NO_CHROME_MCP` | disable Chrome MCP auto-configuration for a Chrome-capable image |
@@ -646,7 +721,7 @@ not accept), so you can see which source won:
 AGENT_VM_IMAGE_TAG: <unset>
 user:    ghcr.io/wirenboard/agent-vm-template:latest [/home/alice/.config/agent-vm/config.toml]
 project: none
-default: ghcr.io/wirenboard/agent-vm-template:latest
+default: retained default [/home/alice/.config/agent-vm/default-image.json]
 selected (without --image): ghcr.io/wirenboard/agent-vm-template:latest (from user config /home/alice/.config/agent-vm/config.toml)
 ```
 

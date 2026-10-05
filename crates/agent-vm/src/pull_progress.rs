@@ -27,8 +27,13 @@ use microsandbox::sandbox::{PullProgress, PullProgressHandle};
 const BRAILLE_TICKS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Drive the progress UI to completion. Returns when the channel closes.
-pub async fn render(mut handle: PullProgressHandle) {
-    let mut display = PullProgressDisplay::new();
+///
+/// `reference_label` is `Some(label)` when the acquisition's reference is
+/// redacted (the default tier): the SDK's event reference is then never
+/// rendered, and the fixed `label` is shown instead. `None` renders the event's
+/// own reference, preserving explicit-source behavior.
+pub async fn render(mut handle: PullProgressHandle, reference_label: Option<String>) {
+    let mut display = PullProgressDisplay::new(reference_label);
     while let Some(event) = handle.recv().await {
         display.handle_event(event);
     }
@@ -59,13 +64,15 @@ struct PullProgressDisplay {
     /// fast path where Complete arrives without a prior Started).
     materialize_styled: Vec<bool>,
     reference: String,
+    /// When set, the fixed label to show instead of the event's reference.
+    fixed_reference: Option<String>,
     download_style: ProgressStyle,
     materialize_style: ProgressStyle,
     done_style: ProgressStyle,
 }
 
 impl PullProgressDisplay {
-    fn new() -> Self {
+    fn new(fixed_reference: Option<String>) -> Self {
         let is_tty = std::io::stderr().is_terminal();
 
         let mp = MultiProgress::new();
@@ -93,6 +100,7 @@ impl PullProgressDisplay {
             layer_bars: Vec::new(),
             materialize_styled: Vec::new(),
             reference: String::new(),
+            fixed_reference,
             download_style: ProgressStyle::default_bar()
                 .template(
                     "     {prefix}  {bar:36.magenta/238}  {bytes}/{total_bytes}  {msg:.magenta}",
@@ -112,7 +120,10 @@ impl PullProgressDisplay {
     fn handle_event(&mut self, event: PullProgress) {
         match event {
             PullProgress::Resolving { reference } => {
-                self.reference = reference.to_string();
+                self.reference = self
+                    .fixed_reference
+                    .clone()
+                    .unwrap_or_else(|| reference.to_string());
                 self.header
                     .set_message(format!("{:<12} {}...", "Resolving", self.reference));
             }
@@ -122,7 +133,10 @@ impl PullProgressDisplay {
                 ..
             } => {
                 if self.reference.is_empty() {
-                    self.reference = reference.to_string();
+                    self.reference = self
+                        .fixed_reference
+                        .clone()
+                        .unwrap_or_else(|| reference.to_string());
                 }
                 self.header.set_message(format!(
                     "{:<12} {} ({} layer{})",

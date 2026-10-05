@@ -138,7 +138,8 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
     };
 
     // The one image selection for this session (D1), shared with launch/pull.
-    let boot = boot_image::select(args.image.requested()?, &images);
+    let boot = boot_image::select(args.image.requested()?, &images)?;
+    let label = boot.label();
     let image = boot.reference().as_str().to_string();
 
     // D6: a shipped command is fatal only when the verified image is the
@@ -146,19 +147,25 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
     // so every missing command there warns.
     let targets = verification_targets(&verify_catalog, boot.is_default())?;
 
-    println!("==> Pulling {image} into the microsandbox cache");
-    crate::pull::pull_image(&image).await?;
+    println!("==> Pulling {} into the microsandbox cache", label.text());
+    crate::pull::pull_image(&image, &label).await?;
+    // Success-before-adoption (#261): record a default-tier selection only
+    // after its forced acquisition succeeded, and before verification.
+    boot_image::adopt_default_selection(&boot)
+        .context("retaining the selected default boot image")?;
 
     if !args.no_verify {
-        verify_image(&image, &targets).await?;
+        verify_image(&boot, &targets).await?;
     }
 
-    println!("==> {image} ready");
+    println!("==> {} ready", label.text());
     Ok(())
 }
 
-async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
-    println!("==> Verifying {image}");
+async fn verify_image(boot: &boot_image::BootImage, targets: &[VerifyTarget]) -> Result<()> {
+    let label = boot.label();
+    let image = boot.reference().as_str();
+    println!("==> Verifying {}", label.text());
     println!("==> Booting throwaway sandbox (this is the first VM cold-start; ~3s on a warm host)");
     // The pull step above already pulled the new manifest, so IfMissing
     // is fine here.
@@ -174,12 +181,14 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
         .await
         .context("preparing verify config")?;
     // The exact config handed to the SDK, behind AGENT_VM_DEBUG_CONFIG, so the
-    // native setup check can assert the verification input's image reference.
-    if let Some(dump) = crate::debug_config::sandbox_config(&config)? {
+    // native setup check can assert the verification input's image reference. A
+    // redacted selection renders a fixed marker instead.
+    if let Some(dump) = crate::debug_config::sandbox_config(&config, label.is_redacted())? {
         eprintln!("{dump}");
     }
     let (progress, task) = Sandbox::create_with_pull_progress(config);
-    let render_task = tokio::spawn(crate::pull_progress::render(progress));
+    let reference_label = label.is_redacted().then(|| label.text().to_string());
+    let render_task = tokio::spawn(crate::pull_progress::render(progress, reference_label));
     // See pull.rs: await render before propagating errors so finish()
     // clears the bars, and use the logging helper so render-task panics
     // are visible instead of silently swallowed.
@@ -188,7 +197,8 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
         .context("create-with-pull-progress join")
         .and_then(|inner| inner.context("booting verify sandbox"));
     crate::pull_progress::await_render(render_task).await;
-    let sandbox = result?;
+    let sandbox = result
+        .map_err(|error| label.redact_error("booting the verification sandbox from", error))?;
 
     // Per-tool `--version` checks, run independently so the error names which
     // one fails instead of a generic && short-circuit.
@@ -214,7 +224,7 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
                     .await
                     .map(|out| out.status().code == 0)
                     .unwrap_or(false);
-                if let Err(error) = report(image, target, present, outcome) {
+                if let Err(error) = report(&label, target, present, outcome) {
                     sandbox.stop_and_wait().await.ok();
                     Sandbox::remove("agent-vm-setup-verify").await.ok();
                     return Err(error);
@@ -237,9 +247,10 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
 /// user-selected image is the user's to keep working and `setup` never installs
 /// software (ADR-0035, D6).
 ///
-/// `image` is the reference `setup` verified, so the diagnostic can name the
-/// image this configuration boots and point at the tool declaration that must
-/// supply the command.
+/// `label` is the safe name of the image `setup` verified (an escaped explicit
+/// reference, or the fixed default-tier label), so the diagnostic can name the
+/// image this configuration boots without echoing a record-sourced reference,
+/// and point at the tool declaration that must supply the command.
 ///
 /// A transport failure — `sandbox.exec` returning `Err` because the sandbox
 /// died or agentd is unreachable — is indistinguishable here from an absent
@@ -247,7 +258,7 @@ async fn verify_image(image: &str, targets: &[VerifyTarget]) -> Result<()> {
 /// is deliberate: `setup` cannot repair a dead sandbox by failing the run, and
 /// the verify sandbox has already booted by this point.
 fn report(
-    image: &str,
+    label: &boot_image::ImageLabel,
     target: &VerifyTarget,
     present: bool,
     outcome: Result<ExecOutput, MicrosandboxError>,
@@ -292,14 +303,14 @@ fn report(
         } else {
             "missing from the image".to_string()
         };
-        // `image` may be user-supplied on `--image`, so escape it before it
-        // reaches a terminal.
-        let image = config::escape_str(image);
+        // `label` is escaped for an explicit source and a fixed phrase for the
+        // default tier, so it is safe before it reaches a terminal.
         bail!(
-            "{verbs}: command {command} is {because} — {image} is the default boot image this \
-             configuration boots. agent-vm does not install tools; add the program to your image \
-             or change the tool's command, pull a newer tag (`agent-vm pull`), or report at \
-             https://github.com/wirenboard/agent-vm/issues"
+            "{verbs}: command {command} is {because} — this configuration boots {}. \
+             agent-vm does not install tools; add the program to your image or change the \
+             tool's command, pull a newer tag (`agent-vm pull`), or report at \
+             https://github.com/wirenboard/agent-vm/issues",
+            label.text()
         );
     }
     if present {
@@ -309,7 +320,7 @@ fn report(
             "==> WARNING: {verbs}: command {command} is not in the selected image {}; \
              agent-vm does not install tools — add it to your image or change the tool's \
              command",
-            config::escape_str(image),
+            label.text(),
         );
     }
     Ok(())
@@ -461,7 +472,7 @@ mod tests {
     #[test]
     fn report_bails_for_a_missing_shipped_command() {
         let err = report(
-            "ghcr.io/wirenboard/agent-vm/template:latest",
+            &boot_image::ImageLabel::for_tests("ghcr.io/wirenboard/agent-vm/template:latest"),
             &target(&["codex"], "codex", true),
             false,
             not_runnable(),
@@ -484,7 +495,7 @@ mod tests {
     fn report_warns_for_a_missing_optional_command() {
         assert!(
             report(
-                "agent-vm-template:1",
+                &boot_image::ImageLabel::for_tests("agent-vm-template:1"),
                 &target(&["mytool"], "mytool", false),
                 false,
                 not_runnable()
@@ -500,7 +511,7 @@ mod tests {
     #[test]
     fn report_bails_for_a_broken_shipped_command() {
         let err = report(
-            "agent-vm-base:1",
+            &boot_image::ImageLabel::for_tests("agent-vm-base:1"),
             &target(&["claude"], "claude", true),
             true,
             not_runnable(),

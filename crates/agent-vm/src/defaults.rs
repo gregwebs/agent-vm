@@ -4,19 +4,26 @@
 //! or change other distribution wiring
 //! without grepping for string literals across subcommands.
 
-/// The **default boot image**: the maintained, finished image agent-vm boots
-/// verbatim when no `--image`, `AGENT_VM_IMAGE_TAG`, user config or project
-/// config `image` selects another. It is built by CI
-/// (`images/Dockerfile` + `images/tools/`); the launcher never composes or
-/// builds it. #261 replaces this fixed fallback with a retained, seeded
-/// selection behind [`crate::boot_image::default_image`].
+/// The **initial default-image recommendation**: the immutable image agent-vm
+/// offers when no `--image`, `AGENT_VM_IMAGE_TAG`, user config, project config
+/// `image` or retained user selection names another.
 ///
-/// Tags published by CI:
-/// - `:latest` — moving tag, rebuilt hourly to pick up agent
-///   updates (Claude Code, OpenCode, Codex etc.).
-/// - `:YYYY-MM-DDTHH` — timestamped, immutable. Use for
-///   reproducible setups.
-pub const DEFAULT_IMAGE_REF: &str = "ghcr.io/wirenboard/agent-vm-template:latest";
+/// It is a *recommendation*, not a selection: the launcher's owned state is the
+/// user-scoped retained record ([`crate::boot_image`]), written only after this
+/// image has actually been acquired. Changing this constant changes what a user
+/// with no record is offered; it never rewrites an existing retained selection.
+///
+/// The value is pinned by digest because a mutable tag cannot name exact
+/// content: `:latest` is rebuilt hourly, so `:latest` today and `:latest` after
+/// a cache loss are different bytes. These are **existing published bytes of the
+/// old `agent-vm-template`** — a single `application/vnd.oci.image.manifest.v1+json`
+/// for Linux/amd64, not a multiarch index, and not the maintained multiarch
+/// release. It is an interim development recommendation only: #265 owns pinning
+/// and validating the production recommendation against real artifact
+/// consumption. Because selection is success-before-adoption, a host that
+/// cannot acquire it (e.g. Apple Silicon) keeps no record and a later compatible
+/// recommendation rescues the user.
+pub const INITIAL_DEFAULT_IMAGE_REF: &str = "ghcr.io/wirenboard/agent-vm-template@sha256:fd05aaa697c2488e9f7384d069ba2244078faf6b5320998b546c93f98f8d5f18";
 
 /// Marker written last by the Chrome DevTools image after its checks pass.
 pub const CHROME_MCP_CAPABILITY_PATH: &str = "/etc/agent-vm-capabilities/chrome-devtools-mcp";

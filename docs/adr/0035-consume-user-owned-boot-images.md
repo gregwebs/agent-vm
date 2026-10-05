@@ -3,7 +3,10 @@
 ## Status
 
 Accepted. Implementation decision for [agent-vm #259](https://github.com/gregwebs/agent-vm/issues/259),
-slice 2 of [agent-vm #257](https://github.com/gregwebs/agent-vm/issues/257).
+slice 2 of [agent-vm #257](https://github.com/gregwebs/agent-vm/issues/257);
+the retained-default decision below is [agent-vm
+#261](https://github.com/gregwebs/agent-vm/issues/261), slice 4 (amended, see
+*Decision*).
 Supersedes [ADR-0003](0003-project-tooling-layers.md),
 [ADR-0019](0019-tool-free-base-and-per-tool-layers.md),
 [ADR-0028](0028-explicit-image-flag-beats-the-other-environment-variable.md),
@@ -55,6 +58,24 @@ source-integrity gates in `images/` and `.github/workflows/`. Those stay.
   `--image` > `AGENT_VM_IMAGE_TAG` (empty = unset) > user config `image` >
   project config `image` > the default boot image. `run`, `pull`, `setup` and
   `doctor` all resolve through one function (`boot_image::select`).
+- **The default is a retained, user-scoped selection (#261, this ADR).** The
+  bootstrap/digest fallback is a **retained default**: an immutable OCI
+  reference (`repo@sha256:…`) in the user-scoped
+  `$HOME/.config/agent-vm/default-image.json` (a sibling of `config.toml`, not a
+  key in it, so the user *config* tier cannot displace the project tier). A
+  launcher carries an **initial recommendation** (a compiled-in immutable
+  reference) offered only when no record exists; `select` reads the record
+  lazily and writes nothing, and the record is **adopted only after the image
+  was successfully acquired** (success-before-adoption), write-once under an
+  exclusive `flock` so concurrent first launches cannot overwrite each other. A
+  failed initial acquisition therefore leaves no record, so a later compatible
+  recommendation (e.g. a multiarch release) can rescue the host instead of
+  stranding it. A retained record is never silently replaced; replacing a
+  *working* one is [#262](https://github.com/gregwebs/agent-vm/issues/262). A
+  missing/corrupt/unreadable record fails the verbs that need the default with a
+  fixed reason and an escaped path; it is never auto-reset. The record is not a
+  download cache: msb owns the bytes, so cache loss, `AGENT_VM_STATE_DIR` or a
+  new project does not move the selection.
 - **Config-file images are OCI references only.** A config `image` that the SDK
   would classify as a host path (`/`, `./`, `../`, `.`, `..`) is rejected, so a
   repo-supplied `.agent-vm/config.toml` cannot boot the host root filesystem as
@@ -94,11 +115,19 @@ source-integrity gates in `images/` and `.github/workflows/`. Those stay.
 - The committed recipe/version pins and source-integrity gates are retained
   (now exercised by `crates/agent-vm/tests/image_sources.rs` and the
   `script/` gates), independent of the unimplemented Layer DAG.
+- **#261 fulfilled.** The default boot image is a retained, user-scoped,
+  digest-pinned selection with success-before-adoption; the compiled-in value is
+  only an interim initial recommendation, and
+  [#265](https://github.com/gregwebs/agent-vm/issues/265) owns pinning and
+  validating the production multiarch recommendation against real artifact
+  consumption. The interim value is Linux/amd64-only, which is safe precisely
+  because a failed acquisition retains nothing.
 - Follow-ups: [#260](https://github.com/gregwebs/agent-vm/issues/260) (explicit
   build/import CLI and the base-link import tag),
-  [#261](https://github.com/gregwebs/agent-vm/issues/261) (retained/default
-  selection), [#262](https://github.com/gregwebs/agent-vm/issues/262) (upgrade),
-  #263–#265 (image repo, release, consumption).
+  [#262](https://github.com/gregwebs/agent-vm/issues/262) (explicit upgrade /
+  replacement of a working retained default),
+  [#265](https://github.com/gregwebs/agent-vm/issues/265) (production
+  recommendation), #263–#264 (image repo, release).
 
 ## Alternatives
 

@@ -3830,7 +3830,15 @@ const CLI_REF: &str = "localhost:1/cli:latest";
 const ENV_REF: &str = "localhost:1/env:latest";
 const USER_REF: &str = "localhost:1/user:latest";
 const PROJECT_REF: &str = "localhost:1/project:latest";
-const DEFAULT_REF: &str = "localhost:1/default:latest";
+/// The default-slot seam value: an immutable (digest-pinned) loopback ref, so a
+/// default fallthrough does not start a real multi-GB pull. `AGENT_VM_TEST_DEFAULT_IMAGE`
+/// is an *initial recommendation* only, so it must be a valid immutable reference.
+const DEFAULT_REF: &str =
+    "localhost:1/default@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+/// A second immutable recommendation, for tests that change what a launcher
+/// offers *after* a default was already retained.
+const RECOMMENDATION_B: &str =
+    "localhost:1/other@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 /// A custom runtime tool the project can declare; its command exists as a guest
 /// command name only, so the launch reaches `builder.build()`.
@@ -3842,6 +3850,23 @@ fn oci_reference(config: &serde_json::Value) -> String {
         .as_str()
         .unwrap_or("<none>")
         .to_string()
+}
+
+/// The fixed marker the **display copy** of a redacted (default-tier) debug
+/// config shows instead of the record/recommendation reference. Kept in sync
+/// with `debug_config::REDACTED_REFERENCE`.
+const REDACTED_DEFAULT_MARKER: &str = "<redacted default boot image>";
+
+/// The reference an acquisition-config oracle may observe for `expected`: an
+/// explicit source (CLI/env/user/project) is exact and visible; the default tier
+/// is redacted in the debug dump, so its exact reference is asserted in memory
+/// (`boot_image` unit tests) and here only the marker is observable.
+fn observable_reference(expected: &str) -> &str {
+    if expected == DEFAULT_REF {
+        REDACTED_DEFAULT_MARKER
+    } else {
+        expected
+    }
 }
 
 /// The two tiers' `image` settings (and, when `declares_tool`, the project's
@@ -3919,6 +3944,7 @@ fn check_pull_acquisition(stderr: &str, expected: &str) -> Result<(), String> {
     let configs = acquisition_configs(stderr)?;
     let config = acquisition_config(&configs, "agent-vm-pull")?;
     let reference = oci_reference(config);
+    let expected = observable_reference(expected);
     if reference != expected {
         return Err(format!(
             "the acquisition config boots {reference}, expected {expected}"
@@ -4107,17 +4133,25 @@ fn image_precedence_at_every_cli_boundary() {
                 "{} ({tool}): the bogus image must fail acquisition, stderr:\n{stderr}",
                 row.name
             );
-            assert!(
-                stderr.contains(&format!(
-                    "==> Boot image {} (from {}",
-                    row.expected, row.source
-                )),
-                "{} ({tool}): notice missing/wrong:\n{stderr}",
-                row.name
-            );
+            if row.expected == DEFAULT_REF {
+                assert!(
+                    stderr.contains("==> Boot image: the default boot image"),
+                    "{} ({tool}): default notice missing:\n{stderr}",
+                    row.name
+                );
+            } else {
+                assert!(
+                    stderr.contains(&format!(
+                        "==> Boot image: {} (from {}",
+                        row.expected, row.source
+                    )),
+                    "{} ({tool}): notice missing/wrong:\n{stderr}",
+                    row.name
+                );
+            }
             assert_eq!(
                 oci_reference(&debug_config_json(&stderr)),
-                row.expected,
+                observable_reference(row.expected),
                 "{} ({tool})",
                 row.name
             );
@@ -4167,7 +4201,18 @@ fn image_precedence_at_every_cli_boundary() {
                 "{} ({verb}): the bogus image must fail, stderr:\n{stderr}",
                 row.name
             );
-            if verb == "pull" {
+            if row.expected == DEFAULT_REF {
+                let safe = if verb == "pull" {
+                    "==> the default boot image is the image this configuration boots from"
+                } else {
+                    "==> Pulling the default boot image into the microsandbox cache"
+                };
+                assert!(
+                    stdout.contains(safe),
+                    "{} ({verb}): default notice missing:\n{stdout}",
+                    row.name
+                );
+            } else if verb == "pull" {
                 assert!(
                     stdout.contains(&format!("==> {} (from {}", row.expected, row.source)),
                     "{} ({verb}): selection notice missing:\n{stdout}",
@@ -4218,14 +4263,24 @@ fn image_precedence_at_every_cli_boundary() {
             }
             let out = harness.builtin(&["doctor"], &envs);
             let stdout = stdout_of(&out);
-            assert!(
-                stdout.contains(&format!(
-                    "selected (without --image): {} (from {}",
-                    row.expected, row.source
-                )),
-                "{} (doctor): selected row missing:\n{stdout}",
-                row.name
-            );
+            if row.expected == DEFAULT_REF {
+                assert!(
+                    stdout.contains(
+                        "selected (without --image): not selected; initial recommendation ["
+                    ),
+                    "{} (doctor): default selected row missing:\n{stdout}",
+                    row.name
+                );
+            } else {
+                assert!(
+                    stdout.contains(&format!(
+                        "selected (without --image): {} (from {}",
+                        row.expected, row.source
+                    )),
+                    "{} (doctor): selected row missing:\n{stdout}",
+                    row.name
+                );
+            }
         }
     }
 }
@@ -4585,7 +4640,7 @@ fn custom_catalog_and_tool_edits_do_not_change_the_boot_image() {
         let out = harness.launch_argv(tool, &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
         assert_eq!(
             oci_reference(&debug_config_json(&stderr_of(&out))),
-            DEFAULT_REF,
+            REDACTED_DEFAULT_MARKER,
             "{tool}"
         );
     }
@@ -5001,7 +5056,7 @@ fn failed_image_acquisition_never_invokes_a_builder() {
         );
         assert_eq!(
             oci_reference(&debug_config_json(&stderr)),
-            expected,
+            observable_reference(expected),
             "{name}"
         );
         // Absence of a prompt and of any fallback image are supplemental.
@@ -5195,4 +5250,500 @@ fn a_non_unicode_image_override_fails_every_verb_that_reads_it() {
             );
         }
     }
+}
+
+// ===========================================================================
+//
+// The retained default (issue #261): a user-scoped, immutable bookmark, adopted
+// only after the image was actually acquired. These are boot-free CLI checks:
+// they observe selection, the record's bytes and the failure paths. The
+// *successful-adoption* path needs a real acquisition and lives in the native
+// `script/test/e2e.sh` retained-default group.
+
+impl Harness {
+    /// The retained-default record under this harness's isolated `$HOME`.
+    fn selection_record(&self) -> PathBuf {
+        self.home_root.join(".config/agent-vm/default-image.json")
+    }
+
+    fn selection_lock(&self) -> PathBuf {
+        self.home_root.join(".config/agent-vm/default-image.lock")
+    }
+
+    fn write_selection(&self, contents: &str) {
+        write(&self.selection_record(), contents);
+    }
+
+    fn write_selection_ref(&self, reference: &str) {
+        self.write_selection(&format!("{{\"version\":1,\"image\":\"{reference}\"}}\n"));
+    }
+
+    /// The record's exact bytes, or `None` when it does not exist.
+    fn selection_bytes(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.selection_record()).ok()
+    }
+
+    fn assert_no_selection(&self, context: &str) {
+        assert!(
+            self.selection_bytes().is_none(),
+            "{context}: a selection record was created"
+        );
+        assert!(
+            !self.selection_lock().exists(),
+            "{context}: a selection lock was created"
+        );
+    }
+}
+
+#[test]
+fn diagnostics_and_help_never_create_a_selection() {
+    let harness = Harness::new();
+    let envs = [("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)];
+
+    let doctor = harness.builtin(&["doctor"], &envs);
+    let stdout = stdout_of(&doctor);
+    assert!(
+        doctor.status.success(),
+        "doctor on a healthy host must exit 0:\n{stdout}\n{}",
+        stderr_of(&doctor)
+    );
+    assert!(
+        stdout.contains("default: not selected; initial recommendation ["),
+        "doctor must report an uninitialized recommendation, not a retained selection:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(DEFAULT_REF),
+        "doctor must not echo the recommendation reference:\n{stdout}"
+    );
+    harness.assert_no_selection("doctor");
+
+    for args in [
+        vec!["--help"],
+        vec!["help", "shell"],
+        vec!["shell", "--help"],
+        vec!["pull", "--help"],
+    ] {
+        let out = harness.builtin(&args, &envs);
+        assert!(out.status.success(), "{args:?} must exit 0");
+        harness.assert_no_selection(&format!("{args:?}"));
+    }
+
+    let reset = harness.builtin(&["doctor", "--reset-msb-db"], &envs);
+    assert!(
+        reset.status.success(),
+        "doctor --reset-msb-db must exit 0:\n{}",
+        stderr_of(&reset)
+    );
+    harness.assert_no_selection("doctor --reset-msb-db");
+}
+
+#[test]
+fn a_failed_initial_acquisition_leaves_the_selection_absent() {
+    // Success-before-adoption (M1): an unreachable recommendation must leave no
+    // record, so a later compatible recommendation can still rescue the user.
+    for (verb, argv) in [
+        ("probe", vec!["probe"]),
+        ("pull", vec!["pull"]),
+        ("setup", vec!["setup"]),
+    ] {
+        let harness = Harness::new();
+        harness.write_project(PROBE_TOOL);
+        let out = harness.builtin(&argv, &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+        assert!(
+            !out.status.success(),
+            "{verb}: an unreachable default must fail:\n{}",
+            stderr_of(&out)
+        );
+        harness.assert_no_selection(verb);
+        let doctor = stdout_of(
+            &harness.builtin(&["doctor"], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]),
+        );
+        assert!(
+            doctor.contains("not selected; initial recommendation"),
+            "{verb}: doctor must still report an uninitialized default:\n{doctor}"
+        );
+    }
+}
+
+#[test]
+fn a_retained_selection_survives_a_changed_recommendation() {
+    // The saved bookmark, not the launcher's current recommendation, decides a
+    // default launch. Changing the seam (a simulated launcher upgrade) and then
+    // removing it must not move the selection or rewrite the record.
+    let harness = Harness::new();
+    harness.write_project(PROBE_TOOL);
+    harness.write_selection_ref(DEFAULT_REF);
+    let before = harness.selection_bytes().unwrap();
+
+    for envs in [
+        vec![("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+        vec![],
+    ] {
+        let out = harness.launch_argv("probe", &[], &envs);
+        let stderr = stderr_of(&out);
+        assert!(
+            !out.status.success(),
+            "the bogus retained image must fail acquisition:\n{stderr}"
+        );
+        assert_eq!(
+            oci_reference(&debug_config_json(&stderr)),
+            REDACTED_DEFAULT_MARKER,
+            "the retained image, not the recommendation, must be booted:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(DEFAULT_REF) && !stderr.contains(RECOMMENDATION_B),
+            "neither the retained record nor the recommendation may leak:\n{stderr}"
+        );
+        assert_eq!(
+            harness.selection_bytes().unwrap(),
+            before,
+            "the retained record must be byte-identical"
+        );
+
+        let doctor = stdout_of(&harness.builtin(&["doctor"], &envs));
+        assert!(
+            doctor.contains("default: retained default ["),
+            "doctor must report the retained selection safely:\n{doctor}"
+        );
+        assert!(
+            doctor.contains("selected (without --image): retained default ["),
+            "doctor must select the retained image safely:\n{doctor}"
+        );
+        assert!(
+            !doctor.contains(DEFAULT_REF) && !doctor.contains(RECOMMENDATION_B),
+            "doctor must not echo a default-tier reference:\n{doctor}"
+        );
+    }
+
+    // A *separate* fresh HOME initialized with B yields B: the recommendation is
+    // still what an uninitialized host is offered.
+    let other = Harness::new();
+    other.write_project(PROBE_TOOL);
+    let out = other.launch_argv(
+        "probe",
+        &[],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+    );
+    assert_eq!(
+        oci_reference(&debug_config_json(&stderr_of(&out))),
+        REDACTED_DEFAULT_MARKER
+    );
+    assert!(
+        !stderr_of(&out).contains(RECOMMENDATION_B),
+        "an uninitialized recommendation must not leak either"
+    );
+}
+
+#[test]
+fn explicit_sources_leave_the_selection_untouched() {
+    // Neither an absent nor a present record may be read, adopted or rewritten
+    // by a higher-precedence source.
+    for (name, cli, env, user, project, expected) in [
+        ("cli", Some(CLI_REF), None, None, None, CLI_REF),
+        ("env", None, Some(ENV_REF), None, None, ENV_REF),
+        ("user", None, None, Some(USER_REF), None, USER_REF),
+        ("project", None, None, None, Some(PROJECT_REF), PROJECT_REF),
+    ] {
+        let harness = Harness::new();
+        write_image_tiers(
+            &harness,
+            ImageTiers {
+                user,
+                project,
+                declares_tool: true,
+            },
+        );
+        harness.write_selection_ref(DEFAULT_REF);
+        let before = harness.selection_bytes().unwrap();
+        let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)];
+        if let Some(env) = env {
+            envs.push(("AGENT_VM_IMAGE_TAG", env));
+        }
+        let mut argv: Vec<&str> = Vec::new();
+        if let Some(cli) = cli {
+            argv.push("--image");
+            argv.push(cli);
+        }
+        let out = harness.launch_argv("probe", &argv, &envs);
+        let stderr = stderr_of(&out);
+        assert_eq!(
+            oci_reference(&debug_config_json(&stderr)),
+            expected,
+            "{name}: the higher source must win"
+        );
+        assert_eq!(
+            harness.selection_bytes().unwrap(),
+            before,
+            "{name}: the retained record must be untouched"
+        );
+    }
+
+    // With the record absent, an explicit source must not create one.
+    let harness = Harness::new();
+    write_image_tiers(
+        &harness,
+        ImageTiers {
+            user: None,
+            project: Some(PROJECT_REF),
+            declares_tool: true,
+        },
+    );
+    let out = harness.launch_argv(
+        "probe",
+        &[],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    assert_eq!(
+        oci_reference(&debug_config_json(&stderr_of(&out))),
+        PROJECT_REF
+    );
+    harness.assert_no_selection("explicit project image with an absent record");
+}
+
+#[test]
+fn a_corrupt_selection_fails_closed_and_never_repairs() {
+    const CORRUPT: &str = "{\"version\":1,\"image\":\"sk-SENSITIVE-TOKEN\"}\n";
+    let harness = Harness::new();
+    harness.write_project(PROBE_TOOL);
+    harness.write_selection(CORRUPT);
+    let before = harness.selection_bytes().unwrap();
+
+    // No higher source: the damaged record is a hard error *before* any
+    // acquisition or config dump, and its bytes are never repaired.
+    let out = harness.launch_argv(
+        "probe",
+        &[],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        !out.status.success(),
+        "a corrupt record must fail the launch:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("default-image.json") && stderr.contains("restore the intended digest"),
+        "the error must name the escaped path and a recovery:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "a corrupt record must fail before any acquisition:\n{stderr}"
+    );
+    // M2: neither the token nor the record bytes may appear anywhere.
+    assert!(
+        !stderr.contains("sk-SENSITIVE-TOKEN") && !stderr.contains("sk-SENSITIVE"),
+        "the diagnostic leaked the record contents:\n{stderr}"
+    );
+    assert_eq!(harness.selection_bytes().unwrap(), before);
+
+    // A valid explicit override still works, without parsing or rewriting it.
+    let out = harness.launch_argv(
+        "probe",
+        &["--image", CLI_REF],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
+    let stderr = stderr_of(&out);
+    assert_eq!(oci_reference(&debug_config_json(&stderr)), CLI_REF);
+    assert_eq!(harness.selection_bytes().unwrap(), before);
+
+    // Doctor reports the damage and exits nonzero while still rendering every
+    // section it can.
+    let doctor = harness.builtin(&["doctor"], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+    let stdout = stdout_of(&doctor);
+    assert!(
+        !doctor.status.success(),
+        "doctor must exit nonzero for a damaged default:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("==> boot image") && stdout.contains("default: error:"),
+        "doctor must render the section and the error:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("sk-SENSITIVE"),
+        "doctor's message leaked the record contents:\n{stdout}"
+    );
+}
+
+/// M2 tracing: a default-tier invocation must not let the *dependency* image
+/// stack (`oci_client`, `microsandbox`, `reqwest`, `hyper`) log the
+/// record-sourced reference under `RUST_LOG=trace`. The explicit-source control
+/// proves dependency tracing is otherwise enabled, so the assertion is
+/// discriminating and explicit-source behavior is unchanged.
+#[test]
+fn a_default_tier_invocation_suppresses_dependency_image_tracing() {
+    const SENSITIVE_REPO: &str = "followup-private-retained-token";
+    const SENSITIVE: &str = "localhost:1/followup-private-retained-token@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    let harness = Harness::new();
+    harness.write_selection_ref(SENSITIVE);
+    let mut cmd = harness.base_command();
+    cmd.env("RUST_LOG", "trace")
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B);
+    let out = Harness::run_on(cmd, &["pull"]);
+    assert!(
+        !out.status.success(),
+        "the bogus retained ref must fail the pull"
+    );
+    let combined = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        !combined.contains(SENSITIVE_REPO) && !combined.contains(SENSITIVE),
+        "dependency tracing leaked the default-tier reference:\n{combined}"
+    );
+    assert!(
+        combined.contains(REDACTED_DEFAULT_MARKER),
+        "the debug-config display copy must still be redacted:\n{combined}"
+    );
+    assert!(
+        combined.contains("pulling the default boot image failed"),
+        "the failure must stay a fixed stage reason:\n{combined}"
+    );
+
+    // Positive control: an explicit source keeps dependency tracing. If this
+    // control did not see the log, the redaction assertion above would prove
+    // nothing.
+    let explicit = Harness::new();
+    let mut cmd = explicit.base_command();
+    cmd.env("RUST_LOG", "trace")
+        .env("AGENT_VM_IMAGE_TAG", "localhost:1/cli-explicit:latest");
+    let out = Harness::run_on(cmd, &["pull"]);
+    assert!(
+        !out.status.success(),
+        "the explicit bogus ref must fail too"
+    );
+    let combined = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        combined.contains("oci_client::client") && combined.contains("cli-explicit"),
+        "explicit-source dependency tracing must stay enabled (positive control):\n{combined}"
+    );
+}
+
+/// The defect this pins: a *valid* higher source must not mask a damaged
+/// default in `doctor`. The launch still honours the override, but the
+/// diagnosis of the full state is nonzero after printing every section.
+#[test]
+fn doctor_reports_a_damaged_default_even_with_a_valid_override() {
+    let harness = Harness::new();
+    harness.write_selection("{\"version\":1,\"image\":\"sk-CORRUPT-TOKEN\"}\n");
+    let before = harness.selection_bytes().unwrap();
+
+    let doctor = harness.builtin(&["doctor"], &[("AGENT_VM_IMAGE_TAG", ENV_REF)]);
+    let stdout = stdout_of(&doctor);
+    assert!(
+        !doctor.status.success(),
+        "a damaged default must fail doctor even when a valid override wins the \
+         launch:\n{stdout}"
+    );
+    assert!(stdout.contains("==> boot image"), "{stdout}");
+    assert!(stdout.contains("default: error:"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "selected (without --image): {ENV_REF} (from AGENT_VM_IMAGE_TAG)"
+        )),
+        "the valid override must still be shown:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("sk-CORRUPT"),
+        "the damaged record must not leak:\n{stdout}"
+    );
+    assert_eq!(harness.selection_bytes().unwrap(), before);
+}
+
+/// M2: a record-sourced reference never reaches a notice, the debug-config
+/// display copy, progress, or an acquisition error chain — even when valid.
+#[test]
+fn a_default_tier_reference_is_redacted_across_output() {
+    const SENSITIVE: &str = "localhost:1/private-retained-token@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let harness = Harness::new();
+    harness.write_project(PROBE_TOOL);
+    harness.write_selection_ref(SENSITIVE);
+    let before = harness.selection_bytes().unwrap();
+
+    // A default-tier launch: notice, debug dump and failure are all redacted.
+    let out = harness.launch_argv(
+        "probe",
+        &[],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+    );
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("==> Boot image: the default boot image"),
+        "the default notice must be a fixed label:\n{stderr}"
+    );
+    assert_eq!(
+        oci_reference(&debug_config_json(&stderr)),
+        REDACTED_DEFAULT_MARKER,
+        "the display copy must redact the image reference:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("booting a sandbox from the default boot image failed"),
+        "acquisition failure must be a fixed, stage-specific reason:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(SENSITIVE) && !stderr.contains(RECOMMENDATION_B),
+        "neither the retained record nor the recommendation may leak:\n{stderr}"
+    );
+    assert_eq!(harness.selection_bytes().unwrap(), before);
+
+    // `pull` writes its selection notice to stdout and the dump/error to stderr.
+    let pull = harness.builtin(
+        &["pull"],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+    );
+    assert!(!pull.status.success());
+    let combined = format!("{}{}", stdout_of(&pull), stderr_of(&pull));
+    assert!(
+        combined.contains("the default boot image is the image this configuration boots from"),
+        "pull must name the default safely:\n{combined}"
+    );
+    assert!(
+        combined.contains(REDACTED_DEFAULT_MARKER),
+        "pull's display copy must redact the reference:\n{combined}"
+    );
+    assert!(
+        !combined.contains(SENSITIVE) && !combined.contains(RECOMMENDATION_B),
+        "pull leaked a default-tier reference:\n{combined}"
+    );
+
+    // An *uninitialized* host (recommendation only) is redacted too.
+    let fresh = Harness::new();
+    fresh.write_project(PROBE_TOOL);
+    let out = fresh.launch_argv("probe", &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", SENSITIVE)]);
+    let stderr = stderr_of(&out);
+    assert!(
+        !stderr.contains(SENSITIVE),
+        "the initial recommendation leaked:\n{stderr}"
+    );
+    assert_eq!(
+        oci_reference(&debug_config_json(&stderr)),
+        REDACTED_DEFAULT_MARKER
+    );
+}
+
+#[test]
+fn the_selection_is_scoped_to_user_home_not_state_or_cwd() {
+    let harness = Harness::new();
+    harness.write_project(PROBE_TOOL);
+    harness.write_selection_ref(DEFAULT_REF);
+    let before = harness.selection_bytes().unwrap();
+
+    // A different project cwd and a different state root must not move the
+    // bookmark: it is user-scoped, not cache- or project-scoped. The state root
+    // stays short, or the sandbox control socket exceeds `sun_path`.
+    let elsewhere = tempfile::tempdir_in("/tmp").unwrap();
+    let mut cmd = harness.base_command();
+    cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)
+        .env("AGENT_VM_STATE_DIR", elsewhere.path())
+        .current_dir(elsewhere.path());
+    let out = Harness::run_on(cmd, &["shell"]);
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        oci_reference(&debug_config_json(&stderr)),
+        REDACTED_DEFAULT_MARKER,
+        "the retained default must not follow the state root or cwd:\n{stderr}"
+    );
+    assert_eq!(harness.selection_bytes().unwrap(), before);
+
+    // A different HOME is genuinely independent.
+    let other = Harness::new();
+    other.assert_no_selection("a different HOME");
 }

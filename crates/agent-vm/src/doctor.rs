@@ -42,7 +42,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use clap::Args as ClapArgs;
 
-use crate::boot_image::{self, BootImage};
+use crate::boot_image;
 use crate::config::{
     ConfigConflict, ConfigReport, ConfiguredImage, ConfiguredImages, LaunchCatalog, TierReport,
     TierStatus, Tool, ToolOrigin,
@@ -138,13 +138,21 @@ pub fn run(args: Args) -> Result<()> {
             println!();
             println!("{}", describe_launch_view(&launch));
         }
+        let (boot_image_section, boot_image_failure) =
+            describe_boot_image(images.as_ref(), &env_slot);
         println!();
-        println!("{}", describe_boot_image(images.as_ref(), &env_slot));
+        println!("{boot_image_section}");
         println!();
         println!("==> agent-vm doctor: available operations");
         println!("      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next");
         println!("                       agent-vm shell/run recreates it at the bundled schema");
         if let Some(error) = catalog_failure {
+            return Err(error);
+        }
+        // A leftover of the rendered section is still a failure: `doctor` found
+        // damaged state, so it must exit nonzero *after* printing every section
+        // it could still read.
+        if let Some(error) = boot_image_failure {
             return Err(error);
         }
         if matches!(env_slot, boot_image::EnvOverride::Invalid) {
@@ -698,10 +706,17 @@ fn describe_tier(tier: &TierReport) -> String {
     }
 }
 
-fn describe_boot_image(images: Option<&ConfiguredImages>, env: &boot_image::EnvOverride) -> String {
-    // Read-only diagnostics: this uses the selection owner (whose default
-    // acquisition may read D9's env / later #261's state) so it cannot disagree
-    // with a launch. It is not a purity claim.
+/// Renders the boot-image section and returns the failure it found, if any.
+///
+/// Observational by construction: [`boot_image::observe`] reads the retained
+/// record and resolves the selection from **one** snapshot, so the `default`
+/// row and `selected (without --image)` row cannot disagree across a concurrent
+/// adoption, and nothing is created, locked or repaired. A damaged default still
+/// renders every tier row and a clear error; the caller exits nonzero.
+fn describe_boot_image(
+    images: Option<&ConfiguredImages>,
+    env: &boot_image::EnvOverride,
+) -> (String, Option<anyhow::Error>) {
     let mut out = String::from("==> boot image\n");
     let env_override = match env {
         boot_image::EnvOverride::Present(override_) => {
@@ -722,13 +737,34 @@ fn describe_boot_image(images: Option<&ConfiguredImages>, env: &boot_image::EnvO
             out.push_str(
                 "AGENT_VM_IMAGE_TAG: <present but not valid Unicode; refusing to select>\n",
             );
-            return out;
+            return (out, None);
         }
+    };
+    // An unreadable config leaves the tiers unknown, but the default slot is
+    // still readable, so `doctor` reports it with the *same* selector an empty
+    // config would use rather than inventing a second resolution path.
+    let configured = images.cloned().unwrap_or_default();
+    let observation = boot_image::observe(env_override, &configured);
+    let default_row = describe_default_observation(&observation.default);
+    // A user scope that cannot be *located* (`$HOME` unset, empty or relative)
+    // is already reported by the config section as an unavailable user tier;
+    // it is not a damaged record, so on its own it does not fail the
+    // diagnostic. A record that exists but cannot be read/parsed does — this
+    // follows the *default* row, not the effective selection, so a valid
+    // `AGENT_VM_IMAGE_TAG` cannot mask the damage (the override still wins the
+    // launch; the diagnosis still fails).
+    let scope_locatable = matches!(crate::config::host_home_dir(), Ok(Some(_)));
+    let failure = match &observation.default {
+        boot_image::DefaultObservation::Unavailable { message } if scope_locatable => {
+            Some(anyhow::anyhow!(message.clone()))
+        }
+        _ => None,
     };
     let Some(images) = images else {
         // The config could not be read, so the tiers are unknown.
-        out.push_str("unknown (configuration could not be read)");
-        return out;
+        out.push_str("unknown (configuration could not be read)\n");
+        out.push_str(&format!("default: {default_row}"));
+        return (out, failure);
     };
     out.push_str(&format!(
         "user:    {}\n",
@@ -742,19 +778,43 @@ fn describe_boot_image(images: Option<&ConfiguredImages>, env: &boot_image::EnvO
     } else {
         out.push_str(&format!("project: {project}\n"));
     }
-    out.push_str(&format!(
-        "default: {}\n",
-        crate::config::escape_str(boot_image::default_image().as_str())
-    ));
+    out.push_str(&format!("default: {default_row}\n"));
     // Doctor accepts no `--image`, so the selected row excludes the command
-    // line: it is the env slot, then config, then default.
-    let selected: BootImage = boot_image::select(env_override, images);
-    out.push_str(&format!(
-        "selected (without --image): {} (from {})",
-        crate::config::escape_str(selected.reference().as_str()),
-        selected.source().describe()
-    ));
-    out
+    // line: it is the env slot, then config, then the default slot. When the
+    // default slot won, the selected row reuses the *safe* default label rather
+    // than rendering its reference.
+    match &observation.selected {
+        Ok(selected) if selected.is_default() => {
+            out.push_str(&format!("selected (without --image): {default_row}"));
+        }
+        Ok(selected) => out.push_str(&format!(
+            "selected (without --image): {} (from {})",
+            crate::config::escape_str(selected.reference().as_str()),
+            selected.source().describe()
+        )),
+        Err(error) => out.push_str(&format!("selected (without --image): error: {error:#}")),
+    }
+    (out, failure)
+}
+
+/// The `default:` row: which immutable image this host retains, the offered
+/// recommendation when nothing is retained yet, or a safe diagnostic. Never a
+/// raw record/recommendation reference — only a fixed label and the escaped
+/// record path — so `doctor` can be shared or pasted without leaking a private
+/// registry name.
+fn describe_default_observation(observation: &boot_image::DefaultObservation) -> String {
+    match observation {
+        boot_image::DefaultObservation::Retained { path, .. } => {
+            format!("retained default [{}]", crate::config::escape_path(path))
+        }
+        boot_image::DefaultObservation::Uninitialized { path, .. } => format!(
+            "not selected; initial recommendation [{}]",
+            crate::config::escape_path(path)
+        ),
+        boot_image::DefaultObservation::Unavailable { message } => {
+            format!("error: {message}")
+        }
+    }
 }
 
 /// `ghcr.io/owner/name:tag [/path/to/config.toml]` or `none`.

@@ -37,6 +37,7 @@ crates/agent-vm/src/
 ├── network.rs              # egress policy and published ports
 ├── mount.rs                # --mount grammar and volume wiring
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
+│   └── default_selection.rs#   the retained digest record: read-only load, write-once adopt
 ├── msb_install.rs          # locate + version-verify the bundled msb; MSB_HOME
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
 ├── doctor.rs               # operator diagnostics and db recovery
@@ -581,6 +582,25 @@ microsandbox's `RootfsSource` supports an OCI reference, a host directory
 (`Bind`), or a qcow2/raw/vmdk file. agent-vm uses the OCI path, booting the
 selected image verbatim (see
 [USAGE](USAGE.md#selecting-the-boot-image)).
+
+```text
+[CLI/env/config tiers] ─┐
+                        ├─► boot_image::select ──► SandboxBuilder.image(ref) ──► msb acquire (IfMissing)
+[retained default] ─────┘        (lazy, fallible)           │                              │
+   │  UserConfig/ProjectConfig win over it;                 │                              │ content cached
+   │  an absent record falls back to the                     │                              ▼
+   │  initial recommendation (no write)                      │                       adopt the ref into
+   ▼                                                         │                       default-image.json
+$HOME/.config/agent-vm/default-image.json ◄──────────────────┴───── (only after a *successful* default-tier acquire)
+```
+
+The **saved selection is not the image cache.** The record names exact content;
+msb owns the bytes and may refetch a missing layer. It is also not a project or
+launcher-version artifact: it lives with the user-scoped settings, so a new
+project, a cleared cache or a new `AGENT_VM_STATE_DIR` leaves it alone. Reading
+it is lazy and read-only, which is why `help` and `doctor` touch nothing;
+adoption happens once, after a default-tier image is actually acquired. See
+[USAGE](USAGE.md#the-retained-default) for the operational details.
 
 - **Standard OCI semantics.** microsandbox's layer cache, GC, snapshotting, and
   metadata DB all key off OCI references. Going through that path means getting

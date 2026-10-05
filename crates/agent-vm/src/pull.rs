@@ -48,19 +48,26 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
              falling back to --image/AGENT_VM_IMAGE_TAG or the default boot image"
         );
     }
-    let boot = boot_image::select(args.image.requested()?, &images);
-    println!("==> {boot} is the image this configuration boots from");
-    pull_image(boot.reference().as_str()).await?;
-    println!(
-        "==> {} pulled into the microsandbox cache",
-        boot.reference().as_str()
-    );
+    let boot = boot_image::select(args.image.requested()?, &images)?;
+    let label = boot.label();
+    println!("==> {label} is the image this configuration boots from");
+    pull_image(boot.reference().as_str(), &label).await?;
+    // Success-before-adoption (#261): only after the forced acquisition
+    // succeeded may a default-tier selection become the retained default. A
+    // `pull --image X` refreshes X and never adopts it.
+    boot_image::adopt_default_selection(&boot)
+        .context("retaining the selected default boot image")?;
+    println!("==> {} pulled into the microsandbox cache", label.text());
     Ok(())
 }
 
 /// Force a pull of `image` into the microsandbox cache and exit. Used
 /// by both `agent-vm pull` and the verify step in `agent-vm setup`.
-pub async fn pull_image(image: &str) -> Result<()> {
+///
+/// `label` is the selection's safe output policy: when it is redacted (the
+/// default tier) the debug dump, progress display and any acquisition error
+/// carry the fixed label instead of the record/recommendation reference.
+pub async fn pull_image(image: &str, label: &boot_image::ImageLabel) -> Result<()> {
     let is_local = is_plain_http_registry(image);
     let config = Sandbox::builder("agent-vm-pull")
         .image(image)
@@ -74,12 +81,14 @@ pub async fn pull_image(image: &str) -> Result<()> {
         .context("preparing pull config")?;
     // The exact config handed to the SDK, behind AGENT_VM_DEBUG_CONFIG, so an
     // integration test can assert the acquisition input (the selected image
-    // reference) rather than a selector notice or a connection error.
-    if let Some(dump) = crate::debug_config::sandbox_config(&config)? {
+    // reference) rather than a selector notice or a connection error. A
+    // redacted selection renders a fixed marker instead of the reference.
+    if let Some(dump) = crate::debug_config::sandbox_config(&config, label.is_redacted())? {
         eprintln!("{dump}");
     }
     let (progress, task) = Sandbox::create_with_pull_progress(config);
-    let render = tokio::spawn(crate::pull_progress::render(progress));
+    let reference_label = label.is_redacted().then(|| label.text().to_string());
+    let render = tokio::spawn(crate::pull_progress::render(progress, reference_label));
     // Await render BEFORE propagating any error from `task`. Two reasons:
     // (1) `task` finishing drops the progress sender, so render's recv
     // loop is already winding down; this just lets `display.finish()`
@@ -90,7 +99,11 @@ pub async fn pull_image(image: &str) -> Result<()> {
     let result = task
         .await
         .context("pull task join")
-        .and_then(|inner| inner.context("pulling image"));
+        .and_then(|inner| inner.context("pulling image"))
+        // A redacted (default-tier) failure must not chain the registry URL
+        // that embeds the reference; the fixed reason still names the stage. An
+        // explicit source keeps its error unchanged.
+        .map_err(|error| label.redact_error("pulling", error));
     crate::pull_progress::await_render(render).await;
     let sandbox = result?;
     sandbox.stop_and_wait().await.ok();
@@ -99,10 +112,13 @@ pub async fn pull_image(image: &str) -> Result<()> {
     // Only after a successful pull do we record what we landed. If
     // anything above failed, the marker is unchanged and the next
     // launch's banner still flags this image as needing an update.
-    if let Some(digest) = crate::image_check::fetch_remote_digest(image).await
+    if let Some(digest) = crate::image_check::fetch_remote_digest(image, label.is_redacted()).await
         && let Err(e) = crate::pulled_marker::write(image, &digest)
     {
-        eprintln!("warn: failed to record pulled digest: {e}");
+        // The marker error is a trusted-host path error (state root), never the
+        // image reference, so it is not record data; it is printed as-is for
+        // debugging (not escaped).
+        eprintln!("warn: failed to record pulled digest: {e:#}");
     }
 
     Ok(())
