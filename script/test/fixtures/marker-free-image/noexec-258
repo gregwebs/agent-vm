@@ -1,0 +1,6 @@
+#258 fixture: a file that exists on the guest PATH but is never executable.
+#
+# Installed mode 0644 at /usr/local/bin/noexec-258 by the `marker-free` target,
+# so `setup`'s presence probe must classify a declared `noexec-258` as "present
+# but not executable", never as absent. It must never be made executable: the
+# e2e check asserts the not-executable diagnostic.

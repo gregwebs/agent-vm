@@ -224,9 +224,10 @@ fn catalog_from_tools(mut tools: Vec<Tool>) -> Result<LaunchCatalog> {
     if shell_fallback_added {
         tools.push(builtin_shell()?);
     }
+    let declared_len = tools.len() - usize::from(shell_fallback_added);
     Ok(LaunchCatalog {
         entries: resolve_provisioning(tools)?,
-        shell_fallback_added,
+        declared_len,
     })
 }
 
@@ -236,24 +237,6 @@ fn catalog_from_tools(mut tools: Vec<Tool>) -> Result<LaunchCatalog> {
 /// this cannot itself fail on the shipped catalog), and by tests.
 pub(crate) fn default_launch_catalog() -> Result<LaunchCatalog> {
     catalog_from_tools(default_tools()?)
-}
-
-/// The `command` values of the compiled-in default tools: the binaries the
-/// published image is contractually required to carry. `setup` derives its
-/// fatal-vs-warn severity from membership here, **not** from a tool's
-/// [`ToolOrigin`], because that contract belongs to the *binary*, not to the
-/// tier that declared the tool. Otherwise a user config that restates `claude`
-/// (to change `args`, say) would turn a missing `claude` back into a warning.
-/// Derived from [`default_tools`], never hand-copied.
-///
-/// `Result` because the compiled-in defaults are parsed through the same
-/// raw-to-validated path as user input; a broken default is already a hard
-/// error elsewhere ([`default_launch_catalog`]).
-pub(crate) fn shipped_tool_commands() -> Result<Vec<String>> {
-    Ok(default_tools()?
-        .iter()
-        .map(|tool| tool.command().to_string())
-        .collect())
 }
 
 /// The outcome of loading the tool config, as data. One value rather than a
@@ -284,7 +267,15 @@ const ALL_TOOLS_WILDCARD: &str = "*";
 #[derive(Debug)]
 pub(crate) struct LaunchCatalog {
     entries: Vec<CatalogEntry>,
-    shell_fallback_added: bool,
+    /// How many leading entries are declarations *right now*: the prefix
+    /// describes the catalog's current contents, not a historical record. When
+    /// dispatch removes one through [`Self::take_entry`], the prefix shrinks
+    /// with it, so it always states what is still declared. The synthesized
+    /// `shell` fallback, when present, is the single entry after this prefix.
+    /// `cli` and `doctor` render all of `entries` ([`Self::as_slice`]); `setup`
+    /// verifies only the declarations ([`Self::declarations`]), because the
+    /// fallback "is not a declaration".
+    declared_len: usize,
 }
 
 /// One launch-catalog entry: a tool plus the provisioning set resolved for it.
@@ -336,10 +327,24 @@ impl LaunchCatalog {
         &self.entries
     }
 
-    /// True when the built-in `shell` was appended because no declared tool
-    /// claimed the name; `doctor` labels the row from this.
-    pub(crate) fn shell_fallback_added(&self) -> bool {
-        self.shell_fallback_added
+    /// Only the entries the configuration declares, as the catalog currently
+    /// stands. `as_slice` is the full verb list — the built-in `shell` fallback
+    /// included — for `cli` and `doctor`; `setup`'s verification scope is exactly
+    /// the declarations, because a fallback is a launch affordance, not
+    /// something the user asked to verify. The prefix length is maintained in
+    /// one place ([`Self::take_entry`]), so this is not index arithmetic at the
+    /// call site.
+    pub(crate) fn declarations(&self) -> &[CatalogEntry] {
+        &self.entries[..self.declared_len]
+    }
+
+    /// True when the entry after the declaration prefix is the built-in
+    /// `shell` fallback — that is, `shell` is currently a launch affordance
+    /// rather than a declaration. Derived from the current prefix (not from the
+    /// historical fact that a fallback was appended), so `doctor` labels the row
+    /// and `setup` scopes verification for what the catalog holds now.
+    pub(crate) fn has_shell_fallback(&self) -> bool {
+        self.declared_len < self.entries.len()
     }
 
     /// Remove just the named entry from the catalog and hand it on for
@@ -355,6 +360,13 @@ impl LaunchCatalog {
             .entries
             .iter()
             .position(|entry| entry.tool.name() == name)?;
+        // Keep the prefix describing the catalog's *current* contents: a
+        // removed declaration is no longer declared, so the prefix shrinks with
+        // it. Removing the `shell` fallback (the entry at `declared_len`) leaves
+        // the prefix — and every declaration in it — alone.
+        if index < self.declared_len {
+            self.declared_len -= 1;
+        }
         Some(self.entries.remove(index))
     }
 }
@@ -2219,7 +2231,7 @@ mod tests {
             .map(|entry| entry.tool().name())
             .collect();
         assert_eq!(names, ["solo", "shell"]);
-        assert!(catalog.shell_fallback_added());
+        assert!(catalog.has_shell_fallback());
         let shell = catalog
             .as_slice()
             .iter()
@@ -2238,7 +2250,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.user("[[tools]]\nname = \"shell\"\ncommand = \"zsh\"\n");
         let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
-        assert!(!catalog.shell_fallback_added());
+        assert!(!catalog.has_shell_fallback());
         assert_eq!(catalog.as_slice().len(), 1);
         assert_eq!(catalog.as_slice()[0].tool().name(), "shell");
         assert_eq!(catalog.as_slice()[0].tool().command(), "zsh");
@@ -2253,7 +2265,7 @@ mod tests {
             let fixture = Fixture::new();
             fixture.user(user).project(project);
             let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
-            assert!(!catalog.shell_fallback_added());
+            assert!(!catalog.has_shell_fallback());
             let names: Vec<&str> = catalog
                 .as_slice()
                 .iter()
@@ -2299,6 +2311,75 @@ mod tests {
         );
         assert!(catalog.take_entry("solo").is_none(), "removed once");
         assert!(catalog.take_entry("absent").is_none());
+    }
+
+    /// Removing a declaration while the built-in `shell` fallback is present:
+    /// the prefix shrinks, so `shell` stays the fallback rather than being
+    /// promoted to a declaration.
+    #[test]
+    fn take_entry_decrements_the_prefix_for_a_declaration_with_a_fallback() {
+        let fixture = Fixture::new();
+        fixture.user(&one_tool("solo"));
+        let mut catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert!(catalog.has_shell_fallback());
+
+        let solo = catalog.take_entry("solo").expect("solo is in the catalog");
+        assert_eq!(solo.tool().name(), "solo");
+        assert!(
+            catalog.declarations().is_empty(),
+            "solo is no longer declared"
+        );
+        assert!(catalog.has_shell_fallback(), "shell stays the fallback");
+        assert_eq!(catalog.as_slice().len(), 1);
+    }
+
+    /// Removing a declaration from the compiled-in default catalog (where
+    /// `shell` is itself declared, so no fallback is appended) must keep the
+    /// prefix within `entries` — the arithmetic bug that made `declarations()`
+    /// panic here — and leave `shell` a declaration.
+    #[test]
+    fn take_entry_decrements_the_prefix_for_a_default_declaration() {
+        let mut catalog = default_launch_catalog().unwrap();
+        assert!(!catalog.has_shell_fallback());
+        let declared_before = catalog.declarations().len();
+
+        let dsh = catalog.take_entry("dsh").expect("dsh is a default tool");
+        assert_eq!(dsh.tool().name(), "dsh");
+        assert_eq!(catalog.declarations().len(), declared_before - 1);
+        assert!(
+            !catalog
+                .declarations()
+                .iter()
+                .any(|entry| entry.tool().name() == "dsh"),
+            "the removed declaration is gone from the prefix"
+        );
+        assert!(
+            catalog
+                .declarations()
+                .iter()
+                .any(|entry| entry.tool().name() == "shell"),
+            "shell is still declared, not a fallback"
+        );
+        assert!(!catalog.has_shell_fallback());
+    }
+
+    /// Removing the `shell` fallback itself leaves the declaration prefix
+    /// untouched, and the flag clears because nothing sits after the prefix.
+    #[test]
+    fn take_entry_of_the_fallback_leaves_the_prefix_untouched() {
+        let fixture = Fixture::new();
+        fixture.user(&one_tool("solo"));
+        let mut catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        let declared_before = catalog.declarations().len();
+        assert!(catalog.has_shell_fallback());
+
+        let shell = catalog
+            .take_entry("shell")
+            .expect("shell is in the catalog");
+        assert_eq!(shell.tool().name(), "shell");
+        assert_eq!(catalog.declarations().len(), declared_before);
+        assert_eq!(catalog.as_slice().len(), declared_before);
+        assert!(!catalog.has_shell_fallback());
     }
 
     /// The provisioning set of `name` in `catalog`, in `CredentialProvider::ALL`

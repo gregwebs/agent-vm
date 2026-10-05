@@ -646,7 +646,7 @@ fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Opti
                     describe_tool(entry.tool(), entry.provisioned())
                 ));
             }
-            if catalog.shell_fallback_added() {
+            if catalog.has_shell_fallback() {
                 out.push_str(
                     "note: `shell` was not declared; the built-in fallback is registered so you\n\
                      still have a way into the guest.\n",

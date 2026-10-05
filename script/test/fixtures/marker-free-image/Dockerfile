@@ -17,6 +17,10 @@ RUN ! command -v bash
 FROM ${ALPINE} AS marker-free
 RUN apk add --no-cache bash
 COPY --chmod=0755 hello-258 /usr/local/bin/hello-258
+# A file on PATH that is deliberately NOT executable, so the setup verification
+# diagnostic's "present but not executable" case is covered with real guest
+# evidence (mode fixed here, not by the source file's mode).
+COPY --chmod=0644 noexec-258 /usr/local/bin/noexec-258
 
 # The same minimal base with a present, NON-numeric `/etc/agent-vm-image-version`.
 # A stamp that is not a version must be ignored (the boot/image contract has no

@@ -56,22 +56,28 @@ declares only `claude`, then only `agent-vm claude` (plus the built-ins and a
 the same list, in the same order.
 
 `agent-vm setup` pulls the selected image and, unless `--no-verify` is given,
-boots a throwaway sandbox and verifies **every configured tool** by running its
-`command` with `--version` (a direct argv exec, never a shell string — a
-present-but-broken binary fails rather than passing an `exists` check).
-Severity follows the **image**, not the declaring tier: a shipped command
-(`pi`/`codex`/`opencode`/`claude`/`copilot`/`dsh`/`shell`) is fatal only when
-the verified image is the **default** boot image; for any image you selected
-(`--image`, `AGENT_VM_IMAGE_TAG`, or a config `image`) every missing command
-**warns**, because you own that image and agent-vm never installs software. A
-shipped command whose `--version` exits non-zero is fatal on the default image
-too. **This user-selected-image severity policy is the implemented behavior,
-but is proposed pending maintainer confirmation (issue #259); the default-image
-behavior is unchanged.** `setup` executes the configured commands inside the
+boots a throwaway sandbox and verifies **every tool your configuration
+declares** by running its `command` with `--version` (a direct argv exec,
+never a shell string). A command your configuration does not name is not
+checked at all (the built-in `shell` fallback is a launch affordance, not a
+declaration, so it is not verified). **Every declared tool is required — on the
+default boot image
+and on any image you selected** (`--image`, `AGENT_VM_IMAGE_TAG`, or a config
+`image`): if a declared command is missing, or its `--version` exits non-zero,
+`setup` fails, because agent-vm never installs software. Every tool is expected
+to answer `--version`; a presence/executability-only check may be offered later
+as an alternative, but is not available today. A failing probe is diagnosed as
+one of three cases: no entry found on the guest `PATH` (for a bare command
+name) or at the configured path (for a command that names one), present but not
+a runnable executable (a non-executable file or a directory), and present and
+executable but `--version` failed.
+`setup` executes the configured commands inside the
 throwaway VM — the
 same trust as running any agent-vm command in a directory with a `.agent-vm/`.
-A broken config warns and falls back to the shipped defaults and the default
-boot image, so a config typo never blocks the pull/boot/verify recovery path.
+A broken config warns and falls back: verification uses the shipped default
+tools and the image already selected by `--image`/`AGENT_VM_IMAGE_TAG` (or the
+default boot image), so a config typo never blocks the pull/boot/verify
+recovery path.
 
 `agent-vm` keeps its sandbox registry under a private `MSB_HOME` —
 `~/.local/state/agent-vm/msb-home` on Linux, `~/.agent-vm-msb` on macOS
