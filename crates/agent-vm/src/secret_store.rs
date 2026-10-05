@@ -1158,15 +1158,20 @@ fn inventory_paths() -> Result<InventoryPaths> {
 /// When `AGENT_VM_TEST_SECRET_RECORD` names a path, `set` records only the
 /// accepted value's **length and SHA-256** — never its bytes — to that file, so
 /// `tests/secret_pty.rs` can assert the *exact* value the hidden reader
-/// delivered without a real credential store (review finding N3). It is
-/// compiled out of release builds, so a shipped binary cannot be pointed at a
-/// secret-recording backend. The inventory paths still honor `$HOME`.
-#[cfg(debug_assertions)]
+/// delivered without a real credential store (review finding N3). The inventory
+/// paths still honor `$HOME`.
+///
+/// Gated on `any(test, debug_assertions)`: the `test` arm lets this type's unit
+/// test compile and run under `--release` (where `debug_assertions` is off), and
+/// `debug_assertions` is the arm [`test_recording_store`] exposes. `test` is
+/// never set for a shipped binary, so a release binary still cannot be pointed
+/// at a secret-recording backend.
+#[cfg(any(test, debug_assertions))]
 pub(crate) struct RecordingKeychain {
     path: PathBuf,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 impl KeychainBackend for RecordingKeychain {
     fn set(&self, _service: &ServiceName, value: &SecretValue) -> Result<(), KeychainFailure> {
         use sha2::{Digest as _, Sha256};

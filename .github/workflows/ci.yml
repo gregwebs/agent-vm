@@ -48,6 +48,18 @@ jobs:
       - name: Test
         run: cargo test -p agent-vm
 
+      # Type-check-only. CI runs the *debug* test profile, so the release test
+      # profile rots silently: a `#[cfg(test)]` use of a `#[cfg(debug_assertions)]`
+      # item (the recording keychain) compiled in debug and broke `--release`.
+      # `cargo check` is deliberate rather than `cargo test --no-run`: the class
+      # of rot here is a name-resolution error, which `check` catches, while
+      # `--no-run` pays for release codegen and linking for no extra coverage.
+      # Neither runs the tests: the debug-only seams are compiled out under
+      # `--release` and the tests that need them fail loudly rather than skip
+      # (see `tests/secret_pty.rs`), so the release *run* is not a gate.
+      - name: Check release tests
+        run: cargo check --release -p agent-vm --tests
+
       - name: Format check
         continue-on-error: true
         run: cargo fmt --all -- --check

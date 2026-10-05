@@ -51,8 +51,9 @@
 //! Note: `cargo test --release -p agent-vm` **fails loudly** rather than skipping.
 //! The recording seam is `#[cfg(debug_assertions)]`, so under `--release` the
 //! boundary tests fall through to the real store and fail the exit-0 assertion.
-//! That is the right behaviour and it is not in CI (CI's release step is
-//! `cargo build`); do not add a silent skip (review finding R7).
+//! That is the right behaviour: CI type-checks the release test profile
+//! (`cargo check --release -p agent-vm --tests`) but never runs it, so do not
+//! add a silent skip (review finding R7).
 
 #![cfg(unix)]
 
