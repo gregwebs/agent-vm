@@ -161,7 +161,8 @@ It *names exact image content* (a digest, never a moving tag); microsandbox
 separately downloads and caches that content. So the default is independent of
 the msb cache and of every project: clearing the cache, enabling the shared
 cache, changing `AGENT_VM_STATE_DIR` or working in another directory does not
-move it. It is deliberately a separate file from `config.toml` — writing a
+move it. Change it deliberately with [explicit upgrade](#explicitly-upgrading-the-default).
+It is deliberately a separate file from `config.toml` — writing a
 top-level `image =` there would make the *user config* tier win over the
 *project* tier, which is a precedence change, not a bookmark.
 
@@ -181,7 +182,7 @@ value, and a newer release may change it). How the two interact:
   successful launch. Nothing is stranded on bytes your host cannot boot.
 - **A retained default is never silently replaced.** A different recommendation,
   a launcher upgrade, a project image, or a cache loss leaves the retained
-  digest alone. `adopt` is write-once (first writer wins), so concurrent first
+  digest alone. automatic `adopt` is write-once (first writer wins), so concurrent first
   launches cannot overwrite each other.
 - **The digest must resolve.** A retained digest whose content is unavailable
   (registry gone, content deleted) fails the launch with the same error a
@@ -215,9 +216,50 @@ names the escaped path with a fixed reason; nothing is auto-reset. To recover,
 restore the intended digest record from backup, or deliberately move the file
 aside to reinitialize from the current recommendation.
 
-Replacing an *already working* retained default is not implemented yet
-(issue [#262](https://github.com/gregwebs/agent-vm/issues/262)); until then the
-deliberate move-aside above is the recovery.
+### Explicitly upgrading the default
+
+```sh
+agent-vm upgrade --image ghcr.io/owner/standard:release-2
+agent-vm shell --no-git -- bash -c 'my-program --version'
+```
+
+`--image REF` is required and accepts an OCI tag or digest, not a local path.
+Environment/config launch images do not choose the upgrade target, even with
+broken tool configuration. There is no automatic latest discovery; explicitly
+requesting `:latest` resolves it only for this invocation.
+
+```text
+explicit OCI target → native acquire → immutable host manifest pin
+                    → native pinned-cache acquire → host-Linux config check
+                    → selection flock → atomic retained-record replacement
+```
+
+The command uses the ambient **local** microsandbox cache and native registry
+auth/TLS settings. It consumes registry content without Docker and **does not
+boot or replace a VM**. Only future sessions falling through to the default
+change: CLI, environment, user and project image overrides and running sessions
+are untouched. Acquisition or publication failure exits nonzero and leaves the
+old selection and cached image usable; unused new artifacts may remain cached.
+No old images are deleted. A successfully re-acquired same digest leaves valid
+record bytes unchanged. Atomic rename protects against interruption, not
+power-loss durability (`fsync` is not added).
+
+An absent record can be initialized directly, without consulting the initial
+recommendation. A damaged record is rejected, not automatically repaired; use
+the recovery procedure above. Concurrent explicit publications serialize under
+the same lock as ordinary adoption; the last successful explicit commit wins,
+and a delayed ordinary adopter cannot overwrite it. A launch that already
+selected the previous default may still boot it.
+
+Roll back by passing a known previous full digest reference to the same
+`upgrade --image` command. Acquisition must succeed again before selection
+changes; `pull --image` remains a cache refresh, never default replacement.
+
+Upgrade progress/application errors use a fixed redacted image label, not the
+old or requested reference or native source chains. Inspect your user-owned
+record directly for the pin. Clap usage errors may echo an invalid value you
+supplied on argv (status 2); this exception does not apply to stored references.
+See [the retained default](#the-retained-default) for scope and recovery.
 
 ### Customizing the image
 

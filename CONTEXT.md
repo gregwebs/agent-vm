@@ -383,8 +383,11 @@ The digest-pinned image a host keeps as its default after acquiring it, in the
 user-scoped `$HOME/.config/agent-vm/default-image.json`. A *bookmark* naming
 exact content, not a download cache: it is independent of the msb image cache,
 `AGENT_VM_STATE_DIR` and any project, and it is written **only after** the image
-was acquired (success-before-adoption), write-once, so no failed or concurrent
-first launch overwrites it. Distinguished from the **initial recommendation**
+was acquired (success-before-adoption). Automatic initialization is write-once,
+so no failed or concurrent first launch overwrites it. A **deliberate default-image
+upgrade** is successful native acquisition and host-platform validation followed
+by replacement of this retained fallback; it affects future default-image
+sessions only. See [explicit upgrade](USAGE.md#explicitly-upgrading-the-default). Distinguished from the **initial recommendation**
 below. See
 [USAGE.md#the-retained-default](USAGE.md#the-retained-default). _Avoid_: cache
 entry, default config, pinned layer.

@@ -28,6 +28,7 @@ const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "build",
     "setup",
     "pull",
+    "upgrade",
     "msb",
     "clipboard",
     "doctor",

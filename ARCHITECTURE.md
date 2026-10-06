@@ -37,7 +37,8 @@ crates/agent-vm/src/
 ├── network.rs              # egress policy and published ports
 ├── mount.rs                # --mount grammar and volume wiring
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
-│   └── default_selection.rs#   the retained digest record: read-only load, write-once adopt
+│   ├── default_selection.rs#   retained record: read-only load, automatic adopt, explicit replace
+│   └── upgrade.rs          #   native acquire/pin/platform check before default replacement
 ├── image_build.rs          # explicit user Dockerfile export + cache-only native import
 ├── msb_install.rs          # locate + version-verify the bundled msb; MSB_HOME
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
@@ -600,7 +601,26 @@ msb owns the bytes and may refetch a missing layer. It is also not a project or
 launcher-version artifact: it lives with the user-scoped settings, so a new
 project, a cleared cache or a new `AGENT_VM_STATE_DIR` leaves it alone. Reading
 it is lazy and read-only, which is why `help` and `doctor` touch nothing;
-adoption happens once, after a default-tier image is actually acquired. See
+automatic adoption happens once, after a default-tier image is actually acquired.
+Explicit upgrade adds a separate edge:
+
+```text
+upgrade --image REF → native target pull → manifest pin → native pinned pull
+                   → complete pinned cache + host-Linux config
+                   → AcquiredDefaultImage → same flock → atomic replace(record)
+```
+
+Two native pulls trade redundant manifest requests for a populated digest cache
+key; no native cache alias is hand-published. The returned host manifest digest,
+not an index digest or moving tag, is retained. Native auth/TLS, OCI integrity,
+materialization and cache I/O are trusted runtime operations. The small platform
+conjunction is proved; JSON decoding and platform comparisons are trusted.
+Acquisition runs outside the selection lock. Publication rechecks record health
+under the lock: same-pin replacement preserves bytes, explicit writers are
+last-commit-wins, and automatic adoption stays first-writer-wins. Rename is the
+last fallible write; completion output is best-effort. Interruption leaves the
+old or complete new record; no fsync/power-loss guarantee is added. Old cache
+artifacts and active sessions are never removed by upgrade. See
 [USAGE](USAGE.md#the-retained-default) for the operational details.
 
 - **Standard OCI semantics.** microsandbox's layer cache, GC, snapshotting, and

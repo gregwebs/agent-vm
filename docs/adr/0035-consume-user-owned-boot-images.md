@@ -6,7 +6,7 @@ Accepted. Implementation decision for [agent-vm #259](https://github.com/gregweb
 slice 2 of [agent-vm #257](https://github.com/gregwebs/agent-vm/issues/257);
 the retained-default decision below is [agent-vm
 #261](https://github.com/gregwebs/agent-vm/issues/261), slice 4 (amended, see
-*Decision*).
+*Decision*). Explicit replacement is implemented by [#262](https://github.com/gregwebs/agent-vm/issues/262).
 Supersedes [ADR-0003](0003-project-tooling-layers.md),
 [ADR-0019](0019-tool-free-base-and-per-tool-layers.md),
 [ADR-0028](0028-explicit-image-flag-beats-the-other-environment-variable.md),
@@ -74,7 +74,11 @@ source-integrity gates in `images/` and `.github/workflows/`. Those stay.
   failed initial acquisition therefore leaves no record, so a later compatible
   recommendation (e.g. a multiarch release) can rescue the host instead of
   stranding it. A retained record is never silently replaced; replacing a
-  *working* one is [#262](https://github.com/gregwebs/agent-vm/issues/262). A
+  *working* one requires explicit `upgrade --image REF` (#262): native target
+  acquisition, canonical manifest pin acquisition, complete pinned-cache and
+  host-Linux config validation precede replacement/initialization under the same
+  lock and record. Same-pin success preserves record bytes. Only future default
+  sessions change; overrides, running sessions and previous cache remain intact. A
   missing/corrupt/unreadable record fails the verbs that need the default with a
   fixed reason and an escaped path; it is never auto-reset. The record is not a
   download cache: msb owns the bytes, so cache loss, `AGENT_VM_STATE_DIR` or a
@@ -134,9 +138,9 @@ source-integrity gates in `images/` and `.github/workflows/`. Those stay.
   validating the production multiarch recommendation against real artifact
   consumption. The interim value is Linux/amd64-only, which is safe precisely
   because a failed acquisition retains nothing.
-- Follow-ups: [#262](https://github.com/gregwebs/agent-vm/issues/262) (explicit upgrade /
-  replacement of a working retained default),
-  [#265](https://github.com/gregwebs/agent-vm/issues/265) (production
+- **#262 fulfilled.** Explicit replacement remains separate from write-once
+  automatic adoption. See [USAGE](../../USAGE.md#explicitly-upgrading-the-default).
+- Follow-ups: [#265](https://github.com/gregwebs/agent-vm/issues/265) (production
   recommendation), #263–#264 (image repo, release).
 
 ## Alternatives

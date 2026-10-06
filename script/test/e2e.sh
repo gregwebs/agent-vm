@@ -1244,6 +1244,30 @@ check_harness_negative() {
   fi
   rm -f "$oracle_log" || result=1
 
+  # (g) The #262 registry access-record oracle. A genuine access record counts
+  # once; a duplicate telemetry span naming the same path does not; an
+  # unrecognized format is a legitimate zero; and a grep observation error
+  # (status 2) is a failure, never a zero. Without the last case a matcher that
+  # stopped matching would make "warm default makes zero registry reads" pass
+  # vacuously.
+  local access_record telemetry_span oracle_status=0
+  access_record='10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] "GET /v2/lib/manifests/tag HTTP/1.1" 200 3 "-" "docker/1"'
+  telemetry_span='time="2025-01-01T00:00:00Z" level=info msg="GET /v2/lib/manifests/tag" span=abc'
+  assert_eq "access-record oracle counts a real record" "1" \
+    "$(upgrade_access_record_count "$access_record")" || result=1
+  assert_eq "access-record oracle ignores a telemetry-only span" "0" \
+    "$(upgrade_access_record_count "$telemetry_span")" || result=1
+  assert_eq "access-record oracle counts a mixed log once" "1" \
+    "$(upgrade_access_record_count "$access_record"$'\n'"$telemetry_span")" || result=1
+  assert_eq "access-record oracle treats an unmatched format as a legitimate zero" "0" \
+    "$(upgrade_access_record_count 'unrecognized log format')" || result=1
+  (
+    # shellcheck disable=SC2329  # invoked indirectly by upgrade_access_record_count
+    grep() { return 2; }
+    upgrade_access_record_count "$access_record"
+  ) >/dev/null 2>&1 || oracle_status=$?
+  assert_eq "access-record oracle propagates a matcher error" "2" "$oracle_status" || result=1
+
   local observed_pass="$PASSED" observed_fail="$FAILED"
   if [ "$observed_pass" -ne 0 ] || [ "$observed_fail" -ne 2 ]; then
     echo "    FAIL: harness negative expected 0 pass / 2 fail, got $observed_pass/$observed_fail"
@@ -2941,6 +2965,283 @@ custom_image_retained_default() {
   return "$result"
 }
 
+# Docker's image store may push an OCI index even for a host-only fixture.
+# Upgrade retains the child manifest, not that envelope digest.
+registry_host_manifest_digest() {
+  local port="$1" repo="$2" tag="$3" doc child
+  doc="$(curl -fsS -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'     "http://127.0.0.1:$port/v2/$repo/manifests/$tag")" || return 1
+  child="$(jq -r '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest][0] // empty' <<<"$doc")" || return 1
+  if [ -n "$child" ]; then printf '%s' "$child"; else registry_manifest_digest "$port" "$repo" "$tag"; fi
+}
+
+# Publication shares the operator's local daemon, not registry credentials or
+# credential helpers. Only its Unix endpoint is carried into test-owned config.
+UPGRADE_DOCKER_HOST=""
+upgrade_docker() {
+  env -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH -u DOCKER_API_VERSION     DOCKER_HOST="$UPGRADE_DOCKER_HOST" DOCKER_CONFIG="$RETAINED_HOME/docker"     "$REAL_DOCKER" "$@"
+}
+
+# Native metadata is an inventory input, not an unchanged-content oracle. Hash
+# full artifact bytes and VMDK extents independently before a failed upgrade.
+upgrade_cache_snapshot() {
+  python3 - "$RETAINED_STATE/msb-home/cache" "$1" "$2" "$WORK/upgrade-b-manifest.json" <<'PY'
+import hashlib, json, pathlib, re, sys
+cache, ref, output = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+digest = ref.split('@', 1)[1]
+paths = set()
+for path in (cache / 'manifests').glob('*.json'):
+    doc = json.loads(path.read_bytes())
+    if doc['manifest_digest'] != digest:
+        continue
+    # Native metadata reserializes the parsed manifest. Verify its semantics
+    # against independently fetched registry bytes, not that serialization hash.
+    fixture = pathlib.Path(sys.argv[4])
+    assert 'sha256:' + hashlib.sha256(fixture.read_bytes()).hexdigest() == digest
+    assert json.loads(doc['raw_manifest_json']) == json.loads(fixture.read_bytes())
+    assert 'sha256:' + hashlib.sha256(doc['raw_config_json'].encode()).hexdigest() == doc['config_digest']
+    config = json.loads(doc['raw_config_json'])
+    assert config['rootfs']['diff_ids'] == [layer['diff_id'] for layer in doc['layers']]
+    paths.add(path)
+    safe = digest.replace(':', '_')
+    paths.add(cache / 'fsmeta' / (safe + '.erofs'))
+    descriptor = cache / 'vmdk' / (safe + '.vmdk')
+    paths.add(descriptor)
+    for line in descriptor.read_text().splitlines():
+        if line.startswith(('RW ', 'RDONLY ')):
+            extent = pathlib.Path(re.search(r'"([^"]+)"', line)[1])
+            paths.add(extent if extent.is_absolute() else descriptor.parent / extent)
+    for layer in doc['layers']:
+        paths.add(cache / 'layers' / (layer['diff_id'].replace(':', '_') + '.erofs'))
+        blob = cache / 'layers' / (layer['digest'].replace(':', '_') + '.tar.gz')
+        if blob.exists(): paths.add(blob)
+assert paths, 'no cached metadata for retained digest'
+inventory = {}
+for path in paths:
+    data = path.read_bytes()
+    inventory[str(path)] = [len(data), hashlib.sha256(data).hexdigest()]
+output.write_text(json.dumps(inventory, sort_keys=True))
+PY
+}
+
+# Count manifest/blob access records in one registry log text. Registry v3
+# asynchronously emits duplicate trace spans whose names contain GET paths
+# after the request has already completed, so only the anchored Apache combined
+# access record counts. grep status 1 is a legitimate no-match (zero); any other
+# failure is an observation error and must never become a zero.
+upgrade_access_record_count() {
+  local count status=0
+  count="$(grep -cE '^[^ ]+ - - \[.*\] "(GET|HEAD) /v2/[^ ]*/(manifests|blobs)/' <<<"$1")" || status=$?
+  case "$status" in
+    0) printf '%s' "$count" ;;
+    1) printf '0' ;;
+    *) return "$status" ;;
+  esac
+}
+
+upgrade_registry_read_count() {
+  local logs
+  logs="$(upgrade_docker logs "$1" 2>&1)" || return 1
+  upgrade_access_record_count "$logs"
+}
+
+# A fresh tick proves guest execution continued, not merely that the launcher
+# process and a stale status file survived.
+upgrade_live_advanced() {
+  local dir="$1" pid="$2" old_tick="$3" deadline=$(( $(date +%s) + 15 ))
+  while [ "$(date +%s)" -lt "$deadline" ] && kill -0 "$pid" 2>/dev/null; do
+    if [ -f "$dir/tick" ] && [ "$(cat "$dir/tick")" != "$old_tick" ]; then return 0; fi
+    sleep 1
+  done
+  echo '    FAIL: live A guest did not advance its handshake'
+  return 1
+}
+
+custom_image_default_upgrade() {
+  local result=0 container port repo ref_a ref_b proj live out reads_before reads_after
+  local live_pid=0 identity tick catalog_before pids_before deadline ready=0
+  local reg="registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8"
+  [ -x "$AGENT_VM_DEV_BIN" ] && [ -x "$AGENT_VM_RELEASE_BIN" ] || return 1
+  retained_bin_honors_seam "$AGENT_VM_DEV_BIN" || return 1
+  retained_bin_ignores_seam "$AGENT_VM_RELEASE_BIN" || return 1
+  RETAINED_HOME="$WORK/uh"
+  RETAINED_STATE="$WORK/ust"
+  AGENT_VM_RETAINED_BIN="$AGENT_VM_DEV_BIN"
+  mkdir -p "$RETAINED_HOME/docker" "$RETAINED_STATE/msb-home" || return 1
+  printf '{"auths":{}}\n' > "$RETAINED_HOME/docker/config.json"
+  UPGRADE_DOCKER_HOST="${DOCKER_HOST:-$(docker context inspect --format '{{.Endpoints.docker.Host}}')}" || return 1
+  case "$UPGRADE_DOCKER_HOST" in
+    unix://*) ;;
+    *) echo '    BLOCKER: #262 fixtures require a local Unix Docker endpoint for credential-isolated publication'; return 1 ;;
+  esac
+  proj="$(custom_project upgrade-probe)" || return 1
+  live="$(custom_project upgrade-live)" || return 1
+  container="$(upgrade_docker run -d --rm -p 127.0.0.1::5000 "$reg")" || return 1
+  port="$(upgrade_docker port "$container" 5000/tcp | head -1 | sed 's/.*://')"
+  deadline=$(( $(date +%s) + 30 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  if [ "$ready" -ne 1 ]; then upgrade_docker rm -f "$container" >/dev/null; return 1; fi
+  repo="e2e-262-$RUN_ID"
+  upgrade_docker tag "$CUSTOM_MARKER" "localhost:$port/$repo:a" || result=1
+  upgrade_docker tag "$CUSTOM_STAMP" "localhost:$port/$repo:b" || result=1
+  upgrade_docker push "localhost:$port/$repo:a" >/dev/null || result=1
+  upgrade_docker push "localhost:$port/$repo:b" >/dev/null || result=1
+  ref_a="localhost:$port/$repo@$(registry_manifest_digest "$port" "$repo" a)" || result=1
+  ref_b="localhost:$port/$repo@$(registry_host_manifest_digest "$port" "$repo" b)" || result=1
+  curl -fsS -H 'Accept: application/vnd.oci.image.manifest.v1+json'     "http://127.0.0.1:$port/v2/$repo/manifests/${ref_b##*@}" > "$WORK/upgrade-b-manifest.json" || result=1
+  retained_env "$ref_a"
+  retained_launch upgrade-cold "$proj" hello-258 --no-git || result=1
+  require_launch_ok upgrade-cold || result=1
+  out="$(launch_output upgrade-cold)"
+  assert_eq 'upgrade cold guest A' stamp=absent "$(grep '^stamp=' <<<"$out")" || result=1
+  grep -qF "$ref_a" "$(retained_record)" || result=1
+  if [ "$result" -eq 0 ]; then
+    # Same guest Bash process writes its identity and stamp on each observation.
+    # A separate project prevents B's launch from replacing A by sandbox name.
+    (cd "$live" || exit 1; exec "${LAUNCH_ENV[@]}" "${OFFLINE_ENV[@]}" \
+      DOCKER_CONFIG="$RETAINED_HOME/docker" XDG_CONFIG_HOME="$WORK/offline-config" \
+      PATH="$SHIM_DIR:/usr/bin:/bin" HOST_SHIM_LOG="$HOST_SHIM_LOG" \
+      "$AGENT_VM_DEV_BIN" shell --no-git --mount "$live:/probe" -- bash -c \
+      'for ((i=0;i<180;i++)); do printf "%s\n" "$$" > /probe/identity; hello-258 > /probe/status.tmp; mv /probe/status.tmp /probe/status; printf "%s\n" "$i" > /probe/tick; [ ! -e /probe/stop ] || exit 0; sleep 1; done; exit 94') \
+      > "$WORK/upgrade-live.out" 2>&1 </dev/null &
+    live_pid=$!
+    deadline=$(( $(date +%s) + 60 ))
+    while { [ ! -f "$live/status" ] || [ ! -f "$live/tick" ]; } && [ "$(date +%s)" -lt "$deadline" ] && kill -0 "$live_pid" 2>/dev/null; do sleep 1; done
+    if [ ! -f "$live/status" ] || [ ! -f "$live/tick" ]; then result=1; else
+      identity="$(cat "$live/identity")"
+      tick="$(cat "$live/tick")"
+      grep -q '^stamp=absent$' "$live/status" || result=1
+      catalog_before="$(avm_retained_state msb list --format json)" || result=1
+      pids_before="$(runtime_pids)" || result=1
+      retained_env
+      AGENT_VM_RETAINED_BIN="$AGENT_VM_RELEASE_BIN"
+      retained_launch upgrade-command "$proj" upgrade --image "$ref_b" || result=1
+      require_launch_ok upgrade-command || result=1
+      assert_eq 'upgrade creates no sandbox entries' "$catalog_before" "$(avm_retained_state msb list --format json)" || result=1
+      assert_eq 'upgrade creates no VM processes' "$pids_before" "$(runtime_pids)" || result=1
+      jq -e --arg ref "$ref_b" '.version == 1 and .image == $ref' "$(retained_record)" >/dev/null || result=1
+      kill -0 "$live_pid" 2>/dev/null || result=1
+      upgrade_live_advanced "$live" "$live_pid" "$tick" || result=1
+      assert_eq 'live A process identity unchanged' "$identity" "$(cat "$live/identity")" || result=1
+      grep -q '^stamp=absent$' "$live/status" || result=1
+      assert_no_host_calls || result=1
+      retained_launch upgrade-new-b "$proj" hello-258 --no-git || result=1
+      require_launch_ok upgrade-new-b || result=1
+      grep -q '^stamp=present$' "$WORK/upgrade-new-b.out" || result=1
+      cp "$(retained_record)" "$WORK/upgrade-record-before"
+      upgrade_cache_snapshot "$ref_b" "$WORK/upgrade-cache-before" || result=1
+      tick="$(cat "$live/tick")"
+      retained_launch upgrade-failure "$proj" upgrade --image "localhost:$port/$repo:unavailable" || result=1
+      [ "$CAPTURE_STATUS" -eq 1 ] || result=1
+      cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
+      upgrade_cache_snapshot "$ref_b" "$WORK/upgrade-cache-after" || result=1
+      cmp "$WORK/upgrade-cache-before" "$WORK/upgrade-cache-after" || result=1
+      kill -0 "$live_pid" 2>/dev/null || result=1
+      upgrade_live_advanced "$live" "$live_pid" "$tick" || result=1
+      assert_eq 'failed upgrade leaves live A identity' "$identity" "$(cat "$live/identity")" || result=1
+      grep -q '^stamp=absent$' "$live/status" || result=1
+    fi
+    touch "$live/stop"
+    deadline=$(( $(date +%s) + 30 ))
+    while kill -0 "$live_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do sleep 1; done
+    if kill -0 "$live_pid" 2>/dev/null; then
+      kill -TERM "$live_pid" 2>/dev/null || true
+      sleep 5
+      kill -KILL "$live_pid" 2>/dev/null || true
+      result=1
+    fi
+    wait "$live_pid" || result=1
+  fi
+  upgrade_docker logs "$container" > "$WORK/upgrade-registry-before.log" 2>&1 || result=1
+  reads_before="$(upgrade_registry_read_count "$container")" || result=1
+  # Non-vacuous negative oracle: the cold acquisition, the explicit upgrade and
+  # the failed acquisition must already be visible as access records before a
+  # zero-warm claim means anything. Then one deliberate live manifest read must
+  # increment the same counter; the registry access log flushes asynchronously,
+  # so wait for the increment within a bounded deadline.
+  if [ "${reads_before:-0}" -le 0 ]; then
+    echo "    FAIL: cold/upgrade produced no observable registry access records"
+    result=1
+  fi
+  local cal_target=$(( ${reads_before:-0} + 1 )) cal_deadline
+  curl -fsS -o /dev/null \
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "http://127.0.0.1:$port/v2/$repo/manifests/a" || result=1
+  cal_deadline=$(( $(date +%s) + 15 ))
+  while [ "$(date +%s)" -lt "$cal_deadline" ]; do
+    reads_before="$(upgrade_registry_read_count "$container")" || { result=1; break; }
+    if [ "$reads_before" -ge "$cal_target" ]; then break; fi
+    sleep 1
+  done
+  assert_eq 'one live manifest read increments the access oracle' "$cal_target" "$reads_before" || result=1
+  retained_env "$ref_a"
+  AGENT_VM_RETAINED_BIN="$AGENT_VM_DEV_BIN"
+  retained_launch upgrade-warm "$proj" hello-258 --no-git || result=1
+  require_launch_ok upgrade-warm || result=1
+  out="$(launch_output upgrade-warm)"
+  assert_eq 'changed recommendation still boots B' stamp=present "$(grep '^stamp=' <<<"$out")" || result=1
+  AGENT_VM_RETAINED_BIN="$AGENT_VM_RELEASE_BIN"
+  retained_env
+  retained_launch upgrade-release-warm "$proj" hello-258 --no-git || result=1
+  require_launch_ok upgrade-release-warm || result=1
+  reads_after="$(upgrade_registry_read_count "$container")" || result=1
+  upgrade_docker logs "$container" > "$WORK/upgrade-registry-after.log" 2>&1 || result=1
+  assert_eq 'warm default makes zero registry reads' "$reads_before" "$reads_after" || result=1
+  # Adjacent override boundaries use guest stamps, not notices. User A must
+  # outrank project B, env B must outrank user A, and CLI B must outrank env A.
+  # The project-only case then repoints the project fixture to A, so project A
+  # must outrank the retained default B: a launcher that ignored project
+  # overrides would fall through to retained B (stamp=present) and fail there.
+  printf 'image = "%s"\n' "$ref_a" > "$RETAINED_HOME/.config/agent-vm/config.toml"
+  cp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-before"
+  { printf 'image = "%s"\n' "$ref_b"; cat "$WORK/upgrade-project-before"; } > "$proj/.agent-vm/config.toml"
+  cp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-with-image"
+  cp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-before"
+  local tier expected
+  for tier in cli env user; do
+    retained_env
+    expected=stamp=absent
+    case "$tier" in
+      cli) LAUNCH_ENV+=(AGENT_VM_IMAGE_TAG="$ref_a"); retained_launch "upgrade-$tier" "$proj" hello-258 --no-git --image "$ref_b"; expected=stamp=present ;;
+      env) LAUNCH_ENV+=(AGENT_VM_IMAGE_TAG="$ref_b"); retained_launch "upgrade-$tier" "$proj" hello-258 --no-git; expected=stamp=present ;;
+      user) retained_launch "upgrade-$tier" "$proj" hello-258 --no-git ;;
+    esac
+    require_launch_ok "upgrade-$tier" || result=1
+    out="$(launch_output "upgrade-$tier")"
+    assert_eq "upgrade override $tier guest" "$expected" "$(grep '^stamp=' <<<"$out")" || result=1
+    cmp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-with-image" || result=1
+    cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
+    cmp "$RETAINED_HOME/.config/agent-vm/config.toml" "$WORK/upgrade-user-before" || result=1
+  done
+  # Project-only: remove the user tier and repoint the project fixture to A,
+  # refreshing its expected-byte snapshot before the guest observation.
+  rm "$RETAINED_HOME/.config/agent-vm/config.toml"
+  { printf 'image = "%s"\n' "$ref_a"; cat "$WORK/upgrade-project-before"; } > "$proj/.agent-vm/config.toml"
+  cp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-with-image"
+  retained_env
+  retained_launch upgrade-project "$proj" hello-258 --no-git || result=1
+  require_launch_ok upgrade-project || result=1
+  out="$(launch_output upgrade-project)"
+  assert_eq 'upgrade override project guest' stamp=absent "$(grep '^stamp=' <<<"$out")" || result=1
+  cmp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-with-image" || result=1
+  cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
+  cp "$WORK/upgrade-project-before" "$proj/.agent-vm/config.toml"
+  upgrade_docker rm -f "$container" >/dev/null || result=1
+  retained_env
+  retained_launch upgrade-offline-b "$proj" hello-258 --no-git || result=1
+  require_launch_ok upgrade-offline-b || result=1
+  out="$(launch_output upgrade-offline-b)"
+  assert_eq 'offline default B boots' stamp=present "$(grep '^stamp=' <<<"$out")" || result=1
+  retained_launch upgrade-offline-a "$proj" hello-258 --no-git --image "$ref_a" || result=1
+  require_launch_ok upgrade-offline-a || result=1
+  out="$(launch_output upgrade-offline-a)"
+  assert_eq 'old cached A remains bootable' stamp=absent "$(grep '^stamp=' <<<"$out")" || result=1
+  assert_no_host_calls || result=1
+  return "$result"
+}
+
 # --------------------------------------------------------------- run all ----
 
 echo "e2e: group=$GROUP"
@@ -3154,6 +3455,7 @@ run_check "custom-image-credential-injection" custom_image_credential_injection
 run_check "custom-image-nonstandard-imported" custom_image_nonstandard_imported
 run_check "custom-image-nonstandard-cold-warm" custom_image_nonstandard_cold_warm
 run_check "custom-image-retained-default" custom_image_retained_default
+run_check "custom-image-default-upgrade" custom_image_default_upgrade
 run_check "custom-image-no-bash-attach" check_custom_no_bash_attach
 run_check "custom-image-user-home-attach-nonroot" check_custom_user_home_attach nonroot
 run_check "custom-image-user-home-attach-root" check_custom_user_home_attach root

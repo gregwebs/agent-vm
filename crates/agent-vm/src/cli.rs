@@ -168,6 +168,9 @@ pub(crate) enum Cmd {
     /// Refresh the cached boot image.
     Pull(pull::Args),
 
+    /// Explicitly acquire and select a new default boot image.
+    Upgrade(crate::boot_image::upgrade::Args),
+
     /// Forward arguments to the bundled `msb` with agent-vm's MSB_HOME/MSB_PATH
     /// pinned (e.g. `agent-vm msb ls`, `agent-vm msb status`). Relies on
     /// `needs_msb_setup` staying true for this variant — see main().
@@ -225,6 +228,7 @@ pub(crate) enum Dispatch {
 pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "setup",
     "pull",
+    "upgrade",
     "msb",
     "clipboard",
     "doctor",
@@ -395,6 +399,7 @@ fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
         | Cmd::Clipboard(_)
         | Cmd::Doctor(_)
         | Cmd::Secret(_)
+        | Cmd::Upgrade(_)
         | Cmd::Build(_)
         | Cmd::InterceptHook(_) => {}
     }
@@ -1112,6 +1117,7 @@ mod tests {
         for builtin in [
             "setup",
             "pull",
+            "upgrade",
             "msb",
             "clipboard",
             "doctor",
@@ -1181,6 +1187,55 @@ mod tests {
             );
             assert!(help.contains("--build-arg"), "{help}");
         }
+    }
+
+    #[test]
+    fn upgrade_requires_typed_target_independent_of_config_and_environment() {
+        let mut env = crate::test_env::guard();
+        env.set_var("AGENT_VM_IMAGE_TAG", "ignored:ambient");
+        for config in [
+            Ok(report_from("image = \"project:tag\"\n")),
+            Err(anyhow!("broken TOML")),
+        ] {
+            assert!(matches!(
+                parse_from(
+                    ["agent-vm", "upgrade", "--image", "localhost:1234/a:tag"],
+                    config
+                )
+                .unwrap(),
+                Dispatch::Builtin {
+                    cmd: Cmd::Upgrade(_),
+                    ..
+                }
+            ));
+        }
+        for args in [
+            vec!["agent-vm", "upgrade"],
+            vec!["agent-vm", "upgrade", "--image", "/path"],
+            vec!["agent-vm", "upgrade", "--image", "a:tag", "--yes"],
+        ] {
+            assert_eq!(
+                build_command(&Catalog::Ready(default_catalog()))
+                    .try_get_matches_from(args)
+                    .unwrap_err()
+                    .exit_code(),
+                2
+            );
+        }
+        for args in [
+            ["agent-vm", "upgrade", "--help"],
+            ["agent-vm", "help", "upgrade"],
+        ] {
+            let error = build_command(&Catalog::Broken(anyhow!("broken")))
+                .try_get_matches_from(args)
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 0);
+            assert!(error.to_string().contains("--image <REF>"));
+        }
+        let error = build_command(&Catalog::Ready(default_catalog()))
+            .try_get_matches_from(["agent-vm", "upgrade"])
+            .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
     }
 
     // -- P1/P2: the `secret` verbs dispatch -------------------------------

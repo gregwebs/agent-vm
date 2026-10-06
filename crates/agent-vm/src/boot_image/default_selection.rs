@@ -13,15 +13,17 @@
 //! the user tier outrank the project tier, which is a precedence change, not a
 //! retention.
 //!
-//! # Write-once, after acquisition
+//! # Automatic adoption and explicit replacement, after acquisition
 //!
 //! [`load`] is read-only and never repairs: a genuinely absent file is
 //! `Ok(None)`, and anything else that cannot be turned into a validated
-//! immutable reference is an error naming a recovery. [`adopt`] is the only
-//! mutator, is called only after the image content was actually acquired, and
-//! is first-writer-wins under an exclusive `flock`: a concurrent second adopter
-//! (or a launcher upgrade) cannot replace a record already on disk. Replacing a
-//! *working* retained default is deliberately not implemented here (#262).
+//! immutable reference is an error naming a recovery. [`adopt`] is the
+//! automatic mutator, called only after successful acquisition. It is
+//! first-writer-wins under an exclusive `flock`: a concurrent second adopter
+//! (or a changed launcher recommendation) cannot replace a record already on disk. Replacing a
+//! *working* retained default requires [`replace`] with an acquisition token (#262).
+//! It shares the lock/record, rechecks health, preserves same-pin bytes, and
+//! publishes last-commit-wins without changing ordinary adoption semantics.
 //!
 //! [`adopt`] checks for an existing valid record **before** it creates the
 //! config directory, the lock file or any temporary file: a steady-state
@@ -58,7 +60,7 @@ use anyhow::{Result, anyhow};
 use rustix::fs::{FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::boot_image::ImmutableImageRef;
+use crate::boot_image::{AcquiredDefaultImage, DefaultUpgradeOutcome, ImmutableImageRef};
 use crate::config;
 use crate::host_paths;
 
@@ -215,6 +217,53 @@ fn adopt_to_with_checkpoint(
     Ok(true)
 }
 
+/// Explicit publication is separate from ordinary first-writer adoption. Only
+/// upgrade's native acquisition path can produce the success token.
+pub(super) fn replace(acquired: &AcquiredDefaultImage) -> Result<DefaultUpgradeOutcome> {
+    replace_to(&selection_paths()?, acquired)
+}
+
+fn replace_to(
+    paths: &SelectionPaths,
+    acquired: &AcquiredDefaultImage,
+) -> Result<DefaultUpgradeOutcome> {
+    replace_to_with_checkpoint(paths, acquired, || {}, host_paths::atomic_write)
+}
+
+fn replace_to_with_checkpoint(
+    paths: &SelectionPaths,
+    acquired: &AcquiredDefaultImage,
+    after_recheck: impl FnOnce(),
+    save: impl FnOnce(&Path, &[u8], u32) -> Result<()>,
+) -> Result<DefaultUpgradeOutcome> {
+    replace_to_with_lock_checkpoint(paths, acquired, || {}, after_recheck, save)
+}
+
+fn replace_to_with_lock_checkpoint(
+    paths: &SelectionPaths,
+    acquired: &AcquiredDefaultImage,
+    after_lock: impl FnOnce(),
+    after_recheck: impl FnOnce(),
+    save: impl FnOnce(&Path, &[u8], u32) -> Result<()>,
+) -> Result<DefaultUpgradeOutcome> {
+    load_from(paths)?;
+    std::fs::create_dir_all(&paths.directory)
+        .map_err(|_| selection_error(&paths.directory, "could not be created"))?;
+    let lock = open_lock(&paths.lock())?;
+    host_paths::flock_exclusive(&lock)
+        .map_err(|_| selection_error(&paths.lock(), "could not be locked"))?;
+    after_lock();
+    if load_from(paths)?.as_ref() == Some(&acquired.reference) {
+        return Ok(DefaultUpgradeOutcome::Unchanged);
+    }
+    after_recheck();
+    let bytes = serialize_v1(&acquired.reference)
+        .map_err(|_| selection_error(&paths.record(), "could not be encoded for saving"))?;
+    save(&paths.record(), &bytes, SELECTION_FILE_MODE)
+        .map_err(|_| selection_error(&paths.record(), "could not be saved"))?;
+    Ok(DefaultUpgradeOutcome::Changed)
+}
+
 /// Open (creating if needed) the sibling lock file as a regular file, refusing
 /// to follow a final-component symlink. `O_NOFOLLOW` turns the symlink into an
 /// error rather than a stat-then-open race. Every failure is a fixed reason
@@ -319,6 +368,222 @@ fn selection_error(path: &Path, reason: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token(raw: &str) -> AcquiredDefaultImage {
+        AcquiredDefaultImage {
+            reference: parsed(raw),
+        }
+    }
+
+    #[test]
+    fn replacement_initializes_changes_and_preserves_same_pin_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, paths) = temp_paths();
+        assert_eq!(
+            replace_to(&paths, &token(A)).unwrap(),
+            DefaultUpgradeOutcome::Changed
+        );
+        assert_eq!(
+            replace_to(&paths, &token(B)).unwrap(),
+            DefaultUpgradeOutcome::Changed
+        );
+        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), B);
+        assert_eq!(
+            std::fs::metadata(paths.record())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let formatted = format!("{{ \"image\": \"{B}\", \"version\": 1 }}");
+        std::fs::write(paths.record(), &formatted).unwrap();
+        assert_eq!(
+            replace_to(&paths, &token(B)).unwrap(),
+            DefaultUpgradeOutcome::Unchanged
+        );
+        assert_eq!(std::fs::read(paths.record()).unwrap(), formatted.as_bytes());
+        adopt_to(&paths, &parsed(A)).unwrap();
+        assert_eq!(std::fs::read(paths.record()).unwrap(), formatted.as_bytes());
+    }
+
+    #[test]
+    fn replacement_failures_preserve_old_record_and_do_not_chain_sources() {
+        let (_dir, paths) = temp_paths();
+        adopt_to(&paths, &parsed(A)).unwrap();
+        let old = std::fs::read(paths.record()).unwrap();
+        let error = replace_to_with_checkpoint(
+            &paths,
+            &token(B),
+            || {},
+            |_, _, _| Err(anyhow!("private source")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("could not be saved"));
+        assert!(!format!("{error:#}").contains("private source"));
+        assert_eq!(std::fs::read(paths.record()).unwrap(), old);
+        std::fs::remove_file(paths.lock()).unwrap();
+        std::fs::create_dir(paths.lock()).unwrap();
+        assert!(replace_to(&paths, &token(B)).is_err());
+        assert_eq!(std::fs::read(paths.record()).unwrap(), old);
+    }
+
+    #[test]
+    fn replacement_rejects_every_damaged_record_before_writing_a_lock() {
+        for bytes in [
+            b"not json".to_vec(),
+            vec![0xff],
+            vec![b'x'; MAX_SELECTION_FILE_BYTES as usize + 1],
+            format!("{{\"version\":2,\"image\":\"{A}\"}}").into_bytes(),
+        ] {
+            let (_dir, paths) = temp_paths();
+            std::fs::write(paths.record(), &bytes).unwrap();
+            assert!(replace_to(&paths, &token(B)).is_err());
+            assert_eq!(std::fs::read(paths.record()).unwrap(), bytes);
+            assert!(!paths.lock().exists());
+        }
+        for kind in ["symlink", "directory", "fifo"] {
+            let (dir, paths) = temp_paths();
+            match kind {
+                "symlink" => {
+                    std::os::unix::fs::symlink(dir.path().join("absent"), paths.record()).unwrap()
+                }
+                "directory" => std::fs::create_dir(paths.record()).unwrap(),
+                _ => {
+                    use std::os::unix::ffi::OsStrExt;
+                    let path =
+                        std::ffi::CString::new(paths.record().as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+            }
+            assert!(replace_to(&paths, &token(B)).is_err());
+            assert!(std::fs::symlink_metadata(paths.record()).is_ok());
+            assert!(!paths.lock().exists());
+        }
+    }
+
+    #[test]
+    fn replacement_holds_same_flock_and_last_explicit_writer_wins() {
+        use std::sync::{Arc, mpsc};
+        let (_dir, paths) = temp_paths();
+        adopt_to(&paths, &parsed(A)).unwrap();
+        let paths = Arc::new(paths);
+        let (at_tx, at_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer_paths = Arc::clone(&paths);
+        let writer = std::thread::spawn(move || {
+            replace_to_with_checkpoint(
+                &writer_paths,
+                &token(B),
+                || {
+                    at_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+                host_paths::atomic_write,
+            )
+        });
+        at_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let probe = std::fs::File::open(paths.lock()).unwrap();
+        let locked =
+            rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive);
+        release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(locked, Err(rustix::io::Errno::WOULDBLOCK));
+        adopt_to(&paths, &parsed(A)).unwrap();
+        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), B);
+        replace_to(&paths, &token(C)).unwrap();
+        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), C);
+    }
+
+    #[test]
+    fn concurrent_replacement_readers_never_see_partial_json() {
+        use std::sync::{Arc, Barrier};
+        let (_dir, paths) = temp_paths();
+        adopt_to(&paths, &parsed(A)).unwrap();
+        let paths = Arc::new(paths);
+        let start = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            for reference in [A, B] {
+                let paths = Arc::clone(&paths);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..100 {
+                        replace_to(&paths, &token(reference)).unwrap();
+                    }
+                });
+            }
+            start.wait();
+            for _ in 0..1000 {
+                assert!([A, B].contains(&load_from(&paths).unwrap().unwrap().as_str()));
+            }
+        });
+    }
+
+    #[test]
+    fn replacement_rechecks_damage_under_lock() {
+        let (_dir, paths) = temp_paths();
+        adopt_to(&paths, &parsed(A)).unwrap();
+        let error = replace_to_with_lock_checkpoint(
+            &paths,
+            &token(B),
+            || {
+                std::fs::write(paths.record(), b"damaged while waiting").unwrap();
+            },
+            || panic!("must reject before saving"),
+            host_paths::atomic_write,
+        )
+        .unwrap_err();
+        assert_safe(&error, &paths.record());
+        assert_eq!(
+            std::fs::read(paths.record()).unwrap(),
+            b"damaged while waiting"
+        );
+    }
+
+    #[test]
+    fn replacement_refuses_symlink_lock_with_escaped_path() {
+        let (dir, _) = temp_paths();
+        let paths = SelectionPaths::new(dir.path().join("unsafe\u{1b}path"));
+        std::fs::create_dir(paths.directory.clone()).unwrap();
+        adopt_to(&paths, &parsed(A)).unwrap();
+        let old = std::fs::read(paths.record()).unwrap();
+        std::fs::remove_file(paths.lock()).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("target"), paths.lock()).unwrap();
+        let error = replace_to(&paths, &token(B)).unwrap_err();
+        assert_safe(&error, &paths.lock());
+        assert_eq!(std::fs::read(paths.record()).unwrap(), old);
+        assert!(!dir.path().join("target").exists());
+    }
+
+    #[test]
+    fn adoption_before_upgrade_is_superseded_not_the_reverse() {
+        use std::sync::{Arc, mpsc};
+        let (_dir, paths) = temp_paths();
+        let paths = Arc::new(paths);
+        let (at_tx, at_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let adopter_paths = Arc::clone(&paths);
+        let adopter = std::thread::spawn(move || {
+            adopt_to_with_checkpoint(&adopter_paths, &parsed(A), || {
+                at_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        at_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let writer_paths = Arc::clone(&paths);
+        let writer = std::thread::spawn(move || replace_to(&writer_paths, &token(B)));
+        release_tx.send(()).unwrap();
+        adopter.join().unwrap().unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), B);
+        adopt_to(&paths, &parsed(A)).unwrap();
+        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), B);
+    }
 
     const A: &str =
         "localhost:1/a@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
