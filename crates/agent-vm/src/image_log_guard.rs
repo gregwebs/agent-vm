@@ -9,7 +9,8 @@
 //!
 //! The subscriber installed by [`crate::init_tracing`] asks
 //! [`dependency_event_allowed`] for every event/span. Until an invocation has
-//! actually selected the default tier the guard is off, so an explicit
+//! selected the default tier or started an explicit default upgrade, the guard
+//! is off, so an ordinary explicit
 //! CLI/env/config invocation keeps the dependency logging it had before. Once
 //! [`activate`] runs (from selection, before any acquisition), non-`agent_vm`
 //! events are suppressed for the rest of the process — which is exactly one
@@ -31,8 +32,8 @@ use vstd::prelude::*;
 
 static DEFAULT_TIER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Mark this process as booting the default tier. Called once, from selection,
-/// before any acquisition.
+/// Mark this process as using the default's redaction policy. Selection and
+/// explicit default upgrade activate it before native image acquisition.
 pub(crate) fn activate() {
     DEFAULT_TIER_ACTIVE.store(true, Ordering::SeqCst);
 }

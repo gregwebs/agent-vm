@@ -113,6 +113,7 @@ pub(crate) const USER_CONFIG_DIR_RELATIVE: &str = ".config/agent-vm";
 pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     "setup",
     "pull",
+    "upgrade",
     "msb",
     "clipboard",
     "doctor",

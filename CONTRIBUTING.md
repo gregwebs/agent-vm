@@ -197,6 +197,23 @@ operator HOME or copies credentials into agent-vm state. The #260 checks cover
 real explicit-build stdout shape/integrity, actual shell/root/persistent guest
 execution, Docker-free finished archive imports, shared/persisted redirects,
 retained selection and working-reference preservation/replacement.
+`tests/default_image_upgrade.rs` exercises the actual CLI and native registry
+against genuine OCI bytes on a bound loopback listener, without Docker or a VM.
+It isolates HOME/state/cwd and Docker config (empty auths, no helpers), but native
+automatic auth may still perform read-only OS keyring lookup, and machine-wide
+managed policy still applies. Require a noninteractive credential environment
+with no matching loopback credential and absent/compatible managed policy; never
+modify host keyring items or policy for tests. Failure preservation hashes old
+metadata and referenced EROFS/fsmeta/VMDK artifacts independently, including a
+shared-layer failure; native cache completeness alone is not an unchanged-byte
+oracle. The custom group also tests explicit release upgrade A→B, an unchanged
+live A in a different project, new/warm/offline B, all override boundaries,
+failed-acquisition byte preservation and explicitly bootable cached A. Its
+registry publication uses empty test-owned Docker auth configuration and only
+the operator daemon's Unix endpoint (Colima/Docker Desktop), not copied
+credentials/helpers. This requires the same signed launchers, Docker/network and dedicated serial native
+host as the retained-default check. It is manual evidence, not CI VM coverage.
+
 `tests/image_build.rs` exercises the actual native importer under fake Docker
 without a VM; native e2e is manual, never a substitute for those CLI tests.
 

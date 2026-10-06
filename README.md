@@ -111,3 +111,6 @@ for builder prerequisites and host-build trust.
 - [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) —
   file-backed credential-injection and refresh boundary.
 - [CODING_STANDARDS.md](CODING_STANDARDS.md) — repo coding standards.
+
+To deliberately change the retained default, see
+[explicit default-image upgrade](USAGE.md#explicitly-upgrading-the-default).

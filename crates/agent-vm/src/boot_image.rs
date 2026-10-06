@@ -30,6 +30,10 @@
 //!   compatible recommendation (e.g. a future multiarch release) can rescue the
 //!   user instead of stranding them on bytes their host cannot boot.
 //!
+//! Explicit [`upgrade`] acquisition can replace the retained fallback after
+//! native success and host-platform validation; ordinary adoption stays
+//! write-once. Neither path changes overrides or running sessions.
+//!
 //! # The default tier is not display data
 //!
 //! The default reference is record-sourced (or the launcher's recommendation on
@@ -69,6 +73,18 @@ use vstd::prelude::*;
 use crate::config::ConfiguredImages;
 
 mod default_selection;
+pub(crate) mod upgrade;
+
+/// Native acquisition and host-platform validation must precede publication.
+pub(crate) struct AcquiredDefaultImage {
+    reference: ImmutableImageRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultUpgradeOutcome {
+    Changed,
+    Unchanged,
+}
 
 /// A boot-image reference, validated at its boundary.
 ///
@@ -308,6 +324,14 @@ impl fmt::Display for ImageLabel {
 }
 
 impl ImageLabel {
+    pub(crate) fn for_default_upgrade() -> Self {
+        Self {
+            text: "the requested default boot image".to_string(),
+            origin: None,
+            redacted: true,
+        }
+    }
+
     /// The reference for an explicit source or the fixed label for the default
     /// tier — without the `(from …)` origin.
     pub(crate) fn text(&self) -> &str {
@@ -325,8 +349,8 @@ impl ImageLabel {
         }
     }
 
-    /// True when the selected reference came from the default tier and must not
-    /// be rendered, logged or chained into an error.
+    /// True for default-tier selection or explicit default upgrade: references
+    /// must not be rendered, logged or chained into an error.
     pub(crate) fn is_redacted(&self) -> bool {
         self.redacted
     }
@@ -1173,6 +1197,10 @@ mod tests {
         env.set_var("AGENT_VM_TEST_DEFAULT_IMAGE", B);
         super::default_selection::adopt(&ImmutableImageRef::parse(A).unwrap()).unwrap();
 
+        super::default_selection::replace(&AcquiredDefaultImage {
+            reference: ImmutableImageRef::parse(B).unwrap(),
+        })
+        .unwrap();
         let empty = ConfiguredImages::for_test(ImageTierFixture {
             user: None,
             project: None,
@@ -1193,7 +1221,7 @@ mod tests {
         let value = serde_json::to_value(&config).unwrap();
         assert_eq!(
             value["image"]["Oci"]["reference"],
-            serde_json::json!(A),
+            serde_json::json!(B),
             "the SDK config must carry the retained digest"
         );
     }

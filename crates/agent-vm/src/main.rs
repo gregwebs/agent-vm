@@ -153,6 +153,10 @@ fn main() -> Result<()> {
                 catalog,
                 images,
             } => pull::run(args, catalog, images).await,
+            Dispatch::Builtin {
+                cmd: Cmd::Upgrade(args),
+                ..
+            } => boot_image::upgrade::run(args).await,
             // Explicit user-owned build + import (#260). Reads no catalog and
             // no image selection; `args` is self-contained.
             Dispatch::Builtin {
