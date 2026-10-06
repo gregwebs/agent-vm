@@ -25,6 +25,7 @@ const BOGUS_IMAGE: &str = "localhost:1/does-not-exist:latest";
 /// Subcommands `build_command` registers that are not launch verbs
 /// (`cli::BUILTIN_SUBCOMMANDS`, which integration tests cannot import).
 const BUILTIN_SUBCOMMANDS: &[&str] = &[
+    "build",
     "setup",
     "pull",
     "msb",

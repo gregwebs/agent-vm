@@ -107,25 +107,24 @@ docker buildx build \
   -f images/Dockerfile images
 ```
 
-Import it directly into agent-vm's private microsandbox cache:
+Import the completed Docker-store image through the selected signed bundle:
 
 ```bash
-./script/build/import-image.sh agent-vm-template:latest
+docker image save --output image.tar agent-vm-template:latest &&
+  ./target/macos-dev/bin/agent-vm msb image load --input image.tar --tag agent-vm-template:dev
 ```
 
-To use a different cache tag, pass both the Docker source and destination tag:
+The dev bundle uses its normal pinned runtime resolution; a release-only
+importer is not needed. Alternatively explicitly build your Dockerfile with an
+OCI-capable builder and select the result:
 
 ```bash
-./script/build/import-image.sh my-local-image:dev agent-vm-template:dev
+./target/macos-dev/bin/agent-vm build --tag my-image:dev --builder native-oci .
+./target/macos-dev/bin/agent-vm shell --image my-image:dev -- my-program
 ```
 
-`import-image.sh` also creates a Docker **base link**
-(`agent-vm-base:<msb-manifest-digest-hex>`) at import time — reading the digest
-back from the freshly loaded destination and tagging the Docker **source** image.
-The launcher no longer consumes it; [#260](https://github.com/gregwebs/agent-vm/issues/260)
-removes the import-time tagging.
-
-The script accepts zero to two positional arguments. The Docker source defaults to `agent-vm-template:latest`, and the destination tag defaults to the source. It verifies the Docker image is exactly `linux/arm64`, resolves agent-vm's state directory, and pipes `docker save` into `msb image load`. It does not run a registry or create a caller-managed tar archive. `msb` currently stages stdin in a temporary file before ingesting it, so temporary free space roughly equal to the Docker archive is still required.
+See [Explicit builds and archive import](USAGE.md#explicit-builds-and-archive-import)
+for driver/local-FROM restrictions, temporary disk space and host-build trust.
 
 ### Building the template locally
 
@@ -154,7 +153,8 @@ done
 docker tag "$prev" agent-vm-template:dev
 
 # Import the finished template and select it.
-./script/build/import-image.sh agent-vm-template:dev
+docker image save --output template.tar agent-vm-template:dev
+./target/macos-dev/bin/agent-vm msb image load --input template.tar --tag agent-vm-template:dev
 ./target/macos-dev/bin/agent-vm shell --image agent-vm-template:dev \
   -- 'for b in claude codex opencode copilot; do "$b" --version; done'
 ```
@@ -162,10 +162,6 @@ docker tag "$prev" agent-vm-template:dev
 The launcher never builds or composes these sources itself; the loop above is an
 image-authoring step.
 
-The local tag `agent-vm-base:dev` shares its repository name with the import
-script's Docker-local base links (`agent-vm-base:<64-hex>`). That is a listing
-collision only: a link tag is always 64 hex characters, so no link can be
-shadowed.
 `images/build.sh` performs the same chain against a loopback registry and pushes
 both published tags (`agent-vm-base:latest`, `agent-vm-template:latest`); it
 requires the same `docker`-driver builder and checks for it up front.

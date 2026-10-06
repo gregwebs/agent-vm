@@ -44,7 +44,7 @@ use vstd::prelude::*;
 use crate::boot_image::OverrideSource;
 use crate::config::{Catalog, CatalogEntry, ConfigReport, ConfiguredImages, Tool};
 use crate::run;
-use crate::{clipboard, doctor, intercept_hook, msb_cmd, pull, secret, setup};
+use crate::{clipboard, doctor, image_build, intercept_hook, msb_cmd, pull, secret, setup};
 
 verus! {
 
@@ -183,6 +183,10 @@ pub(crate) enum Cmd {
     /// Manage agent-vm's own values in the host system keychain.
     Secret(secret::Args),
 
+    /// Explicitly build a Dockerfile and import the result into agent-vm's
+    /// image cache (Docker is invoked; nothing is selected or booted).
+    Build(image_build::Args),
+
     /// Internal: invoked by msb's interceptor hook for matched OAuth
     /// and scoped GitHub requests. Reads stdin and writes the protocol
     /// response on stdout. Not meant for direct use.
@@ -225,6 +229,7 @@ pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "clipboard",
     "doctor",
     "secret",
+    "build",
     "_intercept-hook",
     "help",
 ];
@@ -383,10 +388,14 @@ fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
     match cmd {
         Cmd::Pull(args) => args.image.reconcile(sub),
         Cmd::Setup(args) => args.image.reconcile(sub),
+        // `build`'s `--tag` is a result reference in msb's cache, not a launch
+        // image selection: it deliberately carries no `ImageArgs` and so
+        // consumes no `--image`/env override.
         Cmd::Msb(_)
         | Cmd::Clipboard(_)
         | Cmd::Doctor(_)
         | Cmd::Secret(_)
+        | Cmd::Build(_)
         | Cmd::InterceptHook(_) => {}
     }
 }
@@ -1100,11 +1109,78 @@ mod tests {
             .write_long_help(&mut help)
             .expect("the broken-config help renders");
         let help = String::from_utf8(help).unwrap();
-        for builtin in ["setup", "pull", "msb", "clipboard", "doctor", "secret"] {
+        for builtin in [
+            "setup",
+            "pull",
+            "msb",
+            "clipboard",
+            "doctor",
+            "secret",
+            "build",
+        ] {
             assert!(help.contains(builtin), "missing builtin {builtin}: {help}");
         }
         assert!(help.contains("could not be read"), "{help}");
         assert!(help.contains("agent-vm doctor"), "{help}");
+    }
+
+    // -- build is a fixed built-in with no image-selection input --------
+
+    /// `build` must work with a ready catalog, a broken catalog, and with an
+    /// image override in the environment — those are not build inputs, so it
+    /// consumes no `--image` and no env tier.
+    #[test]
+    fn build_dispatches_as_a_builtin_without_taking_an_image_selection() {
+        let broken: Result<ConfigReport, anyhow::Error> = Err(anyhow!("config: broken on purpose"));
+        for config in [Ok(report_from("tools = []\n")), broken] {
+            let dispatch = parse_from(["agent-vm", "build", "--tag", "my-app:dev"], config)
+                .unwrap_or_else(|error| panic!("build must parse: {error:#}"));
+            match dispatch {
+                Dispatch::Builtin {
+                    cmd: Cmd::Build(_), ..
+                } => {}
+                _ => panic!("build must dispatch as a built-in"),
+            }
+        }
+
+        // A configured tool named `build` is rejected at validation, so it can
+        // never shadow the built-in (asserted over RESERVED_TOOL_NAMES too).
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("config.toml");
+        std::fs::write(
+            &project,
+            "[[tools]]\nname = \"build\"\ncommand = \"build\"\n",
+        )
+        .unwrap();
+        let error = crate::config::load(&ConfigPaths {
+            user: Some(dir.path().join("no-user-config.toml")),
+            project,
+        })
+        .expect_err("a tool named build must be refused");
+        assert!(format!("{error:#}").contains("reserved"));
+    }
+
+    #[test]
+    fn build_help_is_available_under_a_ready_and_a_broken_catalog() {
+        for command in [
+            build_command(&Catalog::Ready(default_catalog())),
+            build_command(&Catalog::Broken(anyhow!("broken on purpose"))),
+        ] {
+            let mut help = Vec::new();
+            command
+                .find_subcommand("build")
+                .expect("build is registered")
+                .clone()
+                .bin_name("agent-vm build")
+                .write_long_help(&mut help)
+                .expect("build help renders");
+            let help = String::from_utf8(help).unwrap();
+            assert!(
+                help.contains("Import the built image under this reference"),
+                "{help}"
+            );
+            assert!(help.contains("--build-arg"), "{help}");
+        }
     }
 
     // -- P1/P2: the `secret` verbs dispatch -------------------------------

@@ -23,9 +23,10 @@ vstd = "=0.0.0-2026-09-20-0158"
 # our own from-source msb. Keep `local` (the in-process sandbox/SDK surface),
 # plus net + keyring.
 microsandbox = { path = "../../vendor/microsandbox/sdk/rust", default-features = false, features = ["local", "net", "keyring"] }
-# Direct dep (not re-exported by the SDK crate above) so run.rs/layer.rs can
-# read cached OCI image metadata (GlobalCache::read_image_metadata) and
-# import Reference/ImageConfig/CachedImageMetadata directly.
+# Direct dep (not re-exported by the SDK crate above) so run.rs can read
+# cached OCI image metadata (GlobalCache::read_image_metadata) and import
+# Reference/ImageConfig/CachedImageMetadata directly, and so image_build.rs can
+# call load_archive to import a built OCI archive into that same cache.
 microsandbox-image = { path = "../../vendor/microsandbox/crates/image" }
 # Direct dep so agent-vm can read the vendored migration set and derive the
 # bundled schema-version identifier (see src/msb_schema.rs). Already in the
@@ -56,7 +57,9 @@ microsandbox-runtime = { path = "../../vendor/microsandbox/crates/runtime", defa
 # of what the vendored workspace already enables (vendor/microsandbox/Cargo.toml),
 # so this adds no new sea-orm compilation. See issue #30.
 sea-orm = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
-tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "time"] }
+# `process` gives image_build.rs the async `docker buildx build` child; the
+# other features predate it.
+tokio = { version = "1.42", features = ["macros", "process", "rt-multi-thread", "time"] }
 # `wrap_help` makes clap detect the terminal width and wrap long help
 # text to it; without it the multi-paragraph `--help` prose renders as
 # unbroken one-line-per-paragraph walls.
@@ -165,6 +168,11 @@ microsandbox-types = { path = "../../vendor/microsandbox/packages/microsandbox-t
 # new compilation -- it only makes the function nameable. See
 # `tests/config_launch_driven.rs`'s fake-runtime fixture.
 microsandbox-utils = { path = "../../vendor/microsandbox/crates/utils" }
+# Test-only: `tests/support/image_archive.rs` writes a minimal one-image OCI
+# layout archive to feed the real native importer under a fake Docker. Reuses
+# the tar 0.4 already in the graph (via the vendored msb/image crates) rather
+# than adding a package.
+tar = "0.4"
 # Property tests for `mount::lexical_link_path` (pure string surgery over
 # symlink target text -- the one total function in that module, so the
 # obvious quickcheck candidate per CODING_STANDARDS "Use property based

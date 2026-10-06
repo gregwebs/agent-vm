@@ -3,10 +3,9 @@
 # Build it, import it, and select it to build, test, lint and navigate a Go
 # code base inside the microVM (there is no launcher-side layering, #259):
 #
-#   docker buildx build --load \
+#   agent-vm build --builder native-oci \
 #     --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
-#     -t agent-vm-go-dev:dev examples/layers/go-dev
-#   ./script/build/import-image.sh agent-vm-go-dev:dev
+#     --tag agent-vm-go-dev:dev examples/layers/go-dev
 #   agent-vm claude --image agent-vm-go-dev:dev
 #
 # It provides the pinned Go toolchain (go, gofmt, go vet, ...) plus the two

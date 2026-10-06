@@ -18,7 +18,7 @@
 # which `docker/setup-buildx-action` with `driver: docker` also uses). If your
 # default builder is `docker-container`, either create a `docker`-driver
 # builder (`docker buildx create --driver docker --use`) or use the published
-# images and `script/build/import-image.sh`.
+# images and import completed archives with `agent-vm msb image load --input`.
 
 set -euo pipefail
 
