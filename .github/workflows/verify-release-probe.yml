@@ -66,9 +66,10 @@ jobs:
             echo "MSB_LIBKRUN_EMBEDDED=1" >> "$GITHUB_ENV"
             echo "RESULT libkrun not in linkage; recorded as embedded in msb"
           fi
-          firmware=$(basename "$(readlink -f "$MSB_FW")")
-          echo "MSB_LIBKRUN_VERSION=${firmware#libkrunfw.so.}" >> "$GITHUB_ENV"
-          echo "RESULT firmware version ${firmware#libkrunfw.so.}"
+          fwdir=$(dirname "$MSB_FW")
+          fwver=$(basename "$(ls "$fwdir"/libkrunfw.so.*.* | sort -V | tail -1)")
+          echo "MSB_LIBKRUN_VERSION=${fwver#libkrunfw.so.}" >> "$GITHUB_ENV"
+          echo "RESULT firmware version ${fwver#libkrunfw.so.}"
 
       - name: Download the published v0.1.3 assets anonymously
         run: |
@@ -76,6 +77,14 @@ jobs:
           rm -rf /tmp/assets
           bash images/script/release/download-release.sh --version 0.1.3 --arch amd64 --out /tmp/assets
           ls -l /tmp/assets | head -30
+
+      - name: Diagnose the runtime doctor check in place
+        run: |
+          set -ux
+          "$MSB_BIN" --version || true
+          "$MSB_BIN" doctor || echo "RESULT doctor exit: $?"
+          ls -l /dev/kvm
+          id
 
       - name: Run the promotion gate with a real amd64 boot
         env:
@@ -96,6 +105,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: verify-release-amd64-logs
-          path: /tmp/assets/*.log
+          path: /tmp/assets/**
           if-no-files-found: ignore
           retention-days: 5
