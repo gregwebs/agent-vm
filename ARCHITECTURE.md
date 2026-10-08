@@ -47,7 +47,7 @@ crates/agent-vm/src/
 ├── config.rs               # read-only tool config parse/merge/validate (doctor preview)
 └── …                       # clipboard, pull, setup, user, env_flag, …
 
-images/                     # the default-boot-image sources and their build script
+vendor/agent-vm-images/      # contributor-only pinned independent image sources
 vendor/microsandbox/        # git submodule: the runtime and its SDK
 bin/agent-vm-ccusage        # host-side token/cost reporting across sandboxes
 ```
@@ -513,32 +513,26 @@ chance to finish *after* the stream closes rather than dropping it mid-flight.
 
 ### What is in it
 
-The Dockerfile (`images/Dockerfile`, Debian 13 slim) is the **base**: it
-carries what every agent session needs — base CLI utilities (`curl`, `wget`,
-`git`, `jq`, `python3`, `ripgrep`, `fd-find`) plus network and process
-diagnostics, `gh` from the GitHub apt repo, Node.js 22 from NodeSource, the
-Docker engine with `fuse-overlayfs`, zellij, and the tool-layer facilities (the
-host-CA shim, the `/opt/agent` prefix, an empty `/opt/agent-vm/seed.d/`). It
-carries **no** agent CLI.
+The independent [image repository](https://github.com/gregwebs/agent-vm-images)
+owns ordinary tool-free base and standard Dockerfiles. The base supplies Debian
+facilities; the standard extends it with all six agents using committed version
+pins/locks and canonical shared installer helpers (not six copied contracts).
+Only the standard is published, with independent versions and matching registry
+and archive graphs. Its optional Pi wrapper/packages and seed hooks are image
+content, not universal custom-image requirements.
 
-The six shipped agents live in standalone recipes under `images/tools/`
-(`dsh`, `pi`, `codex`, `opencode`, `claude`, `copilot`). CI builds each `FROM`
-the base and installs **one exact, committed version** selected by a build
-`ARG` and recorded in an `org.agent-vm.version.*` image label; the finished
-template is the **default boot image** the launcher boots. No shipped build
-resolves an upstream `latest`/channel: `codex`, `opencode` and `claude` carry a
-pinned vendored installer, `copilot` installs an exact npm pin, and `dsh`/`pi`
-are pinned by a committed `package-lock.json` installed with `npm ci` (`dsh`
-needs the lock to freeze a working dependency layout). Each recipe carries its own byte-identical copy of
-the shared recipe/install contract under `images/tools/<tool>/contract/` instead
-of the base's legacy `agent-vm-install` helper. `pi` additionally carries an
-agent-vm-owned wrapper (`/usr/local/bin/pi`) and a mandatory warning extension
-(see the third subtlety below). The claude layer also carries
-the four `claude-plugins-official` LSP servers. Chromium is *not* in the base: it
-is an opt-in image capability, detected after boot by a supplied artifact (the
-image-capability marker, or the wrapper itself when no marker is present) — see
-[`examples/layers/chrome-devtools`](examples/layers/chrome-devtools/) and the
-boot image contract (#258).
+```text
+source gitlink (contributors only) → independent standard release
+                                  → immutable index → native Linux child → msb cache
+                                                     ↑
+                        CLI/env/config or retained default selection
+```
+
+The compiled v0.1.3 initial recommendation names the multiarch **index**. Native
+msb chooses the host child; successful first adoption keeps the index reference.
+An explicit upgrade instead retains the resolved child digest. Installed binary
+and runtime paths never read image sources. Chrome remains an optional
+[user-Dockerfile example](examples/layers/chrome-devtools/), not standard content.
 
 Three build-time subtleties are worth knowing:
 
@@ -640,11 +634,8 @@ executable by the guest user, and a runtime-initializable `/etc/passwd`/
 `/etc/group`. A breach is a clean launch-time diagnostic, not a mysterious in-VM
 failure.
 
-`images/build.sh` builds and pushes through a loopback `registry:2` as a
-separate developer workflow; it is not called by `agent-vm setup`. Docker's CLI
-stays the right interface for it — that keeps volume, port-forwarding, and
-`docker inspect` details out of the Rust binary, and means rebuilding the image
-does not recompile the binary or vice versa. Users can explicitly build/import through `image_build::run`:
+Image authoring and publication belong to the independent image owner and do
+not recompile the launcher. Users explicitly build/import through `image_build::run`:
 
 ```text
 main prologue → resolved local backend cache → private completed OCI export

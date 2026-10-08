@@ -412,10 +412,10 @@ mod tests {
 
     #[test]
     fn parses_localhost_with_port() {
-        let p = ParsedRef::parse("localhost:5000/agent-vm-template:latest").unwrap();
+        let p = ParsedRef::parse("localhost:5000/standard:test").unwrap();
         assert_eq!(p.host, "localhost:5000");
-        assert_eq!(p.name, "agent-vm-template");
-        assert_eq!(p.tag, "latest");
+        assert_eq!(p.name, "standard");
+        assert_eq!(p.tag, "test");
         assert!(p.is_insecure);
     }
 
@@ -430,10 +430,10 @@ mod tests {
 
     #[test]
     fn parses_ghcr_explicit_tag() {
-        let p = ParsedRef::parse("ghcr.io/wirenboard/agent-vm-template:v1").unwrap();
+        let p = ParsedRef::parse("ghcr.io/gregwebs/agent-vm-standard:v0.1.3").unwrap();
         assert_eq!(p.host, "ghcr.io");
-        assert_eq!(p.name, "wirenboard/agent-vm-template");
-        assert_eq!(p.tag, "v1");
+        assert_eq!(p.name, "gregwebs/agent-vm-standard");
+        assert_eq!(p.tag, "v0.1.3");
         assert!(!p.is_insecure);
     }
 
@@ -441,14 +441,14 @@ mod tests {
     fn parses_ghcr_bearer_challenge() {
         // The exact header ghcr.io returns for an anonymous manifest GET.
         let c = BearerChallenge::parse(
-            r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:wirenboard/agent-vm-template:pull""#,
+            r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:gregwebs/agent-vm-standard:pull""#,
         )
         .unwrap();
         assert_eq!(c.realm, "https://ghcr.io/token");
         assert_eq!(c.service.as_deref(), Some("ghcr.io"));
         assert_eq!(
             c.scope.as_deref(),
-            Some("repository:wirenboard/agent-vm-template:pull")
+            Some("repository:gregwebs/agent-vm-standard:pull")
         );
     }
 

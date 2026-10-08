@@ -894,7 +894,7 @@ mod tests {
     #[test]
     fn config_images_accept_oci_references() {
         for accepted in [
-            "ghcr.io/wirenboard/agent-vm-template:latest",
+            "ghcr.io/gregwebs/agent-vm-standard:v0.1.3",
             "localhost:1/user:latest",
             "agent-vm-e2e-258-fixture:marker-free",
             "repo@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",

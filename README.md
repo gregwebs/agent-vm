@@ -62,18 +62,25 @@ Please try out the project and give feedback or star it but don't rely on it for
 
 - Linux with `/dev/kvm` (rw) and membership in the `kvm` group, or an
   Apple Silicon Mac for the [supported source-build workflow](macos-build.md).
-- Cargo for building (will produce releases soon)
+- Linux: Node 18+ for the npm distribution. macOS: a signed source-built bundle.
+- Installed launches need native VM support and network on first acquisition,
+  not Docker or image-source files. Docker is needed only for explicit image builds.
 
 ## Quick start
 
 ```bash
-cargo build
+npm install -g @wirenboard/agent-vm  # Linux; macOS: follow macos-build.md
 
 agent-vm setup            # pulls the image this config boots from and verifies it boots
 
 cd ~/your-project
 agent-vm claude           # a configured launch verb; see `agent-vm --help`
 ```
+
+The initial recommendation is the released v0.1.3 standard image containing all
+six agents. Successful first acquisition retains its immutable index reference;
+launcher upgrades never replace an existing selection. Image sources and releases
+live in [agent-vm-images](https://github.com/gregwebs/agent-vm-images), independently of the launcher.
 
 The launch verbs come from your tool configuration (two tiers, user-wins), so
 `agent-vm --help` lists exactly the tools you have configured; `agent-vm doctor`

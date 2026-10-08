@@ -13,17 +13,11 @@
 /// image has actually been acquired. Changing this constant changes what a user
 /// with no record is offered; it never rewrites an existing retained selection.
 ///
-/// The value is pinned by digest because a mutable tag cannot name exact
-/// content: `:latest` is rebuilt hourly, so `:latest` today and `:latest` after
-/// a cache loss are different bytes. These are **existing published bytes of the
-/// old `agent-vm-template`** — a single `application/vnd.oci.image.manifest.v1+json`
-/// for Linux/amd64, not a multiarch index, and not the maintained multiarch
-/// release. It is an interim development recommendation only: #265 owns pinning
-/// and validating the production recommendation against real artifact
-/// consumption. Because selection is success-before-adoption, a host that
-/// cannot acquire it (e.g. Apple Silicon) keeps no record and a later compatible
-/// recommendation rescues the user.
-pub const INITIAL_DEFAULT_IMAGE_REF: &str = "ghcr.io/wirenboard/agent-vm-template@sha256:fd05aaa697c2488e9f7384d069ba2244078faf6b5320998b546c93f98f8d5f18";
+/// The released v0.1.3 multiarch index names immutable content; native msb
+/// chooses the Linux child for the host architecture. Image and launcher
+/// versions are independent. Changing this recommendation never replaces a
+/// retained record.
+pub const INITIAL_DEFAULT_IMAGE_REF: &str = "ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de";
 
 /// Marker written last by the Chrome DevTools image after its checks pass.
 pub const CHROME_MCP_CAPABILITY_PATH: &str = "/etc/agent-vm-capabilities/chrome-devtools-mcp";
@@ -48,50 +42,69 @@ pub const WRITABLE_UPPER_MIB: u32 = 16 * 1024;
 
 #[cfg(test)]
 mod tests {
-    use std::cmp::Ordering;
+    #[derive(serde::Deserialize)]
+    struct ReleasePin {
+        version: String,
+        source_sha: String,
+        index_digest: String,
+        platforms: Vec<PlatformPin>,
+    }
 
-    /// The interlock that stops CI promoting a `:latest` image before an
-    /// API-3-capable launcher is on npm (issue #84 §5.4). The file must parse
-    /// as a plain `major.minor.patch` semver and must name no version newer
-    /// than this crate — a version that does not exist yet would block `:latest`
-    /// promotion forever (`script/check-image-promotion-gate.sh`).
-    ///
-    /// Deliberately **not** equality: `images/min-agent-vm-version` is decoupled
-    /// from `CARGO_PKG_VERSION` on purpose, and `CONTRIBUTING.md` makes every
-    /// feature PR bump the workspace version, so equality would force every PR
-    /// to advance the promotion floor and block the hourly pipeline after every
-    /// merge.
+    #[derive(serde::Deserialize)]
+    struct PlatformPin {
+        graph: GraphPin,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GraphPin {
+        os: String,
+        architecture: String,
+        manifest: DescriptorPin,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DescriptorPin {
+        digest: String,
+    }
+
     #[test]
-    fn min_agent_vm_version_is_a_semver_no_newer_than_this_crate() {
+    fn initial_recommendation_matches_released_multiarch_index() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../images/min-agent-vm-version");
+            .join("tests/fixtures/standard-release/release.json");
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-        let min = raw.trim();
-        let min_parts = parse_semver(min);
-        let crate_parts = parse_semver(env!("CARGO_PKG_VERSION"));
-        assert_ne!(
-            compare(min_parts, crate_parts),
-            Ordering::Greater,
-            "images/min-agent-vm-version {min} is newer than the crate version {}; \
-             CI would block :latest promotion until that version reaches npm",
-            env!("CARGO_PKG_VERSION")
+        let pin: ReleasePin = serde_json::from_str(&raw).unwrap();
+        assert_eq!(pin.version, "0.1.3");
+        assert_eq!(pin.source_sha, "087f8bad3de624a5dad38f1669e7dea96996371a");
+        assert_eq!(
+            super::INITIAL_DEFAULT_IMAGE_REF,
+            format!("ghcr.io/gregwebs/agent-vm-standard@{}", pin.index_digest)
         );
-    }
-
-    fn parse_semver(s: &str) -> [u64; 3] {
-        let parts: Vec<&str> = s.split('.').collect();
-        assert_eq!(parts.len(), 3, "not a major.minor.patch version: {s:?}");
-        let mut out = [0u64; 3];
-        for (slot, part) in out.iter_mut().zip(parts) {
-            *slot = part
-                .parse()
-                .unwrap_or_else(|_| panic!("non-numeric semver component {part:?} in {s:?}"));
-        }
-        out
-    }
-
-    fn compare(a: [u64; 3], b: [u64; 3]) -> Ordering {
-        a.cmp(&b)
+        let mut platforms: Vec<_> = pin
+            .platforms
+            .iter()
+            .map(|p| {
+                assert_eq!(p.graph.os, "linux");
+                assert_ne!(p.graph.manifest.digest, pin.index_digest);
+                (
+                    p.graph.architecture.as_str(),
+                    p.graph.manifest.digest.as_str(),
+                )
+            })
+            .collect();
+        platforms.sort_unstable();
+        assert_eq!(
+            platforms,
+            vec![
+                (
+                    "amd64",
+                    "sha256:b10203f2e4511b7501235f4329c4cf71186b2e46373897407c0eb9604689b582"
+                ),
+                (
+                    "arm64",
+                    "sha256:bbfd3732893d5f76eb3dfd3d2e5f7779982b98adaa0be6b73be8084300f88a3b"
+                ),
+            ]
+        );
     }
 }

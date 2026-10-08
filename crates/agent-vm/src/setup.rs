@@ -1,7 +1,6 @@
-//! `agent-vm setup` — pull the base OCI image and verify it under microsandbox.
+//! `agent-vm setup` — pull the selected OCI image and verify it under microsandbox.
 //!
-//! The image is hosted on a registry that CI publishes on a separate
-//! cadence (see `.github/workflows/build-image.yml`). Setup just
+//! Standard-image releases belong to the independent agent-vm-images repo. Setup just
 //! pulls into microsandbox's cache and verifies by booting a
 //! throwaway sandbox.
 //!
@@ -33,7 +32,7 @@
 //! directly with `--version` (`sandbox.exec`, argv — never a shell string),
 //! because a config `command` is not validated beyond non-empty/NUL-free and
 //! must never be concatenated into a script. `--version` is the gate: a non-zero
-//! exit is fatal, matching `images/Dockerfile`'s build-time check, so a
+//! exit is fatal, so a
 //! present-but-broken binary fails instead of slipping through an exists-check.
 //! The diagnostic then classifies *why* the command failed by probing how the
 //! `command` appears on the guest — a guest `PATH` search for a bare name, a
@@ -618,7 +617,7 @@ mod tests {
     #[test]
     fn report_names_the_configured_path_for_a_pathname_command() {
         let err = report(
-            &boot_image::ImageLabel::for_tests("agent-vm-base:1"),
+            &boot_image::ImageLabel::for_tests("example/image:test"),
             &target(&["mytool"], "/opt/private/my-agent"),
             Some(CommandPresence::Absent),
             not_runnable(),
@@ -666,7 +665,7 @@ mod tests {
     #[test]
     fn report_bails_for_a_not_executable_declared_command() {
         let err = report(
-            &boot_image::ImageLabel::for_tests("agent-vm-base:1"),
+            &boot_image::ImageLabel::for_tests("example/image:test"),
             &target(&["mytool"], "my-agent"),
             Some(CommandPresence::NotExecutable),
             not_runnable(),
@@ -695,7 +694,7 @@ mod tests {
     #[test]
     fn report_bails_for_a_broken_declared_command() {
         let err = report(
-            &boot_image::ImageLabel::for_tests("agent-vm-base:1"),
+            &boot_image::ImageLabel::for_tests("example/image:test"),
             &target(&["claude"], "claude"),
             Some(CommandPresence::Executable),
             not_runnable(),
@@ -714,7 +713,7 @@ mod tests {
     #[test]
     fn report_renders_a_transport_failure_when_presence_is_unknown() {
         let err = report(
-            &boot_image::ImageLabel::for_tests("agent-vm-base:1"),
+            &boot_image::ImageLabel::for_tests("example/image:test"),
             &target(&["claude"], "claude"),
             None,
             not_runnable(),
@@ -916,7 +915,7 @@ mod tests {
     #[test]
     fn report_does_not_claim_missing_when_presence_is_unknown() {
         let err = report(
-            &boot_image::ImageLabel::for_tests("agent-vm-base:1"),
+            &boot_image::ImageLabel::for_tests("example/image:test"),
             &target(&["mytool"], "my-agent"),
             Some(CommandPresence::Unknown),
             not_runnable(),

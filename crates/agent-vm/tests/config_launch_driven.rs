@@ -5437,6 +5437,58 @@ fn a_retained_selection_survives_a_changed_recommendation() {
 }
 
 #[test]
+fn the_historical_interim_selection_survives_the_standard_recommendation() {
+    // Observation must not acquire the historic published image: ordinary Cargo
+    // tests remain boot-free and never download production image content.
+    const HISTORIC: &str = "ghcr.io/wirenboard/agent-vm-template@sha256:fd05aaa697c2488e9f7384d069ba2244078faf6b5320998b546c93f98f8d5f18";
+    let harness = Harness::new();
+    harness.write_selection_ref(HISTORIC);
+    let before = harness.selection_bytes().unwrap();
+    for envs in [
+        vec![("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+        vec![],
+    ] {
+        let out = harness.builtin(&["doctor"], &envs);
+        let doctor = stdout_of(&out);
+        assert!(doctor.contains("selected (without --image): retained default ["));
+        assert!(!doctor.contains(HISTORIC));
+        assert_eq!(harness.selection_bytes().unwrap(), before);
+    }
+    for (cli, env, user, project, expected) in [
+        (Some(CLI_REF), None, None, None, CLI_REF),
+        (None, Some(ENV_REF), None, None, ENV_REF),
+        (None, None, Some(USER_REF), None, USER_REF),
+        (None, None, None, Some(PROJECT_REF), PROJECT_REF),
+    ] {
+        let harness = Harness::new();
+        harness.write_selection_ref(HISTORIC);
+        let before = harness.selection_bytes().unwrap();
+        write_image_tiers(
+            &harness,
+            ImageTiers {
+                user,
+                project,
+                declares_tool: true,
+            },
+        );
+        let mut envs = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)];
+        if let Some(env) = env {
+            envs.push(("AGENT_VM_IMAGE_TAG", env));
+        }
+        let mut argv = Vec::new();
+        if let Some(cli) = cli {
+            argv.extend(["--image", cli]);
+        }
+        let out = harness.launch_argv("probe", &argv, &envs);
+        assert_eq!(
+            oci_reference(&debug_config_json(&stderr_of(&out))),
+            expected
+        );
+        assert_eq!(harness.selection_bytes().unwrap(), before);
+    }
+}
+
+#[test]
 fn explicit_sources_leave_the_selection_untouched() {
     // Neither an absent nor a present record may be read, adopted or rewritten
     // by a higher-precedence source.

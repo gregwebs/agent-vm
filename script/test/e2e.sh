@@ -1,47 +1,35 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016  # guest-side commands deliberately single-quote `$(...)`
 #
-# End-to-end (VM-boot) verification for agent-vm on Apple Silicon.
+# Native VM verification; CI runs only the boot-free harness contracts.
 #
-# It boots real microVMs through the agent-vm CLI and asserts the behaviours
-# CI cannot observe. Two groups:
-#   all          (default) the dev-image checks below plus the custom-image group
-#   custom-image only the #258 marker-free custom-image group; needs Docker, the
-#                release-bundle `msb`, and a launcher binary — no dev images
+# Groups:
+#   released-image  installed release, registry + corresponding archive, native
+#                   amd64/arm64; no Docker or image sources needed by launcher
+#   custom-image    existing marker-free regression suite; Apple Silicon only,
+#                   Docker/buildx, validated debug and release bundles required
+#   all             (default) released-image followed by custom-image
 #
-# See CONTRIBUTING.md#end-to-end-vm-boot-tests-optional for background and
-# acceptance criteria.
+# Released-image inputs (required):
+#   AGENT_VM_RELEASE_BIN            absolute relocated installed release binary
+#   AGENT_VM_E2E_RELEASE_ASSETS_DIR  verified native v0.1.3 assets directory
+#   AGENT_VM_E2E_OTHER_ASSETS_DIR    verified opposite-architecture assets directory
+#   AGENT_VM_E2E_BUILD_SOURCE_DIR    the candidate's ACTUAL build checkout, which
+#                                   must be absent after relocation (operator records
+#                                   its correspondence to the candidate)
+# Released-image inputs (optional):
+#   AGENT_VM_E2E_NODE               vetted absolute Node interpreter for an
+#                                   installed npm dispatcher candidate; defaults to
+#                                   `node` resolved from the caller PATH
+# Gate prerequisites: jq, shasum, python3 (and node for an npm dispatcher).
 #
-# This is **not** run on CI: GitHub's macOS runners are Intel and cannot boot
-# these arm64 microVMs. It is the standard local entry point instead.
+# Custom-image inputs:
+#   AGENT_VM_BIN / AGENT_VM_DEV_BIN  validated debug launcher
+#   AGENT_VM_RELEASE_BIN            validated release launcher
+#   AGENT_VM_E2E_BUILDER            optional existing docker-container builder
 #
-# Inputs (all optional; `env -u` if your shell exports the image vars):
-#   AGENT_VM_BIN                     launcher binary. Default: target/macos-dev/bin/agent-vm,
-#                                    else target/macos/bin/agent-vm.
-#   AGENT_VM_DEV_BIN                 debug launcher for the retained-default check's
-#                                    recommendation-seam runs. Default: $AGENT_VM; must be a
-#                                    debug build (the seam is compiled out of release builds,
-#                                    which the check verifies).
-#   AGENT_VM_RELEASE_BIN             release launcher for the retained-default check.
-#                                    Default: target/macos/bin/agent-vm. Required: the check
-#                                    fails, never skips, when it is absent.
-#   AGENT_VM_STATE_DIR               state root. Default: $HOME/.local/state/agent-vm.
-#   AGENT_VM_E2E_STATE_DIR           overrides AGENT_VM_STATE_DIR for this run only.
-#   AGENT_VM_E2E_TEMPLATE_IMAGE      finished template (the default boot image) in docker.
-#                                    Default: agent-vm-template:dev.
-#
-# Opt-in checks (skipped, with a notice, when the variable is unset):
-#   AGENT_VM_E2E_LEGACY_IMAGE=<ref>           an image that supplies
-#                                             /opt/agent-vm/seed-claude-plugins.sh (E8)
-#   AGENT_VM_E2E_UPDATE_CHECK=1               probe the registry (E9; needs network)
-#
-# State changes (all additive): the finished template is imported into
-# $AGENT_VM_STATE_DIR's msb cache under its dev tag, and the custom fixtures are
-# imported into a fresh isolated under-$WORK state root. The `all` group's
-# template checks select the dev tag explicitly: the *default* image is now the
-# user-scoped retained record (#261), which the custom-image group's
-# retained-default check owns. Undo with `agent-vm doctor --reset-msb-db` if you
-# want the state dir byte-identical.
+# All launches use owned private HOME/state/cache. Real native joins remain
+# manual; see CONTRIBUTING.md. No debug recommendation seam in released-image.
 
 set -euo pipefail
 
@@ -64,7 +52,7 @@ case "${1:-}" in
     exit 0
     ;;
   "") ;;
-  all | custom-image)
+  all | custom-image | released-image)
     GROUP="$1"
     ;;
   *)
@@ -78,6 +66,13 @@ die() {
   echo "e2e: $*" >&2
   exit 1
 }
+
+[[ $# -le 1 ]] || die "expected at most one group"
+if [[ "$GROUP" == released-image || "$GROUP" == all ]]; then
+  bash "$REPO_ROOT/script/test/e2e-released-image.sh"
+  [[ "$GROUP" != released-image ]] || exit 0
+fi
+[[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || die "custom-image/all requires Apple Silicon"
 
 # ---------------------------------------------------------------- inputs ----
 
@@ -96,8 +91,6 @@ fi
 AGENT_VM_DEV_BIN="${AGENT_VM_DEV_BIN:-$AGENT_VM}"
 AGENT_VM_RELEASE_BIN="${AGENT_VM_RELEASE_BIN:-$REPO_ROOT/target/macos/bin/agent-vm}"
 
-TEMPLATE_IMAGE="${AGENT_VM_E2E_TEMPLATE_IMAGE:-agent-vm-template:dev}"
-STATE_DIR="${AGENT_VM_E2E_STATE_DIR:-${AGENT_VM_STATE_DIR:-$HOME/.local/state/agent-vm}}"
 
 # Save native connection/plugin configuration before disposable HOME isolation.
 absolute_override() {
@@ -121,12 +114,6 @@ or point AGENT_VM_BIN at one."
 
 command -v docker >/dev/null 2>&1 || die "docker is required but not on PATH"
 docker info >/dev/null 2>&1 || die "the docker daemon is unreachable; start colima or Docker Desktop"
-
-if [[ "$GROUP" == all ]]; then
-  docker image inspect "$TEMPLATE_IMAGE" >/dev/null 2>&1 ||
-    die "docker image '$TEMPLATE_IMAGE' is missing; build the dev image first — see
-  macos-build.md (and AGENT_VM_E2E_TEMPLATE_IMAGE to point at a different tag)."
-fi
 
 # The custom-image group is a serial native-VM run. Concurrent agent-vm/msb
 # sessions on this host would make the process/catalog absence observations
@@ -159,15 +146,6 @@ trap cleanup_work EXIT
 # earlier run's tag. Docker repository names and the local-registry refs must be
 # lowercase, and mktemp's suffix is mixed-case, so normalize it once here.
 RUN_ID="$(printf '%s' "${WORK##*.}" | tr '[:upper:]' '[:lower:]')"
-
-# The developer's real state dir is only the dev-image groups' store. The
-# custom-image group uses its own fresh under-$WORK root ($CUSTOM_STATE), and
-# touching the dev dir there could write a one-way cache redirect into it.
-if [[ "$GROUP" == all ]]; then
-  mkdir -p "$STATE_DIR/msb-home"
-
-
-fi
 
 # A fresh, short, isolated state root for every custom-image boot. Never the
 # shared dev state dir above: these checks must not see dev-image refs.
@@ -232,20 +210,13 @@ assert_custom_cache_isolated() {
 mkdir -p "$CUSTOM_STATE/msb-home" "$CUSTOM_HOME"
 # ------------------------------------------------------------- host helpers --
 
-# agent-vm with the image env var dropped, so a default-config check really
-# resolves the default rather than an inherited AGENT_VM_IMAGE_TAG.
-avm() {
-  "${OFFLINE_ENV[@]}" env -u AGENT_VM_IMAGE_TAG \
-    XDG_CONFIG_HOME="$WORK/offline-config" AGENT_VM_STATE_DIR="$STATE_DIR" "$AGENT_VM" "$@"
-}
-
 # agent-vm against the isolated custom state root (only ever used off the shim).
 avm_custom_state() {
   "${CUSTOM_ENV[@]}" "$AGENT_VM" "$@"
 }
 
 import_image() {
-  local source="$1" dest="${2:-$1}" state="${3:-$STATE_DIR}"
+  local source="$1" dest="${2:-$1}" state="${3:?custom state required}"
   echo "==> Importing $source as $dest"
   local archive
   archive="$(mktemp "$WORK/docker-save.XXXXXX")" || return 1
@@ -1045,14 +1016,16 @@ check_harness_negative() {
   reset_host_shim_log || return 1
   : >"$log" || return 1
 
-  # shellcheck disable=SC2329  # invoked indirectly through run_check
+  # shellcheck disable=SC2317,SC2329  # invoked indirectly through run_check;
+  # 0.9 (the Ubuntu CI version) reports the body as unreachable instead.
   failing_capture() {
     local out
     out="$(exit 37)" || return 1
     : "$out"
     assert_no_host_calls
   }
-  # shellcheck disable=SC2329  # invoked indirectly through run_check
+  # shellcheck disable=SC2317,SC2329  # invoked indirectly through run_check;
+  # 0.9 (the Ubuntu CI version) reports the body as unreachable instead.
   failing_assert() {
     assert_eq "deliberately wrong" "a" "b" || return 1
     assert_no_host_calls
@@ -1111,7 +1084,8 @@ check_harness_negative() {
   # (b) A grep error (status 2) must not be treated as proof that a synthetic
   # token is absent from guest output.
   if (
-    # shellcheck disable=SC2329  # invoked indirectly by assert_no_match
+    # shellcheck disable=SC2317,SC2329  # invoked indirectly by assert_no_match;
+    # 0.9 (the Ubuntu CI version) reports the stub as unreachable instead.
     grep() { return 2; }
     assert_no_credential_leak "grep2 probe" "haystack with no tokens" >/dev/null 2>&1
   ); then
@@ -1281,147 +1255,6 @@ check_harness_negative() {
   PASSED="$saved_passed"
   FAILED="$saved_failed"
   return "$result"
-}
-
-# ============================================================ dev checks ====
-
-# E1: all six --version checks pass in the finished template guest.
-check_template_has_all_tools() {
-  local out
-  out="$(avm shell --no-git --image "$TEMPLATE_IMAGE" -- bash -c '
-    for t in dsh pi codex opencode claude copilot; do
-      if [ "$t" = dsh ]; then
-        [ -n "$(dsh --version 2>/dev/null)" ] || { echo "MISSING:$t"; exit 1; }
-      else
-        "$t" --version >/dev/null 2>&1 || { echo "MISSING:$t"; exit 1; }
-      fi
-    done
-  ' 2>&1)" || {
-    echo "$out" | tail -20
-    return 1
-  }
-  assert_no_match "no missing tool" "MISSING:" "$out"
-}
-
-# E2 / AC 7: a launch whose image is the dev template boots it with docker and
-# buildx absent from PATH (and their invocation shims silent). The template is
-# selected explicitly: the *default* image is the user-scoped retained record
-# (#261), covered by the custom-image group's retained-default check.
-check_selected_image_zero_docker() {
-  local proj="$WORK/default-image" shim="$WORK/shim-dev" log="$WORK/docker-calls.log"
-  mkdir -p "$proj" || return 1
-  make_builder_shims "$shim" "$log" || return 1
-
-  local out
-  out="$(cd "$proj" && "${OFFLINE_ENV[@]}" env -u AGENT_VM_IMAGE_TAG \
-    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$shim:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" AGENT_VM_STATE_DIR="$STATE_DIR" \
-    "$AGENT_VM" shell --no-git --image "$TEMPLATE_IMAGE" -- bash -c 'true' 2>&1)" || {
-    echo "$out" | tail -20
-    return 1
-  }
-  assert_match "boots the selected dev template" \
-    "^==> Booting sandbox from $TEMPLATE_IMAGE " "$out" || return 1
-  assert_no_builder_calls "selected-image" "$log" || return 1
-}
-
-# #259: former `.agent-vm/layers/*` and `.agent-vm/layer/` directories are
-# ordinary data now — the selected image still boots and no builder runs.
-check_former_layer_dir_is_inert() {
-  local proj="$WORK/former-layers" shim="$WORK/shim-dev" log="$WORK/docker-calls.log"
-  mkdir -p "$proj/.agent-vm/layers/10-poison/sub/deeper" "$proj/.agent-vm/layer" || return 1
-  printf '!! not a dockerfile\n' >"$proj/.agent-vm/layers/10-poison/Dockerfile"
-  printf '&& no\n' >"$proj/.agent-vm/layers/10-poison/sub/deeper/Dockerfile"
-  printf '?? legacy\n' >"$proj/.agent-vm/layer/Dockerfile"
-  make_builder_shims "$shim" "$log" || return 1
-
-  local out
-  out="$(cd "$proj" && "${OFFLINE_ENV[@]}" env -u AGENT_VM_IMAGE_TAG \
-    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$shim:/usr/bin:/bin" DOCKER_SHIM_LOG="$log" AGENT_VM_STATE_DIR="$STATE_DIR" \
-    "$AGENT_VM" shell --no-git --image "$TEMPLATE_IMAGE" -- bash -c 'true' 2>&1)" || {
-    echo "$out" | tail -20
-    return 1
-  }
-  assert_match "boots the selected image despite former layer dirs" \
-    "^==> Booting sandbox from $TEMPLATE_IMAGE " "$out" || return 1
-  assert_no_builder_calls "former-layer dirs" "$log" || return 1
-  if [[ ! -f "$proj/.agent-vm/layers/10-poison/Dockerfile" || ! -f "$proj/.agent-vm/layer/Dockerfile" ]]; then
-    echo "    FAIL: a former layer directory was removed (must be inert, not migrated)"
-    return 1
-  fi
-}
-
-# E1c / #96: ~/.pi resolves to state and persists across an independent boot.
-# #259: consumes the already-finished template image; no launcher build.
-pi_home_persists() {
-  local mode="$1"
-  local -a root_flag=()
-  [[ "$mode" == root ]] && root_flag=(--root)
-  local proj="$WORK/pi-home-$mode-$RUN_ID"
-  mkdir -p "$proj/.agent-vm"
-  cat >"$proj/.agent-vm/config.toml" <<'EOF'
-[[tools]]
-name = "pi"
-command = "pi"
-EOF
-
-  local first second
-  first="$(cd "$proj" && avm shell ${root_flag[@]+"${root_flag[@]}"} \
-    --image "$TEMPLATE_IMAGE" -- bash -c '
-      printf "link=%s\n" "$(readlink "$HOME/.pi")"
-      printf "isdir=%s\n" "$([ -d "$HOME/.pi" ] && echo yes)"
-      mkdir -p "$HOME/.pi/agent/npm/node_modules" \
-        && printf "sentinel-96" > "$HOME/.pi/agent/npm/node_modules/e2e-marker"
-      printf "wrote=%s\n" "$?"
-    ' 2>&1)" || { echo "$first" | tail -20; return 1; }
-  assert_match "$mode: ~/.pi points at the state dir" "^link=/agent-vm-state/pi$" "$first" || return 1
-  assert_match "$mode: ~/.pi resolves to a real directory" "^isdir=yes$" "$first" || return 1
-  assert_match "$mode: Pi's global-package dir is writable" "^wrote=0$" "$first" || return 1
-
-  second="$(cd "$proj" && avm shell ${root_flag[@]+"${root_flag[@]}"} \
-    --image "$TEMPLATE_IMAGE" -- bash -c '
-      printf "survived=%s\n" "$(cat "$HOME/.pi/agent/npm/node_modules/e2e-marker" 2>&1)"
-    ' 2>&1)" || { echo "$second" | tail -20; return 1; }
-  assert_match "$mode: state survives an independent boot" "^survived=sentinel-96$" "$second"
-}
-
-# E8 / optional: an image that supplies /opt/agent-vm/seed-claude-plugins.sh is
-# seeded through the ordinary runtime entry point. This tests that supplied
-# artifact only; it makes no released-default or lineage claim.
-check_legacy_seed() {
-  local proj="$WORK/legacy"
-  mkdir -p "$proj"
-  local out
-  out="$(cd "$proj" && avm shell --no-git --image "$AGENT_VM_E2E_LEGACY_IMAGE" -- bash -c '
-    echo "seed-d-entries=$(ls /opt/agent-vm/seed.d 2>/dev/null | wc -l | tr -d " ")"
-    claude plugin list 2>&1
-  ' 2>&1)" || {
-    echo "$out" | tail -20
-    return 1
-  }
-  assert_match "the image supplies no seed.d" "^seed-d-entries=0$" "$out" || return 1
-  assert_match "plugins seeded via the supplied named script" \
-    "lsp@claude-plugins-official" "$out"
-}
-
-# E9: --update-check probes the selected boot image (here a project-selected
-# image different from the published default), never a derived layer tag.
-check_update_check() {
-  local proj="$WORK/update"
-  mkdir -p "$proj/.agent-vm"
-  cat >"$proj/.agent-vm/config.toml" <<EOF
-image = "$TEMPLATE_IMAGE"
-EOF
-  local out
-  out="$(cd "$proj" && env -u AGENT_VM_IMAGE_TAG \
-    AGENT_VM_UPDATE_CHECK=1 RUST_LOG=agent_vm=debug AGENT_VM_STATE_DIR="$STATE_DIR" \
-    "$AGENT_VM" shell --no-git -- bash -c 'sleep 6' 2>&1)" || {
-    echo "$out" | tail -20
-    return 1
-  }
-  assert_match "probes the selected boot image" \
-    "registry update probe.*$TEMPLATE_IMAGE" "$out" || return 1
-  assert_no_match "never probes a derived layer tag" \
-    "registry update probe.*agent-vm-layer:" "$out"
 }
 
 # ==================================================== custom-image checks ====
@@ -3246,25 +3079,8 @@ custom_image_default_upgrade() {
 
 echo "e2e: group=$GROUP"
 echo "e2e: launcher=$AGENT_VM"
-if [[ "$GROUP" == all ]]; then
-  echo "e2e: state=$STATE_DIR"
-  echo "e2e: images=$TEMPLATE_IMAGE"
-fi
-
 make_host_shims
 run_check "harness-negative" check_harness_negative
-
-if [[ "$GROUP" == all ]]; then
-  import_image "$TEMPLATE_IMAGE"
-
-  run_check "template-has-all-tools" check_template_has_all_tools
-  run_check "selected-image-zero-docker" check_selected_image_zero_docker
-  run_check "former-layer-dir-inert" check_former_layer_dir_is_inert
-  run_check "pi-home-persists-nonroot" pi_home_persists non-root
-  run_check "pi-home-persists-root" pi_home_persists root
-  run_optional "supplied-named-seed" AGENT_VM_E2E_LEGACY_IMAGE check_legacy_seed
-  run_optional "update-check-probes-selected" AGENT_VM_E2E_UPDATE_CHECK check_update_check
-fi
 
 # #260 uses a separate short HOME/state, never the #258 fixture store.
 setup_explicit_builder() {

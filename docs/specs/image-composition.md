@@ -1,3 +1,8 @@
+> **Superseded/abandoned by #257 and [ADR-0035](../adr/0035-consume-user-owned-boot-images.md).**
+> This is historical reference, not supported behavior or implementation requirements.
+> Use [USAGE](../../USAGE.md#selecting-the-boot-image) and the independent
+> [image owner](https://github.com/gregwebs/agent-vm-images) for current contracts.
+
 # Image composition: implementation handoff
 
 Status: **Abandoned** — superseded by [#257](https://github.com/gregwebs/agent-vm/issues/257) / [ADR-0035](../adr/0035-consume-user-owned-boot-images.md); kept as history.

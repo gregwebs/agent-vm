@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
+ARG BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de
 FROM ${BASE_IMAGE}
 
 RUN apt-get update \

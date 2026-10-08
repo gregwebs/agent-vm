@@ -14,8 +14,8 @@ Supersedes [ADR-0003](0003-project-tooling-layers.md),
 [ADR-0030](0030-tool-versions-in-identity-and-current-tags.md),
 [ADR-0031](0031-tool-image-contract.md),
 [ADR-0032](0032-one-layer-kind.md) and
-[ADR-0033](0033-default-rebase-with-build-provenance.md). Amends
-[ADR-0034](0034-versioned-image-releases.md),
+[ADR-0033](0033-default-rebase-with-build-provenance.md) and
+[ADR-0034](0034-versioned-image-releases.md). Amends
 [ADR-0015](0015-config-driven-tools.md) and
 [ADR-0022](0022-dsh-tool-layer.md).
 
@@ -38,7 +38,8 @@ image.
 The Layer DAG (ADR-0029–0033) was never implemented — no code ever composed a
 DAG, stitched images, or maintained current tags. What *is* implemented is the
 image production pipeline: committed recipe/version pins, lockfiles and the
-source-integrity gates in `images/` and `.github/workflows/`. Those stay.
+source-integrity gates, now retained at the independent [image owner](https://github.com/gregwebs/agent-vm-images). #263/#264 implemented source maintenance/publication; #265 moves
+the contributor gitlink and launcher recommendation, without a runtime source dependency.
 
 ## Decision
 
@@ -129,19 +130,21 @@ source-integrity gates in `images/` and `.github/workflows/`. Those stay.
   image selection; release and distribution work moves to
   [#263–#265](https://github.com/gregwebs/agent-vm/issues/263).
 - The committed recipe/version pins and source-integrity gates are retained
-  (now exercised by `crates/agent-vm/tests/image_sources.rs` and the
-  `script/` gates), independent of the unimplemented Layer DAG.
+  in the independent image repository, not in launcher Cargo tests,
+  independent of the unimplemented Layer DAG.
 - **#261 fulfilled.** The default boot image is a retained, user-scoped,
   digest-pinned selection with success-before-adoption; the compiled-in value is
-  only an interim initial recommendation, and
-  [#265](https://github.com/gregwebs/agent-vm/issues/265) owns pinning and
-  validating the production multiarch recommendation against real artifact
-  consumption. The interim value is Linux/amd64-only, which is safe precisely
-  because a failed acquisition retains nothing.
+  the v0.1.3 multiarch standard index as of #265, pinned alongside contributor
+  sources at `087f8bad3de624a5dad38f1669e7dea96996371a`. Native acquisition
+  chooses the host child, but first adoption preserves the index ref. Real
+  installed registry/archive joins are manual, not CI container evidence.
+  #265 remains incomplete until native joins exist on both architectures;
+  launcher release is held pending amd64 evidence and maintainer image
+  promotion or explicit risk acceptance. Merge is not image promotion.
 - **#262 fulfilled.** Explicit replacement remains separate from write-once
   automatic adoption. See [USAGE](../../USAGE.md#explicitly-upgrading-the-default).
-- Follow-ups: [#265](https://github.com/gregwebs/agent-vm/issues/265) (production
-  recommendation), #263–#264 (image repo, release).
+- Follow-up evidence: [#265](https://github.com/gregwebs/agent-vm/issues/265)
+  (native installed consumption on both architectures).
 
 ## Alternatives
 

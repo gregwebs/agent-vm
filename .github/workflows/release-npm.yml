@@ -4,8 +4,9 @@ name: release-npm
 # supported platform, then publish the main package and per-platform
 # subpackages to npm. Tagged releases only — `v<semver>` (e.g. v1.2.3).
 #
-# The image is published on a separate cadence (see build-image.yml);
-# binary releases pin the default image to the moving `:latest` tag.
+# The independent image owner publishes standard releases. The binary carries
+# an immutable initial recommendation; existing retained selections survive.
+# Changed recommendations require manual native evidence before tagging; see CONTRIBUTING.md.
 
 on:
   push:

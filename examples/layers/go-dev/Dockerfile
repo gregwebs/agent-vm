@@ -4,7 +4,7 @@
 # code base inside the microVM (there is no launcher-side layering, #259):
 #
 #   agent-vm build --builder native-oci \
-#     --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+#     --build-arg BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de \
 #     --tag agent-vm-go-dev:dev examples/layers/go-dev
 #   agent-vm claude --image agent-vm-go-dev:dev
 #
@@ -22,7 +22,7 @@
 # retarget the build, and every `ENV` keeps `PATH` additive
 # (`PATH=<new>:${PATH}`) so the base's directories are never dropped.
 
-ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
+ARG BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de
 FROM ${BASE_IMAGE}
 
 # A C toolchain, for the two things the Go distribution itself defers to the

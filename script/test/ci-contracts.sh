@@ -52,33 +52,14 @@ if [[ "$guard_only" == false ]]; then
         -p msb-krun-compat-evidence --all-targets -- -D warnings
     "$REPO_ROOT/script/test/msb-krun-compat-contract.sh"
     bash "$REPO_ROOT/script/test/build-workflow.sh"
-    bash "$REPO_ROOT/script/test/pi-wrapper.sh"
-    bash "$REPO_ROOT/script/test/pi-install.sh"
-    bash "$REPO_ROOT/script/test/pi-prepare-lock.sh"
-    bash "$REPO_ROOT/script/test/pi-verify.sh"
-    bash "$REPO_ROOT/script/test/dsh-verify.sh"
-    bash "$REPO_ROOT/script/test/dsh-prepare-lock.sh"
-    bash "$REPO_ROOT/script/test/upgrade-scripts.sh"
-    bash "$REPO_ROOT/script/test/agent-versions.sh"
     bash "$REPO_ROOT/script/test/rust-toolchain-consistency.sh"
-    bash "$REPO_ROOT/script/test/tool-access.sh"
-    bash "$REPO_ROOT/script/test/shipped-installer-contracts.sh"
-    bash "$REPO_ROOT/script/test/copilot-verify.sh"
-    bash "$REPO_ROOT/script/test/claude-installer.sh"
-    bash "$REPO_ROOT/script/test/codex-installer.sh"
-    bash "$REPO_ROOT/script/test/opencode-installer.sh"
-    bash "$REPO_ROOT/script/test/vendored-installers.sh"
-    bash "$REPO_ROOT/script/test/shipped-tool-recipes.sh" --self-test
-    bash "$REPO_ROOT/script/test/sync-recipe-contracts.sh"
-    "$REPO_ROOT/script/build/sync-recipe-contracts.sh" --check
-    python3 -c 'import ast,sys;[ast.parse(open(p,encoding="utf-8").read(),p) for p in sys.argv[1:]]' \
-        "$REPO_ROOT/images/recipe-contract/check-tool-access.py" \
-        "$REPO_ROOT/images/recipe-contract/install-status.py" \
-        "$REPO_ROOT"/images/tools/*/contract/check-tool-access.py \
-        "$REPO_ROOT"/images/tools/*/contract/install-status.py \
-        "$REPO_ROOT/script/test/fixtures/installer-egress/addon.py" \
-        "$REPO_ROOT/script/test/host-watchdog.py"
-    node --check "$REPO_ROOT/images/tools/dsh/check-lock-update.js"
+    bash "$REPO_ROOT/script/test/standard-release-pin.sh"
+    bash "$REPO_ROOT/script/test/standard-release-pin-test.sh"
+    bash "$REPO_ROOT/script/test/no-image-source-dependency.sh"
+    bash "$REPO_ROOT/script/test/no-image-source-dependency-test.sh"
+    bash "$REPO_ROOT/script/test/chrome-example-contract.sh"
+    bash "$REPO_ROOT/script/test/e2e-release-contract.sh"
+
 fi
 
 # --- Shell guard rail --------------------------------------------------------
@@ -90,56 +71,13 @@ fi
 # them (they are bind-mounted into their layer's Dockerfile at image-build
 # time), so this is their only shell guard.
 syntax_check=(
-    images/tools/dsh/install-dsh.sh
-    images/tools/dsh/prepare-lock.sh
-    images/tools/pi/prepare-lock.sh
-    images/tools/pi/bridge/prepare-lock.sh
-    script/build/dockerfile-label.sh
-    script/test/dsh-prepare-lock.sh
-    script/test/pi-prepare-lock.sh
-    script/test/pi-verify.sh
-    images/tools/claude/install-claude.sh
-    images/tools/claude/verify-claude.sh
-    images/tools/claude/vendor/install.sh
-    script/test/claude-installer.sh
-    images/tools/codex/install-codex.sh
-    images/tools/codex/verify-codex.sh
-    images/tools/codex/vendor/install.sh
-    script/test/codex-installer.sh
-    images/tools/opencode/install-opencode.sh
-    images/tools/opencode/verify-opencode.sh
-    images/tools/opencode/vendor/install.sh
-    script/test/opencode-installer.sh
-    script/test/vendored-installers.sh
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
-    script/test/shipped-tool-recipes.sh
     script/check-runtime-provenance.sh
     script/test/runtime-provenance.sh
     script/test/msb-krun-compat.sh
     script/test/msb-krun-compat-contract.sh
     script/build/macos.sh
-    script/build/agent-versions.sh
-    script/build/npm-pin.sh
-    images/build.sh
     script/test/build-workflow.sh
-    images/tools/pi/pi.sh
-    images/tools/pi/install-pi.sh
-    images/tools/pi/install-pi-packages.sh
-    images/tools/pi/verify-pi.sh
-    images/tools/pi/seed-claude-bridge-config.sh
-    images/tools/pi/upgrade-pi.sh
-    images/tools/pi/bridge/upgrade-bridge.sh
-    images/tools/dsh/verify-dsh.sh
-    images/tools/copilot/install-copilot.sh
-    images/tools/copilot/verify-copilot.sh
-    script/test/copilot-verify.sh
-    script/test/copilot-installer.sh
-    images/tools/dsh/upgrade-dsh.sh
-    script/test/dsh-verify.sh
-    script/test/pi-wrapper.sh
-    script/test/pi-install.sh
-    script/test/upgrade-scripts.sh
-    script/test/agent-versions.sh
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
@@ -150,40 +88,16 @@ syntax_check=(
     examples/layers/go-dev/install-golangci-lint.sh
     examples/layers/go-dev/install-gopls.sh
     examples/layers/go-dev/verify-toolchain.sh
-    script/build/sync-recipe-contracts.sh
-    script/test/tool-access.sh
-    script/test/sync-recipe-contracts.sh
-    script/test/host-watchdog.sh
-    script/test/shipped-installer-contracts.sh
-    script/test/shipped-installer-network.sh
-    images/recipe-contract/download.sh
-    images/recipe-contract/run-install.sh
-    images/recipe-contract/run-npm.sh
-    images/recipe-contract/run-report.sh
-    images/tools/dsh/contract/download.sh
-    images/tools/dsh/contract/run-install.sh
-    images/tools/dsh/contract/run-npm.sh
-    images/tools/dsh/contract/run-report.sh
-    images/tools/pi/contract/download.sh
-    images/tools/pi/contract/run-install.sh
-    images/tools/pi/contract/run-npm.sh
-    images/tools/pi/contract/run-report.sh
-    images/tools/codex/contract/download.sh
-    images/tools/codex/contract/run-install.sh
-    images/tools/codex/contract/run-npm.sh
-    images/tools/codex/contract/run-report.sh
-    images/tools/opencode/contract/download.sh
-    images/tools/opencode/contract/run-install.sh
-    images/tools/opencode/contract/run-npm.sh
-    images/tools/opencode/contract/run-report.sh
-    images/tools/claude/contract/download.sh
-    images/tools/claude/contract/run-install.sh
-    images/tools/claude/contract/run-npm.sh
-    images/tools/claude/contract/run-report.sh
-    images/tools/copilot/contract/download.sh
-    images/tools/copilot/contract/run-install.sh
-    images/tools/copilot/contract/run-npm.sh
-    images/tools/copilot/contract/run-report.sh
+    script/test/standard-release-pin.sh
+    script/test/standard-release-pin-test.sh
+    script/test/no-image-source-dependency.sh
+    script/test/no-image-source-dependency-test.sh
+    script/test/chrome-example-contract.sh
+    script/test/e2e-release-contract.sh
+    script/test/e2e-released-image.sh
+    script/test/e2e.sh
+    script/test/lib/released-image-checks.sh
+    examples/layers/chrome-devtools/agent-vm-chrome-mcp
     "$self_relative"
 )
 
@@ -191,57 +105,14 @@ syntax_check=(
 # that `build_in_docker.sh` invokes; it is deliberately a superset-by-one of
 # syntax_check rather than a divergence from the criterion above.
 shellcheck_files=(
-    images/tools/dsh/install-dsh.sh
-    images/tools/dsh/prepare-lock.sh
-    images/tools/pi/prepare-lock.sh
-    images/tools/pi/bridge/prepare-lock.sh
-    script/build/dockerfile-label.sh
-    script/test/dsh-prepare-lock.sh
-    script/test/pi-prepare-lock.sh
-    script/test/pi-verify.sh
-    images/tools/claude/install-claude.sh
-    images/tools/claude/verify-claude.sh
-    images/tools/claude/vendor/install.sh
-    script/test/claude-installer.sh
-    images/tools/codex/install-codex.sh
-    images/tools/codex/verify-codex.sh
-    images/tools/codex/vendor/install.sh
-    script/test/codex-installer.sh
-    images/tools/opencode/install-opencode.sh
-    images/tools/opencode/verify-opencode.sh
-    images/tools/opencode/vendor/install.sh
-    script/test/opencode-installer.sh
-    script/test/vendored-installers.sh
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     vendor/microsandbox/vendor/libkrunfw/scripts/test-build-in-docker.sh
-    script/test/shipped-tool-recipes.sh
     script/check-runtime-provenance.sh
     script/test/runtime-provenance.sh
     script/test/msb-krun-compat.sh
     script/test/msb-krun-compat-contract.sh
     script/build/macos.sh
-    script/build/agent-versions.sh
-    script/build/npm-pin.sh
-    images/build.sh
     script/test/build-workflow.sh
-    images/tools/pi/pi.sh
-    images/tools/pi/install-pi.sh
-    images/tools/pi/install-pi-packages.sh
-    images/tools/pi/verify-pi.sh
-    images/tools/pi/seed-claude-bridge-config.sh
-    images/tools/pi/upgrade-pi.sh
-    images/tools/pi/bridge/upgrade-bridge.sh
-    images/tools/dsh/verify-dsh.sh
-    images/tools/copilot/install-copilot.sh
-    images/tools/copilot/verify-copilot.sh
-    script/test/copilot-verify.sh
-    script/test/copilot-installer.sh
-    images/tools/dsh/upgrade-dsh.sh
-    script/test/dsh-verify.sh
-    script/test/pi-wrapper.sh
-    script/test/pi-install.sh
-    script/test/upgrade-scripts.sh
-    script/test/agent-versions.sh
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
@@ -252,40 +123,16 @@ shellcheck_files=(
     examples/layers/go-dev/install-golangci-lint.sh
     examples/layers/go-dev/install-gopls.sh
     examples/layers/go-dev/verify-toolchain.sh
-    script/build/sync-recipe-contracts.sh
-    script/test/tool-access.sh
-    script/test/sync-recipe-contracts.sh
-    script/test/host-watchdog.sh
-    script/test/shipped-installer-contracts.sh
-    script/test/shipped-installer-network.sh
-    images/recipe-contract/download.sh
-    images/recipe-contract/run-install.sh
-    images/recipe-contract/run-npm.sh
-    images/recipe-contract/run-report.sh
-    images/tools/dsh/contract/download.sh
-    images/tools/dsh/contract/run-install.sh
-    images/tools/dsh/contract/run-npm.sh
-    images/tools/dsh/contract/run-report.sh
-    images/tools/pi/contract/download.sh
-    images/tools/pi/contract/run-install.sh
-    images/tools/pi/contract/run-npm.sh
-    images/tools/pi/contract/run-report.sh
-    images/tools/codex/contract/download.sh
-    images/tools/codex/contract/run-install.sh
-    images/tools/codex/contract/run-npm.sh
-    images/tools/codex/contract/run-report.sh
-    images/tools/opencode/contract/download.sh
-    images/tools/opencode/contract/run-install.sh
-    images/tools/opencode/contract/run-npm.sh
-    images/tools/opencode/contract/run-report.sh
-    images/tools/claude/contract/download.sh
-    images/tools/claude/contract/run-install.sh
-    images/tools/claude/contract/run-npm.sh
-    images/tools/claude/contract/run-report.sh
-    images/tools/copilot/contract/download.sh
-    images/tools/copilot/contract/run-install.sh
-    images/tools/copilot/contract/run-npm.sh
-    images/tools/copilot/contract/run-report.sh
+    script/test/standard-release-pin.sh
+    script/test/standard-release-pin-test.sh
+    script/test/no-image-source-dependency.sh
+    script/test/no-image-source-dependency-test.sh
+    script/test/chrome-example-contract.sh
+    script/test/e2e-release-contract.sh
+    script/test/e2e-released-image.sh
+    script/test/e2e.sh
+    script/test/lib/released-image-checks.sh
+    examples/layers/chrome-devtools/agent-vm-chrome-mcp
     "$self_relative"
 )
 

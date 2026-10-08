@@ -27,27 +27,25 @@ cross-compiled artifacts, rewrites every `package.json` version
 field to match the release tag, and runs `npm publish` for each
 package. See `.github/workflows/release-npm.yml`.
 
-The OCI image is on a separate cadence (hourly cron) — see
-`.github/workflows/build-image.yml`. Binary releases pin the
-default image to `ghcr.io/wirenboard/agent-vm-template:latest`; users
-override per-launch via `--image` or `AGENT_VM_IMAGE_TAG`.
+The standard image has independent releases in
+[agent-vm-images](https://github.com/gregwebs/agent-vm-images). The binary carries an
+immutable initial index recommendation; successfully acquired retained selections
+survive launcher releases. Default consumption requires no Docker/image sources.
+Matching archives are explicitly imported with `agent-vm msb image load --input
+FILE --tag REF`; see [USAGE](../USAGE.md#explicit-builds-and-archive-import).
+Before releasing a changed recommendation, follow the native evidence/release hold
+in [CONTRIBUTING](../CONTRIBUTING.md#release--version-bump).
 
 ## Local smoke test
 
-To verify the launcher resolves a subpackage correctly without
-publishing, drop a prebuilt binary into a subpackage's `bin/` and
-`npm link` it:
-
-    # build the binary
-    cargo build --release -p agent-vm
-    cargo build --release --manifest-path vendor/microsandbox/Cargo.toml \
-        -p microsandbox-cli --bin msb
-
-    cp target/release/agent-vm npm-dist/agent-vm-linux-x64/bin/
-    cp vendor/microsandbox/target/release/msb npm-dist/agent-vm-linux-x64/bin/
-    cp ~/.microsandbox/lib/libkrunfw.so.5.2.1 npm-dist/agent-vm-linux-x64/lib/
-
-    cd npm-dist/agent-vm-linux-x64 && npm link && cd ..
-    cd npm-dist/agent-vm && npm link @wirenboard/agent-vm-linux-x64 && npm link
-
-    agent-vm --help   # should exec target/release/agent-vm
+On native Linux, copy these templates into an owned staging directory, populate
+platform `bin/` and `lib/` with the candidate and matching reviewed runtime/firmware,
+and set all package versions/optional dependencies consistently. Use `npm pack
+--ignore-scripts` for main and platform packages, then install both local tarballs
+with `npm install --prefix OWNED_PREFIX --ignore-scripts PLATFORM.tgz MAIN.tgz`.
+Inspect tar listings for source/recipe absence and invoke
+`OWNED_PREFIX/node_modules/.bin/agent-vm --help`. Do not use `npm link`, global
+installation, arbitrary operator firmware or user caches for this test. Use private
+HOME/state/XDG config and `AGENT_VM_SHARE_MSB_CACHE=0`. This boot-free dispatch
+smoke does not prove native VM consumption; run `e2e.sh released-image` on the
+installed package as documented in CONTRIBUTING.
