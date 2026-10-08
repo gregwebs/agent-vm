@@ -92,27 +92,27 @@ state, so it sees the same sandboxes agent-vm does.
 
 ## Image release cadence
 
-The production workflow publishes the maintained **base** image and the
-**template** built on it; the launcher consumes the template:
+The independent [image repository](https://github.com/gregwebs/agent-vm-images)
+publishes one standard image, `ghcr.io/gregwebs/agent-vm-standard`, containing
+Debian facilities and all six agents (dsh, pi, codex, opencode, claude, copilot).
+Image versions are independent of launcher versions. There is no hourly or
+`latest` recommendation, launcher-version promotion floor, or 14-day retention
+policy. The tool-free base is a local source building block, not a public product.
 
-- `ghcr.io/wirenboard/agent-vm-template:latest` — the **maintained template**: Debian
-  plus the docker engine, diagnostic CLIs, and the six shipped agent CLIs
-  (dsh, pi, codex, opencode, claude, copilot). This is the production image a
-  *new* release will recommend; the launcher's current interim initial
-  recommendation is the older digest-pinned template (see
-  [The retained default](#the-retained-default)).
+This launcher initially recommends the v0.1.3 multiarch index:
 
-It is rebuilt hourly from the **committed** sources. The hourly cron no longer
-resolves new upstream tool releases: a tool version changes only when a
-developer commits a bump (`script/build/agent-versions.sh --write` or a
-lockfile upgrade script). It accepts a pinned `…:YYYY-MM-DDTHH` tag
-(immutable; the last 14 days are retained). The image is only as new as the
-sources it was built from; a template published **before** a pin bump keeps the
-older tool until it is rebuilt.
+```text
+ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de
+```
 
-The agent-vm binary and the image it launches are not version-locked by any
-image-side stamp. What a boot image must provide is the **[boot image
-contract](#boot-image-contract)**.
+Native msb selects its Linux host-platform child. Successful default acquisition
+retains the **index** reference; explicit `upgrade` retains its resolved native
+**child** digest. Existing records and explicit selections are unaffected.
+Matching per-architecture GitHub Release archives are for explicit import, never
+a registry-failure fallback. See the [image owner's release contract](https://github.com/gregwebs/agent-vm-images/blob/main/docs/standard-image-releases.md)
+for authentication and publication policy. A source rebuild need not reproduce
+published bytes. Compatibility is the [boot image contract](#boot-image-contract),
+not an image-side version stamp.
 
 ## Selecting the boot image
 
@@ -125,7 +125,7 @@ catalog never changes it). First present source wins:
 | environment | `AGENT_VM_IMAGE_TAG=REF` (an empty value counts as unset) |
 | user config | top-level `image = "REF"` in `~/.config/agent-vm/config.toml` |
 | project config | top-level `image = "REF"` in `<cwd>/.agent-vm/config.toml` |
-| default | your retained digest (see [The retained default](#the-retained-default)), or the interim initial recommendation when nothing is retained |
+| default | your retained digest (see [The retained default](#the-retained-default)), or the initial recommendation when nothing is retained |
 
 `agent-vm shell`, `agent-vm claude` and `agent-vm mytool` all boot the same
 image; so do `pull` and `setup`.
@@ -154,7 +154,7 @@ acquired once, kept in the user-scoped file
 `$HOME/.config/agent-vm/default-image.json`:
 
 ```json
-{"version":1,"image":"ghcr.io/wirenboard/agent-vm-template@sha256:…"}
+{"version":1,"image":"ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de"}
 ```
 
 It *names exact image content* (a digest, never a moving tag); microsandbox
@@ -167,8 +167,8 @@ top-level `image =` there would make the *user config* tier win over the
 *project* tier, which is a precedence change, not a bookmark.
 
 The launcher also carries an **initial recommendation** (an immutable
-`@sha256:…` reference compiled into the binary; it is the interim development
-value, and a newer release may change it). How the two interact:
+`@sha256:…` reference compiled into the binary; currently the released v0.1.3
+multiarch index, and a newer release may change it). How the two interact:
 
 - **Selection is lazy and read-only.** A higher source wins without reading the
   record; `help`, `doctor`, `--help` and `pull/setup --help` never write one.
@@ -178,7 +178,7 @@ value, and a newer release may change it). How the two interact:
   half-written record, no substitute image.
 - **A failed first acquisition can still be rescued.** Because a failed attempt
   retains nothing, a later release whose recommendation your host *can* acquire
-  (for example a future multiarch image) becomes your default on its next
+  (for example after a network failure) becomes your default on its next
   successful launch. Nothing is stranded on bytes your host cannot boot.
 - **A retained default is never silently replaced.** A different recommendation,
   a launcher upgrade, a project image, or a cache loss leaves the retained
@@ -266,6 +266,14 @@ See [the retained default](#the-retained-default) for scope and recovery.
 Build user-owned software with an ordinary Dockerfile, then explicitly select it.
 Directory names never activate composition; see [`examples/layers/`](examples/layers/).
 
+Extend the released Debian-based standard image, or clone the independent
+[image sources](https://github.com/gregwebs/agent-vm-images) and build the
+tool-free base locally with an ordinary `FROM`. Source build/version maintenance
+instructions belong there; installed agent-vm needs neither that checkout nor
+its contributor submodule. The examples need Debian/apt/Node facilities, not just
+the minimal boot contract.
+
+
 #### Explicit builds and archive import
 
 ```text
@@ -311,7 +319,17 @@ docker image save --output image.tar SOURCE &&
   agent-vm msb image load --input image.tar --tag my-image:dev
 ```
 
-A finished archive can be imported without Docker:
+For the standard release, first download/authenticate the exact native v0.1.3
+archive using the [image owner's public release instructions](https://github.com/gregwebs/agent-vm-images/blob/main/docs/standard-image-releases.md).
+Then, for example on arm64:
+
+```sh
+agent-vm msb image load --input agent-vm-standard-v0.1.3-linux-arm64.oci.tar --tag my-standard:0.1.3
+agent-vm shell --image my-standard:0.1.3 -- bash -c 'pi --version'
+```
+
+Import does not adopt a default selection. There is no automatic archive download
+or fallback. A finished archive can be imported without Docker:
 
 ```sh
 agent-vm msb image load --input image.tar --tag my-image:dev
@@ -698,7 +716,7 @@ override are deliberately **not** honored.
 
 ```toml
 # Top-level, optional: the boot image for every session (an OCI reference).
-image = "ghcr.io/wirenboard/agent-vm-template:latest"
+image = "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
 
 [[tools]]
 name = "mytool"                      # required; the `agent-vm <name>` verb
@@ -830,10 +848,10 @@ not accept), so you can see which source won:
 ```text
 ==> boot image
 AGENT_VM_IMAGE_TAG: <unset>
-user:    ghcr.io/wirenboard/agent-vm-template:latest [/home/alice/.config/agent-vm/config.toml]
+user:    ghcr.io/gregwebs/agent-vm-standard:v0.1.3 [/home/alice/.config/agent-vm/config.toml]
 project: none
 default: retained default [/home/alice/.config/agent-vm/default-image.json]
-selected (without --image): ghcr.io/wirenboard/agent-vm-template:latest (from user config /home/alice/.config/agent-vm/config.toml)
+selected (without --image): ghcr.io/gregwebs/agent-vm-standard:v0.1.3 (from user config /home/alice/.config/agent-vm/config.toml)
 ```
 
 ### The `shell` fallback

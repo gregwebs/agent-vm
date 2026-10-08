@@ -5,7 +5,7 @@
 # #259):
 #
 #   agent-vm build --builder native-oci \
-#     --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+#     --build-arg BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de \
 #     --tag agent-vm-rust-dev:dev examples/layers/rust-dev
 #   agent-vm claude --image agent-vm-rust-dev:dev
 #
@@ -24,7 +24,7 @@
 # retarget the build, and every `ENV` keeps `PATH` additive
 # (`PATH=<new>:${PATH}`) so the base's directories are never dropped.
 
-ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
+ARG BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de
 FROM ${BASE_IMAGE}
 
 # Pins. RUST_TOOLCHAIN is enforced against rust-toolchain.toml's channel, and

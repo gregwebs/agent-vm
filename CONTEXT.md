@@ -395,16 +395,25 @@ entry, default config, pinned layer.
 ## Initial recommendation
 
 The immutable `@sha256:…` reference a launcher offers when no retained default
-exists yet, compiled into the binary (interim development value; a release may
-change it). Reading it never writes; only a successful acquisition adopts it. A
+exists yet, compiled into the binary (the released v0.1.3 multiarch index; a
+launcher release may change it). Reading it never writes; only a successful acquisition adopts it. A
 release that changes this value changes what a *new* host is offered, never an
 existing retained default. _Avoid_: default image (unqualified), tag default.
+
+## Standard image
+
+The maintained all-six-agent finished release product, distinct from the tool-free
+base and from a user's retained selection. Sources belong to the independent
+[image repository](https://github.com/gregwebs/agent-vm-images). The contributor
+`vendor/agent-vm-images` gitlink records source provenance, not runtime image
+identity; installed launchers need no source files.
 
 ## Base image
 
 The tool-free foundation built from the image repository's sources, which the
 **default boot image** and user-owned images can extend with ordinary Dockerfiles.
-The launcher never builds it; it is source content for image authors.
+The launcher never builds it; it is local-only source content for image authors,
+not a public release product.
 
 ## Image-owned Pi package
 

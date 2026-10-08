@@ -1,6 +1,6 @@
 # ADR-0033: Default to rebase, preserving build provenance
 
-**Superseded by [ADR-0035](0035-consume-user-owned-boot-images.md) (#257). The launcher DAG/current-tag/version-identity system was not implemented; committed recipe/version pins and source integrity checks are implemented and retained.**
+**Superseded by [ADR-0035](0035-consume-user-owned-boot-images.md) (#257). The launcher DAG/current-tag/version-identity system was not implemented; committed recipe/version pins and source integrity checks are retained in the independent [image repository](https://github.com/gregwebs/agent-vm-images); source ownership moved by #265.**
 
 Accepted (decision), not yet implemented. Resolved by
 [Rebasing tool layers onto an updated base](https://github.com/gregwebs/agent-vm/issues/208)

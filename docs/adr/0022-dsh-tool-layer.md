@@ -46,12 +46,12 @@ whole home is what keeps a Models-UI API key across launches.
 
 The layer is the chain's **first** step. Like `pi`, a committed lockfile makes
 it large (~324 MiB installed tree, a ~360 MiB image layer) and rare to change;
-the bottom is where the layer-ordering policy (ADR-0019, `images/tools/README.md`)
+the bottom is where the layer-ordering policy (ADR-0019, [images/tools/README.md](https://github.com/gregwebs/agent-vm-images/tree/main/images/tools/README.md))
 puts such a layer so it is not re-emitted on every codex/claude release above it.
 
 ### 2. Installed from a committed lockfile, not a floating installer
 
-`images/tools/dsh/` commits a `package.json` + `package-lock.json` and runs
+[images/tools/dsh/](https://github.com/gregwebs/agent-vm-images/tree/main/images/tools/dsh/) commits a `package.json` + `package-lock.json` and runs
 `npm ci --ignore-scripts` into `/opt/agent-vm/dsh`, linking `dsh` and the
 lock-pinned `pnpm` onto `PATH`. The lock freezes the working dependency layout
 *and* every transitive integrity hash. `verify-dsh.sh` asserts the binary's

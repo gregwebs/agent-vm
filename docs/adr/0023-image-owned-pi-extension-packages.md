@@ -71,7 +71,7 @@ must be able to walk up into a real npm tree.
 
 ### D2 — Activation is an explicit wrapper `--extension`
 
-The Pi wrapper (`images/tools/pi/pi.sh`) execs Pi with the mandatory
+The Pi wrapper ([images/tools/pi/pi.sh](https://github.com/gregwebs/agent-vm-images/tree/main/images/tools/pi/pi.sh)) execs Pi with the mandatory
 `--extension` and, when the bridge is present, a second one. `--extension` is
 documented as repeatable (`dist/cli/args.js`, "can be used multiple times") and
 parsed with no arity limit.
@@ -88,8 +88,9 @@ Asymmetric on purpose. The mandatory warning is agent-vm's own contract and must
 fail closed — an `--extension` Pi cannot load is fatal before session startup,
 which is exactly the behaviour ADR-0012 relies on. The bridge is a convenience:
 its absence must cost the bridge, not `pi`. So the wrapper tests `-r` before
-adding the flag, and a build that soft-failed its `npm ci` (the tree is deleted)
-ships an image whose `pi` still runs and still warns.
+adding the flag, and a user image without the bridge still runs and warns. The historical
+soft-fail build policy does not apply to maintained standard releases: their
+installer audits are fatal at the independent image owner.
 
 `AGENT_VM_PI_NO_BRIDGE` (any non-empty value) is the opt-out. It exists because
 pinned third-party code runs in-process in every non-subcommand invocation: a
@@ -104,7 +105,7 @@ risk, which is why it buys less than it looks like.
 
 ### D4 — The pin is a committed lockfile; the Claude Code binary is the image's own
 
-`images/tools/pi/bridge/package.json` pins `pi-claude-bridge` to an exact
+[images/tools/pi/bridge/package.json](https://github.com/gregwebs/agent-vm-images/tree/main/images/tools/pi/bridge/package.json) pins `pi-claude-bridge` to an exact
 version and `package-lock.json` is committed beside it; the layer runs `npm ci`
 from them, so the build resolves nothing.
 
@@ -131,21 +132,21 @@ Two flags are mandatory, on **both** the lock generation and the `npm ci`:
 during the image build. There is deliberately **no** bespoke integrity verifier
 (contrast `install-pi.sh`): that one exists only because npm ignores our lock for
 Pi's shrinkwrapped subtree, and this tree has no shrinkwrap anywhere in its
-chain, so `npm ci` authenticates every tarball itself. A `cargo test` guard fails
+chain, so `npm ci` authenticates every tarball itself. The independent image owner's source-test guard fails
 the build if a regenerated lock ever loses that property.
 
-An absent bridge is legal in exactly one *build* case — a soft-failed `npm ci`
+**Historical build policy (not maintained standard releases):** an absent bridge was legal in exactly one *build* case — a soft-failed `npm ci`
 — and the layer's `verify-pi.sh` gate enforces precisely that: a missing tree is
 a hard failure unless `AGENT_INSTALL_SOFT_FAIL` is set, and every tree that
 *did* ship is asserted world-readable (C7). (At runtime a user may remove the
 tree; the wrapper's existence check degrades that to "no bridge", which
-`script/test/pi-layer-runtime.sh` pins.)
+[image-owner pi-runtime.sh](https://github.com/gregwebs/agent-vm-images/blob/main/script/test/pi-runtime.sh) pins.)
 
 ## Consequences
 
 - **`pi list` does not show the bridge, and `pi update` / `pi uninstall` cannot
   move it.** It is image-owned, not a Pi-managed package. The pin moves when
-  this repo moves it, like every other agent in the image. `script/test/pi-layer-runtime.sh`
+  the independent image owner moves it, like every other agent in the image. [image-owner pi-runtime.sh](https://github.com/gregwebs/agent-vm-images/blob/main/script/test/pi-runtime.sh)
   runs the bridge as a non-root uid, exercises the degradation contract with the
   tree removed, and pins `pi list`'s unchanged output.
 - **Pinned third-party extension code runs in-process in every non-subcommand
@@ -186,7 +187,8 @@ tree; the wrapper's existence check degrades that to "no bridge", which
   the proxy. That is a pre-existing defect on `claude` and `shell` too, tracked
   as [#165](https://github.com/gregwebs/agent-vm/issues/165); this ADR extends
   the affected surface to a third verb rather than fixing it.
-- **A custom catalog can ship the bridge without `claude`.** `declared_layers`
+- **Historical composition behavior, withdrawn by ADR-0035:** a custom catalog
+  could ship the bridge without `claude`. `declared_layers`
   composes the layers the *catalog* declares, so a config that declares `pi`
   with the built-in `layer` but no `claude` tool builds an image with the
   always-loaded bridge and no image Claude Code: the seed hook no-ops (its

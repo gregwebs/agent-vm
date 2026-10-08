@@ -9,16 +9,18 @@ build or compose these directories. Select the finished result separately. See
 [ADR-0035](../../docs/adr/0035-consume-user-owned-boot-images.md).
 
 The directories under `examples/layers/` are examples, not activated by
-default. The six shipped recipes under `images/tools/` are the repo's other
-worked examples — and the ones that produce the **default boot image** the
-launcher ships.
+default. Maintained installers and standard-image sources live in the independent
+[image repository](https://github.com/gregwebs/agent-vm-images), which also has a
+[tool-free base extension example](https://github.com/gregwebs/agent-vm-images/tree/main/examples/base-extension).
+These examples require the Debian-based standard image's apt/Node facilities;
+the minimal boot contract alone is insufficient. Their default parent is the
+immutable v0.1.3 index, overrideable with `--build-arg BASE_IMAGE=…`.
 
-Build an example on top of the default boot image (or any image satisfying the
-[boot image contract](../../USAGE.md#boot-image-contract)):
+Build an example and select its finished result:
 
 ```sh
 agent-vm build --builder native-oci \
-  --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+  --build-arg BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de \
   --tag my-image:dev examples/layers/rust-dev
 agent-vm shell --image my-image:dev                # or: image = "my-image:dev"
 ```
@@ -27,13 +29,13 @@ Every example needs the two lines below; the `ARG` is what
 `--build-arg BASE_IMAGE=…` overrides:
 
 ```dockerfile
-ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
+ARG BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de
 FROM ${BASE_IMAGE}
 ```
 
 Two conventions: expose environment through `ENV` (agent-vm reads the image's
 OCI `ENV`), and leave `ENTRYPOINT`/`CMD` inert — agentd execs the agent
-directly. Do not assume a particular base beyond the boot image contract.
+directly. These Debian-based examples are not portable to every minimal boot image.
 
 ## Index
 
@@ -63,7 +65,7 @@ Build it on top of the default boot image and select it:
 
 ```sh
 agent-vm build --builder native-oci \
-  --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+  --build-arg BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de \
   --tag agent-vm-rust-dev:dev examples/layers/rust-dev
 agent-vm claude --image agent-vm-rust-dev:dev
 ```
@@ -133,7 +135,7 @@ Build it on top of the default boot image and select it:
 
 ```sh
 agent-vm build --builder native-oci \
-  --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+  --build-arg BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de \
   --tag agent-vm-go-dev:dev examples/layers/go-dev
 agent-vm claude --image agent-vm-go-dev:dev
 ```
@@ -186,7 +188,7 @@ Build it on top of the default boot image and select it:
 
 ```sh
 agent-vm build --builder native-oci \
-  --build-arg BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest \
+  --build-arg BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de \
   --tag agent-vm-chrome:dev examples/layers/chrome-devtools
 agent-vm claude --image agent-vm-chrome:dev
 ```
@@ -195,6 +197,21 @@ It installs Chromium and the Chrome DevTools MCP integration; see
 [USAGE.md](../../USAGE.md#chrome-devtools-mcp) for the runtime behavior. The
 Dockerfile pre-warms the npm cache for root mode only: arbitrary non-root guest
 homes remain persistent but download on first use.
+
+### Manual Chrome runtime check
+
+Static capability/wrapper agreement runs in launcher CI, but the former Chrome
+runtime workflow is retired. On a native Docker host, build this ordinary
+Dockerfile with `docker build -t av-chrome-check examples/layers/chrome-devtools`,
+then check the dedicated account, sudo scope and headless browser:
+
+```bash
+docker run --rm av-chrome-check bash -c 'set -e; test "$(id -u chrome)" = 9999; visudo -cf /etc/sudoers.d/agent-vm-chrome; sudo -n -u chrome -H -- test -w /home/chrome/.pki/nssdb; sudo -n -u chrome -H -- chromium --headless --disable-gpu --dump-dom about:blank'
+```
+
+Also test an arbitrary numeric UID with writable HOME and the wrapper's NSS/CA
+handling before changing this example. Docker checks are not VM MCP integration
+proof; the custom-image native suite owns the launcher-side capability join.
 
 ## Combining examples
 

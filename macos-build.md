@@ -4,7 +4,7 @@ These instructions support Apple Silicon Macs (`arm64`, M1 or newer). Intel macO
 
 ## Prerequisites
 
-Install the Xcode Command Line Tools, rustup with the known-good Rust 1.98.1 toolchain, and Docker Desktop. Docker remains required for the separate guest-agent and local OCI-image steps; Apple's `container` CLI is additionally supported for the firmware kernel bundle:
+Install the Xcode Command Line Tools, rustup with the known-good Rust 1.98.1 toolchain, and Docker Desktop. Docker is required to compile the guest agent, not for installed default launches; Apple's `container` CLI is additionally supported for the firmware kernel bundle:
 
 ```bash
 xcode-select --install
@@ -19,7 +19,7 @@ Start Docker Desktop, initialize the recursive submodules, and check the exact t
 
 ```bash
 docker info
-git submodule update --init --recursive
+git submodule update --init --recursive vendor/microsandbox
 RUSTUP_AUTO_INSTALL=0 rustup run 1.98.1 rustc --version
 RUSTUP_AUTO_INSTALL=0 rustup run 1.98.1 cargo --version
 ```
@@ -80,7 +80,7 @@ target/macos-dev/
 Run it directly, the same way you'd run the release bundle:
 
 ```bash
-./target/macos-dev/bin/agent-vm shell --image agent-vm-template:latest -- uname -m
+./target/macos-dev/bin/agent-vm shell --no-git -- uname -m
 ```
 
 The Docker-built `agentd` and container-built firmware outputs are unaffected
@@ -97,26 +97,24 @@ Never ship or benchmark from `target/macos-dev/`; use the default
 
 ## Import and boot a local image without a registry
 
-Build or identify a local native `linux/arm64` Docker image. For example:
+Build or identify a finished native `linux/arm64` image using your Dockerfile.
+For maintained base/standard source builds, follow the independent
+[image repository](https://github.com/gregwebs/agent-vm-images). Optionally initialize
+its contributor pin with `git submodule update --init vendor/agent-vm-images`;
+Cargo and macOS runtime builds require only `vendor/microsandbox`.
+
+### Building a standard/custom image locally
+
+Source rebuilds are image-authoring operations and need not equal the published
+digest. Once your build produces `my-image:dev`, import and select it explicitly:
 
 ```bash
-docker buildx build \
-  --platform linux/arm64 \
-  --load \
-  -t agent-vm-template:latest \
-  -f images/Dockerfile images
+docker image save --output image.tar my-image:dev &&
+  ./target/macos-dev/bin/agent-vm msb image load --input image.tar --tag my-image:dev
+./target/macos-dev/bin/agent-vm shell --no-git --image my-image:dev -- uname -m
 ```
 
-Import the completed Docker-store image through the selected signed bundle:
-
-```bash
-docker image save --output image.tar agent-vm-template:latest &&
-  ./target/macos-dev/bin/agent-vm msb image load --input image.tar --tag agent-vm-template:dev
-```
-
-The dev bundle uses its normal pinned runtime resolution; a release-only
-importer is not needed. Alternatively explicitly build your Dockerfile with an
-OCI-capable builder and select the result:
+Or explicitly build/import a user Dockerfile with an OCI-capable builder:
 
 ```bash
 ./target/macos-dev/bin/agent-vm build --tag my-image:dev --builder native-oci .
@@ -124,59 +122,10 @@ OCI-capable builder and select the result:
 ```
 
 See [Explicit builds and archive import](USAGE.md#explicit-builds-and-archive-import)
-for driver/local-FROM restrictions, temporary disk space and host-build trust.
-
-### Building the template locally
-
-The default boot image is the base plus the six shipped tool recipes. To build
-it from the committed sources and boot it without a registry, chain the recipes
-with `docker buildx` (as `images/build.sh` does), import the finished template,
-and select it with `--image` / `image =`:
-
-```bash
-set -euo pipefail
-# Every step is `--load`ed into the daemon (as `images/build.sh` does) so the
-# next step's `FROM` resolves; that needs a `docker`-driver builder
-# (`docker buildx create --driver docker --use`). Each recipe consumes its
-# committed exact `ARG AGENT_VERSION_*` default (dsh/pi use their committed
-# locks), so the chain is reproducible. To move a version, run
-# `script/build/agent-versions.sh --write` (or the owning `upgrade-*.sh`),
-# review the diff, then rebuild.
-docker buildx build --platform linux/arm64 --load -t agent-vm-base:dev -f images/Dockerfile images
-prev=agent-vm-base:dev
-for t in dsh pi codex opencode claude copilot; do
-  docker buildx build --platform linux/arm64 --load \
-    --build-arg BASE_IMAGE="$prev" \
-    -t "agent-vm-$t:dev" "images/tools/$t"
-  prev="agent-vm-$t:dev"
-done
-docker tag "$prev" agent-vm-template:dev
-
-# Import the finished template and select it.
-docker image save --output template.tar agent-vm-template:dev
-./target/macos-dev/bin/agent-vm msb image load --input template.tar --tag agent-vm-template:dev
-./target/macos-dev/bin/agent-vm shell --image agent-vm-template:dev \
-  -- 'for b in claude codex opencode copilot; do "$b" --version; done'
-```
-
-The launcher never builds or composes these sources itself; the loop above is an
-image-authoring step.
-
-`images/build.sh` performs the same chain against a loopback registry and pushes
-both published tags (`agent-vm-base:latest`, `agent-vm-template:latest`); it
-requires the same `docker`-driver builder and checks for it up front.
-
-Cache references are exact. Importing `agent-vm-template:latest` does not populate `ghcr.io/wirenboard/agent-vm-template:latest`.
-
-From a disposable project directory, verify the cached image without a registry update check:
-
-```bash
-/path/to/agent-vm/target/macos/bin/agent-vm shell \
-  --image agent-vm-template:latest \
-  -- uname -m
-```
-
-The guest should print `aarch64`, the command should exit successfully, and the sandbox should stop cleanly. `agent-vm setup` is not a local-cache check: setup deliberately pulls its selected image with `PullPolicy::Always`.
+for driver/local-FROM restrictions, disk space and host-build trust. Cache references
+are exact: importing `my-image:dev` does not populate a registry-qualified ref.
+The guest should print `aarch64` and stop cleanly. `setup` is not a local-cache
+check: it deliberately pulls its selected image with `PullPolicy::Always`.
 
 ## Verify the registry-backed workflow
 
@@ -233,7 +182,7 @@ publishing the bundle. Run runtime smoke tests from a normal Terminal without
 ```text
 Error: creating sandbox
 Caused by:
-    image error: registry error: Not authorized: url https://index.docker.io/v2/library/agent-vm-template/manifests/latest
+    image error: registry error: Not authorized: url https://index.docker.io/v2/library/my-image/manifests/dev
 ```
 
 This is **not** a registry-credentials problem, and there is nothing to log in
@@ -245,10 +194,10 @@ exported from a shell profile acts as `--image` whenever no flag is passed, so
 it can silently select the wrong reference. (An explicit `--image` still wins
 over `AGENT_VM_IMAGE_TAG` — see `USAGE.md`.)
 
-- an unqualified `agent-vm-template:latest` resolves to
-  `index.docker.io/library/agent-vm-template` — **not** to the local image cache
-  and **not** to `ghcr.io/wirenboard/agent-vm-template`
-- use the fully qualified `ghcr.io/wirenboard/agent-vm-template:latest`, or an
+- an unqualified `my-image:dev` resolves to
+  `index.docker.io/library/my-image` — **not** to the local image cache
+  and **not** to `ghcr.io/gregwebs/agent-vm-standard`
+- use the fully qualified `ghcr.io/gregwebs/agent-vm-standard:v0.1.3`, or an
   imported local tag — see [Import and boot a local image without a
   registry](#import-and-boot-a-local-image-without-a-registry)
 

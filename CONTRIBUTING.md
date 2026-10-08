@@ -25,7 +25,7 @@ Clone the repository and its recursive submodules:
 ```bash
 git clone https://github.com/gregwebs/agent-vm
 cd agent-vm
-git submodule update --init --recursive
+git submodule update --init --recursive vendor/microsandbox
 ```
 
 On Apple Silicon macOS, follow the [canonical macOS guide](macos-build.md).
@@ -60,8 +60,11 @@ does not build `msb`.
 Use packaged `agent-vm build --tag REF --builder NAME CONTEXT` for explicit
 Dockerfile builds, or `agent-vm msb image load --input archive.tar --tag REF`
 for completed Docker-save/OCI archives. Both initialize the same cache as
-launch; no prewarming builtin or source importer is needed. `images/build.sh`
-remains the separate registry-backed production workflow.
+launch; no prewarming builtin or source importer is needed. Image authoring and
+publication belong to [agent-vm-images](https://github.com/gregwebs/agent-vm-images).
+Optionally initialize its contributor pin with
+`git submodule update --init vendor/agent-vm-images`; Cargo and macOS bundle
+builds need only the recursive microsandbox submodule, not image sources.
 
 The pinned Rust toolchain (`rust-toolchain.toml`) is copied by hand into a
 few other files (Cargo's MSRV, CI, the release workflow, the macOS build
@@ -73,9 +76,10 @@ The CI pre-build gate is `script/test/ci-contracts.sh`: it checks runtime source
 provenance, runs the harness contracts, and syntax-checks (`bash -n`) and lints
 (`shellcheck`) every script the workflow runs. Run it locally with shellcheck
 installed (`brew install shellcheck` on macOS, `sudo apt-get install -y
-shellcheck` on Debian/Ubuntu); the full gate also needs the recursive submodule
-and a working Cargo toolchain, while `bash script/test/ci-contracts.sh
---guard-only` runs just the shell guard and needs neither.
+shellcheck` on Debian/Ubuntu); the full gate also needs the recursive submodule,
+a working Cargo toolchain, and `jq`/`shasum`/`python3` (the boot-free
+released-image controls), while `bash script/test/ci-contracts.sh --guard-only`
+runs just the shell guard and needs none of those.
 
 ### Verifying contracts locally (optional)
 
@@ -150,53 +154,66 @@ there.
 
 ### End-to-end (VM-boot) tests (optional)
 
-These boot real microVMs and are the only way to observe the launcher, the
-images and the guest together. **They do not run on CI**: GitHub's macOS runners
-are Intel and cannot boot these `linux/arm64` guests, and they need `docker` plus
-multiple GB of images. `script/test/e2e.sh` is the single entry point; it runs
-the checks described below and exits non-zero on any failure.
+Real microVM tests do not run in CI. `script/test/e2e.sh` is the single manual
+entry point: `released-image` is native amd64/arm64 and Docker-independent;
+`custom-image` remains Apple Silicon-only and needs Docker/buildx, validated
+debug/release bundles and network for its pinned fixtures. `all` runs both.
+Every group uses private HOME/state/cache; no development template is needed.
+Use a dedicated serial native host, no concurrent agent-vm/msb VMs, compatible
+managed runtime policy and no matching GHCR/loopback credentials in the OS
+keyring. Never edit operator policy/keychain to make a test pass.
 
-Prerequisites: an Apple Silicon Mac with colima or Docker Desktop running, plus
-the locally built `linux/arm64` **template** image (`agent-vm-template:dev`)
-from [Local image builds](macos-build.md). Build signed release and dev bundles
-with `./script/build/macos.sh` and `./script/build/macos.sh --dev`.
-The custom-image group needs Docker/buildx with OCI-capable docker-container
-builder support, both validated launchers, and network for pinned fixtures:
+For released-image, first authenticate/download both v0.1.3 archives using the
+[source-pinned image-owner release interfaces](https://github.com/gregwebs/agent-vm-images/blob/main/docs/standard-image-releases.md).
+This host-side preparation is not an installed-launcher source dependency.
+Build an owned clone under `target/verify-265-source`, initializing only
+`vendor/microsandbox`; build/test/check there and run `./script/build/macos.sh`.
+Relocate the **complete signed bin/lib bundle** outside the checkout, then
+remove only that owned disposable clone so its baked Cargo source path is absent.
+Record that clone's canonical path in `AGENT_VM_E2E_BUILD_SOURCE_DIR` and bind it
+to the candidate through the reviewed build logs; the join asserts that declared
+path is absent. This is an operator-provided provenance binding, not detection: the
+join cannot tell whether the declared directory really built the candidate, so the
+reviewed logs must establish the correspondence. The helper never deletes or moves
+anything — only the operator removes the owned checkout after relocation. Never
+deinitialize or move the operator's image submodule. On native Linux use locally packed main/platform npm tarballs with
+matching reviewed runtime/firmware and versions, installed with
+`npm install --prefix OWNED_PREFIX --ignore-scripts` (not global links). Linux npm
+installation cannot be demonstrated on macOS.
+
+The released-image gate requires `jq`, `shasum`, and `python3` on `PATH`, and
+`node` for an installed npm dispatcher candidate (the Linux route). `node` is
+resolved from the caller `PATH` before environment isolation — so an nvm or
+`/usr/local` install works — or supplied explicitly in `AGENT_VM_E2E_NODE` as an
+absolute path; the dispatcher is then invoked through that vetted interpreter
+rather than bypassing it for the native binary.
 
 ```bash
-./script/test/e2e.sh custom-image
-./script/test/e2e.sh all     # uses caller HOME/state; requires the maintained dev template
+AGENT_VM_RELEASE_BIN=/absolute/relocated/bin/agent-vm \
+AGENT_VM_E2E_RELEASE_ASSETS_DIR=/short/verified/assets-arm64 \
+AGENT_VM_E2E_OTHER_ASSETS_DIR=/short/verified/assets-amd64 \
+AGENT_VM_E2E_BUILD_SOURCE_DIR=/absolute/owned/build/clone \
+  bash script/test/e2e.sh released-image
+# On native amd64 reverse the architecture directories. An npm-installed
+# candidate may add AGENT_VM_E2E_NODE=/absolute/vetted/node.
+AGENT_VM_BIN=/absolute/debug/bin/agent-vm \
+AGENT_VM_DEV_BIN=/absolute/debug/bin/agent-vm \
+AGENT_VM_RELEASE_BIN=/absolute/release/bin/agent-vm \
+  bash script/test/e2e.sh custom-image
 ```
 
-The custom-image group uses fresh private HOME/state and a separate owned
-shared cache, never a cache-prewarming workaround. Plain `all` also runs dev-image
-checks in the caller's HOME and normal state; it does not isolate those checks.
-To isolate `all`, supply a fresh HOME/state and disable ambient cache sharing,
-while preserving the caller's Docker configuration (resolve relative overrides
-against the caller's working directory first):
+The release join runs the actual installed candidate with `env -i`, private
+state/cache, no image override/debug seam on first default acquisition, calibrated
+failing Docker/buildx decoys, and a guest six-agent probe as the host UID:GID.
+It observes the native child graph but retains the index, imports the matching
+archive in a different fresh state, tests persistence/retention/override boundaries
+and corrupt/opposite-architecture rejection. Logs and private caches are retained
+for diagnosis; remove only owned scratch after confirming VMs stopped. It does
+not import image-owner Python modules or certify signatures itself: use the
+owner's public commands before invoking it and record both-architecture graph
+correspondence, artifact hashes and exact candidate/runtime signatures alongside
+native logs. Guest `--network none` is not proof of host-offline acquisition.
 
-```bash
-E2E_ROOT="$(mktemp -d /tmp/av-e2e.XXXXXX)"
-mkdir "$E2E_ROOT/home"
-env -u MSB_CONFIG_PATH HOME="$E2E_ROOT/home" AGENT_VM_STATE_DIR="$E2E_ROOT/state" \
-  AGENT_VM_E2E_STATE_DIR="$E2E_ROOT/state" AGENT_VM_SHARE_MSB_CACHE=0 \
-  DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}" \
-  BUILDX_CONFIG="${BUILDX_CONFIG:-${DOCKER_CONFIG:-$HOME/.docker}/buildx}" \
-  XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
-  ./script/test/e2e.sh all
-```
-
-Keep that test-owned root for failure diagnosis; remove it only when no test VM
-is running. The preserved XDG path is operator configuration, not private state.
-The custom-image harness captures absolute effective
-`DOCKER_CONFIG`, `BUILDX_CONFIG`, `XDG_CONFIG_HOME` and the real Docker executable
-before isolation, preserving them for every build/store/save and owned-builder
-cleanup. Custom-image launch probes remove operator Docker connection/config
-overrides and use fresh test-owned XDG config plus calibrated failure shims. It never restores
-operator HOME or copies credentials into agent-vm state. The #260 checks cover
-real explicit-build stdout shape/integrity, actual shell/root/persistent guest
-execution, Docker-free finished archive imports, shared/persisted redirects,
-retained selection and working-reference preservation/replacement.
 `tests/default_image_upgrade.rs` exercises the actual CLI and native registry
 against genuine OCI bytes on a bound loopback listener, without Docker or a VM.
 It isolates HOME/state/cwd and Docker config (empty auths, no helpers), but native
@@ -217,18 +234,8 @@ host as the retained-default check. It is manual evidence, not CI VM coverage.
 `tests/image_build.rs` exercises the actual native importer under fake Docker
 without a VM; native e2e is manual, never a substitute for those CLI tests.
 
-Set `AGENT_VM_E2E_LEGACY_IMAGE` (an image that supplies
-`/opt/agent-vm/seed-claude-plugins.sh`) and/or `AGENT_VM_E2E_UPDATE_CHECK=1` to
-enable the opt-in checks; `./script/test/e2e.sh --help` lists them. Each check
-covers one of: the fast path (a default launch boots the published template with
-**zero** `docker` invocations), the finished-template tool set, Pi HOME
-persistence, inert former `.agent-vm/layers/` directories, and the custom-image
-group (a config/`--image` selected image and setup's verification input).
-
-`script/test/e2e.sh` takes an optional group: `all` (the default; the dev-image
-checks above plus the custom-image group) or `custom-image` (only the marker-free
-custom-image group; its retained-default check is described below). The
-custom-image group needs only Docker, the release
+The custom-image group's retained-default check is described below.
+The custom-image group needs only Docker, the release
 bundle's `msb`, and a launcher binary — **no dev images** — plus network for the
 pinned fixture base/`apk add bash` and a digest-pinned local registry service. It
 builds the `script/test/fixtures/marker-free-image` targets, boots them through
@@ -278,9 +285,9 @@ tools are present yet report as missing:
 
 ```bash
 # correct — finds claude/codex/opencode
-agent-vm shell --image agent-vm-template:dev -- bash -c 'claude --version'
+agent-vm shell --image ghcr.io/gregwebs/agent-vm-standard:v0.1.3 -- bash -c 'claude --version'
 # WRONG — "/etc/profile" resets PATH; `command -v claude` prints nothing
-agent-vm shell --image agent-vm-template:dev -- bash -lc 'claude --version'
+agent-vm shell --image ghcr.io/gregwebs/agent-vm-standard:v0.1.3 -- bash -lc 'claude --version'
 ```
 
 `script/test/e2e.sh` always uses `bash -c` for exactly this reason. (A shell
@@ -339,40 +346,19 @@ positive explicit-source control.
 |---|---|---|
 | `cargo test --workspace` | yes (`ci.yml`) | `#[ignore]`d e2e excluded |
 | `cargo check --release -p agent-vm --tests` | yes (`ci.yml`) | type-check only; pins that the release test profile still compiles under the test cfg, since CI's run is the debug profile |
-| `script/test/e2e.sh` | **no** | needs Apple Silicon + a VM boot; `all` (dev images + custom) or `custom-image` (Docker + release `msb` + launcher, no dev images; the retained-default check also needs `AGENT_VM_RELEASE_BIN`) |
-| `cargo test … -- --ignored` | **no** | the one keychain round-trip test; operator opt-in, writes one host keychain item |
-| `script/test/chrome-layer-contract.sh` / `chrome-layer-runtime.sh` | yes (`chrome-layer-contract.yml`) | docker-driver build + contract |
-| `script/test/shipped-tool-recipes.sh` | yes (`shipped-tool-recipes.yml`, native amd64) + manually on native arm64 | real docker-driver build + numeric-uid label/report/T5 audit + label replay. A `workflow_dispatch` run with `full_contract: true` adds `--overrides --chain`; the overrides/chain matrix is not part of the default PR gate |
-| `script/test/shipped-installer-network.sh` | **no** (default PR); yes on a dispatched `full_contract: true` native-amd64 run (`shipped-tool-recipes.yml`) | restricted-egress allowlist over the real vendored installers; the default PR gate never runs it |
-| `script/test/pi-layer-runtime.sh` | yes (`pi-layer.yml`) | deep pi runtime matrix |
-| `script/test/build-workflow.sh` | yes (macOS leg of `ci.yml`) | fake-plutil seam, no VM |
-| `script/test/ci-contracts.sh`, `image-promotion-gate.sh`, `verus-verification.sh` | yes | static / contract gates |
+| `script/test/e2e.sh` | **no** | native installed registry/archive joins; custom/all additionally require Apple Silicon and Docker |
+| `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
+| `script/test/build-workflow.sh` | yes (macOS) | fake-plutil bundle seam, no VM/image sources |
+| `script/test/ci-contracts.sh` | yes | runtime provenance, shell guards, offline pin/negative controls, Chrome static and e2e dispatch contracts |
+| `script/test/verus-verification.sh` | yes | machine-checked boundary contracts |
+| Image source/build/installer/runtime/egress audits | independent image repo CI | migrated; equivalence not verified by launcher CI |
 
-Shipped tool versions are bumped **explicitly by a developer and committed**,
-never resolved by CI: `bash script/build/agent-versions.sh --write` rewrites the
-four installer defaults (`codex`, `opencode`, `claude`, `copilot`) and the
-lockfile upgrade scripts bump `dsh`/`pnpm` and `pi`/`pi-claude-bridge`. Ordinary
-and release builds consume only the committed values. The recipe/install
-contract is documented in [`images/tools/README.md`](images/tools/README.md);
-the boot-image ownership and selection contract is
-[ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md).
-
-The restricted-egress gate (`shipped-installer-network.sh`) runs on a
-**dispatched** native-amd64 `shipped-tool-recipes.yml` run with
-`full_contract: true`: that job runs the recipe audit with `--overrides --chain`
-and then the network gate with `--overrides`, producing real native-amd64
-evidence for the installed vendored installers against the deny-by-default
-proxy. The **default PR** run of the same workflow (no `full_contract`) runs
-only the default recipe audit and does **not** invoke the network gate, so a PR
-is not blocked on the restricted-egress matrix. Run the network gate locally
-before merging a version bump if you want that evidence before the dispatched
-run.
-
-The Docker gate (`shipped-tool-recipes.sh`, `pi-layer-runtime.sh`) needs no VM:
-it drives real `docker buildx`/`docker run`. The end-to-end VM smoke
-(`script/test/e2e.sh`) is separate and must be run manually on Apple Silicon
-before merge; a numeric uid in a container is **not** evidence of the
-launcher/MSB boot path.
+Image versions/installers/locks belong to the independent
+[image owner](https://github.com/gregwebs/agent-vm-images), not this Cargo workspace.
+The [boot-image ownership decision](docs/adr/0035-consume-user-owned-boot-images.md)
+separates that maintenance from runtime selection. Chrome's static example gate
+remains here; PR-time Chrome Docker runtime coverage is reduced. Container audits
+cannot substitute for native installed launcher/MSB registry/archive boot evidence.
 
 ## CI action pins
 
@@ -456,9 +442,23 @@ git commit -am "..."                   # lock alongside the bump
 
 `Cargo.lock` always moves with the version, so commit it alongside.
 
+Before tagging/releasing a launcher with a changed initial recommendation,
+maintainers must review authenticated published registry/archive correspondence
+and installed native registry **and** archive joins on both amd64 and arm64.
+The v0.1.3 pin must not be released until the missing amd64 join is recorded and
+the maintainer promotes the image or explicitly accepts the risk. Local CI and
+arm64 evidence may permit merge; they do not complete #265, which stays open
+until both architectures are verified. No recurring live adapter is wired into
+`release-npm.yml`; tags/manual dispatch are release actions, not merge actions.
+
 ## Submodule merges
 
-`vendor/microsandbox` is a submodule with its own branches. When a
+Both `vendor/microsandbox` and `vendor/agent-vm-images` are submodules.
+Image maintenance is reviewed/merged independently before advancing its gitlink;
+installed launchers do not depend on that source checkout. For either submodule,
+merge inside first when both repositories changed. For example with microsandbox:
+
+When a
 worktree changes both the agent-vm code and the vendored microsandbox
 code, merge inside the submodule **before** merging the superproject —
 otherwise the superproject merge will conflict on the gitlink and

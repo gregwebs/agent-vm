@@ -8,7 +8,7 @@
 # `BASE_IMAGE` lets a caller build this example FROM a different boot image
 # (any image satisfying the boot image contract); the default keeps a bare
 # `docker build` of this directory working for smoke-testing.
-ARG BASE_IMAGE=ghcr.io/wirenboard/agent-vm-template:latest
+ARG BASE_IMAGE=ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de
 FROM ${BASE_IMAGE}
 
 # WB C/C++ build essentials. Ported verbatim from images/Dockerfile's former

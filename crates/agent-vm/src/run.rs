@@ -47,7 +47,7 @@ use crate::user;
 ///   sorting + English-messages but UTF-8-aware — the right neutral sandbox
 ///   default. We don't propagate the host's `$LANG` (that locale may not
 ///   exist in the guest image and would silently fall back to C). Also
-///   pinned in `images/Dockerfile` for non-agent-vm uses of the image.
+///   pinned in the independent image repo's `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
 
 /// Host environment variables agent-vm forwards into every guest verbatim. This
@@ -60,8 +60,7 @@ const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF
 /// #162 renamed-replacement notice reads).
 pub(crate) const RAW_FORWARDED_ENV: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
 
-/// The launcher's baked fallback guest `PATH` — kept in sync by hand with the
-/// **base** `images/Dockerfile`'s `ENV PATH=…`. It is an **exec-only**
+/// The launcher's baked fallback guest `PATH`. It is an **exec-only**
 /// fallback for when the acquired image's own OCI config declares no `PATH`
 /// at all — never a substitute for the image PATH on a cold first
 /// acquisition. The real effective PATH is read back from the created
@@ -74,8 +73,7 @@ pub(crate) const RAW_FORWARDED_ENV: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API
 const FALLBACK_GUEST_PATH: &str = "/usr/local/bin:/usr/bin:/usr/sbin:/bin";
 
 /// The effective `PATH` for the launch's `bash` spawn, read from the created
-/// sandbox's resolved config (the acquired image's OCI `PATH`, or a layer's
-/// additive override). The **last** `PATH` entry wins, matching guest env's
+/// sandbox's resolved config (the acquired image's OCI `PATH`). The **last** `PATH` entry wins, matching guest env's
 /// last-wins semantics; an explicitly empty value is preserved (an image that
 /// truly sets `PATH=` means it), and only *absence* falls back to
 /// [`FALLBACK_GUEST_PATH`].

@@ -1,3 +1,6 @@
 [submodule "vendor/microsandbox"]
 	path = vendor/microsandbox
 	url = https://github.com/gregwebs/microsandbox.git
+[submodule "vendor/agent-vm-images"]
+	path = vendor/agent-vm-images
+	url = https://github.com/gregwebs/agent-vm-images.git

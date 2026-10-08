@@ -164,9 +164,7 @@ mod tests {
 
     #[test]
     fn local_registries_are_plain_http() {
-        assert!(is_plain_http_registry(
-            "localhost:5000/agent-vm-template:latest"
-        ));
+        assert!(is_plain_http_registry("localhost:5000/standard:test"));
         assert!(is_plain_http_registry("127.0.0.1:5000/x"));
         assert!(is_plain_http_registry("0.0.0.0:8080/x"));
         assert!(is_plain_http_registry("dev.local/x"));
@@ -176,7 +174,7 @@ mod tests {
     #[test]
     fn public_registries_are_not_plain_http() {
         assert!(!is_plain_http_registry(
-            "ghcr.io/wirenboard/agent-vm-template:latest"
+            "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
         ));
         assert!(!is_plain_http_registry("docker.io/library/debian:13"));
         assert!(!is_plain_http_registry("registry.example.com/x"));
@@ -197,7 +195,7 @@ mod tests {
         env.set_var("AGENT_VM_INSECURE_REGISTRY", "1");
         assert!(is_plain_http_registry("registry.corp.example:5000/x"));
         assert!(is_plain_http_registry(
-            "ghcr.io/wirenboard/agent-vm-template:latest"
+            "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
         ));
         env.remove_var("AGENT_VM_INSECURE_REGISTRY");
         // After cleanup the heuristic resumes its normal behaviour.

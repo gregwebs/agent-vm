@@ -19,7 +19,7 @@ the host *precedence* and host *import* clauses this ADR reserved — for Pi's o
 would make them true; #94's half is recorded as history, not pending work.
 
 **Two complementary advisories, not one.** The mandatory Pi image extension
-(`images/tools/pi/extensions/guest-credential-warning.js`) warns about a
+([images/tools/pi/extensions/guest-credential-warning.js](https://github.com/gregwebs/agent-vm-images/tree/main/images/tools/pi/extensions/guest-credential-warning.js)) warns about a
 *future* in-guest sign-in and is gated on Pi's own `hasUI`. A host-side
 report of *existing* state runs on **every** launch (`claude`, `codex`,
 `opencode`, `copilot`, `pi`, `shell`, and any custom tool) and shows the same

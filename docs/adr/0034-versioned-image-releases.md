@@ -1,10 +1,16 @@
 # ADR-0034: Versioned image releases instead of a continuously published registry
 
-**Amended by [ADR-0035](0035-consume-user-owned-boot-images.md) / #257**:
-same-repository image sources, archive-only distribution, a shared launcher
-composer, and a launcher-fixed image selection are withdrawn (#263–#265 own
-release/distribution); independent image versioning and integrity verification
-stand.
+**Superseded by [ADR-0035](0035-consume-user-owned-boot-images.md) / #257;
+source/distribution ownership cutover implemented by #265.** The original decision
+below is historical, not supported behavior. Independent versioning and content
+integrity remain useful principles.
+
+| Withdrawn assumption | Current contract |
+|---|---|
+| same repo, embedded recipes, shared composer | independent image repo; contributor-only submodule; ordinary Dockerfiles |
+| archive-only automatic acquisition | registry default plus explicit/manual corresponding archive import |
+| launcher-fixed selection | retained fallback, explicit upgrade; new recommendation affects new hosts only |
+| hourly/promotion-floor/retention or remote package deletion | retired without deleting user caches or published artifacts |
 
 Accepted (decision), not yet implemented. Resolved by
 [CI, published surface, and image-API migration](https://github.com/gregwebs/agent-vm/issues/209)
