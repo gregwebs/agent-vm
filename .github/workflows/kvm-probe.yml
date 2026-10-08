@@ -1,0 +1,76 @@
+name: kvm-probe
+
+# Throwaway diagnostic: can a GitHub-hosted runner actually boot an msb/libkrun
+# microVM (needed for the native amd64 join)?
+on:
+  push:
+    branches: [probe/kvm-availability]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+          - runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Probe /dev/kvm and CPU virtualisation flags
+        run: |
+          set -x
+          uname -m
+          id
+          free -m | head -2
+          df -h / | tail -1
+          ls -l /dev/kvm || echo "RESULT no /dev/kvm node"
+          echo "RESULT cpu virt flags: $(grep -c -E 'vmx|svm' /proc/cpuinfo || true)"
+          lsmod | grep -E '^kvm' || echo "RESULT no kvm modules loaded"
+
+      - name: Unlock KVM for the runner user (documented udev recipe)
+        run: |
+          set -x
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || echo "RESULT no /dev/kvm node after udev"
+          if [ -e /dev/kvm ]; then
+            test -r /dev/kvm && echo "RESULT kvm readable" || echo "RESULT kvm NOT readable"
+            test -w /dev/kvm && echo "RESULT kvm writable" || echo "RESULT kvm NOT writable"
+          fi
+
+      - name: Install the published launcher from npm
+        if: matrix.runner == 'ubuntu-24.04'
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install @wirenboard/agent-vm
+        if: matrix.runner == 'ubuntu-24.04'
+        run: |
+          set -x
+          mkdir -p /tmp/av && cd /tmp/av
+          npm init -y >/dev/null
+          npm install @wirenboard/agent-vm 2>&1 | tail -5
+          ./node_modules/.bin/agent-vm --version || true
+          ls -l node_modules/@wirenboard/agent-vm-linux-x64/bin/ || true
+
+      - name: Attempt a real boot of the pinned released image (amd64)
+        if: matrix.runner == 'ubuntu-24.04'
+        continue-on-error: true
+        env:
+          AGENT_VM_STATE_DIR: /tmp/av-state
+          HOME: /tmp/av-home
+        run: |
+          set -x
+          mkdir -p /tmp/av-home /tmp/av-proj /tmp/av-state
+          cd /tmp/av-proj
+          timeout 900 /tmp/av/node_modules/.bin/agent-vm setup \
+            --image ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04cacfea47836c2e5d113c4d42de 2>&1 | tail -40
+          echo "RESULT setup exit: ${PIPESTATUS[0]}"
