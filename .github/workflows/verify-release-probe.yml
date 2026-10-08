@@ -54,6 +54,22 @@ jobs:
             echo "MSB_FW=$PWD/$plat/lib/libkrunfw.so.5"
           } >> "$GITHUB_ENV"
 
+      - name: Record the reviewed runtime declaration from the shipped distribution
+        run: |
+          set -eux
+          ldd "$MSB_BIN" | tee /tmp/msb-linkage.txt
+          if ldd "$MSB_BIN" | grep -q 'libkrun\.'; then
+            runtime=$(ldd "$MSB_BIN" | awk '/libkrun\./{print $3; exit}')
+            echo "MSB_LIBKRUN_PATH=$runtime" >> "$GITHUB_ENV"
+            echo "RESULT dynamic libkrun: $runtime"
+          else
+            echo "MSB_LIBKRUN_EMBEDDED=1" >> "$GITHUB_ENV"
+            echo "RESULT libkrun not in linkage; recorded as embedded in msb"
+          fi
+          firmware=$(basename "$(readlink -f "$MSB_FW")")
+          echo "MSB_LIBKRUN_VERSION=${firmware#libkrunfw.so.}" >> "$GITHUB_ENV"
+          echo "RESULT firmware version ${firmware#libkrunfw.so.}"
+
       - name: Download the published v0.1.3 assets anonymously
         run: |
           set -eux
