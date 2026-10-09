@@ -91,6 +91,26 @@
 //! AC 10) requires that unavailability never creates plaintext storage.
 //! Docker falls back to a plaintext file on headless Linux; agent-vm does not.
 //!
+//! # A read that never returns is abandoned, not waited on (#251)
+//!
+//! Every read this module serves calls the platform credential store
+//! synchronously, and that call has **no bound of its own**: on macOS
+//! `SecKeychainFindGenericPassword` waits on the system's unlock prompt when the
+//! keychain is locked, and on Linux a Secret Service round-trip waits on the
+//! keyring daemon. A launch inherits that wait, and holds
+//! `~/.config/agent-vm/.secret-inventory.lock` for its duration, which wedges
+//! every other agent-vm process; nothing above this module can tell a user who
+//! is typing a password from a call that is wedged. So the bound lives here, at
+//! the one boundary that knows it is calling a platform store:
+//! [`BoundedKeychainReads`] abandons a read that outlives
+//! [`keychain_read_bound`] and reports it as [`KeychainFailure::Unresponsive`],
+//! which every caller already renders as a locked/unavailable keychain rather
+//! than as a missing value.
+//!
+//! Only **reads** are bounded. An abandoned `set` or `delete` would keep
+//! running and could still commit, turning a reported failure into a later lie
+//! about what is stored — a worse outcome than the wait it avoids.
+//!
 //! Crash durability is **not** claimed: [`crate::host_paths::atomic_write`]
 //! renames without `fsync`ing the file or its directory, so a power loss can
 //! lose the most recent inventory update. The consequence is a listing drift,
@@ -102,8 +122,12 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::File;
+use std::io::IsTerminal as _;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use vstd::prelude::*;
@@ -598,6 +622,12 @@ pub(crate) enum KeychainFailure {
     Unavailable,
     Ambiguous,
     Rejected,
+    /// The platform read outlived [`keychain_read_bound`] and was abandoned
+    /// (#251). Distinct from [`Self::Ambiguous`] and [`Self::Rejected`] because
+    /// the store never observed a result at all, and distinct from
+    /// [`Self::Unavailable`] because the credential store may be perfectly
+    /// reachable — it is this process that stopped waiting.
+    Unresponsive,
     Unknown,
 }
 
@@ -616,6 +646,10 @@ impl KeychainFailure {
                  Keychain Access / seahorse"
             }
             Self::Rejected => "the system keychain rejected the item",
+            Self::Unresponsive => {
+                "the system keychain did not respond before the read was abandoned - it may be \
+                 waiting on a locked keychain or an unlock prompt; unlock the keychain and retry"
+            }
             Self::Unknown => "the system keychain failed for an unrecognized reason",
         }
     }
@@ -806,6 +840,110 @@ fn read_stored_secret(
         Ok(bytes) => Ok(Some(StoredSecret::new(bytes))),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(classify(error)),
+    }
+}
+
+/// How long a keychain **read** may take before the store abandons it (#251).
+///
+/// An *attended* process (stdin on a TTY: the launcher's own interactive signal,
+/// see `run.rs`) may be sitting on a GUI unlock prompt the user is answering, so
+/// it gets a long bound. An *unattended* one — a script, CI, a piped stdin — can
+/// never answer a prompt, so it fails fast. Both are bounded: a healthy read is
+/// a local call that takes microseconds, and no caller can distinguish slow from
+/// wedged.
+const KEYCHAIN_READ_BOUND_ATTENDED: Duration = Duration::from_secs(60);
+const KEYCHAIN_READ_BOUND_UNATTENDED: Duration = Duration::from_secs(5);
+
+/// The read bound for this process, chosen once at store construction.
+fn keychain_read_bound() -> Duration {
+    if std::io::stdin().is_terminal() {
+        KEYCHAIN_READ_BOUND_ATTENDED
+    } else {
+        KEYCHAIN_READ_BOUND_UNATTENDED
+    }
+}
+
+/// Bounds every **read** the wrapped backend serves (#251).
+///
+/// The platform read is a synchronous call into the OS credential store that can
+/// block on an unlock prompt no layer above can answer (see the module docs).
+/// Wrapping the backend — rather than timing out in `get`/`probe` — keeps the
+/// bound out of reach of a caller that forgets it, and lets a test drive the
+/// timeout with a backend that never answers, which the OS store cannot be made
+/// to do in CI.
+///
+/// Writes pass straight through: see the module docs for why an abandoned
+/// mutation is not a failure this store is allowed to report.
+pub(crate) struct BoundedKeychainReads<B> {
+    backend: Arc<B>,
+    bound: Duration,
+}
+
+impl<B: KeychainBackend + Send + Sync + 'static> BoundedKeychainReads<B> {
+    pub(crate) fn new(backend: B, bound: Duration) -> Self {
+        Self {
+            backend: Arc::new(backend),
+            bound,
+        }
+    }
+
+    /// Run `read` on its own thread and give up after the bound.
+    ///
+    /// The abandoned thread is deliberately not joined: the platform call cannot
+    /// be cancelled, and waiting for it is the hang this exists to prevent. It
+    /// holds none of this store's state — the inventory `flock` guard lives in
+    /// the caller's frame — so abandoning it cannot wedge a later verb, and the
+    /// value it eventually reads is dropped (and zeroized) on that thread when
+    /// nothing is left to receive it.
+    fn bounded<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&B) -> std::result::Result<T, KeychainFailure> + Send + 'static,
+    ) -> std::result::Result<T, KeychainFailure> {
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(read(&backend));
+        });
+        match rx.recv_timeout(self.bound) {
+            Ok(Ok(read)) => Ok(read),
+            Ok(Err(failure)) => Err(failure),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(KeychainFailure::Unresponsive),
+            // The reader thread panicked. That is a bug in agent-vm or in the
+            // platform adapter, not a keychain state, and `Unknown` is where
+            // this module already puts another thread's panic.
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(KeychainFailure::Unknown),
+        }
+    }
+}
+
+impl<B: KeychainBackend + Send + Sync + 'static> KeychainBackend for BoundedKeychainReads<B> {
+    fn set(
+        &self,
+        service: &ServiceName,
+        value: &SecretValue,
+    ) -> std::result::Result<(), KeychainFailure> {
+        self.backend.set(service, value)
+    }
+
+    fn probe(&self, service: &ServiceName) -> std::result::Result<Presence, KeychainFailure> {
+        let service = service.clone();
+        self.bounded(move |backend| backend.probe(&service))
+    }
+
+    fn get(
+        &self,
+        service: &ServiceName,
+    ) -> std::result::Result<Option<StoredSecret>, KeychainFailure> {
+        let service = service.clone();
+        self.bounded(move |backend| backend.get(&service))
+    }
+
+    fn delete(&self, service: &ServiceName) -> std::result::Result<Presence, KeychainFailure> {
+        self.backend.delete(service)
+    }
+
+    fn is_test_recording(&self) -> bool {
+        self.backend.is_test_recording()
     }
 }
 
@@ -1123,10 +1261,15 @@ impl<B: KeychainBackend> SecretStore<B> {
 }
 
 /// Production construction: the user-scoped inventory paths and the host
-/// credential store. Fails explicitly when `$HOME` is unusable, so no verb ever
-/// writes to a relative or empty location.
-pub(crate) fn system_store() -> Result<SecretStore<SystemKeychain>> {
-    Ok(SecretStore::new(SystemKeychain, inventory_paths()?))
+/// credential store, with every read bounded (#251).
+///
+/// Fails explicitly when `$HOME` is unusable, so no verb ever writes to a
+/// relative or empty location.
+pub(crate) fn system_store() -> Result<SecretStore<BoundedKeychainReads<SystemKeychain>>> {
+    Ok(SecretStore::new(
+        BoundedKeychainReads::new(SystemKeychain, keychain_read_bound()),
+        inventory_paths()?,
+    ))
 }
 
 /// The user-scoped inventory paths, resolved through the shared `$HOME`
@@ -1947,6 +2090,173 @@ mod tests {
         ));
     }
 
+    // -- agent-vm #251: a read that never returns is abandoned ---------------
+
+    /// A `Send + Sync` backend with one value and a chosen read delay.
+    /// [`DelayedKeychain::never`] models the platform call that blocks on a
+    /// locked keychain's unlock prompt; it exists because `fake::FakeKeychain`
+    /// cannot serve here — its fault-injection cells are deliberately `!Sync`,
+    /// and a bounded read runs on another thread.
+    struct DelayedKeychain {
+        value: Vec<u8>,
+        read_delay: Option<Duration>,
+    }
+
+    impl DelayedKeychain {
+        fn never() -> Self {
+            Self {
+                value: b"sk-REAL".to_vec(),
+                read_delay: None,
+            }
+        }
+
+        fn immediately() -> Self {
+            Self {
+                value: b"sk-REAL".to_vec(),
+                read_delay: Some(Duration::ZERO),
+            }
+        }
+
+        fn read_delay(&self) {
+            match self.read_delay {
+                Some(delay) => std::thread::sleep(delay),
+                None => loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                },
+            }
+        }
+    }
+
+    impl KeychainBackend for DelayedKeychain {
+        fn set(&self, _: &ServiceName, _: &SecretValue) -> Result<(), KeychainFailure> {
+            Ok(())
+        }
+
+        fn probe(&self, _: &ServiceName) -> Result<Presence, KeychainFailure> {
+            self.read_delay();
+            Ok(Presence::Present)
+        }
+
+        fn get(&self, _: &ServiceName) -> Result<Option<StoredSecret>, KeychainFailure> {
+            self.read_delay();
+            Ok(Some(StoredSecret::new(self.value.clone())))
+        }
+
+        fn delete(&self, _: &ServiceName) -> Result<Presence, KeychainFailure> {
+            Ok(Presence::Absent)
+        }
+    }
+
+    /// A store with the production read bound over `backend`, and the temp dir
+    /// the store's inventory lives in.
+    fn bounded_store(
+        backend: DelayedKeychain,
+        bound: Duration,
+    ) -> (
+        tempfile::TempDir,
+        SecretStore<BoundedKeychainReads<DelayedKeychain>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(
+            BoundedKeychainReads::new(backend, bound),
+            InventoryPaths::new(dir.path().to_path_buf()),
+        );
+        (dir, store)
+    }
+
+    /// The type is the assertion for the production wiring: if `system_store`
+    /// goes back to returning the bare `SystemKeychain`, the bound silently
+    /// stops applying to every verb and every launch, and this stops compiling.
+    /// A runtime assertion is not available — CI cannot make the OS store block.
+    #[test]
+    fn the_production_store_is_wired_to_bounded_reads() {
+        let _pin: fn() -> Result<SecretStore<BoundedKeychainReads<SystemKeychain>>> = system_store;
+    }
+
+    /// `store.resolve(&name("alpha"))`, run on its own thread so a regression
+    /// to an unbounded read fails this test rather than stalling the suite. The
+    /// store comes back with the outcome, so a caller can keep using it.
+    fn resolve_within_deadline<B: KeychainBackend + Send + 'static>(
+        store: SecretStore<B>,
+    ) -> (SecretStore<B>, Resolved) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let resolved = store.resolve(&name("alpha"));
+            let _ = tx.send((store, resolved));
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(pair) => pair,
+            Err(_) => panic!("the keychain read was not bounded: no result after 30s"),
+        }
+    }
+
+    /// The platform read cannot be cancelled, so the store abandons it and
+    /// reports the closed `Unresponsive` class instead of waiting forever.
+    #[test]
+    fn a_read_that_outlives_the_bound_is_abandoned_and_reported() {
+        let (_dir, store) = bounded_store(DelayedKeychain::never(), Duration::from_millis(200));
+        let (_, resolved) = resolve_within_deadline(store);
+        assert!(
+            matches!(
+                resolved,
+                Resolved::Unavailable(KeychainFailure::Unresponsive)
+            ),
+            "expected Unavailable(Unresponsive), got {resolved:?}"
+        );
+    }
+
+    /// Abandoning the read must release the inventory lock: the reported hang
+    /// held `~/.config/agent-vm/.secret-inventory.lock` for as long as the
+    /// platform call blocked, which wedged every other agent-vm process. `set`
+    /// takes that same `flock`, so it returning is the lock being free.
+    #[test]
+    fn an_abandoned_read_releases_the_inventory_lock() {
+        let (_dir, store) = bounded_store(DelayedKeychain::never(), Duration::from_millis(200));
+        let (store, resolved) = resolve_within_deadline(store);
+        assert!(matches!(
+            resolved,
+            Resolved::Unavailable(KeychainFailure::Unresponsive)
+        ));
+        store
+            .set(&name("alpha"), &value("sk-REAL"))
+            .expect("the inventory lock was released");
+    }
+
+    /// A probe is a read too: `secret ls` must report the wedged store rather
+    /// than hang on it, and the listing must still list.
+    #[test]
+    fn a_listing_reports_a_wedged_read_instead_of_waiting_for_it() {
+        let (_dir, store) = bounded_store(DelayedKeychain::never(), Duration::from_millis(200));
+        store.set(&name("alpha"), &value("sk-REAL")).expect("set");
+        assert_eq!(
+            store.list().expect("a listing"),
+            vec![SecretEntry {
+                service: name("alpha"),
+                status: StorageStatus::Unavailable(KeychainFailure::Unresponsive),
+            }]
+        );
+    }
+
+    /// The bound must not cost the fast path its value: a read inside the bound
+    /// returns byte for byte, through both read verbs.
+    #[test]
+    fn a_read_inside_the_bound_returns_the_value_unchanged() {
+        let (_dir, store) =
+            bounded_store(DelayedKeychain::immediately(), Duration::from_millis(200));
+        match store.resolve(&name("alpha")) {
+            Resolved::Value(resolved) => assert_eq!(resolved.expose_for_test(), "sk-REAL"),
+            other => panic!("expected Value, got {other:?}"),
+        }
+        store.set(&name("alpha"), &value("sk-REAL")).expect("set");
+        assert_eq!(
+            store.list().expect("a listing"),
+            vec![SecretEntry {
+                service: name("alpha"),
+                status: StorageStatus::Stored,
+            }]
+        );
+    }
+
     /// The debug-only recording seam records a length and a digest of what was
     /// set; it must never become a way to read that value back out.
     #[test]
@@ -2022,6 +2332,7 @@ mod tests {
             KeychainFailure::Unavailable,
             KeychainFailure::Ambiguous,
             KeychainFailure::Rejected,
+            KeychainFailure::Unresponsive,
             KeychainFailure::Unknown,
         ] {
             assert_no_leak(&format!("{failure:?}"), SECRET);
