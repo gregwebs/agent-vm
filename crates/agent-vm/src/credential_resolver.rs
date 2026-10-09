@@ -114,7 +114,8 @@ pub(crate) trait CredentialSource: Send + Sync {
 ///
 /// The backend is [`BoundedKeychainReads`] because a phase-1 resolve is exactly
 /// where an unbounded platform read used to park the launcher forever while
-/// holding the secret inventory's lock (#251).
+/// holding the secret inventory's lock (#251). The store's lock wait is bounded
+/// the same way, so a peer holding it cannot park a launch either (#291).
 pub(crate) struct KeychainCredentialSource {
     store: Mutex<SecretStore<BoundedKeychainReads<SystemKeychain>>>,
 }
@@ -1000,6 +1001,38 @@ credentials:
     }
 
     #[test]
+    fn a_busy_inventory_lock_names_the_lock_in_the_launch_message() {
+        let source = TestSource::new().script(
+            "beta",
+            Scripted::Unavailable(KeychainFailure::InventoryBusy),
+        );
+        let error = one(BETA_REQUIRED, &["beta"], &*source).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("could not be read for `beta`"), "{text}");
+        assert!(text.contains("secret inventory lock"), "{text}");
+        let optional = TestSource::new().script(
+            "alpha",
+            Scripted::Unavailable(KeychainFailure::InventoryBusy),
+        );
+        let launch = one(ALPHA, &["alpha"], &*optional).unwrap();
+        let notice = launch.withheld()[0].notice();
+        assert!(notice.contains("secret inventory lock"), "{notice}");
+        assert!(notice.contains("continuing without it"), "{notice}");
+        let launch = one_with_policy(
+            BETA_REQUIRED,
+            &["beta"],
+            &*source,
+            MissingCredentialPolicy::Warn,
+        )
+        .unwrap();
+        assert!(launch.ready().is_empty());
+        assert_eq!(launch.withheld().len(), 1);
+        let notice = launch.withheld()[0].notice();
+        assert!(notice.contains("secret inventory lock"), "{notice}");
+        assert!(notice.contains("--allow-missing-credentials"), "{notice}");
+    }
+
+    #[test]
     fn optional_credential_warns_and_withholds() {
         let source = TestSource::new().script("alpha", Scripted::Missing);
         let launch = one(ALPHA, &["alpha"], &*source).expect("optional is not fatal");
@@ -1354,23 +1387,28 @@ credentials:
 
         // A ready service whose store is missing maps to NotFound; a ready
         // service whose store is unavailable maps to Failed.
-        let source = TestSource::new()
-            .script("alpha", Scripted::Missing)
-            .script("beta", Scripted::Unavailable(KeychainFailure::AccessDenied));
-        // Phase 1 refuses Missing/Unavailable for required, so build the
-        // resolver through the type's own constructor instead.
-        let resolver = KeychainCredentialResolver {
-            source: dyn_source(&source),
-            allowed: names(&["alpha", "beta"]),
-        };
-        assert_eq!(
-            resolver.resolve("alpha").unwrap_err(),
-            microsandbox::CredentialResolveError::NotFound
-        );
-        assert_eq!(
-            resolver.resolve("beta").unwrap_err(),
-            microsandbox::CredentialResolveError::Failed
-        );
+        for failure in [
+            KeychainFailure::AccessDenied,
+            KeychainFailure::InventoryBusy,
+        ] {
+            let source = TestSource::new()
+                .script("alpha", Scripted::Missing)
+                .script("beta", Scripted::Unavailable(failure));
+            // Phase 1 refuses Missing/Unavailable for required, so build the
+            // resolver through the type's own constructor instead.
+            let resolver = KeychainCredentialResolver {
+                source: dyn_source(&source),
+                allowed: names(&["alpha", "beta"]),
+            };
+            assert_eq!(
+                resolver.resolve("alpha").unwrap_err(),
+                microsandbox::CredentialResolveError::NotFound
+            );
+            assert_eq!(
+                resolver.resolve("beta").unwrap_err(),
+                microsandbox::CredentialResolveError::Failed
+            );
+        }
     }
 
     /// Build the *actual* durable network config a launch would register, from

@@ -116,6 +116,19 @@
 //! lose the most recent inventory update. The consequence is a listing drift,
 //! never a lost value, and it is repairable by re-running `secret set`. See
 //! ADR-0024.
+//!
+//! # The lock wait is bounded; a mutation under the lock is not (#291)
+//!
+//! `set` and `remove` hold the inventory lock across their platform call, and
+//! that call stays unbounded for the #251 reason above. Bounding reads did
+//! not bound the lock: a mutation parked on an unlock prompt held it
+//! indefinitely, and every other agent-vm process on the host — every verb and
+//! every credential-bearing launch — waited behind it in silence. The bound is
+//! on the **waiter**: [`SecretStore::lock`] gives up after
+//! [`inventory_lock_wait`], and the verbs name the lock file
+//! ([`KeychainFailure::InventoryBusy`] for a launch). A waiter that gives up has
+//! not begun its own read-modify-write, so its failure is true when reported
+//! and stays true — the property that bounding the holder cannot have.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -134,7 +147,9 @@ use vstd::prelude::*;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config;
-use crate::host_paths::{atomic_write, flock_exclusive, read_bounded_regular_file};
+use crate::host_paths::{
+    FlockWait, atomic_write, flock_exclusive_within, read_bounded_regular_file,
+};
 
 verus! {
 
@@ -607,7 +622,8 @@ pub(crate) enum Presence {
     Absent,
 }
 
-/// A **closed**, value-free classification of platform failures.
+/// A **closed**, value-free classification of platform failures, and of the two
+/// ways this process stops waiting for an answer.
 ///
 /// `keyring::Error` is `#[non_exhaustive]`, derives `Debug`, and carries
 /// `BadEncoding(Vec<u8>)` plus arbitrary boxed platform errors, so it must never
@@ -628,6 +644,12 @@ pub(crate) enum KeychainFailure {
     /// [`Self::Unavailable`] because the credential store may be perfectly
     /// reachable — it is this process that stopped waiting.
     Unresponsive,
+    /// This process could not acquire the inventory lock within
+    /// [`inventory_lock_wait`] (#291); no platform operation was started.
+    /// In contrast, [`Self::Unresponsive`] means a platform read started but
+    /// no read result was observed before this process stopped waiting.
+    /// Polling does not identify a holder or prove continuous ownership.
+    InventoryBusy,
     Unknown,
 }
 
@@ -649,6 +671,12 @@ impl KeychainFailure {
             Self::Unresponsive => {
                 "the system keychain did not respond before the read was abandoned - it may be \
                  waiting on a locked keychain or an unlock prompt; unlock the keychain and retry"
+            }
+            Self::InventoryBusy => {
+                "could not acquire the secret inventory lock \
+                 (~/.config/agent-vm/.secret-inventory.lock) within the wait; another process \
+                 may be using it, possibly waiting on a keychain unlock prompt; unlock the \
+                 keychain or let that command finish, and retry"
             }
             Self::Unknown => "the system keychain failed for an unrecognized reason",
         }
@@ -863,6 +891,24 @@ fn keychain_read_bound() -> Duration {
     }
 }
 
+/// How long a verb waits for another process to release the inventory lock (#291).
+///
+/// The read bound, by design and not by coincidence: the holder this wait is
+/// for may be parked on the same unlock prompt a read would be, and whether this
+/// process's user can answer it is the question [`keychain_read_bound`] already
+/// answers. Not longer: a longer wait would always outlast a holder's abandoned
+/// read and then start a second one. See ADR-0024's #291 amendment.
+fn inventory_lock_wait() -> Duration {
+    keychain_read_bound()
+}
+
+/// The lock wait for tests that do not exercise contention: long enough that
+/// healthy in-process contention (`concurrent_sets_do_not_lose_an_inventory_row`)
+/// is expected to finish within it. Independent of the test runner's stdin mode;
+/// not a fairness or scheduler guarantee.
+#[cfg(test)]
+pub(crate) const TEST_LOCK_WAIT: Duration = Duration::from_secs(5);
+
 /// Bounds every **read** the wrapped backend serves (#251).
 ///
 /// The platform read is a synchronous call into the OS credential store that can
@@ -996,6 +1042,14 @@ struct InventoryLock {
     _file: File,
 }
 
+/// Why [`SecretStore::lock`] returned without the lock. `Busy` is separate so
+/// `resolve` can report it as its own closed class and the verbs can name the
+/// lock; an I/O failure keeps its `anyhow` context.
+enum LockRefusal {
+    Busy,
+    Failed(anyhow::Error),
+}
+
 /// The names-only inventory document, as written to disk.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct InventoryFile {
@@ -1008,6 +1062,8 @@ struct InventoryFile {
 pub(crate) struct SecretStore<B: KeychainBackend> {
     backend: B,
     paths: InventoryPaths,
+    /// Production shares the read bound; tests supply an explicit wait (#291).
+    lock_wait: Duration,
     /// Test-only: when `Some`, the inventory write fails with this message. S16
     /// models "the delete succeeded, the listing write failed"; that cannot be
     /// provoked portably through the filesystem (a read-only directory is
@@ -1019,10 +1075,11 @@ pub(crate) struct SecretStore<B: KeychainBackend> {
 }
 
 impl<B: KeychainBackend> SecretStore<B> {
-    pub(crate) fn new(backend: B, paths: InventoryPaths) -> Self {
+    pub(crate) fn new(backend: B, paths: InventoryPaths, lock_wait: Duration) -> Self {
         Self {
             backend,
             paths,
+            lock_wait,
             #[cfg(test)]
             fail_inventory_write: Cell::new(None),
         }
@@ -1043,7 +1100,7 @@ impl<B: KeychainBackend> SecretStore<B> {
     /// was not updated — **not** that nothing is stored, because a failed
     /// *replace* may leave the previous value in place.
     pub(crate) fn set(&self, service: &ServiceName, value: &SecretValue) -> Result<()> {
-        let _lock = self.lock()?;
+        let _lock = self.lock_for_verb()?;
         let mut names = self.load_inventory()?;
         if !names.contains(service) {
             names.insert(service.clone());
@@ -1056,7 +1113,7 @@ impl<B: KeychainBackend> SecretStore<B> {
 
     /// Every tracked name with its storage status, in name order.
     pub(crate) fn list(&self) -> Result<Vec<SecretEntry>> {
-        let _lock = self.lock()?;
+        let _lock = self.lock_for_verb()?;
         let names = self.load_inventory()?;
         let mut rows = Vec::with_capacity(names.len());
         for service in names {
@@ -1079,7 +1136,7 @@ impl<B: KeychainBackend> SecretStore<B> {
     /// happen *and* drop the row, leaving an invisible live credential. The
     /// extra probe costs one more keychain access; that is the right trade.
     pub(crate) fn remove(&self, service: &ServiceName) -> Result<RemoveOutcome> {
-        let _lock = self.lock()?;
+        let _lock = self.lock_for_verb()?;
         let mut names = self.load_inventory()?;
         let listed = names.contains(service);
         let deleted = self.backend.delete(service).map_err(|failure| {
@@ -1134,11 +1191,14 @@ impl<B: KeychainBackend> SecretStore<B> {
     /// never races a `secret set`/`secret rm` on the same host. A failure to
     /// take the lock is reported as [`Resolved::Unavailable`]: from the
     /// caller's point of view the source "could not be read", which is the
-    /// class that decides between warning and hard error.
+    /// class that decides between warning and hard error. A peer that keeps the
+    /// lock past the wait is [`KeychainFailure::InventoryBusy`]; other lock
+    /// failures are `Unknown`.
     pub(crate) fn resolve(&self, service: &ServiceName) -> Resolved {
         let _lock = match self.lock() {
             Ok(lock) => lock,
-            Err(_) => return Resolved::Unavailable(KeychainFailure::Unknown),
+            Err(LockRefusal::Busy) => return Resolved::Unavailable(KeychainFailure::InventoryBusy),
+            Err(LockRefusal::Failed(_)) => return Resolved::Unavailable(KeychainFailure::Unknown),
         };
         match self.backend.get(service) {
             Ok(Some(stored)) => match stored.into_value() {
@@ -1151,9 +1211,11 @@ impl<B: KeychainBackend> SecretStore<B> {
     }
 
     /// Take the exclusive inventory lock, creating the directory and lock file
-    /// if needed. Held until the returned guard is dropped.
-    fn lock(&self) -> Result<InventoryLock> {
-        self.paths.ensure_dir()?;
+    /// if needed, waiting at most `self.lock_wait` for a peer. Held until the
+    /// returned guard is dropped. The `File` is dropped on every `Err`, so a
+    /// waiter that gives up no longer has the lock file open.
+    fn lock(&self) -> std::result::Result<InventoryLock, LockRefusal> {
+        self.paths.ensure_dir().map_err(LockRefusal::Failed)?;
         let path = self.paths.lock_path();
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -1162,9 +1224,20 @@ impl<B: KeychainBackend> SecretStore<B> {
             .truncate(false)
             .mode(INVENTORY_FILE_MODE)
             .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        flock_exclusive(&file)?;
-        Ok(InventoryLock { _file: file })
+            .with_context(|| format!("opening {}", path.display()))
+            .map_err(LockRefusal::Failed)?;
+        match flock_exclusive_within(&file, self.lock_wait).map_err(LockRefusal::Failed)? {
+            FlockWait::Acquired => Ok(InventoryLock { _file: file }),
+            FlockWait::TimedOut => Err(LockRefusal::Busy),
+        }
+    }
+
+    /// [`Self::lock`] for the verbs, which report through an `anyhow` chain.
+    fn lock_for_verb(&self) -> Result<InventoryLock> {
+        self.lock().map_err(|refusal| match refusal {
+            LockRefusal::Busy => inventory_busy_error(&self.paths.lock_path(), self.lock_wait),
+            LockRefusal::Failed(error) => error,
+        })
     }
 
     /// The tracked names, or an empty set when the inventory file is absent
@@ -1261,7 +1334,8 @@ impl<B: KeychainBackend> SecretStore<B> {
 }
 
 /// Production construction: the user-scoped inventory paths and the host
-/// credential store, with every read bounded (#251).
+/// credential store, with every read bounded (#251) and the inventory lock
+/// wait bounded (#291).
 ///
 /// Fails explicitly when `$HOME` is unusable, so no verb ever writes to a
 /// relative or empty location.
@@ -1269,6 +1343,7 @@ pub(crate) fn system_store() -> Result<SecretStore<BoundedKeychainReads<SystemKe
     Ok(SecretStore::new(
         BoundedKeychainReads::new(SystemKeychain, keychain_read_bound()),
         inventory_paths()?,
+        inventory_lock_wait(),
     ))
 }
 
@@ -1362,9 +1437,24 @@ pub(crate) fn test_recording_store() -> Result<Option<SecretStore<RecordingKeych
                 path: PathBuf::from(path),
             },
             inventory_paths()?,
+            inventory_lock_wait(),
         ))),
         _ => Ok(None),
     }
+}
+
+/// The verbs' contention error (#291). Names agent-vm's own lock file and the
+/// wait, never a service name, and says nothing was changed: the lock is
+/// acquired before any inventory/value mutation. Setup may create a directory
+/// or lock file; "changed nothing" refers to inventory rows and secret values.
+fn inventory_busy_error(path: &Path, waited: Duration) -> anyhow::Error {
+    let path = path.display();
+    anyhow!(
+        "could not acquire the secret inventory lock {path} within {waited:?}; another process \
+         may be using it, possibly waiting on a keychain unlock prompt. Unlock the keychain \
+         or let that command finish, then retry; this command changed nothing. Use lsof to \
+         inspect processes with this file open"
+    )
 }
 
 /// Every inventory-load failure names the path (agent-vm's own) and the
@@ -1526,6 +1616,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::{Arc, Barrier};
+    use std::time::Instant;
 
     use proptest::prelude::*;
     use proptest::sample::Index;
@@ -1567,7 +1658,7 @@ mod tests {
         }
 
         fn store(&self) -> SecretStore<Rc<FakeKeychain>> {
-            SecretStore::new(Rc::clone(&self.backend), self.paths())
+            SecretStore::new(Rc::clone(&self.backend), self.paths(), TEST_LOCK_WAIT)
         }
 
         fn inventory(&self) -> PathBuf {
@@ -2160,6 +2251,7 @@ mod tests {
         let store = SecretStore::new(
             BoundedKeychainReads::new(backend, bound),
             InventoryPaths::new(dir.path().to_path_buf()),
+            TEST_LOCK_WAIT,
         );
         (dir, store)
     }
@@ -2179,15 +2271,238 @@ mod tests {
     fn resolve_within_deadline<B: KeychainBackend + Send + 'static>(
         store: SecretStore<B>,
     ) -> (SecretStore<B>, Resolved) {
+        within_deadline("the keychain read", move || {
+            let resolved = store.resolve(&name("alpha"));
+            (store, resolved)
+        })
+    }
+
+    /// A regression fails finitely rather than joining a stuck worker.
+    fn within_deadline<T: Send + 'static>(
+        what: &'static str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let resolved = store.resolve(&name("alpha"));
-            let _ = tx.send((store, resolved));
+            let _ = tx.send(work());
         });
         match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(pair) => pair,
-            Err(_) => panic!("the keychain read was not bounded: no result after 30s"),
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{what} was not bounded: no result after 30s")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{what} worker disconnected or panicked before returning a result")
+            }
         }
+    }
+    // -- agent-vm #291: a bounded waiter, never an abandoned writer --------
+
+    const SHORT: Duration = Duration::from_millis(200);
+    const SHORT_UPPER: Duration = Duration::from_secs(2);
+
+    fn assert_short(elapsed: Duration) {
+        assert!(
+            SHORT <= elapsed && elapsed < SHORT_UPPER,
+            "elapsed: {elapsed:?}"
+        );
+    }
+
+    fn hold_inventory_lock(dir: &Path) -> File {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(INVENTORY_FILE_MODE)
+            .open(dir.join(LOCK_FILE_NAME))
+            .unwrap();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        file
+    }
+
+    #[test]
+    fn every_verb_gives_up_on_a_held_inventory_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let _holder = hold_inventory_lock(dir.path());
+        let store = SecretStore::new(
+            FakeKeychain::new(),
+            InventoryPaths::new(dir.path().to_path_buf()),
+            SHORT,
+        );
+        within_deadline("all inventory verbs", move || {
+            for verb in 0..3 {
+                let started = Instant::now();
+                let error = match verb {
+                    0 => store.set(&name("alpha"), &value("v")).unwrap_err(),
+                    1 => store.list().unwrap_err(),
+                    _ => store.remove(&name("alpha")).unwrap_err(),
+                };
+                assert_short(started.elapsed());
+                let text = format!("{error:#}");
+                for expected in [
+                    "could not acquire the secret inventory lock",
+                    "200ms",
+                    "changed nothing",
+                ] {
+                    assert!(text.contains(expected), "{text}");
+                }
+                assert!(
+                    text.contains(&store.paths.lock_path().display().to_string()),
+                    "{text}"
+                );
+                assert!(!text.contains("alpha"), "{text}");
+            }
+            let started = Instant::now();
+            assert!(matches!(
+                store.resolve(&name("alpha")),
+                Resolved::Unavailable(KeychainFailure::InventoryBusy)
+            ));
+            assert_short(started.elapsed());
+        });
+    }
+
+    #[test]
+    fn a_set_that_gives_up_on_the_lock_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let _holder = hold_inventory_lock(dir.path());
+        let store = SecretStore::new(
+            FakeKeychain::new(),
+            InventoryPaths::new(dir.path().to_path_buf()),
+            SHORT,
+        );
+        let store = within_deadline("refused set", move || {
+            let started = Instant::now();
+            assert!(store.set(&name("alpha"), &value("v")).is_err());
+            assert_short(started.elapsed());
+            store
+        });
+        assert_eq!(store.backend.stored("alpha"), None);
+        assert!(!dir.path().join(INVENTORY_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn a_lock_released_during_the_wait_lets_the_verb_proceed() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = hold_inventory_lock(dir.path());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(holder);
+            let _ = tx.send(());
+        });
+        let store = SecretStore::new(
+            FakeKeychain::new(),
+            InventoryPaths::new(dir.path().to_path_buf()),
+            TEST_LOCK_WAIT,
+        );
+        let store = within_deadline("released set", move || {
+            store.set(&name("alpha"), &value("v")).unwrap();
+            assert_eq!(store.backend.stored("alpha").as_deref(), Some("v"));
+            store
+        });
+        rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        within_deadline("released listing", move || {
+            let rows = store.list().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].service.as_str(), "alpha");
+        });
+    }
+
+    /// A gate models a writer parked on a platform prompt. A disconnected gate
+    /// fails without committing, so test failure does not strand the holder.
+    struct GatedKeychain {
+        entered: mpsc::SyncSender<()>,
+        gate: std::sync::Mutex<mpsc::Receiver<()>>,
+        committed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl KeychainBackend for GatedKeychain {
+        fn set(&self, _: &ServiceName, _: &SecretValue) -> Result<(), KeychainFailure> {
+            self.entered
+                .send(())
+                .map_err(|_| KeychainFailure::Unknown)?;
+            self.gate
+                .lock()
+                .unwrap()
+                .recv()
+                .map_err(|_| KeychainFailure::Unknown)?;
+            self.committed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn probe(&self, _: &ServiceName) -> Result<Presence, KeychainFailure> {
+            Ok(Presence::Present)
+        }
+        fn get(&self, _: &ServiceName) -> Result<Option<StoredSecret>, KeychainFailure> {
+            Ok(Some(StoredSecret::new(b"sk-REAL".to_vec())))
+        }
+        fn delete(&self, _: &ServiceName) -> Result<Presence, KeychainFailure> {
+            Ok(Presence::Absent)
+        }
+    }
+
+    #[test]
+    fn a_write_holding_the_lock_is_not_abandoned_while_a_waiter_gives_up() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = InventoryPaths::new(dir.path().to_path_buf());
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let committed = Arc::new(AtomicBool::new(false));
+        let gated = GatedKeychain {
+            entered: entered_tx,
+            gate: std::sync::Mutex::new(gate_rx),
+            committed: Arc::clone(&committed),
+        };
+        let holder = SecretStore::new(
+            BoundedKeychainReads::new(gated, Duration::from_millis(100)),
+            paths.clone(),
+            TEST_LOCK_WAIT,
+        );
+        let (holder_tx, holder_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = holder_tx.send(holder.set(&name("alpha"), &value("v")));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let waiter = SecretStore::new(FakeKeychain::new(), paths.clone(), SHORT);
+        within_deadline("waiter behind writer", move || {
+            let started = Instant::now();
+            let error = waiter.set(&name("beta"), &value("v")).unwrap_err();
+            assert!(format!("{error:#}").contains("secret inventory lock"));
+            assert_short(started.elapsed());
+            let started = Instant::now();
+            assert!(matches!(
+                waiter.resolve(&name("beta")),
+                Resolved::Unavailable(KeychainFailure::InventoryBusy)
+            ));
+            assert_short(started.elapsed());
+        });
+        assert!(
+            matches!(holder_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "holder's write was abandoned"
+        );
+        gate_tx.send(()).unwrap();
+        holder_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        assert!(committed.load(Ordering::SeqCst));
+        within_deadline("listing after writer", move || {
+            let store = SecretStore::new(FakeKeychain::new(), paths, TEST_LOCK_WAIT);
+            let rows = store.list().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].service.as_str(), "alpha");
+        });
+    }
+
+    #[test]
+    fn the_busy_message_names_the_real_lock_path() {
+        assert!(KeychainFailure::InventoryBusy.message().contains(&format!(
+            "~/{}/{}",
+            config::USER_CONFIG_DIR_RELATIVE,
+            LOCK_FILE_NAME
+        )));
     }
 
     /// The platform read cannot be cancelled, so the store abandons it and
@@ -2333,6 +2648,7 @@ mod tests {
             KeychainFailure::Ambiguous,
             KeychainFailure::Rejected,
             KeychainFailure::Unresponsive,
+            KeychainFailure::InventoryBusy,
             KeychainFailure::Unknown,
         ] {
             assert_no_leak(&format!("{failure:?}"), SECRET);
@@ -2398,7 +2714,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join(crate::config::USER_CONFIG_DIR_RELATIVE);
         assert!(!dir.exists(), "the fixture must start with no config dir");
-        let store = SecretStore::new(FakeKeychain::new(), InventoryPaths::new(dir.clone()));
+        let store = SecretStore::new(
+            FakeKeychain::new(),
+            InventoryPaths::new(dir.clone()),
+            TEST_LOCK_WAIT,
+        );
         store.set(&name("anthropic"), &value("sk-REAL")).unwrap();
         assert_eq!(mode(&dir), CONFIG_DIR_MODE);
         assert_eq!(mode(&dir.join(INVENTORY_FILE_NAME)), INVENTORY_FILE_MODE);
@@ -2431,27 +2751,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = InventoryPaths::new(dir.path().to_path_buf());
         let barrier = Arc::new(Barrier::new(2));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (tx, rx) = mpsc::channel();
         let handles: Vec<_> = ["alpha", "beta"]
             .into_iter()
             .map(|raw| {
                 let paths = paths.clone();
                 let barrier = Arc::clone(&barrier);
+                let tx = tx.clone();
                 std::thread::spawn(move || {
-                    let store = SecretStore::new(FakeKeychain::new(), paths);
+                    let store = SecretStore::new(FakeKeychain::new(), paths, TEST_LOCK_WAIT);
                     let service = ServiceName::parse(raw).unwrap();
                     let value = SecretValue::parse(b"sk-REAL".to_vec()).unwrap();
                     barrier.wait();
                     for _ in 0..25 {
                         store.set(&service, &value).unwrap();
                     }
+                    tx.send(()).unwrap();
                 })
             })
             .collect();
+        drop(tx);
+        for _ in 0..2 {
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        }
         for handle in handles {
+            while !handle.is_finished() {
+                assert!(Instant::now() < deadline, "worker did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            }
             handle.join().unwrap();
         }
-        let store = SecretStore::new(FakeKeychain::new(), paths);
-        let rows = store.list().unwrap();
+        let rows = within_deadline("concurrent final listing", move || {
+            SecretStore::new(FakeKeychain::new(), paths, TEST_LOCK_WAIT)
+                .list()
+                .unwrap()
+        });
         let names: Vec<&str> = rows.iter().map(|row| row.service.as_str()).collect();
         assert_eq!(names, ["alpha", "beta"], "a lost row hides a stored value");
     }
@@ -2511,6 +2847,7 @@ mod tests {
         let store = SecretStore::new(
             SystemKeychain,
             InventoryPaths::new(dir.path().to_path_buf()),
+            TEST_LOCK_WAIT,
         );
         let service = name("avm-manual-check");
         let value = value("synthetic-manual-check-value");
