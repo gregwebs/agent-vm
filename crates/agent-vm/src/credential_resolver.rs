@@ -91,7 +91,8 @@ use crate::config::USER_CONFIG_DIR_RELATIVE;
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::credential_yaml::{self, AuthorizationSet, GuestEnvName};
 use crate::secret_store::{
-    KeychainFailure, Resolved, SecretStore, ServiceName, SystemKeychain, system_store,
+    BoundedKeychainReads, KeychainFailure, Resolved, SecretStore, ServiceName, SystemKeychain,
+    system_store,
 };
 // Named only by the debug-only seam below and by the tests, so a release build
 // (which compiles neither) would report it as an unused import.
@@ -110,8 +111,12 @@ pub(crate) trait CredentialSource: Send + Sync {
 /// file lock) but for the trait bound: it makes the source `Sync` from the
 /// store being `Send`, independent of whether the test-only `Cell` field is
 /// compiled in.
+///
+/// The backend is [`BoundedKeychainReads`] because a phase-1 resolve is exactly
+/// where an unbounded platform read used to park the launcher forever while
+/// holding the secret inventory's lock (#251).
 pub(crate) struct KeychainCredentialSource {
-    store: Mutex<SecretStore<SystemKeychain>>,
+    store: Mutex<SecretStore<BoundedKeychainReads<SystemKeychain>>>,
 }
 
 impl KeychainCredentialSource {

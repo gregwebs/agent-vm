@@ -1209,7 +1209,8 @@ agent-vm secret rm anthropic
 - `ls` prints **names and storage status only** — never a value, not even part
   of one. `stored` means the keychain answered; `missing` means it answered and
   found nothing; `unavailable: …` means it could not be asked (locked, denied,
-  or no Secret Service running).
+  or no Secret Service running), including a read agent-vm abandoned because the
+  platform call never returned — see the macOS keychain prompt note below.
 - **An empty listing proves nothing about the keychain.** It exits zero and
   means only "no names are tracked"; no probe ran. A listing with any
   `unavailable:` row exits non-zero, so a script is never told everything is
@@ -1380,6 +1381,14 @@ probes once per listed name. That is possible and identity-dependent, not
 guaranteed — and if you deny the prompt, the row reads `unavailable: …` rather
 than crashing. This is also why overriding `$HOME` (and so the login keychain's
 path) makes every verb report the store as unavailable.
+
+If the prompt is never answered — a locked keychain with nobody at the GUI, a
+launch from a script — agent-vm **abandons the read** instead of waiting
+indefinitely, and reports the same "could not be read" class (a tight bound when
+stdin is not a TTY, a generous one when it is; the values live with the store in
+`crates/agent-vm/src/secret_store.rs`). An unattended script therefore fails with
+this row rather than hanging, and the inventory lock it holds is released
+(agent-vm #251).
 
 ## Project hook
 If the project root contains an executable `.agent-vm.runtime.sh`,

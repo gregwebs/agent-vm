@@ -305,3 +305,27 @@ amendment records its shape rather than quietly widening the original claim:
   value that fails it is a distinct `InvalidValue` outcome, never `Missing`.
 
 No exception is added to this record's rule that a value is never rendered.
+
+## Amendment: every read is bounded (agent-vm #251)
+
+This record's store calls the platform credential store synchronously, and that
+call has **no bound of its own**: on macOS `SecKeychainFindGenericPassword`
+waits on the system's unlock prompt when the keychain is locked, and on Linux a
+Secret Service round-trip waits on the keyring daemon. A launcher that inherited
+that wait held `.secret-inventory.lock` for its whole duration and never
+surfaced a diagnostic, so `agent-vm shell` could hang forever on a host whose
+login keychain was locked or whose prompt nobody answered.
+
+The production backend is therefore wrapped in `BoundedKeychainReads`: `get` and
+`probe` run on a helper thread and are abandoned after `keychain_read_bound()`
+(60 s with stdin on a TTY, 5 s otherwise), reporting the new closed
+`KeychainFailure::Unresponsive`. That outcome reaches callers through the
+existing "the store could not be asked" path, so it is the same warning-or-hard
+error the availability table already defines — never `Missing`. The abandoned
+thread is not joined (the platform call cannot be cancelled) and holds none of
+this store's state, so abandoning it cannot wedge a later verb.
+
+**Only reads are bounded.** A `set` or `delete` abandoned by its caller would
+keep running and could still commit, so a reported failure could later become
+false — a worse outcome than the wait it avoids. `flock` contention is bounded
+indirectly: a holder can no longer be stuck in an unbounded read.
