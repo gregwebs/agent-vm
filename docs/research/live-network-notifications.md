@@ -1,6 +1,6 @@
 # Live network approvals: notification and host entry-point options
 
-Research date: 2026-10-09. For [research ticket #298](https://github.com/gregwebs/agent-vm/issues/298) in the confirmed [wayfinder map #296](https://github.com/gregwebs/agent-vm/issues/296). Agent-vm baseline: `88ea07bb8e4b3dfe4959772536f04f44f2fd87e9`.
+Research date: 2026-10-09. For [Research notification options](https://github.com/gregwebs/agent-vm/issues/298) in [Explore live network approvals](https://github.com/gregwebs/agent-vm/issues/296). Agent-vm baseline: `88ea07bb8e4b3dfe4959772536f04f44f2fd87e9`.
 
 ## Scope and evidence
 
