@@ -685,9 +685,10 @@ fn external_termination_signals_restore_the_terminal() {
 /// Finding R1 — once the hidden read has finished, the process must still be
 /// terminable. `SignalGuard::drop` used to leave a signal-hook handler installed
 /// that swallowed SIGINT/SIGTERM/SIGHUP/SIGQUIT, and `secret set` continues past
-/// the read into the store, whose first act is a blocking `flock` on the
-/// inventory lock. Holding that lock from the test keeps the child alive in
-/// exactly that post-read window, and `SIGTERM` must still end it.
+/// the read into the store, whose first act is the bounded wait on the inventory
+/// lock (60 s under a PTY, #291). Holding it keeps the child alive in that
+/// post-read window, and `SIGTERM` must still end it. The configured post-read
+/// waits total about 20.2 s, inside the bound absent excessive scheduling delay.
 #[test]
 fn sigterm_terminates_after_the_hidden_read_while_the_store_lock_is_held() {
     let home = tempfile::tempdir().unwrap();

@@ -13,13 +13,119 @@
 //! `main`'s msb setup, and leaving it unset is what proves that.
 
 use std::{
-    io::Write as _,
+    io::{Read, Write as _},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
+}
+
+struct CapturedChild {
+    child: Option<Child>,
+    stdout: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    stderr: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+}
+
+impl CapturedChild {
+    fn cleanup(&mut self) -> String {
+        let mut errors = Vec::new();
+        if let Some(mut child) = self.child.take() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    if let Err(error) = child.kill()
+                        && !matches!(child.try_wait(), Ok(Some(_)))
+                    {
+                        errors.push(format!("kill: {error}"));
+                    }
+                    if let Err(error) = child.wait() {
+                        errors.push(format!("reap: {error}"));
+                    }
+                }
+            }
+        }
+        errors.join("; ")
+    }
+
+    fn fail(&mut self, reason: &str) -> ! {
+        let cleanup = self.cleanup();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let stdout = self
+            .stdout
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let stderr = self
+            .stderr
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        panic!(
+            "{reason}; cleanup: {cleanup}; stdout: {stdout:?}; stderr: {stderr:?} (timeout/disconnect means drain incomplete)"
+        );
+    }
+}
+
+impl Drop for CapturedChild {
+    fn drop(&mut self) {
+        let error = self.cleanup();
+        if !error.is_empty() {
+            eprintln!("child cleanup failed: {error}");
+        }
+    }
+}
+
+fn drain(pipe: impl Read + Send + 'static) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = {
+            let mut pipe = pipe;
+            pipe.read_to_end(&mut bytes).map(|_| bytes)
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn wait_bounded(mut child: CapturedChild, started: Instant, limit: Duration) -> (Output, Duration) {
+    let deadline = started + limit;
+    let status = loop {
+        match child.child.as_mut().unwrap().try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => child.fail(&format!("waiting: {error}")),
+        }
+        if Instant::now() >= deadline {
+            child.fail("child exceeded deadline");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = match child
+        .stdout
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        Ok(Ok(bytes)) => bytes,
+        error => child.fail(&format!("stdout drain: {error:?}")),
+    };
+    let stderr = match child
+        .stderr
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        Ok(Ok(bytes)) => bytes,
+        error => child.fail(&format!(
+            "stderr drain: {error:?}; collected stdout: {stdout:?}"
+        )),
+    };
+    child.child.take();
+    (
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+        started.elapsed(),
+    )
 }
 
 struct Harness {
@@ -109,6 +215,75 @@ impl Harness {
             .write_all(input)
             .expect("writing the piped value");
         child.wait_with_output().expect("waiting for agent-vm")
+    }
+
+    fn secret_command(&self, args: &[&str], recording: bool) -> Command {
+        let mut command = Command::new(agent_vm_bin());
+        command
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", self.home.path())
+            .env("AGENT_VM_STATE_DIR", self.state.path())
+            .current_dir(self.project.path())
+            .args(args);
+        if recording {
+            command.env("AGENT_VM_TEST_SECRET_RECORD", self.recording_path());
+        }
+        command
+    }
+
+    fn spawn_secret(&self, args: &[&str], recording: bool, stdin: Stdio) -> CapturedChild {
+        let (_, stdout) = mpsc::channel();
+        let (_, stderr) = mpsc::channel();
+        let child = self
+            .secret_command(args, recording)
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Own cleanup before any pipe extraction or reader setup can unwind.
+        let mut owned = CapturedChild {
+            child: Some(child),
+            stdout,
+            stderr,
+        };
+        owned.stdout = drain(owned.child.as_mut().unwrap().stdout.take().unwrap());
+        owned.stderr = drain(owned.child.as_mut().unwrap().stderr.take().unwrap());
+        owned
+    }
+
+    fn run_secret_bounded(
+        &self,
+        args: &[&str],
+        recording: bool,
+        input: Option<&[u8]>,
+        limit: Duration,
+    ) -> (Output, Duration) {
+        let started = Instant::now();
+        let mut child = self.spawn_secret(
+            args,
+            recording,
+            if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            },
+        );
+        if let Some(input) = input {
+            let result = child
+                .child
+                .as_mut()
+                .unwrap()
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input);
+            if let Err(error) = result {
+                child.fail(&format!("stdin write: {error}"));
+            }
+        }
+        wait_bounded(child, started, limit)
     }
 
     fn config_dir(&self) -> PathBuf {
@@ -623,38 +798,146 @@ fn a_corrupt_inventory_names_the_path_and_the_recovery_and_quotes_nothing() {
 #[test]
 fn concurrent_secret_sets_do_not_lose_an_inventory_row() {
     let harness = Harness::new();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(30);
     let mut children = Vec::new();
     for index in 0..12 {
         let name = format!("svc-{index}");
-        let mut child = Command::new(agent_vm_bin())
-            .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", harness.home.path())
-            .env("AGENT_VM_STATE_DIR", harness.state.path())
-            .env("AGENT_VM_TEST_SECRET_RECORD", harness.recording_path())
-            .current_dir(harness.project.path())
-            .args(["secret", "set", &name])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to run agent-vm");
-        child
+        let mut child = harness.spawn_secret(&["secret", "set", &name], true, Stdio::piped());
+        if let Err(error) = child
+            .child
+            .as_mut()
+            .unwrap()
             .stdin
             .take()
-            .expect("child stdin is piped")
+            .unwrap()
             .write_all(b"v")
-            .expect("writing the piped value");
-        children.push((name, child));
+        {
+            child.fail(&format!("stdin write: {error}"));
+        }
+        children.push((name, child, None));
     }
-    for (name, child) in &mut children {
-        let status = child.wait().expect("waiting for agent-vm");
-        assert!(status.success(), "concurrent set {name} failed");
+    let failure = loop {
+        let mut failure = None;
+        for (_, child, status) in &mut children {
+            if status.is_none() {
+                match child.child.as_mut().unwrap().try_wait() {
+                    Ok(found) => *status = found,
+                    Err(error) => {
+                        failure = Some(format!("waiting: {error}"));
+                        break;
+                    }
+                }
+            }
+        }
+        if failure.is_some() {
+            break failure;
+        }
+        if children.iter().all(|(_, _, status)| status.is_some()) {
+            break None;
+        }
+        if Instant::now() >= deadline {
+            break Some("concurrent children exceeded deadline".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if failure.is_some()
+        || children
+            .iter()
+            .any(|(_, _, status)| status.is_some_and(|s| !s.success()))
+    {
+        let cleanup: Vec<_> = children
+            .iter_mut()
+            .map(|(_, child, _)| child.cleanup())
+            .collect();
+        panic!(
+            "concurrent set failure: {failure:?}; statuses: {:?}; cleanup: {cleanup:?}",
+            children
+                .iter()
+                .map(|(name, _, status)| (name, status))
+                .collect::<Vec<_>>()
+        );
     }
-
-    let listed = harness.run_recording(&["secret", "ls"]);
+    let (listed, _) =
+        harness.run_secret_bounded(&["secret", "ls"], true, None, Duration::from_secs(30));
+    assert!(listed.status.success(), "{listed:?}");
     let text = stdout_of(&listed);
-    for (name, _) in &children {
+    for (name, _, _) in &children {
         assert!(text.contains(name.as_str()), "{name} missing from:\n{text}");
     }
+}
+
+fn hold_inventory_lock(harness: &Harness) -> std::fs::File {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(harness.config_dir()).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(harness.config_dir().join(".secret-inventory.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    file
+}
+
+#[test]
+fn ls_gives_up_on_a_held_inventory_lock_and_names_it() {
+    let harness = Harness::new();
+    let _holder = hold_inventory_lock(&harness);
+    let (out, elapsed) =
+        harness.run_secret_bounded(&["secret", "ls"], false, None, Duration::from_secs(30));
+    assert!(!out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let text = stderr_of(&out);
+    assert!(text.contains("secret inventory lock"), "{text}");
+    assert!(
+        text.contains(
+            &harness
+                .config_dir()
+                .join(".secret-inventory.lock")
+                .display()
+                .to_string()
+        ),
+        "{text}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(30),
+        "{elapsed:?}"
+    );
+}
+
+#[test]
+fn a_piped_set_that_gives_up_on_the_lock_records_nothing() {
+    let harness = Harness::new();
+    let _holder = hold_inventory_lock(&harness);
+    let (out, elapsed) = harness.run_secret_bounded(
+        &["secret", "set", "alpha"],
+        true,
+        Some(b"v"),
+        Duration::from_secs(30),
+    );
+    assert!(!out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let text = stderr_of(&out);
+    assert!(text.contains("changed nothing"), "{text}");
+    assert!(
+        text.contains(
+            &harness
+                .config_dir()
+                .join(".secret-inventory.lock")
+                .display()
+                .to_string()
+        ),
+        "{text}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(30),
+        "{elapsed:?}"
+    );
+    assert!(!harness.recording_path().exists());
+    assert!(!harness.config_dir().join("secret-inventory.json").exists());
 }

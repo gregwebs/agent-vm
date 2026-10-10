@@ -9,6 +9,7 @@ use std::{
         unix::ffi::OsStrExt,
     },
     path::{Component, Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -138,10 +139,10 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
 ///
 /// The lock is released when the caller drops `file` (the fd closes) or by the
 /// kernel on process death, so a crashed process cannot wedge the resource.
-/// This is the shared primitive behind the `secret` inventory lock
-/// (`secret_store.rs`); `secrets::ProjectLock` still carries its own copy,
-/// and migrating it here is a deliberate follow-up rather than part of this
-/// change.
+/// Callers whose holder may wait outside agent-vm (the secret inventory lock,
+/// #291) use [`flock_exclusive_within`] instead. `secrets::ProjectLock` keeps
+/// its blocking copy and `oauth_refresh::RefreshLock` its polling one;
+/// migrating them is a deliberate follow-up.
 pub fn flock_exclusive(file: &std::fs::File) -> Result<()> {
     loop {
         match rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive) {
@@ -151,6 +152,101 @@ pub fn flock_exclusive(file: &std::fs::File) -> Result<()> {
                 return Err(anyhow!(error)).context("flock(LOCK_EX) failed");
             }
         }
+    }
+}
+
+/// The first and the longest pause between attempts in [`flock_exclusive_within`].
+/// The cap bounds the requested pause, not scheduler delay or acquisition
+/// latency. Doubling avoids starting with the full cap for a short critical
+/// section; polling still has no fairness guarantee.
+const FLOCK_POLL_FIRST: Duration = Duration::from_millis(1);
+const FLOCK_POLL_MAX: Duration = Duration::from_millis(50);
+
+/// How a bounded `flock` wait ended. `TimedOut` means a contended attempt at
+/// or after the deadline; it does not identify a holder or establish that the
+/// lock was continuously held. Only the caller knows how to render it.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlockWait {
+    Acquired,
+    TimedOut,
+}
+
+/// Take an exclusive `flock(2)` on `file`, waiting at most `wait` for a peer to
+/// release it.
+///
+/// Polls `LOCK_EX | LOCK_NB` rather than blocking: a blocking `flock` can only
+/// be abandoned by a signal, and a blocking call on a helper thread would take
+/// the lock after the caller gave up and keep it with nobody left to release
+/// it. The deadline is checked after a contended attempt; when it passed after
+/// an attempt that began before it, one final attempt is made without
+/// sleeping, so the last attempt is at or after the deadline. A zero `wait` is
+/// exactly one attempt. Interrupted attempts also check the deadline;
+/// exhaustion on interruption is an I/O error, not evidence of contention.
+/// Scheduler/OS delays may overshoot the requested wait; there is no hard
+/// real-time guarantee. Release semantics are [`flock_exclusive`]'s.
+pub(crate) fn flock_exclusive_within(file: &std::fs::File, wait: Duration) -> Result<FlockWait> {
+    flock_exclusive_within_using(
+        wait,
+        || rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive),
+        || {},
+    )
+}
+
+/// Internal seam: production supplies the real syscall and a no-op checkpoint.
+/// Tests inject errno sequences or pause after the first contended attempt,
+/// as default_selection's *_with_checkpoint helpers do.
+fn flock_exclusive_within_using(
+    wait: Duration,
+    mut attempt: impl FnMut() -> std::result::Result<(), Errno>,
+    after_first_contention: impl FnOnce(),
+) -> Result<FlockWait> {
+    let deadline = Instant::now()
+        .checked_add(wait)
+        .ok_or_else(|| anyhow!("the flock wait {wait:?} overflows the clock"))?;
+    let mut pause = FLOCK_POLL_FIRST;
+    let mut checkpoint = Some(after_first_contention);
+    loop {
+        // When the attempt began, not when it returned: a slow attempt, the
+        // tracing event, or the checkpoint after it can cross the deadline.
+        // `TimedOut` must rest on a contended attempt made at or after the
+        // deadline, or the promise that a lock free at the deadline is
+        // acquired would be false.
+        let attempt_started = Instant::now();
+        match attempt() {
+            Ok(()) => return Ok(FlockWait::Acquired),
+            Err(Errno::INTR) => {
+                if Instant::now() >= deadline {
+                    return Err(anyhow!(Errno::INTR))
+                        .context("flock(LOCK_EX | LOCK_NB) interrupted at the wait deadline");
+                }
+                continue;
+            }
+            Err(Errno::WOULDBLOCK) => {}
+            Err(error) => {
+                return Err(anyhow!(error)).context("flock(LOCK_EX | LOCK_NB) failed");
+            }
+        }
+        if let Some(checkpoint) = checkpoint.take() {
+            tracing::debug!(
+                ?wait,
+                "flock contended; polling until released or the wait expires"
+            );
+            checkpoint();
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            if attempt_started >= deadline {
+                return Ok(FlockWait::TimedOut);
+            }
+            // The deadline passed after an attempt that began before it, so
+            // that attempt cannot justify `TimedOut`. Make one final attempt
+            // now, without sleeping, so the timeout is reported only if that
+            // post-deadline attempt is still contended.
+            continue;
+        }
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(FLOCK_POLL_MAX);
     }
 }
 
@@ -716,6 +812,217 @@ fn random_temp_name() -> Result<OsString> {
 mod tests {
     use super::*;
     use std::fs;
+
+    const SHORT: Duration = Duration::from_millis(200);
+    const SHORT_UPPER: Duration = Duration::from_secs(2);
+
+    fn second_handle(path: &Path) -> fs::File {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap()
+    }
+
+    fn within<T: Send + 'static>(
+        what: &'static str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(value) => value,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{what} was not bounded: no result after 30s")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{what} worker disconnected or panicked before returning a result")
+            }
+        }
+    }
+
+    fn assert_short(elapsed: Duration) {
+        assert!(
+            SHORT <= elapsed && elapsed < SHORT_UPPER,
+            "elapsed: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_held_flock_times_out_after_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let a = second_handle(&path);
+        rfs::flock(&a, rfs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let b = second_handle(&path);
+        let (outcome, elapsed) = within("held flock", move || {
+            let started = Instant::now();
+            (
+                flock_exclusive_within(&b, SHORT).unwrap(),
+                started.elapsed(),
+            )
+        });
+        assert_eq!(outcome, FlockWait::TimedOut);
+        assert_short(elapsed);
+    }
+
+    #[test]
+    fn a_flock_released_during_the_wait_is_acquired() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let a = second_handle(&path);
+        rfs::flock(&a, rfs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let b = second_handle(&path);
+        let (contended_tx, contended_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = flock_exclusive_within_using(
+                Duration::from_secs(5),
+                || rfs::flock(&b, rfs::FlockOperation::NonBlockingLockExclusive),
+                || {
+                    contended_tx.send(()).unwrap();
+                    proceed_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                },
+            )
+            .unwrap();
+            let _ = tx.send((outcome, b));
+        });
+        contended_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        drop(a);
+        proceed_tx.send(()).unwrap();
+        let (outcome, b) = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(outcome, FlockWait::Acquired);
+        let c = second_handle(&path);
+        assert_eq!(
+            rfs::flock(&c, rfs::FlockOperation::NonBlockingLockExclusive),
+            Err(Errno::WOULDBLOCK)
+        );
+        drop(b);
+    }
+
+    /// A contention sample taken before the deadline must not justify
+    /// `TimedOut`: the holder can release while the first contended attempt is
+    /// still the most recent one. The checkpoint holds that attempt open across
+    /// the deadline, then the holder is released, and the waiter must make the
+    /// promised post-deadline attempt and acquire. Finite: every receive has a
+    /// 30 s deadline, so a wrong fix fails rather than hangs.
+    #[test]
+    fn a_release_that_crosses_the_deadline_is_still_acquired() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let a = second_handle(&path);
+        rfs::flock(&a, rfs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let b = second_handle(&path);
+        let (contended_tx, contended_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = flock_exclusive_within_using(
+                SHORT,
+                || rfs::flock(&b, rfs::FlockOperation::NonBlockingLockExclusive),
+                || {
+                    contended_tx.send(()).unwrap();
+                    // Keep the first contended attempt as the most recent one
+                    // while the deadline passes, then let the holder release.
+                    proceed_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                },
+            )
+            .unwrap();
+            let _ = tx.send((outcome, b));
+        });
+        contended_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // Cross the deadline with the holder still held, then release it. A
+        // pre-deadline sample cannot report `TimedOut` for a lock free at the
+        // deadline.
+        std::thread::sleep(SHORT + Duration::from_millis(200));
+        drop(a);
+        proceed_tx.send(()).unwrap();
+        let (outcome, b) = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(outcome, FlockWait::Acquired);
+        let c = second_handle(&path);
+        assert_eq!(
+            rfs::flock(&c, rfs::FlockOperation::NonBlockingLockExclusive),
+            Err(Errno::WOULDBLOCK)
+        );
+        drop(b);
+    }
+
+    #[test]
+    fn a_zero_wait_is_one_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let a = second_handle(&path);
+        let a = within("free zero wait", move || {
+            assert_eq!(
+                flock_exclusive_within(&a, Duration::ZERO).unwrap(),
+                FlockWait::Acquired
+            );
+            a
+        });
+        let b = second_handle(&path);
+        within("held zero wait", move || {
+            let started = Instant::now();
+            assert_eq!(
+                flock_exclusive_within(&b, Duration::ZERO).unwrap(),
+                FlockWait::TimedOut
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+        });
+        drop(a);
+    }
+
+    #[test]
+    fn interrupted_attempts_obey_the_deadline_without_claiming_contention() {
+        within("interrupted then acquired", || {
+            let mut attempts = [Err(Errno::INTR), Ok(())].into_iter();
+            let mut count = 0;
+            let outcome = flock_exclusive_within_using(
+                Duration::from_secs(5),
+                || {
+                    count += 1;
+                    attempts.next().unwrap()
+                },
+                || {},
+            )
+            .unwrap();
+            assert_eq!(outcome, FlockWait::Acquired);
+            assert_eq!(count, 2);
+        });
+        for first in [Errno::INTR, Errno::WOULDBLOCK] {
+            within("repeating interruption", move || {
+                let mut errors = std::iter::once(first).chain(std::iter::repeat(Errno::INTR));
+                let started = Instant::now();
+                let error =
+                    flock_exclusive_within_using(SHORT, || Err(errors.next().unwrap()), || {})
+                        .unwrap_err();
+                assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::INTR));
+                assert!(format!("{error:#}").contains("interrupted at the wait deadline"));
+                assert_short(started.elapsed());
+            });
+        }
+        within("zero interrupted wait", || {
+            let mut count = 0;
+            let error = flock_exclusive_within_using(
+                Duration::ZERO,
+                || {
+                    count += 1;
+                    Err(Errno::INTR)
+                },
+                || {},
+            )
+            .unwrap_err();
+            assert_eq!(count, 1);
+            assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::INTR));
+            assert!(format!("{error:#}").contains("interrupted at the wait deadline"));
+        });
+    }
 
     #[test]
     fn guest_state_dir_rejects_unsafe_relative_paths_before_effects() {

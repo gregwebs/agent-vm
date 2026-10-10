@@ -152,6 +152,10 @@ The primitive is `host_paths::flock_exclusive`, a new shared `EINTR`-looping
 helper. `secrets::ProjectLock` and `mount::lock_exclusive` still carry their own
 copies; migrating them is a deliberate follow-up, not part of this change.
 
+_Amended by #291._ The inventory lock is now taken with
+`host_paths::flock_exclusive_within`, which gives up after a bound; see the
+#291 amendment.
+
 ### D6 — `rm` re-probes after the delete
 
 ```
@@ -329,3 +333,56 @@ this store's state, so abandoning it cannot wedge a later verb.
 keep running and could still commit, so a reported failure could later become
 false — a worse outcome than the wait it avoids. `flock` contention is bounded
 indirectly: a holder can no longer be stuck in an unbounded read.
+
+**Superseded in part by the #291 amendment below:** a holder in a `set` or
+`delete` was never bounded, so neither was the wait behind it.
+
+## Amendment: the lock wait is bounded (agent-vm #291)
+
+The #251 amendment's last claim holds only for a holder in a read. `set` and
+`rm` call the platform store while holding `.secret-inventory.lock`, and that
+call is deliberately unbounded, so a mutation parked on an unlock prompt or a
+Secret Service round-trip held the lock indefinitely. Every other agent-vm
+process then blocked in `flock(LOCK_EX)` with no output; because the lock is
+user-scoped and host-wide (D1, D2), one wedged mutation wedged every `secret`
+verb and every credential-bearing launch on the host.
+
+The **wait** is now bounded; the mutation is not. `SecretStore` takes the lock
+through `host_paths::flock_exclusive_within`, which polls
+`LOCK_EX | LOCK_NB` (1 ms back-off doubling to 50 ms) and gives up after
+`inventory_lock_wait()` — the read bound, 60 s with stdin on a TTY and 5 s
+otherwise, because the question is the same one: can this process's user
+answer the prompt that is holding things up. A waiter that gives up has not
+begun its own read-modify-write, so its failure is true when reported and
+stays true. A `secret` verb fails naming the lock file and the wait and says
+it changed nothing; a launch's resolution reports the closed
+`KeychainFailure::InventoryBusy` through the existing "could not be read"
+path. At the pre-boot check, an optional credential is withheld; a required
+credential refuses the launch unless `--allow-missing-credentials` was passed.
+A failure on the later spawn-time read refuses the launch, even for a
+credential originally optional. That path discards the closed cause and
+reports `ResolveFailed`; its hint names lock contention as a possible cause.
+Lock contention in `secret ls` is a command-level error: non-zero exit, no
+rows, not an `unavailable:` row.
+
+Bounding the holder's platform call instead was rejected. The orphaned call
+cannot be cancelled, so it could commit after the failure was reported. If the
+abandoned holder also released the lock, a concurrent `rm` could run between
+the reported failure and the late commit and leave a stored value with no
+inventory row, the state D4 exists to prevent; if it kept the lock, waiters
+would still wait. A blocking `flock` on a helper thread was rejected because
+it would take the lock after its caller gave up and keep it.
+
+The message names the lock file, not the holding process: macOS exposes no
+`flock` holder, and a pid recorded in the lock file can name a process that no
+longer holds it. Its `lsof` advice is prose, not an unquoted shell command
+generated from a HOME-derived path. An open descriptor does not prove lock
+ownership.
+
+Polling gives up the kernel's wake-on-release: the requested pause is capped
+at 50 ms, with scheduler delay in addition. Transient availability between
+samples or release followed by reacquisition can be missed, and a waiter can
+lose to later arrivals. A lock still free at the final attempt is acquired.
+Neither fairness nor an end-to-end 50 ms acquisition bound is guaranteed.
+`host_paths::flock_exclusive` keeps its unbounded semantics for the fork and
+default-image locks, whose holders never wait on a credential store.

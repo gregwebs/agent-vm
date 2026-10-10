@@ -46,7 +46,7 @@ jobs:
         run: cargo build --release -p agent-vm
 
       - name: Test
-        run: cargo test -p agent-vm
+        run: timeout --signal=TERM --kill-after=10s 30m cargo test -p agent-vm
 
       # Type-check-only. CI runs the *debug* test profile, so the release test
       # profile rots silently: a `#[cfg(test)]` use of a `#[cfg(debug_assertions)]`

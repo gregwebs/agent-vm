@@ -610,10 +610,11 @@ impl Drop for RawHiddenTerminal {
 /// signal (`signal-hook-registry`'s own `unregister` warning). On its own that
 /// would make the process ignore `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` for the
 /// rest of its life — `secret set` continues past the read into the store, whose
-/// first act is a blocking `flock` on the inventory lock, so a concurrent
-/// `secret set` would make it unkillable except with `SIGKILL` (review finding
-/// R1). This guard therefore captures each signal's prior `sigaction` in
-/// [`SignalGuard::enable`] and restores it in `Drop`, after unregistering.
+/// first act is waiting on the inventory lock (up to a minute when attended,
+/// #291), so a concurrent `secret set` would make it unkillable for that long
+/// except with `SIGKILL` (review finding R1). This guard captures each signal's
+/// prior `sigaction` in [`SignalGuard::enable`] and restores it in `Drop`, after
+/// unregistering.
 ///
 /// # An inherited `SIG_IGN` is not a request to die
 ///
@@ -920,7 +921,11 @@ mod tests {
     }
 
     fn store(dir: &std::path::Path, backend: FakeKeychain) -> SecretStore<FakeKeychain> {
-        SecretStore::new(backend, InventoryPaths::new(dir.to_path_buf()))
+        SecretStore::new(
+            backend,
+            InventoryPaths::new(dir.to_path_buf()),
+            crate::secret_store::TEST_LOCK_WAIT,
+        )
     }
 
     /// C1 — exact rendering, including alignment past the header width and the

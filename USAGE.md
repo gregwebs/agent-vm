@@ -1211,6 +1211,8 @@ agent-vm secret rm anthropic
   found nothing; `unavailable: …` means it could not be asked (locked, denied,
   or no Secret Service running), including a read agent-vm abandoned because the
   platform call never returned — see the macOS keychain prompt note below.
+  Lock contention is a command-level error: `secret ls` exits non-zero with no
+  rows, not an `unavailable:` row, even when the inventory is empty (agent-vm #291).
 - **An empty listing proves nothing about the keychain.** It exits zero and
   means only "no names are tracked"; no probe ran. A listing with any
   `unavailable:` row exits non-zero, so a script is never told everything is
@@ -1386,9 +1388,23 @@ If the prompt is never answered — a locked keychain with nobody at the GUI, a
 launch from a script — agent-vm **abandons the read** instead of waiting
 indefinitely, and reports the same "could not be read" class (a tight bound when
 stdin is not a TTY, a generous one when it is; the values live with the store in
-`crates/agent-vm/src/secret_store.rs`). An unattended script therefore fails with
-this row rather than hanging, and the inventory lock it holds is released
-(agent-vm #251).
+`crates/agent-vm/src/secret_store.rs`).
+An unattended `secret ls` reports this as an `unavailable:` row rather than
+hanging on that read, and the inventory lock it holds is released (agent-vm #251).
+
+Every `secret` verb, and every launch that reads a stored value, first takes
+`~/.config/agent-vm/.secret-inventory.lock`. A `secret set` or `secret rm` keeps
+it while the keychain decides — including while an unlock prompt is up — because
+an abandoned write could still land after agent-vm reported it failed. Any other
+agent-vm process that needs the lock meanwhile waits the same bound and then
+gives up: a `secret` verb fails naming the lock file and changes nothing; a
+launch reports the credential as could-not-be-read (agent-vm #291). At the
+pre-boot check, an optional credential is withheld; a required credential refuses
+the launch unless `--allow-missing-credentials` was passed. A failure on the
+later spawn-time read refuses the launch, even if the credential was originally
+optional. Answer the prompt or let the other command finish, then retry. Use
+lsof to inspect processes with the lock file open; that alone does not identify
+its holder.
 
 ## Project hook
 If the project root contains an executable `.agent-vm.runtime.sh`,

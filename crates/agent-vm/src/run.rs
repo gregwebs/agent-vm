@@ -167,7 +167,8 @@ fn translate_create_error(error: anyhow::Error) -> anyhow::Error {
                     .to_owned()
             }
             microsandbox::HeaderCredentialError::ResolveFailed { .. } => "a configured credential \
-                 could not be read at spawn time - the keychain may have been locked, or its item \
+                 could not be read at spawn time - the keychain may have been locked, another \
+                 agent-vm process may have held the secret inventory lock, or its item \
                  changed, between the pre-boot check and the spawn. Re-run the launch; if it \
                  repeats, check `agent-vm secret ls`"
                 .to_owned(),
