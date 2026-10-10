@@ -117,9 +117,11 @@ CARGO_TARGET_DIR=target/verus cargo verus verify -p agent-vm
 cargo's fingerprint, so sharing one `target/` with ordinary builds makes every switch
 a full rebuild. Expect a few minutes the first time and a few seconds thereafter.
 
-The `rust-dev` example custom image (`examples/layers/rust-dev`) pre-installs this
-same pinned release for an in-VM agent on `linux/amd64`; see
-[`examples/layers/README.md`](examples/layers/README.md#rust-development).
+The `rust-dev` example custom image in agent-vm-images pre-installs this same pinned
+release for an in-VM agent on `linux/amd64`; see its
+[README](https://github.com/gregwebs/agent-vm-images/blob/main/examples/layers/README.md#rust-development).
+Its Rust/Verus pins mirror `rust-toolchain.toml`/`verus.yml` and are updated in
+agent-vm-images after a bump here.
 
 `bash script/test/verus-verification.sh` runs exactly what CI runs: the verification
 plus the assertion that it actually verified something, then a pair of throwaway
@@ -349,15 +351,16 @@ positive explicit-source control.
 | `script/test/e2e.sh` | **no** | native installed registry/archive joins; custom/all additionally require Apple Silicon and Docker |
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
 | `script/test/build-workflow.sh` | yes (macOS) | fake-plutil bundle seam, no VM/image sources |
-| `script/test/ci-contracts.sh` | yes | runtime provenance, shell guards, offline pin/negative controls, Chrome static and e2e dispatch contracts |
+| `script/test/ci-contracts.sh` | yes | runtime provenance, shell guards, offline pin/negative controls, Chrome launcher-path agreement and e2e dispatch contracts |
 | `script/test/verus-verification.sh` | yes | machine-checked boundary contracts |
 | Image source/build/installer/runtime/egress audits | independent image repo CI | migrated; equivalence not verified by launcher CI |
 
 Image versions/installers/locks belong to the independent
 [image owner](https://github.com/gregwebs/agent-vm-images), not this Cargo workspace.
 The [boot-image ownership decision](docs/adr/0035-consume-user-owned-boot-images.md)
-separates that maintenance from runtime selection. Chrome's static example gate
-remains here; PR-time Chrome Docker runtime coverage is reduced. Container audits
+separates that maintenance from runtime selection. Chrome example content checks moved
+with the example to agent-vm-images; only launcher path agreement remains here.
+PR-time Chrome Docker runtime coverage is reduced. Container audits
 cannot substitute for native installed launcher/MSB registry/archive boot evidence.
 
 ## CI action pins

@@ -13,9 +13,10 @@ env:
   # cold cache could not download it at all; tagged releases are retained
   # (the release list reaches back six months). A Verus bump is a deliberate
   # change: move the release, this digest, the `vstd` pin in
-  # crates/agent-vm/Cargo.toml, the copy in CONTRIBUTING.md and the
-  # `examples/layers/rust-dev` pin together. `script/check-rust-toolchain.sh`
-  # enforces the last of those against this file.
+  # crates/agent-vm/Cargo.toml and the copy in CONTRIBUTING.md together. After
+  # this bump lands, update the mirrored `ARG`s in
+  # agent-vm-images `examples/layers/rust-dev/Dockerfile` (bump order and the
+  # unchecked-equality policy: agent-vm-images docs/image-source-ownership.md).
   VERUS_RELEASE: "0.2026.09.20.aef82ed"
   # sha256 of verus-0.2026.09.20.aef82ed-x86-linux.zip (485678212 bytes).
   VERUS_SHA256: "7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33"
