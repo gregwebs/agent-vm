@@ -52,77 +52,40 @@ pub(crate) struct Args {
     )]
     pub(crate) auto_publish: bool,
 
-    /// Allow guest egress to one IP or CIDR (repeatable).
+    /// Allow one IP/CIDR, optionally narrowed by tcp:// or udp:// and :PORT (repeatable).
     ///
-    /// Examples: `--allow-egress 10.100.1.75` (single host),
-    /// `--allow-egress 10.100.1.0/24` (CIDR),
-    /// `--allow-egress fd00::1/128` (IPv6).
-    ///
-    /// The default policy (`NetworkPolicy::from_profiles([Public])`)
-    /// only allows DNS and the `Public` destination group, so RFC1918
-    /// (10/8, 172.16/12, 192.168/16, 100.64/10), loopback, link-
-    /// local, and metadata addresses are all denied with
-    /// ECONNREFUSED. Use this flag to reach a specific dev box on
-    /// the same LAN as the host. Use `--allow-lan` instead if you
-    /// want to open the entire Private group at once.
+    /// Address-wide, not hostname-isolated. Hostnames are not supported yet.
+    /// Use brackets for a port on an IPv6 address or CIDR. No implicit port 443.
     #[arg(
         long = "allow-egress",
-        value_name = "IP|CIDR",
+        value_name = "[tcp://|udp://]IP|CIDR[:PORT]",
         help_heading = "Network egress"
     )]
     pub(crate) allow_egress: Vec<String>,
 
-    /// Allow guest egress to the whole private LAN.
-    ///
-    /// Switches the egress policy from `from_profiles([Public])` to
-    /// `from_profiles([Public, Private])` — adds the entire
-    /// `DestinationGroup::Private` (10/8, 172.16/12, 192.168/16,
-    /// 100.64/10, fc00::/7) to the allow list. Coarser than
-    /// `--allow-egress <CIDR>`; useful for "trust everything on my
-    /// LAN". Loopback, link-local, and metadata are still denied.
-    ///
-    /// Security note: a compromised in-guest process gets full
-    /// access to every device on your LAN with this flag. Prefer
-    /// `--allow-egress <CIDR>` for production-ish uses.
-    #[arg(
-        long = "allow-lan",
-        default_value_t = false,
-        help_heading = "Network egress"
-    )]
-    pub(crate) allow_lan: bool,
+    /// Allow public internet egress and DNS. Guest egress is denied by default.
+    #[arg(long = "allow-internet-egress", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_name = "BOOL", value_parser = clap::value_parser!(bool), help_heading = "Network egress")]
+    pub(crate) allow_internet_egress: Option<bool>,
 
-    /// Allow the guest to reach the host's 127.0.0.1 services.
+    /// Allow Private RFC1918, 100.64/10 and fc00::/7. Does not itself grant internet or DNS.
     ///
-    /// The smoltcp stack rewrites the per-sandbox gateway IP
-    /// (resolves as `host.microsandbox.internal` inside the guest)
-    /// to host's loopback, so e.g. a dev server bound to
-    /// `127.0.0.1:8080` on the host becomes reachable from the guest
-    /// at `host.microsandbox.internal:8080`. Adds the
-    /// `DestinationGroup::Host` (the gateway IP only) to the allow
-    /// list; loopback, link-local, metadata, and the wider LAN
-    /// remain denied.
+    /// Risk: a compromised guest gets access to every device on your LAN.
+    #[arg(long = "allow-lan", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_name = "BOOL", value_parser = clap::value_parser!(bool), help_heading = "Network egress")]
+    pub(crate) allow_lan: Option<bool>,
+
+    /// Allow host loopback services through host.microsandbox.internal, including the host DNS resolver. Does not itself grant internet.
     ///
-    /// Security note: anything bound to the host's loopback —
-    /// including admin UIs, dev DBs, the Docker socket if it's
-    /// listening on a TCP port — becomes reachable from a possibly-
-    /// compromised in-guest process. Use only when you actually need
-    /// it.
-    #[arg(
-        long = "allow-host",
-        default_value_t = false,
-        help_heading = "Network egress"
-    )]
-    pub(crate) allow_host: bool,
+    /// Risk: host loopback services, including admin UIs, dev databases and the Docker socket, become reachable.
+    #[arg(long = "allow-host", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_name = "BOOL", value_parser = clap::value_parser!(bool), help_heading = "Network egress")]
+    pub(crate) allow_host: Option<bool>,
 }
 
 /// Validated networking intent for one sandbox launch.
 #[derive(Debug)]
 pub(crate) struct Plan {
     publish_ports: Vec<PublishPort>,
-    egress_policy: Option<microsandbox::NetworkPolicy>,
+    egress: crate::egress_policy::EgressAuthority,
     auto_publish: bool,
-    allow_lan: bool,
-    allow_host: bool,
     proxy_notice: Option<ProxyNotice>,
 }
 
@@ -243,18 +206,19 @@ impl Plan {
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
         let publish_ports = parse_publish_args(&args.publish).context("parsing --publish")?;
-        let allow_egress_cidrs =
-            parse_allow_egress(&args.allow_egress).context("parsing --allow-egress")?;
-        let egress_policy =
-            build_egress_policy(args.allow_lan, args.allow_host, &allow_egress_cidrs);
+        let egress =
+            crate::egress_policy::EgressAuthority::from_cli(crate::egress_policy::CliEgress {
+                internet: args.allow_internet_egress,
+                lan: args.allow_lan,
+                host: args.allow_host,
+                allowances: &args.allow_egress,
+            })?;
         let proxy_notice = active_guest_proxy_var_from(lookup)
             .map(|(variable, value)| ProxyNotice { variable, value });
         Ok(Self {
             publish_ports,
-            egress_policy,
+            egress,
             auto_publish: args.auto_publish,
-            allow_lan: args.allow_lan,
-            allow_host: args.allow_host,
             proxy_notice,
         })
     }
@@ -274,25 +238,7 @@ impl Plan {
                 port.guest_port,
             )?;
         }
-        if let Some(policy) = &self.egress_policy {
-            for rule in &policy.rules {
-                if let microsandbox_network::policy::Destination::Cidr(cidr) = rule.destination {
-                    writeln!(output, "==> Egress policy: allowing {cidr}")?;
-                }
-            }
-        }
-        if self.allow_lan {
-            writeln!(
-                output,
-                "==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable)"
-            )?;
-        }
-        if self.allow_host {
-            writeln!(
-                output,
-                "==> Egress policy: --allow-host enabled (host.microsandbox.internal → host 127.0.0.1 reachable)"
-            )?;
-        }
+        self.egress.write_notices(output)?;
         if let Some(proxy) = &self.proxy_notice {
             writeln!(
                 output,
@@ -304,17 +250,12 @@ impl Plan {
     }
 
     pub(crate) fn apply_to(&self, builder: SandboxBuilder) -> SandboxBuilder {
-        if self.egress_policy.is_none() && self.publish_ports.is_empty() && !self.auto_publish {
-            return builder;
-        }
-        let policy = self.egress_policy.clone();
+        let policy = self.egress.policy();
         let publish_ports = self.publish_ports.clone();
         let auto_publish = self.auto_publish;
         let enable_tls = !publish_ports.is_empty();
         builder.network(move |mut network| {
-            if let Some(policy) = policy {
-                network = network.policy(policy);
-            }
+            network = network.policy(policy);
             // TlsBuilder defaults to enabled, so only opt in for explicit ports.
             if enable_tls {
                 network = network.tls(|tls| tls);
@@ -540,75 +481,6 @@ fn parse_port(entry: &str, field: &str, s: &str) -> Result<u16> {
         .with_context(|| format!("--publish {entry:?}: {field} {s:?} is not a u16"))
 }
 
-/// Parse `--allow-egress` entries. Each entry is an IP literal or
-/// a CIDR (e.g. `10.100.1.75` or `10.100.1.0/24`). A bare IP is
-/// expanded to a /32 (v4) or /128 (v6) CIDR — that matches the
-/// shape the policy builder's `Destination::Cidr` expects.
-fn parse_allow_egress(raw: &[String]) -> Result<Vec<ipnetwork::IpNetwork>> {
-    let mut out = Vec::with_capacity(raw.len());
-    for entry in raw {
-        // Try CIDR first (foo/N); fall back to bare IP.
-        let cidr = if entry.contains('/') {
-            entry
-                .parse::<ipnetwork::IpNetwork>()
-                .with_context(|| format!("--allow-egress {entry:?}: not a valid CIDR"))?
-        } else {
-            let ip: std::net::IpAddr = entry
-                .parse()
-                .with_context(|| format!("--allow-egress {entry:?}: not an IP address or CIDR"))?;
-            // /32 for v4, /128 for v6 — single-host rule.
-            ipnetwork::IpNetwork::from(ip)
-        };
-        out.push(cidr);
-    }
-    Ok(out)
-}
-
-/// Egress policy for the requested overrides, or `None` when none were
-/// requested — leaves the SDK default `NetworkPolicy::from_profiles([Public])`
-/// untouched rather than installing an equivalent-but-distinct policy, so a
-/// plain launch's egress behavior can never silently drift from the SDK
-/// default as that default evolves.
-///
-/// `--allow-lan` adds `NetworkProfile::Private`, `--allow-host` adds
-/// `NetworkProfile::Host`, and each `--allow-egress` CIDR becomes a
-/// `Rule::allow_egress(Destination::Cidr(..))` prepended ahead of the
-/// profile-derived rules. `Public` is always retained.
-fn build_egress_policy(
-    allow_lan: bool,
-    allow_host: bool,
-    allow_egress_cidrs: &[ipnetwork::IpNetwork],
-) -> Option<microsandbox::NetworkPolicy> {
-    if !allow_lan && !allow_host && allow_egress_cidrs.is_empty() {
-        return None;
-    }
-    use microsandbox::NetworkProfile;
-    use microsandbox_network::policy::{Destination, Rule};
-
-    let mut profiles = vec![NetworkProfile::Public];
-    if allow_lan {
-        profiles.push(NetworkProfile::Private);
-    }
-    if allow_host {
-        profiles.push(NetworkProfile::Host);
-    }
-    let mut policy = microsandbox::NetworkPolicy::from_profiles(profiles);
-
-    // Prepend the explicit CIDR allows ahead of the profile-derived group
-    // rules. NOTE: with every rule here an `allow` under the policy's
-    // `default_egress == Deny`, allow-list ORDER is functionally inert today
-    // (the first matching allow wins, and every candidate rule allows) — this
-    // is kept only so a future `deny` rule inserted here would take
-    // precedence over the group rules, not because correctness needs it now.
-    let mut cidr_rules: Vec<Rule> = allow_egress_cidrs
-        .iter()
-        .map(|net| Rule::allow_egress(Destination::Cidr(*net)))
-        .collect();
-    cidr_rules.append(&mut policy.rules);
-    policy.rules = cidr_rules;
-    Some(policy)
-}
-
 /// Pure proxy lookup, taking a function instead of reading the real process
 /// environment so tests don't need unsafe
 /// `std::env::set_var`/`remove_var` mutation under `cargo test`'s parallel
@@ -648,8 +520,9 @@ mod tests {
             publish: Vec::new(),
             auto_publish: false,
             allow_egress: Vec::new(),
-            allow_lan: false,
-            allow_host: false,
+            allow_internet_egress: None,
+            allow_lan: None,
+            allow_host: None,
         }
     }
 
@@ -734,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_retains_allow_egress_parse_context() {
+    fn plan_reports_the_allow_egress_error_without_repeating_the_flag() {
         let error = Plan::from_args_with_proxy_lookup(
             Args {
                 allow_egress: vec!["not-an-ip".into()],
@@ -743,11 +616,20 @@ mod tests {
             |_| None,
         )
         .expect_err("invalid CIDR is rejected");
-        assert!(format!("{error:#}").starts_with("parsing --allow-egress:"));
+        // The `AllowanceError` display already names `--allow-egress #1`, so a
+        // `parsing --allow-egress` context would repeat the flag.
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "--allow-egress #1: {}",
+                crate::egress_policy::AllowanceError::Hostname
+            )
+        );
+        assert!(!format!("{error:#}").contains("not-an-ip"));
     }
 
     #[tokio::test]
-    async fn default_plan_leaves_builder_network_config_unchanged() {
+    async fn default_plan_denies_all_egress_and_preserves_non_policy_network_config() {
         let baseline = test_builder("network-default")
             .build()
             .await
@@ -757,10 +639,37 @@ mod tests {
             .build()
             .await
             .expect("applied config");
+        let mut applied = serde_json::to_value(applied.spec.network).unwrap();
+        // Materialize dependency defaults independently of the builder closure.
+        // Normalize only the expected wire representation: normalizing applied
+        // JSON could hide an added unknown key or another closure mutation.
+        let dense: microsandbox_network::config::NetworkConfig =
+            serde_json::from_value(serde_json::to_value(baseline.spec.network).unwrap()).unwrap();
+        assert!(dense.strict);
+        assert!(dense.dns.rebind_protection);
+        assert!(dense.dns.nameservers.is_empty());
+        assert_eq!(dense.dns.query_timeout_ms, 5000);
+        assert!(!dense.tls.enabled);
+        assert!(dense.secrets.secrets.is_empty());
+        assert!(dense.secrets.header_credentials.is_empty());
+        assert_eq!(dense.tls.intercepted_ports, [443]);
+        assert!(dense.max_tcp_connections.is_none());
+        assert!(dense.max_udp_connections.is_none());
+        assert!(dense.rate_limiter.is_none());
+        let wire: microsandbox::sandbox::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(dense).unwrap()).unwrap();
+        let mut baseline = serde_json::to_value(wire).unwrap();
+        assert_eq!(baseline["secrets"]["secrets"], serde_json::json!([]));
+        assert_eq!(baseline["intercept"]["rules"], serde_json::json!([]));
+        assert_eq!(baseline["intercept"]["hook"], serde_json::Value::Null);
+        assert_eq!(baseline["intercept"]["max_request_bytes"], 65536);
         assert_eq!(
-            serde_json::to_value(applied.spec.network).expect("serializable config"),
-            serde_json::to_value(baseline.spec.network).expect("serializable config")
+            applied["policy"],
+            serde_json::json!({"default_egress":"deny","default_ingress":"allow","rules":[]})
         );
+        applied.as_object_mut().unwrap().remove("policy");
+        baseline.as_object_mut().unwrap().remove("policy");
+        assert_eq!(applied, baseline);
     }
 
     #[tokio::test]
@@ -786,12 +695,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_egress_overrides_preserve_policy_defaults_dns_groups_and_cidr_order() {
+    async fn group_flags_and_allowances_emit_the_documented_rule_list() {
         let mut input = args();
         input.publish.push("8080:3000".into());
         input.allow_egress = vec!["10.0.0.5".into(), "fd00::1".into()];
-        input.allow_lan = true;
-        input.allow_host = true;
+        input.allow_lan = Some(true);
+        input.allow_host = Some(true);
         let network = configured_network(input, "network-policy").await;
         let policy = &network["policy"];
         assert_eq!(policy["default_egress"], "deny");
@@ -804,17 +713,32 @@ mod tests {
             policy["rules"][1]["destination"]["cidr"],
             serde_json::json!("fd00::1/128")
         );
-        let groups = policy_groups(&network);
-        assert_eq!(groups, ["public", "private", "host"]);
+        assert_eq!(policy_groups(&network), ["private", "host"]);
+        assert_eq!(policy["rules"].as_array().unwrap().len(), 4);
         assert_eq!(
             policy["rules"][2],
-            serde_json::json!({
-                "direction": "egress",
-                "destination": {"group": "host"},
-                "protocols": ["udp", "tcp"],
-                "ports": [{"start": 53, "end": 53}],
-                "action": "allow",
-            })
+            serde_json::json!({"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"})
+        );
+        assert_eq!(
+            policy["rules"][3],
+            serde_json::json!({"direction":"egress","destination":{"group":"host"},"protocols":[],"ports":[],"action":"allow"})
+        );
+        let internet = configured_network(
+            Args {
+                allow_internet_egress: Some(true),
+                allow_lan: Some(true),
+                allow_host: Some(true),
+                allow_egress: vec!["10.0.0.5".into(), "fd00::1".into()],
+                ..args()
+            },
+            "network-policy-internet",
+        )
+        .await;
+        assert_eq!(policy_groups(&internet), ["public", "private", "host"]);
+        assert_eq!(internet["policy"]["rules"].as_array().unwrap().len(), 6);
+        assert_eq!(
+            internet["policy"]["rules"][2],
+            serde_json::json!({"direction":"egress","destination":{"group":"host"},"protocols":["udp","tcp"],"ports":[{"start":53,"end":53}],"action":"allow"})
         );
         assert_eq!(network["tls"]["enabled"], true);
         assert_eq!(network["ports"][0]["host_port"], 8080);
@@ -832,6 +756,7 @@ mod tests {
         )
         .await;
         let rules = network["policy"]["rules"].as_array().expect("policy rules");
+        assert_eq!(rules.len(), 2);
         assert_eq!(
             rules[0]["destination"]["cidr"],
             serde_json::json!("10.20.30.0/24")
@@ -852,25 +777,34 @@ mod tests {
                     allow_egress: vec!["10.0.0.5".into()],
                     ..args()
                 },
-                vec!["public"],
+                vec![],
             ),
             (
                 "lan",
                 Args {
                     publish: vec!["8080:3000".into()],
-                    allow_lan: true,
+                    allow_lan: Some(true),
                     ..args()
                 },
-                vec!["public", "private"],
+                vec!["private"],
             ),
             (
                 "host",
                 Args {
                     publish: vec!["8080:3000".into()],
-                    allow_host: true,
+                    allow_host: Some(true),
                     ..args()
                 },
-                vec!["public", "host"],
+                vec!["host"],
+            ),
+            (
+                "internet",
+                Args {
+                    publish: vec!["8080:3000".into()],
+                    allow_internet_egress: Some(true),
+                    ..args()
+                },
+                vec!["public"],
             ),
         ] {
             let network = configured_network(input, &format!("network-{name}")).await;
@@ -890,6 +824,7 @@ mod tests {
     #[tokio::test]
     async fn only_explicit_publish_enables_tls_and_auto_publish_is_configured() {
         for (name, input) in [
+            ("default", args()),
             (
                 "egress",
                 Args {
@@ -928,8 +863,8 @@ mod tests {
         let mut input = args();
         input.publish.push("8080:3000".into());
         input.allow_egress.push("10.0.0.5".into());
-        input.allow_lan = true;
-        input.allow_host = true;
+        input.allow_lan = Some(true);
+        input.allow_host = Some(true);
         let output = notice_output(input, |variable| match variable {
             "https_proxy" => Some(" http://alice:hunter2@proxy.example:3128/path@kept ".into()),
             _ => None,
@@ -938,8 +873,9 @@ mod tests {
             output,
             "==> Publishing host 127.0.0.1:8080/tcp → guest :3000\n\
 ==> Egress policy: allowing 10.0.0.5/32\n\
-==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable)\n\
-==> Egress policy: --allow-host enabled (host.microsandbox.internal → host 127.0.0.1 reachable)\n\
+==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable; does not itself enable DNS)\n\
+==> Egress policy: --allow-host enabled (host.microsandbox.internal → host 127.0.0.1 reachable; includes the host DNS resolver)\n\
+==> Egress DNS: arbitrary-name DNS queries authorized via --allow-host (resolver/rebind/platform constraints still apply)\n\
 ==> Guest egress proxy: https_proxy=http://proxy.example:3128/path@kept (used when it parses as an http:// proxy; NO_PROXY honored, otherwise egress goes direct)\n"
         );
         assert!(!output.contains("alice"));
@@ -1027,7 +963,7 @@ mod tests {
                     .find_map(|(name, value)| (*name == variable).then(|| (*value).into()))
             });
             if case.selected.is_empty() {
-                assert!(output.is_empty(), "{}", case.name);
+                assert!(!output.contains("Guest egress proxy"), "{}", case.name);
             } else {
                 assert!(output.contains(case.selected), "{}: {output}", case.name);
                 assert!(
@@ -1054,7 +990,9 @@ mod tests {
         });
         assert_eq!(
             output,
-            "==> Guest egress proxy: http_proxy=http://lower-http.example:3128 (used when it parses as an http:// proxy; NO_PROXY honored, otherwise egress goes direct)\n"
+            "==> Egress policy: all guest egress denied (opt in with --allow-internet-egress, --allow-egress, --allow-lan or --allow-host)\n\
+==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP allowances)\n\
+==> Guest egress proxy: http_proxy=http://lower-http.example:3128 (used when it parses as an http:// proxy; NO_PROXY honored, otherwise egress goes direct)\n"
         );
         for ignored in [
             "upper-http.example",
@@ -1207,5 +1145,43 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[tokio::test]
+    async fn plan_parses_internet_flag_and_false_overrides() {
+        let baseline = configured_network(args(), "network-flags").await;
+        let disabled = configured_network(
+            Args {
+                allow_internet_egress: Some(false),
+                allow_lan: Some(false),
+                allow_host: Some(false),
+                ..args()
+            },
+            "network-flags",
+        )
+        .await;
+        assert_eq!(baseline, disabled);
+    }
+
+    /// The sandbox name and derived socket paths the boot-free harness contract
+    /// (`script/test/egress-default-deny-contract.sh`) pins. The Python cleanup
+    /// code recomputes these paths; this test keeps the Runtime's derivation
+    /// authoritative so the mirror cannot silently drift.
+    #[test]
+    fn harness_owned_socket_paths_match_runtime_derivation() {
+        use sha2::{Digest, Sha256};
+        let name = "agent-vm-0123456789ab-4242";
+        let run_dir = std::path::Path::new("/tmp/av302-msb-home/run");
+        let digest = Sha256::digest(name.as_bytes());
+        let hex = |bytes: usize| -> String {
+            digest[..bytes].iter().map(|b| format!("{b:02x}")).collect()
+        };
+        let canonical = run_dir.join("sandboxes").join(hex(12));
+        let legacy = run_dir.join("agent").join(format!("{}.sock", hex(16)));
+        let paths = microsandbox_runtime::ipc::sandbox_socket_paths(run_dir, name);
+        assert_eq!(paths.canonical_dir, canonical);
+        assert_eq!(paths.agent, canonical.join("agent.sock"));
+        assert_eq!(paths.control, canonical.join("control.sock"));
+        assert_eq!(paths.legacy_agent, legacy);
+        assert_eq!(paths.legacy_control, legacy.with_extension("control.sock"));
     }
 }

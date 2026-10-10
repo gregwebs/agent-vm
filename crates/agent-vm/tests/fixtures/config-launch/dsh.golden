@@ -108,8 +108,48 @@
   ],
   "network": {
     "enabled": true,
+    "interface": {},
     "ports": [],
+    "policy": {
+      "default_egress": "deny",
+      "default_ingress": "allow",
+      "rules": []
+    },
+    "dns": {
+      "rebind_protection": true,
+      "nameservers": [],
+      "query_timeout_ms": 5000
+    },
+    "tls": {
+      "enabled": false,
+      "intercepted_ports": [
+        443
+      ],
+      "bypass": [],
+      "verify_upstream": true,
+      "block_quic_on_intercept": true,
+      "upstream_ca_cert": [],
+      "scoped_upstream_ca_cert": [],
+      "scoped_verify_upstream": [],
+      "intercept_ca": {
+        "cert_path": null,
+        "key_path": null
+      },
+      "cache": {
+        "capacity": 1000,
+        "validity_hours": 24
+      }
+    },
     "strict": true,
+    "secrets": {
+      "secrets": [],
+      "violation_action": "block-and-log"
+    },
+    "intercept": {
+      "rules": [],
+      "hook": null,
+      "max_request_bytes": 65536
+    },
     "max_connections": null,
     "trust_host_cas": false
   },

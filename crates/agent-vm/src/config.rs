@@ -899,6 +899,7 @@ fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, TierConten
     let text = std::str::from_utf8(&bytes).map_err(|_| utf8_error(path))?;
     let raw: RawConfig =
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
+    reject_network_table(raw.network.as_ref(), path, kind)?;
     let image = validate_image(raw.image.as_deref(), path)?;
     let tools = validate_tools(raw.tools, path, kind)?;
 
@@ -910,6 +911,38 @@ fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, TierConten
             },
         },
         TierContents { tools, image },
+    ))
+}
+
+const NETWORK_SETTINGS: [&str; 4] = [
+    "allow_internet_egress",
+    "allow_lan",
+    "allow_host",
+    "allow_egress",
+];
+
+fn reject_network_table(table: Option<&toml::Table>, file: &Path, kind: TierKind) -> Result<()> {
+    let Some(table) = table else {
+        return Ok(());
+    };
+    let settings: Vec<_> = NETWORK_SETTINGS
+        .iter()
+        .filter(|key| table.contains_key(**key))
+        .map(|key| format!("network.{key}"))
+        .collect();
+    let setting = if settings.is_empty() {
+        "[network]".to_owned()
+    } else {
+        settings.join(", ")
+    };
+    let reason = match kind {
+        TierKind::User => "[network] in the user config is not supported yet",
+        TierKind::Project => "network access cannot be granted by the project config",
+        TierKind::BuiltIn => "network access cannot be granted by the built-in config",
+    };
+    Err(anyhow!(
+        "config: {}: {setting}: {reason}; pass --allow-* launch flags",
+        quoted_path(file)
     ))
 }
 
@@ -934,6 +967,7 @@ fn default_tools() -> Result<Vec<Tool>> {
     let path = Path::new("default-tools.toml");
     let raw: RawConfig = toml::from_str(DEFAULT_TOOLS_TOML)
         .map_err(|error| deserialize_error(path, DEFAULT_TOOLS_TOML, &error))?;
+    reject_network_table(raw.network.as_ref(), path, TierKind::BuiltIn)?;
     validate_tools(raw.tools, path, TierKind::BuiltIn)
 }
 
@@ -1213,6 +1247,9 @@ fn launch_closure(tools: &[Tool], index: &HashMap<String, usize>, start: usize) 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    // Recognize the table only to refuse it with a value-safe tier diagnostic.
+    #[serde(default)]
+    network: Option<toml::Table>,
     /// The session's **boot image**, an OCI reference (D4). Optional: an
     /// image-only file declares no tools and keeps the shipped defaults.
     #[serde(default)]
@@ -1906,6 +1943,61 @@ mod tests {
     use std::collections::BTreeSet;
     use std::collections::HashSet;
     use std::fs;
+
+    #[test]
+    fn network_table_is_refused_in_the_project_tier_naming_setting_and_tier() {
+        let f = Fixture::new();
+        f.project("[network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/8\"]");
+        let message = f.load().unwrap_err().to_string();
+        for expected in [
+            quoted_path(&f.project),
+            "network.allow_lan".into(),
+            "network.allow_egress".into(),
+            "project config".into(),
+        ] {
+            assert!(message.contains(&expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn network_table_is_not_yet_supported_in_the_user_tier() {
+        let f = Fixture::new();
+        f.user("[network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/8\"]");
+        let message = f.load().unwrap_err().to_string();
+        for expected in [
+            quoted_path(&f.user),
+            "network.allow_lan".into(),
+            "network.allow_egress".into(),
+            "user config is not supported yet".into(),
+        ] {
+            assert!(message.contains(&expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn network_refusal_never_echoes_values_or_unknown_keys() {
+        let f = Fixture::new();
+        f.user("[network]\nsk_live_abc = \"hunter2\"\nother = \"10.9.8.7\"");
+        let message = f.load().unwrap_err().to_string();
+        assert!(message.contains("[network]"));
+        for secret in ["sk_live_abc", "hunter2", "10.9.8.7", "other"] {
+            assert!(!message.contains(secret));
+        }
+    }
+
+    #[test]
+    fn empty_network_table_is_still_refused() {
+        let f = Fixture::new();
+        f.project("[network]");
+        assert!(f.load().unwrap_err().to_string().contains("[network]"));
+    }
+
+    #[test]
+    fn shipped_defaults_declare_no_network_table() {
+        let raw: RawConfig = toml::from_str(DEFAULT_TOOLS_TOML).unwrap();
+        assert!(raw.network.is_none());
+        assert!(default_tools().is_ok());
+    }
 
     // -- fixture helpers ---------------------------------------------------
 

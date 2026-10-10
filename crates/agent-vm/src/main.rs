@@ -11,6 +11,7 @@ mod credential_yaml;
 mod debug_config;
 mod defaults;
 mod doctor;
+mod egress_policy;
 mod env_flag;
 mod github_graphql;
 mod guest_home;

@@ -29,9 +29,17 @@ Mounts & ports:
           Auto-forward every guest listener onto the host (Lima-style)
 
 Network egress:
-      --allow-egress <IP|CIDR>  Allow guest egress to one IP or CIDR (repeatable)
-      --allow-lan               Allow guest egress to the whole private LAN
-      --allow-host              Allow the guest to reach the host's 127.0.0.1 services
+      --allow-egress <[tcp://|udp://]IP|CIDR[:PORT]>
+          Allow one IP/CIDR, optionally narrowed by tcp:// or udp:// and :PORT (repeatable)
+      --allow-internet-egress[=<BOOL>]
+          Allow public internet egress and DNS. Guest egress is denied by default [possible values:
+          true, false]
+      --allow-lan[=<BOOL>]
+          Allow Private RFC1918, 100.64/10 and fc00::/7. Does not itself grant internet or DNS
+          [possible values: true, false]
+      --allow-host[=<BOOL>]
+          Allow host loopback services through host.microsandbox.internal, including the host DNS
+          resolver. Does not itself grant internet [possible values: true, false]
 
 Image:
       --image <REF>   Boot this image instead of the configured one [env: AGENT_VM_IMAGE_TAG]

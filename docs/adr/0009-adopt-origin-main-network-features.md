@@ -9,6 +9,9 @@ vendored line is no longer `integration/v0.6.15-agent-vm` integrating
 `origin/main`, but the fork's `main` tip with the fork features re-applied onto
 upstream v0.7.4. The wiring decisions for features 1-4 remain applicable.
 
+Superseded in part by [ADR-0036](0036-default-deny-launch-egress.md):
+launch egress is default-deny and group grants no longer imply Public.
+
 ## Context
 
 ADR-0006 adopted the clean Microsandbox v0.6.15 baseline and fail-closed

@@ -358,7 +358,7 @@ mod tests {
 
     use microsandbox_network::{
         builder::NetworkBuilder,
-        policy::{NetworkPolicy, NetworkProfile},
+        policy::NetworkPolicy,
         secrets::config::{HostPattern, SecretSource, SecretViolationAction},
     };
 
@@ -1190,7 +1190,14 @@ mod tests {
             anthropic_token_file: Some(path("anthropic")),
             ..CredsState::default()
         };
-        let base_policy = NetworkPolicy::from_profiles([NetworkProfile::Private]);
+        let base_policy: NetworkPolicy = serde_json::from_value(serde_json::json!({
+            "default_egress": "deny", "default_ingress": "allow", "rules": [
+                {"direction":"egress","destination":{"cidr":"10.0.0.0/24"},"protocols":["tcp"],"ports":[{"start":22,"end":22}],"action":"allow"},
+                {"direction":"egress","destination":{"cidr":"fd00::/64"},"protocols":["udp"],"ports":[{"start":123,"end":123}],"action":"allow"},
+                {"direction":"egress","destination":{"cidr":"192.0.2.7/32"},"protocols":[],"ports":[],"action":"allow"},
+                {"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"}
+            ]
+        })).unwrap();
         let base = NetworkBuilder::new()
             .policy(base_policy.clone())
             .port(8080, 3000)
@@ -1207,9 +1214,10 @@ mod tests {
         assert_eq!(config.ports.len(), 1);
         assert_eq!(config.ports[0].host_port, 8080);
         assert!(config.auto_publish.is_some());
-        assert_eq!(config.policy.default_egress, base_policy.default_egress);
-        assert_eq!(config.policy.default_ingress, base_policy.default_ingress);
-        assert_eq!(config.policy.rules.len(), base_policy.rules.len());
+        assert_eq!(
+            serde_json::to_value(&config.policy).unwrap(),
+            serde_json::to_value(&base_policy).unwrap()
+        );
         assert!(config.tls.enabled);
     }
 

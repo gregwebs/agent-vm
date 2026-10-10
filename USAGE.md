@@ -21,8 +21,10 @@ cargo build
 agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
 
 cd ~/your-project
-agent-vm claude           # a configured launch verb; see `agent-vm --help`
+agent-vm claude --allow-internet-egress
 ```
+
+See [Ports & egress](#ports--egress) for narrower grants and their risks.
 
 The npm package bundles a prebuilt `agent-vm` binary, `msb`, and
 libkrunfw. agent-vm finds them via `current_exe()`-relative paths, so a
@@ -450,6 +452,7 @@ Each launcher accepts:
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
 | `--allow-missing-credentials` | warn and launch when a requested YAML credential is missing or unreadable, instead of refusing — see [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection). Never covers a built-in provider's own missing host credential |
 | `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). A live bind that would expose a host Pi credential file is refused — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted). Capacity is host-specific. |
+| `--allow-internet-egress`, `--allow-lan`, `--allow-host`, `--allow-egress`, `--publish`, `--auto-publish` | see [Ports & egress](#ports--egress); egress is denied by default |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 
 ### Extra and forked mounts
@@ -715,6 +718,8 @@ override are deliberately **not** honored.
 
 ### Schema
 
+`[network]` is refused: project authority is never accepted; user authority is not supported yet (see [#302](https://github.com/gregwebs/agent-vm/issues/302)).
+
 ```toml
 # Top-level, optional: the boot image for every session (an OCI reference).
 image = "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
@@ -953,6 +958,8 @@ wins wholesale and does **not** inherit the shipped `env` — add
 the guest as signed out.
 
 ### Errors and recovery
+
+A `[network]` table is refused in either tier with the file, setting and tier named.
 
 A config parse/validation error fails any launch verb with *that* error — never
 clap's "unrecognized subcommand". Ordinary `agent-vm doctor` still exits
@@ -1287,8 +1294,9 @@ What to expect:
   host on that port, not only the credential's origin — that is the cost of a
   per-port interception decision, so prefer the default 443 unless the service
   really lives on another port.
-- **Egress policy is unchanged.** Authorizing an origin does not open egress to
-  it. If your policy denies the host, the request never reaches injection.
+- **Authorization does not grant egress.** Egress is denied by default; an
+  authorized origin also needs `--allow-internet-egress` (or a numeric allowance).
+  A denied destination never reaches injection.
 - **Rotation is launch-scoped.** A value rotated with `agent-vm secret set`
   while a sandbox runs is *not* picked up; the next launch uses the new value.
 - **Malformed authorization fails closed.** An unreadable, foreign-owned,
@@ -1454,25 +1462,93 @@ one.
 
 ## Ports & egress
 
-The default network policy (`public_only`) lets the guest reach
-the public internet plus DNS, and denies everything else
-(loopback, RFC1918 LAN, link-local, cloud-metadata, the host).
-Open holes per-launch with these flags — they compose:
+Tool-launch guest egress is **denied by default**, including DNS query authorization.
+Before **0.2.0**, the guest reached the public internet by default; agents that
+call provider APIs now need `--allow-internet-egress` until hostname allowances
+ship. Grants compose independently and apply only to this launch.
+The temporary guests booted by `setup` and `pull` still use the SDK public-internet
+and DNS default; this launch policy does not cover them. `setup` runs each
+configured tool's declared `command --version` from a project-selectable image.
+These guests have no project mounts or secrets.
 
 | flag | what it opens | guest-side address |
 |---|---|---|
-| `--publish HOST:GUEST[/proto]` | host port `HOST` → guest port `GUEST` (`tcp` default; `/udp` for UDP) | inbound to the guest |
-| `--auto-publish` | every `0.0.0.0:*` / `127.0.0.1:*` listener inside the guest is mirrored to the host loopback (Lima-style) | host: `127.0.0.1:<guest-port>` |
-| `--allow-egress IP\|CIDR` (repeatable) | one IP or one CIDR through the egress deny | dial directly by IP |
-| `--allow-lan` | the whole `DestinationGroup::Private` (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7) | dial any LAN IP |
-| `--allow-host` | the per-sandbox gateway IP, which the smoltcp stack rewrites to host `127.0.0.1` | `host.microsandbox.internal:<port>` (already in guest `/etc/hosts`) |
+| `--allow-internet-egress[=BOOL]` | public internet plus DNS queries | public addresses |
+| `--allow-lan[=BOOL]` | Private group: 10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7 | LAN IP |
+| `--allow-host[=BOOL]` | sandbox gateway, rewritten to host loopback; includes the host resolver | `host.microsandbox.internal:<port>` |
+| `--allow-egress SPEC` (repeatable) | one numeric IP/CIDR, optionally protocol/port-scoped | dial by IP |
+| `--publish HOST:GUEST[/proto]` | host port → guest port (`tcp` default; `/udp` for UDP); **never opens egress** | inbound to guest |
+| `--auto-publish` | mirrors guest wildcard/loopback listeners to host loopback | host `127.0.0.1:<guest-port>` |
 
-Loopback (guest's own `127.0.0.1`), link-local, and cloud metadata
-(`169.254.169.254`) stay denied even with `--allow-lan` — they're
-disjoint groups by design. `--allow-host` is the narrowest way to
-reach a dev server bound to host `127.0.0.1`; `--allow-lan` is the
-broadest. A compromised in-guest process gets full access to
-whatever you open, so prefer the narrowest flag that fits.
+Each Boolean flag without a value means true; `--allow-internet-egress=false`,
+`--allow-lan=false` and `--allow-host=false` grant nothing for that group.
+LAN and host never imply public internet access. Guest loopback, link-local
+and cloud metadata are not part of the LAN grant. Prefer the narrowest grant:
+every process in the guest receives the authority you open.
+
+### Numeric allowance grammar
+
+| form | example | scope |
+|---|---|---|
+| IP or CIDR | `192.0.2.7`, `10.0.0.0/8`, `2001:db8::/32` | any transport/port |
+| `tcp://` or `udp://` + IP/CIDR | `tcp://10.0.0.0/8`, `udp://2001:db8::/32` | selected transport, any port |
+| IPv4 + `:PORT` | `tcp://192.0.2.7:443` | selected port |
+| bracketed IP/CIDR + `:PORT` | `[2001:db8::7]:22`, `udp://[10.0.0.0/8]:53`, `[2001:db8::/32]:443` | selected port; brackets required for CIDR + port and IPv6 + port |
+| bracketed IP/CIDR without port | `[2001:db8::/32]` | any port |
+
+Schemes are case-insensitive; there is no implicit port 443.
+Ports are canonical decimal 1–65535 (no sign, whitespace or leading zero).
+Bare IPv6 is an address, never guessed as an address-plus-port. CIDR prefixes also accept signed/zero-padded lengths (`/+24`, `/024`) and
+IPv4 netmasks (`/255.255.255.0`), rendered as canonical prefix lengths. CIDRs are
+canonicalized to network boundaries; IPv4-mapped IPv6 is normalized to IPv4
+when its prefix permits that. Duplicate canonical grants keep their first
+occurrence. Hostnames are rejected as **not supported yet**. Numeric grants
+are address-wide, not hostname-isolated: any service sharing an allowed IP
+can be reached within the grant's transport/port scope.
+
+Numeric CIDRs match **any address** in the range, not just public or LAN
+addresses. A CIDR covering the sandbox gateway (IPv4 in `100.64.0.0/10`, IPv6
+in ULA `fd00::/8`), such as `100.64.0.0/10`, `fd00::/8`, `fc00::/7`,
+`0.0.0.0/0` or `::/0`, reaches host loopback services through the gateway.
+A CIDR covering link-local metadata (such as `169.254.0.0/16` or `0.0.0.0/0`)
+also grants access to those metadata endpoints, within its transport/port scope.
+
+### DNS and launch behavior
+
+| grants | DNS queries |
+|---|---|
+| none, numeric only, or LAN only | denied |
+| host (with or without LAN/numeric) | host resolver authorized |
+| internet (with any other grants) | queries authorized |
+
+Denied queries return NXDOMAIN promptly **when the runtime's DNS forwarder is
+available**. If host DNS configuration cannot be read and the forwarder cannot
+initialize, queries time out instead. Plain port-53 DNS to a numerically
+allowed resolver IP still returns NXDOMAIN in this release; this is an accepted limitation
+([microsandbox #75](https://github.com/gregwebs/microsandbox/issues/75)). Use DoH
+on an allowed IP or `--allow-internet-egress` instead.
+
+With `--allow-internet-egress`, private DNS answers still receive NXDOMAIN
+(rebind protection) unless `--allow-lan` or a local numeric allowance **without
+a port** covers the answer. `tcp://`/`udp://` without a port qualifies;
+port-scoped allowances do not. Query authorization does not remove resolver,
+rebind or platform-policy checks. `--allow-host` includes host-resolver queries,
+which can carry data to that resolver even without internet permission.
+
+Image seed hooks, project `.agent-vm.runtime.sh`, MCP servers and provider CLIs
+run under this same policy; network operations may fail offline. A non-zero
+**project runtime hook** aborts launch. Image seed hooks end in `; true`, so their
+failure is not propagated; this release does not change that handling.
+
+Host `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment settings carry only
+connections already allowed by policy. A denied destination is never dialed,
+directly or through the proxy. Loopback/link-local dial targets always go direct.
+On a TLS-intercepted port, a connection without a TLS ClientHello carrying SNI
+is dropped even when the destination is numerically allowed.
+
+Project `[network]` can never grant authority; user `[network]` is not supported
+yet. Both are refused with a file/setting/tier diagnostic. Persistent network
+authority is not supported yet; all current grants are CLI-only (see [#302](https://github.com/gregwebs/agent-vm/issues/302)).
 
 ## Troubleshooting
 

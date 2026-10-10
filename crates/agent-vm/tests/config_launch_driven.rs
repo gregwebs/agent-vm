@@ -703,6 +703,96 @@ fn normalized_config(harness: &Harness, out: &Output) -> serde_json::Value {
     serde_json::from_str(&harness.normalize_json(&state, &config)).unwrap()
 }
 
+/// The frozen sparse network an unconfigured builder carries — the pre-change
+/// `dsh.golden` shape, from `88ea07b`. This is the *input* to the independent
+/// dense materialization below, never a value read back from a launch.
+fn sparse_default_network() -> serde_json::Value {
+    serde_json::json!({
+        "enabled": true,
+        "ports": [],
+        "strict": true,
+        "max_connections": null,
+        "trust_host_cas": false
+    })
+}
+
+/// The launcher's default-deny egress policy (§3.1): every rule must be an
+/// explicit allow, so the unconfigured default is the empty list.
+fn default_deny_policy() -> serde_json::Value {
+    serde_json::json!({"default_egress": "deny", "default_ingress": "allow", "rules": []})
+}
+
+/// Independently materialize the engine's dense network for a sparse input:
+/// sparse -> engine `NetworkConfig` (dependency serde defaults) -> wire
+/// `NetworkSpec`, with the launcher's default-deny policy substituted in place.
+///
+/// This mirrors `network::tests::default_plan_denies_all_egress_and_preserves_\
+/// non_policy_network_config`'s oracle. It never calls `.network()`, the
+/// credential overlay, or reads actual launch output, so it cannot bless a
+/// non-policy mutation introduced by the builder closure.
+fn dense_default_network() -> serde_json::Value {
+    let dense: microsandbox_network::config::NetworkConfig =
+        serde_json::from_value(sparse_default_network()).expect("sparse default network decodes");
+    let wire: microsandbox::sandbox::NetworkSpec =
+        serde_json::from_value(serde_json::to_value(&dense).unwrap()).unwrap();
+    let mut value = serde_json::to_value(&wire).unwrap();
+    // Replace, never `Value::remove` — with `preserve_order` that swap-removes
+    // and relocates the last key.
+    value["policy"] = default_deny_policy();
+    value
+}
+
+/// Assert a launch that provisions nothing and requests no egress carries the
+/// engine's dense defaults with only the launcher's default-deny policy. Pins
+/// the empty authorization sets and disabled TLS from the engine's source
+/// values, not from observed output.
+fn assert_default_deny_zero_provision_network(network: &serde_json::Value, context: &str) {
+    assert_eq!(
+        network["policy"],
+        default_deny_policy(),
+        "{context}: policy"
+    );
+    assert_eq!(
+        *network,
+        dense_default_network(),
+        "{context}: non-policy network mutated"
+    );
+    assert_eq!(
+        network["tls"]["enabled"],
+        serde_json::json!(false),
+        "{context}"
+    );
+    assert_eq!(
+        network["tls"]["intercepted_ports"],
+        serde_json::json!([443]),
+        "{context}"
+    );
+    assert_eq!(
+        network["secrets"]["secrets"],
+        serde_json::json!([]),
+        "{context}"
+    );
+    assert!(
+        network["secrets"].get("header_credentials").is_none(),
+        "{context}: an empty header-credential set is wire-omitted"
+    );
+    assert_eq!(
+        network["intercept"]["rules"],
+        serde_json::json!([]),
+        "{context}"
+    );
+    assert_eq!(
+        network["intercept"]["hook"],
+        serde_json::Value::Null,
+        "{context}"
+    );
+    assert_eq!(
+        network["intercept"]["max_request_bytes"],
+        serde_json::json!(65536),
+        "{context}"
+    );
+}
+
 /// Assert the tool-dependent content the goldens pin *directly*, so a future
 /// widening of the normalizer cannot quietly stop pinning it. Every field here
 /// is decided by the launched tool (or is a constant of the launch contract),
@@ -747,27 +837,24 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         "CODEX_HOME must be emitted only for the tools that declare it ({tool})"
     );
 
-    // The credential secret set follows the verb's provisioning set. `dsh`
-    // provisions nothing, so the whole `secrets` object is absent for it; every
-    // other verb provisions at least one provider and must carry
-    // it. Assert the presence explicitly rather than defaulting the array for
-    // every verb (a structurally missing object would otherwise pass for an
-    // empty-expectation verb such as `copilot`).
+    // The credential secret set follows the verb's provisioning set. Every
+    // launch now installs the launcher's default-deny policy via
+    // `Plan::apply_to`, so `.network()` materializes the engine's dense
+    // `secrets` subdocument for **every** tool, `dsh` included. `dsh` declares
+    // no provider, so its resulting authorization set is an empty, **present**
+    // object (never a missing one). Require a real array: a structurally
+    // missing or malformed object must fail rather than default to empty.
     if matches!(tool, "dsh") {
-        assert!(
-            config["network"].get("secrets").is_none(),
-            "{tool} provisions nothing, so it must not carry a `secrets` object"
-        );
-    } else {
-        assert!(
-            config["network"]["secrets"]["secrets"].is_array(),
-            "{tool} provisions at least one provider and must carry a `secrets` object"
-        );
+        assert_default_deny_zero_provision_network(&config["network"], "dsh");
     }
+    assert!(
+        config["network"]["secrets"]["secrets"].is_array(),
+        "{tool} must carry a present `secrets.secrets` array"
+    );
     let secrets = config["network"]["secrets"]["secrets"]
         .as_array()
-        .cloned()
-        .unwrap_or_default();
+        .expect("secrets.secrets is an array")
+        .clone();
     let env_vars: Vec<&str> = secrets
         .iter()
         .map(|secret| secret["env_var"].as_str().unwrap())
@@ -825,26 +912,18 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
     // no-route launch is acceptable — the hook only fires on a matched route
     // (`InterceptConfig`'s docs), and the `--allowed-repo` push restriction
     // rides the GitHub-egress routes, which are unaffected.
-    // `dsh` has no proxied route, so the whole `intercept` object is
-    // absent for it; every other verb keeps it (copilot keeps the
-    // serde-default body).
-    // Assert the object's presence explicitly rather than defaulting for every
-    // verb, so a structurally missing object cannot pass.
-    if matches!(tool, "dsh") {
-        assert!(
-            config["network"].get("intercept").is_none(),
-            "{tool} has no proxied route, so it must not carry an `intercept` object"
-        );
-    } else {
-        assert!(
-            config["network"]["intercept"].is_object(),
-            "{tool} must carry the `intercept` object"
-        );
-    }
+    // `dsh` has no proxied route, so its intercept body is the serde default;
+    // because `.network()` now always runs, that **inactive** body is present
+    // rather than absent. Assert its presence explicitly, and require a real
+    // rules array rather than defaulting a missing field to empty.
+    assert!(
+        config["network"]["intercept"].is_object(),
+        "{tool} must carry the `intercept` object"
+    );
     let rules = config["network"]["intercept"]["rules"]
         .as_array()
-        .cloned()
-        .unwrap_or_default();
+        .expect("intercept.rules is an array")
+        .clone();
     let hook = &config["network"]["intercept"]["hook"];
     if rules.is_empty() {
         assert!(hook.is_null(), "hook present with no routes ({tool})");
@@ -886,11 +965,11 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
         actual_rules, expected_rules,
         "intercept rules changed for {tool}"
     );
-    if tool == "copilot" {
+    if matches!(tool, "dsh" | "copilot") {
         assert_eq!(
-            config["network"]["intercept"]["max_request_bytes"],
-            serde_json::json!(65536),
-            "copilot's intercept object must degrade to the serde default body"
+            config["network"]["intercept"],
+            serde_json::json!({"rules": [], "hook": null, "max_request_bytes": 65536}),
+            "{tool}'s intercept object must be the inactive serde default body"
         );
     }
 }
@@ -3032,8 +3111,7 @@ fn a_dangling_tools_reference_fails_a_launch_but_not_doctor() {
 }
 
 /// A declared `shell` that opts out (`tools = []`) provisions nothing, and the
-/// launch still boots — with **no TLS overlay**, because `apply_to` returns the
-/// builder untouched when `secrets` is empty. The shape is newly reachable.
+/// launch still boots — with no TLS overlay and no egress (default-deny).
 #[test]
 fn a_zero_provisioning_launch_boots_with_no_tls_overlay() {
     let harness = Harness::new();
@@ -3051,46 +3129,31 @@ fn a_zero_provisioning_launch_boots_with_no_tls_overlay() {
         registered_secret_env_vars(&config).is_empty(),
         "no provider is provisioned"
     );
-    let tls_enabled = config["network"]["tls"]["enabled"]
-        .as_bool()
-        .unwrap_or(false);
-    assert!(
-        !tls_enabled,
-        "no TLS overlay when there is nothing to substitute"
+
+    // `Plan::apply_to` now always installs the launcher's policy, so even a
+    // zero-provisioning launch carries an explicit, closed `policy`; TLS stays
+    // disabled and the credential sets stay empty. Compare the whole dense
+    // network to the independent engine-derived baseline (G1's helper), never
+    // to anything the launch printed.
+    assert_default_deny_zero_provision_network(&config["network"], "zero-provisioning shell");
+
+    // The launcher policy is deliberately **not** the SDK default. Pin both
+    // sides so a change to either the launcher's decision or the dependency
+    // default is noticed: the SDK default still admits the public group.
+    let sdk_default_policy =
+        serde_json::to_value(&microsandbox_network::config::NetworkConfig::default().policy)
+            .unwrap();
+    assert_ne!(
+        config["network"]["policy"], sdk_default_policy,
+        "the launcher must not inherit the SDK default policy"
     );
-    let intercept = &config["network"]["intercept"];
-    if !intercept.is_null() {
-        assert!(
-            intercept["rules"].as_array().unwrap().is_empty(),
-            "`.intercept()` must not run: {intercept}"
-        );
-    }
-    // A zero-provisioning launch never calls `.network()` at all
-    // (`credential_injection::Plan::apply_to` early-returns, and `network::Plan`
-    // has no egress policy to apply here), so the dumped spec carries **no**
-    // `policy` subdocument. Pin that observed shape too, so a future change that
-    // starts emitting a policy here is noticed rather than silently absorbed.
     assert!(
-        config["network"].get("policy").is_none(),
-        "a zero-provisioning launch carries no explicit policy"
-    );
-    // "No explicit policy" is not an *open* policy, but it is not a narrower
-    // egress either: the engine materializes an unset policy as
-    // `NetworkPolicy::default()` — `default_egress: deny` plus the public-profile
-    // allow — which is exactly what a wired launch's `.network()` overlay
-    // materializes (ADR-0017). A zero-provisioning launch is therefore exactly
-    // as open as a wired one. Compare the *whole* materialized policy (via its
-    // serialized form, since `NetworkPolicy` has no `PartialEq`) so a rule-level
-    // relaxation — an added allow, a flipped `default_ingress` — is caught, not
-    // just the default action.
-    let materialized: microsandbox_network::config::NetworkConfig =
-        serde_json::from_value(config["network"].clone())
-            .expect("the engine accepts a spec with no policy subdocument");
-    let wired_default = microsandbox_network::config::NetworkConfig::default();
-    assert_eq!(
-        serde_json::to_value(&materialized.policy).unwrap(),
-        serde_json::to_value(&wired_default.policy).unwrap(),
-        "a zero-provisioning launch materializes the same default policy as a wired launch"
+        sdk_default_policy["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["destination"]["group"] == "public"),
+        "the SDK default policy must still carry a public group"
     );
 }
 
@@ -3115,6 +3178,10 @@ fn a_fallback_shell_under_a_custom_catalog_provisions_nothing() {
     assert!(!state.join("claude/.credentials.json").exists());
     let host_secrets = PathBuf::from(format!("{}.secrets", state.display()));
     assert!(!host_secrets.join("anthropic").exists());
+    // A custom-catalog fallback shell also requests no egress, so it too gets
+    // the dense default-deny network — pin it here so this shape is covered
+    // without a golden.
+    assert_default_deny_zero_provision_network(&config["network"], "fallback shell");
 }
 
 /// **The other half of "a guest cannot spend a credential its verb did not
@@ -5800,4 +5867,318 @@ fn the_selection_is_scoped_to_user_home_not_state_or_cwd() {
     // A different HOME is genuinely independent.
     let other = Harness::new();
     other.assert_no_selection("a different HOME");
+}
+
+// ---------------------------------------------------------------------------
+// G3–G7 — the launcher egress policy reached through the real CLI
+// ---------------------------------------------------------------------------
+
+/// The `state_root/<hash>` project key the launcher derives, so a launch can be
+/// inspected without parsing a banner it never printed.
+fn project_hash(project: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = project.canonicalize().expect("canonicalize project");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::new();
+    for byte in &digest[..6] {
+        use std::fmt::Write;
+        write!(&mut out, "{byte:02x}").unwrap();
+    }
+    out
+}
+
+/// Whether any file named `name` under `root` holds `contents` — used to prove
+/// a `:fork` seed actually captured its source.
+fn dir_contains(root: &Path, name: &str, contents: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_contains(&path, name, contents) {
+                return true;
+            }
+        } else if path.file_name().is_some_and(|n| n == name)
+            && std::fs::read_to_string(&path).is_ok_and(|body| body == contents)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// G3: the network flags reach the dumped `SandboxConfig`. A malformed
+/// allowance fails before any egress is installed; the accepted set emits
+/// exactly the §3.1 rule list, in order.
+#[test]
+fn network_flags_reach_the_sandbox_config() {
+    // The bracketed-CIDR typo is rejected at parse time, so this launch never
+    // reaches the builder and creates no launch state.
+    let harness = Harness::new();
+    let out = harness.launch(
+        "shell",
+        &[
+            "--allow-internet-egress",
+            "--allow-lan",
+            "--allow-egress",
+            "tcp://[10.0.0.0/24]:22",
+            "--allow-egress",
+            "10.0.0.0/24:22",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "a rejected allowance must fail the launch"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("--allow-egress #2: a port on a CIDR needs brackets"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "a rejected allowance must not reach builder wiring: {stderr}"
+    );
+
+    // The accepted set emits the documented rules, in order.
+    let harness = Harness::new();
+    let out = harness.launch(
+        "shell",
+        &[
+            "--allow-internet-egress",
+            "--allow-lan",
+            "--allow-egress",
+            "tcp://[10.0.0.0/24]:22",
+        ],
+    );
+    let config = normalized_config(&harness, &out);
+    assert_eq!(config["network"]["policy"]["default_egress"], "deny");
+    assert_eq!(config["network"]["policy"]["default_ingress"], "allow");
+    assert_eq!(
+        config["network"]["policy"]["rules"],
+        serde_json::json!([
+            {"direction":"egress","destination":{"cidr":"10.0.0.0/24"},"protocols":["tcp"],"ports":[{"start":22,"end":22}],"action":"allow"},
+            {"direction":"egress","destination":{"group":"host"},"protocols":["udp","tcp"],"ports":[{"start":53,"end":53}],"action":"allow"},
+            {"direction":"egress","destination":{"group":"public"},"protocols":[],"ports":[],"action":"allow"},
+            {"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"}
+        ])
+    );
+}
+
+/// G4: a rejected hostname allowance fails before *any* launch state is created;
+/// a valid numeric control reaches the expected bogus-image failure with its
+/// fork, credential and MSB state already on disk.
+#[test]
+fn hostname_allowance_is_refused_before_launch_state_is_created() {
+    let mount_source = support::project_tempdir();
+    std::fs::write(mount_source.path().join("sentinel"), "seed").unwrap();
+
+    // Rejected: the hostname allowance stops the launch at parse time.
+    let rejected = Harness::new();
+    let mount = format!("{}:/forked:fork", mount_source.path().display());
+    let out = rejected.launch(
+        "claude",
+        &["--mount", &mount, "--allow-egress", "api.example.com"],
+    );
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("hostname allowances are not supported yet"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("api.example.com"),
+        "the raw hostname must not be echoed: {stderr}"
+    );
+    assert_eq!(
+        rejected.msb_log(),
+        "--version\n",
+        "a rejected launch must not make any runtime call beyond the identity probe"
+    );
+    let hash = project_hash(&rejected.project_root);
+    assert!(
+        !rejected.state_root.join(&hash).exists(),
+        "a rejected launch must not create the project state dir"
+    );
+    assert!(
+        !rejected.state_root.join(format!("{hash}.mounts")).exists(),
+        "a rejected launch must not create the fork store"
+    );
+    assert!(
+        !rejected.state_root.join(format!("{hash}.secrets")).exists(),
+        "a rejected launch must not capture credentials"
+    );
+    assert!(
+        !rejected.state_root.join("msb-home").exists(),
+        "a rejected launch must not initialize MSB launch state"
+    );
+
+    // Positive control: the same launch with a numeric allowance reaches the
+    // (expected) bogus-image failure, having created the state the rejection
+    // must avoid.
+    let control = Harness::new();
+    let mount = format!("{}:/forked:fork", mount_source.path().display());
+    let out = control.launch(
+        "claude",
+        &["--mount", &mount, "--allow-egress", "10.0.0.0/8"],
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "the control must reach builder wiring: {stderr}"
+    );
+    let hash = project_hash(&control.project_root);
+    let mounts = control.state_root.join(format!("{hash}.mounts"));
+    assert!(mounts.exists(), "the fork store must be created");
+    assert!(
+        dir_contains(&mounts, "sentinel", "seed"),
+        "the fork seed must contain the sentinel"
+    );
+    assert!(
+        control
+            .state_root
+            .join(format!("{hash}.secrets"))
+            .join("anthropic")
+            .exists(),
+        "the control must capture the host credential before the image pull fails"
+    );
+    assert!(
+        control.state_root.join(&hash).join("home").exists(),
+        "the control must provision the guest home"
+    );
+    assert!(
+        control.state_root.join("msb-home").exists(),
+        "the control must initialize MSB launch state"
+    );
+}
+
+/// G5: a `[network]` table in the project or user tier is refused with a named
+/// diagnostic that points at the setting and the tier; the project tier can
+/// never grant egress.
+#[test]
+fn project_network_table_fails_every_launch() {
+    let harness = Harness::new();
+    harness.write_project("[network]\nallow_lan = true\n");
+    let out = harness.launch_default("shell");
+    assert!(!out.status.success(), "a project [network] table must fail");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("network.allow_lan"), "{stderr}");
+    assert!(
+        stderr.contains("network access cannot be granted by the project config"),
+        "{stderr}"
+    );
+
+    let harness = Harness::new();
+    harness.write_user("[network]\nallow_lan = true\n");
+    let out = harness.launch_default("shell");
+    assert!(!out.status.success(), "a user [network] table must fail");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("network.allow_lan"), "{stderr}");
+    assert!(
+        stderr.contains("[network] in the user config is not supported yet"),
+        "{stderr}"
+    );
+}
+
+/// RJ1: each rejected allowance reports the exact `--allow-egress #1:`
+/// diagnostic and never echoes the rejected input. This is the host-side oracle
+/// the native harness's `rejection_diagnostic` mirrors; keeping them equal
+/// means a native RJ1 pass cannot come from a clap or unrelated error.
+#[test]
+fn allowance_rejections_report_exact_messages() {
+    let harness = Harness::new();
+    for (value, expected) in [
+        (
+            "reject.invalid",
+            "--allow-egress #1: hostname allowances are not supported yet; use an IP address or CIDR, or --allow-internet-egress",
+        ),
+        (
+            "10.0.0.0/24:18080",
+            "--allow-egress #1: a port on a CIDR needs brackets, e.g. tcp://[10.0.0.0/24]:22",
+        ),
+        (
+            "http://1.1.1.1:80",
+            "--allow-egress #1: unsupported scheme; use tcp:// or udp:// (or no scheme for all protocols)",
+        ),
+    ] {
+        let out = harness.launch("shell", &["--allow-egress", value]);
+        assert!(!out.status.success(), "{value} must be rejected");
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(expected), "{value}: {stderr}");
+        assert!(
+            !stderr.contains(value),
+            "{value} must not be echoed: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn user_network_refusal_is_rendered_in_doctor_tool_configuration() {
+    let harness = Harness::new();
+    harness.write_user("[network]\nallow_lan = true\n");
+    let out = harness.base_command().arg("doctor").output().unwrap();
+    assert!(!out.status.success(), "doctor must report config failure");
+    let stdout = stdout_of(&out);
+    let section = stdout
+        .split("==> tool configuration")
+        .nth(1)
+        .unwrap()
+        .split("\n==>")
+        .next()
+        .unwrap();
+    assert!(section.contains("error: config:"), "{stdout}");
+    assert!(section.contains("network.allow_lan"), "{stdout}");
+    assert!(
+        section.contains("[network] in the user config is not supported yet"),
+        "{stdout}"
+    );
+}
+
+/// G6: credential provisioning installs no egress (story 33). The credential
+/// overlay is present, but the launcher's policy is still the empty
+/// default-deny list.
+#[test]
+fn credential_provisioning_adds_no_egress() {
+    let harness = Harness::new();
+    let out = harness.launch_default("claude");
+    let config = normalized_config(&harness, &out);
+    assert_eq!(config["network"]["policy"]["default_egress"], "deny");
+    assert_eq!(
+        config["network"]["policy"]["rules"],
+        serde_json::json!([]),
+        "credential provisioning must not add egress"
+    );
+    assert!(
+        !config["network"]["secrets"]["secrets"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the credential overlay must still be present"
+    );
+    assert_eq!(config["network"]["tls"]["enabled"], true);
+    assert!(config["network"]["intercept"].is_object());
+}
+
+/// G7: the harness's committed two-tool config drives a real non-interactive
+/// launch whose trailing args land verbatim in the guest command, with the
+/// default-deny policy and the dense zero-provision network.
+#[test]
+fn harness_probe_tool_launches_with_its_trailing_args() {
+    let harness = Harness::new();
+    harness.write_project(include_str!(
+        "../../../script/test/fixtures/egress-config.toml"
+    ));
+    let out = harness.launch("egressprobe", &["--no-git", "--", "D1", "id-1"]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert_eq!(
+        debug_guest_command(&stderr),
+        "bash ./egress-probe.sh D1 id-1",
+        "the trailing args must reach the guest command verbatim"
+    );
+    let config = debug_config_json(&stderr);
+    assert_default_deny_zero_provision_network(&config["network"], "egressprobe");
 }

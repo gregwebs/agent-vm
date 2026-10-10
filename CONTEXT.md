@@ -480,3 +480,20 @@ _Avoid_: "masked file" — masks were removed by
 [ADR-0014](docs/adr/0014-narrow-fork-mounts-to-directories.md) and nothing is
 overlaid; "excluded" — `:exclude=REL` is a user-declared seed option, while
 this is an unconditional launch invariant.
+
+## Egress authority
+
+**Egress allowance**: a numeric IP/CIDR with optional transport and port.
+Address-wide, never hostname-isolated; sharing an allowed address shares its
+permission within those filters.
+
+**Group grant**: internet = `Public`, LAN = `Private`, host = sandbox gateway.
+Each is independent. Host includes host-resolver query authorization; internet
+also authorizes DNS. Numeric and LAN-only grants do not.
+
+Authority is CLI-only in this release; both config tiers refuse `[network]`.
+Persistent grants are not supported yet (see [#302](https://github.com/gregwebs/agent-vm/issues/302)).
+See [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) for DNS limitations.
+
+_Avoid_: "allow list" for the whole policy, or "network profile" (the runtime's
+`from_profiles` abstraction, deliberately not used for tool launches).
