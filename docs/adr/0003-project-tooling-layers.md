@@ -2,6 +2,8 @@
 
 ## Status
 
+**Relocated:** the `examples/layers/` examples cited below moved to [agent-vm-images](https://github.com/gregwebs/agent-vm-images/tree/main/examples/layers) (agent-vm-images#23); paths here are historical.
+
 **Superseded by [ADR-0035](0035-consume-user-owned-boot-images.md)** (#259):
 project layer chains, `--layer`, derived images and the layer contract are
 removed.

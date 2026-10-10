@@ -2,6 +2,8 @@
 
 ## Status
 
+**Relocated:** the `examples/layers/` examples cited below moved to [agent-vm-images](https://github.com/gregwebs/agent-vm-images/tree/main/examples/layers) (agent-vm-images#23); paths here are historical.
+
 **Superseded by [ADR-0035](0035-consume-user-owned-boot-images.md) (#257). The launcher DAG/current-tag/version-identity system was not implemented; committed recipe/version pins and source integrity checks are retained in the independent [image repository](https://github.com/gregwebs/agent-vm-images); source ownership moved by #265.**
 
 Accepted (decision). Not yet implemented — tracked by the map

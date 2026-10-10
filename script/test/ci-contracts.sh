@@ -58,6 +58,7 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/no-image-source-dependency.sh"
     bash "$REPO_ROOT/script/test/no-image-source-dependency-test.sh"
     bash "$REPO_ROOT/script/test/chrome-example-contract.sh"
+    bash "$REPO_ROOT/script/test/chrome-example-contract-test.sh"
     bash "$REPO_ROOT/script/test/e2e-release-contract.sh"
 
 fi
@@ -66,10 +67,9 @@ fi
 # Guard rail for the shell this workflow runs: every script the commands above
 # execute, the scripts those invoke in turn, scripts other jobs in this workflow
 # run, and the fixtures they use belong in both lists. Scripts only other
-# workflows run are guarded there. The examples/layers/rust-dev and
-# examples/layers/go-dev build scripts are guarded here too: no workflow runs
-# them (they are bind-mounted into their layer's Dockerfile at image-build
-# time), so this is their only shell guard.
+# workflows run are guarded there. The example image scripts (Chrome wrapper,
+# Go/Rust installers) moved to agent-vm-images, whose
+# script/test/example-layers.sh guards them.
 syntax_check=(
     vendor/microsandbox/vendor/libkrunfw/build_in_docker.sh
     script/check-runtime-provenance.sh
@@ -81,23 +81,16 @@ syntax_check=(
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
-    examples/layers/rust-dev/install-rust.sh
-    examples/layers/rust-dev/install-verus.sh
-    examples/layers/rust-dev/verify-toolchain.sh
-    examples/layers/go-dev/install-go.sh
-    examples/layers/go-dev/install-golangci-lint.sh
-    examples/layers/go-dev/install-gopls.sh
-    examples/layers/go-dev/verify-toolchain.sh
     script/test/standard-release-pin.sh
     script/test/standard-release-pin-test.sh
     script/test/no-image-source-dependency.sh
     script/test/no-image-source-dependency-test.sh
     script/test/chrome-example-contract.sh
+    script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
     script/test/e2e-released-image.sh
     script/test/e2e.sh
     script/test/lib/released-image-checks.sh
-    examples/layers/chrome-devtools/agent-vm-chrome-mcp
     "$self_relative"
 )
 
@@ -116,23 +109,16 @@ shellcheck_files=(
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
-    examples/layers/rust-dev/install-rust.sh
-    examples/layers/rust-dev/install-verus.sh
-    examples/layers/rust-dev/verify-toolchain.sh
-    examples/layers/go-dev/install-go.sh
-    examples/layers/go-dev/install-golangci-lint.sh
-    examples/layers/go-dev/install-gopls.sh
-    examples/layers/go-dev/verify-toolchain.sh
     script/test/standard-release-pin.sh
     script/test/standard-release-pin-test.sh
     script/test/no-image-source-dependency.sh
     script/test/no-image-source-dependency-test.sh
     script/test/chrome-example-contract.sh
+    script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
     script/test/e2e-released-image.sh
     script/test/e2e.sh
     script/test/lib/released-image-checks.sh
-    examples/layers/chrome-devtools/agent-vm-chrome-mcp
     "$self_relative"
 )
 

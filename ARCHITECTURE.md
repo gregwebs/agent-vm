@@ -532,7 +532,8 @@ The compiled v0.1.3 initial recommendation names the multiarch **index**. Native
 msb chooses the host child; successful first adoption keeps the index reference.
 An explicit upgrade instead retains the resolved child digest. Installed binary
 and runtime paths never read image sources. Chrome remains an optional
-[user-Dockerfile example](examples/layers/chrome-devtools/), not standard content.
+[user-Dockerfile example](https://github.com/gregwebs/agent-vm-images/tree/main/examples/layers/chrome-devtools)
+in agent-vm-images, not standard content.
 
 Three build-time subtleties are worth knowing:
 

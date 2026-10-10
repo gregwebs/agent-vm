@@ -47,10 +47,11 @@ conntrack/iptables ~62ms, nf_tables ~3ms). So it's a real but *minor* cost:
   struct-page init): create ≈ 1.49s @1G / 1.68–1.92s @2G / 2.9s @4G. Lower the default
   (`AGENT_VM_MEMORY_GIB`, currently 2) for sessions that don't need 2 GiB (~0.2s+).
 - **Chrome-MCP CA `certutil` (~270ms)** stays off the launch critical path: the opt-in
-  `examples/layers/chrome-devtools/agent-vm-chrome-mcp` wrapper imports the per-install
-  CA when the MCP starts, rather than synchronously before every agent exec. Chromium
-  honours its per-user NSS DB rather than only the system CA bundle, so the work is
-  skipped entirely unless the Chrome DevTools image capability is present.
+  agent-vm-images `chrome-devtools` example's `agent-vm-chrome-mcp` wrapper imports
+  the per-install CA when the MCP starts, rather than synchronously before every
+  agent exec. Chromium honours its per-user NSS DB rather than only the system CA
+  bundle, so the work is skipped entirely unless the Chrome DevTools image
+  capability is present.
 
 ## Reproduce
 

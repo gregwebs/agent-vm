@@ -264,7 +264,8 @@ See [the retained default](#the-retained-default) for scope and recovery.
 ### Customizing the image
 
 Build user-owned software with an ordinary Dockerfile, then explicitly select it.
-Directory names never activate composition; see [`examples/layers/`](examples/layers/).
+Directory names never activate composition; see the agent-vm-images
+[examples](https://github.com/gregwebs/agent-vm-images/tree/main/examples/layers).
 
 Extend the released Debian-based standard image, or clone the independent
 [image sources](https://github.com/gregwebs/agent-vm-images) and build the
@@ -1022,9 +1023,10 @@ The default boot image does not include Chromium. An image that provides the
 `/etc/agent-vm-capabilities/chrome-devtools-mcp` marker or the
 `/usr/local/bin/agent-vm-chrome-mcp` wrapper — gets the launcher's owned
 `mcpServers.chrome-devtools` entry; any other image boots normally with the
-entry removed. Build and select such an image with ordinary Docker (see
-[`examples/layers/chrome-devtools/`](examples/layers/chrome-devtools/) for a
-Dockerfile that installs it `FROM` the default boot image).
+entry removed. Build and select such an image with ordinary Docker (see the
+agent-vm-images
+[`chrome-devtools` example](https://github.com/gregwebs/agent-vm-images/tree/main/examples/layers/chrome-devtools)
+for a Dockerfile that installs it `FROM` the default boot image).
 `AGENT_VM_NO_CHROME_MCP=1` removes the automatic entry but leaves Chromium
 available for manual use. The launcher adds its owned
 `mcpServers.chrome-devtools` entry when the boot image advertises the capability
