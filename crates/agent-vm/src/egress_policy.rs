@@ -461,7 +461,9 @@ fn address_network(text: &str) -> Result<ipnetwork::IpNetwork, AllowanceError> {
     };
     parsed.map_err(|()| AllowanceError::MalformedAddress)
 }
-use crate::egress_hostname::{HostnameAllowance, InterceptedPorts, domain_rules};
+use crate::egress_hostname::{
+    CanonicalHostname, HostnameAllowance, InterceptedPorts, domain_rules,
+};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Allowance {
     Address(EgressAllowance),
@@ -602,6 +604,16 @@ impl EgressAuthority {
     }
     pub(crate) fn intercepted_ports(&self) -> Option<InterceptedPorts> {
         InterceptedPorts::for_hostnames(&self.hostnames)
+    }
+    /// Lookup-free report query; reads authority without granting or resolving.
+    pub(crate) fn covers_tls(&self, name: &CanonicalHostname, port: std::num::NonZeroU16) -> bool {
+        let public = group_rules(self.groups).public;
+        public
+            || self.intercepted_ports().is_some_and(|ports| {
+                self.hostnames
+                    .iter()
+                    .any(|h| h.grants_tls(name, port, &ports))
+            })
     }
     pub(crate) fn policy(&self) -> microsandbox::NetworkPolicy {
         use microsandbox_network::policy::{Action, Destination, DestinationGroup, Rule};

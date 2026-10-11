@@ -38,6 +38,7 @@ crates/agent-vm/src/
 ├── egress_hostname.rs      # hostname allowance acceptance, port scope, Domain rule assembly
 ├── dns_name.rs             # shared ASCII DNS label byte kernel (credential + egress)
 ├── network.rs              # published ports, proxy notice, launch Plan
+├── network_requests.rs     # tool requests: parse, coverage report (never authority)
 ├── mount.rs                # --mount grammar and volume wiring
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   ├── default_selection.rs#   retained record: read-only load, automatic adopt, explicit replace
@@ -1175,6 +1176,7 @@ directories the user never asked for. The state-root precedence is in
 | Default-deny launch egress and CLI-only authority | [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) |
 | Hostname egress allowances — TLS on intercepted ports only | [ADR-0037](docs/adr/0037-hostname-egress-allowances.md) |
 | Authority config-directory exposure guard | [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md) |
+| Non-authoritative tool network requests | [ADR-0039](docs/adr/0039-non-authoritative-tool-network-requests.md) |
 
 ## Deliberate non-goals
 

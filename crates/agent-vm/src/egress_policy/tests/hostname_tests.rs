@@ -312,3 +312,109 @@ fn hostname_runtime_differential_with_dns_cache() {
         }
     }
 }
+
+#[test]
+fn network_request_coverage_table() {
+    use crate::network_requests::NetworkRequests;
+    let requests = NetworkRequests::parse(
+        &[
+            "api.example.com",
+            "tcp://api.example.com:8443",
+            "tcp://api.example.com:9443",
+            "other.example",
+        ]
+        .map(str::to_owned),
+    )
+    .unwrap();
+    for (bits, specs, expected) in [
+        (0, vec![], [false, false, false, false]),
+        (1, vec![], [true, true, true, true]),
+        (2, vec![], [false, false, false, false]),
+        (4, vec![], [false, false, false, false]),
+        (6, vec![], [false, false, false, false]),
+        (0, vec!["0.0.0.0/0"], [false, false, false, false]),
+        (
+            0,
+            vec!["tcp://[93.184.216.0/24]:443"],
+            [false, false, false, false],
+        ),
+        (0, vec!["api.example.com"], [true, false, false, false]),
+        (
+            0,
+            vec!["tcp://api.example.com:8443"],
+            [false, true, false, false],
+        ),
+        (
+            0,
+            vec!["tcp://api.example.com:8443", "tcp://api.example.com:9443"],
+            [false, true, true, false],
+        ),
+        (
+            0,
+            vec!["api.example.com", "tcp://x.example:8443"],
+            [true, true, false, false],
+        ),
+        (0, vec!["API.Example.com."], [true, false, false, false]),
+    ] {
+        let auth = hostname_auth(bits, &specs);
+        let actual: Vec<_> = requests
+            .iter()
+            .map(|r| auth.covers_tls(r.name(), r.port()))
+            .collect();
+        assert_eq!(actual, expected, "{bits}: {specs:?}");
+    }
+}
+#[test]
+fn network_request_coverage_matches_policy_rules() {
+    use crate::network_requests::NetworkRequests;
+    use microsandbox_network::policy::{DestinationGroup, Direction};
+    const COVERAGE_SPECS: &[&[&str]] = &[
+        &[],
+        &["api.example.com"],
+        &["tcp://api.example.com:8443"],
+        &["tcp://api.example.com:8443", "tcp://api.example.com:9443"],
+        &["api.example.com", "tcp://x.example:8443"],
+        &["API.Example.com.", "api.example.com:443"],
+        &["10.1.2.3", "0.0.0.0/0", "tcp://[93.184.216.0/24]:443"],
+        &["api.example.com", "10.0.0.0/8"],
+    ];
+    let requests = NetworkRequests::parse(
+        &[
+            "api.example.com",
+            "api.example.com:8443",
+            "api.example.com:9443",
+            "api.example.com:22",
+            "x.example",
+            "x.example:8443",
+            "other.example",
+        ]
+        .map(str::to_owned),
+    )
+    .unwrap();
+    for bits in 0..8 {
+        for specs in COVERAGE_SPECS {
+            let auth = hostname_auth(bits, specs);
+            for request in requests.iter() {
+                let oracle = auth.policy().rules.iter().any(|rule| {
+                    rule.action == Action::Allow
+                        && matches!(rule.direction, Direction::Egress | Direction::Any)
+                        && (rule.protocols.is_empty() || rule.protocols.contains(&Protocol::Tcp))
+                        && (rule.ports.is_empty()
+                            || rule.ports.iter().any(|p| {
+                                p.start <= request.port().get() && request.port().get() <= p.end
+                            }))
+                        && match &rule.destination {
+                            Destination::Group(DestinationGroup::Public) => true,
+                            Destination::Domain(d) => d.as_str() == request.name().as_str(),
+                            _ => false,
+                        }
+                });
+                assert_eq!(
+                    auth.covers_tls(request.name(), request.port()),
+                    oracle,
+                    "{bits} {specs:?} {request}"
+                );
+            }
+        }
+    }
+}

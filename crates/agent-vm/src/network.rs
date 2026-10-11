@@ -1,5 +1,6 @@
 //! Launch networking configuration, validation, and lifecycle reporting.
 
+use crate::network_requests::{NetworkRequests, RequestReport, RequestTier};
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::SandboxBuilder};
@@ -251,6 +252,17 @@ impl Plan {
             )?;
         }
         Ok(())
+    }
+
+    /// Reads the authority being applied; requests cannot change it.
+    pub(crate) fn request_report<'a>(
+        &self,
+        requests: &'a NetworkRequests,
+        tier: RequestTier,
+    ) -> RequestReport<'a> {
+        RequestReport::compose(requests, tier, |request| {
+            self.egress.covers_tls(request.name(), request.port())
+        })
     }
 
     pub(crate) fn apply_to(&self, builder: SandboxBuilder) -> SandboxBuilder {

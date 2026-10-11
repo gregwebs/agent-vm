@@ -48,6 +48,9 @@ host loopback services; link-local-covering ranges reach cloud metadata.
 `0.0.0.0/0` and `::/0` include their respective gateways and link-local ranges. See
 [Ports & egress](USAGE.md#ports--egress) for DNS and resolver limitations.
 
+A tool can declare `network_requests`; a launch reports the ones its grants do
+not cover and continues ([Tool network requests](USAGE.md#tool-network-requests)).
+
 Missing planned features:
 
 * MCP gateway

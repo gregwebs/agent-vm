@@ -52,6 +52,22 @@ def matrix():
         add(name, EGRESS, old, new, egress)
         add(name + "-proof", EGRESS, old, new, gate, "verification results::")
     hostname = SRC + "egress_hostname.rs"
+    requests = SRC + "network_requests.rs"
+    coverage = rust("network_request_coverage")
+    request_units = rust("network_requests::tests::")
+    add("request-port-ignored", hostname,
+        "&self.name == name && self.effective_ports(ports).contains(&port.get())",
+        "&self.name == name", coverage)
+    add("request-internet-ignored", EGRESS,
+        "let public = group_rules(self.groups).public;",
+        "let public = false;", coverage)
+    add("request-report-unbounded", requests,
+        ".take_while(|(shown, _)| report_budget_allows(*shown))",
+        ".take_while(|_| true)", request_units)
+    limit_body = "    ensures ok == request_count_within_limit_spec(count),\n{\n    count <= MAX_NETWORK_REQUESTS\n}"
+    limit_mutant = "    ensures ok == request_count_within_limit_spec(count),\n{\n    count <= MAX_NETWORK_REQUESTS + 1\n}"
+    add("request-limit", requests, limit_body, limit_mutant, request_units)
+    add("request-limit-proof", requests, limit_body, limit_mutant, gate, "verification results::")
     shape = rust("hostname_rule_shape")
     host_kernel = rust("egress_hostname::tests")
     proxy = rust("hostname_proxy_selection_mirrors_the_host_connector")

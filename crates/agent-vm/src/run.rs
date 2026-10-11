@@ -5,6 +5,7 @@
 //! `OPENAI_API_KEY`); host-rooted refresh-able credentials land in
 //! Phase 3/4.
 
+use crate::network_requests::RequestTier;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -1274,6 +1275,13 @@ pub(crate) async fn launch(
     network_plan
         .emit_launch_notices()
         .context("writing launch networking notices")?;
+    // Compare declarations to the authority just printed, before applying it.
+    for line in network_plan
+        .request_report(tool.network_requests(), RequestTier::from(tool.origin()))
+        .lines()
+    {
+        notices.emit(line)?;
+    }
 
     let executable =
         std::env::current_exe().context("resolving agent-vm executable for credential hook")?;
@@ -3523,7 +3531,8 @@ mod tests {
         assert!(plan < position("mount::prepare("));
         assert!(plan < position("ensure_msb_home("));
         assert!(plan < notices);
-        assert!(notices < base_network);
+        let report = position("network_plan\n        .request_report(");
+        assert!(notices < report && report < base_network);
         assert!(base_network < credential_network);
         assert!(credential_network < build);
         assert!(build < create);
