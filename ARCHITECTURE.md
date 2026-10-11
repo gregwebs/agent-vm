@@ -34,7 +34,8 @@ crates/agent-vm/src/
 │   └── intercept_hook/
 │       ├── http.rs         #   shared request parsing / response framing
 │       └── oauth_refresh.rs#   OAuth validation, rotation, single-flight
-├── network.rs              # egress policy and published ports
+├── egress_policy.rs        # --allow-egress grammar + launch egress policy (default-deny)
+├── network.rs              # published ports, proxy notice, launch Plan
 ├── mount.rs                # --mount grammar and volume wiring
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   ├── default_selection.rs#   retained record: read-only load, automatic adopt, explicit replace
@@ -1162,6 +1163,7 @@ directories the user never asked for. The state-root precedence is in
 | Default to rebase, preserving build provenance (superseded by ADR-0035) | [ADR-0033](docs/adr/0033-default-rebase-with-build-provenance.md) |
 | Versioned image releases instead of a continuously published registry (amended by ADR-0035) | [ADR-0034](docs/adr/0034-versioned-image-releases.md) |
 | Consume user-owned boot images (supersedes ADR-0003/0019/0028–0033; amends ADR-0034/0015/0022) | [ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md) |
+| Default-deny launch egress and CLI-only authority | [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) |
 
 ## Deliberate non-goals
 

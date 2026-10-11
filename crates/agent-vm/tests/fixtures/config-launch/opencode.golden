@@ -113,34 +113,7 @@
     "policy": {
       "default_egress": "deny",
       "default_ingress": "allow",
-      "rules": [
-        {
-          "direction": "egress",
-          "destination": {
-            "group": "host"
-          },
-          "protocols": [
-            "udp",
-            "tcp"
-          ],
-          "ports": [
-            {
-              "start": 53,
-              "end": 53
-            }
-          ],
-          "action": "allow"
-        },
-        {
-          "direction": "egress",
-          "destination": {
-            "group": "public"
-          },
-          "protocols": [],
-          "ports": [],
-          "action": "allow"
-        }
-      ]
+      "rules": []
     },
     "dns": {
       "rebind_protection": true,

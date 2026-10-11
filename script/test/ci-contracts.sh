@@ -60,6 +60,7 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/chrome-example-contract.sh"
     bash "$REPO_ROOT/script/test/chrome-example-contract-test.sh"
     bash "$REPO_ROOT/script/test/e2e-release-contract.sh"
+    bash "$REPO_ROOT/script/test/egress-default-deny-contract.sh"
 
 fi
 
@@ -88,6 +89,9 @@ syntax_check=(
     script/test/chrome-example-contract.sh
     script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
+    script/test/egress-default-deny.sh
+    script/test/egress-default-deny-contract.sh
+    script/test/fixtures/egress-probe.sh
     script/test/e2e-released-image.sh
     script/test/e2e.sh
     script/test/lib/released-image-checks.sh
@@ -116,6 +120,9 @@ shellcheck_files=(
     script/test/chrome-example-contract.sh
     script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
+    script/test/egress-default-deny.sh
+    script/test/egress-default-deny-contract.sh
+    script/test/fixtures/egress-probe.sh
     script/test/e2e-released-image.sh
     script/test/e2e.sh
     script/test/lib/released-image-checks.sh
@@ -130,10 +137,19 @@ assert_listed() {
     for entry in "$@"; do
         [[ "$entry" == "$needle" ]] && return 0
     done
-    fail "this script ($needle) is missing from the $list_name guard list"
+    fail "script ($needle) is missing from the $list_name guard list"
 }
 assert_listed 'bash -n' "$self_relative" "${syntax_check[@]}"
 assert_listed 'shellcheck' "$self_relative" "${shellcheck_files[@]}"
+
+# These explicit checks are independent of the join's dispatch list: deleting
+# a membership must fail even when only the guard seam is selected.
+assert_listed 'bash -n' 'script/test/egress-default-deny.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/egress-default-deny-contract.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/fixtures/egress-probe.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/egress-default-deny.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/egress-default-deny-contract.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/fixtures/egress-probe.sh' "${shellcheck_files[@]}"
 
 is_vendored() {
     [[ "$1" == vendor/microsandbox/* ]]

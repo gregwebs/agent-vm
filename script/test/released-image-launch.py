@@ -52,12 +52,36 @@ def _validate_bound(name, value):
     return float(value)
 
 
+def _live_group_members(pgid):
+    """PIDs of live (non-zombie) processes in this group, or None if unknown."""
+    try:
+        listing = subprocess.run(["ps", "-e", "-o", "pid=,pgid=,stat="], capture_output=True,
+                                 text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    members = []
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1].lstrip("-").isdigit() and int(fields[1]) == pgid:
+            state = fields[2] if len(fields) > 2 else ""
+            if state[:1] not in ("Z", "X", "x"):
+                members.append(int(fields[0]))
+    return members
+
+
 def _signal_group(pgid, sig):
     try:
         os.killpg(pgid, sig)
     except ProcessLookupError:
         # The whole group already exited between calls; nothing to signal.
         pass
+    except PermissionError:
+        # macOS returns EPERM (not ESRCH) for killpg to a group whose leader is
+        # an unreaped zombie with no live members. Tolerate it only when the
+        # host positively confirms no live process remains in the group;
+        # otherwise a real un-signalled survivor must surface.
+        if _live_group_members(pgid) != []:
+            raise
 
 
 def _terminate_group(proc, grace):
@@ -71,6 +95,10 @@ def _terminate_group(proc, grace):
     try:
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
+        # Reap a leader that exited after the grace wait expired: a still-
+        # unreaped zombie leader makes macOS killpg return EPERM for the (now
+        # empty) group instead of ESRCH.
+        proc.poll()
         _signal_group(pgid, signal.SIGKILL)
         proc.wait()
         return

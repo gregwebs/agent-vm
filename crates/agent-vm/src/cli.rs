@@ -860,6 +860,44 @@ mod tests {
         assert!(!text.contains("unrecognized subcommand"), "{text}");
     }
 
+    #[test]
+    fn network_table_rejection_is_a_deferred_catalog_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(&user, "[network]\nallow_lan = true").unwrap();
+        let load = || {
+            crate::config::load(&crate::config::ConfigPaths {
+                user: Some(user.clone()),
+                project: dir.path().join("absent.toml"),
+            })
+        };
+        assert!(matches!(
+            parse_from(["agent-vm", "doctor"], load()).unwrap(),
+            Dispatch::Builtin {
+                cmd: Cmd::Doctor(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_from(["agent-vm", "msb", "--version"], load()).unwrap(),
+            Dispatch::Builtin {
+                cmd: Cmd::Msb(_),
+                ..
+            }
+        ));
+        let help = build_command(&Catalog::Broken(load().unwrap_err()))
+            .try_get_matches_from(["agent-vm", "--help"])
+            .unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains(CONFIG_BROKEN_NOTE));
+        let error = parse_from(["agent-vm", "shell"], load())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("network.allow_lan"));
+        assert!(error.contains("user config is not supported yet"));
+    }
+
     // -- T10: the asymmetric broken-config acceptance criterion -----------
 
     #[test]

@@ -238,7 +238,32 @@ def main():
         if marker.exists():
             failures.append("main with an invalid bound spawned a child")
 
-        # 4) Parent interruption cleans up the owned group: Ctrl-C (SIGINT) and
+        # 4) macOS returns EPERM (not ESRCH) for killpg to a group whose leader
+        #    is an unreaped zombie with no live members. A bounded timeout must
+        #    not turn that empty group into a supervisor failure; a genuinely
+        #    live group must still be signalled.
+        zombie = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.exit(0)"], start_new_session=True
+        )
+        time.sleep(0.5)
+        try:
+            helper._signal_group(zombie.pid, signal.SIGKILL)
+        except Exception as exc:  # noqa: BLE001 - any raise is a regression
+            failures.append(f"zombie-leader empty group raised {exc!r}")
+        finally:
+            zombie.wait()
+        live = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        helper._signal_group(live.pid, signal.SIGKILL)
+        try:
+            live.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            failures.append("live owned group survived SIGKILL")
+            live.kill()
+            live.wait()
+
+        # 5) Parent interruption cleans up the owned group: Ctrl-C (SIGINT) and
         #    SIGTERM, with resistant descendants.
         interruption_case(
             failures, "sigint", signal.SIGINT, 130, scenario, tmp

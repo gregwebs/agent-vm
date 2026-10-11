@@ -130,41 +130,32 @@ Mounts & ports:
           share.
 
 Network egress:
-      --allow-egress <IP|CIDR>
-          Allow guest egress to one IP or CIDR (repeatable).
+      --allow-egress <[tcp://|udp://]IP|CIDR[:PORT]>
+          Allow one IP/CIDR, optionally narrowed by tcp:// or udp:// and :PORT (repeatable).
 
-          Examples: `--allow-egress 10.100.1.75` (single host), `--allow-egress 10.100.1.0/24`
-          (CIDR), `--allow-egress fd00::1/128` (IPv6).
+          Address-wide, not hostname-isolated. Hostnames are not supported yet. Use brackets for a
+          port on an IPv6 address or CIDR. No implicit port 443.
 
-          The default policy (`NetworkPolicy::from_profiles([Public])`) only allows DNS and the
-          `Public` destination group, so RFC1918 (10/8, 172.16/12, 192.168/16, 100.64/10), loopback,
-          link- local, and metadata addresses are all denied with ECONNREFUSED. Use this flag to
-          reach a specific dev box on the same LAN as the host. Use `--allow-lan` instead if you
-          want to open the entire Private group at once.
+      --allow-internet-egress[=<BOOL>]
+          Allow public internet egress and DNS. Guest egress is denied by default
 
-      --allow-lan
-          Allow guest egress to the whole private LAN.
+          [possible values: true, false]
 
-          Switches the egress policy from `from_profiles([Public])` to `from_profiles([Public,
-          Private])` — adds the entire `DestinationGroup::Private` (10/8, 172.16/12, 192.168/16,
-          100.64/10, fc00::/7) to the allow list. Coarser than `--allow-egress <CIDR>`; useful for
-          "trust everything on my LAN". Loopback, link-local, and metadata are still denied.
+      --allow-lan[=<BOOL>]
+          Allow Private RFC1918, 100.64/10 and fc00::/7. Does not itself grant internet or DNS.
 
-          Security note: a compromised in-guest process gets full access to every device on your LAN
-          with this flag. Prefer `--allow-egress <CIDR>` for production-ish uses.
+          Risk: a compromised guest gets access to every device on your LAN.
 
-      --allow-host
-          Allow the guest to reach the host's 127.0.0.1 services.
+          [possible values: true, false]
 
-          The smoltcp stack rewrites the per-sandbox gateway IP (resolves as
-          `host.microsandbox.internal` inside the guest) to host's loopback, so e.g. a dev server
-          bound to `127.0.0.1:8080` on the host becomes reachable from the guest at
-          `host.microsandbox.internal:8080`. Adds the `DestinationGroup::Host` (the gateway IP only)
-          to the allow list; loopback, link-local, metadata, and the wider LAN remain denied.
+      --allow-host[=<BOOL>]
+          Allow host loopback services through host.microsandbox.internal, including the host DNS
+          resolver. Does not itself grant internet.
 
-          Security note: anything bound to the host's loopback — including admin UIs, dev DBs, the
-          Docker socket if it's listening on a TCP port — becomes reachable from a possibly-
-          compromised in-guest process. Use only when you actually need it.
+          Risk: host loopback services, including admin UIs, dev databases and the Docker socket,
+          become reachable.
+
+          [possible values: true, false]
 
 Image:
       --image <REF>
@@ -220,11 +211,12 @@ Fork mounts:
   fork, remove the exact directory printed at launch, then launch the same declaration again.
 
 Networking (deny-by-default; flags compose):
-  --publish        host  → guest   open an inbound port to a guest service
-  --auto-publish   guest → host    mirror guest listeners onto host loopback
-  --allow-egress   guest → IP/LAN  reach one IP or subnet
-  --allow-lan      guest → LAN     reach the whole private range
-  --allow-host     guest → host    reach the host's 127.0.0.1 services
+  --publish                host  → guest     open an inbound port to a guest service
+  --auto-publish           guest → host      mirror guest listeners onto host loopback
+  --allow-internet-egress  guest → internet  public internet + DNS
+  --allow-egress           guest → IP/LAN    reach one IP/CIDR [proto/port]
+  --allow-lan              guest → LAN       reach the whole private range
+  --allow-host             guest → host      reach the host's 127.0.0.1 services
 
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus

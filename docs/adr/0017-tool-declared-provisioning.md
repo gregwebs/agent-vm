@@ -117,6 +117,14 @@ see the Amendment at the end of this ADR):
   closes over `default-tools.toml`'s tools *present in the catalog* — and when a
   user config replaces the defaults, the only one present is `shell` itself.
   `USAGE.md` carries the resulting guidance.
+
+> **Amended by [ADR-0036](0036-default-deny-launch-egress.md):** launch egress
+> is default-deny; every tool launch installs an explicit policy, including
+> zero-provisioning launches. Only the policy and `.network()` descriptions in
+> the following two historical bullets no longer apply; the absence of a TLS
+> overlay when `secrets` is empty remains true. Provisioning still grants no
+> connection authority.
+
 - **Network egress is not provider-scoped.** The policy is `default_egress:
   deny` plus a blanket `destination: { group: "public" }` allow, identical in
   all five goldens, so a `codex` guest can still *reach* `api.anthropic.com`; it

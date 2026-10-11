@@ -480,11 +480,12 @@ Fork mounts:
   fork, remove the exact directory printed at launch, then launch the same declaration again.
 
 Networking (deny-by-default; flags compose):
-  --publish        host  → guest   open an inbound port to a guest service
-  --auto-publish   guest → host    mirror guest listeners onto host loopback
-  --allow-egress   guest → IP/LAN  reach one IP or subnet
-  --allow-lan      guest → LAN     reach the whole private range
-  --allow-host     guest → host    reach the host's 127.0.0.1 services
+  --publish                host  → guest     open an inbound port to a guest service
+  --auto-publish           guest → host      mirror guest listeners onto host loopback
+  --allow-internet-egress  guest → internet  public internet + DNS
+  --allow-egress           guest → IP/LAN    reach one IP/CIDR [proto/port]
+  --allow-lan              guest → LAN       reach the whole private range
+  --allow-host             guest → host      reach the host's 127.0.0.1 services
 
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
@@ -682,6 +683,7 @@ pub(crate) async fn launch(
     // configured image must not create state. `args.image.requested()` also
     // applies the empty-`AGENT_VM_IMAGE_TAG`-is-unset rule.
     let boot = boot_image::select(args.image.requested()?, images)?;
+    let network_plan = crate::network::Plan::from_args(args.network)?;
     // The one output policy for this selection: explicit sources render their
     // escaped reference; the default tier renders a fixed label and redacts the
     // reference from every notice, debug dump, progress line and error chain.
@@ -1271,7 +1273,6 @@ pub(crate) async fn launch(
     // suppressed. That decision is made once, in `assemble_guest_env` below,
     // rather than at each emission site; see `credential_resolver`.
 
-    let network_plan = crate::network::Plan::from_args(args.network)?;
     network_plan
         .emit_launch_notices()
         .context("writing launch networking notices")?;
@@ -3440,6 +3441,8 @@ mod tests {
         let credential_network = position("builder = credential_plan.apply_to(builder)?;");
         let build = position("let config = builder.build().await");
         let create = position("Sandbox::create_with_pull_progress(config)");
+        assert!(plan < position("mount::prepare("));
+        assert!(plan < position("ensure_msb_home("));
         assert!(plan < notices);
         assert!(notices < base_network);
         assert!(base_network < credential_network);
@@ -3460,8 +3463,9 @@ mod tests {
         assert!(defaults.args.network.publish.is_empty());
         assert!(!defaults.args.network.auto_publish);
         assert!(defaults.args.network.allow_egress.is_empty());
-        assert!(!defaults.args.network.allow_lan);
-        assert!(!defaults.args.network.allow_host);
+        assert_eq!(defaults.args.network.allow_internet_egress, None);
+        assert_eq!(defaults.args.network.allow_lan, None);
+        assert_eq!(defaults.args.network.allow_host, None);
 
         let parsed = TestCli::try_parse_from([
             "agent-vm",
@@ -3483,9 +3487,70 @@ mod tests {
         assert_eq!(parsed.args.network.publish, ["8080:3000", "8081:3001"]);
         assert!(parsed.args.network.auto_publish);
         assert_eq!(parsed.args.network.allow_egress, ["10.0.0.5", "fd00::1"]);
-        assert!(parsed.args.network.allow_lan);
-        assert!(parsed.args.network.allow_host);
+        assert_eq!(parsed.args.network.allow_lan, Some(true));
+        assert_eq!(parsed.args.network.allow_host, Some(true));
         assert_eq!(parsed.args.agent_args, ["--agent-flag"]);
+        let explicit = TestCli::try_parse_from([
+            "agent-vm",
+            "--allow-internet-egress",
+            "--allow-lan=false",
+            "--allow-host=true",
+            "--allow-egress",
+            "tcp://[10.0.0.0/24]:22",
+        ])
+        .unwrap();
+        assert_eq!(explicit.args.network.allow_internet_egress, Some(true));
+        assert_eq!(explicit.args.network.allow_lan, Some(false));
+        assert_eq!(explicit.args.network.allow_host, Some(true));
+        assert_eq!(
+            explicit.args.network.allow_egress,
+            ["tcp://[10.0.0.0/24]:22"]
+        );
+        let spaced = TestCli::try_parse_from(["agent-vm", "--allow-lan", "false"]).unwrap();
+        assert_eq!(spaced.args.network.allow_lan, Some(true));
+        assert_eq!(spaced.args.agent_args, ["false"]);
+        assert!(TestCli::try_parse_from(["agent-vm", "--allow-lan=maybe"]).is_err());
+        assert_eq!(
+            TestCli::try_parse_from(["agent-vm", "--allow-lan", "--allow-lan=false"])
+                .err()
+                .unwrap()
+                .kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn non_interactive_tool_appends_trailing_args_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("config.toml");
+        std::fs::write(
+            &project,
+            include_str!("../../../script/test/fixtures/egress-config.toml"),
+        )
+        .unwrap();
+        let catalog = crate::config::load(&crate::config::ConfigPaths {
+            user: None,
+            project,
+        })
+        .unwrap()
+        .into_launch_catalog()
+        .unwrap();
+        assert_eq!(
+            inner_argv(
+                tool(&catalog, "egressprobe"),
+                vec!["D1".into(), "id-1".into()]
+            ),
+            ["./egress-probe.sh", "D1", "id-1"]
+        );
+    }
+
+    #[test]
+    fn interactive_shell_turns_dash_c_into_a_literal_command_word() {
+        let catalog = default_catalog();
+        assert_eq!(
+            inner_argv(tool(&catalog, "shell"), vec!["-c".into(), "echo hi".into()]),
+            ["-O", "histappend", "-c", "'-c' 'echo hi'"]
+        );
     }
 
     #[test]

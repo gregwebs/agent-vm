@@ -1,0 +1,10 @@
+[[tools]]
+name = "egressprobe"
+command = "bash"
+args = ["./egress-probe.sh"]
+
+[[tools]]
+name = "egresscreds"
+command = "bash"
+args = ["./egress-probe.sh"]
+credentials = ["anthropic"]

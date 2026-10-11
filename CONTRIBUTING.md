@@ -277,6 +277,40 @@ cache under the default msb config sources: it neutralizes an inherited
 `AGENT_VM_SHARE_MSB_CACHE`, `AGENT_VM_MSB_CACHE_DIR` and `MSB_CONFIG_PATH`, while #260 uses a separate fresh shared cache. It makes no released-default or lineage
 claim.
 
+#### Default-deny egress harness
+
+`script/test/egress-default-deny.sh` is the serial native networking harness;
+`e2e.sh` does not certify networking. Its boot-free companion is
+`bash script/test/egress-default-deny-contract.sh`. Mutation controls run with
+`python3 script/test/egress-mutations.py --evidence /absolute/owned/log-directory`
+(pinned Verus on PATH); only disposable source copies are changed.
+
+On a dedicated native macOS Apple Silicon host, build the debug bundle and
+supply authenticated, verified native v0.1.3 release assets:
+
+```bash
+./script/build/macos.sh --dev
+AGENT_VM_BIN="$PWD/target/macos-dev/bin/agent-vm" \
+AGENT_VM_E2E_RELEASE_ASSETS_DIR=/absolute/verified/assets-arm64 \
+  bash script/test/egress-default-deny.sh --smoke
+# Repeat without --smoke for the full matrix.
+```
+
+Require no concurrent VMs, compatible managed policy, no matching GHCR or
+loopback credentials in the OS keyring, a reachable host RFC1918/CGN address,
+and firewall access for TCP 18080/18081, UDP 19090/18080 and proxy 18888.
+Public HTTP/DNS controls must work before a denial is counted. Guest tools are
+checked at preflight; paired IPv6/rebind groups report NOT RUN when unavailable.
+Never change operator DNS, policy or keychain to make a test pass.
+
+The harness creates private HOME/state/cache and retains `summary.tsv`,
+per-case logs and `owned.jsonl` under its printed owned work root. Preserve
+commands, candidate/runtime identity and release-asset hashes alongside them.
+Cleanup is bounded and identity-checked; inspect reported survivors before
+removing only owned scratch. Smoke is not full evidence. This harness does not
+certify Linux: native Linux testing, runtime capability admission and combined
+platform evidence remain outstanding under [#302](https://github.com/gregwebs/agent-vm/issues/302).
+
 #### `bash -c`, not `bash -lc`, for in-guest commands
 
 When you pass a command to the guest yourself, pass it through a non-login

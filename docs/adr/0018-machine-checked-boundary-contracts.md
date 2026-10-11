@@ -34,6 +34,7 @@ A pure predicate that cannot be verified usually cannot be verified because it d
 
 | decision (proved kernel) | I/O or untranslatable shell (trusted adapter) |
 |---|---|
+| `egress_policy::split_scheme` / `split_target` | `EgressAllowance::parse` — `IpAddr` / `IpNetwork::from_str` measure `target_is_address` (passed as `whole_address`) and parse the exact address slice |
 | `http::contains_escaped_path_escape_bytes(&[u8])` | `http::contains_escaped_path_escape(&str)` — `str::as_bytes` |
 | `msb_install::socket_path_fits(usize)` | `check_socket_path_len` — `Path` → `as_os_str().len()`, `anyhow::bail!` |
 | `oauth_refresh::path_is_exact(&[u8])` | `validated_target` — `url::Url::parse` and the scheme/host/port/userinfo checks |
@@ -54,6 +55,10 @@ One `verus!` block per owning module, in place, no new crate and no moved code. 
 
 | Site (module) | Contract that is machine-checked |
 |---|---|
+| `egress_policy.rs` — `split_scheme` | Exhaustive scheme/result/offset correspondence: Any only without `://`, TCP/UDP at offset 6, unsupported schemes rejected. |
+| `egress_policy.rs` — `split_target` | Exact address range and port value, complete delimiter/suffix grammar and error precedence; no substring or silent filter loss. |
+| `egress_policy.rs` — `port_from_decimal_bytes` | Accepted iff canonical decimal 1–65535, with exact decimal value; no leading zero. |
+| `egress_policy.rs` — `group_rules` | Gateway DNS and Public iff internet; Private iff LAN; Host iff host. Grants are independent. |
 | `intercept_hook/http.rs` — `contains_escaped_path_escape_bytes` | **No false negatives.** If it returns `false`, no byte position `i` in the target begins a `%` followed by a pair that is malformed, truncated, or decodes to `.`/`/`/`\` (`escape_at`). The loop invariant is "every position behind the cursor is clean", so the postcondition follows from the exit condition. |
 | `image_capabilities.rs` — `chrome_mcp_policy`, `ChromeMcpDecision::enabled` | **Precedence is total.** Each of the five `ensures` clauses covers one region of the three-artifact-input space (`advertised`, `wrapper_present`, `opted_out`); `OptedOut` dominates, nothing but `opted_out` can produce it, and `enabled()` holds exactly for `Advertised`/`WrapperProvided`. Amended by #258 (2026-10): the image-API input is removed, so a supplied capability marker or a supplied wrapper enables — supplied artifacts, not image identity. |
 | `msb_install.rs` — `socket_path_fits` | **The accept/reject comparison, including at the boundary** (`len <= SUN_PATH_USABLE_LEN`). Stated plainly: the exec body restates the spec, so what is proved is that the decision *is* that comparison — **not** that the socket-path invariant holds end to end. |
@@ -92,6 +97,7 @@ One `verus!` block per owning module, in place, no new crate and no moved code. 
 
 Stated so that nobody reads more into the surface than is there. Verified code calls into, and trusts, the following; **none of it is proved**:
 
+- `egress_policy::EgressAllowance::parse`: std/`ipnetwork` address parsing, canonicalization and hostname-message classification; `EgressAuthority::policy`: `Rule` construction and ordering. Scheme/target splitting and decimal ports are proved, not trusted.
 - `str::as_bytes` (total and infallible; the escape property is a property of bytes either way);
 - `OsStr::as_bytes` (`OsStrExt`) in `cli::is_secret_route` and `config::guest_paths_overlap`; the route decision is proved, the `OsString` → bytes measurement is not. In `config` it also trusts the *invariant* that a normalized `PersistPath`'s `Path` rendering is its components joined by single `/` (established by `normalize_persist`, not proved), and that a compiled `HomeLink::home_relative` is likewise `/`-joined. The launch-time mount check (`guest_home::mount_conflicts`) extends the same precondition to the guest mount paths it feeds the predicate: each is normalized by `resolve_project_guest_path` / `mount::normalize_guest` before it arrives;
 - `OsStr::len` — the socket-path decision is proved, the *byte measurement* of the path is not;

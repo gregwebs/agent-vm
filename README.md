@@ -5,8 +5,8 @@ Run inside a per-project [microsandbox](https://docs.microsandbox.dev/) (libkrun
 - **Filesystem protection.**
   The working directory is bind-mounted at its host path and you can mount other directories.
   Choose read-only, write, or fork (copied) mounts.
-- **Network allow list**
-  Disable or enable networking, enforce allow lists 
+- **Default-deny egress.**
+  Opt in to the public internet, LAN, host, or specific IPs/CIDRs (with protocol/port).
 - **Dropped User or root**
   The guest runs as your host user uid without sudo (--root is available when needed).
   Provide your own Dockerfile and configuration files to specify whats in your VM.
@@ -22,6 +22,20 @@ Run inside a per-project [microsandbox](https://docs.microsandbox.dev/) (libkrun
   `git remote -v`; extend with `--repo OWNER/NAME`. `gh pr create`,
   `git push` etc. are filtered at the proxy — off-list calls get a 403
   before they reach GitHub.
+
+**Breaking change in 0.2.0:** existing tool launches now have no guest egress or
+DNS query authorization until you pass a grant. Agents calling provider APIs
+(`claude`, `codex`, …) need `--allow-internet-egress` to restore public internet
+and DNS access (or numeric `--allow-egress` allowances for address-only access)
+until hostname allowances ship ([#302](https://github.com/gregwebs/agent-vm/issues/302)). `--allow-lan` and `--allow-host` no longer imply
+internet access. Plain port-53 DNS to an IP-allowed resolver remains denied
+in this release
+([microsandbox #75](https://github.com/gregwebs/microsandbox/issues/75)). A
+numeric CIDR matches every address it covers: gateway-covering ranges
+(such as IPv4 `100.64.0.0/10` or IPv6 ULA `fd00::/8` and `fc00::/7`) reach
+host loopback services; link-local-covering ranges reach cloud metadata.
+`0.0.0.0/0` and `::/0` include their respective gateways and link-local ranges. See
+[Ports & egress](USAGE.md#ports--egress) for DNS and resolver limitations.
 
 Missing planned features:
 
@@ -74,8 +88,10 @@ npm install -g @wirenboard/agent-vm  # Linux; macOS: follow macos-build.md
 agent-vm setup            # pulls the image this config boots from and verifies it boots
 
 cd ~/your-project
-agent-vm claude           # a configured launch verb; see `agent-vm --help`
+agent-vm claude --allow-internet-egress
 ```
+
+See [Ports & egress](USAGE.md#ports--egress) for narrower grants and their risks.
 
 The initial recommendation is the released v0.1.3 standard image containing all
 six agents. Successful first acquisition retains its immutable index reference;
