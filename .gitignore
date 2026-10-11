@@ -2,6 +2,7 @@
 **/*.rs.bk
 Cargo.lock.bak
 .DS_Store
+__pycache__
 
 AGENTS.local.md
 
