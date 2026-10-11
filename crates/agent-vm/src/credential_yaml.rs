@@ -368,9 +368,6 @@ pub(crate) const MAX_AUTHORIZATIONS: usize = 32;
 pub(crate) const MAX_INJECTION_RULES: usize = 32;
 /// Mirrors microsandbox's `MAX_HEADER_CREDENTIAL_FORMAT_BYTES`.
 pub(crate) const MAX_FORMAT_BYTES: usize = 256;
-/// Mirrors the runtime's origin-host checks (`> 253` rejected).
-pub(crate) const MAX_HOST_BYTES: usize = 253;
-pub(crate) const MAX_LABEL_BYTES: usize = 63;
 /// An env name crosses `execve`; 128 bytes is far above any real name.
 pub(crate) const MAX_ENV_NAME_BYTES: usize = 128;
 /// Structural YAML nesting the schema can possibly need.
@@ -381,8 +378,9 @@ pub(crate) const MAX_STRUCTURAL_DEPTH: usize = 16;
 // The proved predicates (ADR-0018)
 // ---------------------------------------------------------------------------
 //
-// One `verus!` block for this module, in place, no moved code. Every constant
-// a spec function mentions lives here so the spec can name it. The exec bodies
+// Credential decisions stay in this module; the shared LDH shape lives in
+// `dns_name`. Every constant a spec function *here* mentions lives in this
+// module so the spec can name it (`dns_name` keeps its own). The exec bodies
 // restate the spec expressions inline: a `spec fn` erases under a plain build,
 // so an exec call to one would not compile (the same rule `secret_store.rs`
 // records).
@@ -572,21 +570,13 @@ pub(crate) fn structural_depth_within_limit(depth: usize) -> (ok: bool)
 }
 
 // ---------------------------------------------------------------------------
-// The format and origin-host contracts (#161 review, M5)
+// The format contract (#161 review, M5)
 // ---------------------------------------------------------------------------
 //
-// Both are decisions on untrusted input that the brief required to be
-// machine-checked (ADR-0018): the `%s`-placeholder count and the origin-host
-// byte shape. The `&str`/`Path` -> bytes measurement stays a trusted adapter
-// outside this block (the callers).
-
-/// An accepted origin-host byte: lowercase letter, digit or `-`.
-///
-/// Written out flat so the exec bodies can restate exactly this expression, the
-/// same reason [`header_name_byte_allowed`] is flat.
-pub(crate) open spec fn ldh_byte_allowed(byte: u8) -> bool {
-    (b'a' <= byte && byte <= b'z') || (b'0' <= byte && byte <= b'9') || byte == b'-'
-}
+// A decision on untrusted input that the brief required to be machine-checked
+// (ADR-0018): the `%s`-placeholder count. The `&str` -> bytes measurement stays
+// a trusted adapter outside this block (the callers). The origin-host byte
+// shape moved to `dns_name` (ADR-0018's `dns_name.rs` row).
 
 /// Non-overlapping `%s` occurrences, the same count `str::matches("%s")`
 /// produces (so `%%s` counts one). Recursive so the executable body below is a
@@ -665,80 +655,6 @@ pub(crate) fn format_placeholder_count_is_one(bytes: &[u8]) -> (ok: bool)
         && count_placeholders(bytes) == 1
 }
 
-/// Whether `bytes[i..]` continues a valid LDH host given the scanner state:
-/// `label_len` bytes into the current label, and `prev_dash` whether the byte
-/// just consumed was `-`. At the end of the input the final label must be
-/// complete (non-empty, <= [`MAX_LABEL_BYTES`]) and must not end in `-`.
-///
-/// This is the byte-exact kernel of [`origin_host_is_exact_bytes`]; the
-/// canonicalization and the IP-literal/IP policy checks stay outside it.
-pub(crate) open spec fn host_prefix_ok(
-    bytes: Seq<u8>,
-    i: int,
-    label_len: int,
-    prev_dash: bool,
-) -> bool
-    decreases bytes.len() - i,
-{
-    if i >= bytes.len() {
-        label_len >= 1 && label_len <= MAX_LABEL_BYTES && !prev_dash
-    } else if bytes[i] == b'.' {
-        label_len >= 1 && label_len <= MAX_LABEL_BYTES && !prev_dash
-            && host_prefix_ok(bytes, i + 1, 0, false)
-    } else {
-        ldh_byte_allowed(bytes[i])
-            && !(label_len == 0 && bytes[i] == b'-')
-            && label_len < MAX_LABEL_BYTES
-            && host_prefix_ok(bytes, i + 1, label_len + 1, bytes[i] == b'-')
-    }
-}
-
-/// The LDH *byte shape* of a canonical origin host: non-empty, <= 253 bytes,
-/// only `[a-z0-9.-]`, no trailing dot, and non-empty labels of <= 63 bytes that
-/// neither start nor end with `-`.
-pub(crate) open spec fn origin_host_is_exact_spec(bytes: Seq<u8>) -> bool {
-    1 <= bytes.len() && bytes.len() <= MAX_HOST_BYTES && host_prefix_ok(bytes, 0, 0, false)
-}
-
-// The recursive body mirrors `host_prefix_ok` clause for clause, so the
-// postcondition is definitional; the value is that the accepted language is
-// *specified* and the executable form cannot drift from it silently.
-#[allow(clippy::manual_range_contains)]
-fn host_prefix_ok_exec(
-    bytes: &[u8],
-    i: usize,
-    label_len: usize,
-    prev_dash: bool,
-) -> (ok: bool)
-    ensures ok == host_prefix_ok(bytes@, i as int, label_len as int, prev_dash),
-    decreases bytes.len() - i,
-{
-    if i >= bytes.len() {
-        label_len >= 1 && label_len <= MAX_LABEL_BYTES && !prev_dash
-    } else {
-        let byte = bytes[i];
-        if byte == b'.' {
-            label_len >= 1 && label_len <= MAX_LABEL_BYTES && !prev_dash
-                && host_prefix_ok_exec(bytes, i + 1, 0, false)
-        } else {
-            let allowed = (b'a' <= byte && byte <= b'z')
-                || (b'0' <= byte && byte <= b'9')
-                || byte == b'-';
-            assert(allowed == ldh_byte_allowed(byte));
-            allowed
-                && !(label_len == 0 && byte == b'-')
-                && label_len < MAX_LABEL_BYTES
-                && host_prefix_ok_exec(bytes, i + 1, label_len + 1, byte == b'-')
-        }
-    }
-}
-
-#[allow(clippy::len_zero)]
-pub(crate) fn origin_host_is_exact_bytes(bytes: &[u8]) -> (ok: bool)
-    ensures ok == origin_host_is_exact_spec(bytes@),
-{
-    1 <= bytes.len() && bytes.len() <= MAX_HOST_BYTES && host_prefix_ok_exec(bytes, 0, 0, false)
-}
 
 } // verus!
 
@@ -1517,11 +1433,11 @@ fn parse_domain(raw: &str) -> std::result::Result<(String, u16), &'static str> {
     if host.is_empty() {
         return Err(DOMAIN_EMPTY_HOST);
     }
-    if host.len() > MAX_HOST_BYTES {
+    if host.len() > crate::dns_name::MAX_HOST_BYTES {
         return Err(DOMAIN_TOO_LONG);
     }
     let host = host.to_ascii_lowercase();
-    if !origin_host_is_exact_bytes(host.as_bytes()) {
+    if !crate::dns_name::ldh_host_bytes(host.as_bytes()) {
         return Err(DOMAIN_MALFORMED);
     }
     // The runtime rejects anything that parses as an IP address; mirroring it

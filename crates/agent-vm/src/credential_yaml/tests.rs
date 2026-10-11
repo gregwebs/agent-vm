@@ -1019,20 +1019,22 @@ fn predicates_agree_with_their_rejection_labels() {
     assert_eq!(over_limit.len(), MAX_FORMAT_BYTES + 1);
     assert!(!format_placeholder_count_is_one(over_limit.as_bytes()));
 
-    assert!(origin_host_is_exact_bytes(b"api.example.com"));
-    assert!(origin_host_is_exact_bytes(b"a1-b2.example.co.uk"));
+    assert!(crate::dns_name::ldh_host_bytes(b"api.example.com"));
+    assert!(crate::dns_name::ldh_host_bytes(b"a1-b2.example.co.uk"));
     assert!(
-        origin_host_is_exact_bytes(b"127.0.0.1"),
+        crate::dns_name::ldh_host_bytes(b"127.0.0.1"),
         "an IP literal passes the *byte* shape; the IP policy is a separate check"
     );
-    assert!(!origin_host_is_exact_bytes(b""));
-    assert!(!origin_host_is_exact_bytes(b"api.example.com."));
-    assert!(!origin_host_is_exact_bytes(b"API.example.com"));
-    assert!(!origin_host_is_exact_bytes(b"api..example.com"));
-    assert!(!origin_host_is_exact_bytes(b"-api.example.com"));
-    assert!(!origin_host_is_exact_bytes(b"api-.example.com"));
-    assert!(!origin_host_is_exact_bytes(b"api.example.com/path"));
-    assert!(!origin_host_is_exact_bytes(&[b'a'; MAX_HOST_BYTES + 1]));
+    assert!(!crate::dns_name::ldh_host_bytes(b""));
+    assert!(!crate::dns_name::ldh_host_bytes(b"api.example.com."));
+    assert!(!crate::dns_name::ldh_host_bytes(b"API.example.com"));
+    assert!(!crate::dns_name::ldh_host_bytes(b"api..example.com"));
+    assert!(!crate::dns_name::ldh_host_bytes(b"-api.example.com"));
+    assert!(!crate::dns_name::ldh_host_bytes(b"api-.example.com"));
+    assert!(!crate::dns_name::ldh_host_bytes(b"api.example.com/path"));
+    assert!(!crate::dns_name::ldh_host_bytes(
+        &[b'a'; crate::dns_name::MAX_HOST_BYTES + 1]
+    ));
 
     assert!(guest_env_name_is_valid_bytes(b"A_1"));
     assert!(guest_env_name_is_valid_bytes(b"_x"));

@@ -130,11 +130,12 @@ Mounts & ports:
           share.
 
 Network egress:
-      --allow-egress <[tcp://|udp://]IP|CIDR[:PORT]>
-          Allow one IP/CIDR, optionally narrowed by tcp:// or udp:// and :PORT (repeatable).
+      --allow-egress <[tcp://|udp://]IP|CIDR[:PORT] | [tcp://]HOST[:PORT]>
+          Allow one IP/CIDR or TLS hostname, optionally transport/port-scoped (repeatable).
 
-          Address-wide, not hostname-isolated. Hostnames are not supported yet. Use brackets for a
-          port on an IPv6 address or CIDR. No implicit port 443.
+          Numeric grants are address-wide. Hostname grants are TLS-only, SNI- and DNS-verified, and
+          refused with a host HTTP proxy. Bare hostnames use intercepted ports (443 by default). Use
+          brackets for a port on an IPv6 address or CIDR.
 
       --allow-internet-egress[=<BOOL>]
           Allow public internet egress and DNS. Guest egress is denied by default
@@ -214,7 +215,7 @@ Networking (deny-by-default; flags compose):
   --publish                host  → guest     open an inbound port to a guest service
   --auto-publish           guest → host      mirror guest listeners onto host loopback
   --allow-internet-egress  guest → internet  public internet + DNS
-  --allow-egress           guest → IP/LAN    reach one IP/CIDR [proto/port]
+  --allow-egress           guest → IP/host   reach one IP/CIDR or TLS hostname [proto/port]
   --allow-lan              guest → LAN       reach the whole private range
   --allow-host             guest → host      reach the host's 127.0.0.1 services
 

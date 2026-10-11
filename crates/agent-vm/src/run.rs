@@ -483,7 +483,7 @@ Networking (deny-by-default; flags compose):
   --publish                host  → guest     open an inbound port to a guest service
   --auto-publish           guest → host      mirror guest listeners onto host loopback
   --allow-internet-egress  guest → internet  public internet + DNS
-  --allow-egress           guest → IP/LAN    reach one IP/CIDR [proto/port]
+  --allow-egress           guest → IP/host   reach one IP/CIDR or TLS hostname [proto/port]
   --allow-lan              guest → LAN       reach the whole private range
   --allow-host             guest → host      reach the host's 127.0.0.1 services
 

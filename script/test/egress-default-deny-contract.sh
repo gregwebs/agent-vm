@@ -35,20 +35,26 @@ with tempfile.TemporaryDirectory(prefix="egress-outside-") as tmp:
     expected |= {(case, "ipv6") for case in ("V6c", "DNS6c", "V6", "D1")}
     expected |= {("RB1", variant) for variant in
                  ("internet", "address", "tcp", "udp", "port", "tcp-port", "udp-port")}
-    expected |= {("RJ1", variant) for variant in ("hostname", "cidr-port", "scheme")}
+    expected |= {("RJ1", variant) for variant in ("udp-hostname", "dns-port", "alias", "wildcard",
+                                                   "numeric-final", "cidr-port", "scheme")}
+    expected |= {(case, "ipv4") for case in (
+        "HNc HN1 HN2 HN3 HN4 HN5 HN5c HN6 OP1 OP1c OP2 OP2c OP3 OP3c "
+        "HP1 HP2 HP2c HP3 HP4 HP5 HP6 HP6c PXH1").split()}
+    expected |= {("RB2", variant) for variant in
+                 ("hostname-only", "lan", "udp", "tcp", "port", "tcp-port")}
     output = subprocess.check_output(["bash", str(root / "script/test/egress-default-deny.sh"),
                                       "--print-plan"], text=True, timeout=10)
     rows = [json.loads(line) for line in output.splitlines()]
     cases = [row for row in rows if row["kind"] != "admin"]
-    assert len(cases) == len(expected) == 44
+    assert len(cases) == len(expected) == 77
     assert {(row["case"], row["variant"]) for row in cases} == expected
     base = {"HOME", "XDG_CONFIG_HOME", "AGENT_VM_STATE_DIR", "PATH", "TERM", "AGENT_VM_SHARE_MSB_CACHE"}
     for row in cases:
         case, argv = row["case"], row["argv"]
         tool = "egresscreds" if case in ("CR1", "CR1c") else "egressprobe"
         assert row["tool"] == argv[1] == tool
-        assert row["kind"] == ("validation-only" if case == "RJ1" else "guest")
-        if case != "RJ1":
+        assert row["kind"] == ("validation-only" if case in ("RJ1", "PXH1") else "guest")
+        if case not in ("RJ1", "PXH1"):
             assert argv[argv.index("--") + 1] == case
         else:
             assert "--" not in argv
@@ -71,7 +77,7 @@ with tempfile.TemporaryDirectory(prefix="egress-outside-") as tmp:
     for row in admins:
         assert row["tool"] is None
         assert "egressprobe" not in row["argv"] and "egresscreds" not in row["argv"]
-    print("host-only per-case print-plan inventory PASS: 44 cases, 9 admin objects")
+    print("host-only per-case print-plan inventory PASS: 77 cases, 9 admin objects")
 PY
 
 # Primitive status/wire controls and dispatcher expectations are complementary:

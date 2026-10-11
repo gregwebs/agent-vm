@@ -5952,6 +5952,10 @@ fn network_flags_reach_the_sandbox_config() {
             "--allow-lan",
             "--allow-egress",
             "tcp://[10.0.0.0/24]:22",
+            "--allow-egress",
+            "api.example.com",
+            "--allow-egress",
+            "tcp://git.example.com:8443",
         ],
     );
     let config = normalized_config(&harness, &out);
@@ -5963,16 +5967,23 @@ fn network_flags_reach_the_sandbox_config() {
             {"direction":"egress","destination":{"cidr":"10.0.0.0/24"},"protocols":["tcp"],"ports":[{"start":22,"end":22}],"action":"allow"},
             {"direction":"egress","destination":{"group":"host"},"protocols":["udp","tcp"],"ports":[{"start":53,"end":53}],"action":"allow"},
             {"direction":"egress","destination":{"group":"public"},"protocols":[],"ports":[],"action":"allow"},
-            {"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"}
+            {"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443},{"start":8443,"end":8443}],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"git.example.com"},"protocols":["tcp"],"ports":[{"start":8443,"end":8443}],"action":"allow"}
         ])
+    );
+    assert_eq!(config["network"]["tls"]["enabled"], true);
+    assert_eq!(
+        config["network"]["tls"]["intercepted_ports"],
+        serde_json::json!([443, 8443])
     );
 }
 
-/// G4: a rejected hostname allowance fails before *any* launch state is created;
-/// a valid numeric control reaches the expected bogus-image failure with its
+/// G4: a rejected UDP hostname allowance fails before *any* launch state is created;
+/// a valid hostname control reaches the expected bogus-image failure with its
 /// fork, credential and MSB state already on disk.
 #[test]
-fn hostname_allowance_is_refused_before_launch_state_is_created() {
+fn rejected_allowance_is_refused_before_launch_state_is_created() {
     let mount_source = support::project_tempdir();
     std::fs::write(mount_source.path().join("sentinel"), "seed").unwrap();
 
@@ -5981,12 +5992,12 @@ fn hostname_allowance_is_refused_before_launch_state_is_created() {
     let mount = format!("{}:/forked:fork", mount_source.path().display());
     let out = rejected.launch(
         "claude",
-        &["--mount", &mount, "--allow-egress", "api.example.com"],
+        &["--mount", &mount, "--allow-egress", "udp://api.example.com"],
     );
     assert!(!out.status.success());
     let stderr = stderr_of(&out);
     assert!(
-        stderr.contains("hostname allowances are not supported yet"),
+        stderr.contains("hostnames allow TLS over TCP only"),
         "{stderr}"
     );
     assert!(
@@ -6016,14 +6027,14 @@ fn hostname_allowance_is_refused_before_launch_state_is_created() {
         "a rejected launch must not initialize MSB launch state"
     );
 
-    // Positive control: the same launch with a numeric allowance reaches the
+    // Positive control: the same launch with a TLS hostname allowance reaches the
     // (expected) bogus-image failure, having created the state the rejection
     // must avoid.
     let control = Harness::new();
     let mount = format!("{}:/forked:fork", mount_source.path().display());
     let out = control.launch(
         "claude",
-        &["--mount", &mount, "--allow-egress", "10.0.0.0/8"],
+        &["--mount", &mount, "--allow-egress", "api.example.com"],
     );
     let stderr = stderr_of(&out);
     assert!(
@@ -6092,8 +6103,24 @@ fn allowance_rejections_report_exact_messages() {
     let harness = Harness::new();
     for (value, expected) in [
         (
-            "reject.invalid",
-            "--allow-egress #1: hostname allowances are not supported yet; use an IP address or CIDR, or --allow-internet-egress",
+            "udp://reject.invalid",
+            "--allow-egress #1: hostnames allow TLS over TCP only; use tcp://HOST:PORT, or an IP/CIDR for UDP",
+        ),
+        (
+            "reject.invalid:53",
+            "--allow-egress #1: ports 53 and 853 carry the sandbox DNS path and cannot be hostname-allowed; use an IP/CIDR",
+        ),
+        (
+            "host.microsandbox.internal",
+            "--allow-egress #1: host.microsandbox.internal is the sandbox host; use --allow-host",
+        ),
+        (
+            "*.reject.invalid",
+            "--allow-egress #1: not an IP address, CIDR or hostname (hostnames: one or more labels of ASCII letters, digits and '-', not ending in a numeric label; write non-ASCII names as A-labels; no wildcards)",
+        ),
+        (
+            "1.2.3",
+            "--allow-egress #1: not an IP address, CIDR or hostname (hostnames: one or more labels of ASCII letters, digits and '-', not ending in a numeric label; write non-ASCII names as A-labels; no wildcards)",
         ),
         (
             "10.0.0.0/24:18080",
@@ -6109,7 +6136,7 @@ fn allowance_rejections_report_exact_messages() {
         let stderr = stderr_of(&out);
         assert!(stderr.contains(expected), "{value}: {stderr}");
         assert!(
-            !stderr.contains(value),
+            (value == "host.microsandbox.internal" || !stderr.contains(value)),
             "{value} must not be echoed: {stderr}"
         );
     }
@@ -6181,4 +6208,93 @@ fn harness_probe_tool_launches_with_its_trailing_args() {
     );
     let config = debug_config_json(&stderr);
     assert_default_deny_zero_provision_network(&config["network"], "egressprobe");
+}
+
+#[test]
+fn hostname_with_host_proxy_is_refused_before_launch_state_is_created() {
+    let harness = Harness::new();
+    let out = harness.launch_with_env(
+        "shell",
+        &["--allow-egress", "api.example.com"],
+        &[("HTTPS_PROXY", "http://127.0.0.1:9")],
+    );
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success());
+    assert!(stderr.contains("hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress"), "{stderr}");
+    assert!(!stderr.contains(CONFIG_MARKER));
+    assert!(!stderr.contains("api.example.com"));
+    assert!(!stderr.contains("127.0.0.1:9"));
+    assert!(
+        !harness
+            .state_root
+            .join(project_hash(&harness.project_root))
+            .exists()
+    );
+    assert!(!harness.state_root.join("msb-home").exists());
+    let control = Harness::new();
+    let out = control.launch("shell", &["--allow-egress", "api.example.com"]);
+    assert!(stderr_of(&out).contains(CONFIG_MARKER));
+}
+
+#[test]
+fn zero_provision_hostname_launch_enables_interception() {
+    let harness = Harness::new();
+    harness.write_user("[[tools]]\nname = \"plain\"\ncommand = \"/bin/echo\"\ntools = []\n");
+    let out = harness.launch("plain", &["--allow-egress", "api.example.com"]);
+    let config = normalized_config(&harness, &out);
+    let network = &config["network"];
+    assert_eq!(network["tls"]["enabled"], true);
+    assert_eq!(network["strict"], true);
+    assert_eq!(
+        network["tls"]["intercepted_ports"],
+        serde_json::json!([443])
+    );
+    assert_eq!(network["secrets"]["secrets"], serde_json::json!([]));
+    assert!(
+        network["secrets"].get("header_credentials").is_none(),
+        "an empty header-credential set is wire-omitted"
+    );
+    assert_eq!(
+        network["policy"]["rules"],
+        serde_json::json!([
+            {"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}
+        ])
+    );
+}
+
+#[test]
+fn hostname_allowance_survives_the_credential_overlay() {
+    let harness = Harness::new();
+    harness.write_user(ONE_YAML_TOOL);
+    write_credentials(
+        &harness.home_root,
+        "credentials:\n  - service: my-service\n    apiKey:\n      name: MY_SERVICE_KEY\n      sentinelEnv: true\n      inject: [{domain: 'api.my-service.example:9443', header: x-api-key, format: '%s'}]\n",
+    );
+    let out = harness.launch_with_env(
+        "t",
+        &[
+            "--allow-egress",
+            "api.example.com",
+            "--allow-egress",
+            "tcp://git.example.com:8443",
+        ],
+        &[(
+            "AGENT_VM_TEST_CREDENTIAL",
+            "my-service=sk-test-overlay-value",
+        )],
+    );
+    let config = normalized_config(&harness, &out);
+    let network = &config["network"];
+    assert_eq!(network["tls"]["enabled"], true);
+    assert_eq!(
+        network["tls"]["intercepted_ports"],
+        serde_json::json!([443, 8443, 9443])
+    );
+    assert_eq!(
+        network["policy"],
+        serde_json::json!({"default_egress":"deny","default_ingress":"allow","rules":[
+            {"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443},{"start":8443,"end":8443}],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"git.example.com"},"protocols":["tcp"],"ports":[{"start":8443,"end":8443}],"action":"allow"}
+        ]})
+    );
 }

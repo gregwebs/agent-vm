@@ -301,7 +301,12 @@ loopback credentials in the OS keyring, a reachable host RFC1918/CGN address,
 and firewall access for TCP 18080/18081, UDP 19090/18080 and proxy 18888.
 Public HTTP/DNS controls must work before a denial is counted. Guest tools are
 checked at preflight; paired IPv6/rebind groups report NOT RUN when unavailable.
-Never change operator DNS, policy or keychain to make a test pass.
+On macOS, firewall access must cover the **host Python interpreter** serving the
+fixtures, not just the launcher. A blocked interpreter can accept a LAN socket
+and then fail with `Socket is not connected`, while loopback controls pass.
+Check the interpreter's incoming-connection status; use an already-allowed
+interpreter on the harness's `PATH` rather than changing operator firewall rules.
+Never change operator DNS, firewall, policy or keychain to make a test pass.
 
 The harness creates private HOME/state/cache and retains `summary.tsv`,
 per-case logs and `owned.jsonl` under its printed owned work root. Preserve

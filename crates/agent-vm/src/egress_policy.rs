@@ -406,17 +406,21 @@ pub(crate) struct EgressAllowance {
 pub(crate) enum AllowanceError {
     Empty,
     UnsupportedScheme,
-    Hostname,
+    UdpHostname,
+    HostnameDnsPort,
+    HostAlias,
     MalformedAddress,
     PortNeedsBrackets,
     MalformedPort,
 }
 impl AllowanceError {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Empty,
         Self::UnsupportedScheme,
-        Self::Hostname,
+        Self::UdpHostname,
+        Self::HostnameDnsPort,
+        Self::HostAlias,
         Self::MalformedAddress,
         Self::PortNeedsBrackets,
         Self::MalformedPort,
@@ -427,8 +431,10 @@ impl std::fmt::Display for AllowanceError {
         f.write_str(match self {
             Self::Empty => "empty allowance",
             Self::UnsupportedScheme => "unsupported scheme; use tcp:// or udp:// (or no scheme for all protocols)",
-            Self::Hostname => "hostname allowances are not supported yet; use an IP address or CIDR, or --allow-internet-egress",
-            Self::MalformedAddress => "not an IP address or CIDR",
+            Self::UdpHostname => "hostnames allow TLS over TCP only; use tcp://HOST:PORT, or an IP/CIDR for UDP",
+            Self::HostnameDnsPort => "ports 53 and 853 carry the sandbox DNS path and cannot be hostname-allowed; use an IP/CIDR",
+            Self::HostAlias => "host.microsandbox.internal is the sandbox host; use --allow-host",
+            Self::MalformedAddress => "not an IP address, CIDR or hostname (hostnames: one or more labels of ASCII letters, digits and '-', not ending in a numeric label; write non-ASCII names as A-labels; no wildcards)",
             Self::PortNeedsBrackets => "a port on a CIDR needs brackets, e.g. tcp://[10.0.0.0/24]:22",
             Self::MalformedPort => "port must be a decimal number 1-65535",
         })
@@ -453,18 +459,39 @@ fn address_network(text: &str) -> Result<ipnetwork::IpNetwork, AllowanceError> {
             .map(ipnetwork::IpNetwork::from)
             .map_err(|_| ())
     };
-    parsed.map_err(|()| {
-        if (1..=253).contains(&text.len())
-            && text
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-            && text.bytes().any(|b| b.is_ascii_alphabetic())
-        {
-            AllowanceError::Hostname
-        } else {
-            AllowanceError::MalformedAddress
+    parsed.map_err(|()| AllowanceError::MalformedAddress)
+}
+use crate::egress_hostname::{HostnameAllowance, InterceptedPorts, domain_rules};
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Allowance {
+    Address(EgressAllowance),
+    Hostname(HostnameAllowance),
+}
+impl Allowance {
+    pub(crate) fn parse(text: &str) -> Result<Self, AllowanceError> {
+        if text.is_empty() {
+            return Err(AllowanceError::Empty);
         }
-    })
+        let (scheme, start) = split_scheme(text.as_bytes())?;
+        let target = &text[start..];
+        let layout = split_target(target.as_bytes(), address_network(target).is_ok())?;
+        let slice = &target[layout.addr_start..layout.addr_end];
+        match address_network(slice) {
+            Ok(_) => EgressAllowance::parse(text).map(Self::Address),
+            Err(_) => {
+                HostnameAllowance::from_target(scheme, layout.addr_start == 1, slice, layout.port)
+                    .map(Self::Hostname)
+            }
+        }
+    }
+}
+impl std::fmt::Display for Allowance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Address(a) => a.fmt(f),
+            Self::Hostname(h) => h.fmt(f),
+        }
+    }
 }
 impl EgressAllowance {
     pub(crate) fn parse(text: &str) -> Result<Self, AllowanceError> {
@@ -545,15 +572,19 @@ pub(crate) struct CliEgress<'a> {
 pub(crate) struct EgressAuthority {
     groups: GroupGrants,
     allowances: Vec<EgressAllowance>,
+    hostnames: Vec<HostnameAllowance>,
 }
 impl EgressAuthority {
     pub(crate) fn from_cli(input: CliEgress<'_>) -> anyhow::Result<Self> {
         let mut allowances = Vec::new();
+        let mut hostnames = Vec::new();
         for (i, text) in input.allowances.iter().enumerate() {
-            let allowance = EgressAllowance::parse(text)
+            let allowance = Allowance::parse(text)
                 .map_err(|e| anyhow::anyhow!("--allow-egress #{}: {e}", i + 1))?;
-            if !allowances.contains(&allowance) {
-                allowances.push(allowance);
+            match allowance {
+                Allowance::Address(a) if !allowances.contains(&a) => allowances.push(a),
+                Allowance::Hostname(h) if !hostnames.contains(&h) => hostnames.push(h),
+                _ => {}
             }
         }
         Ok(Self {
@@ -563,7 +594,14 @@ impl EgressAuthority {
                 host: input.host.unwrap_or(false),
             },
             allowances,
+            hostnames,
         })
+    }
+    pub(crate) fn has_hostnames(&self) -> bool {
+        !self.hostnames.is_empty()
+    }
+    pub(crate) fn intercepted_ports(&self) -> Option<InterceptedPorts> {
+        InterceptedPorts::for_hostnames(&self.hostnames)
     }
     pub(crate) fn policy(&self) -> microsandbox::NetworkPolicy {
         use microsandbox_network::policy::{Action, Destination, DestinationGroup, Rule};
@@ -581,6 +619,9 @@ impl EgressAuthority {
                 rules.push(Rule::allow_egress(Destination::Group(group)));
             }
         }
+        if let Some(ports) = self.intercepted_ports() {
+            rules.extend(domain_rules(&self.hostnames, &ports));
+        }
         // from_profiles opens DNS for LAN alone; none() also denies ingress.
         microsandbox::NetworkPolicy {
             default_egress: Action::Deny,
@@ -590,6 +631,7 @@ impl EgressAuthority {
     }
     pub(crate) fn write_notices(&self, output: &mut impl std::io::Write) -> std::io::Result<()> {
         if self.allowances.is_empty()
+            && !self.has_hostnames()
             && !self.groups.internet
             && !self.groups.lan
             && !self.groups.host
@@ -620,6 +662,32 @@ impl EgressAuthority {
                 "==> Egress policy: --allow-host enabled (host.microsandbox.internal → host 127.0.0.1 reachable; includes the host DNS resolver)"
             )?;
         }
+        if let Some(ports) = self.intercepted_ports() {
+            for rule in domain_rules(&self.hostnames, &ports) {
+                if let microsandbox_network::policy::Destination::Domain(name) = rule.destination {
+                    let effective = rule
+                        .ports
+                        .iter()
+                        .map(|p| p.start.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    writeln!(
+                        output,
+                        "==> Egress policy: allowing TLS to {name} on ports {effective} (SNI and DNS verified; no plain HTTP)"
+                    )?;
+                }
+            }
+            let effective = ports
+                .to_vec()
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(
+                output,
+                "==> TLS interception: ports {effective} — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT."
+            )?;
+        }
         let source = match (self.groups.internet, self.groups.host) {
             (true, true) => Some("both"),
             (true, false) => Some("--allow-internet-egress"),
@@ -631,10 +699,15 @@ impl EgressAuthority {
                 output,
                 "==> Egress DNS: arbitrary-name DNS queries authorized via {source} (resolver/rebind/platform constraints still apply)"
             )
+        } else if self.has_hostnames() {
+            writeln!(
+                output,
+                "==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)"
+            )
         } else {
             writeln!(
                 output,
-                "==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP allowances)"
+                "==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP or hostname allowances)"
             )
         }
     }
@@ -701,6 +774,7 @@ mod tests {
         }
     }
 
+    mod hostname_tests;
     proptest! {
         #[test]
         fn port_kernel_matches_decimal_oracle(s in "[0-9+\\- a]{0,7}") {
@@ -800,6 +874,7 @@ mod tests {
                 UnsupportedScheme,
                 &[
                     "https://1.1.1.1",
+                    "https://example.com",
                     "icmp://1.1.1.1",
                     "://1.1.1.1",
                     "tcp://udp://1.1.1.1",
@@ -849,19 +924,38 @@ mod tests {
                     ":0",
                 ],
             ),
+            (UdpHostname, &["udp://h.example", "udp://h.example:53"]),
+            (HostnameDnsPort, &["h.example:53", "tcp://h.example:853"]),
+            (HostAlias, &["host.microsandbox.internal."]),
             (
-                Hostname,
+                MalformedAddress,
                 &[
-                    "example.com",
-                    "tcp://api.example.com:443",
-                    "localhost",
-                    "example.com:443",
+                    "[h.example]:443",
+                    "*.h.example",
+                    ".h.example",
+                    "user@h.example",
+                    "h.example/p",
+                    "h.example?q",
+                    "bücher.example",
+                    "h.example..",
+                    "1234",
+                    "127.1",
+                    "0x7f.1",
+                ],
+            ),
+            (
+                MalformedPort,
+                &[
+                    "h.example:0",
+                    "h.example:022",
+                    "h.example:65536",
+                    "tcp://h.example:65536",
                 ],
             ),
         ];
         for (error, inputs) in rows {
             for input in *inputs {
-                assert_eq!(EgressAllowance::parse(input), Err(*error), "{input}");
+                assert_eq!(Allowance::parse(input), Err(*error), "{input}");
             }
         }
     }
@@ -948,7 +1042,7 @@ mod tests {
     }
     #[test]
     fn error_index_never_echoes_input() {
-        let raw = ["1.1.1.1".to_owned(), "example.com".to_owned()];
+        let raw = ["1.1.1.1".to_owned(), "udp://example.com".to_owned()];
         let error = EgressAuthority::from_cli(CliEgress {
             internet: None,
             lan: None,
@@ -959,7 +1053,7 @@ mod tests {
         .to_string();
         assert_eq!(
             error,
-            format!("--allow-egress #2: {}", AllowanceError::Hostname)
+            format!("--allow-egress #2: {}", AllowanceError::UdpHostname)
         );
         assert!(!error.contains("example"));
     }
@@ -1205,7 +1299,7 @@ mod tests {
             if let Some(source) = source {
                 expected.push_str(&format!("==> Egress DNS: arbitrary-name DNS queries authorized via {source} (resolver/rebind/platform constraints still apply)\n"));
             } else {
-                expected.push_str("==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP allowances)\n");
+                expected.push_str("==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP or hostname allowances)\n");
             }
             assert_eq!(String::from_utf8(output).unwrap(), expected);
         }
@@ -1213,7 +1307,7 @@ mod tests {
     proptest! {
         #[test]
         fn rejected_errors_are_fixed_text(s in any::<String>()) {
-            if let Err(e) = EgressAllowance::parse(&s) {
+            if let Err(e) = Allowance::parse(&s) {
                 prop_assert!(AllowanceError::ALL.map(|e| e.to_string()).contains(&e.to_string()));
             }
         }
@@ -1225,10 +1319,10 @@ mod tests {
         }
         #[test]
         fn grammar_shaped_display_is_a_fixed_point(s in "[a-zA-Z0-9:/\\[\\].+ -]{0,90}") {
-            if let Ok(a) = EgressAllowance::parse(&s) {
+            if let Ok(a) = Allowance::parse(&s) {
                 let displayed = a.to_string();
-                let reparsed = EgressAllowance::parse(&displayed);
-                prop_assert_eq!(reparsed, Ok(a));
+                let reparsed = Allowance::parse(&displayed);
+                prop_assert_eq!(&reparsed, &Ok(a));
                 prop_assert_eq!(reparsed.unwrap().to_string(), displayed);
             }
         }

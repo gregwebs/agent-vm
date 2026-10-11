@@ -520,13 +520,226 @@ _case_dns_pair() {
     done
 }
 
+# Receipt-tier TLS probes report an attempt, not handshake success: upstream
+# receipt listeners deliberately close before certificate verification completes.
+tls_probe() {
+    python3 - "$@" <<'PY'
+import socket, ssl, sys
+if len(sys.argv) != 4:
+    raise SystemExit(2)
+host, port, name = sys.argv[1:]
+try:
+    port = int(port)
+    if not 1 <= port <= 65535:
+        raise ValueError("port")
+    context = ssl.create_default_context()
+    if name == "-":
+        context.check_hostname = False
+        name = None
+    with socket.create_connection((host, port), timeout=3) as conn:
+        with context.wrap_socket(conn, server_hostname=name):
+            pass
+except ValueError:
+    raise SystemExit(2)
+except OSError:
+    pass
+print("TLS_ATTEMPT", host, port, name or "-")
+PY
+}
+
+https_get() {
+    # The dial IP may be pinned only after a same-sandbox forwarded lookup.
+    # No -k: the zero-provision CA installation is part of the contract.
+    curl -4 --http1.1 --max-time 10 --silent --show-error "$@"
+}
+
+opaque_send() {
+    python3 - "$@" <<'PY'
+import socket, sys
+if len(sys.argv) != 4:
+    raise SystemExit(2)
+try:
+    host, port, encoded = sys.argv[1:]
+    payload = bytes.fromhex(encoded)
+    if len(payload) > 65536:
+        raise ValueError("payload budget")
+    with socket.create_connection((host, int(port)), timeout=3) as conn:
+        conn.sendall(payload)
+        conn.shutdown(socket.SHUT_WR)
+    print("OPAQUE_SENT", encoded)
+except ValueError:
+    raise SystemExit(2)
+except OSError:
+    raise SystemExit(1)
+PY
+}
+
+server_first() {
+    python3 - "$@" <<'PY'
+import socket, sys
+if len(sys.argv) != 4:
+    raise SystemExit(2)
+try:
+    host, port, encoded = sys.argv[1:]
+    with socket.create_connection((host, int(port)), timeout=3) as conn:
+        banner = b""
+        while len(banner) < 13:
+            part = conn.recv(13 - len(banner))
+            if not part:
+                raise OSError("short banner")
+            banner += part
+        if banner != b"220 fixture\r\n":
+            raise OSError("wrong banner")
+        conn.sendall(bytes.fromhex(encoded))
+        conn.shutdown(socket.SHUT_WR)
+    print("BANNER_OK", banner.hex())
+except ValueError:
+    raise SystemExit(2)
+except OSError:
+    raise SystemExit(1)
+PY
+}
+
+tls_held_two_requests() {
+    python3 - "$@" <<'PY'
+import http.client, socket, ssl, sys
+if len(sys.argv) != 5:
+    raise SystemExit(2)
+ip, sni, second_host, expectation = sys.argv[1:]
+if expectation not in ("allow", "deny"):
+    raise SystemExit(2)
+connects = 0
+try:
+    conn = socket.create_connection((ip, 443), timeout=10)
+    connects += 1
+    with ssl.create_default_context().wrap_socket(conn, server_hostname=sni) as held:
+        fd = held.fileno()
+        for index, authority in enumerate((sni, second_host)):
+            held.sendall(f"GET / HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n".encode("ascii"))
+            try:
+                response = http.client.HTTPResponse(held)
+                response.begin()
+                # A close-delimited body cannot establish a held connection.
+                if response.length is None and not response.chunked:
+                    raise ValueError("response has no bounded body framing")
+                body = response.read(8 * 1024 * 1024 + 1)
+                if len(body) > 8 * 1024 * 1024:
+                    raise ValueError("response budget")
+                if response.length not in (None, 0):
+                    raise OSError("incomplete response body")
+                status = response.status
+                response.close()
+            except (OSError, http.client.HTTPException):
+                if index != 1 or expectation != "deny":
+                    raise
+                if held.fileno() != fd or connects != 1:
+                    raise ValueError("connection reopened")
+                print("HELD_DENIED connects=1")
+                break
+            if index == 1 and expectation == "deny":
+                raise ValueError("second authority returned an HTTP response")
+            if not 200 <= status < 300:
+                raise ValueError("non-2xx response")
+            if held.fileno() != fd or connects != 1:
+                raise ValueError("connection reopened")
+            print(f"HELD_OK request={index + 1} connects={connects} fd={fd}")
+except (OSError, ValueError, http.client.HTTPException):
+    raise SystemExit(1)
+PY
+}
+
+# ---- #306 hostname tier ---------------------------------------------------
+# These attempts are judged by host-side receipts (TLS SNI, opaque payload,
+# banner bytes), not by the probe's exit status: a denied dial and a framing or
+# rule denial both surface as "no receipt". `expected` is 0 (receipt required)
+# or 1 (no receipt). The payload/SNI is the trailing ATTEMPT field so the host
+# can join the exact receipt without duplicating the constant.
+
+_case_tls() {  # NAME HOST PORT EXPECTED LABEL
+    local name="$1" host="$2" port="$3" expected="$4" label="$5" rc=0
+    printf 'ATTEMPT %s %s tls %s %s %s %s %s\n' "$case_id" "$label" "$host" "$port" "$expected" "$attempt_id-$label" "$name"
+    tls_probe "$host" "$port" "$name" || rc=$?
+    (( rc == PROBE_USAGE )) && return "$PROBE_USAGE"
+    return 0
+}
+
+_case_binary() {  # PROTOCOL HOST PORT HEX EXPECTED LABEL
+    local proto="$1" host="$2" port="$3" hex="$4" expected="$5" label="$6" rc=0
+    printf 'ATTEMPT %s %s %s %s %s %s %s %s\n' "$case_id" "$label" "$proto" "$host" "$port" "$expected" "$attempt_id-$label" "$hex"
+    if [[ "$proto" == banner ]]; then
+        server_first "$host" "$port" "$hex" || rc=$?
+    else
+        opaque_send "$host" "$port" "$hex" || rc=$?
+    fi
+    (( rc == PROBE_USAGE )) && return "$PROBE_USAGE"
+    return 0
+}
+
+_case_https() {  # URL EXPECTED LABEL [RESOLVE_SPEC] [FOLLOW]
+    # EXPECTED is "0" (2xx), "1" (not 2xx, or no response), or a 3-digit
+    # status. The trailing ATTEMPT field is the resolve spec ("-" when none).
+    local url="$1" expected="$2" label="$3" resolve="${4:-}" follow="${5:-}" rc=0 out
+    printf 'ATTEMPT %s %s https %s 443 %s %s %s\n' "$case_id" "$label" "$url" "$expected" "$attempt_id-$label" "${resolve:--}"
+    local argv=(-o /dev/null -w '%{http_code}')
+    [[ -n "$resolve" ]] && argv+=(--resolve "$resolve")
+    [[ "$follow" == follow ]] && argv+=(-L)
+    out=$(https_get "${argv[@]}" "$url" 2>&1) || rc=$?
+    printf 'HTTP_CODE %s rc=%s\n' "${out##*$'\n'}" "$rc"
+    return 0
+}
+
+_case_http_nohost() {  # HOST PORT EXPECTED LABEL
+    # HTTP/1.0 with no Host header: D1 blocks it on numeric flows once any
+    # hostname rule exists, so the receipt must be absent.
+    local host="$1" port="$2" expected="$3" label="$4" rc=0
+    printf 'ATTEMPT %s %s tcp %s %s %s %s %s\n' "$case_id" "$label" "$host" "$port" "$expected" "$attempt_id-$label" "nohost"
+    _probe_bounded 5 _http_nohost "HTTP_FAIL $attempt_id-$label" "$host" "$port" "$attempt_id-$label" || rc=$?
+    (( rc == PROBE_USAGE )) && return "$PROBE_USAGE"
+    return 0
+}
+
+_http_nohost() {  # HOST PORT ID
+    local host="$1" port="$2" id="$3"
+    { exec 3<>"/dev/tcp/$host/$port"; } 2>/dev/null || { echo "HTTP_FAIL $id"; return "$PROBE_NET"; }
+    printf 'GET /r/%s HTTP/1.0\r\nConnection: close\r\n\r\n' "$id" >&3 2>/dev/null || true
+    exec 3<&- 3>&-
+    echo "HTTP_FAIL $id"
+    return "$PROBE_NET"
+}
+
+_case_held() {  # IP SNI SECOND EXPECTED LABEL
+    local ip="$1" sni="$2" second="$3" expected="$4" label="$5" rc=0 expectation
+    printf 'ATTEMPT %s %s held %s 443 %s %s %s\n' "$case_id" "$label" "$ip" "$expected" "$attempt_id-$label" "$sni->$second"
+    expectation=deny
+    [[ "$expected" == 0 ]] && expectation=allow
+    tls_held_two_requests "$ip" "$sni" "$second" "$expectation" || rc=$?
+    (( rc == PROBE_USAGE )) && return "$PROBE_USAGE"
+    return 0
+}
+
+_hostname_preflight() {
+    local tls_enabled="$1" cmd
+    for cmd in python3 curl; do
+        command -v "$cmd" >/dev/null || { echo "PREFLIGHT missing=$cmd"; return "$PROBE_USAGE"; }
+    done
+    python3 -c 'import ssl, socket' >/dev/null 2>&1 || { echo 'PREFLIGHT missing=ssl,socket'; return "$PROBE_USAGE"; }
+    if [[ "$tls_enabled" == 1 ]]; then
+        [[ -r /.msb/tls/ca.pem ]] || { echo 'PREFLIGHT missing=ca'; return "$PROBE_USAGE"; }
+        [[ -n "${SSL_CERT_FILE:-}" && -r "$SSL_CERT_FILE" ]] || { echo 'PREFLIGHT missing=SSL_CERT_FILE'; return "$PROBE_USAGE"; }
+        python3 -c 'import os; from pathlib import Path; ca=Path("/.msb/tls/ca.pem").read_bytes().strip(); assert ca in Path(os.environ["SSL_CERT_FILE"]).read_bytes()' || { echo 'PREFLIGHT missing=trusted-ca'; return "$PROBE_USAGE"; }
+    elif [[ -e /.msb/tls/ca.pem ]]; then
+        echo 'PREFLIGHT unexpected=ca'
+        return "$PROBE_USAGE"
+    fi
+}
+
 _case_preflight() {
     local cmd
     for cmd in bash dd od timeout; do
         command -v "$cmd" >/dev/null || { echo "PREFLIGHT missing=$cmd"; return "$PROBE_USAGE"; }
     done
     [[ -n "${EPOCHREALTIME:-}" ]] || { echo "PREFLIGHT missing=EPOCHREALTIME"; return "$PROBE_USAGE"; }
-    command -v python3 >/dev/null || command -v node >/dev/null || return "$PROBE_USAGE"
+    _hostname_preflight "${1:-0}" || return "$PROBE_USAGE"
     local gw
     gw=$(gateway) || return "$PROBE_USAGE"
     [[ -n "$gw" ]] || return "$PROBE_USAGE"
@@ -547,6 +760,12 @@ _case_dispatch() {
     [[ -n "$lan" ]] || return "$PROBE_USAGE"
     gw=$(gateway) || return "$PROBE_USAGE"
     [[ -n "$gw" ]] || return "$PROBE_USAGE"
+    case "$case_id" in
+        HNc|HN1|HN2|HN3|HN4|HN5|HN6|OP1|OP2|OP3|RB2|HP1|HP2|HP2c|HP3|HP4|HP5|HP6|HP6c)
+            _case_preflight 1 || return "$PROBE_USAGE" ;;
+        HN5c|OP1c|OP2c|OP3c)
+            _case_preflight 0 || return "$PROBE_USAGE" ;;
+    esac
     case "$case_id" in
         LC1)
             _case_flow 0 tcp "$lan" 18080 lan-tcp80 || return 2
@@ -651,6 +870,161 @@ _case_dispatch() {
         V6)
             _case_flow 0 public 2606:4700:4700::1111 80 public-v6-1111 || return 2
             _case_flow 1 public 2606:4700:4700::1001 80 public-v6-1001 || return 2 ;;
+        HNc)
+            # Admission is host-side (ladder step); the probe warms the cache
+            # through the step's DNS path, then dials TLS with SNI=name.
+            local name step
+            IFS=, read -r name step <<<"$extra"
+            [[ -n "$name" && -n "$step" ]] || return 2
+            if [[ "$step" == c ]]; then
+                _case_dns OK "$lan" "$name" udp hnc-dns || return 2
+            else
+                _case_dns OK "$gw" "$name" udp hnc-dns || return 2
+            fi
+            [[ "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_tls "$name" "$lan" 18443 0 hnc-tls || return 2 ;;
+        HN1)
+            local a b c d
+            IFS=, read -r a b c d <<<"$extra"
+            [[ -n "$a" && -n "$b" && -n "$c" && -n "$d" ]] || return 2
+            _case_dns OK "$gw" "$a" udp hn1a-dns || return 2
+            [[ "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_dns OK "$gw" "$b" udp hn1b-dns || return 2
+            [[ "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_dns OK "$gw" "$c" udp hn1c-dns || return 2
+            [[ "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_tls "$a" "$lan" 18443 0 hn1a-18443 || return 2
+            _case_tls "$a" "$lan" 18444 1 hn1a-18444 || return 2
+            _case_tls "$b" "$lan" 18444 0 hn1b-18444 || return 2
+            _case_tls "$b" "$lan" 18443 1 hn1b-18443 || return 2
+            _case_tls "$c" "$lan" 18443 0 hn1c-18443 || return 2
+            _case_tls "$c" "$lan" 18444 0 hn1c-18444 || return 2
+            _case_dns NX "$gw" "$d" udp hn1d-dns || return 2
+            _case_tls "$d" "$lan" 18443 1 hn1d-18443 || return 2 ;;
+        HN2)
+            local a b lan2
+            IFS=, read -r a b lan2 <<<"$extra"
+            [[ -n "$a" && -n "$b" && -n "$lan2" ]] || return 2
+            _case_dns OK "$gw" "$a" udp hn2a-dns || return 2
+            [[ "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_dns OK "$gw" "$b" udp hn2b-dns || return 2
+            [[ "$CASE_DNS_A" == "$lan2" ]] || return 2
+            _case_tls "$a" "$lan" 18443 0 hn2a-lan || return 2
+            _case_tls "$b" "$lan2" 18443 0 hn2b-lan2 || return 2
+            _case_tls "$a" "$lan2" 18443 1 hn2a-wrong || return 2
+            _case_tls "$b" "$lan" 18443 1 hn2b-wrong || return 2 ;;
+        HN3)
+            local n="$extra"
+            [[ -n "$n" ]] || return 2
+            _case_dns OK "$gw" "$n" udp hn3-dns || return 2
+            [[ "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_tls "$n" "$lan" 18443 0 hn3-sni || return 2
+            _case_tls - "$lan" 18443 1 hn3-nosni || return 2
+            _case_binary opaque "$lan" 18443 50494e4720780d0a0d0a 1 hn3-plain || return 2
+            _case_flow 1 tcp "$lan" 18080 lan-tcp80 || return 2 ;;
+        HN4)
+            local a b
+            IFS=, read -r a b <<<"$extra"
+            [[ -n "$a" && -n "$b" ]] || return 2
+            _case_dns OK "$gw" "$a" udp hn4a-dns || return 2
+            [[ "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_dns OK "$gw" "$b" udp hn4b-dns || return 2
+            [[ "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_tls "$a" "$lan" 18443 0 hn4a-tls || return 2
+            _case_tls "$b" "$lan" 18443 1 hn4b-tls || return 2 ;;
+        HN5)
+            local n="$extra"
+            [[ -n "$n" ]] || return 2
+            _case_dns OK "$gw" "$n" udp hn5-dns || return 2
+            [[ "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_tls arbitrary.invalid "$lan" 18443 0 hn5-numeric || return 2
+            _case_tls "$n" "$lan" 18443 0 hn5-name || return 2
+            _case_binary opaque "$lan" 18443 50494e47 1 hn5-plain || return 2 ;;
+        HN5c) _case_binary opaque "$lan" 18443 50494e47 0 hn5c-plain || return 2 ;;
+        HN6)
+            local n="$extra"
+            [[ -n "$n" ]] || return 2
+            _case_dns OK "$gw" "$n" udp hn6-dns || return 2
+            [[ "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_flow 0 tcp "$lan" 18080 lan-tcp80 || return 2
+            _case_http_nohost "$lan" 18080 1 hn6-nohost || return 2 ;;
+        OP1|OP1c)
+            # The guest dials the numeric LAN grant; the hostname rule only has
+            # to exist so the emitted Domain rule turns on D1 authority
+            # enforcement. OP1c is the same flow without the hostname rule.
+            _case_binary opaque "$lan" 18090 50494e4720780d0a0d0a "$([ "$case_id" == OP1 ] && echo 1 || echo 0)" op-printable || return 2 ;;
+        OP2|OP2c)
+            _case_binary opaque "$lan" 18090 000102030405060708090a0b0c0d0e0f10 0 op-binary || return 2 ;;
+        OP3|OP3c)
+            _case_binary banner "$lan" 18091 515549540d0a 0 op-banner || return 2 ;;
+        RB2)
+            # Admission is the variant grant; the query is authorized by the
+            # Domain rule. Assert the variant's expected DNS outcome and, for
+            # the admitted variants, that the private answer formed a binding.
+            local name="$extra" expected
+            [[ -n "$name" ]] || return 2
+            case "$variant" in
+                hostname-only|port|tcp-port) expected=NX ;;
+                lan|udp|tcp) expected=OK ;;
+                *) return 2 ;;
+            esac
+            _case_dns "$expected" "$gw" "$name" udp "rb2-$variant-udp" || return 2
+            [[ "$expected" != OK || "$CASE_DNS_A" == "$lan" ]] || return 2
+            _case_dns "$expected" "$gw" "$name" tcp "rb2-$variant-tcp" || return 2
+            [[ "$expected" != OK || "$CASE_DNS_A" == "$lan" ]] || return 2 ;;
+        HP1)
+            local n="$extra"
+            _case_dns OK "$gw" "$n" udp hp1-com-dns || return 2
+            _case_https "https://$n/" 0 hp1-https || return 2
+            _case_dns_pair NX "$gw" example.org hp1-scope || return 2
+            _case_https "http://$n/" 1 hp1-http || return 2 ;;
+        HP2)
+            local a b
+            IFS=, read -r a b <<<"$extra"
+            _case_dns OK "$gw" "$a" udp hp2-dns || return 2
+            _case_held "$CASE_DNS_A" "$a" "$b" 1 hp2-switch || return 2 ;;
+        HP2c)
+            local a
+            IFS=, read -r a _ <<<"$extra"
+            _case_dns OK "$gw" "$a" udp hp2c-dns || return 2
+            _case_held "$CASE_DNS_A" "$a" "$a" 0 hp2c-same || return 2 ;;
+        HP3)
+            local a b
+            IFS=, read -r a b <<<"$extra"
+            _case_dns OK "$gw" "$b" udp hp3b-dns || return 2
+            local spoof="$CASE_DNS_A"
+            _case_dns OK "$gw" "$a" udp hp3a-dns || return 2
+            # The spoof control is only meaningful when the two names resolve
+            # to disjoint public addresses.
+            [[ "$spoof" != "$CASE_DNS_A" ]] || return 2
+            _case_https "https://$a/" 0 hp3-control || return 2
+            _case_https "https://$a/" 1 hp3-spoof "$a:443:$spoof" || return 2 ;;
+        HP4)
+            local a b
+            IFS=, read -r a b <<<"$extra"
+            _case_dns OK "$gw" "$a" udp hp4a-dns || return 2
+            local ip="$CASE_DNS_A"
+            _case_dns OK "$gw" "$b" udp hp4b-dns || return 2
+            [[ "$CASE_DNS_A" == "$ip" ]] || return 2
+            _case_https "https://$a/" 0 hp4-a "$a:443:$ip" || return 2
+            _case_https "https://$b/" 1 hp4-b "$b:443:$ip" || return 2 ;;
+        HP5)
+            local n="$extra"
+            _case_dns OK "$gw" "$n" udp hp5-dns || return 2
+            _case_https "https://$n/" 0 hp5-control || return 2
+            _case_tls - "$CASE_DNS_A" 443 1 hp5-nosni || return 2 ;;
+        HP6|HP6c)
+            # The control case also allows the redirect target, so the same
+            # first hop must then follow successfully.
+            local a b expected=1
+            IFS=, read -r a b <<<"$extra"
+            [[ "$case_id" == HP6c ]] && expected=0
+            _case_dns OK "$gw" "$b" udp hp6b-dns || return 2
+            [[ "$CASE_DNS_A" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
+            _case_dns OK "$gw" "$a" udp hp6a-dns || return 2
+            _case_https "https://$a/" 301 hp6-first || return 2
+            _case_https "https://$a/" "$expected" hp6-redirect "" follow || return 2 ;;
+        PXH1) return 0 ;; # validation-only: no guest probe runs
         *) echo "CASE $case_id UNKNOWN"; return "$PROBE_USAGE" ;;
     esac
 }

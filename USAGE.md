@@ -1464,8 +1464,9 @@ one.
 
 Tool-launch guest egress is **denied by default**, including DNS query authorization.
 Before **0.2.0**, the guest reached the public internet by default; agents that
-call provider APIs now need `--allow-internet-egress` until hostname allowances
-ship. Grants compose independently and apply only to this launch.
+call provider APIs now need `--allow-internet-egress`, or a TLS hostname
+allowance (`--allow-egress api.example.com`) narrower than the whole internet.
+Grants compose independently and apply only to this launch.
 The temporary guests booted by `setup` and `pull` still use the SDK public-internet
 and DNS default; this launch policy does not cover them. `setup` runs each
 configured tool's declared `command --version` from a project-selectable image.
@@ -1476,7 +1477,7 @@ These guests have no project mounts or secrets.
 | `--allow-internet-egress[=BOOL]` | public internet plus DNS queries | public addresses |
 | `--allow-lan[=BOOL]` | Private group: 10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7 | LAN IP |
 | `--allow-host[=BOOL]` | sandbox gateway, rewritten to host loopback; includes the host resolver | `host.microsandbox.internal:<port>` |
-| `--allow-egress SPEC` (repeatable) | one numeric IP/CIDR, optionally protocol/port-scoped | dial by IP |
+| `--allow-egress SPEC` (repeatable) | one numeric IP/CIDR, optionally protocol/port-scoped, **or** one hostname (TLS only) | dial by IP or TLS SNI |
 | `--publish HOST:GUEST[/proto]` | host port → guest port (`tcp` default; `/udp` for UDP); **never opens egress** | inbound to guest |
 | `--auto-publish` | mirrors guest wildcard/loopback listeners to host loopback | host `127.0.0.1:<guest-port>` |
 
@@ -1502,7 +1503,7 @@ Bare IPv6 is an address, never guessed as an address-plus-port. CIDR prefixes al
 IPv4 netmasks (`/255.255.255.0`), rendered as canonical prefix lengths. CIDRs are
 canonicalized to network boundaries; IPv4-mapped IPv6 is normalized to IPv4
 when its prefix permits that. Duplicate canonical grants keep their first
-occurrence. Hostnames are rejected as **not supported yet**. Numeric grants
+occurrence. Numeric grants
 are address-wide, not hostname-isolated: any service sharing an allowed IP
 can be reached within the grant's transport/port scope.
 
@@ -1513,6 +1514,57 @@ in ULA `fd00::/8`), such as `100.64.0.0/10`, `fd00::/8`, `fc00::/7`,
 A CIDR covering link-local metadata (such as `169.254.0.0/16` or `0.0.0.0/0`)
 also grants access to those metadata endpoints, within its transport/port scope.
 
+### Hostname allowance grammar
+
+A hostname allowance covers **TLS on intercepted ports only**. It is the narrow
+alternative to `--allow-internet-egress`: instead of every public address, it
+authorizes one exact name, verified by the TLS SNI the guest sends and by the DNS
+answer the runtime cached for it ([ADR-0037](docs/adr/0037-hostname-egress-allowances.md)).
+Plain HTTP to a hostname is **not** supported.
+
+| form | example | scope |
+|---|---|---|
+| bare hostname | `api.example.com` | every intercepted port of this launch (443 by default) |
+| `tcp://HOST` | `tcp://api.example.com` | same as bare |
+| `tcp://HOST:PORT` | `tcp://git.corp.example:8443` | that port only |
+| scheme-less `HOST:PORT` | `api.example.com:8443` | same as `tcp://HOST:PORT` |
+
+A hostname is ASCII and case-insensitive, canonicalized to lowercase, with at
+most one terminal dot (stripped, so `API.Example.COM.` is `api.example.com`).
+Its labels must be letters, digits and `-`; the **final label must not be
+numeric**, which rejects inet_aton forms such as `1234`, `1.2.3`, `127.1` and
+`0x7f.1`. Wildcards (`*.example.com`), a leading dot, userinfo, a path, query or
+fragment, brackets, non-ASCII (write an A-label) and the host alias are refused.
+A single-label name such as `build` is accepted and authorizes exactly that DNS
+name — no search-domain expansion, so a guest stub that appends a search suffix
+queries a different name and gets NXDOMAIN.
+
+**Ports are global to the launch, and widen cross-host.** The intercepted ports
+are `{443}` unioned with every `PORT` any `tcp://HOST:PORT` entry names. A bare
+hostname gets all of them, so adding `tcp://git.corp.example:8443` also widens
+every bare hostname to 8443 and makes 8443 TLS-only for **every** destination
+(see the interception paragraph below). Write `tcp://api.example.com:443` to pin
+one port. `tcp://host:80` is accepted, but port 80 then becomes TLS-only
+globally, not plain HTTP. Credential-only ports never widen a hostname rule.
+Ports 53 and 853 (the DNS dispatch ports) and `udp://HOST` are refused; UDP can
+only be allowed by an explicit IP/CIDR permission.
+
+**Private answers need an extra grant.** A hostname resolving to a private or
+reserved address is not admitted by the hostname rule alone; add `--allow-lan`,
+or a **port-less** local numeric allowance. A bare or `tcp://` CIDR admits the
+answer and authorizes the address wide; a port-less `udp://CIDR` admits it
+**without** authorizing TCP, giving name-isolated TCP authority. A port-scoped
+numeric rule does not qualify (rebind protection).
+
+**A selected host HTTP proxy refuses a hostname launch.** `HTTPS_PROXY`,
+`HTTP_PROXY` or `ALL_PROXY` pointing at a usable `http://` proxy makes the
+runtime route through a proxy that resolves the CONNECT name itself, so the
+address it dials would not be the one policy checked. A hostname launch is then
+refused before launch with fixed text; unset the proxy, use an IP/CIDR
+allowance, or use `--allow-internet-egress`. `NO_PROXY=*` is the only exemption
+(a per-name `NO_PROXY` entry does not lift the refusal). A non-`http` value (for
+example a `socks5://` proxy) is not selected and keeps the existing notice.
+
 ### DNS and launch behavior
 
 | grants | DNS queries |
@@ -1520,6 +1572,12 @@ also grants access to those metadata endpoints, within its transport/port scope.
 | none, numeric only, or LAN only | denied |
 | host (with or without LAN/numeric) | host resolver authorized |
 | internet (with any other grants) | queries authorized |
+| hostname only | only the allowed hostnames resolve (each `Domain` rule authorizes its own lookups) |
+
+With hostnames but no internet or host grant, only the allowed names resolve;
+other names get NXDOMAIN when the forwarder is available. A hostname grant does
+**not** emit `allow_dns()` — its `Domain` rule authorizes its own lookup. Private
+answers still need `--allow-lan` or a port-less local numeric allowance, as above.
 
 Denied queries return NXDOMAIN promptly **when the runtime's DNS forwarder is
 available**. If host DNS configuration cannot be read and the forwarder cannot
@@ -1543,8 +1601,31 @@ failure is not propagated; this release does not change that handling.
 Host `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment settings carry only
 connections already allowed by policy. A denied destination is never dialed,
 directly or through the proxy. Loopback/link-local dial targets always go direct.
-On a TLS-intercepted port, a connection without a TLS ClientHello carrying SNI
-is dropped even when the destination is numerically allowed.
+A hostname launch refuses a selected host HTTP proxy (see *Hostname allowance
+grammar*); `NO_PROXY=*` is the only exemption.
+
+**TLS interception is per-port and global.** A hostname launch turns on TLS
+interception for its intercepted ports, so on those ports — for **every**
+destination, including numerically allowed ones — the guest must send a TLS
+ClientHello carrying SNI (no-SNI and non-TLS traffic is dropped), UDP/QUIC is
+dropped, and the guest must trust the sandbox CA. Private TLS bundles (Python
+`certifi`, pinned certs, JVM trust stores) fail under interception.
+
+**Plain-text protocols can be interrupted once any hostname rule exists.** With
+at least one hostname rule, a numeric/group-authorized flow on a non-intercepted
+port has its first flight inspected: a missing or multiple HTTP `Host` header is
+blocked; printable bytes that contain a header boundary (`\r\n\r\n`) are parsed
+as HTTP and an invalid request line or non-`HTTP/1.x` version is blocked —
+including mid-stream, so plain-text protocols (SMTP DATA, IMAP literals, Redis
+inline, IRC) can be blocked. Printable bytes that look like an HTTP request
+prefix are buffered, then blocked. Conclusively binary first flights pass
+unchanged, and a server-first banner relays before the handler waits for client
+bytes. This narrows what numeric grants carry; it never widens a hostname rule.
+
+**DNS-cache bindings expire.** A client that keeps using a previously resolved
+IP longer than the runtime's minimum resolved-hostname TTL gets a reset. CNAME
+chains bind under the queried name, so a stub resolver that re-queries the CNAME
+target separately gets NXDOMAIN.
 
 Project `[network]` can never grant authority; user `[network]` is not supported
 yet. Both are refused with a file/setting/tier diagnostic. Persistent network
