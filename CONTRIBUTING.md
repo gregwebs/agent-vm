@@ -316,6 +316,29 @@ removing only owned scratch. Smoke is not full evidence. This harness does not
 certify Linux: native Linux testing, runtime capability admission and combined
 platform evidence remain outstanding under [#302](https://github.com/gregwebs/agent-vm/issues/302).
 
+#### Config-dir guard live check
+
+On a dedicated native host with no concurrent VMs:
+
+```bash
+./script/build/macos.sh --dev
+AGENT_VM_BIN="$PWD/target/macos-dev/bin/agent-vm" \
+AGENT_VM_LIVE_TEST_IMAGE=VERIFIED_NATIVE_IMAGE \
+  bash script/test/config-dir-guard-live.sh
+```
+
+The script uses private HOME and state, explicit image selection, and retains
+logs under its printed root. The first boot acquires into private state unless
+the opt-in shared cache is enabled: `AGENT_VM_SHARE_MSB_CACHE=1` selects it and
+`AGENT_VM_MSB_CACHE_DIR=<path>` sets its location — the flag is checked first,
+so `AGENT_VM_MSB_CACHE_DIR` alone still acquires privately. Record the image digest,
+binary hash and per-row results. It checks link laundering refusals, read-only
+and fork controls, home/mount refusals and a case-variant prospective layout.
+Its boot-free companion is
+`bash script/test/config-dir-guard-contract.sh` (guest snippets plus the
+socket-path budget; host-only, never native evidence). CI syntax-checks/lints
+the script and runs the companion but **does not run native VM rows**.
+
 #### `bash -c`, not `bash -lc`, for in-guest commands
 
 When you pass a command to the guest yourself, pass it through a non-login

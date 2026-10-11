@@ -155,6 +155,29 @@ def matrix():
         ("cleanup-unbounded", 'if deadline is not None:', 'if False and deadline is not None:'),
     ):
         add(name, FIXTURE, old, new, host, "FAILED (")
+    guard = SRC + "protected_config_dir.rs"
+    guard_tests = rust("protected_config_dir")
+    for name, old, new in (
+        ("prospective-bytewise", "    if !name_is_plain(a) || !name_is_plain(b) { return true; }", "    return a == b;"),
+        ("wildcard-dropped", "    if !name_is_plain(a) || !name_is_plain(b) { return true; }", "    if !name_is_plain(a) || !name_is_plain(b) { return false; }"),
+        ("exposes-no-identity", "(root_id.is_some() && ids[i] == root_id) || config::byte_path_contains", "false || config::byte_path_contains"),
+        ("prospective-path-only", "src_id == ids[j] || anchor_paths_match", "false || anchor_paths_match"),
+    ):
+        add(name, guard, old, new, guard_tests)
+        add(name + "-proof", guard, old, new, gate, "verification results::")
+    add("launch-nlink-skip", SRC + "mount.rs", "    config_dir.check_authority_links()?;", "    // mutant: skipped authority link check", rust("mount"))
+    add("prospective-skip", guard,
+        "                let (anchor, suffix) = resolve(&root, Walk::ProvisionedSource)?.end;",
+        "                return Ok(());\n                let (anchor, suffix) = resolve(&root, Walk::ProvisionedSource)?.end;", guard_tests)
+    add("guard-skip-core", SRC + "mount.rs", "        config_dir.check_core_bind(source)?;", "        let _ = source;", rust("mount"))
+    add("relative-unanchored", guard, "        cwd.join(path)", "        path.to_path_buf()", guard_tests)
+    add("guard-ro-too", SRC + "mount.rs", "!m.is_readonly() && !m.is_fork()", "!m.is_fork()", rust("mount"))
+    add("authority-home-from-pi", SRC + "run.rs",
+        '    let authority_home = config::host_home_dir().context("locating the authority home")?;',
+        "    let authority_home = host_home.clone();", rust("run::tests::raw_authority_home_selected"))
+    add("account-home-dropped", SRC + "mount.rs",
+        "        .chain(context.account_home.iter())",
+        "", rust("mount"))
     return controls
 
 

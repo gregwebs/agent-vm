@@ -8,6 +8,9 @@ persistent user-config authority; **C** = hostname allowances; **E** = release
 integration and native platform evidence. Story numbers refer to that issue's
 acceptance checklist.
 
+The guard half of A2 is delivered by [ADR-0038](0038-config-dir-exposure-guard.md)
+(#323). Persisted authority remains pending (#305); A1 remains CLI-only.
+
 Supersedes ADR-0009's implicit Public grant. **Breaking change in 0.2.0**:
 existing tool launches have no egress or DNS query authorization until a grant is
 passed. `--allow-internet-egress` restores public internet and DNS for provider

@@ -244,6 +244,13 @@ creates a continuing external bind. See [ADR-0014](docs/adr/0014-narrow-fork-mou
 for the narrowed policy and [ADR-0013](docs/adr/0013-add-forked-mounts.md) for the
 retained lifecycle and reset details.
 
+**Authority directories must not be guest-writable.** `protected_config_dir.rs`
+encapsulates the resolution walk, prospective anchor/name comparison and four
+contracted kernels behind measurement and three checks. `mount::prepare` uses
+it before state creation; run supplies raw authority HOME and the account home.
+Unlike the Pi guard, it is unconditional, protects lookup directories, and
+exempts read-only/fork sources. See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md).
+
 **Host Pi credential files never reach the guest.** Which host files those are,
 and whether a given mount is one of the ways they would, is one deep module:
 `protected_host_files.rs` measures a route set per launch and answers three
@@ -1167,6 +1174,7 @@ directories the user never asked for. The state-root precedence is in
 | Consume user-owned boot images (supersedes ADR-0003/0019/0028–0033; amends ADR-0034/0015/0022) | [ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md) |
 | Default-deny launch egress and CLI-only authority | [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) |
 | Hostname egress allowances — TLS on intercepted ports only | [ADR-0037](docs/adr/0037-hostname-egress-allowances.md) |
+| Authority config-directory exposure guard | [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md) |
 
 ## Deliberate non-goals
 

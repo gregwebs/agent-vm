@@ -91,6 +91,7 @@ pub(crate) struct ExtraMount {
     /// Exact source spelling. It is part of fork identity and deliberately not canonicalized.
     pub(crate) source_spelling: String,
     pub(crate) host: PathBuf,
+    pub(crate) spelled_host: PathBuf,
     pub(crate) guest: PathBuf,
     pub(crate) policy: MountPolicy,
     /// Normalized relative entries omitted from a `:fork` seed. Empty for
@@ -263,6 +264,7 @@ pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
         }
         out.push(ExtraMount {
             source_spelling: host_s,
+            spelled_host: host.clone(),
             host,
             guest,
             policy,
@@ -358,6 +360,7 @@ impl From<BindPath> for ExtraMount {
     fn from(p: BindPath) -> ExtraMount {
         ExtraMount {
             source_spelling: p.host.display().to_string(),
+            spelled_host: p.host.clone(),
             host: p.host,
             guest: p.guest,
             policy: MountPolicy::BindReadOnly { follow_links: true },
@@ -1569,6 +1572,7 @@ mod tests {
 
         let mounts = vec![ExtraMount {
             source_spelling: String::new(),
+            spelled_host: (real).clone(),
             host: real,
             guest: home_path.join("skills"),
             policy: MountPolicy::BindReadOnly { follow_links: true },
@@ -1604,6 +1608,7 @@ mod tests {
 
         let mounts = vec![ExtraMount {
             source_spelling: String::new(),
+            spelled_host: host.clone(),
             host: host.clone(),
             guest: host,
             policy: MountPolicy::BindReadOnly { follow_links: true },
@@ -1634,6 +1639,7 @@ mod tests {
         let mounts = vec![
             ExtraMount {
                 source_spelling: String::new(),
+                spelled_host: host.clone(),
                 host: host.clone(),
                 guest: host,
                 policy: MountPolicy::BindReadOnly { follow_links: true },
@@ -1643,6 +1649,7 @@ mod tests {
                 // An explicit mount claims the discovered target's real
                 // path as its GUEST, from a different HOST.
                 source_spelling: String::new(),
+                spelled_host: explicit_host.clone(),
                 host: explicit_host.clone(),
                 guest: target.clone(),
                 policy: MountPolicy::BindReadWrite,
@@ -1663,6 +1670,7 @@ mod tests {
     fn expand_leaves_non_follow_mounts_untouched() {
         let mounts = vec![ExtraMount {
             source_spelling: String::new(),
+            spelled_host: PathBuf::from("/"),
             host: "/".into(),
             guest: "/g".into(),
             policy: MountPolicy::BindReadWrite,
@@ -1679,6 +1687,7 @@ mod tests {
     fn expand_without_home_errors_only_when_follow_links_present() {
         let mounts = vec![ExtraMount {
             source_spelling: String::new(),
+            spelled_host: PathBuf::from("/"),
             host: "/".into(),
             guest: "/".into(),
             policy: MountPolicy::BindReadOnly { follow_links: true },
@@ -1702,6 +1711,7 @@ mod tests {
 
         let mounts = vec![ExtraMount {
             source_spelling: String::new(),
+            spelled_host: host.clone(),
             host: host.clone(),
             guest: host,
             policy: MountPolicy::BindReadOnly { follow_links: true },
@@ -1765,11 +1775,14 @@ pub(crate) struct PreparedMountPlan {
 pub(crate) struct MountContext {
     pub(crate) mount_store: PathBuf,
     pub(crate) host_home: Option<PathBuf>,
+    /// Raw authority HOME is distinct from Pi's UTF-8/account fallback.
+    pub(crate) authority_home: Option<PathBuf>,
+    pub(crate) account_home: Option<PathBuf>,
     /// Guest paths owned by agent-vm itself.  An explicit mount may not
     /// replace one: that would silently change HOME/project/state semantics.
     pub(crate) core_guest_mounts: Vec<PathBuf>,
     /// Host sources of agent-vm's own binds (guest HOME, project dir, state
-    /// dir) with the role each one plays. Checked for protected-file exposure
+    /// dir) with the role each one plays. Checked for Pi-file and config-directory exposure
     /// exactly like an explicit mount, because the project bind is the
     /// canonicalized cwd and is writable (`session.rs:45`): `cd ~ && agent-vm
     /// shell` would hand the guest the whole host `$HOME`.
@@ -1805,7 +1818,8 @@ fn normalize_guest(raw: &str) -> Result<PathBuf> {
 }
 
 /// Prepare a complete, closed mount plan.  This is deliberately the only
-/// boundary allowed to inspect mount sources or create fork state.
+/// boundary allowed to inspect mount sources or create fork state. Both the
+/// Pi-file and config-directory guards run before any fork/session mutation.
 pub(crate) fn prepare(
     requests: Vec<ExtraMount>,
     context: &MountContext,
@@ -1836,6 +1850,19 @@ pub(crate) fn prepare(
                 push_notice(&mut notices, &mut seen, advisory);
             }
         }
+    }
+
+    let homes: Vec<PathBuf> = context
+        .authority_home
+        .iter()
+        .chain(context.account_home.iter())
+        .cloned()
+        .collect();
+    let cwd = std::env::current_dir().context("reading the launch directory")?;
+    let config_dir = crate::protected_config_dir::ProtectedConfigDir::measure(&homes, &cwd)?;
+    config_dir.check_authority_links()?;
+    for source in &context.core_host_sources {
+        config_dir.check_core_bind(source)?;
     }
 
     let mut requests = requests;
@@ -1941,6 +1968,13 @@ pub(crate) fn prepare(
     // followed alias is an ordinary discovered bind) and before
     // `validate_plan`/`prepare_forks` (so a refusal has no side effects).
     enforce_protected_files(&expanded, explicit_count, &protected, &mut notices)?;
+    for mount in expanded.iter().filter(|m| !m.is_readonly() && !m.is_fork()) {
+        config_dir.check_writable_mount(
+            &mount.source_spelling,
+            &mount.spelled_host,
+            &mount.host,
+        )?;
+    }
     // A fork seeded by a pre-#90 build may already contain a copy of a
     // protected file, and a READY fork is reused *without* reading its source,
     // so no source-side check catches it. Report the orphaned directory that
@@ -3154,6 +3188,8 @@ mod prepare_tests {
     fn context_with_home(store: &Path, home: PathBuf) -> MountContext {
         MountContext {
             mount_store: store.to_path_buf(),
+            authority_home: Some(home.clone()),
+            account_home: None,
             host_home: Some(home),
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
@@ -3164,6 +3200,8 @@ mod prepare_tests {
     fn context_without_home(store: &Path) -> MountContext {
         MountContext {
             mount_store: store.to_path_buf(),
+            authority_home: None,
+            account_home: None,
             host_home: None,
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
@@ -3417,6 +3455,8 @@ mod prepare_tests {
             let store = tempfile::tempdir().unwrap();
             let mount_context = MountContext {
                 mount_store: store.path().to_path_buf(),
+                authority_home: Some(home.clone()),
+                account_home: None,
                 host_home: Some(home),
                 core_guest_mounts: vec![target],
                 core_host_sources: Vec::new(),
@@ -3562,6 +3602,8 @@ mod prepare_tests {
                     parse_extra_mounts(&declarations).unwrap(),
                     &MountContext {
                         mount_store: store.path().to_path_buf(),
+                        authority_home: Some(root.path().to_path_buf()),
+                        account_home: None,
                         host_home: Some(root.path().to_path_buf()),
                         core_guest_mounts: vec![root.path().join("core-child")],
                         core_host_sources: Vec::new(),
@@ -3647,6 +3689,8 @@ mod prepare_tests {
             parse_extra_mounts(&[file_mount, followed]).unwrap(),
             &MountContext {
                 mount_store: store.path().to_path_buf(),
+                authority_home: Some(home_path.clone()),
+                account_home: None,
                 host_home: Some(home_path.clone()),
                 core_guest_mounts: Vec::new(),
                 core_host_sources: Vec::new(),
@@ -6018,5 +6062,186 @@ mod prepare_tests {
             "{error}"
         );
         assert!(store_tree(store.path()).is_empty(), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod config_dir_guard_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        project: PathBuf,
+        store: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let home = base.join("home");
+            let project = base.join("project");
+            let store = base.join("store");
+            for path in [&home, &project, &store] {
+                fs::create_dir(path).unwrap();
+            }
+            Self {
+                _root: root,
+                home,
+                project,
+                store,
+            }
+        }
+        fn context(&self, sources: Vec<CoreHostSource>) -> MountContext {
+            MountContext {
+                mount_store: self.store.clone(),
+                host_home: Some(self.home.clone()),
+                authority_home: Some(self.home.clone()),
+                account_home: None,
+                core_guest_mounts: vec![],
+                core_host_sources: sources,
+            }
+        }
+        fn refused(&self, requests: Vec<ExtraMount>, context: &MountContext, text: &str) {
+            let e = prepare(requests, context).unwrap_err();
+            assert!(e.to_string().contains(text), "{e:#}");
+            assert!(fs::read_dir(&self.store).unwrap().next().is_none());
+        }
+    }
+    #[test]
+    fn config_guard_core_sources_and_precedence() {
+        let f = Fixture::new();
+        fs::create_dir(f.home.join(".config")).unwrap();
+        for path in [&f.home, &f.home.join(".config")] {
+            f.refused(
+                vec![],
+                &f.context(vec![CoreHostSource::new(
+                    CoreBind::ProjectDir,
+                    path.clone(),
+                )]),
+                "launch authority",
+            );
+        }
+        let project = f.home.join("code/p");
+        fs::create_dir_all(&project).unwrap();
+        assert!(
+            prepare(
+                vec![],
+                &f.context(vec![CoreHostSource::new(CoreBind::ProjectDir, project)])
+            )
+            .is_ok()
+        );
+        f.refused(
+            vec![],
+            &f.context(vec![CoreHostSource::new(
+                CoreBind::StateDir,
+                f.home.clone(),
+            )]),
+            "AGENT_VM_STATE_DIR",
+        );
+        fs::create_dir_all(f.home.join(".pi/agent")).unwrap();
+        f.refused(
+            vec![],
+            &f.context(vec![CoreHostSource::new(
+                CoreBind::ProjectDir,
+                f.home.clone(),
+            )]),
+            "host Pi credential file",
+        );
+    }
+    #[test]
+    fn config_guard_writable_mounts_and_exemptions() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.home.join(".config/agent-vm")).unwrap();
+        for raw in [
+            f.home.display().to_string(),
+            format!("{}:/h:rw", f.home.display()),
+            format!("{}:/cfg", f.home.join(".config/agent-vm").display()),
+        ] {
+            f.refused(
+                parse_extra_mounts(&[raw]).unwrap(),
+                &f.context(vec![]),
+                "launch authority",
+            );
+        }
+        for mode in ["ro", "fork"] {
+            let raw = format!("{}:/cfg:{mode}", f.home.join(".config/agent-vm").display());
+            assert!(prepare(parse_extra_mounts(&[raw]).unwrap(), &f.context(vec![])).is_ok());
+        }
+    }
+    #[test]
+    fn config_guard_followed_readonly_target_is_allowed() {
+        let f = Fixture::new();
+        let links = f.home.join("code/p/links");
+        fs::create_dir_all(&links).unwrap();
+        fs::create_dir_all(f.home.join(".config/agent-vm")).unwrap();
+        symlink(f.home.join(".config/agent-vm"), links.join("cfg")).unwrap();
+        let raw = format!("{}:/links:follow-links", links.display());
+        assert!(prepare(parse_extra_mounts(&[raw]).unwrap(), &f.context(vec![])).is_ok());
+    }
+    #[test]
+    fn config_guard_missing_state_and_home_refuse_before_mutation() {
+        for bind in [CoreBind::StateDir, CoreBind::GuestHome] {
+            let f = Fixture::new();
+            let path = f.store.join("ab12");
+            let source = if bind == CoreBind::GuestHome {
+                path.join("home")
+            } else {
+                path
+            };
+            symlink(source.join(".config"), f.home.join(".config")).unwrap();
+            f.refused(
+                vec![],
+                &f.context(vec![CoreHostSource::new(bind, source)]),
+                "does not exist yet",
+            );
+        }
+    }
+    #[test]
+    fn config_guard_hard_links_are_checked_in_prepare() {
+        let f = Fixture::new();
+        let file = f.home.join(".config/agent-vm/config.toml");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "# no network").unwrap();
+        fs::hard_link(file, f.project.join("alias")).unwrap();
+        f.refused(vec![], &f.context(vec![]), "has 2 hard links");
+    }
+    #[test]
+    fn config_guard_raw_authority_home_is_distinct_from_pi_home() {
+        let f = Fixture::new();
+        let raw = f.project.parent().unwrap().join("raw-home");
+        let account = f.project.parent().unwrap().join("account-home");
+        fs::create_dir(&raw).unwrap();
+        fs::create_dir(&account).unwrap();
+        symlink(f.project.join(".config"), raw.join(".config")).unwrap();
+        let mut context = f.context(vec![CoreHostSource::new(
+            CoreBind::ProjectDir,
+            f.project.clone(),
+        )]);
+        context.authority_home = Some(raw);
+        context.account_home = Some(account);
+        f.refused(vec![], &context, "launch authority");
+    }
+    /// A launch with `HOME` unset reads no user config but must still protect
+    /// the *account* home a later launch would use (ADR-0038, "Both homes").
+    /// This plan is exposing only through `account_home`, so dropping that
+    /// input or measuring the Pi home in its place would let it through.
+    #[test]
+    fn config_guard_account_home_is_measured_without_an_authority_home() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.home.join(".config/agent-vm")).unwrap();
+        let source = CoreHostSource::new(CoreBind::ProjectDir, f.home.clone());
+        let mut exposing = f.context(vec![source.clone()]);
+        exposing.authority_home = None;
+        exposing.account_home = Some(f.home.clone());
+        f.refused(vec![], &exposing, "launch authority");
+        // Control: with neither home measured the same plan is accepted, so
+        // the refusal above is caused by the account-home input, not the
+        // fixture (the Pi advisory path does not cover it).
+        let mut control = f.context(vec![source]);
+        control.authority_home = None;
+        control.account_home = None;
+        assert!(prepare(vec![], &control).is_ok());
     }
 }

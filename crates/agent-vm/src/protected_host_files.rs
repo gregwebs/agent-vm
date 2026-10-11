@@ -117,7 +117,7 @@ pub(crate) enum CoreBind {
 }
 
 impl CoreBind {
-    fn description(self) -> &'static str {
+    pub(crate) fn description(self) -> &'static str {
         match self {
             Self::ProjectDir => "project directory",
             Self::StateDir => "state directory",
