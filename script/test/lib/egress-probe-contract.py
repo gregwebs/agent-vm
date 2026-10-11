@@ -251,5 +251,144 @@ exec bash ./egress-probe.sh "$1" hook-tool 127.0.0.1 ipv4
                         self.assertFalse(thread.is_alive())
 
 
+class HostnamePrimitives(unittest.TestCase):
+    def shell(self, expression, path=None):
+        command = f"EGRESS_PROBE_LIB=1 . {shlex.quote(str(PROBE))}; {expression}"
+        env = dict(os.environ)
+        if path is not None:
+            env["PATH"] = str(path)
+        return subprocess.run(["/bin/bash", "-c", command], env=env, capture_output=True, text=True, timeout=10)
+
+    def test_preflight_rejects_missing_ssl_curl_and_ca(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            python = root / "python3"
+            curl = root / "curl"
+            python.write_text("#!/bin/sh\nexit 1\n")
+            curl.write_text("#!/bin/sh\nexit 0\n")
+            python.chmod(0o755)
+            curl.chmod(0o755)
+            result = self.shell("_hostname_preflight 0", root)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("PREFLIGHT missing=ssl,socket", result.stdout)
+            python.write_text("#!/bin/sh\nexit 0\n")
+            curl.unlink()
+            result = self.shell("_hostname_preflight 0", root)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("PREFLIGHT missing=curl", result.stdout)
+            curl.write_text("#!/bin/sh\nexit 0\n")
+            curl.chmod(0o755)
+            self.assertFalse(Path("/.msb/tls/ca.pem").exists(), "host-only control requires absent guest CA")
+            result = self.shell("_hostname_preflight 1", root)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("PREFLIGHT missing=ca", result.stdout)
+            self.assertEqual(self.shell("_hostname_preflight 0", root).returncode, 0)
+
+    def test_receipt_primitives(self):
+        path = PROBE.parents[1] / "lib/egress-hostname-fixtures.py"
+        spec = importlib.util.spec_from_file_location("host_receipt_control", path)
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        for function, payload, marker in [
+            ("tls_probe", b"", "TLS_ATTEMPT"),
+            ("opaque_send", b"PING x\r\n\r\n", "OPAQUE_SENT"),
+            ("opaque_send", bytes(range(256)), "OPAQUE_SENT"),
+            ("server_first", b"QUIT\r\n", "BANNER_OK"),
+        ]:
+            with self.subTest(function=function, size=len(payload)), socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                listener.settimeout(5)
+                received = []
+                def serve():
+                    conn, _ = listener.accept()
+                    with conn:
+                        conn.settimeout(3)
+                        if function == "tls_probe":
+                            header = fixture.read_exact(conn, 5)
+                            data = fixture.read_exact(conn, int.from_bytes(header[3:5], "big"))
+                            received.append(fixture.client_hello_sni(header + data))
+                        else:
+                            if function == "server_first":
+                                conn.sendall(b"220 fixture\r\n")
+                            data = b""
+                            while True:
+                                part = conn.recv(4096)
+                                if not part:
+                                    break
+                                data += part
+                            received.append(data)
+                thread = threading.Thread(target=serve, daemon=True)
+                thread.start()
+                argument = "fixture.example" if function == "tls_probe" else payload.hex()
+                result = self.shell(f"{function} 127.0.0.1 {listener.getsockname()[1]} {argument}")
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(marker, result.stdout)
+                self.assertEqual(received, ["fixture.example" if function == "tls_probe" else payload])
+
+    def test_held_probe_uses_one_connection_for_both_requests(self):
+        # This controls probe framing/reuse, not TLS or runtime authority enforcement.
+        import contextlib
+        import io
+        import ssl
+        from unittest.mock import patch
+        program = PROBE.read_text().split("tls_held_two_requests() {", 1)[1].split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+        direct_connect = socket.create_connection
+        for expectation in ("allow", "deny"):
+            with self.subTest(expectation=expectation), socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                listener.settimeout(5)
+                requests, connects = [], []
+                def serve():
+                    conn, _ = listener.accept()
+                    with conn:
+                        conn.settimeout(5)
+                        for index in range(2):
+                            head = b""
+                            while not head.endswith(b"\r\n\r\n"):
+                                part = conn.recv(1)
+                                if not part:
+                                    return
+                                head += part
+                            requests.append(head)
+                            if index == 1 and expectation == "deny":
+                                return
+                            if index == 0:
+                                conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n")
+                            else:
+                                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                thread = threading.Thread(target=serve, daemon=True)
+                thread.start()
+                def connect(address, timeout):
+                    connects.append(address)
+                    return direct_connect(listener.getsockname(), timeout=timeout)
+                class Context:
+                    def wrap_socket(self, conn, server_hostname):
+                        self_name = server_hostname
+                        if self_name != "fixture.example":
+                            raise AssertionError(self_name)
+                        return conn
+                output = io.StringIO()
+                argv = ["probe", "127.0.0.1", "fixture.example", "fixture.example" if expectation == "allow" else "other.example", expectation]
+                with patch.object(sys, "argv", argv), patch.object(socket, "create_connection", connect), patch.object(ssl, "create_default_context", Context), contextlib.redirect_stdout(output):
+                    exec(compile(program, "held-probe-control", "exec"), {})
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(len(connects), 1)
+                self.assertEqual(len(requests), 2)
+                self.assertIn("HELD_OK request=1 connects=1", output.getvalue())
+                self.assertIn("HELD_DENIED connects=1" if expectation == "deny" else "HELD_OK request=2 connects=1", output.getvalue())
+
+    def test_https_probe_keeps_verification_and_http1(self):
+        result = self.shell('curl() { printf "%s\\n" "$@"; }; https_get https://fixture.example/')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--http1.1", result.stdout)
+        self.assertIn("--max-time", result.stdout)
+        self.assertNotIn("-k", result.stdout.splitlines())
+
+
 if __name__ == "__main__":
     unittest.main()

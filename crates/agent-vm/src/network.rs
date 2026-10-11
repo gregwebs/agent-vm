@@ -52,13 +52,14 @@ pub(crate) struct Args {
     )]
     pub(crate) auto_publish: bool,
 
-    /// Allow one IP/CIDR, optionally narrowed by tcp:// or udp:// and :PORT (repeatable).
+    /// Allow one IP/CIDR or TLS hostname, optionally transport/port-scoped (repeatable).
     ///
-    /// Address-wide, not hostname-isolated. Hostnames are not supported yet.
-    /// Use brackets for a port on an IPv6 address or CIDR. No implicit port 443.
+    /// Numeric grants are address-wide. Hostname grants are TLS-only, SNI- and DNS-verified,
+    /// and refused with a host HTTP proxy. Bare hostnames use intercepted ports (443 by default).
+    /// Use brackets for a port on an IPv6 address or CIDR.
     #[arg(
         long = "allow-egress",
-        value_name = "[tcp://|udp://]IP|CIDR[:PORT]",
+        value_name = "[tcp://|udp://]IP|CIDR[:PORT] | [tcp://]HOST[:PORT]",
         help_heading = "Network egress"
     )]
     pub(crate) allow_egress: Vec<String>,
@@ -213,8 +214,11 @@ impl Plan {
                 host: args.allow_host,
                 allowances: &args.allow_egress,
             })?;
-        let proxy_notice = active_guest_proxy_var_from(lookup)
-            .map(|(variable, value)| ProxyNotice { variable, value });
+        let observation = observe_host_proxy(lookup);
+        if egress.has_hostnames() && observation.connector_used {
+            anyhow::bail!(HOSTNAME_PROXY_REFUSAL);
+        }
+        let proxy_notice = observation.notice;
         Ok(Self {
             publish_ports,
             egress,
@@ -253,12 +257,17 @@ impl Plan {
         let policy = self.egress.policy();
         let publish_ports = self.publish_ports.clone();
         let auto_publish = self.auto_publish;
-        let enable_tls = !publish_ports.is_empty();
+        let hostname_ports = self.egress.intercepted_ports().map(|ports| ports.to_vec());
+        let enable_tls = !publish_ports.is_empty() || hostname_ports.is_some();
         builder.network(move |mut network| {
             network = network.policy(policy);
-            // TlsBuilder defaults to enabled, so only opt in for explicit ports.
             if enable_tls {
-                network = network.tls(|tls| tls);
+                // The hostname set includes 443, so replacing the default loses nothing.
+                // The later credential overlay unions its own ports (ADR-0037).
+                network = network.tls(|tls| match &hostname_ports {
+                    Some(ports) => tls.intercepted_ports(ports.clone()),
+                    None => tls,
+                });
             }
             for port in &publish_ports {
                 network = match port.protocol {
@@ -481,30 +490,71 @@ fn parse_port(entry: &str, field: &str, s: &str) -> Result<u16> {
         .with_context(|| format!("--publish {entry:?}: {field} {s:?} is not a u16"))
 }
 
+const HOSTNAME_PROXY_REFUSAL: &str = "hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress";
+struct HostProxyObservation {
+    notice: Option<ProxyNotice>,
+    connector_used: bool,
+}
 /// Pure proxy lookup, taking a function instead of reading the real process
 /// environment so tests don't need unsafe
 /// `std::env::set_var`/`remove_var` mutation under `cargo test`'s parallel
 /// threads.
-fn active_guest_proxy_var_from(
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Option<(&'static str, ProxyDisplay)> {
+///
+/// Mirrors `HostHttpProxyConnector::from_values`. Both the notice and the
+/// refusal use this observation; a notice's first value alone misses
+/// cross-variable fallback.
+fn observe_host_proxy(lookup: impl Fn(&str) -> Option<String>) -> HostProxyObservation {
+    let mut notice = None;
+    let mut usable = false;
     for (upper, lower) in [
         ("HTTPS_PROXY", "https_proxy"),
         ("HTTP_PROXY", "http_proxy"),
         ("ALL_PROXY", "all_proxy"),
     ] {
-        // Lowercase first, matching the netstack's own preference — the
-        // banner must name the variable the netstack will actually use.
-        for var in [lower, upper] {
-            if let Some(value) = lookup(var) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some((var, ProxyDisplay::parse(value)));
-                }
+        let chosen = [lower, upper].into_iter().find_map(|var| {
+            lookup(var)
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .map(|s| (var, s))
+        });
+        if let Some((variable, value)) = chosen {
+            usable |= connector_would_select(&value);
+            if notice.is_none() {
+                notice = Some(ProxyNotice {
+                    variable,
+                    value: ProxyDisplay::parse(&value),
+                });
             }
         }
     }
-    None
+    let no_proxy = ["no_proxy", "NO_PROXY"].into_iter().find_map(|var| {
+        lookup(var)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    });
+    let wildcard = no_proxy.is_some_and(|s| {
+        s.split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .any(|s| s == "*")
+    });
+    HostProxyObservation {
+        notice,
+        connector_used: usable && !wildcard,
+    }
+}
+fn connector_would_select(value: &str) -> bool {
+    let authority = match value.trim().split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => rest,
+        Some(_) => return false,
+        None => value.trim(),
+    }
+    .split(['/', '?', '#'])
+    .next()
+    .unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+        .trim();
+    valid_proxy_authority(host_port)
 }
 
 #[cfg(test)]
@@ -525,6 +575,8 @@ mod tests {
             allow_host: None,
         }
     }
+
+    mod hostname_tests;
 
     fn plan(input: Args) -> Plan {
         Plan::from_args_with_proxy_lookup(input, |_| None).expect("valid networking plan")
@@ -610,7 +662,7 @@ mod tests {
     fn plan_reports_the_allow_egress_error_without_repeating_the_flag() {
         let error = Plan::from_args_with_proxy_lookup(
             Args {
-                allow_egress: vec!["not-an-ip".into()],
+                allow_egress: vec!["udp://not-an-ip.example".into()],
                 ..args()
             },
             |_| None,
@@ -622,7 +674,7 @@ mod tests {
             format!("{error:#}"),
             format!(
                 "--allow-egress #1: {}",
-                crate::egress_policy::AllowanceError::Hostname
+                crate::egress_policy::AllowanceError::UdpHostname
             )
         );
         assert!(!format!("{error:#}").contains("not-an-ip"));
@@ -698,7 +750,12 @@ mod tests {
     async fn group_flags_and_allowances_emit_the_documented_rule_list() {
         let mut input = args();
         input.publish.push("8080:3000".into());
-        input.allow_egress = vec!["10.0.0.5".into(), "fd00::1".into()];
+        input.allow_egress = vec![
+            "10.0.0.5".into(),
+            "fd00::1".into(),
+            "api.example.com".into(),
+            "tcp://git.example.com:8443".into(),
+        ];
         input.allow_lan = Some(true);
         input.allow_host = Some(true);
         let network = configured_network(input, "network-policy").await;
@@ -714,7 +771,7 @@ mod tests {
             serde_json::json!("fd00::1/128")
         );
         assert_eq!(policy_groups(&network), ["private", "host"]);
-        assert_eq!(policy["rules"].as_array().unwrap().len(), 4);
+        assert_eq!(policy["rules"].as_array().unwrap().len(), 6);
         assert_eq!(
             policy["rules"][2],
             serde_json::json!({"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"})
@@ -728,18 +785,37 @@ mod tests {
                 allow_internet_egress: Some(true),
                 allow_lan: Some(true),
                 allow_host: Some(true),
-                allow_egress: vec!["10.0.0.5".into(), "fd00::1".into()],
+                allow_egress: vec![
+                    "10.0.0.5".into(),
+                    "fd00::1".into(),
+                    "api.example.com".into(),
+                    "tcp://git.example.com:8443".into(),
+                ],
                 ..args()
             },
             "network-policy-internet",
         )
         .await;
         assert_eq!(policy_groups(&internet), ["public", "private", "host"]);
-        assert_eq!(internet["policy"]["rules"].as_array().unwrap().len(), 6);
+        assert_eq!(internet["policy"]["rules"].as_array().unwrap().len(), 8);
         assert_eq!(
             internet["policy"]["rules"][2],
             serde_json::json!({"direction":"egress","destination":{"group":"host"},"protocols":["udp","tcp"],"ports":[{"start":53,"end":53}],"action":"allow"})
         );
+        for (configured, domain_start) in [(&network, 4usize), (&internet, 6usize)] {
+            assert_eq!(
+                configured["tls"]["intercepted_ports"],
+                serde_json::json!([443, 8443])
+            );
+            assert_eq!(
+                configured["policy"]["rules"][domain_start],
+                serde_json::json!({"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443},{"start":8443,"end":8443}],"action":"allow"})
+            );
+            assert_eq!(
+                configured["policy"]["rules"][domain_start + 1],
+                serde_json::json!({"direction":"egress","destination":{"domain":"git.example.com"},"protocols":["tcp"],"ports":[{"start":8443,"end":8443}],"action":"allow"})
+            );
+        }
         assert_eq!(network["tls"]["enabled"], true);
         assert_eq!(network["ports"][0]["host_port"], 8080);
         assert_eq!(network["ports"][0]["guest_port"], 3000);
@@ -780,6 +856,15 @@ mod tests {
                 vec![],
             ),
             (
+                "hostname",
+                Args {
+                    publish: vec!["8080:3000".into()],
+                    allow_egress: vec!["build".into()],
+                    ..args()
+                },
+                vec![],
+            ),
+            (
                 "lan",
                 Args {
                     publish: vec!["8080:3000".into()],
@@ -810,6 +895,11 @@ mod tests {
             let network = configured_network(input, &format!("network-{name}")).await;
             assert_eq!(policy_groups(&network), expected_groups, "{name}");
             assert_eq!(network["policy"]["default_ingress"], "allow", "{name}");
+            assert_eq!(
+                network["tls"]["intercepted_ports"],
+                serde_json::json!([443]),
+                "{name}"
+            );
             assert_eq!(network["tls"]["enabled"], true, "{name}");
             assert_eq!(
                 network["ports"],
@@ -822,7 +912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_explicit_publish_enables_tls_and_auto_publish_is_configured() {
+    async fn tls_is_enabled_only_by_publish_or_hostname_allowances() {
         for (name, input) in [
             ("default", args()),
             (
@@ -840,6 +930,19 @@ mod tests {
                 },
             ),
         ] {
+            let published = configured_network(
+                Args {
+                    publish: vec!["8080:3000".into()],
+                    ..args()
+                },
+                "publish-default-ports",
+            )
+            .await;
+            assert_eq!(published["tls"]["enabled"], true);
+            assert_eq!(
+                published["tls"]["intercepted_ports"],
+                serde_json::json!([443])
+            );
             let network = configured_network(input, &format!("network-tls-{name}")).await;
             assert_eq!(
                 network["tls"]["enabled"], false,
@@ -991,7 +1094,7 @@ mod tests {
         assert_eq!(
             output,
             "==> Egress policy: all guest egress denied (opt in with --allow-internet-egress, --allow-egress, --allow-lan or --allow-host)\n\
-==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP allowances)\n\
+==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP or hostname allowances)\n\
 ==> Guest egress proxy: http_proxy=http://lower-http.example:3128 (used when it parses as an http:// proxy; NO_PROXY honored, otherwise egress goes direct)\n"
         );
         for ignored in [

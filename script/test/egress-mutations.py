@@ -51,6 +51,30 @@ def matrix():
     for name, old, new in kernel_mutations:
         add(name, EGRESS, old, new, egress)
         add(name + "-proof", EGRESS, old, new, gate, "verification results::")
+    hostname = SRC + "egress_hostname.rs"
+    shape = rust("hostname_rule_shape")
+    host_kernel = rust("egress_hostname::tests")
+    proxy = rust("hostname_proxy_selection_mirrors_the_host_connector")
+    add("domain-all-ports", hostname, "ports: effective.into_iter().map(PortRange::single).collect(),", "ports: vec![],", shape)
+    add("domain-any-protocol", hostname, "protocols: vec![Protocol::Tcp],", "protocols: vec![],", shape)
+    add("domain-first", EGRESS, "rules.extend(domain_rules(&self.hostnames, &ports));", "rules.splice(0..0, domain_rules(&self.hostnames, &ports));", shape)
+    add("hostname-dns", EGRESS, "rules.extend(domain_rules(&self.hostnames, &ports));", "rules.push(Rule::allow_dns()); rules.extend(domain_rules(&self.hostnames, &ports));", shape)
+    add("tls-ports-missing", NETWORK, "Some(ports) => tls.intercepted_ports(ports.clone()),", "Some(_) => tls,", rust("hostname_launch_keeps_strict_and_intercepts_every_domain_port"))
+    add("tls-off", NETWORK, "let enable_tls = !publish_ports.is_empty() || hostname_ports.is_some();", "let enable_tls = !publish_ports.is_empty();", rust("hostname_launch_keeps_strict_and_intercepts_every_domain_port"))
+    add("bare-port-443-only", hostname, "HostnameScope::InterceptedPorts => ports.to_vec(),", "HostnameScope::InterceptedPorts => { let _ = ports; vec![443] },", shape)
+    for name, old, new in (
+        ("dns-port-allowed", "if p == 53 || p == 853 { Err(HostnameScopeError::DnsPort) }", "if false { Err(HostnameScopeError::DnsPort) }"),
+        ("udp-hostname", "if scheme == SchemeSel::Udp { return Err(HostnameScopeError::Udp); }", "if false { return Err(HostnameScopeError::Udp); }"),
+        ("numeric-final-label", "!numeric_label_bytes(bytes)", "{ let _ = numeric_label_bytes(bytes); true }"),
+        ("single-label-refused", "None => {\n            proof {", "None => { return false;\n            proof {"),
+    ):
+        add(name, hostname, old, new, host_kernel)
+        add(name + "-proof", hostname, old, new, gate, "verification results::")
+    add("alias-allowed", hostname, 'if host == "host.microsandbox.internal" {', 'if false {', rust("grammar_error_precedence_table"))
+    add("hostname-proxy-unchecked", NETWORK, "if egress.has_hostnames() && observation.connector_used {", "if false && egress.has_hostnames() && observation.connector_used {", proxy)
+    add("proxy-any-scheme", NETWORK, 'Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => rest,', 'Some((_, rest)) => rest,', proxy)
+    add("proxy-first-var-only", NETWORK, "usable |= connector_would_select(&value);", "if notice.is_none() { usable |= connector_would_select(&value); }", proxy)
+    add("proxy-no-proxy-ignored", NETWORK, "connector_used: usable && !wildcard,", "connector_used: usable && (wildcard || !wildcard),", proxy)
     dense = rust("network::tests::default_plan_denies_all_egress_and_preserves_non_policy_network_config")
     early = "if self.publish_ports.is_empty() && !self.auto_publish { return builder; }\n        let policy = self.egress.policy();"
     add("early-return", NETWORK, "let policy = self.egress.policy();", early, dense)
@@ -91,7 +115,7 @@ def matrix():
         'let base_ports = intercepted_ports_of(&network)?;\n        network = network.policy(serde_json::from_value(serde_json::json!({"default_egress":"deny","default_ingress":"allow","rules": [\n' +
         ','.join(['{"direction":"egress","destination":{"group":"public"},"protocols":[],"ports":[],"action":"allow"}'] * 4) +
         ']})).unwrap());', rust("credential_overlay_preserves_base_network_plan"))
-    g4 = rust("hostname_allowance_is_refused_before_launch_state_is_created", True)
+    g4 = rust("rejected_allowance_is_refused_before_launch_state_is_created", True)
     for name, suffix in (("project", ""), ("mounts", ".mounts"), ("secrets", ".secrets")):
         add("preparse-" + name, SRC + "run.rs",
             "\n    let network_plan = crate::network::Plan::from_args(args.network)?;",
@@ -99,14 +123,16 @@ def matrix():
             ('&early.state_dir' if not suffix else 'early.state_dir.with_extension("' + suffix[1:] + '")') +
             ')?;\n    let network_plan = crate::network::Plan::from_args(args.network)?;', g4)
     add("valid-no-fork", TEST,
-        '&["--mount", &mount, "--allow-egress", "10.0.0.0/8"],',
-        '&["--allow-egress", "10.0.0.0/8"],', g4)
+        '&["--mount", &mount, "--allow-egress", "api.example.com"],',
+        '&["--allow-egress", "api.example.com"],', g4)
     add("valid-no-credential", SRC + "run.rs", '.context("snapshotting host credentials")?;', '.context("snapshotting host credentials")?;\n    if let Some(file) = &creds.anthropic_token_file { std::fs::remove_file(file)?; }', g4)
     host = ["python3", "script/test/lib/egress-supervisor-contract.py"]
     for name, old, new in (
-        ("shell-argv", 'if case.guest:\n        argv.extend(("--", case.case, ident, lan, case.variant,', 'if case.guest:\n        argv[1] = "shell"\n        argv.extend(("--", "-c", case.case, ident, lan, case.variant,'),
+        ("shell-argv",
+         '    if case.guest:\n        extra = hostname_extra(case, values, lan2 or DEFAULT_LAN2, hnc_step) if hostname_tier(case.case) else (\n            answer if case.case == "I1a" else rebind if case.case == "RB1" else "")\n        argv.extend(("--", case.case, ident, lan, case.variant, extra))',
+         '    if case.guest:\n        argv[1] = "shell"\n        extra = hostname_extra(case, values, lan2 or DEFAULT_LAN2, hnc_step) if hostname_tier(case.case) else (\n            answer if case.case == "I1a" else rebind if case.case == "RB1" else "")\n        argv.extend(("--", "-c", case.case, ident, lan, case.variant, extra))'),
         ("credential-tool", 'argv = [binary, case.tool,', 'argv = [binary, "egressprobe",'),
-        ("rejection-guest", 'if case.guest:\n        argv.extend', 'if case.guest or case.case == "RJ1":\n        argv.extend'),
+        ("rejection-guest", 'if case.guest:\n        extra = hostname_extra', 'if case.guest or case.case == "RJ1":\n        extra = hostname_extra'),
         ("extra-env", 'env = base_environment(work)\n    extras', 'env = base_environment(work)\n    env["MUTANT"] = "1"\n    extras'),
         ("tcp-calibration", '"LC1": ("lan-tcp80", "lan-tcp81", "lan-udp90", "lan-udp80"),', '"LC1": ("lan-tcp80", "lan-udp90", "lan-udp80"),'),
         ("udp-calibration", '"LC1": ("lan-tcp80", "lan-tcp81", "lan-udp90", "lan-udp80"),', '"LC1": ("lan-tcp80", "lan-tcp81", "lan-udp90"),'),

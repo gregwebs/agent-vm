@@ -112,13 +112,14 @@ class Contracts(unittest.TestCase):
         self.assertEqual(len(commands), len({(c.case, c.variant) for c in commands}))
         self.assertEqual({c.variant for c in commands if c.case == "RB1"},
                          {"internet", "address", "tcp", "udp", "port", "tcp-port", "udp-port"})
-        self.assertEqual(len([c for c in commands if c.case == "RJ1"]), 3)
+        self.assertEqual(len([c for c in commands if c.case == "RJ1"]), 7)
+        self.assertEqual(len([c for c in commands if c.case == "RB2"]), 6)
         expected_keys = {"HOME", "XDG_CONFIG_HOME", "AGENT_VM_STATE_DIR", "PATH", "TERM", "AGENT_VM_SHARE_MSB_CACHE"}
         for case, command in zip(egress.CASES, commands):
             self.assertEqual(command.tool == "egresscreds", case.case in ("CR1", "CR1c"))
             self.assertEqual(command.argv[1], command.tool)
             self.assertEqual(set(command.env), expected_keys | set(case.extras))
-            self.assertEqual(command.kind == "validation-only", case.case == "RJ1")
+            self.assertEqual(command.kind == "validation-only", case.case in ("RJ1", "PXH1"))
             self.assertEqual("--" in command.argv, case.guest)
             if case.guest:
                 self.assertEqual(command.argv[command.argv.index("--")+1], case.case)
@@ -186,7 +187,6 @@ class Contracts(unittest.TestCase):
                     continue
                 self.assertIn(label, command.controls, (case, label))
                 control, variant, attempt = command.controls[label].split(":")
-                self.assertEqual(attempt, label, (case, label))
                 positive = cases[(control, variant)]
                 self.assertIn(attempt, egress.expected_attempts(positive))
                 self.assertIn(egress.attempt_expectations(positive)[attempt], ("0", "OK"))
@@ -337,20 +337,18 @@ class Contracts(unittest.TestCase):
                 proc.wait(timeout=2)
 
     def test_rejection_diagnostics_are_specific_and_fault_detecting(self):
-        errors = {
-            "hostname": "hostname allowances are not supported yet; use an IP address or CIDR, or --allow-internet-egress",
-            "cidr-port": "a port on a CIDR needs brackets, e.g. tcp://[10.0.0.0/24]:22",
-            "scheme": "unsupported scheme; use tcp:// or udp:// (or no scheme for all protocols)",
-        }
+        errors = egress.RJ1_MESSAGES
         for variant, error in errors.items():
             diagnostic = "--allow-egress #1: " + error
             self.assertTrue(egress.validation_rejected(1, diagnostic, variant))
             for status in (0, 124, 130, 143):
                 self.assertFalse(egress.validation_rejected(status, diagnostic, variant))
+            value = egress.RJ1_VALUES[variant]
+            echo = [] if value in error else [diagnostic + " " + value]
+            others = {other for other in errors.values() if other != error}
             for text in ("unrelated egress failure", "clap: --allow-egress missing argument",
                          diagnostic.replace("#1", "#2"), diagnostic + " CASE RJ1 BEGIN",
-                         diagnostic + " reject.invalid", *[
-                             "--allow-egress #1: " + other for other in errors.values() if other != error]):
+                         *echo, *["--allow-egress #1: " + other for other in others]):
                 self.assertFalse(egress.validation_rejected(1, text, variant), text)
         diagnostic = ".agent-vm.runtime.sh failed (exit 7)"
         self.assertTrue(egress.strict_hook_rejected(diagnostic))

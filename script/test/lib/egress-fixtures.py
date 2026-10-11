@@ -226,6 +226,14 @@ def _handle_connect(directory: Path, conn: socket.socket) -> None:
             pass
 
 
+def hostname_fixtures():
+    path = Path(__file__).with_name("egress-hostname-fixtures.py")
+    spec = importlib.util.spec_from_file_location("egress_hostname_fixtures", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def serve(directory: Path, ephemeral_ports=False) -> int:
     directory.mkdir(parents=True, exist_ok=True)
     ready: list = []
@@ -236,12 +244,17 @@ def serve(directory: Path, ephemeral_ports=False) -> int:
     for port in ((0, 0) if ephemeral_ports else UDP_RECEIPT_PORTS):
         threads.append(threading.Thread(target=_serve_udp, args=(directory, port, ready, lock)))
     threads.append(threading.Thread(target=_serve_proxy, args=(directory, ready, lock, ("127.0.0.1", 0) if ephemeral_ports else PROXY_ADDR)))
+    hostname = hostname_fixtures()
+    for port, kind in ((18443, "tls"), (18444, "tls"), (18090, "opaque"), (18091, "banner")):
+        threads.append(threading.Thread(target=hostname.serve,
+            args=(directory, 0 if ephemeral_ports else port, kind, ready, lock,
+                  lambda line: record_receipt(directory, line))))
     for thread in threads:
         thread.daemon = True
         thread.start()
     # Ready only once every listener has bound.
     deadline = time.monotonic() + 5
-    expected = len(TCP_RECEIPT_PORTS) + len(UDP_RECEIPT_PORTS) + 1
+    expected = len(TCP_RECEIPT_PORTS) + len(UDP_RECEIPT_PORTS) + 5
     while True:
         with lock:
             count = len(ready)
@@ -253,7 +266,7 @@ def serve(directory: Path, ephemeral_ports=False) -> int:
         time.sleep(0.05)
     (directory / "ports.json").write_text(json.dumps({
         kind: sorted(port for protocol, port in ready if protocol == kind)
-        for kind in ("tcp", "udp", "proxy")}))
+        for kind in ("tcp", "udp", "proxy", "tls", "opaque", "banner")}))
     (directory / READY_NAME).write_text(str(int(time.time())), encoding="utf-8")
     stop = threading.Event()
 
@@ -365,8 +378,51 @@ CASES = (
           ("tcp-port", ("--allow-egress", "tcp://[{cidr}]:18080")),
           ("udp-port", ("--allow-egress", "udp://[{cidr}]:18080")))),
     *(Case("RJ1", variant, flags=("--allow-egress", value), guest=False)
-      for variant, value in (("hostname", "reject.invalid"), ("cidr-port", "{cidr}:18080"),
+      for variant, value in (("udp-hostname", "udp://reject.invalid"), ("dns-port", "reject.invalid:53"),
+                             ("alias", "host.microsandbox.internal"), ("wildcard", "*.reject.invalid"),
+                             ("numeric-final", "1.2.3"), ("cidr-port", "{cidr}:18080"),
                              ("scheme", "http://1.1.1.1:80"))),
+    # #306 hostname tier (ADR-0037). Names are sslip.io renderings of the LAN
+    # address so the host resolver returns the fixture answer; the ladder and
+    # the gate live in orchestrate(). Each entry in `flags` is either a raw flag
+    # token (it starts with `--`) or an allowance, which build_command emits as
+    # `--allow-egress ALLOWANCE`. `{admission}` expands to the HNc ladder step's
+    # private-answer admission: a port-less UDP CIDR, or the diagnostic
+    # `--allow-lan` of step (b).
+    Case("HNc", flags=("{admission}", "tcp://{hnc}:18443")),
+    Case("HN1", flags=("{admission}", "tcp://{hn1a}:18443", "tcp://{hn1b}:18444", "{hn1c}")),
+    Case("HN2", flags=("{admission}", "tcp://{hn2a}:18443", "tcp://{hn2b}:18443")),
+    Case("HN3", flags=("{admission}", "tcp://{hn3}:18443")),
+    Case("HN4", flags=("--allow-internet-egress", "udp://{lan}/32", "tcp://{hn4a}:18443")),
+    Case("HN5", flags=("{admission}", "tcp://{lan}:18443", "tcp://{hn5}:18443")),
+    Case("HN5c", flags=("{admission}", "tcp://{lan}:18443")),
+    Case("HN6", flags=("{admission}", "tcp://{lan}:18080", "tcp://{hn6}:18443")),
+    # OP rows need no DNS lookup or private-answer admission: the guest dials
+    # the numeric LAN grant, and the hostname entry only has to exist so the
+    # emitted Domain rule makes `has_domain_rules()` true (D1). Each OPn has an
+    # OPnc control without the hostname rule.
+    Case("OP1", flags=("tcp://{lan}:18090", "tcp://{op1}:18443")),
+    Case("OP1c", flags=("tcp://{lan}:18090",)),
+    Case("OP2", flags=("tcp://{lan}:18090", "tcp://{op2}:18443")),
+    Case("OP2c", flags=("tcp://{lan}:18090",)),
+    Case("OP3", flags=("tcp://{lan}:18091", "tcp://{op3}:18443")),
+    Case("OP3c", flags=("tcp://{lan}:18091",)),
+    *(Case("RB2", variant, flags=("tcp://{rb2}:18443", *grant), optional="rebind")
+      for variant, grant in (
+          ("hostname-only", ()), ("lan", ("--allow-lan",)),
+          ("udp", ("udp://{cidr}",)),
+          ("tcp", ("tcp://{cidr}",)),
+          ("port", ("[{cidr}]:18080",)),
+          ("tcp-port", ("tcp://[{cidr}]:18080",)))),
+    Case("HP1", flags=("example.com",)),
+    Case("HP2", flags=("example.com",)),
+    Case("HP2c", flags=("example.com",)),
+    Case("HP3", flags=("example.com", "--allow-host")),
+    Case("HP4", flags=("{hp4a}", "--allow-host")),
+    Case("HP5", flags=("example.com",)),
+    Case("HP6", flags=("www.github.com", "--allow-host")),
+    Case("HP6c", flags=("www.github.com", "github.com", "--allow-host")),
+    Case("PXH1", flags=("example.com",), guest=False, extras=("HTTPS_PROXY",)),
     Case("CL1"),
 )
 
@@ -375,6 +431,37 @@ def base_environment(work: Path) -> dict[str, str]:
     return {"HOME": str(work / "home"), "XDG_CONFIG_HOME": str(work / "config"),
             "AGENT_VM_STATE_DIR": str(work / "state"), "PATH": "/usr/bin:/bin",
             "TERM": "dumb", "AGENT_VM_SHARE_MSB_CACHE": "0"}
+
+
+# Exact positive controls for the #306 hostname tier: every denial/NX attempt
+# names a passing positive attempt the orchestrator joins it against. Same-case
+# positives where the case proves its own framing; a sibling case otherwise.
+HOSTNAME_CONTROLS = {
+    ("HN1", "ipv4"): {"hn1a-18444": ("HN1", "ipv4", "hn1a-18443"),
+                       "hn1b-18443": ("HN1", "ipv4", "hn1b-18444"),
+                       "hn1d-dns": ("HNc", "ipv4", "hnc-dns"),
+                       "hn1d-18443": ("HN1", "ipv4", "hn1c-18443")},
+    ("HN2", "ipv4"): {"hn2a-wrong": ("HN2", "ipv4", "hn2a-lan"),
+                       "hn2b-wrong": ("HN2", "ipv4", "hn2b-lan2")},
+    ("HN3", "ipv4"): {"hn3-nosni": ("HN3", "ipv4", "hn3-sni"),
+                       "hn3-plain": ("HN3", "ipv4", "hn3-sni"),
+                       "lan-tcp80": ("LC1", "ipv4", "lan-tcp80")},
+    ("HN4", "ipv4"): {"hn4b-tls": ("HN4", "ipv4", "hn4a-tls")},
+    ("HN5", "ipv4"): {"hn5-plain": ("HN5", "ipv4", "hn5-name")},
+    ("HN6", "ipv4"): {"hn6-nohost": ("HN6", "ipv4", "lan-tcp80")},
+    ("OP1", "ipv4"): {"op-printable": ("OP1c", "ipv4", "op-printable")},
+    ("HP1", "ipv4"): {"hp1-scope-udp": ("HP1", "ipv4", "hp1-com-dns"),
+                       "hp1-scope-tcp": ("HP1", "ipv4", "hp1-com-dns"),
+                       "hp1-http": ("HP1", "ipv4", "hp1-https")},
+    ("HP2", "ipv4"): {"hp2-switch": ("HP2c", "ipv4", "hp2c-same")},
+    ("HP3", "ipv4"): {"hp3-spoof": ("HP3", "ipv4", "hp3-control")},
+    ("HP4", "ipv4"): {"hp4-b": ("HP4", "ipv4", "hp4-a")},
+    ("HP5", "ipv4"): {"hp5-nosni": ("HP5", "ipv4", "hp5-control")},
+    ("HP6", "ipv4"): {"hp6-redirect": ("HP6c", "ipv4", "hp6-redirect")},
+    **{("RB2", variant): {f"rb2-{variant}-udp": ("RB2", "lan", "rb2-lan-udp"),
+                           f"rb2-{variant}-tcp": ("RB2", "lan", "rb2-lan-tcp")}
+       for variant in ("hostname-only", "port", "tcp-port")},
+}
 
 
 # Links identify the exact successful attempt, including resolver/name/transport.
@@ -387,6 +474,9 @@ FLOW_CONTROLS = {"lan-tcp80": "LC1:ipv4:lan-tcp80", "lan-tcp81": "LC1:ipv4:lan-t
 
 def control_links(case: Case) -> dict[str, str]:
     links = dict(FLOW_CONTROLS)
+    for label, (target_case, target_variant, target) in HOSTNAME_CONTROLS.get(
+            (case.case, case.variant), {}).items():
+        links[label] = f"{target_case}:{target_variant}:{target}"
     for proto in ("udp", "tcp"):
         for resolver in ("gateway", "explicit"):
             links[f"{resolver}-{proto}"] = f"I1:ipv4:{resolver}-{proto}"
@@ -434,6 +524,8 @@ class Command:
 
 
 def expected_attempts(case: Case) -> tuple[str, ...]:
+    if hostname_tier(case.case):
+        return tuple(row[0] for row in hostname_rows(case))
     gateway = ("gateway-udp", "gateway-tcp")
     explicit = ("explicit-udp", "explicit-tcp")
     common = ("lan-tcp80", "public-1111")
@@ -467,6 +559,8 @@ def expected_attempts(case: Case) -> tuple[str, ...]:
 
 
 def attempt_expectations(case: Case) -> dict[str, str]:
+    if hostname_tier(case.case):
+        return {row[0]: row[2] for row in hostname_rows(case)}
     denied = {
         "I1": ("lan-tcp80", "host-tcp80"),
         "D1": ("lan-tcp80", "lan-udp90", "host-tcp80", "public-1111"),
@@ -493,27 +587,188 @@ def attempt_protocol(label: str) -> str:
     return "udp" if "-udp" in label else "tcp"
 
 
+# ---------------------------------------------------------------------------
+# #306 hostname tier (ADR-0037)
+# ---------------------------------------------------------------------------
+# A second test-owned address for HN2 (host interface or LAN alias); the run
+# overrides it with --lan2. The HP4 placeholder is replaced by the host-side
+# shared-public-IP pair search before a run.
+HP4_PAIR = ("example.com", "www.example.com")
+DEFAULT_LAN2 = "192.0.2.2"  # TEST-NET-1: plan/print only, never dialed
+
+# Ordered (label, protocol, expectation) rows per case. The probe emits exactly
+# this sequence, so this table is the independent inventory the contract checks.
+HOSTNAME_ROWS = {
+    "HNc": (("hnc-dns", "dns-udp", "OK"), ("hnc-tls", "tls", "0")),
+    "HN1": (("hn1a-dns", "dns-udp", "OK"), ("hn1b-dns", "dns-udp", "OK"),
+            ("hn1c-dns", "dns-udp", "OK"), ("hn1a-18443", "tls", "0"),
+            ("hn1a-18444", "tls", "1"), ("hn1b-18444", "tls", "0"),
+            ("hn1b-18443", "tls", "1"), ("hn1c-18443", "tls", "0"),
+            ("hn1c-18444", "tls", "0"), ("hn1d-dns", "dns-udp", "NX"),
+            ("hn1d-18443", "tls", "1")),
+    "HN2": (("hn2a-dns", "dns-udp", "OK"), ("hn2b-dns", "dns-udp", "OK"),
+            ("hn2a-lan", "tls", "0"), ("hn2b-lan2", "tls", "0"),
+            ("hn2a-wrong", "tls", "1"), ("hn2b-wrong", "tls", "1")),
+    "HN3": (("hn3-dns", "dns-udp", "OK"), ("hn3-sni", "tls", "0"),
+            ("hn3-nosni", "tls", "1"), ("hn3-plain", "opaque", "1"),
+            ("lan-tcp80", "tcp", "1")),
+    "HN4": (("hn4a-dns", "dns-udp", "OK"), ("hn4b-dns", "dns-udp", "OK"),
+            ("hn4a-tls", "tls", "0"), ("hn4b-tls", "tls", "1")),
+    "HN5": (("hn5-dns", "dns-udp", "OK"), ("hn5-numeric", "tls", "0"),
+            ("hn5-name", "tls", "0"), ("hn5-plain", "opaque", "1")),
+    "HN5c": (("hn5c-plain", "opaque", "0"),),
+    "HN6": (("hn6-dns", "dns-udp", "OK"), ("lan-tcp80", "tcp", "0"),
+            ("hn6-nohost", "tcp", "1")),
+    "OP1": (("op-printable", "opaque", "1"),),
+    "OP1c": (("op-printable", "opaque", "0"),),
+    "OP2": (("op-binary", "opaque", "0"),),
+    "OP2c": (("op-binary", "opaque", "0"),),
+    "OP3": (("op-banner", "banner", "0"),),
+    "OP3c": (("op-banner", "banner", "0"),),
+    "HP1": (("hp1-com-dns", "dns-udp", "OK"), ("hp1-https", "https", "0"),
+            ("hp1-scope-udp", "dns-udp", "NX"), ("hp1-scope-tcp", "dns-tcp", "NX"),
+            ("hp1-http", "https", "1")),
+    "HP2": (("hp2-dns", "dns-udp", "OK"), ("hp2-switch", "held", "1")),
+    "HP2c": (("hp2c-dns", "dns-udp", "OK"), ("hp2c-same", "held", "0")),
+    "HP3": (("hp3b-dns", "dns-udp", "OK"), ("hp3a-dns", "dns-udp", "OK"),
+            ("hp3-control", "https", "0"), ("hp3-spoof", "https", "1")),
+    "HP4": (("hp4a-dns", "dns-udp", "OK"), ("hp4b-dns", "dns-udp", "OK"),
+            ("hp4-a", "https", "0"), ("hp4-b", "https", "1")),
+    "HP5": (("hp5-dns", "dns-udp", "OK"), ("hp5-control", "https", "0"),
+            ("hp5-nosni", "tls", "1")),
+    "HP6": (("hp6b-dns", "dns-udp", "OK"), ("hp6a-dns", "dns-udp", "OK"),
+            ("hp6-first", "https", "301"), ("hp6-redirect", "https", "1")),
+    "HP6c": (("hp6b-dns", "dns-udp", "OK"), ("hp6a-dns", "dns-udp", "OK"),
+             ("hp6-first", "https", "301"), ("hp6-redirect", "https", "0")),
+    "PXH1": (),
+}
+RB2_VARIANTS = ("hostname-only", "lan", "udp", "tcp", "port", "tcp-port")
+
+# ADR-0037 / plan §7.5 gate. HNc is the calibration for the HN rows: once it
+# succeeds via the non-confounding admissions (a) or (c), a FAIL or NOT RUN in
+# any HN row is a completion gate. Step (b), `--allow-lan`, is diagnostic only
+# (it authorizes the LAN address-wide), so it cannot support deny evidence; if
+# every step fails the name x port matrix has no native evidence (outcome (d)).
+HN_GATE_CASES = frozenset({"HN1", "HN2", "HN3", "HN4", "HN5", "HN5c", "HN6"})
+# The OP rows need no DNS lookup or private-answer admission, so they run
+# whatever the HNc ladder does and are always a completion gate: a FAIL or NOT
+# RUN in any of them blocks.
+OP_GATE_CASES = frozenset({"OP1", "OP1c", "OP2", "OP2c", "OP3", "OP3c"})
+OUTCOME_D = ("HNc failed on every available ladder step (outcome (d): the name x port "
+             "matrix has NO native evidence in this environment)")
+HOSTNAME_PROXY_REFUSAL = ("hostname allowances cannot be enforced through the host HTTP proxy "
+                          "(HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the "
+                          "address scope is not checked; unset the proxy, use an IP/CIDR "
+                          "allowance, or use --allow-internet-egress")
+
+
+def hostname_gate(hnc_step, results) -> tuple[bool, list[str]]:
+    """Return ``(blocked, blockers)`` for the HN/OP completion gate. The OP rows
+    are always gated; the HN rows only once HNc calibrated via (a)/(c)."""
+    gated = set(OP_GATE_CASES)
+    if hnc_step in ("a", "c"):
+        gated |= HN_GATE_CASES
+    blockers = [f"{r['case'].case}:{r['status']}" for r in results
+                if r["case"].case in gated and r["status"] != "PASS"]
+    return bool(blockers), blockers
+
+
+def hostname_tier(case: str) -> bool:
+    return case in HOSTNAME_ROWS or case == "RB2" or case == "PXH1"
+
+
+def hostname_rows(case: Case):
+    if case.case == "RB2":
+        expected = "OK" if case.variant in ("lan", "udp", "tcp") else "NX"
+        return ((f"rb2-{case.variant}-udp", "dns-udp", expected),
+                (f"rb2-{case.variant}-tcp", "dns-tcp", expected))
+    return HOSTNAME_ROWS[case.case]
+
+
+def hostname_values(lan: str, lan2: str = "") -> dict[str, str]:
+    dashed = lan.replace(".", "-")
+    dashed2 = (lan2 or DEFAULT_LAN2).replace(".", "-")
+
+    def name(prefix, suffix):
+        return f"{prefix}.{suffix}.sslip.io"
+
+    return {
+        "lan": lan, "cidr": lan.rsplit(".", 1)[0] + ".0/24",
+        "hnc": name("hnc", dashed),
+        "hn1a": name("hn1a", dashed), "hn1b": name("hn1b", dashed),
+        "hn1c": name("hn1c", dashed), "hn1d": name("hn1d", dashed),
+        "hn2a": name("hn2a", dashed), "hn2b": name("hn2b", dashed2),
+        "hn3": name("hn3", dashed), "hn4a": name("hn4a", dashed),
+        "hn4b": name("hn4b", dashed), "hn5": name("hn5", dashed),
+        "hn6": name("hn6", dashed), "op1": name("op1", dashed),
+        "op2": name("op2", dashed), "op3": name("op3", dashed),
+        "rb2": name("rb2", dashed), "hp4a": HP4_PAIR[0], "hp4b": HP4_PAIR[1],
+    }
+
+
+def hostname_argv_flags(case: Case, values: dict[str, str], hnc_step: str) -> list[str]:
+    """Raw argv tokens for one hostname-tier case. `{admission}` is the HNc
+    ladder step's private-answer admission; any other non-`--` token is an
+    `--allow-egress` allowance."""
+    admission = ["--allow-lan"] if hnc_step == "b" else ["--allow-egress", f"udp://{values['lan']}/32"]
+    flags: list[str] = []
+    for flag in case.flags:
+        if flag == "{admission}":
+            flags.extend(admission)
+        elif flag.startswith("--"):
+            flags.append(flag.format(**values))
+        else:
+            flags.extend(("--allow-egress", flag.format(**values)))
+    return flags
+
+
+def hostname_extra(case: Case, values: dict[str, str], lan2: str, hnc_step: str) -> str:
+    v = values
+    return {
+        "HNc": f"{v['hnc']},{hnc_step}",
+        "HN1": f"{v['hn1a']},{v['hn1b']},{v['hn1c']},{v['hn1d']}",
+        "HN2": f"{v['hn2a']},{v['hn2b']},{lan2}",
+        "HN3": v["hn3"], "HN4": f"{v['hn4a']},{v['hn4b']}",
+        "HN5": v["hn5"], "HN5c": "", "HN6": v["hn6"],
+        "OP1": "", "OP1c": "", "OP2": "", "OP2c": "",
+        "OP3": "", "OP3c": "", "RB2": v["rb2"],
+        "HP1": "example.com", "HP2": "example.com,example.org",
+        "HP2c": "example.com,example.com", "HP3": "example.com,files.pythonhosted.org",
+        "HP4": f"{v['hp4a']},{v['hp4b']}", "HP5": "example.com",
+        "HP6": "www.github.com,github.com", "HP6c": "www.github.com,github.com",
+        "PXH1": "",
+    }[case.case]
+
+
 def build_command(case: Case, work: Path, binary: str, lan: str, *, answer="ANSWER_FROM_H1",
-                  rebind="", attempt="") -> Command:
+                  rebind="", attempt="", lan2="", hnc_step="a") -> Command:
     cidr = lan.rsplit(".", 1)[0] + ".0/24"
-    values = {"lan": lan, "cidr": cidr}
+    values = hostname_values(lan, lan2) if hostname_tier(case.case) else {"lan": lan, "cidr": cidr}
     env = base_environment(work)
     extras = {"HTTP_PROXY": "http://127.0.0.1:18888", "HTTPS_PROXY": "http://127.0.0.1:18888",
               "NO_PROXY": lan, "MSB_CONFIG_PATH": str(work / "floor.json")}
     env.update({key: extras[key] for key in case.extras})
-    argv = [binary, case.tool, "--no-git", "--image", IMAGE,
-            *(flag.format(**values) for flag in case.flags)]
+    if hostname_tier(case.case):
+        flags = hostname_argv_flags(case, values, hnc_step)
+    else:
+        flags = [flag.format(**values) for flag in case.flags]
+    argv = [binary, case.tool, "--no-git", "--image", IMAGE, *flags]
     ident = attempt or f"{case.case}-{case.variant}"
     if case.guest:
-        argv.extend(("--", case.case, ident, lan, case.variant,
-                     answer if case.case == "I1a" else rebind if case.case == "RB1" else ""))
+        extra = hostname_extra(case, values, lan2 or DEFAULT_LAN2, hnc_step) if hostname_tier(case.case) else (
+            answer if case.case == "I1a" else rebind if case.case == "RB1" else "")
+        argv.extend(("--", case.case, ident, lan, case.variant, extra))
     project = work / (case.case[:3] if case.case.startswith("HK") else "creds" if case.tool == "egresscreds" else "proj")
     setup = ("private synthetic anthropic OAuth seed; remove seed and captured material",) if case.tool == "egresscreds" else ()
+    if hostname_tier(case.case):
+        protocols = {row[0]: row[1] for row in hostname_rows(case)}
+    else:
+        protocols = {label: attempt_protocol(label) for label in expected_attempts(case)}
     return Command(case.case, case.variant, case.tool, "guest" if case.guest else "validation-only",
                    env, tuple(argv), str(project), 300 if case.guest else 10, 10,
                    case.extras, (case.optional,) if case.optional else (), control_links(case), setup,
                    expected_attempts=expected_attempts(case), attempt_expectations=attempt_expectations(case),
-                   attempt_protocols={label: attempt_protocol(label) for label in expected_attempts(case)})
+                   attempt_protocols=protocols)
 
 
 def admin_command(work: Path, binary: str, verb: str, args=(), bound=10) -> Command:
@@ -973,6 +1228,24 @@ def write_hook(work: Path, name: str, lan: str, ident: str, port=18080):
     (project / ".agent-vm.runtime.sh").write_text(hook)
 
 
+RJ1_VALUES = {
+    "udp-hostname": "udp://reject.invalid", "dns-port": "reject.invalid:53",
+    "alias": "host.microsandbox.internal", "wildcard": "*.reject.invalid",
+    "numeric-final": "1.2.3", "cidr-port": "{cidr}:18080", "scheme": "http://1.1.1.1:80",
+}
+RJ1_MESSAGES = {
+    "udp-hostname": "hostnames allow TLS over TCP only; use tcp://HOST:PORT, or an IP/CIDR for UDP",
+    "dns-port": "ports 53 and 853 carry the sandbox DNS path and cannot be hostname-allowed; use an IP/CIDR",
+    "alias": "host.microsandbox.internal is the sandbox host; use --allow-host",
+    "wildcard": "not an IP address, CIDR or hostname (hostnames: one or more labels of ASCII letters, "
+                "digits and '-', not ending in a numeric label; write non-ASCII names as A-labels; no wildcards)",
+    "numeric-final": "not an IP address, CIDR or hostname (hostnames: one or more labels of ASCII letters, "
+                     "digits and '-', not ending in a numeric label; write non-ASCII names as A-labels; no wildcards)",
+    "cidr-port": "a port on a CIDR needs brackets, e.g. tcp://[10.0.0.0/24]:22",
+    "scheme": "unsupported scheme; use tcp:// or udp:// (or no scheme for all protocols)",
+}
+
+
 def rejection_diagnostic(variant: str) -> str:
     """The exact `--allow-egress #1:` message for an RJ1 variant.
 
@@ -980,16 +1253,17 @@ def rejection_diagnostic(variant: str) -> str:
     `allowance_rejections_report_exact_messages`; a native RJ1 pass therefore
     cannot come from a clap error or an unrelated egress-worded failure.
     """
-    return "--allow-egress #1: " + {
-        "hostname": "hostname allowances are not supported yet; use an IP address or CIDR, or --allow-internet-egress",
-        "cidr-port": "a port on a CIDR needs brackets, e.g. tcp://[10.0.0.0/24]:22",
-        "scheme": "unsupported scheme; use tcp:// or udp:// (or no scheme for all protocols)",
-    }[variant]
+    return "--allow-egress #1: " + RJ1_MESSAGES[variant]
 
 
 def validation_rejected(status: int, text: str, variant: str) -> bool:
+    diagnostic = rejection_diagnostic(variant)
+    value = RJ1_VALUES.get(variant, "")
+    # The alias message legitimately names the input; every other variant must
+    # not echo the supplied value.
+    echoed = bool(value) and value not in diagnostic and value in text
     return (status not in (0, 124, 130, 143) and "CASE " not in text
-            and "reject.invalid" not in text and rejection_diagnostic(variant) in text)
+            and diagnostic in text and not echoed)
 
 
 def strict_hook_rejected(text: str) -> bool:
@@ -1097,12 +1371,13 @@ def attempts_for(case: Case, ident: str, text: str):
             rows[-1]["output"] += line + "\n"
         if line.startswith("ATTEMPT "):
             parts = line.split()
-            if len(parts) != 8 or parts[1] != case.case:
+            if len(parts) < 8 or parts[1] != case.case:
                 raise RuntimeError("malformed guest attempt")
-            _, _, label, protocol, endpoint, port, expectation, receipt = parts
+            _, _, label, protocol, endpoint, port, expectation, receipt = parts[:8]
             rows.append({"key": f"{case.case}:{case.variant}:{label}", "label": label,
                          "protocol": protocol, "endpoint": endpoint, "port": port,
-                         "expectation": expectation, "receipt": receipt, "output": ""})
+                         "expectation": expectation, "receipt": receipt,
+                         "detail": " ".join(parts[8:]), "output": ""})
     if case.case.startswith("HK"):
         rows.append({"key": f"{case.case}:{case.variant}:hook", "label": "hook", "protocol": "tcp",
                      "endpoint": "LAN", "port": "18080", "expectation": "0" if case.case.endswith("c") else "1",
@@ -1122,8 +1397,19 @@ def check_attempt_inventory(command: Command, rows: list[dict]) -> list[str]:
     return errors
 
 
-def check_attempts(work: Path, case: Case, text: str, rows: list[dict]) -> list[str]:
+def _receipt_lines(work: Path) -> list[str]:
+    path = work / "fx/receipts.log"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def check_attempts(work: Path, case: Case, text: str, rows: list[dict],
+                  receipt_offset: int = 0) -> list[str]:
     failures = []
+    # Hostname-tier receipts are keyed by port and payload/SNI, not by attempt
+    # id, so a control case's receipt can collide with the case under test (for
+    # example OP1c's printable payload and OP1's identical payload). Scope every
+    # lookup to the lines written since this case began.
+    records = _receipt_lines(work)[receipt_offset:]
     for row in rows:
         expected = row["expectation"]
         receipt = row["receipt"]
@@ -1151,6 +1437,45 @@ def check_attempts(work: Path, case: Case, text: str, rows: list[dict]) -> list[
             if not any(line.startswith(marker) and " id_ok=1 qr=1 question_ok=1 tc=0 " in line
                        and f" rcode={3 if expected == 'NX' else 0} " in line for line in row["output"].splitlines()):
                 failures.append(f"validated DNS response missing: {row['label']}")
+        elif row["protocol"] in ("tls", "opaque", "banner"):
+            detail = row.get("detail", "")
+            peer = row["endpoint"]
+            if row["protocol"] == "tls":
+                hits = [line for line in records if line.split()[:3] == ["tls", row["port"], peer]
+                        and line.split()[-1:] == [detail]]
+                plain = [line for line in records if line.split()[:3] == ["tcp-plain", row["port"], peer]]
+                present = bool(hits)
+                wrong = bool(plain)
+            else:
+                hits = [line for line in records if len(line.split()) == 4
+                        and line.split()[0] in ("opaque", "tcp-plain")
+                        and line.split()[1] == row["port"] and line.split()[2] == peer
+                        and line.split()[3] == detail]
+                present = bool(hits)
+                wrong = False
+            if expected == "0" and not present:
+                failures.append(f"missing hostname receipt: {row['label']}")
+            if expected == "1" and (present or wrong):
+                failures.append(f"unexpected hostname receipt: {row['label']}")
+        elif row["protocol"] == "https":
+            match = re.search(r"^HTTP_CODE (\S*) rc=(\d+)$", row["output"], re.M)
+            if not match:
+                failures.append(f"https status missing: {row['label']}")
+            else:
+                code, rc = match.group(1), int(match.group(2))
+                ok = rc == 0 and code.isdigit()
+                if expected == "0":
+                    good = ok and 200 <= int(code) < 300
+                elif expected == "1":
+                    good = not (ok and 200 <= int(code or 0) < 300)
+                else:
+                    good = ok and code == expected
+                if not good:
+                    failures.append(f"https status mismatch: {row['label']}")
+        elif row["protocol"] == "held":
+            marker = "HELD_OK" if expected == "0" else "HELD_DENIED"
+            if marker not in row["output"]:
+                failures.append(f"held-connection marker missing: {row['label']}")
         else:
             failures.append(f"unknown attempt protocol: {row['protocol']}")
     return failures
@@ -1223,6 +1548,95 @@ def print_plan(work: Path, binary: str, lan: str, smoke=False):
         print(json.dumps(command.plan(), sort_keys=True))
 
 
+def run_single_case(work: Path, args, launches: list, case: Case, *, ident: str,
+                    lan2: str = "", hnc_step: str = "a") -> dict:
+    """One launch + receipt/attempt check. Used by the HNc ladder, which needs
+    up to three attempts of the same case before the main sweep."""
+    command = build_command(case, work, args.binary, args.lan, attempt=ident, lan2=lan2, hnc_step=hnc_step)
+    owned = OwnedLaunch(work, command, ident)
+    launches.append(owned)
+    receipt_offset = len(_receipt_lines(work))
+    status = owned.run()
+    text = owned.log.read_text(errors="replace") if owned.log.exists() else ""
+    rows = attempts_for(case, ident, text)
+    failures = check_attempt_inventory(command, rows)
+    if status != 0:
+        failures.append(f"primary expected 0, actual {status}")
+    if f"CASE {case.case} BEGIN" not in text.splitlines():
+        failures.append("guest BEGIN missing")
+    if f"CASE {case.case} END" not in text.splitlines():
+        failures.append("guest END missing")
+    failures.extend(check_attempts(work, case, text, rows, receipt_offset))
+    failures.extend(cleanup_launch(owned))
+    return {"case": case, "status": "FAIL" if failures else "PASS", "failures": failures, "attempts": rows}
+
+
+HNC_STEP_C_REASON = ("not implemented: the <lan>:53 DNS fixture (serve_dns) is not wired into "
+                     "the fixture supervisor; it also needs operator approval for a privileged bind")
+
+
+def hnc_ladder(work: Path, args, launches: list, hnc_case: Case, lan2: str):
+    """ADR-0037 / plan §7.5: try the admission ladder in order until HNc
+    succeeds, recording every step. Returns (winning_step, result, steps)."""
+    steps = []
+    last = None
+    for step in ("a", "b"):
+        step_result = run_single_case(work, args, launches, hnc_case,
+                                      ident=f"HNc-{step}-{len(launches)}", lan2=lan2, hnc_step=step)
+        steps.append([step, step_result["status"], list(step_result["failures"])])
+        if step_result["status"] == "PASS":
+            return step, step_result, steps
+        last = last or step_result
+    # Step (c) is always NOT RUN: the test-owned <lan>:53 DNS listener is not
+    # wired into the supervisor, so the step would query no listener and fail
+    # misleadingly (see HNC_STEP_C_REASON).
+    steps.append(["c", "NOT RUN", [HNC_STEP_C_REASON]])
+    return None, (last or {"case": hnc_case, "status": "NOT RUN", "failures": [], "attempts": []}), steps
+
+
+def host_internet_available() -> bool:
+    """Bounded host-side check for the public HP tier; a failure means the row
+    is NOT RUN, never a false denial."""
+    try:
+        with socket.create_connection(("example.com", 443), timeout=4):
+            return True
+    except OSError:
+        return False
+
+
+def find_shared_public_pair() -> tuple[str, str] | None:
+    """A pair of public names sharing one non-gateway IPv4, for HP4."""
+    import ipaddress
+    candidates = ["example.com", "www.example.com", "example.org", "www.example.org",
+                  "example.net", "www.example.net"]
+    by_address: dict[str, str] = {}
+    for name in candidates:
+        try:
+            addresses = {ipaddress.IPv4Address(row[4][0]) for row in socket.getaddrinfo(name, 443, socket.AF_INET)}
+        except OSError:
+            continue
+        for address in addresses:
+            if not address.is_global:
+                continue
+            previous = by_address.get(str(address))
+            if previous and previous != name:
+                return previous, name
+            by_address.setdefault(str(address), name)
+    return None
+
+
+def resolve_second_address(candidate: str) -> str:
+    """Accept --lan2 only when it is a plain non-loopback IPv4 literal."""
+    if not candidate:
+        return ""
+    import ipaddress
+    try:
+        address = ipaddress.IPv4Address(candidate)
+    except ValueError:
+        return ""
+    return candidate if not address.is_loopback else ""
+
+
 def orchestrate(args) -> int:
     if args.print_plan:
         print_plan(args.work or Path("/var/tmp/av302.PLAN"), args.binary or "/absolute/bundle/bin/agent-vm", args.lan or "192.168.1.2", args.smoke)
@@ -1282,9 +1696,46 @@ def orchestrate(args) -> int:
             (sys.executable, str(Path(__file__).resolve()), "resolve", rebind, args.lan), str(work / "proj"), 5, ADMIN_GRACE)
         status, _ = run_admin(work, calibration)
         rebind_available = status == 0
+        # --- #306 hostname tier calibration (ADR-0037 / plan §7.5) ---------
+        # The smoke tier is the numeric subset; the ladder and the public/shared
+        # calibrations are full-tier work, so they are skipped under --smoke.
+        global HP4_PAIR
+        lan2 = resolve_second_address(getattr(args, "lan2", "") or "")
+        hostname_skips = {}
+        hnc_step, shared_pair, public_ok = None, None, True
+        if not args.smoke:
+            shared_pair = find_shared_public_pair()
+            if shared_pair:
+                HP4_PAIR = shared_pair
+            public_ok = host_internet_available()
+            hnc_case = next(case for case in CASES if case.case == "HNc")
+            hnc_step, hnc_result, hnc_steps = hnc_ladder(work, args, launches, hnc_case, lan2)
+            append_owned(work, {"phase": "hnc-ladder", "steps": hnc_steps, "winner": hnc_step})
+            if hnc_step in ("a", "c"):
+                gate_reason = ""
+            elif hnc_step == "b":
+                gate_reason = ("HNc calibrated only via the diagnostic --allow-lan step (b); "
+                               "deny rows are confounded, so the name x port matrix has no evidence")
+            else:
+                gate_reason = OUTCOME_D
+            hostname_skips = {name: gate_reason for name in HN_GATE_CASES} if gate_reason else {}
+            if not lan2:
+                hostname_skips["HN2"] = "no second test-owned address (--lan2/AGENT_VM_EGRESS_LAN2)"
+            if shared_pair is None:
+                hostname_skips["HP4"] = "no shared public IP pair for the HP4 calibration"
+            if not public_ok:
+                for name in ("HP1", "HP2", "HP2c", "HP3", "HP4", "HP5", "HP6", "HP6c"):
+                    hostname_skips[name] = "host internet/calibration unavailable"
         for case in selected_cases(args.smoke):
+            if case.case == "HNc":
+                results.append(hnc_result)
+                for row in hnc_result["attempts"]:
+                    all_attempts[row["key"]] = hnc_result
+                continue
             reason = ""
-            if case.optional == "rebind" and not rebind_available:
+            if case.case in hostname_skips:
+                reason = hostname_skips[case.case]
+            elif case.optional == "rebind" and not rebind_available:
                 reason = "host resolver did not return fixture LAN A"
             elif case.optional == "ipv6" and not v6_available:
                 reason = "paired IPv6 family/controls unavailable"
@@ -1301,12 +1752,14 @@ def orchestrate(args) -> int:
             ident = f"{case.case}-{case.variant}-{len(launches)}"
             if case.case.startswith("HK"):
                 write_hook(work, case.case[:3], args.lan, ident + "-hook")
-            command = build_command(case, work, args.binary, args.lan, answer=answer, rebind=rebind, attempt=ident)
+            command = build_command(case, work, args.binary, args.lan, answer=answer, rebind=rebind,
+                                    attempt=ident, lan2=lan2, hnc_step=hnc_step or "a")
             if case.tool == "egresscreds":
                 prepare_project(work, work / "creds")
                 seed_credentials(work)
             before = snapshot_validation(work) if not case.guest else None
             proxy_before = (work / "fx/receipts.log").read_text() if (work / "fx/receipts.log").exists() else ""
+            receipt_offset = len(_receipt_lines(work))
             owned = OwnedLaunch(work, command, ident)
             launches.append(owned)
             ingress = None
@@ -1352,9 +1805,16 @@ def orchestrate(args) -> int:
                     failures.append("default-deny notice missing")
                 if case.case not in ("P0", "CL1") and not rows:
                     failures.append("no attempts observed")
-                failures.extend(check_attempts(work, case, text, rows))
+                failures.extend(check_attempts(work, case, text, rows, receipt_offset))
             else:
-                if not validation_rejected(status, text, case.variant):
+                if case.case == "PXH1":
+                    # C8: the selected host HTTP proxy refuses the hostname
+                    # launch with fixed text and never echoes the input. Its
+                    # positive control is PX1 (a numeric launch under the same
+                    # proxy variables still launches).
+                    if status in (0, 124, 130, 143) or "CASE " in text or HOSTNAME_PROXY_REFUSAL not in text:
+                        failures.append("hostname proxy refusal oracle failed")
+                elif not validation_rejected(status, text, case.variant):
                     failures.append("validation rejection oracle failed")
                 if before != snapshot_validation(work):
                     failures.append("validation-only invocation mutated private launch state")
@@ -1441,7 +1901,12 @@ def orchestrate(args) -> int:
                         result["failures"].append(f"floor control failed: {target}")
             if result["failures"]:
                 result["status"] = "FAIL"
-        primary = interrupted or (1 if any(r["status"] == "FAIL" for r in results) else 0)
+        # ADR-0037 gate: a FAIL or NOT RUN in any OP row always blocks; in an
+        # HN row only once HNc succeeds via the non-confounding admission (a)/(c).
+        gate_blocked, blockers = hostname_gate(hnc_step, results)
+        if gate_blocked:
+            append_owned(work, {"phase": "hn-gate", "blockers": blockers})
+        primary = interrupted or (1 if gate_blocked or any(r["status"] == "FAIL" for r in results) else 0)
     except _load_owned_launch().LaunchInterrupted as error:
         primary = 128 + error.signum
     except KeyboardInterrupt:
@@ -1478,6 +1943,7 @@ def orchestrate(args) -> int:
 
 
 def self_test() -> int:
+    hostname_fixtures().self_test()
     import http.client
 
     # Ephemeral binds exercise each fixed listener's handler without occupying
@@ -1574,7 +2040,34 @@ def self_test() -> int:
             for sock in udp_sockets:
                 sock.close()
         print("self-test: both TCP, both UDP, CONNECT and full 3s absence OK")
-        return 0
+    gate_self_test()
+    return 0
+
+
+def _fake_result(case_id, status):
+    return {"case": Case(case_id), "status": status, "failures": [], "attempts": []}
+
+
+def gate_self_test() -> None:
+    # ADR-0037 gate: HNc pass + an HN/OP NOT RUN (or FAIL) is a blocking FAIL;
+    # when every ladder step fails, the NOT RUN rows are legitimate and the
+    # outcome (d) sentence is recorded.
+    assert hostname_gate("a", [_fake_result("HN1", "NOT RUN")]) == (True, ["HN1:NOT RUN"])
+    assert hostname_gate("c", [_fake_result("OP3", "FAIL"), _fake_result("HN5", "PASS")]) == (
+        True, ["OP3:FAIL"])
+    assert hostname_gate("a", [_fake_result("HN1", "PASS"), _fake_result("HP1", "NOT RUN")]) == (False, [])
+    # (b) is diagnostic only: it can neither certify nor gate an HN deny row.
+    assert hostname_gate("b", [_fake_result("HN1", "NOT RUN")]) == (False, [])
+    # (d): no non-confounding calibration, so HN NOT RUN is allowed.
+    assert hostname_gate(None, [_fake_result("HN1", "NOT RUN")]) == (False, [])
+    # The OP rows are always gated: a NOT RUN blocks whatever the ladder step.
+    assert hostname_gate(None, [_fake_result("OP1", "NOT RUN")]) == (True, ["OP1:NOT RUN"])
+    assert hostname_gate("b", [_fake_result("OP2c", "NOT RUN"), _fake_result("HN1", "NOT RUN")]) == (
+        True, ["OP2c:NOT RUN"])
+    assert "outcome (d)" in OUTCOME_D and "NO native evidence" in OUTCOME_D
+    assert "not implemented" in HNC_STEP_C_REASON and "serve_dns" in HNC_STEP_C_REASON
+    assert "hostname allowances cannot be enforced" in HOSTNAME_PROXY_REFUSAL
+    print("self-test: HN/OP gate and outcome-(d) wording OK")
 
 
 # ---------------------------------------------------------------------------
@@ -1629,6 +2122,7 @@ def main(argv=None) -> int:
     run_p.add_argument("--assets", default=os.environ.get("AGENT_VM_E2E_RELEASE_ASSETS_DIR"))
     run_p.add_argument("--lan", default=os.environ.get("AGENT_VM_EGRESS_LAN"))
     run_p.add_argument("--rebind", default=os.environ.get("AGENT_VM_EGRESS_REBIND_NAME", ""))
+    run_p.add_argument("--lan2", default=os.environ.get("AGENT_VM_EGRESS_LAN2", ""))
 
     sub.add_parser("self-test")
 

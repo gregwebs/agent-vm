@@ -487,13 +487,33 @@ this is an unconditional launch invariant.
 Address-wide, never hostname-isolated; sharing an allowed address shares its
 permission within those filters.
 
+**Hostname allowance**: one exact ASCII DNS name (`api.example.com`, or a single
+label such as `build`) authorized for **TLS on intercepted ports only** — SNI
+and DNS-cache verified, never plain HTTP, never UDP. A bare name covers every
+intercepted port of the launch; `tcp://HOST:PORT` pins one. This is the narrow
+alternative to the internet grant; a hostname resolving to a private address
+still needs a local or group allowance for answer eligibility. See
+[ADR-0037](docs/adr/0037-hostname-egress-allowances.md).
+
+**Intercepted port**: a port on which the runtime terminates guest TLS to
+inspect the SNI. Interception is **per-port and global**: on an intercepted port
+every destination needs a TLS ClientHello with SNI, and UDP/QUIC is dropped.
+A hostname allowance's ports are the launch-wide `{443}` unioned with every
+`tcp://HOST:PORT` port, so naming a port for one hostname widens every bare
+hostname and makes that port TLS-only globally.
+
 **Group grant**: internet = `Public`, LAN = `Private`, host = sandbox gateway.
 Each is independent. Host includes host-resolver query authorization; internet
-also authorizes DNS. Numeric and LAN-only grants do not.
+also authorizes DNS for any name. A hostname grant authorizes lookups of its
+own name only, never arbitrary-name DNS. Numeric and LAN-only grants do not
+authorize DNS.
 
 Authority is CLI-only in this release; both config tiers refuse `[network]`.
 Persistent grants are not supported yet (see [#302](https://github.com/gregwebs/agent-vm/issues/302)).
-See [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) for DNS limitations.
+See [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) for DNS limitations and
+[ADR-0037](docs/adr/0037-hostname-egress-allowances.md) for hostname allowances.
 
-_Avoid_: "allow list" for the whole policy, or "network profile" (the runtime's
-`from_profiles` abstraction, deliberately not used for tool launches).
+_Avoid_: "domain allowance", "wildcard host" and "host allowance" for a hostname
+grant — the unit is an exact name, not a suffix or a host; "allow list" for the
+whole policy; "network profile" (the runtime's `from_profiles` abstraction,
+deliberately not used for tool launches).

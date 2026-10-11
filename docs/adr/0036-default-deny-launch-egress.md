@@ -11,9 +11,12 @@ acceptance checklist.
 Supersedes ADR-0009's implicit Public grant. **Breaking change in 0.2.0**:
 existing tool launches have no egress or DNS query authorization until a grant is
 passed. `--allow-internet-egress` restores public internet and DNS for provider
-CLIs; numeric allowances are an address-only alternative. Hostnames are not yet
-supported. See [Ports & egress](../../USAGE.md#ports--egress) for the CLI grammar
-and DNS table; [CONTEXT.md](../../CONTEXT.md#egress-authority) defines the terms.
+CLIs; numeric allowances are an address-only alternative. **Hostnames were not
+yet supported in A1; C arrives with
+[ADR-0037](0037-hostname-egress-allowances.md)**, which adds TLS-only hostname
+allowances on intercepted ports and amends this ADR where noted. See
+[Ports & egress](../../USAGE.md#ports--egress) for the CLI grammar and DNS table;
+[CONTEXT.md](../../CONTEXT.md#egress-authority) defines the terms.
 
 ## Decision
 
@@ -62,7 +65,12 @@ the existing runtime version identity probe still occurs first.
   behavior accepts protocol-filtered, port-less rules (`tcp://`/`udp://`); a
   port-scoped rule does not qualify. The revision comment's wording says both
   port/protocol-filtered rules are ignored; this ADR records the narrower source
-  behavior rather than claiming that broader restriction.
+  behavior rather than claiming that broader restriction. [ADR-0037](0037-hostname-egress-allowances.md)
+  carries the same eligibility rule forward for hostname allowances (its D4): a
+  `Domain` rule never admits a private answer by itself.
+- Host permission includes host-resolver query authorization, so an appended
+  `deny_dns()` is unreachable behind the port-less `Group(Host)` rule and is not
+  emitted. [ADR-0037](0037-hostname-egress-allowances.md) keeps this status quo.
 
 ## Grammar and proof boundary
 
@@ -95,8 +103,11 @@ enforcement evidence has been collected for this change.
 
 All tool-launch guest programs, MCP servers and hooks share the policy. Project runtime-hook
 failure aborts launch; image seed hooks retain their existing `; true` handling.
-Host proxies carry only already-authorized connections. TLS interception remains
-per port: missing TLS ClientHello/SNI fails closed even for numeric destinations.
+Host proxies carry only already-authorized connections, except that the ambient
+host HTTP proxy resolves a CONNECT name itself; [ADR-0037](0037-hostname-egress-allowances.md)
+refuses hostname launches while such a proxy would be selected. TLS interception
+remains per port: missing TLS ClientHello/SNI fails closed even for numeric
+destinations.
 
 ## Rejected alternatives
 
@@ -106,5 +117,7 @@ per port: missing TLS ClientHello/SNI fails closed even for numeric destinations
   introduces order-dependent deny rules into an otherwise OR-like policy.
 - Add `allow_dns()` for numeric allowances: opens query authority unrelated to
   the granted numeric connection scope; the accepted port-53 limitation is explicit.
-- Add hostname or persistent config authority in A1: separate C/A2 boundaries
-  need their own implementation and protection; neither is silently approximated.
+- Add hostname or persistent config authority in A1: A2 (persistent config
+  authority) is still deferred and needs its own implementation and protection.
+  Hostname authority is delivered by [ADR-0037](0037-hostname-egress-allowances.md),
+  not approximated here.

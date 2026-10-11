@@ -29,8 +29,8 @@ Mounts & ports:
           Auto-forward every guest listener onto the host (Lima-style)
 
 Network egress:
-      --allow-egress <[tcp://|udp://]IP|CIDR[:PORT]>
-          Allow one IP/CIDR, optionally narrowed by tcp:// or udp:// and :PORT (repeatable)
+      --allow-egress <[tcp://|udp://]IP|CIDR[:PORT] | [tcp://]HOST[:PORT]>
+          Allow one IP/CIDR or TLS hostname, optionally transport/port-scoped (repeatable)
       --allow-internet-egress[=<BOOL>]
           Allow public internet egress and DNS. Guest egress is denied by default [possible values:
           true, false]

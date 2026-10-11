@@ -26,8 +26,13 @@ Run inside a per-project [microsandbox](https://docs.microsandbox.dev/) (libkrun
 **Breaking change in 0.2.0:** existing tool launches now have no guest egress or
 DNS query authorization until you pass a grant. Agents calling provider APIs
 (`claude`, `codex`, …) need `--allow-internet-egress` to restore public internet
-and DNS access (or numeric `--allow-egress` allowances for address-only access)
-until hostname allowances ship ([#302](https://github.com/gregwebs/agent-vm/issues/302)). `--allow-lan` and `--allow-host` no longer imply
+and DNS access. Narrower alternatives exist: numeric `--allow-egress` allowances
+for address-only access, or TLS hostname allowances (`--allow-egress
+api.example.com`) for one exact name — a provider CLI may need several, and a
+selected host HTTP proxy (`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`) refuses a
+hostname launch, so unset it or use `NO_PROXY=*`
+([#302](https://github.com/gregwebs/agent-vm/issues/302)). `--allow-lan` and
+`--allow-host` no longer imply
 internet access. Plain port-53 DNS to an IP-allowed resolver remains denied
 in this release
 ([microsandbox #75](https://github.com/gregwebs/microsandbox/issues/75)). A
