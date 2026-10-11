@@ -467,6 +467,16 @@ read-only bind). See
 _Avoid_: "bind mount", which remains connected to the host path; "copy-on-write
 mount", which implies lazy shared backing storage.
 
+## Protected config directory
+
+`~/.config/agent-vm`, where agent-vm reads launch authority, which is never
+inside a writable live bind. Protection includes directories its lookup searches
+and prospective directories reached through missing components, measuring raw
+`$HOME` and the account home. Read-only binds and fork copies are exempt.
+See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md) for the rule and gaps.
+
+_Avoid_: "masked"; "protected host file", which means the Pi files.
+
 ## Protected host file
 
 One of the two host Pi files agent-vm must never hand to a guest —

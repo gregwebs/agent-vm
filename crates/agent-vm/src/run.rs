@@ -470,6 +470,7 @@ Examples:
   agent-vm {name} --repo owner/other-repo     widen the GitHub allow-list
 
 Fork mounts:
+  Writable binds (the project dir included) may not contain ~/.config/agent-vm; launch from a project directory, not $HOME.
   `:fork` copies its source directory once into project-scoped persistent state; later launches
   reuse that copy, so source and fork changes never synchronize in either direction.
   `:fork:follow-links` materializes symlink targets in the copy; without it, symlinks are preserved.
@@ -740,25 +741,22 @@ pub(crate) async fn launch(
         &session.project_dir,
         &session.state_dir,
     );
+    let mount_context = launch_mount_context(
+        session.mount_store_dir(),
+        mount_home.clone(),
+        core_volumes
+            .iter()
+            .map(|volume| PathBuf::from(&volume.guest_path))
+            .collect(),
+        // Core binds are writable too; the role names the remedy on refusal.
+        core_volumes
+            .iter()
+            .map(|volume| CoreHostSource::new(volume.bind, volume.host_path.clone()))
+            .collect(),
+    )?;
     let mount_plan = mount::prepare(
         mount::parse_extra_mounts(&args.mount).context("parsing --mount")?,
-        &mount::MountContext {
-            mount_store: session.mount_store_dir(),
-            host_home: mount_home.clone(),
-            core_guest_mounts: core_volumes
-                .iter()
-                .map(|volume| PathBuf::from(&volume.guest_path))
-                .collect(),
-            // The project bind is the canonicalized cwd and writable, so
-            // `cd ~ && agent-vm shell` would hand the guest the host `$HOME`
-            // with no `--mount` at all. agent-vm's own binds are checked
-            // exactly like an explicit mount, and each carries its role so a
-            // refusal names the bind it actually is.
-            core_host_sources: core_volumes
-                .iter()
-                .map(|volume| CoreHostSource::new(volume.bind, volume.host_path.clone()))
-                .collect(),
-        },
+        &mount_context,
     )
     .context("preparing --mount")?;
 
@@ -2632,11 +2630,92 @@ fn should_check_update(flag: bool, env_val: Option<&str>) -> bool {
 /// per-request timeout in `image_check`.
 const UPDATE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+// Keep home selection in the same constructor exercised by the subprocess test:
+// root mode must not discard raw HOME merely because Pi requires UTF-8.
+fn launch_mount_context(
+    mount_store: PathBuf,
+    host_home: Option<PathBuf>,
+    core_guest_mounts: Vec<PathBuf>,
+    core_host_sources: Vec<CoreHostSource>,
+) -> Result<mount::MountContext> {
+    let authority_home = config::host_home_dir().context("locating the authority home")?;
+    Ok(mount::MountContext {
+        mount_store,
+        host_home,
+        authority_home,
+        account_home: user::account_home_dir(),
+        core_guest_mounts,
+        core_host_sources,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn raw_authority_home_selected() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let raw = PathBuf::from(OsString::from_vec(b"/agent-vm-m11a-home-\xff".to_vec()));
+        assert!(raw.to_str().is_none());
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("HOME", raw.as_os_str())
+            .env("AGENT_VM_M11A_CHILD", "1")
+            .args([
+                "--exact",
+                "run::tests::authority_home_selection_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The child emits only a bounded test report, below pipe capacity.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("M11a child timed out");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{:?}", out);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("M11A_RAW_AUTHORITY_HOME_OK"));
+    }
+
+    #[test]
+    fn authority_home_selection_child() {
+        use std::os::unix::ffi::OsStrExt;
+        if std::env::var_os("AGENT_VM_M11A_CHILD").as_deref() != Some(std::ffi::OsStr::new("1")) {
+            return;
+        }
+        assert!(user::resolve_guest_identity(true).unwrap().is_none());
+        let context = launch_mount_context(
+            PathBuf::from("/agent-vm-m11a-unused-store"),
+            user::host_home_dir(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let selected = context.authority_home.as_ref().expect("raw authority HOME");
+        assert!(selected.to_str().is_none());
+        assert_eq!(selected.as_os_str().as_bytes(), b"/agent-vm-m11a-home-\xff");
+        assert_ne!(context.host_home.as_ref(), Some(selected));
+        assert_ne!(context.account_home.as_ref(), Some(selected));
+        println!("M11A_RAW_AUTHORITY_HOME_OK");
+    }
 
     /// A real, empty `$HOME` shared by every test in this binary: `prepare`
     /// fails closed on a declared mount when `$HOME` is unset, and this is not
@@ -4330,6 +4409,8 @@ options ndots:2 timeout:1";
                 mount::parse_extra_mounts(&[raw]).unwrap(),
                 &mount::MountContext {
                     mount_store: store.path().to_path_buf(),
+                    authority_home: Some(test_home()),
+                    account_home: None,
                     host_home: Some(test_home()),
                     core_guest_mounts: Vec::new(),
                     core_host_sources: Vec::new(),
@@ -4373,6 +4454,8 @@ options ndots:2 timeout:1";
         let raw = format!("{}:/guest:fork", source.path().display());
         let context = mount::MountContext {
             mount_store: store.path().to_path_buf(),
+            authority_home: Some(test_home()),
+            account_home: None,
             host_home: Some(test_home()),
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
@@ -4419,6 +4502,8 @@ options ndots:2 timeout:1";
                 .unwrap(),
             &mount::MountContext {
                 mount_store: self_store.path().to_path_buf(),
+                authority_home: Some(test_home()),
+                account_home: None,
                 host_home: Some(test_home()),
                 core_guest_mounts: Vec::new(),
                 core_host_sources: Vec::new(),

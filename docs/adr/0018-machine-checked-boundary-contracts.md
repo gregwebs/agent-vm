@@ -44,6 +44,14 @@ A pure predicate that cannot be verified usually cannot be verified because it d
 | `http::header_block_end` / `is_token_bytes` / `has_no_crlf` | `Request::parse` — `anyhow` context, `String`/`Vec` assembly, `str::from_utf8` |
 | `dns_name::ldh_host_bytes` / `egress_hostname::egress_hostname_bytes` / `hostname_scope` | `HostnameAllowance::from_target` — ASCII/one-trailing-dot canonicalization, the `host.microsandbox.internal` comparison and `DomainName::from_str`; `domain_rules` unions intercepted ports and emits one `[Tcp]` `Domain` rule per distinct name |
 
+Additional ADR-0038 decision/adapter pairs:
+
+| decision (proved kernel) | trusted adapter |
+|---|---|
+| `protected_config_dir::exposing_entry` | `check_core_bind` / `check_writable_mount`: resolution walk, `canonicalize`, `metadata`, `Path` → bytes |
+| `protected_config_dir::exposing_prospective` / `may_name_same_entry` | missing-source branch of `check_core_bind`: cwd anchoring, prospective walk and component splitting |
+| `protected_config_dir::authority_file_singly_linked` | `check_authority_links`: `symlink_metadata` and `MetadataExt::nlink`; #305 adds its read-time caller |
+
 The interface stays narrow: `contains_escaped_path_escape` takes `&str`, so no verification detail leaks into its call sites.
 
 ### Syntax: `verus!` only
@@ -97,6 +105,11 @@ One `verus!` block per owning module, in place, no new crate and no moved code. 
 
 | `image_build.rs` — `result_reference_is_acceptable` | Accepted iff the config-image policy accepts the reference and the native parser sees no digest. The four Boolean cases are tested; Docker, archive ingestion and publication I/O are not proved. |
 
+| `protected_config_dir.rs` — `authority_file_singly_linked` | Exactly `nlink == 1`, shared with #305's future read-time kernel. |
+| `protected_config_dir.rs` — `may_name_same_entry` | Exactly the conservative plain-name/ASCII-case/wildcard rule. Proves the rule, **not its adequacy for any filesystem**. |
+| `protected_config_dir.rs` — `exposing_entry` | First hit by identity or component-wise containment, or no hits; reuses `byte_path_contains`'s `ensures`. |
+| `protected_config_dir.rs` — `exposing_prospective` | First hit by identity-or-name-equivalent anchor plus name-equivalent suffix prefix, or no hits. |
+
 ### The trusted boundary
 
 Stated so that nobody reads more into the surface than is there. Verified code calls into, and trusts, the following; **none of it is proved**:
@@ -115,6 +128,7 @@ Stated so that nobody reads more into the surface than is there. Verified code c
 - `image_log_guard::dependency_event_allowed` — the trusted adapter around the proved `image_log_event_allowed`. It trusts the process-global `AtomicBool::load` and `tracing::Metadata::target`, plus the exact `agent_vm`/`agent_vm::` namespace match; the subscriber/filter wiring and all logging I/O are **not** formally verified;
 - `image_build::ResultReference::from_str` trusts `ImageRef::from_config` and native `Reference::digest`; fixed adapter reasons do not redact clap's rejected-value rendering.
 - `boot_image::upgrade::check_host_platform` trusts serde required-field/type/duplicate checks, string equality and native `Platform::host_linux`. Native registry resolution/auth/TLS, OCI integrity, cache validation/materialization, async acquisition, locking and atomic publication remain trusted; they are not proved by the platform conjunction.
+- `protected_config_dir`'s resolution walk and route collection, cwd anchoring, path/component byte conversion, metadata/link counts and canonicalization. Missing components becoming real directories, the name rule's filesystem adequacy, reliable identity and a stable tree through binding are assumptions, not proved; [ADR-0038](0038-config-dir-exposure-guard.md) names the gaps.
 - all syscalls, and everything with I/O, FFI, async or locks;
 - `vendor/microsandbox` and every other dependency.
 

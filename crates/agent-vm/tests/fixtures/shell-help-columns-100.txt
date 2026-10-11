@@ -202,6 +202,8 @@ Examples:
   agent-vm shell --repo owner/other-repo     widen the GitHub allow-list
 
 Fork mounts:
+  Writable binds (the project dir included) may not contain ~/.config/agent-vm; launch from a
+  project directory, not $HOME.
   `:fork` copies its source directory once into project-scoped persistent state; later launches
   reuse that copy, so source and fork changes never synchronize in either direction.
   `:fork:follow-links` materializes symlink targets in the copy; without it, symlinks are preserved.

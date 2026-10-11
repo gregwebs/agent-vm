@@ -515,6 +515,33 @@ would leave a directory that may hold a plaintext credential. A v2 fork whose
 original source is gone cannot be reseeded: the launch errors on the missing
 source, and the printed orphan is what you remove.
 
+### agent-vm's config directory is never writable from the guest
+
+`~/.config/agent-vm` holds `credentials.yaml`, which authorizes launch secrets.
+A guest must not be able to plant authority for a later launch. Every launch
+refuses writable project, state, guest-home and extra binds that contain or
+alias this directory, or a directory its lookup searches, even if no authority
+file exists yet. Both raw `$HOME` and the account home are measured.
+
+Missing state/home sources are checked too: future names compare ignoring ASCII
+case, and names outside `[A-Za-z0-9._-]` or ending in `.` may match any name,
+a conservative rule that can refuse safe layouts. Relative state roots still
+work and are anchored at the launch directory.
+
+`ro` and `:fork` are fine under this guard; a bind strictly inside the directory
+is also allowed. Pi's separate policy still applies. **0.3.0 breaks launching
+from `$HOME` for everyone**, not just Pi users. Run from a project directory,
+mount read-only or a narrower source, or relocate `AGENT_VM_STATE_DIR` when
+state or guest home exposes authority. Forking a broad home copies everything,
+so prefer a narrower source.
+
+Every launch also refuses a regular `config.toml` with more than one hard link
+(or any link count other than one), even without network settings. Remove the
+other links or replace it with a copy. Non-launch verbs still work.
+`credentials.yaml` hard links remain #319; runtime races and nested mount
+aliases remain #322/#321. See [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md)
+for the trusted boundary and accepted gaps.
+
 ### Host Pi credential files are never mounted
 
 Two host files must never reach the guest: `~/.pi/agent/auth.json` (Pi's
@@ -558,7 +585,7 @@ otherwise the home recorded for your uid in the account database
 launch that declares a `--mount` refused, because the Pi home cannot be
 located.
 
-When `~/.pi` does not exist, none of the refusals apply: there is nothing to
+When `~/.pi` does not exist, none of the **Pi** refusals apply (the config-directory guard above still applies): there is nothing to
 leak today, so the same routes produce a one-line advisory instead (the
 residual risk is installing Pi *and* logging in during a live session). Known,
 accepted gaps, all in [`docs/adr/0020`](docs/adr/0020-protect-host-pi-credential-files.md):
@@ -1632,6 +1659,16 @@ yet. Both are refused with a file/setting/tier diagnostic. Persistent network
 authority is not supported yet; all current grants are CLI-only (see [#302](https://github.com/gregwebs/agent-vm/issues/302)).
 
 ## Troubleshooting
+
+- **Config-directory exposure / “launch authority”** — run from a project,
+  not `$HOME`; use `:ro` or a narrower mount. For a state/home bind, move
+  `AGENT_VM_STATE_DIR` outside the authority lookup route.
+- **“does not exist yet; once created it could be, or contain”** — a missing
+  state/home source could hold a future authority lookup directory. Remove
+  the exposing symlink layout or choose unrelated state. Relative state
+  roots are resolved against the launch cwd; messages retain `..` spelling.
+- **“has … hard links”** — remove other links to `config.toml`, or replace
+  it with a separate copy. Content and `[network]` presence do not matter.
 
 - **`RegisterNetDevice(IrqsExhausted)` at boot** — device capacity is host
   and runtime dependent. Drop a `--mount` to recover. Linux x86_64 uses a

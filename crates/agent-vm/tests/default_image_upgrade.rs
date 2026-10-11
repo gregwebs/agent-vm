@@ -626,7 +626,10 @@ fn upgrade_preserves_all_overrides_and_default_diagnostic_redaction() {
     let a = h.image(&ArchiveSpec::default());
     let pin = server.image("private-marker", "a", &a);
     let user = h.home.join(".config/agent-vm/config.toml");
-    let project = h.root.path().join(".agent-vm/config.toml");
+    // Launch cwd must not contain the harness's authority home (ADR-0038).
+    let project_dir = h.root.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
+    let project = project_dir.join(".agent-vm/config.toml");
     fs::create_dir_all(user.parent().unwrap()).unwrap();
     fs::create_dir_all(project.parent().unwrap()).unwrap();
     fs::write(&user, "image = \"localhost:1/user:tag\"\n").unwrap();
@@ -635,6 +638,7 @@ fn upgrade_preserves_all_overrides_and_default_diagnostic_redaction() {
     let project_bytes = fs::read(&project).unwrap();
     success(&bounded(
         h.command()
+            .current_dir(&project_dir)
             .env("AGENT_VM_IMAGE_TAG", "localhost:1/env:tag")
             .env("RUST_LOG", "trace")
             .args(["upgrade", "--image", &pin]),
@@ -651,6 +655,7 @@ fn upgrade_preserves_all_overrides_and_default_diagnostic_redaction() {
         (None, None, "localhost:1/user:tag"),
     ] {
         let mut cmd = h.command();
+        cmd.current_dir(&project_dir);
         cmd.env("AGENT_VM_DEBUG_CONFIG", "1");
         if let Some(env) = ambient {
             cmd.env("AGENT_VM_IMAGE_TAG", env);
@@ -668,6 +673,7 @@ fn upgrade_preserves_all_overrides_and_default_diagnostic_redaction() {
     fs::remove_file(&user).unwrap();
     let out = bounded(
         h.command()
+            .current_dir(&project_dir)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
             .args(["shell", "--no-git", "--", "bash", "-c", "true"]),
     );
@@ -676,6 +682,7 @@ fn upgrade_preserves_all_overrides_and_default_diagnostic_redaction() {
     let count = server.count();
     let out = bounded(
         h.command()
+            .current_dir(&project_dir)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
             .args(["shell", "--no-git", "--", "bash", "-c", "true"]),
     );

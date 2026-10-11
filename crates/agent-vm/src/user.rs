@@ -245,6 +245,13 @@ pub fn host_home_dir() -> Option<PathBuf> {
     host_home_from(env::var("HOME").ok(), passwd_home_for_uid(uid))
 }
 
+/// Also protect the home a later ordinary launch will use, even when this
+/// launch supplies a different HOME.
+pub fn account_home_dir() -> Option<PathBuf> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    passwd_home_for_uid(unsafe { libc::geteuid() })
+}
+
 /// Pure core of [`host_home_dir`] — takes both sources as parameters so the
 /// precedence and the empty-string guard are unit-testable without mutating
 /// process env or the passwd database.

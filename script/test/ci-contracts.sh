@@ -61,6 +61,7 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/chrome-example-contract-test.sh"
     bash "$REPO_ROOT/script/test/e2e-release-contract.sh"
     bash "$REPO_ROOT/script/test/egress-default-deny-contract.sh"
+    bash "$REPO_ROOT/script/test/config-dir-guard-contract.sh"
 
 fi
 
@@ -89,6 +90,15 @@ syntax_check=(
     script/test/chrome-example-contract.sh
     script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
+    script/test/config-dir-guard-live.sh
+    script/test/config-dir-guard-contract.sh
+    script/test/fixtures/config-dir-guard/guest-n1a.sh
+    script/test/fixtures/config-dir-guard/guest-n1b.sh
+    script/test/fixtures/config-dir-guard/guest-n3.sh
+    script/test/fixtures/config-dir-guard/guest-n4.sh
+    script/test/fixtures/config-dir-guard/guest-n5.sh
+    script/test/fixtures/config-dir-guard/guest-n7.sh
+    script/test/lib/config-dir-guard.sh
     script/test/egress-default-deny.sh
     script/test/egress-default-deny-contract.sh
     script/test/fixtures/egress-probe.sh
@@ -120,6 +130,15 @@ shellcheck_files=(
     script/test/chrome-example-contract.sh
     script/test/chrome-example-contract-test.sh
     script/test/e2e-release-contract.sh
+    script/test/config-dir-guard-live.sh
+    script/test/config-dir-guard-contract.sh
+    script/test/fixtures/config-dir-guard/guest-n1a.sh
+    script/test/fixtures/config-dir-guard/guest-n1b.sh
+    script/test/fixtures/config-dir-guard/guest-n3.sh
+    script/test/fixtures/config-dir-guard/guest-n4.sh
+    script/test/fixtures/config-dir-guard/guest-n5.sh
+    script/test/fixtures/config-dir-guard/guest-n7.sh
+    script/test/lib/config-dir-guard.sh
     script/test/egress-default-deny.sh
     script/test/egress-default-deny-contract.sh
     script/test/fixtures/egress-probe.sh
@@ -150,6 +169,24 @@ assert_listed 'bash -n' 'script/test/fixtures/egress-probe.sh' "${syntax_check[@
 assert_listed 'shellcheck' 'script/test/egress-default-deny.sh' "${shellcheck_files[@]}"
 assert_listed 'shellcheck' 'script/test/egress-default-deny-contract.sh' "${shellcheck_files[@]}"
 assert_listed 'shellcheck' 'script/test/fixtures/egress-probe.sh' "${shellcheck_files[@]}"
+assert_listed 'bash -n' 'script/test/config-dir-guard-live.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/config-dir-guard-contract.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/lib/config-dir-guard.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/fixtures/config-dir-guard/guest-n1a.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/fixtures/config-dir-guard/guest-n1b.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/fixtures/config-dir-guard/guest-n3.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/fixtures/config-dir-guard/guest-n4.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/fixtures/config-dir-guard/guest-n5.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/fixtures/config-dir-guard/guest-n7.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/config-dir-guard-live.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/config-dir-guard-contract.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/lib/config-dir-guard.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/fixtures/config-dir-guard/guest-n1a.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/fixtures/config-dir-guard/guest-n1b.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/fixtures/config-dir-guard/guest-n3.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/fixtures/config-dir-guard/guest-n4.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/fixtures/config-dir-guard/guest-n5.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/fixtures/config-dir-guard/guest-n7.sh' "${shellcheck_files[@]}"
 
 is_vendored() {
     [[ "$1" == vendor/microsandbox/* ]]
