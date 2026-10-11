@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network Approval Sketches</title>
+<!--
+  PROTOTYPE — throwaway. For "Choose the notification and approval experience"
+  (gregwebs/agent-vm#297), part of "Explore live network approvals" (#296).
+  Four structurally different approval experiences (?variant=A..D), each shown
+  against the ticket's four scenarios (?s=1..4). All commands, text and flows
+  are sketches: nothing here is implemented or a proposed final grammar.
+-->
+<style>
+:root{--bg:#f5f4ef;--fg:#1d1d1b;--mut:#6b6a63;--card:#fff;--line:#d9d6cc;--term:#14161a;--tfg:#d6d9de;--tmut:#7d848f;
+  --ok:#2f7d4f;--warn:#a86512;--bad:#b23b3b;--acc:#2f5fa8;--note:#fff8dc}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#17181b;--fg:#e6e4dd;--mut:#9b9a93;--card:#202226;--line:#34363c;--term:#0c0d10;--note:#2a2618}}
+:root[data-theme="dark"]{--bg:#17181b;--fg:#e6e4dd;--mut:#9b9a93;--card:#202226;--line:#34363c;--term:#0c0d10;--note:#2a2618}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;padding:16px 16px 96px}
+main{max-width:1100px;margin:0 auto}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:17px;margin:0 0 6px}h3{font-size:14px;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut)}
+.lede{color:var(--mut);margin:0 0 14px}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 14px}
+.tabs button{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:999px;padding:5px 12px;cursor:pointer;font:inherit;font-size:13px}
+.tabs button[aria-pressed="true"]{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+.scen{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;align-items:start}
+.pane{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.pane .hd{font-size:12px;color:var(--mut);padding:6px 10px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:8px}
+.term{background:var(--term);color:var(--tfg);font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;padding:10px 12px;white-space:pre-wrap;word-break:break-word;margin:0}
+.term .m{color:var(--tmut)}.term .g{color:#7fd19b}.term .y{color:#e8c06a}.term .r{color:#f08a8a}.term .b{color:#8ab4f8}.term .k{background:#2a2e36;padding:0 3px;border-radius:3px}
+.notif{margin:10px;border-radius:12px;background:rgba(127,127,127,.12);padding:10px 12px;font-size:13px}
+.notif .app{font-size:11px;color:var(--mut);display:flex;justify-content:space-between}
+.notif b{display:block;margin:2px 0}
+.notif .acts{display:flex;gap:6px;margin-top:8px}
+.notif .acts span{border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:12px;background:var(--card)}
+.dialog{margin:10px;border:1px solid var(--line);border-radius:10px;padding:12px;font-size:13px;background:var(--card);box-shadow:0 6px 20px rgba(0,0,0,.12)}
+.dialog .row{display:flex;gap:8px;align-items:flex-start;margin:6px 0}
+.btns{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}
+.btns span{border:1px solid var(--line);border-radius:6px;padding:4px 10px}
+.btns .pri{background:var(--acc);color:#fff;border-color:var(--acc)}
+.tag{display:inline-block;font-size:11px;border-radius:4px;padding:0 5px;margin-right:4px;border:1px solid currentColor}
+.tag.ok{color:var(--ok)}.tag.warn{color:var(--warn)}.tag.bad{color:var(--bad)}
+.side{background:var(--note);border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-size:14px}
+.side ul{margin:4px 0 0;padding-left:18px}
+.legend{font-size:13px;color:var(--mut);margin-top:16px;border-top:1px solid var(--line);padding-top:10px}
+#bar{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);display:flex;align-items:center;gap:8px;background:#111;color:#fff;border-radius:999px;padding:6px 8px;box-shadow:0 6px 24px rgba(0,0,0,.35);font-size:13px;z-index:9;max-width:calc(100vw - 32px)}
+#bar button{background:#333;color:#fff;border:0;border-radius:999px;width:30px;height:30px;cursor:pointer;font-size:15px;flex:none}
+#bar span{padding:0 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+</style>
+</head>
+<body>
+<main>
+<h1>Live network approvals: experience sketches</h1>
+<p class="lede">PROTOTYPE for <a href="https://github.com/gregwebs/agent-vm/issues/297">Choose the notification and approval experience</a>. All four variants share the same rules. A denied request has already failed. Approval happens only on the host, by an explicit human choice of <b>this session</b> or <b>always for this project</b>, and the app or user retries afterwards. Use ← → (or the bar) to switch variants and the tabs to switch scenarios. Command names are placeholders.</p>
+<div class="tabs" id="stabs"></div>
+<div class="scen" id="scen"></div>
+<section id="variant"></section>
+<div class="legend">
+<span class="tag ok">approvable</span> a network allowance would permit it ·
+<span class="tag warn">locked</span> an administrator/platform restriction; no prompt can lift it ·
+<span class="tag bad">not network</span> a credential or GitHub repository refusal, which is a different authority and never shown as approvable here
+</div>
+</main>
+<div id="bar"><button id="prev" aria-label="Previous variant">←</button><span id="vlabel"></span><button id="next" aria-label="Next variant">→</button></div>
+<script>
+const SCEN = {
+ 1:{t:"Denied site mid-task",d:"<b>claude</b> in <code>~/code/shop</code> (macOS desktop) tries <code>https://docs.stripe.com</code> while researching. The same burst also hits <code>169.254.169.254</code> (platform floor) and a <code>git push</code> to a repo the credential isn't scoped for."},
+ 2:{t:"Background flood",d:"Over 10 minutes, a telemetry SDK retries <code>o4501.ingest.sentry.io</code> 140 times and <code>statsig.anthropic.com</code> 38 times, while the user is focused on the attached CLI. Nothing the user asked for is broken."},
+ 3:{t:"Session vs project",d:"<code>pip install</code> needs <code>pypi.org</code> (wanted every time in this project) and the user wants a one-off look at <code>raw.githubusercontent.com</code> (this session only). A second session of the same project is also running."},
+ 4:{t:"SSH / headless",d:"User SSHes into a Linux box with no desktop and runs <code>agent-vm codex</code> inside tmux. <code>api.openai.com</code> is allowed, but <code>registry.npmjs.org</code> is denied during a build."}
+};
+const T = s => `<pre class="term">${s}</pre>`;
+const pane = (hd, body, right='') => `<div class="pane"><div class="hd"><span>${hd}</span><span>${right}</span></div>${body}</div>`;
+const notif = (app, title, body, acts=[]) => `<div class="notif"><div class="app"><span>${app}</span><span>now</span></div><b>${title}</b>${body}${acts.length?`<div class="acts">${acts.map(a=>`<span>${a}</span>`).join('')}</div>`:''}</div>`;
+const side = (title, items) => `<div class="side"><b>${title}</b><ul>${items.map(i=>`<li>${i}</li>`).join('')}</ul></div>`;
+const guestFail = T(`<span class="m">claude (attached CLI, untouched)</span>
+⏺ Fetch(https://docs.stripe.com/api/refunds)
+  ⎿ <span class="r">Error: getaddrinfo ENOTFOUND docs.stripe.com</span>
+⏺ The site couldn't be reached. Continuing without it…`);
+
+const V = {
+A:{name:"Desktop nudge → host terminal",
+ pitch:"An OS notification, coalesced per project, is the only push signal. Clicking it opens a <i>new host terminal</i> running an interactive review. The click only navigates; the decision is made in that terminal. Without a desktop, the same review is reached by typing the command.",
+ s:{
+ 1:()=>`<div class="grid">${pane("guest app (attached terminal)",guestFail)}
+ ${pane("macOS Notification Center",notif("agent-vm","shop: 1 site blocked","docs.stripe.com · claude session 4821<br><span style='color:var(--mut)'>+1 locked destination (not approvable)</span>",["Review…"]))}
+ ${pane("new host Terminal window (opened by click)",T(`$ agent-vm egress review --session 4821
+<span class="m">project ~/code/shop · session 4821 (claude, started 10:02)</span>
+
+ <span class="g">●</span> docs.stripe.com:443  tcp/tls   1 denial, 10:14:03
+     <span class="m">name seen in DNS lookup (from guest, unverified)</span>
+ <span class="y">⊘</span> 169.254.169.254:80  <span class="y">locked: platform metadata floor</span>
+ <span class="m">  git push github.com/acme/infra was refused by the
+   credential scope, not the network. See: agent-vm secret …</span>
+
+Allow docs.stripe.com:443?
+  <span class="k">s</span> this session   <span class="k">p</span> always for ~/code/shop   <span class="k">n</span> skip
+> <span class="g">s</span>
+<span class="g">✓</span> allowed for session 4821. The failed request isn't replayed;
+  ask the agent to retry.`))}</div>`,
+ 2:()=>`<div class="grid">${pane("macOS Notification Center (one entry, updated in place)",notif("agent-vm","shop: 2 sites blocked (178 attempts)","o4501.ingest.sentry.io ×140 · statsig.anthropic.com ×38",["Review…","Mute shop for 1h"]))}
+ ${pane("rules sketched",T(`<span class="m">coalescing key:</span> project + session
+<span class="m">first denial of a new host →</span> notify
+<span class="m">repeat of known host  →</span> update count, no new banner
+<span class="m">new host within 60s  →</span> fold into same banner
+<span class="m">mute                 →</span> suppress banners; review still lists them
+<span class="m">session ends         →</span> withdraw notification`))}</div>`,
+ 3:()=>`<div class="grid">${pane("host review terminal",T(`$ agent-vm egress review
+<span class="m">project ~/code/shop · 2 running sessions (4821 claude, 4907 codex)</span>
+
+ <span class="g">●</span> pypi.org:443                  session 4821
+ <span class="g">●</span> raw.githubusercontent.com:443 session 4821
+
+pypi.org:443 →  <span class="k">s</span> session  <span class="k">p</span> project  <span class="k">n</span> skip
+> <span class="g">p</span>
+  Always allow <span class="b">pypi.org:443</span> for <span class="b">~/code/shop</span>?
+  Applies to every future launch of this project and now to 4821.
+  <span class="y">4907 picks it up at relaunch (live update TBD by #301).</span>  [y/N] y
+<span class="g">✓</span> project allowance recorded
+
+raw.githubusercontent.com:443 → <span class="g">s</span>
+<span class="g">✓</span> session 4821 only. Ends when 4821 exits.`))}
+ ${side("Note",["The project-scope choice asks for a second confirmation and repeats the canonical path. The session choice doesn't.","files.pythonhosted.org will be denied next. That's a separate host, so it means a second round trip."])}</div>`,
+ 4:()=>`<div class="grid">${pane("SSH session (tmux pane 1, attached codex)",T(`<span class="r">npm ERR! getaddrinfo ENOTFOUND registry.npmjs.org</span>
+<span class="m">(no banner: the launcher stays silent after startup)</span>`))}
+ ${pane("tmux pane 2 (user must think to open it)",T(`$ agent-vm egress review
+ <span class="g">●</span> registry.npmjs.org:443  session 7710, 3 denials
+> <span class="g">s</span>
+<span class="g">✓</span> allowed for session 7710`))}
+ ${side("Gap",["No desktop, so no push signal. Discovery depends on the user recognizing ENOTFOUND as a policy denial.","A one-line hint at launch (\"denials: agent-vm egress review\") is the only nudge without breaking the quiet-CLI rule."])}</div>`
+ },
+ tradeoffs:["+ No guest involvement in discovery; the push signal stays entirely on the host.","+ Smallest trusted surface: a host CLI plus a notification sender.","− Opening a fresh terminal from a click is platform-fragile (research: no universal default-terminal contract).","− Headless users get no signal at all."]},
+B:{name:"Agent relays a host command",
+ pitch:"No push notification is required. When a request is denied, the guest gets a <i>read-only hint</i> of a denial ID and the host command to run, and the coding agent tells the human. The host command re-reads the denial from host records, so the guest's text never authorizes anything. Desktop notifications are optional extras.",
+ s:{
+ 1:()=>`<div class="grid">${pane("guest app (attached terminal)",T(`⏺ Fetch(https://docs.stripe.com/api/refunds)
+  ⎿ <span class="r">Error: blocked by agent-vm network policy</span>
+⏺ The sandbox blocked docs.stripe.com. If you want me to use it,
+  run this <b>on your host</b> (not in here), then tell me to retry:
+
+    <span class="b">agent-vm egress allow d-7f3a</span>`))}
+ ${pane("any host terminal",T(`$ agent-vm egress allow d-7f3a
+<span class="m">denial d-7f3a, recorded by the host at 10:14:03</span>
+  destination  <span class="b">docs.stripe.com:443</span> tcp/tls
+  project      ~/code/shop
+  session      4821 (claude, running)
+
+  <span class="k">s</span> this session  <span class="k">p</span> always for this project  <span class="k">n</span> cancel
+> <span class="g">s</span>
+<span class="g">✓</span> allowed for session 4821`))}
+ ${side("Where the guest hint comes from (feasibility → #301)",["DNS denial today is plain NXDOMAIN, which carries no text. A hint could come from a guest-readable denial log (<code>/run/agent-vm/denials</code>), a short-lived guest tool, or, on intercepted TLS ports only, an HTTP 403 page after interception.","169.254.169.254 → hint says <i>locked</i> and offers no command. The git push refusal shows the credential message, not an egress hint.","Hostile guest text can only suggest an ID or hostname. The host shows its own record, and an unknown ID simply fails."])}</div>`,
+ 2:()=>`<div class="grid">${pane("guest app",T(`<span class="m">(nothing shown: background SDK failures go to its own logs;
+the agent never sees them)</span>`))}
+ ${pane("host, when the user goes looking",T(`$ agent-vm egress denials
+<span class="m">~/code/shop · session 4821 · last 10 min</span>
+  o4501.ingest.sentry.io:443   ×140  d-81c2
+  statsig.anthropic.com:443    ×38   d-81c9`))}
+ ${side("Effect",["Floods are silent by construction, so there's no notification spam.","…but silent denials the user might want are also invisible unless the agent notices them."])}</div>`,
+ 3:()=>`<div class="grid">${pane("guest app",T(`⏺ pip install failed: pypi.org blocked.
+  On your host run: <span class="b">agent-vm egress allow d-90aa</span>
+⏺ README fetch failed: raw.githubusercontent.com blocked.
+  On your host run: <span class="b">agent-vm egress allow d-90b1</span>`))}
+ ${pane("host",T(`$ agent-vm egress allow d-90aa --project
+  Always allow <span class="b">pypi.org:443</span> for <span class="b">~/code/shop</span>? [y/N] y
+<span class="g">✓</span> project allowance (applies to 4821 now; 4907 per #301)
+$ agent-vm egress allow d-90b1
+  <span class="k">s</span>/<span class="k">p</span>/<span class="k">n</span> > s
+<span class="g">✓</span> session 4821 only`))}
+ ${side("Risk",["The agent may suggest <code>--project</code>. The host prompt must still ask and must never treat a pasted flag as consent: the confirm question repeats the scope."])}</div>`,
+ 4:()=>`<div class="grid">${pane("tmux pane 1 (codex)",T(`<span class="r">npm ERR! blocked by agent-vm network policy: registry.npmjs.org</span>
+• The sandbox blocked registry.npmjs.org.
+  On the host run: <span class="b">agent-vm egress allow d-c120</span>`))}
+ ${pane("tmux pane 2 / another SSH login",T(`$ agent-vm egress allow d-c120
+ <span class="b">registry.npmjs.org:443</span> · session 7710
+> <span class="g">s</span>
+<span class="g">✓</span> allowed`))}
+ ${side("Effect",["Works identically over SSH: there's no desktop dependency at all."])}</div>`
+ },
+ tradeoffs:["+ Headless and desktop users get the same flow, and discovery happens in the context where the failure is visible.","+ No packaging of notification helpers needed for v1.","− Needs a guest-visible denial channel (new surface; leaks which destinations are blocked to the guest, which is harmless but new).","− Relies on the agent noticing and relaying correctly; silent background denials stay invisible."]},
+C:{name:"Approvals console",
+ pitch:"A long-running <i>host</i> console (<code>agent-vm egress watch</code>) in its own terminal tab, pane or SSH login streams denials from every running session and takes single-key decisions. Notifications are optional and only say “see the console”. The future GUI is this console with buttons.",
+ s:{
+ 1:()=>`<div class="grid">${pane("guest app (attached terminal)",guestFail)}
+ ${pane("host tab: agent-vm egress watch","<pre class='term'>"+`<span class="m">agent-vm egress watch · 2 sessions · ↑↓ select · s session · p project · x dismiss</span>
+─────────────────────────────────────────────────────────────
+ PROJECT   SESSION    DESTINATION           N   STATUS
+<span class="b">▶ shop      4821 claude docs.stripe.com:443   1   pending</span>
+  shop      4821 claude 169.254.169.254:80    2   <span class="y">locked (platform)</span>
+  shop      4821 claude github.com git push   1   <span class="r">credential scope ›</span>
+─────────────────────────────────────────────────────────────
+<span class="m">docs.stripe.com · name from guest DNS lookup (unverified)
+first 10:14:03 · last 10:14:03</span>
+s → <span class="g">✓ allowed for session 4821</span>`+"</pre>")}</div>`,
+ 2:()=>`<div class="grid">${pane("host tab: watch",T(`  PROJECT SESSION DESTINATION               N    STATUS
+  shop    4821    o4501.ingest.sentry.io:443 <span class="y">140</span>  pending
+  shop    4821    statsig.anthropic.com:443  <span class="y">38</span>   pending
+<span class="m">rows aggregate by destination; counts tick, rows don't multiply.
+x = dismiss (stays denied; re-surfaces only if the count passes 1000?)</span>`))}
+ ${side("Effect",["Floods cost one row each, with no banners.","Only useful if the console is open; otherwise it falls back to whatever the desktop nudge provides."])}</div>`,
+ 3:()=>`<div class="grid">${pane("host tab: watch",T(`<span class="b">▶ shop  4821 claude  pypi.org:443</span>                  pending
+  shop  4821 claude  raw.githubusercontent.com:443 pending
+p
+┌ Always allow pypi.org:443 for ~/code/shop? ──────────────┐
+│ applies to: 4821 now, 4907 <span class="y">(live? see #301)</span>, future   │
+│ revoke later: agent-vm egress revoke …                    │
+│                               <span class="k">y</span> confirm   <span class="k">esc</span> cancel │
+└───────────────────────────────────────────────────────────┘`))}
+ ${pane("host tab: watch → allowances view (tab key)",T(`PROJECT ~/code/shop
+  <span class="g">project</span>  pypi.org:443               granted 10:21
+SESSION 4821
+  <span class="g">session</span>  raw.githubusercontent.com  granted 10:22
+  <span class="g">session</span>  1.1.1.1 (launch --allow-egress)
+SESSION 4907
+  <span class="m">(none)</span>`))}</div>`,
+ 4:()=>`<div class="grid">${pane("SSH login #2: agent-vm egress watch",T(`  PROJECT  SESSION     DESTINATION              N  STATUS
+<span class="b">▶ webapp   7710 codex  registry.npmjs.org:443   3  pending</span>
+s → <span class="g">✓ allowed for session 7710</span>`))}
+ ${side("Effect",["Good headless story if the user habitually keeps it open, e.g. as a tmux split launched by a wrapper script (not Zellij-specific)."])}</div>`
+ },
+ tradeoffs:["+ One trusted host surface for discovery, decision, inspection and revocation; it maps 1:1 to a future GUI.","+ No guest-visible changes.","− Needs a live denial-event subscription across sessions (an interface demand on #301).","− Another thing to keep open; users who don't open it see nothing."]},
+D:{name:"Native approval dialog",
+ pitch:"A small installed host helper app (macOS agent app, Linux GApplication) posts the notification. Its action opens a <i>native confirm dialog owned by the helper</i>, never authorizing from the notification action itself. Closest to the future GUI, with the heaviest packaging.",
+ s:{
+ 1:()=>`<div class="grid">${pane("guest app",guestFail)}
+ ${pane("notification → helper dialog",notif("agent-vm helper","docs.stripe.com blocked","shop · claude session 4821",["Review"])+`<div class="dialog"><b>Allow network access?</b>
+ <div class="row"><span>Destination</span><code>docs.stripe.com:443 (TLS)</code></div>
+ <div class="row"><span>Project</span><code>~/code/shop</code></div>
+ <div class="row"><span>Session</span><code>4821 · claude · running</code></div>
+ <div class="row">◉ This session only &nbsp; ○ Always for this project</div>
+ <div class="row" style="color:var(--mut);font-size:12px">The blocked request already failed; retry it after allowing.</div>
+ <div class="btns"><span>Keep blocked</span><span class="pri">Allow</span></div></div>`)}
+ ${side("Locked & credential rows",["The helper never posts for 169.254.169.254; it appears only in the helper's list, greyed out as <i>locked</i>.","Credential refusals are not this helper's concern."])}</div>`,
+ 2:()=>`<div class="grid">${pane("notification (replaced in place)",notif("agent-vm helper","shop: 2 sites blocked","sentry.io ×140, statsig ×38",["Review","Don't notify for these"]))}
+ ${side("Effect",["\"Don't notify for these\" is a quiet-list, <b>not</b> a deny rule and not an allowance.","Opening a dialog per host would be unbearable, so review shows a list first."])}</div>`,
+ 3:()=>`<div class="grid">${pane("helper dialog, project choice",`<div class="dialog"><b>Allow pypi.org:443</b>
+ <div class="row">○ This session only &nbsp; ◉ Always for <code>~/code/shop</code></div>
+ <div class="row" style="color:var(--warn);font-size:12px">Applies to all future launches of this project. Other running session 4907: <i>live update depends on #301</i>.</div>
+ <div class="btns"><span>Cancel</span><span class="pri">Always allow</span></div></div>`)}</div>`,
+ 4:()=>`<div class="grid">${side("SSH / headless",["The helper can't post: there's no desktop session bus, and macOS SSH routing is unknown (research).","Must fall back to a host CLI (variant A or C), so D is never the only surface."])}</div>`
+ },
+ tradeoffs:["+ Most familiar consumer UX; the dialog can show rich, trustworthy context.","− Packaging: a signed macOS helper bundle, plus .desktop and D-Bus activation on Linux. None of it is validated yet.","− Still needs a CLI fallback for headless, so it's strictly additive."]}
+};
+const KEYS = Object.keys(V);
+const q = new URLSearchParams(location.search);
+let v = KEYS.includes(q.get('variant')) ? q.get('variant') : 'A';
+let s = SCEN[q.get('s')] ? q.get('s') : '1';
+function render(){
+  const x = V[v];
+  document.getElementById('stabs').innerHTML = Object.entries(SCEN).map(([k,o])=>`<button data-s="${k}" aria-pressed="${k===s}">${k}. ${o.t}</button>`).join('');
+  document.getElementById('scen').innerHTML = `<b>Scenario ${s}:</b> ${SCEN[s].d}`;
+  document.getElementById('variant').innerHTML = `<h2>${v}. ${x.name}</h2><p class="lede">${x.pitch}</p>${x.s[s]()}<h3>Tradeoffs</h3>${side('',x.tradeoffs)}`;
+  document.getElementById('vlabel').textContent = `${v} (${x.name})`;
+  const u = new URL(location); u.searchParams.set('variant',v); u.searchParams.set('s',s); history.replaceState(null,'',u);
+}
+function step(d){ v = KEYS[(KEYS.indexOf(v)+d+KEYS.length)%KEYS.length]; render(); }
+document.getElementById('prev').onclick=()=>step(-1);
+document.getElementById('next').onclick=()=>step(1);
+document.getElementById('stabs').onclick=e=>{const b=e.target.closest('button'); if(b){s=b.dataset.s; render();}};
+addEventListener('keydown',e=>{ if(e.target.closest('input,textarea,[contenteditable]'))return; if(e.key==='ArrowLeft')step(-1); if(e.key==='ArrowRight')step(1); if(/^[1-4]$/.test(e.key)){s=e.key;render();} });
+render();
+</script>
+</body>
+</html>
