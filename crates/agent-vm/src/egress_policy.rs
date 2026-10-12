@@ -66,6 +66,40 @@ pub fn port_from_decimal_bytes(bytes: &[u8]) -> (port: Option<u16>)
     Some(value as u16)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
+pub enum GrantSource { Default, UserConfig, Cli }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedGrant { pub enabled: bool, pub source: GrantSource }
+
+/// A `--allow-*` flag's explicit value, or `None` when the flag was absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CliGrant(pub Option<bool>);
+/// The saved `[network]` value for one group, or `None` when it is unset.
+/// No `Structural`: nothing compares these by value, and `ResolvedGrant`
+/// beside them omits it too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedGrant(pub Option<bool>);
+
+/// An explicit flag (true or false) beats the saved setting; nothing beats default-deny but an explicit true.
+///
+/// The two sources have distinct types so a call site that swaps them -- the
+/// "saved beats CLI" defect -- cannot compile.
+pub fn resolve_grant(cli: CliGrant, saved: SavedGrant) -> (r: ResolvedGrant)
+    ensures
+        r.enabled == match cli.0 { Some(c) => c, None => match saved.0 { Some(u) => u, None => false } },
+        (r.source == GrantSource::Cli) == cli.0.is_some(),
+        (r.source == GrantSource::UserConfig) == (cli.0.is_none() && saved.0.is_some()),
+        (r.source == GrantSource::Default) == (cli.0.is_none() && saved.0.is_none()),
+{
+    match cli.0 {
+        Some(c) => ResolvedGrant { enabled: c, source: GrantSource::Cli },
+        None => match saved.0 {
+            Some(u) => ResolvedGrant { enabled: u, source: GrantSource::UserConfig },
+            None => ResolvedGrant { enabled: false, source: GrantSource::Default },
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupGrants { pub internet: bool, pub lan: bool, pub host: bool }
 #[derive(Debug, PartialEq, Eq)]
@@ -464,6 +498,14 @@ fn address_network(text: &str) -> Result<ipnetwork::IpNetwork, AllowanceError> {
 use crate::egress_hostname::{
     CanonicalHostname, HostnameAllowance, InterceptedPorts, domain_rules,
 };
+/// Borrowed verified user authority; resolution assembles it without filesystem reads.
+pub(crate) struct UserEgress<'a> {
+    pub(crate) file: &'a std::path::Path,
+    pub(crate) internet: Option<bool>,
+    pub(crate) lan: Option<bool>,
+    pub(crate) host: Option<bool>,
+    pub(crate) allowances: &'a [Allowance],
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Allowance {
     Address(EgressAllowance),
@@ -570,34 +612,184 @@ pub(crate) struct CliEgress<'a> {
     pub(crate) host: Option<bool>,
     pub(crate) allowances: &'a [String],
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EntrySources {
+    user: bool,
+    cli: bool,
+}
+impl EntrySources {
+    fn tag(self) -> &'static str {
+        match (self.user, self.cli) {
+            (true, true) => "user config and --allow-egress",
+            (true, false) => "user config",
+            _ => "--allow-egress",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+struct GroupOrigin {
+    resolved: ResolvedGrant,
+    saved: Option<bool>,
+}
+#[derive(Debug)]
+struct Provenance {
+    file: std::path::PathBuf,
+    internet: GroupOrigin,
+    lan: GroupOrigin,
+    host: GroupOrigin,
+    // Membership by canonical value, never index-aligned with effective lists.
+    user_entries: Vec<Allowance>,
+    cli_entries: Vec<Allowance>,
+}
+impl Provenance {
+    fn sources(&self, entry: &Allowance) -> EntrySources {
+        EntrySources {
+            user: self.user_entries.contains(entry),
+            cli: self.cli_entries.contains(entry),
+        }
+    }
+    fn hostname_sources(&self, name: &microsandbox_network::policy::DomainName) -> EntrySources {
+        let contains = |entries: &[Allowance]| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Allowance::Hostname(h) if h.domain() == name))
+        };
+        EntrySources {
+            user: contains(&self.user_entries),
+            cli: contains(&self.cli_entries),
+        }
+    }
+}
+
+/// Which sources carry the launch's hostname authority (ADR-0037 C8 refusal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostnameAuthority<'a> {
+    /// Only the launch flags (`--allow-egress`).
+    Cli,
+    /// Only the saved user-tier `[network]` table, whose file this is.
+    Saved(&'a std::path::Path),
+    /// Both the saved table and this launch's flags.
+    SavedAndCli(&'a std::path::Path),
+}
+
 #[derive(Debug)]
 pub(crate) struct EgressAuthority {
     groups: GroupGrants,
     allowances: Vec<EgressAllowance>,
     hostnames: Vec<HostnameAllowance>,
+    provenance: Option<Provenance>,
 }
 impl EgressAuthority {
+    #[cfg(test)]
     pub(crate) fn from_cli(input: CliEgress<'_>) -> anyhow::Result<Self> {
+        Self::resolve(input, None)
+    }
+    pub(crate) fn resolve(
+        cli: CliEgress<'_>,
+        user: Option<UserEgress<'_>>,
+    ) -> anyhow::Result<Self> {
+        let internet = resolve_grant(
+            CliGrant(cli.internet),
+            SavedGrant(user.as_ref().and_then(|u| u.internet)),
+        );
+        let lan = resolve_grant(
+            CliGrant(cli.lan),
+            SavedGrant(user.as_ref().and_then(|u| u.lan)),
+        );
+        let host = resolve_grant(
+            CliGrant(cli.host),
+            SavedGrant(user.as_ref().and_then(|u| u.host)),
+        );
+        let mut cli_entries = Vec::new();
+        for (i, text) in cli.allowances.iter().enumerate() {
+            let entry = Allowance::parse(text)
+                .map_err(|e| anyhow::anyhow!("--allow-egress #{}: {e}", i + 1))?;
+            if !cli_entries.contains(&entry) {
+                cli_entries.push(entry);
+            }
+        }
+        let user_entries = user
+            .as_ref()
+            .map_or_else(Vec::new, |u| u.allowances.to_vec());
         let mut allowances = Vec::new();
         let mut hostnames = Vec::new();
-        for (i, text) in input.allowances.iter().enumerate() {
-            let allowance = Allowance::parse(text)
-                .map_err(|e| anyhow::anyhow!("--allow-egress #{}: {e}", i + 1))?;
-            match allowance {
-                Allowance::Address(a) if !allowances.contains(&a) => allowances.push(a),
-                Allowance::Hostname(h) if !hostnames.contains(&h) => hostnames.push(h),
+        for entry in user_entries.iter().chain(&cli_entries) {
+            match entry {
+                Allowance::Address(a) if !allowances.contains(a) => allowances.push(*a),
+                Allowance::Hostname(h) if !hostnames.contains(h) => hostnames.push(h.clone()),
                 _ => {}
             }
         }
+        let provenance = user.map(|u| Provenance {
+            file: u.file.to_owned(),
+            internet: GroupOrigin {
+                resolved: internet,
+                saved: u.internet,
+            },
+            lan: GroupOrigin {
+                resolved: lan,
+                saved: u.lan,
+            },
+            host: GroupOrigin {
+                resolved: host,
+                saved: u.host,
+            },
+            user_entries,
+            cli_entries,
+        });
         Ok(Self {
             groups: GroupGrants {
-                internet: input.internet.unwrap_or(false),
-                lan: input.lan.unwrap_or(false),
-                host: input.host.unwrap_or(false),
+                internet: internet.enabled,
+                lan: lan.enabled,
+                host: host.enabled,
             },
             allowances,
             hostnames,
+            provenance,
         })
+    }
+    /// Where the launch's hostname authority comes from, for the ambient-proxy
+    /// refusal. `Some` iff some hostname allowance exists.
+    pub(crate) fn hostname_authority(&self) -> Option<HostnameAuthority<'_>> {
+        if self.hostnames.is_empty() {
+            return None;
+        }
+        let Some(provenance) = self.provenance.as_ref() else {
+            return Some(HostnameAuthority::Cli);
+        };
+        let hostname =
+            |entries: &[Allowance]| entries.iter().any(|a| matches!(a, Allowance::Hostname(_)));
+        Some(
+            match (
+                hostname(&provenance.user_entries),
+                hostname(&provenance.cli_entries),
+            ) {
+                (true, true) => HostnameAuthority::SavedAndCli(&provenance.file),
+                (true, false) => HostnameAuthority::Saved(&provenance.file),
+                (false, _) => HostnameAuthority::Cli,
+            },
+        )
+    }
+    #[cfg(test)]
+    fn sourced_entries(&self) -> Vec<(String, EntrySources)> {
+        self.allowances
+            .iter()
+            .cloned()
+            .map(Allowance::Address)
+            .chain(self.hostnames.iter().cloned().map(Allowance::Hostname))
+            .map(|a| {
+                (
+                    a.to_string(),
+                    self.provenance.as_ref().map_or(
+                        EntrySources {
+                            user: false,
+                            cli: true,
+                        },
+                        |p| p.sources(&a),
+                    ),
+                )
+            })
+            .collect()
     }
     pub(crate) fn has_hostnames(&self) -> bool {
         !self.hostnames.is_empty()
@@ -642,6 +834,13 @@ impl EgressAuthority {
         }
     }
     pub(crate) fn write_notices(&self, output: &mut impl std::io::Write) -> std::io::Result<()> {
+        if let Some(p) = &self.provenance {
+            writeln!(
+                output,
+                "==> Egress authority: user config \"{}\" [network] merged with this launch's flags (flags override its true/false settings and add allowances; nothing is saved)",
+                crate::config::escape_path(&p.file)
+            )?;
+        }
         if self.allowances.is_empty()
             && !self.has_hostnames()
             && !self.groups.internet
@@ -654,25 +853,56 @@ impl EgressAuthority {
             )?;
         }
         for allowance in &self.allowances {
-            writeln!(output, "==> Egress policy: allowing {allowance}")?;
+            if let Some(p) = &self.provenance {
+                writeln!(
+                    output,
+                    "==> Egress policy: allowing {allowance} ({})",
+                    p.sources(&Allowance::Address(*allowance)).tag()
+                )?;
+            } else {
+                writeln!(output, "==> Egress policy: allowing {allowance}")?;
+            }
         }
-        if self.groups.internet {
-            writeln!(
-                output,
-                "==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)"
-            )?;
-        }
-        if self.groups.lan {
-            writeln!(
-                output,
-                "==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable; does not itself enable DNS)"
-            )?;
-        }
-        if self.groups.host {
-            writeln!(
-                output,
-                "==> Egress policy: --allow-host enabled (host.microsandbox.internal → host 127.0.0.1 reachable; includes the host DNS resolver)"
-            )?;
+        for (enabled, origin, setting, flag, detail) in [
+            (
+                self.groups.internet,
+                self.provenance.as_ref().map(|p| p.internet),
+                "allow_internet_egress",
+                "--allow-internet-egress",
+                "public internet; does not itself grant LAN or host",
+            ),
+            (
+                self.groups.lan,
+                self.provenance.as_ref().map(|p| p.lan),
+                "allow_lan",
+                "--allow-lan",
+                "Private RFC1918 + 100.64/10 + fc00::/7 reachable; does not itself enable DNS",
+            ),
+            (
+                self.groups.host,
+                self.provenance.as_ref().map(|p| p.host),
+                "allow_host",
+                "--allow-host",
+                "host.microsandbox.internal → host 127.0.0.1 reachable; includes the host DNS resolver",
+            ),
+        ] {
+            if enabled {
+                if origin.is_some_and(|o| o.resolved.source == GrantSource::UserConfig) {
+                    writeln!(
+                        output,
+                        "==> Egress policy: {setting} = true in user config ({detail})"
+                    )?;
+                } else {
+                    writeln!(output, "==> Egress policy: {flag} enabled ({detail})")?;
+                }
+            } else if origin
+                .is_some_and(|o| o.resolved.source == GrantSource::Cli && o.saved == Some(true))
+            {
+                writeln!(
+                    output,
+                    "==> Egress policy: {flag}=false overrides {setting} = true in user config"
+                )?;
+            }
         }
         if let Some(ports) = self.intercepted_ports() {
             for rule in domain_rules(&self.hostnames, &ports) {
@@ -683,10 +913,18 @@ impl EgressAuthority {
                         .map(|p| p.start.to_string())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    writeln!(
-                        output,
-                        "==> Egress policy: allowing TLS to {name} on ports {effective} (SNI and DNS verified; no plain HTTP)"
-                    )?;
+                    if let Some(p) = &self.provenance {
+                        writeln!(
+                            output,
+                            "==> Egress policy: allowing TLS to {name} on ports {effective} (SNI and DNS verified; no plain HTTP; {})",
+                            p.hostname_sources(&name).tag()
+                        )?;
+                    } else {
+                        writeln!(
+                            output,
+                            "==> Egress policy: allowing TLS to {name} on ports {effective} (SNI and DNS verified; no plain HTTP)"
+                        )?;
+                    }
                 }
             }
             let effective = ports
@@ -700,11 +938,37 @@ impl EgressAuthority {
                 "==> TLS interception: ports {effective} — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT."
             )?;
         }
-        let source = match (self.groups.internet, self.groups.host) {
-            (true, true) => Some("both"),
-            (true, false) => Some("--allow-internet-egress"),
-            (false, true) => Some("--allow-host"),
-            (false, false) => None,
+        let source = if let Some(p) = &self.provenance {
+            let label = |origin: GroupOrigin, setting: &str, flag: &str| {
+                if origin.resolved.source == GrantSource::UserConfig {
+                    format!("user config {setting}")
+                } else {
+                    flag.to_owned()
+                }
+            };
+            let mut sources = Vec::new();
+            if self.groups.internet {
+                sources.push(label(
+                    p.internet,
+                    "allow_internet_egress",
+                    "--allow-internet-egress",
+                ));
+            }
+            if self.groups.host {
+                sources.push(label(p.host, "allow_host", "--allow-host"));
+            }
+            if sources.is_empty() {
+                None
+            } else {
+                Some(sources.join(" and "))
+            }
+        } else {
+            match (self.groups.internet, self.groups.host) {
+                (true, true) => Some("both".to_owned()),
+                (true, false) => Some("--allow-internet-egress".to_owned()),
+                (false, true) => Some("--allow-host".to_owned()),
+                (false, false) => None,
+            }
         };
         if let Some(source) = source {
             writeln!(
@@ -729,6 +993,363 @@ impl EgressAuthority {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn resolve_saved(
+        groups: crate::user_network::SavedGroups,
+        entries: &[&str],
+        cli: CliEgress<'_>,
+    ) -> EgressAuthority {
+        let user = crate::user_network::UserNetwork::for_test(
+            "/home/a/.config/agent-vm/config.toml",
+            groups,
+            entries,
+        );
+        EgressAuthority::resolve(cli, Some(user.egress())).unwrap()
+    }
+    fn empty_cli() -> CliEgress<'static> {
+        CliEgress {
+            internet: None,
+            lan: None,
+            host: None,
+            allowances: &[],
+        }
+    }
+    // Independent: the expected source and permission are enumerated, not derived by resolve.
+    #[test]
+    fn resolve_grant_matches_the_nine_row_table() {
+        use GrantSource::*;
+        for (cli, user, enabled, source) in [
+            (None, None, false, Default),
+            (None, Some(false), false, UserConfig),
+            (None, Some(true), true, UserConfig),
+            (Some(false), None, false, Cli),
+            (Some(false), Some(false), false, Cli),
+            (Some(false), Some(true), false, Cli),
+            (Some(true), None, true, Cli),
+            (Some(true), Some(false), true, Cli),
+            (Some(true), Some(true), true, Cli),
+        ] {
+            assert_eq!(
+                resolve_grant(CliGrant(cli), SavedGrant(user)),
+                ResolvedGrant { enabled, source }
+            );
+        }
+    }
+    proptest! {
+        #[test]
+        fn resolve_grant_matches_option_precedence(cli in any::<Option<bool>>(), user in any::<Option<bool>>()) {
+            prop_assert_eq!(resolve_grant(CliGrant(cli), SavedGrant(user)).enabled, cli.or(user).unwrap_or(false));
+        }
+    }
+
+    // Independent rule/source oracle: literal SDK wire objects, no rule constructors.
+    #[test]
+    fn resolve_emits_enumerated_rules_and_sources() {
+        use crate::user_network::SavedGroups;
+        use serde_json::json;
+        let private = json!([{"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"}]);
+        let lan = SavedGroups {
+            lan: Some(true),
+            ..Default::default()
+        };
+        let cases = [
+            (resolve_saved(lan, &[], empty_cli()), private, None, vec![]),
+            (
+                resolve_saved(
+                    lan,
+                    &[],
+                    CliEgress {
+                        lan: Some(false),
+                        ..empty_cli()
+                    },
+                ),
+                json!([]),
+                None,
+                vec![],
+            ),
+            (
+                resolve_saved(
+                    Default::default(),
+                    &["10.0.0.5"],
+                    CliEgress {
+                        allowances: &["10.0.0.5/32".into(), "192.168.1.0/24".into()],
+                        ..empty_cli()
+                    },
+                ),
+                json!([
+                    {"direction":"egress","destination":{"cidr":"10.0.0.5/32"},"protocols":[],"ports":[],"action":"allow"},
+                    {"direction":"egress","destination":{"cidr":"192.168.1.0/24"},"protocols":[],"ports":[],"action":"allow"}
+                ]),
+                None,
+                vec![
+                    (
+                        "10.0.0.5/32",
+                        EntrySources {
+                            user: true,
+                            cli: true,
+                        },
+                    ),
+                    (
+                        "192.168.1.0/24",
+                        EntrySources {
+                            user: false,
+                            cli: true,
+                        },
+                    ),
+                ],
+            ),
+            (
+                resolve_saved(
+                    SavedGroups {
+                        internet: Some(true),
+                        ..Default::default()
+                    },
+                    &[],
+                    empty_cli(),
+                ),
+                json!([
+                    {"direction":"egress","destination":{"group":"host"},"protocols":["udp","tcp"],"ports":[{"start":53,"end":53}],"action":"allow"},
+                    {"direction":"egress","destination":{"group":"public"},"protocols":[],"ports":[],"action":"allow"}
+                ]),
+                None,
+                vec![],
+            ),
+            (
+                resolve_saved(
+                    Default::default(),
+                    &["api.example.com"],
+                    CliEgress {
+                        allowances: &["tcp://api.example.com:8443".into()],
+                        ..empty_cli()
+                    },
+                ),
+                json!([{"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443},{"start":8443,"end":8443}],"action":"allow"}]),
+                Some(vec![443, 8443]),
+                vec![
+                    (
+                        "api.example.com",
+                        EntrySources {
+                            user: true,
+                            cli: false,
+                        },
+                    ),
+                    (
+                        "tcp://api.example.com:8443",
+                        EntrySources {
+                            user: false,
+                            cli: true,
+                        },
+                    ),
+                ],
+            ),
+            (
+                resolve_saved(Default::default(), &[], empty_cli()),
+                json!([]),
+                None,
+                vec![],
+            ),
+        ];
+        for (authority, rules, ports, entries) in cases {
+            assert_eq!(
+                serde_json::to_value(authority.policy()).unwrap()["rules"],
+                rules
+            );
+            assert_eq!(authority.intercepted_ports().map(|p| p.to_vec()), ports);
+            assert_eq!(
+                authority.sourced_entries(),
+                entries
+                    .into_iter()
+                    .map(|(s, sources)| (s.to_owned(), sources))
+                    .collect::<Vec<_>>()
+            );
+            assert!(authority.provenance.is_some());
+        }
+        let h = resolve_saved(
+            Default::default(),
+            &["api.example.com"],
+            CliEgress {
+                allowances: &["tcp://api.example.com:8443".into()],
+                ..empty_cli()
+            },
+        );
+        assert_eq!(
+            h.provenance
+                .as_ref()
+                .unwrap()
+                .hostname_sources(h.hostnames[0].domain()),
+            EntrySources {
+                user: true,
+                cli: true
+            }
+        );
+        let internet = resolve_saved(
+            SavedGroups {
+                internet: Some(true),
+                ..Default::default()
+            },
+            &[],
+            empty_cli(),
+        );
+        assert_eq!(
+            internet.provenance.unwrap().internet.resolved.source,
+            GrantSource::UserConfig
+        );
+    }
+
+    #[test]
+    fn resolution_union_is_canonical_deduped_and_user_first() {
+        let authority = resolve_saved(
+            Default::default(),
+            &["10.0.0.5", "api.example.com"],
+            CliEgress {
+                allowances: &["10.0.0.5/32".into(), "192.168.1.0/24".into()],
+                ..empty_cli()
+            },
+        );
+        assert_eq!(
+            authority.sourced_entries(),
+            vec![
+                (
+                    "10.0.0.5/32".into(),
+                    EntrySources {
+                        user: true,
+                        cli: true
+                    }
+                ),
+                (
+                    "192.168.1.0/24".into(),
+                    EntrySources {
+                        user: false,
+                        cli: true
+                    }
+                ),
+                (
+                    "api.example.com".into(),
+                    EntrySources {
+                        user: true,
+                        cli: false
+                    }
+                ),
+            ]
+        );
+    }
+    proptest! {
+        // Independent canonical classes, not Allowance::parse as the expectation.
+        #[test]
+        fn canonical_union_matches_vocabulary_membership(user_bits in any::<u8>(), cli_bits in any::<u8>()) {
+            let vocabulary = [
+                ("10.0.0.5", "10.0.0.5/32"), ("10.0.0.5/32", "10.0.0.5/32"),
+                ("API.example.com.", "api.example.com"), ("api.example.com", "api.example.com"),
+                ("192.168.1.7/24", "192.168.1.0/24"), ("192.168.1.0/24", "192.168.1.0/24"),
+            ];
+            let user: Vec<_> = vocabulary.iter().enumerate().filter(|(i, _)| user_bits & (1 << i) != 0).map(|(_, (text, _))| *text).collect();
+            let cli: Vec<String> = vocabulary.iter().enumerate().filter(|(i, _)| cli_bits & (1 << i) != 0).map(|(_, (text, _))| (*text).into()).collect();
+            let expected_membership = |bits: u8, canonical: &str| vocabulary.iter().enumerate().any(|(i, (_, c))| bits & (1 << i) != 0 && *c == canonical);
+            let authority = resolve_saved(Default::default(), &user, CliEgress { allowances: &cli, ..empty_cli() });
+            let actual = authority.sourced_entries();
+            let expected: std::collections::BTreeSet<_> = vocabulary.iter().enumerate().filter(|(i, _)| (user_bits | cli_bits) & (1 << i) != 0).map(|(_, (_, c))| *c).collect();
+            prop_assert_eq!(actual.len(), expected.len());
+            prop_assert_eq!(actual.iter().map(|(c, _)| c.as_str()).collect::<std::collections::BTreeSet<_>>(), expected);
+            for (canonical, sources) in actual {
+                prop_assert_eq!(sources, EntrySources { user: expected_membership(user_bits, &canonical), cli: expected_membership(cli_bits, &canonical) });
+            }
+        }
+        // Metamorphic: both sides resolve; independent rule oracles above establish correctness.
+        #[test]
+        fn user_tier_is_metamorphic_to_equivalent_flags(
+            saved in any::<[Option<bool>; 3]>(), flags in any::<[Option<bool>; 3]>(), hostname in any::<bool>(),
+        ) {
+            let user_entries = if hostname { vec!["10.0.0.5", "api.example.com"] } else { vec!["10.0.0.5"] };
+            let cli_entries = vec!["10.0.0.5/32".into(), "192.168.1.0/24".into()];
+            let resolved = resolve_saved(crate::user_network::SavedGroups { internet: saved[0], lan: saved[1], host: saved[2] }, &user_entries,
+                CliEgress { internet: flags[0], lan: flags[1], host: flags[2], allowances: &cli_entries });
+            let mut union: Vec<String> = user_entries.iter().map(|s| (*s).into()).collect();
+            union.extend(cli_entries);
+            let equivalent = EgressAuthority::from_cli(CliEgress {
+                internet: Some(flags[0].or(saved[0]).unwrap_or(false)), lan: Some(flags[1].or(saved[1]).unwrap_or(false)), host: Some(flags[2].or(saved[2]).unwrap_or(false)), allowances: &union,
+            }).unwrap();
+            prop_assert_eq!(serde_json::to_value(resolved.policy()).unwrap(), serde_json::to_value(equivalent.policy()).unwrap());
+        }
+    }
+    #[test]
+    fn notices_with_user_table_show_provenance() {
+        use crate::user_network::SavedGroups;
+        const HEADER: &str = "==> Egress authority: user config \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override its true/false settings and add allowances; nothing is saved)\n";
+        const TLS: &str = "==> TLS interception: ports 443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n";
+        let saved = SavedGroups {
+            lan: Some(true),
+            ..Default::default()
+        };
+        for row in 1..=3 {
+            let cli_entries = ["10.0.0.5/32".into(), "192.168.1.0/24".into()];
+            let cli = match row {
+                2 => CliEgress {
+                    lan: Some(false),
+                    ..empty_cli()
+                },
+                3 => CliEgress {
+                    internet: Some(true),
+                    allowances: &cli_entries,
+                    ..empty_cli()
+                },
+                _ => empty_cli(),
+            };
+            let authority = resolve_saved(saved, &["10.0.0.5", "api.example.com"], cli);
+            let mut out = Vec::new();
+            authority.write_notices(&mut out).unwrap();
+            let mut expected = HEADER.to_owned();
+            if row == 3 {
+                expected.push_str("==> Egress policy: allowing 10.0.0.5/32 (user config and --allow-egress)\n==> Egress policy: allowing 192.168.1.0/24 (--allow-egress)\n==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n");
+            } else {
+                expected.push_str("==> Egress policy: allowing 10.0.0.5/32 (user config)\n");
+            }
+            if row == 2 {
+                expected.push_str("==> Egress policy: --allow-lan=false overrides allow_lan = true in user config\n");
+            } else {
+                expected.push_str("==> Egress policy: allow_lan = true in user config (Private RFC1918 + 100.64/10 + fc00::/7 reachable; does not itself enable DNS)\n");
+            }
+            expected.push_str("==> Egress policy: allowing TLS to api.example.com on ports 443 (SNI and DNS verified; no plain HTTP; user config)\n");
+            expected.push_str(TLS);
+            expected.push_str(if row == 3 { "==> Egress DNS: arbitrary-name DNS queries authorized via --allow-internet-egress (resolver/rebind/platform constraints still apply)\n" }
+                else { "==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n" });
+            assert_eq!(String::from_utf8(out).unwrap(), expected);
+        }
+        let mixed = resolve_saved(
+            SavedGroups {
+                host: Some(true),
+                ..Default::default()
+            },
+            &[],
+            CliEgress {
+                internet: Some(true),
+                ..empty_cli()
+            },
+        );
+        let mut out = Vec::new();
+        mixed.write_notices(&mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{HEADER}==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n==> Egress policy: allow_host = true in user config (host.microsandbox.internal → host 127.0.0.1 reachable; includes the host DNS resolver)\n==> Egress DNS: arbitrary-name DNS queries authorized via --allow-internet-egress and user config allow_host (resolver/rebind/platform constraints still apply)\n"
+            )
+        );
+        let split = resolve_saved(
+            Default::default(),
+            &["api.example.com"],
+            CliEgress {
+                allowances: &["tcp://api.example.com:8443".into()],
+                ..empty_cli()
+            },
+        );
+        let mut out = Vec::new();
+        split.write_notices(&mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{HEADER}==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (SNI and DNS verified; no plain HTTP; user config and --allow-egress)\n==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
+            )
+        );
+    }
 
     #[test]
     fn trusted_port_rejects_zero_instead_of_granting_all_ports() {

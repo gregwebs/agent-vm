@@ -524,3 +524,35 @@ fn m11b_root_mode_preserves_raw_non_utf8_authority_home() {
     assert!(text.contains("launch authority"), "{text}");
     assert!(!text.contains("[debug] sandbox config JSON:"));
 }
+
+#[test]
+fn m12_home_launch_refused_with_valid_network_authority() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    let file = h.home_path().join(".config/agent-vm/config.toml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        include_str!("../../../script/test/fixtures/persisted-network/user-allow-host.toml"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(
+        file.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let out = h.run_shell_from(&[], &h.home_path());
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    for (_, expected) in
+        include_str!("../../../script/test/fixtures/persisted-network/expected-stderr.tsv")
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter(|(row, _)| *row == "PN5")
+    {
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+    assert!(!stderr.contains("Egress policy"));
+    assert_no_launch_side_effects(&h, &stderr);
+}

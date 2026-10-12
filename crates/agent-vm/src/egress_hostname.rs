@@ -186,6 +186,9 @@ impl PortNot53Or853 {
     }
 }
 impl HostnameAllowance {
+    pub(crate) fn domain(&self) -> &DomainName {
+        &self.domain
+    }
     // Keep the SDK DomainName here: requests carry no rule-ready domain.
     pub(crate) fn into_request_parts(self) -> (CanonicalHostname, HostnameScope) {
         (self.name, self.scope)

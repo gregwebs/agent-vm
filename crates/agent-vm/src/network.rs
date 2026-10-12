@@ -199,25 +199,42 @@ impl Plan {
     ///
     /// Proxy lookup is ambient because the vendored netstack uses the process
     /// environment too; only a trimmed, credential-free rendering is retained.
-    pub(crate) fn from_args(args: Args) -> Result<Self> {
-        Self::from_args_with_proxy_lookup(args, |variable| std::env::var(variable).ok())
+    pub(crate) fn from_args(
+        args: Args,
+        user: Option<&crate::user_network::UserNetwork>,
+    ) -> Result<Self> {
+        Self::from_args_with_proxy_lookup(args, user, |variable| std::env::var(variable).ok())
     }
 
     fn from_args_with_proxy_lookup(
         args: Args,
+        user: Option<&crate::user_network::UserNetwork>,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
         let publish_ports = parse_publish_args(&args.publish).context("parsing --publish")?;
-        let egress =
-            crate::egress_policy::EgressAuthority::from_cli(crate::egress_policy::CliEgress {
+        let egress = crate::egress_policy::EgressAuthority::resolve(
+            crate::egress_policy::CliEgress {
                 internet: args.allow_internet_egress,
                 lan: args.allow_lan,
                 host: args.allow_host,
                 allowances: &args.allow_egress,
-            })?;
+            },
+            user.map(crate::user_network::UserNetwork::egress),
+        )?;
         let observation = observe_host_proxy(lookup);
         if egress.has_hostnames() && observation.connector_used {
-            anyhow::bail!(HOSTNAME_PROXY_REFUSAL);
+            use crate::egress_policy::HostnameAuthority;
+            match egress.hostname_authority() {
+                Some(HostnameAuthority::Saved(file)) => anyhow::bail!(
+                    "{HOSTNAME_PROXY_REFUSAL} (hostnames saved in user config \"{}\" [network] apply to every launch; remove them there)",
+                    crate::config::escape_path(file)
+                ),
+                Some(HostnameAuthority::SavedAndCli(file)) => anyhow::bail!(
+                    "{HOSTNAME_PROXY_REFUSAL} (hostnames from --allow-egress and saved in user config \"{}\" [network] both apply to every launch; remove the saved ones there and stop passing --allow-egress)",
+                    crate::config::escape_path(file)
+                ),
+                _ => anyhow::bail!(HOSTNAME_PROXY_REFUSAL),
+            }
         }
         let proxy_notice = observation.notice;
         Ok(Self {
@@ -591,7 +608,7 @@ mod tests {
     mod hostname_tests;
 
     fn plan(input: Args) -> Plan {
-        Plan::from_args_with_proxy_lookup(input, |_| None).expect("valid networking plan")
+        Plan::from_args_with_proxy_lookup(input, None, |_| None).expect("valid networking plan")
     }
 
     fn test_builder(name: &str) -> SandboxBuilder {
@@ -607,8 +624,94 @@ mod tests {
         serde_json::to_value(config.spec.network).expect("network serializes")
     }
 
+    #[tokio::test]
+    async fn user_grants_reach_the_applied_policy() {
+        let user = crate::user_network::UserNetwork::for_test(
+            "user.toml",
+            crate::user_network::SavedGroups {
+                lan: Some(true),
+                ..Default::default()
+            },
+            &["10.0.0.5"],
+        );
+        let plan = Plan::from_args_with_proxy_lookup(args(), Some(&user), |_| None).unwrap();
+        let config = plan
+            .apply_to(test_builder("saved-grants"))
+            .build()
+            .await
+            .unwrap();
+        let network = serde_json::to_value(config.spec.network).unwrap();
+        assert_eq!(
+            network["policy"]["rules"],
+            serde_json::json!([
+                {"direction":"egress","destination":{"cidr":"10.0.0.5/32"},"protocols":[],"ports":[],"action":"allow"},
+                {"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"}
+            ])
+        );
+    }
+
+    #[test]
+    fn user_hostname_with_host_proxy_is_refused() {
+        let user = crate::user_network::UserNetwork::for_test(
+            "user\n.toml",
+            Default::default(),
+            &["api.example.com"],
+        );
+        let error = Plan::from_args_with_proxy_lookup(args(), Some(&user), |v| {
+            (v == "HTTPS_PROXY").then(|| "http://127.0.0.1:9".into())
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "{HOSTNAME_PROXY_REFUSAL} (hostnames saved in user config \"user\\x0a.toml\" [network] apply to every launch; remove them there)"
+            )
+        );
+        let numeric = crate::user_network::UserNetwork::for_test(
+            "user.toml",
+            Default::default(),
+            &["10.0.0.5"],
+        );
+        assert!(
+            Plan::from_args_with_proxy_lookup(args(), Some(&numeric), |v| (v == "HTTPS_PROXY")
+                .then(|| "http://127.0.0.1:9".into()))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn host_proxy_refusal_blames_every_hostname_source() {
+        let proxy = |v: &str| (v == "HTTPS_PROXY").then(|| "http://127.0.0.1:9".into());
+        let mut cli_only = args();
+        cli_only.allow_egress = vec!["cli.example.com".into()];
+        assert_eq!(
+            Plan::from_args_with_proxy_lookup(cli_only, None, proxy)
+                .unwrap_err()
+                .to_string(),
+            HOSTNAME_PROXY_REFUSAL
+        );
+        let user = crate::user_network::UserNetwork::for_test(
+            "user.toml",
+            Default::default(),
+            &["saved.example.com"],
+        );
+        let mut both = args();
+        both.allow_egress = vec!["cli.example.com".into()];
+        let error = Plan::from_args_with_proxy_lookup(both, Some(&user), proxy)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--allow-egress"), "{error}");
+        assert!(
+            error.contains("saved in user config \"user.toml\""),
+            "{error}"
+        );
+        assert!(error.contains("stop passing --allow-egress"), "{error}");
+    }
+
     fn notice_output(input: Args, proxy: impl Fn(&str) -> Option<String>) -> String {
-        let plan = Plan::from_args_with_proxy_lookup(input, proxy).expect("valid networking plan");
+        let plan =
+            Plan::from_args_with_proxy_lookup(input, None, proxy).expect("valid networking plan");
         let mut output = Vec::new();
         plan.emit_launch_notices_to(&mut output)
             .expect("notice output");
@@ -663,6 +766,7 @@ mod tests {
                     publish: vec![value.into()],
                     ..args()
                 },
+                None,
                 |_| None,
             )
             .expect_err("invalid publish input is rejected");
@@ -677,6 +781,7 @@ mod tests {
                 allow_egress: vec!["udp://not-an-ip.example".into()],
                 ..args()
             },
+            None,
             |_| None,
         )
         .expect_err("invalid CIDR is rejected");
@@ -1134,7 +1239,7 @@ mod tests {
                 "unsafe output: {output}"
             );
         }
-        let plan = Plan::from_args_with_proxy_lookup(args(), |variable| {
+        let plan = Plan::from_args_with_proxy_lookup(args(), None, |variable| {
             (variable == "https_proxy").then(|| "http:////alice:hunter2@proxy.example:3128".into())
         })
         .expect("valid plan");

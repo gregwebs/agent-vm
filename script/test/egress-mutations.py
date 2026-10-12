@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -134,10 +135,10 @@ def matrix():
     g4 = rust("rejected_allowance_is_refused_before_launch_state_is_created", True)
     for name, suffix in (("project", ""), ("mounts", ".mounts"), ("secrets", ".secrets")):
         add("preparse-" + name, SRC + "run.rs",
-            "\n    let network_plan = crate::network::Plan::from_args(args.network)?;",
+            "\n    let network_plan = crate::network::Plan::from_args(args.network, user_network)?;",
             '\n    let early = ProjectSession::for_cwd()?;\n    std::fs::create_dir_all(' +
             ('&early.state_dir' if not suffix else 'early.state_dir.with_extension("' + suffix[1:] + '")') +
-            ')?;\n    let network_plan = crate::network::Plan::from_args(args.network)?;', g4)
+            ')?;\n    let network_plan = crate::network::Plan::from_args(args.network, user_network)?;', g4)
     add("valid-no-fork", TEST,
         '&["--mount", &mount, "--allow-egress", "api.example.com"],',
         '&["--allow-egress", "api.example.com"],', g4)
@@ -194,15 +195,79 @@ def matrix():
     add("account-home-dropped", SRC + "mount.rs",
         "        .chain(context.account_home.iter())",
         "", rust("mount"))
+    persisted = SRC + "user_network.rs"
+    grant_old = """    match cli.0 {
+        Some(c) => ResolvedGrant { enabled: c, source: GrantSource::Cli },
+        None => match saved.0 {
+            Some(u) => ResolvedGrant { enabled: u, source: GrantSource::UserConfig },
+            None => ResolvedGrant { enabled: false, source: GrantSource::Default },
+        },
+    }"""
+    grant_new = """    match saved.0 {
+        Some(u) => ResolvedGrant { enabled: u, source: GrantSource::UserConfig },
+        None => match cli.0 {
+            Some(c) => ResolvedGrant { enabled: c, source: GrantSource::Cli },
+            None => ResolvedGrant { enabled: false, source: GrantSource::Default },
+        },
+    }"""
+    for name, path, old, new, tests in (
+        ("saved-beats-cli", EGRESS, grant_old, grant_new, egress),
+        ("symlink-trusted", persisted, "Reached::ThroughSymlink => Some(AuthorityRefusal::ThroughSymlink)", "Reached::ThroughSymlink => None", rust("user_network::tests")),
+        ("links-ignored", persisted, "else if !authority_file_singly_linked(f.nlink) { Some(AuthorityRefusal::FileLinks(f.nlink)) }", "else if false { Some(AuthorityRefusal::FileLinks(f.nlink)) }", rust("user_network::tests")),
+        ("mask-other-only", persisted, "else if f.mode & 0o022 != 0", "else if f.mode & 0o002 != 0", rust("user_network::tests")),
+    ):
+        add(name, path, old, new, tests)
+        add(name + "-proof", path, old, new, gate, "verification results::")
+    add("user-allowances-dropped", EGRESS,
+        "for entry in user_entries.iter().chain(&cli_entries) {",
+        "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", True))
+    add("verify-always-skipped", SRC + "config.rs",
+        'TierKind::User => user_network::from_user_tier(file, read, table)\n            .map(Some)\n            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(file))),',
+        'TierKind::User => Ok(None),', rust("unsafe_user_network_is_refused_before_launch_state", True))
+    add("descriptor-reopen", SRC + "host_paths.rs", "            after_open();",
+        "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;",
+        rust("noting_symlink_takes_bytes_and_facts_from_the_opened_descriptor"))
+    add("builtin-network-accepted", SRC + "config.rs",
+        "return Err(network_refusal(table, path, RefusingTier::BuiltIn));", "let _ = table;",
+        rust("builtin_network_table_is_refused_naming_setting_and_tier"))
     return controls
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--evidence", type=Path)
+    parser.add_argument("--check-anchors", action="store_true")
     parser.add_argument("--only", help="substring of mutation name")
     args = parser.parse_args()
+    controls = matrix()
+    if args.check_anchors:
+        for name, path, old, _, _, _ in controls:
+            expected = 2 if name in ("port-value", "port-value-proof") else 1
+            matches = (ROOT / path).read_text().count(old)
+            if matches != expected:
+                raise RuntimeError(f"stale or ambiguous mutation anchor: {name}: {matches}, expected {expected}")
+        print(f"PASS: {len(controls)} mutation anchors")
+        return 0
+    if args.evidence is None:
+        parser.error("--evidence is required unless --check-anchors is used")
     evidence = args.evidence.resolve()
+    # Refuse to reuse a non-empty directory: it would overwrite per-row logs and
+    # leave stale rows beside the fresh results.json.
+    if evidence.exists() and any(evidence.iterdir()):
+        parser.error(
+            f"--evidence {evidence} is not empty; use a fresh directory so runs cannot be mixed"
+        )
+    selected = [row for row in controls if not args.only or args.only in row[0]]
+    # Fail closed before spending ~30 minutes: the -proof rows need the pinned
+    # Verus release, and a missing toolchain would otherwise land as a bare FAIL
+    # indistinguishable from a surviving mutant.
+    if any(name.endswith("-proof") for name, *_ in selected) and shutil.which("cargo-verus") is None:
+        print(
+            "FAIL: cargo-verus is not on PATH; the selected -proof rows need the "
+            "pinned Verus release on PATH",
+            file=sys.stderr,
+        )
+        return 2
     evidence.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     # Reuse compiled dependencies without ever sharing live source files.
@@ -219,9 +284,7 @@ def main():
                 shutil.copy2(source, dest)
         (copy / "vendor").symlink_to(ROOT / "vendor", target_is_directory=True)
         results = []
-        for name, path, old, new, command, marker in matrix():
-            if args.only and args.only not in name:
-                continue
+        for name, path, old, new, command, marker in selected:
             file = copy / path
             original = file.read_text()
             matches = 2 if name in ("port-value", "port-value-proof") else 1

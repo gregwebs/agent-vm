@@ -517,7 +517,8 @@ source, and the printed orphan is what you remove.
 
 ### agent-vm's config directory is never writable from the guest
 
-`~/.config/agent-vm` holds `credentials.yaml`, which authorizes launch secrets.
+`~/.config/agent-vm` holds `credentials.yaml`, which authorizes launch secrets,
+and `config.toml` `[network]`, which authorizes egress.
 A guest must not be able to plant authority for a later launch. Every launch
 refuses writable project, state, guest-home and extra binds that contain or
 alias this directory, or a directory its lookup searches, even if no authority
@@ -745,11 +746,19 @@ override are deliberately **not** honored.
 
 ### Schema
 
-`[network]` is refused: project authority is never accepted; user authority is not supported yet (see [#302](https://github.com/gregwebs/agent-vm/issues/302)).
+`[network]` authority is user-tier only, from a verified file. The project tier
+refuses it. See [Persisted grants](#persisted-grants-user-config).
 
 ```toml
 # Top-level, optional: the boot image for every session (an OCI reference).
 image = "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
+
+# Optional, USER CONFIG ONLY (never put this in project config):
+# [network]
+# allow_internet_egress = false
+# allow_lan = true
+# allow_host = false
+# allow_egress = ["10.0.0.5", "api.example.com"]
 
 [[tools]]
 name = "mytool"                      # required; the `agent-vm <name>` verb
@@ -998,7 +1007,8 @@ the guest as signed out.
 
 ### Errors and recovery
 
-A `[network]` table is refused in either tier with the file, setting and tier named.
+A `[network]` table is refused in the project tier with the file, setting and
+tier named; in the user tier it is verified (see [Persisted grants](#persisted-grants-user-config)).
 
 A config parse/validation error fails any launch verb with *that* error — never
 clap's "unrecognized subcommand". Ordinary `agent-vm doctor` still exits
@@ -1505,7 +1515,8 @@ Tool-launch guest egress is **denied by default**, including DNS query authoriza
 Before **0.2.0**, the guest reached the public internet by default; agents that
 call provider APIs now need `--allow-internet-egress`, or a TLS hostname
 allowance (`--allow-egress api.example.com`) narrower than the whole internet.
-Grants compose independently and apply only to this launch.
+Grants compose independently. CLI grants apply only to this launch; persisted
+grants come from the user config.
 The temporary guests booted by `setup` and `pull` still use the SDK public-internet
 and DNS default; this launch policy does not cover them. `setup` runs each
 configured tool's declared `command --version` from a project-selectable image.
@@ -1522,9 +1533,55 @@ These guests have no project mounts or secrets.
 
 Each Boolean flag without a value means true; `--allow-internet-egress=false`,
 `--allow-lan=false` and `--allow-host=false` grant nothing for that group.
+Explicit `=false` overrides a saved true for that group.
 LAN and host never imply public internet access. Guest loopback, link-local
 and cloud metadata are not part of the LAN grant. Prefer the narrowest grant:
 every process in the guest receives the authority you open.
+
+### Persisted grants (user config)
+
+Only `~/.config/agent-vm/config.toml` can save grants:
+
+```toml
+[network]
+allow_lan = true
+allow_egress = ["10.0.0.5", "api.example.com"]
+```
+
+| Launch flags | internet | LAN | host | allowances |
+|---|---|---|---|---|
+| none | false | true (user) | false | `10.0.0.5/32`, TLS `api.example.com` (user) |
+| `--allow-lan=false` | false | false (CLI) | false | same saved allowances |
+| `--allow-internet-egress --allow-egress 10.0.0.5/32 --allow-egress 192.168.1.0/24` | true (CLI) | true (user) | false | one `10.0.0.5/32` (both sources), TLS `api.example.com` (user), `192.168.1.0/24` (CLI) |
+
+Each Boolean is CLI → user → false. Allowances are the user-first canonical
+union; flags never subtract saved entries. Nothing is saved by a launch.
+The same numeric and hostname grammar applies; an empty table grants nothing
+but still requires a verified file.
+
+The config must be a regular file, **not a symlink**, with one hard link, owned
+by you and not group/other-writable (`0600` or `0644` is fine). Its immediate
+directory must be owned by you and not group/other-writable (`0700` is fine).
+Keep `~` and `~/.config` writable only by you: ancestors and ACLs are **not**
+checked. A tools/image-only symlink still works; review the file's `[network]`
+table before replacing it with the file itself to carry authority.
+
+Notices name the file and each grant's source, for example:
+
+```text
+==> Egress policy: allowing 10.0.0.5/32 (user config and --allow-egress)
+==> Egress policy: --allow-lan=false overrides allow_lan = true in user config
+```
+
+Saved hostnames with a selected host HTTP proxy refuse **every launch**.
+`--allow-*=false` does not clear `allow_egress`, and adding a numeric
+`--allow-egress` does not bypass the refusal. Unset the proxy variables (or use
+`NO_PROXY=*`), or remove the saved hostname to recover.
+
+`setup`/`pull` temporary guests ignore these grants (#303). The directory
+exposure guard is unchanged: launching from `$HOME` remains refused.
+See [ADR-0040](docs/adr/0040-persisted-user-network-authority.md) for the threat,
+trusted boundary and accepted gaps.
 
 ### Numeric allowance grammar
 
@@ -1724,9 +1781,8 @@ prefix are buffered, then blocked. Conclusively binary first flights pass
 unchanged, and a server-first banner relays before the handler waits for client
 bytes. This narrows what numeric grants carry; it never widens a hostname rule.
 
-Project `[network]` can never grant authority; user `[network]` is not supported
-yet. Both are refused with a file/setting/tier diagnostic. Persistent network
-authority is not supported yet; all current grants are CLI-only (see [#302](https://github.com/gregwebs/agent-vm/issues/302)).
+Project `[network]` can never grant authority. Verified user-tier grants merge
+with launch flags as described in [Persisted grants](#persisted-grants-user-config).
 
 ## Troubleshooting
 
@@ -1737,8 +1793,18 @@ authority is not supported yet; all current grants are CLI-only (see [#302](http
   state/home source could hold a future authority lookup directory. Remove
   the exposing symlink layout or choose unrelated state. Relative state
   roots are resolved against the launch cwd; messages retain `..` spelling.
-- **“has … hard links”** — remove other links to `config.toml`, or replace
-  it with a separate copy. Content and `[network]` presence do not matter.
+- **“reached through a symbolic link”** — the link target may be writable by a
+  guest or project. Review the file's `[network]` table before replacing the
+  link with the file itself; tools/image-only symlinks still work without
+  `[network]`.
+- **“group- or other-writable”** — another account or a guest may have written
+  the file or its directory. Review the `[network]` table before `chmod go-w`;
+  a mode change does not establish authorship. The file and directory must both
+  be owned by you.
+- **“has … hard links” / “with … hard links”** — another name for `config.toml`
+  may be guest- or project-writable. Review the `[network]` table before
+  removing links or copying the file. The launch-time check applies regardless
+  of content; `[network]` also invokes the read-time check.
 
 - **`RegisterNetDevice(IrqsExhausted)` at boot** — device capacity is host
   and runtime dependent. Drop a `--mount` to recover. Linux x86_64 uses a

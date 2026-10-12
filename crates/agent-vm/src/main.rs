@@ -47,6 +47,7 @@ mod setup;
 #[cfg(test)]
 mod test_env;
 mod user;
+mod user_network;
 
 use anyhow::{Context, Result};
 
@@ -146,8 +147,9 @@ fn main() -> Result<()> {
             Dispatch::Launch {
                 entry,
                 images,
+                user_network,
                 args,
-            } => exit_with(run::launch(&entry, &images, *args).await?),
+            } => exit_with(run::launch(&entry, &images, user_network.as_ref(), *args).await?),
             Dispatch::Builtin {
                 cmd: Cmd::Setup(args),
                 catalog,

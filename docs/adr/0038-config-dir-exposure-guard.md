@@ -3,16 +3,17 @@
 ## Status
 
 Accepted for [#323](https://github.com/gregwebs/agent-vm/issues/323), the guard
-half of #302 A2. Persisted `[network]` authority remains pending in #305;
-this change does not accept it. Breaking release: **0.3.0**.
+half of #302 A2. This guard did not accept persisted `[network]` authority.
+Amended by [ADR-0040](0040-persisted-user-network-authority.md): #305 adds its verified user-tier read,
+without changing this guard. Breaking guard release: **0.3.0**.
 
 ## Context
 
 `~/.config/agent-vm/credentials.yaml` authorizes launch secrets today. A guest
 that can write its directory can plant a normal-looking user-owned `0644`
 file for a later launch. Read-time owner, mode and symlink checks cannot
-recognize guest authorship. The same directory will hold network authority
-once #305 lands; the guard must precede that feature.
+recognize guest authorship. ADR-0040 adds network authority in the same
+directory; this guard preceded that feature.
 
 ```text
 launch P1 → writable window → plant authority in host config directory
@@ -128,8 +129,9 @@ file. No contents are read or echoed by this guard.
 While the directory guard holds, an already linked file cannot be laundered
 through a launch by this build. Host-created links mid-session remain trusted.
 `credentials.yaml` link counts are deliberately excluded (#319).
-`authority_file_singly_linked` is the single one-name rule that #305's read-time
-kernel must also call; a read-time-only rule is insufficient.
+`authority_file_singly_linked` is the single one-name rule also called by
+`user_network::network_authority_refusal` (ADR-0040); a read-time-only rule
+is insufficient.
 
 ## Trusted boundary and accepted gaps
 
@@ -176,8 +178,9 @@ launch until other links are removed or the file is replaced with a copy.
 Non-launch verbs, including doctor, are unaffected.
 
 Writable-bind routes to the credentials directory are guarded subject to the
-accepted gaps; credentials file hard links stay open (#319). #305 can add
-persisted network authority on top; `[network]` is still rejected here.
+accepted gaps; credentials file hard links stay open (#319). This guard release
+rejected `[network]`. Amended by [ADR-0040](0040-persisted-user-network-authority.md): verified user-tier
+network authority is accepted on top of the unchanged guard.
 
 ## Alternatives rejected
 

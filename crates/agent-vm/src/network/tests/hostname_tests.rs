@@ -83,7 +83,7 @@ fn hostname_proxy_selection_mirrors_the_host_connector() {
         };
         let mut input = args();
         input.allow_egress = vec!["api.example.com".into()];
-        let result = Plan::from_args_with_proxy_lookup(input, lookup);
+        let result = Plan::from_args_with_proxy_lookup(input, None, lookup);
         if *refused {
             let error = result.err().unwrap().to_string();
             assert_eq!(error, HOSTNAME_PROXY_REFUSAL);
@@ -109,13 +109,13 @@ fn proxy_refusal_applies_only_to_hostname_launches() {
         },
     ] {
         assert!(
-            Plan::from_args_with_proxy_lookup(input, |v| (v == "http_proxy")
+            Plan::from_args_with_proxy_lookup(input, None, |v| (v == "http_proxy")
                 .then(|| "http://p:3128".into()))
             .is_ok()
         );
         input = args();
         input.allow_egress = vec!["udp://h.example".into()];
-        let error = Plan::from_args_with_proxy_lookup(input, |v| {
+        let error = Plan::from_args_with_proxy_lookup(input, None, |v| {
             (v == "http_proxy").then(|| "http://p:3128".into())
         })
         .err()
@@ -134,7 +134,7 @@ fn proxy_refusal_applies_only_to_hostname_launches() {
 fn allowance_grammar_errors_precede_the_proxy_refusal() {
     let mut input = args();
     input.allow_egress = vec!["udp://h.example".into()];
-    let error = Plan::from_args_with_proxy_lookup(input, |v| {
+    let error = Plan::from_args_with_proxy_lookup(input, None, |v| {
         (v == "http_proxy").then(|| "http://p:3128".into())
     })
     .unwrap_err()

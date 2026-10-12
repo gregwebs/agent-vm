@@ -9,7 +9,8 @@ integration and native platform evidence. Story numbers refer to that issue's
 acceptance checklist.
 
 The guard half of A2 is delivered by [ADR-0038](0038-config-dir-exposure-guard.md)
-(#323). Persisted authority remains pending (#305); A1 remains CLI-only.
+(#323). Amended by [ADR-0040](0040-persisted-user-network-authority.md): the user tier accepts verified `[network]`;
+the project/built-in tiers still refuse. A1 describes CLI authority.
 
 Supersedes ADR-0009's implicit Public grant. **Breaking change in 0.2.0**:
 existing tool launches have no egress or DNS query authorization until a grant is
@@ -44,9 +45,9 @@ pin effective non-policy defaults, including empty secrets/intercept arrays.
 Credentials authorize substitution, not connections: their overlay must retain
 the exact base policy, not just its rule count.
 
-Both config tiers refuse `[network]` with file/setting/tier diagnostics. Project
-config can never grant network authority; protected user-tier persistent
-authority is deferred to A2. A1 is CLI-only and makes no persisted-authority claim.
+A1 refused both config tiers. Amended by [ADR-0040](0040-persisted-user-network-authority.md): the user tier accepts
+verified `[network]`; the project/built-in tiers still refuse with
+file/setting/tier diagnostics. Project config can never grant network authority.
 Validation precedes mount preparation, credential capture and state creation;
 the existing runtime version identity probe still occurs first.
 

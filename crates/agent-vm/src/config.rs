@@ -72,6 +72,11 @@
 //! [`guest_paths_overlap`] backs the within-tool, cross-tool and reserved-link
 //! checks, and `guest_home::links` turns the surviving paths into the one
 //! guest-HOME link list both guest-user modes provision from.
+//! # Network authority is user-tier only
+//!
+//! ADR-0040 permits verified user [network] tables; project and built-in tiers cannot grant access.
+
+use crate::user_network::{self, UserNetwork};
 
 use crate::network_requests::{NetworkRequests, RequestTier};
 use std::{
@@ -165,6 +170,7 @@ pub(crate) struct ConfigReport {
     project: TierReport,
     resolved: ResolvedTools,
     images: ConfiguredImages,
+    user_network: Option<UserNetwork>,
     uses_defaults: bool,
     conflicts: Vec<ConfigConflict>,
 }
@@ -191,6 +197,11 @@ impl ConfigReport {
     /// any catalog error) cannot erase a readable image choice.
     pub(crate) fn images(&self) -> &ConfiguredImages {
         &self.images
+    }
+
+    /// Read before into_launch_catalog consumes the report, like images.
+    pub(crate) fn user_network(&self) -> Option<&UserNetwork> {
+        self.user_network.as_ref()
     }
 
     /// True when neither file declared a tool and the compiled-in defaults
@@ -860,6 +871,7 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
             user: user_contents.image,
             project: project_contents.image,
         },
+        user_network: user_contents.network,
         uses_defaults,
         conflicts,
     })
@@ -869,6 +881,7 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
 /// one value so the tool count and the image cannot be read from two different
 /// parses.
 struct TierContents {
+    network: Option<UserNetwork>,
     tools: Vec<Tool>,
     image: Option<ConfiguredImage>,
 }
@@ -878,6 +891,7 @@ impl TierContents {
         Self {
             tools: Vec::new(),
             image: None,
+            network: None,
         }
     }
 }
@@ -918,12 +932,13 @@ fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, TierConten
         Err(error) => return Err(safe_io_error("reading metadata for", path, &error)),
     }
 
-    let bytes = crate::host_paths::read_bounded_regular_file(path, MAX_CONFIG_FILE_BYTES)
-        .map_err(|error| safe_anyhow_error("reading", path, &error))?;
+    let (bytes, final_component) =
+        crate::host_paths::read_bounded_regular_file_noting_symlink(path, MAX_CONFIG_FILE_BYTES)
+            .map_err(|error| safe_anyhow_error("reading", path, &error))?;
     let text = std::str::from_utf8(&bytes).map_err(|_| utf8_error(path))?;
     let raw: RawConfig =
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
-    reject_network_table(raw.network.as_ref(), path, kind)?;
+    let network = network_for_tier(raw.network.as_ref(), path, kind, &final_component)?;
     let image = validate_image(raw.image.as_deref(), path)?;
     let tools = validate_tools(raw.tools, path, kind)?;
 
@@ -934,22 +949,38 @@ fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, TierConten
                 declared_tools: tools.len(),
             },
         },
-        TierContents { tools, image },
+        TierContents {
+            tools,
+            image,
+            network,
+        },
     ))
 }
 
-const NETWORK_SETTINGS: [&str; 4] = [
-    "allow_internet_egress",
-    "allow_lan",
-    "allow_host",
-    "allow_egress",
-];
+fn network_for_tier(
+    table: Option<&toml::Table>,
+    file: &Path,
+    kind: TierKind,
+    read: &crate::host_paths::FinalComponent,
+) -> Result<Option<UserNetwork>> {
+    let Some(table) = table else { return Ok(None) };
+    match kind {
+        TierKind::User => user_network::from_user_tier(file, read, table)
+            .map(Some)
+            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(file))),
+        TierKind::Project => Err(network_refusal(table, file, RefusingTier::Project)),
+        TierKind::BuiltIn => Err(network_refusal(table, file, RefusingTier::BuiltIn)),
+    }
+}
 
-fn reject_network_table(table: Option<&toml::Table>, file: &Path, kind: TierKind) -> Result<()> {
-    let Some(table) = table else {
-        return Ok(());
-    };
-    let settings: Vec<_> = NETWORK_SETTINGS
+#[derive(Clone, Copy)]
+enum RefusingTier {
+    Project,
+    BuiltIn,
+}
+
+fn network_refusal(table: &toml::Table, file: &Path, tier: RefusingTier) -> anyhow::Error {
+    let settings: Vec<_> = user_network::SETTINGS
         .iter()
         .filter(|key| table.contains_key(**key))
         .map(|key| format!("network.{key}"))
@@ -959,15 +990,14 @@ fn reject_network_table(table: Option<&toml::Table>, file: &Path, kind: TierKind
     } else {
         settings.join(", ")
     };
-    let reason = match kind {
-        TierKind::User => "[network] in the user config is not supported yet",
-        TierKind::Project => "network access cannot be granted by the project config",
-        TierKind::BuiltIn => "network access cannot be granted by the built-in config",
+    let reason = match tier {
+        RefusingTier::Project => "network access cannot be granted by the project config",
+        RefusingTier::BuiltIn => "network access cannot be granted by the built-in config",
     };
-    Err(anyhow!(
-        "config: {}: {setting}: {reason}; pass --allow-* launch flags",
+    anyhow!(
+        "config: {}: {setting}: {reason}; use --allow-* launch flags, or [network] in the user config",
         quoted_path(file)
-    ))
+    )
 }
 
 /// Validate one tier's top-level `image` into an [`ImageRef`]. The reason comes
@@ -988,10 +1018,16 @@ fn validate_image(raw: Option<&str>, file: &Path) -> Result<Option<ConfiguredIma
 
 /// Parse the embedded fallback catalog through the same validated path.
 fn default_tools() -> Result<Vec<Tool>> {
+    tools_from_builtin_text(DEFAULT_TOOLS_TOML)
+}
+
+fn tools_from_builtin_text(text: &str) -> Result<Vec<Tool>> {
     let path = Path::new("default-tools.toml");
-    let raw: RawConfig = toml::from_str(DEFAULT_TOOLS_TOML)
-        .map_err(|error| deserialize_error(path, DEFAULT_TOOLS_TOML, &error))?;
-    reject_network_table(raw.network.as_ref(), path, TierKind::BuiltIn)?;
+    let raw: RawConfig =
+        toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
+    if let Some(table) = raw.network.as_ref() {
+        return Err(network_refusal(table, path, RefusingTier::BuiltIn));
+    }
     validate_tools(raw.tools, path, TierKind::BuiltIn)
 }
 
@@ -1271,7 +1307,7 @@ fn launch_closure(tools: &[Tool], index: &HashMap<String, usize>, start: usize) 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    // Recognize the table only to refuse it with a value-safe tier diagnostic.
+    // User tier: verified by user_network; project/built-in: value-safe refusal.
     #[serde(default)]
     network: Option<toml::Table>,
     /// The session's **boot image**, an OCI reference (D4). Optional: an
@@ -1983,34 +2019,46 @@ mod tests {
             "network.allow_lan".into(),
             "network.allow_egress".into(),
             "project config".into(),
+            "; use --allow-* launch flags, or [network] in the user config".into(),
         ] {
             assert!(message.contains(&expected), "{message}");
         }
     }
 
     #[test]
-    fn network_table_is_not_yet_supported_in_the_user_tier() {
+    fn user_network_table_is_parsed_and_reported() {
         let f = Fixture::new();
         f.user("[network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/8\"]");
-        let message = f.load().unwrap_err().to_string();
-        for expected in [
-            quoted_path(&f.user),
-            "network.allow_lan".into(),
-            "network.allow_egress".into(),
-            "user config is not supported yet".into(),
-        ] {
-            assert!(message.contains(&expected), "{message}");
-        }
+        let report = f.load().unwrap();
+        assert_eq!(
+            report.user_network(),
+            Some(&UserNetwork::for_test(
+                &f.user,
+                user_network::SavedGroups {
+                    lan: Some(true),
+                    ..Default::default()
+                },
+                &["10.0.0.0/8"]
+            ))
+        );
+        assert_eq!(report.user_network().unwrap().file(), f.user);
     }
 
     #[test]
     fn network_refusal_never_echoes_values_or_unknown_keys() {
-        let f = Fixture::new();
-        f.user("[network]\nsk_live_abc = \"hunter2\"\nother = \"10.9.8.7\"");
-        let message = f.load().unwrap_err().to_string();
-        assert!(message.contains("[network]"));
-        for secret in ["sk_live_abc", "hunter2", "10.9.8.7", "other"] {
-            assert!(!message.contains(secret));
+        for user in [false, true] {
+            let f = Fixture::new();
+            let text = "[network]\nsk_live_abc = \"hunter2\"\nother = \"10.9.8.7\"";
+            if user {
+                f.user(text);
+            } else {
+                f.project(text);
+            }
+            let message = f.load().unwrap_err().to_string();
+            assert!(message.contains("[network]"));
+            for secret in ["sk_live_abc", "hunter2", "10.9.8.7", "other"] {
+                assert!(!message.contains(secret));
+            }
         }
     }
 
@@ -2028,11 +2076,104 @@ mod tests {
         assert!(default_tools().is_ok());
     }
 
+    #[test]
+    fn builtin_network_table_is_refused_naming_setting_and_tier() {
+        for text in [
+            "[network]\n",
+            "[network]\nallow_lan = true\nallow_egress = [\"sk-live-SENTINEL-305\"]\n",
+        ] {
+            let message = tools_from_builtin_text(text).unwrap_err().to_string();
+            assert!(message.contains("default-tools.toml"));
+            assert!(message.contains("network access cannot be granted by the built-in config"));
+            assert!(!message.contains("sk-live-SENTINEL-305"));
+            if text.contains("allow_lan") {
+                assert!(message.contains("network.allow_lan, network.allow_egress"));
+            } else {
+                assert!(message.contains("[network]"));
+            }
+        }
+        assert_eq!(
+            tools_from_builtin_text(DEFAULT_TOOLS_TOML).unwrap(),
+            default_tools().unwrap()
+        );
+    }
+
+    #[test]
+    fn empty_user_network_table_is_verified_and_grants_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.user("[network]\n");
+        assert_eq!(
+            f.load().unwrap().user_network(),
+            Some(&UserNetwork::for_test(&f.user, Default::default(), &[]))
+        );
+        fs::set_permissions(&f.user, fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("group- or other-writable")
+        );
+    }
+
+    #[test]
+    fn symlinked_user_config_without_network_still_loads() {
+        let f = Fixture::new();
+        let target = f.user.with_file_name("dotfile");
+        write_file(&target, &one_tool("custom"));
+        std::os::unix::fs::symlink(&target, &f.user).unwrap();
+        assert!(f.load().is_ok());
+        write_file(&target, "[network]\n");
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("reached through a symbolic link")
+        );
+    }
+
+    #[test]
+    fn symlinked_user_config_with_network_is_refused() {
+        let f = Fixture::new();
+        let target = f.user.with_file_name("dotfile");
+        write_file(&target, "[network]\nallow_host = true\n");
+        std::os::unix::fs::symlink(&target, &f.user).unwrap();
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("reached through a symbolic link")
+        );
+    }
+
+    #[test]
+    fn user_network_in_a_tools_only_file_does_not_change_the_catalog() {
+        let f = Fixture::new();
+        f.user(&one_tool("custom"));
+        let before_report = f.load().unwrap();
+        let before: Vec<_> = before_report
+            .resolved()
+            .0
+            .iter()
+            .map(tool_summary)
+            .collect();
+        f.user(&format!(
+            "{}\n[network]\nallow_lan = true\n",
+            one_tool("custom")
+        ));
+        let after_report = f.load().unwrap();
+        let after: Vec<_> = after_report.resolved().0.iter().map(tool_summary).collect();
+        assert_eq!(after, before);
+    }
+
     // -- fixture helpers ---------------------------------------------------
 
     fn write_file(path: &Path, contents: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     fn write_bytes(path: &Path, contents: &[u8]) {

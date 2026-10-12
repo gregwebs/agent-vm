@@ -59,6 +59,7 @@ pub(crate) struct HostFileFacts {
     /// redundant on the platform where it is already the wider type.
     pub(crate) mode: RawMode,
     pub(crate) size: u64,
+    pub(crate) nlink: u64,
 }
 
 /// [`read_bounded_regular_file`] with `O_NOFOLLOW`, returning the descriptor's
@@ -67,28 +68,51 @@ pub(crate) struct HostFileFacts {
 /// The credential *authorization* file (`credentials.yaml`, #161) is the caller:
 /// a symlink at its final component would let whatever is on the other end
 /// decide which origins receive a real value, so `O_NOFOLLOW` refuses it
-/// outright (`ELOOP`) instead of stat-then-open, which races. The type, size and
-/// `after_fstat` checks are shared with the existing reader; only the flag and
-/// the returned facts are new, so the two paths cannot drift.
+/// outright (`ELOOP`) instead of stat-then-open, which races.
+///
+/// This reader and the following reader (`read_regular_fd_checkpointed`) are
+/// deliberately separate implementations: their type/size/read checks are
+/// duplicate bodies, and they already differ on a negative `st_size` (this one
+/// clamps to 0, the other rejects it) and on the test hook — only
+/// `read_regular_fd_checkpointed` carries the `after_fstat` seam. Only the
+/// differential test
+/// `noting_symlink_matches_the_following_reader_on_every_shape` holds them
+/// together, so a change to one must be reflected in the other by hand.
 pub(crate) fn read_bounded_regular_file_no_follow(
     path: &Path,
     max: u64,
 ) -> Result<(Vec<u8>, HostFileFacts)> {
-    let fd = rfs::open(
+    match open_no_follow(path)? {
+        NoFollowOpen::File(fd) => read_regular_no_follow_fd(fd, path, max),
+        NoFollowOpen::Symlink => Err(anyhow!(
+            "{} is a symbolic link; refusing to follow it",
+            path.display()
+        )),
+    }
+}
+
+enum NoFollowOpen {
+    File(OwnedFd),
+    Symlink,
+}
+
+fn open_no_follow(path: &Path) -> Result<NoFollowOpen> {
+    match rfs::open(
         path,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(|error| {
-        if error == Errno::LOOP {
-            anyhow!(
-                "{} is a symbolic link; refusing to follow it",
-                path.display()
-            )
-        } else {
-            anyhow!(error).context(format!("opening {}", path.display()))
-        }
-    })?;
+    ) {
+        Ok(fd) => Ok(NoFollowOpen::File(fd)),
+        Err(Errno::LOOP) => Ok(NoFollowOpen::Symlink),
+        Err(error) => Err(anyhow!(error).context(format!("opening {}", path.display()))),
+    }
+}
+
+fn read_regular_no_follow_fd(
+    fd: OwnedFd,
+    path: &Path,
+    max: u64,
+) -> Result<(Vec<u8>, HostFileFacts)> {
     let stat = rfs::fstat(&fd)
         .map_err(|error| anyhow!(error))
         .with_context(|| format!("stating {}", path.display()))?;
@@ -96,6 +120,9 @@ pub(crate) fn read_bounded_regular_file_no_follow(
         uid: stat.st_uid,
         mode: stat.st_mode,
         size: stat.st_size.max(0) as u64,
+        // nlink_t is u16 on macOS, u32 on Linux aarch64, u64 on Linux x86_64.
+        #[allow(clippy::useless_conversion)]
+        nlink: u64::from(stat.st_nlink),
     };
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
         return Err(anyhow!("{} is not a regular file", path.display()));
@@ -112,6 +139,44 @@ pub(crate) fn read_bounded_regular_file_no_follow(
         return Err(anyhow!("{} exceeds its size limit", path.display()));
     }
     Ok((data, facts))
+}
+
+/// No descriptor facts vouch for bytes reached through a final symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalComponent {
+    Regular(HostFileFacts),
+    Symlink,
+}
+
+pub(crate) fn read_bounded_regular_file_noting_symlink(
+    path: &Path,
+    max: u64,
+) -> Result<(Vec<u8>, FinalComponent)> {
+    read_bounded_regular_file_noting_symlink_checkpointed(path, max, || {})
+}
+
+// The checkpoint tests replacement without introducing a second production read path.
+fn read_bounded_regular_file_noting_symlink_checkpointed(
+    path: &Path,
+    max: u64,
+    after_open: impl FnOnce(),
+) -> Result<(Vec<u8>, FinalComponent)> {
+    match open_no_follow(path)? {
+        NoFollowOpen::File(fd) => {
+            after_open();
+            read_regular_no_follow_fd(fd, path, max)
+                .map(|(bytes, facts)| (bytes, FinalComponent::Regular(facts)))
+        }
+        NoFollowOpen::Symlink => {
+            read_bounded_regular_file(path, max).map(|bytes| (bytes, FinalComponent::Symlink))
+        }
+    }
+}
+
+/// euid is the identity the kernel checked when it opened the file.
+pub(crate) fn current_euid() -> u32 {
+    // SAFETY: geteuid is an argument-free libc call with no preconditions.
+    unsafe { libc::geteuid() }
 }
 
 /// Writes trusted-host files atomically. The initial parent open intentionally
@@ -812,6 +877,98 @@ fn random_temp_name() -> Result<OsString> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn noting_symlink_reports_regular_facts_including_nlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        fs::write(&path, b"original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        for links in [1, 2] {
+            if links == 2 {
+                fs::hard_link(&path, root.path().join("alias")).unwrap();
+            }
+            let (bytes, component) = read_bounded_regular_file_noting_symlink(&path, 100).unwrap();
+            let FinalComponent::Regular(facts) = component else {
+                panic!("regular file")
+            };
+            assert_eq!(bytes, b"original");
+            assert_eq!(facts.nlink, links);
+            assert_eq!(facts.uid, current_euid());
+            assert_eq!(facts.mode & 0o777, 0o644);
+        }
+    }
+
+    #[test]
+    fn noting_symlink_follows_a_final_symlink_and_tags_it() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let path = root.path().join("config.toml");
+        fs::write(&target, b"dotfile").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(
+            read_bounded_regular_file_noting_symlink(&path, 100).unwrap(),
+            (b"dotfile".to_vec(), FinalComponent::Symlink)
+        );
+    }
+
+    #[test]
+    fn noting_symlink_matches_the_following_reader_on_every_shape() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("regular"), b"original").unwrap();
+        fs::write(root.path().join("large"), vec![0; 101]).unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        std::os::unix::fs::symlink("regular", root.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("absent", root.path().join("dangling")).unwrap();
+        let fifo = root.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a live, NUL-terminated path; mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        for shape in ["regular", "link", "dangling", "fifo", "dir", "large"] {
+            let path = root.path().join(shape);
+            let old = read_bounded_regular_file(&path, 100);
+            let new = read_bounded_regular_file_noting_symlink(&path, 100);
+            match (old, new) {
+                (Ok(old), Ok((new, _))) => assert_eq!(old, new, "{shape}"),
+                (Err(_), Err(_)) => {}
+                results => panic!("readers disagree for {shape}: {results:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn noting_symlink_takes_bytes_and_facts_from_the_opened_descriptor() {
+        use std::os::unix::fs::PermissionsExt;
+        for symlink_replacement in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("config.toml");
+            fs::write(&path, b"original").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let (bytes, component) =
+                read_bounded_regular_file_noting_symlink_checkpointed(&path, 100, || {
+                    fs::rename(&path, root.path().join("moved")).unwrap();
+                    let replacement = if symlink_replacement {
+                        let target = root.path().join("canary");
+                        std::os::unix::fs::symlink(&target, &path).unwrap();
+                        target
+                    } else {
+                        path.clone()
+                    };
+                    fs::write(&replacement, b"replacement!").unwrap();
+                    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o666)).unwrap();
+                    fs::hard_link(&replacement, root.path().join("alias")).unwrap();
+                })
+                .unwrap();
+            let FinalComponent::Regular(facts) = component else {
+                panic!("original descriptor")
+            };
+            assert_eq!(bytes, b"original");
+            assert_eq!(facts.nlink, 1);
+            assert_eq!(facts.mode & 0o777, 0o600);
+            assert_eq!(facts.size, 8);
+        }
+    }
 
     const SHORT: Duration = Duration::from_millis(200);
     const SHORT_UPPER: Duration = Duration::from_secs(2);
