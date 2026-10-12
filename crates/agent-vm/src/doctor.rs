@@ -859,9 +859,15 @@ fn describe_tool(tool: &Tool, provisioned: ProviderSet) -> String {
     } else {
         format!("; env={env_count}")
     };
+    let requests = tool.network_requests();
+    let requests = if requests.is_empty() {
+        String::new()
+    } else {
+        format!("; network_requests={}", requests.bounded_display())
+    };
     format!(
         "{} -> \"{}\"; args={}; credentials={credentials}; \
-         provisions={provisions}; persist={}; source={source}{interactive_shell}{env}",
+         provisions={provisions}; persist={}; source={source}{interactive_shell}{env}{requests}",
         crate::config::escape_str(tool.name()),
         crate::config::escape_str(tool.command()),
         tool.arg_count(),
@@ -1747,5 +1753,45 @@ credentials:
             text.contains("absent - not requested by any configured launch"),
             "{text}"
         );
+    }
+    #[test]
+    fn network_requests_doctor_bounded_metadata_and_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        let base = "[[tools]]\nname = \"t\"\ncommand = \"t\"\n";
+        std::fs::write(
+            &user,
+            format!("{base}network_requests = [\"b.example:8443\",\"a.example\"]\n"),
+        )
+        .unwrap();
+        let report = config_report(Some(&user), &project);
+        assert!(
+            describe_tool(&report.resolved().as_slice()[0], ProviderSet::new([]))
+                .ends_with("; network_requests=a.example,tcp://b.example:8443")
+        );
+        let names: Vec<_> = (0..9).map(|i| format!("\"n{i}.example\"")).collect();
+        std::fs::write(
+            &user,
+            format!("{base}network_requests = [{}]\n", names.join(",")),
+        )
+        .unwrap();
+        let report = config_report(Some(&user), &project);
+        assert!(describe_tool(&report.resolved().as_slice()[0], ProviderSet::new([])).ends_with("; network_requests=n0.example,n1.example,n2.example,n3.example,n4.example,n5.example,n6.example,n7.example,+1 more"));
+        std::fs::write(&project, base).unwrap();
+        assert!(
+            describe_config(config_report(Some(&user), &project))
+                .0
+                .contains("differing fields: network_requests")
+        );
+        std::fs::write(
+            &user,
+            format!("{base}network_requests = [\"sk-test-sensitivevalue\"]\n"),
+        )
+        .unwrap();
+        let report = config_report(Some(&user), &project);
+        let row = describe_tool(&report.resolved().as_slice()[0], ProviderSet::new([]));
+        assert!(row.ends_with("; network_requests=sk-test-sensitivevalue"));
+        assert_eq!(row.matches("sk-test-sensitivevalue").count(), 1);
     }
 }

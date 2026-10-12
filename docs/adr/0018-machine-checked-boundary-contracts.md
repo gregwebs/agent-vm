@@ -34,6 +34,7 @@ A pure predicate that cannot be verified usually cannot be verified because it d
 
 | decision (proved kernel) | I/O or untranslatable shell (trusted adapter) |
 |---|---|
+| `network_requests::request_count_within_limit` | `NetworkRequests::parse` — hostname/address classification, default port and error mapping |
 | `egress_policy::split_scheme` / `split_target` | `Allowance::parse` — `IpAddr` / `IpNetwork::from_str` measure `target_is_address` (passed as `whole_address`) and parse the exact address slice |
 | `http::contains_escaped_path_escape_bytes(&[u8])` | `http::contains_escaped_path_escape(&str)` — `str::as_bytes` |
 | `msb_install::socket_path_fits(usize)` | `check_socket_path_len` — `Path` → `as_os_str().len()`, `anyhow::bail!` |
@@ -64,6 +65,8 @@ One `verus!` block per owning module, in place, no new crate and no moved code. 
 
 | Site (module) | Contract that is machine-checked |
 |---|---|
+| `network_requests.rs` — `request_count_within_limit` | Exactly count ≤ 64; proves the comparison, not that 64 is appropriate. |
+| `network_requests.rs` — `report_budget_allows` | Exactly shown < 8; shared by launch and doctor rendering. Proves the comparison, not the caller's count. |
 | `egress_policy.rs` — `split_scheme` | Exhaustive scheme/result/offset correspondence: Any only without `://`, TCP/UDP at offset 6, unsupported schemes rejected. |
 | `egress_policy.rs` — `split_target` | Exact address range and port value, complete delimiter/suffix grammar and error precedence; no substring or silent filter loss. |
 | `egress_policy.rs` — `port_from_decimal_bytes` | Accepted iff canonical decimal 1–65535, with exact decimal value; no leading zero. |
@@ -114,6 +117,7 @@ One `verus!` block per owning module, in place, no new crate and no moved code. 
 
 Stated so that nobody reads more into the surface than is there. Verified code calls into, and trusts, the following; **none of it is proved**:
 
+- `NetworkRequests::parse` trusts `Allowance::parse`'s address-vs-name verdict, the 443 default and error mapping. `EgressAuthority::covers_tls` is an unproved query checked by coverage table and policy-rule differential tests; `RequestReport` composition and rendering are checked by report tests. [ADR-0039](0039-non-authoritative-tool-network-requests.md) records the non-authority data-flow invariant.
 - `egress_policy::Allowance::parse`: std/`ipnetwork` address parsing and canonicalization, the fall-through to `HostnameAllowance::from_target` when an address parse fails, and message classification; `EgressAuthority::policy`: `Rule` construction and ordering (numeric/group before `Domain`, no deny rules). Scheme/target splitting and decimal ports are proved, not trusted. `egress_hostname::HostnameAllowance::from_target` is the trusted adapter around the proved `egress_hostname_bytes` / `hostname_scope`: it trusts ASCII-only and one-trailing-dot canonicalization, the exact `host.microsandbox.internal` alias comparison, and `DomainName::from_str`'s acceptance of the canonical name (mapped to the fixed `MalformedAddress` message and never unwrapped). `InterceptedPorts::for_hostnames` and `domain_rules` are the trusted assembly that unions ports and emits one `[Tcp]` `Domain` rule per distinct name; the kernels fix acceptance and scope, not the assembly. `observe_host_proxy` is a hand mirror of the vendored `HostHttpProxyConnector::from_values` selection rule (cross-variable fallback, `http`/scheme-less usable, `NO_PROXY=*` exempt), which agent-vm cannot call; drift is a #308 capability-admission concern, and the C8 refusal is documented in [ADR-0037](0037-hostname-egress-allowances.md). The vendored private-answer eligibility predicate (`NetworkPolicy::evaluate_explicit_egress_ip`) is `pub(crate)` with no public equivalent seam: the independent unit oracle compares our serialized rule shape against its documented input contract (empty `ports`, protocol coverage, `Cidr`/`Group` destination) rather than calling it, and the forwarder caller, its vendored `rebind_filter_*` tests and the intended native RB2 rows (currently NOT RUN on the macOS reference host — see [ADR-0037](0037-hostname-egress-allowances.md)) are the independent implementation evidence.
 - `str::as_bytes` (total and infallible; the escape property is a property of bytes either way);
 - `OsStr::as_bytes` (`OsStrExt`) in `cli::is_secret_route` and `config::guest_paths_overlap`; the route decision is proved, the `OsString` → bytes measurement is not. In `config` it also trusts the *invariant* that a normalized `PersistPath`'s `Path` rendering is its components joined by single `/` (established by `normalize_persist`, not proved), and that a compiled `HomeLink::home_relative` is likewise `/`-joined. The launch-time mount check (`guest_home::mount_conflicts`) extends the same precondition to the guest mount paths it feeds the predicate: each is normalized by `resolve_project_guest_path` / `mount::normalize_guest` before it arrives;

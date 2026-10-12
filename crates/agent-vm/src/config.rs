@@ -3,7 +3,8 @@
 //!
 //! A **tool declaration** (`[[tools]]` in a config file) is *data*: a guest
 //! command, its default argv, the credential providers it needs, extra
-//! guest-HOME-relative paths to persist, and guest env pairs. This module
+//! guest-HOME-relative paths to persist, guest env pairs, and network requests.
+//! Requests never grant network access. This module
 //! never executes a command, creates guest state, builds an image, or captures
 //! a credential. A top-level `image` key selects the **boot image**
 //! independently of the tools (see [`crate::boot_image`]).
@@ -72,6 +73,7 @@
 //! checks, and `guest_home::links` turns the surviving paths into the one
 //! guest-HOME link list both guest-user modes provision from.
 
+use crate::network_requests::{NetworkRequests, RequestTier};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
@@ -441,6 +443,16 @@ pub(crate) enum ToolOrigin {
     Project(PathBuf),
 }
 
+impl From<&ToolOrigin> for RequestTier {
+    fn from(origin: &ToolOrigin) -> Self {
+        match origin {
+            ToolOrigin::BuiltIn => Self::BuiltIn,
+            ToolOrigin::User(_) => Self::User,
+            ToolOrigin::Project(_) => Self::Project,
+        }
+    }
+}
+
 /// One validated tool definition. All fields are private; readers use the
 /// accessors below.
 #[derive(Debug, PartialEq, Eq)]
@@ -470,6 +482,8 @@ pub(crate) struct Tool {
     /// secrets, so the field is private and `doctor` only ever sees
     /// [`Self::env_count`] — the same rule as `argv`.
     env: BTreeMap<String, String>,
+    /// Declaration only: never authority and not folded over provisioning.
+    network_requests: NetworkRequests,
     origin: ToolOrigin,
     /// The tool's position in its declaring file's `[[tools]]` list. Provenance
     /// like `origin`, not a config field: excluded from definition equality and
@@ -568,6 +582,10 @@ impl Tool {
         self.env.len()
     }
 
+    pub(crate) fn network_requests(&self) -> &NetworkRequests {
+        &self.network_requests
+    }
+
     pub(crate) fn origin(&self) -> &ToolOrigin {
         &self.origin
     }
@@ -584,6 +602,7 @@ impl Tool {
             && self.persist == other.persist
             && self.interactive_shell == other.interactive_shell
             && self.env == other.env
+            && self.network_requests == other.network_requests
     }
 
     /// The differing fields, in the fixed schema order the warning renders.
@@ -612,6 +631,9 @@ impl Tool {
         // Appended last for the same reason as `interactive_shell` above.
         if self.env != other.env {
             fields.push(ToolField::Env);
+        }
+        if self.network_requests != other.network_requests {
+            fields.push(ToolField::NetworkRequests);
         }
         fields
     }
@@ -753,6 +775,7 @@ pub(crate) enum ToolField {
     // and the multi-field ordering test depend on this sequence.
     InteractiveShell,
     Env,
+    NetworkRequests,
 }
 
 impl ToolField {
@@ -765,6 +788,7 @@ impl ToolField {
             ToolField::Persist => "persist",
             ToolField::InteractiveShell => "interactive_shell",
             ToolField::Env => "env",
+            ToolField::NetworkRequests => "network_requests",
         }
     }
 }
@@ -1279,6 +1303,8 @@ struct RawTool {
     interactive_shell: bool,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    network_requests: Vec<String>,
 }
 
 /// Validate the raw `[[tools]]` entries into a catalog, rejecting duplicate
@@ -1309,6 +1335,8 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
         let tools_field = validate_tool_refs(tool.tools, file, index, &name)?;
         let persist = validate_persist(tool.persist, file, index, &name)?;
         let env = validate_env(tool.env, file, index, &name)?;
+        let network_requests = NetworkRequests::parse(&tool.network_requests)
+            .map_err(|error| tool_error(file, index, &name, error))?;
 
         tools.push(Tool {
             name,
@@ -1320,6 +1348,7 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
             persist,
             interactive_shell: tool.interactive_shell,
             env,
+            network_requests,
             origin: kind.origin(file),
             declaration_index: index,
         });
@@ -1843,7 +1872,7 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
     };
     anyhow!(
         "config: {}{location}: invalid TOML or tool schema; check syntax and field types. \
-         Required: a string `name` and `command`; `args`, `credentials`, `tools`, and `persist` are \
+         Required: a string `name` and `command`; `args`, `credentials`, `tools`, `persist` and `network_requests` are \
          arrays of strings; `env` is a table of string values; the top-level `image` and each \
          tool's `command` are strings.",
         quoted_path(file)
@@ -2821,7 +2850,7 @@ mod tests {
         omitted.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\n");
         let explicit = Fixture::new();
         explicit.user(
-            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = []\ncredentials = []\npersist = []\n",
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nargs = []\ncredentials = []\npersist = []\nnetwork_requests = []\n",
         );
         let a = omitted.load().unwrap();
         let b = explicit.load().unwrap();
@@ -3361,7 +3390,7 @@ mod tests {
 
     #[test]
     fn each_differing_field_is_reported_individually_in_fixed_order() {
-        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\ncredentials = [\"openai\"]\ntools = [\"base\"]\npersist = [\"p\"]\ninteractive_shell = false\nenv = { A = \"1\" }\n";
+        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\ncredentials = [\"openai\"]\ntools = [\"base\"]\npersist = [\"p\"]\ninteractive_shell = false\nenv = { A = \"1\" }\nnetwork_requests = [\"a.example\"]\n";
         let cases = [
             ("command = \"other\"", ToolField::Command),
             ("args = [\"b\"]", ToolField::Args),
@@ -3370,6 +3399,10 @@ mod tests {
             ("persist = [\"q\"]", ToolField::Persist),
             ("interactive_shell = true", ToolField::InteractiveShell),
             ("env = { A = \"2\" }", ToolField::Env),
+            (
+                "network_requests = [\"b.example\"]",
+                ToolField::NetworkRequests,
+            ),
         ];
         for (mutated, expected) in cases {
             let project_body = base.replace(
@@ -3381,6 +3414,7 @@ mod tests {
                     ToolField::Persist => "persist = [\"p\"]",
                     ToolField::InteractiveShell => "interactive_shell = false",
                     ToolField::Env => "env = { A = \"1\" }",
+                    ToolField::NetworkRequests => "network_requests = [\"a.example\"]",
                 },
                 mutated,
             );
@@ -3398,20 +3432,26 @@ mod tests {
             );
         }
 
-        // With several fields differing at once, `env` is reported *last*, after
-        // `interactive_shell` (D7). This is the multi-field half of V3; the
-        // per-field cases above are the other half.
+        // New fields stay last so existing warning ordering does not change.
         let project_body = base
             .replace("interactive_shell = false", "interactive_shell = true")
-            .replace("env = { A = \"1\" }", "env = { A = \"2\" }");
+            .replace("env = { A = \"1\" }", "env = { A = \"2\" }")
+            .replace(
+                "network_requests = [\"a.example\"]",
+                "network_requests = [\"b.example\"]",
+            );
         let fixture = Fixture::new();
         fixture.user(base).project(&project_body);
         let report = fixture.load().unwrap();
         assert_eq!(report.conflicts().len(), 1);
         assert_eq!(
             report.conflicts()[0].fields(),
-            &[ToolField::InteractiveShell, ToolField::Env],
-            "env must be reported last"
+            &[
+                ToolField::InteractiveShell,
+                ToolField::Env,
+                ToolField::NetworkRequests
+            ],
+            "network_requests must be reported last"
         );
         assert_eq!(ToolField::Env.as_str(), "env");
     }
@@ -4124,5 +4164,125 @@ mod tests {
                 !RESERVED_TOOL_NAMES.contains(&name.as_str()) && seen.insert(name.clone())
             })
             .collect()
+    }
+    #[test]
+    fn network_requests_tiers_validation_and_provenance() {
+        for user in [true, false] {
+            let f = Fixture::new();
+            let body = "[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = [\"B.example.\", \"a.example:443\"]\n";
+            if user {
+                f.user(body);
+            } else {
+                f.project(body);
+            }
+            assert_eq!(
+                f.load().unwrap().resolved().as_slice()[0]
+                    .network_requests()
+                    .bounded_display(),
+                "a.example,b.example"
+            );
+            let body = "[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = [\"a.example\", \"SENTINEL-9c1f.example:0\"]\n";
+            if user {
+                f.user(body);
+            } else {
+                f.project(body);
+            }
+            let path = if user { &f.user } else { &f.project };
+            assert_eq!(
+                f.load().unwrap_err().to_string(),
+                format!(
+                    "config: {} declaration [0] tool \"t\": network_requests[1]: port must be a decimal number 1-65535",
+                    quoted_path(path)
+                )
+            );
+            let body =
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = \"a.example\"\n";
+            if user {
+                f.user(body);
+            } else {
+                f.project(body);
+            }
+            assert!(
+                f.load()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("`network_requests`")
+            );
+        }
+        let f = Fixture::new();
+        f.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = [\"a.example\",\"b.example\"]\n")
+            .project("[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = [\"B.example.\",\"a.example\",\"a.example:443\"]\n");
+        assert!(f.load().unwrap().conflicts().is_empty());
+        f.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\n");
+        let report = f.load().unwrap();
+        assert_eq!(
+            report.conflicts()[0].fields(),
+            &[ToolField::NetworkRequests]
+        );
+        assert!(
+            report.resolved().as_slice()[0]
+                .network_requests()
+                .is_empty()
+        );
+        assert_eq!(
+            report.resolved().as_slice()[0].origin(),
+            &ToolOrigin::User(f.user.clone())
+        );
+        f.project(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nnetwork_requests = [\"udp://a.example\"]\n",
+        );
+        assert!(f.load().is_err());
+        assert_eq!(ToolField::NetworkRequests.as_str(), "network_requests");
+    }
+    #[test]
+    fn network_requests_provisioning_noninterference() {
+        for tier in 0..3 {
+            let f = Fixture::new();
+            let body = "[[tools]]\nname = \"a\"\ncommand = \"a\"\ncredentials = [\"anthropic\"]\npersist = [\"x\"]\n[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n";
+            if tier != 1 {
+                f.user(body);
+            }
+            let project_body = if tier == 2 {
+                body.replace("anthropic", "openai")
+                    .replace("command = \"bash\"", "command = \"bash\"\ntools = []")
+            } else {
+                body.to_owned()
+            };
+            if tier != 0 {
+                f.project(&project_body);
+            }
+            let before = f.load().unwrap().into_launch_catalog().unwrap();
+            let with = body
+                .replace(
+                    "command = \"a\"",
+                    "command = \"a\"\nnetwork_requests = [\"api.example.com\"]",
+                )
+                .replace(
+                    "command = \"bash\"",
+                    "command = \"bash\"\nnetwork_requests = [\"other.example\"]",
+                );
+            if tier != 1 {
+                f.user(&with);
+            }
+            if tier != 0 {
+                let project_with = project_body
+                    .replace(
+                        "command = \"a\"",
+                        "command = \"a\"\nnetwork_requests = [\"api.example.com\"]",
+                    )
+                    .replace(
+                        "command = \"bash\"",
+                        "command = \"bash\"\nnetwork_requests = [\"other.example\"]",
+                    );
+                f.project(&project_with);
+            }
+            let after = f.load().unwrap().into_launch_catalog().unwrap();
+            assert_eq!(before.entries.len(), after.entries.len());
+            for (a, b) in before.entries.iter().zip(&after.entries) {
+                assert_eq!(a.provisioned(), b.provisioned());
+                assert_eq!(a.requested_names(), b.requested_names());
+                assert_eq!(a.persist(), b.persist());
+            }
+        }
     }
 }

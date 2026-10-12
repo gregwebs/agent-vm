@@ -409,8 +409,8 @@ files stay ephemeral while declared/config links target persistent state. TLS:
 agentd adds the session CA to the system bundle
 (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt` or
 `/etc/ssl/cert.pem`) and sets `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/
-`CURL_CA_BUNDLE`/`NODE_EXTRA_CA_CERTS`; software with its own trust store
-(Chromium/NSS, Java keystores, …) needs its own integration.
+`CURL_CA_BUNDLE`/`NODE_EXTRA_CA_CERTS`. Client-side constraints are in
+[TLS client requirements](#tls-client-requirements).
 
 **Optional integrations** (inert when absent, ordinary image content — not
 lineage/ABI/migration promises): executable `seed.d` hooks, the supplied
@@ -760,6 +760,7 @@ tools = ["claude"]                   # optional; tools to provision (same file, 
 persist = [".cache/mytool"]          # optional; guest-HOME-relative, kept under <state>/persist/
 env = { VAR = "value" }              # optional; guest env pairs for this tool
 interactive_shell = false            # optional; join trailing args into `-c`
+network_requests = ["api.example.com"] # optional; destinations the tool expects (never grants access)
 ```
 
 - `image` — optional top-level; an OCI image reference selecting the **boot
@@ -844,6 +845,14 @@ interactive_shell = false            # optional; join trailing args into `-c`
   command line instead of being appended as separate argv entries. The shipped
   `shell` tool sets it.
 
+- `network_requests` — optional array in either tier, using the
+  [hostname allowance grammar](#hostname-allowance-grammar). Bare names mean
+  port 443; IP/CIDR entries are refused. At most 64 declared entries per tool;
+  names are canonicalized, deduplicated and sorted. This is a declaration only:
+  it never authorizes a lookup or connection, never provisions a credential or
+  tool, and is not inherited through `tools`. Launches and `doctor` print these
+  values (`doctor` lists up to 8): public metadata must not contain secrets.
+
 Unknown keys, wrong types, malformed TOML, unknown
 provider names, duplicate tool names within one file, and **overlapping**
 `persist` entries (equal or one an ancestor of the other — within one tool,
@@ -854,7 +863,8 @@ catalog tool provides, and a tool named `*`. They are also hard errors for
 invalid `env` entries: a key that is empty, or contains
 `=`/NUL/whitespace/control characters, or starts with `MSB_`, or is
 `HOME`/`USER`/`LOGNAME`, and an `env` **value** containing NUL. There is no
-silent fallback to the defaults.
+silent fallback to the defaults. Invalid `network_requests` entries and more
+than 64 declared entries are also hard errors.
 
 ### Merge order and defaults
 
@@ -862,6 +872,8 @@ The user file is authoritative for any tool name it contains; the project
 file may add whole tool definitions the user did not write. This is a union
 of whole definitions, **not** a field-by-field overlay: a repo cannot fill in
 an omitted `persist`, `credentials`, or `tools` on a user-defined tool.
+A project cannot add requests to a user-declared tool: a differing list is a
+`network_requests` conflict, and the user definition wins.
 Resolved order is user declarations first, then project-only declarations (the
 order `--help` and `doctor` both use). The top-level `image` is **not** merged:
 the user tier's `image` wins over the project tier's, and a file that declares
@@ -1631,12 +1643,75 @@ directly or through the proxy. Loopback/link-local dial targets always go direct
 A hostname launch refuses a selected host HTTP proxy (see *Hostname allowance
 grammar*); `NO_PROXY=*` is the only exemption.
 
-**TLS interception is per-port and global.** A hostname launch turns on TLS
-interception for its intercepted ports, so on those ports — for **every**
-destination, including numerically allowed ones — the guest must send a TLS
-ClientHello carrying SNI (no-SNI and non-TLS traffic is dropped), UDP/QUIC is
-dropped, and the guest must trust the sandbox CA. Private TLS bundles (Python
-`certifi`, pinned certs, JVM trust stores) fail under interception.
+### Tool network requests
+
+Only the launched tool's own `network_requests` are reported. Unmet requests
+are informational; the launch always continues and no authority is added.
+“Covered” means lookup-free syntactic coverage by public or same-name grants,
+not a connectivity promise.
+
+| Launch grant | Request coverage |
+|---|---|
+| `--allow-internet-egress` | Any name and port |
+| Same-name hostname allowance | Its effective ports, including bare-name cross-host widening |
+| IP/CIDR, `--allow-lan`, `--allow-host` | Not matched to names; may be a false “unmet” |
+
+Covered names still depend on resolution/NXDOMAIN and private-answer eligibility
+([DNS and launch behavior](#dns-and-launch-behavior)), and
+[TLS client requirements](#tls-client-requirements).
+
+No requests means no report. With all covered, the single line is:
+
+```text
+==> Tool network requests (user config): all 2 covered by this launch's public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply); requests never grant access
+```
+
+With unmet requests (tier labels are `built-in defaults`, `user config` or
+`project config`):
+
+```text
+==> Tool network requests (project config): 2 of 2 not covered by this launch's public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply); requests never grant access and the launch continues
+==>   unmet: api.example.com
+==>   unmet: tcp://git.corp.example:8443
+==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names
+```
+
+At most 8 sorted unmet entries are printed; further entries produce
+`==>   … and N more not shown`. The report is at most 11 lines. Covered
+requests are never listed beside approval wording, and the grant hint never
+contains a project-supplied value.
+
+### TLS client requirements
+
+TLS interception is per-port and global. Port 443 is intercepted whenever a
+launch has credentials, any hostname allowance (including a bare name on a
+zero-credential launch), or published ports; each `tcp://HOST:PORT` hostname
+allowance adds its `PORT` to the intercepted set for the whole launch. Tool
+`network_requests` themselves never enable TLS. On every intercepted port, for
+every destination, clients must send a TLS ClientHello with SNI; no-SNI and
+non-TLS traffic is dropped. UDP/QUIC is dropped, so HTTP/3 clients must fall
+back to TCP.
+
+Clients must trust the sandbox CA installed by the
+[boot image contract](#boot-image-contract). Clients with their own store or
+pins (Java keystores, Chromium/NSS, Python `certifi` used directly, pinned
+certificates) need separate CA integration or compatible pinning; without it,
+they fail under interception.
+
+When relying on a hostname allowance, the ClientHello SNI must equal the allowed name,
+and the dialed address must be bound to that name in the runtime DNS cache.
+Resolve through the guest's configured resolver: a client using its own DoH,
+hard-coded addresses or `/etc/hosts` cannot establish that binding itself.
+An unbound address is refused unless another grant covers the flow.
+This cache-binding requirement does not apply to Public-group or numeric flows.
+
+**DNS-cache bindings expire.** When relying on a hostname allowance, a client
+that keeps using a previously resolved IP past the runtime's minimum
+resolved-hostname TTL gets a reset unless the binding is refreshed. CNAME
+chains bind under the queried name, so a stub resolver that re-queries the CNAME
+target separately gets NXDOMAIN.
+
+A covered network request is still subject to these client requirements.
 
 **Plain-text protocols can be interrupted once any hostname rule exists.** With
 at least one hostname rule, a numeric/group-authorized flow on a non-intercepted
@@ -1648,11 +1723,6 @@ inline, IRC) can be blocked. Printable bytes that look like an HTTP request
 prefix are buffered, then blocked. Conclusively binary first flights pass
 unchanged, and a server-first banner relays before the handler waits for client
 bytes. This narrows what numeric grants carry; it never widens a hostname rule.
-
-**DNS-cache bindings expire.** A client that keeps using a previously resolved
-IP longer than the runtime's minimum resolved-hostname TTL gets a reset. CNAME
-chains bind under the queried name, so a stub resolver that re-queries the CNAME
-target separately gets NXDOMAIN.
 
 Project `[network]` can never grant authority; user `[network]` is not supported
 yet. Both are refused with a file/setting/tier diagnostic. Persistent network

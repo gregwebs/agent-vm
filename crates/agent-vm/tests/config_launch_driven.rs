@@ -6298,3 +6298,383 @@ fn hostname_allowance_survives_the_credential_overlay() {
         ]})
     );
 }
+
+// #307 — tool network requests
+const REQUEST_SCOPE: &str =
+    "public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply)";
+const REQUEST_HINT: &str = "==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names";
+const FETCHER: &str = "[[tools]]\nname = \"fetcher\"\ncommand = \"/bin/echo\"\ntools = []\n";
+const FETCH_REQUESTS: &str =
+    "network_requests = [\"api.example.com\",\"tcp://git.corp.example:8443\"]\n";
+fn request_block(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .skip_while(|l| !l.starts_with("==> Tool network requests"))
+        .take_while(|l| l.starts_with("==> Tool network requests") || l.starts_with("==>   "))
+        .collect()
+}
+#[test]
+fn requests_unmet_launch_continues_and_proxy_order() {
+    for proxy in [false, true] {
+        let h = Harness::new();
+        h.write_project(&format!("{FETCHER}{FETCH_REQUESTS}"));
+        let out = h.launch_with_env(
+            "fetcher",
+            &[],
+            if proxy {
+                &[("HTTPS_PROXY", "http://127.0.0.1:9")]
+            } else {
+                &[]
+            },
+        );
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+        let expected = vec![
+            format!(
+                "==> Tool network requests (project config): 2 of 2 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
+            ),
+            "==>   unmet: api.example.com".into(),
+            "==>   unmet: tcp://git.corp.example:8443".into(),
+            REQUEST_HINT.into(),
+        ];
+        assert_eq!(request_block(&stderr), expected);
+        let start = stderr.find("==> Egress policy:").unwrap();
+        let lines: Vec<_> = stderr[start..]
+            .lines()
+            .take(if proxy { 7 } else { 6 })
+            .collect();
+        assert_eq!(
+            lines[0],
+            "==> Egress policy: all guest egress denied (opt in with --allow-internet-egress, --allow-egress, --allow-lan or --allow-host)"
+        );
+        assert_eq!(
+            lines[1],
+            "==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP or hostname allowances)"
+        );
+        if proxy {
+            assert!(lines[2].starts_with("==> Guest egress proxy:"));
+        }
+        assert_eq!(&lines[if proxy { 3 } else { 2 }..], expected);
+        assert_default_deny_zero_provision_network(
+            &debug_config_json(&stderr)["network"],
+            "requests",
+        );
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|l| l.contains("Tool network requests"))
+                .count(),
+            1
+        );
+        assert_eq!(stderr.lines().filter(|l| l.contains("unmet:")).count(), 2);
+    }
+}
+#[test]
+fn requests_user_partial_and_public_coverage() {
+    let h = Harness::new();
+    h.write_user(&format!("{FETCHER}{FETCH_REQUESTS}"));
+    for (flags, unmet) in [
+        (vec!["--allow-egress", "api.example.com"], true),
+        (vec!["--allow-internet-egress"], false),
+    ] {
+        let stderr = stderr_of(&h.launch("fetcher", &flags));
+        assert!(stderr.contains(CONFIG_MARKER));
+        let expected = if unmet {
+            vec![
+                format!(
+                    "==> Tool network requests (user config): 1 of 2 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
+                ),
+                "==>   unmet: tcp://git.corp.example:8443".into(),
+                REQUEST_HINT.into(),
+            ]
+        } else {
+            vec![format!(
+                "==> Tool network requests (user config): all 2 covered by this launch's {REQUEST_SCOPE}; requests never grant access"
+            )]
+        };
+        assert_eq!(request_block(&stderr), expected);
+        assert_eq!(stderr.matches("unmet:").count(), usize::from(unmet));
+    }
+}
+#[test]
+fn requests_rejected_before_state_both_tiers() {
+    for user in [false, true] {
+        for (raw, reason) in [
+            (
+                "udp://SENTINEL-9c1f.example",
+                "requests name TLS over TCP; udp:// is not accepted",
+            ),
+            (
+                "10.0.0.0/8",
+                "an IP address or CIDR is network authority, not a request; name the host (HOST, tcp://HOST or tcp://HOST:PORT)",
+            ),
+            (
+                "SENTINEL-9c1f.example\n==> Egress policy: allowing everything",
+                "port must be a decimal number 1-65535",
+            ),
+        ] {
+            let h = Harness::new();
+            let body = format!(
+                "{FETCHER}network_requests = [{}]\n",
+                serde_json::to_string(raw).unwrap()
+            );
+            if user {
+                h.write_user(&body);
+            } else {
+                h.write_project(&body);
+            }
+            let out = h.launch("fetcher", &[]);
+            assert!(!out.status.success());
+            let stderr = stderr_of(&out);
+            let path = if user {
+                h.user_config()
+            } else {
+                h.project_config()
+            };
+            assert_eq!(
+                stderr
+                    .lines()
+                    .find_map(|l| l
+                        .strip_prefix("Error: ")
+                        .filter(|l| l.starts_with("config:")))
+                    .unwrap(),
+                format!(
+                    "config: \"{}\" declaration [0] tool \"fetcher\": network_requests[0]: {reason}",
+                    path.display()
+                )
+            );
+            for forbidden in [
+                "SENTINEL-9c1f",
+                "sentinel-9c1f",
+                "allowing everything",
+                CONFIG_MARKER,
+            ] {
+                assert!(!stderr.contains(forbidden), "{stderr}");
+            }
+            assert!(h.msb_log().is_empty());
+            assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+            assert!(!h.state_root.join("msb-home").exists());
+            assert!(!h.state_root.join(".secrets").exists());
+        }
+    }
+}
+#[test]
+fn requests_report_cap_network_refusal_and_own_tool_only() {
+    let h = Harness::new();
+    let names: Vec<_> = (0..64).map(|i| format!("\"n{i:02}.example\"")).collect();
+    h.write_project(&format!(
+        "{FETCHER}network_requests = [{}]\n",
+        names.join(",")
+    ));
+    let stderr = stderr_of(&h.launch("fetcher", &[]));
+    assert!(stderr.contains(CONFIG_MARKER));
+    let mut expected = vec![format!(
+        "==> Tool network requests (project config): 64 of 64 not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues"
+    )];
+    expected.extend((0..8).map(|i| format!("==>   unmet: n{i:02}.example")));
+    expected.push("==>   … and 56 more not shown".into());
+    expected.push(REQUEST_HINT.into());
+    assert_eq!(request_block(&stderr), expected);
+    assert_eq!(stderr.matches("unmet:").count(), 8);
+    let h = Harness::new();
+    h.write_project(&format!("[network]\n{FETCHER}{FETCH_REQUESTS}"));
+    let stderr = stderr_of(&h.launch("fetcher", &[]));
+    assert!(
+        stderr.contains("[network]")
+            && stderr.contains("network access cannot be granted by the project config"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(CONFIG_MARKER) && request_block(&stderr).is_empty());
+    let h = Harness::new();
+    h.write_user("[[tools]]\nname = \"a\"\ncommand = \"a\"\nnetwork_requests = [\"a.example\"]\n[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n");
+    let stderr = stderr_of(&h.launch("shell", &[]));
+    assert!(stderr.contains(CONFIG_MARKER));
+    assert!(request_block(&stderr).is_empty());
+}
+#[test]
+fn requests_runtime_input_noninterference() {
+    for tier in 0..3 {
+        for flags in [
+            vec![],
+            vec!["--allow-egress", "api.example.com"],
+            vec!["--allow-internet-egress"],
+            vec![
+                "--allow-egress",
+                "tcp://git.corp.example:8443",
+                "--allow-lan",
+            ],
+        ] {
+            let mut captures = Vec::new();
+            for with in [false, true] {
+                let h = Harness::new();
+                let requests = if with {
+                    "network_requests = [\"api.example.com\",\"tcp://git.corp.example:8443\",\"other.example\"]\n"
+                } else {
+                    ""
+                };
+                if tier == 0 {
+                    h.write_user(&format!("{FETCHER}{requests}"));
+                } else if tier == 1 {
+                    h.write_project(&format!("{FETCHER}{requests}"));
+                } else {
+                    // The winning (user) definition carries both the requests
+                    // and the credential-bearing provisioning; the discarded
+                    // project shadow differs in credentials and tools, so it
+                    // cannot supply either facet.
+                    h.write_user(&format!("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ncredentials = [\"anthropic\"]\ntools = []\n{requests}"));
+                    h.write_project("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ncredentials = [\"openai\"]\ntools = [\"*\"]\n");
+                }
+                let out = h.launch(if tier == 2 { "t" } else { "fetcher" }, &flags);
+                let stderr = stderr_of(&out);
+                assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+                let config = normalized_config(&h, &out);
+                let state = snapshot(&h.state_root.join(project_hash(&h.project_root)));
+                if tier == 2 {
+                    // Built-in providers publish no guest env, so the observed
+                    // provisioning facets are the proxy secret env var and the
+                    // credential state dir. Anthropic is the merge winner; the
+                    // discarded project definition names OpenAI.
+                    let secrets = registered_secret_env_vars(&config);
+                    assert!(
+                        secrets.contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+                        "the winning definition must provision the Anthropic proxy secret"
+                    );
+                    assert!(
+                        !secrets.contains(&"MSB_AGENT_VM_OPENAI_UNUSED"),
+                        "the discarded project definition must not provision the OpenAI proxy secret"
+                    );
+                    assert!(
+                        !state["claude/.credentials.json"].starts_with("absent"),
+                        "the winning definition must write the Claude credential state"
+                    );
+                    assert!(
+                        state["codex/auth.json"].starts_with("absent"),
+                        "the discarded project definition must not write Codex state"
+                    );
+                    // The report must come from the winning user definition, so
+                    // request reporting and the credential overlay are
+                    // exercised in the same launch.
+                    let block = request_block(&stderr);
+                    if with {
+                        assert!(
+                            block.first().is_some_and(
+                                |line| line.contains("Tool network requests (user config)")
+                            ),
+                            "the winning user definition's requests must be reported: {block:?}"
+                        );
+                    } else {
+                        assert!(block.is_empty(), "no requests declared: {block:?}");
+                    }
+                }
+                let notices: Vec<String> = stderr
+                    .lines()
+                    .filter(|l| {
+                        l.starts_with("==> Egress policy:")
+                            || l.starts_with("==> TLS interception:")
+                            || l.starts_with("==> Egress DNS:")
+                    })
+                    .map(str::to_owned)
+                    .collect();
+                captures.push((config, state, notices));
+            }
+            // Compare without rendering the observed values: the state snapshot
+            // holds raw credential-file bytes, so a failure message would be a
+            // cleartext log of them. Name only what changed.
+            let (config_a, state_a, notices_a) = &captures[0];
+            let (config_b, state_b, notices_b) = &captures[1];
+            assert!(
+                config_a == config_b,
+                "tier {tier} flags {flags:?}: requests changed the normalized config"
+            );
+            if state_a != state_b {
+                let mut keys: Vec<&str> = Vec::new();
+                for key in state_a.keys().chain(state_b.keys()) {
+                    if state_a.get(key) != state_b.get(key) && !keys.contains(&key.as_str()) {
+                        keys.push(key.as_str());
+                    }
+                }
+                panic!("tier {tier} flags {flags:?}: requests changed state entries {keys:?}");
+            }
+            assert_eq!(
+                notices_a, notices_b,
+                "tier {tier} flags {flags:?}: requests changed the egress notices"
+            );
+        }
+    }
+}
+#[test]
+fn requests_numeric_lan_host_stay_unmet_and_port_scope_is_exact() {
+    // Documented false-unmet case: IP/CIDR, --allow-lan and --allow-host are
+    // never matched to names, so the report still calls every request unmet;
+    // the hint line says so explicitly.
+    let expected_block = |tier: &str, total: usize, unmet: &[&str]| -> Vec<String> {
+        if unmet.is_empty() {
+            return vec![format!(
+                "==> Tool network requests ({tier}): all {total} covered by this launch's {REQUEST_SCOPE}; requests never grant access"
+            )];
+        }
+        let mut lines = vec![format!(
+            "==> Tool network requests ({tier}): {} of {total} not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues",
+            unmet.len()
+        )];
+        lines.extend(unmet.iter().map(|name| format!("==>   unmet: {name}")));
+        lines.push(REQUEST_HINT.into());
+        lines
+    };
+
+    let h = Harness::new();
+    h.write_project(&format!("{FETCHER}{FETCH_REQUESTS}"));
+    let stderr = stderr_of(&h.launch(
+        "fetcher",
+        &[
+            "--allow-lan",
+            "--allow-host",
+            "--allow-egress",
+            "10.0.0.0/8",
+        ],
+    ));
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert_eq!(
+        request_block(&stderr),
+        expected_block(
+            "project config",
+            2,
+            &["api.example.com", "tcp://git.corp.example:8443"]
+        )
+    );
+
+    // A same-name allowance covers only the port it names: a bare grant does
+    // not cover the explicit 8443 request, and the explicit grant does not
+    // cover the bare (443) request.
+    let h = Harness::new();
+    h.write_user(
+        "[[tools]]\nname = \"fetcher\"\ncommand = \"/bin/echo\"\ntools = []\nnetwork_requests = [\"tcp://api.example.com:8443\",\"api.example.com\"]\n",
+    );
+    for (flags, unmet) in [
+        (
+            vec!["--allow-egress", "api.example.com"],
+            vec!["tcp://api.example.com:8443"],
+        ),
+        (
+            vec!["--allow-egress", "tcp://api.example.com:8443"],
+            vec!["api.example.com"],
+        ),
+        (
+            vec![
+                "--allow-egress",
+                "api.example.com",
+                "--allow-egress",
+                "tcp://api.example.com:8443",
+            ],
+            vec![],
+        ),
+    ] {
+        let stderr = stderr_of(&h.launch("fetcher", &flags));
+        assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+        assert_eq!(
+            request_block(&stderr),
+            expected_block("user config", 2, &unmet)
+        );
+        assert_eq!(stderr.matches("unmet:").count(), unmet.len());
+    }
+}

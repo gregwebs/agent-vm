@@ -518,12 +518,19 @@ also authorizes DNS for any name. A hostname grant authorizes lookups of its
 own name only, never arbitrary-name DNS. Numeric and LAN-only grants do not
 authorize DNS.
 
-Authority is CLI-only in this release; both config tiers refuse `[network]`.
+**Network request**: a tool declaration's non-authoritative statement of a TLS
+destination (exact name + port) it expects to contact; reported when unmet,
+never a grant.
+
+Authority is CLI-only in this release; config may request but not grant.
+Both config tiers refuse `[network]`.
 Persistent grants are not supported yet (see [#302](https://github.com/gregwebs/agent-vm/issues/302)).
 See [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) for DNS limitations and
-[ADR-0037](docs/adr/0037-hostname-egress-allowances.md) for hostname allowances.
+[ADR-0037](docs/adr/0037-hostname-egress-allowances.md) for hostname allowances;
+[ADR-0039](docs/adr/0039-non-authoritative-tool-network-requests.md) for requests.
 
-_Avoid_: "domain allowance", "wildcard host" and "host allowance" for a hostname
-grant — the unit is an exact name, not a suffix or a host; "allow list" for the
+_Avoid_: "requested allowance" and "tool allowance" for a network request
+(a request is not an allowance); "domain allowance", "wildcard host" and
+"host allowance" for a hostname grant — the unit is an exact name, not a suffix or a host; "allow list" for the
 whole policy; "network profile" (the runtime's `from_profiles` abstraction,
 deliberately not used for tool launches).

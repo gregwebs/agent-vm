@@ -11,6 +11,10 @@ Accepted. Implementation decision for [agent-vm
 [#307](https://github.com/gregwebs/agent-vm/issues/307) and
 [#308](https://github.com/gregwebs/agent-vm/issues/308).
 
+The #307 follow-ups are delivered by
+[ADR-0039](0039-non-authoritative-tool-network-requests.md). Operational TLS
+client requirements live in [USAGE](../../USAGE.md#tls-client-requirements).
+
 ## Context
 
 A1 ([ADR-0036](0036-default-deny-launch-egress.md)) made tool-launch egress
@@ -133,18 +137,13 @@ authorize. It is documented compatibility behaviour for this slice; a runtime
 fix ("apply authority enforcement only when the flow's first match is a hostname
 rule") is a separately scoped, optional microsandbox issue.
 
-**D2 — interception is per-port and global.** On every intercepted port, for
-**every** destination including numeric/group grants: the guest must send a TLS
-ClientHello with SNI (no-SNI and non-TLS traffic is dropped); UDP/QUIC is
-dropped; and guest TLS clients must trust the sandbox CA, so private bundles
-(Python `certifi`, pinned certs, JVM trust stores) fail. Credential launches
-already pay this on 443; hostnames impose it on zero-provision launches and on
-every port any hostname entry adds.
+**D2 — interception is per-port and global.** Credential launches already pay
+this on 443; hostnames impose it on zero-provision launches and on every port
+any hostname entry adds. See [TLS client requirements](../../USAGE.md#tls-client-requirements)
+for client-side requirements.
 
-**D3 — cache TTL.** Bindings expire. A client that keeps using an IP longer than
-the minimum resolved-hostname TTL gets an RST at SYN. CNAME chains bind under
-the **queried** name, so a stub resolver that re-queries the CNAME target
-separately gets NXDOMAIN.
+**D3 — cache TTL.** Bindings expire; this is an accepted runtime limitation.
+See [TLS client requirements](../../USAGE.md#tls-client-requirements) for client advice.
 
 **D4 — private answers.** A `Domain` rule never admits a private or reserved
 answer by itself. It needs `--allow-lan` or a **port-less** local numeric

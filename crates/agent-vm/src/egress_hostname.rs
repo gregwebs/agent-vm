@@ -138,9 +138,9 @@ use microsandbox_network::policy::{
 };
 use std::{collections::BTreeSet, num::NonZeroU16};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CanonicalHostname(String);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PortNot53Or853(NonZeroU16);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum HostnameScope {
@@ -173,7 +173,32 @@ impl InterceptedPorts {
         self.0.iter().map(|p| p.get()).collect()
     }
 }
+impl CanonicalHostname {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl PortNot53Or853 {
+    // Evaluated at compile time, so this cannot panic during launch.
+    pub(crate) const HTTPS: Self = Self(NonZeroU16::new(443).unwrap());
+    pub(crate) fn get(self) -> NonZeroU16 {
+        self.0
+    }
+}
 impl HostnameAllowance {
+    // Keep the SDK DomainName here: requests carry no rule-ready domain.
+    pub(crate) fn into_request_parts(self) -> (CanonicalHostname, HostnameScope) {
+        (self.name, self.scope)
+    }
+    pub(crate) fn grants_tls(
+        &self,
+        name: &CanonicalHostname,
+        port: NonZeroU16,
+        ports: &InterceptedPorts,
+    ) -> bool {
+        &self.name == name && self.effective_ports(ports).contains(&port.get())
+    }
+
     pub(crate) fn from_target(
         scheme: SchemeSel,
         bracketed: bool,
