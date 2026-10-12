@@ -9,6 +9,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What the vendored runtime prints for `msb --version`. `point_at_msb`
 /// refuses any other version, so this is the one literal to change when the
@@ -19,11 +20,41 @@ use std::path::{Path, PathBuf};
 pub const VERSION_LINE: &str = "msb 0.7.4";
 
 /// Write `contents` to `path` as a mode-0755 executable.
+///
+/// Writes a uniquely named temporary and renames it into place. The rename is
+/// atomic replacement, so a reader never sees a half-written script and a test
+/// can rewrite a running shim without the writer side failing on `ETXTBSY`. It
+/// does not narrow the `execve` race: `ETXTBSY` checks the inode's write count,
+/// and `rename` keeps the inode, so a concurrent `fork` that duplicates the
+/// temporary's write descriptor still blocks an immediate `exec` of `path`.
+/// That race is kernel timing, so a caller that immediately `exec`s the result
+/// retries on `ExecutableFileBusy`.
 pub fn write_executable(path: &Path, contents: &str) {
-    std::fs::write(path, contents).unwrap();
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).unwrap();
+    let temp = temp_path(path);
+    let result = (|| -> std::io::Result<()> {
+        std::fs::write(&temp, contents)?;
+        let mut perms = std::fs::metadata(&temp)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&temp, perms)?;
+        std::fs::rename(&temp, path)
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp);
+        panic!("write_executable({}) failed: {error}", path.display());
+    }
+}
+
+/// A process-unique sibling of `path`, so parallel tests writing the same
+/// fixture name cannot collide on the temporary.
+fn temp_path(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "fixture".to_owned());
+    name.push_str(&format!(".{}.{unique}.tmp", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// Write `dir/msb`, a fake that answers every invocation with

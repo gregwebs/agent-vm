@@ -18,6 +18,32 @@ mod support;
 use image_archive::{ArchiveSpec, LayerContent, PlatformSpec};
 use oci_registry::{Image, Server};
 
+/// Run a freshly written fixture shim once. `execve` of a file that another
+/// thread's concurrent `fork` still holds a duplicate write descriptor for
+/// fails with `ETXTBSY`; `rename` keeps the inode, so writing through a
+/// temporary does not narrow that race. The kernel timing is not controllable,
+/// so retry briefly rather than failing the harness.
+fn calibration_status(path: &Path, log: &Path) -> std::process::ExitStatus {
+    let mut attempts = 0;
+    loop {
+        match Command::new(path)
+            .env_clear()
+            .env("HOST_CALL_LOG", log)
+            .arg("fixture-calibration")
+            .status()
+        {
+            Ok(status) => return status,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+            {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("fixture calibration exec {path:?} failed: {error}"),
+        }
+    }
+}
+
 struct Harness {
     root: tempfile::TempDir,
     _short_state: tempfile::TempDir,
@@ -61,12 +87,7 @@ impl Harness {
             ("wget", 94),
             ("msb", 93),
         ] {
-            let status = Command::new(bin.join(name))
-                .env_clear()
-                .env("HOST_CALL_LOG", &log)
-                .arg("fixture-calibration")
-                .status()
-                .unwrap();
+            let status = calibration_status(&bin.join(name), &log);
             assert_eq!(status.code(), Some(code));
             assert!(
                 fs::read_to_string(&log)
@@ -426,7 +447,7 @@ fn every_native_failure_preserves_a_record_metadata_and_artifact_hashes() {
     );
     before.unchanged(&h, &pin_a);
     assert!(
-        !server.requests.lock().unwrap()[start..]
+        !server.requests()[start..]
             .iter()
             .any(|(_, p)| p == &format!("/v2/images/blobs/{}", a.written.layer_digest)),
         "shared A layer must be reused"
@@ -559,6 +580,10 @@ fn interrupted_stream_and_refused_registry_preserve_every_old_byte() {
     }
     server.release_blob();
     let out = collect_bounded(child);
+    // A resuming client's `Range` is served as `206`; a recorded error means
+    // the fixture met a request shape it does not model. Report it before the
+    // exit-code assertion, where the recorded errors are the useful signal.
+    assert_eq!(server.errors(), Vec::<String>::new());
     assert_eq!(out.status.code(), Some(1));
     before.unchanged(&h, &pin_a);
     let host = server.host.clone();
@@ -798,7 +823,7 @@ fn native_user_registry_settings_and_trace_redaction_are_preserved() {
         base64::engine::general_purpose::STANDARD.encode("fixture-user:fixture-password")
     );
     assert!(
-        server.headers.lock().unwrap().iter().any(|header| header
+        server.headers().iter().any(|header| header
             .trim()
             .split_once(": ")
             .is_some_and(|(name, value)| name.eq_ignore_ascii_case("Authorization")
