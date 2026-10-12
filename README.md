@@ -53,6 +53,8 @@ host loopback services; link-local-covering ranges reach cloud metadata.
 
 A tool can declare `network_requests`; a launch reports the ones its grants do
 not cover and continues ([Tool network requests](USAGE.md#tool-network-requests)).
+Claude/Codex/OpenCode/Pi declare [documented baseline requests](docs/default-tool-network-requests.md),
+not automatic grants or all optional traffic. Copilot's inventory is pending #340.
 
 Missing planned features:
 

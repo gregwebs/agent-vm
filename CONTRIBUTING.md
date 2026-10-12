@@ -311,6 +311,15 @@ Never change operator DNS, firewall, policy or keychain to make a test pass.
 The harness creates private HOME/state/cache and retains `summary.tsv`,
 per-case logs and `owned.jsonl` under its printed owned work root. Preserve
 commands, candidate/runtime identity and release-asset hashes alongside them.
+Smoke includes NR1/NR2 (actual default Pi `--version`, unmet/all-covered built-in
+request stderr) and NR3 (default shell marker, no request inheritance), alongside
+LC1/HC1/I1 positive controls and D1/L1 denials. NR rows record native diagnostics,
+not packet enforcement or provider-login success. Retain raw NR logs/version
+labels and complete cleanup receipts. For #328, missing native prerequisites
+are V7 **NOT RUN**, which blocks merge/release acceptance until exact-candidate
+external evidence is supplied. Copilot inventory remains pending #340; see
+[endpoint evidence](docs/default-tool-network-requests.md).
+
 Cleanup is bounded and identity-checked; inspect reported survivors before
 removing only owned scratch. Smoke is not full evidence. This harness does not
 certify Linux: native Linux testing, runtime capability admission and combined
@@ -539,6 +548,15 @@ the fix is simply to pick a shorter override, e.g. `~/.avm`.
 ## Release / version bump
 
 Every feature PR bumps the workspace version.
+
+Provider/integration or image-source upgrade checklist:
+- **Default-tool endpoint evidence:** the upgrade author audits exact names,
+  TLS ports, roles, auth/feature conditions and excluded candidates against the
+  pinned versions in [the canonical evidence](docs/default-tool-network-requests.md).
+  Update declarations and independent expectation tests with the evidence.
+  The release PR reviewer signs off before release approval. Recheck endpoint
+  bug reports too; Copilot remains an explicit #340 gap, not a certified row.
+  Launcher metadata does not automatically follow image-source bumps.
 
 Bump `workspace.package.version` in the root `Cargo.toml` **in the
 feature branch itself**, so the PR that lands the change also lands its

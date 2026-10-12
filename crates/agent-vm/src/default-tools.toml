@@ -45,12 +45,19 @@
 # defaults to `["*"]`, so it *provisions* every provider the catalog's tools
 # declare without *requiring* any of them. See ADR-0017.
 
+# Network requests are TLS/TCP 443 diagnostic metadata, not grants or
+# credential effects. Scoped provider/refresh/relay/catalog baseline, not all
+# optional traffic. Evidence: docs/default-tool-network-requests.md.
+# Shell has no provider destination and inherits no requests from provisioning.
+
 # `dsh` (DeepSeek Harness) boots its browser UI with no profile flag, so the
 # shipped default argv is `web` (the same command issue #149 installs with).
 # The guest reaches that UI through the launcher's `--publish` inbound port.
 #
 # Like `pi`, dsh declares no `credentials`: it is a multi-provider harness
 # whose adapter list is configuration, and it must start with none configured.
+# No universal network request: its dormant adapter has no configured provider.
+# Browser UI ingress is not egress.
 # Its base profile already mounts the `llm-pi-ai` multi-provider adapter dormant
 # (`@deepseek-ai/dsh-base`'s `cordis.patch.yml`), so a user who wants
 # Anthropic/OpenAI support stores an API key in the credentials document or
@@ -98,6 +105,8 @@ persist = [".dsh"]
 # and telemetry are forwarded -- see ADR-0021.
 [[tools]]
 name = "pi"
+# Explicit shipped bridge baseline, not inherited from tools or all Pi adapters.
+network_requests = ["api.anthropic.com", "mcp-proxy.anthropic.com", "platform.claude.com"]
 command = "pi"
 args = []
 tools = ["claude"]
@@ -105,6 +114,7 @@ persist = []
 
 [[tools]]
 name = "codex"
+network_requests = ["api.openai.com", "auth.openai.com", "chatgpt.com"]
 command = "codex"
 args = []
 credentials = ["openai"]
@@ -113,6 +123,7 @@ env = { CODEX_HOME = "/agent-vm-state/codex" }
 
 [[tools]]
 name = "opencode"
+network_requests = ["api.openai.com", "auth.openai.com", "chatgpt.com", "models.opencode.ai"]
 command = "opencode"
 args = []
 credentials = ["openai", "opencode-static"]
@@ -120,6 +131,7 @@ persist = []
 
 [[tools]]
 name = "claude"
+network_requests = ["api.anthropic.com", "mcp-proxy.anthropic.com", "platform.claude.com"]
 command = "claude"
 args = ["--dangerously-skip-permissions"]
 credentials = ["anthropic"]
@@ -127,6 +139,7 @@ persist = []
 
 [[tools]]
 name = "copilot"
+# Known incomplete inventory, not providerless: deferred to #340 (see evidence doc).
 command = "copilot"
 args = ["--allow-all-tools"]
 credentials = ["copilot"]

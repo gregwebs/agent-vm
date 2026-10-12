@@ -1702,6 +1702,18 @@ grammar*); `NO_PROXY=*` is the only exemption.
 
 ### Tool network requests
 
+Shipped Claude/Codex/OpenCode/Pi declare a [scoped baseline](docs/default-tool-network-requests.md)
+for provider, provisioned account-refresh, relay and catalog paths, not every
+optional connection. Copilot is deliberately incomplete pending [#340](https://github.com/gregwebs/agent-vm/issues/340).
+Dsh has no configured universal provider; shell has no provider destination and
+inherits no requests from wildcard provisioning. Empty metadata does not mean
+offline. Custom catalogs do not inherit these defaults.
+
+For already-provisioned Claude auth with no grants, the built-in report lists
+`api.anthropic.com`, `mcp-proxy.anthropic.com`, `platform.claude.com` as unmet;
+see the [restricted built-in example](docs/default-tool-network-requests.md#restricted-built-in-example)
+and the evidence document for versions, exclusions and maintenance ownership.
+
 Only the launched tool's own `network_requests` are reported. Unmet requests
 are informational; the launch always continues and no authority is added.
 “Covered” means lookup-free syntactic coverage by public or same-name grants,

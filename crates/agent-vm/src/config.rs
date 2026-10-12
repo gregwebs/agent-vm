@@ -2355,6 +2355,65 @@ mod tests {
 
     // -- the legacy `run::Agent` characterization table -------------------
 
+    #[test]
+    fn shipped_default_network_requests_match_documented_baselines() {
+        // Independent transcription of the reviewed endpoint evidence, not proxy hosts.
+        let expected: [(&str, &[&str]); 7] = [
+            ("dsh", &[]),
+            (
+                "pi",
+                &[
+                    "api.anthropic.com",
+                    "mcp-proxy.anthropic.com",
+                    "platform.claude.com",
+                ],
+            ),
+            (
+                "codex",
+                &["api.openai.com", "auth.openai.com", "chatgpt.com"],
+            ),
+            (
+                "opencode",
+                &[
+                    "api.openai.com",
+                    "auth.openai.com",
+                    "chatgpt.com",
+                    "models.opencode.ai",
+                ],
+            ),
+            (
+                "claude",
+                &[
+                    "api.anthropic.com",
+                    "mcp-proxy.anthropic.com",
+                    "platform.claude.com",
+                ],
+            ),
+            // Copilot is a pending inventory (#340), not an offline tool.
+            ("copilot", &[]),
+            ("shell", &[]),
+        ];
+        let tools = default_tools().unwrap();
+        assert_eq!(tools.len(), 7);
+        for (tool, (name, names)) in tools.iter().zip(expected) {
+            assert_eq!(tool.name(), name);
+            assert_eq!(tool.origin(), &ToolOrigin::BuiltIn);
+            assert_eq!(
+                tool.network_requests()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                names,
+                "{name}"
+            );
+            assert!(
+                tool.network_requests()
+                    .iter()
+                    .all(|request| request.port().get() == 443)
+            );
+        }
+    }
+
     /// **T1.** The compiled-in defaults, transcribed *verbatim* from
     /// `run::Agent`'s `command()`/`default_args()`/`credential_providers()` and
     /// `matches!(agent, Agent::Shell)` as of `bb299d1` (the pre-#82 `main`).

@@ -7106,3 +7106,225 @@ fn native_row_oracles_are_rendered_diagnostics() {
         }
     }
 }
+
+// Hand-transcribed evidence oracle; never derived from the embedded catalog.
+const SHIPPED_REQUESTS: [(&str, &[&str]); 7] = [
+    ("dsh", &[]),
+    (
+        "pi",
+        &[
+            "api.anthropic.com",
+            "mcp-proxy.anthropic.com",
+            "platform.claude.com",
+        ],
+    ),
+    (
+        "codex",
+        &["api.openai.com", "auth.openai.com", "chatgpt.com"],
+    ),
+    (
+        "opencode",
+        &[
+            "api.openai.com",
+            "auth.openai.com",
+            "chatgpt.com",
+            "models.opencode.ai",
+        ],
+    ),
+    (
+        "claude",
+        &[
+            "api.anthropic.com",
+            "mcp-proxy.anthropic.com",
+            "platform.claude.com",
+        ],
+    ),
+    // Known incomplete inventory, deferred to #340; empty does not mean offline.
+    ("copilot", &[]),
+    ("shell", &[]),
+];
+
+fn shipped_request_block(tier: &str, total: usize, unmet: &[&str]) -> Vec<String> {
+    if total == 0 {
+        return vec![];
+    }
+    if unmet.is_empty() {
+        return vec![format!(
+            "==> Tool network requests ({tier}): all {total} covered by this launch's {REQUEST_SCOPE}; requests never grant access"
+        )];
+    }
+    let mut lines = vec![format!(
+        "==> Tool network requests ({tier}): {} of {total} not covered by this launch's {REQUEST_SCOPE}; requests never grant access and the launch continues",
+        unmet.len()
+    )];
+    lines.extend(unmet.iter().map(|name| format!("==>   unmet: {name}")));
+    lines.push(REQUEST_HINT.into());
+    lines
+}
+
+#[test]
+fn shipped_default_network_requests_default_deny() {
+    for (tool, names) in SHIPPED_REQUESTS {
+        let h = Harness::new();
+        let out = h.launch_default(tool);
+        let text = stderr_of(&out);
+        assert!(
+            text.contains(CONFIG_MARKER) && text.contains("guest command"),
+            "{tool}: {text}"
+        );
+        assert_eq!(
+            request_block(&text),
+            shipped_request_block("built-in defaults", names.len(), names),
+            "{tool}"
+        );
+        if !names.is_empty() {
+            let report = text.find("==> Tool network requests").unwrap();
+            for notice in ["==> Egress policy:", "==> Egress DNS:"] {
+                assert!(text.find(notice).unwrap() < report, "{text}");
+            }
+            for notice in ["==> TLS interception:", "==> Guest egress proxy:"] {
+                if let Some(pos) = text.find(notice) {
+                    assert!(pos < report, "{text}");
+                }
+            }
+            assert!(report < text.find(CONFIG_MARKER).unwrap());
+        }
+    }
+    let h = Harness::new();
+    let text =
+        stderr_of(&h.launch_with_env("claude", &[], &[("HTTPS_PROXY", "http://127.0.0.1:9")]));
+    assert!(text.contains(CONFIG_MARKER));
+    assert_eq!(
+        request_block(&text),
+        shipped_request_block("built-in defaults", 3, SHIPPED_REQUESTS[4].1)
+    );
+    assert!(
+        text.find("==> Guest egress proxy:").unwrap()
+            < text.find("==> Tool network requests").unwrap()
+    );
+}
+
+#[test]
+fn shipped_default_network_requests_partial_and_public_coverage() {
+    let names = SHIPPED_REQUESTS[4].1;
+    for (flags, unmet) in [
+        (vec![], names),
+        (vec!["--allow-egress", "api.anthropic.com:443"], &names[1..]),
+        (vec!["--allow-egress", "api.anthropic.com:8443"], names),
+        (vec!["--allow-internet-egress"], &[][..]),
+    ] {
+        let h = Harness::new();
+        let text = stderr_of(&h.launch("claude", &flags));
+        assert!(text.contains(CONFIG_MARKER), "{text}");
+        assert_eq!(
+            request_block(&text),
+            shipped_request_block("built-in defaults", 3, unmet)
+        );
+        assert_eq!(text.matches("Tool network requests (").count(), 1);
+    }
+    for (tool, names) in SHIPPED_REQUESTS
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty())
+    {
+        let h = Harness::new();
+        let text = stderr_of(&h.launch(tool, &["--allow-internet-egress"]));
+        assert!(text.contains(CONFIG_MARKER));
+        assert_eq!(
+            request_block(&text),
+            shipped_request_block("built-in defaults", names.len(), &[])
+        );
+    }
+    let h = Harness::new();
+    h.write_user("[[tools]]\nname = \"claude\"\ncommand = \"claude\"\n");
+    h.write_project(
+        "[[tools]]\nname = \"other\"\ncommand = \"echo\"\nnetwork_requests = [\"other.example\"]\n",
+    );
+    for tool in ["claude", "shell"] {
+        let text = stderr_of(&h.launch_default(tool));
+        assert!(text.contains(CONFIG_MARKER));
+        assert!(request_block(&text).is_empty());
+    }
+    let text = stderr_of(&h.launch_default("other"));
+    assert!(text.contains(CONFIG_MARKER));
+    assert_eq!(
+        request_block(&text),
+        shipped_request_block("project config", 1, &["other.example"])
+    );
+}
+
+#[test]
+fn shipped_default_network_requests_noninterference() {
+    let mut stripped: toml::Value =
+        toml::from_str(include_str!("../src/default-tools.toml")).unwrap();
+    for tool in stripped["tools"].as_array_mut().unwrap() {
+        tool.as_table_mut().unwrap().remove("network_requests");
+    }
+    // toml's production dependency is parse-only. These shipped field values
+    // use strings, booleans, arrays and inline env tables; no serializer feature needed.
+    fn field(value: &toml::Value) -> String {
+        match value {
+            toml::Value::Table(table) => format!(
+                "{{ {} }}",
+                table
+                    .iter()
+                    .map(|(key, value)| format!("{key} = {}", field(value)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            _ => serde_json::to_string(value).unwrap(),
+        }
+    }
+    let stripped = stripped["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            format!(
+                "[[tools]]\n{}\n",
+                tool.as_table()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| format!("{key} = {}", field(value)))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })
+        .collect::<String>();
+    for (tool, _) in SHIPPED_REQUESTS {
+        let mut captures = Vec::new();
+        for project in [false, true] {
+            let h = Harness::new();
+            if project {
+                h.write_project(&stripped);
+            }
+            let out = h.launch_default(tool);
+            let text = stderr_of(&out);
+            assert!(text.contains(CONFIG_MARKER));
+            let config = normalized_config(&h, &out);
+            let state = snapshot(&h.state_root.join(project_hash(&h.project_root)));
+            let notices: Vec<_> = text
+                .lines()
+                .filter(|line| {
+                    line.starts_with("==> Egress policy:")
+                        || line.starts_with("==> Egress DNS:")
+                        || line.starts_with("==> TLS interception:")
+                })
+                .map(str::to_owned)
+                .collect();
+            captures.push((config, state, notices));
+        }
+        // Fixed-list snapshot includes credential bytes: never print values on failure.
+        assert!(
+            captures[0].0 == captures[1].0,
+            "{tool}: normalized SandboxConfig changed"
+        );
+        assert!(
+            captures[0].1 == captures[1].1,
+            "{tool}: fixed-list state or HOME symlinks changed"
+        );
+        assert_eq!(
+            captures[0].2, captures[1].2,
+            "{tool}: authority notices changed"
+        );
+    }
+}

@@ -121,9 +121,14 @@ class Contracts(unittest.TestCase):
             self.assertEqual(set(command.env), expected_keys | set(case.extras))
             self.assertEqual(command.kind == "validation-only", case.case in ("RJ1", "PXH1"))
             self.assertEqual("--" in command.argv, case.guest)
-            if case.guest:
+            if case.case in ("NR1", "NR2", "NR3"):
+                trailing = ("echo", "AGENT_VM_328_SHELL_STARTED") if case.case == "NR3" else ("--version",)
+                self.assertEqual(command.argv[command.argv.index("--")+1:], trailing)
+                self.assertEqual(Path(command.cwd), self.work / "requests")
+            elif case.guest:
                 self.assertEqual(command.argv[command.argv.index("--")+1], case.case)
-            self.assertNotIn("shell", command.argv)
+            if case.case != "NR3":
+                self.assertNotIn("shell", command.argv)
             self.assertNotIn("-c", command.argv)
             self.assertFalse(case.extras and not case.case.startswith(("PX", "FL")))
         printed = subprocess.check_output([sys.executable, str(MODULE_PATH), "run", "--print-plan",
@@ -134,7 +139,10 @@ class Contracts(unittest.TestCase):
             self.assertEqual(list(command.argv), printed["argv"])
             self.assertEqual(command.env, printed["env"])
             project = Path(command.cwd)
-            egress.prepare_project(self.work, project)
+            if command.case in ("NR1", "NR2", "NR3"):
+                egress.prepare_default_request_project(self.work)
+            else:
+                egress.prepare_project(self.work, project)
             (project / "recorder-mode").touch()
             status, _ = egress.run_admin(self.work, command)
             self.assertEqual(status, 0)
