@@ -117,6 +117,46 @@ def _driver(scenario, pidfile):
     return 0
 
 
+def _driver_reentrant(scenario, pidfile):
+    """Interrupt `run_in_owned_group` inside its own outer `Popen.wait`.
+
+    `subprocess.Popen._wait` calls `os.waitpid` while holding its non-reentrant
+    `_waitpid_lock`. Injecting the SIGTERM from inside that waitpid makes the
+    signal handler run with the lock held -- the exact window a real terminal
+    SIGTERM lands in occasionally and the CI flake hung on. A handler that only
+    interrupts unwinds cleanly; one that tears down with a nested blocking
+    `Popen.wait` self-deadlocks on the lock. The signal is delivered once the
+    scenario has recorded its pids, so the group can also be checked stopped.
+    """
+    helper = load_helper()
+    pid = pathlib.Path(pidfile)
+    real_waitpid = os.waitpid
+    fired = []
+
+    def injecting_waitpid(wait_pid, flags):
+        if not fired and wait_pid != -1 and pid.exists():
+            fired.append(True)
+            os.kill(os.getpid(), signal.SIGTERM)
+        return real_waitpid(wait_pid, flags)
+
+    os.waitpid = injecting_waitpid
+    try:
+        helper.run_in_owned_group(
+            [sys.executable, str(scenario), str(pidfile)],
+            env=dict(os.environ),
+            cwd=None,
+            timeout=3600,
+            grace=1.0,
+        )
+    except KeyboardInterrupt:
+        return 130
+    except helper.LaunchInterrupted as exc:
+        return 128 + exc.signum
+    finally:
+        os.waitpid = real_waitpid
+    return 0
+
+
 def interruption_case(failures, label, signum, expected_rc, scenario, tmp):
     pidfile = pathlib.Path(tmp) / f"{label}.pids"
     driver = subprocess.Popen(
@@ -139,6 +179,7 @@ def interruption_case(failures, label, signum, expected_rc, scenario, tmp):
         try:
             rc = driver.wait(timeout=30)
         except subprocess.TimeoutExpired:
+            _report_interruption_hang(label, signum, driver, pidfile)
             failures.append(f"{label}: driver did not exit after signal {signum}")
             driver.kill()
             driver.wait()
@@ -146,6 +187,57 @@ def interruption_case(failures, label, signum, expected_rc, scenario, tmp):
         if rc != expected_rc:
             failures.append(f"{label}: driver exit {rc}, expected {expected_rc}")
         assert_stopped(failures, label, pids)
+    finally:
+        if driver.poll() is None:
+            driver.kill()
+            driver.wait()
+
+
+def _report_interruption_hang(label, signum, driver, pidfile):
+    """Print what the 30s hang left behind, so CI output is diagnosable.
+
+    Without this the only evidence is "did not exit"; with it, the next
+    occurrence says whether escalation ever ran, whether the driver was
+    already reaped, and which group members are still live.
+    """
+    print(f"{label}: diagnosed hang after signal {signum}", file=sys.stderr)
+    print(f"  driver.poll()={driver.poll()}", file=sys.stderr)
+    print(f"  pidfile={pidfile} contents={parse_pids(pidfile)!r}", file=sys.stderr)
+    pids = parse_pids(pidfile)
+    if len(pids) == 4:
+        pgid = pids[2]
+        print(
+            f"  live group members for pgid {pgid}: "
+            f"{load_helper()._live_group_members(pgid)!r}",
+            file=sys.stderr,
+        )
+
+
+def reentrant_case(failures, scenario, tmp):
+    """A SIGTERM delivered while the outer `Popen.wait` holds its lock must
+    still interrupt the helper (regression for the reentrant-teardown hang)."""
+    pidfile = pathlib.Path(tmp) / "reentrant.pids"
+    driver = subprocess.Popen(
+        [
+            sys.executable,
+            "-B",
+            str(pathlib.Path(__file__).resolve()),
+            "--driver-reentrant",
+            str(scenario),
+            str(pidfile),
+        ],
+        env=dict(os.environ),
+    )
+    try:
+        try:
+            rc = driver.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            _report_interruption_hang("reentrant-sigterm", signal.SIGTERM, driver, pidfile)
+            failures.append("reentrant-sigterm: driver did not exit (teardown deadlocked)")
+            return
+        if rc != 143:
+            failures.append(f"reentrant-sigterm: driver exit {rc}, expected 143")
+        assert_stopped(failures, "reentrant-sigterm", parse_pids(pidfile))
     finally:
         if driver.poll() is None:
             driver.kill()
@@ -271,6 +363,7 @@ def main():
         interruption_case(
             failures, "sigterm", signal.SIGTERM, 143, scenario, tmp
         )
+        reentrant_case(failures, scenario, tmp)
 
     for failure in failures:
         print(f"released-image-launch-test: FAIL: {failure}", file=sys.stderr)
@@ -283,4 +376,6 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "--driver":
         sys.exit(_driver(sys.argv[2], sys.argv[3]))
+    if len(sys.argv) >= 4 and sys.argv[1] == "--driver-reentrant":
+        sys.exit(_driver_reentrant(sys.argv[2], sys.argv[3]))
     sys.exit(main())
