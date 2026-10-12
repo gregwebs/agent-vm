@@ -20,8 +20,9 @@ use oci_registry::{Image, Server};
 
 /// Run a freshly written fixture shim once. `execve` of a file that another
 /// thread's concurrent `fork` still holds a duplicate write descriptor for
-/// fails with `ETXTBSY`; the kernel race is timing-dependent, so retry briefly
-/// rather than failing the harness.
+/// fails with `ETXTBSY`; `rename` keeps the inode, so writing through a
+/// temporary does not narrow that race. The kernel timing is not controllable,
+/// so retry briefly rather than failing the harness.
 fn calibration_status(path: &Path, log: &Path) -> std::process::ExitStatus {
     let mut attempts = 0;
     loop {
@@ -446,7 +447,7 @@ fn every_native_failure_preserves_a_record_metadata_and_artifact_hashes() {
     );
     before.unchanged(&h, &pin_a);
     assert!(
-        !server.requests.lock().unwrap()[start..]
+        !server.requests()[start..]
             .iter()
             .any(|(_, p)| p == &format!("/v2/images/blobs/{}", a.written.layer_digest)),
         "shared A layer must be reused"
@@ -579,14 +580,12 @@ fn interrupted_stream_and_refused_registry_preserve_every_old_byte() {
     }
     server.release_blob();
     let out = collect_bounded(child);
+    // A resuming client's `Range` is served as `206`; a recorded error means
+    // the fixture met a request shape it does not model. Report it before the
+    // exit-code assertion, where the recorded errors are the useful signal.
+    assert_eq!(server.errors(), Vec::<String>::new());
     assert_eq!(out.status.code(), Some(1));
     before.unchanged(&h, &pin_a);
-    // The fixture records a request it could not serve instead of panicking.
-    // Nothing here should have been recorded: a resuming client's `Range` is
-    // served as 206, so an entry means the fixture met a request shape it does
-    // not model, which is the loud guard the old `assert!(range.is_none())`
-    // provided before it aborted the whole test binary.
-    assert_eq!(server.errors(), Vec::<String>::new());
     let host = server.host.clone();
     drop(server);
     let before = Snapshot::take(&h, &pin_a, &a);
@@ -824,7 +823,7 @@ fn native_user_registry_settings_and_trace_redaction_are_preserved() {
         base64::engine::general_purpose::STANDARD.encode("fixture-user:fixture-password")
     );
     assert!(
-        server.headers.lock().unwrap().iter().any(|header| header
+        server.headers().iter().any(|header| header
             .trim()
             .split_once(": ")
             .is_some_and(|(name, value)| name.eq_ignore_ascii_case("Authorization")
