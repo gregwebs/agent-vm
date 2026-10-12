@@ -342,6 +342,9 @@ class Case:
 # Order is significant: calibrations precede dependent probes, except I1a,
 # whose endpoint must first be decoded by H1.
 CASES = (
+    Case("NR1", tool="pi"),
+    Case("NR2", tool="pi", flags=("--allow-internet-egress",)),
+    Case("NR3", tool="shell"),
     Case("P0"), Case("LC1", flags=("--allow-lan",)),
     Case("HC1", flags=("--allow-host",)),
     Case("I1", flags=("--allow-internet-egress",)),
@@ -473,6 +476,8 @@ FLOW_CONTROLS = {"lan-tcp80": "LC1:ipv4:lan-tcp80", "lan-tcp81": "LC1:ipv4:lan-t
 
 
 def control_links(case: Case) -> dict[str, str]:
+    if case.case in ("NR1", "NR2", "NR3"):
+        return {}
     links = dict(FLOW_CONTROLS)
     for label, (target_case, target_variant, target) in HOSTNAME_CONTROLS.get(
             (case.case, case.variant), {}).items():
@@ -524,6 +529,8 @@ class Command:
 
 
 def expected_attempts(case: Case) -> tuple[str, ...]:
+    if case.case in ("NR1", "NR2", "NR3"):
+        return ()
     if hostname_tier(case.case):
         return tuple(row[0] for row in hostname_rows(case))
     gateway = ("gateway-udp", "gateway-tcp")
@@ -559,6 +566,8 @@ def expected_attempts(case: Case) -> tuple[str, ...]:
 
 
 def attempt_expectations(case: Case) -> dict[str, str]:
+    if case.case in ("NR1", "NR2", "NR3"):
+        return {}
     if hostname_tier(case.case):
         return {row[0]: row[2] for row in hostname_rows(case)}
     denied = {
@@ -744,6 +753,12 @@ def build_command(case: Case, work: Path, binary: str, lan: str, *, answer="ANSW
                   rebind="", attempt="", lan2="", hnc_step="a") -> Command:
     cidr = lan.rsplit(".", 1)[0] + ".0/24"
     values = hostname_values(lan, lan2) if hostname_tier(case.case) else {"lan": lan, "cidr": cidr}
+    if case.case in ("NR1", "NR2", "NR3"):
+        trailing = ("--version",) if case.tool == "pi" else ("echo", "AGENT_VM_328_SHELL_STARTED")
+        return Command(case.case, case.variant, case.tool, "guest", base_environment(work),
+                       (binary, case.tool, "--no-git", "--image", IMAGE, *case.flags, "--", *trailing),
+                       str(work / "requests"), 300, 10, controls={},
+                       expected_attempts=(), attempt_expectations={}, attempt_protocols={})
     env = base_environment(work)
     extras = {"HTTP_PROXY": "http://127.0.0.1:18888", "HTTPS_PROXY": "http://127.0.0.1:18888",
               "NO_PROXY": lan, "MSB_CONFIG_PATH": str(work / "floor.json")}
@@ -1217,6 +1232,59 @@ def prepare_project(work: Path, project: Path):
         shutil.copyfile(repo_root() / "script/test/fixtures" / source, project / dest)
 
 
+def prepare_default_request_project(work: Path) -> Path:
+    project = work / "requests"
+    project.mkdir(parents=True, exist_ok=True)
+    # No custom catalog may shadow the executable embedded defaults.
+    for config in (project / ".agent-vm/config.toml", work / "home/.config/agent-vm/config.toml",
+                   work / "config/agent-vm/config.toml"):
+        if config.exists():
+            raise RuntimeError("default-request project requires isolated absent tool config")
+    return project
+
+
+def check_default_request_diagnostics(case: Case, status: int, text: str) -> list[str]:
+    """Host-only diagnostic oracle; coverage is not provider connectivity."""
+    failures = []
+    if status != 0:
+        failures.append(f"default-request launch status {status}")
+    lines = text.splitlines()
+    if case.case == "NR3":
+        if "AGENT_VM_328_SHELL_STARTED" not in lines:
+            failures.append("shell marker missing")
+    elif not any(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", line) for line in lines):
+        failures.append("Pi semantic version missing")
+    if case.case in ("NR1", "NR3"):
+        for notice in (
+            "==> Egress policy: all guest egress denied (opt in with --allow-internet-egress, --allow-egress, --allow-lan or --allow-host)",
+            "==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP or hostname allowances)",
+        ):
+            if notice not in lines:
+                failures.append("default-deny notice missing")
+    scope = "public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply)"
+    expected = []
+    if case.case == "NR1":
+        expected = [f"==> Tool network requests (built-in defaults): 3 of 3 not covered by this launch's {scope}; requests never grant access and the launch continues",
+                    "==>   unmet: api.anthropic.com", "==>   unmet: mcp-proxy.anthropic.com",
+                    "==>   unmet: platform.claude.com",
+                    "==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names"]
+    elif case.case == "NR2":
+        expected = [f"==> Tool network requests (built-in defaults): all 3 covered by this launch's {scope}; requests never grant access"]
+    # Other launch/credential notes may be indented outside this block.
+    observed = [line for line in lines if line.startswith(("==> Tool network requests", "==>   unmet:",
+                                                          "==>   to grant:", "==>   … and"))]
+    if observed != expected:
+        failures.append("default-request report framing/order/names mismatch")
+    if expected:
+        start = lines.index(expected[0]) if expected[0] in lines else -1
+        if start < 0 or lines[start:start + len(expected)] != expected:
+            failures.append("default-request block is not contiguous")
+        for i, line in enumerate(lines):
+            if line.startswith(("==> Egress policy:", "==> Egress DNS:", "==> Guest egress proxy:", "==> TLS interception:")) and i > start:
+                failures.append("network notice after request report")
+    return failures
+
+
 def write_hook(work: Path, name: str, lan: str, ident: str, port=18080):
     project = work / name
     prepare_project(work, project)
@@ -1525,7 +1593,7 @@ def health_command(work: Path) -> Command:
 
 
 def selected_cases(smoke=False):
-    return tuple(case for case in CASES if not smoke or (case.case in ("P0", "LC1", "HC1", "I1", "D1", "L1") and not case.optional))
+    return tuple(case for case in CASES if not smoke or (case.case in ("P0", "LC1", "HC1", "I1", "D1", "L1", "NR1", "NR2", "NR3") and not case.optional))
 
 
 def fixture_command(work: Path) -> Command:
@@ -1655,6 +1723,7 @@ def orchestrate(args) -> int:
     for directory in ("home", "config", "state", "fx"):
         (work / directory).mkdir()
     prepare_project(work, work / "proj")
+    prepare_default_request_project(work)
     (work / "floor.json").write_text('{"deployment_profile":"multi-tenant"}\n')
     launches, results, all_attempts = [], [], {}
     fixture = None
@@ -1790,7 +1859,9 @@ def orchestrate(args) -> int:
             rows = attempts_for(case, ident, text)
             failures.extend(check_attempt_inventory(command, rows))
             expected = 124 if case.case == "CL1" else 7 if case.case == "HK2" else 0
-            if case.guest:
+            if case.case in ("NR1", "NR2", "NR3"):
+                failures.extend(check_default_request_diagnostics(case, status, text))
+            elif case.guest:
                 if status != expected:
                     failures.append(f"primary expected {expected}, actual {status}")
                 if case.case != "HK2" and f"CASE {case.case} BEGIN" not in text.splitlines():
@@ -1944,6 +2015,44 @@ def orchestrate(args) -> int:
 
 def self_test() -> int:
     hostname_fixtures().self_test()
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        project = prepare_default_request_project(work)
+        assert not (project / ".agent-vm/config.toml").exists()
+        deny = "==> Egress policy: all guest egress denied (opt in with --allow-internet-egress, --allow-egress, --allow-lan or --allow-host)\n==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP or hostname allowances)\n"
+        unmet = "==> Tool network requests (built-in defaults): 3 of 3 not covered by this launch's public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply); requests never grant access and the launch continues\n==>   unmet: api.anthropic.com\n==>   unmet: mcp-proxy.anthropic.com\n==>   unmet: platform.claude.com\n==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names\n"
+        covered = "==> Tool network requests (built-in defaults): all 3 covered by this launch's public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply); requests never grant access\n"
+        for case, text, trailing in (
+            (Case("NR1", tool="pi"), deny + unmet + "0.87.1\n", ("--version",)),
+            (Case("NR2", tool="pi", flags=("--allow-internet-egress",)), covered + "0.87.1\n", ("--version",)),
+            (Case("NR3", tool="shell"), deny + "AGENT_VM_328_SHELL_STARTED\n", ("echo", "AGENT_VM_328_SHELL_STARTED")),
+        ):
+            command = build_command(case, work, "/candidate", "192.168.1.2")
+            assert command.cwd == str(project)
+            assert command.argv == ("/candidate", case.tool, "--no-git", "--image", IMAGE, *case.flags, "--", *trailing)
+            assert not command.expected_attempts and not command.controls
+            assert check_default_request_diagnostics(case, 0, text) == []
+            assert check_default_request_diagnostics(case, 0, "==>   unrelated credential note\n" + text + "==>   unrelated launch note\n") == []
+            assert check_default_request_diagnostics(case, 1, text)
+            assert check_default_request_diagnostics(case, 0, text.replace("0.87.1", "").replace("AGENT_VM_328_SHELL_STARTED", ""))
+            if case.case != "NR3":
+                for old, new in (("built-in defaults", "project config"), ("3", "2"), ("Tool network requests", "missing report")):
+                    assert check_default_request_diagnostics(case, 0, text.replace(old, new))
+            if case.case == "NR1":
+                assert check_default_request_diagnostics(case, 0, unmet + deny + "0.87.1\n")
+                assert check_default_request_diagnostics(case, 0, text.replace("==>   unmet: api.anthropic.com\n==>   unmet: mcp-proxy.anthropic.com", "==>   unmet: mcp-proxy.anthropic.com\n==>   unmet: api.anthropic.com"))
+                for old, new in (("platform.claude.com", "api.invalid.example"), ("==>   to grant:", "wrong hint:"), (unmet, ""), (deny, "")):
+                    assert check_default_request_diagnostics(case, 0, text.replace(old, new))
+            if case.case == "NR3":
+                assert check_default_request_diagnostics(case, 0, text + covered)
+        (work / "home/.config/agent-vm").mkdir(parents=True)
+        (work / "home/.config/agent-vm/config.toml").write_text('[[tools]]\nname="shadow"\ncommand="shadow"\n')
+        try:
+            prepare_default_request_project(work)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("user catalog was allowed to shadow defaults")
     import http.client
 
     # Ephemeral binds exercise each fixed listener's handler without occupying

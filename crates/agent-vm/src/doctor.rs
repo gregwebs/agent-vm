@@ -1397,7 +1397,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("claude -> \"claude\"; args=1;"), "{text}");
-        // `claude` declares no `env`, so its row must stay byte-identical —
+        // `claude` declares no `env`, so its row must have no env suffix —
         // no `; env=0` suffix. V7 (D6/D7).
         assert!(
             !text.contains(
@@ -1754,6 +1754,61 @@ credentials:
             "{text}"
         );
     }
+    #[test]
+    fn shipped_default_network_requests_doctor_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (text, _, _) = describe_config(config_report(None, &dir.path().join("absent.toml")));
+        let expected = [
+            ("dsh", ""),
+            (
+                "pi",
+                "api.anthropic.com,mcp-proxy.anthropic.com,platform.claude.com",
+            ),
+            ("codex", "api.openai.com,auth.openai.com,chatgpt.com"),
+            (
+                "opencode",
+                "api.openai.com,auth.openai.com,chatgpt.com,models.opencode.ai",
+            ),
+            (
+                "claude",
+                "api.anthropic.com,mcp-proxy.anthropic.com,platform.claude.com",
+            ),
+            ("copilot", ""),
+            ("shell", ""),
+        ];
+        let baseline_rows = [
+            "dsh -> \"dsh\"; args=1; credentials=none; provisions=none; persist=1; source=built-in",
+            "pi -> \"pi\"; args=0; credentials=none; provisions=anthropic; persist=0; source=built-in",
+            "codex -> \"codex\"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1",
+            "opencode -> \"opencode\"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in",
+            "claude -> \"claude\"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in",
+            "copilot -> \"copilot\"; args=1; credentials=copilot; provisions=copilot; persist=0; source=built-in",
+            "shell -> \"bash\"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=0; source=built-in; interactive_shell=true; env=1",
+        ];
+        for (i, (name, names)) in expected.into_iter().enumerate() {
+            let row = text
+                .lines()
+                .find(|line| line.contains(&format!("{}. {name} ->", i + 1)))
+                .unwrap();
+            let unchanged = row
+                .split_once(". ")
+                .unwrap()
+                .1
+                .split("; network_requests=")
+                .next()
+                .unwrap();
+            assert_eq!(unchanged, baseline_rows[i]);
+            if names.is_empty() {
+                assert!(!row.contains("network_requests"), "{row}");
+            } else {
+                assert!(
+                    row.ends_with(&format!("; network_requests={names}")),
+                    "{row}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn network_requests_doctor_bounded_metadata_and_conflict() {
         let dir = tempfile::tempdir().unwrap();

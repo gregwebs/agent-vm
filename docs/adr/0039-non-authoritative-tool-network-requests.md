@@ -90,4 +90,9 @@ Requests add no authority, TLS interception, credential capture or provisioning.
 Missing requests never block launch. Coverage remains syntactic and lookup-free.
 Request values are publicly rendered metadata and **must not contain secrets**;
 `sk-test-sensitivevalue` is grammatical and is printed, not redacted. This is
-framing protection, not credential detection. Shipped defaults declare none.
+framing protection, not credential detection.
+
+Amendment 2026-10-12 (#328): Claude/Codex/OpenCode/Pi defaults declare scoped
+baseline requests, independently of credential proxy hosts; Copilot is pending
+#340. [Endpoint evidence and maintenance](../default-tool-network-requests.md)
+define the version/auth conditions and exclusions. Behavior is unchanged.
