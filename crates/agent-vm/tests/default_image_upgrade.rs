@@ -18,6 +18,31 @@ mod support;
 use image_archive::{ArchiveSpec, LayerContent, PlatformSpec};
 use oci_registry::{Image, Server};
 
+/// Run a freshly written fixture shim once. `execve` of a file that another
+/// thread's concurrent `fork` still holds a duplicate write descriptor for
+/// fails with `ETXTBSY`; the kernel race is timing-dependent, so retry briefly
+/// rather than failing the harness.
+fn calibration_status(path: &Path, log: &Path) -> std::process::ExitStatus {
+    let mut attempts = 0;
+    loop {
+        match Command::new(path)
+            .env_clear()
+            .env("HOST_CALL_LOG", log)
+            .arg("fixture-calibration")
+            .status()
+        {
+            Ok(status) => return status,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+            {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("fixture calibration exec {path:?} failed: {error}"),
+        }
+    }
+}
+
 struct Harness {
     root: tempfile::TempDir,
     _short_state: tempfile::TempDir,
@@ -61,12 +86,7 @@ impl Harness {
             ("wget", 94),
             ("msb", 93),
         ] {
-            let status = Command::new(bin.join(name))
-                .env_clear()
-                .env("HOST_CALL_LOG", &log)
-                .arg("fixture-calibration")
-                .status()
-                .unwrap();
+            let status = calibration_status(&bin.join(name), &log);
             assert_eq!(status.code(), Some(code));
             assert!(
                 fs::read_to_string(&log)
