@@ -30,6 +30,11 @@ import sys
 # keep treating a timeout as a bounded failure rather than a signal death.
 TIMEOUT_EXIT = 124
 
+# SIGKILL cannot be caught, so a direct child that does not reap within this
+# bound is a host-level failure. Bound it so an escalation that cannot complete
+# surfaces as an error instead of blocking forever.
+KILL_REAP_TIMEOUT = 5.0
+
 
 class LaunchTimedOut(Exception):
     """The launched group overran the timeout and was terminated."""
@@ -41,6 +46,10 @@ class LaunchInterrupted(Exception):
     def __init__(self, signum):
         super().__init__(f"interrupted by signal {signum}")
         self.signum = signum
+
+
+class LaunchTerminationFailed(Exception):
+    """A terminated owned group could not be reaped within the bound."""
 
 
 def _validate_bound(name, value):
@@ -100,9 +109,19 @@ def _terminate_group(proc, grace):
         # empty) group instead of ESRCH.
         proc.poll()
         _signal_group(pgid, signal.SIGKILL)
-        proc.wait()
+        _reap_killed(proc)
         return
     _signal_group(pgid, signal.SIGKILL)
+
+
+def _reap_killed(proc):
+    """Reap a SIGKILLed direct child, bounded so a host stall cannot hang."""
+    try:
+        proc.wait(timeout=KILL_REAP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise LaunchTerminationFailed(
+            f"owned child {proc.pid} survived SIGKILL for {KILL_REAP_TIMEOUT}s"
+        ) from None
 
 
 def _cleanup_group(proc, grace):
@@ -128,13 +147,14 @@ def run_in_owned_group(argv, *, env, cwd, timeout, grace):
     Returns the child's exit status. Raises LaunchTimedOut after the owned group
     is terminated and reaped, and LaunchInterrupted if the parent is interrupted
     (SIGTERM), so the caller never returns while a descendant is still live in
-    the group this helper created. `timeout` and `grace` are validated before
-    any child is spawned.
+    the group this helper created. Raises LaunchTerminationFailed if the group
+    cannot be reaped even after SIGKILL. `timeout` and `grace` are validated
+    before any child is spawned.
     """
     timeout = _validate_bound("timeout", timeout)
     grace = _validate_bound("grace", grace)
 
-    state = {"proc": None, "cleaned": False}
+    state = {"proc": None, "cleaned": False, "interrupted": False}
 
     def cleanup():
         # Serialize cleanup and never signal an already-reaped group id (it could
@@ -146,7 +166,15 @@ def run_in_owned_group(argv, *, env, cwd, timeout, grace):
         _cleanup_group(proc, grace)
 
     def on_signal(signum, _frame):
-        cleanup()
+        # Only interrupt; never tear down from the handler. Teardown calls
+        # Popen.wait, and the interrupted frame below may still hold
+        # Popen._waitpid_lock from its own proc.wait in this same thread -- a
+        # nested blocking wait would deadlock on the non-reentrant lock. The
+        # raise unwinds out of proc.wait (releasing the lock), and the frame
+        # below performs cleanup once it is safe to do so.
+        if state["interrupted"]:
+            return
+        state["interrupted"] = True
         raise LaunchInterrupted(signum)
 
     previous = signal.signal(signal.SIGTERM, on_signal)
@@ -165,6 +193,11 @@ def run_in_owned_group(argv, *, env, cwd, timeout, grace):
         return status
     except KeyboardInterrupt:
         # Ctrl-C goes to this parent, not to the new-session candidate.
+        cleanup()
+        raise
+    except LaunchInterrupted:
+        # proc.wait has unwound, so its _waitpid_lock is free again; cleanup
+        # here can safely wait on the child.
         cleanup()
         raise
     finally:
@@ -222,6 +255,9 @@ def main(argv=None):
         return TIMEOUT_EXIT
     except LaunchInterrupted as exc:
         return 128 + exc.signum
+    except LaunchTerminationFailed as exc:
+        print(f"released-image-launch: {exc}", file=sys.stderr)
+        return 1
     return status if status is not None else 1
 
 
