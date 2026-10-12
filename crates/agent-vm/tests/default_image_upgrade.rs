@@ -581,6 +581,12 @@ fn interrupted_stream_and_refused_registry_preserve_every_old_byte() {
     let out = collect_bounded(child);
     assert_eq!(out.status.code(), Some(1));
     before.unchanged(&h, &pin_a);
+    // The fixture records a request it could not serve instead of panicking.
+    // Nothing here should have been recorded: a resuming client's `Range` is
+    // served as 206, so an entry means the fixture met a request shape it does
+    // not model, which is the loud guard the old `assert!(range.is_none())`
+    // provided before it aborted the whole test binary.
+    assert_eq!(server.errors(), Vec::<String>::new());
     let host = server.host.clone();
     drop(server);
     let before = Snapshot::take(&h, &pin_a, &a);
