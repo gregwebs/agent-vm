@@ -337,7 +337,8 @@ before merging. Their merge is a **union of whole definitions**, not a field
 overlay: the user tier is authoritative for every name it declares, the
 project tier may only add names, and a differing project declaration yields a
 `doctor` warning (user definition wins). Only when both tiers declare **zero**
-tools do the compiled-in defaults apply.
+tools do the compiled-in defaults apply. `[network]` authority is user-tier only;
+project declarations remain non-authoritative.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
 and the in-guest `clipboard`/`_intercept-hook` keep working, and a launch verb
@@ -469,7 +470,8 @@ mount", which implies lazy shared backing storage.
 
 ## Protected config directory
 
-`~/.config/agent-vm`, where agent-vm reads launch authority, which is never
+`~/.config/agent-vm`, where `credentials.yaml` and `[network]` authorize
+launch secrets and egress, respectively. This directory is never
 inside a writable live bind. Protection includes directories its lookup searches
 and prospective directories reached through missing components, measuring raw
 `$HOME` and the account home. Read-only binds and fork copies are exempt.
@@ -522,14 +524,16 @@ authorize DNS.
 destination (exact name + port) it expects to contact; reported when unmet,
 never a grant.
 
-Authority is CLI-only in this release; config may request but not grant.
-Both config tiers refuse `[network]`.
-Persistent grants are not supported yet (see [#302](https://github.com/gregwebs/agent-vm/issues/302)).
+**Persisted grant**: a user-tier `[network]` setting, read only from a verified
+file and merged per launch. Flags override saved booleans and add allowances;
+agent-vm never writes the result back. The project tier refuses `[network]`.
+See [ADR-0040](docs/adr/0040-persisted-user-network-authority.md).
 See [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) for DNS limitations and
 [ADR-0037](docs/adr/0037-hostname-egress-allowances.md) for hostname allowances;
 [ADR-0039](docs/adr/0039-non-authoritative-tool-network-requests.md) for requests.
 
-_Avoid_: "requested allowance" and "tool allowance" for a network request
+_Avoid_: "saved policy" / "profile" for a persisted grant;
+"requested allowance" and "tool allowance" for a network request
 (a request is not an allowance); "domain allowance", "wildcard host" and
 "host allowance" for a hostname grant — the unit is an exact name, not a suffix or a host; "allow list" for the
 whole policy; "network profile" (the runtime's `from_profiles` abstraction,

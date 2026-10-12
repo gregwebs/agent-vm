@@ -488,6 +488,7 @@ Networking (deny-by-default; flags compose):
   --allow-egress           guest → IP/host   reach one IP/CIDR or TLS hostname [proto/port]
   --allow-lan              guest → LAN       reach the whole private range
   --allow-host             guest → host      reach the host's 127.0.0.1 services
+  saved defaults: [network] in ~/.config/agent-vm/config.toml; flags override true/false and add allowances
 
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
@@ -675,6 +676,7 @@ pub struct Args {
 pub(crate) async fn launch(
     entry: &CatalogEntry,
     images: &ConfiguredImages,
+    user_network: Option<&crate::user_network::UserNetwork>,
     args: Args,
 ) -> Result<i32> {
     let tool = entry.tool();
@@ -685,7 +687,7 @@ pub(crate) async fn launch(
     // configured image must not create state. `args.image.requested()` also
     // applies the empty-`AGENT_VM_IMAGE_TAG`-is-unset rule.
     let boot = boot_image::select(args.image.requested()?, images)?;
-    let network_plan = crate::network::Plan::from_args(args.network)?;
+    let network_plan = crate::network::Plan::from_args(args.network, user_network)?;
     // The one output policy for this selection: explicit sources render their
     // escaped reference; the default tier renders a fixed label and redacts the
     // reference from every notice, debug dump, progress line and error chain.
@@ -3522,7 +3524,9 @@ mod tests {
             .expect("run.rs has a test module")
             .0;
         let position = |needle| production.find(needle).expect("launch step is present");
-        let plan = position("let network_plan = crate::network::Plan::from_args(args.network)?;");
+        let plan = position(
+            "let network_plan = crate::network::Plan::from_args(args.network, user_network)?;",
+        );
         let notices = position(".emit_launch_notices()");
         let base_network = position("builder = network_plan.apply_to(builder);");
         let credential_network = position("builder = credential_plan.apply_to(builder)?;");

@@ -217,6 +217,8 @@ pub(crate) enum Dispatch {
         entry: Box<CatalogEntry>,
         /// The two tiers' `image` settings (see the `Builtin` arm).
         images: ConfiguredImages,
+        /// Verified user authority captured before consuming the report, like images.
+        user_network: Option<crate::user_network::UserNetwork>,
         args: Box<run::Args>,
     },
 }
@@ -266,21 +268,22 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let (catalog, images) = match config {
+    let (catalog, images, user_network) = match config {
         // A dangling `tools` reference is *user* input, so it must degrade to
         // the deferred-error path (ADR-0015) rather than `?`-propagate and take
         // `doctor`/`--help`/`clipboard` down with it. The readable `image` is
         // captured first so a catalog error cannot erase it (§5.3).
         Ok(report) => {
             let images = report.images().clone();
+            let user_network = report.user_network().cloned();
             match report.into_launch_catalog() {
-                Ok(catalog) => (Catalog::Ready(catalog), images),
-                Err(error) => (Catalog::Broken(error), images),
+                Ok(catalog) => (Catalog::Ready(catalog), images, user_network),
+                Err(error) => (Catalog::Broken(error), images, None),
             }
         }
         // The configured tiers are unknown, so the recovery builtins fall back
         // to `--image`/env or the default boot image (D7).
-        Err(error) => (Catalog::Broken(error), ConfiguredImages::default()),
+        Err(error) => (Catalog::Broken(error), ConfiguredImages::default(), None),
     };
 
     // Collected so the `secret` scrub below can look at the verb without
@@ -343,6 +346,7 @@ where
                     Ok(Dispatch::Launch {
                         entry: Box::new(entry),
                         images,
+                        user_network,
                         args: Box::new(args),
                     })
                 }
@@ -863,12 +867,12 @@ mod tests {
     #[test]
     fn network_table_rejection_is_a_deferred_catalog_error() {
         let dir = tempfile::tempdir().unwrap();
-        let user = dir.path().join("user.toml");
-        std::fs::write(&user, "[network]\nallow_lan = true").unwrap();
+        let project = dir.path().join("project.toml");
+        std::fs::write(&project, "[network]\nallow_lan = true").unwrap();
         let load = || {
             crate::config::load(&crate::config::ConfigPaths {
-                user: Some(user.clone()),
-                project: dir.path().join("absent.toml"),
+                user: None,
+                project: project.clone(),
             })
         };
         assert!(matches!(
@@ -895,7 +899,37 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("network.allow_lan"));
-        assert!(error.contains("user config is not supported yet"));
+        assert!(error.contains("network access cannot be granted by the project config"));
+    }
+
+    #[test]
+    fn parse_from_carries_the_user_network_into_a_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("user.toml");
+        std::fs::write(&file, "[network]\nallow_lan = true\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let load = || {
+            crate::config::load(&crate::config::ConfigPaths {
+                user: Some(file.clone()),
+                project: dir.path().join("absent.toml"),
+            })
+        };
+        let expected = load().unwrap().user_network().cloned();
+        let Dispatch::Launch { user_network, .. } =
+            parse_from(["agent-vm", "shell"], load()).unwrap()
+        else {
+            panic!("launch")
+        };
+        assert_eq!(user_network, expected);
+        assert!(matches!(
+            parse_from(["agent-vm", "doctor"], load()).unwrap(),
+            Dispatch::Builtin {
+                cmd: Cmd::Doctor(_),
+                ..
+            }
+        ));
     }
 
     // -- T10: the asymmetric broken-config acceptance criterion -----------

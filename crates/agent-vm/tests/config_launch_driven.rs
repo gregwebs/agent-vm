@@ -300,6 +300,22 @@ impl Harness {
         write(&self.user_config(), contents);
     }
 
+    fn write_user_mode(&self, contents: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        self.write_user(contents);
+        std::fs::set_permissions(self.user_config(), std::fs::Permissions::from_mode(mode))
+            .unwrap();
+        std::fs::set_permissions(
+            self.user_config().parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    fn symlink_user_config(&self, target: &Path) {
+        std::fs::create_dir_all(self.user_config().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, self.user_config()).unwrap();
+    }
+
     fn write_project(&self, contents: &str) {
         write(&self.project_config(), contents);
     }
@@ -6066,7 +6082,7 @@ fn rejected_allowance_is_refused_before_launch_state_is_created() {
     );
 }
 
-/// G5: a `[network]` table in the project or user tier is refused with a named
+/// G5: a `[network]` table in the project tier is refused with a named
 /// diagnostic that points at the setting and the tier; the project tier can
 /// never grant egress.
 #[test]
@@ -6079,17 +6095,6 @@ fn project_network_table_fails_every_launch() {
     assert!(stderr.contains("network.allow_lan"), "{stderr}");
     assert!(
         stderr.contains("network access cannot be granted by the project config"),
-        "{stderr}"
-    );
-
-    let harness = Harness::new();
-    harness.write_user("[network]\nallow_lan = true\n");
-    let out = harness.launch_default("shell");
-    assert!(!out.status.success(), "a user [network] table must fail");
-    let stderr = stderr_of(&out);
-    assert!(stderr.contains("network.allow_lan"), "{stderr}");
-    assert!(
-        stderr.contains("[network] in the user config is not supported yet"),
         "{stderr}"
     );
 }
@@ -6145,7 +6150,10 @@ fn allowance_rejections_report_exact_messages() {
 #[test]
 fn user_network_refusal_is_rendered_in_doctor_tool_configuration() {
     let harness = Harness::new();
-    harness.write_user("[network]\nallow_lan = true\n");
+    harness.write_user_mode("[network]\nallow_lan = true\n", 0o600);
+    let target = harness.project_root.join("dotfile");
+    std::fs::rename(harness.user_config(), &target).unwrap();
+    harness.symlink_user_config(&target);
     let out = harness.base_command().arg("doctor").output().unwrap();
     assert!(!out.status.success(), "doctor must report config failure");
     let stdout = stdout_of(&out);
@@ -6157,9 +6165,8 @@ fn user_network_refusal_is_rendered_in_doctor_tool_configuration() {
         .next()
         .unwrap();
     assert!(section.contains("error: config:"), "{stdout}");
-    assert!(section.contains("network.allow_lan"), "{stdout}");
     assert!(
-        section.contains("[network] in the user config is not supported yet"),
+        section.contains("reached through a symbolic link"),
         "{stdout}"
     );
 }
@@ -6676,5 +6683,426 @@ fn requests_numeric_lan_host_stay_unmet_and_port_scope_is_exact() {
             expected_block("user config", 2, &unmet)
         );
         assert_eq!(stderr.matches("unmet:").count(), unmet.len());
+    }
+}
+
+const PN_ORACLES: &str =
+    include_str!("../../../script/test/fixtures/persisted-network/expected-stderr.tsv");
+const PN_HOST: &str =
+    include_str!("../../../script/test/fixtures/persisted-network/user-allow-host.toml");
+
+#[test]
+fn user_network_table_reaches_the_sandbox_policy() {
+    let h = Harness::new();
+    h.write_user_mode("[network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/24\",\"tcp://[192.168.10.0/24]:22\",\"api.example.com\"]\n", 0o600);
+    let out = h.launch_default("shell");
+    let config = normalized_config(&h, &out);
+    assert_eq!(
+        config["network"]["policy"]["rules"],
+        serde_json::json!([
+            {"direction":"egress","destination":{"cidr":"10.0.0.0/24"},"protocols":[],"ports":[],"action":"allow"},
+            {"direction":"egress","destination":{"cidr":"192.168.10.0/24"},"protocols":["tcp"],"ports":[{"start":22,"end":22}],"action":"allow"},
+            {"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}
+        ])
+    );
+    assert_eq!(
+        config["network"]["tls"]["intercepted_ports"],
+        serde_json::json!([443])
+    );
+    let stderr = stderr_of(&out);
+    for text in [
+        "==> Egress authority: user config",
+        "allowing 10.0.0.0/24 (user config)",
+        "allowing tcp://[192.168.10.0/24]:22 (user config)",
+        "no plain HTTP; user config)",
+    ] {
+        assert!(stderr.contains(text), "{stderr}");
+    }
+}
+
+#[test]
+fn cli_false_overrides_a_saved_true() {
+    for (setting, flag, group) in [
+        (
+            "allow_internet_egress",
+            "--allow-internet-egress=false",
+            "public",
+        ),
+        ("allow_lan", "--allow-lan=false", "private"),
+        ("allow_host", "--allow-host=false", "host"),
+    ] {
+        for override_flag in [false, true] {
+            let h = Harness::new();
+            h.write_user_mode(&format!("[network]\n{setting} = true\n"), 0o600);
+            let extra: &[&str] = if override_flag { &[flag] } else { &[] };
+            let out = h.launch("shell", extra);
+            let config = normalized_config(&h, &out);
+            let found = config["network"]["policy"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["destination"]["group"] == group);
+            assert_eq!(found, !override_flag);
+            if override_flag {
+                assert!(
+                    stderr_of(&out)
+                        .contains(&format!("{flag} overrides {setting} = true in user config"))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cli_allowances_union_with_saved_ones_and_nothing_is_saved() {
+    let h = Harness::new();
+    h.write_user_mode(
+        "[network]\nallow_egress = [\"10.0.0.5\",\"api.example.com\"]\n",
+        0o600,
+    );
+    let file = h.user_config();
+    let bytes = std::fs::read(&file).unwrap();
+    let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let inventory = || {
+        let mut entries: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        entries.sort();
+        entries
+    };
+    let before = inventory();
+    let out = h.launch(
+        "shell",
+        &[
+            "--allow-egress",
+            "10.0.0.5/32",
+            "--allow-egress",
+            "192.168.1.0/24",
+        ],
+    );
+    let config = normalized_config(&h, &out);
+    assert_eq!(
+        config["network"]["policy"]["rules"],
+        serde_json::json!([
+            {"direction":"egress","destination":{"cidr":"10.0.0.5/32"},"protocols":[],"ports":[],"action":"allow"},
+            {"direction":"egress","destination":{"cidr":"192.168.1.0/24"},"protocols":[],"ports":[],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}
+        ])
+    );
+    assert!(stderr_of(&out).contains("10.0.0.5/32 (user config and --allow-egress)"));
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), mtime);
+    assert_eq!(inventory(), before);
+}
+fn assert_saved_refusal(h: &Harness, out: &Output, reason: &str, msb_untouched: bool) {
+    assert!(!out.status.success());
+    let stderr = stderr_of(out);
+    assert!(stderr.contains(reason), "{stderr}");
+    assert!(
+        stderr.contains(&h.user_config().display().to_string()),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("sk-live-SENTINEL-305"));
+    assert!(!stderr.contains(CONFIG_MARKER));
+    assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
+    assert!(!h.state_root.join("msb-home").exists());
+    if msb_untouched {
+        assert!(h.msb_log().is_empty());
+    }
+}
+#[test]
+fn unsafe_user_network_is_refused_before_launch_state() {
+    use std::os::unix::fs::PermissionsExt;
+    for shape in [
+        "group",
+        "other",
+        "directory",
+        "hardlink",
+        "symlink",
+        "safe",
+        "readable",
+    ] {
+        let h = Harness::new();
+        h.write_user_mode(
+            "# sk-live-SENTINEL-305\n[network]\nallow_host = true\n",
+            0o600,
+        );
+        let file = h.user_config();
+        let reason = match shape {
+            "group" => {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
+                "group- or other-writable config.toml"
+            }
+            "other" => {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o646)).unwrap();
+                "group- or other-writable config.toml"
+            }
+            "directory" => {
+                std::fs::set_permissions(
+                    file.parent().unwrap(),
+                    std::fs::Permissions::from_mode(0o775),
+                )
+                .unwrap();
+                "directory is group- or other-writable"
+            }
+            "hardlink" => {
+                std::fs::hard_link(&file, h.project_root.join("alias")).unwrap();
+                "2 hard links"
+            }
+            "symlink" => {
+                let target = h.project_root.join("dotfile");
+                std::fs::rename(&file, &target).unwrap();
+                h.symlink_user_config(&target);
+                "reached through a symbolic link"
+            }
+            "readable" => {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+                ""
+            }
+            _ => "",
+        };
+        let out = h.launch_default("shell");
+        if reason.is_empty() {
+            assert!(stderr_of(&out).contains(CONFIG_MARKER));
+        } else {
+            assert_saved_refusal(&h, &out, reason, true);
+        }
+    }
+}
+
+// Read-route coverage for #305 — the config-directory symlink, a directory at
+// the config path, an unreadable file and value safety at the integration
+// boundary. These routes have no coverage in the tests above; the harness,
+// fake `msb` and helpers are the ones this file already provides.
+// ---------------------------------------------------------------------------
+
+/// RA: a `config.toml` that carries `[network]` but cannot be read fails the
+/// launch closed (a read error), rather than silently treating the unreadable
+/// authority as absent. The failure precedes any launch state, so the fake
+/// `msb` is never invoked.
+#[test]
+fn unreadable_user_network_config_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    h.write_user_mode("[network]\nallow_host = true\n", 0o000);
+    let out = h.launch_default("shell");
+    let stderr = stderr_of(&out);
+    assert!(
+        !out.status.success(),
+        "an unreadable config must fail the launch"
+    );
+    assert!(stderr.contains("config"), "{stderr}");
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(!h.state_root.join("msb-home").exists());
+    assert!(
+        h.msb_log().is_empty(),
+        "msb must not be touched: {}",
+        h.msb_log()
+    );
+    // Restore the mode so the `TempDir` guard can remove the tree.
+    std::fs::set_permissions(h.user_config(), std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// RB: the config path is a directory, not a regular file: refused, with no
+/// launch state created. (The T4 `directory` row is a group-writable *parent*,
+/// not a directory at the path itself.)
+#[test]
+fn directory_at_the_user_config_path_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    let dir = h.user_config();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let out = h.launch_default("shell");
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(h.msb_log().is_empty(), "msb log: {}", h.msb_log());
+}
+
+/// RC: the config **directory** (`~/.config/agent-vm`) is itself a symlink to
+/// another directory holding a normal `0600`, singly-linked `[network]` file.
+/// The final component is a regular file, so the `O_NOFOLLOW` first open does
+/// not refuse it, and the parent check resolves the link to a user-owned,
+/// non-`go-w` directory: the table is **accepted**. This is the documented
+/// ADR-0040 route — a symlinked *directory* is followed under the stable-route
+/// assumption, and ADR-0038 still refuses the exposing launch that could plant
+/// the link. Contrast the final-component symlink (`config.toml -> ...`),
+/// which is refused.
+#[test]
+fn symlinked_user_config_directory_is_followed() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    let real = h.home_root.join("realcfg");
+    write(&real.join("config.toml"), "[network]\nallow_host = true\n");
+    std::fs::set_permissions(
+        real.join("config.toml"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = h.user_config().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let out = h.launch_default("shell");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "a symlinked config directory is an accepted, documented ADR-0040 route: {stderr}"
+    );
+}
+
+/// RD: `[network]` type and unknown-key errors are value-safe at the
+/// integration boundary: the launch is refused, the sentinel value never
+/// reaches stderr, and the fake `msb` is untouched. The unit tests pin the
+/// message text; this pins that the real binary's rendering never echoes the
+/// value.
+#[test]
+fn user_network_type_errors_are_value_safe() {
+    const SENTINEL: &str = "sk-live-SENTINEL-305";
+    for text in [
+        format!("[network]\nallow_egress = \"{SENTINEL}\"\n"),
+        format!("[network]\nallow_host = \"{SENTINEL}\"\n"),
+        format!("[network]\n{SENTINEL} = true\n"),
+        "[network]\nallow_egress = [\"10.0.0.1\", 7]\n".to_string(),
+    ] {
+        let h = Harness::new();
+        h.write_user_mode(&text, 0o600);
+        let out = h.launch_default("shell");
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "must refuse: {text}");
+        assert!(!stderr.contains(SENTINEL), "value leaked: {stderr}");
+        assert!(h.msb_log().is_empty(), "msb log: {}", h.msb_log());
+    }
+}
+
+#[test]
+fn symlinked_user_config_without_network_still_launches() {
+    let h = Harness::new();
+    h.write_user_mode("# no authority\n", 0o600);
+    let target = h.project_root.join("dotfile");
+    std::fs::rename(h.user_config(), &target).unwrap();
+    h.symlink_user_config(&target);
+    assert!(stderr_of(&h.launch_default("shell")).contains(CONFIG_MARKER));
+}
+#[test]
+fn saved_hostname_with_host_proxy_is_refused_before_state() {
+    for extra in [
+        vec![],
+        vec!["--allow-lan=false", "--allow-egress", "10.0.0.1"],
+    ] {
+        let h = Harness::new();
+        h.write_user_mode(
+            "# sk-live-SENTINEL-305\n[network]\nallow_egress = [\"api.example.com\"]\n",
+            0o600,
+        );
+        let out = h.launch_with_env("shell", &extra, &[("HTTPS_PROXY", "http://127.0.0.1:9")]);
+        assert_saved_refusal(
+            &h,
+            &out,
+            "hostname allowances cannot be enforced through the host HTTP proxy",
+            false,
+        );
+        assert!(stderr_of(&out).contains(&format!("(hostnames saved in user config \"{}\" [network] apply to every launch; remove them there)", h.user_config().display())));
+    }
+    let h = Harness::new();
+    h.write_user_mode("[network]\n", 0o600);
+    assert!(
+        stderr_of(&h.launch_with_env("shell", &[], &[("HTTPS_PROXY", "http://127.0.0.1:9")]))
+            .contains(CONFIG_MARKER)
+    );
+}
+#[test]
+fn saved_hostname_grant_covers_tool_requests() {
+    for saved in [false, true] {
+        let h = Harness::new();
+        h.write_project(&format!(
+            "{FETCHER}network_requests = [\"api.example.com\"]\n"
+        ));
+        if saved {
+            h.write_user_mode("[network]\nallow_egress = [\"api.example.com\"]\n", 0o600);
+        }
+        let out = h.launch_default("fetcher");
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(CONFIG_MARKER));
+        assert_eq!(stderr.contains("unmet:"), !saved);
+        if saved {
+            assert!(stderr.contains("all 1 covered"), "{stderr}");
+        }
+    }
+}
+#[test]
+fn saved_grants_survive_the_credential_overlay() {
+    let h = Harness::new();
+    h.write_user_mode(&format!("{ONE_YAML_TOOL}\n[network]\nallow_lan = true\nallow_egress = [\"api.example.com\",\"tcp://git.example.com:8443\"]\n"), 0o600);
+    write_credentials(
+        &h.home_root,
+        "credentials:\n  - service: my-service\n    apiKey:\n      name: MY_SERVICE_KEY\n      sentinelEnv: true\n      inject: [{domain: 'api.my-service.example:9443', header: x-api-key, format: '%s'}]\n",
+    );
+    let out = h.launch_with_env(
+        "t",
+        &[],
+        &[(
+            "AGENT_VM_TEST_CREDENTIAL",
+            "my-service=sk-test-overlay-value",
+        )],
+    );
+    let config = normalized_config(&h, &out);
+    assert_eq!(
+        config["network"]["tls"]["intercepted_ports"],
+        serde_json::json!([443, 8443, 9443])
+    );
+    assert_eq!(
+        config["network"]["policy"]["rules"],
+        serde_json::json!([
+            {"direction":"egress","destination":{"group":"private"},"protocols":[],"ports":[],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443},{"start":8443,"end":8443}],"action":"allow"},
+            {"direction":"egress","destination":{"domain":"git.example.com"},"protocols":["tcp"],"ports":[{"start":8443,"end":8443}],"action":"allow"}
+        ])
+    );
+    assert!(
+        !config["network"]["secrets"]["header_credentials"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+#[test]
+fn native_row_oracles_are_rendered_diagnostics() {
+    let rows: std::collections::BTreeSet<_> = PN_ORACLES
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split_once('\t').unwrap().0)
+        .collect();
+    assert_eq!(
+        rows,
+        ["PN1", "PN2", "PN3", "PN4B", "PN5"].into_iter().collect()
+    );
+    for row in ["PN1", "PN2", "PN3", "PN4B"] {
+        let h = Harness::new();
+        if row != "PN1" {
+            h.write_user_mode(PN_HOST, 0o600);
+        }
+        if row == "PN4B" {
+            let target = h.project_root.join("dotfile");
+            std::fs::rename(h.user_config(), &target).unwrap();
+            h.symlink_user_config(&target);
+        }
+        let extra: &[&str] = if row == "PN3" {
+            &["--allow-host=false"]
+        } else {
+            &[]
+        };
+        let out = h.launch("shell", extra);
+        let stderr = stderr_of(&out);
+        for (_, text) in PN_ORACLES
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter(|(key, _)| *key == row)
+        {
+            assert!(stderr.contains(text), "{row}: {stderr}");
+        }
     }
 }

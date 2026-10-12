@@ -29,6 +29,9 @@ A hard-linked `config.toml` also blocks launches. Run from a project directory,
 use `:ro` or a narrower bind, and replace multiply-linked config with a copy.
 See [config directory protection](USAGE.md#agent-vms-config-directory-is-never-writable-from-the-guest).
 
+Grants can also be saved in `~/.config/agent-vm/config.toml` `[network]`
+(user tier only); see [persisted grants](USAGE.md#persisted-grants-user-config).
+
 **Breaking change in 0.2.0:** existing tool launches now have no guest egress or
 DNS query authorization until you pass a grant. Agents calling provider APIs
 (`claude`, `codex`, …) need `--allow-internet-egress` to restore public internet

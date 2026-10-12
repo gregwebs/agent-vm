@@ -339,6 +339,50 @@ Its boot-free companion is
 socket-path budget; host-only, never native evidence). CI syntax-checks/lints
 the script and runs the companion but **does not run native VM rows**.
 
+#### Persisted network live check
+
+On a dedicated macOS Apple Silicon host with no concurrent VMs:
+
+```bash
+./script/build/macos.sh --dev
+AGENT_VM_BIN="$PWD/target/macos-dev/bin/agent-vm" \
+AGENT_VM_LIVE_TEST_IMAGE=VERIFIED_NATIVE_IMAGE \
+  bash script/test/persisted-network-live.sh
+```
+
+Use an explicit verified native image (for example an authenticated immutable
+standard-release reference). The script uses private HOME/state, short
+socket-safe paths and serial owned launches.
+
+The evidence directory is self-identifying. `source.txt` records the commit,
+the full `git status --porcelain` (never empty while unrelated untracked files
+exist) and `git status --porcelain --untracked-files=no`, which is empty
+exactly when the tracked tree matches the commit. `tree.diff` holds the tracked
+changes themselves and `tree.diff.sha256` their digest, so a reader can tell
+whether the rows came from the committed source. `harness.sha256` is the hash
+of **every** file under `script/test/` (the driver and its imports, the sourced
+helpers, the guest probes and the oracles), enumerated from the tree rather
+than hand-listed. `binary.sha256` and `binary-version.txt` identify the binary
+and `image.txt` the image. The run also records stderr, request-log offsets,
+inventories and identity-checked cleanup receipts. Timeout, malformed probe
+output or cleanup survivors are failures, never policy denials. Scratch is
+removed only after successful cleanup; failure retains it for diagnosis.
+
+PN1 denies by default; PN2 reaches with saved host authority; PN3 disables it
+with `=false`. PN4-A plants `[network]` through a tools-only dotfile symlink,
+PN4-B refuses P2 before guest execution/state, and PN4c reaches after replacing
+the link with a verified regular copy. PN5 refuses a HOME launch. The bounded
+probe uses `egress-probe.sh::http_get` and serves `/r/marker` with exact
+`receipt marker` bytes. Request deltas, not a bare connection, decide reach.
+**PN4-A/B/PN4c must pass or receive a written maintainer waiver before #305
+is complete.** Without that evidence a PR says “Part of #305”, not “Closes #305”.
+
+`bash script/test/persisted-network-contract.sh` exercises the write/probe
+snippets on a host-only stand-in and joins the shared diagnostic TSV to
+boot-free CLI tests. It is in `ci-contracts.sh`; it is **not** guest-authorship
+or native enforcement evidence. CI checks the live script's syntax/lint only.
+See [ADR-0040](docs/adr/0040-persisted-user-network-authority.md).
+
 #### `bash -c`, not `bash -lc`, for in-guest commands
 
 When you pass a command to the guest yourself, pass it through a non-login
@@ -414,6 +458,8 @@ positive explicit-source control.
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
 | `script/test/build-workflow.sh` | yes (macOS) | fake-plutil bundle seam, no VM/image sources |
 | `script/test/ci-contracts.sh` | yes | runtime provenance, shell guards, offline pin/negative controls, Chrome launcher-path agreement and e2e dispatch contracts |
+| `script/test/persisted-network-contract.sh` | yes (`ci-contracts.sh`) | host-only snippet controls and shared diagnostic oracles; no native evidence |
+| `script/test/persisted-network-live.sh` | **no** | dedicated macOS arm64 PN rows; required evidence or written waiver |
 | `script/test/verus-verification.sh` | yes | machine-checked boundary contracts |
 | Image source/build/installer/runtime/egress audits | independent image repo CI | migrated; equivalence not verified by launcher CI |
 

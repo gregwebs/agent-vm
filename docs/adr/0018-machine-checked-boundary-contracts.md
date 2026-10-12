@@ -51,7 +51,14 @@ Additional ADR-0038 decision/adapter pairs:
 |---|---|
 | `protected_config_dir::exposing_entry` | `check_core_bind` / `check_writable_mount`: resolution walk, `canonicalize`, `metadata`, `Path` → bytes |
 | `protected_config_dir::exposing_prospective` / `may_name_same_entry` | missing-source branch of `check_core_bind`: cwd anchoring, prospective walk and component splitting |
-| `protected_config_dir::authority_file_singly_linked` | `check_authority_links`: `symlink_metadata` and `MetadataExt::nlink`; #305 adds its read-time caller |
+| `protected_config_dir::authority_file_singly_linked` | `check_authority_links`: `symlink_metadata` and `MetadataExt::nlink`; also called by `user_network::network_authority_refusal` |
+
+Additional [ADR-0040](0040-persisted-user-network-authority.md) pairs:
+
+| decision (proved kernel) | trusted adapter |
+|---|---|
+| `user_network::network_authority_refusal` | `from_user_tier`: path `metadata(parent)`, descriptor `fstat`/`ELOOP` classification from `read_bounded_regular_file_noting_symlink`, `RawMode` → `u32` |
+| `egress_policy::resolve_grant` | `EgressAuthority::resolve`: canonical union, dedupe and source-aware notices |
 
 The interface stays narrow: `contains_escaped_path_escape` takes `&str`, so no verification detail leaks into its call sites.
 
@@ -62,7 +69,6 @@ The attribute style is excluded. Function-level `#[verus_spec]` measures free bu
 ### The verified surface
 
 One `verus!` block per owning module, in place, no new crate and no moved code. `cargo verus verify --locked -p agent-vm` reports a non-zero `verified` count with `0 errors` across them.
-
 | Site (module) | Contract that is machine-checked |
 |---|---|
 | `network_requests.rs` — `request_count_within_limit` | Exactly count ≤ 64; proves the comparison, not that 64 is appropriate. |
@@ -103,15 +109,14 @@ One `verus!` block per owning module, in place, no new crate and no moved code. 
 | `boot_image.rs` — `override_image_is_acceptable` | **The `--image`/`AGENT_VM_IMAGE_TAG` acceptance decision (#259).** Accepted iff the text is non-empty and NUL-free, over all four Boolean combinations, so an accepted override never bypasses a check. This is the permissive pass-through boundary (a local rootfs or disk image stays bootable from the command line), distinct from the stricter config-file rule above. Stated plainly: what is proved is that the decision **is** that conjunction; the `String` measurement (`is_empty`, `contains('\0')`) is the trusted adapter. A table test pins the executable form. |
 | `boot_image.rs` — `immutable_image_is_acceptable` | **The immutable-reference decision (#261).** Accepted iff the text is an acceptable config image (`config_acceptable`) **and** the OCI parser sees a digest (`has_digest`), over all four Boolean combinations, so an accepted reference is exact content and never a moving tag. Load-bearing because the retained default and the initial recommendation are persisted bookkeeping: a tag would make a “retained” selection name whatever the registry serves next, and #265's recommendation is deliberately digest-pinned for the same reason. Stated plainly: what is proved is that the decision **is** that conjunction; the `ImageRef::from_config` re-parse and the `microsandbox_image::Reference::digest().is_some()` measurement are the trusted adapters, and the reference is stored exactly (never trimmed, resolved or normalized). A table test pins the executable form to an independently written conjunction. |
 | `image_log_guard.rs` — `image_log_event_allowed` | **The default-tier tracing redaction decision (#261 follow-up).** An event is allowed iff the process-wide default-tier guard is **inactive** *or* the event's target is agent-vm's own namespace, over all four Boolean combinations, so an armed default-tier invocation never emits a dependency event (the lower-level image stack logs the record-sourced reference, repository name and manifest URL at debug/trace). Stated plainly: what is proved is that the decision **is** that disjunction; the `AtomicBool::load` and the `tracing::Metadata::target` measurement plus the `agent_vm`/`agent_vm::` namespace match are the trusted adapters — the logging I/O and the process-global flag are not proved. A table test pins the executable form. |
-
 | `boot_image/upgrade.rs` — `acquired_platform_is_acceptable` | Accepted iff all three measured facts hold: OS, architecture and required variant match native host Linux. All eight Boolean combinations are tested. This proves the conjunction, not OCI ingestion or executable compatibility. |
-
 | `image_build.rs` — `result_reference_is_acceptable` | Accepted iff the config-image policy accepts the reference and the native parser sees no digest. The four Boolean cases are tested; Docker, archive ingestion and publication I/O are not proved. |
-
-| `protected_config_dir.rs` — `authority_file_singly_linked` | Exactly `nlink == 1`, shared with #305's future read-time kernel. |
+| `protected_config_dir.rs` — `authority_file_singly_linked` | Exactly `nlink == 1`, shared with `user_network::network_authority_refusal`. |
 | `protected_config_dir.rs` — `may_name_same_entry` | Exactly the conservative plain-name/ASCII-case/wildcard rule. Proves the rule, **not its adequacy for any filesystem**. |
 | `protected_config_dir.rs` — `exposing_entry` | First hit by identity or component-wise containment, or no hits; reuses `byte_path_contains`'s `ensures`. |
 | `protected_config_dir.rs` — `exposing_prospective` | First hit by identity-or-name-equivalent anchor plus name-equivalent suffix prefix, or no hits. |
+| `user_network.rs` — `network_authority_refusal` | Accepted iff parent directory and direct regular file have the effective owner, neither is group/other-writable, and file link count is one; directory → symlink → file owner → mode → links refusal precedence. |
+| `egress_policy.rs` — `resolve_grant` | Value and source are CLI when present (including false), otherwise user when present, otherwise false/default. |
 
 ### The trusted boundary
 
@@ -132,6 +137,7 @@ Stated so that nobody reads more into the surface than is there. Verified code c
 - `image_log_guard::dependency_event_allowed` — the trusted adapter around the proved `image_log_event_allowed`. It trusts the process-global `AtomicBool::load` and `tracing::Metadata::target`, plus the exact `agent_vm`/`agent_vm::` namespace match; the subscriber/filter wiring and all logging I/O are **not** formally verified;
 - `image_build::ResultReference::from_str` trusts `ImageRef::from_config` and native `Reference::digest`; fixed adapter reasons do not redact clap's rejected-value rendering.
 - `boot_image::upgrade::check_host_platform` trusts serde required-field/type/duplicate checks, string equality and native `Platform::host_linux`. Native registry resolution/auth/TLS, OCI integrity, cache validation/materialization, async acquisition, locking and atomic publication remain trusted; they are not proved by the platform conjunction.
+- `[network]`'s TOML walk and error mapping, canonical union/dedupe and notices. Parent-directory `stat` is path-based, not descriptor-anchored, and checks only the immediate parent. Ancestors remain unchecked under ADR-0040's stable-route assumption. `ELOOP` → symlink classification, descriptor facts/mode conversion and ACL behavior are trusted; ACLs are not checked.
 - `protected_config_dir`'s resolution walk and route collection, cwd anchoring, path/component byte conversion, metadata/link counts and canonicalization. Missing components becoming real directories, the name rule's filesystem adequacy, reliable identity and a stable tree through binding are assumptions, not proved; [ADR-0038](0038-config-dir-exposure-guard.md) names the gaps.
 - all syscalls, and everything with I/O, FFI, async or locks;
 - `vendor/microsandbox` and every other dependency.

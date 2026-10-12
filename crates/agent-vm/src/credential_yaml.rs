@@ -59,6 +59,7 @@
 //! holds no values, and refusing would break the common `0644` default for no
 //! gain.
 
+use crate::host_paths::current_euid;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::os::unix::fs::MetadataExt;
@@ -817,12 +818,6 @@ fn check_facts(path: &Path, facts: &HostFileFacts) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// `euid` is the identity the kernel checked when it opened the file.
-fn current_euid() -> u32 {
-    // SAFETY: `geteuid` is an argument-free libc call with no preconditions.
-    unsafe { libc::geteuid() }
 }
 
 fn file_error(path: &Path, detail: impl fmt::Display) -> anyhow::Error {
