@@ -18,7 +18,7 @@ pub enum Reached { ThroughSymlink, Direct(FileFacts) }
 
 pub open spec fn others_may_write(mode: u32) -> bool { mode & 0o022u32 != 0u32 }
 pub open spec fn dir_ok(d: DirFacts, euid: u32) -> bool { d.is_dir && d.uid == euid && !others_may_write(d.mode) }
-pub open spec fn file_ok(f: FileFacts, euid: u32) -> bool { f.uid == euid && !others_may_write(f.mode) && f.nlink == 1u64 }
+pub open spec fn file_ok(f: FileFacts, euid: u32) -> bool { f.uid == euid && !others_may_write(f.mode) && crate::protected_config_dir::authority_file_singly_linked_spec(f.nlink) }
 
 /// Precedence mirrors credential_yaml::load: directory first, then the file.
 pub fn network_authority_refusal(reached: Reached, dir: DirFacts, euid: u32) -> (r: Option<AuthorityRefusal>)
@@ -32,7 +32,7 @@ pub fn network_authority_refusal(reached: Reached, dir: DirFacts, euid: u32) -> 
             Reached::Direct(f) =>
                 (f.uid != euid ==> r == Some(AuthorityRefusal::FileOwner))
                 && (f.uid == euid && others_may_write(f.mode) ==> r == Some(AuthorityRefusal::FileWritable))
-                && (f.uid == euid && !others_may_write(f.mode) && f.nlink != 1u64 ==> r == Some(AuthorityRefusal::FileLinks(f.nlink))),
+                && (f.uid == euid && !others_may_write(f.mode) && !crate::protected_config_dir::authority_file_singly_linked_spec(f.nlink) ==> r == Some(AuthorityRefusal::FileLinks(f.nlink))),
         },
 {
     if !dir.is_dir { return Some(AuthorityRefusal::DirNotDirectory); }
@@ -61,12 +61,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) const SETTINGS: [&str; 4] = [
-    "allow_internet_egress",
-    "allow_lan",
-    "allow_host",
-    "allow_egress",
-];
+const INTERNET_SETTING: &str = "allow_internet_egress";
+const LAN_SETTING: &str = "allow_lan";
+const HOST_SETTING: &str = "allow_host";
+const EGRESS_SETTING: &str = "allow_egress";
+pub(crate) const SETTINGS: [&str; 4] =
+    [INTERNET_SETTING, LAN_SETTING, HOST_SETTING, EGRESS_SETTING];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SavedGroups {
@@ -176,7 +176,12 @@ impl fmt::Display for UserNetworkError {
                     SettingReason::NotBool => f.write_str("must be true or false"),
                     SettingReason::NotArray => f.write_str("must be an array of strings"),
                     SettingReason::NotString => f.write_str("must be a string"),
-                    SettingReason::Unknown => f.write_str("unknown setting; supported settings are allow_internet_egress, allow_lan, allow_host and allow_egress"),
+                    SettingReason::Unknown => write!(
+                        f,
+                        "unknown setting; supported settings are {} and {}",
+                        SETTINGS[..3].join(", "),
+                        SETTINGS[3]
+                    ),
                     SettingReason::Allowance(error) => error.fmt(f),
                 }
             }
@@ -185,10 +190,10 @@ impl fmt::Display for UserNetworkError {
 }
 
 pub(crate) fn from_user_tier(
-    file: &Path,
-    read: &FinalComponent,
+    read: &crate::host_paths::VerifiedRead,
     table: &toml::Table,
 ) -> Result<UserNetwork, UserNetworkError> {
+    let file = read.path();
     // Separate path observation, not anchored to the read descriptor; ancestors remain trusted (A2).
     let parent = file.parent().ok_or(UserNetworkError::DirUnexaminable(
         std::io::ErrorKind::NotFound,
@@ -200,7 +205,7 @@ pub(crate) fn from_user_tier(
         uid: meta.uid(),
         mode: meta.mode(),
     };
-    let reached = match read {
+    let reached = match read.final_component() {
         FinalComponent::Symlink => Reached::ThroughSymlink,
         FinalComponent::Regular(f) => Reached::Direct(FileFacts {
             uid: f.uid,
@@ -222,28 +227,22 @@ fn raw_mode_u32(mode: rustix::fs::RawMode) -> u32 {
     u32::from(mode)
 }
 
+fn parse_bool(setting: &'static str, value: &toml::Value) -> Result<bool, UserNetworkError> {
+    value.as_bool().ok_or(UserNetworkError::Setting {
+        setting: SettingPath::Key(setting),
+        reason: SettingReason::NotBool,
+    })
+}
+
 fn parse_table(file: &Path, table: &toml::Table) -> Result<UserNetwork, UserNetworkError> {
     let mut groups = SavedGroups::default();
     let mut allowances = Vec::new();
     for (key, value) in table {
         match key.as_str() {
-            "allow_internet_egress" | "allow_lan" | "allow_host" => {
-                let setting = match key.as_str() {
-                    "allow_internet_egress" => SETTINGS[0],
-                    "allow_lan" => SETTINGS[1],
-                    _ => SETTINGS[2],
-                };
-                let enabled = value.as_bool().ok_or(UserNetworkError::Setting {
-                    setting: SettingPath::Key(setting),
-                    reason: SettingReason::NotBool,
-                })?;
-                match setting {
-                    "allow_internet_egress" => groups.internet = Some(enabled),
-                    "allow_lan" => groups.lan = Some(enabled),
-                    _ => groups.host = Some(enabled),
-                }
-            }
-            "allow_egress" => {
+            INTERNET_SETTING => groups.internet = Some(parse_bool(INTERNET_SETTING, value)?),
+            LAN_SETTING => groups.lan = Some(parse_bool(LAN_SETTING, value)?),
+            HOST_SETTING => groups.host = Some(parse_bool(HOST_SETTING, value)?),
+            EGRESS_SETTING => {
                 let entries = value.as_array().ok_or(UserNetworkError::Setting {
                     setting: SettingPath::Key(SETTINGS[3]),
                     reason: SettingReason::NotArray,
@@ -284,6 +283,52 @@ mod tests {
 
     fn table(text: &str) -> toml::Table {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn boolean_settings_route_independently() {
+        for (setting, field) in [
+            ("allow_internet_egress", 0),
+            ("allow_lan", 1),
+            ("allow_host", 2),
+        ] {
+            for value in [false, true] {
+                let parsed = parse_table(
+                    Path::new("config.toml"),
+                    &table(&format!("{setting} = {value}")),
+                )
+                .unwrap();
+                let mut expected = [None; 3];
+                expected[field] = Some(value);
+                assert_eq!(
+                    [
+                        parsed.groups.internet,
+                        parsed.groups.lan,
+                        parsed.groups.host
+                    ],
+                    expected
+                );
+            }
+        }
+        let mixed = parse_table(
+            Path::new("config.toml"),
+            &table("allow_internet_egress = false\nallow_lan = true\nallow_host = false"),
+        )
+        .unwrap();
+        assert_eq!(
+            mixed.groups,
+            SavedGroups {
+                internet: Some(false),
+                lan: Some(true),
+                host: Some(false)
+            }
+        );
+        assert_eq!(
+            parse_table(Path::new("config.toml"), &table(""))
+                .unwrap()
+                .groups,
+            SavedGroups::default()
+        );
     }
 
     #[test]
@@ -375,9 +420,11 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(&file, b"[network]\n").unwrap();
         let load = || {
-            let (_, read) =
+            let read =
                 crate::host_paths::read_bounded_regular_file_noting_symlink(&file, 100).unwrap();
-            from_user_tier(&file, &read, &table(""))
+            assert_eq!(read.path(), file);
+            assert_eq!(read.bytes(), b"[network]\n");
+            from_user_tier(&read, &table(""))
         };
         for mode in [0o600, 0o644, 0o664, 0o646] {
             fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
@@ -498,9 +545,9 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
     fn refusal_matches_independent_oracle_table() {
         for is_dir in [false, true] {
             for dir_uid in [7, 8] {
-                for dir_mode in [0o700, 0o775] {
+                for dir_mode in [0o700, 0o720, 0o702, 0o775] {
                     for file_uid in [7, 8] {
-                        for file_mode in [0o600, 0o664] {
+                        for file_mode in [0o600, 0o620, 0o602, 0o664] {
                             for nlink in [0, 1, 2, u64::MAX] {
                                 for reached in [
                                     Reached::ThroughSymlink,

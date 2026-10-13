@@ -1563,7 +1563,7 @@ every process in the guest receives the authority you open.
 
 ### Persisted grants (user config)
 
-Only `~/.config/agent-vm/config.toml` can save grants:
+Only `~/.config/agent-vm/config.toml` can carry persisted grants:
 
 ```toml
 [network]
@@ -1573,12 +1573,13 @@ allow_egress = ["10.0.0.5", "api.example.com"]
 
 | Launch flags | internet | LAN | host | allowances |
 |---|---|---|---|---|
-| none | false | true (user) | false | `10.0.0.5/32`, TLS `api.example.com` (user) |
-| `--allow-lan=false` | false | false (CLI) | false | same saved allowances |
-| `--allow-internet-egress --allow-egress 10.0.0.5/32 --allow-egress 192.168.1.0/24` | true (CLI) | true (user) | false | one `10.0.0.5/32` (both sources), TLS `api.example.com` (user), `192.168.1.0/24` (CLI) |
+| none | false | true (persisted grant) | false | `10.0.0.5/32`, TLS `api.example.com` (persisted grants) |
+| `--allow-lan=false` | false | false (CLI) | false | same persisted allowances |
+| `--allow-internet-egress --allow-egress 10.0.0.5/32 --allow-egress 192.168.1.0/24` | true (CLI) | true (persisted grant) | false | one `10.0.0.5/32` (both sources), TLS `api.example.com` (persisted grants), `192.168.1.0/24` (CLI) |
 
-Each Boolean is CLI → user → false. Allowances are the user-first canonical
-union; flags never subtract saved entries. Nothing is saved by a launch.
+Each Boolean is CLI → persisted grant → false. Allowances are the persisted-first
+canonical union; flags never subtract persisted entries. Launches never write
+grants back.
 The same numeric and hostname grammar applies; an empty table grants nothing
 but still requires a verified file.
 
@@ -1592,14 +1593,14 @@ table before replacing it with the file itself to carry authority.
 Notices name the file and each grant's source, for example:
 
 ```text
-==> Egress policy: allowing 10.0.0.5/32 (user config and --allow-egress)
-==> Egress policy: --allow-lan=false overrides allow_lan = true in user config
+==> Egress policy: allowing 10.0.0.5/32 (persisted grants and --allow-egress)
+==> Egress policy: --allow-lan=false overrides persisted grant allow_lan = true
 ```
 
-Saved hostnames with a selected host HTTP proxy refuse **every launch**.
+Persisted hostname grants with a selected host HTTP proxy refuse **every launch**.
 `--allow-*=false` does not clear `allow_egress`, and adding a numeric
 `--allow-egress` does not bypass the refusal. Unset the proxy variables (or use
-`NO_PROXY=*`), or remove the saved hostname to recover.
+`NO_PROXY=*`), or remove the persisted hostname grant to recover.
 
 `setup`/`pull` temporary guests ignore these grants (#303). The directory
 exposure guard is unchanged: launching from `$HOME` remains refused.

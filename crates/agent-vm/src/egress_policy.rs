@@ -620,8 +620,8 @@ struct EntrySources {
 impl EntrySources {
     fn tag(self) -> &'static str {
         match (self.user, self.cli) {
-            (true, true) => "user config and --allow-egress",
-            (true, false) => "user config",
+            (true, true) => "persisted grants and --allow-egress",
+            (true, false) => "persisted grants",
             _ => "--allow-egress",
         }
     }
@@ -837,7 +837,7 @@ impl EgressAuthority {
         if let Some(p) = &self.provenance {
             writeln!(
                 output,
-                "==> Egress authority: user config \"{}\" [network] merged with this launch's flags (flags override its true/false settings and add allowances; nothing is saved)",
+                "==> Egress authority: persisted grants from \"{}\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)",
                 crate::config::escape_path(&p.file)
             )?;
         }
@@ -890,7 +890,7 @@ impl EgressAuthority {
                 if origin.is_some_and(|o| o.resolved.source == GrantSource::UserConfig) {
                     writeln!(
                         output,
-                        "==> Egress policy: {setting} = true in user config ({detail})"
+                        "==> Egress policy: persisted grant {setting} = true ({detail})"
                     )?;
                 } else {
                     writeln!(output, "==> Egress policy: {flag} enabled ({detail})")?;
@@ -900,7 +900,7 @@ impl EgressAuthority {
             {
                 writeln!(
                     output,
-                    "==> Egress policy: {flag}=false overrides {setting} = true in user config"
+                    "==> Egress policy: {flag}=false overrides persisted grant {setting} = true"
                 )?;
             }
         }
@@ -941,7 +941,7 @@ impl EgressAuthority {
         let source = if let Some(p) = &self.provenance {
             let label = |origin: GroupOrigin, setting: &str, flag: &str| {
                 if origin.resolved.source == GrantSource::UserConfig {
-                    format!("user config {setting}")
+                    format!("persisted grant {setting}")
                 } else {
                     flag.to_owned()
                 }
@@ -1274,7 +1274,7 @@ mod tests {
     #[test]
     fn notices_with_user_table_show_provenance() {
         use crate::user_network::SavedGroups;
-        const HEADER: &str = "==> Egress authority: user config \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override its true/false settings and add allowances; nothing is saved)\n";
+        const HEADER: &str = "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n";
         const TLS: &str = "==> TLS interception: ports 443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n";
         let saved = SavedGroups {
             lan: Some(true),
@@ -1299,16 +1299,16 @@ mod tests {
             authority.write_notices(&mut out).unwrap();
             let mut expected = HEADER.to_owned();
             if row == 3 {
-                expected.push_str("==> Egress policy: allowing 10.0.0.5/32 (user config and --allow-egress)\n==> Egress policy: allowing 192.168.1.0/24 (--allow-egress)\n==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n");
+                expected.push_str("==> Egress policy: allowing 10.0.0.5/32 (persisted grants and --allow-egress)\n==> Egress policy: allowing 192.168.1.0/24 (--allow-egress)\n==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n");
             } else {
-                expected.push_str("==> Egress policy: allowing 10.0.0.5/32 (user config)\n");
+                expected.push_str("==> Egress policy: allowing 10.0.0.5/32 (persisted grants)\n");
             }
             if row == 2 {
-                expected.push_str("==> Egress policy: --allow-lan=false overrides allow_lan = true in user config\n");
+                expected.push_str("==> Egress policy: --allow-lan=false overrides persisted grant allow_lan = true\n");
             } else {
-                expected.push_str("==> Egress policy: allow_lan = true in user config (Private RFC1918 + 100.64/10 + fc00::/7 reachable; does not itself enable DNS)\n");
+                expected.push_str("==> Egress policy: persisted grant allow_lan = true (Private RFC1918 + 100.64/10 + fc00::/7 reachable; does not itself enable DNS)\n");
             }
-            expected.push_str("==> Egress policy: allowing TLS to api.example.com on ports 443 (SNI and DNS verified; no plain HTTP; user config)\n");
+            expected.push_str("==> Egress policy: allowing TLS to api.example.com on ports 443 (SNI and DNS verified; no plain HTTP; persisted grants)\n");
             expected.push_str(TLS);
             expected.push_str(if row == 3 { "==> Egress DNS: arbitrary-name DNS queries authorized via --allow-internet-egress (resolver/rebind/platform constraints still apply)\n" }
                 else { "==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n" });
@@ -1330,7 +1330,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!(
-                "{HEADER}==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n==> Egress policy: allow_host = true in user config (host.microsandbox.internal → host 127.0.0.1 reachable; includes the host DNS resolver)\n==> Egress DNS: arbitrary-name DNS queries authorized via --allow-internet-egress and user config allow_host (resolver/rebind/platform constraints still apply)\n"
+                "{HEADER}==> Egress policy: --allow-internet-egress enabled (public internet; does not itself grant LAN or host)\n==> Egress policy: persisted grant allow_host = true (host.microsandbox.internal → host 127.0.0.1 reachable; includes the host DNS resolver)\n==> Egress DNS: arbitrary-name DNS queries authorized via --allow-internet-egress and persisted grant allow_host (resolver/rebind/platform constraints still apply)\n"
             )
         );
         let split = resolve_saved(
@@ -1346,7 +1346,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!(
-                "{HEADER}==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (SNI and DNS verified; no plain HTTP; user config and --allow-egress)\n==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
+                "{HEADER}==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (SNI and DNS verified; no plain HTTP; persisted grants and --allow-egress)\n==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
             )
         );
     }

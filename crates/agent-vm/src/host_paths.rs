@@ -148,10 +148,31 @@ pub(crate) enum FinalComponent {
     Symlink,
 }
 
+/// A coherent bounded read, not authority: symlink bytes carry no descriptor facts.
+/// Parent lookup remains path-based; the supplied path spelling is preserved.
+#[derive(Debug)]
+pub(crate) struct VerifiedRead {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    final_component: FinalComponent,
+}
+
+impl VerifiedRead {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(crate) fn final_component(&self) -> &FinalComponent {
+        &self.final_component
+    }
+}
+
 pub(crate) fn read_bounded_regular_file_noting_symlink(
     path: &Path,
     max: u64,
-) -> Result<(Vec<u8>, FinalComponent)> {
+) -> Result<VerifiedRead> {
     read_bounded_regular_file_noting_symlink_checkpointed(path, max, || {})
 }
 
@@ -160,16 +181,21 @@ fn read_bounded_regular_file_noting_symlink_checkpointed(
     path: &Path,
     max: u64,
     after_open: impl FnOnce(),
-) -> Result<(Vec<u8>, FinalComponent)> {
+) -> Result<VerifiedRead> {
     match open_no_follow(path)? {
         NoFollowOpen::File(fd) => {
             after_open();
-            read_regular_no_follow_fd(fd, path, max)
-                .map(|(bytes, facts)| (bytes, FinalComponent::Regular(facts)))
+            read_regular_no_follow_fd(fd, path, max).map(|(bytes, facts)| VerifiedRead {
+                path: path.to_path_buf(),
+                bytes,
+                final_component: FinalComponent::Regular(facts),
+            })
         }
-        NoFollowOpen::Symlink => {
-            read_bounded_regular_file(path, max).map(|bytes| (bytes, FinalComponent::Symlink))
-        }
+        NoFollowOpen::Symlink => read_bounded_regular_file(path, max).map(|bytes| VerifiedRead {
+            path: path.to_path_buf(),
+            bytes,
+            final_component: FinalComponent::Symlink,
+        }),
     }
 }
 
@@ -889,11 +915,12 @@ mod tests {
             if links == 2 {
                 fs::hard_link(&path, root.path().join("alias")).unwrap();
             }
-            let (bytes, component) = read_bounded_regular_file_noting_symlink(&path, 100).unwrap();
-            let FinalComponent::Regular(facts) = component else {
+            let read = read_bounded_regular_file_noting_symlink(&path, 100).unwrap();
+            assert_eq!(read.path(), path);
+            let FinalComponent::Regular(facts) = read.final_component() else {
                 panic!("regular file")
             };
-            assert_eq!(bytes, b"original");
+            assert_eq!(read.bytes(), b"original");
             assert_eq!(facts.nlink, links);
             assert_eq!(facts.uid, current_euid());
             assert_eq!(facts.mode & 0o777, 0o644);
@@ -907,10 +934,10 @@ mod tests {
         let path = root.path().join("config.toml");
         fs::write(&target, b"dotfile").unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert_eq!(
-            read_bounded_regular_file_noting_symlink(&path, 100).unwrap(),
-            (b"dotfile".to_vec(), FinalComponent::Symlink)
-        );
+        let read = read_bounded_regular_file_noting_symlink(&path, 100).unwrap();
+        assert_eq!(read.path(), path);
+        assert_eq!(read.bytes(), b"dotfile");
+        assert_eq!(read.final_component(), &FinalComponent::Symlink);
     }
 
     #[test]
@@ -930,7 +957,7 @@ mod tests {
             let old = read_bounded_regular_file(&path, 100);
             let new = read_bounded_regular_file_noting_symlink(&path, 100);
             match (old, new) {
-                (Ok(old), Ok((new, _))) => assert_eq!(old, new, "{shape}"),
+                (Ok(old), Ok(new)) => assert_eq!(old, new.bytes(), "{shape}"),
                 (Err(_), Err(_)) => {}
                 results => panic!("readers disagree for {shape}: {results:?}"),
             }
@@ -945,28 +972,50 @@ mod tests {
             let path = root.path().join("config.toml");
             fs::write(&path, b"original").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-            let (bytes, component) =
-                read_bounded_regular_file_noting_symlink_checkpointed(&path, 100, || {
-                    fs::rename(&path, root.path().join("moved")).unwrap();
-                    let replacement = if symlink_replacement {
-                        let target = root.path().join("canary");
-                        std::os::unix::fs::symlink(&target, &path).unwrap();
-                        target
-                    } else {
-                        path.clone()
-                    };
-                    fs::write(&replacement, b"replacement!").unwrap();
-                    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o666)).unwrap();
-                    fs::hard_link(&replacement, root.path().join("alias")).unwrap();
-                })
-                .unwrap();
-            let FinalComponent::Regular(facts) = component else {
+            let read = read_bounded_regular_file_noting_symlink_checkpointed(&path, 100, || {
+                fs::rename(&path, root.path().join("moved")).unwrap();
+                let replacement = if symlink_replacement {
+                    let target = root.path().join("canary");
+                    std::os::unix::fs::symlink(&target, &path).unwrap();
+                    target
+                } else {
+                    path.clone()
+                };
+                fs::write(&replacement, b"replacement!").unwrap();
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o666)).unwrap();
+                fs::hard_link(&replacement, root.path().join("alias")).unwrap();
+            })
+            .unwrap();
+            let FinalComponent::Regular(facts) = read.final_component() else {
                 panic!("original descriptor")
             };
-            assert_eq!(bytes, b"original");
+            assert_eq!(read.bytes(), b"original");
             assert_eq!(facts.nlink, 1);
             assert_eq!(facts.mode & 0o777, 0o600);
             assert_eq!(facts.size, 8);
+            assert_eq!(read.path(), path);
+        }
+    }
+
+    #[test]
+    fn noting_symlink_keeps_distinct_reads_associated() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for (name, bytes, mode) in [
+            ("first", b"one".as_slice(), 0o600),
+            ("second", b"two!".as_slice(), 0o644),
+        ] {
+            let path = root.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let read = read_bounded_regular_file_noting_symlink(&path, 100).unwrap();
+            assert_eq!(read.path(), path);
+            assert_eq!(read.bytes(), bytes);
+            let FinalComponent::Regular(facts) = read.final_component() else {
+                panic!("direct read")
+            };
+            assert_eq!(facts.mode & 0o777, mode as rustix::fs::RawMode);
+            assert_eq!(facts.size, bytes.len() as u64);
         }
     }
 
