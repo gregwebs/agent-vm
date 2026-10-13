@@ -1,6 +1,6 @@
 PN1	==> Egress policy: all guest egress denied
-PN2	==> Egress authority: user config
-PN2	==> Egress policy: allow_host = true in user config
-PN3	==> Egress policy: --allow-host=false overrides allow_host = true in user config
+PN2	==> Egress authority: persisted grants
+PN2	==> Egress policy: persisted grant allow_host = true
+PN3	==> Egress policy: --allow-host=false overrides persisted grant allow_host = true
 PN4B	[network] requires config.toml to be a regular file, but it is reached through a symbolic link
 PN5	Run agent-vm from a project directory instead of $HOME.

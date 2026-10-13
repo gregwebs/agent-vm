@@ -57,7 +57,7 @@ present user `[network]` table invokes authority checks:
 
 Directory refusals precede file refusals; file owner precedes mode, then links.
 `network_authority_refusal` uses ADR-0038's proved
-`authority_file_singly_linked`, not a duplicate link rule.
+`authority_file_singly_linked` and its shared spec, not a duplicate link rule.
 
 A symlinked dotfile config **without** `[network]` still works for tools/image.
 It cannot carry network authority. To opt in, replace the link with the file
@@ -109,7 +109,8 @@ everyone. This change does not soften, duplicate or condition that guard.
 
 [ADR-0018](0018-machine-checked-boundary-contracts.md) records the two kernels:
 `network_authority_refusal` proves acceptance and refusal precedence from
-measured facts; `resolve_grant` proves value and source precedence. Syscalls,
+measured facts, sharing ADR-0038's executable and spec one-name rule;
+`resolve_grant` proves value and source precedence. Syscalls,
 TOML parsing, mode conversion, canonical union, notices and runtime policy
 assembly are trusted adapters tested independently. Neither proofs nor
 boot-free tests establish native runtime enforcement; only the native

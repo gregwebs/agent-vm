@@ -6147,6 +6147,7 @@ fn allowance_rejections_report_exact_messages() {
     }
 }
 
+/// T10: doctor renders authority refusal; detects hidden deferred errors.
 #[test]
 fn user_network_refusal_is_rendered_in_doctor_tool_configuration() {
     let harness = Harness::new();
@@ -6688,9 +6689,11 @@ fn requests_numeric_lan_host_stay_unmet_and_port_scope_is_exact() {
 
 const PN_ORACLES: &str =
     include_str!("../../../script/test/fixtures/persisted-network/expected-stderr.tsv");
+
 const PN_HOST: &str =
     include_str!("../../../script/test/fixtures/persisted-network/user-allow-host.toml");
 
+/// T1: persisted grants reach policy; detects dropped authority.
 #[test]
 fn user_network_table_reaches_the_sandbox_policy() {
     let h = Harness::new();
@@ -6712,15 +6715,16 @@ fn user_network_table_reaches_the_sandbox_policy() {
     );
     let stderr = stderr_of(&out);
     for text in [
-        "==> Egress authority: user config",
-        "allowing 10.0.0.0/24 (user config)",
-        "allowing tcp://[192.168.10.0/24]:22 (user config)",
-        "no plain HTTP; user config)",
+        "==> Egress authority: persisted grants from",
+        "allowing 10.0.0.0/24 (persisted grants)",
+        "allowing tcp://[192.168.10.0/24]:22 (persisted grants)",
+        "no plain HTTP; persisted grants)",
     ] {
         assert!(stderr.contains(text), "{stderr}");
     }
 }
 
+/// T2: explicit false wins; detects reversed precedence.
 #[test]
 fn cli_false_overrides_a_saved_true() {
     for (setting, flag, group) in [
@@ -6745,15 +6749,15 @@ fn cli_false_overrides_a_saved_true() {
                 .any(|r| r["destination"]["group"] == group);
             assert_eq!(found, !override_flag);
             if override_flag {
-                assert!(
-                    stderr_of(&out)
-                        .contains(&format!("{flag} overrides {setting} = true in user config"))
-                );
+                assert!(stderr_of(&out).contains(&format!(
+                    "{flag} overrides persisted grant {setting} = true"
+                )));
             }
         }
     }
 }
 
+/// T3: canonical union is launch-only; detects dropped or saved flags.
 #[test]
 fn cli_allowances_union_with_saved_ones_and_nothing_is_saved() {
     let h = Harness::new();
@@ -6791,11 +6795,58 @@ fn cli_allowances_union_with_saved_ones_and_nothing_is_saved() {
             {"direction":"egress","destination":{"domain":"api.example.com"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}
         ])
     );
-    assert!(stderr_of(&out).contains("10.0.0.5/32 (user config and --allow-egress)"));
+    assert!(stderr_of(&out).contains("10.0.0.5/32 (persisted grants and --allow-egress)"));
     assert_eq!(std::fs::read(&file).unwrap(), bytes);
     assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), mtime);
     assert_eq!(inventory(), before);
 }
+
+/// T11: a Boolean `=false` cannot subtract persisted allowances; detects an
+/// override path that discards the persisted union.
+#[test]
+fn cli_false_keeps_persisted_allowances() {
+    for (setting, flag, group) in [
+        (
+            "allow_internet_egress",
+            "--allow-internet-egress=false",
+            "public",
+        ),
+        ("allow_lan", "--allow-lan=false", "private"),
+        ("allow_host", "--allow-host=false", "host"),
+    ] {
+        let h = Harness::new();
+        h.write_user_mode(
+            &format!("[network]\n{setting} = true\nallow_egress = [\"10.0.0.9\"]\n"),
+            0o600,
+        );
+        let out = h.launch("shell", &[flag]);
+        let config = normalized_config(&h, &out);
+        let rules = config["network"]["policy"]["rules"].as_array().unwrap();
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["destination"]["cidr"] == "10.0.0.9/32"),
+            "{flag} dropped a persisted allowance: {rules:?}"
+        );
+        assert!(
+            !rules.iter().any(|r| r["destination"]["group"] == group),
+            "{flag} left the {group} group enabled: {rules:?}"
+        );
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(&format!(
+                "{flag} overrides persisted grant {setting} = true"
+            )),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("10.0.0.9/32 (persisted grants)"),
+            "{stderr}"
+        );
+    }
+}
+
+/// Refusals must not create launch state.
 fn assert_saved_refusal(h: &Harness, out: &Output, reason: &str, msb_untouched: bool) {
     assert!(!out.status.success());
     let stderr = stderr_of(out);
@@ -6812,6 +6863,8 @@ fn assert_saved_refusal(h: &Harness, out: &Output, reason: &str, msb_untouched: 
         assert!(h.msb_log().is_empty());
     }
 }
+
+/// T4: unsafe authority refuses before state; detects skipped verification.
 #[test]
 fn unsafe_user_network_is_refused_before_launch_state() {
     use std::os::unix::fs::PermissionsExt;
@@ -6874,8 +6927,7 @@ fn unsafe_user_network_is_refused_before_launch_state() {
 
 // Read-route coverage for #305 — the config-directory symlink, a directory at
 // the config path, an unreadable file and value safety at the integration
-// boundary. These routes have no coverage in the tests above; the harness,
-// fake `msb` and helpers are the ones this file already provides.
+// boundary, using the existing fake `msb` harness.
 // ---------------------------------------------------------------------------
 
 /// RA: a `config.toml` that carries `[network]` but cannot be read fails the
@@ -6978,6 +7030,7 @@ fn user_network_type_errors_are_value_safe() {
     }
 }
 
+/// T5: tools-only symlinks remain compatible; detects unconditional refusal.
 #[test]
 fn symlinked_user_config_without_network_still_launches() {
     let h = Harness::new();
@@ -6987,6 +7040,8 @@ fn symlinked_user_config_without_network_still_launches() {
     h.symlink_user_config(&target);
     assert!(stderr_of(&h.launch_default("shell")).contains(CONFIG_MARKER));
 }
+
+/// T6: persisted hostnames refuse proxies before state; detects late refusal.
 #[test]
 fn saved_hostname_with_host_proxy_is_refused_before_state() {
     for extra in [
@@ -7005,7 +7060,7 @@ fn saved_hostname_with_host_proxy_is_refused_before_state() {
             "hostname allowances cannot be enforced through the host HTTP proxy",
             false,
         );
-        assert!(stderr_of(&out).contains(&format!("(hostnames saved in user config \"{}\" [network] apply to every launch; remove them there)", h.user_config().display())));
+        assert!(stderr_of(&out).contains(&format!("hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (persisted hostname grants from \"{}\" [network] apply to every launch; remove them there)", h.user_config().display())));
     }
     let h = Harness::new();
     h.write_user_mode("[network]\n", 0o600);
@@ -7014,6 +7069,8 @@ fn saved_hostname_with_host_proxy_is_refused_before_state() {
             .contains(CONFIG_MARKER)
     );
 }
+
+/// T7: persisted hostname grants cover requests; detects missing coverage.
 #[test]
 fn saved_hostname_grant_covers_tool_requests() {
     for saved in [false, true] {
@@ -7033,6 +7090,8 @@ fn saved_hostname_grant_covers_tool_requests() {
         }
     }
 }
+
+/// T8: credential overlays preserve grants; detects policy replacement.
 #[test]
 fn saved_grants_survive_the_credential_overlay() {
     let h = Harness::new();
@@ -7069,6 +7128,8 @@ fn saved_grants_survive_the_credential_overlay() {
             .is_empty()
     );
 }
+
+/// T9: PN diagnostics match shared oracles; detects harness drift.
 #[test]
 fn native_row_oracles_are_rendered_diagnostics() {
     let rows: std::collections::BTreeSet<_> = PN_ORACLES

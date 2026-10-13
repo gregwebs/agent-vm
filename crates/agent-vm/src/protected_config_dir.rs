@@ -16,8 +16,10 @@ use crate::config;
 use crate::protected_host_files::{CoreBind, CoreHostSource};
 
 verus! {
+pub open spec fn authority_file_singly_linked_spec(nlink: u64) -> bool { nlink == 1u64 }
+
 pub fn authority_file_singly_linked(nlink: u64) -> (r: bool)
-    ensures r == (nlink == 1u64),
+    ensures r == authority_file_singly_linked_spec(nlink),
 { nlink == 1 }
 
 pub open spec fn plain_byte(c: u8) -> bool {

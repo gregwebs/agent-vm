@@ -494,7 +494,8 @@ probe uses `egress-probe.sh::http_get` and serves `/r/marker` with exact
 **PN4-A/B/PN4c must pass or receive a written maintainer waiver before #305
 is complete.** Without that evidence a PR says “Part of #305”, not “Closes #305”.
 
-`bash script/test/persisted-network-contract.sh` exercises the write/probe
+`bash script/test/persisted-network-contract.sh` dispatches to
+`script/test/lib/persisted-network-contract.py`, which exercises the write/probe
 snippets on a host-only stand-in and joins the shared diagnostic TSV to
 boot-free CLI tests, then runs the **actual** live shell against a harmless
 driver stub to prove acceptance, rejection, receipt-before-allocation, cleanup

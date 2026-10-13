@@ -488,7 +488,8 @@ Networking (deny-by-default; flags compose):
   --allow-egress           guest → IP/host   reach one IP/CIDR or TLS hostname [proto/port]
   --allow-lan              guest → LAN       reach the whole private range
   --allow-host             guest → host      reach the host's 127.0.0.1 services
-  saved defaults: [network] in ~/.config/agent-vm/config.toml; flags override true/false and add allowances
+  persisted grants: [network] in ~/.config/agent-vm/config.toml
+  Flags override persisted booleans and add allowances; launches never save changes.
 
 Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus

@@ -25,6 +25,13 @@ def shell_helper(name, value):
     return subprocess.check_output(["bash", "-c", 'source "$1"; "$2" "$3"', "pn", str(HELPER), name, str(value)], text=True, timeout=10)
 
 
+def require_shared_stderr_oracle(row: str, text: str, oracle: str | None) -> None:
+    if oracle:
+        for substring in shell_helper("pn_expected", oracle).splitlines():
+            if substring not in text:
+                raise AssertionError(f"{row}: missing shared stderr oracle {substring!r}")
+
+
 def snapshot_validation(work):
     # Native caches can contain large disk images; inventory hashing must not
     # allocate a whole image. Keep the validation helper's sidecar convention.
@@ -120,10 +127,7 @@ def main():
             text = owned.log.read_text(errors="replace")
             if status in (124, 130, 143) or owned.errors:
                 raise RuntimeError(f"{row}: timeout/interrupt/observation error: {status} {owned.errors}")
-            if oracle:
-                for substring in shell_helper("pn_expected", oracle).splitlines():
-                    if substring not in text:
-                        raise AssertionError(f"{row}: missing shared stderr oracle {substring!r}")
+            require_shared_stderr_oracle(row, text, oracle)
             if server.poll() is not None:
                 raise RuntimeError(f"{row}: host fixture died during launch")
             delta = http_log.read_bytes()[offset:]

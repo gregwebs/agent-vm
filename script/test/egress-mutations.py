@@ -212,6 +212,9 @@ def matrix():
     }"""
     for name, path, old, new, tests in (
         ("saved-beats-cli", EGRESS, grant_old, grant_new, egress),
+        ("directory-owner-ignored", persisted, "if dir.uid != euid { return Some(AuthorityRefusal::DirOwner); }", "if false { return Some(AuthorityRefusal::DirOwner); }", rust("user_network::tests")),
+        ("directory-writable-ignored", persisted, "if dir.mode & 0o022 != 0 { return Some(AuthorityRefusal::DirWritable); }", "if false { return Some(AuthorityRefusal::DirWritable); }", rust("user_network::tests")),
+        ("file-owner-ignored", persisted, "if f.uid != euid { Some(AuthorityRefusal::FileOwner) }", "if false { Some(AuthorityRefusal::FileOwner) }", rust("user_network::tests")),
         ("symlink-trusted", persisted, "Reached::ThroughSymlink => Some(AuthorityRefusal::ThroughSymlink)", "Reached::ThroughSymlink => None", rust("user_network::tests")),
         ("links-ignored", persisted, "else if !authority_file_singly_linked(f.nlink) { Some(AuthorityRefusal::FileLinks(f.nlink)) }", "else if false { Some(AuthorityRefusal::FileLinks(f.nlink)) }", rust("user_network::tests")),
         ("mask-other-only", persisted, "else if f.mode & 0o022 != 0", "else if f.mode & 0o002 != 0", rust("user_network::tests")),
@@ -222,8 +225,8 @@ def matrix():
         "for entry in user_entries.iter().chain(&cli_entries) {",
         "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", True))
     add("verify-always-skipped", SRC + "config.rs",
-        'TierKind::User => user_network::from_user_tier(file, read, table)\n            .map(Some)\n            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(file))),',
-        'TierKind::User => Ok(None),', rust("unsafe_user_network_is_refused_before_launch_state", True))
+        'FileTierKind::User => user_network::from_user_tier(read, table)\n            .map(Some)\n            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(read.path()))),',
+        'FileTierKind::User => Ok(None),', rust("unsafe_user_network_is_refused_before_launch_state", True))
     add("descriptor-reopen", SRC + "host_paths.rs", "            after_open();",
         "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;",
         rust("noting_symlink_takes_bytes_and_facts_from_the_opened_descriptor"))

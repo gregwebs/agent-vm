@@ -524,9 +524,10 @@ authorize DNS.
 destination (exact name + port) it expects to contact; reported when unmet,
 never a grant.
 
-**Persisted grant**: a user-tier `[network]` setting, read only from a verified
-file and merged per launch. Flags override saved booleans and add allowances;
-agent-vm never writes the result back. The project tier refuses `[network]`.
+**Persisted grant**: user-authored host authority in a user-tier `[network]`
+setting, read only from a verified file and merged per launch. CLI flags override
+persisted Boolean values and add allowances for that launch; launches never
+write grants back. The project tier refuses `[network]`.
 See [ADR-0040](docs/adr/0040-persisted-user-network-authority.md).
 See [ADR-0036](docs/adr/0036-default-deny-launch-egress.md) for DNS limitations and
 [ADR-0037](docs/adr/0037-hostname-egress-allowances.md) for hostname allowances;

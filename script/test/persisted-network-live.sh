@@ -85,19 +85,28 @@ driver=''
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
-    if [[ "$shell_owns_scratch" == 1 && -n "$root" ]]; then
-        # Only our mktemp result, before handoff; no driver has used it yet.
-        rmdir -- "$root" || status=1
-    fi
+    # A launched driver may still be alive, so its launch record and scratch must
+    # survive until it is absent: $root/driver.pid is the only identity a
+    # supervisor can use to KILL a TERM-resistant driver. Reap the driver first.
+    # If it ignores TERM this blocks in wait; the record then stays on disk when
+    # the supervisor kills the shell, so recovery is still possible.
     if [[ -n "$driver" ]] && kill -0 "$driver" 2>/dev/null; then
         # Driver's finally block calls cleanup_run (bounded, identity-checked),
         # reaps its http.server, preserves evidence, then removes owned scratch.
         kill -TERM "$driver" 2>/dev/null || true
         wait "$driver" || status=1
     fi
+    if [[ "$shell_owns_scratch" == 1 && -n "$root" ]]; then
+        # Only our mktemp result and our own launch record exist, and the driver
+        # is now absent; drop the record and reclaim the now-empty scratch.
+        rm -f -- "$root/driver.pid"
+        rmdir -- "$root" || status=1
+    fi
     if [[ "$shell_owns_scratch" == 0 && "$status" != 0 && "$status" != 24 && -d "$root" ]]; then
         # Job creation is not driver initialization. After the child is dead,
         # reclaim only empty scratch; never erase driver state or status-24 evidence.
+        # driver.pid is our own launch record, not driver state, so drop it first.
+        rm -f -- "$root/driver.pid"
         if rmdir -- "$root"; then
             echo "Driver failed (status $status); reclaimed empty scratch" >&2
         else
@@ -116,6 +125,11 @@ root="$canonical_root"
     reject 'AGENT_VM_PN_EVIDENCE must be outside the scratch root'
 pn_launch "$root" "$evidence" "$AGENT_VM_BIN" "$AGENT_VM_LIVE_TEST_IMAGE" &
 driver=$!
+# Record the driver's identity inside the scratch it is about to receive, before
+# any handoff. A supervisor that cannot observe the driver's readiness or its
+# own startup publication can still reap this PID (or fail closed) instead of
+# deleting scratch around a live driver.
+printf '%s' "$driver" > "$root/driver.pid"
 shell_owns_scratch=0
 wait "$driver"
 driver=''

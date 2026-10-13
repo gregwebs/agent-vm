@@ -447,7 +447,7 @@ pub(crate) enum TierStatus {
 /// Where a resolved tool came from. File-backed variants retain the declaring
 /// file for diagnostics; provenance is deliberately excluded from definition
 /// equality.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ToolOrigin {
     BuiltIn,
     User(PathBuf),
@@ -842,7 +842,7 @@ impl ConfigConflict {
 /// there is no fallback to defaults.
 pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
     let (user, user_contents) = match &paths.user {
-        Some(path) => read_file_tier(path, TierKind::User)?,
+        Some(path) => read_file_tier(path, FileTierKind::User)?,
         None => (
             TierReport {
                 path: None,
@@ -851,7 +851,7 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
             TierContents::empty(),
         ),
     };
-    let (project, project_contents) = read_file_tier(&paths.project, TierKind::Project)?;
+    let (project, project_contents) = read_file_tier(&paths.project, FileTierKind::Project)?;
 
     let (resolved, uses_defaults, conflicts) =
         if user_contents.tools.is_empty() && project_contents.tools.is_empty() {
@@ -897,18 +897,16 @@ impl TierContents {
 }
 
 #[derive(Clone, Copy)]
-enum TierKind {
+enum FileTierKind {
     User,
     Project,
-    BuiltIn,
 }
 
-impl TierKind {
+impl FileTierKind {
     fn origin(self, file: &Path) -> ToolOrigin {
         match self {
-            TierKind::User => ToolOrigin::User(file.to_path_buf()),
-            TierKind::Project => ToolOrigin::Project(file.to_path_buf()),
-            TierKind::BuiltIn => ToolOrigin::BuiltIn,
+            FileTierKind::User => ToolOrigin::User(file.to_path_buf()),
+            FileTierKind::Project => ToolOrigin::Project(file.to_path_buf()),
         }
     }
 }
@@ -917,7 +915,7 @@ impl TierKind {
 /// the initial `symlink_metadata` means absent; a present-but-dangling
 /// symlink or a file that vanishes before the read is an error, not a quiet
 /// fallback.
-fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, TierContents)> {
+fn read_file_tier(path: &Path, kind: FileTierKind) -> Result<(TierReport, TierContents)> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -932,15 +930,16 @@ fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, TierConten
         Err(error) => return Err(safe_io_error("reading metadata for", path, &error)),
     }
 
-    let (bytes, final_component) =
+    let read =
         crate::host_paths::read_bounded_regular_file_noting_symlink(path, MAX_CONFIG_FILE_BYTES)
             .map_err(|error| safe_anyhow_error("reading", path, &error))?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| utf8_error(path))?;
+    let path = read.path();
+    let text = std::str::from_utf8(read.bytes()).map_err(|_| utf8_error(path))?;
     let raw: RawConfig =
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
-    let network = network_for_tier(raw.network.as_ref(), path, kind, &final_component)?;
+    let network = network_for_tier(raw.network.as_ref(), kind, &read)?;
     let image = validate_image(raw.image.as_deref(), path)?;
-    let tools = validate_tools(raw.tools, path, kind)?;
+    let tools = validate_tools(raw.tools, path, kind.origin(path))?;
 
     Ok((
         TierReport {
@@ -959,17 +958,15 @@ fn read_file_tier(path: &Path, kind: TierKind) -> Result<(TierReport, TierConten
 
 fn network_for_tier(
     table: Option<&toml::Table>,
-    file: &Path,
-    kind: TierKind,
-    read: &crate::host_paths::FinalComponent,
+    kind: FileTierKind,
+    read: &crate::host_paths::VerifiedRead,
 ) -> Result<Option<UserNetwork>> {
     let Some(table) = table else { return Ok(None) };
     match kind {
-        TierKind::User => user_network::from_user_tier(file, read, table)
+        FileTierKind::User => user_network::from_user_tier(read, table)
             .map(Some)
-            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(file))),
-        TierKind::Project => Err(network_refusal(table, file, RefusingTier::Project)),
-        TierKind::BuiltIn => Err(network_refusal(table, file, RefusingTier::BuiltIn)),
+            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(read.path()))),
+        FileTierKind::Project => Err(network_refusal(table, read.path(), RefusingTier::Project)),
     }
 }
 
@@ -1028,7 +1025,7 @@ fn tools_from_builtin_text(text: &str) -> Result<Vec<Tool>> {
     if let Some(table) = raw.network.as_ref() {
         return Err(network_refusal(table, path, RefusingTier::BuiltIn));
     }
-    validate_tools(raw.tools, path, TierKind::BuiltIn)
+    validate_tools(raw.tools, path, ToolOrigin::BuiltIn)
 }
 
 fn discover_user_path() -> Result<Option<PathBuf>> {
@@ -1347,7 +1344,7 @@ struct RawTool {
 /// names and reporting the exact field that failed. Sequentially applying
 /// focused validators keeps each diagnosis specific instead of collapsing the
 /// whole entry into one generic parse error.
-fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<Tool>> {
+fn validate_tools(raw: Vec<RawTool>, file: &Path, origin: ToolOrigin) -> Result<Vec<Tool>> {
     let mut tools = Vec::with_capacity(raw.len());
     let mut first_index: HashMap<String, usize> = HashMap::new();
     for (index, tool) in raw.into_iter().enumerate() {
@@ -1385,7 +1382,7 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, kind: TierKind) -> Result<Vec<
             interactive_shell: tool.interactive_shell,
             env,
             network_requests,
-            origin: kind.origin(file),
+            origin: origin.clone(),
             declaration_index: index,
         });
     }

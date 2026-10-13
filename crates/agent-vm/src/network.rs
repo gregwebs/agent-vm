@@ -226,11 +226,11 @@ impl Plan {
             use crate::egress_policy::HostnameAuthority;
             match egress.hostname_authority() {
                 Some(HostnameAuthority::Saved(file)) => anyhow::bail!(
-                    "{HOSTNAME_PROXY_REFUSAL} (hostnames saved in user config \"{}\" [network] apply to every launch; remove them there)",
+                    "{HOSTNAME_PROXY_REFUSAL} (persisted hostname grants from \"{}\" [network] apply to every launch; remove them there)",
                     crate::config::escape_path(file)
                 ),
                 Some(HostnameAuthority::SavedAndCli(file)) => anyhow::bail!(
-                    "{HOSTNAME_PROXY_REFUSAL} (hostnames from --allow-egress and saved in user config \"{}\" [network] both apply to every launch; remove the saved ones there and stop passing --allow-egress)",
+                    "{HOSTNAME_PROXY_REFUSAL} (hostnames from --allow-egress apply to this launch; persisted hostname grants from \"{}\" [network] apply to every launch; remove the persisted ones there and stop passing --allow-egress)",
                     crate::config::escape_path(file)
                 ),
                 _ => anyhow::bail!(HOSTNAME_PROXY_REFUSAL),
@@ -665,7 +665,7 @@ mod tests {
         assert_eq!(
             error,
             format!(
-                "{HOSTNAME_PROXY_REFUSAL} (hostnames saved in user config \"user\\x0a.toml\" [network] apply to every launch; remove them there)"
+                "{HOSTNAME_PROXY_REFUSAL} (persisted hostname grants from \"user\\x0a.toml\" [network] apply to every launch; remove them there)"
             )
         );
         let numeric = crate::user_network::UserNetwork::for_test(
@@ -701,12 +701,12 @@ mod tests {
         let error = Plan::from_args_with_proxy_lookup(both, Some(&user), proxy)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("--allow-egress"), "{error}");
-        assert!(
-            error.contains("saved in user config \"user.toml\""),
-            "{error}"
+        assert_eq!(
+            error,
+            format!(
+                "{HOSTNAME_PROXY_REFUSAL} (hostnames from --allow-egress apply to this launch; persisted hostname grants from \"user.toml\" [network] apply to every launch; remove the persisted ones there and stop passing --allow-egress)"
+            )
         );
-        assert!(error.contains("stop passing --allow-egress"), "{error}");
     }
 
     fn notice_output(input: Args, proxy: impl Fn(&str) -> Option<String>) -> String {
