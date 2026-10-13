@@ -62,6 +62,7 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/e2e-release-contract.sh"
     bash "$REPO_ROOT/script/test/egress-default-deny-contract.sh"
     bash "$REPO_ROOT/script/test/config-dir-guard-contract.sh"
+    bash "$REPO_ROOT/script/test/build-provenance-contract.sh"
     bash "$REPO_ROOT/script/test/persisted-network-contract.sh"
     # Mutation anchors must still name lines that exist; otherwise the
     # mutation evidence is stale and only a hand-run would notice (#305 N9).
@@ -96,6 +97,7 @@ syntax_check=(
     script/test/e2e-release-contract.sh
     script/test/persisted-network-live.sh
     script/test/persisted-network-contract.sh
+    script/test/build-provenance-contract.sh
     script/test/lib/persisted-network.sh
     script/test/fixtures/persisted-network/guest-pn4-write.sh
     script/test/fixtures/persisted-network/guest-pn-probe.sh
@@ -141,6 +143,7 @@ shellcheck_files=(
     script/test/e2e-release-contract.sh
     script/test/persisted-network-live.sh
     script/test/persisted-network-contract.sh
+    script/test/build-provenance-contract.sh
     script/test/lib/persisted-network.sh
     script/test/fixtures/persisted-network/guest-pn4-write.sh
     script/test/fixtures/persisted-network/guest-pn-probe.sh
@@ -179,6 +182,8 @@ assert_listed 'bash -n' 'script/test/persisted-network-live.sh' "${syntax_check[
 assert_listed 'shellcheck' 'script/test/persisted-network-live.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/persisted-network-contract.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/persisted-network-contract.sh' "${shellcheck_files[@]}"
+assert_listed 'bash -n' 'script/test/build-provenance-contract.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/build-provenance-contract.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/lib/persisted-network.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/lib/persisted-network.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/fixtures/persisted-network/guest-pn4-write.sh' "${syntax_check[@]}"

@@ -31,6 +31,29 @@ libkrunfw. agent-vm finds them via `current_exe()`-relative paths, so a
 user's separate `~/.microsandbox/bin/msb` (if any) never shadows the
 bundled build.
 
+## Version / build identity
+
+```text
+$ agent-vm --version
+agent-vm 0.3.4 (08f515f2c4f8a1c3c9d2b7e6a5f4c3b2a1908f7e)
+```
+
+`--version`/`-V` print the release number and the Git commit the binary was
+built from, measured once at build time:
+
+```text
+agent-vm 0.3.4 (08f515f..., dirty)         tracked files differ from the commit
+agent-vm 0.3.4 (08f515f..., state unknown) Git/status could not be measured
+agent-vm 0.3.4 (unknown)                  built without Git metadata
+```
+
+The revision is always a full object id. The value is baked into the binary, so
+copying it to a machine without Git does not change the output, and setting
+`AGENT_VM_GIT_SHA`/`GITHUB_SHA`/`AGENT_VM_BUILD_PROVENANCE_STRICT` at runtime
+does nothing. This is build metadata, not a signature — it does not prove the
+binary came from that source. See [CONTRIBUTING.md](CONTRIBUTING.md#build-identity-in-agent-vm---version)
+for how it is chosen and for the default invalidation limits.
+
 ## Subcommands
 
 ```

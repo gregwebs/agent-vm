@@ -127,6 +127,92 @@ agent-vm-images after a bump here.
 plus the assertion that it actually verified something, then a pair of throwaway
 fixtures proving the verifier can both pass and fail.
 
+### Build identity in `agent-vm --version`
+
+`agent-vm --version` (and `-V`) report the release number **and the source
+revision the binary was built from** (issue #335):
+
+```text
+agent-vm 0.3.4 (08f515f2c4f8a1c3c9d2b7e6a5f4c3b2a1908f7e)
+agent-vm 0.3.4 (08f515f2c4f8a1c3c9d2b7e6a5f4c3b2a1908f7e, dirty)
+agent-vm 0.3.4 (08f515f2c4f8a1c3c9d2b7e6a5f4c3b2a1908f7e, state unknown)
+agent-vm 0.3.4 (unknown)
+agent-vm 0.3.4 (unknown, dirty)
+```
+
+The full object id is embedded at **build** time by `crates/agent-vm/build.rs`
+as `AGENT_VM_BUILD_VERSION`; nothing looks at Git at runtime, so a copied
+binary reports the same line on a machine without Git. The revision is chosen
+in this order: a valid full `AGENT_VM_GIT_SHA`, then a valid `GITHUB_SHA`, then
+`git rev-parse --verify HEAD` in the build's own repository, then `unknown`.
+Overrides must be exactly 40 or 64 hexadecimal characters (lowercased); an
+invalid override is ignored with a value-free warning when the probe executes. `dirty` means tracked
+files (staged, unstaged, deleted, or tracked changes inside initialized
+submodules) differ from HEAD; untracked and ignored files do not mark a build
+dirty. Shallow clones, detached HEADs, linked worktrees, packed refs and
+submodules all work; a tarball or an unversioned directory nested in another
+checkout degrades to `unknown` rather than adopting the outer repository's
+identity. A build where metadata could not be measured still succeeds.
+
+The line is build metadata, not authenticity: it is inside the artifact, so it
+can be fabricated, and it attests only the tree that was present when the probe
+ran. See [ARCHITECTURE.md](ARCHITECTURE.md#runtime-provenance-and-platform-profiles).
+
+```text
+build.rs (overrides + Git) → embedded AGENT_VM_BUILD_VERSION
+                          → --version / -V (no runtime Git)
+                          → harness check + current source status
+                            ├─ clean full match → native driver
+                            └─ otherwise → retained evidence, refusal
+```
+
+#### Default invalidation, and the accepted blind spot
+
+By default the build script emits precise Cargo watchers for every Git-resolved
+input that decides the identity: HEAD, the index, packed refs, each link of the
+HEAD symbolic-ref chain, the worktree `.git` marker, every tracked path, and
+recursively every initialized submodule. With complete, representable discovery,
+unchanged builds stay fresh, so `cargo build` is a no-op.
+
+No Git, failed/incomplete metadata queries, unsafe watcher paths, or dangling
+tracked symlinks without a bounded parent watcher instead retain safe partial
+watchers and emit a fixed warning
+plus `build.rs/agent-vm-provenance-always-rerun`. This exceptional default
+fallback re-probes and recompiles the launcher every invocation until discovery
+recovers. Dangling links are not silently omitted: a localized parent-directory
+watch detects deletion, retargeting and replacement. Parents at a worktree root
+or enclosing the package/current build outputs instead use the fallback, because
+Cargo scans directories recursively and would include generated build trees.
+Localized parent watches also invalidate on other changes within that subtree.
+
+Cargo compares mtimes, not file modes or ctime. A mode-only `chmod` of a
+tracked file, or replacing a tracked file with a symlink to an older-mtime
+target, is therefore invisible by default and the cached clean label can
+survive. **This is an accepted limitation**, not a clean-tree guarantee; the
+persisted-network harness independently measures the current source status, so
+it still refuses to launch from a currently dirty tree.
+
+If you need to close those gaps, opt in explicitly:
+
+```sh
+cargo build -p agent-vm                                                # cheap, precise
+AGENT_VM_BUILD_PROVENANCE_STRICT=1 cargo build -p agent-vm             # re-probe every build
+```
+
+Strict mode adds an unsatisfiable `build.rs/agent-vm-provenance-always-rerun`
+dependency, so the probe (and the launcher rustc/link step) run on every build.
+Only `unset`, empty, `0` and `1` are accepted; any other value — Unicode or not
+— is a hard, value-free error **when the probe runs**. Because Cargo's env
+fingerprint collapses absent and non-Unicode to the same absent, an
+absent-to-non-Unicode-only transition may reuse a cached default build with no
+diagnostic; that residual is accepted. Unset or `0` restores the cheap behavior
+after one transition build. **No script, CI job or harness enables strict
+mode**, and the persisted-network acceptance does not require it.
+
+`bash script/test/build-provenance-contract.sh` drives the real build script in
+owned miniature Cargo/Git workspaces (controls B1–B19; needs the pinned Cargo,
+a working Git and Python). It is in `script/test/ci-contracts.sh`.
+
 ### `CARGO_TARGET_DIR` must not be on a tmpfs prefix
 
 Several boot-free integration tests (`config_launch_driven.rs`,
@@ -353,6 +439,8 @@ the script and runs the companion but **does not run native VM rows**.
 On a dedicated macOS Apple Silicon host with no concurrent VMs:
 
 ```bash
+# Build from the committed source you intend to verify: the candidate must
+# report that exact clean commit, so build after committing, not before.
 ./script/build/macos.sh --dev
 AGENT_VM_BIN="$PWD/target/macos-dev/bin/agent-vm" \
 AGENT_VM_LIVE_TEST_IMAGE=VERIFIED_NATIVE_IMAGE \
@@ -363,10 +451,30 @@ Use an explicit verified native image (for example an authenticated immutable
 standard-release reference). The script uses private HOME/state, short
 socket-safe paths and serial owned launches.
 
+Before any native work the harness asserts provenance. It validates that the
+harness source is its own Git top level (so a tarball nested in another
+checkout is refused), records `tracked-status.txt` by direct redirection of
+`git status --porcelain --untracked-files=no --ignore-submodules=untracked`,
+captures the candidate's stdout byte-for-byte into `binary-version.txt` and
+runs `script/test/lib/build-provenance.py`
+(`binary-version.txt`, full HEAD, `tracked-status.txt`). The checker accepts
+**only** a known full commit equal to HEAD, a self-reported `clean` state, and
+an empty tracked-status file. Dirty, unknown, mismatched or multiline output,
+and a currently dirty tracked source, are rejected with a retained receipt
+(`provenance-check.txt`) and **zero** scratch allocation or driver launch. The
+acceptance does not depend on the candidate's build mode.
+
+The independent source-status check is what catches a stale-clean default-mode
+binary after a mode-only `chmod` of the source (which mtime watchers miss): the
+freshly measured `tracked-status.txt` is dirty even though the embedded label
+says `clean`. Once the source is restored clean, the self-report cannot prove
+the binary's historical build tree; that limitation is inherent to an embedded
+identity.
+
 The evidence directory is self-identifying. `source.txt` records the commit,
 the full `git status --porcelain` (never empty while unrelated untracked files
-exist) and `git status --porcelain --untracked-files=no`, which is empty
-exactly when the tracked tree matches the commit. `tree.diff` holds the tracked
+exist) and the tracked status above, which is empty exactly when the tracked
+tree matches the commit. `tree.diff` holds the tracked
 changes themselves and `tree.diff.sha256` their digest, so a reader can tell
 whether the rows came from the committed source. `harness.sha256` is the hash
 of **every** file under `script/test/` (the driver and its imports, the sourced
@@ -388,8 +496,11 @@ is complete.** Without that evidence a PR says “Part of #305”, not “Closes
 
 `bash script/test/persisted-network-contract.sh` exercises the write/probe
 snippets on a host-only stand-in and joins the shared diagnostic TSV to
-boot-free CLI tests. It is in `ci-contracts.sh`; it is **not** guest-authorship
-or native enforcement evidence. CI checks the live script's syntax/lint only.
+boot-free CLI tests, then runs the **actual** live shell against a harmless
+driver stub to prove acceptance, rejection, receipt-before-allocation, cleanup
+and status propagation (`build-provenance.py` unit controls plus P6–P10). It is
+in `ci-contracts.sh`; it is **not** guest-authorship or native enforcement
+evidence. CI checks the live script's syntax/lint only.
 See [ADR-0040](docs/adr/0040-persisted-user-network-authority.md).
 
 #### `bash -c`, not `bash -lc`, for in-guest commands
@@ -467,7 +578,8 @@ positive explicit-source control.
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
 | `script/test/build-workflow.sh` | yes (macOS) | fake-plutil bundle seam, no VM/image sources |
 | `script/test/ci-contracts.sh` | yes | runtime provenance, shell guards, offline pin/negative controls, Chrome launcher-path agreement and e2e dispatch contracts |
-| `script/test/persisted-network-contract.sh` | yes (`ci-contracts.sh`) | host-only snippet controls and shared diagnostic oracles; no native evidence |
+| `script/test/persisted-network-contract.sh` | yes (`ci-contracts.sh`) | host-only snippet controls, checker P1–P5 and live-shell P6–P10; no native evidence |
+| `script/test/build-provenance-contract.sh` | yes (`ci-contracts.sh`) | real Cargo/Git build-identity controls B1–B19; no native evidence |
 | `script/test/persisted-network-live.sh` | **no** | dedicated macOS arm64 PN rows; required evidence or written waiver |
 | `script/test/verus-verification.sh` | yes | machine-checked boundary contracts |
 | Image source/build/installer/runtime/egress audits | independent image repo CI | migrated; equivalence not verified by launcher CI |
