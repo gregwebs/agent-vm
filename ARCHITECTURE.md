@@ -375,6 +375,16 @@ as a CLI contract.
 
 ### Runtime provenance and platform profiles
 
+Distinct from **runtime dependency provenance** below and from a signed
+attestation, `agent-vm --version` embeds the source revision the launcher was
+built from as build metadata (issue #335). It is measured once by
+`crates/agent-vm/build.rs` and is not a runtime Git lookup; it names the built
+artifact, not the source pins, and cannot prove the executable came from that
+source. Treated as a provenance *record*, it lets the persisted-network harness
+refuse a stale or dirty candidate before boot. See
+[CONTRIBUTING.md](CONTRIBUTING.md#build-identity-in-agent-vm---version) for the
+default/strict invalidation policy and its accepted blind spots.
+
 `./script/check-runtime-provenance.sh` checks both independent Cargo roots (the
 outer workspace and `vendor/microsandbox`) for the identical official crates.io
 `msb_krun*` 0.1.39 cohort and checksum map, plus the pinned `vendor/libkrunfw`

@@ -12,68 +12,110 @@ if pgrep -x agent-vm >/dev/null || pgrep -x msb >/dev/null; then
     echo 'Concurrent agent-vm/msb process: use a dedicated idle host' >&2
     exit 1
 fi
-script_dir="$(cd -- "${BASH_SOURCE[0]%/*}" && pwd)"
-repo_root="$(cd -- "$script_dir/../.." && pwd)"
+script_dir="$(cd -- "${BASH_SOURCE[0]%/*}" && pwd -P)"
+repo_root="$(cd -- "$script_dir/../.." && pwd -P)"
 # shellcheck source=script/test/lib/persisted-network.sh
 source "$script_dir/lib/persisted-network.sh"
 # Every stderr oracle is obtained through this shared renderer, never duplicated.
 for row in PN1 PN2 PN3 PN4B PN5; do pn_expected "$row" >/dev/null; done
-root="$(mktemp -d /tmp/avm-pn.XXXXXX)"
-root="$(cd "$root" && pwd -P)"
+
+# Every source-metadata call goes through this one adapter. `-C` does not
+# override an inherited GIT_DIR/GIT_WORK_TREE, so a caller could otherwise
+# route Git to a clean checkout B while the harness source stays in A; strip
+# those variables for git's child only and never touch the caller's shell.
+# `--no-optional-locks` keeps observation from refreshing/writing an index.
+pn_git() {
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+        -u GIT_COMMON_DIR -u GIT_NAMESPACE \
+        git --no-optional-locks -C "$repo_root" "$@"
+}
+
+# Rejection evidence exists even when source discovery cannot be trusted.
 evidence="${AGENT_VM_PN_EVIDENCE:-$(mktemp -d /tmp/avm-pn-evidence.XXXXXX)}"
 mkdir -p "$evidence"
 evidence="$(cd "$evidence" && pwd -P)"
-[[ "$evidence" != "$root" && "$evidence" != "$root/"* ]] ||
-    { echo 'AGENT_VM_PN_EVIDENCE must be outside the scratch root' >&2; exit 1; }
 printf 'Evidence: %s\n' "$evidence"
-# Self-identifying provenance: which source, tree state, harness and binary
-# produced these rows. `git status --porcelain` is never empty in a workspace
-# that has unrelated untracked files, so the tracked tree is recorded on its
-# own line too (empty there means the tracked files match the commit) and
-# `tree.diff` holds the actual tracked changes with their digest. The harness
-# files are enumerated from the tree, not hand-listed, so a new fixture cannot
-# silently escape the manifest.
-commit="$(git -C "$repo_root" rev-parse HEAD)" ||
-    { echo 'provenance: git rev-parse HEAD failed' >&2; exit 1; }
-version="$("$AGENT_VM_BIN" --version)" ||
-    { echo 'provenance: the binary does not report --version' >&2; exit 1; }
-{
-    printf 'commit: %s\n' "$commit"
-    printf 'status --porcelain (all; still lists unrelated untracked files):\n'
-    git -C "$repo_root" status --porcelain
-    printf 'status --porcelain --untracked-files=no (empty means the tracked tree matches the commit):\n'
-    git -C "$repo_root" status --porcelain --untracked-files=no
-} | tee "$evidence/source.txt"
-git -C "$repo_root" diff HEAD |
-    tee "$evidence/tree.diff" | shasum -a 256 | tee "$evidence/tree.diff.sha256"
-shasum -a 256 "$AGENT_VM_BIN" | tee "$evidence/binary.sha256"
-printf '%s\n' "$version" | tee "$evidence/binary-version.txt"
+printf 'harness root: %s\nsource identity: not yet validated\n' "$repo_root" > "$evidence/source.txt"
+reject() {
+    printf 'provenance: %s\n' "$1" | tee "$evidence/provenance-check.txt" >&2
+    echo 'Commit current tracked source and rebuild the candidate from it before retrying.' |
+        tee -a "$evidence/provenance-check.txt" >&2
+    exit 1
+}
+# Available artifact facts survive root/Git/version/checker rejection. No native
+# scratch is allocated until every fallible capture and validation succeeds.
 printf 'Image: %s\n' "$AGENT_VM_LIVE_TEST_IMAGE" | tee "$evidence/image.txt"
-# Hash every file under script/test/, not a hand list: the driver imports
-# lib/egress-fixtures.py (which imports lib/egress-hostname-fixtures.py and
-# released-image-launch.py), lib/persisted-network.sh sources
-# lib/config-dir-guard.sh and reads fixtures/persisted-network/, and the guest
-# probes, egress-probe.sh and user-allow-host.toml are copied from fixtures/.
-# Any of these can decide a row's verdict. `git diff HEAD` above pins tracked
-# files outside script/test/. Compiled caches are not source.
+shasum -a 256 "$AGENT_VM_BIN" > "$evidence/binary.sha256" || reject 'binary hash failed'
 find "$script_dir" -type f ! -path '*/__pycache__/*' -print0 |
-    xargs -0 shasum -a 256 | sort -k2 | tee "$evidence/harness.sha256"
+    xargs -0 shasum -a 256 | sort -k2 > "$evidence/harness.sha256" || reject 'harness hash failed'
+
+# A tarball inside another checkout must not adopt the outer source identity.
+toplevel="$(pn_git rev-parse --show-toplevel)" || reject 'cannot discover the Git top level'
+[[ "$toplevel" != *$'\n'* && "$toplevel" != *$'\r'* ]] || reject 'the Git top level contains a newline'
+toplevel="$(cd -- "$toplevel" && pwd -P)" || reject 'the Git top level is not a directory'
+[[ "$toplevel" == "$repo_root" ]] || reject 'the harness source is not its own Git top level'
+commit="$(pn_git rev-parse HEAD)" || reject 'git rev-parse HEAD failed'
+printf 'harness root: %s\ncommit: %s\n' "$repo_root" "$commit" > "$evidence/source.txt"
+pn_git status --porcelain --untracked-files=no --ignore-submodules=untracked \
+    > "$evidence/tracked-status.txt" || reject 'git tracked status failed'
+pn_git status --porcelain > "$evidence/all-status.txt" || reject 'git status failed'
+{
+    printf 'status --porcelain (all; still lists unrelated untracked files):\n'
+    cat "$evidence/all-status.txt"
+    printf 'status --porcelain --untracked-files=no --ignore-submodules=untracked (empty means the tracked tree matches the commit):\n'
+    cat "$evidence/tracked-status.txt"
+} >> "$evidence/source.txt"
+pn_git diff HEAD > "$evidence/tree.diff" || reject 'git diff failed'
+shasum -a 256 "$evidence/tree.diff" > "$evidence/tree.diff.sha256" || reject 'tree diff hash failed'
+# Direct redirection preserves partial output, trailing blank lines and invalid
+# bytes for the independent checker and failure diagnosis.
+"$AGENT_VM_BIN" --version > "$evidence/binary-version.txt" || reject 'the binary does not report --version'
+if ! python3 "$script_dir/lib/build-provenance.py" \
+    "$evidence/binary-version.txt" "$commit" "$evidence/tracked-status.txt" \
+    2>&1 | tee "$evidence/provenance-check.txt"; then
+    echo 'Commit current tracked source and rebuild the candidate from it before retrying.' |
+        tee -a "$evidence/provenance-check.txt" >&2
+    exit 1
+fi
+cat "$evidence/binary-version.txt"
+
+root=''
+shell_owns_scratch=1
 driver=''
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
+    if [[ "$shell_owns_scratch" == 1 && -n "$root" ]]; then
+        # Only our mktemp result, before handoff; no driver has used it yet.
+        rmdir -- "$root" || status=1
+    fi
     if [[ -n "$driver" ]] && kill -0 "$driver" 2>/dev/null; then
         # Driver's finally block calls cleanup_run (bounded, identity-checked),
         # reaps its http.server, preserves evidence, then removes owned scratch.
         kill -TERM "$driver" 2>/dev/null || true
         wait "$driver" || status=1
     fi
+    if [[ "$shell_owns_scratch" == 0 && "$status" != 0 && "$status" != 24 && -d "$root" ]]; then
+        # Job creation is not driver initialization. After the child is dead,
+        # reclaim only empty scratch; never erase driver state or status-24 evidence.
+        if rmdir -- "$root"; then
+            echo "Driver failed (status $status); reclaimed empty scratch" >&2
+        else
+            echo "Driver failed (status $status); retained nonempty scratch: $root" >&2
+        fi
+    fi
     exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+root="$(mktemp -d /tmp/avm-pn.XXXXXX)"
+canonical_root="$(cd "$root" && pwd -P)"
+root="$canonical_root"
+[[ "$evidence" != "$root" && "$evidence" != "$root/"* ]] ||
+    reject 'AGENT_VM_PN_EVIDENCE must be outside the scratch root'
 pn_launch "$root" "$evidence" "$AGENT_VM_BIN" "$AGENT_VM_LIVE_TEST_IMAGE" &
 driver=$!
+shell_owns_scratch=0
 wait "$driver"
 driver=''

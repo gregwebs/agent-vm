@@ -149,7 +149,9 @@ Run `agent-vm doctor` to see the error.";
 #[derive(Parser)]
 #[command(
     name = "agent-vm",
-    version,
+    // The release number plus the source revision this binary was built from
+    // (issue #335), captured once by `build.rs`. Never a runtime Git call.
+    version = env!("AGENT_VM_BUILD_VERSION"),
     about = "Sandboxed microVMs for AI coding agents.",
     after_help = TOP_AFTER_HELP
 )]
