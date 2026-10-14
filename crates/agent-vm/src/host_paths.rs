@@ -34,6 +34,23 @@ pub fn state_root() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".local/state/agent-vm"))
 }
 
+/// Cache derived only from this binary, never launch state (ADR-0041).
+/// Deliberately ignores AGENT_VM_STATE_DIR and XDG_STATE_HOME.
+pub fn cache_root() -> Option<PathBuf> {
+    cache_root_from(
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn cache_root_from(xdg_cache_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(dir) = xdg_cache_home.filter(|p| Path::new(p).is_absolute()) {
+        return Some(PathBuf::from(dir).join("agent-vm"));
+    }
+    home.filter(|p| Path::new(p).is_absolute())
+        .map(|p| PathBuf::from(p).join(".cache/agent-vm"))
+}
+
 /// Reads a regular host credential file without allowing a FIFO or oversized
 /// file to consume a launcher or validated interception request.
 pub(crate) fn read_bounded_regular_file(path: &Path, max: u64) -> Result<Vec<u8>> {
@@ -902,6 +919,36 @@ fn random_temp_name() -> Result<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cache_root_prefers_absolute_xdg_cache_home() {
+        assert_eq!(
+            cache_root_from(Some(OsStr::new("/cache")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/cache/agent-vm"))
+        );
+    }
+    #[test]
+    fn cache_root_ignores_empty_or_relative_xdg_cache_home() {
+        for xdg in ["", "relative"] {
+            assert_eq!(
+                cache_root_from(Some(OsStr::new(xdg)), Some(OsStr::new("/home/u"))),
+                Some(PathBuf::from("/home/u/.cache/agent-vm"))
+            );
+        }
+    }
+    #[test]
+    fn cache_root_falls_back_to_home_dot_cache() {
+        assert_eq!(
+            cache_root_from(None, Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.cache/agent-vm"))
+        );
+    }
+    #[test]
+    fn cache_root_none_without_usable_home() {
+        for home in [None, Some(OsStr::new("")), Some(OsStr::new("relative"))] {
+            assert_eq!(cache_root_from(None, home), None);
+        }
+    }
+
     use std::fs;
 
     #[test]

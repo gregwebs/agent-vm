@@ -128,6 +128,16 @@ pub fn run(args: Args) -> Result<()> {
             )
         );
         println!();
+        if let Some(payload) = crate::embedded_runtime::EMBEDDED.as_ref() {
+            let dir = crate::msb_install::embedded_runtime_root()
+                .ok()
+                .map(|root| crate::embedded_runtime::unpacked_dir(&root, payload));
+            println!(
+                "{}",
+                describe_embedded_runtime(dir.as_deref(), dir.as_ref().is_some_and(|p| p.exists()))
+            );
+            println!();
+        }
         println!("{}", describe_credentials(&gather_credentials(), &launch));
         println!();
         println!("{config_section}");
@@ -168,6 +178,17 @@ pub fn run(args: Args) -> Result<()> {
     let outcome = reset_msb_db_in(&msb_home, &ts)?;
     println!("{}", render(&outcome));
     Ok(())
+}
+
+fn describe_embedded_runtime(dir: Option<&Path>, exists: bool) -> String {
+    match dir {
+        Some(dir) => format!(
+            "==> embedded runtime\nunpacked: {} ({})",
+            dir.display(),
+            if exists { "present" } else { "absent" }
+        ),
+        None => "==> embedded runtime\nunpacked: unresolved (set XDG_CACHE_HOME or HOME)".into(),
+    }
 }
 
 /// Names the *active* `MSB_HOME` and the schema this build understands, so
@@ -989,6 +1010,25 @@ fn render(outcome: &ResetOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn embedded_runtime_section_reports_path_and_presence() {
+        assert_eq!(
+            describe_embedded_runtime(Some(Path::new("/cache/runtime/id")), true),
+            "==> embedded runtime\nunpacked: /cache/runtime/id (present)"
+        );
+        assert_eq!(
+            describe_embedded_runtime(Some(Path::new("/cache/runtime/id")), false),
+            "==> embedded runtime\nunpacked: /cache/runtime/id (absent)"
+        );
+    }
+    #[test]
+    fn embedded_runtime_section_reports_unresolved_root() {
+        assert_eq!(
+            describe_embedded_runtime(None, false),
+            "==> embedded runtime\nunpacked: unresolved (set XDG_CACHE_HOME or HOME)"
+        );
+    }
+
     use clap::Parser;
 
     fn write_file(path: &Path, contents: &[u8]) {

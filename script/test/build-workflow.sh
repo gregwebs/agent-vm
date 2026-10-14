@@ -89,7 +89,7 @@ else
     printf "%s\n" "${FAKE_ACTIVE_RUST_VERSION:-rustc 1.98.1 (fake)}"
 fi'
     make_tool "$fakebin/cargo" '
-printf "cargo cwd=%s target=%s args=%s\n" "$PWD" "${CARGO_TARGET_DIR:-}" "$*" >>"$FAKE_LOG"
+printf "cargo cwd=%s target=%s args=%s embed_msb=%s embed_lib=%s\n" "$PWD" "${CARGO_TARGET_DIR:-}" "$*" "${AGENT_VM_EMBED_MSB:-}" "${AGENT_VM_EMBED_LIBKRUNFW:-}" >>"$FAKE_LOG"
 subdir=debug
 case "$*" in *"--release"*) subdir=release ;; esac
 case "$*" in
@@ -105,6 +105,30 @@ if [[ "${FAKE_MSB_VERSION_FAIL:-}" == 1 ]]; then exit 41; fi
 printf "%s\n" "msb fake-fresh"
 BIN
         chmod +x "$CARGO_TARGET_DIR/$subdir/msb"
+        ;;
+    *"--features embedded-runtime"*"-p agent-vm"*)
+        [[ -f "$AGENT_VM_EMBED_MSB" && -f "$AGENT_VM_EMBED_LIBKRUNFW" ]] || exit 4
+        mkdir -p "$CARGO_TARGET_DIR/$subdir"
+        {
+            printf "#!/bin/bash\nmsb=%q\nlib=%q\n" "$AGENT_VM_EMBED_MSB" "$AGENT_VM_EMBED_LIBKRUNFW"
+            cat <<"BIN"
+if [[ "${1:-}" == --version ]]; then
+    [[ "${FAKE_AGENT_VM_VERSION_FAIL:-}" != 1 ]] || exit 42
+    printf "%s\n" "agent-vm fake-single"
+elif [[ "$*" == "msb --version" ]]; then
+    [[ "${FAKE_SINGLE_SMOKE_FAIL:-}" != 1 ]] || exit 43
+    [[ -z "${MSB_PATH:-}" ]] || exit 44
+    [[ -z "${XDG_CACHE_HOME:-}" ]] || exit 45
+    mkdir -p "$HOME/.cache/agent-vm/runtime/fake/"{bin,lib}
+    cp "$msb" "$HOME/.cache/agent-vm/runtime/fake/bin/msb"
+    cp "$lib" "$HOME/.cache/agent-vm/runtime/fake/lib/libkrunfw.5.dylib"
+    printf "%s\n" "msb fake-fresh"
+else
+    exit 40
+fi
+BIN
+        } >"$CARGO_TARGET_DIR/$subdir/agent-vm"
+        chmod +x "$CARGO_TARGET_DIR/$subdir/agent-vm"
         ;;
     *"-p agent-vm"*)
         mkdir -p "$CARGO_TARGET_DIR/$subdir"
@@ -357,6 +381,22 @@ assert_file_contains "$fixture/calls.log" "codesign --entitlements msb-entitleme
 assert_file_contains "$fixture/target/macos/bin/agent-vm" "fake-fresh"
 assert_file_contains "$fixture/target/macos/bin/msb" "fake-fresh"
 
+: >"$fixture/calls.log"
+run_build "$fixture" "$fakebin" -- --single-binary
+assert_mode 755 "$fixture/target/macos-single/agent-vm"
+assert_file_contains "$fixture/target/macos-single/agent-vm" "fake-single"
+assert_file_contains "$fixture/calls.log" "rustup auto_install=0 args=run 1.98.1 cargo build --release --features embedded-runtime -p agent-vm"
+assert_file_contains "$fixture/calls.log" "embed_msb=$fixture/vendor/microsandbox/build/msb"
+assert_file_contains "$fixture/calls.log" "embed_lib=$fixture/vendor/microsandbox/build/libkrunfw.5.dylib"
+assert_file_contains "$fixture/calls.log" "codesign --verify --strict $fixture/target/macos-single/.smoke/home/.cache/agent-vm/runtime/fake/bin/msb"
+case "$(cat "$fixture/calls.log")" in *"cargo build --release -p agent-vm"*) fail "single build invoked bundle build" ;; esac
+for bundle in macos macos-dev; do
+    assert_file_contains "$fixture/target/$bundle/bin/agent-vm" "fake-fresh"
+    assert_file_contains "$fixture/target/$bundle/bin/msb" "fake-fresh"
+done
+for staging in .agent-vm.next .smoke .msb-entitlements.plist; do [[ ! -e "$fixture/target/macos-single/$staging" ]]; done
+expect_build_failure "--single-binary cannot be combined with --dev" "$fixture" "$fakebin" -- --dev --single-binary
+
 # Argument and preflight failures are early and actionable.
 output="$(PATH="$fakebin" "$fixture/script/build/macos.sh" --help)"
 assert_contains "$output" "Usage:"
@@ -458,6 +498,21 @@ for failure in signature agent-version msb-version; do
     [[ ! -e "$fixture/target/macos/bin/.msb.next" ]]
     [[ ! -e "$fixture/target/macos/lib/.libkrunfw.5.dylib.next" ]]
     [[ ! -e "$fixture/target/macos/.msb-entitlements.plist" ]]
+done
+
+for failure in smoke entitlement arch arch-unpacked version; do
+    make_fixture "single-$failure"
+    mkdir -p "$fixture/target/macos-single"
+    printf old-single >"$fixture/target/macos-single/agent-vm"
+    case "$failure" in
+        smoke) expect_build_failure "failed to start from an empty directory" "$fixture" "$fakebin" env FAKE_SINGLE_SMOKE_FAIL=1 -- --single-binary ;;
+        entitlement) expect_build_failure "missing the boolean com.apple.security.hypervisor entitlement" "$fixture" "$fakebin" env FAKE_HYPERVISOR_ENTITLEMENT=missing -- --single-binary ;;
+        arch) expect_build_failure "must be arm64-only" "$fixture" "$fakebin" env FAKE_BAD_ARCH_PATH=.agent-vm.next -- --single-binary ;;
+        arch-unpacked) expect_build_failure "must be arm64-only" "$fixture" "$fakebin" env FAKE_BAD_ARCH_PATH=.smoke/home/.cache -- --single-binary ;;
+        version) expect_build_failure "staged single-binary agent-vm failed to run with --version" "$fixture" "$fakebin" env FAKE_AGENT_VM_VERSION_FAIL=1 -- --single-binary ;;
+    esac
+    [[ "$(cat "$fixture/target/macos-single/agent-vm")" == old-single ]]
+    for staging in .agent-vm.next .smoke .msb-entitlements.plist; do [[ ! -e "$fixture/target/macos-single/$staging" ]]; done
 done
 
 # Repository-scoped target directories override inherited Cargo output paths.

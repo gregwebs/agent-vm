@@ -11,7 +11,8 @@ or develop agent-vm.
 - Node.js 18+ for the npm-distributed launchers.
 
 The packaged Linux workflow installs its matching libkrunfw on first launch.
-Apple Silicon source builds assemble a self-contained local runtime bundle.
+Apple Silicon source builds assemble a self-contained local runtime bundle, or
+a [single binary](macos-build.md#build-a-single-binary) with `./script/build/macos.sh --single-binary`.
 
 ## Quick start
 
@@ -1821,6 +1822,17 @@ Project `[network]` can never grant authority. Verified user-tier grants merge
 with launch flags as described in [Persisted grants](#persisted-grants-user-config).
 
 ## Troubleshooting
+
+- **Could not find its bundled `msb` binary after copying:** copy the whole
+  bundle (`bin/agent-vm`, `bin/msb`, `lib/libkrunfw.5.dylib` on macOS), or
+  build the opt-in single binary with `./script/build/macos.sh --single-binary`.
+  Symlinking `agent-vm` to a complete bundle is supported.
+- **Could not unpack its embedded `msb` runtime:** make the cache writable,
+  or set `XDG_CACHE_HOME` to an absolute writable directory. The default is
+  `~/.cache/agent-vm/runtime/<id>/`, separate from launch state.
+- **Does not match the runtime embedded:** remove only the runtime directory
+  named by the diagnostic and retry; do not re-sign extracted msb.
+  `agent-vm doctor` shows the unpacked runtime path without creating it.
 
 - **Config-directory exposure / “launch authority”** — run from a project,
   not `$HOME`; use `:ro` or a narrower mount. For a state/home bind, move

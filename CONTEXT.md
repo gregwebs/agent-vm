@@ -93,6 +93,17 @@ installed `msb` uses is a different thing agent-vm deliberately does not point
 at (except the opt-in cache share); and when schema-scoping matters — the
 schema home is the concept, the env var just points at it.
 
+## Runtime pair
+
+**msb + libkrunfw**, the executable VMM and firmware library used together.
+A **Bundle** carries them beside agent-vm in `bin/` and `lib/`. A **Single
+binary** embeds the pair and unpacks it on first use (opt-in release form).
+
+**Unpacked runtime**: `<cache_root>/runtime/<id>/{bin,lib}`, derived only from
+the binary, not launch state. **Cache root**: `$XDG_CACHE_HOME/agent-vm` or
+`~/.cache/agent-vm`. Avoid "install" for unpacking. See
+[ADR-0041](docs/adr/0041-single-binary-embedded-runtime.md).
+
 ## Credential shielding
 
 The explicitly authorized use of a credential on behalf of an untrusted guest
