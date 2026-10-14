@@ -23,39 +23,6 @@ Run inside a per-project [microsandbox](https://docs.microsandbox.dev/) (libkrun
   `git push` etc. are filtered at the proxy — off-list calls get a 403
   before they reach GitHub.
 
-**Breaking change in 0.3.0:** launches from `$HOME` and writable binds containing
-`~/.config/agent-vm` are refused, even without Pi or existing config files.
-A hard-linked `config.toml` also blocks launches. Run from a project directory,
-use `:ro` or a narrower bind, and replace multiply-linked config with a copy.
-See [config directory protection](USAGE.md#agent-vms-config-directory-is-never-writable-from-the-guest).
-
-Grants can also be saved in `~/.config/agent-vm/config.toml` `[network]`
-(user tier only); see [persisted grants](USAGE.md#persisted-grants-user-config).
-
-**Breaking change in 0.2.0:** existing tool launches now have no guest egress or
-DNS query authorization until you pass a grant. Agents calling provider APIs
-(`claude`, `codex`, …) need `--allow-internet-egress` to restore public internet
-and DNS access. Narrower alternatives exist: numeric `--allow-egress` allowances
-for address-only access, or TLS hostname allowances (`--allow-egress
-api.example.com`) for one exact name — a provider CLI may need several, and a
-selected host HTTP proxy (`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`) refuses a
-hostname launch, so unset it or use `NO_PROXY=*`
-([#302](https://github.com/gregwebs/agent-vm/issues/302)). `--allow-lan` and
-`--allow-host` no longer imply
-internet access. Plain port-53 DNS to an IP-allowed resolver remains denied
-in this release
-([microsandbox #75](https://github.com/gregwebs/microsandbox/issues/75)). A
-numeric CIDR matches every address it covers: gateway-covering ranges
-(such as IPv4 `100.64.0.0/10` or IPv6 ULA `fd00::/8` and `fc00::/7`) reach
-host loopback services; link-local-covering ranges reach cloud metadata.
-`0.0.0.0/0` and `::/0` include their respective gateways and link-local ranges. See
-[Ports & egress](USAGE.md#ports--egress) for DNS and resolver limitations.
-
-A tool can declare `network_requests`; a launch reports the ones its grants do
-not cover and continues ([Tool network requests](USAGE.md#tool-network-requests)).
-Claude/Codex/OpenCode/Pi declare [documented baseline requests](docs/default-tool-network-requests.md),
-not automatic grants or all optional traffic. Copilot's inventory is pending #340.
-
 Missing planned features:
 
 * MCP gateway
@@ -86,7 +53,7 @@ It seems more geared to datacenter/cloud usage. It has multiple backends and doe
 
 ## Status
 
-Although this is architected for security and every change is inspected for security, further security review is still needed.
+Although this is architected for security, mostly relies on the microsandbox project for security, and every change is inspected for security, further security review is still needed.
 This will happen afer completing testing of a few major features that have just landed.
 If you are currently not sandboxing, then using this tool would be much more secure than that.
 Please try out the project and give feedback or star it but don't rely on it for untrusted workloads yet.
@@ -102,24 +69,20 @@ Please try out the project and give feedback or star it but don't rely on it for
 ## Quick start
 
 ```bash
-npm install -g @wirenboard/agent-vm  # Linux; macOS: follow macos-build.md
+# Clone to build from source
+git clone https://github.com/gregwebs/agent-vm
+cd agent-vm
+git submodule update --init --recursive vendor/microsandbox
 
+# build from source
+cargo build --release
+
+# Pull OCI images
 agent-vm setup            # pulls the image this config boots from and verifies it boots
 
 cd ~/your-project
 agent-vm claude --allow-internet-egress
 ```
-
-See [Ports & egress](USAGE.md#ports--egress) for narrower grants and their risks.
-
-The initial recommendation is the released v0.1.3 standard image containing all
-six agents. Successful first acquisition retains its immutable index reference;
-launcher upgrades never replace an existing selection. Image sources and releases
-live in [agent-vm-images](https://github.com/gregwebs/agent-vm-images), independently of the launcher.
-
-The launch verbs come from your tool configuration (two tiers, user-wins), so
-`agent-vm --help` lists exactly the tools you have configured; `agent-vm doctor`
-shows which config files were found and what they resolved to.
 
 Full flag, subcommand, networking, and troubleshooting reference:
 **[USAGE.md](USAGE.md)**.
@@ -143,16 +106,6 @@ for builder prerequisites and host-build trust.
 - [PLAN.md](PLAN.md) — what is left to do for v1.
 - [Credential shielding specification](docs/specs/credential-shielding.md) —
   agreed user contract and Docker-shaped YAML/CLI design (not yet implemented).
-- [ADR-0035: Consume user-owned boot images](docs/adr/0035-consume-user-owned-boot-images.md) —
-  why the launcher selects and acquires an image instead of building one; see
-  [Selecting the boot image](USAGE.md#selecting-the-boot-image). The superseded
-  [image composition handoff](docs/specs/image-composition.md) is kept as
-  abandoned history.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
   the way they do.
-- [ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md) —
-  file-backed credential-injection and refresh boundary.
 - [CODING_STANDARDS.md](CODING_STANDARDS.md) — repo coding standards.
-
-To deliberately change the retained default, see
-[explicit default-image upgrade](USAGE.md#explicitly-upgrading-the-default).

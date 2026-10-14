@@ -13,18 +13,13 @@ the end-user reference.
   output placement, state-dir cleanup, commit-message style.
 - [docs/adr/](docs/adr/) — architecture decision records for the
   important technical trade-offs.
-- [ADR-0018](docs/adr/0018-machine-checked-boundary-contracts.md) — a new
-  **pure** function that decides a security boundary, a resource limit, or the
-  parse of untrusted input carries a machine-checked `verus!` contract. Extract
-  the decision, not the I/O.
+- We use the /verus skill for writing proofs
 
 ## Build from source
 
-Clone the repository and its recursive submodules:
+You ned recursive submodules:
 
 ```bash
-git clone https://github.com/gregwebs/agent-vm
-cd agent-vm
 git submodule update --init --recursive vendor/microsandbox
 ```
 
@@ -35,13 +30,10 @@ The workflow is directly executable and does not require `just`:
 ./script/build/macos.sh
 ```
 
-While iterating on `agent-vm`'s Rust source, use `./script/build/macos.sh
---dev` instead for a much faster unoptimized build published to
-`target/macos-dev/` — see [Fast development
-build](macos-build.md#fast-development-build).
+While iterating on `agent-vm`'s Rust source, use `./script/build/macos.sh --dev` for a much faster unoptimized build published to
+`target/macos-dev/` — see [Fast development build](macos-build.md#fast-development-build).
 
-On Linux, install the host development packages, build the vendored runtime
-through its supported recipe, and then build agent-vm:
+On Linux, install the host development packages, build the vendored runtime through its supported recipe, and then build agent-vm:
 
 ```bash
 sudo apt-get install -y libcap-ng-dev libdbus-1-dev pkg-config
