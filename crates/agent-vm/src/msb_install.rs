@@ -11,11 +11,14 @@
 //! In order of priority:
 //!
 //! 1. `MSB_PATH` env var — explicit override (testing, CI, devs).
-//! 2. `<exe-dir>/msb` — sibling of `agent-vm` in the install bundle.
+//! 2. Sibling of the symlink-resolved executable (resolved directory first).
+//! 3. `<exe-dir>/msb` — sibling of `agent-vm` in the install bundle.
 //!    This is what the npm distribution ships: each platform
 //!    subpackage drops `agent-vm` and `msb` into `bin/` side by side.
-//! 3. `<workspace>/vendor/microsandbox/build/msb` — the signed output
+//! 4. `<workspace>/vendor/microsandbox/build/msb` — the signed output
 //!    produced by `script/build/macos.sh` in a source checkout.
+//!
+//! 5. Opt-in embedded runtime, unpacked under cache_root()/runtime/<id>.
 //!
 //! The first existing candidate wins. The resolved binary's
 //! `--version` output MUST report exactly the official upstream version
@@ -79,10 +82,52 @@ fn source_built_msb(workspace: &std::path::Path) -> PathBuf {
     workspace.join("vendor/microsandbox/build/msb")
 }
 
-/// Sibling-of-current-exe path, the npm-bundle layout.
-fn exe_sibling_msb() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.join("msb"))
+/// Keep both paths: macOS reports the invoked symlink, Linux resolves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExeLocation {
+    reported: PathBuf,
+    resolved: Option<PathBuf>,
+}
+impl ExeLocation {
+    fn from_process() -> Option<Self> {
+        std::env::current_exe().ok().map(Self::resolve)
+    }
+    fn resolve(reported: PathBuf) -> Self {
+        let resolved = reported.canonicalize().ok();
+        Self { reported, resolved }
+    }
+    fn search_dirs(&self) -> Vec<&Path> {
+        let mut dirs = Vec::new();
+        for exe in self.resolved.iter().chain(std::iter::once(&self.reported)) {
+            if let Some(dir) = exe.parent()
+                && !dirs.contains(&dir)
+            {
+                dirs.push(dir);
+            }
+        }
+        dirs
+    }
+    fn source_workspace(&self) -> Option<&Path> {
+        self.resolved
+            .as_deref()
+            .and_then(source_workspace)
+            .or_else(|| source_workspace(&self.reported))
+    }
+    fn layout_exe(&self) -> &Path {
+        self.resolved.as_deref().unwrap_or(&self.reported)
+    }
+}
+struct LadderInputs {
+    msb_path_env: Option<PathBuf>,
+    exe: Option<ExeLocation>,
+}
+impl LadderInputs {
+    fn from_process() -> Self {
+        Self {
+            msb_path_env: std::env::var_os("MSB_PATH").map(PathBuf::from),
+            exe: ExeLocation::from_process(),
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -164,21 +209,21 @@ fn missing_msb_diagnostic(layout: MissingMsbLayout) -> &'static str {
 /// Returns `Ok(Some(path))` on success, `Ok(None)` if no candidate
 /// exists at all, or `Err` only on a present-but-broken candidate
 /// (e.g. one that fails to even execute).
-pub fn resolved_msb_path() -> Result<Option<PathBuf>> {
-    if let Some(env_path) = std::env::var_os("MSB_PATH") {
-        let p = PathBuf::from(&env_path);
+fn resolve_on_disk(inputs: &LadderInputs) -> Result<Option<PathBuf>> {
+    let sibling = || {
+        inputs
+            .exe
+            .as_ref()
+            .into_iter()
+            .flat_map(ExeLocation::search_dirs)
+            .map(|d| d.join("msb"))
+            .find(|p| p.exists())
+    };
+    if let Some(p) = &inputs.msb_path_env {
         if p.exists() {
-            return Ok(Some(p));
+            return Ok(Some(p.clone()));
         }
-        // Stale env from a previous dev session (common pitfall:
-        // .bashrc / shell init kept the var around after the file was
-        // moved or the dev directory deleted). Name MSB_PATH
-        // explicitly so the user knows what to unset, and offer the
-        // sibling fallback path if we can find one — otherwise the
-        // env var is a permanent foot-gun.
-        if let Some(sibling) = exe_sibling_msb()
-            && sibling.exists()
-        {
+        if let Some(sibling) = sibling() {
             eprintln!(
                 "warn: MSB_PATH={} does not exist; ignoring and using sibling {}",
                 p.display(),
@@ -192,25 +237,103 @@ pub fn resolved_msb_path() -> Result<Option<PathBuf>> {
              Either `unset MSB_PATH` to use the default discovery path, or point \
              it at a valid msb build.",
             p.display(),
-            std::env::current_exe()
-                .map(|e| e.display().to_string())
-                .unwrap_or_else(|_| "<agent-vm exe>".to_string())
+            inputs
+                .exe
+                .as_ref()
+                .map(|e| e.reported.display().to_string())
+                .unwrap_or_else(|| "<agent-vm exe>".into())
         );
     }
-    if let Some(p) = exe_sibling_msb()
-        && p.exists()
-    {
+    if let Some(p) = sibling() {
         return Ok(Some(p));
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(workspace) = source_workspace(&exe)
-    {
-        let dev = source_built_msb(workspace);
-        if dev.exists() {
-            return Ok(Some(dev));
+    if let Some(workspace) = inputs.exe.as_ref().and_then(ExeLocation::source_workspace) {
+        let p = source_built_msb(workspace);
+        if p.exists() {
+            return Ok(Some(p));
         }
     }
     Ok(None)
+}
+
+enum RuntimePin {
+    OnDisk(PathBuf),
+    Embedded(crate::embedded_runtime::UnpackedRuntime),
+}
+const EMBEDDED_RUNTIME_SUBDIR: &str = "runtime";
+const UNPACK_HEADLINE: &str = "agent-vm could not unpack its embedded `msb` runtime";
+pub(crate) fn embedded_runtime_root() -> Result<PathBuf> {
+    crate::host_paths::cache_root()
+        .map(|r| r.join(EMBEDDED_RUNTIME_SUBDIR))
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not resolve agent-vm cache root; set XDG_CACHE_HOME or HOME")
+        })
+}
+fn select_runtime(
+    inputs: &LadderInputs,
+    payload: Option<&crate::embedded_runtime::Payload<'_>>,
+    runtime_root: impl FnOnce() -> Result<PathBuf>,
+) -> Result<RuntimePin> {
+    if let Some(p) = resolve_on_disk(inputs)? {
+        return Ok(RuntimePin::OnDisk(p));
+    }
+    if let Some(payload) = payload {
+        let root = runtime_root().context(UNPACK_HEADLINE)?;
+        return Ok(RuntimePin::Embedded(crate::embedded_runtime::unpack(
+            &root, payload,
+        )?));
+    }
+    let layout = inputs
+        .exe
+        .as_ref()
+        .map(|e| classify_missing_msb_layout(e.layout_exe()))
+        .unwrap_or(MissingMsbLayout::InstalledBundle);
+    let searched = inputs
+        .exe
+        .as_ref()
+        .map(ExeLocation::search_dirs)
+        .unwrap_or_default();
+    bail!(
+        "{}",
+        missing_runtime_diagnostic(layout, &searched, cfg!(target_os = "macos"))
+    )
+}
+fn missing_runtime_diagnostic(
+    layout: MissingMsbLayout,
+    searched: &[&Path],
+    is_macos: bool,
+) -> String {
+    if layout != MissingMsbLayout::InstalledBundle {
+        return missing_msb_diagnostic(layout).into();
+    }
+    let original = missing_msb_diagnostic(layout);
+    let lib = microsandbox_utils::libkrunfw_filename(if is_macos { "macos" } else { "linux" });
+    let build = if is_macos {
+        ", or build a single binary with `./script/build/macos.sh --single-binary`."
+    } else {
+        "."
+    };
+    let searched = if searched.is_empty() {
+        "(agent-vm could not locate its own executable)".into()
+    } else {
+        // Compare resolved identities: macOS reports `/var/...` for a
+        // canonicalize()d `/private/var/...`, so raw-path dedup would list the
+        // same directory twice. Display keeps the searched spelling.
+        let mut seen: Vec<std::path::PathBuf> = Vec::new();
+        let mut shown: Vec<String> = Vec::new();
+        for dir in searched {
+            let identity = dir.canonicalize().unwrap_or_else(|_| (*dir).to_owned());
+            if seen.contains(&identity) {
+                continue;
+            }
+            seen.push(identity);
+            shown.push(dir.display().to_string());
+        }
+        shown.join(", ")
+    };
+    format!(
+        "{original}\n- Copied `agent-vm` by itself? This build does not embed its runtime. Copy the whole bundle (`bin/agent-vm`, `bin/msb`, `lib/{lib}`){build}\nSearched for `msb` in: {searched}"
+    )
 }
 
 /// Resolve the shared OCI cache directory to redirect `paths.cache` at.
@@ -534,7 +657,7 @@ fn check_socket_path_len(socket_path: &Path, sandbox_name: &str) -> Result<()> {
 /// `/dev/kvm` would silently not appear in the guest. Avoid the
 /// conflict entirely by giving agent-vm its own `MSB_HOME` under
 /// `state_root()`. Read-only bits (msb, libkrunfw) come from the
-/// bundle next to `agent-vm` via msb's own resolver
+/// bundle or `<cache_root>/runtime/<id>` (not MSB_HOME) via msb's resolver
 /// (`MSB_PATH` → sibling `lib/`); writable bits (db, cache,
 /// sandboxes, logs, secrets, tls/CA) live here.
 ///
@@ -599,25 +722,27 @@ pub fn ensure_msb_home(dir: &Path) -> Result<()> {
 /// `Err` with an actionable hint if msb is missing or unpatched.
 /// Safe to call multiple times — subsequent calls re-validate.
 pub fn point_at_msb() -> Result<()> {
-    let resolved = match resolved_msb_path()? {
-        Some(p) => p,
-        None => {
-            let layout = std::env::current_exe()
-                .map(|exe| classify_missing_msb_layout(&exe))
-                .unwrap_or(MissingMsbLayout::InstalledBundle);
-            bail!("{}", missing_msb_diagnostic(layout));
+    match select_runtime(
+        &LadderInputs::from_process(),
+        crate::embedded_runtime::EMBEDDED.as_ref(),
+        embedded_runtime_root,
+    )? {
+        RuntimePin::OnDisk(msb) => {
+            verify_official_identity(&msb)?;
+            // SAFETY: main calls this prologue before constructing Tokio; no worker
+            // threads may race with libc getenv/setenv here.
+            unsafe { std::env::set_var("MSB_PATH", &msb) };
         }
-    };
-
-    verify_official_identity(&resolved)?;
-
-    // SAFETY: `main()` is a plain `fn main` and calls `point_at_msb`
-    // BEFORE constructing the tokio runtime. setenv() is not thread-
-    // safe; this ordering invariant is the only thing that makes the
-    // call sound. If you move the call into the runtime context the
-    // multi-threaded workers can race with libc's getenv()
-    // (reqwest, sea-orm, etc. read env on first use) → UB.
-    unsafe { std::env::set_var("MSB_PATH", &resolved) };
+        RuntimePin::Embedded(rt) => {
+            verify_identity(&rt.msb, MsbOrigin::Embedded)?;
+            // SAFETY: same pre-Tokio invariant. Pin both halves before SDK lookup.
+            // Unpack writes only to cache_root(), never launch state (ADR-0041).
+            unsafe {
+                std::env::set_var("MSB_PATH", &rt.msb);
+                std::env::set_var("MSB_LIBKRUNFW_PATH", &rt.libkrunfw);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -638,6 +763,23 @@ fn verify_official_identity_with_path_source(
     msb: &std::path::Path,
     msb_path_is_explicit: bool,
 ) -> Result<()> {
+    verify_identity(
+        msb,
+        if msb_path_is_explicit {
+            MsbOrigin::Explicit
+        } else {
+            MsbOrigin::Discovered
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum MsbOrigin {
+    Explicit,
+    Discovered,
+    Embedded,
+}
+fn verify_identity(msb: &Path, origin: MsbOrigin) -> Result<()> {
     let out = Command::new(msb)
         .arg("--version")
         .output()
@@ -665,15 +807,19 @@ fn verify_official_identity_with_path_source(
         // at this binary. If the user explicitly set MSB_PATH, "set
         // MSB_PATH explicitly" is the LAST thing they need to hear —
         // they need to unset it.
-        let hint = if msb_path_is_explicit {
+        let hint = match origin {
+            MsbOrigin::Explicit => {
             format!(
                 "Your MSB_PATH points at this binary. `unset MSB_PATH` to use the \
                  bundled official msb, or point MSB_PATH at an msb {expected} build."
             )
-        } else {
+        },
+            MsbOrigin::Discovered => {
             "Reinstall agent-vm (e.g. `npm install -g @wirenboard/agent-vm --force`) \
              to restore the bundled official msb."
                 .to_string()
+            },
+            MsbOrigin::Embedded => "This agent-vm binary embeds a different msb build. Rebuild it with `./script/build/macos.sh --single-binary`.".into(),
         };
         bail!(
             "{} reports version {reported:?}, but this agent-vm build vendors official \
@@ -691,6 +837,214 @@ fn verify_official_identity_with_path_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn inputs(exe: PathBuf) -> LadderInputs {
+        LadderInputs {
+            msb_path_env: None,
+            exe: Some(ExeLocation::resolve(exe)),
+        }
+    }
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+    #[test]
+    fn exe_location_resolve_canonicalizes_real_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("bundle/agent-vm");
+        let link = t.path().join("links/agent-vm");
+        touch(&target);
+        std::fs::create_dir(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let exe = ExeLocation::resolve(link.clone());
+        assert_eq!(exe.resolved, Some(target.canonicalize().unwrap()));
+        assert_eq!(
+            exe.search_dirs(),
+            vec![
+                exe.resolved.as_ref().unwrap().parent().unwrap(),
+                link.parent().unwrap()
+            ]
+        );
+    }
+    #[test]
+    fn exe_location_dedups_non_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().canonicalize().unwrap().join("agent-vm");
+        touch(&p);
+        assert_eq!(
+            ExeLocation::resolve(p.clone()).search_dirs(),
+            vec![p.parent().unwrap()]
+        );
+    }
+    #[test]
+    fn exe_location_falls_back_when_unresolvable() {
+        let e = ExeLocation::resolve(PathBuf::from("/absent/agent-vm"));
+        assert_eq!(e.resolved, None);
+        assert_eq!(e.search_dirs(), vec![Path::new("/absent")]);
+        assert_eq!(e.layout_exe(), Path::new("/absent/agent-vm"));
+    }
+    #[test]
+    fn ladder_order_msb_path_sibling_source() {
+        let t = tempfile::tempdir().unwrap();
+        write_source_checkout_marker(t.path());
+        let exe = t.path().join("target/debug/agent-vm");
+        touch(&exe);
+        let source = source_built_msb(t.path());
+        touch(&source);
+        let sibling = exe.with_file_name("msb");
+        touch(&sibling);
+        let explicit = t.path().join("explicit");
+        touch(&explicit);
+        let mut input = inputs(exe);
+        input.msb_path_env = Some(explicit.clone());
+        assert_eq!(resolve_on_disk(&input).unwrap(), Some(explicit));
+        input.msb_path_env = None;
+        assert_eq!(
+            resolve_on_disk(&input).unwrap(),
+            Some(sibling.canonicalize().unwrap())
+        );
+        std::fs::remove_file(sibling).unwrap();
+        assert_eq!(
+            resolve_on_disk(&input).unwrap(),
+            Some(source.canonicalize().unwrap())
+        );
+    }
+    #[test]
+    fn ladder_finds_source_build_through_symlinked_exe() {
+        let t = tempfile::tempdir().unwrap();
+        write_source_checkout_marker(t.path());
+        let exe = t.path().join("target/debug/agent-vm");
+        touch(&exe);
+        let source = source_built_msb(t.path());
+        touch(&source);
+        let link = t.path().join("agent-vm");
+        std::os::unix::fs::symlink(exe, &link).unwrap();
+        assert_eq!(
+            resolve_on_disk(&inputs(link)).unwrap(),
+            Some(source.canonicalize().unwrap())
+        );
+    }
+    #[test]
+    fn stale_msb_path_falls_back_to_resolved_sibling() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = t.path().join("bundle/agent-vm");
+        touch(&exe);
+        let sibling = exe.with_file_name("msb");
+        touch(&sibling);
+        let link = t.path().join("agent-vm");
+        std::os::unix::fs::symlink(exe, &link).unwrap();
+        let mut input = inputs(link);
+        input.msb_path_env = Some(t.path().join("missing"));
+        assert_eq!(
+            resolve_on_disk(&input).unwrap(),
+            Some(sibling.canonicalize().unwrap())
+        );
+    }
+    #[test]
+    fn stale_msb_path_without_sibling_keeps_bail_text() {
+        let input = LadderInputs {
+            msb_path_env: Some(PathBuf::from("/absent/msb")),
+            exe: None,
+        };
+        assert_eq!(
+            resolve_on_disk(&input).unwrap_err().to_string(),
+            "MSB_PATH=/absent/msb is set but the file does not exist, and no fallback msb was found next to <agent-vm exe>.\nEither `unset MSB_PATH` to use the default discovery path, or point it at a valid msb build."
+        );
+    }
+    fn fake_payload<'a>(msb: &'a [u8], lib: &'a [u8]) -> crate::embedded_runtime::Payload<'a> {
+        use crate::embedded_runtime::{Payload, PayloadFile};
+        use sha2::{Digest, Sha256};
+        Payload {
+            msb: PayloadFile {
+                compressed: msb,
+                len: 1,
+                sha256: Sha256::digest(b"m").into(),
+            },
+            libkrunfw: PayloadFile {
+                compressed: lib,
+                len: 1,
+                sha256: Sha256::digest(b"l").into(),
+            },
+        }
+    }
+    #[test]
+    fn select_runtime_prefers_sibling_and_never_resolves_runtime_root() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = t.path().join("agent-vm");
+        touch(&exe);
+        touch(&exe.with_file_name("msb"));
+        assert!(matches!(
+            select_runtime(&inputs(exe), Some(&fake_payload(&[], &[])), || panic!(
+                "bundle reached cache"
+            ))
+            .unwrap(),
+            RuntimePin::OnDisk(_)
+        ));
+    }
+    #[test]
+    fn select_runtime_unpacks_for_lone_binary() {
+        let t = tempfile::tempdir().unwrap();
+        let msb = zstd::encode_all(&b"m"[..], 1).unwrap();
+        let lib = zstd::encode_all(&b"l"[..], 1).unwrap();
+        let pin = select_runtime(
+            &inputs(t.path().join("agent-vm")),
+            Some(&fake_payload(&msb, &lib)),
+            || Ok(t.path().join("cache")),
+        )
+        .unwrap();
+        let RuntimePin::Embedded(rt) = pin else {
+            panic!("not embedded")
+        };
+        assert_eq!(std::fs::read(rt.msb).unwrap(), b"m");
+    }
+    #[test]
+    fn select_runtime_reports_root_resolution_failure() {
+        let err = select_runtime(
+            &LadderInputs {
+                msb_path_env: None,
+                exe: None,
+            },
+            Some(&fake_payload(&[], &[])),
+            || bail!("could not resolve agent-vm cache root; set XDG_CACHE_HOME or HOME"),
+        )
+        .err()
+        .unwrap();
+        assert!(format!("{err:#}").contains(UNPACK_HEADLINE));
+        assert!(format!("{err:#}").contains("set XDG_CACHE_HOME or HOME"));
+    }
+    #[test]
+    fn missing_runtime_diagnostic_appends_copy_hint_for_installed_bundle_only() {
+        for macos in [true, false] {
+            for layout in [
+                MissingMsbLayout::SourceBuildMissing,
+                MissingMsbLayout::SourceSubmoduleUninitialized,
+            ] {
+                let expected = missing_msb_diagnostic(match layout {
+                    MissingMsbLayout::SourceBuildMissing => MissingMsbLayout::SourceBuildMissing,
+                    _ => MissingMsbLayout::SourceSubmoduleUninitialized,
+                });
+                assert_eq!(missing_runtime_diagnostic(layout, &[], macos), expected);
+            }
+            let text = missing_runtime_diagnostic(
+                MissingMsbLayout::InstalledBundle,
+                &[Path::new("/bin")],
+                macos,
+            );
+            assert!(text.contains("Copied `agent-vm` by itself?"));
+            assert!(text.ends_with("Searched for `msb` in: /bin"));
+            assert_eq!(text.contains("--single-binary"), macos);
+        }
+        assert!(
+            missing_runtime_diagnostic(MissingMsbLayout::InstalledBundle, &[], true)
+                .ends_with("(agent-vm could not locate its own executable)")
+        );
+    }
+    #[test]
+    fn embedded_identity_mismatch_names_single_binary_rebuild() {
+        let t = tempfile::tempdir().unwrap();
+        let path = write_fake_msb(t.path(), "msb 9.9.9");
+        assert!(verify_identity(&path, MsbOrigin::Embedded).unwrap_err().to_string().contains("This agent-vm binary embeds a different msb build. Rebuild it with `./script/build/macos.sh --single-binary`."));
+    }
+
     use std::os::unix::fs::PermissionsExt;
 
     fn write_fake_msb(dir: &std::path::Path, version_output: &str) -> PathBuf {
@@ -790,13 +1144,57 @@ mod tests {
     fn resolved_msb_path_honours_env_override() {
         let dir = tempfile::tempdir().unwrap();
         let p = write_fake_msb(dir.path(), &format!("msb {}", expected_msb_version()));
-        // Avoid mutating the process-wide env in parallel tests:
-        // construct the same selection logic locally.
-        let env_val: std::ffi::OsString = p.as_os_str().to_owned();
-        // Re-implement the env branch deterministically:
-        let chosen = PathBuf::from(&env_val);
-        assert!(chosen.exists());
-        assert_eq!(chosen, p);
+        // Avoid mutating the process-wide env in parallel tests: drive the real
+        // selection seam with explicit inputs instead.
+        let input = LadderInputs {
+            msb_path_env: Some(p.clone()),
+            exe: None,
+        };
+        assert_eq!(resolve_on_disk(&input).unwrap(), Some(p));
+    }
+
+    #[test]
+    fn missing_runtime_diagnostic_dedups_canonical_aliases() {
+        let listed = |text: &str| -> String {
+            text.split_once("Searched for `msb` in: ")
+                .expect("searched line")
+                .1
+                .to_string()
+        };
+        let t = tempfile::tempdir().unwrap();
+        let canonical = t.path().canonicalize().unwrap();
+        let alias = t.path().join("alias");
+        std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+
+        // A directory and its symlink alias are one searched location.
+        let text = missing_runtime_diagnostic(
+            MissingMsbLayout::InstalledBundle,
+            &[&alias, &canonical],
+            true,
+        );
+        assert_eq!(listed(&text), alias.display().to_string());
+
+        // Genuinely different directories are both listed, in order.
+        let other = t.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let text = missing_runtime_diagnostic(
+            MissingMsbLayout::InstalledBundle,
+            &[&canonical, &other],
+            true,
+        );
+        assert_eq!(
+            listed(&text),
+            format!("{}, {}", canonical.display(), other.display())
+        );
+
+        // An unresolvable path falls back to its own spelling and dedups too.
+        let absent = t.path().join("absent");
+        let text = missing_runtime_diagnostic(
+            MissingMsbLayout::InstalledBundle,
+            &[&absent, &absent],
+            true,
+        );
+        assert_eq!(listed(&text), absent.display().to_string());
     }
 
     #[test]

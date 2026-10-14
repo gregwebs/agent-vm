@@ -690,6 +690,10 @@ fn warn(message: &str) {
     println!("cargo:warning=agent-vm build provenance: {message}");
 }
 
+#[cfg(feature = "embedded-runtime")]
+#[path = "build_embedded_runtime.rs"]
+mod embedded_runtime;
+
 fn main() {
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
         .expect("CARGO_MANIFEST_DIR is set by Cargo for build scripts");
@@ -735,4 +739,6 @@ fn main() {
         "cargo:rustc-env=AGENT_VM_BUILD_VERSION={}",
         observation.info.version(&package_version)
     );
+    #[cfg(feature = "embedded-runtime")]
+    embedded_runtime::emit(&context.repo_root);
 }

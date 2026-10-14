@@ -569,6 +569,7 @@ positive explicit-source control.
 | `cargo check --release -p agent-vm --tests` | yes (`ci.yml`) | type-check only; pins that the release test profile still compiles under the test cfg, since CI's run is the debug profile |
 | `script/test/e2e.sh` | **no** | native installed registry/archive joins; custom/all additionally require Apple Silicon and Docker |
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
+| `script/test/single-binary-contract.sh` | yes (`ci.yml`) | fake payload; lone copy, reuse, concurrency, tamper, unwritable, rejected-launch state; the only `embedded-runtime` clippy pass, which is what lints the payload build module |
 | `script/test/build-workflow.sh` | yes (macOS) | fake-plutil bundle seam, no VM/image sources |
 | `script/test/ci-contracts.sh` | yes | runtime provenance, shell guards, offline pin/negative controls, Chrome launcher-path agreement and e2e dispatch contracts |
 | `script/test/persisted-network-contract.sh` | yes (`ci-contracts.sh`) | host-only snippet controls, checker P1–P5 and live-shell P6–P10; no native evidence |

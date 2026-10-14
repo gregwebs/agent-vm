@@ -16,7 +16,7 @@ RUST_TOOLCHAIN=1.98.1
 
 usage() {
     cat <<'EOF'
-Usage: ./script/build/macos.sh [--dev]
+Usage: ./script/build/macos.sh [--dev | --single-binary]
 
 Build and verify the Apple Silicon macOS bundle under target/macos.
 
@@ -27,6 +27,10 @@ Build and verify the Apple Silicon macOS bundle under target/macos.
          optimized target/macos bundle. Not for distribution: the
          binaries are larger, unstripped, and slower at runtime. See
          "Fast development build" in macos-build.md.
+
+  --single-binary  Build release agent-vm with embedded-runtime and publish only
+                   target/macos-single/agent-vm. Existing bundles are untouched.
+                   Cannot be combined with --dev.
 EOF
 }
 
@@ -344,6 +348,62 @@ build_agent_vm() {
     }
 }
 
+build_single_binary_agent_vm() {
+    CARGO_NET_GIT_FETCH_WITH_CLI="${CARGO_NET_GIT_FETCH_WITH_CLI:-true}" \
+        CARGO_TARGET_DIR="$REPO_ROOT/target" \
+        AGENT_VM_EMBED_MSB="$REPO_ROOT/vendor/microsandbox/build/msb" \
+        AGENT_VM_EMBED_LIBKRUNFW="$REPO_ROOT/vendor/microsandbox/build/libkrunfw.5.dylib" \
+        run_rust_tool cargo build --release --features embedded-runtime -p agent-vm
+    test -f "$REPO_ROOT/target/release/agent-vm" || {
+        echo "error: Cargo did not produce target/release/agent-vm" >&2
+        exit 1
+    }
+}
+
+publish_single_binary() {
+    local out="$REPO_ROOT/target/macos-single"
+    local staged="$out/.agent-vm.next" smoke="$out/.smoke" entitlements="$out/.msb-entitlements.plist"
+    local agent_vm_version msb_version candidate extracted='' count=0
+
+    mkdir -p "$out"
+    rm -rf "$smoke"
+    # Expanded now: the trap must not read locals after this function returns.
+    # shellcheck disable=SC2064
+    trap "rm -rf $(printf '%q ' "$staged" "$smoke" "$entitlements")" EXIT
+
+    install -m 0755 "$REPO_ROOT/target/release/agent-vm" "$staged"
+    verify_arm64_only "$staged"
+    agent_vm_version="$("$staged" --version)" || {
+        echo "error: staged single-binary agent-vm failed to run with --version" >&2; exit 1; }
+
+    mkdir -p "$smoke/bin" "$smoke/home" "$smoke/state" "$smoke/work"
+    install -m 0755 "$staged" "$smoke/bin/agent-vm"
+    msb_version="$(cd "$smoke/work" &&
+        unset MSB_PATH MSB_LIBKRUNFW_PATH XDG_CACHE_HOME XDG_STATE_HOME AGENT_VM_SHARE_MSB_CACHE AGENT_VM_MSB_CACHE_DIR &&
+        HOME="$smoke/home" AGENT_VM_STATE_DIR="$smoke/state" "$smoke/bin/agent-vm" msb --version)" || {
+        echo "error: single-binary agent-vm failed to start from an empty directory" >&2; exit 1; }
+
+    for candidate in "$smoke"/home/.cache/agent-vm/runtime/*/bin/msb; do
+        [[ -f "$candidate" ]] || continue
+        extracted="$candidate"; count=$((count + 1))
+    done
+    if ((count == 0)); then
+        echo "error: single-binary agent-vm did not unpack msb under $smoke/home/.cache/agent-vm/runtime" >&2; exit 1
+    elif ((count > 1)); then
+        echo "error: single-binary smoke unpacked more than one runtime" >&2; exit 1
+    fi
+    verify_arm64_only "$extracted"
+    verify_arm64_only "${extracted%/bin/msb}/lib/libkrunfw.5.dylib"
+    verify_msb "$extracted" "$entitlements"   # verbatim unpack kept signature + both entitlements
+
+    mv -f "$staged" "$out/agent-vm"
+    rm -rf "$smoke" "$entitlements"
+    trap - EXIT
+    echo "==> macOS single binary ready"
+    printf '%s\n' "$agent_vm_version" "$msb_version"
+    printf '  %s\n' "$out/agent-vm"
+}
+
 verify_arm64_only() {
     local path="$1" archs
     file "$path"
@@ -446,13 +506,17 @@ publish_bundle() {
 }
 
 main() {
-    local dev=false
+    local dev=false single=false
 
     while (($#)); do
         case "$1" in
             -h | --help)
                 usage
                 return
+                ;;
+            --single-binary)
+                single=true
+                shift
                 ;;
             --dev)
                 dev=true
@@ -465,14 +529,25 @@ main() {
         esac
     done
 
+    if [[ "$dev" == true && "$single" == true ]]; then
+        echo "error: --single-binary cannot be combined with --dev" >&2
+        usage >&2
+        exit 2
+    fi
+
     local script_start
     script_start="$(date +%s)"
 
     stage preflight preflight
     stage build_microsandbox_runtime build_microsandbox_runtime "$dev"
     stage require_build_outputs require_build_outputs "$dev"
-    stage build_agent_vm build_agent_vm "$dev"
-    stage publish_bundle publish_bundle "$dev"
+    if [[ "$single" == true ]]; then
+        stage build_single_binary_agent_vm build_single_binary_agent_vm
+        stage publish_single_binary publish_single_binary
+    else
+        stage build_agent_vm build_agent_vm "$dev"
+        stage publish_bundle publish_bundle "$dev"
+    fi
 
     echo "==> [timing] total: $(( $(date +%s) - script_start ))s" >&2
 }

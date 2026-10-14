@@ -62,7 +62,7 @@ Please try out the project and give feedback or star it but don't rely on it for
 
 - Linux with `/dev/kvm` (rw) and membership in the `kvm` group, or an
   Apple Silicon Mac for the [supported source-build workflow](macos-build.md).
-- Linux: Node 18+ for the npm distribution. macOS: a signed source-built bundle.
+- Linux: Node 18+ for the npm distribution. macOS: a signed source-built bundle, or a source-built single binary from `./script/build/macos.sh --single-binary`.
 - Installed launches need native VM support and network on first acquisition,
   not Docker or image-source files. Docker is needed only for explicit image builds.
 

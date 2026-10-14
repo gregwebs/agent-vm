@@ -15,6 +15,7 @@ mod doctor;
 mod egress_grammar;
 mod egress_hostname;
 mod egress_policy;
+mod embedded_runtime;
 mod env_flag;
 mod github_graphql;
 mod guest_home;
@@ -121,7 +122,8 @@ fn main() -> Result<()> {
         msb_install::point_at_msb()?;
         // Select a rerouted msb state location off `~/.microsandbox/` and into
         // agent-vm's own state dir. msb still finds `libkrunfw.so.*`
-        // via MSB_PATH → sibling `../lib/` (the bundle layout), so no
+        // via MSB_PATH → sibling `../lib/` (the bundle layout); the embedded
+        // rung instead pins MSB_LIBKRUNFW_PATH. No
         // copy/sync into MSB_HOME is needed — only the writable state
         // (db, sandboxes, cache, tls/CA, logs) lives here.
         let msb_home = msb_install::configure_msb_home()?;

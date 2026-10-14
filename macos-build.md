@@ -49,6 +49,26 @@ target/macos/
 
 Re-running `./script/build/macos.sh` is safe. It retains Cargo and Docker incremental output and atomically replaces the verified bundle files without requiring manual copying, signing, or environment setup. Firmware reuse also requires a clean recursive checkout, a validated dylib, and a matching `vendor/microsandbox/build/libkrunfw.5.dylib.source-sha` value for the nested firmware gitlink; a missing, stale, dirty, invalid, or force-rebuild (`MSB_FORCE_FIRMWARE_REBUILD=1`) case rebuilds into staged files and publishes the dylib before its matching stamp. The stamp guards this local cache only; it is not release provenance. The macOS workflow does not require `just`.
 
+## Build a single binary
+
+```bash
+./script/build/macos.sh --single-binary
+```
+
+This opt-in release form publishes only `target/macos-single/agent-vm` and
+leaves both existing bundles untouched. It embeds the signed msb + libkrunfw
+(about 30 MB of binary growth), then verifies a lone copied binary starts,
+and checks the unpacked runtime's arm64 architecture, signature and both
+entitlements. `--dev` cannot be combined with this flag.
+
+On first use it unpacks verbatim to `~/.cache/agent-vm/runtime/<id>/`
+(or `$XDG_CACHE_HOME/agent-vm/runtime/<id>/`). Bundle siblings still win,
+so bundle users never unpack. `agent-vm doctor` reports the cache location.
+Old runtimes are not garbage-collected; it is safe to delete this cache when
+no runtime is in use. A later invocation recreates it. See
+[ADR-0041](docs/adr/0041-single-binary-embedded-runtime.md) for integrity policy
+and accepted gaps. This is source-buildable; publication is a follow-up.
+
 ## Fast development build
 
 `./script/build/macos.sh` always builds `agent-vm` and `msb` with cargo's
@@ -140,6 +160,8 @@ A restrictive coding-agent Seatbelt profile can deny access to `com.apple.trustd
 ## Troubleshooting and low-level reference
 
 ### Inspect the bundle
+
+For the single-binary form, `agent-vm doctor` shows the unpacked runtime path.
 
 The build script performs these checks automatically. To inspect them independently:
 

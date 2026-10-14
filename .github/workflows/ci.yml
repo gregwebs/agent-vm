@@ -48,6 +48,9 @@ jobs:
       - name: Test
         run: timeout --signal=TERM --kill-after=10s 30m cargo test -p agent-vm
 
+      - name: Single-binary contract
+        run: bash script/test/single-binary-contract.sh
+
       # Type-check-only. CI runs the *debug* test profile, so the release test
       # profile rots silently: a `#[cfg(test)]` use of a `#[cfg(debug_assertions)]`
       # item (the recording keychain) compiled in debug and broke `--release`.

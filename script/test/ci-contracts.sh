@@ -85,6 +85,7 @@ syntax_check=(
     script/test/msb-krun-compat-contract.sh
     script/build/macos.sh
     script/test/build-workflow.sh
+    script/test/single-binary-contract.sh
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
@@ -131,6 +132,7 @@ shellcheck_files=(
     script/test/msb-krun-compat-contract.sh
     script/build/macos.sh
     script/test/build-workflow.sh
+    script/test/single-binary-contract.sh
     script/check-rust-toolchain.sh
     script/test/rust-toolchain-consistency.sh
     script/test/fixtures/fake-plutil.sh
@@ -178,6 +180,8 @@ assert_listed() {
 assert_listed 'bash -n' "$self_relative" "${syntax_check[@]}"
 assert_listed 'shellcheck' "$self_relative" "${shellcheck_files[@]}"
 
+assert_listed 'bash -n' 'script/test/single-binary-contract.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/single-binary-contract.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/persisted-network-live.sh' "${syntax_check[@]}"
 assert_listed 'shellcheck' 'script/test/persisted-network-live.sh' "${shellcheck_files[@]}"
 assert_listed 'bash -n' 'script/test/persisted-network-contract.sh' "${syntax_check[@]}"

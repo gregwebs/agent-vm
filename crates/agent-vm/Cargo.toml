@@ -14,7 +14,18 @@ path = "src/main.rs"
 [package.metadata.verus]
 verify = true
 
+[features]
+# Opt-in single-binary release form (ADR-0041). Existing packaging and
+# normal build/test/verus runs never read the signed payload files.
+embedded-runtime = ["dep:zstd", "dep:sha2"]
+
+[build-dependencies]
+zstd = { version = "0.13", default-features = false, optional = true }
+sha2 = { version = "0.10", optional = true }
+
 [dependencies]
+# Match the existing transitive feature set; unpack is tested without embedding.
+zstd = { version = "0.13", default-features = false }
 # Verus's standard library, for the in-place `verus!` contracts.
 # See docs/adr/0018-machine-checked-boundary-contracts.md.
 vstd = "=0.0.0-2026-09-20-0158"
