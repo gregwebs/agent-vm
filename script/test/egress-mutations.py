@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SRC = "crates/agent-vm/src/"
 TEST = "crates/agent-vm/tests/config_launch_driven.rs"
 EGRESS = SRC + "egress_policy.rs"
+GRAMMAR = SRC + "egress_grammar.rs"
 NETWORK = SRC + "network.rs"
 FIXTURE = "script/test/lib/egress-fixtures.py"
 PROBE = "script/test/fixtures/egress-probe.sh"
@@ -50,8 +51,8 @@ def matrix():
         ("bracket-suffix", "if k + 1 != t.len() && t[k+1] != 0x3a { return Err(LayoutError::MalformedAddress); }", "if k + 1 != t.len() && t[k+1] != 0x3a { return Ok(TargetLayout { addr_start: 1, addr_end: k, port: None }); }"),
     ]
     for name, old, new in kernel_mutations:
-        add(name, EGRESS, old, new, egress)
-        add(name + "-proof", EGRESS, old, new, gate, "verification results::")
+        add(name, GRAMMAR, old, new, egress)
+        add(name + "-proof", GRAMMAR, old, new, gate, "verification results::")
     hostname = SRC + "egress_hostname.rs"
     requests = SRC + "network_requests.rs"
     coverage = rust("network_request_coverage")

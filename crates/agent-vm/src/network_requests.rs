@@ -1,7 +1,8 @@
 //! Non-authoritative tool metadata: parsing and bounded reporting only (ADR-0039).
 //! Requests never flow into policy or provisioning.
+use crate::egress_grammar::AllowanceError;
 use crate::egress_hostname::{CanonicalHostname, HostnameScope, PortNot53Or853};
-use crate::egress_policy::{Allowance, AllowanceError};
+use crate::egress_policy::Allowance;
 use std::{collections::BTreeSet, fmt, num::NonZeroU16};
 use vstd::prelude::*;
 
@@ -510,7 +511,11 @@ mod tests {
             assert!(!production.contains(forbidden));
         }
         for path in production.split("crate::").skip(1) {
-            assert!(path.starts_with("egress_hostname::") || path.starts_with("egress_policy::"));
+            assert!(
+                path.starts_with("egress_hostname::")
+                    || path.starts_with("egress_policy::")
+                    || path.starts_with("egress_grammar::")
+            );
         }
     }
 }

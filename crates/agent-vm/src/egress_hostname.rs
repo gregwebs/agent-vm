@@ -1,6 +1,6 @@
 //! Hostname acceptance is separate from credential-origin authority.
 use crate::dns_name::ldh_host_bytes;
-use crate::egress_policy::SchemeSel;
+use crate::egress_grammar::{AllowanceError, SchemeSel};
 use vstd::prelude::*;
 
 verus! {
@@ -132,7 +132,6 @@ pub(crate) fn hostname_scope(scheme: SchemeSel, bracketed: bool, port: Option<u1
 }
 }
 
-use crate::egress_policy::AllowanceError;
 use microsandbox_network::policy::{
     Action, Destination, Direction, DomainName, PortRange, Protocol, Rule,
 };

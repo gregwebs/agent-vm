@@ -125,7 +125,7 @@ fn proxy_refusal_applies_only_to_hostname_launches() {
             error,
             format!(
                 "--allow-egress #1: {}",
-                crate::egress_policy::AllowanceError::UdpHostname
+                crate::egress_grammar::AllowanceError::UdpHostname
             )
         );
     }
@@ -143,7 +143,7 @@ fn allowance_grammar_errors_precede_the_proxy_refusal() {
         error,
         format!(
             "--allow-egress #1: {}",
-            crate::egress_policy::AllowanceError::UdpHostname
+            crate::egress_grammar::AllowanceError::UdpHostname
         )
     );
 }

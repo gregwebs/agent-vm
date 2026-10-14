@@ -791,7 +791,7 @@ mod tests {
             format!("{error:#}"),
             format!(
                 "--allow-egress #1: {}",
-                crate::egress_policy::AllowanceError::UdpHostname
+                crate::egress_grammar::AllowanceError::UdpHostname
             )
         );
         assert!(!format!("{error:#}").contains("not-an-ip"));
