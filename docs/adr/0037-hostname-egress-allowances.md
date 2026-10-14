@@ -177,6 +177,12 @@ labels rejected, with the last-dot uniqueness lemma discharging the existential)
 and `hostname_scope` (UDP > bracketed > DNS-port precedence, exact port
 preservation).
 
+#330 moves the shared scheme/target/decimal-port kernels and grammar vocabulary
+(`SchemeSel`, `AllowanceError`) to `egress_grammar`, below both policy and
+hostname parsing. The three hostname decision kernels above stay in their
+existing owners; [ADR-0018](0018-machine-checked-boundary-contracts.md) records
+their contracts and the grammar ownership seam.
+
 Trusted adapters: canonicalization, the alias comparison and
 `DomainName::from_str`; the `InterceptedPorts` union and `domain_rules`
 assembly; `observe_host_proxy`, a hand mirror of the vendored selection rule;

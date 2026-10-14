@@ -12,6 +12,7 @@ mod debug_config;
 mod defaults;
 mod dns_name;
 mod doctor;
+mod egress_grammar;
 mod egress_hostname;
 mod egress_policy;
 mod env_flag;

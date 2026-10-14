@@ -52,7 +52,8 @@ pub fn network_authority_refusal(reached: Reached, dir: DirFacts, euid: u32) -> 
 } // verus!
 
 use crate::{
-    egress_policy::{Allowance, AllowanceError, UserEgress},
+    egress_grammar::AllowanceError,
+    egress_policy::{Allowance, UserEgress},
     host_paths::FinalComponent,
 };
 use std::{

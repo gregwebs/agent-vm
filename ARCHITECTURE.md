@@ -34,7 +34,8 @@ crates/agent-vm/src/
 │   └── intercept_hook/
 │       ├── http.rs         #   shared request parsing / response framing
 │       └── oauth_refresh.rs#   OAuth validation, rotation, single-flight
-├── egress_policy.rs        # --allow-egress grammar + launch egress policy (default-deny)
+├── egress_grammar.rs       # shared scheme/target/port grammar and allowance errors
+├── egress_policy.rs        # allowance dispatch + launch egress authority (default-deny)
 ├── egress_hostname.rs      # hostname allowance acceptance, port scope, Domain rule assembly
 ├── dns_name.rs             # shared ASCII DNS label byte kernel (credential + egress)
 ├── network.rs              # published ports, proxy notice, launch Plan
@@ -54,6 +55,17 @@ crates/agent-vm/src/
 vendor/agent-vm-images/      # contributor-only pinned independent image sources
 vendor/microsandbox/        # git submodule: the runtime and its SDK
 bin/agent-vm-ccusage        # host-side token/cost reporting across sandboxes
+```
+
+Shared allowance syntax sits below authority: policy imports hostname and
+grammar; hostname imports grammar and `dns_name`, never policy. Requests retain
+`Allowance` dispatch from policy and import grammar errors directly; saved-network
+configuration likewise imports grammar errors without moving authority.
+
+```text
+policy ──> hostname ──> dns_name
+  │           │
+  └──> grammar <──┘
 ```
 
 A launch is one pass, and the ordering is load-bearing:
