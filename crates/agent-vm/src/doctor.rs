@@ -10,8 +10,8 @@
 //! same [`crate::cli`] catalog `--help` shows. It shows argument *counts*
 //! rather than values (a user may have mistakenly put a secret in `args`). A
 //! broken config still exits nonzero, but its failure is reported *inside* the
-//! config section so it never suppresses the sections above it — and never
-//! blocks recovery (below).
+//! config section, so it never stops the report early — and never blocks
+//! recovery (below).
 //!
 //! ## `--reset-msb-db`
 //!

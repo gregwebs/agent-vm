@@ -401,6 +401,7 @@ fn assert_report_with_config_error(h: &Harness) {
         "==> active microsandbox home",
         "==> host agent credentials",
         "==> tool configuration",
+        "==> boot image",
         "==> agent-vm doctor: available operations",
     ] {
         assert!(stdout.contains(heading), "missing {heading}: {stdout}");
