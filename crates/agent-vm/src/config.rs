@@ -939,7 +939,7 @@ fn read_file_tier(path: &Path, kind: FileTierKind) -> Result<(TierReport, TierCo
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
     let network = network_for_tier(raw.network.as_ref(), kind, &read)?;
     let image = validate_image(raw.image.as_deref(), path)?;
-    let tools = validate_tools(raw.tools, path, kind.origin(path))?;
+    let tools = validate_tools(raw.tools, kind.origin(path))?;
 
     Ok((
         TierReport {
@@ -1025,7 +1025,7 @@ fn tools_from_builtin_text(text: &str) -> Result<Vec<Tool>> {
     if let Some(table) = raw.network.as_ref() {
         return Err(network_refusal(table, path, RefusingTier::BuiltIn));
     }
-    validate_tools(raw.tools, path, ToolOrigin::BuiltIn)
+    validate_tools(raw.tools, ToolOrigin::BuiltIn)
 }
 
 fn discover_user_path() -> Result<Option<PathBuf>> {
@@ -1161,12 +1161,22 @@ fn validate_persist_ownership(tools: &[Tool]) -> Result<()> {
     Ok(())
 }
 
+/// A tool's provenance for a declaration or persist-ownership diagnostic: the
+/// tier label followed by the escaped, quoted declaring file. It is the sole
+/// renderer of provenance in those messages — callers pass an origin, never a
+/// pre-rendered file — so the named file can never disagree with the tier.
+///
+/// `BuiltIn` still names a file so declaration errors keep the
+/// `default-tools.toml` they printed before the tier was added; the
+/// persist-ownership diagnostics share this renderer and intentionally name it
+/// too.
 fn describe_origin(origin: &ToolOrigin) -> String {
-    match origin {
-        ToolOrigin::BuiltIn => "built-in defaults".to_string(),
-        ToolOrigin::User(file) => format!("user config {}", quoted_path(file)),
-        ToolOrigin::Project(file) => format!("project config {}", quoted_path(file)),
-    }
+    let tier = match origin {
+        ToolOrigin::BuiltIn => "built-in defaults",
+        ToolOrigin::User(_) => "user config",
+        ToolOrigin::Project(_) => "project config",
+    };
+    format!("{tier} {}", quoted_path(origin_file(origin)))
 }
 
 /// The declaring file a diagnostic names. `BuiltIn` stores no path because
@@ -1205,7 +1215,7 @@ fn resolve_provisioning(tools: Vec<Tool>) -> Result<Vec<CatalogEntry>> {
             for (position, reference) in names.iter().enumerate() {
                 if !index.contains_key(reference.as_str()) {
                     return Err(tool_error(
-                        origin_file(&tool.origin),
+                        &tool.origin,
                         tool.declaration_index,
                         &tool.name,
                         format!(
@@ -1344,14 +1354,14 @@ struct RawTool {
 /// names and reporting the exact field that failed. Sequentially applying
 /// focused validators keeps each diagnosis specific instead of collapsing the
 /// whole entry into one generic parse error.
-fn validate_tools(raw: Vec<RawTool>, file: &Path, origin: ToolOrigin) -> Result<Vec<Tool>> {
+fn validate_tools(raw: Vec<RawTool>, origin: ToolOrigin) -> Result<Vec<Tool>> {
     let mut tools = Vec::with_capacity(raw.len());
     let mut first_index: HashMap<String, usize> = HashMap::new();
     for (index, tool) in raw.into_iter().enumerate() {
-        let name = validate_name(&tool.name, file, index)?;
+        let name = validate_name(&tool.name, &origin, index)?;
         if let Some(&first) = first_index.get(name.as_str()) {
             return Err(declaration_error(
-                file,
+                &origin,
                 index,
                 Some(name.as_str()),
                 format!(
@@ -1361,15 +1371,15 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, origin: ToolOrigin) -> Result<
         }
         first_index.insert(name.as_str().to_string(), index);
 
-        let command = validate_command(&tool.command, file, index, &name)?;
-        let argv = validate_argv(tool.args, file, index, &name)?;
+        let command = validate_command(&tool.command, &origin, index, &name)?;
+        let argv = validate_argv(tool.args, &origin, index, &name)?;
         let (credentials, credential_names) =
-            validate_credentials(tool.credentials, file, index, &name)?;
-        let tools_field = validate_tool_refs(tool.tools, file, index, &name)?;
-        let persist = validate_persist(tool.persist, file, index, &name)?;
-        let env = validate_env(tool.env, file, index, &name)?;
+            validate_credentials(tool.credentials, &origin, index, &name)?;
+        let tools_field = validate_tool_refs(tool.tools, &origin, index, &name)?;
+        let persist = validate_persist(tool.persist, &origin, index, &name)?;
+        let env = validate_env(tool.env, &origin, index, &name)?;
         let network_requests = NetworkRequests::parse(&tool.network_requests)
-            .map_err(|error| tool_error(file, index, &name, error))?;
+            .map_err(|error| tool_error(&origin, index, &name, error))?;
 
         tools.push(Tool {
             name,
@@ -1389,10 +1399,10 @@ fn validate_tools(raw: Vec<RawTool>, file: &Path, origin: ToolOrigin) -> Result<
     Ok(tools)
 }
 
-fn validate_name(raw: &str, file: &Path, index: usize) -> Result<ToolName> {
+fn validate_name(raw: &str, origin: &ToolOrigin, index: usize) -> Result<ToolName> {
     if raw.is_empty() {
         return Err(declaration_error(
-            file,
+            origin,
             index,
             None,
             "name must not be empty",
@@ -1403,7 +1413,7 @@ fn validate_name(raw: &str, file: &Path, index: usize) -> Result<ToolName> {
         .any(|character| character.is_whitespace() || character.is_control())
     {
         return Err(declaration_error(
-            file,
+            origin,
             index,
             Some(raw),
             "name must not contain whitespace or control characters",
@@ -1411,7 +1421,7 @@ fn validate_name(raw: &str, file: &Path, index: usize) -> Result<ToolName> {
     }
     if raw.starts_with('-') {
         return Err(declaration_error(
-            file,
+            origin,
             index,
             Some(raw),
             "name must not start with '-'",
@@ -1419,7 +1429,7 @@ fn validate_name(raw: &str, file: &Path, index: usize) -> Result<ToolName> {
     }
     if raw.contains('/') {
         return Err(declaration_error(
-            file,
+            origin,
             index,
             Some(raw),
             "name must be a single command-name token, not a path",
@@ -1427,7 +1437,7 @@ fn validate_name(raw: &str, file: &Path, index: usize) -> Result<ToolName> {
     }
     if raw.chars().all(|character| character == '.') {
         return Err(declaration_error(
-            file,
+            origin,
             index,
             Some(raw),
             "name must not be `.` or `..`",
@@ -1435,7 +1445,7 @@ fn validate_name(raw: &str, file: &Path, index: usize) -> Result<ToolName> {
     }
     if raw == ALL_TOOLS_WILDCARD {
         return Err(declaration_error(
-            file,
+            origin,
             index,
             Some(raw),
             "name `*` is reserved: it is the wildcard in a tool's `tools` list",
@@ -1443,7 +1453,7 @@ fn validate_name(raw: &str, file: &Path, index: usize) -> Result<ToolName> {
     }
     if RESERVED_TOOL_NAMES.contains(&raw) {
         return Err(declaration_error(
-            file,
+            origin,
             index,
             Some(raw),
             "name is reserved for an agent-vm subcommand; choose another name",
@@ -1452,13 +1462,18 @@ fn validate_name(raw: &str, file: &Path, index: usize) -> Result<ToolName> {
     Ok(ToolName(raw.to_string()))
 }
 
-fn validate_command(raw: &str, file: &Path, index: usize, name: &ToolName) -> Result<String> {
+fn validate_command(
+    raw: &str,
+    origin: &ToolOrigin,
+    index: usize,
+    name: &ToolName,
+) -> Result<String> {
     if raw.is_empty() {
-        return Err(tool_error(file, index, name, "command must not be empty"));
+        return Err(tool_error(origin, index, name, "command must not be empty"));
     }
     if raw.contains('\0') {
         return Err(tool_error(
-            file,
+            origin,
             index,
             name,
             "command must not contain NUL",
@@ -1469,7 +1484,7 @@ fn validate_command(raw: &str, file: &Path, index: usize, name: &ToolName) -> Re
 
 fn validate_argv(
     raw: Vec<String>,
-    file: &Path,
+    origin: &ToolOrigin,
     index: usize,
     name: &ToolName,
 ) -> Result<Vec<String>> {
@@ -1477,7 +1492,7 @@ fn validate_argv(
         if argument.contains('\0') {
             // Index and remedy only: never echo the argument's value.
             return Err(tool_error(
-                file,
+                origin,
                 index,
                 name,
                 format!("args[{position}] must not contain NUL"),
@@ -1497,7 +1512,7 @@ fn validate_argv(
 /// precedence between them) is a launch decision, deliberately not a parse one.
 fn validate_credentials(
     raw: Vec<String>,
-    file: &Path,
+    origin: &ToolOrigin,
     index: usize,
     name: &ToolName,
 ) -> Result<(Vec<CredentialProvider>, Vec<ServiceName>)> {
@@ -1506,7 +1521,7 @@ fn validate_credentials(
     for provider_name in raw {
         let service = ServiceName::parse(&provider_name).map_err(|error| {
             tool_error(
-                file,
+                origin,
                 index,
                 name,
                 // The supplied name is deliberately NOT echoed: this is a
@@ -1538,7 +1553,7 @@ fn validate_credentials(
 /// belongs to the launch catalog ([`resolve_provisioning`]).
 fn validate_tool_refs(
     raw: Option<Vec<String>>,
-    file: &Path,
+    origin: &ToolOrigin,
     index: usize,
     name: &ToolName,
 ) -> Result<DeclaredTools> {
@@ -1552,7 +1567,7 @@ fn validate_tool_refs(
     if raw.iter().any(|entry| entry == ALL_TOOLS_WILDCARD) {
         if raw.len() != 1 {
             return Err(tool_error(
-                file,
+                origin,
                 index,
                 name,
                 "tools: `*` must be the only entry; it already means every tool \
@@ -1565,7 +1580,7 @@ fn validate_tool_refs(
     for (position, entry) in raw.into_iter().enumerate() {
         if entry.is_empty() {
             return Err(tool_error(
-                file,
+                origin,
                 index,
                 name,
                 format!("tools[{position}]: must not be empty"),
@@ -1573,7 +1588,7 @@ fn validate_tool_refs(
         }
         if entry.contains('\0') {
             return Err(tool_error(
-                file,
+                origin,
                 index,
                 name,
                 format!("tools[{position}]: must not contain NUL"),
@@ -1682,14 +1697,19 @@ pub(crate) fn guest_paths_overlap(a: &Path, b: &Path) -> bool {
 
 fn validate_persist(
     raw: Vec<String>,
-    file: &Path,
+    origin: &ToolOrigin,
     index: usize,
     name: &ToolName,
 ) -> Result<Vec<PersistPath>> {
     let mut persist: Vec<PersistPath> = Vec::with_capacity(raw.len());
     for (position, declaration) in raw.into_iter().enumerate() {
         let normalized = normalize_persist(&declaration).map_err(|reason| {
-            tool_error(file, index, name, format!("persist[{position}]: {reason}"))
+            tool_error(
+                origin,
+                index,
+                name,
+                format!("persist[{position}]: {reason}"),
+            )
         })?;
         // O(n²) over a handful of declared paths, deliberately: the predicate is
         // overlap, not equality, so a `HashSet` cannot answer it. Two distinct
@@ -1702,7 +1722,7 @@ fn validate_persist(
             }
             if existing.as_path() == normalized.as_path() {
                 return Err(tool_error(
-                    file,
+                    origin,
                     index,
                     name,
                     format!(
@@ -1711,7 +1731,7 @@ fn validate_persist(
                 ));
             }
             return Err(tool_error(
-                file,
+                origin,
                 index,
                 name,
                 format!(
@@ -1728,7 +1748,7 @@ fn validate_persist(
         for link in crate::credential_provider::guest_home_links() {
             if guest_paths_overlap(&normalized, Path::new(link.home_relative)) {
                 return Err(tool_error(
-                    file,
+                    origin,
                     index,
                     name,
                     format!(
@@ -1783,14 +1803,14 @@ fn normalize_persist(declaration: &str) -> std::result::Result<PathBuf, &'static
 /// are the same tool.
 fn validate_env(
     raw: BTreeMap<String, String>,
-    file: &Path,
+    origin: &ToolOrigin,
     index: usize,
     name: &ToolName,
 ) -> Result<BTreeMap<String, String>> {
     for (key, value) in &raw {
         if let Err(reason) = check_env_key(key) {
             return Err(tool_error(
-                file,
+                origin,
                 index,
                 name,
                 format!("env key {}: {reason}", quoted_str(key)),
@@ -1800,7 +1820,7 @@ fn validate_env(
         // place to put a credential (same rule as `args`).
         if value.contains('\0') {
             return Err(tool_error(
-                file,
+                origin,
                 index,
                 name,
                 format!("env {}: value must not contain NUL", quoted_str(key)),
@@ -1865,9 +1885,9 @@ fn supported_provider_names() -> String {
 // Diagnostics: value-safe and control-byte-safe
 // ---------------------------------------------------------------------------
 
-/// A validation error that names the file and declaration but never a value.
+/// A validation error that names the tier, file and declaration, never a value.
 fn declaration_error(
-    file: &Path,
+    origin: &ToolOrigin,
     index: usize,
     name: Option<&str>,
     detail: impl fmt::Display,
@@ -1878,17 +1898,17 @@ fn declaration_error(
     };
     anyhow!(
         "config: {} declaration [{index}] {label}: {detail}",
-        quoted_path(file)
+        describe_origin(origin)
     )
 }
 
 fn tool_error(
-    file: &Path,
+    origin: &ToolOrigin,
     index: usize,
     name: &ToolName,
     detail: impl fmt::Display,
 ) -> anyhow::Error {
-    declaration_error(file, index, Some(name.as_str()), detail)
+    declaration_error(origin, index, Some(name.as_str()), detail)
 }
 
 /// **R1.** The TOML/serde error text is untrusted (a wrong-type message can
@@ -2955,8 +2975,8 @@ mod tests {
     }
 
     /// **T4.** The `tools` validation rules, all rejections. The dangling rows
-    /// assert the **full rendered string** (the diagnostic that drops the file
-    /// or the declaration index is the regression this catches).
+    /// assert the **full rendered string** (the diagnostic that drops the tier,
+    /// file or declaration index is the regression this catches).
     #[test]
     fn tools_validation_rejects_the_malformed_shapes() {
         // `*` mixed with another entry.
@@ -2965,7 +2985,7 @@ mod tests {
         let rendered = format!("{:#}", fixture.load().unwrap_err());
         assert!(rendered.contains("must be the only entry"), "{rendered}");
 
-        // A dangling name in the *project* tier: the full string.
+        // A dangling name in the *user* tier: the full string.
         let fixture = Fixture::new();
         fixture
             .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n")
@@ -2974,7 +2994,7 @@ mod tests {
         assert_eq!(
             format!("{error:#}"),
             format!(
-                "config: {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry",
+                "config: user config {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry",
                 quoted_path(&fixture.user)
             )
         );
@@ -2986,7 +3006,7 @@ mod tests {
         assert_eq!(
             format!("{error:#}"),
             format!(
-                "config: {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry",
+                "config: project config {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry",
                 quoted_path(&fixture.project)
             )
         );
@@ -3003,6 +3023,104 @@ mod tests {
         let rendered = format!("{:#}", fixture.load().unwrap_err());
         assert!(rendered.contains("tools[0]"), "{rendered}");
         assert!(rendered.contains("must not be empty"), "{rendered}");
+    }
+
+    /// #329: one failure reads differently per tier, including the built-in
+    /// catalog and the unnamed-declaration form.
+    #[test]
+    fn declaration_errors_name_the_tier() {
+        let body = "[[tools]]\nname = \"t\"\ncommand = \"\"\n";
+        let user = Fixture::new();
+        user.user(body);
+        let project = Fixture::new();
+        project.project(body);
+        for (rendered, origin) in [
+            (
+                user.load().unwrap_err().to_string(),
+                format!("user config {}", quoted_path(&user.user)),
+            ),
+            (
+                project.load().unwrap_err().to_string(),
+                format!("project config {}", quoted_path(&project.project)),
+            ),
+            (
+                tools_from_builtin_text(body).unwrap_err().to_string(),
+                "built-in defaults \"default-tools.toml\"".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                rendered,
+                format!("config: {origin} declaration [0] tool \"t\": command must not be empty")
+            );
+        }
+
+        let unnamed = Fixture::new();
+        unnamed.project("[[tools]]\nname = \"\"\ncommand = \"t\"\n");
+        assert_eq!(
+            unnamed.load().unwrap_err().to_string(),
+            format!(
+                "config: project config {} declaration [0] tool: name must not be empty",
+                quoted_path(&unnamed.project)
+            )
+        );
+    }
+
+    /// #329: the built-in tier's deferred (dangling-reference) diagnostic is
+    /// reachable only by editing the shipped catalog, so pin its exact text.
+    #[test]
+    fn built_in_deferred_declaration_error_is_pinned() {
+        let tools = tools_from_builtin_text(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_provisioning(tools).unwrap_err().to_string(),
+            "config: built-in defaults \"default-tools.toml\" declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry"
+        );
+    }
+
+    /// #329: the built-in tier's persist-ownership diagnostic names the tier
+    /// and file for both claimants; reachable only by editing the catalog.
+    #[test]
+    fn built_in_persist_ownership_error_is_pinned() {
+        let tools = tools_from_builtin_text(
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\".x\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\npersist = [\".x\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            validate_persist_ownership(&tools).unwrap_err().to_string(),
+            "config: guest persist path \".x\" is claimed by tool \"a\" (built-in defaults \"default-tools.toml\") and tool \"b\" (built-in defaults \"default-tools.toml\"); remove or rename one claim"
+        );
+    }
+
+    /// #329 F1: the ancestor/descendant *overlap* ownership template is a
+    /// distinct branch from the equal-path one above; pin its full text — tier
+    /// and file for both claimants — in both declaration orders. Reachable only
+    /// by editing the shipped catalog.
+    #[test]
+    fn built_in_persist_ownership_overlap_error_is_pinned() {
+        // Ancestor declared first, descendant second: the later tool offends.
+        let tools = tools_from_builtin_text(
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\".x\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\npersist = [\".x/a\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            validate_persist_ownership(&tools).unwrap_err().to_string(),
+            "config: guest persist path \".x/a\" declared by tool \"b\" (built-in defaults \"default-tools.toml\") overlaps \".x\" claimed by tool \"a\" (built-in defaults \"default-tools.toml\"); one would shadow the other"
+        );
+
+        // Reverse declaration order: descendant first, ancestor second.
+        let tools = tools_from_builtin_text(
+            "[[tools]]\nname = \"b\"\ncommand = \"b\"\npersist = [\".x/a\"]\n\
+             [[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\".x\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            validate_persist_ownership(&tools).unwrap_err().to_string(),
+            "config: guest persist path \".x\" declared by tool \"a\" (built-in defaults \"default-tools.toml\") overlaps \".x/a\" claimed by tool \"b\" (built-in defaults \"default-tools.toml\"); one would shadow the other"
+        );
     }
 
     // -- interactive_shell ------------------------------------------------
@@ -3372,6 +3490,39 @@ mod tests {
                 !rendered.contains("rootfs\"") && !rendered.contains("used value"),
                 "value must not be echoed: {rendered}"
             );
+        }
+    }
+
+    /// **#329.** The tier is promised only for *tool declaration* diagnostics
+    /// (USAGE.md, "tool configuration"). The two other config-error shapes name
+    /// the file but must not be decorated with a tier: a syntax error carries a
+    /// line/column, and an image error has no declaration at all. Pinning the
+    /// absence keeps that reference from over-claiming if either is ever routed
+    /// through `describe_origin`.
+    #[test]
+    fn non_declaration_config_errors_name_no_tier() {
+        for (label, body, expected) in [
+            (
+                "syntax",
+                "this is not = = toml\n",
+                "invalid TOML or tool schema",
+            ),
+            (
+                "image",
+                "image = \"not a valid image!!\"\n",
+                "must be an OCI image reference",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            fixture.user(body);
+            let rendered = format!("{:#}", fixture.load().unwrap_err());
+            assert!(rendered.contains(expected), "{label}: {rendered}");
+            for tier in ["user config", "project config", "built-in defaults"] {
+                assert!(
+                    !rendered.contains(tier),
+                    "{label} error names the {tier} tier: {rendered}"
+                );
+            }
         }
     }
 
@@ -4072,6 +4223,38 @@ mod tests {
         );
     }
 
+    /// **#329.** `describe_origin` is now the only place declaration errors
+    /// render the path, so a hostile project path must still be escaped there
+    /// (the sibling "not a regular file" test never reaches a declaration).
+    #[test]
+    fn control_bytes_are_escaped_in_a_declaration_error() {
+        let root = tempfile::tempdir().unwrap();
+        let evil = root.path().join("proj\n\x1b[31mred");
+        write_file(
+            &evil.join(".agent-vm/config.toml"),
+            "[[tools]]\nname = \"t\"\ncommand = \"\"\n",
+        );
+        let paths = ConfigPaths {
+            user: None,
+            project: evil.join(".agent-vm/config.toml"),
+        };
+        let rendered = format!("{:#}", load(&paths).unwrap_err());
+        assert!(!rendered.contains('\x1b'), "raw ESC leaked: {rendered:?}");
+        assert!(!rendered.contains('\n'), "raw newline leaked: {rendered:?}");
+        assert!(
+            rendered.contains("project config"),
+            "tier missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("\\x1b"),
+            "ESC should be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains("\\x0a"),
+            "newline should be escaped: {rendered}"
+        );
+    }
+
     #[test]
     fn non_utf8_bytes_in_a_path_are_escaped() {
         // macOS filesystems reject invalid-UTF-8 filenames, so exercise the
@@ -4384,11 +4567,15 @@ mod tests {
             } else {
                 f.project(body);
             }
-            let path = if user { &f.user } else { &f.project };
+            let (tier, path) = if user {
+                ("user config", &f.user)
+            } else {
+                ("project config", &f.project)
+            };
             assert_eq!(
                 f.load().unwrap_err().to_string(),
                 format!(
-                    "config: {} declaration [0] tool \"t\": network_requests[1]: port must be a decimal number 1-65535",
+                    "config: {tier} {} declaration [0] tool \"t\": network_requests[1]: port must be a decimal number 1-65535",
                     quoted_path(path)
                 )
             );

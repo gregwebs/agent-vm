@@ -1037,9 +1037,10 @@ tier named; in the user tier it is verified (see [Persisted grants](#persisted-g
 A config parse/validation error fails any launch verb with *that* error — never
 clap's "unrecognized subcommand". Ordinary `agent-vm doctor` still exits
 nonzero, but the failure is rendered inside the `==> tool configuration`
-section, naming the file and declaration (or a line/column for syntax errors),
-so the sections above it — state, credentials, and the operations list — still
-print: a repo-supplied config cannot hide them. `agent-vm --help` still exits 0
+section, naming the file — and, for a tool declaration, its tier and index (a
+syntax error gives a line/column instead) — so the sections above it — state,
+credentials, and the operations list — still print: a repo-supplied config
+cannot hide them. `agent-vm --help` still exits 0
 and lists the built-ins with a note pointing at `agent-vm doctor`. Diagnostics
 never echo argument or command values, and control characters in paths and
 names are escaped as `\xNN`. `agent-vm doctor --reset-msb-db` **never reads

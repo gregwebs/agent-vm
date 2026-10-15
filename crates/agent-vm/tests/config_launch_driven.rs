@@ -6434,10 +6434,10 @@ fn requests_rejected_before_state_both_tiers() {
             let out = h.launch("fetcher", &[]);
             assert!(!out.status.success());
             let stderr = stderr_of(&out);
-            let path = if user {
-                h.user_config()
+            let (tier, path) = if user {
+                ("user config", h.user_config())
             } else {
-                h.project_config()
+                ("project config", h.project_config())
             };
             assert_eq!(
                 stderr
@@ -6447,7 +6447,7 @@ fn requests_rejected_before_state_both_tiers() {
                         .filter(|l| l.starts_with("config:")))
                     .unwrap(),
                 format!(
-                    "config: \"{}\" declaration [0] tool \"fetcher\": network_requests[0]: {reason}",
+                    "config: {tier} \"{}\" declaration [0] tool \"fetcher\": network_requests[0]: {reason}",
                     path.display()
                 )
             );
