@@ -49,6 +49,8 @@ mod session;
 mod setup;
 #[cfg(test)]
 mod test_env;
+#[cfg(test)]
+mod test_fixtures;
 mod user;
 mod user_network;
 

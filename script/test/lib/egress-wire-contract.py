@@ -30,6 +30,7 @@ class Peer:
         self.error = None
         self.connections = 0
         self.peers = []
+        self.empty_datagrams = 0
         self.stop = threading.Event()
         self.udp = udp
         if not udp:
@@ -41,6 +42,14 @@ class Peer:
                 try:
                     if udp:
                         data, addr = self.socket.recvfrom(4096)
+                        # A zero-length datagram carries no wire content and
+                        # cannot be the probe's query, whose bytes the cases
+                        # pin exactly. Counting and ignoring it keeps whichever
+                        # datagram happens to arrive first from aborting the
+                        # case (issue #315).
+                        if not data:
+                            self.empty_datagrams += 1
+                            continue
                         self.peers.append(addr)
                         handler(self.socket, data, addr, self.stop)
                     else:
@@ -128,7 +137,7 @@ class WireContract(unittest.TestCase):
     def test_udp_one_socket_wrong_ack_no_ack_and_usage(self):
         for reply, status in [(b"ack wire", 0), (b"ack wrong", 1), (None, 1)]:
             def handler(sock, data, addr, stop):
-                self.assertEqual(data, b"id=wire")
+                self.assertEqual(data, b"id=wire", f"datagram from {addr}: {data!r}")
                 if reply is not None:
                     sock.sendto(reply, addr)
             with self.subTest(reply=reply), Peer(handler, udp=True) as peer:
@@ -221,10 +230,21 @@ class WireContract(unittest.TestCase):
         self.assertEqual("".join(committed.split()), expected)
         for short in (False, True):
             def handler(sock, data, addr, stop):
-                self.assertEqual(data[2:].hex(), expected[4:])
+                self.assertEqual(
+                    data[2:].hex(), expected[4:],
+                    f"query from {addr}: {data.hex()}")
                 response = dns_reply(data)
                 sock.sendto(response[:10] if short else response, addr)
             with self.subTest(short=short), Peer(handler, udp=True) as peer:
+                # A zero-length datagram is not the probe's query; the peer
+                # must ignore it and still validate the query that follows.
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as stray:
+                    stray.sendto(b"", ("127.0.0.1", peer.port))
+                deadline = time.monotonic() + 2
+                while peer.empty_datagrams == 0 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(peer.empty_datagrams, 1,
+                                 "peer did not ignore the zero-length datagram")
                 result = probe("dns_status 127.0.0.1 example.com udp",
                                env={**os.environ, "EGRESS_PROBE_DNS_PORT": str(peer.port)})
                 self.assertEqual(result.returncode, 1 if short else 0, result.stdout + result.stderr)

@@ -2554,6 +2554,7 @@ fn launch_mount_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures::write_executable;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -3656,14 +3657,6 @@ mod tests {
         process.output().expect("/bin/bash runs")
     }
 
-    fn executable(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::write(path, body).expect("write fixture");
-        let mut perms = std::fs::metadata(path).expect("stat fixture").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).expect("chmod fixture");
-    }
-
     /// The guard must actually `exec` the selected program: a sentinel, the
     /// forwarded argv and the program's own exit status are the oracle, not the
     /// guard's lookup alone.
@@ -3672,7 +3665,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        executable(
+        write_executable(
             &bin.join("hello-258"),
             "#!/bin/sh\nprintf 'sentinel=%s\\n' \"$TEST_SENTINEL\"\nprintf 'arg1=[%s] arg2=[%s]\\n' \"$1\" \"$2\"\nexit 23\n",
         );
@@ -3748,7 +3741,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        executable(&bin.join("hello-258"), "#!/bin/sh\necho REAL\nexit 23\n");
+        write_executable(&bin.join("hello-258"), "#!/bin/sh\necho REAL\nexit 23\n");
         let prefix = "hello-258() { echo FUNCTION; }\nalias hello-258='echo ALIAS'\n";
         let out = run_guard_tail("hello-258", &[], Some(bin.to_str().unwrap()), prefix, &[]);
         assert_eq!(out.status.code(), Some(23));
@@ -3760,7 +3753,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        executable(&bin.join("we'ird"), "#!/bin/sh\necho QUOTED\nexit 23\n");
+        write_executable(&bin.join("we'ird"), "#!/bin/sh\necho QUOTED\nexit 23\n");
         let out = run_guard_tail("we'ird", &[], Some(bin.to_str().unwrap()), "", &[]);
         assert_eq!(
             out.status.code(),
@@ -3772,7 +3765,7 @@ mod tests {
 
         let spaced = dir.path().join("bin dir").join("my prog");
         std::fs::create_dir_all(spaced.parent().unwrap()).unwrap();
-        executable(&spaced, "#!/bin/sh\necho SPACED\nexit 23\n");
+        write_executable(&spaced, "#!/bin/sh\necho SPACED\nexit 23\n");
         let out = run_guard_tail(spaced.to_str().unwrap(), &[], Some(""), "", &[]);
         assert_eq!(
             out.status.code(),
@@ -3805,8 +3798,8 @@ mod tests {
         let new = dir.path().join("new");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::create_dir_all(&new).unwrap();
-        executable(&old.join("moved-258"), "#!/bin/sh\necho OLD\nexit 1\n");
-        executable(&new.join("moved-258"), "#!/bin/sh\necho NEW\nexit 23\n");
+        write_executable(&old.join("moved-258"), "#!/bin/sh\necho OLD\nexit 1\n");
+        write_executable(&new.join("moved-258"), "#!/bin/sh\necho NEW\nexit 23\n");
 
         // A hook-shaped script exports a PATH the launcher never set; the guard
         // must see it because it runs after the hook.
