@@ -51,6 +51,30 @@ fn cache_root_from(xdg_cache_home: Option<&OsStr>, home: Option<&OsStr>) -> Opti
         .map(|p| PathBuf::from(p).join(".cache/agent-vm"))
 }
 
+/// Host environment variables this module reads as agent-vm's own
+/// configuration, so no `source: env` credential may name one.
+///
+/// A launch removes a captured env source from its own environment, so claiming
+/// a configuration variable would break the launcher; worse, the diagnostics
+/// that read the variable as a path (`doctor`'s state and cache sections) would
+/// print the credential's value. Issue #353 covers removing that second read;
+/// until it lands, this refusal is what keeps an *accepted* configuration from
+/// disclosing a value. (`XDG_STATE_HOME` and `XDG_CACHE_HOME` below are the ones
+/// read by [`state_root`] and [`cache_root`]; `AGENT_VM_*` is reserved by prefix
+/// and is not repeated here.)
+///
+/// Kept here, next to the readers, as one list on purpose: a new `var_os` read
+/// added to this module must be added here too, or it silently reopens the
+/// hole. This constant and [`is_launcher_config_env`] are that single source of
+/// truth for credential parsing.
+pub(crate) const LAUNCHER_CONFIG_ENV_NAMES: &[&str] = &["XDG_STATE_HOME", "XDG_CACHE_HOME"];
+
+/// Whether `name` is one of the host variables agent-vm itself reads as
+/// configuration ([`LAUNCHER_CONFIG_ENV_NAMES`], or the `AGENT_VM_` prefix).
+pub(crate) fn is_launcher_config_env(name: &str) -> bool {
+    name.starts_with("AGENT_VM_") || LAUNCHER_CONFIG_ENV_NAMES.contains(&name)
+}
+
 /// Reads a regular host credential file without allowing a FIFO or oversized
 /// file to consume a launcher or validated interception request.
 pub(crate) fn read_bounded_regular_file(path: &Path, max: u64) -> Result<Vec<u8>> {

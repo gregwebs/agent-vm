@@ -4,6 +4,7 @@ mod boot_image;
 mod cli;
 mod clipboard;
 mod config;
+mod credential_env;
 mod credential_injection;
 mod credential_provider;
 mod credential_resolver;
@@ -96,6 +97,15 @@ fn main() -> Result<()> {
         return exit_with(secret::run(args)?);
     }
 
+    // Capture while no child has inherited selected values and removal cannot
+    // race a Tokio worker's environment read (#163).
+    let credential_preflight = match &dispatch {
+        Dispatch::Launch { entry, .. } => {
+            credential_resolver::CredentialPreflight::capture(entry.requested_names())
+        }
+        Dispatch::Builtin { .. } => credential_resolver::CredentialPreflight::none(),
+    };
+
     // Locate and pin our patched msb binary via MSB_PATH so a user's
     // separate `~/.microsandbox/bin/msb` can't shadow ours. The hook
     // subcommand runs as a child of msb itself (the binary is
@@ -104,7 +114,8 @@ fn main() -> Result<()> {
     // (e.g. inside the guest VM), so skip the check there too.
     //
     // CRITICAL: `point_at_msb()` / `configure_msb_home()` mutate the
-    // process environment via `unsafe { std::env::set_var(...) }`.
+    // process environment via `unsafe { std::env::set_var(...) }`;
+    // credential preflight above also uses `remove_var` under this invariant.
     // setenv() is not thread-safe under POSIX. We MUST run them
     // before the tokio multi-thread runtime spawns workers (which
     // happens inside `Runtime::new()`). Hence the manual sync `fn
@@ -152,7 +163,16 @@ fn main() -> Result<()> {
                 images,
                 user_network,
                 args,
-            } => exit_with(run::launch(&entry, &images, user_network.as_ref(), *args).await?),
+            } => exit_with(
+                run::launch(
+                    &entry,
+                    &images,
+                    user_network.as_ref(),
+                    credential_preflight,
+                    *args,
+                )
+                .await?,
+            ),
             Dispatch::Builtin {
                 cmd: Cmd::Setup(args),
                 catalog,

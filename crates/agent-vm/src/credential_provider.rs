@@ -291,25 +291,6 @@ pub fn missing_credential_error(provider: CredentialProvider) -> Option<&'static
     provider.spec().missing_credential_error
 }
 
-impl CredentialProvider {
-    /// The host variable agent-vm still forwards verbatim for this provider.
-    /// `None` for a provider with no raw-forwarded variable. #163 removes the
-    /// forwarding entirely; until then this is how #162 can warn that a
-    /// replacement owning a *different* variable leaves the host's real key
-    /// flowing into the guest.
-    ///
-    /// Pinned against `run::RAW_FORWARDED_ENV` as a set by a unit test, so the
-    /// two cannot drift.
-    pub(crate) fn raw_forwarded_env(self) -> Option<&'static str> {
-        match self {
-            Self::Anthropic => Some("ANTHROPIC_API_KEY"),
-            // OpenCode authenticates against OpenAI the way Codex does.
-            Self::OpenAi | Self::OpencodeStatic => Some("OPENAI_API_KEY"),
-            Self::Copilot => None,
-        }
-    }
-}
-
 /// What the substituting proxy must register for `provider` — `None` when the
 /// provider has no proxied secret of its own.
 pub(crate) fn proxy_secret(provider: CredentialProvider) -> Option<ProxySecret> {
@@ -1144,26 +1125,6 @@ mod tests {
         }
         assert_eq!(CredentialProvider::from_config_name("opencode"), None);
         assert_eq!(CredentialProvider::from_config_name(""), None);
-    }
-
-    /// #162: `raw_forwarded_env()` must cover exactly the host variables the
-    /// launcher forwards verbatim (`run::RAW_FORWARDED_ENV`). The #162
-    /// renamed-replacement notice reads this mapping, so a future provider with
-    /// a raw-forwarded variable that nobody added here would make the notice go
-    /// silently blind. Pin as a *set*: the mapping is per-provider, the const is
-    /// a flat list.
-    #[test]
-    fn raw_forwarded_env_covers_exactly_the_launchers_forward_set() {
-        let mut from_providers: Vec<&str> = CredentialProvider::ALL
-            .into_iter()
-            .filter_map(|provider| provider.raw_forwarded_env())
-            .collect();
-        from_providers.sort_unstable();
-        from_providers.dedup();
-        let mut expected: Vec<&str> = crate::run::RAW_FORWARDED_ENV.to_vec();
-        expected.sort_unstable();
-        expected.dedup();
-        assert_eq!(from_providers, expected);
     }
 
     /// V10: property-style internal consistency of the table. Catches a

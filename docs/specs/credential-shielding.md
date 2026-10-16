@@ -97,11 +97,13 @@ Environment sources are supported for specific workflows, but passing
 credentials through environment variables is less desirable than keychain
 storage; documentation and examples should favor the keychain source.
 
-Read selected environment values before spawning child processes, then remove
-them from agent-vm's environment and exclude them from child environments.
-This cannot unset the parent shell's variables or guarantee erasure of previous
-memory contents. Environment values are not automatically imported into the
-keychain. Diagnostics must not disclose them.
+A launch reads its selected environment values before spawning any child, then
+removes them from agent-vm's environment and excludes them from the launch's
+child environments. Verbs that select no credentials (`agent-vm msb <verb>`,
+`agent-vm setup`) do not remove them. This cannot unset the parent shell's
+variables or guarantee erasure of previous memory contents. Environment values
+are not automatically imported into the keychain. Diagnostics must not disclose
+them.
 
 Remove existing automatic raw forwarding of `ANTHROPIC_API_KEY` and
 `OPENAI_API_KEY`; supported use of these variables goes through shielding.
@@ -266,7 +268,8 @@ agent-vm secret rm anthropic
 3. Real values never appear in guest environment/configuration or diagnostic
    output through supported provisioning paths; `sentinelEnv: true` exposes only
    a non-secret placeholder, while false leaves the named guest variable unset.
-4. Environment capture precedes child creation and values are not inherited.
+4. For a launch, environment capture precedes that launch's child creation and
+   its children do not inherit the values.
 5. Only approved exact HTTPS destinations and specified headers receive
    injection; wrong ports, cleartext, unrelated headers,
    paths in configuration, wildcards, bodies, and query injection are rejected

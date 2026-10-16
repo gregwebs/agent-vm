@@ -186,7 +186,7 @@ tree; the wrapper's existence check degrades that to "no bridge", which
   Claude Code prefers it over `~/.claude/.credentials.json`, silently bypassing
   the proxy. That is a pre-existing defect on `claude` and `shell` too, tracked
   as [#165](https://github.com/gregwebs/agent-vm/issues/165); this ADR extends
-  the affected surface to a third verb rather than fixing it.
+  the affected surface to a third verb rather than fixing it. (Removed by #163.)
 - **Historical composition behavior, withdrawn by ADR-0035:** a custom catalog
   could ship the bridge without `claude`. `declared_layers`
   composes the layers the *catalog* declares, so a config that declares `pi`

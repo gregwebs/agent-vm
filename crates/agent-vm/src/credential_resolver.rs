@@ -39,19 +39,21 @@
 //! record is written) proves the source is *available* and drops the value
 //! immediately: it decides between a warning, a withheld credential, and a
 //! hard error before boot. Phase 2 is
-//! [`KeychainCredentialResolver`], called by the runtime immediately before
+//! [`LaunchCredentialResolver`], called by the runtime immediately before
 //! `fork` on a value it never keeps. Splitting them means a locked or missing
 //! keychain fails *before* a sandbox is created, rather than producing a
 //! booted-but-uncredentialed sandbox.
 //!
-//! The cost is two keychain reads per launch — not per connection, which is
-//! why per-connection reads were rejected. Rotation is therefore
+//! A keychain source reads once per requested authorized service in phase 1,
+//! then once per durable reference occurrence in phase 2 (several per service
+//! when it has several rules). `LaunchSource` routes env sources to immutable
+//! bytes captured in `main`, never rereading the environment. Rotation is
 //! launch-scoped: `agent-vm secret set` does not reach a running sandbox.
 //!
 //! [`LaunchCredentials::assemble_guest_env`] is the one ownership-aware guest
 //! environment decision. Every writer whose contribution *could* carry a name a
 //! credential owns is settled there: a tool-declared `env` key is refused, and
-//! host-forwarded / provider-forwarded pairs are dropped (AC2). The launcher's
+//! provider-forwarded pairs are dropped (AC2). The launcher's
 //! own contributions (`PATH`, the guest-identity triple, `GUEST_ALWAYS_ENV`) are
 //! emitted unfiltered because their names are refused as credential-owned names
 //! at load time (see [`LaunchCredentials::assemble_guest_env`] for the precise
@@ -88,8 +90,9 @@ use vstd::prelude::*;
 use zeroize::Zeroizing;
 
 use crate::config::USER_CONFIG_DIR_RELATIVE;
+use crate::credential_env::EnvCapture;
 use crate::credential_provider::{CredentialProvider, ProviderSet};
-use crate::credential_yaml::{self, AuthorizationSet, GuestEnvName};
+use crate::credential_yaml::{self, AuthorizationSet, GuestEnvName, SourceKind};
 use crate::secret_store::{
     BoundedKeychainReads, KeychainFailure, Resolved, SecretStore, ServiceName, SystemKeychain,
     system_store,
@@ -189,33 +192,124 @@ impl CredentialSource for KeychainCredentialSource {
     }
 }
 
-/// A source that resolves nothing, for a launch whose requested names are
-/// **all** built-in providers (or absent). Such a launch has no authorized
-/// YAML credential, so [`resolve_launch`] never reaches its source; this
-/// exists so that launch never constructs (or depends on) a keychain at all -
-/// a host with no `$HOME`, or a Linux host with no Secret Service, must still
-/// be able to run a built-in-only launch exactly as before.
-pub(crate) struct NoKeychainSource;
+/// The one source a launch reads (#163): each requested service is routed to
+/// the single source its authorization selects. An env-sourced service whose
+/// variable was unset resolves `Missing`; it is never retried against the
+/// keychain, and a keychain-sourced service never reads the environment.
+///
+/// `keychain` is `None` when no requested authorization is keychain-sourced, so
+/// a built-in-only or env-only launch constructs no keychain at all (an unset
+/// `$HOME` or a missing Secret Service changes nothing for it).
+pub(crate) struct LaunchSource {
+    keychain: Option<Arc<dyn CredentialSource>>,
+    environment: EnvCapture,
+}
 
-impl CredentialSource for NoKeychainSource {
-    fn resolve(&self, _service: &ServiceName) -> Resolved {
-        Resolved::Missing
+impl CredentialSource for LaunchSource {
+    fn resolve(&self, service: &ServiceName) -> Resolved {
+        if self.environment.selects(service) {
+            return self.environment.resolve(service);
+        }
+        match &self.keychain {
+            Some(keychain) => keychain.resolve(service),
+            None => Resolved::Missing,
+        }
+    }
+}
+
+/// A launch's credential inputs, gathered in `main` before the first child
+/// process and before Tokio (#163): the authorization file, loaded exactly
+/// once, and the host values its `source: env` entries select.
+///
+/// A load error is carried, not raised, so `run::launch` reports it at the same
+/// point (and after the same notices) as before #163.
+pub(crate) struct CredentialPreflight {
+    requested: BTreeSet<ServiceName>,
+    authorizations: Result<AuthorizationSet>,
+    environment: EnvCapture,
+}
+
+impl CredentialPreflight {
+    /// `main`'s prologue only (see `EnvCapture::take_from_process`).
+    pub(crate) fn capture(requested: &BTreeSet<ServiceName>) -> Self {
+        let requested = requested.clone();
+        if requested.is_empty() {
+            // A launch that requests nothing never reads the file (#161).
+            return Self {
+                requested,
+                authorizations: Ok(AuthorizationSet::empty()),
+                environment: EnvCapture::none(),
+            };
+        }
+        match load_authorizations() {
+            Ok(set) => {
+                let environment = EnvCapture::take_from_process(&requested, &set);
+                Self {
+                    requested,
+                    authorizations: Ok(set),
+                    environment,
+                }
+            }
+            // Nothing is selected without a valid file, so nothing is captured.
+            Err(error) => Self {
+                requested,
+                authorizations: Err(error),
+                environment: EnvCapture::none(),
+            },
+        }
+    }
+
+    /// For built-in commands and tests: no request, nothing captured.
+    pub(crate) fn none() -> Self {
+        Self {
+            requested: BTreeSet::new(),
+            authorizations: Ok(AuthorizationSet::empty()),
+            environment: EnvCapture::none(),
+        }
+    }
+
+    /// Phase 1, plus the source phase 2 will use. `None` source when nothing was
+    /// requested (the create path then takes the resolver-free branch).
+    pub(crate) fn resolve(
+        self,
+        policy: MissingCredentialPolicy,
+    ) -> Result<(LaunchCredentials, Option<Arc<dyn CredentialSource>>)> {
+        if self.requested.is_empty() {
+            return Ok((LaunchCredentials::default(), None));
+        }
+        let authorizations = self.authorizations?;
+        let needs_keychain = self.requested.iter().any(|name| {
+            authorizations
+                .get(name)
+                .is_some_and(|credential| credential.source() == SourceKind::Keychain)
+        });
+        let keychain = if needs_keychain {
+            Some(KeychainCredentialSource::system()?)
+        } else {
+            None
+        };
+        let source: Arc<dyn CredentialSource> = Arc::new(LaunchSource {
+            keychain,
+            environment: self.environment,
+        });
+        let launch = resolve_launch(&self.requested, &authorizations, source.as_ref(), policy)?;
+        Ok((launch, Some(source)))
     }
 }
 
 /// Phase 2: the value the runtime's spawn path asks for, immediately before
-/// `fork`.
+/// `fork`, reading the launch's routed source.
 ///
 /// `allowed` is exactly the services this launch authorized **and** requested.
 /// The check is load-bearing (AC8): a durable config tampered with between
 /// build and spawn cannot widen what is read, because a reference outside the
 /// set is refused rather than resolved.
-pub(crate) struct KeychainCredentialResolver {
+pub(crate) struct LaunchCredentialResolver {
     source: Arc<dyn CredentialSource>,
     allowed: BTreeSet<ServiceName>,
 }
 
-impl microsandbox::CredentialResolver for KeychainCredentialResolver {
+impl microsandbox::CredentialResolver for LaunchCredentialResolver {
     fn resolve(
         &self,
         reference: &str,
@@ -272,9 +366,8 @@ impl ReadyCredential {
 /// authorization file, an unsupported field, a rejected stored value, any
 /// guest-env ownership conflict, and a *built-in* provider's own
 /// missing-credential bail all stay hard errors under both variants: the
-/// override "cannot bypass malformed configuration, expand destinations,
-/// forward raw values, or select a fallback source"
-/// (docs/specs/credential-shielding.md line 233).
+/// override cannot relax configuration, destination or value-handling rules
+/// (docs/specs/credential-shielding.md, Availability and failure behavior).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MissingCredentialPolicy {
     /// Default: a missing authorization, or an unavailable `required: true`
@@ -287,8 +380,8 @@ pub(crate) enum MissingCredentialPolicy {
 /// What the guest variable named by `apiKey.name` must end up as.
 ///
 /// "Publish nothing" is not "leave it unset": the name is *owned* by this
-/// authorization, so agent-vm must actively suppress every other writer (raw
-/// forwarding, a tool-declared `env` key) rather than merely declining to add
+/// authorization, so agent-vm must actively suppress every other writer (a tool-declared
+/// `env` key, a provider-forwarded pair) rather than merely declining to add
 /// one (AC2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnvDisposition {
@@ -303,7 +396,7 @@ pub(crate) enum EnvDisposition {
 ///
 /// The writers feeding [`LaunchCredentials::assemble_guest_env`]. Filtering
 /// happens centrally there rather than at each emission site, so the
-/// credential-relevant writers (`tool_env`, `forwarded`, `provider`) can only
+/// credential-relevant writers (`tool_env`, `provider`) can only
 /// be settled in one place (agent-vm #161 review, M1). The launcher-owned
 /// writers (`path`, `identity`, `always`) are emitted unfiltered; their names
 /// are already refused as credential-owned names at load time, so filtering
@@ -311,9 +404,6 @@ pub(crate) enum EnvDisposition {
 pub(crate) struct GuestEnvSources<'a> {
     /// The launched tool's own config-declared `env` pairs.
     pub tool_env: &'a BTreeMap<String, String>,
-    /// Host variables forwarded verbatim (e.g. `ANTHROPIC_API_KEY`), already
-    /// filtered to those actually set and non-empty by the caller.
-    pub forwarded: &'a [(&'static str, String)],
     /// The booted image's own `PATH`, or `None` to leave `PATH` entirely
     /// unset so the acquired OCI config supplies it. `None` never means "fall
     /// back to a literal": the exec layer resolves the effective PATH from the
@@ -347,9 +437,10 @@ pub(crate) struct LaunchCredentials {
 /// Why a requested service could not be used. A closed enum, not a string, so
 /// the message is composed at render time from the service name and a fixed
 /// label - never from anything a source returned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WithheldCause {
     Missing,
+    EnvironmentUnset(GuestEnvName),
     Unavailable(KeychainFailure),
     /// The launch requested a name that is neither a built-in provider nor
     /// authorized. Only reachable under `MissingCredentialPolicy::Warn`;
@@ -375,7 +466,7 @@ impl Withheld {
     /// metadata, already shown by `secret ls`) and, for `Unavailable`, the
     /// closed failure message, so "locked" never reads as "not stored".
     pub(crate) fn reason(&self) -> String {
-        match self.cause {
+        match &self.cause {
             WithheldCause::Missing => format!(
                 "no value is stored in the system keychain for `{}`; store it with `agent-vm secret set {}`",
                 self.service, self.service
@@ -384,6 +475,10 @@ impl Withheld {
                 "the system keychain could not be read for `{}`: {}",
                 self.service,
                 failure.message()
+            ),
+            WithheldCause::EnvironmentUnset(name) => format!(
+                "the host environment variable `{name}` selected by `{}` (`source: env`) was unset or empty when agent-vm started; export it before launching",
+                self.service
             ),
             WithheldCause::NotAuthorized => format!(
                 "`{}` is neither a built-in credential provider nor authorized in {}/{}",
@@ -461,7 +556,7 @@ impl LaunchCredentials {
         &self,
         source: Arc<dyn CredentialSource>,
     ) -> Arc<dyn microsandbox::CredentialResolver> {
-        Arc::new(KeychainCredentialResolver {
+        Arc::new(LaunchCredentialResolver {
             source,
             allowed: self.ready.iter().map(|c| c.service.clone()).collect(),
         })
@@ -504,7 +599,7 @@ impl LaunchCredentials {
     /// emission sites:
     ///
     /// - `tool_env` — an owned name is **refused**;
-    /// - `forwarded` and `provider` — an owned name is **dropped**.
+    /// - `provider` — an owned name is **dropped**.
     ///
     /// The launcher-owned writers are emitted unfiltered on purpose (`path`,
     /// the guest-identity triple in `identity`, and `always`): every one of
@@ -518,7 +613,7 @@ impl LaunchCredentials {
     ///
     /// The tool's own `env` declaring an owned name is refused here rather than
     /// in `config::check_env_key`, which is config-time and has no launch
-    /// context. A forwarded or provider variable an authorization owns is
+    /// context. A provider variable an authorization owns is
     /// suppressed, including while the credential is withheld — "publish
     /// nothing" is not "leave it unset". The sentinel is appended **last** of
     /// every emission point so no other writer can displace it. Injection is
@@ -548,11 +643,6 @@ impl LaunchCredentials {
                 continue;
             }
             env.push((key.clone(), value.clone()));
-        }
-        for (name, value) in sources.forwarded {
-            if !self.owns_env(name) {
-                env.push(((*name).to_owned(), value.clone()));
-            }
         }
         if let Some(path) = &sources.path {
             env.push(("PATH".to_owned(), path.clone()));
@@ -716,8 +806,9 @@ fn resolve_authorized(
             });
         }
         Resolved::Missing | Resolved::Unavailable(_) => {
-            let cause = match &resolved {
-                Resolved::Unavailable(failure) => WithheldCause::Unavailable(*failure),
+            let cause = match (&resolved, credential.source()) {
+                (Resolved::Unavailable(failure), _) => WithheldCause::Unavailable(*failure),
+                (_, SourceKind::Environment) => WithheldCause::EnvironmentUnset(env_name.clone()),
                 _ => WithheldCause::Missing,
             };
             // A `required: true` value that cannot be read is the one
@@ -749,6 +840,23 @@ fn resolve_authorized(
             launch.withheld.push(withheld);
         }
         Resolved::InvalidValue(rejection) => {
+            if credential.source() == SourceKind::Environment {
+                // Storage-specific advice ("it was not stored") is wrong for
+                // env bytes. Keep only the value-free rule for those variants.
+                let rule = match rejection {
+                    crate::secret_store::ValueRejection::Empty
+                    | crate::secret_store::ValueRejection::TooLong => rejection.message(),
+                    crate::secret_store::ValueRejection::EdgeSpace => {
+                        "a leading or trailing space".to_owned()
+                    }
+                    crate::secret_store::ValueRejection::NonPrintable => {
+                        "characters that are not printable ASCII".to_owned()
+                    }
+                };
+                return Err(anyhow!(
+                    "the host environment variable `{env_name}` selected by `{service}` cannot be used: {rule}. Fix or unset it on the host"
+                ));
+            }
             // A hard error regardless of `required` and regardless of the
             // policy: the stored bytes are not a value this release will
             // inject, and treating that as merely withheld would hide a real
@@ -916,10 +1024,6 @@ mod tests {
         launch
             .assemble_guest_env(GuestEnvSources {
                 tool_env,
-                forwarded: &[
-                    ("ANTHROPIC_API_KEY", "host-anthropic".to_owned()),
-                    ("OPENAI_API_KEY", "host-openai".to_owned()),
-                ],
                 path: Some("/image/bin".to_owned()),
                 identity: &[
                     ("HOME", "/host/home".to_owned()),
@@ -1396,7 +1500,7 @@ credentials:
                 .script("beta", Scripted::Unavailable(failure));
             // Phase 1 refuses Missing/Unavailable for required, so build the
             // resolver through the type's own constructor instead.
-            let resolver = KeychainCredentialResolver {
+            let resolver = LaunchCredentialResolver {
                 source: dyn_source(&source),
                 allowed: names(&["alpha", "beta"]),
             };
@@ -1581,13 +1685,12 @@ credentials:
             Some(&EnvDisposition::Unset)
         );
         let env = assemble(&launch, &BTreeMap::new());
-        // The host's real OPENAI_API_KEY is not forwarded, and no sentinel is
+        // No sentinel is
         // published - the name is genuinely unset. The launcher's other writers
         // are untouched.
         assert!(!contains_key(&env, "OPENAI_API_KEY"));
         assert_eq!(value_of(&env, "PATH"), Some("/image/bin"));
         assert_eq!(value_of(&env, "IS_SANDBOX"), Some("1"));
-        assert_eq!(value_of(&env, "ANTHROPIC_API_KEY"), Some("host-anthropic"));
         assert_eq!(
             value_of(&env, "COPILOT_GITHUB_TOKEN"),
             Some("msb-copilot-placeholder-v2")
@@ -1622,7 +1725,6 @@ credentials:
         let error = launch
             .assemble_guest_env(GuestEnvSources {
                 tool_env: &tool_env,
-                forwarded: &[],
                 path: None,
                 identity: &[],
                 always: &[],
@@ -1648,7 +1750,6 @@ credentials:
         let none = launch
             .assemble_guest_env(GuestEnvSources {
                 tool_env: &tool_env,
-                forwarded: &[],
                 path: None,
                 identity: &[],
                 always: &[],
@@ -1663,7 +1764,6 @@ credentials:
         let some = launch
             .assemble_guest_env(GuestEnvSources {
                 tool_env: &tool_env,
-                forwarded: &[],
                 path: Some("/image/bin".to_owned()),
                 identity: &[],
                 always: &[],
@@ -1674,11 +1774,9 @@ credentials:
     }
 
     #[test]
-    fn withheld_optional_credential_still_suppresses_raw_forwarding() {
-        // A host `OPENAI_API_KEY` must not leak when a YAML credential *owns*
-        // the name, even though the keychain read came back `Missing` (so it is
-        // withheld rather than ready). Suppression comes from the authorization,
-        // not from resolution success (AC2).
+    fn a_withheld_optional_credential_leaves_its_variable_unset() {
+        // Ownership survives withholding: an unavailable value cannot enable
+        // another guest-env writer for the authorization's name (AC2).
         let body = "\
 credentials:
   - service: alpha
@@ -1691,7 +1789,6 @@ credentials:
         assert!(launch.ready().is_empty());
         let env = assemble(&launch, &BTreeMap::new());
         assert!(!contains_key(&env, "OPENAI_API_KEY"));
-        assert_eq!(value_of(&env, "ANTHROPIC_API_KEY"), Some("host-anthropic"));
     }
 
     /// The full AC2 matrix against **every** environment writer, ready and
@@ -1722,7 +1819,6 @@ credentials:
                 let env = launch
                     .assemble_guest_env(GuestEnvSources {
                         tool_env: &BTreeMap::new(),
-                        forwarded: &[("OPENAI_API_KEY", "host-openai".to_owned())],
                         path: Some("/image/bin".to_owned()),
                         identity: &root_and_nonroot(identity),
                         always: &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")],
@@ -1742,7 +1838,6 @@ credentials:
                 let env = launch
                     .assemble_guest_env(GuestEnvSources {
                         tool_env: &BTreeMap::new(),
-                        forwarded: &[("OPENAI_API_KEY", "host-openai".to_owned())],
                         path: Some("/image/bin".to_owned()),
                         identity: &root_and_nonroot(identity),
                         always: &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")],
@@ -1760,7 +1855,7 @@ credentials:
     #[test]
     fn an_owned_provider_variable_is_suppressed() {
         // The provider-forwarded names are a second writer that must consult
-        // ownership, exactly like the raw-forwarded list.
+        // ownership.
         let body = "\
 credentials:
   - service: alpha
@@ -1901,5 +1996,234 @@ credentials:
             microsandbox::CredentialResolveError::NotAuthorized
         );
         drop(home);
+    }
+    fn env_authorizations(required: bool, sentinel: bool) -> (tempfile::TempDir, AuthorizationSet) {
+        authorizations(&format!(
+            "credentials:\n  - service: alpha\n    source: env\n    required: {required}\n    apiKey:\n      name: ALPHA_KEY\n      sentinelEnv: {sentinel}\n      inject: [{{domain: api.alpha.example, scheme: bearer}}]\n"
+        ))
+    }
+
+    #[test]
+    fn an_unset_env_source_never_falls_back_to_the_keychain() {
+        for (required, policy) in [
+            (false, MissingCredentialPolicy::Fail),
+            (true, MissingCredentialPolicy::Fail),
+            (true, MissingCredentialPolicy::Warn),
+        ] {
+            let (_home, set) = env_authorizations(required, true);
+            let keychain =
+                TestSource::new().script("alpha", Scripted::Value("sk-store-decoy".into()));
+            let source = LaunchSource {
+                keychain: Some(dyn_source(&keychain)),
+                environment: EnvCapture::take_with(&names(&["alpha"]), &set, |_| None),
+            };
+            let result = resolve_launch(&names(&["alpha"]), &set, &source, policy);
+            let text = if required && policy == MissingCredentialPolicy::Fail {
+                result.unwrap_err().to_string()
+            } else {
+                let launch = result.unwrap();
+                assert!(launch.ready().is_empty());
+                launch.withheld()[0].notice()
+            };
+            assert!(text.contains("ALPHA_KEY"));
+            assert!(text.contains("unset or empty"));
+            assert_eq!(
+                text.contains("because --allow-missing-credentials"),
+                required && policy == MissingCredentialPolicy::Warn
+            );
+            assert!(keychain.lookups().is_empty());
+        }
+    }
+
+    #[test]
+    fn each_service_reads_only_its_own_source() {
+        let (_home, set) = authorizations(
+            "credentials:\n  - service: alpha\n    source: env\n    apiKey:\n      name: ALPHA_KEY\n      sentinelEnv: true\n      inject: [{domain: api.alpha.example, scheme: bearer}]\n  - service: beta\n    apiKey:\n      name: BETA_KEY\n      inject: [{domain: api.beta.example, scheme: bearer}]\n",
+        );
+        let mut captured = Vec::new();
+        let environment = EnvCapture::take_with(&names(&["alpha", "beta"]), &set, |name| {
+            captured.push(name.as_str().to_owned());
+            Some("sk-env".into())
+        });
+        let keychain = TestSource::new().script("beta", Scripted::Value("sk-store".into()));
+        let source = LaunchSource {
+            keychain: Some(dyn_source(&keychain)),
+            environment,
+        };
+        let launch = resolve_launch(
+            &names(&["alpha", "beta"]),
+            &set,
+            &source,
+            MissingCredentialPolicy::Fail,
+        )
+        .unwrap();
+        assert_eq!(launch.ready().len(), 2);
+        assert_eq!(captured, ["ALPHA_KEY"]);
+        assert_eq!(keychain.lookups(), ["beta"]);
+    }
+
+    #[test]
+    fn phase_two_resolves_an_env_service_from_the_capture() {
+        let (_home, set) = env_authorizations(false, true);
+        let source: Arc<dyn CredentialSource> = Arc::new(LaunchSource {
+            keychain: None,
+            environment: EnvCapture::take_with(&names(&["alpha"]), &set, |_| {
+                Some("sk-phase-two".into())
+            }),
+        });
+        let launch = resolve_launch(
+            &names(&["alpha"]),
+            &set,
+            source.as_ref(),
+            MissingCredentialPolicy::Fail,
+        )
+        .unwrap();
+        let resolver = launch.resolver(source);
+        for _ in 0..2 {
+            assert_eq!(&*resolver.resolve("alpha").unwrap(), "sk-phase-two");
+        }
+        assert!(resolver.resolve("beta").is_err());
+    }
+
+    #[test]
+    fn an_invalid_env_value_is_a_hard_error_under_both_policies() {
+        for policy in [MissingCredentialPolicy::Fail, MissingCredentialPolicy::Warn] {
+            let (_home, set) = env_authorizations(false, false);
+            let source = EnvCapture::take_with(&names(&["alpha"]), &set, |_| {
+                Some(" sk-CANARY-invalid".into())
+            });
+            let error = resolve_launch(&names(&["alpha"]), &set, &source, policy)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("ALPHA_KEY"));
+            assert!(error.contains("leading or trailing space"));
+            assert!(!error.contains("sk-CANARY-invalid"));
+        }
+    }
+
+    #[test]
+    fn env_sentinel_true_publishes_only_the_sentinel_and_false_leaves_it_unset() {
+        for sentinel in [true, false] {
+            let (_home, set) = env_authorizations(false, sentinel);
+            let source =
+                EnvCapture::take_with(&names(&["alpha"]), &set, |_| Some("sk-sentinel".into()));
+            let launch = resolve_launch(
+                &names(&["alpha"]),
+                &set,
+                &source,
+                MissingCredentialPolicy::Fail,
+            )
+            .unwrap();
+            let env = assemble(&launch, &BTreeMap::new());
+            assert_eq!(
+                value_of(&env, "ALPHA_KEY"),
+                if sentinel {
+                    Some("proxy-managed")
+                } else {
+                    None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_env_sourced_value_is_injected_into_exactly_its_authorized_header() {
+        use microsandbox_network::{
+            secrets::{credential::ResolvedHeaderCredential, handler::SecretsHandler},
+            shared::{ResolvedHostnameFamily, SharedState},
+        };
+        use std::{
+            net::{IpAddr, SocketAddr},
+            time::Duration,
+        };
+        let canary = "sk-CANARY-163-joined-header";
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let input = b"POST /v1 HTTP/1.1\r\nHost: api.alpha.example\r\nContent-Length: 5\r\nX-Trace: abc\r\n\r\nhello";
+        let expected = format!(
+            "POST /v1 HTTP/1.1\r\nHost: api.alpha.example\r\nContent-Length: 5\r\nX-Trace: abc\r\nauthorization: Bearer {canary}\r\n\r\nhello"
+        );
+        let mut positive_outputs = Vec::new();
+        for sentinel in [true, false] {
+            let (_home, set) = env_authorizations(false, sentinel);
+            let source: Arc<dyn CredentialSource> = Arc::new(LaunchSource {
+                keychain: None,
+                environment: EnvCapture::take_with(&names(&["alpha"]), &set, |_| {
+                    Some(canary.into())
+                }),
+            });
+            let launch = resolve_launch(
+                &names(&["alpha"]),
+                &set,
+                source.as_ref(),
+                MissingCredentialPolicy::Fail,
+            )
+            .unwrap();
+            assert_eq!(launch.ready().len(), 1);
+            assert_eq!(
+                value_of(&assemble(&launch, &BTreeMap::new()), "ALPHA_KEY"),
+                if sentinel {
+                    Some("proxy-managed")
+                } else {
+                    None
+                }
+            );
+            let state = tempfile::tempdir().unwrap();
+            let config = durable_config(&launch, state.path());
+            assert_eq!(config.secrets.header_credentials.len(), 1);
+            assert_eq!(config.secrets.header_credentials[0].reference, "alpha");
+            assert!(!serde_json::to_string(&config).unwrap().contains(canary));
+            assert!(!format!("{config:?}").contains(canary));
+            for (sni, pin, port, tls) in [
+                ("api.alpha.example", "api.alpha.example", 443, true),
+                ("other.example", "other.example", 443, true),
+                ("api.alpha.example", "other.example", 443, true),
+                ("api.alpha.example", "api.alpha.example", 8443, true),
+                ("api.alpha.example", "api.alpha.example", 443, false),
+            ] {
+                let resolver = launch.resolver(Arc::clone(&source));
+                let resolved = config
+                    .secrets
+                    .header_credentials
+                    .iter()
+                    .map(|def| {
+                        ResolvedHeaderCredential::from_definition(
+                            def,
+                            resolver.resolve(&def.reference).unwrap(),
+                        )
+                    })
+                    .collect();
+                let shared = SharedState::new(16);
+                shared.cache_resolved_hostname(
+                    pin,
+                    ResolvedHostnameFamily::Ipv4,
+                    [ip],
+                    Duration::from_secs(300),
+                );
+                let mut handler = if tls {
+                    SecretsHandler::new_tls_intercepted(&config.secrets, sni, ip, &shared)
+                } else {
+                    SecretsHandler::new_plain_http(&config.secrets, sni, ip, &shared)
+                }
+                .with_header_credentials(resolved)
+                .with_guest_dst(SocketAddr::new(ip, port));
+                let request = String::from_utf8(input.to_vec())
+                    .unwrap()
+                    .replace("api.alpha.example", sni);
+                let output = handler.substitute(request.as_bytes()).unwrap().into_owned();
+                if sni == "api.alpha.example" && pin == sni && port == 443 && tls {
+                    assert_eq!(output, expected.as_bytes());
+                    assert_eq!(
+                        String::from_utf8_lossy(&output)
+                            .matches("authorization:")
+                            .count(),
+                        1
+                    );
+                    positive_outputs.push(output);
+                } else {
+                    assert_eq!(output, request.as_bytes());
+                }
+            }
+        }
+        assert_eq!(positive_outputs[0], positive_outputs[1]);
     }
 }

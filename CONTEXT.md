@@ -118,7 +118,10 @@ file masking.
 
 A host-side location from which a credential value is obtained, such as a named
 environment variable or a system keychain item. Its identity is distinct from
-the secret value, which can rotate without changing the source.
+the secret value, which can rotate without changing the source. Each YAML
+entry selects exactly one source: omitted `source` selects the secret-store item
+named by `service`; `source: env` selects the host variable named by `apiKey.name`,
+captured and removed before a launch spawns any child process.
 
 ## Credential authorization
 
@@ -135,7 +138,7 @@ its guest-facing placeholder should appear. A request is not authorization.
 
 ## Authorized credential
 
-A **credential authorization** in effect: a named **secret store** service, the
+A **credential authorization** in effect: a **credential source**, the
 exact HTTPS origin it may be sent to, and the exact request header it may occupy,
 as declared in `~/.config/agent-vm/credentials.yaml`. It is host-wide and
 user-owned; a **credential request** can name one but cannot bring one into

@@ -737,7 +737,7 @@ with the boundary predicates' machine-checked contracts in
 ### User-authorized YAML credentials (#161)
 
 The second kind of shielded credential is one the user authorizes in
-`~/.config/agent-vm/credentials.yaml`: a keychain `service`, the exact HTTPS
+`~/.config/agent-vm/credentials.yaml`: a named credential source, the exact HTTPS
 origin, and the exact request header the value may occupy. A tool's
 `credentials = [...]` then *requests* it; the request cannot define or widen the
 authorization. Injection is host-side, into that header only, and the guest
@@ -749,10 +749,15 @@ holds a non-secret placeholder (`sentinelEnv: true`) or nothing.
                                                                          ▼
                       launch resolution (phase 1: availability, value dropped)
                                                                          │
-  host keychain ──▶ per-launch resolver (phase 2, at fork) ──▶ private fd ──▶ HTTPS header
+  host keychain or captured host env (`source: env`)
+                └──▶ per-launch resolver (phase 2, at fork) ──▶ private fd ──▶ HTTPS header
                                                                          │
                               guest: placeholder or unset ◀──────────────┘
 ```
+
+For a launch, environment sources are captured and removed in `main` before that
+launch's children and Tokio workers exist; keychain sources retain their
+two-phase reads.
 
 The load path, the grammar, the guest-variable ownership rules and the exact
 guarantee (application-level only; OS swap and same-uid inspection are out of
@@ -1228,6 +1233,7 @@ are settled design positions; work that is merely *unbuilt* lives in
   or race in `wait()`.
 - **No in-VM proxy.** microsandbox does the interception on the host side;
   there is nothing for `mitmproxy` or similar to do inside the guest.
-- **No env-var credential path.** Forwarding `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
+- **No raw env-var forwarding.** Forwarding `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
   from the host was the bootstrap approach and is gone: it cannot express host
   OAuth, and it puts a real secret in `/proc/$$/environ` inside the guest.
+  `source: env` instead captures the value host-side and never publishes it (#163).
