@@ -1,12 +1,26 @@
-Launch shell in a per-project sandbox
+Sandboxed microVMs for AI coding agents.
 
-Usage: agent-vm shell [OPTIONS] [AGENT_ARGS]...
+Usage: agent-vm [OPTIONS] <COMMAND>
 
-Arguments:
-  [AGENT_ARGS]...  Args passed verbatim to the agent; use -- before any agent flags
+Commands:
+  setup      Pull and verify the boot image (run once first)
+  pull       Refresh the cached boot image
+  upgrade    Explicitly acquire and select a new default boot image
+  msb        Forward arguments to the bundled `msb` with agent-vm's MSB_HOME/MSB_PATH pinned (e.g.
+             `agent-vm msb ls`, `agent-vm msb status`). Relies on `needs_msb_setup` staying true for
+             this variant — see main()
+  clipboard  Exchange a string between the host and the sandbox
+  doctor     Diagnostic / maintenance operations for agent-vm's private microsandbox state (e.g.
+             --reset-msb-db)
+  secret     Manage agent-vm's own values in the host system keychain
+  build      Explicitly build a Dockerfile and import the result into agent-vm's image cache (Docker
+             is invoked; nothing is selected or booted)
+  shell      Launch shell in a per-project sandbox; tool arguments are forwarded verbatim
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help (see more with '--help')
+  -h, --help     Print help (see more with '--help')
+  -V, --version  Print version
 
 Sandbox resources:
       --memory <GIB>  Sandbox memory, in GiB [env: AGENT_VM_MEMORY_GIB] [default: 2]
@@ -48,9 +62,13 @@ Image:
 Guest user:
       --root  Run the guest as root (uid 0) instead of the default host user
 
-Examples:
-  agent-vm shell                  launch in the current project
-  agent-vm shell -p 8080:3000     publish guest :3000 to host 127.0.0.1:8080
-  agent-vm shell -- --some-flag   forward args to the tool (after --)
+Getting started:
+  agent-vm setup       fetch and verify the boot image (run once first)
+  cd ~/your-project
+  agent-vm <tool>      launch one of the tools listed above
 
-Trailing args go to the tool. Run with --help for networking, security, and env details.
+Launch options go before the tool: agent-vm [launch options] <tool> [tool arguments...]
+Every argument after the tool is forwarded to it verbatim, including --help and --.
+Built-in commands take their own options after the command and no launch options.
+`agent-vm help <tool>` shows examples; `agent-vm doctor` shows which config files were
+found and what they resolved to.

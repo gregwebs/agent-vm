@@ -361,57 +361,31 @@ fn mkdir_chain(project: &Path) -> Vec<String> {
     out
 }
 
-/// Footer shown under `-h` (the short summary). A few high-value examples
-/// plus a pointer to `--help`. Printed verbatim by clap, so this is exactly
-/// what the user sees. One [`Args`] backs every launch verb, so the examples
-/// are rendered with the verb actually being helped — a hard-coded tool name
-/// would be wrong for a user who configured a different one (and naming a
-/// specific tool is an explicit acceptance criterion of #82).
-pub(crate) fn launch_after_help(name: &str) -> String {
-    format!(
-        "\
+/// Footer under `agent-vm help <tool>`. Shared by every tool verb, so it names no tool.
+pub(crate) const LAUNCH_AFTER_HELP: &str = "\
 Examples:
-  agent-vm {name}                  launch in the current project
-  agent-vm {name} -p 8080:3000     publish guest :3000 to host 127.0.0.1:8080
-  agent-vm {name} -- --some-flag   forward args to the tool (after --)
+  agent-vm <tool>                    launch in the current project
+  agent-vm -p 8080:3000 <tool>        publish guest :3000 to host 127.0.0.1:8080
+  agent-vm <tool> --some-flag         forward args to the tool
 
-Trailing args go to the tool. Run with --help for networking, security, and env details."
-    )
-}
+Launch options go before the tool (see `agent-vm --help`). Every argument after
+the tool is forwarded to it verbatim, including --help and --.";
 
-/// Spaces between `{name}` and an example description in the literal lines of
-/// [`launch_after_long_help`]; the continuation indent is built from it so it
-/// tracks the interpolated verb.
-const EXAMPLE_DESCRIPTION_PAD: usize = 29;
-
-/// Fuller footer shown under `--help`. Same single-[`Args`] constraint: every
-/// launch verb shares it, so the verb is interpolated and no shipped tool is
-/// named anywhere in the literal text.
-///
-/// The example descriptions form a column after `  agent-vm <verb>` plus
-/// [`EXAMPLE_DESCRIPTION_PAD`]. Since the verb is interpolated into every
-/// example line, that column moves with the verb's length — so a wrapped
-/// example's continuation must indent to the *same* column rather than a
-/// hard-coded value (which only lined up for one verb length).
-pub(crate) fn launch_after_long_help(name: &str) -> String {
-    // `  agent-vm ` + the verb + the pad the literal example lines use.
-    let continuation_indent = "  agent-vm ".len() + name.chars().count() + EXAMPLE_DESCRIPTION_PAD;
-    let continuation = " ".repeat(continuation_indent);
-    format!(
-        "\
+/// Full launch-option footer on the top-level command; no catalog-specific names.
+pub(crate) const LAUNCH_OPTIONS_LONG_HELP: &str = "\
 Examples:
-  agent-vm {name}                             launch in the current project
-  agent-vm {name} -- <command>                run one command, then exit
-  agent-vm {name} -- --model opus --resume    forward args to the tool
-  agent-vm {name} --memory 8 --cpus 4         a bigger sandbox
-  agent-vm {name} --mount ~/ref:ro            read-only extra mount
-  agent-vm {name} --mount /etc/hosts:/host-hosts:ro
-{continuation}read-only single-file bind
-  agent-vm {name} --mount ~/skills:ro:follow-links
-{continuation}follow symlinks in a skills dir
-  agent-vm {name} --mount ~/config:/config:fork:exclude=credentials.json
-{continuation}seed an independent writable copy
-  agent-vm {name} --repo owner/other-repo     widen the GitHub allow-list
+  agent-vm <tool>                                  launch in the current project
+  agent-vm <tool> --model opus --resume            forward args to the tool
+  agent-vm shell <command>                         run one command, then exit
+  agent-vm --memory 8 --cpus 4 <tool>              a bigger sandbox
+  agent-vm --mount ~/ref:ro <tool>                 read-only extra mount
+  agent-vm --mount /etc/hosts:/host-hosts:ro <tool>
+                                                   read-only single-file bind
+  agent-vm --mount ~/skills:ro:follow-links <tool>
+                                                   follow symlinks in a skills dir
+  agent-vm --mount ~/config:/config:fork:exclude=credentials.json <tool>
+                                                   seed an independent writable copy
+  agent-vm --repo owner/other-repo <tool>          widen the GitHub allow-list
 
 Fork mounts:
   Writable binds (the project dir included) may not contain ~/.config/agent-vm; launch from a project directory, not $HOME.
@@ -444,10 +418,10 @@ Environment:
   AGENT_VM_PROFILE                      print per-phase boot timings
   AGENT_VM_DEBUG_CONFIG                 dump the SandboxConfig JSON before boot
   AGENT_VM_NO_CHROME_MCP                disable Chrome MCP auto-configuration for Chrome-capable images
-  RUST_LOG                              tracing filter (e.g. agent_vm=debug)"
-    )
-}
+  RUST_LOG                              tracing filter (e.g. agent_vm=debug)";
 
+/// The **launch options**, flattened into the top-level [`crate::cli`] command
+/// and written before the tool verb.
 #[derive(ClapArgs)]
 pub struct Args {
     /// Sandbox memory, in GiB.
@@ -458,7 +432,7 @@ pub struct Args {
         value_name = "GIB",
         help_heading = "Sandbox resources"
     )]
-    memory: u32,
+    pub(crate) memory: u32,
 
     /// vCPU count for the sandbox.
     #[arg(
@@ -569,7 +543,7 @@ pub struct Args {
         value_name = "HOST[:GUEST][:MODE]...",
         help_heading = "Mounts & ports"
     )]
-    mount: Vec<String>,
+    pub(crate) mount: Vec<String>,
 
     #[command(flatten)]
     network: crate::network::Args,
@@ -601,14 +575,7 @@ pub struct Args {
     /// "Guest user"). Can also be enabled persistently with a truthy
     /// `AGENT_VM_ROOT` (1|true|yes|on).
     #[arg(long = "root", default_value_t = false, help_heading = "Guest user")]
-    root: bool,
-
-    /// Args passed verbatim to the agent; use -- before any agent flags.
-    ///
-    /// Forwarded verbatim to the in-sandbox agent command. Use `--` if
-    /// any argument starts with `-` to keep clap from claiming it.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-    pub(crate) agent_args: Vec<String>,
+    pub(crate) root: bool,
 }
 
 /// Take the resolved **catalog entry**, which carries both the tool and the
@@ -623,6 +590,7 @@ pub(crate) async fn launch(
     user_network: Option<&crate::user_network::UserNetwork>,
     credential_preflight: CredentialPreflight,
     args: Args,
+    tool_args: Vec<String>,
 ) -> Result<i32> {
     let tool = entry.tool();
     let provisioned = entry.provisioned();
@@ -1337,10 +1305,10 @@ pub(crate) async fn launch(
     // adjacent; it depends only on the tool and the user's args, not on the
     // sandbox. The guest command line travels over the exec request *after*
     // boot, so it is absent from the `SandboxConfig` dump below — this line is
-    // the only observable form of it. The user's own args can appear here, the
+    // the only observable form of it. The tool arguments can appear here, the
     // same exposure class as the dump, behind the same opt-in flag.
     let inner_cmd = tool.command();
-    let inner_argv = inner_argv(tool, args.agent_args);
+    let inner_argv = inner_argv(tool, tool_args);
     let config = builder.build().await.context("preparing sandbox config")?;
     if let Some(dump) = crate::debug_config::sandbox_config(&config, label.is_redacted())? {
         notices.emit(dump)?;
@@ -1502,7 +1470,7 @@ pub(crate) async fn launch(
     }
     .render();
     let cmd = image_contract::LAUNCH_SHELL;
-    let agent_args: Vec<String> = vec!["-c".into(), shell_line];
+    let shell_argv: Vec<String> = vec!["-c".into(), shell_line];
 
     let t_run = Instant::now();
     let exit = if std::io::stdin().is_terminal() {
@@ -1522,7 +1490,7 @@ pub(crate) async fn launch(
         // override is the acquired image's resolved config value (#258).
         match sandbox
             .attach_with(cmd, |a| {
-                a.args(agent_args)
+                a.args(shell_argv)
                     .cwd(project_guest_path.clone())
                     .user(exec_user.clone())
                     .env("PATH", exec_path.clone())
@@ -1554,7 +1522,7 @@ pub(crate) async fn launch(
         use tokio::io::AsyncWriteExt as _;
         let mut handle = match sandbox
             .exec_stream_with(cmd, |e| {
-                e.args(agent_args)
+                e.args(shell_argv)
                     .cwd(project_guest_path.clone())
                     .user(exec_user.clone())
                     .env("PATH", exec_path.clone())
@@ -2298,7 +2266,7 @@ const RUN_IMAGE_SEED_HOOKS: &str = concat!(
 );
 
 /// The guest command line: the tool's default argv (minus any flag the user
-/// already passed), then the user's own args — or, for an interactive shell, a
+/// already passed), then the tool arguments — or, for an interactive shell, a
 /// single `-c` with those args joined and escaped.
 ///
 /// Pure and string-only so the seven default tools' guest command lines are
@@ -2311,14 +2279,14 @@ const RUN_IMAGE_SEED_HOOKS: &str = concat!(
 /// The `argv` values' "why" lives beside them in `default-tools.toml`; the
 /// filter here is the one rule that belongs to the launch path rather than the
 /// catalogue: a default flag the user already passed is not duplicated.
-pub(crate) fn inner_argv(tool: &Tool, agent_args: Vec<String>) -> Vec<String> {
+pub(crate) fn inner_argv(tool: &Tool, tool_args: Vec<String>) -> Vec<String> {
     let mut inner_args: Vec<String> = tool
         .argv()
         .iter()
-        .filter(|default| !agent_args.iter().any(|user| user == *default))
+        .filter(|default| !tool_args.iter().any(|user| user == *default))
         .map(|argument| argument.to_string())
         .collect();
-    if tool.is_interactive_shell() && !agent_args.is_empty() {
+    if tool.is_interactive_shell() && !tool_args.is_empty() {
         // `agent-vm shell foo bar` runs `foo bar` as a command. Without `-c`,
         // bash treats the first non-option positional as a script filename and
         // PATH-searches for it, so `agent-vm shell ls` lands on `/usr/bin/ls`
@@ -2326,7 +2294,7 @@ pub(crate) fn inner_argv(tool: &Tool, agent_args: Vec<String>) -> Vec<String> {
         // magic. Joining the user's args into a single `-c` command line (each
         // arg shell-escaped so quoting is preserved across the boundary) is
         // the standard fix.
-        let cmd = agent_args
+        let cmd = tool_args
             .iter()
             .map(|a| shell_escape(a))
             .collect::<Vec<_>>()
@@ -2334,7 +2302,7 @@ pub(crate) fn inner_argv(tool: &Tool, agent_args: Vec<String>) -> Vec<String> {
         inner_args.push("-c".into());
         inner_args.push(cmd);
     } else {
-        inner_args.extend(agent_args);
+        inner_args.extend(tool_args);
     }
     inner_args
 }
@@ -3315,6 +3283,10 @@ mod tests {
 
     #[test]
     fn root_flag_parses_via_clap() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         #[derive(clap::Parser)]
         struct TestCli {
             #[command(flatten)]
@@ -3351,7 +3323,7 @@ mod tests {
     #[test]
     fn environment_help_block_lists_the_shared_truthy_set() {
         let rendered = format!("({})", crate::env_flag::TRUTHY.join("|"));
-        let long_help = launch_after_long_help("shell");
+        let long_help = LAUNCH_OPTIONS_LONG_HELP;
         for var in [
             "AGENT_VM_ROOT",
             "AGENT_VM_UPDATE_CHECK",
@@ -3370,10 +3342,11 @@ mod tests {
 
     #[test]
     fn update_check_flag_parses_via_clap() {
-        // `Args` is normally flattened into a subcommand variant
-        // (`main.rs`'s `Cmd::Shell(run::Args)` etc.); wrap it the same way
-        // here so `--update-check` goes through real clap parsing rather
-        // than calling `should_check_update` directly.
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        // `Args` is flattened into the top-level CLI.
         #[derive(clap::Parser)]
         struct TestCli {
             #[command(flatten)]
@@ -3390,17 +3363,8 @@ mod tests {
             TestCli::try_parse_from(["agent-vm", "--update-check"]).expect("parses --update-check");
         assert!(cli.args.update_check);
 
-        // The removed `--no-update-check` flag is no longer a recognized
-        // option, but `agent_args` is a `trailing_var_arg` +
-        // `allow_hyphen_values` catch-all, so clap does NOT hard-reject an
-        // unknown `--xxx`: it silently absorbs it as a positional and
-        // forwards it to the launched agent/shell command instead of
-        // erroring. Lock in that (surprising but pre-existing, unrelated to
-        // this change) behavior so it doesn't silently change later.
-        let cli = TestCli::try_parse_from(["agent-vm", "--no-update-check"])
-            .expect("old flag string still parses (absorbed into agent_args, not rejected)");
-        assert!(!cli.args.update_check);
-        assert_eq!(cli.args.agent_args, vec!["--no-update-check".to_string()]);
+        // Unknown flags among launch options are clap errors.
+        assert!(TestCli::try_parse_from(["agent-vm", "--no-update-check"]).is_err());
     }
 
     #[test]
@@ -3436,7 +3400,11 @@ mod tests {
     }
 
     #[test]
-    fn flattened_network_args_preserve_values_defaults_and_trailing_agent_args() {
+    fn flattened_network_args_preserve_values_and_defaults() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         #[derive(clap::Parser)]
         struct TestCli {
             #[command(flatten)]
@@ -3465,16 +3433,13 @@ mod tests {
             "fd00::1",
             "--allow-lan",
             "--allow-host",
-            "--",
-            "--agent-flag",
         ])
-        .expect("all network options parse before trailing agent args");
+        .expect("all network launch options parse");
         assert_eq!(parsed.args.network.publish, ["8080:3000", "8081:3001"]);
         assert!(parsed.args.network.auto_publish);
         assert_eq!(parsed.args.network.allow_egress, ["10.0.0.5", "fd00::1"]);
         assert_eq!(parsed.args.network.allow_lan, Some(true));
         assert_eq!(parsed.args.network.allow_host, Some(true));
-        assert_eq!(parsed.args.agent_args, ["--agent-flag"]);
         let explicit = TestCli::try_parse_from([
             "agent-vm",
             "--allow-internet-egress",
@@ -3491,9 +3456,7 @@ mod tests {
             explicit.args.network.allow_egress,
             ["tcp://[10.0.0.0/24]:22"]
         );
-        let spaced = TestCli::try_parse_from(["agent-vm", "--allow-lan", "false"]).unwrap();
-        assert_eq!(spaced.args.network.allow_lan, Some(true));
-        assert_eq!(spaced.args.agent_args, ["false"]);
+        assert!(TestCli::try_parse_from(["agent-vm", "--allow-lan", "false"]).is_err());
         assert!(TestCli::try_parse_from(["agent-vm", "--allow-lan=maybe"]).is_err());
         assert_eq!(
             TestCli::try_parse_from(["agent-vm", "--allow-lan", "--allow-lan=false"])
@@ -3505,7 +3468,7 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_tool_appends_trailing_args_verbatim() {
+    fn non_interactive_tool_appends_tool_arguments_verbatim() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("config.toml");
         std::fs::write(

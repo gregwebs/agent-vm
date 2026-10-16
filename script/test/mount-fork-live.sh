@@ -18,16 +18,16 @@ printf 'secret' >"$source/hidden"
 printf 'cache-secret' >"$source/cache/hidden"
 
 run_guest() {
-  AGENT_VM_STATE_DIR="$state" "$AGENT_VM_BIN" shell --no-git \
+  AGENT_VM_STATE_DIR="$state" "$AGENT_VM_BIN" --no-git \
     --image "$AGENT_VM_MOUNT_TEST_IMAGE" "$@"
 }
 
 # Fork seeding, persistence, and the physical exclusion are all observable
 # from the guest.  Source mutation after the first launch must not propagate.
-run_guest --mount "$source:/fork:fork:exclude=hidden:exclude=cache" -- \
+run_guest --mount "$source:/fork:fork:exclude=hidden:exclude=cache" shell \
   bash -ceu '[ "$(cat /fork/visible)" = seed ]; test ! -e /fork/hidden; test ! -e /fork/cache; printf guest >/fork/visible'
 printf 'host-later' >"$source/visible"
-run_guest --mount "$source:/fork:fork:exclude=hidden:exclude=cache" -- \
+run_guest --mount "$source:/fork:fork:exclude=hidden:exclude=cache" shell \
   bash -ceu '[ "$(cat /fork/visible)" = guest ]; test ! -e /fork/hidden; test ! -e /fork/cache'
 [ "$(cat "$source/visible")" = host-later ]
 
@@ -38,10 +38,10 @@ run_guest --mount "$source:/fork:fork:exclude=hidden:exclude=cache" -- \
 external="$root/external"
 printf outside >"$external"
 ln -s "$external" "$source/link"
-run_guest --mount "$source:/links:fork" -- \
+run_guest --mount "$source:/links:fork" shell \
   bash -ceu 'test -L /links/link; test "$(readlink /links/link)" = "'"$external"'"'
-run_guest --mount "$source:/follow:fork:follow-links" -- \
+run_guest --mount "$source:/follow:fork:follow-links" shell \
   bash -ceu 'test ! -L /follow/link; test -f /follow/link; test "$(cat /follow/link)" = outside'
 printf changed >"$external"
-run_guest --mount "$source:/follow:fork:follow-links" -- \
+run_guest --mount "$source:/follow:fork:follow-links" shell \
   bash -ceu 'test "$(cat /follow/link)" = outside'

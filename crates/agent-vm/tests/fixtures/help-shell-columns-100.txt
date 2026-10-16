@@ -1,0 +1,14 @@
+Launch shell in a per-project sandbox; tool arguments are forwarded verbatim
+
+Usage: agent-vm shell [TOOL_ARGS]...
+
+Arguments:
+  [TOOL_ARGS]...  Forwarded to the tool verbatim, including --help and --
+
+Examples:
+  agent-vm <tool>                    launch in the current project
+  agent-vm -p 8080:3000 <tool>        publish guest :3000 to host 127.0.0.1:8080
+  agent-vm <tool> --some-flag         forward args to the tool
+
+Launch options go before the tool (see `agent-vm --help`). Every argument after
+the tool is forwarded to it verbatim, including --help and --.

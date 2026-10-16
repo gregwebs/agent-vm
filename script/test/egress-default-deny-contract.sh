@@ -52,16 +52,17 @@ with tempfile.TemporaryDirectory(prefix="egress-outside-") as tmp:
     for row in cases:
         case, argv = row["case"], row["argv"]
         tool = "pi" if case in ("NR1", "NR2") else "shell" if case == "NR3" else "egresscreds" if case in ("CR1", "CR1c") else "egressprobe"
-        assert row["tool"] == argv[1] == tool
+        tool_index = argv.index(tool)
+        assert row["tool"] == argv[tool_index] == tool
         assert row["kind"] == ("validation-only" if case in ("RJ1", "PXH1") else "guest")
         if case in ("NR1", "NR2", "NR3"):
-            assert argv[argv.index("--") + 1:] == (["echo", "AGENT_VM_328_SHELL_STARTED"] if case == "NR3" else ["--version"])
+            assert argv[tool_index + 1:] == (["echo", "AGENT_VM_328_SHELL_STARTED"] if case == "NR3" else ["--version"])
             assert Path(row["cwd"]).name == "requests"
             assert row["expected_attempts"] == [] and row["controls"] == {}
             assert ("--allow-internet-egress" in argv) == (case == "NR2")
             assert not any(flag.startswith(("--allow-host", "--allow-lan", "--allow-egress")) for flag in argv)
         elif case not in ("RJ1", "PXH1"):
-            assert argv[argv.index("--") + 1] == case
+            assert argv[tool_index + 1] == case
         else:
             assert "--" not in argv
         extras = set(row["declared_extras"])

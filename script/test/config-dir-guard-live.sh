@@ -43,7 +43,7 @@ aux="$root/aux"
 cd "$root/p1"
 
 run_guest() {
-  "$AGENT_VM_BIN" shell --no-git --image "$AGENT_VM_LIVE_TEST_IMAGE" "$@"
+  "$AGENT_VM_BIN" --no-git --image "$AGENT_VM_LIVE_TEST_IMAGE" "$@"
 }
 refuse() {
   local row="$1" message="$2"
@@ -61,27 +61,27 @@ refuse() {
 }
 
 ln "$cfg" "$aux/cfg.toml"
-refuse N1a 'has 2 hard links' --mount "$aux:/aux" -- bash -ceu "$(cat "$fixtures/guest-n1a.sh")" avm-seed "$seed_text"
-refuse N1b 'has 2 hard links' --mount "$aux:/aux" -- bash -ceu "$(cat "$fixtures/guest-n1b.sh")" avm-seed "$seed_text"
+refuse N1a 'has 2 hard links' --mount "$aux:/aux" shell bash -ceu "$(cat "$fixtures/guest-n1a.sh")" avm-seed "$seed_text"
+refuse N1b 'has 2 hard links' --mount "$aux:/aux" shell bash -ceu "$(cat "$fixtures/guest-n1b.sh")" avm-seed "$seed_text"
 rm "$aux/cfg.toml"
 
 # These refusals also precede the first cache acquisition.
 cd "$HOME"
-refuse N5-home 'project directory' -- bash -ceu "$(cat "$fixtures/guest-n5.sh")"
+refuse N5-home 'project directory' shell bash -ceu "$(cat "$fixtures/guest-n5.sh")"
 cd "$root/p1"
-refuse N5-mount 'would let the guest change' --mount "$HOME/.config" -- bash -ceu "$(cat "$fixtures/guest-n5.sh")"
+refuse N5-mount 'would let the guest change' --mount "$HOME/.config" shell bash -ceu "$(cat "$fixtures/guest-n5.sh")"
 
-run_guest --mount "$HOME/.config/agent-vm:/cfg:ro" -- bash -ceu "$(cat "$fixtures/guest-n3.sh")" avm-seed "$seed_text" >"$root/N3.log" 2>&1
+run_guest --mount "$HOME/.config/agent-vm:/cfg:ro" shell bash -ceu "$(cat "$fixtures/guest-n3.sh")" avm-seed "$seed_text" >"$root/N3.log" 2>&1
 grep -F 'N3_GUEST_OK' "$root/N3.log"
 cmp "$cfg" "$root/original"
-run_guest -- bash -ceu 'echo N3_SECOND_BOOT_OK' >"$root/N3-second.log" 2>&1
+run_guest shell bash -ceu 'echo N3_SECOND_BOOT_OK' >"$root/N3-second.log" 2>&1
 grep -F 'N3_SECOND_BOOT_OK' "$root/N3-second.log"
 echo 'PASS N3'
 
-run_guest --mount "$HOME/.config/agent-vm:/cfg:fork" -- bash -ceu "$(cat "$fixtures/guest-n4.sh")" avm-seed "$seed_text" >"$root/N4.log" 2>&1
+run_guest --mount "$HOME/.config/agent-vm:/cfg:fork" shell bash -ceu "$(cat "$fixtures/guest-n4.sh")" avm-seed "$seed_text" >"$root/N4.log" 2>&1
 grep -F 'N4_GUEST_OK' "$root/N4.log"
 cmp "$cfg" "$root/original"
-run_guest -- bash -ceu 'echo N4_SECOND_BOOT_OK' >"$root/N4-second.log" 2>&1
+run_guest shell bash -ceu 'echo N4_SECOND_BOOT_OK' >"$root/N4-second.log" 2>&1
 grep -F 'N4_SECOND_BOOT_OK' "$root/N4-second.log"
 echo 'PASS N4'
 
@@ -114,7 +114,7 @@ mkdir -p "$AGENT_VM_STATE_DIR"
 ln -s "$AGENT_VM_STATE_DIR/$upper/home/.config" "$HOME/.config"
 # The config file is now absent, so N7 has a distinct oracle from refuse().
 cd "$p1"
-if run_guest -- bash -ceu "$(cat "$fixtures/guest-n7.sh")" avm-seed "$seed_text" >"$root/N7.log" 2>&1; then
+if run_guest shell bash -ceu "$(cat "$fixtures/guest-n7.sh")" avm-seed "$seed_text" >"$root/N7.log" 2>&1; then
   echo 'N7 unexpectedly launched' >&2; exit 1
 fi
 grep -F 'does not exist yet' "$root/N7.log"
@@ -124,7 +124,7 @@ fi
 [[ ! -e "$AGENT_VM_STATE_DIR/$hash" ]]
 [[ -z "$(find "$AGENT_VM_STATE_DIR" -mindepth 1 -print -quit)" ]]
 cd "$root/p2"
-run_guest -- bash -ceu 'echo N7_P2_BOOT_OK' >"$root/N7-p2.log" 2>&1
+run_guest shell bash -ceu 'echo N7_P2_BOOT_OK' >"$root/N7-p2.log" 2>&1
 grep -F 'N7_P2_BOOT_OK' "$root/N7-p2.log"
 [[ ! -e "$AGENT_VM_STATE_DIR/$hash" ]]
 [[ ! -e "$HOME/.config/agent-vm/credentials.yaml" ]]

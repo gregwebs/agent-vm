@@ -13,6 +13,10 @@
 //! status 0) and usage errors, so a launch verb cannot report a config error
 //! where clap's help was asked for.
 //!
+//! Launch options precede the tool verb at the top level. A tool verb has one
+//! raw positional and no help flag: every token after it is a **tool argument**.
+//! A misplaced launch option before a built-in is returned as a clap usage error.
+//!
 //! # A broken config is deferred, not fatal
 //!
 //! `config::load` runs before parsing, because the catalog decides which
@@ -53,18 +57,12 @@ pub(crate) open spec fn secret_word() -> Seq<u8> {
     b"secret"@
 }
 
-/// The clap help-traversal keyword, as bytes.
-pub(crate) open spec fn help_word() -> Seq<u8> {
-    b"help"@
-}
-
-/// Whether `argv` addresses the `secret` subtree by either entry path: the verb
-/// (`agent-vm secret …`) or clap's help traversal (`agent-vm help secret …`).
-/// The decision is load-bearing: a `secret`-route parse error can carry a
-/// supplied value, and only this predicate decides whether the fixed scrub runs.
+/// Whether any token after the binary name is `secret`. Launch options can
+/// precede the verb, and help traversal can reach it too. Over-scrubbing is
+/// accepted: only this predicate decides whether a value-bearing parse error
+/// gets the fixed scrub.
 pub(crate) open spec fn route_is_secret(argv: Seq<Seq<u8>>) -> bool {
-    (2 <= argv.len() && argv[1] =~= secret_word())
-        || (3 <= argv.len() && argv[1] =~= help_word() && argv[2] =~= secret_word())
+    exists|i: int| 1 <= i < argv.len() && argv[i] =~= secret_word()
 }
 
 /// Whole-token equality, never a prefix or a substring: a token that merely
@@ -98,31 +96,24 @@ fn token_equals(token: &[u8], word: &[u8]) -> (equal: bool)
 /// non-UTF-8 argument can be mistaken for `secret`.
 fn route_is_secret_tokens(argv: &[&[u8]]) -> (out: bool)
     ensures
-        out == (
-            (2 <= argv@.len() && argv@[1]@ =~= secret_word())
-                || (3 <= argv@.len() && argv@[1]@ =~= help_word() && argv@[2]@ =~= secret_word())
-        ),
+        out == route_is_secret(argv@.map_values(|token: &[u8]| token@)),
 {
-    let len = argv.len();
-    if len < 2 {
-        return false;
+    let mut index: usize = 1;
+    while index < argv.len()
+        invariant
+            1 <= index,
+            forall|j: int|
+                1 <= j < index && j < argv@.len() ==> !(#[trigger] argv@[j]@ =~= secret_word()),
+        decreases argv.len() - index,
+    {
+        if token_equals(argv[index], &b"secret"[..]) {
+            assert(argv@.map_values(|token: &[u8]| token@)[index as int] =~= secret_word());
+            return true;
+        }
+        index += 1;
     }
-    if token_equals(argv[1], &b"secret"[..]) {
-        assert(argv@[1]@ =~= secret_word());
-        return true;
-    }
-    if len < 3 {
-        return false;
-    }
-    let is_help = token_equals(argv[1], &b"help"[..]);
-    let is_secret = token_equals(argv[2], &b"secret"[..]);
-    if is_help {
-        assert(argv@[1]@ =~= help_word());
-    }
-    if is_secret {
-        assert(argv@[2]@ =~= secret_word());
-    }
-    is_help && is_secret
+    assert(!route_is_secret(argv@.map_values(|token: &[u8]| token@)));
+    false
 }
 
 } // verus!
@@ -136,9 +127,11 @@ Getting started:
   cd ~/your-project
   agent-vm <tool>      launch one of the tools listed above
 
-Launch verbs come from your tool configuration and all share the same options;
-see `agent-vm <tool> --help` for mounts, ports, networking and credentials.
-`agent-vm doctor` shows which config files were found and what they resolved to.";
+Launch options go before the tool: agent-vm [launch options] <tool> [tool arguments...]
+Every argument after the tool is forwarded to it verbatim, including --help and --.
+Built-in commands take their own options after the command and no launch options.
+`agent-vm help <tool>` shows examples; `agent-vm doctor` shows which config files were
+found and what they resolved to.";
 
 /// Shown under `agent-vm --help` when the config could not be read, so the
 /// absent verb list is explained rather than silently empty.
@@ -156,6 +149,9 @@ Run `agent-vm doctor` to see the error.";
     after_help = TOP_AFTER_HELP
 )]
 struct Cli {
+    /// Meaningful only before a tool verb; built-ins reject command-line values.
+    #[command(flatten)]
+    launch: run::Args,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -221,7 +217,10 @@ pub(crate) enum Dispatch {
         images: ConfiguredImages,
         /// Verified user authority captured before consuming the report, like images.
         user_network: Option<crate::user_network::UserNetwork>,
+        /// The launch options.
         args: Box<run::Args>,
+        /// Every argv token after the tool verb, verbatim.
+        tool_args: Vec<String>,
     },
 }
 
@@ -291,44 +290,49 @@ where
     // Collected so the `secret` scrub below can look at the verb without
     // consuming the iterator twice; the bound is already `Into<OsString>`.
     let argv: Vec<OsString> = argv.into_iter().map(Into::into).collect();
-    // Two entry paths reach the `secret` subtree: the verb itself
-    // (`agent-vm secret …`) and clap's synthesized help traversal
-    // (`agent-vm help secret …`). The second is not redundant: clap *validates*
-    // the names it is asked to explain and prints the offending token verbatim,
-    // exactly as it does on the direct path, so both must be scrubbed.
     let secret_route = is_secret_route(&argv);
 
-    let matches = match build_command(&catalog).try_get_matches_from(argv) {
+    let mut command = build_command(&catalog);
+    if argv.len() <= 1 {
+        command = command_without_launch_env(&command);
+    }
+    let matches = match command.clone().try_get_matches_from(&argv) {
         Ok(matches) => matches,
-        Err(error) => {
-            // `secret` may have carried a value in any position on either entry
-            // path, and clap prints supplied values on some parse errors, so
-            // replace every non-help, non-version error in that subtree with a
-            // fixed value-free message. A whitelist of *kinds*, not of argv
-            // shapes, so a future clap error variant is scrubbed by default.
-            if secret_route && !clap_outcome_is_help_or_version(error.kind()) {
-                return Err(anyhow!(SECRET_ARGV_ERROR));
+        Err(error) => match (!clap_outcome_is_help_or_version(error.kind()))
+            .then(|| reparse_without_launch_env(&command, &argv, &catalog))
+            .flatten()
+        {
+            Some(matches) => matches,
+            None => {
+                // `secret` may have carried a value in any position on either entry
+                // path, and clap prints supplied values on some parse errors, so
+                // replace every non-help, non-version error in that subtree with a
+                // fixed value-free message. A whitelist of *kinds*, not of argv
+                // shapes, so a future clap error variant is scrubbed by default.
+                if secret_route && !clap_outcome_is_help_or_version(error.kind()) {
+                    return Err(anyhow!(SECRET_ARGV_ERROR));
+                }
+                // On the broken path `allow_external_subcommands` absorbs every
+                // unknown verb, so the only `InvalidSubcommand` clap can raise is
+                // its synthesized `help <x>` validating `x` against the tool-less
+                // command. Report the config error there — never clap's
+                // "unrecognized subcommand" — with a did-you-mean hint when
+                // useful.
+                if error.kind() == clap::error::ErrorKind::InvalidSubcommand
+                    && let Catalog::Broken(config_error) = &catalog
+                {
+                    return Err(config_error_with_hint(
+                        config_error,
+                        invalid_subcommand(&error).as_deref().unwrap_or_default(),
+                    ));
+                }
+                // Help and version are not failures: clap's own `exit()` writes
+                // them to stdout with status 0. Propagating them as
+                // `anyhow::Error` through main's `?` would print help to *stderr*
+                // with status 2.
+                error.exit()
             }
-            // On the broken path `allow_external_subcommands` absorbs every
-            // unknown verb, so the only `InvalidSubcommand` clap can raise is
-            // its synthesized `help <x>` validating `x` against the tool-less
-            // command. Report the config error there — never clap's
-            // "unrecognized subcommand" — with a did-you-mean hint when
-            // useful.
-            if error.kind() == clap::error::ErrorKind::InvalidSubcommand
-                && let Catalog::Broken(config_error) = &catalog
-            {
-                return Err(config_error_with_hint(
-                    config_error,
-                    invalid_subcommand(&error).as_deref().unwrap_or_default(),
-                ));
-            }
-            // Help and version are not failures: clap's own `exit()` writes
-            // them to stdout with status 0. Propagating them as
-            // `anyhow::Error` through main's `?` would print help to *stderr*
-            // with status 2.
-            error.exit()
-        }
+        },
     };
 
     match (matches.subcommand(), catalog) {
@@ -343,13 +347,19 @@ where
         (Some((name, sub)), Catalog::Ready(mut catalog)) => {
             match catalog.take_entry(name) {
                 Some(entry) => {
-                    let mut args = run::Args::from_arg_matches(sub)?;
-                    args.image.reconcile(sub);
+                    let mut args = run::Args::from_arg_matches(&matches)?;
+                    args.image.reconcile(&matches);
                     Ok(Dispatch::Launch {
                         entry: Box::new(entry),
                         images,
                         user_network,
                         args: Box::new(args),
+                        tool_args: tool_args(
+                            &argv,
+                            sub.get_many::<String>(TOOL_ARGS)
+                                .map(|values| values.cloned().collect())
+                                .unwrap_or_default(),
+                        ),
                     })
                 }
                 // Not a tool, so a fixed built-in: the two name sets are disjoint
@@ -359,6 +369,7 @@ where
                 // only a launch verb would have matched) is carried to the built-in
                 // so `setup` can read it.
                 None => {
+                    reject_launch_options(&mut command, &matches, name)?;
                     let mut cmd = Cli::from_arg_matches(&matches)?.cmd;
                     reconcile_image_args(sub, &mut cmd);
                     Ok(Dispatch::Builtin {
@@ -375,6 +386,7 @@ where
             // config error.
             match Cli::from_arg_matches(&matches) {
                 Ok(mut cli) => {
+                    reject_launch_options(&mut command, &matches, name)?;
                     reconcile_image_args(sub, &mut cli.cmd);
                     Ok(Dispatch::Builtin {
                         cmd: cli.cmd,
@@ -411,11 +423,7 @@ fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
     }
 }
 
-/// Whether `argv` addresses the `secret` subtree by either entry path: the
-/// verb (`agent-vm secret …`) or clap's help traversal
-/// (`agent-vm help secret …`). `agent-vm secret help …` is already covered by
-/// the first arm. On both paths clap descends into the subtree's arguments and
-/// can render a supplied value on a parse error, so both get the fixed scrub.
+/// Whether any token after the binary name is `secret`, regardless of position.
 ///
 /// The decision is the verified [`route_is_secret_tokens`]; this function is the
 /// trusted `OsString` → bytes adapter.
@@ -459,7 +467,13 @@ pub(crate) fn build_command(catalog: &Catalog) -> clap::Command {
                 .after_help(format!("{TOP_AFTER_HELP}\n\n{CONFIG_BROKEN_NOTE}"));
         }
     }
+    let short = match catalog {
+        Catalog::Ready(_) => TOP_AFTER_HELP.to_owned(),
+        Catalog::Broken(_) => format!("{TOP_AFTER_HELP}\n\n{CONFIG_BROKEN_NOTE}"),
+    };
     command
+        .after_help(short.clone())
+        .after_long_help(format!("{short}\n\n{}", run::LAUNCH_OPTIONS_LONG_HELP))
 }
 
 /// Format the deferred config error as the primary message, appending clap's
@@ -500,15 +514,123 @@ fn nearest_builtin(verb: &str) -> Option<&'static str> {
         .map(|(builtin, _)| builtin)
 }
 
-/// One launch subcommand, backed by the shared [`run::Args`]. `tool.name()` is
-/// a validated name, so it carries no whitespace or control characters into
-/// rendered help; `tool.command()` is deliberately not rendered (see module
-/// docs).
+/// A raw tool verb: no flags or help flag can claim a tool argument.
+/// Only validated tool names, never guest commands, enter rendered help.
 fn launch_subcommand(tool: &Tool) -> clap::Command {
-    run::Args::augment_args(clap::Command::new(tool.name().to_owned()))
-        .about(format!("Launch {} in a per-project sandbox", tool.name()))
-        .after_help(run::launch_after_help(tool.name()))
-        .after_long_help(run::launch_after_long_help(tool.name()))
+    clap::Command::new(tool.name().to_owned())
+        .about(format!(
+            "Launch {} in a per-project sandbox; tool arguments are forwarded verbatim",
+            tool.name()
+        ))
+        .disable_help_flag(true)
+        .arg(
+            clap::Arg::new(TOOL_ARGS)
+                .value_name("TOOL_ARGS")
+                .help("Forwarded to the tool verbatim, including --help and --")
+                .num_args(0..)
+                .action(clap::ArgAction::Append)
+                .trailing_var_arg(true)
+                .allow_hyphen_values(true),
+        )
+        .after_help(run::LAUNCH_AFTER_HELP)
+}
+
+/// The id of a tool verb's single positional: every **tool argument**.
+const TOOL_ARGS: &str = "tool_args";
+
+/// Every argv token after the tool verb, verbatim.
+///
+/// clap delivers them as `values`, a suffix of `argv` with one exception: it
+/// consumes a `--` that directly follows the verb, even under
+/// `trailing_var_arg`. That is the only token it can drop (the tool
+/// subcommand has no flags, no subcommands and no help flag), and the verb
+/// itself is never `--` (a tool name cannot start with `-`), so a `--` just
+/// before the suffix is the consumed one and is restored.
+fn tool_args(argv: &[OsString], values: Vec<String>) -> Vec<String> {
+    let consumed_escape = argv
+        .len()
+        .checked_sub(values.len() + 1)
+        .is_some_and(|index| argv[index] == *"--");
+    if consumed_escape {
+        std::iter::once("--".to_owned()).chain(values).collect()
+    } else {
+        values
+    }
+}
+
+/// Every **launch option**, read from [`run::Args`] itself so a new launch
+/// option is covered without a list to keep in step.
+fn launch_options() -> Vec<clap::Arg> {
+    run::Args::augment_args(clap::Command::new("launch-options"))
+        .get_arguments()
+        .cloned()
+        .collect()
+}
+
+/// Remove only the top-level launch options' env bindings. Built-in
+/// subcommands keep their own bindings (notably pull/setup's --image).
+fn command_without_launch_env(command: &clap::Command) -> clap::Command {
+    let launch = launch_options();
+    command.clone().mut_args(|arg| {
+        if launch.iter().any(|option| option.get_id() == arg.get_id()) {
+            arg.env(None)
+        } else {
+            arg
+        }
+    })
+}
+
+/// A launch option's environment binding (`AGENT_VM_MEMORY_GIB`, `AGENT_VM_CPUS`,
+/// `AGENT_VM_IMAGE_TAG`) lives on the top-level command, so clap reads and
+/// validates it for every verb. A malformed value must still fail a launch,
+/// but must not take down a built-in that never reads it — `doctor` reports an
+/// unreadable `AGENT_VM_IMAGE_TAG` itself. So retry without those bindings,
+/// and keep the retry only when the verb does not launch.
+fn reparse_without_launch_env(
+    command: &clap::Command,
+    argv: &[OsString],
+    catalog: &Catalog,
+) -> Option<clap::ArgMatches> {
+    let matches = command_without_launch_env(command)
+        .try_get_matches_from(argv)
+        .ok()?;
+    let verb = matches.subcommand_name()?;
+    let launches = matches!(catalog, Catalog::Ready(_)) && !BUILTIN_SUBCOMMANDS.contains(&verb);
+    (!launches).then_some(matches)
+}
+
+/// A built-in takes no launch options. Only a value typed on the command
+/// line counts: an environment variable (`AGENT_VM_IMAGE_TAG`, …) or a default
+/// is not a misplaced option. Names the first one in argv and never a value,
+/// so the message is safe on the `secret` route.
+fn reject_launch_options(
+    command: &mut clap::Command,
+    matches: &clap::ArgMatches,
+    verb: &str,
+) -> Result<()> {
+    let misplaced = launch_options()
+        .into_iter()
+        .filter(|option| {
+            matches.value_source(option.get_id().as_str())
+                == Some(clap::parser::ValueSource::CommandLine)
+        })
+        .min_by_key(|option| matches.index_of(option.get_id().as_str()));
+    match misplaced {
+        None => Ok(()),
+        Some(option) => {
+            let long = option
+                .get_long()
+                .unwrap_or_else(|| option.get_id().as_str());
+            Err(anyhow::Error::new(command.error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "the launch option '--{long}' cannot be used with '{verb}': \
+                     launch options apply only to tool verbs \
+                     (agent-vm [launch options] <tool>)"
+                ),
+            )))
+        }
+    }
 }
 
 /// Levenshtein distance. Small inputs (subcommand names) so the simple
@@ -536,6 +658,267 @@ mod tests {
     use super::*;
     use crate::config::{ConfigPaths, LaunchCatalog, RESERVED_TOOL_NAMES};
     use std::path::Path;
+
+    const MYTOOL: &str = "[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\n";
+    const SHELL_ONLY: &str =
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n";
+
+    fn launch_of(dispatch: Dispatch) -> (Box<run::Args>, Vec<String>) {
+        match dispatch {
+            Dispatch::Launch {
+                args, tool_args, ..
+            } => (args, tool_args),
+            Dispatch::Builtin { .. } => panic!("expected a launch"),
+        }
+    }
+
+    #[test]
+    fn launch_options_before_the_verb_configure_the_launch() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        let (args, tool_args) = launch_of(
+            parse_from(
+                [
+                    "agent-vm", "--mount", "/x", "--memory", "4", "mytool", "--resume",
+                ],
+                Ok(report_from(MYTOOL)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(args.mount, ["/x"]);
+        assert_eq!(args.memory, 4);
+        assert_eq!(tool_args, ["--resume"]);
+        let (args, tool_args) = launch_of(
+            parse_from(
+                [
+                    "agent-vm",
+                    "--memory",
+                    "4",
+                    "--cpus",
+                    "2",
+                    "-p",
+                    "8080:3000",
+                    "--root",
+                    "--no-git",
+                    "mytool",
+                ],
+                Ok(report_from(MYTOOL)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(args.memory, 4);
+        assert!(args.root);
+        assert!(tool_args.is_empty());
+        let (args, tool_args) = launch_of(
+            parse_from(
+                ["agent-vm", "--image", "x", "shell", "my-program"],
+                Ok(report_from(MYTOOL)),
+            )
+            .unwrap(),
+        );
+        assert!(args.image.requested().unwrap().is_some());
+        assert_eq!(tool_args, ["my-program"]);
+    }
+
+    #[test]
+    fn every_token_after_the_verb_is_a_tool_argument() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        for tokens in [
+            vec!["--mount", "/x", "--root", "--image", "y"],
+            vec!["--help"],
+            vec!["-h"],
+            vec!["help"],
+            vec!["-V"],
+            vec!["--", "foo"],
+            vec!["--", "--", "x"],
+            vec!["--"],
+            vec!["a", "--", "b"],
+            vec![],
+        ] {
+            let argv: Vec<_> = ["agent-vm", "mytool"]
+                .into_iter()
+                .chain(tokens.iter().copied())
+                .collect();
+            let (args, tool_args) = launch_of(parse_from(argv, Ok(report_from(MYTOOL))).unwrap());
+            assert_eq!(tool_args, tokens);
+            assert!(args.mount.is_empty());
+            assert!(!args.root);
+            assert!(args.image.requested().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn a_launch_option_before_a_builtin_is_a_usage_error() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        for broken in [false, true] {
+            for (argv, option, verb) in [
+                (
+                    vec!["agent-vm", "--mount", "/x", "doctor"],
+                    "--mount",
+                    "doctor",
+                ),
+                (vec!["agent-vm", "-p", "1:2", "pull"], "--publish", "pull"),
+                (
+                    vec!["agent-vm", "--root", "--mount", "/x", "doctor"],
+                    "--root",
+                    "doctor",
+                ),
+                (
+                    vec!["agent-vm", "--mount", "sk-ant-REAL-VALUE", "secret", "ls"],
+                    "--mount",
+                    "secret",
+                ),
+            ] {
+                let config = if broken {
+                    Err(anyhow::anyhow!("broken"))
+                } else {
+                    Ok(report_from(MYTOOL))
+                };
+                let error = parse_from(argv, config).err().expect("misplaced option");
+                let usage = error.downcast_ref::<clap::Error>().unwrap();
+                assert_eq!(usage.kind(), clap::error::ErrorKind::ArgumentConflict);
+                assert_eq!(usage.exit_code(), 2);
+                let text = usage.to_string();
+                assert!(
+                    text.contains(&format!("'{option}'")) && text.contains(&format!("'{verb}'")),
+                    "{text}"
+                );
+                assert!(!text.contains("sk-ant"));
+            }
+        }
+    }
+
+    #[test]
+    fn environment_values_are_not_misplaced_launch_options() {
+        let mut env = crate::test_env::guard();
+        env.set_var("AGENT_VM_IMAGE_TAG", "env:1");
+        env.set_var("AGENT_VM_MEMORY_GIB", "4");
+        env.remove_var("AGENT_VM_CPUS");
+        for broken in [false, true] {
+            for verb in ["pull", "doctor"] {
+                let config = if broken {
+                    Err(anyhow::anyhow!("broken"))
+                } else {
+                    Ok(report_from(MYTOOL))
+                };
+                assert!(matches!(
+                    parse_from(["agent-vm", verb], config).unwrap(),
+                    Dispatch::Builtin { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn a_malformed_launch_env_value_fails_a_launch_but_not_a_builtin() {
+        let mut env = crate::test_env::guard();
+        env.set_var("AGENT_VM_MEMORY_GIB", "abc");
+        env.remove_var("AGENT_VM_CPUS");
+        env.remove_var("AGENT_VM_IMAGE_TAG");
+        for argv in [vec!["agent-vm", "doctor"], vec!["agent-vm", "secret", "ls"]] {
+            assert!(matches!(
+                parse_from(argv, Ok(report_from(SHELL_ONLY))).unwrap(),
+                Dispatch::Builtin { .. }
+            ));
+        }
+        let catalog = Catalog::Ready(report_from(SHELL_ONLY).into_launch_catalog().unwrap());
+        let command = build_command(&catalog);
+        let argv: Vec<OsString> = ["agent-vm", "shell"].into_iter().map(Into::into).collect();
+        assert_eq!(
+            command
+                .clone()
+                .try_get_matches_from(&argv)
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert!(reparse_without_launch_env(&command, &argv, &catalog).is_none());
+        let error = parse_from(
+            [
+                "agent-vm",
+                "secret",
+                "set",
+                "svc",
+                "--help=sk-ant-REAL-VALUE",
+            ],
+            Ok(report_from(SHELL_ONLY)),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains(SECRET_ARGV_ERROR));
+        assert!(!error.to_string().contains("sk-ant"));
+    }
+
+    #[test]
+    fn a_broken_config_still_reports_its_error_after_launch_options() {
+        let mut env = crate::test_env::guard();
+        env.remove_var("AGENT_VM_IMAGE_TAG");
+        env.remove_var("AGENT_VM_CPUS");
+        for memory in ["4", "abc"] {
+            env.set_var("AGENT_VM_MEMORY_GIB", memory);
+            let error = parse_from(
+                ["agent-vm", "--mount", "x", "anything"],
+                Err(anyhow::anyhow!("config: broken on purpose")),
+            )
+            .err()
+            .unwrap();
+            assert!(error.to_string().contains("config: broken on purpose"));
+            assert!(!error.to_string().contains("unrecognized subcommand"));
+            assert!(error.downcast_ref::<clap::Error>().is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_or_spaced_flags_before_the_verb_are_usage_errors() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        let command = build_command(&Catalog::Ready(
+            report_from(SHELL_ONLY).into_launch_catalog().unwrap(),
+        ));
+        for argv in [
+            vec!["agent-vm", "--bogus", "shell"],
+            vec!["agent-vm", "--allow-lan", "false", "shell"],
+        ] {
+            assert_eq!(
+                command
+                    .clone()
+                    .try_get_matches_from(argv)
+                    .unwrap_err()
+                    .exit_code(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn is_secret_route_finds_secret_anywhere_after_the_binary() {
+        for (argv, expected) in [
+            (vec!["agent-vm", "secret", "ls"], true),
+            (vec!["agent-vm", "--root", "secret", "ls"], true),
+            (vec!["agent-vm", "help", "secret"], true),
+            (
+                vec!["agent-vm", "--memory", "4", "help", "secret", "set"],
+                true,
+            ),
+            (vec!["agent-vm"], false),
+            (vec!["secret"], false),
+            (vec!["agent-vm", "secretx"], false),
+            (vec!["agent-vm", "shell"], false),
+        ] {
+            let argv: Vec<OsString> = argv.into_iter().map(Into::into).collect();
+            assert_eq!(is_secret_route(&argv), expected, "{argv:?}");
+        }
+    }
 
     /// A `ConfigReport` loaded from `body` in a throwaway project file. `load`
     /// reads the file eagerly, so the temp dir is gone by the time this
@@ -575,6 +958,10 @@ mod tests {
 
     #[test]
     fn default_catalog_registers_builtins_then_tools_in_order() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let catalog = default_catalog();
         let mut command = build_command(&Catalog::Ready(catalog));
         // `build()` runs clap's `_check_help_and_version`, which is what
@@ -604,6 +991,10 @@ mod tests {
 
     #[test]
     fn every_builtin_subcommand_is_reserved_from_tool_names() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         // Set equality, not just built-in ⊆ reserved: a reserved name with no
         // built-in would silently forbid a tool name for no reason, which is
         // the other half of the drift this test exists to catch.
@@ -618,6 +1009,10 @@ mod tests {
 
     #[test]
     fn a_claude_only_catalog_registers_only_claude_and_shell() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let report = report_from(
             "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n",
         );
@@ -635,6 +1030,10 @@ mod tests {
 
     #[test]
     fn parse_from_carries_the_image_tiers_without_the_catalog() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         // A project `image` and a tool declaration: the dispatch must carry both
         // the tool entry and the readable image tiers (§5.3).
         let dir = tempfile::tempdir().unwrap();
@@ -779,7 +1178,7 @@ mod tests {
 
         // The launch arm with a typed flag beats the env.
         let dispatch = parse_from(
-            ["agent-vm", "shell", "--image", "cli:1"],
+            ["agent-vm", "--image", "cli:1", "shell"],
             Ok(report_from("tools = []\n")),
         )
         .expect("shell parses");
@@ -820,19 +1219,22 @@ mod tests {
 
     #[test]
     fn parse_from_dispatches_a_project_tool_and_a_builtin() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let body = "[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\nargs = [\"--fast\"]\n";
 
-        // A launch verb carries the resolved tool and its trailing args.
-        let dispatch = parse_from(
-            ["agent-vm", "mytool", "--", "--resume"],
-            Ok(report_from(body)),
-        )
-        .expect("mytool parses");
+        // A launch verb carries the resolved tool and its tool arguments.
+        let dispatch = parse_from(["agent-vm", "mytool", "--resume"], Ok(report_from(body)))
+            .expect("mytool parses");
         match dispatch {
-            Dispatch::Launch { entry, args, .. } => {
+            Dispatch::Launch {
+                entry, tool_args, ..
+            } => {
                 assert_eq!(entry.tool().name(), "mytool");
                 assert_eq!(entry.tool().command(), "my-agent");
-                assert_eq!(args.agent_args, ["--resume"]);
+                assert_eq!(tool_args, ["--resume"]);
             }
             Dispatch::Builtin { .. } => panic!("mytool should dispatch as a launch"),
         }
@@ -854,6 +1256,10 @@ mod tests {
 
     #[test]
     fn a_dangling_tools_reference_is_a_deferred_config_error() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let body = "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n";
         // A launch verb reports the config error, never clap's
         // unrecognized-subcommand, exactly like a syntactically broken config.
@@ -868,6 +1274,10 @@ mod tests {
 
     #[test]
     fn network_table_rejection_is_a_deferred_catalog_error() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project.toml");
         std::fs::write(&project, "[network]\nallow_lan = true").unwrap();
@@ -906,6 +1316,10 @@ mod tests {
 
     #[test]
     fn parse_from_carries_the_user_network_into_a_launch() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("user.toml");
@@ -938,6 +1352,10 @@ mod tests {
 
     #[test]
     fn a_broken_config_errors_a_launch_but_a_valid_one_errors_a_missing_tool() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         // `claude` under a broken config returns *that* error.
         let result = parse_from(
             ["agent-vm", "claude"],
@@ -969,6 +1387,10 @@ mod tests {
 
     #[test]
     fn a_broken_config_reports_its_error_and_hints_at_a_near_builtin_verb() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         // A misspelled built-in keeps clap's helpfulness, but as a hint after
         // the config error — never as clap's "unrecognized subcommand".
         let result = parse_from(
@@ -1010,6 +1432,10 @@ mod tests {
     /// `InvalidSubcommand` clap raises. It must still report the config error.
     #[test]
     fn help_for_an_unknown_verb_under_a_broken_config_reports_the_config_error() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let result = parse_from(
             ["agent-vm", "help", "claude"],
             Err(anyhow!("config: broken on purpose")),
@@ -1023,6 +1449,10 @@ mod tests {
 
     #[test]
     fn nearest_builtin_detects_typos_and_rejects_real_verbs() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         assert_eq!(nearest_builtin("doctro"), Some("doctor"));
         assert_eq!(nearest_builtin("doctr"), Some("doctor"));
         assert_eq!(nearest_builtin("setp"), Some("setup"));
@@ -1059,13 +1489,37 @@ mod tests {
     }
 
     #[test]
-    fn shell_accepts_network_options_and_keeps_help_stable() {
-        let command = build_command(&Catalog::Ready(default_catalog())).term_width(100);
+    fn launch_options_parse_before_the_verb_and_help_is_stable() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        let catalog = report_from(SHELL_ONLY).into_launch_catalog().unwrap();
+        let command = build_command(&Catalog::Ready(catalog))
+            .term_width(100)
+            .mut_args(|arg| arg.hide_env_values(true));
+        let mut built = command.clone();
+        built.build();
+        assert_eq!(
+            subcommand_names(&built),
+            [
+                "setup",
+                "pull",
+                "upgrade",
+                "msb",
+                "clipboard",
+                "doctor",
+                "secret",
+                "build",
+                "_intercept-hook",
+                "shell",
+                "help"
+            ]
+        );
         command
             .clone()
             .try_get_matches_from([
                 "agent-vm",
-                "shell",
                 "-p",
                 "8080:3000",
                 "--publish",
@@ -1077,47 +1531,36 @@ mod tests {
                 "fd00::1",
                 "--allow-lan",
                 "--allow-host",
-                "--",
+                "shell",
                 "--agent-flag",
             ])
-            .expect("the real shell subcommand accepts all network options");
-
-        let mut shell = command
-            .find_subcommand("shell")
-            .expect("shell subcommand is registered")
-            .clone()
-            .bin_name("agent-vm shell")
-            // These fixtures characterize the CLI contract, not ambient process
-            // configuration. Keep the env-variable labels but omit their values
-            // on this test-only clone so parallel tests never need setenv().
-            .mut_args(|arg| arg.hide_env_values(true));
-
-        let mut short_help = Vec::new();
-        shell
-            .clone()
-            .write_help(&mut short_help)
-            .expect("short shell help renders");
-        let short_actual = normalize_help_whitespace_only_lines(
-            &String::from_utf8(short_help).expect("help is UTF-8"),
-        );
-
-        let mut long_help = Vec::new();
-        shell
-            .write_long_help(&mut long_help)
-            .expect("long shell help renders");
-        let long_actual = normalize_help_whitespace_only_lines(
-            &String::from_utf8(long_help).expect("help is UTF-8"),
-        );
-
+            .expect("every network option parses before the verb");
+        let render = |argv: &[&str]| {
+            let error = command
+                .clone()
+                .try_get_matches_from(argv)
+                .expect_err("help is an Err");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "{argv:?}"
+            );
+            normalize_help_whitespace_only_lines(&error.to_string())
+        };
         assert_help_fixture(
-            "shell-short-help-columns-100.txt",
-            &short_actual,
-            include_str!("../tests/fixtures/shell-short-help-columns-100.txt"),
+            "top-help-columns-100.txt",
+            &render(&["agent-vm", "--help"]),
+            include_str!("../tests/fixtures/top-help-columns-100.txt"),
         );
         assert_help_fixture(
-            "shell-help-columns-100.txt",
-            &long_actual,
-            include_str!("../tests/fixtures/shell-help-columns-100.txt"),
+            "top-short-help-columns-100.txt",
+            &render(&["agent-vm", "-h"]),
+            include_str!("../tests/fixtures/top-short-help-columns-100.txt"),
+        );
+        assert_help_fixture(
+            "help-shell-columns-100.txt",
+            &render(&["agent-vm", "help", "shell"]),
+            include_str!("../tests/fixtures/help-shell-columns-100.txt"),
         );
     }
 
@@ -1149,6 +1592,10 @@ mod tests {
     /// non-name character and require no token to equal a tool name.
     #[test]
     fn the_help_text_names_no_specific_tool() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         fn named_tool(haystack: &str) -> Option<&'static str> {
             let tokens: Vec<&str> = haystack
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
@@ -1158,19 +1605,23 @@ mod tests {
                 .find(|tool| tokens.contains(tool))
         }
 
-        let short = run::launch_after_help("shell");
-        let long = run::launch_after_long_help("shell");
+        let short = run::LAUNCH_AFTER_HELP;
+        let long = run::LAUNCH_OPTIONS_LONG_HELP;
         for (what, haystack) in [
             ("TOP_AFTER_HELP", TOP_AFTER_HELP),
-            ("the short launch footer", short.as_str()),
-            ("the long launch footer", long.as_str()),
             (
-                "shell-help-columns-100.txt",
-                include_str!("../tests/fixtures/shell-help-columns-100.txt"),
+                "help shell",
+                include_str!("../tests/fixtures/help-shell-columns-100.txt"),
+            ),
+            ("the short launch footer", short),
+            ("the long launch footer", long),
+            (
+                "top-help-columns-100.txt",
+                include_str!("../tests/fixtures/top-help-columns-100.txt"),
             ),
             (
-                "shell-short-help-columns-100.txt",
-                include_str!("../tests/fixtures/shell-short-help-columns-100.txt"),
+                "top-short-help-columns-100.txt",
+                include_str!("../tests/fixtures/top-short-help-columns-100.txt"),
             ),
         ] {
             if let Some(tool) = named_tool(haystack) {
@@ -1181,6 +1632,10 @@ mod tests {
 
     #[test]
     fn broken_config_help_lists_builtins_and_points_at_doctor() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let command = build_command(&Catalog::Broken(anyhow!("broken on purpose")));
         let mut help = Vec::new();
         command
@@ -1211,6 +1666,10 @@ mod tests {
     /// consumes no `--image` and no env tier.
     #[test]
     fn build_dispatches_as_a_builtin_without_taking_an_image_selection() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let broken: Result<ConfigReport, anyhow::Error> = Err(anyhow!("config: broken on purpose"));
         for config in [Ok(report_from("tools = []\n")), broken] {
             let dispatch = parse_from(["agent-vm", "build", "--tag", "my-app:dev"], config)
@@ -1242,6 +1701,10 @@ mod tests {
 
     #[test]
     fn build_help_is_available_under_a_ready_and_a_broken_catalog() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         for command in [
             build_command(&Catalog::Ready(default_catalog())),
             build_command(&Catalog::Broken(anyhow!("broken on purpose"))),
@@ -1349,6 +1812,10 @@ mod tests {
 
     #[test]
     fn secret_verbs_dispatch_with_their_service() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let dispatch = parse_from(["agent-vm", "secret", "ls"], Ok(report_from("")))
             .expect("`secret ls` parses");
         assert_eq!(secret_op(&dispatch), "ls");
@@ -1374,6 +1841,10 @@ mod tests {
     /// be exercised there too.
     #[test]
     fn secret_verbs_still_dispatch_on_the_broken_config_path() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         for argv in [
             vec!["agent-vm", "secret", "ls"],
             vec!["agent-vm", "secret", "set", "anthropic"],
@@ -1401,6 +1872,10 @@ mod tests {
     /// assertion vacuous.
     #[test]
     fn clap_errors_in_the_secret_subtree_are_scrubbed() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let needle = "sk-ant-REAL-VALUE";
         let flag = format!("--{needle}");
         let attached = format!("--help={needle}");
@@ -1408,6 +1883,9 @@ mod tests {
             parts.iter().map(|part| (*part).to_owned()).collect()
         };
         let cases = vec![
+            argv(&["agent-vm", "--memory", "4", "secret", &flag]),
+            argv(&["agent-vm", "--memory", "4", "secret", &attached]),
+            argv(&["agent-vm", "--root", "help", "secret", needle]),
             argv(&["agent-vm", "secret", &flag]),
             argv(&["agent-vm", "secret", &attached]),
             argv(&["agent-vm", "secret", "rm", "svc", "extra"]),
@@ -1441,6 +1919,10 @@ mod tests {
     /// code path renders. `secret::run` refuses them (see `secret.rs`'s C3).
     #[test]
     fn swallowed_argument_shapes_confine_the_value_to_the_refusal_fields() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         const SECRET: &str = "sk-ant-REAL-VALUE";
         let cases = vec![
             vec!["agent-vm", "secret", "set", "svc", SECRET],
@@ -1487,6 +1969,10 @@ mod tests {
     /// `secret set --help` and `help secret` still render.
     #[test]
     fn secret_help_is_never_scrubbed() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let command = build_command(&Catalog::Ready(default_catalog()));
         for argv in [
             vec!["agent-vm", "secret", "--help"],
@@ -1510,6 +1996,10 @@ mod tests {
     /// P6's other half — the whitelist is exactly help and version.
     #[test]
     fn the_scrub_whitelist_is_only_help_and_version() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         use clap::error::ErrorKind;
         for kind in [
             ErrorKind::DisplayHelp,
@@ -1532,6 +2022,10 @@ mod tests {
     /// The top-level help still lists `secret` with its one-line description.
     #[test]
     fn the_top_level_help_lists_the_secret_verb() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
         let mut help = Vec::new();
         build_command(&Catalog::Ready(default_catalog()))
             .write_long_help(&mut help)

@@ -516,9 +516,9 @@ tools are present yet report as missing:
 
 ```bash
 # correct — finds claude/codex/opencode
-agent-vm shell --image ghcr.io/gregwebs/agent-vm-standard:v0.1.3 -- bash -c 'claude --version'
+agent-vm --image ghcr.io/gregwebs/agent-vm-standard:v0.1.3 shell bash -c 'claude --version'
 # WRONG — "/etc/profile" resets PATH; `command -v claude` prints nothing
-agent-vm shell --image ghcr.io/gregwebs/agent-vm-standard:v0.1.3 -- bash -lc 'claude --version'
+agent-vm --image ghcr.io/gregwebs/agent-vm-standard:v0.1.3 shell bash -lc 'claude --version'
 ```
 
 `script/test/e2e.sh` always uses `bash -c` for exactly this reason. (A shell

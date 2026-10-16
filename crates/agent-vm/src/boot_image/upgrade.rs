@@ -17,7 +17,7 @@ use super::{
     default_selection,
 };
 
-const TARGET_REASON: &str = "upgrade targets must be OCI image references (tag or digest); use shell --image for a local rootfs launch";
+const TARGET_REASON: &str = "upgrade targets must be OCI image references (tag or digest); launch a local rootfs with agent-vm --image PATH <tool>";
 
 #[derive(clap::Args)]
 pub(crate) struct Args {
@@ -259,7 +259,7 @@ mod tests {
         ] {
             let error = raw.parse::<UpgradeTarget>().err().unwrap();
             assert_eq!(error, TARGET_REASON);
-            assert!(error.contains("shell --image"));
+            assert!(error.contains("agent-vm --image PATH <tool>"));
             if !raw.is_empty() {
                 assert!(!error.contains(raw));
             }

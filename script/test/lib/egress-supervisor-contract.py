@@ -117,16 +117,17 @@ class Contracts(unittest.TestCase):
         expected_keys = {"HOME", "XDG_CONFIG_HOME", "AGENT_VM_STATE_DIR", "PATH", "TERM", "AGENT_VM_SHARE_MSB_CACHE"}
         for case, command in zip(egress.CASES, commands):
             self.assertEqual(command.tool == "egresscreds", case.case in ("CR1", "CR1c"))
-            self.assertEqual(command.argv[1], command.tool)
+            tool_index = command.argv.index(command.tool)
+            self.assertEqual(command.argv[:4], (str(self.binary), "--no-git", "--image", egress.IMAGE))
             self.assertEqual(set(command.env), expected_keys | set(case.extras))
             self.assertEqual(command.kind == "validation-only", case.case in ("RJ1", "PXH1"))
-            self.assertEqual("--" in command.argv, case.guest)
+            self.assertNotIn("--", command.argv)
             if case.case in ("NR1", "NR2", "NR3"):
                 trailing = ("echo", "AGENT_VM_328_SHELL_STARTED") if case.case == "NR3" else ("--version",)
-                self.assertEqual(command.argv[command.argv.index("--")+1:], trailing)
+                self.assertEqual(command.argv[tool_index + 1:], trailing)
                 self.assertEqual(Path(command.cwd), self.work / "requests")
             elif case.guest:
-                self.assertEqual(command.argv[command.argv.index("--")+1], case.case)
+                self.assertEqual(command.argv[tool_index + 1], case.case)
             if case.case != "NR3":
                 self.assertNotIn("shell", command.argv)
             self.assertNotIn("-c", command.argv)

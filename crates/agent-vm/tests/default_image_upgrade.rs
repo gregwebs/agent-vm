@@ -490,7 +490,7 @@ fn actual_usage_health_and_config_boundaries_do_not_choose_upgrade_target() {
             })
         );
         if args.contains(&"/path") {
-            assert!(String::from_utf8_lossy(&out.stderr).contains("shell --image"));
+            assert!(String::from_utf8_lossy(&out.stderr).contains("agent-vm --image PATH <tool>"));
         }
         assert!(!h.record().exists());
         assert_eq!(server.count(), 0);
@@ -685,11 +685,11 @@ fn upgrade_preserves_all_overrides_and_default_diagnostic_redaction() {
         if let Some(env) = ambient {
             cmd.env("AGENT_VM_IMAGE_TAG", env);
         }
-        cmd.args(["shell", "--no-git"]);
+        cmd.arg("--no-git");
         if let Some(cli) = cli {
             cmd.args(["--image", cli]);
         }
-        cmd.args(["--", "bash", "-c", "true"]);
+        cmd.args(["shell", "bash", "-c", "true"]);
         let out = bounded(&mut cmd);
         let text = String::from_utf8_lossy(&out.stderr);
         assert!(text.contains(expected), "{text}");
@@ -700,7 +700,7 @@ fn upgrade_preserves_all_overrides_and_default_diagnostic_redaction() {
         h.command()
             .current_dir(&project_dir)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
-            .args(["shell", "--no-git", "--", "bash", "-c", "true"]),
+            .args(["--no-git", "shell", "bash", "-c", "true"]),
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("localhost:1/project:tag"));
     fs::remove_file(&project).unwrap();
@@ -709,7 +709,7 @@ fn upgrade_preserves_all_overrides_and_default_diagnostic_redaction() {
         h.command()
             .current_dir(&project_dir)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
-            .args(["shell", "--no-git", "--", "bash", "-c", "true"]),
+            .args(["--no-git", "shell", "bash", "-c", "true"]),
     );
     let text = String::from_utf8_lossy(&out.stderr);
     assert!(text.contains("the default boot image"));

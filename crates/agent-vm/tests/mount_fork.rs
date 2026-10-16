@@ -121,8 +121,8 @@ fn state_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 /// One isolated `$HOME` + `AGENT_VM_STATE_DIR` + project dir (cwd) + fake
-/// `MSB_PATH`, plus a helper to invoke `agent-vm shell --mount ... --image
-/// <bogus>` with a fully-controlled environment (no inherited vars beyond
+/// `MSB_PATH`, plus a helper to invoke `agent-vm --mount ... --image
+/// <bogus> shell` with a fully-controlled environment (no inherited vars beyond
 /// `PATH`) and `AGENT_VM_DEBUG_CONFIG=1` set.
 struct Harness {
     home: tempfile::TempDir,
@@ -159,7 +159,7 @@ impl Harness {
         self.project.path().canonicalize().unwrap()
     }
 
-    /// Run `agent-vm shell --mount <m> [--mount <m>...] --image <bogus>`
+    /// Run `agent-vm --mount <m> [--mount <m>...] --image <bogus> shell`
     /// with `HOME`/`AGENT_VM_STATE_DIR`/cwd pinned to this harness's
     /// tempdirs, `MSB_PATH` pinned to the fake patched msb, and
     /// `AGENT_VM_DEBUG_CONFIG=1` set so `launch()` dumps the built
@@ -222,8 +222,7 @@ impl Harness {
             .env("AGENT_VM_STATE_DIR", state)
             .env("MSB_PATH", &self.fake_msb)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
-            .current_dir(project)
-            .arg("shell");
+            .current_dir(project);
         if set_home {
             cmd.env("HOME", self.home.path());
         }
@@ -233,7 +232,7 @@ impl Harness {
         for m in mounts {
             cmd.arg("--mount").arg(m);
         }
-        cmd.args(["--image", BOGUS_IMAGE]);
+        cmd.args(["--image", BOGUS_IMAGE]).arg("shell");
         run_with_timeout(cmd, Duration::from_secs(15))
     }
 }

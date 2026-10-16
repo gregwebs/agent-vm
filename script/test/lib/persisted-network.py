@@ -119,7 +119,7 @@ def main():
             env = EGRESS.base_environment(work)
             env.update(AGENT_VM_BIN=binary, AGENT_VM_LIVE_TEST_IMAGE=image)
             snippet = "echo GUEST_EXECUTED; bash ./guest-pn4-write.sh" if guest == "write" else "echo GUEST_EXECUTED; bash ./guest-pn-probe.sh 18090 marker"
-            argv = (binary, "shell", "--no-git", "--image", image, *flags, "--", "bash", "-c", snippet)
+            argv = (binary, "--no-git", "--image", image, *flags, "shell", "bash", "-c", snippet)
             command = EGRESS.Command(row, "native", "shell", "validation-only" if expected == "refuse" else "guest", env, argv, str(project), 300, 10)
             owned = EGRESS.OwnedLaunch(work, command, row)
             launches.append(owned)

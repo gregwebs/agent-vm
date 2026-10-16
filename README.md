@@ -81,7 +81,7 @@ cargo build --release
 agent-vm setup            # pulls the image this config boots from and verifies it boots
 
 cd ~/your-project
-agent-vm claude --allow-internet-egress
+agent-vm --allow-internet-egress claude
 ```
 
 Full flag, subcommand, networking, and troubleshooting reference:
@@ -91,7 +91,7 @@ Build and select your own finished image; launches never run Docker:
 
 ```sh
 agent-vm build --tag my-image:dev --builder native-oci .
-agent-vm shell --image my-image:dev -- my-program
+agent-vm --image my-image:dev shell my-program
 ```
 
 See [Explicit builds and archive import](USAGE.md#explicit-builds-and-archive-import)

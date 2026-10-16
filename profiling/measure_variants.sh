@@ -13,7 +13,7 @@ ROUNDS=${1:-10}
 
 cd "$PROJ" || exit 1
 swap() { cp "$VAR/libkrunfw-$1.so.5.2.1" "$LIBSO" || exit 1; }
-create() { local mem="$1"; AGENT_VM_PROFILE=1 "$AGENTVM" shell --memory "$mem" true 2>&1 \
+create() { local mem="$1"; AGENT_VM_PROFILE=1 "$AGENTVM" --memory "$mem" shell true 2>&1 \
   | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'create:[[:space:]]+[0-9.]+s' | grep -oE '[0-9.]+'; }
 mstat() { tr ' ' '\n' <<<"$1" | awk 'NF{n++;v=$1;s+=v;ss+=v*v;if(mn==""||v<mn)mn=v;if(v>mx)mx=v} END{if(!n){print "no data";exit} m=s/n;d=ss/n-m*m;if(d<0)d=0;printf "mean=%.3f sd=%.3f min=%.3f max=%.3f n=%d",m,sqrt(d),mn,mx,n}'; }
 
