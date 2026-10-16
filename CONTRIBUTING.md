@@ -9,8 +9,7 @@ the end-user reference.
 - [CODING_STANDARDS.md](CODING_STANDARDS.md) — documentation, bash,
   coding, and security standards for this repo.
 - [AGENTS.md](AGENTS.md) — conventions for coding agents (Claude Code,
-  Codex, etc.) working on this repo: submodule-merge ordering, build
-  output placement, state-dir cleanup, commit-message style.
+  Codex, etc.) working on this repo.
 - [docs/adr/](docs/adr/) — architecture decision records for the
   important technical trade-offs.
 - We use the /verus skill for writing proofs
@@ -80,26 +79,10 @@ A few pure boundary predicates carry machine-checked Verus contracts
 needed for an ordinary build**: `cargo build`, `cargo test` and `cargo clippy` work
 with no Verus on `PATH`, because a `verus!` block erases to ordinary Rust. CI verifies
 the contracts in [`.github/workflows/verus.yml`](.github/workflows/verus.yml), which is
-the single source of truth for the pinned release and its digest — take both from
-there if this section ever looks stale.
+the single source of truth for the pinned release, its digest, and how it is installed.
 
-To run the same check locally, install the pinned release. On Linux:
-
-```bash
-release=0.2026.09.20.aef82ed
-zip="verus-$release-x86-linux.zip"
-curl -fSLO "https://github.com/verus-lang/verus/releases/download/release/$release/$zip"
-echo "7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  $zip" | sha256sum -c -
-unzip -q "$zip"                     # unpack anywhere; creates verus-x86-linux/
-export PATH="$PWD/verus-x86-linux:$PATH"
-```
-
-On macOS the asset is `verus-$release-arm64-macos.zip`, the unpacked directory is
-`verus-arm64-macos/`, and the digest check is `shasum -a 256 -c -`. That asset is a
-different file with a different digest; this repo pins and enforces only the
-`x86-linux` digest, because that is the one CI uses.
-
-Then, from the repository root:
+To run the same check locally, install that release with `script/install-verus.sh`,
+then from the repository root:
 
 ```bash
 CARGO_TARGET_DIR=target/verus cargo verus verify -p agent-vm
@@ -232,16 +215,44 @@ the checkout is not itself under one of those prefixes — a checkout at
 the check runs on the canonicalized path, which is off-prefix, so it passes
 there.
 
+### Smoke boot (start here)
+
+The cheapest boot check: one command, minutes, no Docker, no release assets and no
+dedicated host. Run it before concluding anything about the host. It does not
+substitute for `e2e.sh` below.
+
+```sh
+export AGENT_VM_STATE_DIR=/tmp/avm-smoke/state   # private MSB_HOME (ADR-0004)
+export HOME=/tmp/avm-smoke/home                  # private config + credentials
+export MSB_PATH="$PWD/vendor/microsandbox/build/msb"   # the msb this build pins
+cargo build --release -p agent-vm
+./target/release/agent-vm setup                  # pulls the pinned image, then boots a
+                                                 # verification sandbox
+```
+
+`MSB_PATH` is the part that matters. The `msb` on `PATH` is often a different
+installation — Homebrew, a packaged release, another checkout — and agent-vm
+requires the exact build it was vendored against. A command that failed against
+the wrong `msb` is evidence about that binary, not about the host.
+
+Two failures that look environmental and are not:
+
+* `... reports version "X", but this agent-vm build vendors official Microsandbox Y`
+  — wrong `msb`. Point `MSB_PATH` at `vendor/microsandbox/build/msb`.
+* `database schema is newer than this msb binary` — a newer agent-vm already
+  forward-migrated this state root, and migrations are one-way. Give each build its
+  own `AGENT_VM_STATE_DIR`, or recover with `agent-vm doctor --reset-msb-db`.
+
+A smoke boot that fails is a **blocked run**: report the exact command and the
+exact error. It is not evidence that VMs cannot boot on this host.
+
 ### End-to-end (VM-boot) tests (optional)
 
 Real microVM tests do not run in CI. `script/test/e2e.sh` is the single manual
-entry point: `released-image` is native amd64/arm64 and Docker-independent;
-`custom-image` remains Apple Silicon-only and needs Docker/buildx, validated
-debug/release bundles and network for its pinned fixtures. `all` runs both.
-Every group uses private HOME/state/cache; no development template is needed.
-Use a dedicated serial native host, no concurrent agent-vm/msb VMs, compatible
-managed runtime policy and no matching GHCR/loopback credentials in the OS
-keyring. Never edit operator policy/keychain to make a test pass.
+entry point; its `--help` lists the groups and every input, so they are not repeated
+here. Use a dedicated serial native host, no concurrent agent-vm/msb VMs, compatible
+managed runtime policy and no matching GHCR/loopback credentials in the OS keyring.
+Never edit operator policy/keychain to make a test pass.
 
 For released-image, first authenticate/download both v0.1.3 archives using the
 [source-pinned image-owner release interfaces](https://github.com/gregwebs/agent-vm-images/blob/main/docs/standard-image-releases.md).
@@ -261,12 +272,11 @@ matching reviewed runtime/firmware and versions, installed with
 `npm install --prefix OWNED_PREFIX --ignore-scripts` (not global links). Linux npm
 installation cannot be demonstrated on macOS.
 
-The released-image gate requires `jq`, `shasum`, and `python3` on `PATH`, and
-`node` for an installed npm dispatcher candidate (the Linux route). `node` is
-resolved from the caller `PATH` before environment isolation — so an nvm or
-`/usr/local` install works — or supplied explicitly in `AGENT_VM_E2E_NODE` as an
-absolute path; the dispatcher is then invoked through that vetted interpreter
-rather than bypassing it for the native binary.
+The released-image gate needs `node` for an installed npm dispatcher candidate (the
+Linux route). It is resolved from the caller `PATH` before environment isolation —
+so an nvm or `/usr/local` install works — or supplied explicitly in
+`AGENT_VM_E2E_NODE` as an absolute path; the dispatcher is then invoked through that
+vetted interpreter rather than bypassing it for the native binary.
 
 ```bash
 AGENT_VM_RELEASE_BIN=/absolute/relocated/bin/agent-vm \
@@ -623,31 +633,22 @@ reasoning about the changes made.
 
 ## Isolate `AGENT_VM_STATE_DIR` when building agent-vm across worktrees
 
-`agent-vm`'s private microsandbox home (`MSB_HOME/db/msb.db`) is a
-single flat directory under `$AGENT_VM_STATE_DIR` (default
-`$HOME/.local/state/agent-vm`), shared by *every* `agent-vm` build you
-run on this host — it is not namespaced by which worktree/branch built
-it (see `docs/adr/0004-single-shared-msb-home.md`). sea-orm migrations
-are one-way, so running a build from a worktree vendoring a newer
-microsandbox schema, then switching to one with an older schema, trips
-a fail-fast guard (`msb_preflight.rs`) that blocks every command until
-you run `agent-vm doctor --reset-msb-db` — which re-pulls images on
-next boot.
+`agent-vm`'s private microsandbox home is a single flat directory under
+`$AGENT_VM_STATE_DIR` (default `$HOME/.local/state/agent-vm`), shared by *every*
+`agent-vm` build on this host — it is not namespaced by worktree or branch. Because
+sea-orm migrations are one-way, switching between worktrees that vendor different
+microsandbox schemas trips a fail-fast guard; the error names the fix, and
+[ADR-0004](docs/adr/0004-single-shared-msb-home.md) has the rationale.
 
-If you're building and running `agent-vm shell`/`run` from more than
-one worktree in the same session (or expect to), set
-`AGENT_VM_STATE_DIR` to a distinct path per worktree first, e.g.
+If you're building and running `agent-vm shell`/`run` from more than one worktree in
+the same session (or expect to), set `AGENT_VM_STATE_DIR` to a distinct path per
+worktree first, e.g.
 `export AGENT_VM_STATE_DIR="$HOME/.local/state/agent-vm-$(basename "$PWD")"`.
-Hitting the guard isn't dangerous (nothing is deleted, the error names
-the fix), just a time cost worth avoiding proactively.
 
-On macOS, keep the resulting `AGENT_VM_STATE_DIR` short. Unix-domain
-sockets have a ~103-108 byte `sun_path` limit depending on platform,
-and microsandbox binds each sandbox's control/agent socket under this
-root — a long worktree or branch name folded into the path above can
-overflow it. The socket-path preflight added by #40 fails closed with
-a clear error if this happens (it never silently truncates the path);
-the fix is simply to pick a shorter override, e.g. `~/.avm`.
+On macOS, keep that path short: microsandbox binds each sandbox's control/agent
+socket under it, and `sun_path` is limited to ~103-108 bytes, so a long worktree or
+branch name folded into the path above can overflow it. The socket-path preflight
+fails closed rather than silently truncating; pick a shorter override, e.g. `~/.avm`.
 
 
 
@@ -690,14 +691,10 @@ until both architectures are verified. No recurring live adapter is wired into
 
 Both `vendor/microsandbox` and `vendor/agent-vm-images` are submodules.
 Image maintenance is reviewed/merged independently before advancing its gitlink;
-installed launchers do not depend on that source checkout. For either submodule,
-merge inside first when both repositories changed. For example with microsandbox:
-
-When a
-worktree changes both the agent-vm code and the vendored microsandbox
-code, merge inside the submodule **before** merging the superproject —
-otherwise the superproject merge will conflict on the gitlink and
-you'll have to redo the submodule merge anyway. Pattern:
+installed launchers do not depend on that source checkout. For either submodule, when a worktree changes both the agent-vm code and the
+vendored code, merge inside the submodule **before** merging the superproject —
+otherwise the superproject merge will conflict on the gitlink and you'll have to
+redo the submodule merge anyway. Pattern:
 
 1. `cd vendor/microsandbox && git merge --no-ff <subm-feature-branch>`
 2. `cd ../.. && git add vendor/microsandbox` (bumps the gitlink)

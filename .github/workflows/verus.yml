@@ -12,8 +12,9 @@ env:
   # (`0.2026.09.16.7325eee`) was a rolling build that upstream withdrew, so a
   # cold cache could not download it at all; tagged releases are retained
   # (the release list reaches back six months). A Verus bump is a deliberate
-  # change: move the release, this digest, the `vstd` pin in
-  # crates/agent-vm/Cargo.toml and the copy in CONTRIBUTING.md together. After
+  # change: move the release, this digest and the `vstd` pin in
+  # crates/agent-vm/Cargo.toml together (`script/install-verus.sh` reads both
+  # values from this file, so there is no third copy to keep in step). After
   # this bump lands, update the mirrored `ARG`s in
   # agent-vm-images `examples/layers/rust-dev/Dockerfile` (bump order and the
   # unchecked-equality policy: agent-vm-images docs/image-source-ownership.md).
@@ -40,10 +41,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libcap-ng-dev libdbus-1-dev shellcheck
 
-      - name: Shell guard for this workflow's script
+      - name: Shell guard for this workflow's scripts
         run: |
-          bash -n script/test/verus-verification.sh
-          shellcheck script/test/verus-verification.sh
+          bash -n script/test/verus-verification.sh script/install-verus.sh
+          shellcheck script/test/verus-verification.sh script/install-verus.sh
 
       # This literal is enforced against rust-toolchain.toml by
       # script/check-rust-toolchain.sh's check_verus_yml, and must also equal

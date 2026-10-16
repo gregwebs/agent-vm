@@ -46,7 +46,7 @@ trap cleanup EXIT
 
 require_cargo_verus() {
     command -v cargo-verus >/dev/null 2>&1 ||
-        fail "cargo-verus is not on PATH; install the pinned Verus release (see CONTRIBUTING.md)"
+        fail "cargo-verus is not on PATH; install the pinned Verus release with script/install-verus.sh"
 }
 
 repo_gate() {
