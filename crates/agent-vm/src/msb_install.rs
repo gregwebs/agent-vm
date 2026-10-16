@@ -1045,15 +1045,12 @@ mod tests {
         assert!(verify_identity(&path, MsbOrigin::Embedded).unwrap_err().to_string().contains("This agent-vm binary embeds a different msb build. Rebuild it with `./script/build/macos.sh --single-binary`."));
     }
 
-    use std::os::unix::fs::PermissionsExt;
-
     fn write_fake_msb(dir: &std::path::Path, version_output: &str) -> PathBuf {
         let path = dir.join("msb");
-        let script = format!("#!/bin/sh\necho '{version_output}'\nexit 0\n");
-        std::fs::write(&path, script).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        crate::test_fixtures::write_executable(
+            &path,
+            &format!("#!/bin/sh\necho '{version_output}'\nexit 0\n"),
+        );
         path
     }
 
