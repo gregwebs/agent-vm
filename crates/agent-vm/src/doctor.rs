@@ -49,7 +49,7 @@ use crate::config::{
 };
 use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::credential_resolver;
-use crate::credential_yaml::AuthorizationSet;
+use crate::credential_yaml::{AuthorizationSet, GuestEnvName, SourceKind};
 use crate::pi_credential_inspection::{PiCredentialReport, inspect_project};
 use crate::secret_store::ServiceName;
 
@@ -493,6 +493,8 @@ struct YamlRow {
     /// uses the authorization *instead of* the host file rather than as a
     /// standalone credential.
     replaces_builtin: bool,
+    source: SourceKind,
+    env_name: GuestEnvName,
 }
 
 /// Which launches request an authorization, and which host providers a launch
@@ -580,9 +582,14 @@ fn gather_launch_view(catalog: Option<&LaunchCatalog>) -> LaunchView {
     view.yaml = selection
         .requested
         .iter()
-        .map(|service| YamlRow {
-            service: service.as_str().to_owned(),
-            replaces_builtin: CredentialProvider::from_config_name(service.as_str()).is_some(),
+        .filter_map(|service| {
+            let credential = authorizations.get(service)?;
+            Some(YamlRow {
+                service: service.as_str().to_owned(),
+                replaces_builtin: CredentialProvider::from_config_name(service.as_str()).is_some(),
+                source: credential.source(),
+                env_name: credential.env_name().clone(),
+            })
         })
         .collect();
     view
@@ -609,18 +616,31 @@ fn describe_launch_view(view: &LaunchView) -> String {
         .max()
         .unwrap_or(0);
     for row in &view.yaml {
-        let what = if row.replaces_builtin {
-            "authorized for this launch (replaces the host built-in)"
-        } else {
-            "authorized for this launch"
+        let mut what = match row.source {
+            SourceKind::Keychain => "authorized for this launch".to_owned(),
+            SourceKind::Environment => format!(
+                "authorized for this launch from the host environment (`{}`)",
+                row.env_name
+            ),
         };
+        if row.replaces_builtin {
+            what.push_str(" (replaces the host built-in)");
+        }
         out.push_str(&format!("{:<width$}  {what}\n", row.service));
     }
-    if !view.yaml.is_empty() {
-        out.push_str(
-            "note: values are not read here; `agent-vm secret ls` reports whether a value is \
-             stored.\n",
-        );
+    if view
+        .yaml
+        .iter()
+        .any(|row| row.source == SourceKind::Keychain)
+    {
+        out.push_str("note: values are not read here; `agent-vm secret ls` reports whether a value is stored.\n");
+    }
+    if view
+        .yaml
+        .iter()
+        .any(|row| row.source == SourceKind::Environment)
+    {
+        out.push_str("note: environment values are read by the launch, not by doctor.\n");
     }
     out.truncate(out.trim_end_matches('\n').len());
     out
@@ -1708,10 +1728,20 @@ credentials:
                 YamlRow {
                     service: "alpha".into(),
                     replaces_builtin: false,
+                    source: SourceKind::Keychain,
+                    env_name: GuestEnvName::parse("ALPHA_KEY").unwrap(),
                 },
                 YamlRow {
                     service: "anthropic".into(),
                     replaces_builtin: true,
+                    source: SourceKind::Keychain,
+                    env_name: GuestEnvName::parse("ANTHROPIC_API_KEY").unwrap(),
+                },
+                YamlRow {
+                    service: "env".into(),
+                    replaces_builtin: false,
+                    source: SourceKind::Environment,
+                    env_name: GuestEnvName::parse("MY_KEY").unwrap(),
                 },
             ],
             ..LaunchView::default()
@@ -1733,6 +1763,16 @@ credentials:
         );
         assert!(
             text.contains("`agent-vm secret ls` reports whether a value is stored"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "env        authorized for this launch from the host environment (`MY_KEY`)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("environment values are read by the launch, not by doctor"),
             "{text}"
         );
     }

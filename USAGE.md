@@ -1215,15 +1215,10 @@ what makes the shipped `claude-bridge` provider work with no in-guest login:
 Claude Code child the bridge spawns reaches Anthropic with your **host**
 credential. Four consequences are worth knowing:
 
-- **A host `ANTHROPIC_API_KEY` wins over all of it.** agent-vm publishes a
-  host-set `ANTHROPIC_API_KEY` into the guest as the **real, unsubstituted**
-  value (`OPENAI_API_KEY` likewise); Claude Code prefers the environment
-  variable over `~/.claude/.credentials.json`, so it bypasses the placeholder
-  proxy entirely and, if the key is unusable, every bridge turn fails with an
-  Anthropic auth error. `unset ANTHROPIC_API_KEY` before starting `pi`. This is a
-  pre-existing defect that also affects `agent-vm claude` and `agent-vm shell`
-  ([#165](https://github.com/gregwebs/agent-vm/issues/165)); `agent-vm pi` does
-  not introduce it, it adds a third verb it bites.
+- **Host API keys are not forwarded.** agent-vm does not publish host
+  `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` into the guest (#163). To use an exported
+  key, authorize it with `source: env` (see
+  [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection)).
 - **An in-guest `claude login` cannot complete once the host has a credential.**
   The launch registers the `POST platform.claude.com/v1/oauth/token` intercept
   route, and the hook answers token *refresh* grants only: an authorization-code
@@ -1306,9 +1301,10 @@ agent-vm secret rm anthropic
   injection into a request, is separate host configuration. See the
   [credential shielding specification](docs/specs/credential-shielding.md) and
   [ADR-0025](docs/adr/0025-yaml-credential-shielding.md).
-- **No fallback, ever.** If the platform credential store is unavailable, the
-  operation fails with a classified message. agent-vm never writes a value to a
-  plaintext file, and never degrades to an environment variable.
+- **No secret-store fallback, ever.** If the platform credential store is
+  unavailable, the operation fails with a classified message. agent-vm never writes a value to a
+  plaintext file, and never degrades to an environment variable. An environment
+  source exists only when an authorization explicitly selects it.
 
 agent-vm keeps a **names-only** record of what it has stored at
 `~/.config/agent-vm/secret-inventory.json` (mode 0600), beside a
@@ -1343,7 +1339,58 @@ credentials:
           scheme: bearer                   # shorthand for authorization + "Bearer %s"
 ```
 
-Then have a tool request it, in a user or project `config.toml`:
+#### Reading the value from a host environment variable (`source: env`)
+
+Prefer keychain storage. For workflows that need an exported key, authorize the
+host variable explicitly in `~/.config/agent-vm/credentials.yaml`:
+
+```yaml
+credentials:
+  - service: openai
+    source: env
+    apiKey:
+      name: OPENAI_API_KEY
+      sentinelEnv: true
+      inject: [{domain: api.openai.com, scheme: bearer}]
+```
+
+The host and guest variable names match. For a launch, a requested, authorized
+env source's value is captured once before any child of that launch is spawned
+and removed from agent-vm's environment, so the launch's `msb`, `git` and `gh`
+children do not inherit it. Verbs that select no credentials — `agent-vm msb
+<verb>` and `agent-vm setup` — do not remove it, so this is a per-launch
+guarantee, not a scrub of every process. The parent shell
+keeps its variable. Set-but-empty means unset; rotation takes effect on the next
+launch. There is no keychain fallback. Names agent-vm reads as its own
+configuration (`AGENT_VM_*`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`) are refused
+because removing them would change launcher configuration. Same-uid inspection
+of the launcher, including Linux `/proc/<pid>/environ`'s initial environment
+block, is out of scope ([ADR-0025](docs/adr/0025-yaml-credential-shielding.md)).
+
+**Migration since 0.3.9:** an exported `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` is no
+longer copied into the guest. To use them through shielding:
+
+```yaml
+credentials:
+  - service: anthropic
+    source: env
+    apiKey:
+      name: ANTHROPIC_API_KEY
+      sentinelEnv: true
+      inject: [{domain: api.anthropic.com, header: x-api-key, format: "%s"}]
+  - service: openai
+    source: env
+    apiKey:
+      name: OPENAI_API_KEY
+      sentinelEnv: true
+      inject: [{domain: api.openai.com, scheme: bearer}]
+```
+
+A same-named entry replaces the built-in's credential handling; see the
+replacement table below. Egress must still allow the origin.
+
+For the keychain example above, request `my-service` in a user or project
+`config.toml` (an env source is requested the same way, by service name):
 
 ```toml
 [[tools]]
@@ -1378,9 +1425,8 @@ What to expect:
   launch that requests a credential, with a message naming the file but never
   its contents. A launch that requests nothing is unaffected.
 - **Names owned by an authorization win.** If `apiKey.name` is
-  `OPENAI_API_KEY`, agent-vm stops forwarding the host's `OPENAI_API_KEY` for
-  that launch, suppresses any provider-forwarded variable of the same name, and
-  refuses a tool-declared `env` key of the same name. Names agent-vm itself must
+  `OPENAI_API_KEY`, agent-vm suppresses any provider-forwarded variable of the
+  same name and refuses a tool-declared `env` key of the same name. Names agent-vm itself must
   publish (`IS_SANDBOX`, `LANG`, `PATH`, `HOME`/`USER`/`LOGNAME`, the `MSB_`
   namespace) cannot be authorized as `apiKey.name` at all. A `sentinelEnv: false`
   variable the boot image defines is refused, and unreadable image metadata
@@ -1420,18 +1466,11 @@ What to expect:
   directory) is left in place — deleting it would be new destructive behaviour
   on data a concurrent launch may hold. The **guest-visible** placeholder *is*
   cleared; the real host copy is not. Remove the state directory to clear it.
-- **A renamed authorization does not shield the built-in's variable.**
-  Ownership is by variable name: a YAML `anthropic` entry with
-  `apiKey.name: MY_KEY` leaves the host's `ANTHROPIC_API_KEY` forwarded into the
-  guest verbatim. agent-vm warns at launch (naming the provider and the still-
-  forwarded variable, never the value) and suggests `apiKey.name:
-  ANTHROPIC_API_KEY` or unsetting it on the host. Removing the raw forwarding
-  outright is [#163](https://github.com/gregwebs/agent-vm/issues/163).
 - **`--allow-missing-credentials` (host-only).** A per-launch flag that warns
   and continues instead of refusing when a requested `credentials = [...]` name
   has no authorization, and when an authorized `required: true` credential's
-  value cannot be read. The guest gets neither the credential nor a fallback, so
-  the in-guest tool may still fail its own sign-in. It cannot bypass a malformed,
+  value cannot be read, or its `source: env` variable is unset or empty. The
+  guest gets neither the credential nor a fallback, so the in-guest tool may still fail its own sign-in. It cannot bypass a malformed,
   unsupported or rejected `credentials.yaml`, an integrity refusal (foreign owner
   or group/other write), a stored value the store rejects, a `sentinelEnv: false`
   name the boot image defines (or unreadable image metadata), a tool-`env` name
@@ -1446,10 +1485,11 @@ What to expect:
   any configured launch` — and names each requested authorization as
   `authorized for this launch`. It reads the authorization file, never the
   credential store, so it neither prompts nor writes; `agent-vm secret ls`
-  reports whether a value is stored. See
+  reports whether a keychain value is stored. Env rows name the host variable;
+  doctor never reads its value or presence. See
   [Checking what agent-vm can see](#checking-what-agent-vm-can-see).
-- **Unsupported, by name, never silently ignored.** `source` (an environment
-  source is #163), `permissions`/`permissions.network`, `oauth`, `basic`,
+- **Unsupported, by name, never silently ignored.** `source` values other than
+  `env`, `apiKey.env`, `permissions`/`permissions.network`, `oauth`, `basic`,
   `username`, request signing, query/body injection, kit/hooks/images/mounts/
   ports/composition, and wildcard, path, cleartext, userinfo, IP-literal or
   non-ASCII destinations are all refused with the reason.

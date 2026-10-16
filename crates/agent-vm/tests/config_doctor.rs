@@ -835,3 +835,31 @@ fn a_malformed_credentials_file_is_reported_in_band() {
     assert!(stdout.contains("==> host agent credentials"), "{stdout}");
     assert!(stdout.contains("==> tool configuration"), "{stdout}");
 }
+
+#[test]
+fn an_env_sourced_authorization_is_labelled_and_never_read() {
+    let h = Harness::new();
+    h.write_user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"my-env-service\"]\n");
+    h.write_credentials("credentials:\n  - service: my-env-service\n    source: env\n    apiKey:\n      name: MY_KEY\n      inject: [{domain: api.example.com, scheme: bearer}]\n");
+    let absent = h.run_doctor();
+    assert_success(&absent);
+    let set = h
+        .base_command()
+        .env("MY_KEY", "sk-CANARY-163-doctor")
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert_success(&set);
+    assert_eq!(set.stdout, absent.stdout);
+    assert_eq!(set.stderr, absent.stderr);
+    let text = stdout_of(&set);
+    assert!(
+        text.contains(
+            "my-env-service  authorized for this launch from the host environment (`MY_KEY`)"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("environment values are read by the launch, not by doctor"));
+    assert!(!text.contains("secret ls"));
+    assert!(!text.contains("sk-CANARY-163-doctor"));
+}

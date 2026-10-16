@@ -1,3 +1,8 @@
+//! # Sources
+//! Omitted `source` selects the keychain item named by `service`; `source: env`
+//! selects the host variable named by `apiKey.name`. Each entry has one source,
+//! without fallback. Pre-child capture belongs to `credential_env`.
+//!
 //! `~/.config/agent-vm/credentials.yaml`: the user's credential
 //! **authorization**, agent-vm #161.
 //!
@@ -99,11 +104,6 @@ pub(crate) const SENTINEL_ENV_VALUE: &str = "proxy-managed";
 /// The messages are constants; the user's text is never interpolated.
 const UNSUPPORTED_ENTRY_FIELDS: &[(&str, &str)] = &[
     (
-        "source",
-        "`source` is not supported in this release; the only source is the agent-vm keychain item \
-         named by `service` (agent-vm#163 adds an environment source)",
-    ),
-    (
         "permissions",
         "`permissions` is not supported; network authorization is expressed by the exact origin \
          of each `inject` entry, and an authorization never opens egress on its own",
@@ -154,13 +154,12 @@ const UNSUPPORTED_API_KEY_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "source",
-        "`apiKey.source` is not supported; the source is the agent-vm keychain item named by the \
-         entry's `service`",
+        "`apiKey.source` is not supported; `source` belongs on the entry beside `service` (`source: env`)",
     ),
     (
         "env",
-        "`apiKey.env` is not supported; the source is the keychain item named by the entry's \
-         `service` (agent-vm#163 adds an environment source)",
+        "`apiKey.env` is not supported; to read the value from a host environment variable set `source: env` \
+         on the entry and name the variable with `apiKey.name`",
     ),
 ];
 
@@ -186,7 +185,7 @@ const UNSUPPORTED_INJECT_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "value",
-        "a literal `value` is not supported; the value comes from the keychain at launch time",
+        "a literal `value` is not supported; the value comes from the entry's selected host source at launch time",
     ),
 ];
 
@@ -238,8 +237,22 @@ impl AuthorizationSet {
     }
 }
 
-/// One authorized credential. Holds no value: the value lives in the keychain
-/// and is read only by an authorized launch's resolver.
+/// Where an authorization obtains its value. Exactly one source, with no fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceKind {
+    Keychain,
+    Environment,
+}
+
+const SOURCE_UNKNOWN: &str = "`source` must be `env` (the host environment variable named by `apiKey.name`), or omitted for the agent-vm keychain item named by `service`";
+const ENV_SOURCE_LAUNCHER_NAME: &str = concat!(
+    "with `source: env`, `apiKey.name` must not name a host variable agent-vm reads as its own ",
+    "configuration (`AGENT_VM_*`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`): a launch removes an ",
+    "environment-sourced credential from its own environment, and agent-vm configures itself from ",
+    "these variables; choose a different `apiKey.name`",
+);
+
+/// One authorization, never a value: its selected host source is read only by a launch.
 #[derive(Debug)]
 pub(crate) struct AuthorizedCredential {
     service: ServiceName,
@@ -250,12 +263,17 @@ pub(crate) struct AuthorizedCredential {
     #[allow(dead_code)]
     description: Option<String>,
     required: bool,
+    source: SourceKind,
     env_name: GuestEnvName,
     sentinel_env: bool,
     inject: Vec<InjectionRule>,
 }
 
 impl AuthorizedCredential {
+    pub(crate) fn source(&self) -> SourceKind {
+        self.source
+    }
+
     /// Whether a failed or unavailable source is a hard error before boot.
     pub(crate) fn required(&self) -> bool {
         self.required
@@ -1111,7 +1129,7 @@ fn convert_entry(
     let index_path = format!("credentials[{index}]");
     let object = expect_mapping(path, &index_path, entry)?;
     let api_key = entry_field(object, "apiKey");
-    let mut known = vec!["service", "description", "required", "apiKey"];
+    let mut known = vec!["service", "description", "required", "source", "apiKey"];
     reject_unknown_fields(
         path,
         &index_path,
@@ -1124,7 +1142,7 @@ fn convert_entry(
         return Err(at(
             path,
             &index_path,
-            "must set `service` (the agent-vm keychain item to authorize)",
+            "must set `service` (the credential authorization's name)",
         ));
     };
     let Some(service_str) = service_raw.as_str() else {
@@ -1157,6 +1175,21 @@ fn convert_entry(
                 path,
                 &format!("{index_path}.required"),
                 "must be `true` or `false` (a quoted string or null is not a boolean)",
+            ));
+        }
+    };
+
+    let source = match object.get("source") {
+        None => SourceKind::Keychain,
+        Some(serde_json::Value::String(text)) if text == "env" => SourceKind::Environment,
+        Some(serde_json::Value::String(_)) => {
+            return Err(at(path, &format!("{index_path}.source"), SOURCE_UNKNOWN));
+        }
+        Some(_) => {
+            return Err(at(
+                path,
+                &format!("{index_path}.source"),
+                "must be a string (the value is not shown)",
             ));
         }
     };
@@ -1195,6 +1228,16 @@ fn convert_entry(
     };
     let env_name = GuestEnvName::parse(name_str)
         .map_err(|reason| at(path, &format!("{api_path}.name"), reason))?;
+
+    if source == SourceKind::Environment
+        && crate::host_paths::is_launcher_config_env(env_name.as_str())
+    {
+        return Err(at(
+            path,
+            &format!("{api_path}.name"),
+            ENV_SOURCE_LAUNCHER_NAME,
+        ));
+    }
 
     let sentinel = strict_bool_field(path, &api_path, api_key, "sentinelEnv")?;
     let proxy = strict_bool_field(path, &api_path, api_key, "proxyManaged")?;
@@ -1247,6 +1290,7 @@ fn convert_entry(
         service,
         description,
         required,
+        source,
         env_name,
         sentinel_env,
         inject,

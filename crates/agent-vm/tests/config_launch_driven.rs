@@ -133,6 +133,7 @@ fn write_fake_msb(dir: &Path) -> PathBuf {
         &format!(
             "#!/bin/sh\n\
              echo \"$*\" >> \"$(dirname \"$0\")/msb-invocations.log\"\n\
+             env >> \"$(dirname \"$0\")/msb-environ.log\"\n\
              if [ \"$1\" = \"__launch-protocol\" ]; then\n\
              \x20 echo '{{\"protocols\":[1,2],\"required_restore_backing\":true,\"header_credentials\":true}}'\n\
              \x20 exit 0\n\
@@ -359,6 +360,10 @@ impl Harness {
     }
 
     /// Whether the fake `msb` was probed for the header-credential capability.
+    fn msb_environ(&self) -> String {
+        std::fs::read_to_string(self.fake_msb.with_file_name("msb-environ.log")).unwrap_or_default()
+    }
+
     fn saw_capability_probe(&self) -> bool {
         self.msb_log()
             .lines()
@@ -1411,16 +1416,16 @@ fn the_override_does_not_bypass_a_malformed_authorization_file() {
     );
 }
 
-/// Row 2: a recognized-but-unsupported field (`source`; #163 is not landed).
+/// Unsupported functionality remains refused under the override.
 #[test]
 fn the_override_does_not_bypass_an_unsupported_field() {
     let harness = Harness::new();
     harness.write_user(ONE_YAML_TOOL);
     write_credentials(
         &harness.home_root,
-        "credentials:\n  - service: my-service\n    source: env\n    apiKey:\n      name: MY_SERVICE_KEY\n      inject: [{domain: api.my-service.example, header: x-api-key, format: \"%s\"}]\n",
+        "credentials:\n  - service: my-service\n    permissions:\n      network: [x]\n    apiKey:\n      name: MY_SERVICE_KEY\n      inject: [{domain: api.my-service.example, header: x-api-key, format: \"%s\"}]\n",
     );
-    assert_the_override_does_not_bypass(&harness, "t", &[], "`source` is not supported");
+    assert_the_override_does_not_bypass(&harness, "t", &[], "`permissions` is not supported");
 }
 
 /// Row 3: a wildcard destination can never be expanded by the override.
@@ -1596,16 +1601,15 @@ fn a_replaced_provider_does_not_inherit_the_built_in_requirement() {
     assert!(rendered.contains(CONFIG_MARKER), "{rendered}");
 }
 
-/// C6 (#162): a replacement that owns a *differently named* variable leaves the
-/// host's raw key forwarded. Warn, and never render the value.
+/// A renamed replacement never publishes the host's raw key (#163).
 #[test]
-fn a_renamed_replacement_warns_that_the_hosts_raw_key_is_still_forwarded() {
+fn a_renamed_replacement_does_not_forward_the_hosts_raw_key() {
     let harness = Harness::new();
     write_credentials(
         &harness.home_root,
         "credentials:\n  - service: anthropic\n    apiKey:\n      name: MY_KEY\n      sentinelEnv: true\n      inject: [{domain: api.anthropic.example, header: x-api-key, format: \"%s\"}]\n",
     );
-    let canary = "sk-host-real-canary-1a2b3c4d5e6f70819203a4b5c6d7e8f9";
+    let canary = "sk-CANARY-163-renamed";
     let out = harness.launch_with_env(
         "claude",
         &[],
@@ -1615,24 +1619,13 @@ fn a_renamed_replacement_warns_that_the_hosts_raw_key_is_still_forwarded() {
         ],
     );
     let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
-    assert!(
-        rendered.contains("the host's `ANTHROPIC_API_KEY` is still forwarded"),
-        "the silent security downgrade must be reported: {rendered}"
-    );
-    // The notice is about a *real* exposure: the host's raw value really is in
-    // the guest env, which is exactly why the warning exists.
+    assert!(!rendered.contains(canary));
+    assert!(!rendered.contains("still forwarded"));
     let config = debug_config_json(&stderr_of(&out));
     assert!(
-        env_pairs(&config)
+        !env_pairs(&config)
             .iter()
-            .any(|(key, value)| *key == "ANTHROPIC_API_KEY" && *value == canary),
-        "the warning must describe the actual environment: {:?}",
-        env_pairs(&config)
-    );
-    // The *authorization's* stored value is never rendered anywhere (ADR-0024).
-    assert!(
-        !rendered.contains("sk-test-replacement"),
-        "the stored value leaked: {rendered}"
+            .any(|(name, _)| *name == "ANTHROPIC_API_KEY")
     );
 }
 
@@ -1659,43 +1652,6 @@ fn a_same_named_replacement_does_not_warn_about_raw_forwarding() {
             .find(|(key, _)| *key == "ANTHROPIC_API_KEY")
             .map(|(_, value)| *value),
         Some("proxy-managed")
-    );
-}
-
-/// **R5/S4 (#162).** `openai` and `opencode-static` both forward the *same*
-/// variable, `OPENAI_API_KEY`. When both are replaced and neither authorization
-/// owns that name, the raw-forwarding notice must fire **once**, naming the
-/// variable once and listing both providers — not twice with advice
-/// (`apiKey.name: OPENAI_API_KEY`) that only one of the two entries could
-/// follow.
-#[test]
-fn a_shared_forwarded_variable_is_warned_about_once() {
-    let harness = Harness::new();
-    write_credentials(
-        &harness.home_root,
-        "credentials:\n  - service: openai\n    apiKey:\n      name: MY_OPENAI_KEY\n      sentinelEnv: true\n      inject: [{domain: api.openai.example, header: x-api-key, format: \"%s\"}]\n  - service: opencode-static\n    apiKey:\n      name: MY_OPENCODE_KEY\n      sentinelEnv: true\n      inject: [{domain: api.opencode.example, header: x-api-key, format: \"%s\"}]\n",
-    );
-    harness.write_project(
-        "[[tools]]\nname = \"dual\"\ncommand = \"/bin/echo\"\ncredentials = [\"openai\", \"opencode-static\"]\n",
-    );
-    let out = harness.launch_with_env("dual", &[], &[("OPENAI_API_KEY", "sk-host-canary")]);
-    let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
-    let notices = rendered.matches("still forwarded").count();
-    assert_eq!(
-        notices, 1,
-        "the shared OPENAI_API_KEY must produce exactly one notice: {rendered}"
-    );
-    let notice = rendered
-        .lines()
-        .find(|line| line.contains("still forwarded"))
-        .expect("a notice");
-    assert!(notice.contains("`openai`"), "{notice}");
-    assert!(notice.contains("`opencode-static`"), "{notice}");
-    assert!(notice.contains("`OPENAI_API_KEY`"), "{notice}");
-    // The canary value is a real host value and must never be rendered.
-    assert!(
-        !rendered.contains("sk-host-canary"),
-        "a host value leaked: {rendered}"
     );
 }
 
@@ -7388,4 +7344,304 @@ fn shipped_default_network_requests_noninterference() {
             "{tool}: authority notices changed"
         );
     }
+}
+
+const IMAGE_METADATA_REFUSAL: &str = "the boot image's environment could not be read, so agent-vm cannot verify that a `sentinelEnv: false` variable is unset in the guest";
+const ENV_UNSET_REASON: &str = "the host environment variable `MY_SERVICE_KEY` selected by `my-service` (`source: env`) was unset or empty when agent-vm started; export it before launching";
+
+fn env_yaml(required: bool, sentinel: bool) -> String {
+    format!(
+        "credentials:\n  - service: my-service\n    source: env\n    required: {required}\n    apiKey:\n      name: MY_SERVICE_KEY\n      sentinelEnv: {sentinel}\n      inject: [{{domain: api.my-service.example, scheme: bearer}}]\n"
+    )
+}
+
+fn env_harness(required: bool, sentinel: bool) -> Harness {
+    let h = Harness::new();
+    h.write_user(ONE_YAML_TOOL);
+    write_credentials(&h.home_root, &env_yaml(required, sentinel));
+    h
+}
+
+fn rendered_output(out: &Output) -> String {
+    format!("{}{}", stdout_of(out), stderr_of(out))
+}
+
+fn assert_no_canary_files(path: &Path, canary: &str) {
+    if !path.exists() {
+        return;
+    }
+    for entry in std::fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            assert_no_canary_files(&entry.path(), canary);
+        } else if entry.file_type().unwrap().is_file() {
+            assert!(
+                !std::fs::read(entry.path())
+                    .unwrap()
+                    .windows(canary.len())
+                    .any(|bytes| bytes == canary.as_bytes()),
+                "canary in durable file"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_env_sourced_credential_is_registered_and_its_value_reaches_no_guest_file_output_or_child() {
+    let h = env_harness(false, true);
+    let canary = "sk-CANARY-163-s1";
+    let out = h.launch_with_env(
+        "t",
+        &[],
+        &[
+            ("MY_SERVICE_KEY", canary),
+            ("PRESENT_CONTROL", "visible-163"),
+        ],
+    );
+    let rendered = rendered_output(&out);
+    assert!(h.saw_capability_probe(), "{rendered}");
+    let config = debug_config_json(&stderr_of(&out));
+    let def = &config["network"]["secrets"]["header_credentials"][0];
+    assert_eq!(def["reference"], "my-service");
+    assert_eq!(def["origin"]["host"], "api.my-service.example");
+    assert_eq!(def["header"], "authorization");
+    assert!(env_pairs(&config).contains(&("MY_SERVICE_KEY", "proxy-managed")));
+    assert!(!rendered.contains(canary));
+    assert_no_canary_files(&h.state_root, canary);
+    let state = state_dir(&stderr_of(&out));
+    assert_no_canary_files(
+        &PathBuf::from(format!("{}.secrets", state.display())),
+        canary,
+    );
+    let child = h.msb_environ();
+    assert!(
+        child
+            .lines()
+            .any(|line| line == "PRESENT_CONTROL=visible-163")
+    );
+    assert!(!child.contains(canary));
+    assert!(
+        !child
+            .lines()
+            .any(|line| line.starts_with("MY_SERVICE_KEY="))
+    );
+}
+
+#[test]
+fn an_env_source_with_sentinel_false_fails_closed_on_unreadable_image_metadata_without_echo() {
+    let h = env_harness(false, false);
+    let canary = "sk-CANARY-163-s2";
+    let out = h.launch_with_env("t", &[], &[("MY_SERVICE_KEY", canary)]);
+    let rendered = rendered_output(&out);
+    assert!(!out.status.success());
+    assert!(rendered.contains(IMAGE_METADATA_REFUSAL), "{rendered}");
+    assert!(!rendered.contains(canary));
+}
+
+fn assert_unset_stage(required: bool, extra: &[&str], envs: &[(&str, &str)]) {
+    let h = env_harness(required, true);
+    let out = h.launch_with_env("t", extra, envs);
+    let rendered = rendered_output(&out);
+    let rescued = !extra.is_empty();
+    assert!(!out.status.success());
+    if !required || rescued {
+        let suffix = if required {
+            "; continuing without it because --allow-missing-credentials was passed"
+        } else {
+            "; continuing without it"
+        };
+        assert!(
+            rendered.contains(&format!("warning: {ENV_UNSET_REASON}{suffix}")),
+            "{rendered}"
+        );
+        assert!(rendered.contains(IMAGE_METADATA_REFUSAL), "{rendered}");
+    } else {
+        assert!(rendered.contains(ENV_UNSET_REASON), "{rendered}");
+        assert!(!rendered.contains(&format!("warning: {ENV_UNSET_REASON}")));
+        assert!(!rendered.contains(IMAGE_METADATA_REFUSAL));
+    }
+    assert!(!rendered.contains(CONFIG_MARKER));
+    assert!(!h.saw_capability_probe());
+    assert!(!rendered.contains("sk-CANARY-163-s3"));
+}
+
+#[test]
+fn an_unset_optional_env_source_warns_and_proceeds_to_the_image_metadata_guard() {
+    assert_unset_stage(
+        false,
+        &[],
+        &[("AGENT_VM_TEST_CREDENTIAL", "my-service=sk-CANARY-163-s3")],
+    );
+}
+#[test]
+fn an_unset_required_env_source_fails_before_the_image_stage() {
+    assert_unset_stage(
+        true,
+        &[],
+        &[("AGENT_VM_TEST_CREDENTIAL", "my-service=sk-CANARY-163-s3")],
+    );
+}
+#[test]
+fn an_unset_required_env_source_with_the_override_warns_and_proceeds_to_the_image_metadata_guard() {
+    assert_unset_stage(
+        true,
+        &["--allow-missing-credentials"],
+        &[("AGENT_VM_TEST_CREDENTIAL", "my-service=sk-CANARY-163-s3")],
+    );
+}
+/// An empty selected variable is a *selected* value: it must be removed from
+/// agent-vm's environment just like a non-empty one, so no child inherits an
+/// `MY_SERVICE_KEY=` binding (set-but-empty differs from unset for a child and
+/// for the guest). The non-empty case is covered by
+/// `an_env_sourced_credential_is_registered_…`; the empty case only reached the
+/// in-process adapter (E2/E4), never an actual child environment, so a change
+/// that moved `remove_var` behind the non-empty branch would pass every
+/// existing test. This drives the real binary and inspects the fake `msb`'s
+/// environment.
+#[test]
+fn an_empty_env_value_is_removed_from_the_child_environment() {
+    let h = env_harness(false, true);
+    let out = h.launch_with_env(
+        "t",
+        &[],
+        &[("MY_SERVICE_KEY", ""), ("PRESENT_CONTROL", "visible-163")],
+    );
+    let child = h.msb_environ();
+    // Positive control: the child env dump was actually captured, so the
+    // absence assertion below cannot pass on an unreadable/empty log.
+    assert!(
+        child
+            .lines()
+            .any(|line| line == "PRESENT_CONTROL=visible-163"),
+        "child environment was not captured: {child:?}"
+    );
+    assert!(
+        !child
+            .lines()
+            .any(|line| line.starts_with("MY_SERVICE_KEY=")),
+        "an empty selected variable was inherited by a child: {child:?}"
+    );
+    // Same documented stage as an unset value: warn, then the image guard.
+    let rendered = rendered_output(&out);
+    assert!(rendered.contains(ENV_UNSET_REASON), "{rendered}");
+}
+
+#[test]
+fn an_empty_env_value_is_unset_but_a_malformed_one_is_refused() {
+    assert_unset_stage(false, &[], &[("MY_SERVICE_KEY", "")]);
+    for extra in [&[][..], &["--allow-missing-credentials"][..]] {
+        let h = env_harness(false, true);
+        let out = h.launch_with_env("t", extra, &[("MY_SERVICE_KEY", " sk-CANARY-163-s4")]);
+        let rendered = rendered_output(&out);
+        assert!(!out.status.success());
+        assert!(rendered.contains("MY_SERVICE_KEY"));
+        assert!(rendered.contains("leading or trailing space"));
+        assert!(!rendered.contains("sk-CANARY-163-s4"));
+        assert!(!rendered.contains(IMAGE_METADATA_REFUSAL));
+        assert!(!rendered.contains(CONFIG_MARKER));
+        assert!(!h.saw_capability_probe());
+    }
+}
+#[test]
+fn an_unset_env_source_does_not_fall_back_to_a_stored_value() {
+    let h = env_harness(false, true);
+    h.write_user(&ONE_YAML_TOOL.replace("[\"my-service\"]", "[\"my-service\", \"other-service\"]"));
+    write_credentials(
+        &h.home_root,
+        &(env_yaml(false, true)
+            + "  - service: other-service\n    apiKey:\n      name: OTHER_SERVICE_KEY\n      inject: [{domain: api.other.example, scheme: bearer}]\n"),
+    );
+    let out = h.launch_with_env(
+        "t",
+        &[],
+        &[(
+            "AGENT_VM_TEST_CREDENTIAL",
+            "my-service=sk-CANARY-163-keychain",
+        )],
+    );
+    let rendered = rendered_output(&out);
+    assert!(
+        rendered.contains(&format!(
+            "warning: {ENV_UNSET_REASON}; continuing without it"
+        )),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("warning: no value is stored in the system keychain for `other-service`"),
+        "{rendered}"
+    );
+    assert!(rendered.contains(IMAGE_METADATA_REFUSAL));
+    assert!(!rendered.contains("sk-CANARY-163-keychain"));
+    assert!(!h.saw_capability_probe());
+}
+#[test]
+fn host_api_key_variables_are_never_forwarded() {
+    let h = Harness::new();
+    let out = h.launch_with_env(
+        "claude",
+        &[],
+        &[
+            ("ANTHROPIC_API_KEY", "sk-CANARY-163-anthropic"),
+            ("OPENAI_API_KEY", "sk-CANARY-163-openai"),
+        ],
+    );
+    let rendered = rendered_output(&out);
+    assert!(!rendered.contains("sk-CANARY-163-"));
+    let config = debug_config_json(&stderr_of(&out));
+    assert!(
+        !env_pairs(&config)
+            .iter()
+            .any(|(name, _)| ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"].contains(name))
+    );
+    assert!(registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"));
+}
+#[test]
+fn an_unrequested_env_authorization_is_inert() {
+    let h = Harness::new();
+    h.write_user(ONE_YAML_TOOL);
+    write_credentials(
+        &h.home_root,
+        &env_yaml(false, true)
+            .replace("my-service", "other")
+            .replace("MY_SERVICE_KEY", "OTHER_KEY"),
+    );
+    let out = h.launch_with_env("t", &[], &[("OTHER_KEY", "visible-163-inert")]);
+    assert!(rendered_output(&out).contains("neither a built-in"));
+    assert!(
+        h.msb_environ()
+            .lines()
+            .any(|line| line == "OTHER_KEY=visible-163-inert")
+    );
+}
+#[test]
+fn a_requested_keychain_authorization_does_not_capture_its_host_variable() {
+    let h = env_harness(false, true);
+    write_credentials(
+        &h.home_root,
+        &env_yaml(false, true).replace("    source: env\n", ""),
+    );
+    let out = h.launch_with_env(
+        "t",
+        &[],
+        &[
+            ("MY_SERVICE_KEY", "visible-163-keychain-name"),
+            ("AGENT_VM_TEST_CREDENTIAL", "my-service=sk-CANARY-163-store"),
+        ],
+    );
+    assert!(h.saw_capability_probe());
+    assert!(
+        h.msb_environ()
+            .lines()
+            .any(|line| line == "MY_SERVICE_KEY=visible-163-keychain-name")
+    );
+    assert!(!rendered_output(&out).contains("sk-CANARY-163-store"));
+}
+#[test]
+fn the_override_does_not_bypass_an_unknown_source() {
+    let h = env_harness(false, true);
+    write_credentials(
+        &h.home_root,
+        &env_yaml(false, true).replace("source: env", "source: keychain"),
+    );
+    assert_the_override_does_not_bypass(&h, "t", &[], "`source` must be `env`");
 }

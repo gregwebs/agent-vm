@@ -1,6 +1,6 @@
 # 0025. YAML credential shielding
 
-Status: Accepted (agent-vm #161; extended by #162).
+Status: Accepted (agent-vm #161; extended by #162 and #163).
 
 ## Context
 
@@ -120,8 +120,7 @@ resolution success:
 
 - `sentinelEnv: true` and resolvable ⇒ the non-secret sentinel
   (`proxy-managed`) is published **last** of every emission point.
-- otherwise ⇒ agent-vm publishes nothing, suppresses raw
-  `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` forwarding *and* any provider-forwarded
+- otherwise ⇒ agent-vm publishes nothing, suppresses any provider-forwarded
   variable (`COPILOT_GITHUB_TOKEN`) for that name, and refuses a tool-declared
   `env` key for it. Names the launcher itself must publish (`IS_SANDBOX`,
   `LANG`, `PATH`, the guest identity, the `MSB_` namespace) are refused as
@@ -159,7 +158,6 @@ handled explicitly:
 | host capture (placeholder file, token file) | suppressed | suppressed | suppressed | suppressed |
 | proxy `FileSecret` + OAuth `Route` | suppressed | suppressed | suppressed | suppressed |
 | required hard bail (`missing_credential_error`) | skipped; YAML `required` governs | n/a | n/a | skipped; YAML `required` governs |
-| raw-forwarded host variable | suppressed only if the authorization owns that exact `apiKey.name` (unchanged #161 rule — see the gap below) | same | same | n/a |
 | guest-HOME links, eager state dirs, `persist` | kept | kept | kept | kept |
 | onboarding bypass files | kept | kept | kept | kept |
 | the OpenCode `model` pin | — | — | **argument conjoined with capture** | — |
@@ -219,15 +217,8 @@ handled explicitly:
   and unlinks their host token files, because those rows are that provider's
   credential handling, sourced from the same host `auth.json` — a large
   consequence of one YAML line, hence documented in USAGE.md as well.
-- **The raw-forwarding gap.** Ownership is by *variable name*. A YAML `anthropic`
-  entry with `apiKey.name: MY_KEY` leaves the host's `ANTHROPIC_API_KEY`
-  raw-forwarded (`run::RAW_FORWARDED_ENV`), so the user's belief that they
-  shielded Anthropic is false. Before #162 that configuration was a hard error,
-  so this is a newly reachable state, and it is **not** silent: the launch emits
-  a notice naming the provider and the still-forwarded variable (never a value).
-  Removing the forwarding outright is #163. The mapping from provider to
-  forwarded variable is `CredentialProvider::raw_forwarded_env()`, pinned against
-  `RAW_FORWARDED_ENV` by a test so the two cannot drift.
+- **The raw-forwarding gap is closed by #163:** forwarding removed;
+  `raw_forwarded_env`/`RAW_FORWARDED_ENV` deleted.
 - **Ordering.** Phase-1 resolution now runs *before* host credential capture, so
   the `replaced` set exists when capture is gated and the `==> host credentials`
   notice reflects the post-replacement state. It does **not** move ahead of the
@@ -260,13 +251,6 @@ It cannot bypass, and both policies refuse identically for:
 - a `sentinelEnv: false` name the boot image defines, or unreadable image
   metadata;
 - a tool-declared `env` key colliding with an owned name;
-- **the raw forwarding the spec's "forward raw values" clause names.** The flag
-  does not *cause* it — the forwarding is #161 behaviour #163 removes, and the
-  C6 notice above fires — but the *combination* is newly reachable: a
-  `required: true` `anthropic` entry with `apiKey.name: MY_KEY` whose value
-  cannot be read, plus the flag, skips the built-in bail (the name is in
-  `replaced`) and launches with the host's raw `ANTHROPIC_API_KEY` still
-  forwarded into the guest;
 - **a built-in provider's own missing-credential bail.** The override's scope is
   the YAML authority. The built-in case degrades to agent-vm's own machinery
   being half-wired — the guest comes up signed out and in-guest `/login` cannot
@@ -284,10 +268,33 @@ it. The race is pre-existing in kind (`claude` and `codex` already race under
 `REFRESH_LOCK_PROJECT`), but #162 makes it reachable from a **single** tool by
 one YAML line, so it is recorded here rather than discovered later.
 
-`source` is still parsed only far enough to be *rejected by name*: `source: env`
-is #163, alongside the general removal of raw API-key forwarding (#162 suppresses
-it only where a YAML authorization owns the name, and warns where a renamed
-authorization leaves it in effect).
+### Environment source (#163)
+
+Omitted `source` selects the keychain; `source: env` selects only the host
+variable named by `apiKey.name`, without fallback. `main` captures selected
+values before `point_at_msb` spawns its identity-check child and before Tokio
+starts workers: this both prevents inheritance and makes `remove_var` safe.
+The authorization file is loaded once; a load error is carried as data and
+reported at the old phase-1 position to preserve error/notice ordering.
+
+`LaunchSource` routes by the capture's selected-service map, derived from that
+same authorization set. A second authorization lookup would read the same fact
+again, not add an independent gate. An env-only launch constructs no keychain.
+Unset and empty values both mean Missing. Only requested, authorized env sources
+are captured: inert authorizations still change nothing and read nothing.
+`AGENT_VM_*` names are refused for env sources because removal would change the
+launcher's own configuration; the same rule covers every other host variable
+agent-vm reads as configuration, today `XDG_STATE_HOME` and `XDG_CACHE_HOME`
+(`host_paths::LAUNCHER_CONFIG_ENV_NAMES`, the one list that credentials parsing
+consults so a new path read cannot silently reopen the gap). Until #353 removes
+`doctor`'s read of those variables, a value claimed as a credential source would
+otherwise be printed as a state or cache path. Keychain guest names retain their
+old rule: the refusal is env-source-only.
+
+Surviving copies additionally include the captured zeroizing bytes for the
+whole launch. Removal cannot unset the parent shell or erase the original
+strings: Linux `/proc/<pid>/environ` can retain the initial environment block.
+Same-uid host inspection remains outside the application-level guarantee.
 
 ### Doctor resolves the launch context (#178)
 
@@ -407,8 +414,8 @@ rebuild-your-`msb` message naming `MSB_PATH`.
   service named only there but absent from `credentials.yaml` still gets the
   ordinary "no authorization" refusal. The value it supplies still goes
   through `SecretValue::try_parse`, so it cannot smuggle a rejected value.
-- A launch whose requested names are all built-in providers constructs no
-  keychain at all, so an unset `$HOME` or a missing Secret Service does not
+- A launch whose requested names are all built-in providers or
+  env-sourced constructs no keychain at all, so an unset `$HOME` or a missing Secret Service does not
   change its behaviour.
 - #162's capture gate carries the machine-checked contract ADR-0018 now requires
   of it: `secrets::capture_decision(provisioned, replaced)` proves

@@ -266,7 +266,6 @@ fn rejects_each_unsupported_field_by_name() {
     // Each case adds one recognized-but-unsupported key to an otherwise valid
     // entry; the refusal must name the constant category, not fall through.
     let cases: &[(&str, &str, &str)] = &[
-        ("source", "    source: env\n", "source"),
         (
             "permissions.network",
             "    permissions:\n      network: [\"api.example.com\"]\n",
@@ -290,6 +289,7 @@ fn rejects_each_unsupported_field_by_name() {
         ("composition", "    composition: {}\n", "compose"),
         ("apiKey.value", "      value: literal\n", "value"),
         ("apiKey.source", "      source: env\n", "apiKey.source"),
+        ("apiKey.env", "      env: HOST_KEY\n", "apiKey.env"),
         ("inject.query", "          query: token\n", "query string"),
         ("inject.cookies", "          cookies: [x]\n", "cookies"),
     ];
@@ -302,6 +302,9 @@ fn rejects_each_unsupported_field_by_name() {
             minimal("alpha").replace("    apiKey:", &format!("{extra}    apiKey:"))
         };
         let error = home.refuses(&body);
+        if matches!(*label, "apiKey.source" | "apiKey.env") {
+            assert!(error.contains("source: env"), "{error}");
+        }
         assert!(
             error.contains(expected),
             "{label}: expected the refusal to name {expected:?}, got: {error}"
@@ -1051,4 +1054,81 @@ fn predicates_agree_with_their_rejection_labels() {
     assert!(!injection_rule_count_within_limit(MAX_INJECTION_RULES + 1));
     assert!(structural_depth_within_limit(MAX_STRUCTURAL_DEPTH));
     assert!(!structural_depth_within_limit(MAX_STRUCTURAL_DEPTH + 1));
+}
+
+#[test]
+fn source_env_selects_the_environment_and_omission_the_keychain() {
+    let home = Home::new();
+    for (extra, expected) in [
+        ("", SourceKind::Keychain),
+        ("    source: env\n", SourceKind::Environment),
+    ] {
+        let set =
+            home.accepts(&minimal("alpha").replace("    apiKey:", &format!("{extra}    apiKey:")));
+        assert_eq!(
+            set.get(&ServiceName::parse("alpha").unwrap())
+                .unwrap()
+                .source(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn an_unknown_or_mistyped_source_is_refused_without_echo() {
+    let home = Home::new();
+    for source in [
+        "keychain",
+        "ENV",
+        "\"\"",
+        "1",
+        "null",
+        "[env]",
+        "sk-CANARY-163-source",
+    ] {
+        let error = home.refuses(
+            &minimal("alpha").replace("    apiKey:", &format!("    source: {source}\n    apiKey:")),
+        );
+        assert!(error.contains(".source"));
+        assert!(!error.contains("sk-CANARY-163-source"));
+    }
+}
+
+#[test]
+fn an_env_source_cannot_name_a_launcher_configuration_variable() {
+    let home = Home::new();
+    // Every one of these is a host variable agent-vm reads as its own
+    // configuration (`AGENT_VM_*` by prefix, the two XDG variables in
+    // `host_paths`), so an env source must not claim it: the launch removes a
+    // captured variable from its own environment, and a configuration read of
+    // the same name would print the credential's value (issue #353 keeps that
+    // second read; this refusal is what makes the accepted set safe).
+    for name in ["AGENT_VM_SOMETHING", "XDG_STATE_HOME", "XDG_CACHE_HOME"] {
+        let body = minimal("alpha").replace("ALPHA_KEY", name);
+        // The rule is env-source-only: the same guest name is still accepted
+        // from the keychain, so no keychain configuration changes meaning.
+        home.accepts(&body);
+        let env_body = body.replace("    apiKey:", "    source: env\n    apiKey:");
+        let error = home.refuses(&env_body);
+        assert!(error.contains("apiKey.name"), "{error}");
+        assert!(
+            error.contains("configuration"),
+            "the refusal names the configuration rule: {error}"
+        );
+        assert!(
+            !error.contains("sk-CANARY"),
+            "the value is never rendered: {error}"
+        );
+    }
+    // Lookalikes are not the launcher's variables, so they stay accepted: the
+    // check is an exact name or the `AGENT_VM_` prefix, never a fuzzy match.
+    for name in [
+        "XDG_STATE_HOMEX",
+        "MY_XDG_STATE_HOME",
+        "AGENT_VMX",
+        "XAGENT_VM_FOO",
+    ] {
+        let body = minimal("alpha").replace("ALPHA_KEY", name);
+        home.accepts(&body.replace("    apiKey:", "    source: env\n    apiKey:"));
+    }
 }

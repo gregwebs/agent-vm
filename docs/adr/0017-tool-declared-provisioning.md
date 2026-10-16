@@ -194,7 +194,7 @@ This is the shape the Decision above was written for, and it needs no new rule:
 One non-DR change is recorded for honesty: the `ANTHROPIC_API_KEY` publication
 this ADR does not touch becomes reachable on a third verb. That pre-existing
 defect is tracked separately as
-[#165](https://github.com/gregwebs/agent-vm/issues/165).
+[#165](https://github.com/gregwebs/agent-vm/issues/165). (Removed by #163.)
 
 ## Alternatives
 

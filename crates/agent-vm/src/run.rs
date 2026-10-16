@@ -1,17 +1,12 @@
 //! `agent-vm <agent> [args...]` — boot a per-project sandbox and attach to
 //! the chosen agent (or a shell).
 //!
-//! Phase 2 only knows about env-var auth (`ANTHROPIC_API_KEY`,
-//! `OPENAI_API_KEY`); host-rooted refresh-able credentials land in
-//! Phase 3/4.
-
 use crate::network_requests::RequestTier;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     env,
     io::IsTerminal as _,
     path::{Path, PathBuf},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -22,9 +17,7 @@ use microsandbox::{Sandbox, sandbox::PullPolicy};
 use crate::boot_image::{self, ImageArgs};
 use crate::config::{self, CatalogEntry, ConfiguredImages, Tool};
 use crate::credential_provider;
-use crate::credential_resolver::{
-    self, CredentialSource, LaunchCredentials, MissingCredentialPolicy,
-};
+use crate::credential_resolver::{CredentialPreflight, MissingCredentialPolicy};
 use crate::image_contract;
 use crate::mount;
 use crate::protected_host_files::CoreHostSource;
@@ -50,16 +43,6 @@ use crate::user;
 ///   exist in the guest image and would silently fall back to C). Also
 ///   pinned in the independent image repo's `images/Dockerfile` for non-agent-vm uses of the image.
 const GUEST_ALWAYS_ENV: &[(&str, &str)] = &[("IS_SANDBOX", "1"), ("LANG", "C.UTF-8")];
-
-/// Host environment variables agent-vm forwards into every guest verbatim. This
-/// is the pre-#161 behaviour: a host-set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`
-/// wins over the proxy placeholder. #161 suppresses the forwarding only for a
-/// name an authorization owns (see `assemble_guest_env`); removing the forwarding
-/// altogether is #163's scope. Listed here so the set is discoverable, and
-/// pinned against `CredentialProvider::raw_forwarded_env()` by a unit test in
-/// `credential_provider` so the two cannot drift (that mapping is what the
-/// #162 renamed-replacement notice reads).
-pub(crate) const RAW_FORWARDED_ENV: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
 
 /// The launcher's baked fallback guest `PATH`. It is an **exec-only**
 /// fallback for when the acquired image's own OCI config declares no `PATH`
@@ -104,47 +87,6 @@ async fn image_config_env(image: &str) -> Option<Vec<String>> {
     }
 }
 
-/// Resolve this launch's credential requests (#161), and keep the source the
-/// phase-2 resolver will use.
-///
-/// Split out of `launch` so the "no request means no dependency on the file"
-/// rule is one place rather than a conditional threaded through the body.
-fn resolve_credentials(
-    entry: &CatalogEntry,
-    policy: MissingCredentialPolicy,
-) -> Result<(LaunchCredentials, Option<Arc<dyn CredentialSource>>)> {
-    if entry.requested_names().is_empty() {
-        return Ok((LaunchCredentials::default(), None));
-    }
-    let authorizations = credential_resolver::load_authorizations()?;
-    // A keychain is constructed only when one of the requested names is
-    // actually authorized. A launch whose names are all built-in providers
-    // therefore touches no keychain and cannot fail on an unusable `$HOME` or a
-    // missing Secret Service, exactly as before #161. It is also unchanged by
-    // #162's precedence: a requested built-in name that is *also* authorized
-    // makes `get` return `Some`, so the keychain is constructed for it.
-    let authorized_any = entry
-        .requested_names()
-        .iter()
-        .any(|name| authorizations.get(name).is_some());
-    let source = if authorized_any {
-        Some(credential_resolver::KeychainCredentialSource::system()?)
-    } else {
-        None
-    };
-    let phase_one: &dyn CredentialSource = match &source {
-        Some(source) => source.as_ref(),
-        None => &credential_resolver::NoKeychainSource,
-    };
-    let launch = credential_resolver::resolve_launch(
-        entry.requested_names(),
-        &authorizations,
-        phase_one,
-        policy,
-    )?;
-    Ok((launch, source))
-}
-
 /// Translate the runtime's closed header-credential refusals into an
 /// actionable message (#161).
 ///
@@ -167,6 +109,7 @@ fn translate_create_error(error: anyhow::Error) -> anyhow::Error {
                  `vendor/microsandbox` and make sure `MSB_PATH` points at it"
                     .to_owned()
             }
+            // Captured env bytes cannot change between phases; this hint is for keychain reads.
             microsandbox::HeaderCredentialError::ResolveFailed { .. } => "a configured credential \
                  could not be read at spawn time - the keychain may have been locked, another \
                  agent-vm process may have held the secret inventory lock, or its item \
@@ -678,6 +621,7 @@ pub(crate) async fn launch(
     entry: &CatalogEntry,
     images: &ConfiguredImages,
     user_network: Option<&crate::user_network::UserNetwork>,
+    credential_preflight: CredentialPreflight,
     args: Args,
 ) -> Result<i32> {
     let tool = entry.tool();
@@ -1011,8 +955,9 @@ pub(crate) async fn launch(
     // `credentials.yaml` ahead of host credential capture and the
     // `==> host credentials` notice, and nothing else - the tooling-layer build
     // and the session/guest-home provisioning already ran earlier.
+    // The file was loaded and env values captured in main before children (#163).
     let (launch_credentials, credential_source) =
-        resolve_credentials(entry, missing_credential_policy)?;
+        credential_preflight.resolve(missing_credential_policy)?;
 
     // `provisioned` is the launch catalog's resolved closure (parameter).
     // The requirement set is the tool's own `credentials`, read by the bail
@@ -1038,8 +983,8 @@ pub(crate) async fn launch(
     };
 
     // The built-ins a same-named authorization replaced. Read once here and
-    // reused by the requirement bail below and the raw-forwarding notice
-    // further down, so `replaced()` has exactly two readers in this file (this
+    // reused by the requirement bail below and CredentialProvisioning
+    // above, so `replaced()` has exactly two readers in this file (this
     // binding and the `CredentialProvisioning` above).
     let replaced = launch_credentials.replaced();
 
@@ -1302,59 +1247,6 @@ pub(crate) async fn launch(
     builder = network_plan.apply_to(builder);
     builder = credential_plan.apply_to(builder)?;
 
-    // Host variables agent-vm forwards verbatim. AC2 suppression happens in
-    // `assemble_guest_env` below — the one ownership-aware assembly — so a name
-    // a YAML authorization owns (including while the credential is withheld)
-    // never falls back to the host's real value. General removal of this
-    // forwarding remains #163's scope.
-    let forwarded: Vec<(&'static str, String)> = RAW_FORWARDED_ENV
-        .iter()
-        .filter_map(|&var| {
-            env::var(var)
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(|value| (var, value))
-        })
-        .collect();
-    // #162: a replacement only suppresses the raw forwarding of the *name it
-    // owns*. A differently-named `apiKey.name` leaves the host's real key
-    // flowing into the guest, which is the opposite of what the user asked for.
-    // Warn rather than fail: failing would refuse a launch that #161 accepted,
-    // and #163 removes the forwarding outright. The `owns_env` conjunct is what
-    // makes the warning exact: `forwarded` is the *raw* candidate list, and only
-    // `assemble_guest_env` (below) drops the owned names, so this fires exactly
-    // when the host value really does reach the guest.
-    //
-    // Grouped by variable, not one notice per provider: `openai` and
-    // `opencode-static` share `OPENAI_API_KEY`, so replacing both would
-    // otherwise emit two notices whose advice (`apiKey.name: OPENAI_API_KEY`)
-    // only one of the two entries could follow. One notice names the variable
-    // once and lists every replaced provider it belongs to.
-    let mut still_forwarded: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
-    for provider in replaced.iter() {
-        if let Some(var) = provider.raw_forwarded_env()
-            && forwarded.iter().any(|(name, _)| *name == var)
-            && !launch_credentials.owns_env(var)
-        {
-            still_forwarded
-                .entry(var)
-                .or_default()
-                .push(provider.config_name());
-        }
-    }
-    for (var, providers) in still_forwarded {
-        let subject = providers
-            .iter()
-            .map(|name| format!("`{name}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let verb = if providers.len() == 1 { "is" } else { "are" };
-        notices.emit(format!(
-            "warning: {subject} {verb} authorized in credentials.yaml, but the host's `{var}` is \
-             still forwarded into the guest because the authorization owns a different variable. Set \
-             `apiKey.name: {var}` to shield it, or unset `{var}` on the host",
-        ))?;
-    }
     // The guest `PATH` is owned by the booted image, and it is deliberately not
     // resolved here (#258). Any pre-create cache read would miss the OCI config
     // on a cold first acquisition and pin the launcher's fallback literal,
@@ -1408,7 +1300,7 @@ pub(crate) async fn launch(
     let provider_env = credential_provider::provider_guest_env(launch_providers);
 
     // Guest env, the one emission point (#161, AC2). Every writer's
-    // contribution — the tool's own `env`, raw forwarding, PATH, the guest
+    // contribution — the tool's own `env`, PATH, the guest
     // identity, the launcher constants and provider variables — is filtered or
     // rejected in `assemble_guest_env`, so no writer can bypass ownership by
     // not consulting it, and an owned name's sentinel is published last of all.
@@ -1424,7 +1316,6 @@ pub(crate) async fn launch(
     let assembled = launch_credentials
         .assemble_guest_env(crate::credential_resolver::GuestEnvSources {
             tool_env: tool.guest_env(),
-            forwarded: &forwarded,
             path: None,
             identity: &identity,
             always: GUEST_ALWAYS_ENV,

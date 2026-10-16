@@ -3249,11 +3249,8 @@ mod tests {
             "IS_SANDBOX",
             "LANG",
             "TERM",
-            // The host-conditional passthrough (`run.rs` publishes these only
-            // when the host has them set), a third class that is neither
-            // position-protected nor rejected — deliberately unguarded,
-            // because a declaration that sets `env` can already set `command`
-            // (ADR-0016).
+            // Ordinary tool-declarable keys: automatic host forwarding was
+            // removed by #163. A declaration can already set `command`.
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
         ] {
