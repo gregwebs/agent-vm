@@ -1035,6 +1035,42 @@ bridge needs it). Set `AGENT_VM_PI_NO_BRIDGE=1` (any non-empty value) to take th
 bridge out of the picture entirely — the recovery hatch if it ever throws, or if
 you installed your own copy.
 
+**The `agent-vm-codex` provider — pending image delivery.** PR B changes the
+launcher, not the image: the pinned v0.1.3 standard image lacks this provider,
+its wrapper activation and the registry-gated host-import warning clause.
+[ADR-0044](docs/adr/0044-pi-reaches-host-codex-through-an-image-owned-provider.md)
+defines PR A's contract for images carrying it: a small agent-vm-owned
+extension, `/opt/agent-vm/pi-extensions/agent-vm-codex.js`, loaded by the same
+wrapper. On such an image, when the project's guest
+`/agent-vm-state/codex/auth.json` holds agent-vm's exact placeholder **and** your host has a `codex login`, it registers
+an `agent-vm-codex` provider, so `/model` offers `agent-vm-codex/<id>` — Pi's own
+`openai-codex` model ids — with no in-guest sign-in. Requests carry the guest
+placeholder, and the proxy substitutes your host subscription token on
+`chatgpt.com`; a refresh stays host-side on `auth.openai.com`. See
+[ADR-0044](docs/adr/0044-pi-reaches-host-codex-through-an-image-owned-provider.md).
+Three things to know:
+
+- **It is a distinct provider, not Pi's own `openai-codex`.** An in-guest
+  `/login openai-codex` therefore writes a different entry and is never
+  shadowed — but see *Credential-free agents* below for why that login cannot
+  complete once the host has a Codex login.
+- **SSE only.** The extension forces Pi's SSE transport for this provider, so
+  the WebSocket session reuse Pi otherwise negotiates under `transport: auto` is
+  not used here.
+- **A failed refresh says so.** If the host cannot refresh its login, the turn
+  fails with a message asking you to run `codex login` on the **host**, then
+  start a new turn. It carries no status, code or reply body, and Pi's session
+  retry does not restart it.
+
+Your **image** has to carry this extension. The shipped v0.1.3 standard image
+predates it, and the image version that ships it is **pending publication** —
+check the image's release notes, or `ls /opt/agent-vm/pi-extensions/` in the
+guest. On an image without it the placeholder is still written and nothing
+reads it, so `agent-vm-codex/*` is simply absent from `/model`. On an image
+carrying A, its warning change uses the same registration gate: the host-import
+sentence appears only when this provider registered. The current pin has no
+such sentence or gate.
+
 **Env.** The wrapper forces `PI_SKIP_VERSION_CHECK=1`, because agent-vm owns the
 binary (a root-owned image layer) and Pi's "newer version" fetch can only ever be
 noise. It forces **no** telemetry policy: `PI_TELEMETRY` is left exactly as the
@@ -1245,14 +1281,17 @@ guest instead, and it persists per project:
   `dsh plugin --profile web add <package>` (pnpm is installed).
 
 "Declares no `credentials`" is not the whole story for `pi`, though: it also
-declares `tools = ["claude"]`, so a `pi` launch **provisions** the Anthropic
-credential **without requiring** it
-([ADR-0017](docs/adr/0017-tool-declared-provisioning.md) alternative 2). That is
-what makes the shipped `claude-bridge` provider work with no in-guest login:
-`agent-vm pi` writes the Anthropic placeholder into the project's
-`~/.claude/.credentials.json` and registers the proxy substitution, so the
-Claude Code child the bridge spawns reaches Anthropic with your **host**
-credential. Four consequences are worth knowing:
+declares `tools = ["claude", "codex"]`, so a `pi` launch **provisions** the
+Anthropic and OpenAI credentials **without requiring** either
+([ADR-0017](docs/adr/0017-tool-declared-provisioning.md) alternative 2). The
+first edge is what makes the shipped `claude-bridge` provider work with no
+in-guest login: `agent-vm pi` writes the Anthropic placeholder into the
+project's `~/.claude/.credentials.json` and registers the proxy substitution, so
+the Claude Code child the bridge spawns reaches Anthropic with your **host**
+credential. The second writes `/agent-vm-state/codex/auth.json`, which the
+`agent-vm-codex` provider carries to `chatgpt.com` on an image carrying PR A
+([ADR-0044](docs/adr/0044-pi-reaches-host-codex-through-an-image-owned-provider.md)).
+Six consequences are worth knowing:
 
 - **Host API keys are not forwarded.** agent-vm does not publish host
   `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` into the guest (#163). To use an exported
@@ -1264,6 +1303,21 @@ credential. Four consequences are worth knowing:
   exchange is rejected and Claude Code reports a bare `OAuth error … status code
   400`. With **no** host credential nothing is registered, so `claude login`
   works — that is exactly the case where you would want it.
+- **An in-guest `pi` `/login openai-codex` cannot complete, and an existing
+  guest `openai-codex` login cannot refresh, once the host has a Codex login.**
+  The same rule, one provider over: the `POST auth.openai.com/oauth/token`
+  intercept route answers placeholder refresh grants only, so an
+  authorization-code exchange (403) and a real refresh token both fail. The
+  mirror of the `claude login` bullet above, with the same shape: with **no**
+  host Codex login, nothing is registered and `openai-codex` works normally.
+  Workarounds: use the host-backed `agent-vm-codex/*` provider (which needs an
+  image carrying that extension), or launch from a host with no Codex login.
+- **A host Codex login overwrites a credential at `/agent-vm-state/codex/auth.json`.**
+  Successful capture replaces tokens stored there, for example by a prior
+  `agent-vm codex`/`shell` launch or an explicit `CODEX_HOME`, with agent-vm's
+  placeholder. Pi inherits neither `CODEX_HOME` nor a guest-HOME `.codex` link;
+  this does not overwrite an arbitrary HOME-relative in-Pi `codex login`.
+  With no host Codex login the file is left byte-for-byte alone.
 - **An image that ships the `pi-claude-bridge` provider must also carry a
   working `claude` executable.** The default boot image ships Pi with the
   image-owned `pi-claude-bridge` extension, whose Claude Code child is the same
@@ -1275,13 +1329,26 @@ credential. Four consequences are worth knowing:
   deliberately uses another provider does not need the bridge, so this does not
   apply to it.
 - **The catalog declaration is separate from the image.** The shipped `pi` tool
-  declares `tools = ["claude"]`, which provisions Anthropic through Claude Code's
-  credential. A custom catalog that copies that declaration must also resolve a
-  `claude` tool (or its `credentials` requirement); otherwise the declaration
-  fails on a **dangling-tool error**, which is a *config* problem, not an image
-  one. Merely having `claude` installed in the image does **not** synthesize the
-  catalog entry or its provisioning edges — drop the reference or declare the
-  credential requirement directly if the catalog deliberately omits `claude`.
+  declares `tools = ["claude", "codex"]`, which provisions Anthropic through
+  Claude Code's credential and OpenAI through Codex's. A custom catalog that
+  copies that declaration must also resolve `claude` and `codex` tools (or their
+  `credentials` requirements); otherwise the declaration fails on a
+  **dangling-tool error**, which is a *config* problem, not an image one. Merely
+  having either installed in the image does **not** synthesize the catalog entry
+  or its provisioning edges — drop the reference or declare the credential
+  requirement directly if the catalog deliberately omits one.
+
+**A launcher release newer than your image.** The `pi` provisioning edge above
+is applied by the **launcher**, so it takes effect on any image, while the
+`agent-vm-codex` provider only exists on an image that carries the extension.
+Until you adopt such an image — retained images stay put until you choose a new
+one ([ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md)) — a `pi` launch
+from a host with a Codex login still installs the `auth.openai.com` intercept
+route and still writes the guest `codex/auth.json` placeholder. No token byte
+reaches the guest, but the two consequences above (blocked in-guest
+`openai-codex`, overwritten guest Codex state) apply **without** offering the
+`agent-vm-codex/*` workaround. The workaround arrives with the image, not with
+the launcher.
 
 ### Storing your own secret values
 

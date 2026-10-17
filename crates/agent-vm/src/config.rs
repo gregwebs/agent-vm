@@ -2381,6 +2381,8 @@ mod tests {
                 "pi",
                 &[
                     "api.anthropic.com",
+                    "auth.openai.com",
+                    "chatgpt.com",
                     "mcp-proxy.anthropic.com",
                     "platform.claude.com",
                 ],
@@ -2504,8 +2506,9 @@ mod tests {
     /// assertion; fails on *any* closure or default bug. `credentials` is the
     /// *requirement* set and is asserted separately, so an implementation that
     /// conflates the two fails here. `pi` is the one shipped verb whose two
-    /// sets differ: it declares `tools = ["claude"]`, so the `pi -> claude`
-    /// edge provisions Anthropic without requiring it.
+    /// sets differ: it declares `tools = ["claude", "codex"]`, so the
+    /// `pi -> claude` and `pi -> codex` edges provision Anthropic and OpenAI
+    /// without requiring either.
     #[test]
     fn default_catalog_provisioning_sets_are_exactly_the_spec_table() {
         use CredentialProvider::*;
@@ -2517,7 +2520,7 @@ mod tests {
         let expected: [(&str, &[CredentialProvider], &[CredentialProvider]); 7] = [
             //  verb        credentials (required)     provisioned
             ("dsh", &[], &[]),
-            ("pi", &[], &[Anthropic]),
+            ("pi", &[], &[Anthropic, OpenAi]),
             ("codex", &[OpenAi], &[OpenAi]),
             (
                 "opencode",
@@ -4047,10 +4050,12 @@ mod tests {
     }
 
     /// **V3.** `provisioned()` is unchanged for every embedded default entry by
-    /// the `launch_closure` refactor. The one deliberate exception is `pi`,
-    /// which gained `tools = ["claude"]` (the image-owned pi-claude-bridge
-    /// extension needs Claude Code's own credential), so it now provisions
-    /// Anthropic while still requiring nothing.
+    /// the `launch_closure` refactor. Two deliberate exceptions are both on
+    /// `pi`: `tools = ["claude"]` (the image-owned pi-claude-bridge extension
+    /// needs Claude Code's own credential) and `tools = ["codex"]` (the
+    /// image-owned agent-vm-codex extension needs the `codex/auth.json`
+    /// placeholder, ADR-0044), so it now provisions Anthropic and OpenAI while
+    /// still requiring nothing.
     #[test]
     fn default_catalog_provisioning_is_unchanged() {
         use CredentialProvider::*;
@@ -4068,7 +4073,7 @@ mod tests {
             observed,
             vec![
                 ("dsh", vec![]),
-                ("pi", vec![Anthropic]),
+                ("pi", vec![Anthropic, OpenAi]),
                 ("codex", vec![OpenAi]),
                 ("opencode", vec![OpenAi, OpencodeStatic]),
                 ("claude", vec![Anthropic]),

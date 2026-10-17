@@ -1264,12 +1264,13 @@ def check_default_request_diagnostics(case: Case, status: int, text: str) -> lis
     scope = "public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply)"
     expected = []
     if case.case == "NR1":
-        expected = [f"==> Tool network requests (built-in defaults): 3 of 3 not covered by this launch's {scope}; requests never grant access and the launch continues",
-                    "==>   unmet: api.anthropic.com", "==>   unmet: mcp-proxy.anthropic.com",
+        expected = [f"==> Tool network requests (built-in defaults): 5 of 5 not covered by this launch's {scope}; requests never grant access and the launch continues",
+                    "==>   unmet: api.anthropic.com", "==>   unmet: auth.openai.com",
+                    "==>   unmet: chatgpt.com", "==>   unmet: mcp-proxy.anthropic.com",
                     "==>   unmet: platform.claude.com",
                     "==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names"]
     elif case.case == "NR2":
-        expected = [f"==> Tool network requests (built-in defaults): all 3 covered by this launch's {scope}; requests never grant access"]
+        expected = [f"==> Tool network requests (built-in defaults): all 5 covered by this launch's {scope}; requests never grant access"]
     # Other launch/credential notes may be indented outside this block.
     observed = [line for line in lines if line.startswith(("==> Tool network requests", "==>   unmet:",
                                                           "==>   to grant:", "==>   … and"))]
@@ -2020,8 +2021,8 @@ def self_test() -> int:
         project = prepare_default_request_project(work)
         assert not (project / ".agent-vm/config.toml").exists()
         deny = "==> Egress policy: all guest egress denied (opt in with --allow-internet-egress, --allow-egress, --allow-lan or --allow-host)\n==> Egress DNS: queries denied (NXDOMAIN when forwarder is available; use IP or hostname allowances)\n"
-        unmet = "==> Tool network requests (built-in defaults): 3 of 3 not covered by this launch's public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply); requests never grant access and the launch continues\n==>   unmet: api.anthropic.com\n==>   unmet: mcp-proxy.anthropic.com\n==>   unmet: platform.claude.com\n==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names\n"
-        covered = "==> Tool network requests (built-in defaults): all 3 covered by this launch's public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply); requests never grant access\n"
+        unmet = "==> Tool network requests (built-in defaults): 5 of 5 not covered by this launch's public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply); requests never grant access and the launch continues\n==>   unmet: api.anthropic.com\n==>   unmet: auth.openai.com\n==>   unmet: chatgpt.com\n==>   unmet: mcp-proxy.anthropic.com\n==>   unmet: platform.claude.com\n==>   to grant: --allow-egress HOST or tcp://HOST:PORT, or --allow-internet-egress; IP/CIDR, --allow-lan and --allow-host grants are not matched to names\n"
+        covered = "==> Tool network requests (built-in defaults): all 5 covered by this launch's public or same-name grants (no lookup; DNS, private-answer and TLS client limits still apply); requests never grant access\n"
         for case, text, trailing in (
             (Case("NR1", tool="pi"), deny + unmet + "0.87.1\n", ("--version",)),
             (Case("NR2", tool="pi", flags=("--allow-internet-egress",)), covered + "0.87.1\n", ("--version",)),
@@ -2036,13 +2037,24 @@ def self_test() -> int:
             assert check_default_request_diagnostics(case, 1, text)
             assert check_default_request_diagnostics(case, 0, text.replace("0.87.1", "").replace("AGENT_VM_328_SHELL_STARTED", ""))
             if case.case != "NR3":
-                for old, new in (("built-in defaults", "project config"), ("3", "2"), ("Tool network requests", "missing report")):
-                    assert check_default_request_diagnostics(case, 0, text.replace(old, new))
+                for old, new in (("built-in defaults", "project config"), ("5", "4"), ("Tool network requests", "missing report")):
+                    mutated = text.replace(old, new)
+                    # A no-op mutation would assert nothing; the count check must
+                    # actually change the text it then rejects.
+                    assert mutated != text, (case.case, old, new)
+                    assert check_default_request_diagnostics(case, 0, mutated)
             if case.case == "NR1":
                 assert check_default_request_diagnostics(case, 0, unmet + deny + "0.87.1\n")
-                assert check_default_request_diagnostics(case, 0, text.replace("==>   unmet: api.anthropic.com\n==>   unmet: mcp-proxy.anthropic.com", "==>   unmet: mcp-proxy.anthropic.com\n==>   unmet: api.anthropic.com"))
+                # Sorted order is the contract; swap the first two *adjacent*
+                # names so the mutation cannot collapse to a no-op.
+                reordered = text.replace("==>   unmet: api.anthropic.com\n==>   unmet: auth.openai.com",
+                                         "==>   unmet: auth.openai.com\n==>   unmet: api.anthropic.com")
+                assert reordered != text, "the reordering mutation must move real lines"
+                assert check_default_request_diagnostics(case, 0, reordered)
                 for old, new in (("platform.claude.com", "api.invalid.example"), ("==>   to grant:", "wrong hint:"), (unmet, ""), (deny, "")):
-                    assert check_default_request_diagnostics(case, 0, text.replace(old, new))
+                    mutated = text.replace(old, new)
+                    assert mutated != text, (case.case, old, new)
+                    assert check_default_request_diagnostics(case, 0, mutated)
             if case.case == "NR3":
                 assert check_default_request_diagnostics(case, 0, text + covered)
         (work / "home/.config/agent-vm").mkdir(parents=True)

@@ -1433,13 +1433,14 @@ mod tests {
         );
 
         // `pi` is the shipped catalog's one verb whose requirement and
-        // provisioning sets differ: `tools = ["claude"]` provisions anthropic
-        // without requiring it, so the row is the visible proof that naming a
-        // tool never inherits its hard bail. Rendered as `credentials=none;
-        // provisions=anthropic` (ADR-0017's `provisions=` column).
+        // provisioning sets differ: `tools = ["claude", "codex"]` provisions
+        // anthropic and openai without requiring either, so the row is the
+        // visible proof that naming a tool never inherits its hard bail.
+        // Rendered as `credentials=none; provisions=anthropic,openai`
+        // (ADR-0017's `provisions=` column).
         assert!(
             text.contains(
-                "pi -> \"pi\"; args=0; credentials=none; provisions=anthropic; persist=0; source=built-in"
+                "pi -> \"pi\"; args=0; credentials=none; provisions=anthropic,openai; persist=0; source=built-in"
             ),
             "{text}"
         );
@@ -1842,7 +1843,7 @@ credentials:
             ("dsh", ""),
             (
                 "pi",
-                "api.anthropic.com,mcp-proxy.anthropic.com,platform.claude.com",
+                "api.anthropic.com,auth.openai.com,chatgpt.com,mcp-proxy.anthropic.com,platform.claude.com",
             ),
             ("codex", "api.openai.com,auth.openai.com,chatgpt.com"),
             (
@@ -1858,7 +1859,7 @@ credentials:
         ];
         let baseline_rows = [
             "dsh -> \"dsh\"; args=1; credentials=none; provisions=none; persist=1; source=built-in",
-            "pi -> \"pi\"; args=0; credentials=none; provisions=anthropic; persist=0; source=built-in",
+            "pi -> \"pi\"; args=0; credentials=none; provisions=anthropic,openai; persist=0; source=built-in",
             "codex -> \"codex\"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1",
             "opencode -> \"opencode\"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in",
             "claude -> \"claude\"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in",

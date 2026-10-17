@@ -33,6 +33,9 @@ use crate::host_paths::{
 
 pub const ANTHROPIC_ACCESS_PLACEHOLDER: &str = "msb-anthropic-placeholder-a-v2";
 pub const ANTHROPIC_REFRESH_PLACEHOLDER: &str = "msb-anthropic-placeholder-r-v2";
+// The image-owned `agent-vm-codex` Pi extension (agent-vm-images) matches these
+// two values literally to decide whether to register its provider, so renaming
+// either needs a coordinated image release (ADR-0044).
 pub const OPENAI_ACCESS_PLACEHOLDER: &str = "msb-openai-placeholder-a-v2";
 pub const OPENAI_REFRESH_PLACEHOLDER: &str = "msb-openai-placeholder-r-v2";
 /// Synthetic JWT (alg:none) carrying only placeholder fields. Codex

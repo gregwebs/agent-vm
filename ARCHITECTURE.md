@@ -594,18 +594,23 @@ guest-user modes. The prefix
   the mandatory extension: it enforces `PI_SKIP_VERSION_CHECK=1` (agent-vm owns
   the binary, so Pi's update check is unactionable noise); it forwards a Pi
   subcommand verbatim (`pi list`, never `pi -e … list`, which would turn `list`
-  into a prompt); and it loads the image-owned `claude-bridge` extension only
-  when that file is readable and `AGENT_VM_PI_NO_BRIDGE` is unset. Otherwise it
-  passes
+  into a prompt); it loads the image-owned `claude-bridge` extension only when
+  that file is readable and `AGENT_VM_PI_NO_BRIDGE` is unset. It passes
   `--extension /opt/agent-vm/pi-extensions/guest-credential-warning.js` (an
-  explicit path, so `--no-extensions` cannot silence it) and, when present, a
-  second `--extension` for the bridge. Following the parity
-  principle it injects no other default — no `--approve` and no `PI_TELEMETRY`
-  — so `--approve`/`--no-approve` and telemetry are Pi's own and are forwarded
-  untouched. The warning is gated on Pi's own `ctx.hasUI` — `true` for
-  `tui`/`rpc`, `false` for `print`/`json` — so machine-readable output is
-  byte-clean with no second suppression mechanism. The installation and the
-  extension directory are replaceable; the wrapper is not — see
+  explicit path, so `--no-extensions` cannot silence it) and, when present,
+  a further `--extension` argument for the bridge.
+  Following the parity principle it injects no other default — no `--approve`
+  and no `PI_TELEMETRY` — so `--approve`/`--no-approve` and telemetry are Pi's
+  own and are forwarded untouched. The warning is gated on Pi's own `ctx.hasUI`
+  — `true` for `tui`/`rpc`, `false` for `print`/`json` — so machine-readable
+  output is byte-clean with no second suppression mechanism.
+  [ADR-0044](docs/adr/0044-pi-reaches-host-codex-through-an-image-owned-provider.md)'s
+  PR A contract adds a fourth wrapper decision: load the bare `agent-vm-codex`
+  extension when readable. On an image carrying A, the warning also appends its
+  host-import clause only when that provider registered. The pinned v0.1.3 image
+  has neither this activation nor the registry-gated clause; PR B does not ship them.
+  The installation and the extension directory are replaceable; the wrapper is
+  not — see
   [ADR-0012](docs/adr/0012-stable-pi-image-customization-seam.md),
   [ADR-0021](docs/adr/0021-project-scoped-pi-home-and-wrapper-parity.md) and
   [ADR-0023](docs/adr/0023-image-owned-pi-extension-packages.md).
@@ -863,7 +868,7 @@ Per **provisioned** provider, at every launch (capture is gated on the launch's
 provisioning set — the tools the launched tool declares, transitively; see
 [ADR-0017](docs/adr/0017-tool-declared-provisioning.md); `pi` is the one shipped
 verb whose provisioning set is wider than its requirement set, through the
-`pi -> claude` edge):
+`pi -> claude` and `pi -> codex` edges):
 
 1. **Host side.** agent-vm reads the host credential file
    (`~/.claude/.credentials.json`, `~/.codex/auth.json`,
@@ -1210,6 +1215,7 @@ directories the user never asked for. The state-root precedence is in
 | Hostname egress allowances — TLS on intercepted ports only | [ADR-0037](docs/adr/0037-hostname-egress-allowances.md) |
 | Authority config-directory exposure guard | [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md) |
 | Non-authoritative tool network requests | [ADR-0039](docs/adr/0039-non-authoritative-tool-network-requests.md) |
+| Pi reaches host Codex through an image-owned provider | [ADR-0044](docs/adr/0044-pi-reaches-host-codex-through-an-image-owned-provider.md) |
 
 ## Deliberate non-goals
 

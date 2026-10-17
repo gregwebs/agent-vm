@@ -12,11 +12,27 @@ superseded by [#164](https://github.com/gregwebs/agent-vm/issues/164), which
 does not import Pi's own `auth.json` at all — it points Pi at Claude Code's
 credential through the existing Anthropic provider, a different credential in a
 different file (see
-[ADR-0023](0023-image-owned-pi-extension-packages.md)). **#91 (import OpenAI
-and Codex credentials through host Pi) is still open**, and it would owe exactly
-the host *precedence* and host *import* clauses this ADR reserved — for Pi's own
-`auth.json`. Those clauses therefore stay out until #91 lands the behaviour that
-would make them true; #94's half is recorded as history, not pending work.
+[ADR-0023](0023-image-owned-pi-extension-packages.md)). **#91 is closed for its
+route, not on merit.**
+[#360](https://github.com/gregwebs/agent-vm/issues/360) adopts the #164 route:
+PR B makes `pi` provision `openai`; ADR-0044's PR A contract requires an
+image-owned extension to register a **distinct** provider id, `agent-vm-codex`,
+so no same-provider *precedence* or *replacement* arises to reserve a clause
+for. Pi's own `~/.pi/agent/auth.json` is still never imported. See
+[ADR-0044](0044-pi-reaches-host-codex-through-an-image-owned-provider.md).
+
+**Precedence is not the only interaction, and #360 makes that concrete.** The
+`auth.openai.com` intercept route that a host Codex login installs is shared by
+every OpenAI client in the guest, and it answers placeholder refresh grants
+only. So on a `pi` launch from a host with a Codex login, a guest-managed
+`openai-codex` login can neither complete nor refresh (403). The distinct
+provider id keeps the two credentials apart; it does **not** keep the guest one
+working. This is a documented consequence with a stated workaround
+(`agent-vm-codex/*`, or launch from a host with no Codex login), not a silent
+override. The `agent-vm-codex/*` workaround requires an image carrying PR A.
+The pinned v0.1.3 image has neither that extension/activation nor the warning's
+host-import clause. Under PR A's contract, that clause appears only when
+`agent-vm-codex` is registered.
 
 **Two complementary advisories, not one.** The mandatory Pi image extension
 ([images/tools/pi/extensions/guest-credential-warning.js](https://github.com/gregwebs/agent-vm-images/tree/main/images/tools/pi/extensions/guest-credential-warning.js)) warns about a
@@ -25,10 +41,11 @@ report of *existing* state runs on **every** launch (`claude`, `codex`,
 `opencode`, `copilot`, `pi`, `shell`, and any custom tool) and shows the same
 facts from `agent-vm doctor` without starting Pi. The two do not contradict each
 other and neither suppresses the other: the extension's `hasUI` gate is not
-inherited by the launcher warning. Clauses about host *precedence* or host
-*import* were deliberately reserved for #94/#91; #94 is closed, so its half is
-moot, but #91 remains open and still owns those clauses for Pi's own `auth.json`
-(see above).
+inherited by the launcher warning. A host-*precedence* clause stays out: no
+host credential shares a provider id with a guest one. On an image carrying
+PR A, ADR-0044 requires a host-*import* clause gated on the `agent-vm-codex`
+provider actually being registered; it describes the imported Codex credential,
+never Pi's own `auth.json`. That clause is absent from the current pin.
 
 **Structure, not resolution.** `pi_credential_inspection` classifies the shape
 of project-scoped `pi/agent/auth.json` and `pi/agent/models.json` (plus any real

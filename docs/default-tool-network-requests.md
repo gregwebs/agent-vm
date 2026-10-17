@@ -1,9 +1,12 @@
 # Shipped default-tool network requests
 
-Reviewed 2026-10-12 for [#328](https://github.com/gregwebs/agent-vm/issues/328).
+Reviewed 2026-10-12 for [#328](https://github.com/gregwebs/agent-vm/issues/328);
+source key F and the second Pi row added for
+[#360](https://github.com/gregwebs/agent-vm/issues/360).
 The executable source is [default-tools.toml](../crates/agent-vm/src/default-tools.toml).
-This completes four provider rows, **not all shipped tools**: Copilot's inventory
-is deferred to [#340](https://github.com/gregwebs/agent-vm/issues/340).
+This completes five provider rows (the four from #328 plus Pi's
+`agent-vm-codex` extension), **not all shipped tools**: Copilot's inventory is
+deferred to [#340](https://github.com/gregwebs/agent-vm/issues/340).
 
 ## Contract and scope
 
@@ -69,6 +72,8 @@ implementations or maintained primary documentation below.
 | OpenCode 1.18.34 | `chatgpt.com` | OpenAI subscription inference | D |
 | OpenCode 1.18.34 | `models.opencode.ai` | Credential-free provider-catalog refresh | D |
 | Pi 0.87.1 + bridge 0.8.0 | `api.anthropic.com`, `mcp-proxy.anthropic.com`, `platform.claude.com` | Explicit shipped Claude bridge baseline under the same provisioned auth conditions, not all Pi adapters or a provisioning union | A, A1, E |
+| Pi 0.87.1 + `agent-vm-codex` (PR A contract; pending) | `chatgpt.com` | ChatGPT subscription inference (`/backend-api/codex/responses`) carrying the provisioned placeholder | F |
+| Pi 0.87.1 + `agent-vm-codex` (PR A contract; pending) | `auth.openai.com` | Placeholder OAuth refresh on a 401, answered host-side by `_intercept_hook`; already-provisioned baseline | F |
 | Copilot 1.0.90 | omitted | **Incomplete evidence**, not absence of provider traffic; #340 | C |
 | dsh | omitted | Dormant multi-provider adapter, no configured/required provider, no universal inference name; browser UI ingress is not egress | Embedded catalog |
 | shell | omitted | General command shell, no universal provider destination despite wildcard provisioning | Embedded catalog |
@@ -173,8 +178,7 @@ use these HTTPS origins. The catalog fetches `${source}/api.json` and
 
 ### E — shipped Pi bridge and version applicability
 
-Image-source pin `087f8bad3de624a5dad38f1669e7dea96996371a`:
-[wrapper](https://github.com/gregwebs/agent-vm-images/blob/087f8bad3de624a5dad38f1669e7dea96996371a/images/tools/pi/pi.sh)
+Image-source pin `087f8bad3de624a5dad38f1669e7dea96996371a`:[wrapper](https://github.com/gregwebs/agent-vm-images/blob/087f8bad3de624a5dad38f1669e7dea96996371a/images/tools/pi/pi.sh)
 forces `PI_SKIP_VERSION_CHECK=1` and loads the bridge unless opted out;
 [seed](https://github.com/gregwebs/agent-vm-images/blob/087f8bad3de624a5dad38f1669e7dea96996371a/images/tools/pi/seed-claude-bridge-config.sh)
 selects the image Claude executable;
@@ -186,6 +190,43 @@ not certify auth routing. This source contract is not certification of every
 retained standard archive or custom/older image; static artifact inspection is
 Linux/x64, not a cross-architecture routing trace. Launcher declarations do not
 automatically follow image-source upgrades or regional/custom providers.
+
+### F — `agent-vm-codex` Pi extension (pending implementation provenance)
+
+This is ADR-0044's PR A contract, not completed shipped routing evidence.
+The pinned v0.1.3 image lacks the extension, wrapper activation and registry-gated
+warning clause. Reviewed PR A source is still required to establish provenance.
+
+[`@earendil-works/pi-ai@0.87.1`](https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-0.87.1.tgz)
+(the package Pi's bundled entry supplies), registry SHA-512 integrity checked
+during evidence collection:
+`sha512-X/3PfQBnnoeVdO9Cv8zHghUMglzlgNZYGNzoPnbRoGnHl3Rw3TlA2UKSUB7BRHUOxMryHXYa8dnjWZlbRheDZA==`.
+In `dist/api/openai-codex-responses.js`: the codex base URL is
+`https://chatgpt.com/backend-api` (line 20), `resolveCodexUrl` appends
+`/codex/responses` (line 458), and the request is issued through
+`options?.fetch ?? globalThis.fetch` (line 267). Under PR A's contract, `agent-vm-codex`
+forces SSE for exactly that reason
+([ADR-0044](adr/0044-pi-reaches-host-codex-through-an-image-owned-provider.md)),
+so an image carrying A must dial these two names — and only these two:
+
+- **`chatgpt.com`** — the inference POST.
+- **`auth.openai.com`** — the extension's placeholder refresh on a 401. The
+  route is host-side: the guest POSTs to the same exact name the `codex` and
+  `opencode` rows already declare.
+
+**`api.openai.com` is deliberately not declared for `pi`.** Only Pi's built-in
+`openai` provider reaches it, and only with a user-configured API key, which
+this baseline excludes. A `baseUrl` override in a guest `models.json` is not
+part of the baseline either; PR A must refuse any inference host other than
+`chatgpt.com`.
+
+**Source pin: pending.** The extension, the wrapper's `--extension` for it and
+the gated warning clause are agent-vm-images deliverables
+(`images/tools/pi/extensions/agent-vm-codex.js`, `images/tools/pi/pi.sh`). That
+change had not merged when this row was written, so `E`'s `087f8ba` pin —
+v0.1.3 — is the pin for the **bridge** row only and predates this one. Fill in
+the merge commit and the image version that ships it before the release
+reviewer signs off.
 
 ## Maintenance and acceptance
 
@@ -201,8 +242,9 @@ substitution, not a traffic inventory. Claude's current overlap is independently
 evidenced, not an equality invariant. Pi is explicit, not inherited; OpenCode's
 credential-free catalog is a counterexample to deriving requests from credentials.
 
-Native NR1/NR2 exercise genuine default Pi version stderr (unmet/covered); NR3
-runs a default shell marker with no request block. They prove diagnostics and
+Native NR1/NR2 exercise genuine default Pi version stderr (unmet/covered) over
+all five declared names; NR3 runs a default shell marker with no request block.
+They prove diagnostics and
 continued execution, not inference/login or packet enforcement. They must pass
 with paired LC1/HC1/I1 positives and D1/L1 denials, cleanup receipts and no default
 image adoption against the exact candidate/native assets. Missing prerequisites
