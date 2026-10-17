@@ -1,4 +1,4 @@
-//! Black-box integration tests for `agent-vm build` (#260).
+//! Black-box integration tests for `agent-vm image build`/`image import` (#260).
 //!
 //! These spawn the real compiled `agent-vm` binary with a controlled
 //! `HOME`/`AGENT_VM_STATE_DIR`/`MSB_PATH` and a **fake `docker` on PATH** that
@@ -233,7 +233,7 @@ impl Harness {
 
 fn write_fake_docker(path: &Path) {
     let script = r#"#!/bin/bash
-# Fake Docker for agent-vm build tests. Records argv NUL-separated, replays a
+# Fake Docker for agent-vm image build/import tests. Records argv NUL-separated, replays a
 # fixture archive on stdout, and can fail or die by signal on demand.
 {
   printf 'CALL\0'
@@ -241,11 +241,17 @@ fn write_fake_docker(path: &Path) {
   printf 'END\0'
 } >> "${FAKE_DOCKER_LOG:?}"
 
-if [ "${1:-}" != "buildx" ] || [ "${2:-}" != "build" ]; then
-  printf 'UNEXPECTED\0' >> "${FAKE_DOCKER_LOG:?}"
-  echo "fake docker: unexpected subcommand" >&2
-  exit 97
-fi
+case "${1:-} ${2:-}" in
+  "buildx build") mode=build ;;
+  "image save")
+    [ "${3:-}" = --output ] && [ -n "${4:-}" ] && [ "${5:-}" = -- ] && [ "$#" -eq 6 ] || { printf 'UNEXPECTED\0' >> "$FAKE_DOCKER_LOG"; exit 97; }
+    mode=save; out="$4" ;;
+  *) printf 'UNEXPECTED\0' >> "${FAKE_DOCKER_LOG:?}"; echo "fake docker: unexpected subcommand" >&2; exit 97 ;;
+esac
+
+emit_archive() {
+  if [ "$mode" = save ]; then cat "$FAKE_DOCKER_ARCHIVE" > "$out"; else cat "$FAKE_DOCKER_ARCHIVE"; fi
+}
 
 if [ -n "${FAKE_DOCKER_SLEEP:-}" ]; then
   sleep "${FAKE_DOCKER_SLEEP}"
@@ -265,13 +271,13 @@ fi
 
 if [ -n "${FAKE_DOCKER_EXIT:-}" ] && [ "${FAKE_DOCKER_EXIT}" != "0" ]; then
   if [ -n "${FAKE_DOCKER_EMIT_ON_FAILURE:-}" ] && [ -n "${FAKE_DOCKER_ARCHIVE:-}" ]; then
-    cat "${FAKE_DOCKER_ARCHIVE}"
+    emit_archive
   fi
   exit "${FAKE_DOCKER_EXIT}"
 fi
 
 if [ -n "${FAKE_DOCKER_ARCHIVE:-}" ]; then
-  cat "${FAKE_DOCKER_ARCHIVE}"
+  emit_archive
 fi
 exit 0
 "#;
@@ -419,7 +425,7 @@ fn seed_build(harness: &mut Harness, raw: &str, marker: &str) -> Written {
     let path = harness.home.join(format!("{marker}-seed.tar"));
     let written = image_archive::write(&path, &spec);
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", raw]);
+    let output = harness.run(&["image", "build", "--tag", raw]);
     assert_eq!(
         code_of(&output),
         0,
@@ -447,7 +453,15 @@ fn default_context_and_owned_flags() {
     fs::write(project.path().join("Containerfile"), "FROM scratch\n").unwrap();
     let mut cmd = harness.base_command();
     cmd.current_dir(project.path());
-    cmd.args(["build", "--tag", "app:dev", "-f", "Containerfile", "."]);
+    cmd.args([
+        "image",
+        "build",
+        "--tag",
+        "app:dev",
+        "-f",
+        "Containerfile",
+        ".",
+    ]);
     let output = run_with_timeout(cmd, Duration::from_secs(60));
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
 
@@ -493,6 +507,7 @@ fn optional_arguments_reach_docker_verbatim() {
     harness.replay(&written);
 
     let output = harness.run(&[
+        "image",
         "build",
         "--tag",
         "app:dev",
@@ -562,6 +577,7 @@ fn non_utf8_context_file_and_build_arg_are_forwarded() {
     };
 
     let argv: Vec<OsString> = vec![
+        OsString::from("image"),
         OsString::from("build"),
         OsString::from("--tag"),
         OsString::from("app:dev"),
@@ -598,7 +614,7 @@ fn absolute_dockerfile_outside_the_context_is_forwarded_verbatim() {
 
     let mut cmd = harness.base_command();
     cmd.current_dir(project.path());
-    cmd.args(["build", "--tag", "app:dev", "--file"]);
+    cmd.args(["image", "build", "--tag", "app:dev", "--file"]);
     cmd.arg(&dockerfile);
     cmd.arg(".");
     let output = run_with_timeout(cmd, Duration::from_secs(60));
@@ -634,7 +650,7 @@ fn exactly_one_host_platform_flag_and_anonymous_oci_stdout() {
     let path = harness.home.join("a.tar");
     let written = image_archive::write(&path, &spec);
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
 
     let argv = &harness.docker_calls()[0];
@@ -687,7 +703,7 @@ fn bad_result_references_fail_before_docker_or_msb_build() {
         "has space",
         "",
     ] {
-        let output = harness.run(&["build", "--tag", bad]);
+        let output = harness.run(&["image", "build", "--tag", bad]);
         assert!(
             !output.status.success(),
             "{bad:?} must be rejected, got {:?}",
@@ -697,7 +713,7 @@ fn bad_result_references_fail_before_docker_or_msb_build() {
         assert!(!harness.docker_log.exists(), "docker ran for {bad:?}");
     }
     // A missing --tag is a clap error.
-    let output = harness.run(&["build"]);
+    let output = harness.run(&["image", "build"]);
     assert!(!output.status.success());
     assert!(!harness.docker_log.exists());
 }
@@ -706,13 +722,29 @@ fn bad_result_references_fail_before_docker_or_msb_build() {
 fn out_of_surface_options_are_usage_errors() {
     let harness = Harness::new();
     for argv in [
-        vec!["build", "--tag", "app:dev", "--platform", "linux/amd64"],
-        vec!["build", "--tag", "app:dev", "--output", "type=docker"],
-        vec!["build", "--tag", "app:dev", "--load"],
-        vec!["build", "--tag", "app:dev", "--push"],
-        vec!["build", "--tag", "app:dev", "ctx-a", "ctx-b"],
-        vec!["build", "--tag", "app:dev", "--unknown"],
-        vec!["build", "--tag", "app:dev", "ctx", "--", "trailing"],
+        vec![
+            "image",
+            "build",
+            "--tag",
+            "app:dev",
+            "--platform",
+            "linux/amd64",
+        ],
+        vec![
+            "image",
+            "build",
+            "--tag",
+            "app:dev",
+            "--output",
+            "type=docker",
+        ],
+        vec!["image", "build", "--tag", "app:dev", "--load"],
+        vec!["image", "build", "--tag", "app:dev", "--push"],
+        vec!["image", "build", "--tag", "app:dev", "ctx-a", "ctx-b"],
+        vec!["image", "build", "--tag", "app:dev", "--unknown"],
+        vec![
+            "image", "build", "--tag", "app:dev", "ctx", "--", "trailing",
+        ],
     ] {
         let output = harness.run(&argv);
         assert!(
@@ -728,7 +760,12 @@ fn out_of_surface_options_are_usage_errors() {
 fn invalid_tag_diagnostics_echo_rejected_tokens_including_digest_values() {
     let harness = Harness::new();
     // clap renders the rejected token; the adapter's own reason is fixed.
-    let output = harness.run(&["build", "--tag", "invalid-260-DIAGNOSTIC-SENTINEL bad"]);
+    let output = harness.run(&[
+        "image",
+        "build",
+        "--tag",
+        "invalid-260-DIAGNOSTIC-SENTINEL bad",
+    ]);
     assert!(!output.status.success());
     let text = stderr_of(&output);
     assert!(
@@ -741,7 +778,7 @@ fn invalid_tag_diagnostics_echo_rejected_tokens_including_digest_values() {
     // A digest-pinned result is rejected with a fixed reason naming no value.
     let digest = "registry.example.com/team/app@sha256:\
                   2222222222222222222222222222222222222222222222222222222222222222";
-    let output = harness.run(&["build", "--tag", digest]);
+    let output = harness.run(&["image", "build", "--tag", digest]);
     assert!(!output.status.success());
     let text = stderr_of(&output);
     assert!(text.contains("mutable result reference"), "{text}");
@@ -757,9 +794,13 @@ fn help_and_version_do_not_initialize_msb_docker_or_state() {
     // No HOME, no MSB_PATH, no fake docker on PATH: help must still work.
     let bare = support::project_tempdir();
     for argv in [
-        vec!["build", "--help"],
-        vec!["help", "build"],
+        vec!["image", "build", "--help"],
+        vec!["help", "image", "build"],
         vec!["--version"],
+        vec!["image", "--help"],
+        vec!["image", "import", "--help"],
+        vec!["help", "image", "import"],
+        vec!["image", "help", "import"],
     ] {
         let mut cmd = Command::new(agent_vm_bin());
         cmd.env_clear()
@@ -785,19 +826,32 @@ fn help_and_version_do_not_initialize_msb_docker_or_state() {
 }
 
 #[test]
-fn configured_tool_named_build_is_refused() {
+fn configured_tool_named_image_is_refused_and_build_is_allowed() {
     let harness = Harness::new();
     let config_dir = harness.home.join(".config/agent-vm");
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.toml"),
-        "[[tools]]\nname = \"build\"\ncommand = \"build\"\n",
+        "[[tools]]\nname = \"image\"\ncommand = \"build\"\n",
     )
     .unwrap();
 
     let output = harness.run(&["doctor"]);
-    assert!(!output.status.success(), "a tool named build is reserved");
+    assert!(!output.status.success(), "a tool named image is reserved");
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("reserved") && stderr.contains("tool \"image\""),
+        "the refusal must name the reserved tool: {stderr}"
+    );
     assert!(!harness.docker_log.exists());
+    fs::write(
+        config_dir.join("config.toml"),
+        "[[tools]]\nname = \"build\"\ncommand = \"build\"\n",
+    )
+    .unwrap();
+    let out = harness.run(&["help", "build"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("Launch build in a per-project sandbox"));
 }
 
 // ---------------------------------------------------------------------------
@@ -831,7 +885,7 @@ fn build_ignores_config_the_retained_record_and_image_overrides() {
     harness.set("AGENT_VM_IMAGE_TAG", "localhost:1/env:latest");
     let mut cmd = harness.base_command();
     cmd.current_dir(project.path());
-    cmd.args(["build", "--tag", "app:dev"]);
+    cmd.args(["image", "build", "--tag", "app:dev"]);
     let output = run_with_timeout(cmd, Duration::from_secs(60));
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
 
@@ -854,7 +908,7 @@ fn build_ignores_config_the_retained_record_and_image_overrides() {
 
     // A user build arg named BASE_IMAGE is forwarded only when supplied.
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0);
     let without: Vec<String> = harness.docker_calls()[1]
         .iter()
@@ -864,6 +918,7 @@ fn build_ignores_config_the_retained_record_and_image_overrides() {
 
     harness.replay(&written);
     let output = harness.run(&[
+        "image",
         "build",
         "--tag",
         "app:dev",
@@ -903,7 +958,7 @@ fn build_succeeds_despite_a_malformed_tool_config() {
     fs::write(project.path().join(".agent-vm/config.toml"), project_config).unwrap();
     let mut cmd = harness.base_command();
     cmd.current_dir(project.path());
-    cmd.args(["build", "--tag", "app:dev"]);
+    cmd.args(["image", "build", "--tag", "app:dev"]);
     let output = run_with_timeout(cmd, Duration::from_secs(60));
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
 
@@ -941,7 +996,7 @@ fn successful_import_names_the_result_and_preserves_other_refs() {
     let path_b = harness.home.join("b.tar");
     let b = image_archive::write(&path_b, &spec_b);
     harness.replay(&b);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
 
     let meta = metadata(&harness.cache_dir(), "app:dev");
@@ -963,14 +1018,14 @@ fn successful_import_names_the_result_and_preserves_other_refs() {
     let path_c = harness.home.join("c.tar");
     let c = image_archive::write(&path_c, &spec_c);
     harness.replay(&c);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0);
     let meta = metadata(&harness.cache_dir(), "app:dev");
     assert_eq!(meta.manifest_digest, c.manifest_digest);
     assert_eq!(meta.layers[0].diff_id, c.diff_id);
     assert!(layer_materialized(&harness.cache_dir(), &c.diff_id));
     assert_eq!(harness.docker_calls().len(), 3, "one call per invocation");
-    let repeated = harness.run(&["build", "--tag", "app:dev"]);
+    let repeated = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&repeated), 0);
     assert_eq!(
         harness.docker_calls().len(),
@@ -991,7 +1046,7 @@ fn successful_import_names_the_result_and_preserves_other_refs() {
 fn missing_docker_fails_without_importing() {
     let mut harness = Harness::new();
     harness.docker_missing();
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert!(!output.status.success());
     let text = stderr_of(&output);
     assert!(text.contains("docker buildx build"), "{text}");
@@ -1011,7 +1066,14 @@ fn builder_nonzero_exit_fails_without_importing_and_keeps_old_result() {
         "FAKE_DOCKER_ARCHIVE",
         harness.home.join("does-not-exist.tar"),
     );
-    let output = harness.run(&["build", "--tag", "app:dev", "--build-arg", "SECRET=leak-me"]);
+    let output = harness.run(&[
+        "image",
+        "build",
+        "--tag",
+        "app:dev",
+        "--build-arg",
+        "SECRET=leak-me",
+    ]);
     assert_eq!(code_of(&output), 23, "the builder's code is propagated");
     let text = stderr_of(&output);
     assert!(text.contains("docker buildx build failed"), "{text}");
@@ -1046,7 +1108,7 @@ fn complete_archive_with_nonzero_exit_is_never_imported() {
     harness.docker_emit_on_failure();
     harness.set("FAKE_DOCKER_EXIT", "23");
 
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 23);
     assert_eq!(
         metadata(&harness.cache_dir(), "app:dev").manifest_digest,
@@ -1062,7 +1124,7 @@ fn builder_signal_maps_to_128_plus_signo() {
     let a = seed_build(&mut harness, "app:dev", "A");
     harness.docker_signal("TERM");
     harness.replay(&a);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 143);
     assert!(!stderr_of(&output).is_empty());
     assert_eq!(
@@ -1079,7 +1141,7 @@ fn large_builder_stderr_does_not_deadlock() {
     let written = image_archive::write(&path, &spec);
     harness.replay(&written);
     harness.docker_stderr_bytes(2 * 1024 * 1024);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
     assert!(stderr_of(&output).contains(FAKE_DOCKER_STDERR_MARKER));
 }
@@ -1104,7 +1166,7 @@ fn empty_or_garbage_archive_fails_and_keeps_old_result() {
     let empty = harness.home.join("empty.tar");
     fs::write(&empty, b"").unwrap();
     harness.replay_file(&empty);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert!(!output.status.success(), "empty archive must fail");
 
     let complete = image_archive::write(
@@ -1118,14 +1180,14 @@ fn empty_or_garbage_archive_fails_and_keeps_old_result() {
     let bytes = fs::read(complete.path).unwrap();
     fs::write(&truncated, &bytes[..1024]).unwrap();
     harness.replay_file(&truncated);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert!(!output.status.success(), "truncated archive must fail");
     assert!(stderr_of(&output).contains("importing build result"));
 
     let garbage = harness.home.join("garbage.tar");
     image_archive::write_garbage(&garbage);
     harness.replay_file(&garbage);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert!(!output.status.success(), "garbage archive must fail");
     let text = stderr_of(&output);
     assert!(text.contains("importing build result"), "{text}");
@@ -1163,7 +1225,7 @@ fn missing_or_corrupt_blob_fails_and_keeps_old_result() {
         let path = harness.home.join(format!("{name}.tar"));
         image_archive::write(&path, &spec);
         harness.replay_file(&path);
-        let output = harness.run(&["build", "--tag", "app:dev"]);
+        let output = harness.run(&["image", "build", "--tag", "app:dev"]);
         assert!(!output.status.success(), "{name} must fail to import");
         assert_eq!(
             metadata(&harness.cache_dir(), "app:dev").manifest_digest,
@@ -1186,7 +1248,7 @@ fn incompatible_descriptor_platform_is_rejected() {
     let path = harness.home.join("foreign-descriptor.tar");
     image_archive::write(&path, &spec);
     harness.replay_file(&path);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert!(
         !output.status.success(),
         "foreign descriptor must not import"
@@ -1209,7 +1271,7 @@ fn invalid_layer_stream_with_valid_descriptors_is_rejected() {
     let path = harness.home.join("not-a-tar.tar");
     image_archive::write(&path, &spec);
     harness.replay_file(&path);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert!(
         !output.status.success(),
         "a non-tar layer must fail to materialize"
@@ -1240,7 +1302,7 @@ fn metadata_write_io_error_is_reported_and_keeps_old_result() {
     let path = harness.home.join("b.tar");
     image_archive::write(&path, &spec);
     harness.replay_file(&path);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert!(!output.status.success(), "the metadata write must fail");
     let text = stderr_of(&output);
     assert!(text.contains("importing build result"), "{text}");
@@ -1279,7 +1341,7 @@ fn absent_platform_and_foreign_config_are_accepted_and_characterized() {
         let path = harness.home.join(format!("{name}.tar"));
         let written = image_archive::write(&path, &spec);
         harness.replay_file(&path);
-        let output = harness.run(&["build", "--tag", "limitation:test"]);
+        let output = harness.run(&["image", "build", "--tag", "limitation:test"]);
         assert_eq!(
             code_of(&output),
             0,
@@ -1302,7 +1364,7 @@ fn default_private_home_uses_the_private_cache() {
     let (mut harness, cache_dir) = harness_without_state_override();
     let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
     assert_eq!(
         metadata(&cache_dir, "app:dev").manifest_digest,
@@ -1320,7 +1382,7 @@ fn xdg_state_home_uses_its_own_cache() {
 
     let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
     assert_eq!(
         metadata(&xdg_cache, "app:dev").manifest_digest,
@@ -1336,7 +1398,7 @@ fn inherited_msb_home_cannot_override_the_private_home() {
     harness.set("MSB_HOME", foreign.path());
     let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
     assert_eq!(
         metadata(&harness.cache_dir(), "app:dev").manifest_digest,
@@ -1369,7 +1431,7 @@ fn opt_in_shared_cache_default_location_receives_the_result() {
     let shared = harness.home.join(".microsandbox/cache");
     let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
     assert_eq!(
         metadata(&shared, "app:dev").manifest_digest,
@@ -1388,7 +1450,7 @@ fn persisted_shared_redirect_survives_unsetting_the_flag() {
     harness.set("AGENT_VM_MSB_CACHE_DIR", &shared);
     let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
     assert_eq!(
         metadata(&shared, "app:dev").manifest_digest,
@@ -1405,7 +1467,7 @@ fn persisted_shared_redirect_survives_unsetting_the_flag() {
     let path = harness2.home.join("b.tar");
     let b = image_archive::write(&path, &spec);
     harness2.replay_file(&path);
-    let output = harness2.run(&["build", "--tag", "second:ref"]);
+    let output = harness2.run(&["image", "build", "--tag", "second:ref"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
     assert_eq!(
         metadata(&shared, "second:ref").manifest_digest,
@@ -1435,7 +1497,7 @@ fn msb_config_path_redirect_is_honoured() {
 
     let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
     assert_eq!(
         metadata(&cache_dir, "app:dev").manifest_digest,
@@ -1453,7 +1515,7 @@ fn invalid_shared_config_fails_before_the_builder() {
     harness.unset("HOME");
     let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert!(!output.status.success());
     assert!(!harness.docker_log.exists(), "Docker must not run");
 }
@@ -1473,7 +1535,7 @@ fn staging_is_private_isolated_and_cleaned_on_success_and_failure() {
 
     let before_context = fs::read(&containerfile).unwrap();
 
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
 
     // Only this invocation's staging remains (nothing): MSB_HOME/tmp exists but
@@ -1490,7 +1552,7 @@ fn staging_is_private_isolated_and_cleaned_on_success_and_failure() {
 
     // A failure also cleans its own staging.
     harness.docker_exit(7);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 7);
     assert_eq!(
         fs::read_dir(&tmp).unwrap().count(),
@@ -1507,7 +1569,7 @@ fn staged_archive_never_appears_in_the_context() {
     harness.replay(&written);
     let mut cmd = harness.base_command();
     cmd.current_dir(context.path());
-    cmd.args(["build", "--tag", "app:dev", "."]);
+    cmd.args(["image", "build", "--tag", "app:dev", "."]);
     let output = run_with_timeout(cmd, Duration::from_secs(60));
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
     assert_eq!(
@@ -1532,7 +1594,7 @@ fn staging_directory_mode_is_0700_and_archive_0600() {
             .envs(base.get_envs().map(|(key, value)| (key, value.unwrap())));
         cmd.args(["-c", "umask 022; exec \"$@\"", "permission-test"])
             .arg(agent_vm_bin())
-            .args(["build", "--tag", "app:dev"]);
+            .args(["image", "build", "--tag", "app:dev"]);
         let build = std::thread::spawn(move || run_with_timeout(cmd, Duration::from_secs(60)));
         let deadline = Instant::now() + Duration::from_secs(10);
         let observed = (|| -> std::io::Result<(u32, u32)> {
@@ -1548,7 +1610,7 @@ fn staging_directory_mode_is_0700_and_archive_0600() {
             let staging: Vec<_> = fs::read_dir(harness.msb_home().join("tmp"))?
                 .collect::<std::io::Result<Vec<_>>>()?
                 .into_iter()
-                .filter(|entry| entry.file_name().to_string_lossy().starts_with("build-"))
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("image-"))
                 .collect();
             if staging.len() != 1 {
                 return Err(std::io::Error::other(format!(
@@ -1595,7 +1657,7 @@ fn shared_custom_cache_preserves_config_keys_and_private_database() {
     harness.set("AGENT_VM_MSB_CACHE_DIR", &shared);
     let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
     harness.replay(&written);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
     let actual: serde_json::Value = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
     assert_eq!(actual["paths"]["tls"], "/fixture/tls");
@@ -1613,7 +1675,7 @@ fn shared_custom_cache_preserves_config_keys_and_private_database() {
 fn failed_build_does_not_create_an_absent_retained_record() {
     let mut harness = Harness::new();
     harness.docker_exit(23);
-    let output = harness.run(&["build", "--tag", "app:dev"]);
+    let output = harness.run(&["image", "build", "--tag", "app:dev"]);
     assert_eq!(code_of(&output), 23);
     assert!(
         !harness
@@ -1623,4 +1685,495 @@ fn failed_build_does_not_create_an_absent_retained_record() {
     );
     assert_eq!(harness.docker_calls().len(), 1);
     assert!(harness.msb_invocations().is_empty());
+}
+
+fn assert_value_free(output: &Output, sentinels: &[&str]) {
+    for sentinel in sentinels {
+        assert!(
+            !stdout_of(output).contains(sentinel),
+            "{}",
+            stdout_of(output)
+        );
+        assert!(
+            !stderr_of(output).contains(sentinel),
+            "{}",
+            stderr_of(output)
+        );
+    }
+}
+fn import_docker(harness: &Harness, tag: &str) -> Output {
+    harness.run(&[
+        "image",
+        "import",
+        "--docker",
+        "agent-vm-standard:local",
+        "--tag",
+        tag,
+    ])
+}
+fn import_input(harness: &Harness, path: &Path, tag: &str) -> Output {
+    harness.run_os(&[
+        "image".into(),
+        "import".into(),
+        "--input".into(),
+        path.into(),
+        "--tag".into(),
+        tag.into(),
+    ])
+}
+fn assert_imported(cache: &Path, raw: &str, written: &Written) {
+    let actual = metadata(cache, raw);
+    assert_eq!(actual.config_digest, written.config_digest);
+    assert!(layer_materialized(cache, &written.diff_id));
+    assert_eq!(actual.layers[0].diff_id, written.diff_id);
+}
+#[test]
+fn docker_import_saves_exactly_and_publishes() {
+    let mut harness = Harness::new();
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let output = import_docker(&harness, "agent-vm-standard:local");
+    assert_eq!(code_of(&output), 0, "{}", stderr_of(&output));
+    let calls = harness.docker_calls();
+    assert_eq!(calls.len(), 1);
+    let path = PathBuf::from(&calls[0][3]);
+    assert!(path.starts_with(harness.msb_home().join("tmp")));
+    assert!(
+        path.parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("image-")
+    );
+    assert_eq!(path.file_name().unwrap(), "result.tar");
+    assert_eq!(
+        calls[0],
+        [
+            OsString::from("image"),
+            "save".into(),
+            "--output".into(),
+            path.into_os_string(),
+            "--".into(),
+            "agent-vm-standard:local".into()
+        ]
+    );
+    assert_eq!(
+        metadata(&harness.cache_dir(), "agent-vm-standard:local").manifest_digest,
+        written.manifest_digest
+    );
+    assert_imported(&harness.cache_dir(), "agent-vm-standard:local", &written);
+    assert_eq!(
+        stdout_of(&output),
+        "Imported agent-vm-standard:local into agent-vm's image cache; launch it with `--image agent-vm-standard:local`\n"
+    );
+    assert!(!stderr_of(&output).contains("Imported"));
+    assert!(harness.msb_invocations().is_empty());
+}
+#[test]
+fn input_import_works_without_docker() {
+    let mut harness = Harness::new();
+    harness.docker_missing();
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input(&harness, &written.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_imported(&harness.cache_dir(), "app:dev", &written);
+    assert!(!harness.docker_log.exists());
+    assert!(stdout_of(&out).starts_with("Imported app:dev"));
+}
+#[test]
+fn docker_save_nonzero_keeps_old_reference() {
+    let mut harness = Harness::new();
+    let a = seed_build(&mut harness, "app:dev", "A");
+    let before = snapshot(&harness.metadata_snapshot_root());
+    let b = image_archive::write(
+        &harness.home.join("b.tar"),
+        &ArchiveSpec {
+            marker: "B".into(),
+            ..Default::default()
+        },
+    );
+    harness.replay(&b).docker_exit(23).docker_emit_on_failure();
+    let out = import_docker(&harness, "app:dev");
+    assert_eq!(code_of(&out), 23);
+    assert!(stderr_of(&out).contains("docker image save failed"));
+    assert_eq!(snapshot(&harness.metadata_snapshot_root()), before);
+    assert_eq!(
+        metadata(&harness.cache_dir(), "app:dev").manifest_digest,
+        a.manifest_digest
+    );
+    assert!(out.stdout.is_empty());
+}
+#[test]
+fn docker_save_signal_maps_to_128_plus_signo() {
+    let mut harness = Harness::new();
+    seed_build(&mut harness, "app:dev", "A");
+    let before = snapshot(&harness.metadata_snapshot_root());
+    harness.docker_signal("TERM");
+    let out = import_docker(&harness, "app:dev");
+    assert_eq!(code_of(&out), 143);
+    assert_eq!(snapshot(&harness.metadata_snapshot_root()), before);
+}
+#[test]
+fn docker_import_with_docker_missing_fails_cleanly() {
+    let mut harness = Harness::new();
+    harness.docker_missing();
+    let out = import_docker(&harness, "app:dev");
+    assert_eq!(code_of(&out), 1);
+    assert!(stderr_of(&out).contains("docker image save"));
+    assert!(snapshot(&harness.metadata_snapshot_root()).is_empty());
+}
+#[test]
+fn import_usage_errors_are_value_free_and_run_nothing() {
+    let digest = format!("app:SENTINEL_A5@sha256:{}", "a".repeat(64));
+    let conflict = "`agent-vm image import` takes exactly one --tag and exactly one of --docker REF or --input PATH; the arguments are not shown";
+    let missing = "`agent-vm image import` needs --tag REF and one of --docker REF or --input PATH";
+    let unsupported = "`agent-vm image import` does not accept that argument; the arguments are not shown. Supported: --tag REF (--docker REF | --input PATH)";
+    let pinned = "invalid value for --tag <REF>: --tag must name a mutable result reference (e.g. my-app:dev); a digest-pinned reference cannot be updated by a later build or import";
+    let local = "invalid value for --tag <REF>: --tag must be an OCI image reference (e.g. ghcr.io/owner/name:tag or repo@sha256:…); a local path is not accepted here — use --image for a local rootfs";
+    let docker = "invalid value for --docker <REF>: --docker must name an image in the local Docker daemon (e.g. my-image:dev): not empty, no whitespace or NUL, and not starting with '-'";
+    for (args, text) in [
+        (
+            vec![
+                "--docker",
+                "SENTINEL_A1",
+                "--input",
+                "SENTINEL_A2",
+                "--tag",
+                "app:dev",
+            ],
+            conflict,
+        ),
+        (vec!["--tag", "app:SENTINEL_A3"], missing),
+        (vec!["--docker", "SENTINEL_A4"], missing),
+        (vec!["--docker", "x", "--tag", digest.as_str()], pinned),
+        (vec!["--docker", "x", "--tag", "./SENTINEL_A6"], local),
+        (vec!["--docker=-SENTINEL_A7", "--tag", "app:dev"], docker),
+        (vec!["--docker=--privileged", "--tag", "app:dev"], docker),
+        (
+            vec!["--docker", "SENTINEL_A8 x", "--tag", "app:dev"],
+            docker,
+        ),
+        (
+            vec![
+                "--docker",
+                "x",
+                "--tag",
+                "app:dev",
+                "--platform",
+                "SENTINEL_A9",
+            ],
+            unsupported,
+        ),
+        (
+            vec![
+                "--docker",
+                "x",
+                "--tag",
+                "app:dev",
+                "--output",
+                "SENTINEL_A10",
+            ],
+            unsupported,
+        ),
+        (
+            vec!["--docker", "x", "--tag", "app:dev", "--load"],
+            unsupported,
+        ),
+        (
+            vec!["--docker", "x", "--tag", "app:dev", "--push"],
+            unsupported,
+        ),
+        (
+            vec!["--docker", "x", "--tag", "app:dev", "SENTINEL_A11"],
+            unsupported,
+        ),
+    ] {
+        let harness = Harness::new();
+        let argv = ["image", "import"]
+            .into_iter()
+            .chain(args)
+            .collect::<Vec<_>>();
+        let out = harness.run(&argv);
+        assert_eq!(code_of(&out), 2, "{}", stderr_of(&out));
+        assert_eq!(
+            stderr_of(&out),
+            format!(
+                "error: {text}\n\nUsage: agent-vm image import --tag <REF> <--docker <REF>|--input <PATH>>\n\nFor more information, try '--help'.\n"
+            )
+        );
+        assert_value_free(&out, &["SENTINEL", "--privileged"]);
+        assert!(harness.docker_calls().is_empty());
+        assert!(!harness.msb_home().exists());
+    }
+}
+#[test]
+fn input_missing_or_directory_fails_before_any_state() {
+    let harness = Harness::new();
+    let dir = harness.home.join("SENTINEL_IN2");
+    fs::create_dir(&dir).unwrap();
+    let fifo = harness.home.join("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for path in [harness.home.join("SENTINEL_IN1.tar"), dir, fifo] {
+        let out = import_input(&harness, &path, "app:dev");
+        assert_eq!(code_of(&out), 1);
+        assert!(stderr_of(&out).contains("--input must name an existing regular file"));
+        assert_value_free(&out, &["SENTINEL_IN1", "SENTINEL_IN2"]);
+        assert!(!harness.msb_home().exists());
+        assert!(harness.docker_calls().is_empty());
+        assert!(harness.msb_invocations().is_empty());
+    }
+}
+#[test]
+fn input_garbage_archive_keeps_old_reference() {
+    let mut harness = Harness::new();
+    seed_build(&mut harness, "app:dev", "A");
+    let before = snapshot(&harness.metadata_snapshot_root());
+    let path = harness.home.join("garbage.tar");
+    image_archive::write_garbage(&path);
+    assert_eq!(code_of(&import_input(&harness, &path, "app:dev")), 1);
+    assert_eq!(snapshot(&harness.metadata_snapshot_root()), before);
+}
+#[test]
+fn input_typo_with_shared_cache_opt_in_writes_nothing() {
+    let mut harness = Harness::new();
+    let shared = harness.home.join("shared");
+    harness
+        .set("AGENT_VM_SHARE_MSB_CACHE", "1")
+        .set("AGENT_VM_MSB_CACHE_DIR", &shared);
+    let out = import_input(&harness, &harness.home.join("missing"), "app:dev");
+    assert_eq!(code_of(&out), 1);
+    assert!(stderr_of(&out).contains("--input must name an existing regular file"));
+    for path in [
+        harness.msb_home(),
+        harness.msb_home().join("config.json"),
+        shared.clone(),
+        harness.msb_home().join("tmp"),
+    ] {
+        assert!(!path.exists());
+    }
+    assert!(harness.docker_calls().is_empty());
+    assert!(harness.msb_invocations().is_empty());
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input(&harness, &written.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert!(shared.join("manifests").is_dir());
+}
+#[test]
+fn build_is_no_longer_a_verb() {
+    let harness = Harness::new();
+    let out = harness.run(&["build", "--tag", "app:dev"]);
+    assert_eq!(code_of(&out), 2);
+    assert!(stderr_of(&out).contains("unrecognized subcommand 'build'"));
+    assert!(harness.docker_calls().is_empty());
+    let project = support::project_tempdir();
+    fs::create_dir(project.path().join(".agent-vm")).unwrap();
+    fs::write(
+        project.path().join(".agent-vm/config.toml"),
+        "[[tools]\nbroken",
+    )
+    .unwrap();
+    let mut command = harness.base_command();
+    command
+        .current_dir(project.path())
+        .args(["build", "--tag", "app:dev"]);
+    let out = run_with_timeout(command, Duration::from_secs(30));
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("config.toml"));
+    assert!(!stderr_of(&out).contains("unrecognized subcommand"));
+    assert!(harness.docker_calls().is_empty());
+}
+#[test]
+fn docker_import_honours_persisted_shared_redirect() {
+    let mut harness = Harness::new();
+    let shared = harness.home.join("shared");
+    harness
+        .set("AGENT_VM_SHARE_MSB_CACHE", "1")
+        .set("AGENT_VM_MSB_CACHE_DIR", &shared);
+    let a = seed_build(&mut harness, "app:dev", "A");
+    harness.unset("AGENT_VM_SHARE_MSB_CACHE").replay(&a);
+    let out = import_docker(&harness, "second:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_imported(&shared, "second:dev", &a);
+    assert!(!harness.cache_dir().join("manifests").exists());
+}
+#[test]
+fn docker_import_never_writes_selection_or_config() {
+    let mut harness = Harness::new();
+    let config = harness.home.join(".config");
+    fs::create_dir_all(config.join("agent-vm")).unwrap();
+    fs::write(config.join("agent-vm/config.toml"), "tools = []\n").unwrap();
+    let before = snapshot(&config);
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&a);
+    assert_eq!(code_of(&import_docker(&harness, "app:dev")), 0);
+    assert_eq!(snapshot(&config), before);
+    assert!(!config.join("agent-vm/default-image.json").exists());
+}
+#[test]
+fn build_success_notice_is_on_stdout() {
+    let mut harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&a);
+    let out = harness.run(&["image", "build", "--tag", "app:dev"]);
+    assert_eq!(code_of(&out), 0);
+    assert_eq!(
+        stdout_of(&out),
+        "Imported build result as app:dev; launch it with `--image app:dev`\n"
+    );
+    assert!(stderr_of(&out).contains(FAKE_DOCKER_STDERR_MARKER));
+    assert!(!stderr_of(&out).contains("Imported"));
+}
+#[test]
+fn docker_save_archive_publishes_tag_and_its_repotags() {
+    for tags in [Some(vec!["z-source:dev".into()]), None] {
+        let mut harness = Harness::new();
+        let written = image_archive::write_docker_save(
+            &harness.home.join("save.tar"),
+            &[image_archive::DockerSaveImage {
+                marker: "A".into(),
+                repo_tags: tags.clone(),
+            }],
+        );
+        harness.replay(&written[0]);
+        let out = harness.run(&[
+            "image",
+            "import",
+            "--docker",
+            "z-source:dev",
+            "--tag",
+            "a-target:dev",
+        ]);
+        assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+        assert_imported(&harness.cache_dir(), "a-target:dev", &written[0]);
+        if tags.is_some() {
+            assert_imported(&harness.cache_dir(), "z-source:dev", &written[0]);
+        }
+        assert_eq!(
+            snapshot(&harness.metadata_snapshot_root()).len(),
+            if tags.is_some() { 2 } else { 1 }
+        );
+        assert!(!stdout_of(&out).contains("z-source"));
+    }
+}
+#[test]
+fn multi_image_archive_publishes_every_named_image() {
+    let harness = Harness::new();
+    let written = image_archive::write_docker_save(
+        &harness.home.join("save.tar"),
+        &[
+            image_archive::DockerSaveImage {
+                marker: "one".into(),
+                repo_tags: Some(vec!["z-one:dev".into()]),
+            },
+            image_archive::DockerSaveImage {
+                marker: "two".into(),
+                repo_tags: Some(vec!["y-two:dev".into()]),
+            },
+        ],
+    );
+    let out = import_input(&harness, &written[0].path, "a:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    for (raw, index) in [("a:dev", 0), ("z-one:dev", 0), ("y-two:dev", 1)] {
+        assert_imported(&harness.cache_dir(), raw, &written[index]);
+    }
+}
+#[test]
+fn late_alias_failure_restores_the_requested_tag() {
+    for build in [false, true] {
+        let mut harness = Harness::new();
+        let a = image_archive::write_docker_save(
+            &harness.home.join("a.tar"),
+            &[image_archive::DockerSaveImage {
+                marker: "A".into(),
+                repo_tags: Some(vec!["z-source:dev".into()]),
+            }],
+        );
+        assert_eq!(
+            code_of(&import_input(&harness, &a[0].path, "a-target:dev")),
+            0
+        );
+        let target = cache(&harness.cache_dir()).image_metadata_path(&reference("a-target:dev"));
+        let before = fs::read(&target).unwrap();
+        let blocked = cache(&harness.cache_dir())
+            .image_metadata_path(&reference("z-source:dev"))
+            .with_extension("json.part");
+        fs::create_dir(&blocked).unwrap();
+        let b = image_archive::write_docker_save(
+            &harness.home.join("b.tar"),
+            &[image_archive::DockerSaveImage {
+                marker: "B".into(),
+                repo_tags: Some(vec!["z-source:dev".into()]),
+            }],
+        );
+        let out = if build {
+            harness.replay(&b[0]);
+            harness.run(&["image", "build", "--tag", "a-target:dev"])
+        } else {
+            import_input(&harness, &b[0].path, "a-target:dev")
+        };
+        assert_eq!(code_of(&out), 1);
+        assert!(stderr_of(&out).contains(if build {
+            "importing build result"
+        } else {
+            "importing image"
+        }));
+        assert!(stderr_of(&out).contains(".json.part"));
+        assert_eq!(fs::read(target).unwrap(), before);
+        assert_imported(&harness.cache_dir(), "a-target:dev", &a[0]);
+    }
+}
+#[test]
+fn late_alias_failure_removes_a_new_requested_tag() {
+    let harness = Harness::new();
+    let blocked = cache(&harness.cache_dir())
+        .image_metadata_path(&reference("z-source:dev"))
+        .with_extension("json.part");
+    fs::create_dir(&blocked).unwrap();
+    let b = image_archive::write_docker_save(
+        &harness.home.join("b.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "B".into(),
+            repo_tags: Some(vec!["z-source:dev".into()]),
+        }],
+    );
+    let out = import_input(&harness, &b[0].path, "a-target:dev");
+    assert_eq!(code_of(&out), 1, "{}", stderr_of(&out));
+    assert!(
+        !cache(&harness.cache_dir())
+            .image_metadata_path(&reference("a-target:dev"))
+            .exists()
+    );
+}
+#[test]
+fn non_ascii_tag_notice_round_trips() {
+    let harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input(&harness, &a.path, "app:é");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "Imported $'app:\\xc3\\xa9' into agent-vm's image cache; launch it with `--image $'app:\\xc3\\xa9'`\n"
+    );
+    let notice = stdout_of(&out);
+    let word = notice
+        .split("--image ")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches("`\n");
+    let shell = Command::new("bash")
+        .args(["-c", &format!("printf %s {word}")])
+        .output()
+        .unwrap();
+    assert!(shell.status.success());
+    assert!(has_metadata(
+        &harness.cache_dir(),
+        std::str::from_utf8(&shell.stdout).unwrap()
+    ));
 }

@@ -25,8 +25,12 @@ mod host_paths;
 mod image_build;
 mod image_capabilities;
 mod image_check;
+mod image_cmd;
 mod image_contract;
+mod image_import;
 mod image_log_guard;
+mod image_miss;
+mod image_publish;
 mod intercept_hook;
 mod mount;
 mod msb_cmd;
@@ -101,6 +105,15 @@ fn main() -> Result<()> {
     } = dispatch
     {
         return exit_with(secret::run(args)?);
+    }
+
+    // Input typos must fail before the MSB prologue creates state (#359).
+    if let Dispatch::Builtin {
+        cmd: Cmd::Image(args),
+        ..
+    } = &dispatch
+    {
+        image_cmd::preflight(args)?;
     }
 
     // Capture while no child has inherited selected values and removal cannot
@@ -195,12 +208,12 @@ fn main() -> Result<()> {
                 cmd: Cmd::Upgrade(args),
                 ..
             } => boot_image::upgrade::run(args).await,
-            // Explicit user-owned build + import (#260). Reads no catalog and
+            // Explicit user-owned build/import (#260, #359). Reads no catalog and
             // no image selection; `args` is self-contained.
             Dispatch::Builtin {
-                cmd: Cmd::Build(args),
+                cmd: Cmd::Image(args),
                 ..
-            } => exit_with(image_build::run(args).await?),
+            } => exit_with(image_cmd::run(args).await?),
             Dispatch::Builtin {
                 cmd: Cmd::Clipboard(args),
                 ..

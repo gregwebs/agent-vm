@@ -3113,7 +3113,7 @@ explicit_build() {
     HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
     AGENT_VM_SHARE_MSB_CACHE="$BUILD_SHARE" AGENT_VM_MSB_CACHE_DIR="$BUILD_CACHE" \
     REAL_DOCKER="$REAL_DOCKER" BUILD_CAPTURE="$capture" PATH="$WORK/build-bin:$PATH" \
-    "$AGENT_VM" build --tag "$BUILD_REF" --builder "$BUILDER" \
+    "$AGENT_VM" image build --tag "$BUILD_REF" --builder "$BUILDER" \
     --file "$FIXTURE_DIR/Dockerfile" --target "$target" "$FIXTURE_DIR") || return 1
   [ ! -e "$capture.error" ] || return 1
   python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" "$capture" > "$capture.report.json" || return 1
@@ -3144,6 +3144,62 @@ explicit_boot() {
   assert_eq "$name program" hello-258=ok "$(grep '^hello-258=ok$' <<< "$out")" || return 1
   assert_eq "$name stamp" "stamp=$stamp" "$(grep '^stamp=' <<< "$out")" || return 1
   assert_no_host_calls || return 1
+}
+
+# Acquisition failure through the bounded observer, in private state, Docker-free.
+explicit_miss() {
+  local name="$1"
+  shift
+  observe_launch "$name" "$BUILD_PROJECT" "$WORK/$name.out" -- \
+    "${OFFLINE_ENV[@]}" env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u MSB_CONFIG_PATH \
+    HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
+    AGENT_VM_SHARE_MSB_CACHE="$BUILD_SHARE" AGENT_VM_MSB_CACHE_DIR="$BUILD_CACHE" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" "$AGENT_VM" "$@" || return 1
+  [ ! -e "$WORK/$name.timeout" ] || return 1
+  [ "$CAPTURE_STATUS" -ne 0 ] || { echo "    FAIL: $name: the launch succeeded"; return 1; }
+  assert_no_host_calls || return 1
+}
+
+custom_docker_import_workflow() {
+  BUILD_HOME="$WORK/ih" BUILD_STATE="$WORK/is" BUILD_PROJECT="$WORK/ip"
+  BUILD_SHARE=0 BUILD_CACHE="$WORK/unused-cache"
+  local ref="agent-vm-e2e-359-$RUN_ID:dev" container port missing result=0
+  local reg="registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8"
+  explicit_project || return 1
+  (cd "$BUILD_PROJECT" && "${BUILD_ENV[@]}" env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u MSB_CONFIG_PATH \
+    HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
+    AGENT_VM_SHARE_MSB_CACHE="$BUILD_SHARE" AGENT_VM_MSB_CACHE_DIR="$BUILD_CACHE" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="${REAL_DOCKER%/*}:/usr/bin:/bin" \
+    "$AGENT_VM" image import --docker "$CUSTOM_MARKER" --tag "$ref") \
+    > "$WORK/import359.out" 2> "$WORK/import359.err" || return 1
+  grep -qF -- "launch it with \`--image $ref\`" "$WORK/import359.out" || return 1
+  explicit_boot import359 absent --no-git --image "$ref" shell hello-258 || return 1
+  container="$(docker run -d --rm -p 127.0.0.1::5000 "$reg")" ||
+    { echo "    BLOCKER: could not start the local registry container"; return 1; }
+  [ -n "$container" ] || { echo "    BLOCKER: no registry container id"; return 1; }
+  port="$(docker port "$container" 5000/tcp | head -1 | sed 's/.*://')"
+  if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+    echo "    BLOCKER: no single numeric mapped registry port"
+    docker rm -f "$container" >/dev/null 2>&1 || { echo "    FAIL: registry removal failed"; }
+    return 1
+  fi
+  local deadline=$(( $(date +%s) + 30 )) ready=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo "    BLOCKER: registry not ready on 127.0.0.1:$port"
+    docker rm -f "$container" >/dev/null 2>&1 || { echo "    FAIL: registry removal failed"; }
+    return 1
+  fi
+  missing="localhost:$port/e2e-359-$RUN_ID:absent"
+  explicit_miss miss359 --no-git --image "$missing" shell hello-258 || result=1
+  grep -qF "agent-vm image import --docker $missing --tag $missing" "$WORK/miss359.out" || result=1
+  grep -qF "registry error" "$WORK/miss359.out" || result=1
+  docker rm -f "$container" >/dev/null 2>&1 || { echo "    FAIL: registry container removal failed"; result=1; }
+  return "$result"
 }
 
 explicit_project() {
@@ -3223,7 +3279,7 @@ custom_explicit_build_workflow() {
   if (cd "$BUILD_PROJECT" && "${BUILD_ENV[@]}" env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u MSB_CONFIG_PATH \
       HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
       AGENT_VM_SHARE_MSB_CACHE="$BUILD_SHARE" AGENT_VM_MSB_CACHE_DIR="$BUILD_CACHE" \
-      "$AGENT_VM" build --tag "$BUILD_REF" --builder "$BUILDER" --target nonexistent260 "$FIXTURE_DIR"); then return 1; fi
+      "$AGENT_VM" image build --tag "$BUILD_REF" --builder "$BUILDER" --target nonexistent260 "$FIXTURE_DIR"); then return 1; fi
   printf broken > "$WORK/broken260.tar"
   if explicit_offline msb image load --input "$WORK/broken260.tar" --tag "$BUILD_REF"; then return 1; fi
   explicit_boot build260-failure-result absent --no-git --image "$BUILD_REF" shell hello-258 || return 1
@@ -3236,7 +3292,7 @@ custom_explicit_build_workflow() {
       HOME="$BUILD_HOME" AGENT_VM_STATE_DIR="$BUILD_STATE" \
       AGENT_VM_SHARE_MSB_CACHE="$BUILD_SHARE" AGENT_VM_MSB_CACHE_DIR="$BUILD_CACHE" \
     REAL_DOCKER="$REAL_DOCKER" BUILD_CAPTURE="$WORK/rebuild260.oci.tar" PATH="$WORK/build-bin:$PATH" \
-    "$AGENT_VM" build --tag "$BUILD_REF" --builder "$BUILDER" --target stamp-present "$FIXTURE_DIR") || return 1
+    "$AGENT_VM" image build --tag "$BUILD_REF" --builder "$BUILDER" --target stamp-present "$FIXTURE_DIR") || return 1
   [ ! -e "$WORK/rebuild260.oci.tar.error" ] || return 1
   python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" "$WORK/rebuild260.oci.tar" > "$WORK/rebuild260.report.json" || return 1
   explicit_boot build260-replaced present --no-git --image "$BUILD_REF" shell hello-258 || return 1
@@ -3249,6 +3305,7 @@ custom_explicit_build_workflow() {
 run_check "explicit-build-archive-workflow" custom_explicit_build_workflow
 
 prepare_custom_fixtures || die "could not build/import the custom-image fixtures"
+run_check "explicit-docker-import-workflow" custom_docker_import_workflow
 run_check "custom-image-fixtures-imported" check_custom_fixtures_imported
 run_check "custom-image-env-isolation-audit" check_custom_env_isolation
 run_check "custom-image-cache-isolated" check_custom_cache_isolation

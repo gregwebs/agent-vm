@@ -90,7 +90,8 @@ Full flag, subcommand, networking, and troubleshooting reference:
 Build and select your own finished image; launches never run Docker:
 
 ```sh
-agent-vm build --tag my-image:dev --builder native-oci .
+agent-vm image build --tag my-image:dev --builder native-oci .
+# Or: agent-vm image import --docker my-image:dev --tag my-image:dev
 agent-vm --image my-image:dev shell my-program
 ```
 

@@ -1350,7 +1350,12 @@ pub(crate) async fn launch(
         // that embeds the reference; the fixed reason still names the stage. An
         // explicit source keeps its error unchanged.
         Err(error) => {
-            return Err(label.redact_error("booting a sandbox from", translate_create_error(error)));
+            let error = crate::image_miss::attach(
+                translate_create_error(error),
+                boot.reference().as_str(),
+                &label,
+            );
+            return Err(label.redact_error("booting a sandbox from", error));
         }
     };
     // Success-before-adoption (#261): the image's content is now materialized,

@@ -16,9 +16,9 @@ config to microsandbox and supervises the session (`run.rs`). It is the host
 half of the pair whose other half is the **in-guest** side (`intercept_hook`,
 agentd).
 
-_Avoid_: using it for the image builder alone (the launcher does not build
-images); for the `agent-vm` binary in its non-launching verbs (`doctor`,
-`pull`, `setup`), which share the binary but launch nothing; or for
+_Avoid_: using it for the image builder alone (the launcher consumes finished images; `agent-vm image` builds/imports
+them and launches nothing); for the `agent-vm` binary in its non-launching verbs (`doctor`,
+`pull`, `setup`, `image`), which share the binary but launch nothing; or for
 microsandbox.
 
 ## Launch option
@@ -377,6 +377,16 @@ reports the config error rather than clap's "unrecognized subcommand".
 The finished image selected for a guest session, independently of **tool**
 declarations and how the image was built. It contains the software used in the
 guest; tool declarations do not install that software.
+
+## Image cache
+
+agent-vm's own microsandbox image cache (the ambient backend's cache dir,
+including a persisted shared redirect) — the only place a launch looks before
+a registry. `agent-vm image build` and `agent-vm image import` publish into it
+under a mutable **result reference** (`--tag`), plus any names the archive
+carries. The Docker daemon store is not it.
+
+_Avoid_: "local images" without saying which store.
 
 ## Default boot image
 

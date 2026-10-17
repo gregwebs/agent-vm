@@ -91,7 +91,8 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   permissive pass-through (a local rootfs or disk image is still bootable from
   the command line, where the user typed it).
 - **No launch ever invokes Docker/buildx**, and an acquisition failure never
-  falls back to a build.
+  falls back to a build. A registry acquisition failure for an explicit mutable
+  tag prints an import hint; it is text, never an action (ADR-0043).
 - **No legacy detection or shims.** The removed `--layer`, `--base-image` and
   `--yes` flags, the removed `layer` config field, `.agent-vm/layers/` discovery
   and the `AGENT_VM_BASE_IMAGE`/`AGENT_VM_LAYER`/`AGENT_VM_YES` variables are
@@ -164,20 +165,23 @@ the contributor gitlink and launcher recommendation, without a runtime source de
 
 ## Accepted explicit build/import decision (#260)
 
-`agent-vm build` explicitly runs a user-owned Dockerfile with bounded native
+`agent-vm image build` explicitly runs a user-owned Dockerfile with bounded native
 buildx arguments, exports one anonymous host-Linux image with attestations off,
 then imports the completed archive under one mutable result reference. Docker
 owns semantics and caching; launch still consumes finished images only.
 The ambient SDK backend supplies the cache, including persisted redirects.
-Native materialization precedes atomic reference publication; no fallible
-catalog persistence or validation follows that commit. First launch normally
+Native materialization precedes sequential reference publication. The loader
+also publishes archive-supplied names; on failure only the requested tag is
+restored (amended by [ADR-0043](0043-image-command-group-and-daemon-import.md)).
+No separate catalog persistence follows the native import. First launch normally
 persists cached metadata into the catalog. Build never selects/adopts a default
 or writes tool configuration. The obsolete standalone importer/base-link tag is
 removed, without deleting existing user cache or Docker data.
 
 OCI driver support and daemon-only parent visibility are native limitations,
-not automatic parent transport/push/fallback mechanisms. Finished Docker-save
-and OCI archives retain the existing `msb image load --input` workflow.
+not automatic parent transport/push/fallback mechanisms. Finished Docker-save/OCI
+archives and Docker-daemon images are imported with
+`agent-vm image import` (ADR-0043); `msb image load` remains a passthrough.
 See [USAGE](../../USAGE.md#explicit-builds-and-archive-import) for the canonical
 option surface and trust boundary. Docker, async ingestion and I/O are not
 formally proved by the small result-reference acceptance kernel.

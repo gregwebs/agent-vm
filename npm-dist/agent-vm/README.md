@@ -31,7 +31,7 @@ agent-vm claude           # or codex / opencode / copilot / pi / shell
 The compiled immutable standard-image recommendation is retained after successful
 first acquisition; launcher upgrades preserve existing selections. Default launches
 need no Docker or image-source checkout. Archives are explicitly imported through
-`agent-vm msb image load --input FILE --tag REF`, never a download fallback.
+`agent-vm image import --input FILE --tag REF`, never a download fallback.
 
 Full docs, subcommand reference, and source:
 <https://github.com/wirenboard/agent-vm>.

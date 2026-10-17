@@ -4559,7 +4559,7 @@ fn help_tool_order(text: &str) -> Vec<String> {
         "clipboard",
         "doctor",
         "secret",
-        "build",
+        "image",
         "help",
     ];
     let mut out = Vec::new();
@@ -5753,6 +5753,7 @@ fn a_default_tier_reference_is_redacted_across_output() {
     );
     let stderr = stderr_of(&out);
     assert!(!out.status.success(), "{stderr}");
+    assert!(!stderr.contains("agent-vm image import") && !stderr.contains("hint:"));
     assert!(
         stderr.contains("==> Boot image: the default boot image"),
         "the default notice must be a fixed label:\n{stderr}"
@@ -5779,6 +5780,7 @@ fn a_default_tier_reference_is_redacted_across_output() {
     );
     assert!(!pull.status.success());
     let combined = format!("{}{}", stdout_of(&pull), stderr_of(&pull));
+    assert!(!combined.contains("agent-vm image import") && !combined.contains("hint:"));
     assert!(
         combined.contains("the default boot image is the image this configuration boots from"),
         "pull must name the default safely:\n{combined}"
@@ -7686,5 +7688,96 @@ fn bare_argv_keeps_help_independent_of_launch_env() {
                 assert!(!text.contains(forbidden), "{text}");
             }
         }
+    }
+}
+
+#[test]
+fn a_registry_miss_for_an_explicit_tag_hints_the_import() {
+    let harness = Harness::new();
+    harness.write_project(PROBE_TOOL);
+    let decoys = harness.builder_decoys();
+    let out = Harness::run_on(
+        harness.command_with_decoys(&decoys),
+        &["--image", BOGUS_IMAGE, "probe"],
+    );
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("registry error"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "agent-vm image import --docker {BOGUS_IMAGE} --tag {BOGUS_IMAGE}"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("hint: an image that exists only in your local Docker daemon"),
+        "{stderr}"
+    );
+    assert!(harness.decoy_log(&decoys).is_empty());
+}
+
+#[test]
+fn a_non_ascii_tag_hint_is_copy_pasteable() {
+    let harness = Harness::new();
+    harness.write_project(PROBE_TOOL);
+    let out = harness.launch_argv("probe", &["--image", "localhost:1/does-not-exist:é"], &[]);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success());
+    assert!(stderr.contains("registry error"), "{stderr}");
+    assert!(stderr.contains("agent-vm image import --docker $'localhost:1/does-not-exist:\\xc3\\xa9' --tag $'localhost:1/does-not-exist:\\xc3\\xa9'"), "{stderr}");
+    for line in stderr
+        .lines()
+        .filter(|line| line.contains("agent-vm image import"))
+    {
+        assert!(!line.contains('é'));
+    }
+}
+
+#[test]
+fn pull_and_setup_give_the_same_hint() {
+    let harness = Harness::new();
+    harness.write_project(PROBE_TOOL);
+    for verb in ["pull", "setup"] {
+        let out = harness.builtin(&[verb, "--image", CLI_REF], &[]);
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{stderr}");
+        // The registry chain stays beneath the hint: the two must not trade
+        // places (the shared `pull.rs` path, story 14).
+        assert!(stderr.contains("registry error"), "{verb}: {stderr}");
+        assert!(
+            stderr.contains("hint: an image that exists only in your local Docker daemon"),
+            "{verb}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "agent-vm image import --docker {CLI_REF} --tag {CLI_REF}"
+            )),
+            "{verb}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_digest_pinned_registry_miss_has_no_hint() {
+    let harness = Harness::new();
+    harness.write_project(PROBE_TOOL);
+    let raw = format!("localhost:1/does-not-exist@sha256:{}", "b".repeat(64));
+    let out = harness.launch_argv("probe", &["--image", &raw], &[]);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success());
+    assert!(stderr.contains("registry error"), "{stderr}");
+    assert!(!stderr.contains("agent-vm image import"), "{stderr}");
+    // The same suppression at the shared pull/setup call site (`pull.rs`), not
+    // only at launch: a digest there is equally not an import target.
+    for verb in ["pull", "setup"] {
+        let out = harness.builtin(&[verb, "--image", &raw], &[]);
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{verb}: {stderr}");
+        assert!(stderr.contains("registry error"), "{verb}: {stderr}");
+        assert!(!stderr.contains("hint:"), "{verb}: {stderr}");
+        assert!(
+            !stderr.contains("agent-vm image import"),
+            "{verb}: {stderr}"
+        );
     }
 }

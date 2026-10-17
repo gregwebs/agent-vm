@@ -2,7 +2,7 @@
 //!
 //! Everything clap-shaped lives behind this module. The set of **launch
 //! verbs** is a *runtime* fact — read from the resolved tool catalog — while
-//! the fixed built-ins (`setup`, `pull`, `msb`, `clipboard`, `doctor`,
+//! the fixed built-ins (`setup`, `pull`, `upgrade`, `secret`, `image`, `msb`, `clipboard`, `doctor`,
 //! `_intercept-hook`) are static. [`parse_from`] is the seam: argv plus the
 //! *result* of `config::load` yields a [`Dispatch`] decision.
 //!
@@ -48,7 +48,7 @@ use vstd::prelude::*;
 use crate::boot_image::OverrideSource;
 use crate::config::{Catalog, CatalogEntry, ConfigReport, ConfiguredImages, Tool};
 use crate::run;
-use crate::{clipboard, doctor, image_build, intercept_hook, msb_cmd, pull, secret, setup};
+use crate::{clipboard, doctor, intercept_hook, msb_cmd, pull, secret, setup};
 
 verus! {
 
@@ -113,6 +113,51 @@ fn route_is_secret_tokens(argv: &[&[u8]]) -> (out: bool)
         index += 1;
     }
     assert(!route_is_secret(argv@.map_values(|token: &[u8]| token@)));
+    false
+}
+
+/// Import routes whose parse errors must never render supplied values. The
+/// trigger is explicit: no single token in the disjunction (`import` or
+/// `help import`) covers every witness on its own.
+pub(crate) open spec fn route_is_image_import(argv: Seq<Seq<u8>>) -> bool {
+    exists|i: int| 1 <= i && i + 1 < argv.len()
+        && #[trigger] argv[i] =~= b"image"@
+        && (argv[i + 1] =~= b"import"@
+            || (i + 2 < argv.len() && argv[i + 1] =~= b"help"@ && argv[i + 2] =~= b"import"@))
+}
+
+fn route_is_image_import_tokens(argv: &[&[u8]]) -> (out: bool)
+    ensures out == route_is_image_import(argv@.map_values(|token: &[u8]| token@)),
+{
+    let mut index: usize = 1;
+    while index < argv.len()
+        invariant
+            1 <= index,
+            forall|j: int| 1 <= j < index && j + 1 < argv.len() ==>
+                !(#[trigger] argv@[j]@ =~= b"image"@ &&
+                    (argv@[j + 1]@ =~= b"import"@ ||
+                        (j + 2 < argv.len() && argv@[j + 1]@ =~= b"help"@ && argv@[j + 2]@ =~= b"import"@))),
+        decreases argv.len() - index,
+    {
+        if token_equals(argv[index], &b"image"[..]) && argv.len() - index > 1 {
+            if token_equals(argv[index + 1], &b"import"[..]) {
+                assert(argv@.map_values(|token: &[u8]| token@)[index as int] =~= b"image"@);
+                assert(argv@.map_values(|token: &[u8]| token@)[index as int + 1] =~= b"import"@);
+                assert(route_is_image_import(argv@.map_values(|token: &[u8]| token@)));
+                return true;
+            }
+            if argv.len() - index > 2 && token_equals(argv[index + 1], &b"help"[..])
+                && token_equals(argv[index + 2], &b"import"[..]) {
+                assert(argv@.map_values(|token: &[u8]| token@)[index as int] =~= b"image"@);
+                assert(argv@.map_values(|token: &[u8]| token@)[index as int + 1] =~= b"help"@);
+                assert(argv@.map_values(|token: &[u8]| token@)[index as int + 2] =~= b"import"@);
+                assert(route_is_image_import(argv@.map_values(|token: &[u8]| token@)));
+                return true;
+            }
+        }
+        index += 1;
+    }
+    assert(!route_is_image_import(argv@.map_values(|token: &[u8]| token@)));
     false
 }
 
@@ -184,9 +229,9 @@ pub(crate) enum Cmd {
     /// Manage agent-vm's own values in the host system keychain.
     Secret(secret::Args),
 
-    /// Explicitly build a Dockerfile and import the result into agent-vm's
-    /// image cache (Docker is invoked; nothing is selected or booted).
-    Build(image_build::Args),
+    /// Build an image, or import a finished one, into agent-vm's own image cache.
+    /// Docker may be invoked; nothing is selected or booted.
+    Image(crate::image_cmd::Args),
 
     /// Internal: invoked by msb's interceptor hook for matched OAuth
     /// and scoped GitHub requests. Reads stdin and writes the protocol
@@ -236,7 +281,7 @@ pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "clipboard",
     "doctor",
     "secret",
-    "build",
+    "image",
     "_intercept-hook",
     "help",
 ];
@@ -291,6 +336,7 @@ where
     // consuming the iterator twice; the bound is already `Into<OsString>`.
     let argv: Vec<OsString> = argv.into_iter().map(Into::into).collect();
     let secret_route = is_secret_route(&argv);
+    let import_route = is_image_import_route(&argv);
 
     let mut command = build_command(&catalog);
     if argv.len() <= 1 {
@@ -311,6 +357,9 @@ where
                 // shapes, so a future clap error variant is scrubbed by default.
                 if secret_route && !clap_outcome_is_help_or_version(error.kind()) {
                     return Err(anyhow!(SECRET_ARGV_ERROR));
+                }
+                if import_route && !clap_outcome_is_help_or_version(error.kind()) {
+                    return Err(anyhow::Error::new(import_argv_error(&command, &error)));
                 }
                 // On the broken path `allow_external_subcommands` absorbs every
                 // unknown verb, so the only `InvalidSubcommand` clap can raise is
@@ -410,7 +459,7 @@ fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
     match cmd {
         Cmd::Pull(args) => args.image.reconcile(sub),
         Cmd::Setup(args) => args.image.reconcile(sub),
-        // `build`'s `--tag` is a result reference in msb's cache, not a launch
+        // `image`'s `--tag` is a result reference in msb's cache, not a launch
         // image selection: it deliberately carries no `ImageArgs` and so
         // consumes no `--image`/env override.
         Cmd::Msb(_)
@@ -418,7 +467,7 @@ fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
         | Cmd::Doctor(_)
         | Cmd::Secret(_)
         | Cmd::Upgrade(_)
-        | Cmd::Build(_)
+        | Cmd::Image(_)
         | Cmd::InterceptHook(_) => {}
     }
 }
@@ -651,6 +700,44 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut previous, &mut current);
     }
     previous[b.len()]
+}
+
+fn is_image_import_route(argv: &[OsString]) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let tokens: Vec<&[u8]> = argv
+        .iter()
+        .map(|token| token.as_os_str().as_bytes())
+        .collect();
+    route_is_image_import_tokens(&tokens)
+}
+
+/// Never render the original clap error: it may carry arbitrary supplied values.
+fn import_argv_error(command: &clap::Command, error: &clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let text = match error.kind() {
+        ErrorKind::ArgumentConflict => "`agent-vm image import` takes exactly one --tag and exactly one of --docker REF or --input PATH; the arguments are not shown".to_string(),
+        ErrorKind::MissingRequiredArgument => "`agent-vm image import` needs --tag REF and one of --docker REF or --input PATH".to_string(),
+        // The argument is accepted; its value is missing (`--tag` last on the
+        // line). Never clap's own rendering: it would restate the argv.
+        ErrorKind::InvalidValue => {
+            "`agent-vm image import`: an option is missing its value; the arguments are not shown".to_string()
+        }
+        ErrorKind::ValueValidation => {
+            match (error.get(ContextKind::InvalidArg), std::error::Error::source(error)) {
+                (Some(ContextValue::String(arg)), Some(reason)) if arg == "--tag <REF>" || arg == "--docker <REF>" => format!("invalid value for {arg}: {reason}"),
+                _ => "`agent-vm image import`: an argument value was rejected; the value is not shown".to_string(),
+            }
+        }
+        _ => "`agent-vm image import` does not accept that argument; the arguments are not shown. Supported: --tag REF (--docker REF | --input PATH)".to_string(),
+    };
+    let mut import = command
+        .find_subcommand("image")
+        .and_then(|image| image.find_subcommand("import"))
+        .cloned()
+        .unwrap_or_else(|| clap::Command::new("import"))
+        .bin_name("agent-vm image import")
+        .override_usage("agent-vm image import --tag <REF> <--docker <REF>|--input <PATH>>");
+    import.error(error.kind(), text)
 }
 
 #[cfg(test)]
@@ -1449,6 +1536,8 @@ mod tests {
 
     #[test]
     fn nearest_builtin_detects_typos_and_rejects_real_verbs() {
+        assert_eq!(nearest_builtin("imgae"), Some("image"));
+        assert_eq!(nearest_builtin("build"), None);
         let mut env = crate::test_env::guard();
         for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
             env.remove_var(name);
@@ -1510,7 +1599,7 @@ mod tests {
                 "clipboard",
                 "doctor",
                 "secret",
-                "build",
+                "image",
                 "_intercept-hook",
                 "shell",
                 "help"
@@ -1651,7 +1740,7 @@ mod tests {
             "clipboard",
             "doctor",
             "secret",
-            "build",
+            "image",
         ] {
             assert!(help.contains(builtin), "missing builtin {builtin}: {help}");
         }
@@ -1659,43 +1748,246 @@ mod tests {
         assert!(help.contains("agent-vm doctor"), "{help}");
     }
 
-    // -- build is a fixed built-in with no image-selection input --------
+    // -- image group: routing, diagnostics and selection independence --------
 
-    /// `build` must work with a ready catalog, a broken catalog, and with an
-    /// image override in the environment — those are not build inputs, so it
-    /// consumes no `--image` and no env tier.
     #[test]
-    fn build_dispatches_as_a_builtin_without_taking_an_image_selection() {
+    fn is_image_import_route_finds_adjacent_pairs() {
+        for (argv, expected) in [
+            (vec!["av", "image", "import"], true),
+            (vec!["av", "--root", "image", "import"], true),
+            (vec!["av", "help", "image", "import"], true),
+            (vec!["av", "image", "help", "import"], true),
+            (
+                vec!["av", "--memory", "4", "image", "import", "--docker", "x"],
+                true,
+            ),
+            (vec!["av", "image", "build"], false),
+            (vec!["av", "image"], false),
+            (vec!["av", "import"], false),
+            (vec!["av", "imagex", "import"], false),
+            (vec!["av", "image", "importx"], false),
+            (vec!["image", "import"], false),
+            (vec!["av", "image", "build", "--tag", "image"], false),
+        ] {
+            assert_eq!(
+                is_image_import_route(&argv.iter().map(OsString::from).collect::<Vec<_>>()),
+                expected,
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_import_parse_errors_are_value_free() {
+        use clap::error::ErrorKind::*;
+        let mut env = crate::test_env::guard();
+        for key in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(key);
+        }
+        let digest = format!("app:SENTINEL_A5@sha256:{}", "a".repeat(64));
+        for (args, kind, text) in [
+            (
+                vec![
+                    "--docker",
+                    "SENTINEL_A1",
+                    "--input",
+                    "SENTINEL_A2",
+                    "--tag",
+                    "app:dev",
+                ],
+                ArgumentConflict,
+                "takes exactly one --tag",
+            ),
+            (
+                vec!["--tag", "app:SENTINEL_A3"],
+                MissingRequiredArgument,
+                "needs --tag REF",
+            ),
+            (
+                vec!["--docker", "SENTINEL_A4"],
+                MissingRequiredArgument,
+                "needs --tag REF",
+            ),
+            (
+                vec!["--docker", "x", "--tag", digest.as_str()],
+                ValueValidation,
+                "invalid value for --tag <REF>",
+            ),
+            (
+                vec!["--docker", "x", "--tag", "./SENTINEL_A6"],
+                ValueValidation,
+                "invalid value for --tag <REF>",
+            ),
+            (
+                vec!["--docker=-SENTINEL_A7", "--tag", "app:dev"],
+                ValueValidation,
+                "invalid value for --docker <REF>",
+            ),
+            (
+                vec!["--docker=--privileged", "--tag", "app:dev"],
+                ValueValidation,
+                "invalid value for --docker <REF>",
+            ),
+            (
+                vec!["--docker", "SENTINEL_A8 x", "--tag", "app:dev"],
+                ValueValidation,
+                "invalid value for --docker <REF>",
+            ),
+            (
+                vec!["--docker", "x", "--tag"],
+                InvalidValue,
+                "an option is missing its value",
+            ),
+            (
+                vec![
+                    "--docker",
+                    "x",
+                    "--tag",
+                    "app:dev",
+                    "--platform",
+                    "SENTINEL_A9",
+                ],
+                UnknownArgument,
+                "does not accept that argument",
+            ),
+            (
+                vec![
+                    "--docker",
+                    "x",
+                    "--tag",
+                    "app:dev",
+                    "--output",
+                    "SENTINEL_A10",
+                ],
+                UnknownArgument,
+                "does not accept that argument",
+            ),
+            (
+                vec!["--docker", "x", "--tag", "app:dev", "--load"],
+                UnknownArgument,
+                "does not accept that argument",
+            ),
+            (
+                vec!["--docker", "x", "--tag", "app:dev", "--push"],
+                UnknownArgument,
+                "does not accept that argument",
+            ),
+            (
+                vec!["--docker", "x", "--tag", "app:dev", "SENTINEL_A11"],
+                UnknownArgument,
+                "does not accept that argument",
+            ),
+        ] {
+            for broken in [false, true] {
+                let config = if broken {
+                    Err(anyhow!("broken config"))
+                } else {
+                    Ok(report_from("tools = []\n"))
+                };
+                let argv = ["agent-vm", "image", "import"]
+                    .into_iter()
+                    .chain(args.iter().copied());
+                let error = parse_from(argv, config)
+                    .err()
+                    .unwrap()
+                    .downcast::<clap::Error>()
+                    .unwrap();
+                assert_eq!(error.kind(), kind);
+                assert_eq!(error.exit_code(), 2);
+                let shown = error.render().to_string();
+                assert!(shown.contains(text), "{shown}");
+                assert!(
+                    !shown.contains("SENTINEL") && !shown.contains("--privileged"),
+                    "{shown}"
+                );
+                assert!(
+                    shown.contains(
+                        "Usage: agent-vm image import --tag <REF> <--docker <REF>|--input <PATH>>"
+                    ),
+                    "{shown}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn image_build_parse_errors_keep_clap_text() {
+        let mut env = crate::test_env::guard();
+        for key in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(key);
+        }
+        let digest = format!("app:SENTINEL_B1@sha256:{}", "a".repeat(64));
+        let error = build_command(&Catalog::Ready(default_catalog()))
+            .try_get_matches_from(["agent-vm", "image", "build", "--tag", &digest])
+            .unwrap_err();
+        let shown = error.render().to_string();
+        assert!(
+            shown.contains("SENTINEL_B1")
+                && shown.contains("cannot be updated by a later build or import"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn image_verbs_dispatch_as_builtins_without_taking_an_image_selection() {
         let mut env = crate::test_env::guard();
         for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
             env.remove_var(name);
         }
         let broken: Result<ConfigReport, anyhow::Error> = Err(anyhow!("config: broken on purpose"));
         for config in [Ok(report_from("tools = []\n")), broken] {
-            let dispatch = parse_from(["agent-vm", "build", "--tag", "my-app:dev"], config)
-                .unwrap_or_else(|error| panic!("build must parse: {error:#}"));
+            let dispatch = parse_from(
+                ["agent-vm", "image", "build", "--tag", "my-app:dev"],
+                config,
+            )
+            .unwrap_or_else(|error| panic!("build must parse: {error:#}"));
             match dispatch {
                 Dispatch::Builtin {
-                    cmd: Cmd::Build(_), ..
+                    cmd: Cmd::Image(_), ..
                 } => {}
                 _ => panic!("build must dispatch as a built-in"),
             }
         }
 
-        // A configured tool named `build` is rejected at validation, so it can
+        for config in [
+            Ok(report_from("tools = []\n")),
+            Err(anyhow!("broken config")),
+        ] {
+            assert!(matches!(
+                parse_from(
+                    [
+                        "agent-vm",
+                        "image",
+                        "import",
+                        "--input",
+                        "x.tar",
+                        "--tag",
+                        "my-app:dev"
+                    ],
+                    config
+                )
+                .unwrap(),
+                Dispatch::Builtin {
+                    cmd: Cmd::Image(_),
+                    ..
+                }
+            ));
+        }
+
+        // A configured tool named `image` is rejected at validation, so it can
         // never shadow the built-in (asserted over RESERVED_TOOL_NAMES too).
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("config.toml");
         std::fs::write(
             &project,
-            "[[tools]]\nname = \"build\"\ncommand = \"build\"\n",
+            "[[tools]]\nname = \"image\"\ncommand = \"build\"\n",
         )
         .unwrap();
         let error = crate::config::load(&ConfigPaths {
             user: Some(dir.path().join("no-user-config.toml")),
             project,
         })
-        .expect_err("a tool named build must be refused");
+        .expect_err("a tool named image must be refused");
         assert!(format!("{error:#}").contains("reserved"));
     }
 
@@ -1711,10 +2003,12 @@ mod tests {
         ] {
             let mut help = Vec::new();
             command
+                .find_subcommand("image")
+                .unwrap()
                 .find_subcommand("build")
                 .expect("build is registered")
                 .clone()
-                .bin_name("agent-vm build")
+                .bin_name("agent-vm image build")
                 .write_long_help(&mut help)
                 .expect("build help renders");
             let help = String::from_utf8(help).unwrap();
@@ -1723,6 +2017,31 @@ mod tests {
                 "{help}"
             );
             assert!(help.contains("--build-arg"), "{help}");
+            let mut import = command
+                .find_subcommand("image")
+                .unwrap()
+                .find_subcommand("import")
+                .unwrap()
+                .clone();
+            let help = import.render_long_help().to_string();
+            assert!(
+                help.contains("--docker") && help.contains("--input"),
+                "{help}"
+            );
+            for argv in [
+                vec!["agent-vm", "image", "import", "--help"],
+                vec!["agent-vm", "help", "image", "import"],
+                vec!["agent-vm", "image", "help", "import"],
+            ] {
+                assert_eq!(
+                    command
+                        .clone()
+                        .try_get_matches_from(argv)
+                        .unwrap_err()
+                        .kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                );
+            }
         }
     }
 

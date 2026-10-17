@@ -1,11 +1,12 @@
-//! A test-only writer for minimal one-image OCI layout archives.
+//! Test-only writers for OCI layout and classic Docker-save archives.
 //!
-//! `agent-vm build`'s real subject is the native importer, so these fixtures
+//! `agent-vm image build`/`image import`'s real subject is the native importer, so these fixtures
 //! feed it genuine bytes rather than a mock: a `docker buildx build` fake only
 //! replays one of these archives on stdout. Every digest, size and diff ID is
 //! derived here from the bytes this module writes, independently of any
 //! production helper, so a drift in the importer's expectations cannot be
-//! masked by reusing its own computation.
+//! masked by reusing its own computation. The Docker-save writer supplies real
+//! RepoTags and multi-image manifests, not OCI stand-ins for alias tests.
 //!
 //! The layout is the OCI image layout `load_archive` accepts when no Docker
 //! `manifest.json` is present:
@@ -307,4 +308,50 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("low nibble"));
     }
     out
+}
+
+/// Docker-save archives retain their own names in addition to the requested tag.
+pub struct DockerSaveImage {
+    pub marker: String,
+    pub repo_tags: Option<Vec<String>>,
+}
+
+pub fn write_docker_save(path: &Path, images: &[DockerSaveImage]) -> Vec<Written> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut manifest = Vec::new();
+    let mut written = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        let layer = layer_tar(&image.marker);
+        let digest = sha256_hex(&layer);
+        let config = config_json(
+            &ArchiveSpec {
+                marker: image.marker.clone(),
+                ..Default::default()
+            },
+            &digest,
+        );
+        let config_digest = sha256_hex(&config);
+        let config_name = format!("{config_digest}.json");
+        let layer_name = format!("{index}/layer.tar");
+        append(&mut builder, &config_name, &config);
+        append(&mut builder, &layer_name, &layer);
+        manifest.push(serde_json::json!({"Config": config_name, "RepoTags": image.repo_tags, "Layers": [layer_name]}));
+        written.push(Written {
+            path: path.to_path_buf(),
+            marker: image.marker.clone(),
+            // Docker's importer synthesizes its manifest; use config/diff ID as oracle.
+            manifest_digest: String::new(),
+            config_digest,
+            layer_digest: digest.clone(),
+            diff_id: digest.clone(),
+            layer_tar_sha256: digest,
+        });
+    }
+    append(
+        &mut builder,
+        "manifest.json",
+        &serde_json::to_vec(&manifest).unwrap(),
+    );
+    std::fs::write(path, builder.into_inner().unwrap()).unwrap();
+    written
 }

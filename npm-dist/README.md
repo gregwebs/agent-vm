@@ -31,7 +31,7 @@ The standard image has independent releases in
 [agent-vm-images](https://github.com/gregwebs/agent-vm-images). The binary carries an
 immutable initial index recommendation; successfully acquired retained selections
 survive launcher releases. Default consumption requires no Docker/image sources.
-Matching archives are explicitly imported with `agent-vm msb image load --input
+Matching archives are explicitly imported with `agent-vm image import --input
 FILE --tag REF`; see [USAGE](../USAGE.md#explicit-builds-and-archive-import).
 Before releasing a changed recommendation, follow the native evidence/release hold
 in [CONTRIBUTING](../CONTRIBUTING.md#release--version-bump).
