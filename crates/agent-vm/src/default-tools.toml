@@ -81,23 +81,31 @@ persist = [".dsh"]
 # more during a session, and must start with none configured, so it must not
 # inherit any provider's hard bail.
 #
-# It DOES declare `tools = ["claude"]`. Pi reaches Anthropic through the
-# image-owned pi-claude-bridge extension, which spawns Claude Code as a child
-# process and therefore needs *Claude Code's* credential, not Pi's own
-# `auth.json`. Naming the `claude` tool provisions `anthropic` WITHOUT requiring
-# it (ADR-0017: named tools are provisioned, never required), so `agent-vm pi`
-# writes the Anthropic placeholder to `claude/.credentials.json`, registers the
-# proxy substitution, and still launches for a user with no host Claude login.
-# This is ADR-0017 alternative 2 ("a tool that connects to another tool
-# (Pi -> claude)"). Note the inherited side effect: the Anthropic bypass configs
-# (`claude/settings.json`, `claude.json`) are now written on a `pi` launch too,
-# because `write_bypass_configs` follows the provisioning set, not capture.
+# It DOES declare `tools = ["claude", "codex"]`. Each named tool exists to
+# supply a credential that an image-owned Pi extension needs and Pi's own
+# `auth.json` cannot provide. Naming a tool provisions its provider WITHOUT
+# requiring it (ADR-0017: named tools are provisioned, never required), so
+# `agent-vm pi` writes the guest placeholders, registers the proxy
+# substitutions, and still launches for a user with no host login of either
+# kind. This is ADR-0017 alternative 2 ("a tool that connects to another tool").
 #
-# Importing the host's *Pi* credential (~/.pi/agent/auth.json) into Pi's own
-# provider is a different credential in a different file. #94 (Anthropic through
-# host Pi) was closed as superseded by #164, which reaches Anthropic through the
-# `claude` tool edge above instead; #91 (OpenAI and Codex credentials through
-# host Pi) is still open and is not implemented here.
+# `claude` -> the pi-claude-bridge extension spawns Claude Code as a child, so
+# it needs *Claude Code's* credential. Inherited side effect: the Anthropic
+# bypass configs (`claude/settings.json`, `claude.json`) are written on a `pi`
+# launch too, because `write_bypass_configs` follows the provisioning set, not
+# capture.
+#
+# `codex` -> the agent-vm-codex extension registers a Pi provider that carries
+# the `codex/auth.json` placeholder to `chatgpt.com` (ADR-0044). Inherited side
+# effects of the `openai` provider: `codex/config.toml` is written, and a
+# successful capture overwrites a guest-authored `codex/auth.json`. That
+# extension reads a fixed path -- it does NOT inherit `codex`'s `CODEX_HOME`,
+# because tool `env` belongs to the launched tool (ADR-0016), so this file must
+# never grow one here.
+#
+# Pi's own credential file (~/.pi/agent/auth.json) is never imported: #94
+# (Anthropic) was closed as superseded by #164, and #91's host-Pi route is
+# superseded for OpenAI/Codex by #360's tool edge above.
 #
 # The guest-state mapping and PI_SKIP_VERSION_CHECK are issue #96. It
 # deliberately declares no `--approve` (or any trust/telemetry) default:
@@ -105,11 +113,14 @@ persist = [".dsh"]
 # and telemetry are forwarded -- see ADR-0021.
 [[tools]]
 name = "pi"
-# Explicit shipped bridge baseline, not inherited from tools or all Pi adapters.
-network_requests = ["api.anthropic.com", "mcp-proxy.anthropic.com", "platform.claude.com"]
+# Explicit shipped baseline: the bridge's three names plus the two the
+# image-owned agent-vm-codex extension dials. Not inherited from `tools`, and
+# deliberately without api.openai.com: only Pi's built-in `openai` provider
+# reaches it, and only with a user-configured key (ADR-0039).
+network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "mcp-proxy.anthropic.com", "platform.claude.com"]
 command = "pi"
 args = []
-tools = ["claude"]
+tools = ["claude", "codex"]
 persist = []
 
 [[tools]]

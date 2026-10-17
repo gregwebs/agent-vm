@@ -144,6 +144,13 @@ tree; the wrapper's existence check degrades that to "no bridge", which
 
 ## Consequences
 
+- **Not every image-owned Pi extension is a package.** ADR-0044's PR A contract
+  requires the wrapper to existence-check a bare, dependency-free
+  agent-vm-authored `agent-vm-codex` file in `/opt/agent-vm/pi-extensions/`.
+  This extension and activation (and the registry-gated warning change) are
+  absent from the pinned v0.1.3 image, not delivered by PR B. It is not an
+  image-owned Pi package: it has no npm tree, so it needs none of D1's or D4's
+  machinery. D1's two directories are a resolution rule, not a taxonomy.
 - **`pi list` does not show the bridge, and `pi update` / `pi uninstall` cannot
   move it.** It is image-owned, not a Pi-managed package. The pin moves when
   the independent image owner moves it, like every other agent in the image. [image-owner pi-runtime.sh](https://github.com/gregwebs/agent-vm-images/blob/main/script/test/pi-runtime.sh)

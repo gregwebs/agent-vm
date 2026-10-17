@@ -889,7 +889,11 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
             "MSB_AGENT_VM_OPENAI_UNUSED",
             "MSB_AGENT_VM_OPENCODE_OPENAI_UNUSED",
         ],
-        "pi" | "claude" => &["MSB_AGENT_VM_ANTHROPIC_UNUSED"],
+        "pi" => &[
+            "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+            "MSB_AGENT_VM_OPENAI_UNUSED",
+        ],
+        "claude" => &["MSB_AGENT_VM_ANTHROPIC_UNUSED"],
         "copilot" => &["MSB_AGENT_VM_COPILOT_UNUSED"],
         "shell" => &[
             "MSB_AGENT_VM_ANTHROPIC_UNUSED",
@@ -976,7 +980,11 @@ fn assert_tool_dependent_content(tool: &str, config: &serde_json::Value) {
     let expected_rules: &[(&str, &str)] = match tool {
         "dsh" => &[],
         "codex" | "opencode" => &[("auth.openai.com", "/oauth/token")],
-        "pi" | "claude" => &[("platform.claude.com", "/v1/oauth/token")],
+        "claude" => &[("platform.claude.com", "/v1/oauth/token")],
+        "pi" => &[
+            ("platform.claude.com", "/v1/oauth/token"),
+            ("auth.openai.com", "/oauth/token"),
+        ],
         "copilot" => &[],
         "shell" => &[
             ("platform.claude.com", "/v1/oauth/token"),
@@ -2375,6 +2383,324 @@ fn a_pi_launch_writes_the_anthropic_bypass_configs_without_a_host_credential() {
     // leak would be visible here.
     assert!(!settings_text.contains("fake"), "{settings_text}");
     assert!(!root_text.contains("fake"), "{root_text}");
+}
+
+// ---------------------------------------------------------------------------
+// `pi -> codex` provisioning (#360, the agent-vm-codex extension's credential)
+// ---------------------------------------------------------------------------
+
+/// T4 (#360): naming `codex` from `pi` follows ADR-0017 alternative 2, so
+/// `openai` is provisioned but never required. A host with no Codex login must
+/// therefore still get a `pi` launch, with no secret, no refresh route and no
+/// guest placeholder. The removal is checked: a silently-failed `remove_file`
+/// would let this pass on a host that still has a login.
+#[test]
+fn pi_without_a_host_codex_login_launches_and_wires_no_openai() {
+    let harness = Harness::new();
+    let host_credential = harness.home_root.join(".codex/auth.json");
+    std::fs::remove_file(&host_credential).unwrap();
+    assert!(
+        !host_credential.exists(),
+        "the host Codex credential must be gone before the launch"
+    );
+
+    let out = harness.launch_default("pi");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "pi must launch with no host Codex login: {stderr}"
+    );
+    let config = debug_config_json(&stderr);
+    let state = state_dir(&stderr);
+
+    assert!(
+        !registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_OPENAI_UNUSED"),
+        "a failed capture must register no OpenAI secret"
+    );
+    assert!(
+        !intercept_rule_hosts(&config).contains(&"auth.openai.com"),
+        "a failed capture must register no OpenAI refresh route"
+    );
+    assert!(
+        !state.join("codex/auth.json").exists(),
+        "a failed capture must write no guest Codex placeholder"
+    );
+}
+
+/// T5 (#360). A successful capture **overwrites** a guest-authored
+/// `codex/auth.json` with the placeholder -- the OpenAI provider's existing
+/// `refresh_openai` behaviour, now reachable from a `pi` launch. The user impact
+/// is documented in USAGE.md; this is the executable statement of it.
+#[test]
+fn a_pi_launch_overwrites_a_guest_authored_codex_credential_with_the_placeholder() {
+    let harness = Harness::new();
+    // Assert the capture precondition explicitly; without it the guest credential
+    // would remain and the placeholder assertion below would fail.
+    assert!(
+        harness.home_root.join(".codex/auth.json").exists(),
+        "this test needs the harness's host Codex credential"
+    );
+
+    let state = probe_state_dir(&harness, "pi");
+    let guest_credential = r#"{"tokens":{"access_token":"guest-codex-real-canary","refresh_token":"guest-codex-real-refresh-canary","account_id":"11111111-1111-1111-1111-111111111111"}}"#;
+    write(&state.join("codex/auth.json"), guest_credential);
+
+    let out = harness.launch_default("pi");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "pi must launch: {stderr}");
+
+    let after = std::fs::read_to_string(state.join("codex/auth.json")).unwrap();
+    assert!(
+        after.contains("msb-openai-placeholder-a-v2"),
+        "a pi launch must overwrite a guest-authored Codex credential with the proxy placeholder: {after}"
+    );
+    assert!(
+        !after.contains("guest-codex-real-canary"),
+        "the guest-authored access token must be gone after capture: {after}"
+    );
+    assert!(
+        !after.contains("guest-codex-real-refresh-canary"),
+        "the guest-authored refresh token must be gone after capture: {after}"
+    );
+}
+
+/// T6 (#360). The converse of T5, and the reason the overwrite is content-scoped:
+/// when capture fails, the stale-placeholder clearer must leave a guest-authored
+/// `codex/auth.json` byte-identical. An absent host credential is never licence
+/// to delete a guest's own login.
+#[test]
+fn a_pi_launch_with_no_host_codex_login_spares_a_guest_authored_codex_credential() {
+    let harness = Harness::new();
+    let host_credential = harness.home_root.join(".codex/auth.json");
+    std::fs::remove_file(&host_credential).unwrap();
+    assert!(
+        !host_credential.exists(),
+        "the host Codex credential must be gone before the launch"
+    );
+
+    let state = probe_state_dir(&harness, "pi");
+    let guest_credential = r#"{"tokens":{"access_token":"guest-codex-real-spared-canary","refresh_token":"guest-codex-real-spared-refresh","account_id":"33333333-3333-3333-3333-333333333333"}}"#;
+    write(&state.join("codex/auth.json"), guest_credential);
+
+    let out = harness.launch_default("pi");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "pi must still launch with no host Codex login: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("codex/auth.json")).unwrap(),
+        guest_credential,
+        "a guest-authored Codex credential must survive a pi launch that captured nothing"
+    );
+}
+
+/// T7 (#360). The stale-placeholder ordering: `pi` now re-wires OpenAI, so the
+/// placeholder a `codex` launch wrote is kept rather than deleted as unwired.
+#[test]
+fn a_codex_placeholder_survives_the_next_pi_launch() {
+    let harness = Harness::new();
+    let codex = harness.launch_default("codex");
+    let state = state_dir(&stderr_of(&codex));
+    let placeholder = std::fs::read(state.join("codex/auth.json"))
+        .expect("the codex launch writes the Codex placeholder");
+    assert!(
+        String::from_utf8_lossy(&placeholder).contains("msb-openai-placeholder-a-v2"),
+        "expected the proxy placeholder, got: {placeholder:?}"
+    );
+
+    let pi = harness.launch_default("pi");
+    assert!(
+        stderr_of(&pi).contains(CONFIG_MARKER),
+        "pi must launch: {}",
+        stderr_of(&pi)
+    );
+    assert_eq!(
+        std::fs::read(state.join("codex/auth.json"))
+            .expect("a pi launch must not delete the placeholder it re-wires"),
+        placeholder,
+        "a pi launch must leave the codex-written placeholder in place"
+    );
+}
+
+/// T8 (#360). The non-disclosure acceptance criterion, driven through the real
+/// binary: three distinct canaries in the host Codex login must not appear in
+/// anything the guest can read.
+///
+/// Three positive controls keep this from passing vacuously: the seeded host
+/// document really holds all three canaries, capture really wrote the *access*
+/// canary to the host-only `$STATE.secrets/openai`, and the guest document holds
+/// the placeholders instead. Only `$STATE` is scanned -- `.secrets` is its
+/// sibling, never a guest mount -- so a failure means launcher assembly leaked,
+/// not that the scan was pointed at the wrong tree. This is not evidence about
+/// Pi's runtime transport or the real backend (that is a manual credentialed
+/// run).
+#[test]
+fn a_pi_launch_discloses_no_host_openai_token_bytes() {
+    const ACCESS: &str = "canary-360-access-do-not-leak";
+    const REFRESH: &str = "canary-360-refresh-do-not-leak";
+    const ID_TOKEN: &str = "canary-360-id-token-do-not-leak";
+    const ACCOUNT: &str = "22222222-2222-2222-2222-222222222222";
+
+    let harness = Harness::new();
+    let host_path = harness.home_root.join(".codex/auth.json");
+    write(
+        &host_path,
+        &format!(
+            r#"{{"tokens":{{"access_token":"{ACCESS}","refresh_token":"{REFRESH}","id_token":"{ID_TOKEN}","account_id":"{ACCOUNT}"}}}}"#
+        ),
+    );
+
+    let out = harness.launch_default("pi");
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "pi must reach the real config assembly: {stderr}"
+    );
+    let config = debug_config_json(&stderr);
+    let state = state_dir(&stderr);
+    let secrets_sibling = PathBuf::from(format!("{}.secrets", state.display()));
+
+    // -- positive controls: capture was exercised ---------------------------
+    let seeded = std::fs::read_to_string(&host_path).unwrap();
+    for canary in [ACCESS, REFRESH, ID_TOKEN] {
+        assert!(
+            seeded.contains(canary),
+            "the seeded host document must hold {canary}"
+        );
+    }
+    let captured = std::fs::read_to_string(secrets_sibling.join("openai"))
+        .expect("capture must write the host-only OpenAI token file");
+    assert!(
+        captured.contains(ACCESS),
+        "the host-only secret file must hold the access token -- without this the scan proves nothing"
+    );
+    let guest = std::fs::read_to_string(state.join("codex/auth.json"))
+        .expect("a successful capture writes the guest Codex placeholder");
+    for placeholder in [
+        "msb-openai-placeholder-a-v2",
+        "msb-openai-placeholder-r-v2",
+        "msb-openai-placeholder-id-v2",
+    ] {
+        assert!(
+            guest.contains(placeholder),
+            "the guest document must hold {placeholder} instead: {guest}"
+        );
+    }
+    assert!(
+        guest.contains(ACCOUNT),
+        "the account id is not a secret and must survive for codex: {guest}"
+    );
+
+    // -- (a) every regular file the guest can read under $STATE -------------
+    let mut scanned = 0usize;
+    for (path, bytes) in state_regular_files(&state) {
+        scanned += 1;
+        let text = String::from_utf8_lossy(&bytes);
+        for canary in [ACCESS, REFRESH, ID_TOKEN] {
+            assert!(!text.contains(canary), "{} leaks {canary}", path.display());
+        }
+    }
+    assert!(
+        scanned > 0,
+        "the leak scan must have read guest-visible files"
+    );
+
+    // -- (b) the assembled guest environment --------------------------------
+    for (key, value) in env_pairs(&config) {
+        for canary in [ACCESS, REFRESH, ID_TOKEN] {
+            assert!(
+                !key.contains(canary) && !value.contains(canary),
+                "{key} leaks {canary}"
+            );
+        }
+    }
+
+    // -- (c) and (d) the raw streams ----------------------------------------
+    for canary in [ACCESS, REFRESH, ID_TOKEN] {
+        assert!(!stdout.contains(canary), "stdout leaks {canary}");
+        assert!(!stderr.contains(canary), "stderr leaks {canary}");
+    }
+
+    // -- no guest mount exposes the host-only secret directory --------------
+    assert_secret_mount_isolation(&config, &secrets_sibling);
+}
+
+fn assert_secret_mount_isolation(config: &serde_json::Value, secrets_sibling: &Path) {
+    // Resolve fixture aliases (notably macOS /var) before component-wise checks.
+    let secrets_sibling = secrets_sibling.canonicalize().unwrap();
+    for mount in config["mounts"].as_array().unwrap() {
+        let host = Path::new(mount["host"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert!(
+            !host.starts_with(&secrets_sibling) && !secrets_sibling.starts_with(&host),
+            "{} exposes the host-only secret directory",
+            host.display()
+        );
+    }
+}
+
+#[test]
+fn secrets_mount_isolation_rejects_overlaps() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let secrets = root.join("state/project.secrets");
+    write(&secrets.join("openai"), "test-only-token");
+    for relative in [
+        "project",
+        "state/project",
+        "state/project/home",
+        "state/unrelated",
+        "state/project.secrets-other",
+    ] {
+        std::fs::create_dir_all(root.join(relative)).unwrap();
+    }
+    for (relative, rejected) in [
+        ("state/project.secrets", true),
+        ("state/project.secrets/openai", true),
+        ("state", true),
+        ("project", false),
+        ("state/project", false),
+        ("state/project/home", false),
+        ("state/unrelated", false),
+        ("state/project.secrets-other", false),
+    ] {
+        let config = serde_json::json!({"mounts": [{"host": root.join(relative)}]});
+        assert_eq!(
+            std::panic::catch_unwind(|| assert_secret_mount_isolation(&config, &secrets)).is_err(),
+            rejected,
+            "mount isolation control: {relative}"
+        );
+    }
+}
+
+/// Every regular file under `root`, recursively. Skip symlinks to avoid following
+/// guest-namespace aliases and cycles on the host; in-tree targets are walked
+/// through their regular paths.
+fn state_regular_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+        for entry in entries {
+            let path = entry.unwrap().path();
+            let file_type = std::fs::symlink_metadata(&path).unwrap().file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                walk(&path, out);
+            } else if file_type.is_file() {
+                let bytes = std::fs::read(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                out.push((path, bytes));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -7133,6 +7459,8 @@ const SHIPPED_REQUESTS: [(&str, &[&str]); 7] = [
         "pi",
         &[
             "api.anthropic.com",
+            "auth.openai.com",
+            "chatgpt.com",
             "mcp-proxy.anthropic.com",
             "platform.claude.com",
         ],

@@ -169,6 +169,33 @@
           },
           "passthrough_hosts": [],
           "require_tls_identity": true
+        },
+        {
+          "env_var": "MSB_AGENT_VM_OPENAI_UNUSED",
+          "value": "",
+          "source": {
+            "kind": "file",
+            "path": "$STATE_DIR.secrets/openai"
+          },
+          "placeholder": "msb-openai-placeholder-a-v2",
+          "allowed_hosts": [
+            {
+              "exact": "api.openai.com"
+            },
+            {
+              "exact": "chatgpt.com"
+            },
+            {
+              "exact": "auth.openai.com"
+            }
+          ],
+          "substitution": {
+            "headers": true,
+            "query": false,
+            "body": false
+          },
+          "passthrough_hosts": [],
+          "require_tls_identity": true
         }
       ],
       "violation_action": "block-and-log"
@@ -179,6 +206,12 @@
           "host": "platform.claude.com",
           "method": "POST",
           "path_prefix": "/v1/oauth/token",
+          "dispatch_on_headers": false
+        },
+        {
+          "host": "auth.openai.com",
+          "method": "POST",
+          "path_prefix": "/oauth/token",
           "dispatch_on_headers": false
         }
       ],
@@ -207,8 +240,8 @@
 }
 --- state ---
 claude/.credentials.json	[123, 34, 99, 108, 97, 117, 100, 101, 65, 105, 79, 97, 117, 116, 104, 34, 58, 123, 34, 97, 99, 99, 101, 115, 115, 84, 111, 107, 101, 110, 34, 58, 34, 109, 115, 98, 45, 97, 110, 116, 104, 114, 111, 112, 105, 99, 45, 112, 108, 97, 99, 101, 104, 111, 108, 100, 101, 114, 45, 97, 45, 118, 50, 34, 44, 34, 114, 101, 102, 114, 101, 115, 104, 84, 111, 107, 101, 110, 34, 58, 34, 109, 115, 98, 45, 97, 110, 116, 104, 114, 111, 112, 105, 99, 45, 112, 108, 97, 99, 101, 104, 111, 108, 100, 101, 114, 45, 114, 45, 118, 50, 34, 44, 34, 101, 120, 112, 105, 114, 101, 115, 65, 116, 34, 58, 110, 117, 108, 108, 44, 34, 115, 99, 111, 112, 101, 115, 34, 58, 110, 117, 108, 108, 44, 34, 115, 117, 98, 115, 99, 114, 105, 112, 116, 105, 111, 110, 84, 121, 112, 101, 34, 58, 110, 117, 108, 108, 44, 34, 114, 97, 116, 101, 76, 105, 109, 105, 116, 84, 105, 101, 114, 34, 58, 110, 117, 108, 108, 125, 125]
-codex/auth.json	absent:entity not found
-codex/config.toml	absent:entity not found
+codex/auth.json	[123, 34, 116, 111, 107, 101, 110, 115, 34, 58, 123, 34, 97, 99, 99, 101, 115, 115, 95, 116, 111, 107, 101, 110, 34, 58, 34, 109, 115, 98, 45, 111, 112, 101, 110, 97, 105, 45, 112, 108, 97, 99, 101, 104, 111, 108, 100, 101, 114, 45, 97, 45, 118, 50, 34, 44, 34, 114, 101, 102, 114, 101, 115, 104, 95, 116, 111, 107, 101, 110, 34, 58, 34, 109, 115, 98, 45, 111, 112, 101, 110, 97, 105, 45, 112, 108, 97, 99, 101, 104, 111, 108, 100, 101, 114, 45, 114, 45, 118, 50, 34, 44, 34, 97, 99, 99, 111, 117, 110, 116, 95, 105, 100, 34, 58, 34, 48, 48, 48, 48, 48, 48, 48, 48, 45, 48, 48, 48, 48, 45, 48, 48, 48, 48, 45, 48, 48, 48, 48, 45, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 34, 125, 125]
+codex/config.toml	[115, 97, 110, 100, 98, 111, 120, 95, 109, 111, 100, 101, 32, 61, 32, 34, 100, 97, 110, 103, 101, 114, 45, 102, 117, 108, 108, 45, 97, 99, 99, 101, 115, 115, 34, 10, 97, 112, 112, 114, 111, 118, 97, 108, 95, 112, 111, 108, 105, 99, 121, 32, 61, 32, 34, 110, 101, 118, 101, 114, 34, 10]
 copilot/config.json	absent:entity not found
 link:.bash_history	/agent-vm-state/bash_history
 link:.claude	/agent-vm-state/claude
@@ -222,4 +255,4 @@ link:.pi	/agent-vm-state/pi
 opencode-config/opencode.json	absent:entity not found
 secrets/anthropic	[102, 97, 107, 101]
 secrets/copilot	absent:entity not found
-secrets/openai	absent:entity not found
+secrets/openai	[102, 97, 107, 101]

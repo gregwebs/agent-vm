@@ -98,12 +98,12 @@ own synthetic row).
 
 ## Consequences
 
-Per-verb effect under the shipped default catalog (`pi`'s row was added later —
-see the Amendment at the end of this ADR):
+Per-verb effect under the shipped default catalog (see the #164 and #360
+amendments below for `pi`'s two edges):
 
 | verb | `credentials` (required) | provisioning set |
 |---|---|---|
-| `pi` | *(none)* | `{anthropic}` |
+| `pi` | *(none)* | `{anthropic, openai}` |
 | `codex` | `["openai"]` | `{openai}` |
 | `opencode` | `["openai","opencode-static"]` | `{openai, opencode-static}` |
 | `claude` | `["anthropic"]` | `{anthropic}` |
@@ -195,6 +195,31 @@ One non-DR change is recorded for honesty: the `ANTHROPIC_API_KEY` publication
 this ADR does not touch becomes reachable on a third verb. That pre-existing
 defect is tracked separately as
 [#165](https://github.com/gregwebs/agent-vm/issues/165). (Removed by #163.)
+
+## Amendment: #360 — `pi` also provisions OpenAI
+
+[agent-vm #360](https://github.com/gregwebs/agent-vm/issues/360) gives the
+shipped `pi` a second edge, `tools = ["claude", "codex"]`. The rule is
+unchanged: naming a tool provisions its provider without requiring it, so a
+host with no Codex login still gets a `pi` launch. The second edge exists for
+the same reason as the first — under ADR-0044's PR A contract, the image-owned
+`agent-vm-codex` extension carries the guest `codex/auth.json` placeholder to
+`chatgpt.com`, so it needs the `openai` provider's capture and proxy substitution rather than Pi's own
+`auth.json`. See
+[ADR-0044](0044-pi-reaches-host-codex-through-an-image-owned-provider.md) for
+the transport (not yet present in the pinned v0.1.3 image) and
+[ADR-0011](0011-pi-mixed-credential-ownership.md) for what the shared
+`auth.openai.com` refresh route costs.
+
+- **`pi` keeps `credentials = []`**, so it still inherits no hard bail. It
+  remains the one shipped verb whose requirement and provisioning sets differ.
+- **The inherited side effects are the `openai` provider's, not `pi`'s:**
+  `codex/config.toml` is written on every `pi` launch, and a successful capture
+  overwrites a guest-authored `codex/auth.json` with the placeholder. Both are
+  pinned by `tests/config_launch_driven.rs`.
+- **Tool `env` is still not inherited.** The extension reads the fixed
+  `/agent-vm-state/codex/auth.json`, so `pi` gains no `CODEX_HOME`; the
+  "Deliberately unchanged" note about `shell`'s explicit pair stands.
 
 ## Alternatives
 
