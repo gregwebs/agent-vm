@@ -61,7 +61,11 @@ for how it is chosen and for the default invalidation limits.
 <tool>                              launch a configured tool in a per-project sandbox
                                     (the verbs come from your tool configuration;
                                     run `agent-vm --help` for the exact list)
-build --tag REF [OPTIONS] [CONTEXT]  explicitly build + import a user Dockerfile
+image build --tag REF [OPTIONS] [CONTEXT]
+                                    explicitly build + import a user Dockerfile
+image import --tag REF (--docker REF | --input FILE)
+                                    import a finished image into agent-vm's cache
+upgrade --image REF                 acquire and retain a new digest-pinned default
 pull                                refresh the cached image
 setup                               pull base image + verify boot
 doctor                              report host credentials + microsandbox state
@@ -303,8 +307,15 @@ the minimal boot contract.
 
 #### Explicit builds and archive import
 
+**Changed in 0.5.0:** `agent-vm build` is now `agent-vm image build` (same
+options and behavior, except the completion notice is printed on stdout).
+There is no alias: `agent-vm build` now fails as an unknown command, and a
+configured tool may now be named `build` — with such a tool,
+`agent-vm build …` launches it instead. A tool named `image` is refused as reserved.
+
 ```text
-Dockerfile/context → Docker buildx cache → completed anonymous OCI archive
+Dockerfile/context → image build → completed anonymous OCI archive
+Docker daemon image / archive → image import ────────────────┘
                                           ↓ native cache import
                                       result reference
                                           ↓ agent-vm --image REF shell
@@ -312,14 +323,14 @@ Dockerfile/context → Docker buildx cache → completed anonymous OCI archive
 ```
 
 ```sh
-agent-vm build --tag my-image:dev --builder native-oci .
+agent-vm image build --tag my-image:dev --builder native-oci .
 agent-vm --image my-image:dev shell my-program
 ```
 
 The bounded option surface is:
 
 ```text
-agent-vm build --tag REF [-f|--file DOCKERFILE]
+agent-vm image build --tag REF [-f|--file DOCKERFILE]
   [--build-arg KEY[=VALUE]]... [--target STAGE] [--builder NAME]
   [--pull] [--no-cache] [--progress MODE] [CONTEXT]
 ```
@@ -338,12 +349,11 @@ An OCI-capable builder is required. Classic Docker image-store drivers may
 reject OCI export. An isolated `docker-container` builder can export OCI but
 may not see daemon-only local `FROM` tags. Select your builder explicitly;
 agent-vm never creates/changes one, transports parents, pushes or retries a
-failed build. For daemon-only workflows, save the completed image and import
-**only after save succeeds**:
+failed build. Import a finished daemon image in one command; Docker
+`image save` must succeed before anything is imported:
 
 ```sh
-docker image save --output image.tar SOURCE &&
-  agent-vm msb image load --input image.tar --tag my-image:dev
+agent-vm image import --docker SOURCE --tag my-image:dev
 ```
 
 For the standard release, first download/authenticate the exact native v0.1.3
@@ -351,27 +361,47 @@ archive using the [image owner's public release instructions](https://github.com
 Then, for example on arm64:
 
 ```sh
-agent-vm msb image load --input agent-vm-standard-v0.1.3-linux-arm64.oci.tar --tag my-standard:0.1.3
+agent-vm image import --input agent-vm-standard-v0.1.3-linux-arm64.oci.tar --tag my-standard:0.1.3
 agent-vm --image my-standard:0.1.3 shell bash -c 'pi --version'
 ```
 
 Import does not adopt a default selection. There is no automatic archive download
-or fallback. A finished archive can be imported without Docker:
+or fallback. A finished archive works with no Docker on PATH:
 
 ```sh
-agent-vm msb image load --input image.tar --tag my-image:dev
+agent-vm image import --input image.tar --tag my-image:dev
 agent-vm --image my-image:dev shell my-program
 ```
 
-Build imports into the same resolved native cache launch reads, including a
-persisted shared redirect or `MSB_CONFIG_PATH`. The result is not tagged in the
-Docker store and may not appear in `msb image ls` until first launch persists
-cached metadata. Export must succeed before native ingestion; failed export or
-single-image ingestion preserves the old result reference. Native blobs can
-remain after failed ingestion. Concurrent updates retain native semantics.
-Build never reads image selection/defaults, writes configuration or adopts a
-default, boots a guest, installs runtime tools or triggers automatic launch
-builds. Successful import is **not** proof of the boot image contract;
+Build and import publish into the same resolved native cache launch reads,
+including a persisted shared redirect or `MSB_CONFIG_PATH`. The result is not
+tagged in the Docker store and may not appear in `msb image ls` until first
+launch persists cached metadata.
+
+The import publishes `--tag` **and** any names the archive itself carries —
+Docker-save `RepoTags` (so `--docker SOURCE` also leaves `SOURCE` in agent-vm's
+cache) and OCI `ref.name` annotations — for every image in a multi-image archive;
+`--tag` names the first image. The loader commits these references one at a time.
+Export/save must succeed before ingestion; if ingestion then fails, `--tag` is
+restored to what it named before (or removed if new), but an archive-supplied
+name may already have changed. Native blobs can remain after failed ingestion.
+Rollback failure is reported with the import error. Process termination
+mid-import is not covered; concurrent writers are not serialized and rollback
+can revert another writer's commit.
+
+Both verbs print the `--image` value to launch with on stdout; errors and
+Docker's progress go to stderr. Usage errors from `image import` do not echo
+rejected values. Printed references are bash/zsh shell words; non-ASCII bytes
+use `$'…'` escapes without changing the reference.
+
+A registry acquisition failure for an explicit mutable tag prints an import
+hint and retains the registry error chain. It does not prove the image exists
+in Docker. Digests and the redacted default image get no hint; launch never
+runs Docker or automatically imports.
+
+Build and import never read image selection/defaults, write configuration,
+adopt a default, boot a guest, install runtime tools or trigger launch builds.
+Successful import is **not** proof of the boot image contract;
 `shell`/`setup` diagnose unusable software.
 
 Allow space for the completed staged archive under private `MSB_HOME/tmp`,
@@ -382,8 +412,8 @@ leave staging, but never imports before exporter success.
 Host builds are **not credential-shielded guest execution**: trust the
 Dockerfile/context/builder. Docker inherits ordinary host environment,
 credentials and stdin; agent-vm does not invoke runtime credential capture or
-provisioning. Avoid sensitive CLI values: ordinary clap usage errors can echo
-rejected values. Fixed parser reason strings are not redaction.
+provisioning. Avoid sensitive build CLI values: build's ordinary clap usage
+errors can echo rejected values; only import gets value-free parse errors.
 
 ## Boot image contract
 
@@ -456,7 +486,7 @@ COPY --chmod=0755 my-program /usr/local/bin/my-program
 Build and launch on a macOS checkout:
 
 ```sh
-agent-vm build --tag my-image:dev --builder native-oci .
+agent-vm image build --tag my-image:dev --builder native-oci .
 agent-vm --image my-image:dev shell
 ```
 
@@ -815,7 +845,7 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
 - `name` — required; a single command-name token: nonempty, no
   whitespace/control characters, no `/` (a name is not a path), not an
   all-dots spelling (`.`/`..`), no leading `-`, and not one of the reserved
-  subcommands `build`, `setup`, `pull`, `msb`, `clipboard`, `doctor`, `secret`,
+  subcommands `image`, `setup`, `pull`, `upgrade`, `msb`, `clipboard`, `doctor`, `secret`,
   `_intercept-hook`, `help`. Names are case-sensitive. Naming a tool `claude`
   is normal — that is the point.
 - `command` — required, nonempty, NUL-free. The guest command name; it is

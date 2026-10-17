@@ -44,7 +44,11 @@ crates/agent-vm/src/
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   ├── default_selection.rs#   retained record: read-only load, automatic adopt, explicit replace
 │   └── upgrade.rs          #   native acquire/pin/platform check before default replacement
-├── image_build.rs          # explicit user Dockerfile export + cache-only native import
+├── image_build.rs          # explicit user Dockerfile export
+├── image_cmd.rs            # image verb group
+├── image_import.rs         # daemon/archive import
+├── image_publish.rs        # staging, native publication, requested-reference rollback
+├── image_miss.rs           # registry-failure import hint
 ├── msb_install.rs          # locate + version-verify the bundled msb; MSB_HOME
 ├── msb_preflight.rs        # fail fast on a forward-migrated msb.db
 ├── doctor.rs               # operator diagnostics and db recovery
@@ -669,19 +673,21 @@ executable by the guest user, and a runtime-initializable `/etc/passwd`/
 failure.
 
 Image authoring and publication belong to the independent image owner and do
-not recompile the launcher. Users explicitly build/import through `image_build::run`:
+not recompile the launcher. Users explicitly build/import through
+`agent-vm image build|import` (`image_build`/`image_import`, both publishing via
+`image_publish`):
 
 ```text
-main prologue → resolved local backend cache → private completed OCI export
-  → native materialization → atomic single-reference metadata publication
+main input preflight → MSB prologue → ambient cache → completed export/save/archive
+  → native materialization → sequential tag/alias publication
+                            → on failure: restore requested tag only
 ```
 
-The anonymous host-platform export has one result reference, supplied only to
-native `load_archive`. A failed exporter never imports, even if it emitted
-complete bytes. Cache-only import avoids a fallible database persist after
-publication: launch later persists cached metadata normally, so `msb image ls`
-need not show the build immediately. No selection/default writes or fallible
-postcommit checks follow publication. See [the canonical user contract](USAGE.md#explicit-builds-and-archive-import)
+Failed exporters never import, even if complete bytes were emitted. Native
+publication includes archive aliases, not just --tag; rollback restores only
+the requested reference. Cache-only import avoids a fallible database persist
+after publication; first launch persists cached metadata normally. Neither verb
+reads or writes selection/defaults. See [the canonical user contract](USAGE.md#explicit-builds-and-archive-import)
 for driver limitations, archive workflows and host-build trust.
 
 The Rust side does own the **verify** step (boot the pulled image, run the

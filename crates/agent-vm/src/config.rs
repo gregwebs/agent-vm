@@ -125,7 +125,7 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     "clipboard",
     "doctor",
     "secret",
-    "build",
+    "image",
     "_intercept-hook",
     // clap synthesizes a `help` subcommand unconditionally. A second one
     // panics in debug builds and silently shadows clap's in release.
@@ -3550,7 +3550,7 @@ mod tests {
             let error = fixture.load().unwrap_err();
             assert!(format!("{error:#}").contains("reserved"), "{reserved}");
         }
-        for allowed in ["claude", "shell", "copilot", "custom"] {
+        for allowed in ["claude", "shell", "copilot", "custom", "build"] {
             let fixture = Fixture::new();
             fixture.user(&one_tool(allowed));
             assert!(fixture.load().is_ok(), "{allowed} should be allowed");

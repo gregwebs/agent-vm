@@ -13,8 +13,8 @@ Commands:
   doctor     Diagnostic / maintenance operations for agent-vm's private microsandbox state (e.g.
              --reset-msb-db)
   secret     Manage agent-vm's own values in the host system keychain
-  build      Explicitly build a Dockerfile and import the result into agent-vm's image cache (Docker
-             is invoked; nothing is selected or booted)
+  image      Build an image, or import a finished one, into agent-vm's own image cache. Docker may
+             be invoked; nothing is selected or booted
   shell      Launch shell in a per-project sandbox; tool arguments are forwarded verbatim
   help       Print this message or the help of the given subcommand(s)
 

@@ -37,7 +37,7 @@ microsandbox = { path = "../../vendor/microsandbox/sdk/rust", default-features =
 # Direct dep (not re-exported by the SDK crate above) so run.rs can read
 # cached OCI image metadata (GlobalCache::read_image_metadata) and import
 # Reference/ImageConfig/CachedImageMetadata directly, and so image_build.rs can
-# call load_archive to import a built OCI archive into that same cache.
+# call load_archive to import a built or saved archive into that same cache.
 microsandbox-image = { path = "../../vendor/microsandbox/crates/image" }
 # Direct dep so agent-vm can read the vendored migration set and derive the
 # bundled schema-version identifier (see src/msb_schema.rs). Already in the

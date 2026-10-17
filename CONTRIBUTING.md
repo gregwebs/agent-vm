@@ -48,9 +48,9 @@ Source builds use the vendored recipe's `vendor/microsandbox/build/msb`
 artifact; `agent-vm setup` pulls and verifies the selected registry image but
 does not build `msb`.
 
-Use packaged `agent-vm build --tag REF --builder NAME CONTEXT` for explicit
-Dockerfile builds, or `agent-vm msb image load --input archive.tar --tag REF`
-for completed Docker-save/OCI archives. Both initialize the same cache as
+Use packaged `agent-vm image build --tag REF --builder NAME CONTEXT` for explicit
+Dockerfile builds, or `agent-vm image import --tag REF (--docker REF | --input archive.tar)`
+for finished images. Both initialize the same cache as
 launch; no prewarming builtin or source importer is needed. Image authoring and
 publication belong to [agent-vm-images](https://github.com/gregwebs/agent-vm-images).
 Optionally initialize its contributor pin with
@@ -321,8 +321,8 @@ the operator daemon's Unix endpoint (Colima/Docker Desktop), not copied
 credentials/helpers. This requires the same signed launchers, Docker/network and dedicated serial native
 host as the retained-default check. It is manual evidence, not CI VM coverage.
 
-`tests/image_build.rs` exercises the actual native importer under fake Docker
-without a VM; native e2e is manual, never a substitute for those CLI tests.
+`tests/image_build.rs` covers `image build` and `image import` through the
+actual native importer under fake Docker without a VM; native e2e is manual, never a substitute for those CLI tests.
 
 The custom-image group's retained-default check is described below.
 The custom-image group needs only Docker, the release

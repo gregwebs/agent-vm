@@ -103,7 +103,9 @@ pub async fn pull_image(image: &str, label: &boot_image::ImageLabel) -> Result<(
         // A redacted (default-tier) failure must not chain the registry URL
         // that embeds the reference; the fixed reason still names the stage. An
         // explicit source keeps its error unchanged.
-        .map_err(|error| label.redact_error("pulling", error));
+        .map_err(|error| {
+            label.redact_error("pulling", crate::image_miss::attach(error, image, label))
+        });
     crate::pull_progress::await_render(render).await;
     let sandbox = result?;
     sandbox.stop_and_wait().await.ok();
