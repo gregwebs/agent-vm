@@ -149,10 +149,10 @@ INHERITED_SECRET=leak python3 -B "$ROOT/script/test/released-image-launch.py" \
     --root "$WORK/r" --shim "$WORK/shim" --log "$WORK/builder.log" \
     --binary "$WORK/nonstd/agent-vm.js" \
     --interpreter "$WORK/nonstd/bin/vetted-node" --timeout 30 --grace 2 \
-    -- IMAGE_ENV=av265:test shell --no-git -- bash -c true || status=$?
+    -- IMAGE_ENV=av265:test --no-git shell bash -c true || status=$?
 [[ "$status" == 42 ]] || { echo "F3: dispatched status $status, expected 42" >&2; exit 1; }
 grep -qx "arg=$WORK/nonstd/agent-vm.js" "$WORK/dispatch-record"
-for forwarded in shell --no-git -- bash -c true; do
+for forwarded in --no-git shell bash -c true; do
     grep -qx "arg=$forwarded" "$WORK/dispatch-record"
 done
 grep -qx "HOME=$WORK/r/home" "$WORK/dispatch-record"

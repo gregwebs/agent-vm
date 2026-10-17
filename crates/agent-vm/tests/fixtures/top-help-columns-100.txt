@@ -1,17 +1,29 @@
-Launch shell in a per-project sandbox
+Sandboxed microVMs for AI coding agents.
 
-Usage: agent-vm shell [OPTIONS] [AGENT_ARGS]...
+Usage: agent-vm [OPTIONS] <COMMAND>
 
-Arguments:
-  [AGENT_ARGS]...
-          Args passed verbatim to the agent; use -- before any agent flags.
-
-          Forwarded verbatim to the in-sandbox agent command. Use `--` if any argument starts with
-          `-` to keep clap from claiming it.
+Commands:
+  setup      Pull and verify the boot image (run once first)
+  pull       Refresh the cached boot image
+  upgrade    Explicitly acquire and select a new default boot image
+  msb        Forward arguments to the bundled `msb` with agent-vm's MSB_HOME/MSB_PATH pinned (e.g.
+             `agent-vm msb ls`, `agent-vm msb status`). Relies on `needs_msb_setup` staying true for
+             this variant — see main()
+  clipboard  Exchange a string between the host and the sandbox
+  doctor     Diagnostic / maintenance operations for agent-vm's private microsandbox state (e.g.
+             --reset-msb-db)
+  secret     Manage agent-vm's own values in the host system keychain
+  build      Explicitly build a Dockerfile and import the result into agent-vm's image cache (Docker
+             is invoked; nothing is selected or booted)
+  shell      Launch shell in a per-project sandbox; tool arguments are forwarded verbatim
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help
           Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 
 Sandbox resources:
       --memory <GIB>
@@ -187,19 +199,30 @@ Guest user:
           to the project/state bind mounts (see CONTEXT.md "Guest user"). Can also be enabled
           persistently with a truthy `AGENT_VM_ROOT` (1|true|yes|on).
 
+Getting started:
+  agent-vm setup       fetch and verify the boot image (run once first)
+  cd ~/your-project
+  agent-vm <tool>      launch one of the tools listed above
+
+Launch options go before the tool: agent-vm [launch options] <tool> [tool arguments...]
+Every argument after the tool is forwarded to it verbatim, including --help and --.
+Built-in commands take their own options after the command and no launch options.
+`agent-vm help <tool>` shows examples; `agent-vm doctor` shows which config files were
+found and what they resolved to.
+
 Examples:
-  agent-vm shell                             launch in the current project
-  agent-vm shell -- <command>                run one command, then exit
-  agent-vm shell -- --model opus --resume    forward args to the tool
-  agent-vm shell --memory 8 --cpus 4         a bigger sandbox
-  agent-vm shell --mount ~/ref:ro            read-only extra mount
-  agent-vm shell --mount /etc/hosts:/host-hosts:ro
-                                             read-only single-file bind
-  agent-vm shell --mount ~/skills:ro:follow-links
-                                             follow symlinks in a skills dir
-  agent-vm shell --mount ~/config:/config:fork:exclude=credentials.json
-                                             seed an independent writable copy
-  agent-vm shell --repo owner/other-repo     widen the GitHub allow-list
+  agent-vm <tool>                                  launch in the current project
+  agent-vm <tool> --model opus --resume            forward args to the tool
+  agent-vm shell <command>                         run one command, then exit
+  agent-vm --memory 8 --cpus 4 <tool>              a bigger sandbox
+  agent-vm --mount ~/ref:ro <tool>                 read-only extra mount
+  agent-vm --mount /etc/hosts:/host-hosts:ro <tool>
+                                                   read-only single-file bind
+  agent-vm --mount ~/skills:ro:follow-links <tool>
+                                                   follow symlinks in a skills dir
+  agent-vm --mount ~/config:/config:fork:exclude=credentials.json <tool>
+                                                   seed an independent writable copy
+  agent-vm --repo owner/other-repo <tool>          widen the GitHub allow-list
 
 Fork mounts:
   Writable binds (the project dir included) may not contain ~/.config/agent-vm; launch from a

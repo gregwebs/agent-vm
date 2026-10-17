@@ -122,7 +122,7 @@ new_case c10
 mkdir -p "$home/.config/agent-vm"
 : >"$home/.config/agent-vm/config.toml"
 status=0
-(cd "$tmp/project" && run env GIT_CEILING_DIRECTORIES="$tmp" "$binary" shell --no-git --image localhost:1/does-not-exist:latest --mount "$home/.config") >"$tmp/out" 2>"$tmp/err" || status=$?
+(cd "$tmp/project" && run env GIT_CEILING_DIRECTORIES="$tmp" "$binary" --no-git --image localhost:1/does-not-exist:latest --mount "$home/.config" shell) >"$tmp/out" 2>"$tmp/err" || status=$?
 [[ "$status" != 0 ]] || fail C10
 contains 'would let the guest change'
 [[ -z "$(find "$state" -mindepth 1 -print -quit)" ]] || fail 'rejected launch created state'

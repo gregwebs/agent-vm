@@ -4,8 +4,8 @@
 //! This is the one place agent-vm runs Docker. It does **not** choose, adopt or
 //! boot an image: it exports one anonymous OCI archive with `docker buildx
 //! build`, then hands that archive to the native importer under the single
-//! `--tag` result reference. Running the result is a separate `shell --image
-//! REF` operation (see CONTEXT.md → *Boot image* / *Launcher*).
+//! `--tag` result reference. Running the result is a separate `agent-vm --image
+//! REF shell` operation (see CONTEXT.md → *Boot image* / *Launcher*).
 //!
 //! ```text
 //! docker buildx build            (Docker owns Dockerfile/FROM/layers/cache)
@@ -16,7 +16,7 @@
 //! microsandbox_image::load_archive(cache, archive, tags=[result])
 //!         │  materializes content, then atomically writes the reference
 //!         ▼
-//! result ref is launchable via `shell --image result`
+//! result ref is launchable via `agent-vm --image result shell`
 //! ```
 //!
 //! # Why not shell out to `msb image load`?

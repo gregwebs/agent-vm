@@ -756,7 +756,7 @@ def build_command(case: Case, work: Path, binary: str, lan: str, *, answer="ANSW
     if case.case in ("NR1", "NR2", "NR3"):
         trailing = ("--version",) if case.tool == "pi" else ("echo", "AGENT_VM_328_SHELL_STARTED")
         return Command(case.case, case.variant, case.tool, "guest", base_environment(work),
-                       (binary, case.tool, "--no-git", "--image", IMAGE, *case.flags, "--", *trailing),
+                       (binary, "--no-git", "--image", IMAGE, *case.flags, case.tool, *trailing),
                        str(work / "requests"), 300, 10, controls={},
                        expected_attempts=(), attempt_expectations={}, attempt_protocols={})
     env = base_environment(work)
@@ -767,12 +767,12 @@ def build_command(case: Case, work: Path, binary: str, lan: str, *, answer="ANSW
         flags = hostname_argv_flags(case, values, hnc_step)
     else:
         flags = [flag.format(**values) for flag in case.flags]
-    argv = [binary, case.tool, "--no-git", "--image", IMAGE, *flags]
+    argv = [binary, "--no-git", "--image", IMAGE, *flags, case.tool]
     ident = attempt or f"{case.case}-{case.variant}"
     if case.guest:
         extra = hostname_extra(case, values, lan2 or DEFAULT_LAN2, hnc_step) if hostname_tier(case.case) else (
             answer if case.case == "I1a" else rebind if case.case == "RB1" else "")
-        argv.extend(("--", case.case, ident, lan, case.variant, extra))
+        argv.extend((case.case, ident, lan, case.variant, extra))
     project = work / (case.case[:3] if case.case.startswith("HK") else "creds" if case.tool == "egresscreds" else "proj")
     setup = ("private synthetic anthropic OAuth seed; remove seed and captured material",) if case.tool == "egresscreds" else ()
     if hostname_tier(case.case):
@@ -2029,7 +2029,7 @@ def self_test() -> int:
         ):
             command = build_command(case, work, "/candidate", "192.168.1.2")
             assert command.cwd == str(project)
-            assert command.argv == ("/candidate", case.tool, "--no-git", "--image", IMAGE, *case.flags, "--", *trailing)
+            assert command.argv == ("/candidate", "--no-git", "--image", IMAGE, *case.flags, case.tool, *trailing)
             assert not command.expected_attempts and not command.controls
             assert check_default_request_diagnostics(case, 0, text) == []
             assert check_default_request_diagnostics(case, 0, "==>   unrelated credential note\n" + text + "==>   unrelated launch note\n") == []

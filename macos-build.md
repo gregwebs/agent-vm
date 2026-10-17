@@ -100,7 +100,7 @@ target/macos-dev/
 Run it directly, the same way you'd run the release bundle:
 
 ```bash
-./target/macos-dev/bin/agent-vm shell --no-git -- uname -m
+./target/macos-dev/bin/agent-vm --no-git shell uname -m
 ```
 
 The Docker-built `agentd` and container-built firmware outputs are unaffected
@@ -131,14 +131,14 @@ digest. Once your build produces `my-image:dev`, import and select it explicitly
 ```bash
 docker image save --output image.tar my-image:dev &&
   ./target/macos-dev/bin/agent-vm msb image load --input image.tar --tag my-image:dev
-./target/macos-dev/bin/agent-vm shell --no-git --image my-image:dev -- uname -m
+./target/macos-dev/bin/agent-vm --no-git --image my-image:dev shell uname -m
 ```
 
 Or explicitly build/import a user Dockerfile with an OCI-capable builder:
 
 ```bash
 ./target/macos-dev/bin/agent-vm build --tag my-image:dev --builder native-oci .
-./target/macos-dev/bin/agent-vm shell --image my-image:dev -- my-program
+./target/macos-dev/bin/agent-vm --image my-image:dev shell my-program
 ```
 
 See [Explicit builds and archive import](USAGE.md#explicit-builds-and-archive-import)

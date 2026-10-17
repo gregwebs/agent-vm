@@ -535,7 +535,7 @@ impl Tool {
         ProviderSet::new(self.credentials.iter().copied())
     }
 
-    /// True when the user's trailing args must be joined into a single bash
+    /// True when the tool arguments must be joined into a single bash
     /// `-c` command line instead of appended as separate `argv` entries (see
     /// `run::inner_argv`). A first-class config field rather than a
     /// `command == "bash"` check, which would silently misbehave for a

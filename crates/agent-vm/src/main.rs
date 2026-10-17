@@ -67,7 +67,11 @@ fn main() -> Result<()> {
     // (which run *inside* the guest, where a project config is present). See
     // `cli::parse_from`.
     let config = config::ConfigPaths::discover().and_then(|paths| config::load(&paths));
-    let dispatch = cli::parse_from(std::env::args_os(), config)?;
+    let dispatch = match cli::parse_from(std::env::args_os(), config) {
+        Ok(dispatch) => dispatch,
+        // Post-parse usage errors use clap's formatter and exit status too.
+        Err(error) => error.downcast::<clap::Error>()?.exit(),
+    };
 
     // `doctor` is a **diagnostic** and must not depend on a healthy runtime to
     // inspect state (issue #93): dispatching it here, before `point_at_msb` /
@@ -165,6 +169,7 @@ fn main() -> Result<()> {
                 images,
                 user_network,
                 args,
+                tool_args,
             } => exit_with(
                 run::launch(
                     &entry,
@@ -172,6 +177,7 @@ fn main() -> Result<()> {
                     user_network.as_ref(),
                     credential_preflight,
                     *args,
+                    tool_args,
                 )
                 .await?,
             ),

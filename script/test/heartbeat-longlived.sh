@@ -41,7 +41,7 @@ script="i=0; while [ \$i -lt $DURATION_SECS ]; do echo \"tick \$i\"; sleep 1; i=
 timeout_secs=$((DURATION_SECS + 90))
 echo "heartbeat-longlived: holding a PTY session open for ${DURATION_SECS}s (timeout ${timeout_secs}s)..."
 
-output=$(cd "$project_dir" && timeout "$timeout_secs" agent-vm shell --no-git -- bash -lc "$script")
+output=$(cd "$project_dir" && timeout "$timeout_secs" agent-vm --no-git shell bash -lc "$script")
 
 echo "$output" | grep -q '^HEARTBEAT_LONGLIVED_DONE$' || {
     echo "heartbeat-longlived: session did not complete; output was:" >&2

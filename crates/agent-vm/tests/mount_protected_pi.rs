@@ -145,8 +145,7 @@ impl Harness {
             )
             .env("MSB_PATH", &self.fake_msb)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
-            .current_dir(project)
-            .arg(verb);
+            .current_dir(project);
         if set_home {
             cmd.env("HOME", self.home.path());
         } else {
@@ -158,7 +157,7 @@ impl Harness {
         for mount in mounts {
             cmd.arg("--mount").arg(mount);
         }
-        cmd.args(["--image", BOGUS_IMAGE]);
+        cmd.args(["--image", BOGUS_IMAGE]).arg(verb);
         run_with_timeout(cmd, Duration::from_secs(15))
     }
 

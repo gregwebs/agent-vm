@@ -21,6 +21,20 @@ images); for the `agent-vm` binary in its non-launching verbs (`doctor`,
 `pull`, `setup`), which share the binary but launch nothing; or for
 microsandbox.
 
+## Launch option
+
+An `agent-vm` flag that configures a launch (`--mount`, `--image`, `-p`, …).
+Written before the tool verb: `agent-vm --mount ~/ref pi`. Built-in verbs
+(`pull`, `doctor`, …) take their own flags after the verb and accept no launch
+options.
+
+## Tool argument
+
+An argv token after the tool verb. Forwarded to the tool verbatim — including
+`--help` and `--` — and never interpreted by `agent-vm`.
+
+_Avoid_: "agent args", "trailing args".
+
 ## Guest user
 
 The numeric `uid:gid` the in-guest agent process runs as. `.user(...)` is set

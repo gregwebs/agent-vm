@@ -67,6 +67,9 @@ if [[ "$guard_only" == false ]]; then
     # Mutation anchors must still name lines that exist; otherwise the
     # mutation evidence is stale and only a hand-run would notice (#305 N9).
     python3 "$REPO_ROOT/script/test/egress-mutations.py" --check-anchors
+    # #358 moved launch options before the tool verb; the manual migration sweep
+    # found the last old-order caller (profiling/) only by reading, so pin it.
+    python3 "$REPO_ROOT/script/test/launch-argv-order.py"
 
 fi
 

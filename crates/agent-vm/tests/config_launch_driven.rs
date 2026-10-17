@@ -321,34 +321,36 @@ impl Harness {
         write(&self.project_config(), contents);
     }
 
-    /// Launch `tool` against the bogus image with the given extra argv.
-    /// `--image` is passed *before* `extra` so a trailing `-- <agent args>`
-    /// (absorbed by the tool's `trailing_var_arg`) cannot swallow it.
-    fn launch(&self, tool: &str, extra: &[&str]) -> Output {
-        self.launch_with_env(tool, extra, &[])
+    /// Launch `tool` against the bogus image with the given launch options.
+    fn launch(&self, tool: &str, options: &[&str]) -> Output {
+        self.launch_with_env(tool, options, &[])
     }
 
-    /// [`Self::launch`] with extra host environment variables set for the
-    /// child (the base command starts from `env_clear`).
-    fn launch_with_env(&self, tool: &str, extra: &[&str], envs: &[(&str, &str)]) -> Output {
-        // `--image` is passed *before* `extra` so a trailing `-- <agent args>`
-        // (absorbed by the tool's `trailing_var_arg`) cannot swallow it.
+    /// [`Self::launch`] with extra host environment variables.
+    fn launch_with_env(&self, tool: &str, options: &[&str], envs: &[(&str, &str)]) -> Output {
         let mut argv: Vec<&str> = vec!["--image", BOGUS_IMAGE];
-        argv.extend_from_slice(extra);
+        argv.extend_from_slice(options);
         self.launch_argv(tool, &argv, envs)
     }
 
-    /// Run `tool` with exactly `argv` (after the verb) and `envs` set on top of
-    /// the cleared environment. [`Self::launch_with_env`] is the common case;
-    /// this is for a test that must control image selection itself (e.g. pass
-    /// `--image` or nothing at all, so config/env/default precedence is
-    /// observable).
-    fn launch_argv(&self, tool: &str, argv: &[&str], envs: &[(&str, &str)]) -> Output {
+    /// Exact launch options, so image-selection tests can omit the typed override.
+    fn launch_argv(&self, tool: &str, options: &[&str], envs: &[(&str, &str)]) -> Output {
+        self.launch_with_tool_args(tool, options, &[], envs)
+    }
+
+    /// `agent-vm <options…> <tool> <tool_args…>`: the full launch shape.
+    fn launch_with_tool_args(
+        &self,
+        tool: &str,
+        options: &[&str],
+        tool_args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> Output {
         let mut cmd = self.base_command();
         for (key, value) in envs {
             cmd.env(key, value);
         }
-        cmd.arg(tool).args(argv);
+        cmd.args(options).arg(tool).args(tool_args);
         run_with_timeout(cmd, Duration::from_secs(20))
     }
 
@@ -1922,7 +1924,7 @@ fn a_project_declared_tool_launches_its_own_command() {
         "[[tools]]\nname = \"mytool\"\ncommand = \"/bin/echo\"\nargs = [\"--fast\"]\n",
     );
 
-    let out = harness.launch("mytool", &["--", "hi"]);
+    let out = harness.launch_with_tool_args("mytool", &["--image", BOGUS_IMAGE], &["hi"], &[]);
     let stderr = stderr_of(&out);
     assert!(
         stderr.contains(CONFIG_MARKER),
@@ -2807,14 +2809,15 @@ fn a_broken_user_config_fails_a_launch_and_still_allows_help_and_doctor() {
 }
 
 /// The interactive-shell `-c` join, observed end to end and boot-free: the
-/// `[debug] guest command:` line for a launch verb with trailing args is
+/// `[debug] guest command:` line for a launch verb with tool arguments is
 /// exactly what `run::inner_argv` produces, with each user arg shell-escaped
 /// so quoting survives the `bash -c` boundary. `run::tests` pins the pure
 /// function; this pins the wiring that emits it for a real invocation.
 #[test]
 fn shell_user_args_are_joined_and_escaped_in_the_guest_command_line() {
     let harness = Harness::new();
-    let out = harness.launch("shell", &["--", "a b", "c'd"]);
+    let out =
+        harness.launch_with_tool_args("shell", &["--image", BOGUS_IMAGE], &["a b", "c'd"], &[]);
 
     let stderr = stderr_of(&out);
     assert!(
@@ -3809,8 +3812,8 @@ fn every_launch_scan_resolves_nothing() {
     )
     .env("CREDENTIAL_SENTINEL_MARKER", &marker)
     .env("SECRET", "should-not-be-read")
-    .arg("shell")
-    .args(["--image", BOGUS_IMAGE]);
+    .args(["--image", BOGUS_IMAGE])
+    .arg("shell");
     let out = run_with_timeout(cmd, Duration::from_secs(20));
     let stderr = stderr_of(&out);
 
@@ -4160,11 +4163,12 @@ fn image_precedence_at_every_cli_boundary() {
             if let Some(env) = row.env {
                 cmd.env("AGENT_VM_IMAGE_TAG", env);
             }
-            let mut argv: Vec<&str> = vec![tool];
+            let mut argv: Vec<&str> = vec![];
             if let Some(cli) = row.cli {
                 argv.push("--image");
                 argv.push(cli);
             }
+            argv.push(tool);
             let out = Harness::run_on(cmd, &argv);
             let stderr = stderr_of(&out);
             assert!(
@@ -4769,16 +4773,11 @@ fn help_doctor_pull_setup_and_launch_agree_on_image_selection() {
 
     // Every launch/builtin help path exposes the same precedence text and env
     // binding, and none of the removed image/build flags.
+    let tool_help = harness.builtin(&["help", "hello"], &[]);
+    assert!(tool_help.status.success());
+    assert!(stdout_of(&tool_help).contains("tool arguments are forwarded verbatim"));
     let mut paths: Vec<(&str, Output)> = vec![
-        ("help hello", harness.builtin(&["help", "hello"], &[])),
-        (
-            "hello --help",
-            harness.launch_argv("hello", &["--help"], &[]),
-        ),
-        (
-            "shell --help",
-            harness.launch_argv("shell", &["--help"], &[]),
-        ),
+        ("--help", harness.builtin(&["--help"], &[])),
         ("pull --help", harness.builtin(&["pull", "--help"], &[])),
         ("setup --help", harness.builtin(&["setup", "--help"], &[])),
     ];
@@ -4864,26 +4863,22 @@ fn pull_and_setup_reject_removed_composition_flags_as_usage_errors() {
     }
 }
 
-/// Pins the **forwarding** behavior, not a rejection: launch verbs carry a
-/// `trailing_var_arg` positional with `allow_hyphen_values`, so - like any
-/// unregistered hyphen token - the removed flags reach the tool as agent args
-/// rather than being rejected by clap. This is the pre-existing `agent_args`
-/// contract; the launcher registers no legacy handling and never probes a former
-/// `.agent-vm/layers/` directory (a documented deviation from the plan, which
-/// expected exit 2 here). The exact forwarded guest command is asserted, so a
-/// change that silently discards the args cannot pass as "forwarded".
+/// Every token after the verb is forwarded verbatim (ADR-0042).
 #[test]
-fn launch_forwards_removed_composition_flags_as_agent_args() {
-    // (argv after the verb, the exact forwarded guest command)
-    let cases: [(Vec<&str>, &str); 5] = [
+fn launch_forwards_tool_arguments_verbatim() {
+    let cases: [(Vec<&str>, &str); 6] = [
         (vec!["--layer", "/tmp/x"], "/bin/echo --layer /tmp/x"),
         (vec!["--base-image", "x"], "/bin/echo --base-image x"),
         (vec!["--yes"], "/bin/echo --yes"),
         (vec!["-y"], "/bin/echo -y"),
-        // `--` is clap's escape: it is absorbed before the tool's
-        // `trailing_var_arg` positional, so the flags after it reach the tool
-        // identically. This pins that the escape is not silently dropped.
-        (vec!["--", "--layer", "/tmp/x"], "/bin/echo --layer /tmp/x"),
+        (
+            vec!["--mount", "/x", "--help"],
+            "/bin/echo --mount /x --help",
+        ),
+        (
+            vec!["--", "--layer", "/tmp/x"],
+            "/bin/echo -- --layer /tmp/x",
+        ),
     ];
     for (argv, expected) in cases {
         let harness = Harness::new();
@@ -5084,11 +5079,12 @@ fn failed_image_acquisition_never_invokes_a_builder() {
         if let Some(env) = env {
             cmd.env("AGENT_VM_IMAGE_TAG", env);
         }
-        let mut argv = vec!["probe"];
+        let mut argv = vec![];
         if let Some(cli) = cli {
             argv.push("--image");
             argv.push(cli);
         }
+        argv.push("probe");
         let out = Harness::run_on(cmd, &argv);
         let stderr = stderr_of(&out);
         assert!(
@@ -5361,7 +5357,6 @@ fn diagnostics_and_help_never_create_a_selection() {
     for args in [
         vec!["--help"],
         vec!["help", "shell"],
-        vec!["shell", "--help"],
         vec!["pull", "--help"],
     ] {
         let out = harness.builtin(&args, &envs);
@@ -6154,21 +6149,26 @@ fn credential_provisioning_adds_no_egress() {
 }
 
 /// G7: the harness's committed two-tool config drives a real non-interactive
-/// launch whose trailing args land verbatim in the guest command, with the
+/// launch whose tool arguments land verbatim in the guest command, with the
 /// default-deny policy and the dense zero-provision network.
 #[test]
-fn harness_probe_tool_launches_with_its_trailing_args() {
+fn harness_probe_tool_launches_with_its_tool_arguments() {
     let harness = Harness::new();
     harness.write_project(include_str!(
         "../../../script/test/fixtures/egress-config.toml"
     ));
-    let out = harness.launch("egressprobe", &["--no-git", "--", "D1", "id-1"]);
+    let out = harness.launch_with_tool_args(
+        "egressprobe",
+        &["--image", BOGUS_IMAGE, "--no-git"],
+        &["D1", "id-1"],
+        &[],
+    );
     let stderr = stderr_of(&out);
     assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
     assert_eq!(
         debug_guest_command(&stderr),
         "bash ./egress-probe.sh D1 id-1",
-        "the trailing args must reach the guest command verbatim"
+        "the tool arguments must reach the guest command verbatim"
     );
     let config = debug_config_json(&stderr);
     assert_default_deny_zero_provision_network(&config["network"], "egressprobe");
@@ -7644,4 +7644,47 @@ fn the_override_does_not_bypass_an_unknown_source() {
         &env_yaml(false, true).replace("source: env", "source: keychain"),
     );
     assert_the_override_does_not_bypass(&h, "t", &[], "`source` must be `env`");
+}
+
+#[test]
+fn a_launch_option_before_a_builtin_is_a_usage_error() {
+    let harness = Harness::new();
+    for (argv, option) in [
+        (vec!["--mount", "/x", "doctor"], "--mount"),
+        (vec!["--image", CLI_REF, "pull"], "--image"),
+    ] {
+        let out = harness.builtin(&argv, &[]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(stderr_of(&out).contains(&format!("'{option}'")));
+    }
+}
+
+#[test]
+fn bare_argv_keeps_help_independent_of_launch_env() {
+    use std::os::unix::ffi::OsStringExt;
+    for broken in [false, true] {
+        let harness = Harness::new();
+        if broken {
+            harness.write_project(BROKEN);
+        }
+        for (name, value) in [
+            ("AGENT_VM_MEMORY_GIB", std::ffi::OsString::from("4")),
+            ("AGENT_VM_MEMORY_GIB", "abc".into()),
+            ("AGENT_VM_CPUS", "abc".into()),
+            (
+                "AGENT_VM_IMAGE_TAG",
+                std::ffi::OsString::from_vec(vec![0xff]),
+            ),
+        ] {
+            let out = harness.base_command().env(name, value).output().unwrap();
+            assert_eq!(out.status.code(), Some(2));
+            let text = stderr_of(&out);
+            for expected in ["Usage:", "doctor", "Sandbox resources", "Mounts & ports"] {
+                assert!(text.contains(expected), "{text}");
+            }
+            for forbidden in ["requires a subcommand", "invalid value", "invalid UTF-8"] {
+                assert!(!text.contains(forbidden), "{text}");
+            }
+        }
+    }
 }

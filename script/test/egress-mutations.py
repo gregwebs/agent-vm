@@ -147,9 +147,9 @@ def matrix():
     host = ["python3", "script/test/lib/egress-supervisor-contract.py"]
     for name, old, new in (
         ("shell-argv",
-         '    if case.guest:\n        extra = hostname_extra(case, values, lan2 or DEFAULT_LAN2, hnc_step) if hostname_tier(case.case) else (\n            answer if case.case == "I1a" else rebind if case.case == "RB1" else "")\n        argv.extend(("--", case.case, ident, lan, case.variant, extra))',
-         '    if case.guest:\n        argv[1] = "shell"\n        extra = hostname_extra(case, values, lan2 or DEFAULT_LAN2, hnc_step) if hostname_tier(case.case) else (\n            answer if case.case == "I1a" else rebind if case.case == "RB1" else "")\n        argv.extend(("--", "-c", case.case, ident, lan, case.variant, extra))'),
-        ("credential-tool", 'argv = [binary, case.tool,', 'argv = [binary, "egressprobe",'),
+         '    if case.guest:\n        extra = hostname_extra(case, values, lan2 or DEFAULT_LAN2, hnc_step) if hostname_tier(case.case) else (\n            answer if case.case == "I1a" else rebind if case.case == "RB1" else "")\n        argv.extend((case.case, ident, lan, case.variant, extra))',
+         '    if case.guest:\n        argv[len(flags) + 4] = "shell"\n        extra = hostname_extra(case, values, lan2 or DEFAULT_LAN2, hnc_step) if hostname_tier(case.case) else (\n            answer if case.case == "I1a" else rebind if case.case == "RB1" else "")\n        argv.extend(("-c", case.case, ident, lan, case.variant, extra))'),
+        ("credential-tool", 'argv = [binary, "--no-git", "--image", IMAGE, *flags, case.tool]', 'argv = [binary, "--no-git", "--image", IMAGE, *flags, "egressprobe"]'),
         ("rejection-guest", 'if case.guest:\n        extra = hostname_extra', 'if case.guest or case.case == "RJ1":\n        extra = hostname_extra'),
         ("extra-env", 'env = base_environment(work)\n    extras', 'env = base_environment(work)\n    env["MUTANT"] = "1"\n    extras'),
         ("tcp-calibration", '"LC1": ("lan-tcp80", "lan-tcp81", "lan-udp90", "lan-udp80"),', '"LC1": ("lan-tcp80", "lan-udp90", "lan-udp80"),'),

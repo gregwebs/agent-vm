@@ -109,8 +109,7 @@ impl Harness {
             )
             .env("MSB_PATH", &self.fake_msb)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
-            .current_dir(project)
-            .arg(verb);
+            .current_dir(project);
         if set_home {
             cmd.env("HOME", self.home.path());
         } else {
@@ -122,7 +121,7 @@ impl Harness {
         for mount in mounts {
             cmd.arg("--mount").arg(mount);
         }
-        cmd.args(["--no-git", "--image", BOGUS_IMAGE]);
+        cmd.args(["--no-git", "--image", BOGUS_IMAGE]).arg(verb);
         run_with_timeout(cmd, Duration::from_secs(15))
     }
 }
@@ -349,7 +348,7 @@ fn relative_run(h: &Harness, project: &Path, state: &Path) -> Output {
         .env("MSB_PATH", &h.fake_msb)
         .env("AGENT_VM_DEBUG_CONFIG", "1")
         .current_dir(project)
-        .args(["shell", "--no-git", "--image", BOGUS_IMAGE]);
+        .args(["--no-git", "--image", BOGUS_IMAGE, "shell"]);
     run_with_timeout(cmd, Duration::from_secs(15))
 }
 #[test]
@@ -497,7 +496,7 @@ fn m11b_root_mode_preserves_raw_non_utf8_authority_home() {
             .env("MSB_PATH", &h.fake_msb)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
             .current_dir(h.project.path())
-            .args(["shell", "--root", "--no-git", "--image", BOGUS_IMAGE]);
+            .args(["--root", "--no-git", "--image", BOGUS_IMAGE, "shell"]);
         run_with_timeout(cmd, Duration::from_secs(15))
     };
     let out = run();

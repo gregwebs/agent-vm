@@ -1295,7 +1295,7 @@ assert_state_json() {
 custom_image_runs_program() {
   local name="custom-runs" proj out host_uid host_gid
   proj="$(custom_project "$name")" || return 1
-  capture_custom_launch "$name" "$proj" hello-258 --no-git --image "$CUSTOM_MARKER" || return 1
+  capture_custom_launch "$name" "$proj" --no-git --image "$CUSTOM_MARKER" hello-258 || return 1
   require_launch_ok "$name" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output "$name")"
@@ -1309,7 +1309,7 @@ custom_image_runs_program() {
 
   local root="custom-runs-root" root_proj
   root_proj="$(custom_project "$root")" || return 1
-  capture_custom_launch "$root" "$root_proj" hello-258 --no-git --root --image "$CUSTOM_MARKER" || return 1
+  capture_custom_launch "$root" "$root_proj" --no-git --root --image "$CUSTOM_MARKER" hello-258 || return 1
   require_launch_ok "$root" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output "$root")"
@@ -1332,8 +1332,8 @@ custom_image_state_persists() {
   host_gid="$(id -g)"
   if [ "$mode" = root ]; then expected_owner=0:0; else expected_owner="$host_uid:$host_gid"; fi
 
-  capture_custom_launch "$name" "$proj" hello-258 --no-git ${root_flag[@]+"${root_flag[@]}"} \
-    --image "$CUSTOM_MARKER" write "sentinel-258-$mode" || return 1
+  capture_custom_launch "$name" "$proj" --no-git ${root_flag[@]+"${root_flag[@]}"} \
+    --image "$CUSTOM_MARKER" hello-258 write "sentinel-258-$mode" || return 1
   require_launch_ok "$name" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output "$name")"
@@ -1349,8 +1349,8 @@ custom_image_state_persists() {
     "$(grep '^direct_owner_after_write=' <<<"$out")" || return 1
 
   read="custom-state-$mode-read"
-  capture_custom_launch "$read" "$proj" hello-258 --no-git ${root_flag[@]+"${root_flag[@]}"} \
-    --image "$CUSTOM_MARKER" read "$mode" || return 1
+  capture_custom_launch "$read" "$proj" --no-git ${root_flag[@]+"${root_flag[@]}"} \
+    --image "$CUSTOM_MARKER" hello-258 read "$mode" || return 1
   require_launch_ok "$read" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output "$read")"
@@ -1391,8 +1391,8 @@ custom_image_user_home_set() {
     expected_owner="$host_uid:$host_gid"
   fi
 
-  capture_custom_launch "$name" "$proj" hello-258 --no-git ${root_flag[@]+"${root_flag[@]}"} \
-    --image "$CUSTOM_USER_HOME" write "uh-$mode" || return 1
+  capture_custom_launch "$name" "$proj" --no-git ${root_flag[@]+"${root_flag[@]}"} \
+    --image "$CUSTOM_USER_HOME" hello-258 write "uh-$mode" || return 1
   require_launch_ok "$name" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output "$name")"
@@ -1409,8 +1409,8 @@ custom_image_user_home_set() {
     "$(grep '^gitconfig_safe=' <<<"$out")" || return 1
 
   read="custom-user-home-$mode-read"
-  capture_custom_launch "$read" "$proj" hello-258 --no-git ${root_flag[@]+"${root_flag[@]}"} \
-    --image "$CUSTOM_USER_HOME" read "$mode" || return 1
+  capture_custom_launch "$read" "$proj" --no-git ${root_flag[@]+"${root_flag[@]}"} \
+    --image "$CUSTOM_USER_HOME" hello-258 read "$mode" || return 1
   require_launch_ok "$read" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output "$read")"
@@ -1430,7 +1430,7 @@ custom_image_user_home_set() {
 custom_image_missing_program() {
   local name="custom-missing" proj out
   proj="$(custom_project "$name")" || return 1
-  capture_custom_launch "$name" "$proj" missing-258 --no-git --image "$CUSTOM_MARKER" || return 1
+  capture_custom_launch "$name" "$proj" --no-git --image "$CUSTOM_MARKER" missing-258 || return 1
   assert_eq "missing program exit status" "127" "$CAPTURE_STATUS" || return 1
   out="$(launch_output "$name")"
   assert_match "names the configured command" "not-installed-258" "$out" || return 1
@@ -1447,7 +1447,7 @@ custom_image_missing_program() {
 not-installed-258() { printf 'function-body\n'; }
 alias not-installed-258='printf alias-body\n'
 HOOK
-  capture_custom_launch "$hookname" "$hookproj" missing-258 --no-git --image "$CUSTOM_MARKER" || return 1
+  capture_custom_launch "$hookname" "$hookproj" --no-git --image "$CUSTOM_MARKER" missing-258 || return 1
   assert_eq "function/alias exit status" "127" "$CAPTURE_STATUS" || return 1
   out="$(launch_output "$hookname")"
   assert_match "function/alias still gets the contract diagnostic" "not-installed-258" "$out" || return 1
@@ -1462,7 +1462,7 @@ HOOK
 custom_image_without_bash() {
   local name="custom-no-bash" proj out result=0
   proj="$(custom_project "$name")" || return 1
-  if ! capture_custom_launch "$name" "$proj" hello-258 --no-git --image "$CUSTOM_NO_BASH"; then
+  if ! capture_custom_launch "$name" "$proj" --no-git --image "$CUSTOM_NO_BASH" hello-258; then
     emergency_sandbox_cleanup "$CUSTOM_NO_BASH" || true
     return 1
   fi
@@ -1505,17 +1505,17 @@ EOF
   state="$(host_state_dir "$INTEG_PROJ")" || return 1
 
   seed_json='{"mcpServers":{"user-owned":{"command":"user-cmd"}},"unrelatedTopKey":{"keep":true}}'
-  # `shell ... -- bash -c 'SCRIPT'` is the supported/documented argv form: the
+  # `... shell bash -c 'SCRIPT'` is the supported/documented argv form: the
   # interactive shell joins the separately escaped arguments into one `bash -c`
   # command line, so a bare single script string would be looked up as a command.
-  capture_custom_launch "integrations-seed" "$INTEG_PROJ" shell --no-git --image "$CUSTOM_MARKER" -- \
+  capture_custom_launch "integrations-seed" "$INTEG_PROJ" --no-git --image "$CUSTOM_MARKER" shell \
     bash -c "printf '%s' '$seed_json' > /agent-vm-state/claude.json" || return 1
   require_launch_ok "integrations-seed" || return 1
   assert_no_host_calls || return 1
   assert_state_json "seeded unrelated entries" "$UNRELATED_STATE" || return 1
 
   # absent: no owned entry, no seed hook, no integration execution.
-  capture_custom_launch "integrations-absent" "$INTEG_PROJ" hello-258 --no-git --image "$CUSTOM_MARKER" || return 1
+  capture_custom_launch "integrations-absent" "$INTEG_PROJ" --no-git --image "$CUSTOM_MARKER" hello-258 || return 1
   require_launch_ok "integrations-absent" || return 1
   assert_no_host_calls || return 1
   assert_state_json "absent: no owned entry" "$NO_OWNED_STATE" || return 1
@@ -1525,7 +1525,7 @@ EOF
 
   # advertised + supplied wrapper: the configured entry is read from state and
   # actually executed; the supplied seed.d hook runs.
-  capture_custom_launch "integrations-advertised" "$INTEG_PROJ" verify-mcp-258 --no-git --image "$CUSTOM_INTEGRATIONS" || return 1
+  capture_custom_launch "integrations-advertised" "$INTEG_PROJ" --no-git --image "$CUSTOM_INTEGRATIONS" verify-mcp-258 || return 1
   require_launch_ok "integrations-advertised" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output integrations-advertised)"
@@ -1539,7 +1539,7 @@ EOF
   # of Chrome opt-out and still run, and nothing executes the integration.
   rm -f "$state/mcp-executed-258" || return 1
   export AGENT_VM_NO_CHROME_MCP=1
-  capture_custom_launch "integrations-optout" "$INTEG_PROJ" shell --no-git --image "$CUSTOM_INTEGRATIONS" -- \
+  capture_custom_launch "integrations-optout" "$INTEG_PROJ" --no-git --image "$CUSTOM_INTEGRATIONS" shell \
     bash -c 'if [ -e /tmp/seed-258-ran ]; then echo seedflag=present; else echo seedflag=absent; fi'
   optout_rc=$?
   unset AGENT_VM_NO_CHROME_MCP
@@ -1555,7 +1555,7 @@ EOF
 
   # wrapper-provided, no capability marker: capability is the supplied artifact,
   # not image identity; there is no seed.d in this target.
-  capture_custom_launch "integrations-wrapper" "$INTEG_PROJ" verify-mcp-258 --no-git --image "$CUSTOM_WRAPPER" || return 1
+  capture_custom_launch "integrations-wrapper" "$INTEG_PROJ" --no-git --image "$CUSTOM_WRAPPER" verify-mcp-258 || return 1
   require_launch_ok "integrations-wrapper" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output integrations-wrapper)"
@@ -1563,7 +1563,7 @@ EOF
   assert_state_json "wrapper-provided: owned entry configured" "$OWNED_STATE" || return 1
   assert_state_json "wrapper-provided: unrelated entries intact" "$UNRELATED_STATE" || return 1
   [ -e "$state/mcp-executed-258" ] || { echo "    FAIL: wrapper-provided: no execution file"; return 1; }
-  capture_custom_launch "integrations-wrapper-seed" "$INTEG_PROJ" shell --no-git --image "$CUSTOM_WRAPPER" -- \
+  capture_custom_launch "integrations-wrapper-seed" "$INTEG_PROJ" --no-git --image "$CUSTOM_WRAPPER" shell \
     bash -c 'if [ -e /tmp/seed-258-ran ]; then echo seedflag=present; else echo seedflag=absent; fi' || return 1
   require_launch_ok "integrations-wrapper-seed" || return 1
   assert_no_host_calls || return 1
@@ -1574,7 +1574,7 @@ EOF
 
   # absent again: the stale owned entry is removed and nothing re-executes.
   rm -f "$state/mcp-executed-258" || return 1
-  capture_custom_launch "integrations-after" "$INTEG_PROJ" hello-258 --no-git --image "$CUSTOM_MARKER" || return 1
+  capture_custom_launch "integrations-after" "$INTEG_PROJ" --no-git --image "$CUSTOM_MARKER" hello-258 || return 1
   require_launch_ok "integrations-after" || return 1
   assert_no_host_calls || return 1
   assert_state_json "after: owned entry removed" "$NO_OWNED_STATE" || return 1
@@ -1601,19 +1601,19 @@ custom_image_supplied_seeds() {
     proj="$(custom_project "$name")" || return 1
     state="$(host_state_dir "$proj")" || return 1
 
-    capture_custom_launch "$name-first" "$proj" hello-258 --no-git --image "$img" || return 1
+    capture_custom_launch "$name-first" "$proj" --no-git --image "$img" hello-258 || return 1
     require_launch_ok "$name-first" || return 1
     assert_eq "$variant: first boot seeds initial bytes" "seed=initial-258" \
       "$(cat "$state/seed-258.payload")" || return 1
 
-    capture_custom_launch "$name-edit" "$proj" shell --no-git --image "$img" -- \
+    capture_custom_launch "$name-edit" "$proj" --no-git --image "$img" shell \
       bash -c 'printf %s edited-258 > /agent-vm-state/seed-258.payload; if [ -e /tmp/seed-258-ran ]; then echo seedflag=present; else echo seedflag=absent; fi' || return 1
     require_launch_ok "$name-edit" || return 1
     out="$(launch_output "$name-edit")"
     assert_eq "$variant: per-boot flag on the edit boot" "seedflag=present" \
       "$(grep '^seedflag=' <<<"$out")" || return 1
 
-    capture_custom_launch "$name-read" "$proj" shell --no-git --image "$img" -- \
+    capture_custom_launch "$name-read" "$proj" --no-git --image "$img" shell \
       bash -c 'cat /agent-vm-state/seed-258.payload; echo; if [ -e /tmp/seed-258-ran ]; then echo seedflag=present; else echo seedflag=absent; fi' || return 1
     require_launch_ok "$name-read" || return 1
     out="$(launch_output "$name-read")"
@@ -1623,7 +1623,7 @@ custom_image_supplied_seeds() {
       "$(grep '^seedflag=' <<<"$out")" || return 1
 
     rm -f "$state/seed-258.payload" || return 1
-    capture_custom_launch "$name-reseed" "$proj" hello-258 --no-git --image "$img" || return 1
+    capture_custom_launch "$name-reseed" "$proj" --no-git --image "$img" hello-258 || return 1
     require_launch_ok "$name-reseed" || return 1
     assert_eq "$variant: re-seeded initial bytes" "seed=initial-258" \
       "$(cat "$state/seed-258.payload")" || return 1
@@ -1657,7 +1657,7 @@ export PATH="$PWD/bin:$PATH"
 export HOOK_ENV_258=hook-exported-258
 HOOK
 
-  capture_custom_launch "$name" "$proj" hook-only-258 --no-git --image "$CUSTOM_MARKER" alpha "beta gamma" || return 1
+  capture_custom_launch "$name" "$proj" --no-git --image "$CUSTOM_MARKER" hook-only-258 alpha "beta gamma" || return 1
   require_launch_ok "$name" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output "$name")"
@@ -1678,7 +1678,7 @@ EOF
   cat >"$noproj/.agent-vm.runtime.sh" <<'HOOK' || return 1
 export HOOK_ENV_258=hook-exported-258
 HOOK
-  capture_custom_launch "$nopath" "$noproj" hook-only-258 --no-git --image "$CUSTOM_MARKER" || return 1
+  capture_custom_launch "$nopath" "$noproj" --no-git --image "$CUSTOM_MARKER" hook-only-258 || return 1
   assert_eq "without PATH export the tool is missing" "127" "$CAPTURE_STATUS" || return 1
   out="$(launch_output "$nopath")"
   assert_match "no-PATH: names the configured command" "hook-only-258" "$out" || return 1
@@ -1700,7 +1700,7 @@ PROG
 name = "pathname-258"
 command = "./hook dir/tool name"
 EOF
-  capture_custom_launch "$pathname" "$pproj" pathname-258 --no-git --image "$CUSTOM_MARKER" "one two" three || return 1
+  capture_custom_launch "$pathname" "$pproj" --no-git --image "$CUSTOM_MARKER" pathname-258 "one two" three || return 1
   require_launch_ok "$pathname" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output "$pathname")"
@@ -1722,7 +1722,7 @@ custom_image_credential_injection() {
   write_custom_credential_probe "$nproj" || return 1
   write_custom_credential_seed || { remove_custom_credential_material; return 1; }
 
-  if capture_custom_launch "$name" "$proj" credsprobe --no-git --image "$CUSTOM_MARKER"; then
+  if capture_custom_launch "$name" "$proj" --no-git --image "$CUSTOM_MARKER" credsprobe; then
     require_launch_ok "$name" || result=1
     assert_no_host_calls || result=1
     out="$(read_launch_evidence "$name")" || result=1
@@ -1784,7 +1784,7 @@ custom_image_credential_injection() {
   fi
 
   rm -f "$CUSTOM_CREDENTIAL_SEED" || result=1
-  if capture_custom_launch "$nname" "$nproj" credsprobe --no-git --image "$CUSTOM_MARKER"; then
+  if capture_custom_launch "$nname" "$nproj" --no-git --image "$CUSTOM_MARKER" credsprobe; then
     nout="$(read_launch_evidence "$nname")" || result=1
     if [ "$CAPTURE_STATUS" -eq 0 ]; then
       echo "    FAIL: missing host credential must not succeed (exit=$CAPTURE_STATUS)"
@@ -1810,7 +1810,7 @@ custom_image_credential_injection() {
 custom_image_stamp_present() {
   local name="custom-stamp" proj out vname="custom-stamp-value"
   proj="$(custom_project "$name")" || return 1
-  capture_custom_launch "$name" "$proj" hello-258 --no-git --image "$CUSTOM_STAMP" || return 1
+  capture_custom_launch "$name" "$proj" --no-git --image "$CUSTOM_STAMP" hello-258 || return 1
   require_launch_ok "$name" || return 1
   assert_no_host_calls || return 1
   out="$(read_launch_evidence "$name")" || return 1
@@ -1824,7 +1824,7 @@ custom_image_stamp_present() {
   assert_eq "a present image-version stamp is observed" "stamp=present" \
     "$stamp_line" || return 1
 
-  capture_custom_launch "$vname" "$proj" shell --no-git --image "$CUSTOM_STAMP" -- \
+  capture_custom_launch "$vname" "$proj" --no-git --image "$CUSTOM_STAMP" shell \
     bash -c 'stamp=$(cat /etc/agent-vm-image-version) || { printf "stamp_read=failed\n"; exit 1; }; printf "image_stamp=%s\n" "$stamp"' || return 1
   require_launch_ok "$vname" || return 1
   assert_no_host_calls || return 1
@@ -1864,8 +1864,8 @@ custom_image_nonstandard_imported() {
     local -a root_flag=()
     [ "$mode" = root ] && root_flag=(--root)
     proj="$(custom_project "$name")" || return 1
-    capture_custom_launch "$name" "$proj" hello-258 --no-git ${root_flag[@]+"${root_flag[@]}"} \
-      --image "$CUSTOM_NONSTANDARD" || return 1
+    capture_custom_launch "$name" "$proj" --no-git ${root_flag[@]+"${root_flag[@]}"} \
+      --image "$CUSTOM_NONSTANDARD" hello-258 || return 1
     require_launch_ok "$name" || return 1
     assert_no_host_calls || return 1
     out="$(launch_output "$name")"
@@ -1941,9 +1941,9 @@ custom_image_nonstandard_cold_warm() {
     return 1
   fi
 
-  capture_custom_launch "custom-cold-nonroot" "$proj_n" hello-258 --no-git --image "$ref_nonroot" write cold-258 || result=1
+  capture_custom_launch "custom-cold-nonroot" "$proj_n" --no-git --image "$ref_nonroot" hello-258 write cold-258 || result=1
   require_launch_ok "custom-cold-nonroot" || result=1
-  capture_custom_launch "custom-cold-root" "$proj_r" hello-258 --no-git --root --image "$ref_root" write cold-258 || result=1
+  capture_custom_launch "custom-cold-root" "$proj_r" --no-git --root --image "$ref_root" hello-258 write cold-258 || result=1
   require_launch_ok "custom-cold-root" || result=1
   assert_no_host_calls || result=1
   for name in custom-cold-nonroot custom-cold-root; do
@@ -1976,9 +1976,9 @@ custom_image_nonstandard_cold_warm() {
 
   # Warm/offline: the same refs boot again with the registry gone, keep the OCI
   # PATH, execute the program and read back the cold boot's persisted sentinel.
-  capture_custom_launch "custom-warm-nonroot" "$proj_n" hello-258 --no-git --image "$ref_nonroot" read nonroot || result=1
+  capture_custom_launch "custom-warm-nonroot" "$proj_n" --no-git --image "$ref_nonroot" hello-258 read nonroot || result=1
   require_launch_ok "custom-warm-nonroot" || result=1
-  capture_custom_launch "custom-warm-root" "$proj_r" hello-258 --no-git --root --image "$ref_root" read root || result=1
+  capture_custom_launch "custom-warm-root" "$proj_r" --no-git --root --image "$ref_root" hello-258 read root || result=1
   require_launch_ok "custom-warm-root" || result=1
   assert_no_host_calls || result=1
   for name in custom-warm-nonroot custom-warm-root; do
@@ -2011,7 +2011,7 @@ name = "hello-258"
 command = "hello-258"
 persist = [".hello-258.state"]
 EOF
-  capture_custom_launch "$name" "$proj" hello-258 --no-git || return 1
+  capture_custom_launch "$name" "$proj" --no-git hello-258 || return 1
   require_launch_ok "$name" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output "$name")"
@@ -2037,7 +2037,7 @@ persist = [".hello-258.state"]
 name = "second-258"
 command = "hello-258"
 EOF
-  capture_custom_launch "custom-selected-poisoned" "$proj" hello-258 --no-git || return 1
+  capture_custom_launch "custom-selected-poisoned" "$proj" --no-git hello-258 || return 1
   require_launch_ok "custom-selected-poisoned" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output custom-selected-poisoned)"
@@ -2084,7 +2084,7 @@ EOF
 
   # The shipped `shell` boots the selected image; the image is allowed to lack
   # the other shipped agents.
-  capture_custom_launch "custom-user-image-shell" "$empty_proj" shell --no-git -- \
+  capture_custom_launch "custom-user-image-shell" "$empty_proj" --no-git shell \
     bash -c 'command -v hello-258 && printf "image-only=ok\n"' || return 1
   require_launch_ok "custom-user-image-shell" || return 1
   assert_no_host_calls || return 1
@@ -2095,7 +2095,7 @@ EOF
   # The same user image selection with a project that declares its own tool.
   local proj
   proj="$(custom_project custom-user-image-tools)" || return 1
-  capture_custom_launch "custom-user-image-tools" "$proj" hello-258 --no-git || return 1
+  capture_custom_launch "custom-user-image-tools" "$proj" --no-git hello-258 || return 1
   require_launch_ok "custom-user-image-tools" || return 1
   assert_no_host_calls || return 1
   out="$(launch_output custom-user-image-tools)"
@@ -2367,7 +2367,7 @@ EOF
 check_custom_no_bash_attach() {
   local name="custom-attach-no-bash" proj out result=0
   proj="$(custom_project "$name")" || return 1
-  if ! capture_custom_attach "$name" "$proj" hello-258 --no-git --image "$CUSTOM_NO_BASH"; then
+  if ! capture_custom_attach "$name" "$proj" --no-git --image "$CUSTOM_NO_BASH" hello-258; then
     emergency_sandbox_cleanup "$CUSTOM_NO_BASH" || true
     return 1
   fi
@@ -2403,8 +2403,8 @@ check_custom_user_home_attach() {
     expected_owner="$(id -u):$(id -g)"
   fi
 
-  if ! capture_custom_attach "$name" "$proj" hello-258 --no-git ${root_flag[@]+"${root_flag[@]}"} \
-    --image "$CUSTOM_USER_HOME" write "attach-258-$mode"; then
+  if ! capture_custom_attach "$name" "$proj" --no-git ${root_flag[@]+"${root_flag[@]}"} \
+    --image "$CUSTOM_USER_HOME" hello-258 write "attach-258-$mode"; then
     return 1
   fi
   out="$(attach_output "$name")"
@@ -2426,8 +2426,8 @@ check_custom_user_home_attach() {
   assert_no_host_calls || result=1
 
   local read="$name-read"
-  if ! capture_custom_attach "$read" "$proj" hello-258 --no-git ${root_flag[@]+"${root_flag[@]}"} \
-    --image "$CUSTOM_USER_HOME" read "$mode"; then
+  if ! capture_custom_attach "$read" "$proj" --no-git ${root_flag[@]+"${root_flag[@]}"} \
+    --image "$CUSTOM_USER_HOME" hello-258 read "$mode"; then
     return 1
   fi
   out="$(attach_output "$read")"
@@ -2445,7 +2445,7 @@ check_custom_user_home_attach() {
 check_custom_nonstandard_attach() {
   local name="custom-attach-nonstandard" proj out result=0
   proj="$(custom_project "$name")" || return 1
-  if ! capture_custom_attach "$name" "$proj" hello-258 --no-git --image "$CUSTOM_NONSTANDARD"; then
+  if ! capture_custom_attach "$name" "$proj" --no-git --image "$CUSTOM_NONSTANDARD" hello-258; then
     return 1
   fi
   out="$(attach_output "$name")"
@@ -2661,7 +2661,7 @@ custom_image_retained_default() {
   # (1) A genuinely cold first launch through the debug recommendation seam
   # acquires A and *adopts* it: the record names exactly A.
   retained_env "$ref_a"
-  retained_launch "retained-cold" "$proj" hello-258 --no-git write cold-acquire
+  retained_launch "retained-cold" "$proj" --no-git hello-258 write cold-acquire
   require_launch_ok "retained-cold" || result=1
   assert_no_host_calls || result=1
   out="$(launch_output retained-cold)"
@@ -2690,7 +2690,7 @@ custom_image_retained_default() {
   local reads_before reads_after
   reads_before="$(registry_read_count "$container")" || result=1
   retained_env "$ref_b"
-  retained_launch "retained-warm-b" "$proj" hello-258 --no-git
+  retained_launch "retained-warm-b" "$proj" --no-git hello-258
   require_launch_ok "retained-warm-b" || result=1
   assert_no_host_calls || result=1
   out="$(launch_output retained-warm-b)"
@@ -2706,7 +2706,7 @@ custom_image_retained_default() {
   RETAINED_STATE="$empty_state"
   mkdir -p "$RETAINED_STATE/msb-home" || result=1
   retained_env "$ref_b"
-  retained_launch "retained-cold-cache-b" "$proj" hello-258 --no-git
+  retained_launch "retained-cold-cache-b" "$proj" --no-git hello-258
   require_launch_ok "retained-cold-cache-b" || result=1
   assert_no_host_calls || result=1
   out="$(launch_output retained-cold-cache-b)"
@@ -2723,7 +2723,7 @@ custom_image_retained_default() {
   RETAINED_STATE="$fail_state"
   mkdir -p "$fail_home/.config/agent-vm/default-image.lock" "$fail_state/msb-home" || result=1
   retained_env "$ref_a"
-  retained_launch "retained-adopt-fail" "$proj" hello-258 --no-git
+  retained_launch "retained-adopt-fail" "$proj" --no-git hello-258
   if [ "$CAPTURE_STATUS" -eq 0 ]; then
     echo "    FAIL: an adoption failure after a successful acquisition must fail the launch"
     result=1
@@ -2755,7 +2755,7 @@ custom_image_retained_default() {
   RETAINED_HOME="$WORK/rh"
   RETAINED_STATE="$cold_state"
   retained_env "$ref_b"
-  retained_launch "retained-offline" "$proj" hello-258 --no-git read nonroot
+  retained_launch "retained-offline" "$proj" --no-git hello-258 read nonroot
   require_launch_ok "retained-offline" || result=1
   assert_no_host_calls || result=1
   out="$(launch_output retained-offline)"
@@ -2769,7 +2769,7 @@ custom_image_retained_default() {
   # skipped; both candidates were validated up front.
   AGENT_VM_RETAINED_BIN="$rel_bin"
   retained_env "$ref_b"
-  retained_launch "retained-release" "$proj" hello-258 --no-git
+  retained_launch "retained-release" "$proj" --no-git hello-258
   require_launch_ok "retained-release" || result=1
   assert_no_host_calls || result=1
   out="$(launch_output retained-release)"
@@ -2784,7 +2784,7 @@ custom_image_retained_default() {
   RETAINED_STATE="$empty_state"
   mkdir -p "$RETAINED_STATE/msb-home" || result=1
   retained_env "$ref_b"
-  retained_launch "retained-unreachable" "$proj" hello-258 --no-git
+  retained_launch "retained-unreachable" "$proj" --no-git hello-258
   if [ "$CAPTURE_STATUS" -eq 0 ]; then
     echo "    FAIL: an unreachable retained digest must fail the launch"
     result=1
@@ -2925,7 +2925,7 @@ custom_image_default_upgrade() {
   ref_b="localhost:$port/$repo@$(registry_host_manifest_digest "$port" "$repo" b)" || result=1
   curl -fsS -H 'Accept: application/vnd.oci.image.manifest.v1+json'     "http://127.0.0.1:$port/v2/$repo/manifests/${ref_b##*@}" > "$WORK/upgrade-b-manifest.json" || result=1
   retained_env "$ref_a"
-  retained_launch upgrade-cold "$proj" hello-258 --no-git || result=1
+  retained_launch upgrade-cold "$proj" --no-git hello-258 || result=1
   require_launch_ok upgrade-cold || result=1
   out="$(launch_output upgrade-cold)"
   assert_eq 'upgrade cold guest A' stamp=absent "$(grep '^stamp=' <<<"$out")" || result=1
@@ -2936,7 +2936,7 @@ custom_image_default_upgrade() {
     (cd "$live" || exit 1; exec "${LAUNCH_ENV[@]}" "${OFFLINE_ENV[@]}" \
       DOCKER_CONFIG="$RETAINED_HOME/docker" XDG_CONFIG_HOME="$WORK/offline-config" \
       PATH="$SHIM_DIR:/usr/bin:/bin" HOST_SHIM_LOG="$HOST_SHIM_LOG" \
-      "$AGENT_VM_DEV_BIN" shell --no-git --mount "$live:/probe" -- bash -c \
+      "$AGENT_VM_DEV_BIN" --no-git --mount "$live:/probe" shell bash -c \
       'for ((i=0;i<180;i++)); do printf "%s\n" "$$" > /probe/identity; hello-258 > /probe/status.tmp; mv /probe/status.tmp /probe/status; printf "%s\n" "$i" > /probe/tick; [ ! -e /probe/stop ] || exit 0; sleep 1; done; exit 94') \
       > "$WORK/upgrade-live.out" 2>&1 </dev/null &
     live_pid=$!
@@ -2960,7 +2960,7 @@ custom_image_default_upgrade() {
       assert_eq 'live A process identity unchanged' "$identity" "$(cat "$live/identity")" || result=1
       grep -q '^stamp=absent$' "$live/status" || result=1
       assert_no_host_calls || result=1
-      retained_launch upgrade-new-b "$proj" hello-258 --no-git || result=1
+      retained_launch upgrade-new-b "$proj" --no-git hello-258 || result=1
       require_launch_ok upgrade-new-b || result=1
       grep -q '^stamp=present$' "$WORK/upgrade-new-b.out" || result=1
       cp "$(retained_record)" "$WORK/upgrade-record-before"
@@ -3011,13 +3011,13 @@ custom_image_default_upgrade() {
   assert_eq 'one live manifest read increments the access oracle' "$cal_target" "$reads_before" || result=1
   retained_env "$ref_a"
   AGENT_VM_RETAINED_BIN="$AGENT_VM_DEV_BIN"
-  retained_launch upgrade-warm "$proj" hello-258 --no-git || result=1
+  retained_launch upgrade-warm "$proj" --no-git hello-258 || result=1
   require_launch_ok upgrade-warm || result=1
   out="$(launch_output upgrade-warm)"
   assert_eq 'changed recommendation still boots B' stamp=present "$(grep '^stamp=' <<<"$out")" || result=1
   AGENT_VM_RETAINED_BIN="$AGENT_VM_RELEASE_BIN"
   retained_env
-  retained_launch upgrade-release-warm "$proj" hello-258 --no-git || result=1
+  retained_launch upgrade-release-warm "$proj" --no-git hello-258 || result=1
   require_launch_ok upgrade-release-warm || result=1
   reads_after="$(upgrade_registry_read_count "$container")" || result=1
   upgrade_docker logs "$container" > "$WORK/upgrade-registry-after.log" 2>&1 || result=1
@@ -3037,9 +3037,9 @@ custom_image_default_upgrade() {
     retained_env
     expected=stamp=absent
     case "$tier" in
-      cli) LAUNCH_ENV+=(AGENT_VM_IMAGE_TAG="$ref_a"); retained_launch "upgrade-$tier" "$proj" hello-258 --no-git --image "$ref_b"; expected=stamp=present ;;
-      env) LAUNCH_ENV+=(AGENT_VM_IMAGE_TAG="$ref_b"); retained_launch "upgrade-$tier" "$proj" hello-258 --no-git; expected=stamp=present ;;
-      user) retained_launch "upgrade-$tier" "$proj" hello-258 --no-git ;;
+      cli) LAUNCH_ENV+=(AGENT_VM_IMAGE_TAG="$ref_a"); retained_launch "upgrade-$tier" "$proj" --no-git --image "$ref_b" hello-258; expected=stamp=present ;;
+      env) LAUNCH_ENV+=(AGENT_VM_IMAGE_TAG="$ref_b"); retained_launch "upgrade-$tier" "$proj" --no-git hello-258; expected=stamp=present ;;
+      user) retained_launch "upgrade-$tier" "$proj" --no-git hello-258 ;;
     esac
     require_launch_ok "upgrade-$tier" || result=1
     out="$(launch_output "upgrade-$tier")"
@@ -3054,7 +3054,7 @@ custom_image_default_upgrade() {
   { printf 'image = "%s"\n' "$ref_a"; cat "$WORK/upgrade-project-before"; } > "$proj/.agent-vm/config.toml"
   cp "$proj/.agent-vm/config.toml" "$WORK/upgrade-project-with-image"
   retained_env
-  retained_launch upgrade-project "$proj" hello-258 --no-git || result=1
+  retained_launch upgrade-project "$proj" --no-git hello-258 || result=1
   require_launch_ok upgrade-project || result=1
   out="$(launch_output upgrade-project)"
   assert_eq 'upgrade override project guest' stamp=absent "$(grep '^stamp=' <<<"$out")" || result=1
@@ -3063,11 +3063,11 @@ custom_image_default_upgrade() {
   cp "$WORK/upgrade-project-before" "$proj/.agent-vm/config.toml"
   upgrade_docker rm -f "$container" >/dev/null || result=1
   retained_env
-  retained_launch upgrade-offline-b "$proj" hello-258 --no-git || result=1
+  retained_launch upgrade-offline-b "$proj" --no-git hello-258 || result=1
   require_launch_ok upgrade-offline-b || result=1
   out="$(launch_output upgrade-offline-b)"
   assert_eq 'offline default B boots' stamp=present "$(grep '^stamp=' <<<"$out")" || result=1
-  retained_launch upgrade-offline-a "$proj" hello-258 --no-git --image "$ref_a" || result=1
+  retained_launch upgrade-offline-a "$proj" --no-git --image "$ref_a" hello-258 || result=1
   require_launch_ok upgrade-offline-a || result=1
   out="$(launch_output upgrade-offline-a)"
   assert_eq 'old cached A remains bootable' stamp=absent "$(grep '^stamp=' <<<"$out")" || result=1
@@ -3170,17 +3170,17 @@ custom_explicit_build_workflow() {
   explicit_build build260 marker-free || return 1
   [ "$source_before" = "$(shasum -a 256 "$FIXTURE_DIR"/*)" ] || return 1
   python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" --controls "$WORK/build260.oci.tar" || return 1
-  explicit_boot build260-first absent shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
+  explicit_boot build260-first absent --no-git --image "$BUILD_REF" shell hello-258 || return 1
   local out
   out="$(launch_output build260-first)" || return 1
   assert_eq uid "uid=$(id -u)" "$(grep '^uid=' <<< "$out")" || return 1
   assert_eq gid "gid=$(id -g)" "$(grep '^gid=' <<< "$out")" || return 1
   assert_eq home "home=$BUILD_HOME" "$(grep '^home=' <<< "$out")" || return 1
-  explicit_boot build260-root absent shell --no-git --root --image "$BUILD_REF" -- hello-258 || return 1
+  explicit_boot build260-root absent --no-git --root --image "$BUILD_REF" shell hello-258 || return 1
   out="$(launch_output build260-root)" || return 1
   assert_eq root uid=0 "$(grep '^uid=' <<< "$out")" || return 1
-  explicit_boot build260-write absent shell --no-git --image "$BUILD_REF" -- hello-258 write sentinel260 || return 1
-  explicit_boot build260-read absent shell --no-git --image "$BUILD_REF" -- hello-258 read || return 1
+  explicit_boot build260-write absent --no-git --image "$BUILD_REF" shell hello-258 write sentinel260 || return 1
+  explicit_boot build260-read absent --no-git --image "$BUILD_REF" shell hello-258 read || return 1
   out="$(launch_output build260-read)" || return 1
   for field in declared plain project direct; do
     assert_eq "persist $field" "$field=sentinel260" "$(grep "^$field=" <<< "$out")" || return 1
@@ -3194,7 +3194,7 @@ custom_explicit_build_workflow() {
     BUILD_HOME="$WORK/bh-$format" BUILD_STATE="$WORK/bs-$format" BUILD_PROJECT="$WORK/bp-$format"
     explicit_project || return 1
     explicit_offline msb image load --input "$WORK/saved260.$format.tar" --tag "$BUILD_REF" || return 1
-    explicit_boot "build260-import-$format" absent shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
+    explicit_boot "build260-import-$format" absent --no-git --image "$BUILD_REF" shell hello-258 || return 1
   done
   BUILD_HOME="$WORK/bh-sh" BUILD_STATE="$WORK/bs-sh" BUILD_PROJECT="$WORK/bp-sh"
   BUILD_SHARE=1 BUILD_CACHE="$WORK/shared260"
@@ -3202,9 +3202,9 @@ custom_explicit_build_workflow() {
   explicit_build build260-shared marker-free || return 1
   [ -d "$BUILD_CACHE/layers" ] || return 1
   [ ! -d "$BUILD_STATE/msb-home/cache/layers" ] || return 1
-  explicit_boot build260-shared absent shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
+  explicit_boot build260-shared absent --no-git --image "$BUILD_REF" shell hello-258 || return 1
   BUILD_SHARE=0
-  explicit_boot build260-shared-persisted absent shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
+  explicit_boot build260-shared-persisted absent --no-git --image "$BUILD_REF" shell hello-258 || return 1
   BUILD_HOME="$original_home" BUILD_STATE="$original_state" BUILD_PROJECT="$original_project"
   BUILD_CACHE="$WORK/unused-cache"
   # Native archive save can reconstruct transport: derive the pin AFTER reimport.
@@ -3216,7 +3216,7 @@ custom_explicit_build_workflow() {
   record="$BUILD_HOME/.config/agent-vm/default-image.json"
   mkdir -p "${record%/*}" || return 1
   jq -n --arg image "$pin" '{version:1,image:$image}' > "$record" || return 1
-  explicit_boot build260-default absent shell --no-git -- hello-258 || return 1
+  explicit_boot build260-default absent --no-git shell hello-258 || return 1
   cp "$record" "$WORK/record260.before" || return 1
   cp "$BUILD_PROJECT/.agent-vm/config.toml" "$WORK/config260.before" || return 1
   [ ! -e "$BUILD_STATE/msb-home/config.json" ] || return 1
@@ -3226,8 +3226,8 @@ custom_explicit_build_workflow() {
       "$AGENT_VM" build --tag "$BUILD_REF" --builder "$BUILDER" --target nonexistent260 "$FIXTURE_DIR"); then return 1; fi
   printf broken > "$WORK/broken260.tar"
   if explicit_offline msb image load --input "$WORK/broken260.tar" --tag "$BUILD_REF"; then return 1; fi
-  explicit_boot build260-failure-result absent shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
-  explicit_boot build260-failure-default absent shell --no-git -- hello-258 || return 1
+  explicit_boot build260-failure-result absent --no-git --image "$BUILD_REF" shell hello-258 || return 1
+  explicit_boot build260-failure-default absent --no-git shell hello-258 || return 1
   cmp "$record" "$WORK/record260.before" || return 1
   cmp "$BUILD_PROJECT/.agent-vm/config.toml" "$WORK/config260.before" || return 1
   [ ! -e "$BUILD_STATE/msb-home/config.json" ] || return 1
@@ -3239,8 +3239,8 @@ custom_explicit_build_workflow() {
     "$AGENT_VM" build --tag "$BUILD_REF" --builder "$BUILDER" --target stamp-present "$FIXTURE_DIR") || return 1
   [ ! -e "$WORK/rebuild260.oci.tar.error" ] || return 1
   python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" "$WORK/rebuild260.oci.tar" > "$WORK/rebuild260.report.json" || return 1
-  explicit_boot build260-replaced present shell --no-git --image "$BUILD_REF" -- hello-258 || return 1
-  explicit_boot build260-retained absent shell --no-git -- hello-258 || return 1
+  explicit_boot build260-replaced present --no-git --image "$BUILD_REF" shell hello-258 || return 1
+  explicit_boot build260-retained absent --no-git shell hello-258 || return 1
   cmp "$record" "$WORK/record260.before" || return 1
   cmp "$BUILD_PROJECT/.agent-vm/config.toml" "$WORK/config260.before" || return 1
   [ ! -e "$BUILD_STATE/msb-home/config.json" ] || return 1

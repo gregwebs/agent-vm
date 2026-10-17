@@ -132,7 +132,7 @@ echo probe-ok=265'
 probe() {
     local route="$1" name="$2"
     shift 2
-    launch "$route" "$name" shell --no-git "$@" -- bash -c "$PROBE"
+    launch "$route" "$name" --no-git "$@" shell bash -c "$PROBE"
     grep -qx "uid=$(id -u)" "$WORK/$name.log"
     grep -qx "gid=$(id -g)" "$WORK/$name.log"
     grep -qx "arch=$(uname -m | sed 's/arm64/aarch64/')" "$WORK/$name.log"
@@ -148,11 +148,11 @@ record="$WORK/r/home/.config/agent-vm/default-image.json"
 jq -e --arg ref "$REF" '.version == 1 and .image == $ref' "$record" >/dev/null
 cp "$record" "$WORK/record.before"
 inspect r registry-inspect "$REF"
-launch r persistence shell --no-git -- bash -c 'test "$(cat "$HOME/.pi/agent/released-265")" = persisted-265'
+launch r persistence --no-git shell bash -c 'test "$(cat "$HOME/.pi/agent/released-265")" = persisted-265'
 cmp "$record" "$WORK/record.before"
 mkdir -p "$WORK/r/project/.agent-vm/layers/poison"
 printf 'not a Dockerfile\n' > "$WORK/r/project/.agent-vm/layers/poison/Dockerfile"
-launch r inert-layers shell --no-git -- bash -c true
+launch r inert-layers --no-git shell bash -c true
 grep -qx 'not a Dockerfile' "$WORK/r/project/.agent-vm/layers/poison/Dockerfile"
 launch a archive-import msb image load --input "$archive" --tag av265:archive
 inspect a archive-inspect av265:archive
@@ -164,7 +164,7 @@ child="ghcr.io/gregwebs/agent-vm-standard@$(jq -er '.graph.manifest.digest' "$WO
 launch r child-import msb image load --input "$archive" --tag "$child"
 jq -n --arg ref "$child" '{version:1,image:$ref}' > "$record"
 cp "$record" "$WORK/retained.before"
-launch r retained shell --no-git -- bash -c true
+launch r retained --no-git shell bash -c true
 # Immediate: a launch that rewrote the retained child to the recommendation must
 # fail here, before the manual overwrite/restore below can mask it.
 released_image_assert_record_unchanged "$record" "$WORK/retained.before" retained \
@@ -180,19 +180,19 @@ printf 'image = "av265:override"\n' > "$project"
 jq -n '{version:1,image:"invalid.example/unavailable@sha256:1111111111111111111111111111111111111111111111111111111111111111"}' > "$record"
 cp "$record" "$WORK/override-record.before"
 cp "$project" "$WORK/project.before"
-launch r project-override shell --no-git -- bash -c true
+launch r project-override --no-git shell bash -c true
 cmp "$project" "$WORK/project.before"
 printf 'image = "invalid.example/unavailable:test"\n' > "$project"
 printf 'image = "av265:override"\n' > "$user"
 cp "$project" "$WORK/project.bad.before"
 cp "$user" "$WORK/user.before"
-launch r user-override shell --no-git -- bash -c true
+launch r user-override --no-git shell bash -c true
 cmp "$project" "$WORK/project.bad.before"
 cmp "$user" "$WORK/user.before"
 printf 'image = "invalid.example/unavailable:test"\n' > "$user"
 cp "$user" "$WORK/user.bad.before"
-launch r env-override IMAGE_ENV=av265:override shell --no-git -- bash -c true
-launch r cli-override IMAGE_ENV=invalid.example/unavailable:test shell --no-git --image av265:override -- bash -c true
+launch r env-override IMAGE_ENV=av265:override --no-git shell bash -c true
+launch r cli-override IMAGE_ENV=invalid.example/unavailable:test --no-git --image av265:override shell bash -c true
 cmp "$record" "$WORK/override-record.before"
 cmp "$project" "$WORK/project.bad.before"
 cmp "$user" "$WORK/user.bad.before"
@@ -205,7 +205,7 @@ if launch a wrong-arch msb image load --input "$other_archive" --tag av265:archi
 inspect a after-wrong-arch av265:archive
 cmp "$WORK/archive-inspect.log" "$WORK/after-corrupt.log"
 cmp "$WORK/archive-inspect.log" "$WORK/after-wrong-arch.log"
-launch a archive-after-negatives shell --no-git --image av265:archive -- bash -c true
+launch a archive-after-negatives --no-git --image av265:archive shell bash -c true
 [[ ! -e "$WORK/a/home/.config/agent-vm/default-image.json" ]] || fail 'negative imports adopted a default'
 [[ ! -s "$WORK/builder.log" ]] || fail 'installed consumer invoked a builder'
 released_image_assert_record_unchanged "$record" "$WORK/retained.before" retained \

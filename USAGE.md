@@ -22,7 +22,7 @@ cargo build
 agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
 
 cd ~/your-project
-agent-vm claude --allow-internet-egress
+agent-vm --allow-internet-egress claude
 ```
 
 See [Ports & egress](#ports--egress) for narrower grants and their risks.
@@ -246,7 +246,7 @@ aside to reinitialize from the current recommendation.
 
 ```sh
 agent-vm upgrade --image ghcr.io/owner/standard:release-2
-agent-vm shell --no-git -- bash -c 'my-program --version'
+agent-vm --no-git shell bash -c 'my-program --version'
 ```
 
 `--image REF` is required and accepts an OCI tag or digest, not a local path.
@@ -307,13 +307,13 @@ the minimal boot contract.
 Dockerfile/context → Docker buildx cache → completed anonymous OCI archive
                                           ↓ native cache import
                                       result reference
-                                          ↓ shell --image REF
+                                          ↓ agent-vm --image REF shell
                                        guest execution
 ```
 
 ```sh
 agent-vm build --tag my-image:dev --builder native-oci .
-agent-vm shell --image my-image:dev -- my-program
+agent-vm --image my-image:dev shell my-program
 ```
 
 The bounded option surface is:
@@ -352,7 +352,7 @@ Then, for example on arm64:
 
 ```sh
 agent-vm msb image load --input agent-vm-standard-v0.1.3-linux-arm64.oci.tar --tag my-standard:0.1.3
-agent-vm shell --image my-standard:0.1.3 -- bash -c 'pi --version'
+agent-vm --image my-standard:0.1.3 shell bash -c 'pi --version'
 ```
 
 Import does not adopt a default selection. There is no automatic archive download
@@ -360,7 +360,7 @@ or fallback. A finished archive can be imported without Docker:
 
 ```sh
 agent-vm msb image load --input image.tar --tag my-image:dev
-agent-vm shell --image my-image:dev -- my-program
+agent-vm --image my-image:dev shell my-program
 ```
 
 Build imports into the same resolved native cache launch reads, including a
@@ -457,14 +457,24 @@ Build and launch on a macOS checkout:
 
 ```sh
 agent-vm build --tag my-image:dev --builder native-oci .
-agent-vm shell --image my-image:dev
+agent-vm --image my-image:dev shell
 ```
 
 Or push to a registry and use its reference directly with `--image`.
 
-## Launch flags
+## Launch options
 
-Each launcher accepts:
+Launch options go before the tool verb: `agent-vm [launch options] <tool> [tool arguments…]`.
+Every tool argument is forwarded verbatim, including `--help` and `--`.
+
+> **Changed in 0.4.0:** launch options moved before the tool verb. Write
+> `agent-vm --mount ~/ref pi`, not `agent-vm pi --mount ~/ref`. Old-order flags are now
+> forwarded to the tool **without a warning**, so update scripts. `agent-vm <tool> --help` now
+> shows the tool's help; use `agent-vm --help` for launch options and `agent-vm help <tool>`
+> for examples. A `--` after the verb is forwarded too, so `agent-vm pi -- -- …` becomes
+> `agent-vm pi -- …`.
+
+Available launch options:
 
 | flag | what |
 |---|---|
@@ -624,8 +634,8 @@ resolved directory target at its real absolute path, so links that leave
 error; a symlink to a file or a dangling symlink is skipped with a warning.
 `follow-links` implies `:ro`.
 
-Trailing args go to the agent: `agent-vm claude -p "say hi"`,
-`agent-vm shell -- -c 'cargo test'`.
+Tool arguments go to the tool verbatim: `agent-vm claude -p "say hi"`;
+the shell tool runs its arguments as one command: `agent-vm shell cargo test`.
 
 Env-var knobs (all opt-in), in three shapes. A row that lists an
 accepted-value set is a boolean switch: its value is parsed — trimmed and
@@ -792,7 +802,7 @@ credentials = ["openai"]             # optional; credential provider names
 tools = ["claude"]                   # optional; tools to provision (same file, or name one)
 persist = [".cache/mytool"]          # optional; guest-HOME-relative, kept under <state>/persist/
 env = { VAR = "value" }              # optional; guest env pairs for this tool
-interactive_shell = false            # optional; join trailing args into `-c`
+interactive_shell = false            # optional; join tool arguments into `-c`
 network_requests = ["api.example.com"] # optional; destinations the tool expects (never grants access)
 ```
 
@@ -874,7 +884,7 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
   applies them last-wins, so declaring `PATH`, `IS_SANDBOX` or `LANG` has no
   effect — agent-vm always overrides them.
 - `interactive_shell` — optional boolean, default `false`. When true, the
-  user's trailing args are joined (and shell-escaped) into a single `bash -c`
+  user's tool arguments are joined (and shell-escaped) into a single `bash -c`
   command line instead of being appended as separate argv entries. The shipped
   `shell` tool sets it.
 
@@ -969,9 +979,8 @@ a separate mount. Agent-vm forces **no** project-trust policy: Pi's own trust
 prompt appears when it would under vanilla Pi, and the answer you give is
 remembered in the now-persistent `~/.pi/agent/trust.json`, so you decide once.
 An explicit `--approve`/`--no-approve` (or `-a`/`-na`) is honoured because it is
-simply Pi's own flag, forwarded untouched. Note that agent-vm's own parser
-consumes the **first** `--` on the outer command line, so deliver a literal `--`
-to Pi with a second one: `agent-vm pi -- -- …`. `pi <subcommand>` (`pi list`,
+simply Pi's own flag, forwarded untouched. A literal `--` after the verb reaches Pi
+unchanged. `pi <subcommand>` (`pi list`,
 `pi auth`, …) is forwarded **verbatim**, so the wrapper injects no `--extension`
 there and subcommands stay subcommands. `pi` also ships with empty `args`,
 like `codex`/`opencode` — any default flag would belong in the wrapper, not in a
@@ -1195,7 +1204,7 @@ guest instead, and it persists per project:
   `--auto-publish`:
 
   ```sh
-  agent-vm dsh --auto-publish --yes
+  agent-vm --auto-publish dsh --yes
   ```
 
   Anthropic and OpenAI support needs no extra plugin: the harness mounts its
@@ -1613,7 +1622,7 @@ allow_lan = true
 allow_egress = ["10.0.0.5", "api.example.com"]
 ```
 
-| Launch flags | internet | LAN | host | allowances |
+| Launch options | internet | LAN | host | allowances |
 |---|---|---|---|---|
 | none | false | true (persisted grant) | false | `10.0.0.5/32`, TLS `api.example.com` (persisted grants) |
 | `--allow-lan=false` | false | false (CLI) | false | same persisted allowances |
