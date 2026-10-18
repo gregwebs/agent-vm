@@ -373,6 +373,19 @@ claim.
 `python3 script/test/egress-mutations.py --evidence /absolute/owned/log-directory`
 (pinned Verus on PATH); only disposable source copies are changed.
 
+The cargo controls build that copy in the harness's own target dir
+(`target/egress-mutations/target`), and the proof controls use `target/verus`,
+which their gate cleans on every run. Every compiling control then removes the
+package's artifacts with `cargo clean -p agent-vm` before it runs: fingerprints
+ignore the copy's path, so a target built elsewhere otherwise looks fresh and
+re-executes a stale binary, letting a mutation confined to a test file
+"survive" (#327). A control whose mutated source cargo reports as fresh, or as
+never compiled, is a **harness** failure rather than a surviving mutant. Both
+target dirs are warmed before the matrix, so a cold dependency build is not a
+control timeout; the first run pays that build once. `results.json` records each
+control's wall time, and the run prints its total. Concurrent runs are refused
+rather than interleaved.
+
 On a dedicated native macOS Apple Silicon host, build the debug bundle and
 supply authenticated, verified native v0.1.3 release assets:
 

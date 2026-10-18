@@ -3,17 +3,50 @@
 
 Run from any cwd. Logs and the exact command ledger go under --evidence.
 A compiler error, timeout, or missing test is not a killed mutation.
+
+A control's verdict must not depend on build history (#327). Two properties
+carry that:
+
+* Cargo rows build in the harness's own `CARGO_TARGET_DIR`
+  (`target/egress-mutations/target`), never the checkout's `target/`; proof rows
+  keep the documented `target/verus`, which their gate cleans on every run.
+  Fingerprints ignore the copy's path, so a target dir shared with the checkout
+  answers with artifacts that were never compiled from the copy (#327).
+* Every compiling control removes the package's artifacts (`cargo clean -p
+  agent-vm`) and then requires cargo to report that it recompiled the target the
+  mutation lives in. A mutation that was never compiled is a harness failure,
+  never a surviving mutant.
 """
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
+TARGET = ROOT / "target"
+# Cargo rows share one target dir so dependencies compile once. Fingerprints
+# ignore the copy's path, so what keeps a verdict honest is the per-control
+# `cargo clean -p agent-vm` plus the recompile assertion -- never this dir. A
+# lock serializes runs, since cargo holds no lock while a test binary runs.
+HARNESS_TARGET = TARGET / "egress-mutations" / "target"
+# Proof rows keep the documented Verus target dir; `verus-verification.sh
+# --repo-gate` already removes this package's artifacts before it verifies.
+VERUS_TARGET = TARGET / "verus"
+VERUS_WARMUP = ["cargo", "verus", "verify", "--locked", "-p", "agent-vm"]
+CLEAN_PACKAGE = ["cargo", "clean", "-p", "agent-vm"]
+# Build the units the matrix runs, so its cold dependency build happens once,
+# outside every per-control timeout.
+WARMUP = ["cargo", "test", "--locked", "-p", "agent-vm", "--no-run",
+          "--bin", "agent-vm", "--test", "config_launch_driven"]
+WARMUP_TIMEOUT = 3600
+CONTROL_TIMEOUT = 240
 SRC = "crates/agent-vm/src/"
 TEST = "crates/agent-vm/tests/config_launch_driven.rs"
 EGRESS = SRC + "egress_policy.rs"
@@ -24,7 +57,56 @@ PROBE = "script/test/fixtures/egress-probe.sh"
 
 
 def rust(pattern, integration=False):
-    return ["cargo", "test", "--locked", "-p", "agent-vm", *(["--test", "config_launch_driven"] if integration else ["--bin", "agent-vm"]), pattern]
+    # JSON messages are how the harness learns whether cargo recompiled the
+    # package or answered from an artifact it did not compile from the mutation.
+    return [
+        "cargo", "test", "--locked", "-p", "agent-vm", "--message-format=json-render-diagnostics",
+        *(["--test", "config_launch_driven"] if integration else ["--bin", "agent-vm"]), pattern,
+    ]
+
+
+def package_artifacts(text, package):
+    """The compilation events cargo reported for the copy's agent-vm package."""
+    artifacts = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(message, dict) or message.get("reason") != "compiler-artifact":
+            continue
+        if Path(message.get("manifest_path", "")).resolve() == package:
+            artifacts.append(message)
+    return artifacts
+
+
+def mutation_target(path):
+    """The cargo target whose compilation carries a mutation in this file."""
+    if path.startswith("crates/agent-vm/tests/"):
+        return Path(path).stem
+    return "agent-vm"
+
+
+def outcome(name, command, marker, exit_code, text, package, target):
+    """PASS only for a mutation that this run compiled (or verified) and killed."""
+    killed = exit_code != 0 and marker in text
+    if name.endswith("-proof"):
+        verified = "Checking agent-vm v" in text or "Compiling agent-vm v" in text
+        if not verified:
+            return "FAIL", "the gate never checked the agent-vm crate; the mutation was never verified"
+        # "10 errors" also contains "0 errors".
+        killed = killed and not re.search(r"\b0 errors\b", text.split("Checking agent-vm")[-1]) and "error:" in text
+    if command[0] == "cargo":
+        artifacts = [message for message in package_artifacts(text, package)
+                     if message["target"]["name"] == target]
+        if any(message.get("fresh") for message in artifacts):
+            return "FAIL", f"cargo reused a fresh {target} artifact; the mutation was never compiled"
+        if not any(not message.get("fresh") for message in artifacts):
+            return "FAIL", f"cargo reported no {target} compilation; the mutation was never compiled"
+    return ("PASS", None) if killed else ("FAIL", None)
 
 
 def matrix():
@@ -262,7 +344,9 @@ def main():
             f"--evidence {evidence} is not empty; use a fresh directory so runs cannot be mixed"
         )
     selected = [row for row in controls if not args.only or args.only in row[0]]
-    # Fail closed before spending ~30 minutes: the -proof rows need the pinned
+    if not selected:
+        parser.error(f"--only {args.only!r} matched no mutation")
+    # Fail closed before spending ~40 minutes: the -proof rows need the pinned
     # Verus release, and a missing toolchain would otherwise land as a bare FAIL
     # indistinguishable from a surviving mutant.
     if any(name.endswith("-proof") for name, *_ in selected) and shutil.which("cargo-verus") is None:
@@ -272,12 +356,29 @@ def main():
             file=sys.stderr,
         )
         return 2
+    # Cargo does not hold its target lock while a test binary runs, so two runs
+    # sharing a target dir could rebuild or delete the binary the other is
+    # executing -- a false result of exactly the kind this harness rejects.
+    lock_dir = HARNESS_TARGET.parent
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "run.lock"
+    with lock_path.open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"FAIL: another egress mutation run holds {lock_path}", file=sys.stderr)
+            return 2
+        return run_matrix(selected, evidence)
+
+
+def run_matrix(selected, evidence):
     evidence.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    # Reuse compiled dependencies without ever sharing live source files.
-    env["CARGO_TARGET_DIR"] = str(ROOT / "target")
-    with tempfile.TemporaryDirectory(prefix="egress-mutations-", dir=ROOT / "target") as temp:
+    env["CARGO_TARGET_DIR"] = str(HARNESS_TARGET)
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="egress-mutations-", dir=TARGET) as temp:
         copy = Path(temp)
+        package = (copy / "crates/agent-vm/Cargo.toml").resolve()
         tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode().split("\0")
         for name in tracked:
             if not name or name.startswith("vendor/"):
@@ -287,6 +388,28 @@ def main():
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, dest)
         (copy / "vendor").symlink_to(ROOT / "vendor", target_is_directory=True)
+        # Cold dependencies are a build cost, not a control's verdict: warm each
+        # target dir once, outside every per-control timeout.
+        warmups = []
+        if any(command[0] == "cargo" for _, _, _, _, command, _ in selected):
+            warmups.append(("cargo", WARMUP, HARNESS_TARGET))
+        if any(name.endswith("-proof") for name, *_ in selected):
+            warmups.append(("verus", VERUS_WARMUP, VERUS_TARGET))
+        for label, command, target_dir in warmups:
+            env["CARGO_TARGET_DIR"] = str(target_dir)
+            warm_started = time.monotonic()
+            warmup = subprocess.run(command, cwd=copy, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, timeout=WARMUP_TIMEOUT)
+            (evidence / f"warmup-{label}.log").write_bytes(warmup.stdout)
+            print(json.dumps({"warmup": label, "command": command, "CARGO_TARGET_DIR": env["CARGO_TARGET_DIR"],
+                              "exit": warmup.returncode, "seconds": round(time.monotonic() - warm_started, 1)}), flush=True)
+            if warmup.returncode != 0:
+                print(
+                    f"FAIL: the disposable copy's {label} warm-up failed; see {evidence / f'warmup-{label}.log'}",
+                    file=sys.stderr,
+                )
+                return 1
+        env["CARGO_TARGET_DIR"] = str(HARNESS_TARGET)
         results = []
         for name, path, old, new, command, marker in selected:
             file = copy / path
@@ -297,25 +420,43 @@ def main():
             # The port-value mutation intentionally changes bracket/bare paths.
             file.write_text(original.replace(old, new))
             log = evidence / (name + ".log")
-            env["CARGO_TARGET_DIR"] = str(ROOT / "target" / "verus") if name.endswith("-proof") else str(ROOT / "target")
+            env["CARGO_TARGET_DIR"] = str(VERUS_TARGET) if name.endswith("-proof") else str(HARNESS_TARGET)
+            row_started = time.monotonic()
+            status, reason, exit_code = None, None, None
             try:
                 with log.open("w") as out:
                     out.write(json.dumps({"cwd": str(copy), "command": command, "CARGO_TARGET_DIR": env["CARGO_TARGET_DIR"]}) + "\n")
                     out.flush()
-                    run = subprocess.run(command, cwd=copy, env=env, stdout=out, stderr=subprocess.STDOUT, timeout=240)
-                text = log.read_text()
-                killed = run.returncode != 0 and marker in text
-                if name.endswith("-proof"):
-                    killed = killed and "0 errors" not in text.split("Checking agent-vm")[-1] and "error:" in text
-                result = {"mutation": name, "command": command, "status": "PASS" if killed else "FAIL", "exit": run.returncode, "evidence": str(log)}
+                    if command[0] == "cargo":
+                        # The mutated package must be rebuilt from these sources.
+                        # Never trust a fingerprint this run did not produce.
+                        clean = subprocess.run(CLEAN_PACKAGE, cwd=copy, env=env, timeout=CONTROL_TIMEOUT,
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                        out.write(clean.stdout.decode(errors="replace"))
+                        out.write(f"# {CLEAN_PACKAGE[0]} {CLEAN_PACKAGE[1]} {CLEAN_PACKAGE[2]} {CLEAN_PACKAGE[3]}: exit {clean.returncode}\n")
+                        out.flush()
+                        if clean.returncode != 0:
+                            raise RuntimeError("cargo clean -p agent-vm failed; the mutation might not be rebuilt")
+                    run = subprocess.run(command, cwd=copy, env=env, stdout=out, stderr=subprocess.STDOUT, timeout=CONTROL_TIMEOUT)
+                exit_code = run.returncode
+                status, reason = outcome(name, command, marker, exit_code, log.read_text(), package,
+                                         mutation_target(path))
             except subprocess.TimeoutExpired:
-                result = {"mutation": name, "command": command, "status": "FAIL", "reason": "timeout is not fault detection", "evidence": str(log)}
+                status, reason = "FAIL", "timeout is not fault detection"
+            except RuntimeError as failure:
+                status, reason = "FAIL", str(failure)
             finally:
                 file.write_text(original)
+            result = {"mutation": name, "command": command, "status": status, "exit": exit_code,
+                      "seconds": round(time.monotonic() - row_started, 1), "evidence": str(log)}
+            if reason:
+                result["reason"] = reason
             results.append(result)
             print(json.dumps(result), flush=True)
             (evidence / "results.json").write_text(json.dumps(results, indent=2) + "\n")
-        return 0 if results and all(r["status"] == "PASS" for r in results) else 1
+        passed = sum(1 for result in results if result["status"] == "PASS")
+        print(f"total: {passed}/{len(results)} controls PASS in {round(time.monotonic() - started, 1)}s", flush=True)
+        return 0 if results and passed == len(results) else 1
 
 
 if __name__ == "__main__":
