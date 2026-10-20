@@ -798,6 +798,36 @@ project you run it in. It never prints token bytes. This is the first
 thing to run when an in-VM agent comes up signed out. See
 [Credentials](#credentials).
 
+After host agent credentials, a `==> credential store` section reports exactly
+one status row before the tool configuration:
+
+```text
+credential store: not probed (0 tracked names)
+credential store: reachable
+credential store: unavailable (<fixed failure advice>)
+credential store: not probed (inventory unavailable)
+```
+
+The first row means the validated names-only inventory is empty or absent: no
+native lookup runs, and store health remains unknown. Otherwise doctor makes one
+reserved-account lookup, regardless of the number of tracked names, without
+reading user credentials, taking an inventory lock or creating files. A pending
+read emits one warning after about 2s and is abandoned after about 5s, even on a
+terminal (plus scheduler/output overhead). Reachable does **not** mean writable,
+unlocked, or that every item is accessible. An inventory error adds an escaped
+recovery diagnostic. See [ADR-0024](docs/adr/0024-host-secret-inventory.md#amendment-credential-store-diagnostics-agent-vm-379)
+for the store boundary and platform limitations.
+
+The reserved account is never written by agent-vm and cannot be selected through
+`ServiceName`; it is not an OS-enforced reservation against other programs or
+manual keychain editing. Under normal successful searches its absence becomes
+NoEntry/Absent. Native setup/search failures, including a missing Linux default
+collection, remain classified failures rather than being forced to Reachable.
+A lookup may prompt or fail before absence can be established. On macOS an
+externally created matching reserved item could have its bytes read and discarded
+inside keyring; no secret bytes cross the adapter. Neither a no-prompt guarantee
+nor a universal absent-account NoEntry guarantee is made.
+
 It also prints the resolved [tool configuration](#tool-configuration) — the same
 verb list `agent-vm --help` shows.
 
@@ -810,8 +840,9 @@ than leaving a green/absent row to be misread, and a provider no configured
 launch requests reads `not requested by any configured launch`. When a
 configured launch requests an authorized service, `doctor` also prints a
 `==> credentials.yaml (launch credentials)` section naming it as `authorized for
-this launch`. This reads the authorization file only — **not** the credential
-store — so it never prompts and never writes; whether a value is actually stored
+this launch`. This launch-authorization view reads the authorization file only —
+**not** the credential store — so that view never prompts and never writes; whether
+a value is actually stored
 is [`agent-vm secret ls`](#storing-your-own-secret-values)'s answer, and the
 section says so. A host with no `credentials.yaml`, or with only authorizations
 no launch requests, prints no credential rows; the section still appears when
@@ -830,11 +861,20 @@ oversized file, is reported as potentially sensitive. Only `auth.json` and
 `doctor` never resolves `!command` values, expands environment references,
 refreshes OAuth, or writes, rewrites or removes anything; it only reads: the host
 credential files above, the tool configuration, `credentials.yaml`, and the two
-Pi files. Ordinary `doctor` also performs **no** initialization at all — it is
-dispatched before microsandbox bootstrap, so it works even when the bundled `msb`
+Pi files, plus the names-only secret inventory and optional bounded native
+credential-store check above. Ordinary `doctor` also performs **no** initialization
+at all — it is dispatched before microsandbox bootstrap, so it works even when the bundled `msb`
 is missing or unpatched, and it reports the computed paths rather than validating
 that binary. The explicit `agent-vm doctor --reset-msb-db` is the mutating
 exception and keeps its existing behaviour.
+
+Ordinary doctor exits nonzero for inventory discovery/load errors or credential-store
+availability failures, after printing the complete report when `MSB_HOME` can be
+computed. An absent inventory is a successful not-probed result. An uncomputable
+`MSB_HOME` still fails early. Configuration, boot-image and invalid-image-environment
+errors retain precedence over store health failures; output I/O failures take
+precedence over deferred diagnostics. Reset skips inventory discovery/loading and
+native availability entirely, even with broken configuration or inventory.
 
 The report is advisory, not enforcement: it neither blocks a launch nor promises
 that a host substitution exists. Your decision whether to remove or rotate a

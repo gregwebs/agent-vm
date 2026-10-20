@@ -4,8 +4,8 @@
 //!
 //! Spawns the real compiled binary with a controlled `HOME` /
 //! `AGENT_VM_STATE_DIR` / cwd (the project) / fake version-only `MSB_PATH`,
-//! mirroring `tests/doctor_reset.rs`. `doctor` is pure filesystem work
-//! dispatched before the tokio runtime, so no VM or network is touched.
+//! mirroring `tests/doctor_reset.rs`. `doctor` avoids runtime/VM setup; these
+//! absent/empty-inventory fixtures skip native credential-store I/O.
 //!
 //! These tests are deliberately black-box: they prove the discovered paths,
 //! tier statuses, resolved order, warnings, and error redaction as the user
@@ -229,13 +229,19 @@ fn reports_defaults_and_preserves_the_pre_existing_sections() {
     let creds = stdout
         .find("==> host agent credentials")
         .expect("credential section");
+    let store = stdout.find("==> credential store").expect("store section");
+    assert!(stdout.contains("credential store: not probed (0 tracked names)"));
+    let image = stdout.find("==> boot image").expect("image section");
     let tools = stdout
         .find("==> tool configuration")
         .expect("config section");
     let ops = stdout
         .find("==> agent-vm doctor: available operations")
         .expect("operations section");
-    assert!(home < creds && creds < tools && tools < ops, "{stdout}");
+    assert!(
+        home < creds && creds < store && store < tools && tools < image && image < ops,
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -391,6 +397,20 @@ fn a_broken_project_config_never_suppresses_the_rest_of_the_report() {
     let directory = Harness::new();
     std::fs::create_dir_all(directory.project_config()).unwrap();
     assert_report_with_config_error(&directory);
+
+    let both = Harness::new();
+    both.write_project("broken = = toml");
+    write(
+        &both
+            .home_root
+            .join(".config/agent-vm/secret-inventory.json"),
+        "not json",
+    );
+    assert_report_with_config_error(&both);
+    assert!(
+        stdout_of(&both.run_doctor())
+            .contains("credential store: not probed (inventory unavailable)")
+    );
 }
 
 fn assert_report_with_config_error(h: &Harness) {
@@ -400,6 +420,7 @@ fn assert_report_with_config_error(h: &Harness) {
     for heading in [
         "==> active microsandbox home",
         "==> host agent credentials",
+        "==> credential store",
         "==> tool configuration",
         "==> boot image",
         "==> agent-vm doctor: available operations",
@@ -593,6 +614,10 @@ fn snapshot_tree(root: &Path) -> Vec<PathBuf> {
 fn a_malformed_config_does_not_block_db_reset() {
     let h = Harness::new();
     h.write_project("totally = = broken\n");
+    write(
+        &h.home_root.join(".config/agent-vm/secret-inventory.json"),
+        "corrupt inventory",
+    );
 
     let out = h.run_doctor_reset();
     assert_success(&out);
@@ -600,6 +625,12 @@ fn a_malformed_config_does_not_block_db_reset() {
         stdout_of(&out).contains("No microsandbox db"),
         "{}",
         stdout_of(&out)
+    );
+    assert!(!stdout_of(&out).contains("==> credential store"));
+    assert!(
+        !h.home_root
+            .join(".config/agent-vm/.secret-inventory.lock")
+            .exists()
     );
 }
 
@@ -613,8 +644,9 @@ fn a_missing_home_reports_an_unavailable_user_tier() {
         .output()
         .expect("failed to run agent-vm doctor without HOME");
 
-    assert_success(&out);
+    assert_failure(&out);
     let stdout = stdout_of(&out);
+    assert!(stdout.contains("credential store: not probed (inventory unavailable)"));
     assert!(
         stdout.contains("<no HOME; user tier unavailable>"),
         "{stdout}"
@@ -728,28 +760,34 @@ fn a_replaced_provider_is_reported_as_not_read_and_authorized_from_yaml() {
 /// config directory exactly as it found it.
 #[test]
 fn doctor_leaves_no_inventory_lock_behind() {
-    let h = Harness::new();
-    h.write_credentials(ANTHROPIC_AUTHORIZATION);
-    let config_dir = h.credentials().parent().unwrap().to_path_buf();
-    let before: Vec<_> = std::fs::read_dir(&config_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
-
-    let out = h.run_doctor();
-    assert_success(&out);
-
-    let after: Vec<_> = std::fs::read_dir(&config_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
-    assert_eq!(
-        before,
-        after,
-        "doctor must not create or remove anything in {}",
-        config_dir.display()
-    );
-    assert!(!config_dir.join(".secret-inventory.lock").exists());
+    for empty in [false, true] {
+        let h = Harness::new();
+        h.write_credentials(ANTHROPIC_AUTHORIZATION);
+        let config_dir = h.credentials().parent().unwrap().to_path_buf();
+        if empty {
+            write(
+                &config_dir.join("secret-inventory.json"),
+                r#"{"version":1,"services":[]}"#,
+            );
+        }
+        let snapshot = || {
+            let mut files: Vec<_> = std::fs::read_dir(&config_dir)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (e.file_name(), std::fs::read(e.path()).unwrap())
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = snapshot();
+        let out = h.run_doctor();
+        assert_success(&out);
+        assert!(stdout_of(&out).contains("credential store: not probed (0 tracked names)"));
+        assert_eq!(snapshot(), before);
+        assert!(!config_dir.join(".secret-inventory.lock").exists());
+    }
 }
 
 /// A host with no `credentials.yaml` gets no launch section: the pre-#178
@@ -862,4 +900,78 @@ fn an_env_sourced_authorization_is_labelled_and_never_read() {
     assert!(text.contains("environment values are read by the launch, not by doctor"));
     assert!(!text.contains("secret ls"));
     assert!(!text.contains("sk-CANARY-163-doctor"));
+}
+
+#[test]
+fn a_bad_secret_inventory_is_reported_without_suppressing_other_sections() {
+    let h = Harness::new();
+    const CANARY: &str = "sk-CANARY-inventory-379";
+    write(
+        &h.home_root.join(".config/agent-vm/secret-inventory.json"),
+        &format!(r#"{{"version":"{CANARY}","services":[]}}"#),
+    );
+    let mut cmd = h.base_command();
+    cmd.arg("doctor");
+    let out = run_with_timeout(cmd, Duration::from_secs(15));
+    assert_failure(&out);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains(
+        "==> credential store\ncredential store: not probed (inventory unavailable)\nerror: "
+    ));
+    assert!(stdout.contains("delete this file to reset the listing"));
+    for heading in [
+        "==> active microsandbox home",
+        "==> host agent credentials",
+        "==> tool configuration",
+        "==> boot image",
+        "==> agent-vm doctor: available operations",
+    ] {
+        assert!(stdout.contains(heading), "{stdout}");
+    }
+    assert!(!stdout.contains(CANARY));
+    assert!(!stderr_of(&out).contains(CANARY));
+}
+
+/// Phase 2 made every report write fallible so a closed stdout cannot turn
+/// `doctor` into a panic. The unit tests inject a failing writer, which cannot
+/// catch a *new* section printed with `println!` (std panics on EPIPE); this
+/// runs the real binary against a socket whose peer is already closed, so every
+/// stdout write fails. Empty inventory, so no native store access.
+#[test]
+fn doctor_reports_a_closed_stdout_as_an_error_not_a_panic() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let h = Harness::new();
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let mut cmd = h.base_command();
+    cmd.arg("doctor")
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn agent-vm");
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait failed") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent-vm did not exit after its stdout closed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stderr = stderr_handle.join().unwrap();
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("writing doctor output") && stderr.contains("Broken pipe"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
 }

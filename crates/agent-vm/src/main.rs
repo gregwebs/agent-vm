@@ -82,8 +82,9 @@ fn main() -> Result<()> {
     // `ensure_msb_home`, keeps it independent of MSB_HOME setup and the
     // `msb --version` identity check. `doctor::run` needs only the pure
     // `msb_home_dir()` path calculation, so it works on a missing or
-    // unpatched msb. It is also pure sync fs work (no VM/network I/O), so it
-    // is dispatched before the runtime for the same reason as `Msb` below.
+    // unpatched msb. Doctor avoids runtime/VM initialization; its optional
+    // credential-store check may perform bounded native keychain or Secret
+    // Service I/O.
     if let Dispatch::Builtin {
         cmd: Cmd::Doctor(args),
         ..

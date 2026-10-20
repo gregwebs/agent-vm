@@ -51,7 +51,7 @@ use crate::credential_provider::{CredentialProvider, ProviderSet};
 use crate::credential_resolver;
 use crate::credential_yaml::{AuthorizationSet, GuestEnvName, SourceKind};
 use crate::pi_credential_inspection::{PiCredentialReport, inspect_project};
-use crate::secret_store::ServiceName;
+use crate::secret_store::{Availability, ServiceName};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -73,6 +73,53 @@ enum ResetOutcome {
 }
 
 pub fn run(args: Args) -> Result<()> {
+    run_to(args, &mut std::io::stdout(), gather_credential_store)
+}
+
+fn write_line(out: &mut impl std::io::Write, line: &str) -> Result<()> {
+    let mut rendered = String::with_capacity(line.len() + 1);
+    rendered.push_str(line);
+    rendered.push('\n');
+    out.write_all(rendered.as_bytes())
+        .context("writing doctor output")
+}
+
+fn gather_credential_store() -> Result<Availability> {
+    crate::secret_store::doctor_store()?.availability()
+}
+
+fn describe_credential_store(report: &Result<Availability>) -> (String, Option<anyhow::Error>) {
+    let mut section = String::from("==> credential store\ncredential store: ");
+    let failed = match report {
+        Ok(Availability::NotProbed) => {
+            section.push_str("not probed (0 tracked names)");
+            false
+        }
+        Ok(Availability::Reachable) => {
+            section.push_str("reachable");
+            false
+        }
+        Ok(Availability::Unavailable(failure)) => {
+            section.push_str(&format!("unavailable ({})", failure.message()));
+            true
+        }
+        Err(error) => {
+            section.push_str("not probed (inventory unavailable)\nerror: ");
+            section.push_str(&crate::config::quoted_str(&format!("{error:#}")));
+            true
+        }
+    };
+    (
+        section,
+        failed.then(|| anyhow!("credential store check failed; see credential store section")),
+    )
+}
+
+fn run_to(
+    args: Args,
+    out: &mut impl std::io::Write,
+    gather_store: impl FnOnce() -> Result<Availability>,
+) -> Result<()> {
     let msb_home = crate::msb_install::msb_home_dir()?;
 
     if !args.reset_msb_db {
@@ -119,43 +166,55 @@ pub fn run(args: Args) -> Result<()> {
         let env_slot = boot_image::read_env_override();
 
         let db_exists = msb_home.join("db").join("msb.db").exists();
-        println!(
-            "{}",
-            describe_home(
+        write_line(
+            out,
+            &describe_home(
                 &msb_home,
                 db_exists,
-                &crate::msb_schema::bundled_schema_version()
-            )
-        );
-        println!();
+                &crate::msb_schema::bundled_schema_version(),
+            ),
+        )?;
+        write_line(out, "")?;
         if let Some(payload) = crate::embedded_runtime::EMBEDDED.as_ref() {
             let dir = crate::msb_install::embedded_runtime_root()
                 .ok()
                 .map(|root| crate::embedded_runtime::unpacked_dir(&root, payload));
-            println!(
-                "{}",
-                describe_embedded_runtime(dir.as_deref(), dir.as_ref().is_some_and(|p| p.exists()))
-            );
-            println!();
+            write_line(
+                out,
+                &describe_embedded_runtime(
+                    dir.as_deref(),
+                    dir.as_ref().is_some_and(|p| p.exists()),
+                ),
+            )?;
+            write_line(out, "")?;
         }
-        println!("{}", describe_credentials(&gather_credentials(), &launch));
-        println!();
-        println!("{config_section}");
-        // Rendered only when there is something launch-specific to say, so a
-        // host with no `credentials.yaml` (or only inert authorizations) sees
-        // the pre-#178 output unchanged.
+        write_line(out, &describe_credentials(&gather_credentials(), &launch))?;
+        write_line(out, "")?;
+        // Submit preceding sections before a native read can emit its slow notice.
+        out.flush().context("writing doctor output")?;
+        let (store_section, store_failure) = describe_credential_store(&gather_store());
+        write_line(out, &store_section)?;
+        write_line(out, "")?;
+        write_line(out, &config_section)?;
         if !launch.is_empty() {
-            println!();
-            println!("{}", describe_launch_view(&launch));
+            write_line(out, "")?;
+            write_line(out, &describe_launch_view(&launch))?;
         }
         let (boot_image_section, boot_image_failure) =
             describe_boot_image(images.as_ref(), &env_slot);
-        println!();
-        println!("{boot_image_section}");
-        println!();
-        println!("==> agent-vm doctor: available operations");
-        println!("      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next");
-        println!("                       agent-vm shell/run recreates it at the bundled schema");
+        write_line(out, "")?;
+        write_line(out, &boot_image_section)?;
+        write_line(out, "")?;
+        write_line(out, "==> agent-vm doctor: available operations")?;
+        write_line(
+            out,
+            "      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next",
+        )?;
+        write_line(
+            out,
+            "                       agent-vm shell/run recreates it at the bundled schema",
+        )?;
+        out.flush().context("writing doctor output")?;
         if let Some(error) = catalog_failure {
             return Err(error);
         }
@@ -171,13 +230,16 @@ pub fn run(args: Args) -> Result<()> {
                  selected image"
             ));
         }
+        if let Some(error) = store_failure {
+            return Err(error);
+        }
         return Ok(());
     }
 
     let ts = timestamp_suffix(SystemTime::now());
     let outcome = reset_msb_db_in(&msb_home, &ts)?;
-    println!("{}", render(&outcome));
-    Ok(())
+    write_line(out, &render(&outcome))?;
+    out.flush().context("writing doctor output")
 }
 
 fn describe_embedded_runtime(dir: Option<&Path>, exists: bool) -> String {
@@ -1030,6 +1092,426 @@ fn render(outcome: &ResetOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_store_rows_match_all_outcomes() {
+        for (outcome, row, fails) in [
+            (
+                Availability::NotProbed,
+                "not probed (0 tracked names)",
+                false,
+            ),
+            (Availability::Reachable, "reachable", false),
+        ] {
+            let (text, error) = describe_credential_store(&Ok(outcome));
+            assert_eq!(
+                text,
+                format!("==> credential store\ncredential store: {row}")
+            );
+            assert_eq!(error.is_some(), fails);
+        }
+        use crate::secret_store::KeychainFailure as F;
+        for failure in [
+            F::AccessDenied,
+            F::Unavailable,
+            F::Ambiguous,
+            F::Rejected,
+            F::Unresponsive,
+            F::InventoryBusy,
+            F::Unknown,
+        ] {
+            let (text, error) = describe_credential_store(&Ok(Availability::Unavailable(failure)));
+            assert_eq!(
+                text,
+                format!(
+                    "==> credential store\ncredential store: unavailable ({})",
+                    failure.message()
+                )
+            );
+            assert_eq!(
+                error.unwrap().to_string(),
+                "credential store check failed; see credential store section"
+            );
+            assert!(!text.contains("sk-CANARY-value"));
+        }
+        let (text, error) = describe_credential_store(&Err(anyhow!("unsafe\n\x1b path")));
+        assert_eq!(
+            text,
+            "==> credential store\ncredential store: not probed (inventory unavailable)\nerror: \"unsafe\\x0a\\x1b path\""
+        );
+        assert!(error.is_some());
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        flushed: std::rc::Rc<std::cell::Cell<usize>>,
+        submissions: std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
+        fail_write: bool,
+        fail_flush_at: Option<usize>,
+    }
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test broken pipe",
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let n = self.flushed.get() + 1;
+            self.flushed.set(n);
+            self.submissions.borrow_mut().push(self.bytes.clone());
+            if self.fail_flush_at == Some(n) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test flush failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn doctor_output_write_failure_is_an_error() {
+        let mut writer = RecordingWriter {
+            fail_write: true,
+            ..Default::default()
+        };
+        let error = write_line(&mut writer, "hello").unwrap_err();
+        assert_eq!(error.to_string(), "writing doctor output");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    // Environment/cwd are held under the same cooperative guard as other unit
+    // tests. No credential values, timestamps or expiry data enter this fixture.
+    struct RunFixture {
+        old_cwd: PathBuf,
+        root: tempfile::TempDir,
+        _env: crate::test_env::EnvGuard,
+    }
+    impl RunFixture {
+        fn new() -> Self {
+            let mut env = crate::test_env::guard();
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let project = root.path().join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            write_file(
+                &home.join(".config/agent-vm/credentials.yaml"),
+                ANTHROPIC.as_bytes(),
+            );
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                home.join(".config/agent-vm/credentials.yaml"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            env.set_var("HOME", &home);
+            env.set_var("XDG_CACHE_HOME", root.path().join("cache"));
+            env.set_var("AGENT_VM_STATE_DIR", root.path().join("state"));
+            for key in [
+                "AGENT_VM_IMAGE_TAG",
+                "AGENT_VM_TEST_DEFAULT_IMAGE",
+                "MSB_HOME",
+                "XDG_CONFIG_HOME",
+            ] {
+                env.remove_var(key);
+            }
+            let old_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&project).unwrap();
+            Self {
+                old_cwd,
+                root,
+                _env: env,
+            }
+        }
+        fn normalize(&self, text: &str) -> String {
+            let session = crate::session::ProjectSession::for_cwd().unwrap();
+            text.replace(&session.state_dir.display().to_string(), "<project-state>")
+                .replace(
+                    &self
+                        .root
+                        .path()
+                        .canonicalize()
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                    "<fixture>",
+                )
+                .replace(&self.root.path().display().to_string(), "<fixture>")
+        }
+    }
+    impl Drop for RunFixture {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.old_cwd).unwrap();
+        }
+    }
+    fn ordinary() -> Args {
+        Args {
+            reset_msb_db: false,
+        }
+    }
+    fn assert_tail(text: &str) {
+        for heading in [
+            "==> tool configuration",
+            "==> credentials.yaml (launch credentials)",
+            "==> boot image",
+            "==> agent-vm doctor: available operations",
+        ] {
+            assert!(text.contains(heading), "missing {heading}: {text}");
+        }
+        assert!(text.ends_with(
+            "                       agent-vm shell/run recreates it at the bundled schema\n"
+        ));
+        assert_eq!(text.matches("==> credential store\n").count(), 1);
+    }
+
+    #[test]
+    fn run_to_flushes_before_gather_and_after_success() {
+        let _fixture = RunFixture::new();
+        let mut out = RecordingWriter::default();
+        let flushed = out.flushed.clone();
+        let submissions = out.submissions.clone();
+        run_to(ordinary(), &mut out, || {
+            assert_eq!(flushed.get(), 1);
+            let submissions = submissions.borrow();
+            let prefix = std::str::from_utf8(&submissions[0]).unwrap();
+            assert!(prefix.starts_with("==> active microsandbox home\n"));
+            assert!(prefix.contains("==> host agent credentials\n"));
+            assert!(prefix.ends_with("substituted.\n\n"));
+            assert!(!prefix.contains("==> credential store"));
+            assert!(!prefix.contains("==> tool configuration"));
+            Ok(Availability::NotProbed)
+        })
+        .unwrap();
+        assert_eq!(out.flushed.get(), 2);
+        assert_eq!(out.submissions.borrow().last().unwrap(), &out.bytes);
+        assert_tail(std::str::from_utf8(&out.bytes).unwrap());
+    }
+
+    #[test]
+    fn run_to_keeps_tail_on_unavailable() {
+        let _fixture = RunFixture::new();
+        let mut successful = Vec::new();
+        run_to(ordinary(), &mut successful, || Ok(Availability::Reachable)).unwrap();
+        let successful = std::str::from_utf8(&successful).unwrap();
+        let expected_tail = successful.split_once("==> tool configuration\n").unwrap().1;
+        for failure in [
+            crate::secret_store::KeychainFailure::AccessDenied,
+            crate::secret_store::KeychainFailure::Unresponsive,
+        ] {
+            let mut out = RecordingWriter::default();
+            let error = run_to(ordinary(), &mut out, || {
+                Ok(Availability::Unavailable(failure))
+            })
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "credential store check failed; see credential store section"
+            );
+            let text = std::str::from_utf8(&out.bytes).unwrap();
+            assert_tail(text);
+            assert_eq!(
+                text.split_once("==> tool configuration\n").unwrap().1,
+                expected_tail
+            );
+            assert_eq!(out.flushed.get(), 2);
+        }
+    }
+
+    #[test]
+    fn run_to_io_error_precedes_health_failure() {
+        let _fixture = RunFixture::new();
+        for flush in [1, 2] {
+            let mut out = RecordingWriter {
+                fail_flush_at: Some(flush),
+                ..Default::default()
+            };
+            let error = run_to(ordinary(), &mut out, || {
+                Ok(Availability::Unavailable(
+                    crate::secret_store::KeychainFailure::AccessDenied,
+                ))
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), "writing doctor output");
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            if flush == 2 {
+                assert_tail(std::str::from_utf8(&out.bytes).unwrap());
+            }
+        }
+        let mut out = RecordingWriter {
+            fail_write: true,
+            ..Default::default()
+        };
+        let error = run_to(ordinary(), &mut out, || {
+            panic!("gather after failed output")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "writing doctor output");
+    }
+
+    #[test]
+    fn run_to_reset_skips_gather() {
+        let fixture = RunFixture::new();
+        write_file(
+            &fixture
+                .root
+                .path()
+                .join("home/.config/agent-vm/secret-inventory.json"),
+            b"corrupt inventory",
+        );
+        for has_db in [false, true] {
+            if has_db {
+                write_file(&fixture.root.path().join("state/msb-home/db/msb.db"), b"db");
+            }
+            let mut out = RecordingWriter::default();
+            run_to(Args { reset_msb_db: true }, &mut out, || {
+                panic!("reset discovered inventory")
+            })
+            .unwrap();
+            assert_eq!(out.flushed.get(), 1);
+            assert!(
+                !std::str::from_utf8(&out.bytes)
+                    .unwrap()
+                    .contains("credential store")
+            );
+        }
+    }
+
+    #[test]
+    fn run_to_pins_ordinary_and_reset_bytes() {
+        let fixture = RunFixture::new();
+        let mut out = Vec::new();
+        run_to(ordinary(), &mut out, || Ok(Availability::NotProbed)).unwrap();
+        let actual = fixture.normalize(std::str::from_utf8(&out).unwrap());
+        let without_new_section = actual.replace(
+            "==> credential store\ncredential store: not probed (0 tracked names)\n\n",
+            "",
+        );
+        let expected = r###"==> active microsandbox home
+MSB_HOME: <fixture>/state/msb-home
+db:       <fixture>/state/msb-home/db/msb.db (absent)
+this build's bundled schema: m20260922_000001
+
+==> host agent credentials
+claude    <fixture>/home/.claude/.credentials.json
+          absent - replaced by credentials.yaml for pi, claude, shell (host file not read)
+codex     <fixture>/home/.codex/auth.json
+          absent
+opencode  <fixture>/home/.local/share/opencode/auth.json
+          absent
+copilot   <fixture>/home/.cache/claude-vm/copilot-token.json
+          absent
+
+==> this project
+dir:      <fixture>/project
+state:    <project-state>
+captured: <none> (nothing to substitute on the wire)
+guest Claude cred file: absent
+
+==> guest-managed Pi credentials
+Structural inspection of guest-managed Pi state only; agent-vm never resolves, imports, refreshes or removes it.
+auth.json: not present
+models.json: not present
+Only auth.json and models.json are inspected (settings, sessions and installed packages are not).
+
+For the host-captured Claude/Codex/GitHub credentials above, the guest never
+receives a real token: it gets a placeholder that the TLS proxy swaps for the
+host token on the way out. So sign in ON THE HOST (`claude login`,
+`codex login`, `gh auth login`): running `/login` inside the VM cannot work and fails with an OAuth 400.
+Pi guest-managed state is different: a credential created inside the guest
+lives in the project's persistent Pi home and is reported above, not
+substituted.
+
+==> tool configuration
+user:    <fixture>/home/.config/agent-vm/config.toml (absent)
+project: <fixture>/project/.agent-vm/config.toml (absent)
+resolved: built-in defaults; launch-verb order
+  1. dsh -> "dsh"; args=1; credentials=none; provisions=none; persist=1; source=built-in
+  2. pi -> "pi"; args=0; credentials=none; provisions=anthropic,openai; persist=0; source=built-in; network_requests=api.anthropic.com,auth.openai.com,chatgpt.com,mcp-proxy.anthropic.com,platform.claude.com
+  3. codex -> "codex"; args=0; credentials=openai; provisions=openai; persist=0; source=built-in; env=1; network_requests=api.openai.com,auth.openai.com,chatgpt.com
+  4. opencode -> "opencode"; args=0; credentials=openai,opencode-static; provisions=openai,opencode-static; persist=0; source=built-in; network_requests=api.openai.com,auth.openai.com,chatgpt.com,models.opencode.ai
+  5. claude -> "claude"; args=1; credentials=anthropic; provisions=anthropic; persist=0; source=built-in; network_requests=api.anthropic.com,mcp-proxy.anthropic.com,platform.claude.com
+  6. copilot -> "copilot"; args=1; credentials=copilot; provisions=copilot; persist=0; source=built-in
+  7. shell -> "bash"; args=2; credentials=none; provisions=anthropic,openai,opencode-static,copilot; persist=0; source=built-in; interactive_shell=true; env=1
+
+==> credentials.yaml (launch credentials)
+anthropic  authorized for this launch (replaces the host built-in)
+note: values are not read here; `agent-vm secret ls` reports whether a value is stored.
+
+==> boot image
+AGENT_VM_IMAGE_TAG: <unset>
+user:    none
+project: none
+default: not selected; initial recommendation [<fixture>/home/.config/agent-vm/default-image.json]
+selected (without --image): not selected; initial recommendation [<fixture>/home/.config/agent-vm/default-image.json]
+
+==> agent-vm doctor: available operations
+      --reset-msb-db   move MSB_HOME/db aside (reversible) so the next
+                       agent-vm shell/run recreates it at the bundled schema
+"###;
+        let expected = if let Some(payload) = crate::embedded_runtime::EMBEDDED.as_ref() {
+            let runtime = crate::embedded_runtime::unpacked_dir(
+                &fixture.root.path().join("cache/agent-vm/runtime"),
+                payload,
+            );
+            let runtime = fixture.normalize(&runtime.display().to_string());
+            expected.replacen(
+                "==> host agent credentials\n",
+                &format!(
+                    "==> embedded runtime\nunpacked: {runtime} (absent)\n\n==> host agent credentials\n"
+                ),
+                1,
+            )
+        } else {
+            expected.to_owned()
+        };
+        assert_eq!(without_new_section, expected);
+        for has_db in [false, true] {
+            if has_db {
+                write_file(&fixture.root.path().join("state/msb-home/db/msb.db"), b"db");
+            }
+            let mut out = Vec::new();
+            run_to(Args { reset_msb_db: true }, &mut out, || {
+                panic!("reset gather")
+            })
+            .unwrap();
+            let mut text = fixture.normalize(std::str::from_utf8(&out).unwrap());
+            if has_db {
+                let home = fixture.root.path().join("state/msb-home");
+                let target = std::fs::read_dir(home)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .find(|n| n.starts_with("db.reset-"))
+                    .unwrap();
+                text = text.replace(&target, "db.reset-<timestamp>");
+            }
+            let expected = if has_db {
+                r###"==> Moved microsandbox db aside (nothing was deleted)
+from: <fixture>/state/msb-home/db
+to:   <fixture>/state/msb-home/db.reset-<timestamp>
+The database will be recreated at the bundled schema on the next `agent-vm shell`/`run`, and images will be re-pulled on first boot.
+To undo: mv "<fixture>/state/msb-home/db.reset-<timestamp>" "<fixture>/state/msb-home/db"
+"###
+            } else {
+                r###"==> No microsandbox db to reset — nothing was moved.
+checked: <fixture>/state/msb-home/db
+A fresh database will be created on the next `agent-vm shell`/`run`.
+"###
+            };
+            assert_eq!(text, expected);
+        }
+    }
+
     #[test]
     fn embedded_runtime_section_reports_path_and_presence() {
         assert_eq!(
