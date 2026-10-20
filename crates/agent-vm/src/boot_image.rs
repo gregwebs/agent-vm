@@ -9,8 +9,8 @@
 //! --image  >  AGENT_VM_IMAGE_TAG (empty = unset)  >  user image  >  project image  >  default
 //! ```
 //!
-//! — so `run`, `pull`, `setup` and `doctor` cannot disagree about which image a
-//! session boots. The **catalog is deliberately not an input**: changing the
+//! — so `run`, `pull`, `setup`, `doctor` and `image show` cannot disagree about
+//! which image a session boots. The **catalog is deliberately not an input**: changing the
 //! runtime tool declaration must never change the image (issue #259).
 //!
 //! # The default slot: a recommendation, then a retained selection
@@ -41,7 +41,9 @@
 //! is therefore the one place that turns a selection into user-facing text: an
 //! explicit source is its escaped reference plus origin, but the default tier is
 //! a fixed label. The actual [`ImageRef`] still goes to the SDK unchanged; only
-//! *display* redacts it.
+//! *display* redacts it, and [`inspect_selection`] is the one deliberate
+//! exception: `agent-vm image show` reports the selected reference and its
+//! provenance because that is what the user asked to inspect.
 //!
 //! # Config-file images are OCI-only
 //!
@@ -65,7 +67,7 @@
 //! user retains. [`immutable_image_is_acceptable`] is that contraction.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use vstd::prelude::*;
@@ -214,8 +216,10 @@ pub(crate) enum ImageSource {
     UserConfig(PathBuf),
     /// `image` in `<cwd>/.agent-vm/config.toml`.
     ProjectConfig(PathBuf),
-    /// The compiled-in default boot image ([`default_image`]).
-    Default,
+    /// The retained default record at this path.
+    RetainedDefault(PathBuf),
+    /// The compiled-in recommendation offered on a host with no record yet.
+    InitialRecommendation,
 }
 
 impl ImageSource {
@@ -231,7 +235,12 @@ impl ImageSource {
             ImageSource::ProjectConfig(file) => {
                 format!("project config {}", crate::config::escape_path(file))
             }
-            ImageSource::Default => "default".to_string(),
+            // Both default-tier origins stay indistinguishable here: this
+            // description is ordinary diagnostic/logging text. Only
+            // [`inspect_selection`] discloses which origin won.
+            ImageSource::RetainedDefault(_) | ImageSource::InitialRecommendation => {
+                "default".to_string()
+            }
         }
     }
 }
@@ -253,8 +262,31 @@ impl BootImage {
     }
 
     /// True when no user source chose the image.
+    ///
+    /// The trusted adapter around [`default_source_is_default`]: the exhaustive
+    /// match is the *only* place the source enum is measured into the kernel's
+    /// named facts, so an added variant cannot silently classify as default.
+    /// The contract covers `retained || initial` and nothing more — which source
+    /// won, its path, and how it renders stay outside the proof.
     pub(crate) fn is_default(&self) -> bool {
-        matches!(self.source, ImageSource::Default)
+        let facts = match &self.source {
+            ImageSource::RetainedDefault(_) => DefaultSourceFacts {
+                retained: true,
+                initial: false,
+            },
+            ImageSource::InitialRecommendation => DefaultSourceFacts {
+                retained: false,
+                initial: true,
+            },
+            ImageSource::CommandLine
+            | ImageSource::Environment
+            | ImageSource::UserConfig(_)
+            | ImageSource::ProjectConfig(_) => DefaultSourceFacts {
+                retained: false,
+                initial: false,
+            },
+        };
+        default_source_is_default(facts)
     }
 
     /// The safe, user-facing name for this selection.
@@ -265,6 +297,9 @@ impl BootImage {
     /// one seam every notice, progress line, debug dump and acquisition failure
     /// goes through, rather than each caller re-deciding. The actual reference
     /// still reaches the SDK via [`BootImage::reference`].
+    ///
+    /// [`inspect_selection`] is the single, deliberate exception: a user who
+    /// asks `agent-vm image show` is asking for the reference itself.
     pub(crate) fn label(&self) -> ImageLabel {
         if self.is_default() {
             ImageLabel {
@@ -484,12 +519,12 @@ pub(crate) fn env_override(value: Option<&str>) -> anyhow::Result<Option<ImageOv
     }
 }
 
-/// `doctor`'s read of `AGENT_VM_IMAGE_TAG`, distinguishing an **unset** variable
-/// from one that is present but not valid Unicode. Every other verb binds the
-/// variable through clap's `String` argument and fails on a non-Unicode value;
-/// using `std::env::var(..).ok()` here would make `doctor` the one verb that
-/// silently reports an invalid override as absent and then prints a selection
-/// no launch would make.
+/// An **unset** `AGENT_VM_IMAGE_TAG` is distinct from one that is present but
+/// not valid Unicode. Every other verb binds the variable through clap's
+/// `String` argument and fails on a non-Unicode value; using
+/// `std::env::var(..).ok()` would make the non-`--image` consumers (`doctor`,
+/// `image show`) the ones that silently report an invalid override as absent
+/// and then inspect a selection no launch would make.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EnvOverride {
     Unset,
@@ -497,8 +532,8 @@ pub(crate) enum EnvOverride {
     Invalid,
 }
 
-/// Read `AGENT_VM_IMAGE_TAG` for `doctor` through [`EnvOverride`].
-pub(crate) fn doctor_env_override() -> EnvOverride {
+/// Read `AGENT_VM_IMAGE_TAG` for the verbs that have no `--image`.
+pub(crate) fn read_env_override() -> EnvOverride {
     match std::env::var("AGENT_VM_IMAGE_TAG") {
         Ok(value) => match env_override(Some(&value)) {
             Ok(Some(override_)) => EnvOverride::Present(override_),
@@ -527,10 +562,12 @@ pub(crate) fn select(
 /// [`select`] with the default slot supplied as a thunk, so the precedence
 /// table is testable without touching host state. The thunk runs only on the
 /// last branch; every higher-precedence branch returns `Ok` without calling it.
+/// It yields the reference **and** its origin together, so no caller has to
+/// re-read the record to learn which default origin won.
 fn select_with(
     requested: Option<ImageOverride>,
     configured: &ConfiguredImages,
-    default: impl FnOnce() -> Result<ImageRef>,
+    default: impl FnOnce() -> Result<BootImage>,
 ) -> Result<BootImage> {
     if let Some(requested) = requested {
         return Ok(BootImage {
@@ -553,20 +590,75 @@ fn select_with(
     // The default tier's reference must not reach lower-level (dependency)
     // tracing; arm the process-level guard before any acquisition.
     crate::image_log_guard::activate();
-    Ok(BootImage {
-        reference: default()?,
-        source: ImageSource::Default,
-    })
+    default()
 }
 
-/// The default slot's reference: the retained user selection when a record
-/// exists, otherwise the initial recommendation. Read-only — neither branch
-/// writes, so an absent record stays absent until a launch acquires content.
-fn default_slot() -> Result<ImageRef> {
-    match default_selection::load()? {
-        Some(retained) => Ok(retained.into_image_ref()),
-        None => Ok(default_selection::initial_recommendation()?.into_image_ref()),
+/// The default slot: the retained selection when a record exists, otherwise the
+/// initial recommendation. Read-only — neither branch writes, so an absent
+/// record stays absent until a launch acquires content.
+fn default_slot() -> Result<BootImage> {
+    observe_default().selected_image()
+}
+
+/// The explicit inspection report for `image show`.
+///
+/// This is the one interface that deliberately discloses the full selected
+/// reference, including a private retained default: the user asked to inspect
+/// it. Ordinary diagnostics keep going through [`BootImage::label`], which
+/// redacts the default tier.
+///
+/// It shares [`select`]'s precedence and reads the default slot only on the
+/// fallback branch, so a damaged record that a higher source overrides is never
+/// read, reported or repaired. Read-only: no directory, lock, record, cache or
+/// runtime state is created, and nothing is acquired.
+pub(crate) fn inspect_selection(configured: &ConfiguredImages) -> Result<String> {
+    let requested = match read_env_override() {
+        EnvOverride::Unset => None,
+        EnvOverride::Present(override_) => Some(override_),
+        EnvOverride::Invalid => bail!(
+            "AGENT_VM_IMAGE_TAG is set but is not usable as an image override; \
+             a Unicode value is required"
+        ),
+    };
+    let selected = select(requested, configured)?;
+    render_inspection(&selected)
+}
+
+/// The inspection report's fixed source label and the winning file, if any.
+///
+/// Deliberately parallel to [`ImageSource::describe`] rather than reusing it:
+/// that description is diagnostic text shared by notices, progress and debug
+/// output, where the default tier must stay a single redacted label.
+fn inspection_provenance(source: &ImageSource) -> Result<(&'static str, Option<&Path>)> {
+    match source {
+        ImageSource::Environment => Ok(("AGENT_VM_IMAGE_TAG", None)),
+        ImageSource::UserConfig(file) => Ok(("user config", Some(file))),
+        ImageSource::ProjectConfig(file) => Ok(("project config", Some(file))),
+        ImageSource::RetainedDefault(file) => Ok(("retained default", Some(file))),
+        ImageSource::InitialRecommendation => Ok(("initial recommendation", None)),
+        // `image show` takes no `--image`, so this interface cannot produce a
+        // command-line selection; a value-free internal error, not a panic.
+        ImageSource::CommandLine => {
+            bail!("internal error: an image selected by --image cannot be inspected")
+        }
     }
+}
+
+/// Escape every disclosed value for display, then return the whole report.
+///
+/// Buffered rather than printed line by line so a caller cannot emit a partial
+/// report: escaping is display-only, and the reference is used exactly as the
+/// selector produced it.
+fn render_inspection(selected: &BootImage) -> Result<String> {
+    let (label, file) = inspection_provenance(selected.source())?;
+    let mut report = format!(
+        "Image: {}\nSource: {label}\n",
+        crate::config::escape_str(selected.reference().as_str())
+    );
+    if let Some(file) = file {
+        report.push_str(&format!("File: {}\n", crate::config::escape_path(file)));
+    }
+    Ok(report)
 }
 
 /// Record the selected default image as the user's retained default.
@@ -634,6 +726,58 @@ impl fmt::Debug for DefaultObservation {
     }
 }
 
+impl DefaultObservation {
+    /// The selection this snapshot represents, carrying the origin that decides
+    /// disclosure. Both the reference and the source come from `self`, so a
+    /// concurrent record replacement cannot pair one observation's reference
+    /// with another's provenance.
+    fn selected_image(&self) -> Result<BootImage> {
+        match self {
+            Self::Retained { reference, path } => Ok(BootImage {
+                reference: reference.clone().into_image_ref(),
+                source: ImageSource::RetainedDefault(path.clone()),
+            }),
+            // The record's prospective path is not this selection's provenance:
+            // nothing was read from it, so no file is disclosed.
+            Self::Uninitialized { recommendation, .. } => Ok(BootImage {
+                reference: recommendation.clone().into_image_ref(),
+                source: ImageSource::InitialRecommendation,
+            }),
+            // The store's diagnostic is already safe (fixed reason plus escaped
+            // path); re-wrapping it without a source chain keeps it that way.
+            Self::Unavailable { message } => Err(anyhow::anyhow!(message.clone())),
+        }
+    }
+}
+
+/// One read-only snapshot of the default slot: record path, the single content
+/// read, and — only when no record exists — the recommendation.
+fn observe_default() -> DefaultObservation {
+    let snapshot = default_selection::record_path()
+        .and_then(|path| default_selection::load().map(|selection| (path, selection)));
+    match snapshot {
+        Ok((path, Some(retained))) => DefaultObservation::Retained {
+            reference: retained,
+            path,
+        },
+        Ok((path, None)) => match default_selection::initial_recommendation() {
+            Ok(recommendation) => DefaultObservation::Uninitialized {
+                recommendation,
+                path,
+            },
+            // The store's errors are already the safe adapter's output: a
+            // fixed reason plus an escaped path, with no source chain. `{:#}`
+            // and `{}` are therefore the same text and carry nothing unsafe.
+            Err(error) => DefaultObservation::Unavailable {
+                message: format!("{error:#}"),
+            },
+        },
+        Err(error) => DefaultObservation::Unavailable {
+            message: format!("{error:#}"),
+        },
+    }
+}
+
 /// The default slot's state plus the effective selection, from one snapshot.
 #[derive(Debug)]
 pub(crate) struct BootImageObservation {
@@ -642,55 +786,15 @@ pub(crate) struct BootImageObservation {
 }
 
 /// Observe selection without mutating anything: no directory, no lock, no
-/// record. A valid higher source can still yield `Ok(selected)` alongside an
-/// [`DefaultObservation::Unavailable`] default — the damage is reported, but it
-/// did not decide this session's image.
+/// record. The default slot is *always* read here, so `doctor` diagnoses a
+/// damaged default even when a higher source wins the launch; `image show`
+/// calls [`select`] instead and reads that slot only when it must.
 pub(crate) fn observe(
     requested: Option<ImageOverride>,
     configured: &ConfiguredImages,
 ) -> BootImageObservation {
-    let snapshot = default_selection::record_path()
-        .and_then(|path| default_selection::load().map(|selection| (path, selection)));
-    let (default, slot) = match snapshot {
-        Ok((path, Some(retained))) => {
-            let slot = Ok(retained.clone().into_image_ref());
-            (
-                DefaultObservation::Retained {
-                    reference: retained,
-                    path,
-                },
-                slot,
-            )
-        }
-        Ok((path, None)) => match default_selection::initial_recommendation() {
-            Ok(recommendation) => {
-                let slot = Ok(recommendation.clone().into_image_ref());
-                (
-                    DefaultObservation::Uninitialized {
-                        recommendation,
-                        path,
-                    },
-                    slot,
-                )
-            }
-            // The store's errors are already the safe adapter's output: a
-            // fixed reason plus an escaped path, with no source chain. `{:#}`
-            // and `{}` are therefore the same text and carry nothing unsafe.
-            Err(error) => (
-                DefaultObservation::Unavailable {
-                    message: format!("{error:#}"),
-                },
-                Err(error),
-            ),
-        },
-        Err(error) => (
-            DefaultObservation::Unavailable {
-                message: format!("{error:#}"),
-            },
-            Err(error),
-        ),
-    };
-    let selected = select_with(requested, configured, move || slot);
+    let default = observe_default();
+    let selected = select_with(requested, configured, || default.selected_image());
     BootImageObservation { default, selected }
 }
 
@@ -754,6 +858,30 @@ pub(crate) fn immutable_image_is_acceptable(facts: ImmutableImageFacts) -> (acce
         accepted ==> facts.config_acceptable && facts.has_digest,
 {
     facts.config_acceptable && facts.has_digest
+}
+
+/// The two already-measured facts [`BootImage::is_default`] decides on: which
+/// default-tier origin won. Named fields rather than adjacent `bool`
+/// parameters, so an argument swap cannot invert a redaction decision.
+pub(crate) struct DefaultSourceFacts {
+    pub(crate) retained: bool,
+    pub(crate) initial: bool,
+}
+
+/// The default-tier classification decision, contracted (ADR-0018):
+/// **iff** the winning origin is the retained record or the initial
+/// recommendation is the selection the default tier owns — the fact that makes
+/// [`BootImage::label`] redact, adoption eligible and dependency tracing
+/// guarded. Total over all four Boolean combinations.
+///
+/// The trusted adapter, [`BootImage::is_default`], measures the source enum into
+/// these facts; that measurement, which source won, its path and every
+/// redaction/adoption/tracing caller are outside this contract.
+pub(crate) fn default_source_is_default(facts: DefaultSourceFacts) -> (is_default: bool)
+    ensures
+        is_default == (facts.retained || facts.initial),
+{
+    facts.retained || facts.initial
 }
 
 } // verus!
@@ -839,7 +967,10 @@ mod tests {
             });
             let requested = requested_source.map(|s| override_for(expected, s));
             let boot = select_with(requested, &configured, || {
-                Ok(ImageRef::from_override("localhost:1/d:latest".to_string()).unwrap())
+                Ok(BootImage {
+                    reference: ImageRef::from_override("localhost:1/d:latest".to_string()).unwrap(),
+                    source: ImageSource::InitialRecommendation,
+                })
             })
             .unwrap();
             assert_eq!(boot.reference().as_str(), expected);
@@ -861,6 +992,27 @@ mod tests {
         User,
         Project,
         Default,
+    }
+
+    /// ADR-0018's erased check of the contracted default-tier classifier. The
+    /// expected rows are literal, not derived from the kernel, and all four
+    /// Boolean combinations are exercised because the contract is total.
+    #[test]
+    fn default_source_classification_matches_truth_table() {
+        let cases = [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ];
+        for (retained, initial, expected) in cases {
+            let facts = DefaultSourceFacts { retained, initial };
+            assert_eq!(
+                default_source_is_default(facts),
+                expected,
+                "retained={retained} initial={initial}"
+            );
+        }
     }
 
     /// A released build must ignore the debug-only initial-recommendation
@@ -1025,13 +1177,13 @@ mod tests {
     /// `doctor`'s env slot must not conflate an unset variable with one that is
     /// present but not valid Unicode; every other verb fails on such a value.
     #[test]
-    fn doctor_env_override_distinguishes_unset_from_non_unicode() {
+    fn read_env_override_distinguishes_unset_from_non_unicode() {
         let mut env = crate::test_env::guard();
         env.remove_var("AGENT_VM_IMAGE_TAG");
-        assert_eq!(doctor_env_override(), EnvOverride::Unset);
+        assert_eq!(read_env_override(), EnvOverride::Unset);
 
         env.set_var("AGENT_VM_IMAGE_TAG", "localhost:1/x:latest");
-        match doctor_env_override() {
+        match read_env_override() {
             EnvOverride::Present(override_) => {
                 assert_eq!(override_.reference.as_str(), "localhost:1/x:latest");
             }
@@ -1039,13 +1191,13 @@ mod tests {
         }
 
         env.set_var("AGENT_VM_IMAGE_TAG", "");
-        assert_eq!(doctor_env_override(), EnvOverride::Unset);
+        assert_eq!(read_env_override(), EnvOverride::Unset);
 
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
             env.set_var("AGENT_VM_IMAGE_TAG", std::ffi::OsStr::from_bytes(b"\xff"));
-            assert_eq!(doctor_env_override(), EnvOverride::Invalid);
+            assert_eq!(read_env_override(), EnvOverride::Invalid);
         }
     }
 

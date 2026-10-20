@@ -61,6 +61,8 @@ for how it is chosen and for the default invalidation limits.
 <tool>                              launch a configured tool in a per-project sandbox
                                     (the verbs come from your tool configuration;
                                     run `agent-vm --help` for the exact list)
+image show                          print the boot image a launch here would
+                                    select, with its source (read-only, offline)
 image build --tag REF [OPTIONS] [CONTEXT]
                                     explicitly build + import a user Dockerfile
 image import --tag REF (--docker REF | --input FILE)
@@ -177,6 +179,57 @@ no local build.
 does not contain the tool's `command`, the launch prints a contract diagnostic
 and exits 127.
 
+### Inspecting the selected boot image
+
+`agent-vm image show` prints the image a launch in this project would select,
+and where it came from, without acquiring or booting anything:
+
+```console
+$ agent-vm image show
+Image: registry.example/env:dev
+Source: AGENT_VM_IMAGE_TAG
+```
+
+It accepts no options except `--help`. In particular there is no `--image`:
+`image --image REF show` and `image show --image REF` are rejected.
+
+`Image:` is the full selected reference, escaped for the terminal (`\` is
+doubled, `"` is escaped, other control and non-ASCII bytes become `\xNN`),
+exactly as the selector holds it — never trimmed, resolved or normalized.
+`Source:` is one of five fixed labels, and `File:` appears only for the winning
+file-backed source, escaped the same way:
+
+| `Source:` | `File:` |
+|---|---|
+| `AGENT_VM_IMAGE_TAG` | — (not a file) |
+| `user config` | `~/.config/agent-vm/config.toml` |
+| `project config` | `<cwd>/.agent-vm/config.toml` |
+| `retained default` | `$HOME/.config/agent-vm/default-image.json` |
+| `initial recommendation` | — (nothing was read) |
+
+These are the [selection table](#selecting-the-boot-image) rows in the same
+order; `AGENT_VM_IMAGE_TAG=""` counts as unset, exactly as for a launch.
+
+The command is read-only and offline. It consults no cached image, Docker,
+msb, registry, keychain or VM, and creates no record, lock, configuration
+directory, cache or runtime state; it needs neither an installed runtime nor
+image sources. It therefore makes no claim about whether the selected image
+exists, can be downloaded or can boot.
+
+Failures use the diagnostics selection already has, on stderr with an empty
+stdout. An unreadable or invalid configuration is fatal **even when the
+environment would win**, and a damaged retained record is fatal only when the
+fallback is actually needed: a valid environment/user/project image succeeds
+without reading it. `agent-vm doctor` remains the verb that reports such state
+without failing early.
+
+Unlike every other output, `image show` deliberately reveals the full
+reference, including a private retained default — that is what asking for the
+selection means. Its own logs stay silent, and `doctor`, launch notices, the
+`AGENT_VM_DEBUG_CONFIG` dump and acquisition errors keep redacting as before.
+Log output captured while running a successful `agent-vm image show` can
+therefore contain a private registry name.
+
 ### The retained default
 
 The last row of the precedence table is a **retained default**: a bookmark you
@@ -238,7 +291,9 @@ untrusted, user-writable file whose reference may name a private registry), so
 notices, `agent-vm doctor`, the opt-in `AGENT_VM_DEBUG_CONFIG` dump and
 acquisition errors name `the default boot image` and redact its reference rather
 than echoing it. Your own `--image`/`AGENT_VM_IMAGE_TAG`/config `image` values
-are unaffected: they are your inputs, and they are still shown. It is strictly
+are unaffected: they are your inputs, and they are still shown. The one
+deliberate exception is [`agent-vm image show`](#inspecting-the-selected-boot-image),
+which prints the reference because you asked for the selection. It is strictly
 observational — it creates nothing. If the record is
 corrupt, unreadable (a symlink, FIFO, directory, oversized or non-UTF-8 file)
 or names a non-digest reference, every verb that needs the default fails and

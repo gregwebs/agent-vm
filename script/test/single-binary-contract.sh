@@ -132,4 +132,22 @@ new_case c11
 expect_failure env -u HOME -u XDG_CACHE_HOME "$binary" msb --version
 contains 'could not unpack its embedded `msb` runtime'; contains 'set XDG_CACHE_HOME or HOME'
 pass C11
+new_case c12
+# `image show` must return before runtime discovery, so the embedded payload is
+# never unpacked. Only this case's own home/state are asserted: the harness
+# pre-creates both roots on purpose.
+(
+    cd "$tmp/project"
+    env -u XDG_CACHE_HOME -u XDG_STATE_HOME -u MSB_PATH -u MSB_LIBKRUNFW_PATH \
+        -u AGENT_VM_IMAGE_TAG -u AGENT_VM_TEST_DEFAULT_IMAGE \
+        HOME="$home" AGENT_VM_STATE_DIR="$state" "$binary" image show
+) >"$tmp/c12.out" 2>"$tmp/c12.err" || fail "C12: image show failed: $(cat "$tmp/c12.err")"
+grep -q '^Image: ' "$tmp/c12.out" || fail "C12: missing Image line"
+grep -qx 'Source: initial recommendation' "$tmp/c12.out" || fail "C12: wrong source: $(cat "$tmp/c12.out")"
+grep -q '^File: ' "$tmp/c12.out" && fail "C12: an initial recommendation has no source file"
+[[ ! -s "$tmp/c12.err" ]] || fail "C12: stderr not empty: $(cat "$tmp/c12.err")"
+[[ ! -e "$home/.config/agent-vm" ]] || fail "C12: created a configuration directory"
+[[ ! -e "$home/.cache/agent-vm" ]] || fail "C12: unpacked the embedded runtime"
+[[ -z "$(ls -A "$state")" ]] || fail "C12: created runtime state"
+pass C12
 echo 'single-binary contracts passed'

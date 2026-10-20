@@ -6,6 +6,12 @@
 //! `_intercept-hook`) are static. [`parse_from`] is the seam: argv plus the
 //! *result* of `config::load` yields a [`Dispatch`] decision.
 //!
+//! The deferred config failure is consumed differently per verb: diagnoses
+//! where it is diagnostic (`doctor`, `setup`), ignored where it is irrelevant
+//! (`clipboard`, `_intercept-hook`, `image build`/`import`), and fatal for
+//! `image show`, which reports a selection and so cannot use a fallback
+//! configuration.
+//!
 //! `parse_from` takes `argv` explicitly and returns `Result`; it never calls
 //! `get_matches()` and never exits on the success path, so the whole dispatch
 //! table is unit-testable without spawning a process. The one place it exits
@@ -229,8 +235,9 @@ pub(crate) enum Cmd {
     /// Manage agent-vm's own values in the host system keychain.
     Secret(secret::Args),
 
-    /// Build an image, or import a finished one, into agent-vm's own image cache.
-    /// Docker may be invoked; nothing is selected or booted.
+    /// Inspect the selected boot image, or explicitly build/import a finished
+    /// one into agent-vm's own image cache. Nothing boots; only build/import
+    /// may invoke Docker.
     Image(crate::image_cmd::Args),
 
     /// Internal: invoked by msb's interceptor hook for matched OAuth
@@ -241,16 +248,23 @@ pub(crate) enum Cmd {
 }
 
 /// What [`parse_from`] decided to do. Built-in verbs keep their derived clap
-/// types **and** the loaded catalog: only `Cmd::Setup` reads it (it verifies
-/// every configured tool's command), but every built-in carries it so the
-/// catalog a launch *would* have used is the same value `setup` reads.
+/// types **and** the loaded catalog: only `Cmd::Setup` consumes the ready tool
+/// catalog (it verifies every configured tool's command), while `image show`
+/// checks catalog health without consuming its entries. Every built-in carries
+/// the same catalog a launch *would* have used.
+///
+/// `catalog` keeps the *deferred* config failure, and the policy over it is
+/// deliberately asymmetric: `doctor` diagnoses it, `clipboard`/`_intercept-hook`
+/// ignore it (they run inside the guest), `image build`/`import` ignore it, and
+/// `image show` treats it as fatal — a report about a selection cannot be
+/// trusted when the configuration that would have produced it is broken.
 pub(crate) enum Dispatch {
     Builtin {
         cmd: Cmd,
         catalog: Catalog,
         /// Both config tiers' `image` settings, read before the report was
-        /// consumed to build the catalog. Carried to `pull`/`setup` so they can
-        /// select the same image a launch would.
+        /// consumed to build the catalog. Carried to `pull`/`setup`/`image show`
+        /// so they can select the same image a launch would.
         images: ConfiguredImages,
     },
     // `entry` and `args` are boxed so `Dispatch` does not carry the two large
@@ -459,9 +473,11 @@ fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
     match cmd {
         Cmd::Pull(args) => args.image.reconcile(sub),
         Cmd::Setup(args) => args.image.reconcile(sub),
-        // `image`'s `--tag` is a result reference in msb's cache, not a launch
-        // image selection: it deliberately carries no `ImageArgs` and so
-        // consumes no `--image`/env override.
+        // The `image` group deliberately carries no `ImageArgs`: `build`'s and
+        // `import`'s `--tag` is a result reference in msb's cache, not a launch
+        // image selection, and `show` reads `AGENT_VM_IMAGE_TAG` itself through
+        // `boot_image` (where empty-is-unset and non-Unicode refusal live). None
+        // of them consumes a `--image` override.
         Cmd::Msb(_)
         | Cmd::Clipboard(_)
         | Cmd::Doctor(_)
