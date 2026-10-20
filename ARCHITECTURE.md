@@ -45,7 +45,7 @@ crates/agent-vm/src/
 │   ├── default_selection.rs#   retained record: read-only load, automatic adopt, explicit replace
 │   └── upgrade.rs          #   native acquire/pin/platform check before default replacement
 ├── image_build.rs          # explicit user Dockerfile export
-├── image_cmd.rs            # image verb group
+├── image_cmd.rs            # image verb group: read-only `show`, explicit build/import
 ├── image_import.rs         # daemon/archive import
 ├── image_publish.rs        # staging, native publication, requested-reference rollback
 ├── image_miss.rs           # registry-failure import hint
@@ -639,6 +639,15 @@ launcher-version artifact: it lives with the user-scoped settings, so a new
 project, a cleared cache or a new `AGENT_VM_STATE_DIR` leaves it alone. Reading
 it is lazy and read-only, which is why `help` and `doctor` touch nothing;
 automatic adoption happens once, after a default-tier image is actually acquired.
+`agent-vm image show` is the one observational edge: it returns the selected
+reference and its provenance from the same selector (and the same single default
+observation), before runtime discovery, and creates or acquires nothing.
+
+```text
+boot_image::inspect_selection ──► escaped "Image:/Source:/File:" report ──► stdout
+   (same select(); default slot read only if the fallback wins; no runtime, cache, registry or write)
+```
+
 Explicit upgrade adds a separate edge:
 
 ```text

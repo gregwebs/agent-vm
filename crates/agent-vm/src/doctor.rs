@@ -116,7 +116,7 @@ pub fn run(args: Args) -> Result<()> {
         // empty-is-unset rule the launch uses, so the two cannot disagree, while
         // still telling an unset variable apart from one that is present but not
         // valid Unicode (issue #259, Spec S1).
-        let env_slot = boot_image::doctor_env_override();
+        let env_slot = boot_image::read_env_override();
 
         let db_exists = msb_home.join("db").join("msb.db").exists();
         println!(

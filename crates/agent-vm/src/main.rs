@@ -107,6 +107,28 @@ fn main() -> Result<()> {
         return exit_with(secret::run(args)?);
     }
 
+    // `image show` reports the selection a launch *here* would make (#373). It
+    // is a read-only, offline observation, so it returns before the MSB
+    // prologue, the embedded-runtime extraction and the Tokio runtime: it must
+    // work with no runtime installed, no cached image and no registry.
+    //
+    // A carried configuration failure is fatal here rather than diagnostic.
+    // `parse_from` substitutes empty images on a load failure and defers a
+    // catalog failure; inspecting either would report a selection no launch
+    // would make. `doctor` remains the verb that diagnoses a broken config.
+    if let Dispatch::Builtin {
+        cmd: Cmd::Image(args),
+        catalog,
+        images,
+    } = &dispatch
+        && args.is_show()
+    {
+        if let config::Catalog::Broken(error) = catalog {
+            anyhow::bail!("{error:#}");
+        }
+        return image_cmd::show(images);
+    }
+
     // Input typos must fail before the MSB prologue creates state (#359).
     if let Dispatch::Builtin {
         cmd: Cmd::Image(args),
@@ -208,8 +230,9 @@ fn main() -> Result<()> {
                 cmd: Cmd::Upgrade(args),
                 ..
             } => boot_image::upgrade::run(args).await,
-            // Explicit user-owned build/import (#260, #359). Reads no catalog and
-            // no image selection; `args` is self-contained.
+            // Explicit user-owned build/import (#260, #359); `show` returned
+            // above, before the runtime. Reads no catalog and no image
+            // selection; `args` is self-contained.
             Dispatch::Builtin {
                 cmd: Cmd::Image(args),
                 ..

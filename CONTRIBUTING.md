@@ -570,7 +570,10 @@ tier never renders its reference in a notice, `doctor`, the
 test asserts the fixed label/redacted dump plus the record bytes and the
 acquisition boundary, while the exact SDK reference is asserted in-memory in the
 `boot_image` unit tests (both the selected reference and the built
-`SandboxConfig`). A test that wants an *initialized* host writes the record
+`SandboxConfig`). The one intentional exception is `agent-vm image show`
+(`tests/image_show.rs`), where the user explicitly asks to inspect the
+selection: that surface is expected to print the full escaped reference and its
+provenance, and every other default-tier surface stays redacted. A test that wants an *initialized* host writes the record
 directly at `$HOME/.config/agent-vm/default-image.json`
 (`{"version":1,"image":"<digest ref>"}`).
 
@@ -592,7 +595,8 @@ positive explicit-source control.
 | `cargo check --release -p agent-vm --tests` | yes (`ci.yml`) | type-check only; pins that the release test profile still compiles under the test cfg, since CI's run is the debug profile |
 | `script/test/e2e.sh` | **no** | native installed registry/archive joins; custom/all additionally require Apple Silicon and Docker |
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
-| `script/test/single-binary-contract.sh` | yes (`ci.yml`) | fake payload; lone copy, reuse, concurrency, tamper, unwritable, rejected-launch state; the only `embedded-runtime` clippy pass, which is what lints the payload build module |
+| `script/test/single-binary-contract.sh` | yes (`ci.yml`) | fake payload; lone copy, reuse, concurrency, tamper, unwritable, rejected-launch state, and `image show` unpacking nothing (C12); the only `embedded-runtime` clippy pass, which is what lints the payload build module |
+| `cargo test --test image_show` | yes (`cargo test -p agent-vm`) | boot-free black-box `image show` matrix: precedence, provenance, damaged/unused fallback, escaping, help/argument surface, and no runtime/cache/state/network observation. No VM evidence |
 | `script/test/build-workflow.sh` | yes (macOS) | fake-plutil bundle seam, no VM/image sources |
 | `script/test/ci-contracts.sh` | yes | runtime provenance, shell guards, offline pin/negative controls, Chrome launcher-path agreement and e2e dispatch contracts |
 | `script/test/persisted-network-contract.sh` | yes (`ci-contracts.sh`) | host-only snippet controls, checker P1–P5 and live-shell P6–P10; no native evidence |
