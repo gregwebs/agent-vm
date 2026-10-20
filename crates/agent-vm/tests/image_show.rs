@@ -20,11 +20,12 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 mod support;
@@ -159,6 +160,182 @@ fn collect(root: &Path, prefix: &str, meta: &fs::Metadata, out: &mut BTreeMap<St
     }
 }
 
+const DECOY_NAMES: [&str; 4] = ["msb", "docker", "buildx", "curl"];
+const CALIBRATION_ARG: &str = "--calibration";
+
+/// Ten total launches, 1ms apart. A Linux stress matrix of 10,000 fresh
+/// parallel fixtures had 291 fixtures lose a marker without it and none with
+/// it. This is a harness bound for a transient local condition, not a claim
+/// that ten milliseconds covers every host.
+const CALIBRATION_ATTEMPTS: usize = 10;
+const CALIBRATION_RETRY_DELAY: Duration = Duration::from_millis(1);
+
+/// The final launch error and the number of launches the bound allowed; the
+/// count separates an exhaustion from an error that was never retried.
+#[derive(Debug)]
+struct AttemptFailure {
+    error: io::Error,
+    attempts: usize,
+}
+
+impl AttemptFailure {
+    /// The decoy path and concrete kind/errno belong in the failure: the
+    /// discarded `status()` this replaced swallowed the error, so CI failed on
+    /// a missing marker with nothing to say whether or why the launch failed. The
+    /// complete diagnostic must never degrade into `Option::None` either, which
+    /// reads as "this filesystem cannot do that".
+    fn message(&self, path: &Path) -> String {
+        format!(
+            "the decoy executable {} could not be launched after {} attempt(s): {} (kind {:?}, errno {:?})",
+            path.display(),
+            self.attempts,
+            self.error,
+            self.error.kind(),
+            self.error.raw_os_error()
+        )
+    }
+}
+
+/// Retry only a busy executable inode, and only within the measured bound.
+///
+/// Linux refuses `execve` with `ETXTBSY` while any process still holds a
+/// writable reference to the file. The fixture writes, chmods and immediately
+/// executes each decoy, and parallel Linux stress reproduced both the busy
+/// launch and the lost marker, which is what the bound removes. The hosted CI
+/// errno and the owner of any competing writable reference were never
+/// measured, so this explains a plausible failure mode rather than proving the
+/// CI failure's cause. Every other launch error (missing interpreter,
+/// permission, ...) is final, as is any child that did run: retrying those
+/// would hide a broken fixture.
+fn retry_executable_file_busy<T>(
+    mut attempt: impl FnMut() -> io::Result<T>,
+) -> Result<T, AttemptFailure> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && attempts < CALIBRATION_ATTEMPTS =>
+            {
+                std::thread::sleep(CALIBRATION_RETRY_DELAY);
+            }
+            Err(error) => return Err(AttemptFailure { error, attempts }),
+        }
+    }
+}
+
+fn run_decoy(path: &Path) -> io::Result<Output> {
+    Command::new(path)
+        .arg(CALIBRATION_ARG)
+        .stdin(Stdio::null())
+        .output()
+}
+
+/// Execute a freshly written decoy directly, capturing its status and output.
+fn launch_decoy(path: &Path) -> Result<Output, AttemptFailure> {
+    retry_executable_file_busy(|| run_decoy(path))
+}
+
+/// The exact bytes the decoy's `printf '%s %s\n' "$0" "$*"` appends. The
+/// whole line is the oracle: matching `contains(name)` let a name that merely
+/// occurs elsewhere in the log satisfy it.
+fn calibration_line(path: &Path) -> Vec<u8> {
+    let mut line = path.as_os_str().as_bytes().to_vec();
+    line.push(b' ');
+    line.extend_from_slice(CALIBRATION_ARG.as_bytes());
+    line.push(b'\n');
+    line
+}
+
+/// The decoy exits 1 on purpose, so success is the wrong check, and a child
+/// that ran is final and never relaunched. Status 1 plus silence is necessary
+/// but not sufficient: a shell can exit 1 silently on its way to the append, so
+/// the exact log line checked in `calibrate_decoys` stays required.
+fn validate_decoy_output(path: &Path, output: &Output) -> Result<(), String> {
+    if output.status.code() != Some(1) {
+        return Err(format!(
+            "the decoy executable {} must exit 1 after logging; got {:?}\nstdout: {}\nstderr: {}",
+            path.display(),
+            output.status.code(),
+            stdout(output),
+            stderr(output)
+        ));
+    }
+    if !output.stdout.is_empty() || !output.stderr.is_empty() {
+        return Err(format!(
+            "the decoy executable {} must be silent; stdout: {:?}\nstderr: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            stderr(output)
+        ));
+    }
+    Ok(())
+}
+
+/// The log is the discovery oracle for every later "no runtime ran" case, so
+/// the fixture proves it byte for byte before the product is invoked.
+fn validate_calibration_log(actual: &[u8], expected: &[u8]) -> Result<(), String> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "the decoy calibration log is not exactly the expected invocation lines\nexpected: {:?}\nactual: {:?}",
+        String::from_utf8_lossy(expected),
+        String::from_utf8_lossy(actual)
+    ))
+}
+
+/// A decoy that logs its exact argv and then fails like an absent runtime.
+fn write_decoy(path: &Path, trap_log: &Path) {
+    fs::write(
+        path,
+        format!(
+            "#!/bin/sh\nprintf '%s %s\\n' \"$0\" \"$*\" >> '{}'\nexit 1\n",
+            trap_log.display()
+        ),
+    )
+    .expect("write decoy");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod decoy");
+}
+
+/// Absence is the expected outcome when no child ran. Any other read error is
+/// not absence: treating it as an empty log would let the negative assertion
+/// pass while hiding a real fixture problem.
+#[cfg(target_os = "linux")]
+fn read_log_absent_or_bytes(path: &Path) -> Vec<u8> {
+    match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read the decoy calibration log {}: {error}", path.display()),
+    }
+}
+
+/// Write the four decoys, execute each directly, and require the log to be
+/// exactly their invocation lines. The `Err` is the complete diagnostic: a
+/// launch failure keeps its path and concrete kind/errno, an executed child
+/// keeps its status and stderr, and a log mismatch keeps both byte strings.
+fn calibrate_decoys(decoys: &Path, trap_log: &Path) -> Result<(), String> {
+    let mut expected_log = Vec::new();
+    for name in DECOY_NAMES {
+        let path = decoys.join(name);
+        write_decoy(&path, trap_log);
+        // Calibrate the oracle before any negative assertion: the decoy must
+        // actually run and log when invoked directly.
+        let output = launch_decoy(&path).map_err(|failure| failure.message(&path))?;
+        validate_decoy_output(&path, &output)?;
+        expected_log.extend(calibration_line(&path));
+    }
+    let calibration = fs::read(trap_log).map_err(|error| {
+        format!(
+            "read the decoy calibration log {}: {error}",
+            trap_log.display()
+        )
+    })?;
+    validate_calibration_log(&calibration, &expected_log)
+}
+
 /// One private host: every directory the product might touch, plus the decoy
 /// executables. Nothing under `home`/`project` is pre-created beyond the roots
 /// themselves, so "did it create `.config/agent-vm`?" stays observable.
@@ -195,31 +372,12 @@ impl Fixture {
         let tmp = root_path.join("tmp");
         let decoys = root_path.join("decoys");
         for dir in [&home, &project, &tmp, &decoys] {
+            // Only a filesystem that refuses these names (the non-UTF-8 probe)
+            // skips the case. Every later fixture failure is a real failure.
             fs::create_dir_all(dir).ok()?;
         }
         let trap_log = decoys.join("invocations.log");
-        for name in ["msb", "docker", "buildx", "curl"] {
-            let path = decoys.join(name);
-            fs::write(
-                &path,
-                format!(
-                    "#!/bin/sh\nprintf '%s %s\\n' \"$0\" \"$*\" >> '{}'\nexit 1\n",
-                    trap_log.display()
-                ),
-            )
-            .expect("write decoy");
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod decoy");
-            // Calibrate the oracle before any negative assertion: the decoy
-            // must actually run and log when invoked directly.
-            let _ = Command::new(&path).arg("--calibration").status();
-        }
-        let calibration = fs::read_to_string(&trap_log).expect("decoy log after calibration");
-        for name in ["msb", "docker", "buildx", "curl"] {
-            assert!(
-                calibration.contains(&format!("{}/", name)) || calibration.contains(name),
-                "the {name} decoy did not log its calibration invocation:\n{calibration}"
-            );
-        }
+        calibrate_decoys(&decoys, &trap_log).unwrap_or_else(|message| panic!("{message}"));
         fs::remove_file(&trap_log).expect("clear calibration log");
         Some(Self {
             _root: root,
@@ -401,6 +559,363 @@ fn snapshot_rejects_a_disappeared_directory() {
     let meta = fs::symlink_metadata(&directory).unwrap();
     fs::remove_dir(&directory).unwrap();
     collect(&directory, "removed", &meta, &mut BTreeMap::new());
+}
+
+// ---------------------------------------------------------------------------
+// Fixture calibration: the decoy oracle must survive a freshly written exec
+// ---------------------------------------------------------------------------
+
+/// Linux refuses `execve` while a process holds a writable reference to the
+/// file. The reference is released only after the real error was observed, so
+/// this proves the retry relaunches the same fresh decoy rather than masking a
+/// launch that never ran; the marker afterwards is the real recovery signal.
+/// Concurrent writers on the same host can add more busy launches after the
+/// release, so a bounded prefix is accepted but any other errno is not.
+#[cfg(target_os = "linux")]
+#[test]
+fn calibration_recovers_after_the_writable_reference_is_released() {
+    let root = support::project_tempdir();
+    let decoy = root.path().join("held-writer");
+    let log = root.path().join("invocations.log");
+    write_decoy(&decoy, &log);
+    let mut writer = Some(
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&decoy)
+            .expect("hold a writable reference"),
+    );
+    let mut busy_prefix = Vec::new();
+    let output = retry_executable_file_busy(|| {
+        let outcome = run_decoy(&decoy);
+        if let Err(error) = &outcome {
+            busy_prefix.push(error.raw_os_error());
+            if error.raw_os_error() == Some(libc::ETXTBSY) {
+                writer.take();
+            }
+        }
+        outcome
+    })
+    .expect("the released decoy launches");
+    assert!(
+        !busy_prefix.is_empty() && busy_prefix.len() < CALIBRATION_ATTEMPTS,
+        "the writer must block at least one launch and the recovery must fit the bound: {busy_prefix:?}"
+    );
+    assert!(
+        busy_prefix
+            .iter()
+            .all(|errno| *errno == Some(libc::ETXTBSY)),
+        "only a busy executable inode may be retried: {busy_prefix:?}"
+    );
+    validate_decoy_output(&decoy, &output).unwrap();
+    assert_eq!(
+        fs::read(&log).unwrap(),
+        calibration_line(&decoy),
+        "the recovered launch must append exactly one real marker"
+    );
+}
+
+/// A reference that is never released stays red: the bound is a recovery
+/// window, not permission to hang, and the diagnostic must keep the decoy path
+/// with the concrete errno instead of looking like an unusable filesystem.
+#[cfg(target_os = "linux")]
+#[test]
+fn calibration_gives_up_after_the_bounded_attempts() {
+    let root = support::project_tempdir();
+    let decoys = root.path().join("decoys");
+    fs::create_dir(&decoys).expect("create decoys");
+    let log = decoys.join("invocations.log");
+    let msb = decoys.join("msb");
+    write_decoy(&msb, &log);
+    let writer = fs::OpenOptions::new()
+        .write(true)
+        .open(&msb)
+        .expect("hold a writable reference");
+
+    let failure = launch_decoy(&msb).expect_err("a retained writable reference blocks exec");
+    assert_eq!(failure.attempts, CALIBRATION_ATTEMPTS);
+    assert_eq!(failure.error.raw_os_error(), Some(libc::ETXTBSY));
+
+    let message = calibrate_decoys(&decoys, &log).unwrap_err();
+    assert!(message.contains(&msb.display().to_string()), "{message}");
+    assert!(message.contains("os error 26"), "{message}");
+    assert!(
+        message.contains(&format!("after {CALIBRATION_ATTEMPTS} attempt")),
+        "{message}"
+    );
+    assert_eq!(
+        read_log_absent_or_bytes(&log),
+        b"",
+        "a launch that never ran must not log a marker"
+    );
+    drop(writer);
+}
+
+/// The decoy exits 1 whether or not its append worked, so a launch that ran is
+/// final: an unusable log target must fail calibration on the child's own
+/// stderr, with no relaunch, rather than pass on the expected exit code. Only
+/// busy launches may precede that single child.
+#[test]
+fn calibration_rejects_an_executed_decoy_that_could_not_log() {
+    let root = support::project_tempdir();
+    let log = root.path().join("invocations.log");
+    fs::create_dir(&log).expect("an unusable log target");
+    let decoy = root.path().join("append-failure");
+    write_decoy(&decoy, &log);
+
+    let mut launches = 0;
+    let mut busy_prefix = Vec::new();
+    let output = retry_executable_file_busy(|| {
+        launches += 1;
+        let outcome = run_decoy(&decoy);
+        if let Err(error) = &outcome {
+            busy_prefix.push(error.raw_os_error());
+        }
+        outcome
+    })
+    .expect("the shell still starts");
+    assert_eq!(
+        launches - busy_prefix.len(),
+        1,
+        "exactly one executed child, never relaunched: {busy_prefix:?}"
+    );
+    assert!(
+        launches <= CALIBRATION_ATTEMPTS,
+        "the bound applies to the wait for a free inode: {launches} launches"
+    );
+    assert!(
+        busy_prefix
+            .iter()
+            .all(|errno| *errno == Some(libc::ETXTBSY)),
+        "only a busy executable inode may be retried: {busy_prefix:?}"
+    );
+    assert_eq!(output.status.code(), Some(1), "the decoy exits 1 by design");
+    assert!(
+        !output.stderr.is_empty(),
+        "the failed append must explain itself on stderr"
+    );
+
+    let message = validate_decoy_output(&decoy, &output).unwrap_err();
+    assert!(message.contains(&decoy.display().to_string()), "{message}");
+    assert!(message.contains("stderr"), "{message}");
+    assert!(
+        fs::read_dir(&log).unwrap().next().is_none(),
+        "no marker can reach a directory"
+    );
+}
+
+/// Only a busy executable inode is transient. A missing interpreter or a
+/// non-executable file must be final once it appears, so the retry cannot mask
+/// a broken fixture as a timing problem. Busy launches may precede it, but
+/// nothing may follow it.
+#[test]
+fn non_retryable_launch_errors_are_reported_immediately() {
+    let root = support::project_tempdir();
+    let missing_interpreter = root.path().join("missing-interpreter");
+    fs::write(&missing_interpreter, "#!/nonexistent/interpreter\n").unwrap();
+    fs::set_permissions(&missing_interpreter, fs::Permissions::from_mode(0o755)).unwrap();
+    let not_executable = root.path().join("not-executable");
+    fs::write(&not_executable, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&not_executable, fs::Permissions::from_mode(0o644)).unwrap();
+
+    for (path, errno) in [
+        (&missing_interpreter, libc::ENOENT),
+        (&not_executable, libc::EACCES),
+    ] {
+        let mut errnos = Vec::new();
+        let failure = retry_executable_file_busy(|| {
+            let outcome = run_decoy(path);
+            if let Err(error) = &outcome {
+                errnos.push(error.raw_os_error());
+            }
+            outcome
+        })
+        .expect_err("the launch cannot succeed");
+        assert_eq!(
+            failure.attempts,
+            errnos.len(),
+            "every launch either yields the terminal error or a recorded busy prefix: {errnos:?}"
+        );
+        assert!(failure.attempts <= CALIBRATION_ATTEMPTS);
+        assert_eq!(errnos.last(), Some(&Some(errno)), "{}", path.display());
+        assert!(
+            errnos[..errnos.len() - 1]
+                .iter()
+                .all(|errno| *errno == Some(libc::ETXTBSY)),
+            "a terminal error is never retried: {errnos:?}"
+        );
+        assert_eq!(
+            failure.error.raw_os_error(),
+            Some(errno),
+            "{}",
+            path.display()
+        );
+    }
+}
+
+/// The oracle is the exact invocation line. The replaced `contains(name)`
+/// predicate accepted a line that merely mentioned the decoy; an extra line
+/// must not pass either.
+#[test]
+fn calibration_log_requires_the_exact_invocation_lines() {
+    let root = support::project_tempdir();
+    let decoy = root.path().join("docker");
+    let expected = calibration_line(&decoy);
+    assert!(validate_calibration_log(&expected, &expected).is_ok());
+
+    let impostor = format!(
+        "{}/unrelated docker {CALIBRATION_ARG}\n",
+        root.path().display()
+    );
+    assert!(
+        impostor.contains("docker") && impostor.contains(CALIBRATION_ARG),
+        "the impostor line must be the one the replaced predicate accepted"
+    );
+    let message = validate_calibration_log(impostor.as_bytes(), &expected).unwrap_err();
+    assert!(message.contains("docker"), "{message}");
+
+    let mut with_extra = expected.clone();
+    with_extra.extend_from_slice(impostor.as_bytes());
+    assert!(
+        validate_calibration_log(&with_extra, &expected).is_err(),
+        "an extra invocation must not pass"
+    );
+}
+
+/// The bound is a policy, so pin the concrete numbers rather than the constant:
+/// ten total launches, each separated by at least one millisecond, never an
+/// eleventh. A silent relaxation of either value must fail here.
+#[test]
+fn retry_policy_is_bounded_and_waits_between_attempts() {
+    let mut launches = Vec::new();
+    let failure = retry_executable_file_busy::<()>(|| {
+        launches.push(Instant::now());
+        Err(io::Error::from_raw_os_error(libc::ETXTBSY))
+    })
+    .expect_err("a permanently busy inode exhausts the bound");
+
+    assert_eq!(
+        launches.len(),
+        10,
+        "the harness bound is ten total launches"
+    );
+    assert_eq!(failure.attempts, 10);
+    assert_eq!(failure.error.raw_os_error(), Some(libc::ETXTBSY));
+    assert!(
+        launches
+            .windows(2)
+            .all(|pair| pair[1].duration_since(pair[0]) >= Duration::from_millis(1)),
+        "every retry must wait at least the retry delay: {launches:?}"
+    );
+}
+
+/// A busy prefix may precede a final error, but the final error itself must end
+/// the sequence: retrying it would hide a broken fixture as a timing problem.
+#[test]
+fn a_terminal_error_after_a_busy_prefix_is_never_retried() {
+    for terminal in [libc::ENOENT, libc::EACCES] {
+        let mut launches = 0;
+        let failure = retry_executable_file_busy::<()>(|| {
+            launches += 1;
+            Err(io::Error::from_raw_os_error(if launches < 3 {
+                libc::ETXTBSY
+            } else {
+                terminal
+            }))
+        })
+        .expect_err("the terminal error must surface");
+
+        assert_eq!(launches, 3, "the terminal error ends the sequence");
+        assert_eq!(failure.attempts, 3);
+        assert_eq!(failure.error.raw_os_error(), Some(terminal));
+    }
+}
+
+/// A child that executed is final even when it is the last launch the bound
+/// allows: the retry covers launches, not the child's own work.
+#[test]
+fn an_executed_child_after_a_busy_prefix_is_never_relaunched() {
+    let mut launches = 0;
+    let marker = retry_executable_file_busy(|| {
+        launches += 1;
+        if launches < CALIBRATION_ATTEMPTS {
+            Err(io::Error::from_raw_os_error(libc::ETXTBSY))
+        } else {
+            Ok("the executed child")
+        }
+    })
+    .expect("the last allowed launch succeeds");
+
+    assert_eq!(launches, CALIBRATION_ATTEMPTS);
+    assert_eq!(marker, "the executed child");
+}
+
+/// The output oracle is only as good as its rejection of the near misses that
+/// a silently failed append produces: any other exit code, a signal, or output.
+#[test]
+fn validate_decoy_output_rejects_any_status_but_a_silent_one() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let decoy = Path::new("/calibration/decoy");
+    for raw_status in [0, 2 << 8, 9] {
+        let output = Output {
+            status: ExitStatus::from_raw(raw_status),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(
+            validate_decoy_output(decoy, &output).is_err(),
+            "raw status {raw_status} must be rejected"
+        );
+    }
+    for (stdout, stderr) in [
+        (b"unexpected".to_vec(), Vec::new()),
+        (Vec::new(), b"unexpected".to_vec()),
+    ] {
+        let output = Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout,
+            stderr,
+        };
+        assert!(
+            validate_decoy_output(decoy, &output).is_err(),
+            "a decoy that speaks is not silent"
+        );
+    }
+
+    let silent = Output {
+        status: ExitStatus::from_raw(1 << 8),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    validate_decoy_output(decoy, &silent).expect("exit 1 with silence is the accepted shape");
+    assert!(
+        validate_calibration_log(b"", &calibration_line(decoy)).is_err(),
+        "a silent exit 1 still needs the real marker"
+    );
+}
+
+/// The deterministic controls above pin the mechanism; this reproduces the
+/// original symptom itself, with many threads calibrating fresh decoys at
+/// once. With a single attempt per launch, Linux lost markers within a few
+/// hundred fixtures; the bound is what closes that window.
+#[cfg(target_os = "linux")]
+#[test]
+fn parallel_fresh_decoys_all_calibrate() {
+    const THREADS: usize = 8;
+    const FIXTURES_PER_THREAD: usize = 50;
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                for _ in 0..FIXTURES_PER_THREAD {
+                    let root = support::project_tempdir();
+                    let decoys = root.path().join("decoys");
+                    fs::create_dir(&decoys).expect("create decoys");
+                    let log = decoys.join("invocations.log");
+                    calibrate_decoys(&decoys, &log).expect("calibrate fresh decoys");
+                }
+            });
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
