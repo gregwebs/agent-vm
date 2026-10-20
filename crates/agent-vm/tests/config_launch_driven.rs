@@ -4392,7 +4392,7 @@ fn precedence_rows() -> [Precedence; 10] {
             user: Some(USER_REF),
             project: Some(PROJECT_REF),
             expected: ENV_REF,
-            source: "AGENT_VM_IMAGE_TAG",
+            source: "env AGENT_VM_IMAGE_TAG",
         },
         Precedence {
             name: "user beats project",
@@ -4736,7 +4736,7 @@ fn image_whitespace_and_empty_values_do_not_fall_through() {
         );
         let stdout = stdout_of(&out);
         assert!(
-            stdout.contains("(from AGENT_VM_IMAGE_TAG)"),
+            stdout.contains("(from env AGENT_VM_IMAGE_TAG)"),
             "{present:?} (doctor): env override not selected:\n{stdout}"
         );
     }
@@ -6050,7 +6050,7 @@ fn doctor_reports_a_damaged_default_even_with_a_valid_override() {
     assert!(stdout.contains("default: error:"), "{stdout}");
     assert!(
         stdout.contains(&format!(
-            "selected (without --image): {ENV_REF} (from AGENT_VM_IMAGE_TAG)"
+            "selected (without --image): {ENV_REF} (from env AGENT_VM_IMAGE_TAG)"
         )),
         "the valid override must still be shown:\n{stdout}"
     );

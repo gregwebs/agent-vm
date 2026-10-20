@@ -223,12 +223,13 @@ pub(crate) enum ImageSource {
 }
 
 impl ImageSource {
-    /// The source as rendered after the reference, e.g. `command line` or
+    /// The source as rendered after the reference, e.g. `command line`,
+    /// `env AGENT_VM_IMAGE_TAG` or
     /// `user config /home/dev/.config/agent-vm/config.toml`.
     pub(crate) fn describe(&self) -> String {
         match self {
             ImageSource::CommandLine => "command line".to_string(),
-            ImageSource::Environment => "AGENT_VM_IMAGE_TAG".to_string(),
+            ImageSource::Environment => "env AGENT_VM_IMAGE_TAG".to_string(),
             ImageSource::UserConfig(file) => {
                 format!("user config {}", crate::config::escape_path(file))
             }
