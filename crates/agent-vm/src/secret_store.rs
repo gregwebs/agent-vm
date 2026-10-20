@@ -659,16 +659,33 @@ pub(crate) enum KeychainFailure {
     Unknown,
 }
 
+/// What [`KeychainFailure::Unavailable`] tells the user, per host.
+///
+/// Both texts name the store this host actually has, and only remedies that
+/// exist there. They must not be merged into one host-agnostic string: a macOS
+/// user whose login keychain refused a write was told to start a Secret
+/// Service, and went looking for a daemon macOS does not ship. The macOS
+/// remedies are the two ways the same refusal arrives here — the keychain is
+/// locked, or the calling process was never granted keychain access (a shell
+/// started by an agent or inside a sandbox is the usual case).
+#[cfg(target_os = "macos")]
+const UNAVAILABLE_MESSAGE: &str = "the system keychain is unavailable - the login keychain may be \
+     locked, or this process may be denied keychain access (a launch from an agent or sandboxed \
+     shell can be)";
+
+/// The Linux store is a Secret Service daemon, and its absence is the usual
+/// cause, so the message names it.
+#[cfg(not(target_os = "macos"))]
+const UNAVAILABLE_MESSAGE: &str = "the system keychain is unavailable (a Secret Service such as \
+     gnome-keyring or KWallet must be running)";
+
 impl KeychainFailure {
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::AccessDenied => {
                 "the system keychain could not be accessed - it may be locked, or access was denied"
             }
-            Self::Unavailable => {
-                "the system keychain is unavailable (on Linux, a Secret Service such as \
-                 gnome-keyring or KWallet must be running)"
-            }
+            Self::Unavailable => UNAVAILABLE_MESSAGE,
             Self::Ambiguous => {
                 "more than one matching keychain item exists; remove the duplicates with \
                  Keychain Access / seahorse"
@@ -2257,6 +2274,25 @@ mod tests {
             store.resolve(&service),
             Resolved::Unavailable(KeychainFailure::Unavailable)
         ));
+    }
+
+    /// The advice for an unreachable store must fit the host. A macOS user
+    /// whose login keychain refused a write was told to start a Secret Service
+    /// and went looking for a daemon macOS does not ship, so this asserts each
+    /// host names its own store and not the other's.
+    #[test]
+    fn the_unavailable_message_names_this_hosts_store() {
+        let message = KeychainFailure::Unavailable.message();
+        #[cfg(target_os = "macos")]
+        {
+            assert!(message.contains("login keychain"), "{message}");
+            assert!(!message.contains("Secret Service"), "{message}");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(message.contains("Secret Service"), "{message}");
+            assert!(!message.contains("login keychain"), "{message}");
+        }
     }
 
     // -- agent-vm #251: a read that never returns is abandoned ---------------
