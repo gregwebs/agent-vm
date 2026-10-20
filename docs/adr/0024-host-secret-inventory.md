@@ -84,7 +84,8 @@ hand-written, never an unvalidated name, never a quoted byte.
 
 ### D2 — The keychain namespace is `dev.agent-vm.credentials`
 
-One constant, one construction site (`entry_key`), reverse-DNS like
+One constant, user-entry construction through `entry_key` (and a separate
+reserved diagnostic construction through `availability_entry_key`), reverse-DNS like
 microsandbox's `dev.microsandbox.registry` and deliberately unrelated to
 Docker's `com.docker.sandboxes`: agent-vm neither reads nor writes Docker's
 secrets. A test asserts the `(service, account)` pair at the `entry_key` seam —
@@ -418,3 +419,51 @@ reason).
 
 Scope: only the **read** is noticed. The `#291` lock wait stays silent until it
 gives up.
+
+## Amendment: credential-store diagnostics (agent-vm #379)
+
+Doctor uses a validated, **lock-free** inventory snapshot solely to gate a
+reserved-account health check, not authorization or a consistent listing:
+
+```text
+validated inventory snapshot ── empty ──────────────> not probed
+             └── nonempty ── reserved-account lookup ─> reachable / closed failure
+                              [one read; 2s notice; 5s bound]
+```
+
+Writers publish by atomic rename, so the snapshot is sufficient for this hint.
+D5's locking still applies to list and mutations. `list` would create/take a
+lock and probe every tracked name; a user-account lookup could touch a real
+credential or its ACL. Instead `availability_entry_key` pins
+`("dev.agent-vm.credentials", ".agent-vm-doctor")`, whose account the service-name
+parser rejects. Both Present and Absent mean reachable; setup/search errors
+retain the existing closed classification, with no bytes, platform errors or
+source chains crossing the adapter. Reachable does not establish write access,
+unlocked state or all-item access. Empty inventory leaves health unknown.
+
+The reserved account is never written by agent-vm and cannot be selected through
+`ServiceName`; it is not an OS-enforced reservation against other programs or
+manual keychain editing. Under normal successful searches its absence becomes
+NoEntry/Absent. Native setup/search failures, including a missing Linux default
+collection, remain classified failures rather than being forced to Reachable.
+A lookup may prompt or fail before absence can be established. On macOS an
+externally created matching reserved item could have its bytes read and discarded
+inside keyring; no secret bytes cross the adapter. Neither a no-prompt guarantee
+nor a universal absent-account NoEntry guarantee is made.
+
+Source facts for pinned keyring 3.6.3: macOS `get_attributes` reads/discards bytes;
+Linux searches modern then legacy/default-collection items without reading secret
+bytes, can return `NoStorageAccess`, and may unlock a matching locked modern item.
+The Linux persistent builder is `SsCredential`, not a keyutils-only lookup.
+These are adapter/dependency facts, not an OS metadata-only guarantee.
+
+The existing bounded-read worker handles availability too, with the fixed notice
+label `credential store`. Doctor always uses the unattended 5s bound, independent
+of stdin; an unbounded or attended 60s wait defeats a short diagnostic. After 2s
+it emits one existing notice, then waits the remaining 3s (plus scheduling/output
+overhead). An unanswered call becomes Unresponsive; a disconnected/panicking
+worker becomes Unknown. The uncancellable worker is abandoned without joining,
+retrying or holding inventory locks/mutable state. Other secret verbs and launch
+reads retain their attended behavior. Doctor creates nothing, reports the full
+tail before returning a health failure, and reset skips the check entirely;
+[USAGE](../../USAGE.md#checking-what-agent-vm-can-see) defines exit-status policy.

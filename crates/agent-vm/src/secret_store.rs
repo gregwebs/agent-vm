@@ -411,6 +411,7 @@ fn secret_value_is_acceptable_bytes(bytes: &[u8]) -> (ok: bool)
 /// secrets (spec "Keychain source"). Changing this before any user stores a
 /// value is free; afterwards it is a migration.
 const KEYCHAIN_SERVICE: &str = "dev.agent-vm.credentials";
+const AVAILABILITY_ACCOUNT: &str = ".agent-vm-doctor";
 
 const INVENTORY_FILE_NAME: &str = "secret-inventory.json";
 const LOCK_FILE_NAME: &str = ".secret-inventory.lock";
@@ -628,6 +629,13 @@ pub(crate) enum Presence {
     Absent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Availability {
+    NotProbed,
+    Reachable,
+    Unavailable(KeychainFailure),
+}
+
 /// A **closed**, value-free classification of platform failures, and of the two
 /// ways this process stops waiting for an answer.
 ///
@@ -799,9 +807,10 @@ pub(crate) enum Resolved {
     InvalidValue(ValueRejection),
 }
 
-/// Everything the store needs from the platform credential store: four
+/// Everything the store needs from the platform credential store: five
 /// methods and no logic. This is the untestable-in-CI surface, kept minimal.
 pub(crate) trait KeychainBackend {
+    fn availability(&self) -> Result<Presence, KeychainFailure>;
     fn set(&self, service: &ServiceName, value: &SecretValue) -> Result<(), KeychainFailure>;
     /// Presence only. No value crosses into agent-vm code.
     fn probe(&self, service: &ServiceName) -> Result<Presence, KeychainFailure>;
@@ -832,16 +841,12 @@ impl KeychainBackend for SystemKeychain {
     }
 
     fn probe(&self, service: &ServiceName) -> Result<Presence, KeychainFailure> {
-        // `get_attributes` is the presence probe on purpose: keyring's default
-        // implementation calls `get_secret()` for effect and discards the bytes
-        // inside the crate, and the Secret Service backend overrides it to query
-        // attributes without fetching the secret at all. Either way no secret
-        // byte crosses into agent-vm, and this returns an enum.
-        match entry(service)?.get_attributes() {
-            Ok(_) => Ok(Presence::Present),
-            Err(keyring::Error::NoEntry) => Ok(Presence::Absent),
-            Err(error) => Err(classify(error)),
-        }
+        probe_entry(entry(service)?)
+    }
+
+    fn availability(&self) -> Result<Presence, KeychainFailure> {
+        let (service, account) = availability_entry_key();
+        probe_entry(keyring::Entry::new(service, account).map_err(classify)?)
     }
 
     fn get(&self, service: &ServiceName) -> Result<Option<StoredSecret>, KeychainFailure> {
@@ -864,9 +869,23 @@ impl KeychainBackend for SystemKeychain {
     }
 }
 
-/// The one place an entry is constructed. `entry_key` is pure so a test can
-/// assert the `(service, account)` pair at this seam rather than only the
-/// constant — that catches a future two-argument swap.
+// A reserved account cannot be selected through a validated ServiceName.
+fn availability_entry_key() -> (&'static str, &'static str) {
+    (KEYCHAIN_SERVICE, AVAILABILITY_ACCOUNT)
+}
+
+// keyring may read/discard bytes internally on macOS; only presence crosses
+// this seam. Secret Service queries attributes without fetching secret bytes.
+fn probe_entry(entry: keyring::Entry) -> Result<Presence, KeychainFailure> {
+    match entry.get_attributes() {
+        Ok(_) => Ok(Presence::Present),
+        Err(keyring::Error::NoEntry) => Ok(Presence::Absent),
+        Err(error) => Err(classify(error)),
+    }
+}
+
+/// User-entry construction has its own pure tuple seam so tests catch a
+/// namespace change or argument swap independently of the native adapter.
 fn entry_key(service: &ServiceName) -> (&str, &str) {
     (KEYCHAIN_SERVICE, service.as_str())
 }
@@ -921,9 +940,9 @@ const READ_NOTICE_AFTER: Duration = Duration::from_secs(2);
 /// prints. Names the service (already user-visible metadata) and the bound, so
 /// the user learns both what is pending and that an unlock prompt is the way to
 /// let it finish. Never names a value; a read has not produced one.
-fn slow_read_notice(service: &ServiceName, bound: Duration) -> String {
+fn slow_read_notice(label: &str, bound: Duration) -> String {
     format!(
-        "warning: the system keychain has not answered for `{service}` yet; it may be waiting on \
+        "warning: the system keychain has not answered for `{label}` yet; it may be waiting on \
          a locked keychain or an unlock prompt. A read with no answer is abandoned after {bound:?}"
     )
 }
@@ -1023,7 +1042,7 @@ impl<B: KeychainBackend + Send + Sync + 'static> BoundedKeychainReads<B> {
     /// nothing is left to receive it.
     fn bounded<T: Send + 'static>(
         &self,
-        service: &ServiceName,
+        label: &str,
         read: impl FnOnce(&B) -> std::result::Result<T, KeychainFailure> + Send + 'static,
     ) -> std::result::Result<T, KeychainFailure> {
         let backend = Arc::clone(&self.backend);
@@ -1046,7 +1065,7 @@ impl<B: KeychainBackend + Send + Sync + 'static> BoundedKeychainReads<B> {
                 Err(KeychainFailure::Unresponsive)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                (self.notifier)(&slow_read_notice(service, self.bound));
+                (self.notifier)(&slow_read_notice(label, self.bound));
                 match rx.recv_timeout(self.bound - first) {
                     Ok(read) => read,
                     Err(mpsc::RecvTimeoutError::Timeout) => Err(KeychainFailure::Unresponsive),
@@ -1058,6 +1077,10 @@ impl<B: KeychainBackend + Send + Sync + 'static> BoundedKeychainReads<B> {
 }
 
 impl<B: KeychainBackend + Send + Sync + 'static> KeychainBackend for BoundedKeychainReads<B> {
+    fn availability(&self) -> Result<Presence, KeychainFailure> {
+        self.bounded("credential store", |backend| backend.availability())
+    }
+
     fn set(
         &self,
         service: &ServiceName,
@@ -1068,7 +1091,7 @@ impl<B: KeychainBackend + Send + Sync + 'static> KeychainBackend for BoundedKeyc
 
     fn probe(&self, service: &ServiceName) -> std::result::Result<Presence, KeychainFailure> {
         let requested = service.clone();
-        self.bounded(service, move |backend| backend.probe(&requested))
+        self.bounded(service.as_str(), move |backend| backend.probe(&requested))
     }
 
     fn get(
@@ -1076,7 +1099,7 @@ impl<B: KeychainBackend + Send + Sync + 'static> KeychainBackend for BoundedKeyc
         service: &ServiceName,
     ) -> std::result::Result<Option<StoredSecret>, KeychainFailure> {
         let requested = service.clone();
-        self.bounded(service, move |backend| backend.get(&requested))
+        self.bounded(service.as_str(), move |backend| backend.get(&requested))
     }
 
     fn delete(&self, service: &ServiceName) -> std::result::Result<Presence, KeychainFailure> {
@@ -1185,6 +1208,18 @@ impl<B: KeychainBackend> SecretStore<B> {
     /// (review finding R5).
     pub(crate) fn is_test_recording(&self) -> bool {
         self.backend.is_test_recording()
+    }
+
+    /// Atomic inventory replacement makes a lock-free snapshot sufficient for
+    /// this health hint, not authorization or a consistent per-name listing.
+    pub(crate) fn availability(&self) -> Result<Availability> {
+        if self.load_inventory()?.is_empty() {
+            return Ok(Availability::NotProbed);
+        }
+        Ok(match self.backend.availability() {
+            Ok(_) => Availability::Reachable,
+            Err(failure) => Availability::Unavailable(failure),
+        })
     }
 
     /// Store or replace `value` for `service`.
@@ -1442,6 +1477,15 @@ pub(crate) fn system_store() -> Result<SecretStore<BoundedKeychainReads<SystemKe
     ))
 }
 
+/// Diagnostics stay short even on an attended terminal; they hold no lock.
+pub(crate) fn doctor_store() -> Result<SecretStore<BoundedKeychainReads<SystemKeychain>>> {
+    Ok(SecretStore::new(
+        BoundedKeychainReads::new(SystemKeychain, KEYCHAIN_READ_BOUND_UNATTENDED),
+        inventory_paths()?,
+        KEYCHAIN_READ_BOUND_UNATTENDED,
+    ))
+}
+
 /// The user-scoped inventory paths, resolved through the shared `$HOME`
 /// discipline. Shared by the production store and the debug-only test seam so
 /// both honor the same location rules.
@@ -1486,6 +1530,9 @@ pub(crate) struct RecordingKeychain {
 
 #[cfg(any(test, debug_assertions))]
 impl KeychainBackend for RecordingKeychain {
+    fn availability(&self) -> Result<Presence, KeychainFailure> {
+        Ok(Presence::Absent)
+    }
     fn set(&self, _service: &ServiceName, value: &SecretValue) -> Result<(), KeychainFailure> {
         use sha2::{Digest as _, Sha256};
         use std::io::Write as _;
@@ -1578,6 +1625,9 @@ pub(crate) mod fake {
     #[derive(Default)]
     pub(crate) struct FakeKeychain {
         items: RefCell<BTreeMap<String, Vec<u8>>>,
+        pub(crate) availability_answer: Cell<Option<Result<Presence, KeychainFailure>>>,
+        pub(crate) availability_calls: Cell<usize>,
+        pub(crate) other_calls: Cell<usize>,
         fail_set: Cell<Option<KeychainFailure>>,
         fail_probe: Cell<Option<KeychainFailure>>,
         fail_delete: Cell<Option<KeychainFailure>>,
@@ -1631,7 +1681,15 @@ pub(crate) mod fake {
     }
 
     impl KeychainBackend for FakeKeychain {
+        fn availability(&self) -> Result<Presence, KeychainFailure> {
+            self.availability_calls
+                .set(self.availability_calls.get() + 1);
+            self.availability_answer
+                .get()
+                .unwrap_or(Ok(Presence::Absent))
+        }
         fn set(&self, service: &ServiceName, value: &SecretValue) -> Result<(), KeychainFailure> {
+            self.other_calls.set(self.other_calls.get() + 1);
             if let Some(failure) = self.fail_set.get() {
                 return Err(failure);
             }
@@ -1643,6 +1701,7 @@ pub(crate) mod fake {
         }
 
         fn probe(&self, service: &ServiceName) -> Result<Presence, KeychainFailure> {
+            self.other_calls.set(self.other_calls.get() + 1);
             if let Some(failure) = self.fail_probe.get() {
                 return Err(failure);
             }
@@ -1658,6 +1717,7 @@ pub(crate) mod fake {
         /// exercise, so `seed`/`seed_bytes` can plant a value a real `set`
         /// would have refused.
         fn get(&self, service: &ServiceName) -> Result<Option<StoredSecret>, KeychainFailure> {
+            self.other_calls.set(self.other_calls.get() + 1);
             if let Some(failure) = self.fail_probe.get() {
                 return Err(failure);
             }
@@ -1669,6 +1729,7 @@ pub(crate) mod fake {
         }
 
         fn delete(&self, service: &ServiceName) -> Result<Presence, KeychainFailure> {
+            self.other_calls.set(self.other_calls.get() + 1);
             if let Some(failure) = self.fail_delete.get() {
                 return Err(failure);
             }
@@ -1689,6 +1750,9 @@ pub(crate) mod fake {
 /// backend can be inspected after the store has run.
 #[cfg(test)]
 impl KeychainBackend for std::rc::Rc<fake::FakeKeychain> {
+    fn availability(&self) -> Result<Presence, KeychainFailure> {
+        (**self).availability()
+    }
     fn set(&self, service: &ServiceName, value: &SecretValue) -> Result<(), KeychainFailure> {
         (**self).set(service, value)
     }
@@ -1781,6 +1845,381 @@ mod tests {
             !contains_substring_of_len(text, needle, 4),
             "a 4+ character substring of the value leaked: {text}"
         );
+    }
+
+    fn seed_inventory(dir: &Path, count: usize) {
+        let services: Vec<_> = (0..count).map(|n| format!("service{n}")).collect();
+        let bytes =
+            serde_json::to_vec(&serde_json::json!({"version":1,"services":services})).unwrap();
+        atomic_write(&dir.join(INVENTORY_FILE_NAME), &bytes, INVENTORY_FILE_MODE).unwrap();
+    }
+
+    #[test]
+    fn availability_skips_an_absent_or_empty_inventory() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = InventoryPaths::new(home.path().join("absent"));
+        let store = SecretStore::new(FakeKeychain::new(), paths.clone(), TEST_LOCK_WAIT);
+        assert_eq!(store.availability().unwrap(), Availability::NotProbed);
+        assert!(!paths.dir.exists());
+        std::fs::create_dir(&paths.dir).unwrap();
+        seed_inventory(&paths.dir, 0);
+        let before = std::fs::read(paths.inventory_path()).unwrap();
+        assert_eq!(store.availability().unwrap(), Availability::NotProbed);
+        assert_eq!(std::fs::read(paths.inventory_path()).unwrap(), before);
+        assert_eq!(std::fs::read_dir(&paths.dir).unwrap().count(), 1);
+        assert_eq!(store.backend.availability_calls.get(), 0);
+        assert_eq!(store.backend.other_calls.get(), 0);
+    }
+
+    #[test]
+    fn availability_probes_once_regardless_of_inventory_size() {
+        for count in [1, 200] {
+            for presence in [Presence::Present, Presence::Absent] {
+                let h = Harness::new();
+                seed_inventory(h.dir.path(), count);
+                h.backend.seed("service0", "sk-Q7XZPLMN-4w9t-AbCdEf");
+                h.backend.availability_answer.set(Some(Ok(presence)));
+                let before = std::fs::read(h.inventory()).unwrap();
+                assert_eq!(h.store().availability().unwrap(), Availability::Reachable);
+                assert_eq!(h.backend.availability_calls.get(), 1);
+                assert_eq!(h.backend.other_calls.get(), 0);
+                assert_eq!(std::fs::read(h.inventory()).unwrap(), before);
+                assert_eq!(std::fs::read_dir(h.dir.path()).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn availability_preserves_every_closed_failure() {
+        for failure in [
+            KeychainFailure::AccessDenied,
+            KeychainFailure::Unavailable,
+            KeychainFailure::Ambiguous,
+            KeychainFailure::Rejected,
+            KeychainFailure::Unresponsive,
+            KeychainFailure::InventoryBusy,
+            KeychainFailure::Unknown,
+        ] {
+            let h = Harness::new();
+            seed_inventory(h.dir.path(), 1);
+            h.backend.availability_answer.set(Some(Err(failure)));
+            assert_eq!(
+                h.store().availability().unwrap(),
+                Availability::Unavailable(failure)
+            );
+            assert_eq!(h.backend.availability_calls.get(), 1);
+            assert_eq!(h.backend.other_calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn availability_rejects_bad_inventory_without_probing() {
+        const CANARY: &str = "sk-Q7XZPLMN-4w9t-AbCdEf";
+        for body in [
+            "not json".to_owned(),
+            r#"{"version":2,"services":[]}"#.to_owned(),
+            r#"{"version":1,"services":["Bad Name"]}"#.to_owned(),
+            format!(r#"{{"version":"{CANARY}","services":[]}}"#),
+            format!(r#"{{"version":1,"services":"{CANARY}"}}"#),
+        ] {
+            let h = Harness::new();
+            h.write_inventory(&body);
+            assert_bad_availability(&h, CANARY);
+        }
+        let h = Harness::new();
+        h.write_inventory(&"x".repeat((MAX_INVENTORY_BYTES + 1) as usize));
+        assert_bad_availability(&h, CANARY);
+        let h = Harness::new();
+        std::fs::create_dir(h.inventory()).unwrap();
+        assert_bad_availability(&h, CANARY);
+        let h = Harness::new();
+        let path = std::ffi::CString::new(h.inventory().as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // A bounded outer worker makes a regression to opening the FIFO finite.
+        let dir = h.dir;
+        within_deadline("FIFO inventory", move || {
+            let h = Harness {
+                dir,
+                backend: Rc::new(FakeKeychain::new()),
+            };
+            assert_bad_availability(&h, CANARY);
+        });
+    }
+
+    fn assert_bad_availability(h: &Harness, canary: &str) {
+        let text = format!("{:#}", h.store().availability().unwrap_err());
+        assert!(
+            text.contains(&h.inventory().display().to_string()),
+            "{text}"
+        );
+        assert!(text.contains(INVENTORY_RECOVERY), "{text}");
+        assert_no_leak(&text, canary);
+        assert!(!text.contains("Bad Name"));
+        assert_eq!(h.backend.availability_calls.get(), 0);
+        assert_eq!(h.backend.other_calls.get(), 0);
+        assert!(!h.paths().lock_path().exists());
+    }
+
+    #[test]
+    fn availability_does_not_wait_for_or_create_an_inventory_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_inventory(dir.path(), 1);
+        let holder = hold_inventory_lock(dir.path());
+        within_deadline("availability behind inventory lock", move || {
+            let store = SecretStore::new(
+                FakeKeychain::new(),
+                InventoryPaths::new(dir.path().to_owned()),
+                Duration::ZERO,
+            );
+            assert_eq!(store.availability().unwrap(), Availability::Reachable);
+            assert_eq!(store.backend.availability_calls.get(), 1);
+            assert_eq!(store.backend.other_calls.get(), 0);
+            drop(holder);
+        });
+    }
+
+    #[test]
+    fn availability_account_cannot_be_a_user_service() {
+        assert_eq!(
+            availability_entry_key(),
+            ("dev.agent-vm.credentials", ".agent-vm-doctor")
+        );
+        assert!(ServiceName::parse(AVAILABILITY_ACCOUNT).is_err());
+        assert_eq!(
+            slow_read_notice("credential store", KEYCHAIN_READ_BOUND_UNATTENDED),
+            "warning: the system keychain has not answered for `credential store` yet; it may be waiting on a locked keychain or an unlock prompt. A read with no answer is abandoned after 5s"
+        );
+    }
+
+    #[test]
+    fn doctor_store_returns_bounded_reads() {
+        let _pin: fn() -> Result<SecretStore<BoundedKeychainReads<SystemKeychain>>> = doctor_store;
+    }
+
+    #[test]
+    fn doctor_store_always_uses_the_unattended_bound() {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "AGENT_VM_TEST_DOCTOR_FACTORY_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            assert_eq!(std::io::stdin().is_terminal(), mode == "pty");
+            let store = doctor_store().unwrap();
+            assert_eq!(store.backend.bound, Duration::from_secs(5));
+            assert_eq!(store.backend.notice_after, Duration::from_secs(2));
+            assert_eq!(store.lock_wait, Duration::from_secs(5));
+            return;
+        }
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        for mode in ["pty", "pipe"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "secret_store::tests::doctor_store_always_uses_the_unattended_bound",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, mode)
+                .env("HOME", home.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut master = None;
+            if mode == "pty" {
+                let (mut m, mut s) = (-1, -1);
+                assert_eq!(
+                    unsafe {
+                        libc::openpty(
+                            &mut m,
+                            &mut s,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    0
+                );
+                master = Some(unsafe { OwnedFd::from_raw_fd(m) });
+                command.stdin(Stdio::from(unsafe { OwnedFd::from_raw_fd(s) }));
+            } else {
+                command.stdin(Stdio::piped());
+            }
+            let mut child = ChildGuard(command.spawn().unwrap());
+            drop(child.0.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "factory child timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            use std::io::Read as _;
+            let mut errors = String::new();
+            child
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut errors)
+                .unwrap();
+            let mut output = String::new();
+            child
+                .0
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut output)
+                .unwrap();
+            assert!(status.success(), "{mode}: {output}\n{errors}");
+            drop(master);
+        }
+    }
+
+    #[test]
+    fn a_slow_availability_probe_is_noticed_once_and_abandoned() {
+        let (dir, lines, store) = notifying_store(
+            DelayedKeychain::never(),
+            Duration::from_millis(400),
+            Duration::from_millis(100),
+        );
+        seed_inventory(dir.path(), 1);
+        let (result, elapsed) = within_deadline("slow availability", move || {
+            let start = Instant::now();
+            (store.availability().unwrap(), start.elapsed())
+        });
+        assert_eq!(
+            result,
+            Availability::Unavailable(KeychainFailure::Unresponsive)
+        );
+        assert!(elapsed >= Duration::from_millis(400));
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [slow_read_notice(
+                "credential store",
+                Duration::from_millis(400)
+            )]
+        );
+    }
+
+    #[test]
+    fn availability_fast_or_short_bound_is_silent() {
+        for (backend, bound, expected) in [
+            (DelayedKeychain::immediately(), 400, Availability::Reachable),
+            (
+                DelayedKeychain::never(),
+                100,
+                Availability::Unavailable(KeychainFailure::Unresponsive),
+            ),
+        ] {
+            let (dir, lines, store) = notifying_store(
+                backend,
+                Duration::from_millis(bound),
+                Duration::from_millis(200),
+            );
+            seed_inventory(dir.path(), 1);
+            assert_eq!(
+                within_deadline("quiet availability", move || store.availability().unwrap()),
+                expected
+            );
+            assert!(lines.lock().unwrap().is_empty());
+        }
+    }
+
+    struct ReadGatedKeychain {
+        answer: Result<Presence, KeychainFailure>,
+        gate: std::sync::Mutex<mpsc::Receiver<()>>,
+        finished: mpsc::Sender<()>,
+    }
+    impl KeychainBackend for ReadGatedKeychain {
+        fn availability(&self) -> Result<Presence, KeychainFailure> {
+            let released = self.gate.lock().unwrap().recv();
+            let _ = self.finished.send(());
+            released.map_err(|_| KeychainFailure::Unknown)?;
+            self.answer
+        }
+        fn set(&self, _: &ServiceName, _: &SecretValue) -> Result<(), KeychainFailure> {
+            panic!("diagnostic wrote")
+        }
+        fn probe(&self, _: &ServiceName) -> Result<Presence, KeychainFailure> {
+            panic!("per-name probe")
+        }
+        fn get(&self, _: &ServiceName) -> Result<Option<StoredSecret>, KeychainFailure> {
+            panic!("diagnostic fetched bytes")
+        }
+        fn delete(&self, _: &ServiceName) -> Result<Presence, KeychainFailure> {
+            panic!("diagnostic deleted")
+        }
+    }
+
+    #[test]
+    fn availability_answer_after_notice_is_preserved() {
+        for answer in [
+            Ok(Presence::Present),
+            Ok(Presence::Absent),
+            Err(KeychainFailure::AccessDenied),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            // Disconnecting releases a worker even on an assertion panic; cleanup
+            // waits finitely, never joins a potentially stuck native-style read.
+            struct Release {
+                gate: Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
+                done: mpsc::Receiver<()>,
+            }
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    self.gate.lock().unwrap().take();
+                    let _ = self.done.recv_timeout(Duration::from_secs(2));
+                }
+            }
+            let gate = Arc::new(std::sync::Mutex::new(Some(tx)));
+            let _release = Release {
+                gate: Arc::clone(&gate),
+                done: done_rx,
+            };
+            let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorder = Arc::clone(&lines);
+            let backend = BoundedKeychainReads::new(
+                ReadGatedKeychain {
+                    answer,
+                    gate: std::sync::Mutex::new(rx),
+                    finished: done_tx,
+                },
+                Duration::from_secs(2),
+            )
+            .noticing_after(Duration::from_millis(100), move |line| {
+                recorder.lock().unwrap().push(line.to_owned());
+                gate.lock().unwrap().take().unwrap().send(()).unwrap();
+            });
+            let dir = tempfile::tempdir().unwrap();
+            seed_inventory(dir.path(), 1);
+            let store = SecretStore::new(
+                backend,
+                InventoryPaths::new(dir.path().to_owned()),
+                TEST_LOCK_WAIT,
+            );
+            let expected = match answer {
+                Ok(_) => Availability::Reachable,
+                Err(f) => Availability::Unavailable(f),
+            };
+            assert_eq!(
+                within_deadline("released availability", move || store
+                    .availability()
+                    .unwrap()),
+                expected
+            );
+            assert_eq!(
+                *lines.lock().unwrap(),
+                [slow_read_notice("credential store", Duration::from_secs(2))]
+            );
+        }
     }
 
     // -- S13: the namespace seam -----------------------------------------
@@ -2072,6 +2511,7 @@ mod tests {
                     .set(&name("anthropic"), &value("sk-REAL"))
                     .expect_err("set must fail"),
                 store.list().expect_err("list must fail"),
+                store.availability().expect_err("availability must fail"),
                 store
                     .remove(&name("anthropic"))
                     .expect_err("remove must fail"),
@@ -2333,6 +2773,10 @@ mod tests {
     }
 
     impl KeychainBackend for DelayedKeychain {
+        fn availability(&self) -> Result<Presence, KeychainFailure> {
+            self.read_delay();
+            Ok(Presence::Present)
+        }
         fn set(&self, _: &ServiceName, _: &SecretValue) -> Result<(), KeychainFailure> {
             Ok(())
         }
@@ -2619,6 +3063,9 @@ mod tests {
     }
 
     impl KeychainBackend for GatedKeychain {
+        fn availability(&self) -> Result<Presence, KeychainFailure> {
+            Ok(Presence::Present)
+        }
         fn set(&self, _: &ServiceName, _: &SecretValue) -> Result<(), KeychainFailure> {
             self.entered
                 .send(())
