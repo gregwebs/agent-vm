@@ -386,3 +386,35 @@ lose to later arrivals. A lock still free at the final attempt is acquired.
 Neither fairness nor an end-to-end 50 ms acquisition bound is guaranteed.
 `host_paths::flock_exclusive` keeps its unbounded semantics for the fork and
 default-image locks, whose holders never wait on a credential store.
+
+## Amendment: a slow read says so
+
+The bound above made a read finite but not **legible**. Every read up to
+`keychain_read_bound()` printed nothing, so a launch parked on the macOS unlock
+prompt — the exact case the long attended bound exists for — was
+indistinguishable from a hung launcher: no line, no prompt in the terminal, no
+sign that anything would ever end the wait. A user could only conclude the
+launch had wedged.
+
+`BoundedKeychainReads` now waits the first `READ_NOTICE_AFTER` (2 s) of its
+bound, and if the read is still unanswered prints **one** `warning:` line
+naming the service and the bound the read will be abandoned at, then waits the
+remainder. Nothing else changes: the bounds, the `Unresponsive` class, the
+abandoned non-joined thread and the unbounded writes are exactly as above, and
+a read whose bound is at or below the threshold has no "still waiting" moment,
+so it stays silent.
+
+Shortening the attended bound instead was rejected. The wait exists to let a
+user answer a prompt, so cutting it to the handful of seconds a healthy read
+needs does not make the prompt faster — it abandons a read the user is actively
+answering and turns a recoverable launch into a failed one. A spinner or an
+in-place updating line was rejected as well: it needs a terminal to be useful,
+and the line has to reach a piped or logged launch as plainly as an interactive
+one. The store writes one `write_all` to stderr and ignores its error rather
+than going through the launch's notice sink: the read is below that seam and
+`secret ls`/`secret rm` need the same line, while the sink is `!Send` and
+cannot cross into the reader (a closed stderr must not abort a read — #70's
+reason).
+
+Scope: only the **read** is noticed. The `#291` lock wait stays silent until it
+gives up.

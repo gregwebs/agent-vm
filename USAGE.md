@@ -1673,7 +1673,9 @@ If the prompt is never answered — a locked keychain with nobody at the GUI, a
 launch from a script — agent-vm **abandons the read** instead of waiting
 indefinitely, and reports the same "could not be read" class (a tight bound when
 stdin is not a TTY, a generous one when it is; the values live with the store in
-`crates/agent-vm/src/secret_store.rs`).
+`crates/agent-vm/src/secret_store.rs`). A read that is still unanswered after a
+couple of seconds says so first: one `warning:` line on stderr, naming the
+service, so a launch waiting on a prompt you can answer does not look hung.
 An unattended `secret ls` reports this as an `unavailable:` row rather than
 hanging on that read, and the inventory lock it holds is released (agent-vm #251).
 

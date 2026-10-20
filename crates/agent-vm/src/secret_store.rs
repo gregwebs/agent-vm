@@ -107,6 +107,12 @@
 //! which every caller already renders as a locked/unavailable keychain rather
 //! than as a missing value.
 //!
+//! A read that outlives [`READ_NOTICE_AFTER`] while still inside that bound
+//! first **says so**: one stderr line naming the service it is waiting for. The
+//! wait used to be silent, so a launch parked on an unlock prompt was
+//! indistinguishable from a hung launch. The line only explains the wait; the
+//! bound below still decides when the read is abandoned.
+//!
 //! Only **reads** are bounded. An abandoned `set` or `delete` would keep
 //! running and could still commit, turning a reported failure into a later lie
 //! about what is stored — a worse outcome than the wait it avoids.
@@ -135,7 +141,7 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::File;
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -882,6 +888,43 @@ fn read_stored_secret(
 const KEYCHAIN_READ_BOUND_ATTENDED: Duration = Duration::from_secs(60);
 const KEYCHAIN_READ_BOUND_UNATTENDED: Duration = Duration::from_secs(5);
 
+/// How long a read may go unanswered before this process says it is still
+/// waiting.
+///
+/// A healthy read is a local call that answers in moments, so a read that is
+/// still unanswered after this is parked on something the user cannot see: a
+/// locked keychain's unlock prompt, or a wedged keyring daemon. Saying so costs
+/// nothing on the fast path and turns a silent, apparently hung launch into one
+/// that names what it is waiting for. Short enough to arrive while a user is
+/// still watching the terminal, long enough not to narrate a merely slow read.
+/// Both bounds are above it, so a launch that is only briefly slow stays quiet.
+const READ_NOTICE_AFTER: Duration = Duration::from_secs(2);
+
+/// The one line a read that is still unanswered past [`READ_NOTICE_AFTER`]
+/// prints. Names the service (already user-visible metadata) and the bound, so
+/// the user learns both what is pending and that an unlock prompt is the way to
+/// let it finish. Never names a value; a read has not produced one.
+fn slow_read_notice(service: &ServiceName, bound: Duration) -> String {
+    format!(
+        "warning: the system keychain has not answered for `{service}` yet; it may be waiting on \
+         a locked keychain or an unlock prompt. A read with no answer is abandoned after {bound:?}"
+    )
+}
+
+/// Write one notice line to stderr and ignore a failure.
+///
+/// Not `eprintln!`: that panics when the write fails, a real outcome for
+/// `agent-vm … 2>&1 | head` (EPIPE) or a full disk (#70), and a keychain read
+/// must not abort the process because stderr went away — its own outcome is
+/// what decides the launch. One `write_all` of the fully rendered line, so a
+/// partial notice cannot be delivered before a failure.
+fn emit_notice_line(line: &str) {
+    let mut rendered = String::with_capacity(line.len() + 1);
+    rendered.push_str(line);
+    rendered.push('\n');
+    let _ = std::io::stderr().write_all(rendered.as_bytes());
+}
+
 /// The read bound for this process, chosen once at store construction.
 fn keychain_read_bound() -> Duration {
     if std::io::stdin().is_terminal() {
@@ -923,6 +966,9 @@ pub(crate) const TEST_LOCK_WAIT: Duration = Duration::from_secs(5);
 pub(crate) struct BoundedKeychainReads<B> {
     backend: Arc<B>,
     bound: Duration,
+    /// When a still-unanswered read says so, and where that line goes.
+    notice_after: Duration,
+    notifier: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl<B: KeychainBackend + Send + Sync + 'static> BoundedKeychainReads<B> {
@@ -930,10 +976,27 @@ impl<B: KeychainBackend + Send + Sync + 'static> BoundedKeychainReads<B> {
         Self {
             backend: Arc::new(backend),
             bound,
+            notice_after: READ_NOTICE_AFTER,
+            notifier: Arc::new(emit_notice_line),
         }
     }
 
-    /// Run `read` on its own thread and give up after the bound.
+    /// Test seam: a recording sink and a notice delay short enough to observe,
+    /// so a test can assert both the line and its absence without a `2s` wait or
+    /// a real stderr.
+    #[cfg(test)]
+    fn noticing_after(
+        mut self,
+        notice_after: Duration,
+        sink: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        self.notice_after = notice_after;
+        self.notifier = Arc::new(sink);
+        self
+    }
+
+    /// Run `read` on its own thread and give up after the bound, saying so once
+    /// if the read is still unanswered after [`READ_NOTICE_AFTER`].
     ///
     /// The abandoned thread is deliberately not joined: the platform call cannot
     /// be cancelled, and waiting for it is the hang this exists to prevent. It
@@ -943,6 +1006,7 @@ impl<B: KeychainBackend + Send + Sync + 'static> BoundedKeychainReads<B> {
     /// nothing is left to receive it.
     fn bounded<T: Send + 'static>(
         &self,
+        service: &ServiceName,
         read: impl FnOnce(&B) -> std::result::Result<T, KeychainFailure> + Send + 'static,
     ) -> std::result::Result<T, KeychainFailure> {
         let backend = Arc::clone(&self.backend);
@@ -950,14 +1014,28 @@ impl<B: KeychainBackend + Send + Sync + 'static> BoundedKeychainReads<B> {
         std::thread::spawn(move || {
             let _ = tx.send(read(&backend));
         });
-        match rx.recv_timeout(self.bound) {
-            Ok(Ok(read)) => Ok(read),
-            Ok(Err(failure)) => Err(failure),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(KeychainFailure::Unresponsive),
+        // Wait the notice threshold first, then the rest of the bound. When the
+        // bound is at or below the threshold there is no "still waiting" moment
+        // to report, so this single wait is the whole bound (every test bound at
+        // or below the threshold takes this path).
+        let first = self.bound.min(self.notice_after);
+        match rx.recv_timeout(first) {
+            Ok(read) => read,
             // The reader thread panicked. That is a bug in agent-vm or in the
             // platform adapter, not a keychain state, and `Unknown` is where
             // this module already puts another thread's panic.
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(KeychainFailure::Unknown),
+            Err(mpsc::RecvTimeoutError::Timeout) if first == self.bound => {
+                Err(KeychainFailure::Unresponsive)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                (self.notifier)(&slow_read_notice(service, self.bound));
+                match rx.recv_timeout(self.bound - first) {
+                    Ok(read) => read,
+                    Err(mpsc::RecvTimeoutError::Timeout) => Err(KeychainFailure::Unresponsive),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(KeychainFailure::Unknown),
+                }
+            }
         }
     }
 }
@@ -972,16 +1050,16 @@ impl<B: KeychainBackend + Send + Sync + 'static> KeychainBackend for BoundedKeyc
     }
 
     fn probe(&self, service: &ServiceName) -> std::result::Result<Presence, KeychainFailure> {
-        let service = service.clone();
-        self.bounded(move |backend| backend.probe(&service))
+        let requested = service.clone();
+        self.bounded(service, move |backend| backend.probe(&requested))
     }
 
     fn get(
         &self,
         service: &ServiceName,
     ) -> std::result::Result<Option<StoredSecret>, KeychainFailure> {
-        let service = service.clone();
-        self.bounded(move |backend| backend.get(&service))
+        let requested = service.clone();
+        self.bounded(service, move |backend| backend.get(&requested))
     }
 
     fn delete(&self, service: &ServiceName) -> std::result::Result<Presence, KeychainFailure> {
@@ -2254,6 +2332,93 @@ mod tests {
             TEST_LOCK_WAIT,
         );
         (dir, store)
+    }
+
+    /// The temp dir (kept alive), the recorded notice lines, and the store.
+    type NotifyingStore = (
+        tempfile::TempDir,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        SecretStore<BoundedKeychainReads<DelayedKeychain>>,
+    );
+
+    /// A bounded store whose "still waiting" lines are recorded instead of
+    /// printed, so a test can assert both the line and its absence.
+    fn notifying_store(
+        backend: DelayedKeychain,
+        bound: Duration,
+        notice_after: Duration,
+    ) -> NotifyingStore {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&lines);
+        let store = SecretStore::new(
+            BoundedKeychainReads::new(backend, bound).noticing_after(
+                notice_after,
+                move |line: &str| {
+                    recorder.lock().unwrap().push(line.to_owned());
+                },
+            ),
+            InventoryPaths::new(dir.path().to_path_buf()),
+            TEST_LOCK_WAIT,
+        );
+        (dir, lines, store)
+    }
+
+    /// A launch that waits on the keychain used to do so in silence, so an
+    /// unlock prompt was indistinguishable from a hung launch. Past the notice
+    /// threshold the read says so once, naming the service — and the line must
+    /// not shorten the bound, because the prompt may still be answered.
+    #[test]
+    fn a_slow_read_says_so_once_and_still_waits_for_the_bound() {
+        const BOUND: Duration = Duration::from_millis(400);
+        let (_dir, lines, store) =
+            notifying_store(DelayedKeychain::never(), BOUND, Duration::from_millis(100));
+        let (_, resolved, elapsed) = within_deadline("the noticed read", move || {
+            let started = Instant::now();
+            let resolved = store.resolve(&name("alpha"));
+            (store, resolved, started.elapsed())
+        });
+        assert!(
+            matches!(
+                resolved,
+                Resolved::Unavailable(KeychainFailure::Unresponsive)
+            ),
+            "expected Unavailable(Unresponsive), got {resolved:?}"
+        );
+        assert!(
+            elapsed >= BOUND,
+            "the notice shortened the bound: {elapsed:?}"
+        );
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "noticed {lines:?}");
+        assert!(lines[0].contains("`alpha`"), "{:?}", lines[0]);
+        assert!(lines[0].contains("abandoned after"), "{:?}", lines[0]);
+    }
+
+    /// The notice must not turn a healthy read noisy, in either shape: one that
+    /// answers inside the threshold, and one whose bound expires before the
+    /// threshold (there is no "still waiting" moment to report).
+    #[test]
+    fn a_read_that_finishes_before_the_threshold_is_silent() {
+        let (_dir, lines, store) = notifying_store(
+            DelayedKeychain::immediately(),
+            Duration::from_millis(400),
+            Duration::from_millis(100),
+        );
+        assert!(matches!(store.resolve(&name("alpha")), Resolved::Value(_)));
+        assert!(lines.lock().unwrap().is_empty());
+
+        let (_dir, lines, store) = notifying_store(
+            DelayedKeychain::never(),
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        let (_, resolved) = resolve_within_deadline(store);
+        assert!(matches!(
+            resolved,
+            Resolved::Unavailable(KeychainFailure::Unresponsive)
+        ));
+        assert!(lines.lock().unwrap().is_empty());
     }
 
     /// The type is the assertion for the production wiring: if `system_store`
