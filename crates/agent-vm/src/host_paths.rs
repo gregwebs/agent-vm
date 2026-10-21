@@ -317,23 +317,38 @@ pub(crate) enum FlockWait {
 /// exhaustion on interruption is an I/O error, not evidence of contention.
 /// Scheduler/OS delays may overshoot the requested wait; there is no hard
 /// real-time guarantee. Release semantics are [`flock_exclusive`]'s.
-pub(crate) fn flock_exclusive_within(file: &std::fs::File, wait: Duration) -> Result<FlockWait> {
+///
+/// `on_contention` observes a still-contended attempt made before the deadline,
+/// with the time elapsed since acquisition started (#377). It is a synchronous
+/// callback on this thread, repeatable while contention continues, and should
+/// be quick; it cannot influence acquisition policy. A notice it emits is
+/// valid even if a later attempt acquires the lock: a contention sample does
+/// not prove continuous ownership.
+pub(crate) fn flock_exclusive_within(
+    file: &std::fs::File,
+    wait: Duration,
+    on_contention: impl FnMut(Duration),
+) -> Result<FlockWait> {
     flock_exclusive_within_using(
         wait,
         || rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive),
         || {},
+        on_contention,
     )
 }
 
-/// Internal seam: production supplies the real syscall and a no-op checkpoint.
-/// Tests inject errno sequences or pause after the first contended attempt,
-/// as default_selection's *_with_checkpoint helpers do.
+/// Internal seam: production supplies the real syscall, a no-op checkpoint and
+/// the caller's observer. Tests inject errno sequences, pause after the first
+/// contended attempt as default_selection's *_with_checkpoint helpers do, or
+/// record the observer's elapsed samples.
 fn flock_exclusive_within_using(
     wait: Duration,
     mut attempt: impl FnMut() -> std::result::Result<(), Errno>,
     after_first_contention: impl FnOnce(),
+    mut on_contention: impl FnMut(Duration),
 ) -> Result<FlockWait> {
-    let deadline = Instant::now()
+    let started = Instant::now();
+    let deadline = started
         .checked_add(wait)
         .ok_or_else(|| anyhow!("the flock wait {wait:?} overflows the clock"))?;
     let mut pause = FLOCK_POLL_FIRST;
@@ -366,6 +381,16 @@ fn flock_exclusive_within_using(
             );
             checkpoint();
         }
+        // Sampled before the deadline on purpose: a sample taken after it says
+        // nothing a wait at or below its own budget could still act on. The
+        // argument is elapsed since acquisition started, so a notice can say
+        // when the whole wait expires rather than promise extra seconds.
+        let observed_at = Instant::now();
+        if observed_at < deadline {
+            on_contention(observed_at.duration_since(started));
+        }
+        // Resampled: the checkpoint or the observer may have crossed the
+        // deadline, and a stale `deadline - now` would sleep past it.
         let now = Instant::now();
         if now >= deadline {
             if attempt_started >= deadline {
@@ -1139,7 +1164,7 @@ mod tests {
         let (outcome, elapsed) = within("held flock", move || {
             let started = Instant::now();
             (
-                flock_exclusive_within(&b, SHORT).unwrap(),
+                flock_exclusive_within(&b, SHORT, |_| {}).unwrap(),
                 started.elapsed(),
             )
         });
@@ -1166,6 +1191,7 @@ mod tests {
                     contended_tx.send(()).unwrap();
                     proceed_rx.recv_timeout(Duration::from_secs(30)).unwrap();
                 },
+                |_| {},
             )
             .unwrap();
             let _ = tx.send((outcome, b));
@@ -1210,6 +1236,7 @@ mod tests {
                     // while the deadline passes, then let the holder release.
                     proceed_rx.recv_timeout(Duration::from_secs(30)).unwrap();
                 },
+                |_| {},
             )
             .unwrap();
             let _ = tx.send((outcome, b));
@@ -1238,7 +1265,7 @@ mod tests {
         let a = second_handle(&path);
         let a = within("free zero wait", move || {
             assert_eq!(
-                flock_exclusive_within(&a, Duration::ZERO).unwrap(),
+                flock_exclusive_within(&a, Duration::ZERO, |_| {}).unwrap(),
                 FlockWait::Acquired
             );
             a
@@ -1247,12 +1274,197 @@ mod tests {
         within("held zero wait", move || {
             let started = Instant::now();
             assert_eq!(
-                flock_exclusive_within(&b, Duration::ZERO).unwrap(),
+                flock_exclusive_within(&b, Duration::ZERO, |_| {}).unwrap(),
                 FlockWait::TimedOut
             );
             assert!(started.elapsed() < Duration::from_secs(1));
         });
         drop(a);
+    }
+
+    /// A notice is only meaningful for a *contended* attempt inside the wait.
+    /// An immediately successful attempt, a hard error, a pure `EINTR`
+    /// sequence, and a zero wait have no contention sample to report, so the
+    /// observer must stay silent — and the existing outcomes and attempt
+    /// counts must be unchanged.
+    #[test]
+    fn the_contention_observer_is_not_called_without_contention() {
+        within("uncontended observer", || {
+            let mut calls = 0;
+            let outcome = flock_exclusive_within_using(
+                Duration::from_secs(5),
+                || Ok(()),
+                || {},
+                |_| calls += 1,
+            )
+            .unwrap();
+            assert_eq!(outcome, FlockWait::Acquired);
+            assert_eq!(calls, 0);
+
+            let error = flock_exclusive_within_using(
+                Duration::from_secs(5),
+                || Err(Errno::IO),
+                || {},
+                |_| calls += 1,
+            )
+            .unwrap_err();
+            assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::IO));
+            assert_eq!(calls, 0);
+
+            let error = flock_exclusive_within_using(
+                Duration::ZERO,
+                || Err(Errno::INTR),
+                || {},
+                |_| calls += 1,
+            )
+            .unwrap_err();
+            assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::INTR));
+            assert_eq!(calls, 0);
+
+            // A zero wait is exactly one attempt, and it is already at the
+            // deadline, so even a contended attempt reports nothing.
+            let mut attempts = 0;
+            let outcome = flock_exclusive_within_using(
+                Duration::ZERO,
+                || {
+                    attempts += 1;
+                    Err(Errno::WOULDBLOCK)
+                },
+                || {},
+                |_| calls += 1,
+            )
+            .unwrap();
+            assert_eq!(outcome, FlockWait::TimedOut);
+            assert_eq!(attempts, 1);
+            assert_eq!(calls, 0);
+        });
+    }
+
+    /// A valid notice from earlier contention must not turn into a false
+    /// timeout: the observer can hold the waiter across the deadline and the
+    /// lock can be released meanwhile, so the promised post-deadline attempt
+    /// must still acquire. Entry and cleanup share one absolute outer watchdog.
+    #[test]
+    fn an_observer_that_crosses_the_deadline_still_acquires_a_released_lock() {
+        use std::sync::mpsc;
+        const ACQUISITION_ENTRY_BUDGET: Duration = Duration::from_secs(5);
+        const OUTER_WATCHDOG: Duration = Duration::from_secs(30);
+        const CHECKPOINT_OVERHEAD: Duration = Duration::from_millis(350);
+        let watchdog = Instant::now() + OUTER_WATCHDOG;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let holder = second_handle(&path);
+        rfs::flock(&holder, rfs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let waiter = second_handle(&path);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = flock_exclusive_within_using(
+                ACQUISITION_ENTRY_BUDGET,
+                || rfs::flock(&waiter, rfs::FlockOperation::NonBlockingLockExclusive),
+                // Controlled overhead exceeds the former 200 ms entry window;
+                // this is not a sleep used to guess another thread's ordering.
+                || std::thread::sleep(CHECKPOINT_OVERHEAD),
+                |elapsed| {
+                    let entered = Instant::now();
+                    entered_tx
+                        .send((elapsed, entered))
+                        .expect("observer entry acknowledgement");
+                    resume_rx
+                        .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+                        .expect("observer resume gate failed within the outer watchdog");
+                },
+            )
+            .unwrap();
+            let _ = tx.send((outcome, waiter));
+        });
+        // Entry inside the acquisition budget is a precondition: without it the
+        // post-callback branch is not exercised and there is nothing to assert.
+        let (elapsed, entered) = entered_rx
+            .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+            .expect("observer entry precondition failed within the outer watchdog");
+        assert!(elapsed >= CHECKPOINT_OVERHEAD);
+        assert!(
+            elapsed < ACQUISITION_ENTRY_BUDGET,
+            "entry was already past the acquisition budget: {elapsed:?}"
+        );
+        // A full configured wait after recorded entry necessarily crosses the
+        // original acquisition deadline, independent of coordinator scheduling.
+        let cross_deadline = entered + ACQUISITION_ENTRY_BUDGET;
+        assert!(
+            cross_deadline < watchdog,
+            "deadline crossing exceeds outer watchdog"
+        );
+        std::thread::sleep(cross_deadline.saturating_duration_since(Instant::now()));
+        drop(holder);
+        resume_tx
+            .send(())
+            .expect("observer resume gate disconnected");
+        let (outcome, waiter) = rx
+            .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+            .expect("observer result/cleanup failed within the outer watchdog");
+        assert_eq!(outcome, FlockWait::Acquired);
+        let c = second_handle(&path);
+        assert_eq!(
+            rfs::flock(&c, rfs::FlockOperation::NonBlockingLockExclusive),
+            Err(Errno::WOULDBLOCK)
+        );
+        drop(waiter);
+    }
+
+    /// The notice threshold is a *contention* age, so a holder released quickly
+    /// leaves every sample under it. The release is driven by an observed
+    /// sample, not by a sleep that guesses thread order; the threshold is
+    /// deliberately far above the release latency, because a stalled sample can
+    /// legitimately cross it and that run cannot test silence.
+    #[test]
+    fn a_quick_release_leaves_every_contention_sample_under_the_notice_threshold() {
+        use std::sync::{Arc, Mutex, mpsc};
+        const NOTICE_THRESHOLD: Duration = Duration::from_secs(5);
+        const OUTER_WATCHDOG: Duration = Duration::from_secs(30);
+        let watchdog = Instant::now() + OUTER_WATCHDOG;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let holder = second_handle(&path);
+        rfs::flock(&holder, rfs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let waiter = second_handle(&path);
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&samples);
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = flock_exclusive_within_using(
+                Duration::from_secs(30),
+                || rfs::flock(&waiter, rfs::FlockOperation::NonBlockingLockExclusive),
+                || {},
+                |elapsed| {
+                    recorder.lock().unwrap().push(elapsed);
+                    let _ = observed_tx.send(());
+                },
+            )
+            .unwrap();
+            let _ = tx.send((outcome, waiter));
+        });
+        observed_rx
+            .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+            .expect("quick-release observer entry failed within the outer watchdog");
+        drop(holder);
+        let (outcome, waiter) = rx
+            .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+            .expect("quick-release result/cleanup failed within the outer watchdog");
+        assert_eq!(outcome, FlockWait::Acquired);
+        let samples = samples.lock().unwrap();
+        assert!(!samples.is_empty(), "no contention sample was recorded");
+        for sample in samples.iter() {
+            assert!(
+                *sample < NOTICE_THRESHOLD,
+                "timing precondition failed, not a product defect: a contention sample reached \
+                 {sample:?} with a {NOTICE_THRESHOLD:?} threshold, so a notice from it would be \
+                 legitimate and this run cannot test silence"
+            );
+        }
+        drop(waiter);
     }
 
     #[test]
@@ -1267,6 +1479,7 @@ mod tests {
                     attempts.next().unwrap()
                 },
                 || {},
+                |_| {},
             )
             .unwrap();
             assert_eq!(outcome, FlockWait::Acquired);
@@ -1276,9 +1489,13 @@ mod tests {
             within("repeating interruption", move || {
                 let mut errors = std::iter::once(first).chain(std::iter::repeat(Errno::INTR));
                 let started = Instant::now();
-                let error =
-                    flock_exclusive_within_using(SHORT, || Err(errors.next().unwrap()), || {})
-                        .unwrap_err();
+                let error = flock_exclusive_within_using(
+                    SHORT,
+                    || Err(errors.next().unwrap()),
+                    || {},
+                    |_| {},
+                )
+                .unwrap_err();
                 assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::INTR));
                 assert!(format!("{error:#}").contains("interrupted at the wait deadline"));
                 assert_short(started.elapsed());
@@ -1293,6 +1510,7 @@ mod tests {
                     Err(Errno::INTR)
                 },
                 || {},
+                |_| {},
             )
             .unwrap_err();
             assert_eq!(count, 1);

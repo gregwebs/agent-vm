@@ -420,6 +420,9 @@ reason).
 Scope: only the **read** is noticed. The `#291` lock wait stays silent until it
 gives up.
 
+*Historical: superseded by the #377 amendment below, which also notices the lock
+wait while it is still waiting.*
+
 ## Amendment: credential-store diagnostics (agent-vm #379)
 
 Doctor uses a validated, **lock-free** inventory snapshot solely to gate a
@@ -467,3 +470,54 @@ retrying or holding inventory locks/mutable state. Other secret verbs and launch
 reads retain their attended behavior. Doctor creates nothing, reports the full
 tail before returning a health failure, and reset skips the check entirely;
 [USAGE](../../USAGE.md#checking-what-agent-vm-can-see) defines exit-status policy.
+
+## Amendment: a contended lock wait says so (agent-vm #377)
+
+The #291 bound made the inventory-lock wait finite but not **legible**: a
+`secret` verb or a credential-bearing launch queued behind another process's
+unlock prompt printed nothing for its whole 60 s / 5 s budget, so a queued
+command was indistinguishable from a hung one. The notice above covered a
+platform *read*; the wait in front of the lock stayed silent until it gave up.
+
+`host_paths::flock_exclusive_within` now takes a synchronous elapsed-contention
+callback. It is called once per contended attempt whose sample is still before
+the deadline, with the time elapsed since the acquisition started — never for an
+immediately successful, hard-error or interrupted attempt, and never for a wait
+that has already expired. `SecretStore::lock` installs an observer that, once per
+acquisition, renders one best-effort stderr line when that elapsed time reaches
+`READ_NOTICE_AFTER` (2 s) and the configured wait is longer than that threshold:
+
+```text
+secret verb / authorized launch read
+  → SecretStore::lock
+    → flock_exclusive_within(lock, lock_wait, observer)
+      ├─ acquired ──────────────────────> InventoryLock guard, operation proceeds
+      ├─ contended, elapsed < 2 s ──────> keep polling (silent)
+      ├─ contended, elapsed ≥ 2 s ──────> one warning line; SAME polling/deadline
+      ├─ deadline, still contended ─────> existing Busy outcome
+      └─ syscall error ─────────────────> existing I/O outcome
+```
+
+Nothing else moves. The line names the lock file — agent-vm's own path, escaped
+because it derives from `$HOME` — and the **total** budget, and says another
+process *may* be using it: a poll sample shows contention, not continuous
+ownership. It is not a refusal: it does not shorten the wait, it does not restart
+the deadline, and a holder that releases after it still lets the operation
+succeed. A wait at or below the threshold has no "still waiting" moment, so it
+stays silent, and an uncontended acquisition prints nothing. Once is per
+acquisition, not per process: an independent later wait may warn again, and a
+slow platform read behind the lock can still emit its own existing notice.
+
+Every `secret` verb and every launch read shares `SecretStore::lock`, so all of
+them are covered by construction. Emitting from the caller's thread through the
+existing `emit_notice_line` keeps the line value-free and non-fatal when stderr
+is closed, and keeps it reachable from `secret` verbs that never touch the launch
+notice sink. Doctor's availability check stays lock-free (#379) and is not part
+of this notice. Timing is best effort: the 50 ms poll cap, scheduler delay and
+synchronous output mean both the line and the result can be late, and no hard
+real-time bound is promised.
+
+A spinner or an updating terminal line was rejected for the same reason as the
+read notice: the line must reach a piped or logged command as plainly as an
+interactive one. Bounding or cancelling the *holder* when the notice fires was
+rejected because an abandoned mutation can still commit (#251, #291).

@@ -884,6 +884,38 @@ fn hold_inventory_lock(harness: &Harness) -> std::fs::File {
     file
 }
 
+/// The #377 notice: exactly one line, naming the lock path and the unattended
+/// budget, delivered before the existing final failure. A duplicated line means
+/// the notice is per-poll or per-process rather than per-acquisition.
+fn assert_one_lock_notice(stderr: &str, lock_path: &Path) {
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("warning: still waiting for the secret inventory lock"))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "expected exactly one lock notice in:\n{stderr}"
+    );
+    let notice = notices[0];
+    assert!(
+        notice.contains(&format!(
+            "`{}`",
+            lock_path.display().to_string().escape_debug()
+        )),
+        "{notice}"
+    );
+    assert!(notice.contains("5s"), "{notice}");
+    assert!(!notice.contains("changed nothing"), "{notice}");
+    let failure = stderr
+        .find("could not acquire the secret inventory lock")
+        .expect("the existing final failure line");
+    assert!(
+        stderr.find(notice).unwrap() < failure,
+        "the notice must precede the failure:\n{stderr}"
+    );
+}
+
 #[test]
 fn ls_gives_up_on_a_held_inventory_lock_and_names_it() {
     let harness = Harness::new();
@@ -904,6 +936,7 @@ fn ls_gives_up_on_a_held_inventory_lock_and_names_it() {
         ),
         "{text}"
     );
+    assert_one_lock_notice(&text, &harness.config_dir().join(".secret-inventory.lock"));
     assert!(
         elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(30),
         "{elapsed:?}"
@@ -934,6 +967,7 @@ fn a_piped_set_that_gives_up_on_the_lock_records_nothing() {
         ),
         "{text}"
     );
+    assert_one_lock_notice(&text, &harness.config_dir().join(".secret-inventory.lock"));
     assert!(
         elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(30),
         "{elapsed:?}"
