@@ -1,9 +1,16 @@
 //! `agent-vm image import` — publish an already-finished image into agent-vm's
 //! own image cache, from the local Docker daemon or a completed archive (#359).
 //! Never selects, adopts, configures or boots; launches still never run Docker.
-//! Publishes `--tag` plus any names the archive itself carries (see
-//! [`crate::image_publish`]); a failed import restores `--tag` only.
+//! Publishes the result reference — explicit `--tag`, or the `--docker` source
+//! when that is omitted (#385) — plus any names the archive itself carries (see
+//! [`crate::image_publish`]); a failed import restores that reference only.
+//!
+//! A successful import *observes* the selection (read-only, after publication)
+//! solely to decide whether launch guidance is noise: a result reference the
+//! configuration already selects needs no hint.
 
+use crate::boot_image::BootImage;
+use crate::config::ConfiguredImages;
 use crate::image_publish::{ImageTarget, ResultReference};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args as ClapArgs;
@@ -16,15 +23,46 @@ use vstd::prelude::*;
 const DOCKER_SOURCE_REASON: &str = "--docker must name an image in the local Docker daemon (e.g. my-image:dev): not empty, no whitespace or NUL, and not starting with '-'";
 const INPUT_REASON: &str =
     "--input must name an existing regular file (a completed OCI or Docker-save archive)";
+const INFERRED_REFERENCE_REASON: &str = "--docker cannot supply the default --tag";
 
 #[derive(ClapArgs)]
 pub(crate) struct Args {
     /// Import the image under this reference in agent-vm's own image cache.
     /// The reference is mutable: a later build or import replaces it.
-    #[arg(short = 't', long, value_name = "REF")]
-    tag: ResultReference,
+    ///
+    /// Required with --input; with --docker it defaults to the source
+    /// reference, which must itself be a mutable OCI reference.
+    #[arg(
+        short = 't',
+        long,
+        value_name = "REF",
+        required_unless_present = "docker"
+    )]
+    tag: Option<ResultReference>,
     #[command(flatten)]
     source: SourceArgs,
+}
+
+impl Args {
+    /// The one result reference this import publishes under: an explicit
+    /// `--tag`, or the Docker source used as its own default.
+    ///
+    /// Both routes cross the same [`ResultReference`] parser, so an inferred
+    /// destination cannot be a value the explicit spelling would refuse. The
+    /// Docker *source* grammar stays wider: an explicit tag is needed only when
+    /// that parser rejects the source (e.g. a digest-pinned reference or local
+    /// path). Bare hexadecimal IDs may parse as mutable names.
+    pub(crate) fn result_reference(&self) -> Result<ResultReference> {
+        match (&self.tag, &self.source.docker) {
+            (Some(tag), _) => Ok(tag.clone()),
+            (None, Some(docker)) => docker.result_reference(),
+            // clap's `required_unless_present` already refused this shape; an
+            // internal invariant, never a panic. Both reasons are value-free.
+            (None, None) => {
+                bail!("internal error: clap must require --tag unless --docker is given")
+            }
+        }
+    }
 }
 
 #[derive(ClapArgs)]
@@ -77,6 +115,17 @@ impl FromStr for DockerSource {
     }
 }
 
+impl DockerSource {
+    /// The source as the omitted `--tag`. The parser's own reason is fixed text
+    /// that names no value, so it is safe to carry into a usage diagnostic;
+    /// the source itself never is.
+    fn result_reference(&self) -> Result<ResultReference> {
+        self.0.parse::<ResultReference>().map_err(|reason| {
+            anyhow!("{INFERRED_REFERENCE_REASON}: {reason}. Pass an explicit mutable --tag REF")
+        })
+    }
+}
+
 verus! {
 
 /// The four already-measured facts the `--docker` decision reads. Named fields
@@ -108,7 +157,8 @@ pub(crate) fn preflight(args: &Args) -> Result<()> {
     }
 }
 
-pub(crate) async fn run(args: Args) -> Result<i32> {
+pub(crate) async fn run(args: Args, configured: Result<&ConfiguredImages>) -> Result<i32> {
+    let tag = args.result_reference()?;
     match args.source.into_source()? {
         Source::Input(path) => {
             // Repeated: `run` stays self-contained; `preflight` is the boundary
@@ -116,7 +166,7 @@ pub(crate) async fn run(args: Args) -> Result<i32> {
             require_regular_file(&path)?;
             let target = ImageTarget::resolve().await?;
             target
-                .publish(&path, &args.tag)
+                .publish(&path, &tag)
                 .await
                 .context("importing image")?;
         }
@@ -136,19 +186,49 @@ pub(crate) async fn run(args: Args) -> Result<i32> {
                 return Ok(exit);
             }
             target
-                .publish(staging.path(), &args.tag)
+                .publish(staging.path(), &tag)
                 .await
                 .context("importing image")?;
         }
     }
-    // Best-effort completion notice on stdout: stderr is for errors and
-    // Docker's own output.
-    let shown = args.tag.shell_arg();
-    let _ = writeln!(
-        std::io::stdout(),
-        "Imported {shown} into agent-vm's image cache; launch it with `--image {shown}`"
-    );
+    // Observed only now, after publication: the selector's default tier arms a
+    // process-global dependency-log guard, so running it before the native
+    // work would change diagnostics this command already had. The observation
+    // is advisory — a broken configuration must not turn a committed
+    // publication into a failure, and this command changes no selection.
+    let selection = configured.and_then(crate::boot_image::ambient_selection);
+    if let Some(notice) = completion_notice(&tag, selection) {
+        // Best-effort completion notice on stdout: stderr is for errors and
+        // Docker's own output. A failed write is not a failed import.
+        let _ = writeln!(std::io::stdout(), "{notice}");
+    }
     Ok(0)
+}
+
+/// The completion sentence, or nothing when the configuration already selects
+/// exactly this result reference (#385).
+///
+/// Compared as exact reference text: `app` and `app:latest` stay different even
+/// though native registry resolution treats them alike.
+fn completion_notice(tag: &ResultReference, selection: Result<BootImage>) -> Option<String> {
+    match selection {
+        Ok(selected) if selected.reference().as_str() == tag.as_str() => None,
+        // A retained/recommended fallback is not an image the user configured,
+        // so there is nothing to point at: keep only the launch guidance.
+        Ok(selected) if selected.is_default() => Some(launch_notice(tag)),
+        // Either an explicitly configured different image (the user may not
+        // know which one wins) or an unknown selection. Neither discloses the
+        // selected reference, a source path, nor a selection error.
+        Ok(_) | Err(_) => Some(format!(
+            "{}\nRun `agent-vm image show` to see the currently configured image.",
+            launch_notice(tag)
+        )),
+    }
+}
+
+fn launch_notice(tag: &ResultReference) -> String {
+    let shown = tag.shell_arg();
+    format!("Imported {shown} into agent-vm's image cache; launch it with `--image {shown}`")
 }
 
 fn require_regular_file(path: &Path) -> Result<()> {
@@ -268,7 +348,7 @@ mod tests {
         use clap::error::ErrorKind::*;
         for (args, expected) in [
             (vec!["--tag", "app:dev"], MissingRequiredArgument),
-            (vec!["--docker", "app"], MissingRequiredArgument),
+            (vec!["--input", "file"], MissingRequiredArgument),
             (
                 vec!["--tag", "app:dev", "--docker", "app", "--input", "file"],
                 ArgumentConflict,
@@ -282,6 +362,7 @@ mod tests {
                 ],
                 ValueValidation,
             ),
+            (vec!["--docker", "x", "--tag"], InvalidValue),
         ] {
             assert_eq!(
                 TestCli::try_parse_from(std::iter::once("t").chain(args))
@@ -289,6 +370,21 @@ mod tests {
                     .unwrap()
                     .kind(),
                 expected
+            );
+        }
+        for argv in [
+            vec!["--docker", "app"],
+            vec!["--docker", "app", "--tag", "other:dev"],
+            vec!["--docker", "app", "-t", "other:dev"],
+            vec!["--input", "file", "--tag", "app:dev"],
+        ] {
+            assert!(
+                TestCli::try_parse_from(std::iter::once("t").chain(argv.clone()))
+                    .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"))
+                    .args
+                    .result_reference()
+                    .is_ok(),
+                "{argv:?}"
             );
         }
         for flag in ["--platform", "--output", "--load", "--push", "extra"] {
@@ -300,5 +396,62 @@ mod tests {
                 UnknownArgument
             );
         }
+    }
+
+    #[test]
+    fn omitted_tag_defaults_to_the_docker_source() {
+        let parsed = TestCli::try_parse_from(["t", "--docker", "localhost:5000/x:y"]).unwrap();
+        assert_eq!(
+            parsed.args.result_reference().unwrap().as_str(),
+            "localhost:5000/x:y"
+        );
+    }
+
+    #[test]
+    fn explicit_tag_overrides_the_docker_source() {
+        for tag_flag in ["--tag", "-t"] {
+            let parsed =
+                TestCli::try_parse_from(["t", "--docker", "src:dev", tag_flag, "dst:dev"]).unwrap();
+            assert_eq!(parsed.args.result_reference().unwrap().as_str(), "dst:dev");
+        }
+    }
+
+    #[test]
+    fn a_docker_source_that_cannot_be_a_result_reference_needs_an_explicit_tag() {
+        // Docker's own source grammar is wider than a mutable result
+        // reference; neither spelling is a destination.
+        for source in [
+            format!("app@sha256:{}", "a".repeat(64)),
+            "./local-rootfs".to_string(),
+        ] {
+            let parsed = TestCli::try_parse_from(["t", "--docker", &source]).unwrap();
+            let error = parsed.args.result_reference().err().unwrap().to_string();
+            assert!(
+                error.starts_with(INFERRED_REFERENCE_REASON)
+                    && error.contains("Pass an explicit mutable --tag REF"),
+                "{error}"
+            );
+            assert!(!error.contains(&source), "{error}");
+            // The same source is still a valid Docker source with a target.
+            let with_tag =
+                TestCli::try_parse_from(["t", "--docker", &source, "--tag", "app:dev"]).unwrap();
+            assert_eq!(
+                with_tag.args.result_reference().unwrap().as_str(),
+                "app:dev"
+            );
+        }
+    }
+
+    #[test]
+    fn an_archive_without_a_tag_is_an_internal_invariant_not_a_panic() {
+        let args = Args {
+            tag: None,
+            source: SourceArgs {
+                docker: None,
+                input: Some(PathBuf::from("image.tar")),
+            },
+        };
+        let error = args.result_reference().err().unwrap().to_string();
+        assert!(error.contains("internal error"), "{error}");
     }
 }

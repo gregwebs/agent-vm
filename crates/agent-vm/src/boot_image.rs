@@ -9,8 +9,8 @@
 //! --image  >  AGENT_VM_IMAGE_TAG (empty = unset)  >  user image  >  project image  >  default
 //! ```
 //!
-//! — so `run`, `pull`, `setup`, `doctor` and `image show` cannot disagree about
-//! which image a session boots. The **catalog is deliberately not an input**: changing the
+//! — so `run`, `pull`, `setup`, `doctor`, `image show` and import's completion
+//! check cannot disagree about which image a session boots. The **catalog is deliberately not an input**: changing the
 //! runtime tool declaration must never change the image (issue #259).
 //!
 //! # The default slot: a recommendation, then a retained selection
@@ -601,6 +601,26 @@ fn default_slot() -> Result<BootImage> {
     observe_default().selected_image()
 }
 
+/// The selection a launch *here* would make from the ambient environment:
+/// `AGENT_VM_IMAGE_TAG`, then the configured tiers, then the default slot.
+///
+/// The typed half of [`inspect_selection`], so a caller that needs only *which*
+/// image would boot — `image import`'s completion check (#385) — shares this one
+/// precedence table and environment rule instead of parsing the report text.
+/// Read-only, like the selector it wraps; the default slot is still read only
+/// when every higher source is absent.
+pub(crate) fn ambient_selection(configured: &ConfiguredImages) -> Result<BootImage> {
+    let requested = match read_env_override() {
+        EnvOverride::Unset => None,
+        EnvOverride::Present(override_) => Some(override_),
+        EnvOverride::Invalid => bail!(
+            "AGENT_VM_IMAGE_TAG is set but is not usable as an image override; \
+             a Unicode value is required"
+        ),
+    };
+    select(requested, configured)
+}
+
 /// The explicit inspection report for `image show`.
 ///
 /// This is the one interface that deliberately discloses the full selected
@@ -613,16 +633,7 @@ fn default_slot() -> Result<BootImage> {
 /// read, reported or repaired. Read-only: no directory, lock, record, cache or
 /// runtime state is created, and nothing is acquired.
 pub(crate) fn inspect_selection(configured: &ConfiguredImages) -> Result<String> {
-    let requested = match read_env_override() {
-        EnvOverride::Unset => None,
-        EnvOverride::Present(override_) => Some(override_),
-        EnvOverride::Invalid => bail!(
-            "AGENT_VM_IMAGE_TAG is set but is not usable as an image override; \
-             a Unicode value is required"
-        ),
-    };
-    let selected = select(requested, configured)?;
-    render_inspection(&selected)
+    render_inspection(&ambient_selection(configured)?)
 }
 
 /// The inspection report's fixed source label and the winning file, if any.

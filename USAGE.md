@@ -65,7 +65,7 @@ image show                          print the boot image a launch here would
                                     select, with its source (read-only, offline)
 image build --tag REF [OPTIONS] [CONTEXT]
                                     explicitly build + import a user Dockerfile
-image import --tag REF (--docker REF | --input FILE)
+image import (--docker REF [--tag REF] | --input FILE --tag REF)
                                     import a finished image into agent-vm's cache
 upgrade --image REF                 acquire and retain a new digest-pinned default
 pull                                refresh the cached image
@@ -375,6 +375,10 @@ Docker daemon image / archive → image import ───────────
                                       result reference
                                           ↓ agent-vm --image REF shell
                                        guest execution
+
+image import (only after publication) → the same selection `image show` reports
+                                      → completion guidance (read-only; no write,
+                                        adopt, configuration or boot)
 ```
 
 ```sh
@@ -408,8 +412,18 @@ failed build. Import a finished daemon image in one command; Docker
 `image save` must succeed before anything is imported:
 
 ```sh
-agent-vm image import --docker SOURCE --tag my-image:dev
+agent-vm image import --docker my-image:dev        # result reference = source
+agent-vm image import --docker my-image:dev --tag my-renamed:dev
 ```
+
+`--tag` is optional **only** with `--docker`: the source then supplies the
+result reference, so the common case needs one flag. An explicit `--tag` (also
+`-t`) still overrides it. Both routes cross the same parser, so an inferred
+reference is exactly as strict as a typed one: a mutable OCI reference, no
+digest and no local path. Docker's own source grammar is wider (a digest, an ID
+or a path-like name is a valid thing to save), so a source that cannot also be
+a destination needs an explicit `--tag`; agent-vm never rewrites it into
+`latest`. An archive always needs `--tag`.
 
 For the standard release, first download/authenticate the exact native v0.1.3
 archive using the [image owner's public release instructions](https://github.com/gregwebs/agent-vm-images/blob/main/docs/standard-image-releases.md).
@@ -444,18 +458,33 @@ Rollback failure is reported with the import error. Process termination
 mid-import is not covered; concurrent writers are not serialized and rollback
 can revert another writer's commit.
 
-Both verbs print the `--image` value to launch with on stdout; errors and
-Docker's progress go to stderr. Usage errors from `image import` do not echo
-rejected values. Printed references are bash/zsh shell words; non-ASCII bytes
-use `$'…'` escapes without changing the reference.
+Build prints the `--image` value to launch with on stdout. Import prints the
+same sentence unless the configuration already selects exactly the reference it
+just published: then there is nothing to launch differently, so it prints
+nothing. When a *different* image is explicitly configured — environment, user
+config or project config — import adds one line suggesting
+`agent-vm image show` to see the current selection. It never prints that
+selected reference, its source or its file, and a broken configuration or an
+invalid override cannot fail a completed import: the selection is then unknown,
+which behaves like "a different image configured" (guidance plus the hint). A
+retained or recommended fallback is not a configured image, so it gets only the
+launch sentence.
+
+Errors and Docker's progress go to stderr. Usage errors from `image import` do
+not echo rejected values. Printed references are bash/zsh shell words;
+non-ASCII bytes use `$'…'` escapes without changing the reference.
 
 A registry acquisition failure for an explicit mutable tag prints an import
 hint and retains the registry error chain. It does not prove the image exists
 in Docker. Digests and the redacted default image get no hint; launch never
 runs Docker or automatically imports.
 
-Build and import never read image selection/defaults, write configuration,
-adopt a default, boot a guest, install runtime tools or trigger launch builds.
+Neither verb writes configuration or a retained default, adopts a default,
+boots a guest, installs runtime tools or triggers a launch build. Build does not
+consult image selection at all. Import observes it — read-only, with the same
+selector and environment rule as `image show` — once, after the native
+publication succeeds, and only to decide that guidance. The observation is a
+snapshot: a later config edit or launch decides what actually boots.
 Successful import is **not** proof of the boot image contract;
 `shell`/`setup` diagnose unusable software.
 

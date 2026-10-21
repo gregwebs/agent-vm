@@ -435,6 +435,7 @@ where
                     reject_launch_options(&mut command, &matches, name)?;
                     let mut cmd = Cli::from_arg_matches(&matches)?.cmd;
                     reconcile_image_args(sub, &mut cmd);
+                    validate_builtin_args(&command, &cmd)?;
                     Ok(Dispatch::Builtin {
                         cmd,
                         catalog: Catalog::Ready(catalog),
@@ -451,6 +452,7 @@ where
                 Ok(mut cli) => {
                     reject_launch_options(&mut command, &matches, name)?;
                     reconcile_image_args(sub, &mut cli.cmd);
+                    validate_builtin_args(&command, &cli.cmd)?;
                     Ok(Dispatch::Builtin {
                         cmd: cli.cmd,
                         catalog: Catalog::Broken(config_error),
@@ -727,12 +729,34 @@ fn is_image_import_route(argv: &[OsString]) -> bool {
     route_is_image_import_tokens(&tokens)
 }
 
-/// Never render the original clap error: it may carry arbitrary supplied values.
+/// The fixed usage line for `image import`; names the optional-`--tag` form
+/// truthfully rather than clap's rendering of the current argv.
+const IMAGE_IMPORT_USAGE: &str =
+    "agent-vm image import <--docker <REF> [--tag <REF>]|--input <PATH> --tag <REF>>";
+
+/// A value-free `agent-vm image import` usage error with our own fixed usage
+/// and the caller's fixed text. Never renders the original clap error, which
+/// may carry arbitrary supplied values.
+fn import_usage_error(
+    command: &clap::Command,
+    kind: clap::error::ErrorKind,
+    text: impl Into<String>,
+) -> clap::Error {
+    let mut import = command
+        .find_subcommand("image")
+        .and_then(|image| image.find_subcommand("import"))
+        .cloned()
+        .unwrap_or_else(|| clap::Command::new("import"))
+        .bin_name("agent-vm image import")
+        .override_usage(IMAGE_IMPORT_USAGE);
+    import.error(kind, text.into())
+}
+
 fn import_argv_error(command: &clap::Command, error: &clap::Error) -> clap::Error {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
     let text = match error.kind() {
-        ErrorKind::ArgumentConflict => "`agent-vm image import` takes exactly one --tag and exactly one of --docker REF or --input PATH; the arguments are not shown".to_string(),
-        ErrorKind::MissingRequiredArgument => "`agent-vm image import` needs --tag REF and one of --docker REF or --input PATH".to_string(),
+        ErrorKind::ArgumentConflict => "`agent-vm image import` accepts exactly one source, --docker REF or --input PATH, and at most one --tag REF; the arguments are not shown".to_string(),
+        ErrorKind::MissingRequiredArgument => "`agent-vm image import` needs exactly one source, --docker REF or --input PATH; --tag REF is required with --input and defaults to --docker".to_string(),
         // The argument is accepted; its value is missing (`--tag` last on the
         // line). Never clap's own rendering: it would restate the argv.
         ErrorKind::InvalidValue => {
@@ -744,16 +768,40 @@ fn import_argv_error(command: &clap::Command, error: &clap::Error) -> clap::Erro
                 _ => "`agent-vm image import`: an argument value was rejected; the value is not shown".to_string(),
             }
         }
-        _ => "`agent-vm image import` does not accept that argument; the arguments are not shown. Supported: --tag REF (--docker REF | --input PATH)".to_string(),
+        _ => "`agent-vm image import` does not accept that argument; the arguments are not shown. Supported: --docker REF [--tag REF] | --input PATH --tag REF".to_string(),
     };
-    let mut import = command
-        .find_subcommand("image")
-        .and_then(|image| image.find_subcommand("import"))
-        .cloned()
-        .unwrap_or_else(|| clap::Command::new("import"))
-        .bin_name("agent-vm image import")
-        .override_usage("agent-vm image import --tag <REF> <--docker <REF>|--input <PATH>>");
-    import.error(error.kind(), text)
+    import_usage_error(command, error.kind(), text)
+}
+
+/// Post-parse validation for built-in inputs whose value clap accepts but whose
+/// verb cannot act on it. Runs on the ready *and* the broken catalog path, and
+/// is input-only: it stats no file and resolves no configuration.
+///
+/// Deliberately exhaustive over `Cmd` so a new verb must state whether it needs
+/// this. Today only `image import` does: its result reference can be inferred
+/// from `--docker`, which must be refused as a usage error (exit 2) before the
+/// MSB prologue rather than surfacing later as an operational failure.
+fn validate_builtin_args(command: &clap::Command, cmd: &Cmd) -> Result<()> {
+    let validated = match cmd {
+        Cmd::Image(args) => args.validate_result_reference(),
+        Cmd::Setup(_)
+        | Cmd::Pull(_)
+        | Cmd::Upgrade(_)
+        | Cmd::Msb(_)
+        | Cmd::Clipboard(_)
+        | Cmd::Doctor(_)
+        | Cmd::Secret(_)
+        | Cmd::InterceptHook(_) => Ok(()),
+    };
+    validated.map_err(|error| {
+        // The value-free reason is fixed text from the result-reference or
+        // inference boundary; the rejected token is never attached.
+        anyhow::Error::new(import_usage_error(
+            command,
+            clap::error::ErrorKind::ValueValidation,
+            format!("`agent-vm image import`: {error}"),
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -1764,7 +1812,7 @@ mod tests {
         assert!(help.contains("agent-vm doctor"), "{help}");
     }
 
-    // -- image group: routing, diagnostics and selection independence --------
+    // -- image group: routing, diagnostics and selection handling ------------
 
     #[test]
     fn is_image_import_route_finds_adjacent_pairs() {
@@ -1801,6 +1849,7 @@ mod tests {
             env.remove_var(key);
         }
         let digest = format!("app:SENTINEL_A5@sha256:{}", "a".repeat(64));
+        let inferred_digest = format!("app@sha256:{}", "a".repeat(64));
         for (args, kind, text) in [
             (
                 vec![
@@ -1812,17 +1861,29 @@ mod tests {
                     "app:dev",
                 ],
                 ArgumentConflict,
-                "takes exactly one --tag",
+                "accepts exactly one source",
             ),
             (
                 vec!["--tag", "app:SENTINEL_A3"],
                 MissingRequiredArgument,
-                "needs --tag REF",
+                "needs exactly one source",
             ),
             (
-                vec!["--docker", "SENTINEL_A4"],
+                vec!["--input", "SENTINEL_A4"],
                 MissingRequiredArgument,
-                "needs --tag REF",
+                "--tag REF is required with --input and defaults to --docker",
+            ),
+            // Omitted `--tag` + a source that cannot also be a destination:
+            // post-parse validation, on both catalog paths.
+            (
+                vec!["--docker", inferred_digest.as_str()],
+                ValueValidation,
+                "`agent-vm image import`: --docker cannot supply the default --tag",
+            ),
+            (
+                vec!["--docker", "./SENTINEL_A12"],
+                ValueValidation,
+                "Pass an explicit mutable --tag REF",
             ),
             (
                 vec!["--docker", "x", "--tag", digest.as_str()],
@@ -1853,6 +1914,11 @@ mod tests {
                 vec!["--docker", "x", "--tag"],
                 InvalidValue,
                 "an option is missing its value",
+            ),
+            (
+                vec!["--docker", "SENTINEL_A4"],
+                ValueValidation,
+                "Pass an explicit mutable --tag REF",
             ),
             (
                 vec![
@@ -1893,6 +1959,11 @@ mod tests {
                 UnknownArgument,
                 "does not accept that argument",
             ),
+            (
+                vec!["--docker", "x", "--tag", "app:dev", "--tag", "SENTINEL_A13"],
+                ArgumentConflict,
+                "accepts exactly one source",
+            ),
         ] {
             for broken in [false, true] {
                 let config = if broken {
@@ -1918,7 +1989,7 @@ mod tests {
                 );
                 assert!(
                     shown.contains(
-                        "Usage: agent-vm image import --tag <REF> <--docker <REF>|--input <PATH>>"
+                        "Usage: agent-vm image import <--docker <REF> [--tag <REF>]|--input <PATH> --tag <REF>>"
                     ),
                     "{shown}"
                 );

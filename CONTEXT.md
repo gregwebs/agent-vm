@@ -383,8 +383,9 @@ guest; tool declarations do not install that software.
 agent-vm's own microsandbox image cache (the ambient backend's cache dir,
 including a persisted shared redirect) — the only place a launch looks before
 a registry. `agent-vm image build` and `agent-vm image import` publish into it
-under a mutable **result reference** (`--tag`), plus any names the archive
-carries. The Docker daemon store is not it.
+under a mutable **result reference** — `--tag`, or for import the `--docker`
+source when no tag is given — plus any names the archive carries. The Docker
+daemon store is not it.
 
 _Avoid_: "local images" without saying which store.
 
