@@ -1826,9 +1826,14 @@ fn docker_import_with_docker_missing_fails_cleanly() {
 #[test]
 fn import_usage_errors_are_value_free_and_run_nothing() {
     let digest = format!("app:SENTINEL_A5@sha256:{}", "a".repeat(64));
-    let conflict = "`agent-vm image import` takes exactly one --tag and exactly one of --docker REF or --input PATH; the arguments are not shown";
-    let missing = "`agent-vm image import` needs --tag REF and one of --docker REF or --input PATH";
-    let unsupported = "`agent-vm image import` does not accept that argument; the arguments are not shown. Supported: --tag REF (--docker REF | --input PATH)";
+    let docker_pinned_source = format!("app@sha256:{}", "a".repeat(64));
+    let conflict = "`agent-vm image import` accepts exactly one source, --docker REF or --input PATH, and at most one --tag REF; the arguments are not shown";
+    let missing = "`agent-vm image import` needs exactly one source, --docker REF or --input PATH; --tag REF is required with --input and defaults to --docker";
+    let unsupported = "`agent-vm image import` does not accept that argument; the arguments are not shown. Supported: --docker REF [--tag REF] | --input PATH --tag REF";
+    // Omitted `--tag` plus a `--docker` source that is not a mutable result
+    // reference: a post-parse usage error, refused before any state exists.
+    let inferred_digest = "`agent-vm image import`: --docker cannot supply the default --tag: --tag must name a mutable result reference (e.g. my-app:dev); a digest-pinned reference cannot be updated by a later build or import. Pass an explicit mutable --tag REF";
+    let inferred_local = "`agent-vm image import`: --docker cannot supply the default --tag: --tag must be an OCI image reference (e.g. ghcr.io/owner/name:tag or repo@sha256:…); a local path is not accepted here — use --image for a local rootfs. Pass an explicit mutable --tag REF";
     let pinned = "invalid value for --tag <REF>: --tag must name a mutable result reference (e.g. my-app:dev); a digest-pinned reference cannot be updated by a later build or import";
     let local = "invalid value for --tag <REF>: --tag must be an OCI image reference (e.g. ghcr.io/owner/name:tag or repo@sha256:…); a local path is not accepted here — use --image for a local rootfs";
     let docker = "invalid value for --docker <REF>: --docker must name an image in the local Docker daemon (e.g. my-image:dev): not empty, no whitespace or NUL, and not starting with '-'";
@@ -1845,7 +1850,16 @@ fn import_usage_errors_are_value_free_and_run_nothing() {
             conflict,
         ),
         (vec!["--tag", "app:SENTINEL_A3"], missing),
-        (vec!["--docker", "SENTINEL_A4"], missing),
+        (vec!["--input", "SENTINEL_A4"], missing),
+        (
+            vec!["--docker", docker_pinned_source.as_str()],
+            inferred_digest,
+        ),
+        (vec!["--docker", "./SENTINEL_A12"], inferred_local),
+        (
+            vec!["--docker", "x", "--tag", "app:dev", "--tag", "SENTINEL_A13"],
+            conflict,
+        ),
         (vec!["--docker", "x", "--tag", digest.as_str()], pinned),
         (vec!["--docker", "x", "--tag", "./SENTINEL_A6"], local),
         (vec!["--docker=-SENTINEL_A7", "--tag", "app:dev"], docker),
@@ -1895,11 +1909,11 @@ fn import_usage_errors_are_value_free_and_run_nothing() {
             .chain(args)
             .collect::<Vec<_>>();
         let out = harness.run(&argv);
-        assert_eq!(code_of(&out), 2, "{}", stderr_of(&out));
+        assert_eq!(code_of(&out), 2, "{} {}", stderr_of(&out), argv.join(" "));
         assert_eq!(
             stderr_of(&out),
             format!(
-                "error: {text}\n\nUsage: agent-vm image import --tag <REF> <--docker <REF>|--input <PATH>>\n\nFor more information, try '--help'.\n"
+                "error: {text}\n\nUsage: agent-vm image import <--docker <REF> [--tag <REF>]|--input <PATH> --tag <REF>>\n\nFor more information, try '--help'.\n"
             )
         );
         assert_value_free(&out, &["SENTINEL", "--privileged"]);
@@ -2167,6 +2181,560 @@ fn non_ascii_tag_notice_round_trips() {
         .nth(1)
         .unwrap()
         .trim_end_matches("`\n");
+    let shell = Command::new("bash")
+        .args(["-c", &format!("printf %s {word}")])
+        .output()
+        .unwrap();
+    assert!(shell.status.success());
+    assert!(has_metadata(
+        &harness.cache_dir(),
+        std::str::from_utf8(&shell.stdout).unwrap()
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// 12. Defaulted result reference and selection-aware completion (#385)
+// ---------------------------------------------------------------------------
+
+const RETAINED_A: &str =
+    "127.0.0.1:1/private-a@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+impl Harness {
+    /// The user tier's config file, beside the isolated `HOME`.
+    fn user_config_path(&self) -> PathBuf {
+        self.home.join(".config/agent-vm/config.toml")
+    }
+
+    /// The private retained-default record.
+    fn record_path(&self) -> PathBuf {
+        self.home.join(".config/agent-vm/default-image.json")
+    }
+
+    /// A project directory with an isolated cwd, for project-tier cases.
+    fn project_dir(&self) -> PathBuf {
+        let dir = self.home.join("project");
+        fs::create_dir_all(dir.join(".agent-vm")).unwrap();
+        dir
+    }
+
+    fn write_user_image(&mut self, reference: &str) -> &mut Self {
+        let path = self.user_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("image = \"{reference}\"\n")).unwrap();
+        self
+    }
+
+    fn write_project_image(&self, reference: &str) -> PathBuf {
+        let dir = self.project_dir();
+        fs::write(
+            dir.join(".agent-vm/config.toml"),
+            format!("image = \"{reference}\"\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn write_record(&mut self, contents: &str) -> &mut Self {
+        fs::create_dir_all(self.record_path().parent().unwrap()).unwrap();
+        fs::write(self.record_path(), contents).unwrap();
+        self
+    }
+
+    /// Run with an isolated cwd so a project config is arranged per case and
+    /// the test process's own cwd is never read.
+    fn run_in(&self, dir: &Path, argv: &[&str]) -> Output {
+        let mut cmd = self.base_command();
+        cmd.current_dir(dir).args(argv);
+        run_with_timeout(cmd, Duration::from_secs(60))
+    }
+
+    /// Run with an isolated cwd and no project config, so "nothing configured"
+    /// cases cannot inherit whatever the caller's cwd declares.
+    fn run_isolated(&self, argv: &[&str]) -> Output {
+        self.run_in(&self.project_dir(), argv)
+    }
+
+    /// Every file under the user config directory, for "unchanged" assertions.
+    fn config_snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        snapshot(&self.home.join(".config"))
+    }
+}
+
+/// The existing import completion sentence, exactly as printed.
+fn launch_notice(reference: &str) -> String {
+    format!(
+        "Imported {reference} into agent-vm's image cache; launch it with `--image {reference}`\n"
+    )
+}
+
+const SHOW_HINT: &str = "Run `agent-vm image show` to see the currently configured image.\n";
+
+#[test]
+fn docker_source_only_defaults_the_result_reference() {
+    for source in ["app:dev", "app", "localhost:5000/x:y"] {
+        let mut harness = Harness::new();
+        let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+        harness.replay(&written);
+        let out = harness.run_isolated(&["image", "import", "--docker", source]);
+        assert_eq!(code_of(&out), 0, "{source}: {}", stderr_of(&out));
+        // The Docker source is still what reaches Docker, and the inferred
+        // destination is what lands in the cache.
+        assert_eq!(
+            harness.docker_calls()[0].last().unwrap(),
+            &OsString::from(source)
+        );
+        assert_imported(&harness.cache_dir(), source, &written);
+        // No configured image: only the launch guidance.
+        assert_eq!(stdout_of(&out), launch_notice(source), "source {source}");
+    }
+}
+
+#[test]
+fn a_bare_hexadecimal_docker_id_is_accepted_as_the_inferred_reference() {
+    // The omitted-tag decision uses the existing mutable-reference parser, not
+    // a new "looks like an ID" detector: a bare hexadecimal ID parses as a
+    // mutable bare name, so it is a valid inferred destination. Only sources
+    // that parser rejects (digest-pinned, local paths) need an explicit tag.
+    let id = "a".repeat(64);
+    let mut harness = Harness::new();
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_isolated(&["image", "import", "--docker", &id]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        harness.docker_calls()[0].last().unwrap(),
+        &OsString::from(&id)
+    );
+    assert_imported(&harness.cache_dir(), &id, &written);
+    assert_eq!(stdout_of(&out), launch_notice(&id));
+}
+
+#[test]
+fn explicit_tag_still_overrides_the_defaulted_reference() {
+    for argv in [
+        vec!["--docker", "src:dev", "--tag", "dst:dev"],
+        vec!["--tag", "dst:dev", "--docker", "src:dev"],
+        vec!["--docker", "src:dev", "-t", "dst:dev"],
+    ] {
+        let mut harness = Harness::new();
+        let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+        harness.replay(&written);
+        let argv: Vec<&str> = ["image", "import"]
+            .into_iter()
+            .chain(argv.iter().copied())
+            .collect();
+        let out = harness.run(&argv);
+        assert_eq!(code_of(&out), 0, "{argv:?}: {}", stderr_of(&out));
+        assert_imported(&harness.cache_dir(), "dst:dev", &written);
+        assert!(!has_metadata(&harness.cache_dir(), "src:dev"));
+        assert_eq!(harness.docker_calls()[0].last().unwrap(), "src:dev");
+        // The notice compares the destination, never the Docker source.
+        assert_eq!(stdout_of(&out), launch_notice("dst:dev"));
+    }
+}
+
+#[test]
+fn import_is_silent_when_the_configuration_selects_the_result() {
+    for docker in [true, false] {
+        let mut harness = Harness::new();
+        harness.write_user_image("app:dev");
+        let before = harness.config_snapshot();
+        let out = if docker {
+            let written =
+                image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+            harness.replay(&written);
+            let out = harness.run_isolated(&["image", "import", "--docker", "app:dev"]);
+            assert_imported(&harness.cache_dir(), "app:dev", &written);
+            out
+        } else {
+            let written =
+                image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+            let out = import_input_in(&harness, &harness.project_dir(), &written.path, "app:dev");
+            assert_imported(&harness.cache_dir(), "app:dev", &written);
+            out
+        };
+        assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+        assert!(
+            stdout_of(&out).is_empty(),
+            "docker={docker}: {}",
+            stdout_of(&out)
+        );
+        // Import observes; it never writes configuration or a default record.
+        assert_eq!(harness.config_snapshot(), before);
+        assert!(!harness.record_path().exists());
+        assert!(harness.msb_invocations().is_empty());
+    }
+}
+
+#[test]
+fn import_points_at_image_show_when_another_image_is_configured() {
+    // User tier differing.
+    let mut harness = Harness::new();
+    harness.write_user_image("app:other");
+    let cwd = harness.project_dir();
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_in(&cwd, &["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        format!("{}{SHOW_HINT}", launch_notice("app:dev"))
+    );
+    // The selected reference is not disclosed.
+    assert!(!stdout_of(&out).contains("app:other"));
+    assert!(!stderr_of(&out).contains("app:other"));
+
+    // Project tier differing.
+    let harness = Harness::new();
+    let cwd = harness.write_project_image("app:other");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input_in(&harness, &cwd, &written.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        format!("{}{SHOW_HINT}", launch_notice("app:dev"))
+    );
+}
+
+fn import_input_in(harness: &Harness, cwd: &Path, path: &Path, tag: &str) -> Output {
+    let path = path.to_string_lossy().into_owned();
+    harness.run_in(cwd, &["image", "import", "--input", &path, "--tag", tag])
+}
+
+#[test]
+fn import_compares_the_effective_selection() {
+    // The environment winner matches while the user tier differs: silent.
+    let mut harness = Harness::new();
+    harness
+        .write_user_image("app:other")
+        .set("AGENT_VM_IMAGE_TAG", "app:dev");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_isolated(&["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
+
+    // The environment winner differs while the user tier matches: hint.
+    let mut harness = Harness::new();
+    harness
+        .write_user_image("app:dev")
+        .set("AGENT_VM_IMAGE_TAG", "app:env");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_isolated(&["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        format!("{}{SHOW_HINT}", launch_notice("app:dev"))
+    );
+
+    // An empty environment override is unset, exactly as for `image show`.
+    let mut harness = Harness::new();
+    harness
+        .write_user_image("app:dev")
+        .set("AGENT_VM_IMAGE_TAG", "");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_isolated(&["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
+}
+
+#[test]
+fn import_follows_the_tier_precedence_of_the_selection() {
+    // user differs, project matches: user wins, so the result does not match.
+    let mut harness = Harness::new();
+    harness.write_user_image("app:user");
+    let cwd = harness.write_project_image("app:dev");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_in(&cwd, &["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        format!("{}{SHOW_HINT}", launch_notice("app:dev"))
+    );
+
+    // user matches, project differs: the user tier wins, so silent.
+    let mut harness = Harness::new();
+    harness.write_user_image("app:dev");
+    let cwd = harness.write_project_image("app:project");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_in(&cwd, &["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
+
+    // project only, matching: silent.
+    let harness = Harness::new();
+    let cwd = harness.write_project_image("app:dev");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input_in(&harness, &cwd, &written.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
+}
+
+#[test]
+fn import_keeps_only_the_launch_guidance_for_a_fallback_selection() {
+    // Nothing configured: the fallback (retained or recommended) is not an
+    // image the user chose, so no `image show` hint is added.
+    let harness = Harness::new();
+    let cwd = harness.project_dir();
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input_in(&harness, &cwd, &written.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), launch_notice("app:dev"));
+    assert!(!stdout_of(&out).contains(SHOW_HINT.trim()));
+    assert!(!harness.record_path().exists());
+    assert!(!stderr_of(&out).contains("ghcr.io"));
+
+    // A retained default that differs: still only the launch guidance, and the
+    // record is untouched (no adoption, no repair).
+    let mut harness = Harness::new();
+    harness.write_record(&format!("{{\"version\":1,\"image\":\"{RETAINED_A}\"}}\n"));
+    let cwd = harness.project_dir();
+    let before = harness.config_snapshot();
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input_in(&harness, &cwd, &written.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), launch_notice("app:dev"));
+    assert_eq!(harness.config_snapshot(), before);
+    // The private retained reference is never disclosed.
+    for text in [stdout_of(&out), stderr_of(&out)] {
+        assert!(!text.contains("private-a"), "{text}");
+    }
+}
+
+#[test]
+fn import_survives_an_unreadable_selection() {
+    // Broken user config (even with a matching environment override): the
+    // publication still succeeds, with unknown selection handling.
+    let mut harness = Harness::new();
+    let path = harness.user_config_path();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "[[tools]\nNAME_SENTINEL = broken").unwrap();
+    harness.set("AGENT_VM_IMAGE_TAG", "app:dev");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_isolated(&["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_imported(&harness.cache_dir(), "app:dev", &written);
+    assert_eq!(
+        stdout_of(&out),
+        format!("{}{SHOW_HINT}", launch_notice("app:dev"))
+    );
+    // Neither the config error nor its content leaks, and nothing is repaired.
+    for text in [stdout_of(&out), stderr_of(&out)] {
+        assert!(!text.contains("NAME_SENTINEL"), "{text}");
+        assert!(!text.contains("config.toml"), "{text}");
+    }
+
+    // A non-Unicode environment override is an unknown selection, not silence.
+    let mut harness = Harness::new();
+    harness.write_user_image("app:dev");
+    harness.set("AGENT_VM_IMAGE_TAG", OsString::from_vec(vec![0xff, b'x']));
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_isolated(&["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        format!("{}{SHOW_HINT}", launch_notice("app:dev"))
+    );
+
+    // A damaged retained record needed by the fallback: same handling, and the
+    // record is left exactly as found (no reset to the recommendation).
+    let mut harness = Harness::new();
+    harness.write_record("SENTINEL_RECORD damaged\n");
+    let cwd = harness.project_dir();
+    let before = harness.config_snapshot();
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input_in(&harness, &cwd, &written.path, "app:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        format!("{}{SHOW_HINT}", launch_notice("app:dev"))
+    );
+    assert_eq!(harness.config_snapshot(), before);
+    for text in [stdout_of(&out), stderr_of(&out)] {
+        assert!(!text.contains("SENTINEL_RECORD"), "{text}");
+    }
+}
+
+#[test]
+fn an_unused_damaged_record_cannot_suppress_a_matching_selection() {
+    // A higher explicit source wins, so the fallback record is never read: the
+    // completion check must not fail (or hint) because of unused damage.
+    let mut harness = Harness::new();
+    harness
+        .write_user_image("app:dev")
+        .write_record("SENTINEL_RECORD damaged\n");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_isolated(&["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
+}
+
+#[test]
+fn import_compares_exact_reference_spelling() {
+    // `app` and `app:latest` are different text even though native registry
+    // resolution treats them alike; both directions keep the show hint.
+    for (configured, imported) in [("app", "app:latest"), ("app:latest", "app")] {
+        let mut harness = Harness::new();
+        harness.write_user_image(configured);
+        let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+        harness.replay(&written);
+        let out = harness.run_isolated(&["image", "import", "--docker", imported]);
+        assert_eq!(code_of(&out), 0, "{imported}: {}", stderr_of(&out));
+        assert_imported(&harness.cache_dir(), imported, &written);
+        assert_eq!(
+            stdout_of(&out),
+            format!("{}{SHOW_HINT}", launch_notice(imported))
+        );
+    }
+}
+
+#[test]
+fn import_compares_the_requested_reference_not_archive_aliases() {
+    let mut harness = Harness::new();
+    harness.write_user_image("z-source:dev");
+    let written = image_archive::write_docker_save(
+        &harness.home.join("save.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "A".into(),
+            repo_tags: Some(vec!["z-source:dev".into()]),
+        }],
+    );
+    let out = import_input_in(
+        &harness,
+        &harness.project_dir(),
+        &written[0].path,
+        "a-target:dev",
+    );
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    // The archive alias matches the configured image, but the requested result
+    // reference does not: guidance plus the hint.
+    assert_imported(&harness.cache_dir(), "z-source:dev", &written[0]);
+    assert_eq!(
+        stdout_of(&out),
+        format!("{}{SHOW_HINT}", launch_notice("a-target:dev"))
+    );
+}
+
+#[test]
+fn build_completion_output_ignores_the_selection() {
+    // Only import became selection-aware.
+    let mut harness = Harness::new();
+    harness.write_user_image("app:dev");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&written);
+    let out = harness.run_isolated(&["image", "build", "--tag", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "Imported build result as app:dev; launch it with `--image app:dev`\n"
+    );
+}
+
+#[test]
+fn import_observes_the_selection_only_after_native_ingestion() {
+    // The default tier arms a process-global dependency-log guard. If the
+    // selector ran before the native import, this dependency event would be
+    // dropped; observing after publication is what keeps it visible.
+    const MARKER: &str = "loaded layer blob from docker archive";
+    let log = "microsandbox_image::archive::docker=debug";
+
+    // Fallback selection (nothing configured): the native marker survives.
+    let mut harness = Harness::new();
+    harness.set("RUST_LOG", log);
+    let written = image_archive::write_docker_save(
+        &harness.home.join("save.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "A".into(),
+            repo_tags: None,
+        }],
+    );
+    harness.replay(&written[0]);
+    let out = harness.run_isolated(&["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains(MARKER),
+        "native ingestion log was suppressed: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(stdout_of(&out), launch_notice("app:dev"));
+
+    // Explicit-selection control: the logger/fixture is genuinely active.
+    let mut harness = Harness::new();
+    harness.write_user_image("app:other").set("RUST_LOG", log);
+    let written = image_archive::write_docker_save(
+        &harness.home.join("save.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "A".into(),
+            repo_tags: None,
+        }],
+    );
+    harness.replay(&written[0]);
+    let out = harness.run_isolated(&["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains(MARKER),
+        "control case lost the ingestion log: {}",
+        stderr_of(&out)
+    );
+
+    // Late publication failure with a fallback selection: the real error is
+    // still reported, the marker is still visible, and no notice is printed.
+    let mut harness = Harness::new();
+    harness.set("RUST_LOG", log);
+    let blocked = cache(&harness.cache_dir())
+        .image_metadata_path(&reference("z-source:dev"))
+        .with_extension("json.part");
+    fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    fs::create_dir(&blocked).unwrap();
+    let written = image_archive::write_docker_save(
+        &harness.home.join("save.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "A".into(),
+            repo_tags: Some(vec!["z-source:dev".into()]),
+        }],
+    );
+    harness.replay(&written[0]);
+    let out = harness.run_isolated(&["image", "import", "--docker", "app:dev"]);
+    assert_eq!(code_of(&out), 1, "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("importing image"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(stderr_of(&out).contains(MARKER), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
+    assert!(!has_metadata(&harness.cache_dir(), "app:dev"));
+}
+
+#[test]
+fn non_ascii_tag_guidance_keeps_its_shell_word_with_the_show_hint() {
+    let mut harness = Harness::new();
+    harness.write_user_image("app:other");
+    let written = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    let out = import_input_in(&harness, &harness.project_dir(), &written.path, "app:é");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        format!(
+            "Imported $'app:\\xc3\\xa9' into agent-vm's image cache; launch it with `--image $'app:\\xc3\\xa9'`\n{SHOW_HINT}"
+        )
+    );
+    // The escaped word still round-trips to the published reference.
+    let shown = stdout_of(&out);
+    let word = shown
+        .split("--image ")
+        .nth(1)
+        .unwrap()
+        .split('`')
+        .next()
+        .unwrap();
     let shell = Command::new("bash")
         .args(["-c", &format!("printf %s {word}")])
         .output()

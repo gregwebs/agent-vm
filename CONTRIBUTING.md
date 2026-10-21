@@ -49,8 +49,8 @@ artifact; `agent-vm setup` pulls and verifies the selected registry image but
 does not build `msb`.
 
 Use packaged `agent-vm image build --tag REF --builder NAME CONTEXT` for explicit
-Dockerfile builds, or `agent-vm image import --tag REF (--docker REF | --input archive.tar)`
-for finished images. Both initialize the same cache as
+Dockerfile builds, or `agent-vm image import --docker REF [--tag REF]` (an archive
+needs `--tag REF`) for finished images. Both initialize the same cache as
 launch; no prewarming builtin or source importer is needed. Image authoring and
 publication belong to [agent-vm-images](https://github.com/gregwebs/agent-vm-images).
 Optionally initialize its contributor pin with

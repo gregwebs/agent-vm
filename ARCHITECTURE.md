@@ -639,9 +639,11 @@ launcher-version artifact: it lives with the user-scoped settings, so a new
 project, a cleared cache or a new `AGENT_VM_STATE_DIR` leaves it alone. Reading
 it is lazy and read-only, which is why `help` and `doctor` touch nothing;
 automatic adoption happens once, after a default-tier image is actually acquired.
-`agent-vm image show` is the one observational edge: it returns the selected
+`agent-vm image show` is the one *disclosure* edge: it returns the selected
 reference and its provenance from the same selector (and the same single default
 observation), before runtime discovery, and creates or acquires nothing.
+`agent-vm image import` observes the same selector after publishing, but decides
+only whether to print guidance and never discloses the selection (#385).
 
 ```text
 boot_image::inspect_selection ──► escaped "Image:/Source:/File:" report ──► stdout
@@ -699,10 +701,19 @@ main input preflight → MSB prologue → ambient cache → completed export/sav
 
 Failed exporters never import, even if complete bytes were emitted. Native
 publication includes archive aliases, not just --tag; rollback restores only
-the requested reference. Cache-only import avoids a fallible database persist
-after publication; first launch persists cached metadata normally. Neither verb
-reads or writes selection/defaults. See [the canonical user contract](USAGE.md#explicit-builds-and-archive-import)
-for driver limitations, archive workflows and host-build trust.
+the requested reference, which import infers from a `--docker` source when
+`--tag` is omitted. Cache-only import avoids a fallible database persist after
+publication; first launch persists cached metadata normally.
+
+Import has one **advisory, post-publication** edge back into selection: after a
+successful publication it observes the selection once, through the same
+`boot_image` selector and environment rule as `image show`, so a result
+reference the configuration already selects prints no launch guidance (#385).
+Build consults no selection. Neither verb writes configuration, adopts a
+default, boots or acquires anything; a failed observation leaves the completed
+import successful and only adds the `image show` hint. See [the canonical user
+contract](USAGE.md#explicit-builds-and-archive-import) for driver limitations,
+archive workflows and host-build trust.
 
 The Rust side does own the **verify** step (boot the pulled image, run the
 agents' `--version`), because that is exactly the SDK call the launcher makes —

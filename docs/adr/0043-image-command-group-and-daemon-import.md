@@ -3,7 +3,8 @@
 ## Status
 
 Accepted. Breaking in **0.5.0**. Amends ADR-0035's explicit build/import
-decision (#260); implements #359.
+decision (#260); implements #359. Amended in **0.6.9** by #385 (defaulted
+import tag, selection-aware import completion).
 
 ## Context
 
@@ -20,9 +21,15 @@ Docker daemon / archive → image import ─────────────
 ## Decision
 
 - `agent-vm image build` retains build's option surface.
-- `agent-vm image import --tag REF (--docker REF | --input FILE)` imports a
-  completed image. Docker save must succeed before ingestion; archive input
-  needs no Docker. Neither verb selects, adopts, configures or boots anything.
+- `agent-vm image import (--docker REF [--tag REF] | --input FILE --tag REF)`
+  imports a completed image. Docker save must succeed before ingestion; archive
+  input needs no Docker. Neither verb selects, adopts, configures or boots
+  anything. #385: `--tag` is optional only with `--docker`, where the source
+  supplies the result reference; it crosses the same mutable-reference parser,
+  so an explicit `--tag` is needed only when that parser rejects the source
+  (e.g. a digest-pinned reference or local path). Such rejection is a value-free
+  usage error before any state exists. Bare hexadecimal IDs may parse as mutable
+  names. An explicit `--tag` always wins.
 - One publication module, `image_publish`, resolves the ambient SDK cache,
   stages privately and calls native `load_archive`.
 - No `build` alias (ADR-0035's no-shim decision and ADR-0042's single surface).
@@ -50,6 +57,22 @@ This moves build's notice from stderr. Import parse diagnostics are replaced
 with fixed value-free text (exit 2); build retains clap's diagnostics. Printed
 commands use one bash/zsh shell word per reference (`$'…'` for non-ASCII), so
 accepted spellings remain copy-pasteable without terminal control bytes.
+
+#385 makes import's completion **selection-aware**, and only after publication:
+import observes the selection once through the same typed selector and
+environment rule as `image show` (never by parsing its report or spawning it).
+An exact reference match — compared as exact text, so `app` and `app:latest`
+differ — suppresses the completion sentence. An explicitly configured different
+image (environment/user/project, i.e. the effective winner is not a fallback)
+adds a fixed hint to run `agent-vm image show`; a retained or recommended
+fallback keeps only the launch sentence. The selected reference, its source path
+and any selection error are never printed. An unreadable configuration, invalid
+override or damaged needed record therefore cannot fail a committed import or
+change its exit status: the selection is unknown, handled like a different image
+(guidance plus hint). `image show` keeps its strict failure policy, and build's
+notice stays unconditional. Observing after publication also keeps the default
+tier's process-global dependency-log guard from suppressing the native import's
+own diagnostics.
 
 ## Considered Options
 

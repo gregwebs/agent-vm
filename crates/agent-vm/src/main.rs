@@ -232,12 +232,22 @@ fn main() -> Result<()> {
                 ..
             } => boot_image::upgrade::run(args).await,
             // Explicit user-owned build/import (#260, #359); `show` returned
-            // above, before the runtime. Reads no catalog and no image
-            // selection; `args` is self-contained.
+            // above, before the runtime. `build` reads no catalog and no image
+            // selection; `import` keeps the configuration result so it can
+            // *observe* the selection after publishing (#385) without a second
+            // config load and without silently substituting empty tiers for a
+            // failed load.
             Dispatch::Builtin {
                 cmd: Cmd::Image(args),
-                ..
-            } => exit_with(image_cmd::run(args).await?),
+                catalog,
+                images,
+            } => {
+                let configured = match &catalog {
+                    config::Catalog::Ready(_) => Ok(&images),
+                    config::Catalog::Broken(error) => Err(anyhow::anyhow!("{error:#}")),
+                };
+                exit_with(image_cmd::run(args, configured).await?)
+            }
             Dispatch::Builtin {
                 cmd: Cmd::Clipboard(args),
                 ..

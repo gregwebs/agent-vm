@@ -129,7 +129,7 @@ Source rebuilds are image-authoring operations and need not equal the published
 digest. Once your build produces `my-image:dev`, import and select it explicitly:
 
 ```bash
-./target/macos-dev/bin/agent-vm image import --docker my-image:dev --tag my-image:dev
+./target/macos-dev/bin/agent-vm image import --docker my-image:dev
 ./target/macos-dev/bin/agent-vm --no-git --image my-image:dev shell uname -m
 ```
 
@@ -216,8 +216,8 @@ it can silently select the wrong reference. (An explicit `--image` still wins
 over `AGENT_VM_IMAGE_TAG` — see `USAGE.md`.)
 
 - if the image exists only in your local Docker daemon, import it:
-  `agent-vm image import --docker REF --tag REF`. agent-vm prints this hint for
-  explicit tagged images.
+  `agent-vm image import --docker REF` (the tag defaults to the source). agent-vm
+  prints this hint for explicit tagged images.
 - an unqualified `my-image:dev` resolves to
   `index.docker.io/library/my-image` — **not** to the local image cache
   and **not** to `ghcr.io/gregwebs/agent-vm-standard`
