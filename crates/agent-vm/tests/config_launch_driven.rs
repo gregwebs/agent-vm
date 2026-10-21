@@ -7002,10 +7002,82 @@ fn user_network_table_reaches_the_sandbox_policy() {
         "==> Egress authority: persisted grants from",
         "allowing 10.0.0.0/24 (persisted grants)",
         "allowing tcp://[192.168.10.0/24]:22 (persisted grants)",
-        "no plain HTTP; persisted grants)",
+        "==> Egress policy: allowing TLS to api.example.com on ports 443 (persisted grants)",
+        "==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)",
     ] {
         assert!(stderr.contains(text), "{stderr}");
     }
+}
+
+/// One grouped grant line for seven persisted hostnames, one shared security
+/// clause, and unchanged rules: detects per-name repetition returning.
+#[test]
+fn grouped_hostname_egress_notices_preserve_policy_and_saved_config() {
+    const NAMES: [&str; 7] = [
+        "api.deepseek.com",
+        "api.anthropic.com",
+        "platform.claude.com",
+        "api.openai.com",
+        "auth.openai.com",
+        "chatgpt.com",
+        "models.opencode.ai",
+    ];
+    let h = Harness::new();
+    let table: Vec<String> = NAMES.iter().map(|name| format!("\"{name}\"")).collect();
+    h.write_user_mode(
+        &format!("[network]\nallow_egress = [{}]\n", table.join(",")),
+        0o600,
+    );
+    let file = h.user_config();
+    let bytes = std::fs::read(&file).unwrap();
+    let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let inventory = || {
+        let mut entries: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        entries.sort();
+        entries
+    };
+    let before = inventory();
+    let out = h.launch_default("shell");
+    let config = normalized_config(&h, &out);
+    let rules: Vec<serde_json::Value> = NAMES
+        .iter()
+        .map(|name| {
+            serde_json::json!(
+                {"direction":"egress","destination":{"domain":name},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}
+            )
+        })
+        .collect();
+    assert_eq!(
+        config["network"]["policy"]["rules"],
+        serde_json::Value::Array(rules)
+    );
+    assert_eq!(
+        config["network"]["tls"]["intercepted_ports"],
+        serde_json::json!([443])
+    );
+    let stderr = stderr_of(&out);
+    let grant = format!(
+        "==> Egress policy: allowing TLS to {} on ports 443 (persisted grants)",
+        NAMES.join(", ")
+    );
+    assert!(stderr.contains(&grant), "{stderr}");
+    assert_eq!(
+        stderr.matches("==> Egress policy: allowing TLS to").count(),
+        1
+    );
+    assert_eq!(
+        stderr
+            .matches("==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), mtime);
+    assert_eq!(inventory(), before);
 }
 
 /// T2: explicit false wins; detects reversed precedence.

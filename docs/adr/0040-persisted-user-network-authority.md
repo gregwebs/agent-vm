@@ -164,3 +164,16 @@ The independent authority/source oracles, properties, literal policy expectation
 CLI tests and mutation controls exercise the trusted seam. The host-only
 companion cannot certify guest authorship or enforcement. Native commands and
 PN row requirements are in [CONTRIBUTING](../../CONTRIBUTING.md#persisted-network-live-check).
+
+## Amendment: grouped hostname notices
+
+Decision 3's "without a user table, legacy notice bytes are unchanged" still
+holds for the all-denied line, the TLS-interception line, numeric grants, group
+grants and DNS lines. It no longer holds for hostname grants: names with identical
+effective ports and hostname sources now share one `allowing TLS to …` line,
+followed once by `hostname allowances are TLS-only (SNI and DNS verified; no
+plain HTTP)`. Provenance is unchanged — canonical hostname membership across all
+of a name's entries, the `(persisted grants)` / `(--allow-egress)` /
+`(persisted grants and --allow-egress)` tags, and no tag without a user table —
+and the notices describe exactly the same rules. The rendering contract is
+[USAGE](../../USAGE.md#hostname-allowance-grammar).
