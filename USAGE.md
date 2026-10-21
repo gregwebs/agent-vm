@@ -1725,7 +1725,12 @@ it while the keychain decides — including while an unlock prompt is up — bec
 an abandoned write could still land after agent-vm reported it failed. Any other
 agent-vm process that needs the lock meanwhile waits the same bound and then
 gives up: a `secret` verb fails naming the lock file and changes nothing; a
-launch reports the credential as could-not-be-read (agent-vm #291). At the
+launch reports the credential as could-not-be-read (agent-vm #291). A wait that
+is still contended after a couple of seconds says so **while it waits**: one
+`warning:` line on stderr naming the lock file and the total wait, because a
+command queued behind someone else's prompt otherwise looks hung (agent-vm
+#377). That line is not a failure — the same wait continues to its limit, so the
+command can still succeed if the holder finishes first. At the
 pre-boot check, an optional credential is withheld; a required credential refuses
 the launch unless `--allow-missing-credentials` was passed. A failure on the
 later spawn-time read refuses the launch, even if the credential was originally

@@ -135,6 +135,16 @@
 //! ([`KeychainFailure::InventoryBusy`] for a launch). A waiter that gives up has
 //! not begun its own read-modify-write, so its failure is true when reported
 //! and stays true — the property that bounding the holder cannot have.
+//!
+//! That bound made the wait finite but not legible (#377): every poll was
+//! silent, so a user whose command was queued behind another's unlock prompt
+//! saw nothing at all. A still-contended wait past [`READ_NOTICE_AFTER`]
+//! therefore prints **one** `warning:` line naming the lock file and the
+//! budget, through the same best-effort stderr emitter as the read notice. It
+//! says nothing about the outcome: the wait still polls to its own deadline and
+//! can still acquire and succeed, so the line is not a refusal and the deadline
+//! is not restarted. Once per acquisition, not per process — a later, separate
+//! wait may say so again.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -924,16 +934,18 @@ fn read_stored_secret(
 const KEYCHAIN_READ_BOUND_ATTENDED: Duration = Duration::from_secs(60);
 const KEYCHAIN_READ_BOUND_UNATTENDED: Duration = Duration::from_secs(5);
 
-/// How long a read may go unanswered before this process says it is still
-/// waiting.
+/// How long a read or an inventory-lock acquisition may go unanswered before
+/// this process says it is still waiting.
 ///
 /// A healthy read is a local call that answers in moments, so a read that is
 /// still unanswered after this is parked on something the user cannot see: a
-/// locked keychain's unlock prompt, or a wedged keyring daemon. Saying so costs
-/// nothing on the fast path and turns a silent, apparently hung launch into one
-/// that names what it is waiting for. Short enough to arrive while a user is
-/// still watching the terminal, long enough not to narrate a merely slow read.
-/// Both bounds are above it, so a launch that is only briefly slow stays quiet.
+/// locked keychain's unlock prompt, or a wedged keyring daemon. An inventory
+/// lock still held after this long is held by another process for the same kind
+/// of reason (#377). Saying so costs nothing on the fast path and turns a
+/// silent, apparently hung launch into one that names what it is waiting for.
+/// Short enough to arrive while a user is still watching the terminal, long
+/// enough not to narrate a merely slow read. Every bound is above it, so a
+/// launch that is only briefly slow stays quiet.
 const READ_NOTICE_AFTER: Duration = Duration::from_secs(2);
 
 /// The one line a read that is still unanswered past [`READ_NOTICE_AFTER`]
@@ -944,6 +956,25 @@ fn slow_read_notice(label: &str, bound: Duration) -> String {
     format!(
         "warning: the system keychain has not answered for `{label}` yet; it may be waiting on \
          a locked keychain or an unlock prompt. A read with no answer is abandoned after {bound:?}"
+    )
+}
+
+/// The one line an inventory-lock acquisition that is still contended past
+/// [`READ_NOTICE_AFTER`] prints (#377).
+///
+/// Names the lock file — agent-vm's own path, never a service, a stored value,
+/// an OS error or a guessed holder — and the **total** budget, so the reader
+/// knows when the wait gives up rather than expecting that many more seconds.
+/// `may` is deliberate: a poll sample shows contention, not continuous
+/// ownership. The path is escaped because it is derived from `$HOME`, so a
+/// directory name containing a newline must not turn one notice into several
+/// terminal lines.
+fn slow_inventory_lock_notice(path: &Path, wait: Duration) -> String {
+    format!(
+        "warning: still waiting for the secret inventory lock `{}`; another process may be using \
+         it, possibly waiting on a keychain unlock prompt. This wait gives up {wait:?} after it \
+         started; unlock the keychain or let that command finish",
+        path.display().to_string().escape_debug()
     )
 }
 
@@ -1182,6 +1213,11 @@ pub(crate) struct SecretStore<B: KeychainBackend> {
     paths: InventoryPaths,
     /// Production shares the read bound; tests supply an explicit wait (#291).
     lock_wait: Duration,
+    /// When a still-contended lock acquisition says so, and where that line
+    /// goes (#377). Separate from `BoundedKeychainReads`' notice above the lock
+    /// wait: either can fire without the other.
+    lock_notice_after: Duration,
+    lock_notifier: Arc<dyn Fn(&str) + Send + Sync>,
     /// Test-only: when `Some`, the inventory write fails with this message. S16
     /// models "the delete succeeded, the listing write failed"; that cannot be
     /// provoked portably through the filesystem (a read-only directory is
@@ -1198,9 +1234,26 @@ impl<B: KeychainBackend> SecretStore<B> {
             backend,
             paths,
             lock_wait,
+            lock_notice_after: READ_NOTICE_AFTER,
+            lock_notifier: Arc::new(emit_notice_line),
             #[cfg(test)]
             fail_inventory_write: Cell::new(None),
         }
+    }
+
+    /// Test seam: a recording sink and a notice delay short enough to observe,
+    /// so a test can assert both the line and its absence without a `2s` wait or
+    /// a real stderr. Mirrors [`BoundedKeychainReads::noticing_after`]; it leaves
+    /// the backend-read notice and the lock wait untouched.
+    #[cfg(test)]
+    fn noticing_lock_after(
+        mut self,
+        notice_after: Duration,
+        sink: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        self.lock_notice_after = notice_after;
+        self.lock_notifier = Arc::new(sink);
+        self
     }
 
     /// Whether the backend is the debug-only test recording seam, which stores
@@ -1344,6 +1397,11 @@ impl<B: KeychainBackend> SecretStore<B> {
     /// if needed, waiting at most `self.lock_wait` for a peer. Held until the
     /// returned guard is dropped. The `File` is dropped on every `Err`, so a
     /// waiter that gives up no longer has the lock file open.
+    ///
+    /// A wait that is still contended past `self.lock_notice_after` says so once
+    /// (#377) and then keeps polling to the same deadline: the notice neither
+    /// shortens the wait nor reports an outcome, so a holder that releases after
+    /// it still lets this acquisition succeed.
     fn lock(&self) -> std::result::Result<InventoryLock, LockRefusal> {
         self.paths.ensure_dir().map_err(LockRefusal::Failed)?;
         let path = self.paths.lock_path();
@@ -1356,7 +1414,20 @@ impl<B: KeychainBackend> SecretStore<B> {
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))
             .map_err(LockRefusal::Failed)?;
-        match flock_exclusive_within(&file, self.lock_wait).map_err(LockRefusal::Failed)? {
+        // Once per acquisition, not once per store: `Some` is consumed by the
+        // first notice, and a later, independent acquisition starts with it
+        // again. Polling repeats, so a flag (not a call count) decides.
+        let mut unnotified = Some(());
+        let outcome = flock_exclusive_within(&file, self.lock_wait, |elapsed| {
+            if self.lock_wait > self.lock_notice_after
+                && elapsed >= self.lock_notice_after
+                && unnotified.take().is_some()
+            {
+                (self.lock_notifier)(&slow_inventory_lock_notice(&path, self.lock_wait));
+            }
+        })
+        .map_err(LockRefusal::Failed)?;
+        match outcome {
             FlockWait::Acquired => Ok(InventoryLock { _file: file }),
             FlockWait::TimedOut => Err(LockRefusal::Busy),
         }
@@ -3005,6 +3076,343 @@ mod tests {
             ));
             assert_short(started.elapsed());
         });
+    }
+
+    // -- agent-vm #377: a contended lock wait says so once ----------------
+
+    /// A contended-acquisition notice fixture: the recorded lines, the store,
+    /// and the acknowledgement/resume gates. The sink is synchronous (it runs on
+    /// the waiter's own thread) and, when gated, holds that thread inside the
+    /// notice until the coordinator releases it — so "the line was delivered" and
+    /// "the operation returned" are ordered by the test, not by a racy poll of a
+    /// channel.
+    struct LockNoticeFixture {
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+        acknowledged: mpsc::Receiver<()>,
+        resume: mpsc::Sender<()>,
+        store: SecretStore<FakeKeychain>,
+        watchdog: Instant,
+    }
+
+    struct LockNoticeTiming {
+        wait: Duration,
+        notice_after: Duration,
+    }
+
+    fn noticing_lock_store(dir: &Path, timing: LockNoticeTiming, gate: bool) -> LockNoticeFixture {
+        const OUTER_WATCHDOG: Duration = Duration::from_secs(30);
+        let watchdog = Instant::now() + OUTER_WATCHDOG;
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&lines);
+        let (ack_tx, acknowledged) = mpsc::channel();
+        let (resume, resume_rx) = mpsc::channel();
+        // A `Receiver` is not `Sync`, and the sink has to be: the gate lives
+        // behind a mutex, which is what the read-notice fixture does too.
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        let store = SecretStore::new(
+            FakeKeychain::new(),
+            InventoryPaths::new(dir.to_path_buf()),
+            timing.wait,
+        )
+        .noticing_lock_after(timing.notice_after, move |line: &str| {
+            recorder.lock().unwrap().push(line.to_owned());
+            let _ = ack_tx.send(());
+            if gate {
+                resume_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+                    .expect("lock notice resume gate failed within the outer watchdog");
+            }
+        });
+        LockNoticeFixture {
+            lines,
+            acknowledged,
+            resume,
+            store,
+            watchdog,
+        }
+    }
+
+    #[test]
+    fn a_contended_lock_says_so_once_before_it_gives_up() {
+        const WAIT: Duration = Duration::from_secs(5);
+        const NOTICE_AFTER: Duration = Duration::from_millis(100);
+        let dir = tempfile::tempdir().unwrap();
+        let holder = hold_inventory_lock(dir.path());
+        let fixture = noticing_lock_store(
+            dir.path(),
+            LockNoticeTiming {
+                wait: WAIT,
+                notice_after: NOTICE_AFTER,
+            },
+            true,
+        );
+        let LockNoticeFixture {
+            lines,
+            acknowledged,
+            resume,
+            store,
+            watchdog,
+        } = fixture;
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let resolved = store.resolve(&name("alpha"));
+            let _ = result_tx.send((resolved, started.elapsed()));
+        });
+        // Entry inside the acquisition budget is a precondition; a failure here
+        // is a missing notice, not evidence about its timing.
+        acknowledged
+            .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+            .expect("lock notice entry precondition failed within the outer watchdog");
+        {
+            let lines = lines.lock().unwrap();
+            assert_eq!(lines.len(), 1, "noticed {lines:?}");
+            assert_eq!(
+                lines[0],
+                slow_inventory_lock_notice(&dir.path().join(LOCK_FILE_NAME), WAIT)
+            );
+        }
+        // The gated synchronous sink has not returned, so the operation cannot
+        // have completed: the line is delivered while the waiter is still
+        // waiting. Resume it and require the existing outcome and budget.
+        resume
+            .send(())
+            .expect("lock notice resume gate disconnected");
+        let (resolved, elapsed) = result_rx
+            .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+            .expect("lock notice result/cleanup failed within the outer watchdog");
+        assert!(
+            matches!(
+                resolved,
+                Resolved::Unavailable(KeychainFailure::InventoryBusy)
+            ),
+            "expected Busy, got {resolved:?}"
+        );
+        assert!(
+            elapsed >= WAIT,
+            "the notice shortened the wait below its budget: {elapsed:?}"
+        );
+        assert_eq!(lines.lock().unwrap().len(), 1, "the notice repeated");
+        drop(holder);
+    }
+
+    #[test]
+    fn a_lock_released_after_the_notice_still_lets_the_verb_proceed() {
+        const WAIT: Duration = Duration::from_secs(5);
+        const NOTICE_AFTER: Duration = Duration::from_millis(100);
+        let dir = tempfile::tempdir().unwrap();
+        let holder = hold_inventory_lock(dir.path());
+        let fixture = noticing_lock_store(
+            dir.path(),
+            LockNoticeTiming {
+                wait: WAIT,
+                notice_after: NOTICE_AFTER,
+            },
+            true,
+        );
+        let LockNoticeFixture {
+            lines,
+            acknowledged,
+            resume,
+            store,
+            watchdog,
+        } = fixture;
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = store.set(&name("alpha"), &value("sk-REAL"));
+            let _ = result_tx.send((outcome, store));
+        });
+        acknowledged
+            .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+            .expect("lock notice entry precondition failed within the outer watchdog");
+        assert_eq!(lines.lock().unwrap().len(), 1);
+        // The holder finishes after the notice: a notice is not a refusal, so
+        // the mutation must still happen.
+        drop(holder);
+        resume
+            .send(())
+            .expect("lock notice resume gate disconnected");
+        let (outcome, store) = result_rx
+            .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+            .expect("lock notice result/cleanup failed within the outer watchdog");
+        outcome.expect("the wait was treated as a failure");
+        assert_eq!(store.backend.stored("alpha").as_deref(), Some("sk-REAL"));
+        assert_eq!(lines.lock().unwrap().len(), 1, "the notice repeated");
+        let (listed_tx, listed_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = listed_tx.send(store.list());
+        });
+        let rows = listed_rx
+            .recv_timeout(watchdog.saturating_duration_since(Instant::now()))
+            .expect("listing cleanup failed within the lock notice outer watchdog");
+        assert_eq!(rows.unwrap().len(), 1);
+    }
+
+    /// Once per acquisition, not once per store: an independent later wait on
+    /// the same store must say so again, or a second wedged command would be
+    /// silent.
+    #[test]
+    fn each_independent_contended_acquisition_says_so_once() {
+        const WAIT: Duration = Duration::from_millis(300);
+        const NOTICE_AFTER: Duration = Duration::from_millis(100);
+        let dir = tempfile::tempdir().unwrap();
+        let holder = hold_inventory_lock(dir.path());
+        let fixture = noticing_lock_store(
+            dir.path(),
+            LockNoticeTiming {
+                wait: WAIT,
+                notice_after: NOTICE_AFTER,
+            },
+            false,
+        );
+        let LockNoticeFixture {
+            lines, mut store, ..
+        } = fixture;
+        let expected = slow_inventory_lock_notice(&dir.path().join(LOCK_FILE_NAME), WAIT);
+        for acquisition in 1..=2 {
+            let (returned, elapsed) = within_deadline("a noticed acquisition", move || {
+                let started = Instant::now();
+                let error = store.list().unwrap_err();
+                assert!(format!("{error:#}").contains("secret inventory lock"));
+                (store, started.elapsed())
+            });
+            store = returned;
+            assert!(elapsed >= WAIT, "{elapsed:?}");
+            let lines = lines.lock().unwrap();
+            assert_eq!(lines.len(), acquisition, "noticed {lines:?}");
+            assert_eq!(lines[acquisition - 1], expected);
+        }
+        drop(holder);
+    }
+
+    /// Every verb and the launch resolver take the same lock, so all of them
+    /// warn. The outcomes stay the existing ones, and no verb gains backend
+    /// access: a refusal still happens before any inventory or value mutation.
+    #[test]
+    fn every_shared_lock_caller_says_so_once_when_contended() {
+        const WAIT: Duration = Duration::from_millis(300);
+        const NOTICE_AFTER: Duration = Duration::from_millis(100);
+        let dir = tempfile::tempdir().unwrap();
+        let holder = hold_inventory_lock(dir.path());
+        let fixture = noticing_lock_store(
+            dir.path(),
+            LockNoticeTiming {
+                wait: WAIT,
+                notice_after: NOTICE_AFTER,
+            },
+            false,
+        );
+        let LockNoticeFixture { lines, store, .. } = fixture;
+        within_deadline("all noticed verbs", move || {
+            for verb in 0..4 {
+                let started = Instant::now();
+                let busy = match verb {
+                    0 => store.set(&name("alpha"), &value("v")).is_err(),
+                    1 => store.list().is_err(),
+                    2 => store.remove(&name("alpha")).is_err(),
+                    _ => matches!(
+                        store.resolve(&name("alpha")),
+                        Resolved::Unavailable(KeychainFailure::InventoryBusy)
+                    ),
+                };
+                assert!(busy, "verb {verb} was not refused");
+                assert!(started.elapsed() >= WAIT, "verb {verb}");
+                assert_eq!(store.backend.other_calls.get(), 0, "verb {verb}");
+            }
+        });
+        let expected = slow_inventory_lock_notice(&dir.path().join(LOCK_FILE_NAME), WAIT);
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 4, "noticed {lines:?}");
+        for line in lines.iter() {
+            assert_eq!(line, &expected);
+        }
+        assert!(!dir.path().join(INVENTORY_FILE_NAME).exists());
+        drop(holder);
+    }
+
+    /// A wait with no "still waiting" moment — a budget at or below the notice
+    /// threshold — stays silent. The equal case is a behavior check, not a
+    /// guard-mutation detector: with equal budget and threshold the primitive
+    /// requires `elapsed < wait` while the store requires
+    /// `elapsed >= notice_after`, so `>` and `>=` are indistinguishable here.
+    #[test]
+    fn a_wait_at_or_below_the_notice_threshold_stays_silent() {
+        for (wait, notice_after) in [
+            (Duration::from_millis(50), Duration::from_millis(100)),
+            (Duration::from_millis(100), Duration::from_millis(100)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let holder = hold_inventory_lock(dir.path());
+            let fixture =
+                noticing_lock_store(dir.path(), LockNoticeTiming { wait, notice_after }, false);
+            let LockNoticeFixture { lines, store, .. } = fixture;
+            let (store, elapsed) = within_deadline("a quiet wait", move || {
+                let started = Instant::now();
+                assert!(store.list().is_err());
+                (store, started.elapsed())
+            });
+            assert!(elapsed >= wait, "{elapsed:?}");
+            assert!(
+                elapsed < wait + Duration::from_secs(2),
+                "elapsed: {elapsed:?}"
+            );
+            assert!(lines.lock().unwrap().is_empty(), "noticed a quiet wait");
+            drop(holder);
+            drop(store);
+        }
+    }
+
+    /// An uncontended acquisition is silent even with a threshold far below the
+    /// operation's duration: only a contended attempt may be observed.
+    #[test]
+    fn an_uncontended_acquisition_stays_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = noticing_lock_store(
+            dir.path(),
+            LockNoticeTiming {
+                wait: TEST_LOCK_WAIT,
+                notice_after: Duration::from_nanos(1),
+            },
+            false,
+        );
+        let LockNoticeFixture { lines, store, .. } = fixture;
+        let store = within_deadline("an uncontended set", move || {
+            store.set(&name("alpha"), &value("v")).unwrap();
+            store
+        });
+        assert!(matches!(store.resolve(&name("alpha")), Resolved::Value(_)));
+        assert!(lines.lock().unwrap().is_empty());
+    }
+
+    /// The line must identify the lock and the **total** budget, escaped so a
+    /// `$HOME` containing a newline cannot become several terminal lines, and it
+    /// must never carry a service name, a value, an OS error or a shell command.
+    #[test]
+    fn the_lock_notice_is_one_escaped_line_naming_the_lock_and_budget() {
+        let line = slow_inventory_lock_notice(
+            Path::new("/home/odd\nname\twith\tcontrols/.config/agent-vm/.secret-inventory.lock"),
+            Duration::from_secs(5),
+        );
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        assert!(!line.contains('\n') && !line.contains('\t'), "{line:?}");
+        assert!(
+            line.starts_with("warning: still waiting for the secret inventory lock `"),
+            "{line}"
+        );
+        for expected in [
+            "\\n",
+            "\\t",
+            ".secret-inventory.lock",
+            "5s",
+            "after it started",
+        ] {
+            assert!(line.contains(expected), "{expected} missing from {line}");
+        }
+        for absent in ["alpha", "sk-REAL", "would block", "lsof", "changed nothing"] {
+            assert!(!line.contains(absent), "{absent} echoed in {line}");
+        }
     }
 
     #[test]
