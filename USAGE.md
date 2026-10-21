@@ -1914,6 +1914,21 @@ globally, not plain HTTP. Credential-only ports never widen a hostname rule.
 Ports 53 and 853 (the DNS dispatch ports) and `udp://HOST` are refused; UDP can
 only be allowed by an explicit IP/CIDR permission.
 
+**Startup notices group names.** Names whose complete effective port set and
+grant source are identical share one line, in first-seen order, followed once by
+the TLS-only security clause:
+
+```text
+==> Egress policy: allowing TLS to api.example.com, api.anthropic.com on ports 443 (persisted grants)
+==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)
+```
+
+The source tag names the sources that list the hostname, not proof that each one
+grants every displayed port: a persisted bare name plus a CLI `tcp://NAME:PORT`
+for the same name is one `(persisted grants and --allow-egress)` line on the
+union of ports. A launch without a persisted `[network]` table prints no tag at
+all. See [Persisted grants](#persisted-grants-user-config).
+
 **Private answers need an extra grant.** A hostname resolving to a private or
 reserved address is not admitted by the hostname rule alone; add `--allow-lan`,
 or a **port-less** local numeric allowance. A bare or `tcp://` CIDR admits the

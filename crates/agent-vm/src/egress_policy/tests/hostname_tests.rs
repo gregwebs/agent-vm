@@ -4,6 +4,16 @@
 
 use super::*;
 
+const SEVEN: [&str; 7] = [
+    "api.deepseek.com",
+    "api.anthropic.com",
+    "platform.claude.com",
+    "api.openai.com",
+    "auth.openai.com",
+    "chatgpt.com",
+    "models.opencode.ai",
+];
+
 #[test]
 fn hostname_acceptance_and_display_table() {
     for (input, display) in [
@@ -141,7 +151,7 @@ fn hostname_notices_show_effective_ports_and_dns_scope() {
         .unwrap();
     assert_eq!(
         String::from_utf8(output).unwrap(),
-        "==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (SNI and DNS verified; no plain HTTP)\n==> Egress policy: allowing TLS to git.example.com on ports 8443 (SNI and DNS verified; no plain HTTP)\n==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
+        "==> Egress policy: allowing TLS to api.example.com on ports 443, 8443\n==> Egress policy: allowing TLS to git.example.com on ports 8443\n==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)\n==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
     );
     // Mixed launch: a numeric grant, a group grant, a duplicate hostname
     // (dropped), and a later `tcp://HOST:PORT` that must widen every bare
@@ -165,12 +175,92 @@ fn hostname_notices_show_effective_ports_and_dns_scope() {
         String::from_utf8(output).unwrap(),
         "==> Egress policy: allowing 10.0.0.5/32\n\
 ==> Egress policy: --allow-lan enabled (Private RFC1918 + 100.64/10 + fc00::/7 reachable; does not itself enable DNS)\n\
-==> Egress policy: allowing TLS to b.example.com on ports 80, 443 (SNI and DNS verified; no plain HTTP)\n\
-==> Egress policy: allowing TLS to api.example.com on ports 80, 443 (SNI and DNS verified; no plain HTTP)\n\
-==> Egress policy: allowing TLS to plain.example on ports 80 (SNI and DNS verified; no plain HTTP)\n\
+==> Egress policy: allowing TLS to b.example.com, api.example.com on ports 80, 443\n\
+==> Egress policy: allowing TLS to plain.example on ports 80\n\
+==> Egress policy: hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)\n\
 ==> TLS interception: ports 80, 443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n\
 ==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
     );
+}
+
+// The literal names and lines operators see for the provider set the compact
+// form exists for: one grant line, one security clause.
+#[test]
+fn seven_bare_hostnames_share_one_grant_line_and_one_explanation() {
+    let grant = format!(
+        "==> Egress policy: allowing TLS to {} on ports 443",
+        SEVEN.join(", ")
+    );
+    let tail = format!(
+        "{SHARED_TLS_ONLY}\n==> TLS interception: ports 443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
+    );
+    let mut output = Vec::new();
+    resolve_saved(Default::default(), &SEVEN, empty_cli())
+        .write_notices(&mut output)
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        format!(
+            "==> Egress authority: persisted grants from \"/home/a/.config/agent-vm/config.toml\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)\n{grant} (persisted grants)\n{tail}"
+        )
+    );
+    // Without a user table no source suffix appears at all.
+    let mut output = Vec::new();
+    hostname_auth(0, &SEVEN).write_notices(&mut output).unwrap();
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        format!("{grant}\n{tail}")
+    );
+}
+
+#[test]
+fn every_name_of_a_large_group_is_printed_once_without_truncation() {
+    let names: Vec<String> = (0..9).map(|i| format!("h{i}.example")).collect();
+    let specs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut output = Vec::new();
+    hostname_auth(0, &specs).write_notices(&mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.starts_with(&format!(
+        "==> Egress policy: allowing TLS to {} on ports 443\n",
+        names.join(", ")
+    )));
+    assert_eq!(text.matches("on ports").count(), 1, "{text}");
+    assert_eq!(text.matches(SHARED_TLS_ONLY).count(), 1, "{text}");
+}
+
+// A writer that fails after a bounded prefix must surface the error from the
+// later line, not lose it.
+struct FailAfter {
+    written: Vec<u8>,
+    remaining: usize,
+}
+impl std::io::Write for FailAfter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::other("writer closed"));
+        }
+        let taken = buf.len().min(self.remaining);
+        self.written.extend_from_slice(&buf[..taken]);
+        self.remaining -= taken;
+        Ok(taken)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn hostname_notice_write_error_after_the_grant_line_is_returned() {
+    const GRANT: &str = "==> Egress policy: allowing TLS to api.example.com on ports 443\n";
+    let mut writer = FailAfter {
+        written: Vec::new(),
+        remaining: GRANT.len(),
+    };
+    let error = hostname_auth(0, &["api.example.com"])
+        .write_notices(&mut writer)
+        .unwrap_err();
+    assert_eq!(error.to_string(), "writer closed");
+    assert_eq!(String::from_utf8(writer.written).unwrap(), GRANT);
 }
 proptest! {
     #[test]

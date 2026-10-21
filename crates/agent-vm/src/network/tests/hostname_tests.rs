@@ -156,9 +156,12 @@ fn hostname_notice_variants_preserve_launch_order() {
         input.allow_host = Some(host);
         let output = notice_output(input, |_| None);
         let hostname = output.find("allowing TLS to build on ports 443").unwrap();
+        let tls_only = output
+            .find("hostname allowances are TLS-only (SNI and DNS verified; no plain HTTP)")
+            .unwrap();
         let intercept = output.find("==> TLS interception:").unwrap();
         let dns = output.find("==> Egress DNS:").unwrap();
-        assert!(hostname < intercept && intercept < dns);
+        assert!(hostname < tls_only && tls_only < intercept && intercept < dns);
         assert_eq!(
             output.contains("only allowed hostnames resolve"),
             !internet && !host
