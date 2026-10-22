@@ -2,7 +2,7 @@
 //!
 //! Everything clap-shaped lives behind this module. The set of **launch
 //! verbs** is a *runtime* fact — read from the resolved tool catalog — while
-//! the fixed built-ins (`setup`, `pull`, `upgrade`, `secret`, `image`, `msb`, `clipboard`, `doctor`,
+//! the fixed built-ins (`setup`, `secret`, `image`, `msb`, `clipboard`, `doctor`,
 //! `_intercept-hook`) are static. [`parse_from`] is the seam: argv plus the
 //! *result* of `config::load` yields a [`Dispatch`] decision.
 //!
@@ -54,7 +54,7 @@ use vstd::prelude::*;
 use crate::boot_image::OverrideSource;
 use crate::config::{Catalog, CatalogEntry, ConfigReport, ConfiguredImages, Tool};
 use crate::run;
-use crate::{clipboard, doctor, intercept_hook, msb_cmd, pull, secret, setup};
+use crate::{clipboard, doctor, intercept_hook, msb_cmd, secret, setup};
 
 verus! {
 
@@ -211,14 +211,8 @@ struct Cli {
 /// they are generated per catalog entry (see [`launch_subcommand`]).
 #[derive(Subcommand)]
 pub(crate) enum Cmd {
-    /// Pull and verify the boot image (run once first).
+    /// Acquire and verify the boot image (run once first).
     Setup(setup::Args),
-
-    /// Refresh the cached boot image.
-    Pull(pull::Args),
-
-    /// Explicitly acquire and select a new default boot image.
-    Upgrade(crate::boot_image::upgrade::Args),
 
     /// Forward arguments to the bundled `msb` with agent-vm's MSB_HOME/MSB_PATH
     /// pinned (e.g. `agent-vm msb ls`, `agent-vm msb status`). Relies on
@@ -235,9 +229,9 @@ pub(crate) enum Cmd {
     /// Manage agent-vm's own values in the host system keychain.
     Secret(secret::Args),
 
-    /// Inspect the selected boot image, or explicitly build/import a finished
-    /// one into agent-vm's own image cache. Nothing boots; only build/import
-    /// may invoke Docker.
+    /// Inspect the selected boot image, acquire it into the image cache,
+    /// explicitly retain a default, or build/import a finished image.
+    /// Only `show` is offline; only build/import may invoke Docker.
     Image(crate::image_cmd::Args),
 
     /// Internal: invoked by msb's interceptor hook for matched OAuth
@@ -263,7 +257,7 @@ pub(crate) enum Dispatch {
         cmd: Cmd,
         catalog: Catalog,
         /// Both config tiers' `image` settings, read before the report was
-        /// consumed to build the catalog. Carried to `pull`/`setup`/`image show`
+        /// consumed to build the catalog. Carried to `image refresh`/`setup`/`image show`
         /// so they can select the same image a launch would.
         images: ConfiguredImages,
     },
@@ -289,8 +283,6 @@ pub(crate) enum Dispatch {
 /// built-in cannot silently shadow — or be shadowed by — a config tool.
 pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "setup",
-    "pull",
-    "upgrade",
     "msb",
     "clipboard",
     "doctor",
@@ -473,19 +465,19 @@ where
 /// silently, which is exactly the bug (issue #189).
 fn reconcile_image_args(sub: &clap::ArgMatches, cmd: &mut Cmd) {
     match cmd {
-        Cmd::Pull(args) => args.image.reconcile(sub),
         Cmd::Setup(args) => args.image.reconcile(sub),
-        // The `image` group deliberately carries no `ImageArgs`: `build`'s and
-        // `import`'s `--tag` is a result reference in msb's cache, not a launch
-        // image selection, and `show` reads `AGENT_VM_IMAGE_TAG` itself through
-        // `boot_image` (where empty-is-unset and non-Unicode refusal live). None
-        // of them consumes a `--image` override.
+        // Only `image refresh` carries a launch-image selection, and its flag
+        // lives on the subcommand: reconciling against these group matches would
+        // lose the value's origin and the empty-env rule (issue #189).
+        Cmd::Image(args) => args.reconcile_image_args(sub),
+        // `build`'s and `import`'s `--tag` is a result reference in msb's cache,
+        // not a launch image selection, and `show` reads `AGENT_VM_IMAGE_TAG`
+        // itself through `boot_image` (where empty-is-unset and non-Unicode
+        // refusal live). None of them consumes a `--image` override.
         Cmd::Msb(_)
         | Cmd::Clipboard(_)
         | Cmd::Doctor(_)
         | Cmd::Secret(_)
-        | Cmd::Upgrade(_)
-        | Cmd::Image(_)
         | Cmd::InterceptHook(_) => {}
     }
 }
@@ -517,7 +509,7 @@ fn clap_outcome_is_help_or_version(kind: clap::error::ErrorKind) -> bool {
 /// config error. Pure over its inputs so the help fixtures are pinned without
 /// touching `$HOME` or the cwd.
 pub(crate) fn build_command(catalog: &Catalog) -> clap::Command {
-    let mut command = Cli::command();
+    let mut command = refresh_image_help(Cli::command());
     match catalog {
         Catalog::Ready(catalog) => {
             for entry in catalog.as_slice() {
@@ -541,6 +533,49 @@ pub(crate) fn build_command(catalog: &Catalog) -> clap::Command {
     command
         .after_help(short.clone())
         .after_long_help(format!("{short}\n\n{}", run::LAUNCH_OPTIONS_LONG_HELP))
+}
+
+/// The refresh subcommand's own `--image` help.
+///
+/// `image refresh` flattens the launch-image argument type so its precedence,
+/// environment binding and empty-env rule stay shared with launch. That type's
+/// help says it *boots* the image, which is exactly what refresh does not do. The
+/// flag keeps its id, value source and reconciliation; only its rendered help
+/// differs.
+const REFRESH_IMAGE_HELP: &str = "OCI image to acquire instead of the configured selection";
+
+const REFRESH_IMAGE_LONG_HELP: &str = "OCI image to acquire into the image cache instead of the configured selection.\n\nPrecedence: this flag (or `AGENT_VM_IMAGE_TAG`), then the user config `image`, then the project config `image`, then the default boot image. See USAGE.md → \"Selecting the boot image\".";
+
+fn refresh_image_help(mut command: clap::Command) -> clap::Command {
+    // Mutating the `image` subcommand in place, rather than through
+    // `Command::mut_subcommand` on the top-level command: that API removes the
+    // subcommand and pushes it back last, which would silently reorder the
+    // user-facing `--help` verb list (a pinned contract). The nested mutation
+    // is safe because it only reorders `image`'s own children.
+    let Some(index) = command
+        .get_subcommands()
+        .position(|subcommand| subcommand.get_name() == "image")
+    else {
+        return command;
+    };
+    let image = std::mem::take(
+        command
+            .get_subcommands_mut()
+            .nth(index)
+            .expect("the image subcommand was just found"),
+    );
+    let image = image.mut_subcommand("refresh", |refresh| {
+        refresh.mut_arg("image", |arg| {
+            arg.help(REFRESH_IMAGE_HELP)
+                .long_help(REFRESH_IMAGE_LONG_HELP)
+                .help_heading("Image")
+        })
+    });
+    *command
+        .get_subcommands_mut()
+        .nth(index)
+        .expect("the image subcommand slot is stable") = image;
+    command
 }
 
 /// Format the deferred config error as the primary message, appending clap's
@@ -635,7 +670,7 @@ fn launch_options() -> Vec<clap::Arg> {
 }
 
 /// Remove only the top-level launch options' env bindings. Built-in
-/// subcommands keep their own bindings (notably pull/setup's --image).
+/// subcommands keep their own bindings (notably image refresh/setup's --image).
 fn command_without_launch_env(command: &clap::Command) -> clap::Command {
     let launch = launch_options();
     command.clone().mut_args(|arg| {
@@ -785,8 +820,6 @@ fn validate_builtin_args(command: &clap::Command, cmd: &Cmd) -> Result<()> {
     let validated = match cmd {
         Cmd::Image(args) => args.validate_result_reference(),
         Cmd::Setup(_)
-        | Cmd::Pull(_)
-        | Cmd::Upgrade(_)
         | Cmd::Msb(_)
         | Cmd::Clipboard(_)
         | Cmd::Doctor(_)
@@ -916,7 +949,7 @@ mod tests {
                     "--mount",
                     "doctor",
                 ),
-                (vec!["agent-vm", "-p", "1:2", "pull"], "--publish", "pull"),
+                (vec!["agent-vm", "-p", "1:2", "setup"], "--publish", "setup"),
                 (
                     vec!["agent-vm", "--root", "--mount", "/x", "doctor"],
                     "--root",
@@ -954,7 +987,7 @@ mod tests {
         env.set_var("AGENT_VM_MEMORY_GIB", "4");
         env.remove_var("AGENT_VM_CPUS");
         for broken in [false, true] {
-            for verb in ["pull", "doctor"] {
+            for verb in ["setup", "doctor"] {
                 let config = if broken {
                     Err(anyhow::anyhow!("broken"))
                 } else {
@@ -1279,16 +1312,19 @@ mod tests {
                 Some(value) => env.set_var("AGENT_VM_IMAGE_TAG", value),
                 None => env.remove_var("AGENT_VM_IMAGE_TAG"),
             }
-            let mut argv = vec!["agent-vm", "pull"];
+            let mut argv = vec!["agent-vm", "image", "refresh"];
             argv.extend_from_slice(case.argv);
             let dispatch = parse_from(argv, Ok(report_from("tools = []\n")))
                 .unwrap_or_else(|error| panic!("case {case:?} must parse: {error}"));
             let requested = match dispatch {
                 Dispatch::Builtin {
-                    cmd: Cmd::Pull(args),
+                    cmd:
+                        Cmd::Image(crate::image_cmd::Args {
+                            cmd: crate::image_cmd::ImageCmd::Refresh(args),
+                        }),
                     ..
                 } => args.image.requested().expect("a valid override or none"),
-                _ => panic!("pull must dispatch as a built-in"),
+                _ => panic!("image refresh must dispatch as a built-in"),
             };
             match case.expected {
                 Some((reference, source)) => {
@@ -1302,7 +1338,7 @@ mod tests {
     }
 
     /// Every dispatch arm that carries the image argument runs the same
-    /// reconciliation. The launch arm, the ready-catalog built-in arm (`pull`,
+    /// reconciliation. The launch arm, the ready-catalog built-in arm (`image refresh`,
     /// `setup`) and the broken-config built-in arm each call it separately, so
     /// dropping any one of them would bring the bug back silently.
     #[test]
@@ -1342,17 +1378,26 @@ mod tests {
             Dispatch::Builtin { .. } => panic!("shell is a launch verb"),
         }
 
-        // The ready-catalog built-in arm, and the deferred-config-error arm.
-        for verb in ["pull", "setup"] {
+        // The ready-catalog built-in arm, and the deferred-config-error arm:
+        // `image refresh`'s flag lives on the refresh subcommand, so these also
+        // prove the nested reconciliation runs.
+        for argv in [
+            vec!["agent-vm", "image", "refresh", "--image", "cli:1"],
+            vec!["agent-vm", "setup", "--image", "cli:1"],
+        ] {
+            let verb = argv[1];
             for catalog in [
                 Ok(report_from("tools = []\n")),
                 Err(anyhow::anyhow!("broken")),
             ] {
-                let dispatch = parse_from(["agent-vm", verb, "--image", "cli:1"], catalog)
+                let dispatch = parse_from(argv.clone(), catalog)
                     .unwrap_or_else(|error| panic!("{verb} must parse: {error}"));
                 let requested = match dispatch {
                     Dispatch::Builtin {
-                        cmd: Cmd::Pull(args),
+                        cmd:
+                            Cmd::Image(crate::image_cmd::Args {
+                                cmd: crate::image_cmd::ImageCmd::Refresh(args),
+                            }),
                         ..
                     } => args.image.requested().unwrap(),
                     Dispatch::Builtin {
@@ -1657,8 +1702,6 @@ mod tests {
             subcommand_names(&built),
             [
                 "setup",
-                "pull",
-                "upgrade",
                 "msb",
                 "clipboard",
                 "doctor",
@@ -1796,16 +1839,7 @@ mod tests {
             .write_long_help(&mut help)
             .expect("the broken-config help renders");
         let help = String::from_utf8(help).unwrap();
-        for builtin in [
-            "setup",
-            "pull",
-            "upgrade",
-            "msb",
-            "clipboard",
-            "doctor",
-            "secret",
-            "image",
-        ] {
+        for builtin in ["setup", "msb", "clipboard", "doctor", "secret", "image"] {
             assert!(help.contains(builtin), "missing builtin {builtin}: {help}");
         }
         assert!(help.contains("could not be read"), "{help}");
@@ -2133,7 +2167,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_requires_typed_target_independent_of_config_and_environment() {
+    fn set_default_requires_typed_target_independent_of_config_and_environment() {
         let mut env = crate::test_env::guard();
         env.set_var("AGENT_VM_IMAGE_TAG", "ignored:ambient");
         for config in [
@@ -2142,20 +2176,37 @@ mod tests {
         ] {
             assert!(matches!(
                 parse_from(
-                    ["agent-vm", "upgrade", "--image", "localhost:1234/a:tag"],
+                    [
+                        "agent-vm",
+                        "image",
+                        "set-default",
+                        "--image",
+                        "localhost:1234/a:tag"
+                    ],
                     config
                 )
                 .unwrap(),
                 Dispatch::Builtin {
-                    cmd: Cmd::Upgrade(_),
+                    cmd: Cmd::Image(crate::image_cmd::Args {
+                        cmd: crate::image_cmd::ImageCmd::SetDefault(_),
+                    }),
                     ..
                 }
             ));
         }
         for args in [
-            vec!["agent-vm", "upgrade"],
-            vec!["agent-vm", "upgrade", "--image", "/path"],
-            vec!["agent-vm", "upgrade", "--image", "a:tag", "--yes"],
+            vec!["agent-vm", "image", "set-default"],
+            vec!["agent-vm", "image", "set-default", "--image", "/path"],
+            vec![
+                "agent-vm",
+                "image",
+                "set-default",
+                "--image",
+                "a:tag",
+                "--yes",
+            ],
+            // Launch options precede the verb; `image` is not a tool verb.
+            vec!["agent-vm", "--image", "a:tag", "image", "set-default"],
         ] {
             assert_eq!(
                 build_command(&Catalog::Ready(default_catalog()))
@@ -2166,8 +2217,8 @@ mod tests {
             );
         }
         for args in [
-            ["agent-vm", "upgrade", "--help"],
-            ["agent-vm", "help", "upgrade"],
+            ["agent-vm", "image", "set-default", "--help"],
+            ["agent-vm", "help", "image", "set-default"],
         ] {
             let error = build_command(&Catalog::Broken(anyhow!("broken")))
                 .try_get_matches_from(args)
@@ -2176,9 +2227,87 @@ mod tests {
             assert!(error.to_string().contains("--image <REF>"));
         }
         let error = build_command(&Catalog::Ready(default_catalog()))
-            .try_get_matches_from(["agent-vm", "upgrade"])
+            .try_get_matches_from(["agent-vm", "image", "set-default"])
             .unwrap_err();
         assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn removed_image_verbs_can_be_configured_tools_with_verbatim_arguments() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        for name in ["pull", "upgrade"] {
+            let config = format!("[[tools]]\nname = {name:?}\ncommand = \"probe\"\n");
+            let (_, forwarded) = launch_of(
+                parse_from(
+                    ["agent-vm", name, "--image", "tool-value", "--help", "--"],
+                    Ok(report_from(&config)),
+                )
+                .unwrap(),
+            );
+            assert_eq!(forwarded, ["--image", "tool-value", "--help", "--"]);
+            let error = parse_from(["agent-vm", name], Err(anyhow!("deferred config sentinel")))
+                .err()
+                .expect("broken catalog must not launch a tool");
+            assert!(format!("{error:#}").contains("deferred config sentinel"));
+        }
+    }
+
+    #[test]
+    fn image_refresh_takes_its_own_flag_and_removed_verbs_are_not_aliases() {
+        let mut env = crate::test_env::guard();
+        env.remove_var("AGENT_VM_IMAGE_TAG");
+        for args in [
+            vec![
+                "agent-vm",
+                "image",
+                "refresh",
+                "--image",
+                "localhost:1/a:tag",
+            ],
+            vec!["agent-vm", "image", "refresh"],
+            vec!["agent-vm", "image", "refresh", "--help"],
+            vec!["agent-vm", "help", "image", "refresh"],
+        ] {
+            // Help short-circuits as a zero-exit `Err`, so only a non-zero exit
+            // is a parse failure here.
+            if let Err(error) =
+                build_command(&Catalog::Ready(default_catalog())).try_get_matches_from(args.clone())
+            {
+                assert_eq!(error.exit_code(), 0, "{args:?} must parse: {error}");
+            }
+        }
+        for args in [
+            // The launch option must not be accepted on the group.
+            vec![
+                "agent-vm",
+                "image",
+                "--image",
+                "localhost:1/a:tag",
+                "refresh",
+            ],
+            vec!["agent-vm", "image", "refresh", "--yes"],
+            vec!["agent-vm", "image", "refresh", "--dockerfile", "x"],
+        ] {
+            let error = build_command(&Catalog::Ready(default_catalog()))
+                .try_get_matches_from(args.clone())
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{args:?}");
+        }
+        // Removed built-ins leave no alias and no hidden route.
+        for args in [
+            vec!["agent-vm", "pull"],
+            vec!["agent-vm", "upgrade"],
+            vec!["agent-vm", "help", "pull"],
+            vec!["agent-vm", "help", "upgrade"],
+        ] {
+            let error = build_command(&Catalog::Ready(default_catalog()))
+                .try_get_matches_from(args.clone())
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{args:?}");
+        }
     }
 
     // -- P1/P2: the `secret` verbs dispatch -------------------------------

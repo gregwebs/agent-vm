@@ -4,7 +4,9 @@
 
 Accepted. Breaking in **0.5.0**. Amends ADR-0035's explicit build/import
 decision (#260); implements #359. Amended in **0.6.9** by #385 (defaulted
-import tag, selection-aware import completion).
+import tag, selection-aware import completion). Amended in **0.7.0** by #389:
+`image refresh` (boot-free native acquisition) and `image set-default` join the
+group, and no top-level `pull`/`upgrade` alias exists.
 
 ## Context
 
@@ -34,7 +36,7 @@ Docker daemon / archive → image import ─────────────
   stages privately and calls native `load_archive`.
 - No `build` alias (ADR-0035's no-shim decision and ADR-0042's single surface).
   `image` is reserved; `build` is available to configured tools.
-- Launch/pull/setup registry failures for explicit mutable tags get a text-only
+- Launch/`image refresh`/setup registry failures for explicit mutable tags get a text-only
   import hint, with the original error chain retained. Digests and redacted
   defaults get no hint. Launch never runs Docker or falls back to import.
 

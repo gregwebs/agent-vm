@@ -1,41 +1,101 @@
 //! Deliberate acquisition followed by publication of a user-owned default.
 //! Two native pulls populate the canonical digest cache key without inventing
 //! aliases; acquisition never holds the selection lock or creates a VM.
+//!
+//! Both pulls go through [`crate::image_acquire`]'s guarded validating helper,
+//! so the requested key is proven complete, host-Linux and identity-consistent
+//! before this command constructs a success token or touches the retained
+//! record. The second equality below is justified by construction: the child
+//! target is derived from the first result, so it must resolve to the same
+//! resolved identity. An index requested on the first pull is valid even when
+//! its digest differs from the resolved host child.
 
 use std::io::Write;
 use std::str::FromStr;
-
-use anyhow::{Result, anyhow};
-use microsandbox_image::{
-    GlobalCache, ImageError, Platform, PullOptions, PullPolicy, PullResult, Reference, Registry,
-};
-use serde::Deserialize;
-use vstd::prelude::*;
 
 use super::{
     AcquiredDefaultImage, DefaultUpgradeOutcome, ImageLabel, ImageRef, ImmutableImageRef,
     default_selection,
 };
+use crate::image_acquire::{AcquireError, NativeAcquisition, OciTarget, OciTargetError};
+use anyhow::{Result, anyhow};
+use microsandbox_image::{PullResult, Reference};
 
-const TARGET_REASON: &str = "upgrade targets must be OCI image references (tag or digest); launch a local rootfs with agent-vm --image PATH <tool>";
+/// The fixed refusal for a local rootfs/disk `--image` target. Names no value:
+/// the rejected text is user input.
+const TARGET_REASON: &str = "set-default targets must be OCI image references (tag or digest); launch a local rootfs with agent-vm --image PATH <tool>";
+
+/// The fixed refusal for `--image` text that is not a usable OCI reference at
+/// all. It must not suggest a local launch for a malformed reference.
+const INVALID_REFERENCE_REASON: &str =
+    "set-default needs a valid OCI image reference, e.g. ghcr.io/owner/name:tag or repo@sha256:…";
 
 #[derive(clap::Args)]
 pub(crate) struct Args {
     /// OCI image to acquire and retain for future default-image sessions.
-    #[arg(long = "image", value_name = "REF")]
-    target: UpgradeTarget,
+    #[arg(long = "image", value_name = "REF", value_parser = SetDefaultTargetParser)]
+    target: SetDefaultTarget,
 }
 
 #[derive(Clone)]
-struct UpgradeTarget(ImageRef);
+struct SetDefaultTarget(ImageRef);
 
-impl FromStr for UpgradeTarget {
+impl SetDefaultTarget {
+    fn parse(raw: &str) -> std::result::Result<Self, OciTargetError> {
+        // The same acceptance rule the acquisition itself will apply, so a
+        // target clap accepts cannot be refused later for a different reason.
+        OciTarget::parse(raw)?;
+        ImageRef::from_config(raw)
+            .map(Self)
+            .map_err(|_| OciTargetError::InvalidReference)
+    }
+}
+
+impl FromStr for SetDefaultTarget {
     type Err = &'static str;
 
     fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
-        ImageRef::from_config(raw)
-            .map(Self)
-            .map_err(|_| TARGET_REASON)
+        Self::parse(raw).map_err(target_reason)
+    }
+}
+
+/// This command's value-free reason for a rejected `--image` target.
+fn target_reason(error: OciTargetError) -> &'static str {
+    match error {
+        OciTargetError::LocalPath => TARGET_REASON,
+        OciTargetError::InvalidReference => INVALID_REFERENCE_REASON,
+    }
+}
+
+/// Set-default's own clap value parser.
+///
+/// clap's stock `FromStr` wrapper renders the rejected value in its error, and a
+/// private target is still the user's own input, so every refusal is a raw
+/// fixed-reason clap error instead (non-Unicode input included).
+#[derive(Clone)]
+struct SetDefaultTargetParser;
+
+impl clap::builder::TypedValueParser for SetDefaultTargetParser {
+    type Value = SetDefaultTarget;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> std::result::Result<Self::Value, clap::Error> {
+        let reason = match value.to_str() {
+            Some(text) => match SetDefaultTarget::parse(text) {
+                Ok(target) => return Ok(target),
+                Err(error) => target_reason(error),
+            },
+            // Non-Unicode text cannot be an OCI reference; never echo it.
+            None => INVALID_REFERENCE_REASON,
+        };
+        Err(clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            reason,
+        ))
     }
 }
 
@@ -60,53 +120,37 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-async fn acquire_target(target: &UpgradeTarget) -> Result<AcquiredDefaultImage> {
-    let native_target =
-        Reference::from_str(target.0.as_str()).map_err(|_| anyhow!(TARGET_REASON))?;
-    let backend = microsandbox::backend::default_backend();
-    let local = backend.as_local().ok_or_else(|| anyhow!(
-        "default-image upgrade requires the local image cache; unset the cloud backend selection; this command did not change the retained default"
-    ))?;
-    let cache = GlobalCache::new(&local.cache_dir())
-        .map_err(|error| native_error("preparing the native cache", error))?;
-    let options = microsandbox::config::RegistryOptions {
-        insecure: crate::pull::is_plain_http_registry(target.0.as_str()),
-        ..Default::default()
-    };
-    let settings = local.registry_config(native_target.registry(), options).await.map_err(|_| anyhow!(
-        "resolving registry trust/auth configuration failed; this command did not change the retained default"
-    ))?;
-    let registry = Registry::builder(Platform::host_linux(), cache.clone())
-        .auth(settings.auth)
-        .extra_ca_certs(settings.ca_certs)
-        .add_insecure_registries(settings.insecure_registries)
-        .build()
-        .map_err(|error| native_error("preparing registry access", error))?;
+async fn acquire_target(target: &SetDefaultTarget) -> Result<AcquiredDefaultImage> {
+    let native_target = OciTarget::parse(target.0.as_str()).map_err(|error| {
+        anyhow!(
+            "{}; this command did not change the retained default",
+            target_reason(error)
+        )
+    })?;
     let label = ImageLabel::for_default_upgrade();
-    let resolved = pull_native(&registry, &native_target, &label).await?;
-    let pinned_native = pin_reference(&native_target, &resolved);
+    let acquisition = NativeAcquisition::open(&native_target)
+        .await
+        .map_err(set_default_error)?;
+    let resolved = acquisition
+        .pull(&native_target, &label)
+        .await
+        .map_err(set_default_error)?;
+    let pinned_native = pin_reference(native_target.reference(), &resolved);
     let pin = ImmutableImageRef::parse(&pinned_native.whole()).map_err(|_| anyhow!(
         "the acquired image did not yield a usable immutable reference; this command did not change the retained default"
     ))?;
-    let acquired = pull_native(&registry, &pinned_native, &label).await?;
+    let pinned_target = OciTarget::parse(&pinned_native.whole()).map_err(|_| anyhow!(
+        "the acquired image did not yield a usable immutable reference; this command did not change the retained default"
+    ))?;
+    // The target guard is released by the first `pull`; the derived digest key
+    // is acquired fresh, even when both keys normalize identically.
+    let acquired = acquisition
+        .pull(&pinned_target, &label)
+        .await
+        .map_err(set_default_error)?;
     if acquired.manifest_digest != resolved.manifest_digest {
         return Err(identity_error());
     }
-    let (_, metadata) = Registry::pull_cached(
-        &cache,
-        &pinned_native,
-        &PullOptions {
-            pull_policy: PullPolicy::Never,
-            force: false,
-            ..Default::default()
-        },
-    )
-    .map_err(|error| native_error("validating the pinned native cache", error))?
-    .ok_or_else(identity_error)?;
-    if metadata.manifest_digest != resolved.manifest_digest.to_string() {
-        return Err(identity_error());
-    }
-    check_host_platform(&metadata.raw_config_json)?;
     Ok(AcquiredDefaultImage { reference: pin })
 }
 
@@ -124,84 +168,14 @@ fn identity_error() -> anyhow::Error {
     )
 }
 
-async fn pull_native(
-    registry: &Registry,
-    reference: &Reference,
-    label: &ImageLabel,
-) -> Result<PullResult> {
-    let (progress, task) = registry.pull_with_progress(
-        reference,
-        &PullOptions {
-            pull_policy: PullPolicy::Always,
-            force: false,
-            ..Default::default()
-        },
-    );
-    let render = tokio::spawn(crate::pull_progress::render(
-        progress,
-        Some(label.text().to_string()),
-    ));
-    let result = task.await.map_err(|_| anyhow!(
-        "acquiring the requested default boot image failed: native task failed; this command did not change the retained default"
-    )).and_then(|result| result.map_err(|error| native_error("acquiring the requested default boot image", error)));
-    crate::pull_progress::await_render(render).await;
-    result
-}
-
-fn native_error(stage: &str, error: ImageError) -> anyhow::Error {
-    let category = match error {
-        ImageError::Registry(_) => "registry reachability/auth/availability",
-        ImageError::PlatformNotFound { .. } => "no host platform",
-        ImageError::ManifestParse(_) | ImageError::ConfigParse(_) => "invalid OCI metadata",
-        ImageError::DigestMismatch { .. } => "layer integrity failure",
-        ImageError::Materialize { .. } | ImageError::Cache { .. } | ImageError::Io(_) => {
-            "materialization/cache I/O"
-        }
-        ImageError::InvalidCertificate(_) => "invalid trust configuration",
-        _ => "native image validation failure",
-    };
-    anyhow!("{stage} failed: {category}; this command did not change the retained default")
-}
-
-#[derive(Deserialize)]
-struct ConfigPlatform {
-    os: String,
-    architecture: String,
-    variant: Option<String>,
-}
-
-fn check_host_platform(raw_config: &str) -> Result<()> {
-    let config: ConfigPlatform = serde_json::from_str(raw_config).map_err(|_| anyhow!(
-        "acquired image platform metadata is invalid; this command did not change the retained default"
-    ))?;
-    let host = Platform::host_linux();
-    if !acquired_platform_is_acceptable(PlatformFacts {
-        os_matches: config.os == host.os.to_string(),
-        arch_matches: config.architecture == host.arch.to_string(),
-        variant_matches: host
-            .variant
-            .as_ref()
-            .is_none_or(|variant| config.variant.as_ref() == Some(variant)),
-    }) {
-        return Err(anyhow!(
-            "acquired image platform does not match host Linux; this command did not change the retained default"
-        ));
-    }
-    Ok(())
-}
-
-verus! {
-struct PlatformFacts {
-    os_matches: bool,
-    arch_matches: bool,
-    variant_matches: bool,
-}
-
-fn acquired_platform_is_acceptable(facts: PlatformFacts) -> (accepted: bool)
-    ensures accepted == (facts.os_matches && facts.arch_matches && facts.variant_matches)
-{
-    facts.os_matches && facts.arch_matches && facts.variant_matches
-}
+/// Explicit set-default failures are always rendered as fixed, reference-free
+/// text (a valid but private target is still the user's own input we must not
+/// echo on failure), with the "no retained change" guarantee spelled out.
+fn set_default_error(error: AcquireError) -> anyhow::Error {
+    anyhow!(
+        "{}; this command did not change the retained default",
+        error.redacted_message()
+    )
 }
 
 #[cfg(test)]
@@ -241,73 +215,23 @@ mod tests {
     }
 
     #[test]
-    fn targets_are_oci_only_with_upgrade_specific_safe_advice() {
+    fn targets_are_oci_only_with_set_default_specific_safe_advice() {
         for raw in [
             "alpine:latest",
             "localhost:1234/a:release",
             "repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
-            assert!(raw.parse::<UpgradeTarget>().is_ok());
+            assert!(raw.parse::<SetDefaultTarget>().is_ok());
         }
-        for raw in [
-            "",
-            "/private/path",
-            "./rootfs",
-            "..",
-            "repo\nsecret",
-            "repo\u{1b}",
-        ] {
-            let error = raw.parse::<UpgradeTarget>().err().unwrap();
+        for raw in ["", "Foo/Bar:tag", "repo:bad tag", "repo@sha256:short"] {
+            let error = raw.parse::<SetDefaultTarget>().err().unwrap();
+            assert_eq!(error, INVALID_REFERENCE_REASON);
+            assert!(!error.contains("agent-vm --image PATH <tool>"));
+        }
+        for raw in ["/private/path", "./rootfs", "../rootfs", ".."] {
+            let error = raw.parse::<SetDefaultTarget>().err().unwrap();
             assert_eq!(error, TARGET_REASON);
             assert!(error.contains("agent-vm --image PATH <tool>"));
-            if !raw.is_empty() {
-                assert!(!error.contains(raw));
-            }
-        }
-    }
-
-    #[test]
-    fn platform_facts_require_every_conjunct() {
-        for bits in 0..8 {
-            let os = bits & 1 != 0;
-            let arch = bits & 2 != 0;
-            let variant = bits & 4 != 0;
-            assert_eq!(
-                acquired_platform_is_acceptable(PlatformFacts {
-                    os_matches: os,
-                    arch_matches: arch,
-                    variant_matches: variant
-                }),
-                bits == 7
-            );
-        }
-    }
-
-    #[test]
-    fn raw_config_platform_is_required_and_host_linux() {
-        let host = Platform::host_linux();
-        let valid = serde_json::json!({"os":host.os.to_string(), "architecture":host.arch.to_string(), "unrelated":true});
-        assert!(check_host_platform(&valid.to_string()).is_ok());
-        // Native host_linux has no variant constraint; optional config variant is allowed.
-        assert!(check_host_platform(&serde_json::json!({"os":"linux", "architecture":host.arch.to_string(), "variant":"v8"}).to_string()).is_ok());
-        for raw in [
-            "{}",
-            "{\"os\":\"linux\"}",
-            "{\"os\":7,\"architecture\":\"private-marker\"}",
-            "{\"os\":\"linux\",\"os\":\"linux\",\"architecture\":\"amd64\"}",
-        ] {
-            let error = check_host_platform(raw).unwrap_err();
-            assert!(error.to_string().contains("metadata is invalid"));
-            assert!(!format!("{error:#}").contains("private-marker"));
-        }
-        for (os, arch) in [
-            ("windows", host.arch.to_string()),
-            ("linux", "foreign".to_string()),
-        ] {
-            assert!(
-                check_host_platform(&serde_json::json!({"os":os,"architecture":arch}).to_string())
-                    .is_err()
-            );
         }
     }
 }

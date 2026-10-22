@@ -19,7 +19,7 @@ a [single binary](macos-build.md#build-a-single-binary) with `./script/build/mac
 ```bash
 cargo build
 
-agent-vm setup            # pulls the latest image from ghcr.io and verifies it boots
+agent-vm setup            # acquires the selected image and verifies it boots
 
 cd ~/your-project
 agent-vm --allow-internet-egress claude
@@ -67,9 +67,10 @@ image build --tag REF [OPTIONS] [CONTEXT]
                                     explicitly build + import a user Dockerfile
 image import (--docker REF [--tag REF] | --input FILE --tag REF)
                                     import a finished image into agent-vm's cache
-upgrade --image REF                 acquire and retain a new digest-pinned default
-pull                                refresh the cached image
-setup                               pull base image + verify boot
+image refresh [--image REF]         acquire the selected OCI image, without
+                                    booting a VM or changing the retained default
+image set-default --image REF       acquire and retain a new digest-pinned default
+setup                               acquire the selected image + verify boot
 doctor                              report host credentials + microsandbox state
                                     + the resolved tool configuration
                                     (--reset-msb-db recovers a forward-migrated db)
@@ -88,7 +89,40 @@ declares only `claude`, then only `agent-vm claude` (plus the built-ins and a
 `shell` fallback) exists. `agent-vm --help` and `agent-vm doctor` always show
 the same list, in the same order.
 
-`agent-vm setup` pulls the selected image and, unless `--no-verify` is given,
+### Changed in 0.7.0: image operations moved under `image`
+
+`pull` and `upgrade` are gone; there are no aliases or hidden spellings, and a
+configured tool may now use either name.
+
+| before | now |
+|---|---|
+| `agent-vm pull [--image REF]` | `agent-vm image refresh [--image REF]` |
+| `agent-vm upgrade --image REF` | `agent-vm image set-default --image REF` |
+| `agent-vm pull --help` | `agent-vm image refresh --help` |
+
+Flags follow their subcommand: `agent-vm image refresh --image REF` works,
+`agent-vm --image REF image refresh` and `agent-vm image --image REF refresh`
+do not.
+
+`image refresh` is **boot-free native acquisition**: it resolves the selected
+reference (or `--image REF`), checks its current manifest, reuses unchanged
+cached layers, and publishes a complete host-Linux cache entry using the
+ambient microsandbox cache with native registry auth, trust and managed HTTP
+policy. It creates no sandbox, boots no guest and touches no project or running
+guest. Selection, precedence and recovery are unchanged; the opt-in launch
+update banner compares against a marker recording the digest it actually
+acquired, and that marker is neither an approval nor an identity guarantee.
+
+`image set-default` is the renamed deliberate default operation (below), with
+the same acquisition-before-publication safety. Refresh and set-default accept
+only OCI references; a local rootfs/disk path is rejected with advice to launch
+it explicitly (`agent-vm --image PATH <tool>`). Local-path **launches** remain
+supported. `setup` now enforces the same OCI-only acquisition rule for its
+image (local-path launches are still fine), while its optional verification
+guest is separate and unchanged. A bare `image refresh` with no override still
+reacquires your retained digest, not the tag it was originally selected from.
+
+`agent-vm setup` acquires the selected image and, unless `--no-verify` is given,
 boots a throwaway sandbox and verifies **every tool your configuration
 declares** by running its `command` with `--version` (a direct argv exec,
 never a shell string). A command your configuration does not name is not
@@ -109,7 +143,7 @@ throwaway VM — the
 same trust as running any agent-vm command in a directory with a `.agent-vm/`.
 A broken config warns and falls back: verification uses the shipped default
 tools and the image already selected by `--image`/`AGENT_VM_IMAGE_TAG` (or the
-default boot image), so a config typo never blocks the pull/boot/verify
+default boot image), so a config typo never blocks the acquire/boot/verify
 recovery path.
 
 `agent-vm` keeps its sandbox registry under a private `MSB_HOME` —
@@ -138,8 +172,8 @@ ghcr.io/gregwebs/agent-vm-standard@sha256:04701db70ef6c2c75078ca39a85ce4b4c15b04
 ```
 
 Native msb selects its Linux host-platform child. Successful default acquisition
-retains the **index** reference; explicit `upgrade` retains its resolved native
-**child** digest. Existing records and explicit selections are unaffected.
+retains the **index** reference; explicit `image set-default` retains its
+resolved native **child** digest. Existing records and explicit selections are unaffected.
 Matching per-architecture GitHub Release archives are for explicit import, never
 a registry-failure fallback. See the [image owner's release contract](https://github.com/gregwebs/agent-vm-images/blob/main/docs/standard-image-releases.md)
 for authentication and publication policy. A source rebuild need not reproduce
@@ -160,7 +194,8 @@ catalog never changes it). First present source wins:
 | default | your retained digest (see [The retained default](#the-retained-default)), or the initial recommendation when nothing is retained |
 
 `agent-vm shell`, `agent-vm claude` and `agent-vm mytool` all boot the same
-image; so do `pull` and `setup`.
+image. `image refresh` acquires that same selection without booting;
+`setup` acquires it and optionally boots a verification guest.
 
 **Config-file `image` values are OCI references only.** The runtime treats a
 leading `/`, `./`, `../`, `.` or `..` as a host rootfs bind or disk image, so a
@@ -244,7 +279,8 @@ It *names exact image content* (a digest, never a moving tag); microsandbox
 separately downloads and caches that content. So the default is independent of
 the msb cache and of every project: clearing the cache, enabling the shared
 cache, changing `AGENT_VM_STATE_DIR` or working in another directory does not
-move it. Change it deliberately with [explicit upgrade](#explicitly-upgrading-the-default).
+move it. Change it deliberately with
+[image set-default](#explicitly-setting-the-default).
 It is deliberately a separate file from `config.toml` — writing a
 top-level `image =` there would make the *user config* tier win over the
 *project* tier, which is a precedence change, not a bookmark.
@@ -254,7 +290,8 @@ The launcher also carries an **initial recommendation** (an immutable
 multiarch index, and a newer release may change it). How the two interact:
 
 - **Selection is lazy and read-only.** A higher source wins without reading the
-  record; `help`, `doctor`, `--help` and `pull/setup --help` never write one.
+  record; `help`, `doctor`, `--help`, `image refresh --help` and `setup --help`
+  never write one.
 - **An absent record uses the launcher's recommendation — but only *acquires*
   it.** The record is written **only after that image was actually acquired**
   (success-before-adoption). If the acquisition fails, nothing is retained: no
@@ -272,10 +309,13 @@ multiarch index, and a newer release may change it). How the two interact:
   user-typed reference would; it is not silently redirected to another image.
   Restore network access and retry.
 
-`pull` refreshes *the selected reference*; it is **not** an upgrade of the
-default's identity. `pull --image REF` refreshes `REF` and never adopts it as
-your default. Use `--image`/`AGENT_VM_IMAGE_TAG`/config `image` to boot a
-different image for one session, or to point a fresh host at another one.
+`image refresh` acquires *the selected reference* again; it is **not** a change
+of the default's identity. `image refresh --image REF` reacquires `REF` and
+never adopts it as your default. Use
+`--image`/`AGENT_VM_IMAGE_TAG`/config `image` to boot a different image for one
+session, or to point a fresh host at another one. Refreshing does not boot a
+guest, so neither a running guest nor project state is touched; it checks the
+reference's current manifest and reuses unchanged layers.
 
 **Mutable tags vs. digests.** A mutable tag (`:latest`) names *whatever the
 registry serves now*: after a cache loss a `:latest` launch may fetch different
@@ -301,15 +341,15 @@ names the escaped path with a fixed reason; nothing is auto-reset. To recover,
 restore the intended digest record from backup, or deliberately move the file
 aside to reinitialize from the current recommendation.
 
-### Explicitly upgrading the default
+### Explicitly setting the default
 
 ```sh
-agent-vm upgrade --image ghcr.io/owner/standard:release-2
+agent-vm image set-default --image ghcr.io/owner/standard:release-2
 agent-vm --no-git shell bash -c 'my-program --version'
 ```
 
 `--image REF` is required and accepts an OCI tag or digest, not a local path.
-Environment/config launch images do not choose the upgrade target, even with
+Environment/config launch images do not choose the set-default target, even with
 broken tool configuration. There is no automatic latest discovery; explicitly
 requesting `:latest` resolves it only for this invocation.
 
@@ -337,10 +377,11 @@ and a delayed ordinary adopter cannot overwrite it. A launch that already
 selected the previous default may still boot it.
 
 Roll back by passing a known previous full digest reference to the same
-`upgrade --image` command. Acquisition must succeed again before selection
-changes; `pull --image` remains a cache refresh, never default replacement.
+`image set-default --image` command. Acquisition must succeed again before
+selection changes; `image refresh --image` remains a cache reacquisition, never
+default replacement.
 
-Upgrade progress/application errors use a fixed redacted image label, not the
+Set-default progress/application errors use a fixed redacted image label, not the
 old or requested reference or native source chains. Inspect your user-owned
 record directly for the pin. Clap usage errors may echo an invalid value you
 supplied on argv (status 2); this exception does not apply to stored references.
@@ -969,9 +1010,10 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
 - `name` — required; a single command-name token: nonempty, no
   whitespace/control characters, no `/` (a name is not a path), not an
   all-dots spelling (`.`/`..`), no leading `-`, and not one of the reserved
-  subcommands `image`, `setup`, `pull`, `upgrade`, `msb`, `clipboard`, `doctor`, `secret`,
+  subcommands `image`, `setup`, `msb`, `clipboard`, `doctor`, `secret`,
   `_intercept-hook`, `help`. Names are case-sensitive. Naming a tool `claude`
-  is normal — that is the point.
+  is normal — that is the point. `pull` and `upgrade` are no longer reserved
+  (they were removed as built-ins in 0.7.0), so a configured tool may use them.
 - `command` — required, nonempty, NUL-free. The guest command name; it is
   never executed by `doctor`.
 - `args` — optional, the default argv prepended to the user's own args unless
@@ -1819,8 +1861,9 @@ call provider APIs now need `--allow-internet-egress`, or a TLS hostname
 allowance (`--allow-egress api.example.com`) narrower than the whole internet.
 Grants compose independently. CLI grants apply only to this launch; persisted
 grants come from the user config.
-The temporary guests booted by `setup` and `pull` still use the SDK public-internet
-and DNS default; this launch policy does not cover them. `setup` runs each
+The temporary guest booted by `setup` for verification still uses the SDK
+public-internet and DNS default; this launch policy does not cover it. `setup`
+runs each
 configured tool's declared `command --version` from a project-selectable image.
 These guests have no project mounts or secrets.
 
@@ -1881,8 +1924,9 @@ Persisted hostname grants with a selected host HTTP proxy refuse **every launch*
 `--allow-egress` does not bypass the refusal. Unset the proxy variables (or use
 `NO_PROXY=*`), or remove the persisted hostname grant to recover.
 
-`setup`/`pull` temporary guests ignore these grants (#303). The directory
-exposure guard is unchanged: launching from `$HOME` remains refused.
+`setup`'s verification guest ignores these grants (#303). `image refresh` boots
+no guest at all, and no acquisition backend uses this launch policy. The
+directory exposure guard is unchanged: launching from `$HOME` remains refused.
 See [ADR-0040](docs/adr/0040-persisted-user-network-authority.md) for the threat,
 trusted boundary and accepted gaps.
 

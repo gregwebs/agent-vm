@@ -119,8 +119,6 @@ pub(crate) const USER_CONFIG_DIR_RELATIVE: &str = ".config/agent-vm";
 /// name cannot be reserved-but-unreachable or reachable-but-shadowable.
 pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     "setup",
-    "pull",
-    "upgrade",
     "msb",
     "clipboard",
     "doctor",
@@ -713,7 +711,7 @@ impl ConfiguredImage {
     }
 }
 
-/// Both tiers' `image` settings. `Default` (neither set) is also what `pull`
+/// Both tiers' `image` settings. `Default` (neither set) is also what `image refresh`
 /// and `setup` use when the configuration could not be read at all: the
 /// configured tiers are then unknown, and the recovery builtins fall back to
 /// `--image`/env or the default boot image.

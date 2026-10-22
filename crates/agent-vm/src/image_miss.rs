@@ -61,7 +61,7 @@ fn has_registry_error(error: &anyhow::Error) -> bool {
 /// The hint text for one reference.
 ///
 /// The lead line states where the acquisition failed, so the top of the message
-/// is not `Error: hint: …`; it is not a diagnosis (`pull` uses
+/// is not `Error: hint: …`; it is not a diagnosis (`image refresh` uses
 /// `PullPolicy::Always`, so a cache miss is not implied). The reference is
 /// spelled as one shell word - the same spelling in every line - so the whole
 /// hint can be pasted; for ASCII references that is byte-identical to the plain

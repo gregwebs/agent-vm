@@ -27,8 +27,6 @@ const BOGUS_IMAGE: &str = "localhost:1/does-not-exist:latest";
 const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "image",
     "setup",
-    "pull",
-    "upgrade",
     "msb",
     "clipboard",
     "doctor",

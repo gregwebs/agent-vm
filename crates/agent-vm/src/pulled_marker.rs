@@ -1,17 +1,14 @@
-//! Side-channel record of the last digest we successfully pulled.
+//! Advisory digest baseline for the opt-in launch update banner.
 //!
-//! Microsandbox's own cached manifest record doesn't update reliably
-//! after a re-pull under the same tag (see notes in `pull.rs`), so we
-//! can't use `Image::get(...).manifest_digest()` as the "what's in the
-//! cache" signal for the update-available banner. Instead, after every
-//! successful pull we atomically write the per-platform manifest digest
-//! we just landed to a small marker file under XDG_STATE_HOME. The
-//! launch-path update check reads this file.
+//! `image refresh` and setup record the validated native acquisition's resolved
+//! host-manifest digest under the original selected reference. A launch may
+//! seed an absent marker from its cached image. This is banner state, never an
+//! approval record, publication token or proof of current cache identity: other
+//! cache writers need not update it, and marker-write failures are nonfatal.
 //!
-//! Atomicity matters: if a pull is interrupted, the marker file should
-//! be either the *old* digest (so the next launch banner correctly flags
-//! the update) or absent (treated as "not pulled yet"). The write-and-
-//! rename pattern below guarantees we never see a half-written marker.
+//! Atomic rename prevents a partially written digest from becoming the banner
+//! baseline. It does not couple the marker to native cache publication or the
+//! retained default record.
 
 use std::{fs, path::PathBuf};
 

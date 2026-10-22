@@ -60,7 +60,7 @@ the contributor gitlink and launcher recommendation, without a runtime source de
 - **One image per session**, chosen independently of the launched tool, by the
   precedence:
   `--image` > `AGENT_VM_IMAGE_TAG` (empty = unset) > user config `image` >
-  project config `image` > the default boot image. `run`, `pull`, `setup` and
+  project config `image` > the default boot image. `run`, `image refresh`, `setup` and
   `doctor` all resolve through one function (`boot_image::select`).
 - **The default is a retained, user-scoped selection (#261, this ADR).** The
   bootstrap/digest fallback is a **retained default**: an immutable OCI
@@ -75,7 +75,7 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   failed initial acquisition therefore leaves no record, so a later compatible
   recommendation (e.g. a multiarch release) can rescue the host instead of
   stranding it. A retained record is never silently replaced; replacing a
-  *working* one requires explicit `upgrade --image REF` (#262): native target
+  *working* one requires explicit `image set-default --image REF` (#262): native target
   acquisition, canonical manifest pin acquisition, complete pinned-cache and
   host-Linux config validation precede replacement/initialization under the same
   lock and record. Same-pin success preserves record bytes. Only future default
@@ -143,7 +143,7 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   launcher release is held pending amd64 evidence and maintainer image
   promotion or explicit risk acceptance. Merge is not image promotion.
 - **#262 fulfilled.** Explicit replacement remains separate from write-once
-  automatic adoption. See [USAGE](../../USAGE.md#explicitly-upgrading-the-default).
+  automatic adoption. See [USAGE](../../USAGE.md#explicitly-setting-the-default).
 - Follow-up evidence: [#265](https://github.com/gregwebs/agent-vm/issues/265)
   (native installed consumption on both architectures).
 

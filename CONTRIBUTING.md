@@ -45,7 +45,7 @@ cargo build --release -p agent-vm
 unstable `[script]` attribute.
 
 Source builds use the vendored recipe's `vendor/microsandbox/build/msb`
-artifact; `agent-vm setup` pulls and verifies the selected registry image but
+artifact; `agent-vm setup` acquires and verifies the selected registry image but
 does not build `msb`.
 
 Use packaged `agent-vm image build --tag REF --builder NAME CONTEXT` for explicit
@@ -226,7 +226,7 @@ export AGENT_VM_STATE_DIR=/tmp/avm-smoke/state   # private MSB_HOME (ADR-0004)
 export HOME=/tmp/avm-smoke/home                  # private config + credentials
 export MSB_PATH="$PWD/vendor/microsandbox/build/msb"   # the msb this build pins
 cargo build --release -p agent-vm
-./target/release/agent-vm setup                  # pulls the pinned image, then boots a
+./target/release/agent-vm setup                  # acquires the pinned image, then boots a
                                                  # verification sandbox
 ```
 
@@ -306,14 +306,18 @@ native logs. Guest `--network none` is not proof of host-offline acquisition.
 
 `tests/default_image_upgrade.rs` exercises the actual CLI and native registry
 against genuine OCI bytes on a bound loopback listener, without Docker or a VM.
-It isolates HOME/state/cwd and Docker config (empty auths, no helpers), but native
-automatic auth may still perform read-only OS keyring lookup, and machine-wide
+It covers both boot-free paths — `image refresh` (selection, A→B tag movement,
+layer reuse, advisory markers, automatic adoption, and the two-process
+same-cache/same-reference coordination schedules) and `image set-default`
+(explicit target, immutable pin, retained record) — plus failure preservation.
+It isolates HOME/state/cwd and Docker config (empty auths, no helpers), but
+native-entry automatic auth may still perform read-only OS keyring lookup, and machine-wide
 managed policy still applies. Require a noninteractive credential environment
 with no matching loopback credential and absent/compatible managed policy; never
 modify host keyring items or policy for tests. Failure preservation hashes old
 metadata and referenced EROFS/fsmeta/VMDK artifacts independently, including a
 shared-layer failure; native cache completeness alone is not an unchanged-byte
-oracle. The custom group also tests explicit release upgrade A→B, an unchanged
+oracle. The custom group also tests explicit release `image set-default` A→B, an unchanged
 live A in a different project, new/warm/offline B, all override boundaries,
 failed-acquisition byte preservation and explicitly bootable cached A. Its
 registry publication uses empty test-owned Docker auth configuration and only
@@ -584,7 +588,7 @@ process-global filter once the default tier is selected and suppresses every
 non-`agent_vm` event for the rest of that invocation. Explicit-source
 invocations keep dependency logging unchanged. The CLI regression
 (`a_default_tier_invocation_suppresses_dependency_image_tracing`) asserts a
-default-tier `RUST_LOG=trace pull` leaks no repository marker and includes a
+default-tier `RUST_LOG=trace image refresh` leaks no repository marker and includes a
 positive explicit-source control.
 
 #### What runs where

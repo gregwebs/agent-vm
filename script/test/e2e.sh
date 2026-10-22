@@ -1161,10 +1161,10 @@ check_harness_negative() {
   # accepted capture passes; every malformed capture fails. This is the
   # permanent negative control for the substring-false-pass class (Standards S1)
   # and the missing/unreadable-log class (Spec S2).
-  local pull_name='agent-vm-pull' verify_name='agent-vm-setup-verify'
+  local acquire_name='native-image-acquire' verify_name='agent-vm-setup-verify'
   local ref='localhost:1/project:latest'
-  local good=$'agent-vm-pull\tlocalhost:1/project:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
-  if ! assert_dump "$good" "$pull_name" "$ref" >/dev/null 2>&1; then
+  local good=$'native-image-acquire\tlocalhost:1/project:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
+  if ! assert_dump "$good" "$acquire_name" "$ref" >/dev/null 2>&1; then
     echo "    FAIL: assert_dump rejected the accepted capture"
     result=1
   fi
@@ -1173,15 +1173,16 @@ check_harness_negative() {
     result=1
   fi
   local -a bad_dumps=(
-    $'agent-vm-pull\tlocalhost:1/project:latest-WRONG\nagent-vm-setup-verify\tlocalhost:1/project:latest-WRONG'
-    $'agent-vm-pull\tlocalhost:1/project:latest\nagent-vm-pull\tlocalhost:1/other:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
-    $'agent-vm-pull\tlocalhost:1/project:latest'
-    $'agent-vm-pull\tlocalhost:1/project:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest\nextra\tlocalhost:1/project:latest'
-    $'agent-vm-pull\tlocalhost:1/other:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
+    $'native-image-acquire\tlocalhost:1/project:latest-WRONG\nagent-vm-setup-verify\tlocalhost:1/project:latest-WRONG'
+    $'native-image-acquire\tlocalhost:1/project:latest\nnative-image-acquire\tlocalhost:1/other:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
+    $'native-image-acquire\tlocalhost:1/project:latest'
+    $'native-image-acquire\tlocalhost:1/project:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest\nextra\tlocalhost:1/project:latest'
+    $'native-image-acquire\tlocalhost:1/other:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
+    $'agent-vm-pull\tlocalhost:1/project:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
   )
   local bad
   for bad in "${bad_dumps[@]}"; do
-    if assert_dump "$bad" "$pull_name" "$ref" >/dev/null 2>&1; then
+    if assert_dump "$bad" "$acquire_name" "$ref" >/dev/null 2>&1; then
       echo "    FAIL: assert_dump accepted a malformed capture:"
       printf '%s\n' "$bad"
       result=1
@@ -2103,9 +2104,11 @@ EOF
   assert_eq "user-image project tool sentinel" "hello-258=ok" "$(grep '^hello-258=ok$' <<<"$out")" || return 1
 }
 
-# Parse every `[debug] sandbox config JSON:` dump from a captured stream as a
-# complete JSON object (python3's decoder), printing one `name<TAB>Oci ref` per
-# dump. Malformed JSON after a marker is an error, never a dropped dump.
+# Parse every `[debug] sandbox config JSON:` and `[debug] native image
+# acquisition JSON:` dump from a captured stream as a complete JSON object
+# (python3's decoder), printing one `name<TAB>Oci ref` per dump. A native
+# acquisition has no sandbox name, so its fixed `kind` is the row name. Malformed
+# JSON after a marker is an error, never a dropped dump.
 parse_acquisition_dumps() {
   local file="$1"
   python3 - "$file" <<'PY'
@@ -2113,15 +2116,22 @@ import json
 import sys
 
 text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-marker = "[debug] sandbox config JSON: "
+markers = {
+    "[debug] sandbox config JSON: ": "sandbox",
+    "[debug] native image acquisition JSON: ": "native",
+}
 decoder = json.JSONDecoder()
-index = 0
+found = []
+for marker, kind in markers.items():
+    index = 0
+    while True:
+        start = text.find(marker, index)
+        if start < 0:
+            break
+        found.append((start, start + len(marker), kind))
+        index = start + len(marker)
 rows = []
-while True:
-    found = text.find(marker, index)
-    if found < 0:
-        break
-    start = found + len(marker)
+for _, start, kind in sorted(found):
     while start < len(text) and text[start] in " \t\r\n":
         start += 1
     try:
@@ -2129,24 +2139,30 @@ while True:
     except json.JSONDecodeError as error:
         print(f"malformed debug JSON: {error}", file=sys.stderr)
         sys.exit(1)
-    name = obj.get("name", "<none>")
-    try:
-        ref = obj["image"]["Oci"]["reference"]
-    except (KeyError, TypeError):
-        ref = "<none>"
-    rows.append(f"{name}\t{ref}")
-    index = end
+    if kind == "native":
+        if obj.get("kind") != "native-image-acquire":
+            print("unexpected native acquisition kind", file=sys.stderr)
+            sys.exit(1)
+        rows.append(f"native-image-acquire\t{obj.get('reference', '<none>')}")
+    else:
+        name = obj.get("name", "<none>")
+        try:
+            ref = obj["image"]["Oci"]["reference"]
+        except (KeyError, TypeError):
+            ref = "<none>"
+        rows.append(f"{name}\t{ref}")
 for row in rows:
     print(row)
 PY
 }
 
-# Require the capture to be exactly the two acquisition dumps, one per name,
-# each carrying the expected reference. Fields are compared **whole**, never as a
-# substring: a wrong-reference suffix, a duplicated name, a missing name, an
-# extra name, or any other reference all fail. `$3` is the reference both dumps
-# must carry (the initial pull and the setup verification select the same
-# image); `$2` names the row this call is primarily asserting, for the message.
+# Require the capture to hold exactly one native acquisition record and one
+# setup-verification sandbox config, each carrying the expected reference. Fields
+# are compared **whole**, never as a substring: a wrong-reference suffix, a
+# duplicated name, a missing name, an extra name, a stale `agent-vm-pull` sandbox
+# record, or any other reference all fail. `$3` is the reference both records
+# must carry (the refresh and the setup verification select the same image);
+# `$2` names the row this call is primarily asserting, for the message.
 assert_dump() {
   local dumps="$1" expected_name="$2" ref="$3"
   local -a rows=()
@@ -2167,7 +2183,7 @@ assert_dump() {
     name="${line%%	*}"
     dumped="${line#*	}"
     case "$name" in
-      agent-vm-pull | agent-vm-setup-verify) ;;
+      native-image-acquire | agent-vm-setup-verify) ;;
       *)
         echo "    FAIL: unexpected acquisition dump name: [$name]"
         printf '%s\n' "$dumps"
@@ -2276,7 +2292,7 @@ EOF
     require_launch_ok "$name" || result=1
     assert_no_host_calls || result=1
     dumps="$(parse_acquisition_dumps "$WORK/$name.out")" || result=1
-    assert_dump "$dumps" "agent-vm-pull" "$selected" || result=1
+    assert_dump "$dumps" "native-image-acquire" "$selected" || result=1
     assert_dump "$dumps" "agent-vm-setup-verify" "$selected" || result=1
     out="$(launch_output "$name")"
     assert_match "setup reports the selected image ready" "^==> $selected ready$" "$out" || result=1
@@ -2950,7 +2966,7 @@ custom_image_default_upgrade() {
       pids_before="$(runtime_pids)" || result=1
       retained_env
       AGENT_VM_RETAINED_BIN="$AGENT_VM_RELEASE_BIN"
-      retained_launch upgrade-command "$proj" upgrade --image "$ref_b" || result=1
+      retained_launch upgrade-command "$proj" image set-default --image "$ref_b" || result=1
       require_launch_ok upgrade-command || result=1
       assert_eq 'upgrade creates no sandbox entries' "$catalog_before" "$(avm_retained_state msb list --format json)" || result=1
       assert_eq 'upgrade creates no VM processes' "$pids_before" "$(runtime_pids)" || result=1
@@ -2966,7 +2982,7 @@ custom_image_default_upgrade() {
       cp "$(retained_record)" "$WORK/upgrade-record-before"
       upgrade_cache_snapshot "$ref_b" "$WORK/upgrade-cache-before" || result=1
       tick="$(cat "$live/tick")"
-      retained_launch upgrade-failure "$proj" upgrade --image "localhost:$port/$repo:unavailable" || result=1
+      retained_launch upgrade-failure "$proj" image set-default --image "localhost:$port/$repo:unavailable" || result=1
       [ "$CAPTURE_STATUS" -eq 1 ] || result=1
       cmp "$(retained_record)" "$WORK/upgrade-record-before" || result=1
       upgrade_cache_snapshot "$ref_b" "$WORK/upgrade-cache-after" || result=1

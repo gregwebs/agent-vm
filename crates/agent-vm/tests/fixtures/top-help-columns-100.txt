@@ -3,9 +3,7 @@ Sandboxed microVMs for AI coding agents.
 Usage: agent-vm [OPTIONS] <COMMAND>
 
 Commands:
-  setup      Pull and verify the boot image (run once first)
-  pull       Refresh the cached boot image
-  upgrade    Explicitly acquire and select a new default boot image
+  setup      Acquire and verify the boot image (run once first)
   msb        Forward arguments to the bundled `msb` with agent-vm's MSB_HOME/MSB_PATH pinned (e.g.
              `agent-vm msb ls`, `agent-vm msb status`). Relies on `needs_msb_setup` staying true for
              this variant — see main()
@@ -13,8 +11,9 @@ Commands:
   doctor     Diagnostic / maintenance operations for agent-vm's private microsandbox state (e.g.
              --reset-msb-db)
   secret     Manage agent-vm's own values in the host system keychain
-  image      Inspect the selected boot image, or explicitly build/import a finished one into
-             agent-vm's own image cache. Nothing boots; only build/import may invoke Docker
+  image      Inspect the selected boot image, acquire it into the image cache, explicitly retain a
+             default, or build/import a finished image. Only `show` is offline; only build/import
+             may invoke Docker
   shell      Launch shell in a per-project sandbox; tool arguments are forwarded verbatim
   help       Print this message or the help of the given subcommand(s)
 
@@ -185,8 +184,8 @@ Image:
 
           HEADs the registry manifest and prints the "==> A newer image is available …" banner if
           the cached image is stale. Off by default so a normal launch makes no registry contact;
-          run `agent-vm pull` to fetch an update. Can also be enabled persistently with a truthy
-          `AGENT_VM_UPDATE_CHECK` (1|true|yes|on).
+          run `agent-vm image refresh` to fetch an update. Can also be enabled persistently with a
+          truthy `AGENT_VM_UPDATE_CHECK` (1|true|yes|on).
 
 Guest user:
       --root

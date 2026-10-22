@@ -43,9 +43,10 @@ crates/agent-vm/src/
 ├── mount.rs                # --mount grammar and volume wiring
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   ├── default_selection.rs#   retained record: read-only load, automatic adopt, explicit replace
-│   └── upgrade.rs          #   native acquire/pin/platform check before default replacement
+│   └── upgrade.rs          #   set-default flow: native target + pinned child, then replace
+├── image_acquire.rs        # shared boot-free native acquisition: guard, snapshot, validate, rollback
 ├── image_build.rs          # explicit user Dockerfile export
-├── image_cmd.rs            # image verb group: read-only `show`, explicit build/import
+├── image_cmd.rs            # image verb group: read-only `show`, `refresh`, `set-default`, build/import
 ├── image_import.rs         # daemon/archive import
 ├── image_publish.rs        # staging, native publication, requested-reference rollback
 ├── image_miss.rs           # registry-failure import hint
@@ -54,7 +55,7 @@ crates/agent-vm/src/
 ├── doctor.rs               # operator diagnostics and db recovery
 ├── pi_credential_inspection.rs # read-only structural report of guest Pi state (#93)
 ├── config.rs               # read-only tool config parse/merge/validate (doctor preview)
-└── …                       # clipboard, pull, setup, user, env_flag, …
+└── …                       # clipboard, setup, user, env_flag, …
 
 vendor/agent-vm-images/      # contributor-only pinned independent image sources
 vendor/microsandbox/        # git submodule: the runtime and its SDK
@@ -567,7 +568,7 @@ source gitlink (contributors only) → independent standard release
 
 The compiled v0.1.3 initial recommendation names the multiarch **index**. Native
 msb chooses the host child; successful first adoption keeps the index reference.
-An explicit upgrade instead retains the resolved child digest. Installed binary
+An explicit `image set-default` instead retains the resolved child digest. Installed binary
 and runtime paths never read image sources. Chrome remains an optional
 [user-Dockerfile example](https://github.com/gregwebs/agent-vm-images/tree/main/examples/layers/chrome-devtools)
 in agent-vm-images, not standard content.
@@ -650,12 +651,14 @@ boot_image::inspect_selection ──► escaped "Image:/Source:/File:" report �
    (same select(); default slot read only if the fallback wins; no runtime, cache, registry or write)
 ```
 
-Explicit upgrade adds a separate edge:
+Explicit `image set-default` adds a separate edge:
 
 ```text
-upgrade --image REF → native target pull → manifest pin → native pinned pull
-                   → complete pinned cache + host-Linux config
-                   → AcquiredDefaultImage → same flock → atomic replace(record)
+image set-default --image REF
+  → native target pull (under the shared reference guard)
+  → manifest pin → native pinned pull (its own guard)
+  → complete pinned cache + host-Linux config
+  → AcquiredDefaultImage → same flock → atomic replace(record)
 ```
 
 Two native pulls trade redundant manifest requests for a populated digest cache
@@ -668,8 +671,45 @@ under the lock: same-pin replacement preserves bytes, explicit writers are
 last-commit-wins, and automatic adoption stays first-writer-wins. Rename is the
 last fallible write; completion output is best-effort. Interruption leaves the
 old or complete new record; no fsync/power-loss guarantee is added. Old cache
-artifacts and active sessions are never removed by upgrade. See
+artifacts and active sessions are never removed by set-default. See
 [USAGE](USAGE.md#the-retained-default) for the operational details.
+
+`image refresh` acquires without launching or replacing a retained record;
+only a successful default-tier acquisition may initialize an absent record:
+
+```text
+image refresh [--image REF]
+  → the same boot_image selector and broken-config recovery
+  → image_acquire::NativeAcquisition (ambient backend's cache; native auth/trust/HTTP policy)
+  → launcher guard on the actual cache + normalized reference key
+      snapshot prior metadata → native pull (Always, force=false; native lock internal)
+      → complete requested-key cache + resolved-child identity + raw host-Linux config
+          pass → success | fail → restore the under-guard snapshot
+  → advisory pulled-digest marker (that result's manifest digest)
+  → adopt the selected immutable reference only if this was a default-tier success
+```
+
+No sandbox, guest disk, VM execution, Docker/buildx, curl/wget or alternate
+download backend is on this path; a nonbootable OCI image with the right host
+platform refreshes successfully. Layer reuse is native: an unchanged manifest
+downloads no layer blob and never deletes old artifacts to force freshness.
+
+### Same-cache acquisition coordination limits
+
+The launcher guard is a persistent sibling of the native reference metadata in
+the **actual backend cache**, keyed by the SDK's normalized reference. It
+serializes only callers of this shared helper — refresh, setup's acquisition and
+each set-default pull — including processes with different state roots or `HOME`
+that share one writable cache. Lock order is launcher guard → native
+per-reference pull lock → native content locks; set-default releases a target
+guard before acquiring its derived-digest guard so same-key input cannot
+deadlock. Unmodified `msb pull`, ordinary launch cache writers, direct SDK
+clients, archive import/build publication, cache deletion/GC and older launchers
+do **not** take it, and readers/launches can observe the native publication
+before wrapper validation. Those writers must be quiescent for the rollback
+guarantee; this is not an all-writer transaction, no fsync/power-loss or
+process-kill rollback is claimed, and selection/adoption still happens strictly
+after successful validation.
 
 - **Standard OCI semantics.** microsandbox's layer cache, GC, snapshotting, and
   metadata DB all key off OCI references. Going through that path means getting

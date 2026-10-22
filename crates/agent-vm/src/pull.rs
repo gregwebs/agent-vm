@@ -1,46 +1,67 @@
-//! `agent-vm pull` — refresh the cached image without booting a real
-//! sandbox.
+//! `agent-vm image refresh` — acquire the selected OCI reference into
+//! microsandbox's image cache without booting anything.
 //!
-//! Microsandbox's SDK does not currently expose a "pull only" entry
-//! point; the pull happens inside `Sandbox::create`. So we trigger one
-//! by booting a throwaway sandbox with `PullPolicy::Always` and
-//! immediately stopping it.
+//! Acquisition is native ([`crate::image_acquire`]): `Registry` with
+//! `PullPolicy::Always` and `force: false`, so the registry's current manifest is
+//! re-resolved and valid cached layers are reused rather than re-downloaded. No
+//! sandbox, VM, temporary disk, Docker or alternate download backend is
+//! involved, and nothing about a project or a running guest changes.
 //!
-//! Cache integrity note: we deliberately do **not** call `Image::remove`
-//! before the pull (the previous design did, to work around a
-//! microsandbox bug where `Image::get` keeps returning the prior
-//! manifest digest under the same reference). The removal opens a
-//! cache-empty window — if the user ^C's mid-pull, or the registry
-//! disappears, the next `agent-vm shell` triggers a full IfMissing
-//! re-pull from scratch. Instead we keep microsandbox's cache untouched
-//! and track "the digest we successfully pulled" in our own marker file
-//! (`pulled_marker`), updated only after the pull completes. The cache
-//! is therefore always usable; only the update-available banner may be
-//! briefly wrong if interrupted, and it self-corrects on the next pull.
+//! Retention is a *separate* decision made by the caller after acquisition
+//! succeeds ([`boot_image::adopt_default_selection`]): a default-tier refresh may
+//! initialize an absent retained default, and neither `--image`, env nor a
+//! config tier ever replaces one.
+//!
+//! The advisory marker (`pulled_marker`) records the resolved manifest digest
+//! this acquisition actually landed, keyed by the selected reference. It exists
+//! so the launch banner can say "an update is available"; it is not an approval
+//! record, not proof of cached identity, and a failed acquisition leaves it
+//! untouched.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Args as ClapArgs;
-use microsandbox::{Sandbox, sandbox::PullPolicy};
 
 use crate::boot_image;
 use crate::config::{Catalog, ConfiguredImages};
+use crate::image_acquire::{AcquireError, NativeAcquisition, OciTarget, OciTargetError};
+
+/// The fixed refusal for a refresh target that is a local rootfs or disk path.
+/// Names no value: the rejected text is user input.
+pub(crate) const TARGET_REASON: &str = "`agent-vm image refresh` acquires OCI image references (tag or digest) only; \
+     it never boots, formats or reads a local rootfs — launch a local rootfs or disk image with \
+     agent-vm --image PATH <tool> instead";
+
+/// The fixed refusal for a target that is not a usable OCI reference at all.
+/// A malformed reference is not a local path, so it must not be told how to
+/// launch one; the value itself is never echoed.
+pub(crate) const INVALID_REFERENCE_REASON: &str = "`agent-vm image refresh` needs a valid OCI image reference, \
+     e.g. ghcr.io/owner/name:tag or repo@sha256:…";
+
+/// Render this command's value-free refusal for a rejected target.
+pub(crate) fn target_error(error: OciTargetError) -> anyhow::Error {
+    match error {
+        OciTargetError::LocalPath => anyhow!(TARGET_REASON),
+        OciTargetError::InvalidReference => anyhow!(INVALID_REFERENCE_REASON),
+    }
+}
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// The boot image to refresh. Defaults to the image this configuration
-    /// would boot. See "Selecting the boot image" in USAGE.md.
+    /// The OCI boot image to acquire into the image cache without booting.
+    /// Defaults to the image this configuration would boot. See "Selecting the
+    /// boot image" in USAGE.md.
     #[command(flatten)]
     pub(crate) image: boot_image::ImageArgs,
 }
 
 pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Result<()> {
-    // pull also reaches connect_and_migrate (via Sandbox::create_with_pull_progress),
-    // so it can hit the same forward-migrated-DB crash as the boot path. See
-    // src/msb_preflight.rs and issue #30.
+    // The native pull still reaches the shared microsandbox state (its cache and
+    // registry configuration), so it can hit the same forward-migrated-DB crash
+    // as the boot path. See src/msb_preflight.rs and issue #30.
     crate::msb_preflight::ensure_db_not_ahead().await?;
 
     // A broken config leaves the configured image tiers unknown (D7): warn and
-    // fall through to `--image`/env or the default boot image, so `pull` still
+    // fall through to `--image`/env or the default boot image, so refresh still
     // recovers.
     if let Catalog::Broken(error) = &catalog {
         println!(
@@ -52,78 +73,84 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
     let label = boot.label();
     println!("==> {label} is the image this configuration boots from");
     pull_image(boot.reference().as_str(), &label).await?;
-    // Success-before-adoption (#261): only after the forced acquisition
-    // succeeded may a default-tier selection become the retained default. A
-    // `pull --image X` refreshes X and never adopts it.
+    // Success-before-adoption (#261): only after the acquisition succeeded may a
+    // default-tier selection become the retained default. An explicit, env or
+    // config refresh never adopts its target.
     boot_image::adopt_default_selection(&boot)
         .context("retaining the selected default boot image")?;
-    println!("==> {} pulled into the microsandbox cache", label.text());
+    println!(
+        "==> {} acquired into the microsandbox image cache",
+        label.text()
+    );
     Ok(())
 }
 
-/// Force a pull of `image` into the microsandbox cache and exit. Used
-/// by both `agent-vm pull` and the verify step in `agent-vm setup`.
+/// Reject an unusable refresh target from input alone.
+///
+/// Runs before `main`'s MSB prologue, so a CLI/env local rootfs or disk target
+/// cannot create state, read configuration again, select a fallback or stat the
+/// path. Every configured/default reference already satisfies the OCI policy;
+/// only the override can be a local path.
+pub(crate) fn preflight(args: &Args) -> Result<()> {
+    let Some(requested) = args.image.requested()? else {
+        return Ok(());
+    };
+    OciTarget::parse(requested.reference().as_str())
+        .map(|_| ())
+        .map_err(target_error)
+}
+
+/// Acquire `image` into the image cache, without booting. Shared by
+/// `image refresh` and `setup`'s pull step.
 ///
 /// `label` is the selection's safe output policy: when it is redacted (the
 /// default tier) the debug dump, progress display and any acquisition error
 /// carry the fixed label instead of the record/recommendation reference.
 pub async fn pull_image(image: &str, label: &boot_image::ImageLabel) -> Result<()> {
-    let is_local = is_plain_http_registry(image);
-    let config = Sandbox::builder("agent-vm-pull")
-        .image(image)
-        .registry(|r| if is_local { r.insecure() } else { r })
-        .pull_policy(PullPolicy::Always)
-        .cpus(1)
-        .memory(256)
-        .replace()
-        .build()
+    let target = OciTarget::parse(image).map_err(target_error)?;
+    let acquisition = NativeAcquisition::open(&target)
         .await
-        .context("preparing pull config")?;
-    // The exact config handed to the SDK, behind AGENT_VM_DEBUG_CONFIG, so an
-    // integration test can assert the acquisition input (the selected image
-    // reference) rather than a selector notice or a connection error. A
-    // redacted selection renders a fixed marker instead of the reference.
-    if let Some(dump) = crate::debug_config::sandbox_config(&config, label.is_redacted())? {
-        eprintln!("{dump}");
-    }
-    let (progress, task) = Sandbox::create_with_pull_progress(config);
-    let reference_label = label.is_redacted().then(|| label.text().to_string());
-    let render = tokio::spawn(crate::pull_progress::render(progress, reference_label));
-    // Await render BEFORE propagating any error from `task`. Two reasons:
-    // (1) `task` finishing drops the progress sender, so render's recv
-    // loop is already winding down; this just lets `display.finish()`
-    // run `mp.clear()` to restore the terminal before we exit. (2) using
-    // a logging helper makes panics inside the render task (e.g. a
-    // ProgressStyle template typo) visible instead of swallowed by
-    // `JoinHandle::await.ok()`.
-    let result = task
+        .map_err(|error| acquisition_error(label, image, error))?;
+    let result = acquisition
+        .pull(&target, label)
         .await
-        .context("pull task join")
-        .and_then(|inner| inner.context("pulling image"))
-        // A redacted (default-tier) failure must not chain the registry URL
-        // that embeds the reference; the fixed reason still names the stage. An
-        // explicit source keeps its error unchanged.
-        .map_err(|error| {
-            label.redact_error("pulling", crate::image_miss::attach(error, image, label))
-        });
-    crate::pull_progress::await_render(render).await;
-    let sandbox = result?;
-    sandbox.stop_and_wait().await.ok();
-    Sandbox::remove("agent-vm-pull").await.ok();
-
-    // Only after a successful pull do we record what we landed. If
-    // anything above failed, the marker is unchanged and the next
-    // launch's banner still flags this image as needing an update.
-    if let Some(digest) = crate::image_check::fetch_remote_digest(image, label.is_redacted()).await
-        && let Err(e) = crate::pulled_marker::write(image, &digest)
-    {
-        // The marker error is a trusted-host path error (state root), never the
-        // image reference, so it is not record data; it is printed as-is for
-        // debugging (not escaped).
-        eprintln!("warn: failed to record pulled digest: {e:#}");
+        .map_err(|error| acquisition_error(label, image, error))?;
+    // Only a successful, validated acquisition updates the advisory marker, and
+    // it records *this* pull's resolved digest rather than a second registry
+    // probe: a probe could race a moving tag and assumes an index layout.
+    if let Err(error) = crate::pulled_marker::write(image, &result.manifest_digest.to_string()) {
+        // A trusted-host state path error, never the image reference, so it is
+        // printed as-is for debugging (not escaped).
+        eprintln!("warn: failed to record the refreshed image digest: {error:#}");
     }
-
     Ok(())
+}
+
+/// Render an acquisition failure for this selection without leaking a redacted
+/// reference.
+///
+/// A redacted selection may not disclose a reference, and a postvalidation
+/// failure's sources can name one, so its closed safe text is chosen *before*
+/// the generic redactor (which would flatten it into a registry message and lose
+/// the failed-restore stage). It keeps its recovery requirement. Explicit
+/// sources keep both stages, the native chain and the import hint.
+fn acquisition_error(
+    label: &boot_image::ImageLabel,
+    image: &str,
+    error: AcquireError,
+) -> anyhow::Error {
+    if label.is_redacted() {
+        return match error {
+            AcquireError::Native { .. } | AcquireError::RegistrySettings(_) => {
+                label.redact_error("pulling", anyhow!(error.redacted_message()))
+            }
+            // These closed diagnostics carry no reference-bearing source chain.
+            // Preserve coordination stages and publication-uncertain recovery
+            // advice rather than flattening them into a registry failure.
+            _ => anyhow!(error.redacted_message()),
+        };
+    }
+    crate::image_miss::attach(error.into_explicit_error(), image, label)
 }
 
 /// Decide whether the registry needs `--insecure` (plain HTTP).
@@ -163,6 +190,7 @@ pub(crate) fn is_plain_http_registry(image_ref: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boot_image::{ImageArgs, OverrideSource};
 
     #[test]
     fn local_registries_are_plain_http() {
@@ -215,5 +243,86 @@ mod tests {
             );
         }
         env.remove_var("AGENT_VM_INSECURE_REGISTRY");
+    }
+
+    fn args_with(value: Option<&str>) -> Args {
+        Args {
+            image: ImageArgs::for_test(
+                value.map(str::to_string),
+                value.map(|_| OverrideSource::CommandLine),
+            ),
+        }
+    }
+
+    #[test]
+    fn preflight_refuses_local_targets_and_accepts_oci_references() {
+        assert!(preflight(&args_with(None)).is_ok());
+        assert!(preflight(&args_with(Some("alpine:latest"))).is_ok());
+        for local in ["/abs/rootfs", "./rootfs", "..", "/tmp/img.disk"] {
+            let error = preflight(&args_with(Some(local))).unwrap_err();
+            assert_eq!(error.to_string(), TARGET_REASON);
+            assert!(error.to_string().contains("agent-vm --image PATH <tool>"));
+            assert!(!error.to_string().contains(local));
+        }
+        // A malformed reference is not a local launch target and must get the
+        // reference-shape refusal instead of local-launch advice.
+        for malformed in ["Foo/Bar:tag", "repo:bad tag", "repo@sha256:short"] {
+            let error = preflight(&args_with(Some(malformed))).unwrap_err();
+            assert_eq!(error.to_string(), INVALID_REFERENCE_REASON);
+            assert!(!error.to_string().contains("agent-vm --image PATH <tool>"));
+            assert!(!error.to_string().contains(malformed));
+        }
+    }
+
+    #[test]
+    fn redacted_coordination_and_task_failures_keep_actionable_stages() {
+        use crate::image_acquire::ReferenceStage;
+
+        let label = boot_image::ImageLabel::for_default_upgrade();
+        let sentinel = "https://private.example/secret-repository\u{1b}";
+        for (stage, expected) in [
+            (
+                ReferenceStage::LockOpen,
+                "opening the image-cache coordination lock",
+            ),
+            (
+                ReferenceStage::LockAcquire,
+                "acquiring the image-cache coordination lock",
+            ),
+            (
+                ReferenceStage::Snapshot,
+                "snapshotting cached reference metadata",
+            ),
+        ] {
+            let error = acquisition_error(
+                &label,
+                sentinel,
+                AcquireError::ReferenceState {
+                    stage,
+                    source: anyhow!(sentinel),
+                },
+            );
+            let text = format!("{error:#}");
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("private.example"), "{text}");
+            assert!(!text.contains('\u{1b}'), "{text}");
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let join = runtime.block_on(async {
+            tokio::spawn(async { panic!("private source") })
+                .await
+                .unwrap_err()
+        });
+        let error = acquisition_error(&label, sentinel, AcquireError::Task(join));
+        let text = format!("{error:#}");
+        assert!(text.contains("publication is uncertain"), "{text}");
+        assert!(text.contains("check the cache and retry"), "{text}");
+        assert!(!text.contains("private source"), "{text}");
+    }
+
+    #[test]
+    fn preflight_refuses_a_typed_empty_target() {
+        let error = preflight(&args_with(Some(""))).unwrap_err();
+        assert!(error.to_string().contains("must not be empty"), "{error}");
     }
 }

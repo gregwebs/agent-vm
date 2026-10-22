@@ -77,8 +77,9 @@ git submodule update --init --recursive vendor/microsandbox
 # build from source
 cargo build --release
 
-# Pull OCI images
-agent-vm setup            # pulls the image this config boots from and verifies it boots
+# Acquire the selected OCI image; optionally verify it in a guest
+agent-vm image refresh    # acquisition only, no guest
+agent-vm setup            # acquisition plus boot/tool verification
 
 cd ~/your-project
 agent-vm --allow-internet-egress claude

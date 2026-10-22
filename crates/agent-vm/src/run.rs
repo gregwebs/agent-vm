@@ -558,8 +558,8 @@ pub struct Args {
     ///
     /// HEADs the registry manifest and prints the "==> A newer image is
     /// available …" banner if the cached image is stale. Off by default so a
-    /// normal launch makes no registry contact; run `agent-vm pull` to fetch an
-    /// update. Can also be enabled persistently with a truthy
+    /// normal launch makes no registry contact; run `agent-vm image refresh` to
+    /// fetch an update. Can also be enabled persistently with a truthy
     /// `AGENT_VM_UPDATE_CHECK` (1|true|yes|on).
     #[arg(long = "update-check", default_value_t = false, help_heading = "Image")]
     update_check: bool,
@@ -806,7 +806,7 @@ pub(crate) async fn launch(
     // image_check::check_for_update and print a banner if there's a newer
     // image available — but only when opted in via `--update-check` /
     // `AGENT_VM_UPDATE_CHECK`; otherwise a normal launch makes no registry
-    // contact at all. The user runs `agent-vm pull` explicitly to fetch it.
+    // contact at all. The user runs `agent-vm image refresh` explicitly to fetch it.
     let update_check_env = std::env::var("AGENT_VM_UPDATE_CHECK").ok();
     if should_check_update(args.update_check, update_check_env.as_deref()) {
         // The update banner is purely informational, so keep it OFF the
@@ -1247,12 +1247,26 @@ pub(crate) async fn launch(
                     );
                 }
             }
-            None => anyhow::bail!(
-                "the boot image's environment could not be read, so agent-vm cannot verify that a \
-                 `sentinelEnv: false` variable is unset in the guest for `{image}`. Pull or inspect \
-                 the image (`agent-vm pull --image {image}`) so its metadata is cached, and re-run \
-                 the launch; alternatively declare `sentinelEnv: true` in credentials.yaml"
-            ),
+            None => {
+                // `image refresh` acquires OCI references only, so it is a
+                // working suggestion only for an OCI launch target. A local
+                // rootfs/disk launch keeps only the `sentinelEnv: true`
+                // alternative rather than naming a command that always refuses
+                // the user's own image.
+                let acquire = if crate::image_acquire::OciTarget::parse(&image).is_ok() {
+                    format!(
+                        "Cache the image's metadata (`agent-vm image refresh --image {image}`) and \
+                         re-run the launch, or alternatively declare"
+                    )
+                } else {
+                    "Alternatively declare".to_string()
+                };
+                anyhow::bail!(
+                    "the boot image's environment could not be read, so agent-vm cannot verify that a \
+                     `sentinelEnv: false` variable is unset in the guest for `{image}`. {acquire} \
+                     `sentinelEnv: true` in credentials.yaml"
+                )
+            }
         }
     }
 
@@ -2418,7 +2432,7 @@ fn shell_escape(s: &str) -> String {
 /// this very launch.
 ///
 /// The marker (what the banner compares to the registry) was historically
-/// written *only* by `agent-vm pull`. A user who acquired the image via a
+/// written only by `agent-vm image refresh`. A user who acquired the image via a
 /// launch's `IfMissing` auto-pull — or via an older agent-vm that never
 /// wrote it — had no baseline, so the banner could never fire. Here, if
 /// the image is already cached and unmarked, we record its per-platform
@@ -2426,12 +2440,13 @@ fn shell_escape(s: &str) -> String {
 /// (i.e. immediately, since the call below seeds before we probe).
 ///
 /// Safe on the launch path: `IfMissing` never re-pulls, so `Image::get`'s
-/// digest is accurate (the re-pull staleness that makes pull.rs avoid
-/// `Image::get` — see pulled_marker.rs — can't apply here). Verified
+/// digest is accurate (the re-pull staleness that makes `image refresh`
+/// avoid `Image::get` — see pulled_marker.rs — can't apply here). Verified
 /// empirically that `Image::get(...).manifest_digest()` is the same
 /// per-platform digest `image_check::fetch_remote_digest` returns, so the
 /// comparison is apples-to-apples. Only ever *seed* — never overwrite an
-/// existing marker, which is the authoritative record of our last pull.
+/// existing marker, which is the best available advisory record of the last
+/// acquisition (not an identity check).
 async fn seed_pulled_marker_if_absent(image: &str, redact_reference: bool) {
     if crate::pulled_marker::read(image).is_some() {
         return;
@@ -2484,7 +2499,9 @@ async fn notify_if_update_available<W: std::io::Write>(
         notices.emit(format!(
             "==> A newer image is available in the registry (cached {cached}, registry {remote})"
         ))?;
-        notices.emit("==> Run `agent-vm pull` to fetch it. Continuing with the cached image.")?;
+        notices.emit(
+            "==> Run `agent-vm image refresh` to fetch it. Continuing with the cached image.",
+        )?;
     }
     Ok(())
 }

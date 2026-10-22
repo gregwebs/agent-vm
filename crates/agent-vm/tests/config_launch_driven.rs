@@ -1183,12 +1183,13 @@ fn a_sentinel_false_credential_fails_closed_when_image_metadata_is_unreadable() 
     let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
     // Assert the command it prints is *runnable*, not a substring of prose:
     // the earlier assertion (`"Pull or inspect the image"`) passed while the
-    // printed command (`agent-vm pull {image}`) failed with "unexpected
-    // argument", because `pull` takes `--image REF` (agent-vm #161 review,
-    // N1). The exact ref must appear so the instruction is pasteable.
+    // printed command failed with "unexpected argument", because the acquisition
+    // verb is `image refresh` and it takes `--image REF` (agent-vm #161 review,
+    // N1; #389 regrouped the verb). The exact ref must appear so the
+    // instruction is pasteable.
     assert!(
-        rendered.contains(&format!("agent-vm pull --image {BOGUS_IMAGE}")),
-        "the launch did not offer a runnable pull command: {rendered}"
+        rendered.contains(&format!("agent-vm image refresh --image {BOGUS_IMAGE}")),
+        "the launch did not offer a runnable refresh command: {rendered}"
     );
 }
 
@@ -1497,7 +1498,7 @@ fn the_override_does_not_bypass_unreadable_image_metadata() {
         &harness,
         "t",
         &[],
-        &format!("agent-vm pull --image {BOGUS_IMAGE}"),
+        &format!("agent-vm image refresh --image {BOGUS_IMAGE}"),
     );
 }
 
@@ -1585,7 +1586,7 @@ fn the_override_warns_and_proceeds_for_an_unavailable_required_credential() {
         "the withheld credential must be rendered as a warning, not a fatal error: {rendered}"
     );
     assert!(
-        rendered.contains("agent-vm pull --image"),
+        rendered.contains("agent-vm image refresh --image"),
         "the launch must have got past credential resolution to the image-metadata stage: {rendered}"
     );
 }
@@ -4237,6 +4238,15 @@ fn observable_reference(expected: &str) -> &str {
     }
 }
 
+/// The two acquisition verbs as argv prefixes: boot-free `image refresh` and
+/// `setup`'s initial acquisition step (#389).
+const ACQUISITION_VERBS: [&[&str]; 2] = [&["image", "refresh"], &["setup"]];
+
+/// One argv prefix as a printable verb name, for assertion messages.
+fn verb_name(argv: &[&str]) -> String {
+    argv.join(" ")
+}
+
 /// The two tiers' `image` settings (and, when `declares_tool`, the project's
 /// `probe` tool). Named fields rather than two adjacent `Option<&str>`
 /// parameters, so a user/project swap cannot compile
@@ -4306,16 +4316,58 @@ fn acquisition_config<'a>(
     }
 }
 
-/// The whole pull oracle: exactly one `agent-vm-pull` dump whose reference is
-/// `expected`.
+/// The fixed marker of a boot-free native acquisition record. Kept in sync with
+/// `debug_config::native_acquisition`.
+const NATIVE_MARKER: &str = "[debug] native image acquisition JSON: ";
+
+/// Every native-acquisition record in `stderr`, decoded as complete JSON
+/// objects. Malformed JSON after a marker is an error, never silently dropped.
+fn native_acquisitions(stderr: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = Vec::new();
+    let mut rest = stderr;
+    while let Some(index) = rest.find(NATIVE_MARKER) {
+        let after = &rest[index + NATIVE_MARKER.len()..];
+        let mut stream = serde_json::Deserializer::from_str(after).into_iter::<serde_json::Value>();
+        let value = stream
+            .next()
+            .ok_or_else(|| "no JSON after a native acquisition marker".to_string())?;
+        let value = value.map_err(|error| format!("malformed native acquisition JSON: {error}"))?;
+        let offset = stream.byte_offset();
+        out.push(value);
+        rest = &after[offset..];
+    }
+    Ok(out)
+}
+
+/// The whole acquisition oracle: exactly one `native-image-acquire` record whose
+/// reference is `expected`, acquired with `Always`/`force: false`.
+///
+/// A selector notice, a `SandboxConfig` (launch or setup verification) or a
+/// second record is not an acquisition, so all three fail this check.
 fn check_pull_acquisition(stderr: &str, expected: &str) -> Result<(), String> {
-    let configs = acquisition_configs(stderr)?;
-    let config = acquisition_config(&configs, "agent-vm-pull")?;
-    let reference = oci_reference(config);
+    let records = native_acquisitions(stderr)?;
+    let [record] = records.as_slice() else {
+        return Err(format!(
+            "{} native acquisition records, expected exactly one",
+            records.len()
+        ));
+    };
+    if record["kind"].as_str() != Some("native-image-acquire") {
+        return Err(format!("not a native acquisition record: {record}"));
+    }
+    if record["pull_policy"].as_str() != Some("always") {
+        return Err(format!("the record did not acquire Always: {record}"));
+    }
+    if record["force"].as_bool() != Some(false) {
+        return Err(format!("the record forced the acquisition: {record}"));
+    }
+    let reference = record["reference"]
+        .as_str()
+        .ok_or_else(|| format!("no reference in the native acquisition record: {record}"))?;
     let expected = observable_reference(expected);
     if reference != expected {
         return Err(format!(
-            "the acquisition config boots {reference}, expected {expected}"
+            "the native acquisition targets {reference}, expected {expected}"
         ));
     }
     Ok(())
@@ -4323,12 +4375,24 @@ fn check_pull_acquisition(stderr: &str, expected: &str) -> Result<(), String> {
 
 #[test]
 fn acquisition_config_oracle_rejects_notice_only_and_wrong_reference() {
-    // Control: a real pull run parses and names the exact reference.
+    // Control: a real refresh parses and names the exact reference.
     let harness = Harness::new();
     harness.write_project(&format!("image = \"{PROJECT_REF}\"\n"));
-    let out = harness.builtin(&["pull"], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+    let out = harness.builtin(
+        &["image", "refresh"],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+    );
     let stderr = stderr_of(&out);
-    check_pull_acquisition(&stderr, PROJECT_REF).expect("the real pull config is observable");
+    check_pull_acquisition(&stderr, PROJECT_REF).expect("the real refresh is observable");
+
+    // A setup verification `SandboxConfig` alone is not an acquisition.
+    let verification_only = format!(
+        "{CONFIG_MARKER}{{\"name\":\"agent-vm-setup-verify\",\"image\":{{\"Oci\":{{\"reference\":\"{PROJECT_REF}\"}}}}}}\n"
+    );
+    assert!(
+        check_pull_acquisition(&verification_only, PROJECT_REF).is_err(),
+        "a sandbox config with no native record must fail"
+    );
 
     // Rejected captures.
     let notice_only = format!(
@@ -4339,26 +4403,40 @@ fn acquisition_config_oracle_rejects_notice_only_and_wrong_reference() {
         "a notice with no JSON dump must fail"
     );
 
+    let record = |reference: &str| {
+        format!(
+            "{NATIVE_MARKER}{{\"kind\":\"native-image-acquire\",\"reference\":\"{reference}\",\"pull_policy\":\"always\",\"force\":false}}"
+        )
+    };
     let wrong = format!(
-        "{CONFIG_MARKER}{{\"name\":\"agent-vm-pull\",\"image\":{{\"Oci\":{{\"reference\":\"localhost:1/wrong:latest\"}}}}}}\n==> {PROJECT_REF} (from project config /x) is the image this configuration boots from\n"
+        "{}\n==> {PROJECT_REF} (from project config /x) is the image this configuration boots from\n",
+        record("localhost:1/wrong:latest")
     );
     assert!(
         check_pull_acquisition(&wrong, PROJECT_REF).is_err(),
-        "a config with the wrong reference must fail on equality"
+        "a record with the wrong reference must fail on equality"
+    );
+    let suffix = record(&format!("{PROJECT_REF}-suffix"));
+    assert!(
+        check_pull_acquisition(&suffix, PROJECT_REF).is_err(),
+        "a reference that merely extends the expected one must fail"
+    );
+    let forced = record(PROJECT_REF).replace("\"force\":false", "\"force\":true");
+    assert!(
+        check_pull_acquisition(&forced, PROJECT_REF).is_err(),
+        "a forced acquisition must fail"
     );
 
-    let malformed = format!("{CONFIG_MARKER}{{not json\n");
+    let malformed = format!("{NATIVE_MARKER}{{not json\n");
     assert!(
         check_pull_acquisition(&malformed, PROJECT_REF).is_err(),
         "malformed JSON after a marker must fail"
     );
 
-    let duplicate = format!(
-        "{CONFIG_MARKER}{{\"name\":\"agent-vm-pull\",\"image\":{{\"Oci\":{{\"reference\":\"{PROJECT_REF}\"}}}}}}\n{CONFIG_MARKER}{{\"name\":\"agent-vm-pull\",\"image\":{{\"Oci\":{{\"reference\":\"{PROJECT_REF}\"}}}}}}\n"
-    );
+    let duplicate = format!("{}\n{}\n", record(PROJECT_REF), record(PROJECT_REF));
     assert!(
         check_pull_acquisition(&duplicate, PROJECT_REF).is_err(),
-        "two dumps for one name must fail"
+        "two native acquisition records must fail"
     );
 }
 
@@ -4540,8 +4618,8 @@ fn image_precedence_at_every_cli_boundary() {
             row.name
         );
 
-        // --- pull and setup (initial acquisition) ---
-        for verb in ["pull", "setup"] {
+        // --- image refresh and setup (initial acquisition) ---
+        for verb in ACQUISITION_VERBS {
             let harness = Harness::new();
             write_image_tiers(
                 &harness,
@@ -4557,7 +4635,7 @@ fn image_precedence_at_every_cli_boundary() {
             if let Some(env) = row.env {
                 cmd.env("AGENT_VM_IMAGE_TAG", env);
             }
-            let mut argv: Vec<&str> = vec![verb];
+            let mut argv: Vec<&str> = verb.to_vec();
             if let Some(cli) = row.cli {
                 argv.push("--image");
                 argv.push(cli);
@@ -4565,23 +4643,24 @@ fn image_precedence_at_every_cli_boundary() {
             let out = Harness::run_on(cmd, &argv);
             let stderr = stderr_of(&out);
             let stdout = stdout_of(&out);
+            let verb = verb_name(verb);
             assert!(
                 !out.status.success(),
                 "{} ({verb}): the bogus image must fail, stderr:\n{stderr}",
                 row.name
             );
             if row.expected == DEFAULT_REF {
-                let safe = if verb == "pull" {
+                let safe = if verb == "image refresh" {
                     "==> the default boot image is the image this configuration boots from"
                 } else {
-                    "==> Pulling the default boot image into the microsandbox cache"
+                    "==> Acquiring the default boot image into the microsandbox image cache"
                 };
                 assert!(
                     stdout.contains(safe),
                     "{} ({verb}): default notice missing:\n{stdout}",
                     row.name
                 );
-            } else if verb == "pull" {
+            } else if verb == "image refresh" {
                 assert!(
                     stdout.contains(&format!("==> {} (from {}", row.expected, row.source)),
                     "{} ({verb}): selection notice missing:\n{stdout}",
@@ -4590,17 +4669,17 @@ fn image_precedence_at_every_cli_boundary() {
             } else {
                 assert!(
                     stdout.contains(&format!(
-                        "==> Pulling {} into the microsandbox cache",
+                        "==> Acquiring {} into the microsandbox image cache",
                         row.expected
                     )),
-                    "{} ({verb}): pull notice missing:\n{stdout}",
+                    "{} ({verb}): acquisition notice missing:\n{stdout}",
                     row.name
                 );
             }
             check_pull_acquisition(&stderr, row.expected)
                 .unwrap_or_else(|problem| panic!("{} ({verb}): {problem}\n{stderr}", row.name));
-            // setup's unreachable ref fails at its initial pull, so there must
-            // be no verification dump.
+            // setup's unreachable ref fails at its native acquisition, so there
+            // must be no verification dump.
             let configs = acquisition_configs(&stderr).expect("dumps parse");
             assert!(
                 acquisition_config(&configs, "agent-vm-setup-verify").is_err(),
@@ -4690,8 +4769,8 @@ fn image_whitespace_and_empty_values_do_not_fall_through() {
             "{present:?}: no builder calls"
         );
 
-        // pull and setup treat it the same way.
-        for verb in ["pull", "setup"] {
+        // image refresh and setup treat it the same way.
+        for verb in ACQUISITION_VERBS {
             let harness = Harness::new();
             write_image_tiers(
                 &harness,
@@ -4705,7 +4784,8 @@ fn image_whitespace_and_empty_values_do_not_fall_through() {
             let mut cmd = harness.command_with_decoys(&decoys);
             cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)
                 .env("AGENT_VM_IMAGE_TAG", present);
-            let out = Harness::run_on(cmd, &[verb]);
+            let out = Harness::run_on(cmd, verb);
+            let verb = verb_name(verb);
             let stderr = stderr_of(&out);
             assert!(
                 !out.status.success(),
@@ -4877,10 +4957,8 @@ fn doctor_tool_order(text: &str) -> Vec<String> {
 /// the fixed built-ins. Command entries start with exactly two spaces;
 /// wrapped description lines are indented further.
 fn help_tool_order(text: &str) -> Vec<String> {
-    const BUILTINS: [&str; 9] = [
+    const BUILTINS: [&str; 7] = [
         "setup",
-        "pull",
-        "upgrade",
         "msb",
         "clipboard",
         "doctor",
@@ -5104,7 +5182,10 @@ fn help_doctor_pull_setup_and_launch_agree_on_image_selection() {
     assert!(stdout_of(&tool_help).contains("tool arguments are forwarded verbatim"));
     let mut paths: Vec<(&str, Output)> = vec![
         ("--help", harness.builtin(&["--help"], &[])),
-        ("pull --help", harness.builtin(&["pull", "--help"], &[])),
+        (
+            "image refresh --help",
+            harness.builtin(&["image", "refresh", "--help"], &[]),
+        ),
         ("setup --help", harness.builtin(&["setup", "--help"], &[])),
     ];
     for (what, out) in paths.drain(..) {
@@ -5129,6 +5210,60 @@ fn help_doctor_pull_setup_and_launch_agree_on_image_selection() {
             );
         }
     }
+}
+
+/// S3: `image refresh` is a boot-free acquisition verb, so its `--image` help
+/// must describe acquisition. The flattened `boot_image::ImageArgs` help wins
+/// unless the refresh subcommand overrides it, so both help spellings are
+/// pinned here, together with the `set-default` control that keeps its own
+/// acquisition wording.
+#[test]
+fn image_refresh_help_describes_acquisition_not_booting() {
+    let harness = Harness::new();
+    for args in [
+        vec!["image", "refresh", "-h"],
+        vec!["image", "refresh", "--help"],
+        vec!["help", "image", "refresh"],
+    ] {
+        let out = harness.builtin(&args, &[]);
+        let text = stdout_of(&out);
+        assert!(
+            out.status.success(),
+            "{args:?} must exit 0:\n{text}\n{}",
+            stderr_of(&out)
+        );
+        assert!(
+            text.contains("OCI image to acquire"),
+            "{args:?} must describe acquisition:\n{text}"
+        );
+        assert!(
+            text.contains("instead of the configured selection"),
+            "{args:?} must distinguish the refresh override:\n{text}"
+        );
+        assert!(
+            !text.contains("Boot this image"),
+            "{args:?} must not describe refresh as a launch:\n{text}"
+        );
+        if args.contains(&"--help") || args[0] == "help" {
+            assert!(
+                text.contains("OCI image to acquire into the image cache"),
+                "{args:?} must use the refresh-specific long help:\n{text}"
+            );
+            assert!(
+                text.contains("Precedence: this flag (or `AGENT_VM_IMAGE_TAG`)"),
+                "{args:?} must retain the precedence text:\n{text}"
+            );
+        }
+    }
+    let set_default = stdout_of(&harness.builtin(&["image", "set-default", "--help"], &[]));
+    assert!(
+        set_default.contains("OCI image to acquire and retain for future default-image sessions"),
+        "set-default's own help must not change:\n{set_default}"
+    );
+    assert!(
+        !set_default.contains("instead of the configured selection"),
+        "set-default must not inherit refresh's override wording:\n{set_default}"
+    );
 }
 
 /// `doctor` reports the boot image but has no `--image` of its own: a launch's
@@ -5160,10 +5295,10 @@ fn doctor_does_not_accept_an_image_flag() {
 }
 
 #[test]
-fn pull_and_setup_reject_removed_composition_flags_as_usage_errors() {
-    // `pull`/`setup` have no trailing positional, so every removed composition
-    // flag is an ordinary clap usage error (exit 2) on both builtins.
-    for verb in ["pull", "setup"] {
+fn refresh_and_setup_reject_removed_composition_flags_as_usage_errors() {
+    // `image refresh`/`setup` have no trailing positional, so every removed
+    // composition flag is an ordinary clap usage error (exit 2) on both verbs.
+    for verb in ACQUISITION_VERBS {
         for argv in [
             vec!["--layer", "/tmp/x"],
             vec!["--base-image", "x"],
@@ -5171,9 +5306,10 @@ fn pull_and_setup_reject_removed_composition_flags_as_usage_errors() {
             vec!["-y"],
         ] {
             let harness = Harness::new();
-            let mut full = vec![verb];
+            let mut full = verb.to_vec();
             full.extend_from_slice(&argv);
             let out = harness.builtin(&full, &[]);
+            let verb = verb_name(verb);
             assert_eq!(
                 out.status.code(),
                 Some(2),
@@ -5276,19 +5412,20 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
         (None, Some(ENV_REF), ENV_REF),
         (None, None, DEFAULT_REF),
     ] {
-        for verb in ["pull", "setup"] {
+        for verb in ACQUISITION_VERBS {
             let harness = Harness::new();
             harness.write_user(broken);
             let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)];
             if let Some(env) = env {
                 envs.push(("AGENT_VM_IMAGE_TAG", env));
             }
-            let mut args: Vec<&str> = vec![verb];
+            let mut args: Vec<&str> = verb.to_vec();
             if let Some(cli) = cli {
                 args.push("--image");
                 args.push(cli);
             }
             let out = harness.builtin(&args, &envs);
+            let verb = verb_name(verb);
             let stderr = stderr_of(&out);
             let stdout = stdout_of(&out);
             assert!(
@@ -5305,16 +5442,16 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
     }
 
     // A dangling `tools` reference is a catalog error, but a readable `image`
-    // must survive for pull/setup/doctor.
+    // must survive for refresh/setup/doctor.
     let harness = Harness::new();
     harness.write_project(&format!(
         "image = \"{PROJECT_REF}\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n"
     ));
-    for verb in ["pull", "setup"] {
-        let out = harness.builtin(&[verb], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+    for verb in ACQUISITION_VERBS {
+        let out = harness.builtin(verb, &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
         let stderr = stderr_of(&out);
         check_pull_acquisition(&stderr, PROJECT_REF)
-            .unwrap_or_else(|problem| panic!("{verb}: {problem}\n{stderr}"));
+            .unwrap_or_else(|problem| panic!("{}: {problem}\n{stderr}", verb_name(verb)));
     }
     let doctor =
         stdout_of(&harness.builtin(&["doctor"], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]));
@@ -5522,11 +5659,11 @@ fn former_layer_directories_are_inert() {
     );
 }
 
-/// Run one `pull`/`setup` precedence row and return its stderr, or an error if
-/// the actual acquisition config's reference is not the selected one. Used by
-/// the two independent mutation targets below (they run separately so a pull
+/// Run one acquisition precedence row and return its stderr, or an error if the
+/// actual native acquisition's reference is not the selected one. Used by the
+/// two independent mutation targets below (they run separately so a refresh
 /// failure cannot hide a setup failure).
-fn run_builtin_acquisition(row: &Precedence, verb: &str) -> Result<String, String> {
+fn run_builtin_acquisition(row: &Precedence, verb: &[&str]) -> Result<String, String> {
     let harness = Harness::new();
     write_image_tiers(
         &harness,
@@ -5542,11 +5679,12 @@ fn run_builtin_acquisition(row: &Precedence, verb: &str) -> Result<String, Strin
     if let Some(env) = row.env {
         cmd.env("AGENT_VM_IMAGE_TAG", env);
     }
-    let mut argv = vec![verb];
+    let mut argv = verb.to_vec();
     if let Some(cli) = row.cli {
         argv.push("--image");
         argv.push(cli);
     }
+    let verb = verb_name(verb);
     let out = Harness::run_on(cmd, &argv);
     let stderr = stderr_of(&out);
     if out.status.success() {
@@ -5561,17 +5699,17 @@ fn run_builtin_acquisition(row: &Precedence, verb: &str) -> Result<String, Strin
 }
 
 #[test]
-fn pull_uses_the_actual_selected_reference() {
+fn refresh_uses_the_actual_selected_reference() {
     for row in precedence_rows() {
-        run_builtin_acquisition(&row, "pull")
-            .unwrap_or_else(|problem| panic!("{} (pull): {problem}", row.name));
+        run_builtin_acquisition(&row, &["image", "refresh"])
+            .unwrap_or_else(|problem| panic!("{} (image refresh): {problem}", row.name));
     }
 }
 
 #[test]
 fn setup_pull_uses_the_actual_selected_reference() {
     for row in precedence_rows() {
-        run_builtin_acquisition(&row, "setup")
+        run_builtin_acquisition(&row, &["setup"])
             .unwrap_or_else(|problem| panic!("{} (setup): {problem}", row.name));
     }
 }
@@ -5584,11 +5722,17 @@ fn setup_pull_uses_the_actual_selected_reference() {
 #[test]
 fn a_non_unicode_image_override_fails_every_verb_that_reads_it() {
     use std::os::unix::ffi::OsStrExt;
-    for verb in ["doctor", "pull", "setup", "shell"] {
+    for verb in [
+        &["doctor"][..],
+        &["image", "refresh"][..],
+        &["setup"][..],
+        &["shell"][..],
+    ] {
         let harness = Harness::new();
         let mut cmd = harness.base_command();
         cmd.env("AGENT_VM_IMAGE_TAG", std::ffi::OsStr::from_bytes(b"\xff"));
-        let out = Harness::run_on(cmd, &[verb]);
+        let out = Harness::run_on(cmd, verb);
+        let verb = verb_name(verb);
         let stdout = stdout_of(&out);
         let stderr = stderr_of(&out);
         assert_ne!(
@@ -5658,6 +5802,185 @@ impl Harness {
     }
 }
 
+/// R13: setup's documented OCI-only acquisition policy is explicit. A CLI/env
+/// local rootfs or disk target is refused with the local-launch advice — with
+/// and without `--no-verify` — before the native acquisition, so it produces no
+/// registry request, verification guest, marker or retained default.
+///
+/// Setup may already have run its runtime admission by then; only `image
+/// refresh` promises pre-prologue rejection.
+#[test]
+fn setup_refuses_local_cli_env_targets_either_way() {
+    for no_verify in [false, true] {
+        for (source, cli, env) in [
+            ("cli", Some("../rootfs"), None),
+            ("env", None, Some("/private/tmp/disk.img")),
+        ] {
+            let harness = Harness::new();
+            let mut argv = vec!["setup"];
+            let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)];
+            let target;
+            if let Some(cli) = cli {
+                argv.push("--image");
+                target = cli;
+                argv.push(target);
+            } else {
+                target = env.unwrap();
+                envs.push(("AGENT_VM_IMAGE_TAG", target));
+            }
+            if no_verify {
+                argv.push("--no-verify");
+            }
+            let out = harness.builtin(&argv, &envs);
+            let stderr = stderr_of(&out);
+            let context = format!("{source} (no_verify: {no_verify})");
+            assert!(!out.status.success(), "{context}: must fail:\n{stderr}");
+            assert!(
+                stderr.contains("agent-vm --image PATH <tool>"),
+                "{context}: the fixed local-launch advice must be offered:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains(target),
+                "{context}: the rejected local target must not be echoed:\n{stderr}"
+            );
+            // No acquisition, no verification sandbox, no retained default.
+            assert!(
+                !stderr.contains(NATIVE_MARKER),
+                "{context}: a rejected target must not acquire:\n{stderr}"
+            );
+            assert!(
+                acquisition_configs(&stderr).unwrap().is_empty(),
+                "{context}: no sandbox config may be built:\n{stderr}"
+            );
+            harness.assert_no_selection(&context);
+        }
+    }
+}
+
+/// S5: malformed OCI references and local paths are different input classes.
+/// Every acquisition verb refuses each from input alone with its own fixed,
+/// value-free wording: local-launch advice only for a local path, and “not a
+/// valid OCI image reference” for malformed reference text (never the rejected
+/// value). No acquisition record, registry marker, verification guest or
+/// retained default may be produced by either class.
+#[test]
+fn malformed_oci_references_are_refused_value_free_while_local_paths_keep_their_advice() {
+    const MALFORMED: [&str; 3] = ["Foo/Bar:tag", "repo:bad tag", "repo@sha256:short"];
+    for raw in MALFORMED {
+        // `image refresh`, CLI and env overrides.
+        for (source, argv, envs) in [
+            (
+                "refresh cli",
+                vec!["image", "refresh", "--image", raw],
+                vec![],
+            ),
+            (
+                "refresh env",
+                vec!["image", "refresh"],
+                vec![("AGENT_VM_IMAGE_TAG", raw)],
+            ),
+        ] {
+            let harness = Harness::new();
+            let out = harness.builtin(&argv, &envs);
+            let stderr = stderr_of(&out);
+            assert!(!out.status.success(), "{source}: {stderr}");
+            assert!(
+                stderr.contains("`agent-vm image refresh` needs a valid OCI image reference"),
+                "{source} {raw:?}: the invalid-reference wording must be used:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains(raw),
+                "{source}: the rejected value must not be echoed:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("agent-vm --image PATH <tool>"),
+                "{source}: a malformed reference must not get local-launch advice:\n{stderr}"
+            );
+            assert!(!stderr.contains(NATIVE_MARKER), "{source}: {stderr}");
+            assert!(
+                acquisition_configs(&stderr).unwrap().is_empty(),
+                "{source}: no acquisition may be built:\n{stderr}"
+            );
+            assert!(!harness.state_root.join("pulled-digests").exists());
+            harness.assert_no_selection(source);
+        }
+        // `setup`, with and without `--no-verify`.
+        for no_verify in [false, true] {
+            let harness = Harness::new();
+            let mut argv = vec!["setup", "--image", raw];
+            if no_verify {
+                argv.push("--no-verify");
+            }
+            let out = harness.builtin(&argv, &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+            let stderr = stderr_of(&out);
+            let context = format!("setup {raw:?} (no_verify: {no_verify})");
+            assert!(!out.status.success(), "{context}: {stderr}");
+            assert!(
+                stderr.contains("`agent-vm setup` needs a valid OCI image reference"),
+                "{context}: the invalid-reference wording must be used:\n{stderr}"
+            );
+            assert!(!stderr.contains(raw), "{context}: {stderr}");
+            assert!(
+                !stderr.contains("agent-vm --image PATH <tool>"),
+                "{context}: a malformed reference must not get local-launch advice:\n{stderr}"
+            );
+            assert!(!stderr.contains(NATIVE_MARKER), "{context}: {stderr}");
+            assert!(
+                acquisition_configs(&stderr).unwrap().is_empty(),
+                "{context}: no verification guest may be built:\n{stderr}"
+            );
+            assert!(!harness.state_root.join("pulled-digests").exists());
+            harness.assert_no_selection(&context);
+        }
+        // `image set-default` uses its own clap value parser, so the refusal is
+        // a usage error and the raw argv value must not be echoed by clap.
+        let harness = Harness::new();
+        let out = harness.builtin(&["image", "set-default", "--image", raw], &[]);
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(2), "set-default {raw:?}: {stderr}");
+        assert!(
+            stderr.contains("set-default needs a valid OCI image reference"),
+            "set-default {raw:?}: the invalid-reference wording must be used:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(raw),
+            "set-default: the rejected value must not be echoed:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("agent-vm --image PATH <tool>"),
+            "set-default: a malformed reference must not get local-launch advice:\n{stderr}"
+        );
+        harness.assert_no_selection("set-default invalid");
+    }
+
+    // Local-path controls: the same verbs keep the local-launch advice and do
+    // not claim the text was a malformed reference.
+    let harness = Harness::new();
+    let out = harness.builtin(&["image", "refresh", "--image", "../rootfs"], &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("agent-vm --image PATH <tool>"), "{stderr}");
+    assert!(
+        !stderr.contains("needs a valid OCI image reference"),
+        "{stderr}"
+    );
+    harness.assert_no_selection("refresh local control");
+    let out = harness.builtin(&["image", "set-default", "--image", "/path"], &[]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("agent-vm --image PATH <tool>"), "{stderr}");
+    assert!(
+        !stderr.contains("needs a valid OCI image reference"),
+        "{stderr}"
+    );
+    harness.assert_no_selection("set-default local control");
+    assert!(!harness.saw_capability_probe());
+    assert!(
+        harness.msb_log().lines().all(|line| line == "--version"),
+        "{}",
+        harness.msb_log()
+    );
+}
+
 #[test]
 fn diagnostics_and_help_never_create_a_selection() {
     let harness = Harness::new();
@@ -5683,7 +6006,10 @@ fn diagnostics_and_help_never_create_a_selection() {
     for args in [
         vec!["--help"],
         vec!["help", "shell"],
-        vec!["pull", "--help"],
+        vec!["image", "refresh", "--help"],
+        vec!["image", "set-default", "--help"],
+        vec!["help", "image", "refresh"],
+        vec!["help", "image", "set-default"],
     ] {
         let out = harness.builtin(&args, &envs);
         assert!(out.status.success(), "{args:?} must exit 0");
@@ -5705,7 +6031,7 @@ fn a_failed_initial_acquisition_leaves_the_selection_absent() {
     // record, so a later compatible recommendation can still rescue the user.
     for (verb, argv) in [
         ("probe", vec!["probe"]),
-        ("pull", vec!["pull"]),
+        ("image refresh", vec!["image", "refresh"]),
         ("setup", vec!["setup"]),
     ] {
         let harness = Harness::new();
@@ -5992,10 +6318,10 @@ fn a_default_tier_invocation_suppresses_dependency_image_tracing() {
     let mut cmd = harness.base_command();
     cmd.env("RUST_LOG", "trace")
         .env("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B);
-    let out = Harness::run_on(cmd, &["pull"]);
+    let out = Harness::run_on(cmd, &["image", "refresh"]);
     assert!(
         !out.status.success(),
-        "the bogus retained ref must fail the pull"
+        "the bogus retained ref must fail the refresh"
     );
     let combined = format!("{}{}", stdout_of(&out), stderr_of(&out));
     assert!(
@@ -6018,7 +6344,7 @@ fn a_default_tier_invocation_suppresses_dependency_image_tracing() {
     let mut cmd = explicit.base_command();
     cmd.env("RUST_LOG", "trace")
         .env("AGENT_VM_IMAGE_TAG", "localhost:1/cli-explicit:latest");
-    let out = Harness::run_on(cmd, &["pull"]);
+    let out = Harness::run_on(cmd, &["image", "refresh"]);
     assert!(
         !out.status.success(),
         "the explicit bogus ref must fail too"
@@ -6099,25 +6425,26 @@ fn a_default_tier_reference_is_redacted_across_output() {
     );
     assert_eq!(harness.selection_bytes().unwrap(), before);
 
-    // `pull` writes its selection notice to stdout and the dump/error to stderr.
-    let pull = harness.builtin(
-        &["pull"],
+    // `image refresh` writes its selection notice to stdout and the dump/error
+    // to stderr.
+    let refresh = harness.builtin(
+        &["image", "refresh"],
         &[("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
     );
-    assert!(!pull.status.success());
-    let combined = format!("{}{}", stdout_of(&pull), stderr_of(&pull));
+    assert!(!refresh.status.success());
+    let combined = format!("{}{}", stdout_of(&refresh), stderr_of(&refresh));
     assert!(!combined.contains("agent-vm image import") && !combined.contains("hint:"));
     assert!(
         combined.contains("the default boot image is the image this configuration boots from"),
-        "pull must name the default safely:\n{combined}"
+        "refresh must name the default safely:\n{combined}"
     );
     assert!(
         combined.contains(REDACTED_DEFAULT_MARKER),
-        "pull's display copy must redact the reference:\n{combined}"
+        "refresh's display copy must redact the reference:\n{combined}"
     );
     assert!(
         !combined.contains(SENSITIVE) && !combined.contains(RECOMMENDATION_B),
-        "pull leaked a default-tier reference:\n{combined}"
+        "refresh leaked a default-tier reference:\n{combined}"
     );
 
     // An *uninitialized* host (recommendation only) is redacted too.
@@ -7838,6 +8165,45 @@ fn an_env_source_with_sentinel_false_fails_closed_on_unreadable_image_metadata_w
     assert!(!out.status.success());
     assert!(rendered.contains(IMAGE_METADATA_REFUSAL), "{rendered}");
     assert!(!rendered.contains(canary));
+    // Control: an OCI target keeps the runnable refresh suggestion.
+    assert!(
+        rendered.contains(&format!("agent-vm image refresh --image {BOGUS_IMAGE}")),
+        "the OCI control must still suggest refresh: {rendered}"
+    );
+
+    // S4: `image refresh` acquires OCI references only, so recommending it for
+    // a local rootfs/disk launch names a command that always refuses the
+    // user's own image. The refusal and the `sentinelEnv: true` alternative
+    // stay; the refresh suggestion does not. Both selection sources are pinned.
+    for (source, argv, envs) in [
+        ("cli", vec!["--image", "../rootfs"], vec![]),
+        ("env", vec![], vec![("AGENT_VM_IMAGE_TAG", "../rootfs")]),
+    ] {
+        let out = h.launch_argv("t", &argv, &envs);
+        let rendered = rendered_output(&out);
+        assert!(!out.status.success(), "{source}: must fail closed");
+        assert!(
+            rendered.contains(IMAGE_METADATA_REFUSAL),
+            "{source}: {rendered}"
+        );
+        assert!(
+            rendered.contains("Alternatively declare") && rendered.contains("`sentinelEnv: true`"),
+            "{source}: the alternative must be offered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("agent-vm image refresh"),
+            "{source}: a local launch must not recommend refresh: {rendered}"
+        );
+        assert!(!rendered.contains(canary), "{source}: {rendered}");
+        // No VM: no capability probe and no launch invocation (the fake msb
+        // still answers its version probe).
+        assert!(!h.saw_capability_probe(), "{source}");
+        assert!(
+            h.msb_log().lines().all(|line| line == "--version"),
+            "{source}: no VM may be launched: {}",
+            h.msb_log()
+        );
+    }
 }
 
 fn assert_unset_stage(required: bool, extra: &[&str], envs: &[(&str, &str)]) {
@@ -8053,7 +8419,8 @@ fn a_launch_option_before_a_builtin_is_a_usage_error() {
     let harness = Harness::new();
     for (argv, option) in [
         (vec!["--mount", "/x", "doctor"], "--mount"),
-        (vec!["--image", CLI_REF, "pull"], "--image"),
+        (vec!["--image", CLI_REF, "image", "refresh"], "--image"),
+        (vec!["--image", CLI_REF, "setup"], "--image"),
     ] {
         let out = harness.builtin(&argv, &[]);
         assert_eq!(out.status.code(), Some(2));
@@ -8134,11 +8501,14 @@ fn a_non_ascii_tag_hint_is_copy_pasteable() {
 }
 
 #[test]
-fn pull_and_setup_give_the_same_hint() {
+fn refresh_and_setup_give_the_same_hint() {
     let harness = Harness::new();
     harness.write_project(PROBE_TOOL);
-    for verb in ["pull", "setup"] {
-        let out = harness.builtin(&[verb, "--image", CLI_REF], &[]);
+    for verb in ACQUISITION_VERBS {
+        let mut argv = verb.to_vec();
+        argv.extend_from_slice(&["--image", CLI_REF]);
+        let out = harness.builtin(&argv, &[]);
+        let verb = verb_name(verb);
         let stderr = stderr_of(&out);
         assert!(!out.status.success(), "{stderr}");
         // The registry chain stays beneath the hint: the two must not trade
@@ -8167,10 +8537,13 @@ fn a_digest_pinned_registry_miss_has_no_hint() {
     assert!(!out.status.success());
     assert!(stderr.contains("registry error"), "{stderr}");
     assert!(!stderr.contains("agent-vm image import"), "{stderr}");
-    // The same suppression at the shared pull/setup call site (`pull.rs`), not
-    // only at launch: a digest there is equally not an import target.
-    for verb in ["pull", "setup"] {
-        let out = harness.builtin(&[verb, "--image", &raw], &[]);
+    // The same suppression at the shared refresh/setup call site (`pull.rs`),
+    // not only at launch: a digest there is equally not an import target.
+    for verb in ACQUISITION_VERBS {
+        let mut argv = verb.to_vec();
+        argv.extend_from_slice(&["--image", &raw]);
+        let out = harness.builtin(&argv, &[]);
+        let verb = verb_name(verb);
         let stderr = stderr_of(&out);
         assert!(!out.status.success(), "{verb}: {stderr}");
         assert!(stderr.contains("registry error"), "{verb}: {stderr}");

@@ -5,13 +5,13 @@
 //! a poisoned lock is state to reuse, not a reason to fail the process: every
 //! lock below recovers with `PoisonError::into_inner`.
 #![allow(dead_code)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::image_archive::{self, ArchiveSpec, Written};
 
@@ -98,6 +98,17 @@ struct Shared {
     stall: Arc<BlobStall>,
     basic_challenge: Arc<AtomicBool>,
     panic_next: Arc<AtomicBool>,
+    /// Exact manifest paths answered with `401` instead of their routed body.
+    /// The Basic challenge above only refuses `/v2/`, which is not enough to
+    /// model a registry that denies one already-named manifest.
+    denied_manifests: Arc<Mutex<BTreeSet<String>>>,
+    /// `(path, status)` for every denied request, in order.
+    denied_requests: Arc<Mutex<Vec<(String, u16)>>>,
+    /// Connections the accept loop handed to a handler thread. Teardown tests
+    /// wait on this instead of sleeping: a sleep only *hopes* the accept loop
+    /// has taken the connection before `Drop` sets `stop`, which makes the
+    /// join unobservable when the accept loop is slow to be scheduled.
+    handlers_started: Arc<AtomicUsize>,
 }
 
 pub struct Server {
@@ -121,21 +132,93 @@ impl Server {
             stall: Arc::new((Mutex::new(None), Condvar::new())),
             basic_challenge: Arc::new(AtomicBool::new(false)),
             panic_next: Arc::new(AtomicBool::new(false)),
+            denied_manifests: Arc::new(Mutex::new(BTreeSet::new())),
+            denied_requests: Arc::new(Mutex::new(Vec::new())),
+            handlers_started: Arc::new(AtomicUsize::new(0)),
         };
         let worker_shared = shared.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let task = std::thread::spawn(move || {
-            while let Ok((mut stream, _)) = listener.accept() {
+            // Handles of the live connection workers. They are joined by this
+            // accept worker before it exits, so a handler can neither outlive
+            // `Server::drop` nor record an error after drop has read the
+            // oracle. Each handler's first request line is bounded by
+            // `FIRST_LINE_TIMEOUT` (60s) and every later header, body or stall
+            // read by `IDLE_TIMEOUT` (10s), and `release_blob` wakes a waiting
+            // handler, so the join is bounded.
+            let mut handlers: Vec<JoinHandle<()>> = Vec::new();
+            let mut consecutive_transient = 0u32;
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => {
+                        consecutive_transient = 0;
+                        stream
+                    }
+                    // A transient accept failure means one connection was lost.
+                    // Record it with the OS error and keep accepting rather than
+                    // silently exiting the loop: a dead accept worker makes
+                    // every later request fail with a bare reset, which hides
+                    // the actual cause from the test's diagnostics.
+                    Err(error) => {
+                        record_error(
+                            &worker_shared.errors,
+                            format!("registry accept failed: {error:?}"),
+                        );
+                        // The transient retry below must not outlive a stop. If
+                        // teardown's own wake connection is the one that fails,
+                        // `Drop` is already blocked in `join` and no further
+                        // connection is coming, so retrying would hang. The
+                        // error stays recorded, so `Drop` still fails the test.
+                        if worker_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        match error.kind() {
+                            std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                                if consecutive_transient < 64 =>
+                            {
+                                consecutive_transient += 1;
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                };
                 if worker_stop.load(Ordering::SeqCst) {
                     break;
                 }
-                // Keep the accept loop alive across a handler panic: the panic
-                // is recorded, later requests are still served, and the test
-                // fails on the recorded error instead of hanging.
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_connection(&mut stream, &worker_shared);
-                })) {
+                // One thread per connection. A client that keeps a connection
+                // alive (the native client pools them inside this process) must
+                // not starve the accept loop: the launch update probe talks to
+                // the same server from the test process itself, after a native
+                // cache read has left such a connection open.
+                let connection_shared = worker_shared.clone();
+                handlers.push(std::thread::spawn(move || {
+                    connection_shared
+                        .handlers_started
+                        .fetch_add(1, Ordering::SeqCst);
+                    // Keep the accept loop alive across a handler panic: the panic
+                    // is recorded, later requests are still served, and the test
+                    // fails on the recorded error instead of hanging.
+                    if let Err(panic) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_connection(&mut stream, &connection_shared);
+                        }))
+                    {
+                        record_error(
+                            &connection_shared.errors,
+                            format!("registry worker panicked: {}", panic_message(panic)),
+                        );
+                    }
+                }));
+            }
+            for handler in handlers {
+                // A handler that escaped its own catch is still reported, never
+                // re-panicked: this join runs inside the accept worker, whose
+                // result `Drop` joins during its own potentially unwinding drop.
+                if let Err(panic) = handler.join() {
                     record_error(
                         &worker_shared.errors,
                         format!("registry worker panicked: {}", panic_message(panic)),
@@ -153,6 +236,40 @@ impl Server {
     }
     pub fn require_basic_auth(&self) {
         self.shared.basic_challenge.store(true, Ordering::SeqCst);
+    }
+    /// Deny exactly `path` with `401 Unauthorized` and a Basic challenge,
+    /// instead of serving its routed body. The Basic challenge only covers
+    /// `/v2/`, so this is how a test models a registry that refuses one
+    /// *already-routed* manifest (the same key a cached acquisition now
+    /// re-resolves). It changes no other route.
+    pub fn deny_manifest(&self, path: &str) {
+        self.shared
+            .denied_manifests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_owned());
+    }
+    /// `(path, status)` for every request answered by [`Self::deny_manifest`].
+    pub fn denied_requests(&self) -> Vec<(String, u16)> {
+        self.shared
+            .denied_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+    /// Block until the accept loop has handed a connection to a handler thread.
+    /// Teardown tests must not race acceptance against `Drop`: with a sleep,
+    /// `Drop` can set `stop` before the accept loop takes the parked connection,
+    /// so the loop breaks without spawning the handler the test observes.
+    pub fn wait_for_handler(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.shared.handlers_started.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the fixture accepted no connection within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
     /// Arm a stall on `path`. The returned receiver fires once the worker has
     /// written half of the bytes the next `path` request would serve. Arming a
@@ -415,25 +532,86 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// Idle bound for a handler once the request line has arrived: header and body
+/// reads, and each deliberately stalled response, must complete within this.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound for the first request line only. The client's kernel-side handshake
+/// completes before `connect` returns to its caller, so a thread stalled inside
+/// `connect` (observed: 17s on the first outbound connection of a freshly
+/// linked binary on this host) would otherwise be mistaken for a peer that
+/// connects and sends nothing.
+const FIRST_LINE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Serve exactly one request, then close. A bad request is answered with a
 /// protocol response (`416`/`404`) or a recorded diagnostic; a handler panic is
 /// caught and recorded by the caller, which keeps accepting so one bad request
 /// cannot stop the worker.
 fn handle_connection(stream: &mut TcpStream, shared: &Shared) {
-    let Ok(_) = stream.set_read_timeout(Some(Duration::from_secs(10))) else {
+    // Every early return below would otherwise answer the client with an empty
+    // response and *no* recorded error, which is indistinguishable from a
+    // client-side send/close race (a bare "no header terminator" panic). Each
+    // bail-out therefore names its own stage.
+    // The *first* request line gets a generous bound; everything after it is
+    // bounded at `IDLE_TIMEOUT`. The kernel completes the handshake before
+    // `connect` returns to the client, so the accepted socket can exist while
+    // the client thread is still stalled in `connect` — on this host, the first
+    // outbound connection of a freshly linked test binary has been observed to
+    // block for 17s. Enforcing a 10s send deadline on the request line turns
+    // that host stall into an empty response that looks like a protocol defect.
+    // A client that never sends is still recorded (and still fails its test),
+    // just after `FIRST_LINE_TIMEOUT`.
+    if stream.set_read_timeout(Some(FIRST_LINE_TIMEOUT)).is_err() {
+        record_error(
+            &shared.errors,
+            "fixture handler could not set the stream read timeout".into(),
+        );
         return;
-    };
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    }
+    let _ = stream.set_write_timeout(Some(IDLE_TIMEOUT));
     let Ok(reader_stream) = stream.try_clone() else {
+        record_error(
+            &shared.errors,
+            "fixture handler could not clone its stream".into(),
+        );
         return;
     };
     let mut reader = BufReader::new(reader_stream);
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
+    let waiting = Instant::now();
+    if let Err(error) = reader.read_line(&mut line) {
+        record_error(
+            &shared.errors,
+            format!(
+                "fixture handler waited {:?} for a request line and got no bytes: {error:?}",
+                waiting.elapsed()
+            ),
+        );
+        return;
+    }
+    // The request arrived, so the idle bound applies from here on: headers,
+    // bodies and the deliberate stalls are all 10s-bounded.
+    if stream.set_read_timeout(Some(IDLE_TIMEOUT)).is_err() {
+        record_error(
+            &shared.errors,
+            "fixture handler could not shorten the stream read timeout".into(),
+        );
         return;
     }
     let words: Vec<_> = line.split_whitespace().collect();
     if words.len() < 2 {
+        // EOF before any byte is a *readiness probe*, not a malformed request:
+        // `default_image_upgrade::warm_loopback` (and the calibration in
+        // `image_show::s17`) open and immediately drop a real connection to
+        // observe that the listener accepts. A non-empty but unparseable line
+        // stays an error.
+        if line.is_empty() {
+            return;
+        }
+        record_error(
+            &shared.errors,
+            format!("fixture handler received a malformed request line: {line:?}"),
+        );
         return;
     }
     let (method, path) = (words[0].to_owned(), words[1].to_owned());
@@ -476,6 +654,23 @@ fn handle_connection(stream: &mut TcpStream, shared: &Shared) {
             .get(&path)
             .cloned()
     };
+    if shared
+        .denied_manifests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&path)
+    {
+        shared
+            .denied_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.clone(), 401));
+        let _ = write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        return;
+    }
     if path == "/v2/" && shared.basic_challenge.load(Ordering::SeqCst) {
         let _ = write!(
             stream,

@@ -13,6 +13,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use microsandbox_image::Platform;
 
 /// What we learned about the image relative to the registry.
 pub enum UpdateState {
@@ -103,18 +104,18 @@ async fn remote_manifest_digest(
     // platform manifest is identical (e.g. a `docker tag` + push that
     // reuses all layers). So:
     //
-    // 1. GET the index, find the linux/amd64 entry.
+    // 1. GET the index, find the host-Linux child `image refresh` acquires.
     // 2. Return that entry's digest.
     //
-    // If the tag points directly at a single-arch manifest (no index),
+    // If the reference points directly at a single-arch manifest (no index),
     // step 1 fails to parse as an index and we fall back to the digest
     // header from the GET response itself.
     let scheme = if parsed.is_insecure { "http" } else { "https" };
     let url = format!(
-        "{scheme}://{host}/v2/{name}/manifests/{tag}",
+        "{scheme}://{host}/v2/{name}/manifests/{selector}",
         host = parsed.host,
         name = parsed.name,
-        tag = parsed.tag,
+        selector = parsed.selector,
     );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -132,30 +133,80 @@ async fn remote_manifest_digest(
         Ok(v) => v,
         Err(_) => return Ok(direct_digest),
     };
-    // Multi-arch index: walk manifests[] looking for linux/amd64.
+    // Multi-arch index: pick the same child native acquisition would resolve on
+    // this host. The marker records that host child, so comparing it to an
+    // amd64-only entry would show a permanent false "update available" banner on
+    // every other architecture.
     if let Some(arr) = body.get("manifests").and_then(|v| v.as_array()) {
-        for entry in arr {
-            let os = entry
-                .pointer("/platform/os")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let arch = entry
-                .pointer("/platform/architecture")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            // x86_64-host pin; the rewrite is x86_64-only in v1.
-            if os == "linux"
-                && arch == "amd64"
-                && let Some(d) = entry.get("digest").and_then(|v| v.as_str())
-            {
-                return Ok(Some(d.to_string()));
-            }
-        }
-        // No matching platform entry → can't compare.
-        return Ok(None);
+        return Ok(index_manifest_digest(arr, &Platform::host_linux()));
     }
     // Single-arch manifest: the digest header is the right one.
     Ok(direct_digest)
+}
+
+/// Select the index descriptor native acquisition resolves for `platform`.
+///
+/// This mirrors the oci-client resolver `microsandbox`'s `RegistryBuilder`
+/// installs (`resolve_platform_digest`), which — not the secondary
+/// `parse_and_resolve_manifest` path — is what an actual pull uses:
+///
+/// * skip attestation descriptors and descriptors with no platform;
+/// * require the target's OS and architecture;
+/// * with no target variant take the **first** eligible descriptor;
+/// * with a target variant take the **first exact** variant, otherwise the
+///   **first** same-OS/arch fallback.
+///
+/// It is deliberately not a "keep looking and take the last match" search: the
+/// banner baseline must be the digest the acquisition actually landed. A
+/// foreign child is never selected merely because it appears first, and `None`
+/// means there is no comparable descriptor at all.
+fn index_manifest_digest(entries: &[serde_json::Value], platform: &Platform) -> Option<String> {
+    let target_os = platform.os.to_string();
+    let target_arch = platform.arch.to_string();
+    let mut fallback: Option<String> = None;
+    for entry in entries {
+        if entry
+            .get("mediaType")
+            .and_then(|value| value.as_str())
+            .is_some_and(|media_type| media_type.contains("attestation"))
+        {
+            continue;
+        }
+        let Some(entry_platform) = entry.get("platform") else {
+            continue;
+        };
+        let os = entry_platform
+            .get("os")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let arch = entry_platform
+            .get("architecture")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if os != target_os || arch != target_arch {
+            continue;
+        }
+        let Some(digest) = entry.get("digest").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        match platform.variant.as_deref() {
+            Some(target_variant)
+                if entry_platform
+                    .get("variant")
+                    .and_then(|value| value.as_str())
+                    == Some(target_variant) =>
+            {
+                return Some(digest.to_string());
+            }
+            Some(_) => {
+                if fallback.is_none() {
+                    fallback = Some(digest.to_string());
+                }
+            }
+            None => return Some(digest.to_string()),
+        }
+    }
+    fallback
 }
 
 /// The Accept set every manifest GET sends — both the v2 single-arch
@@ -307,21 +358,35 @@ async fn fetch_bearer_token(
 struct ParsedRef {
     host: String,
     name: String,
-    tag: String,
+    /// The manifests-endpoint selector: a tag, or a digest for an immutable
+    /// reference.
+    selector: String,
     is_insecure: bool,
 }
 
 impl ParsedRef {
     fn parse(image_ref: &str) -> Option<Self> {
-        // tag
-        let (without_tag, tag) = match image_ref.rsplit_once(':') {
-            // The colon in `localhost:5000/...` is the port, not a tag.
-            // A real tag colon never has a `/` after it.
-            Some((before, after)) if !after.contains('/') => (before, after.to_string()),
-            _ => (image_ref, "latest".to_string()),
+        // A digest reference (`repo@sha256:…`) selects that manifest by digest,
+        // which the manifests endpoint accepts where it accepts a tag. Whatever
+        // precedes `@` is still ordinary reference text.
+        let (reference, selector) = match image_ref.rsplit_once('@') {
+            Some((reference, digest)) if !digest.is_empty() && !digest.contains('/') => {
+                (reference, digest.to_string())
+            }
+            _ => match image_ref.rsplit_once(':') {
+                // The colon in `localhost:5000/...` is the port, not a tag.
+                // A real tag colon never has a `/` after it.
+                Some((before, after)) if !after.contains('/') => (before, after.to_string()),
+                _ => (image_ref, "latest".to_string()),
+            },
         };
 
-        // host / name
+        // host / name; text before a digest may still carry a tag to strip. The
+        // same rule keeps a `host:port` colon from being read as a tag.
+        let without_tag = match reference.rsplit_once(':') {
+            Some((before, after)) if !after.contains('/') => before,
+            _ => reference,
+        };
         let (host, name) = match without_tag.split_once('/') {
             Some((h, n)) if h.contains('.') || h.contains(':') || h == "localhost" => {
                 (h.to_string(), n.to_string())
@@ -334,7 +399,7 @@ impl ParsedRef {
         Some(Self {
             host,
             name,
-            tag,
+            selector,
             is_insecure,
         })
     }
@@ -415,7 +480,7 @@ mod tests {
         let p = ParsedRef::parse("localhost:5000/standard:test").unwrap();
         assert_eq!(p.host, "localhost:5000");
         assert_eq!(p.name, "standard");
-        assert_eq!(p.tag, "test");
+        assert_eq!(p.selector, "test");
         assert!(p.is_insecure);
     }
 
@@ -424,7 +489,7 @@ mod tests {
         let p = ParsedRef::parse("alpine").unwrap();
         assert_eq!(p.host, "registry-1.docker.io");
         assert_eq!(p.name, "alpine");
-        assert_eq!(p.tag, "latest");
+        assert_eq!(p.selector, "latest");
         assert!(!p.is_insecure);
     }
 
@@ -433,8 +498,196 @@ mod tests {
         let p = ParsedRef::parse("ghcr.io/gregwebs/agent-vm-standard:v0.1.3").unwrap();
         assert_eq!(p.host, "ghcr.io");
         assert_eq!(p.name, "gregwebs/agent-vm-standard");
-        assert_eq!(p.tag, "v0.1.3");
+        assert_eq!(p.selector, "v0.1.3");
         assert!(!p.is_insecure);
+    }
+
+    /// The immutable-index consumer check: a digest reference uses the digest as
+    /// the manifests selector, with host/repository parsed from the text before
+    /// `@` (and an optional tag there stripped).
+    #[test]
+    fn parses_digest_references_as_manifest_selectors() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for (input, expected_name, expected_host) in [
+            (
+                format!("localhost:5000/standard@{digest}"),
+                "standard",
+                "localhost:5000",
+            ),
+            (
+                format!("localhost:5000/standard:tag@{digest}"),
+                "standard",
+                "localhost:5000",
+            ),
+            (
+                format!("ghcr.io/owner/name@{digest}"),
+                "owner/name",
+                "ghcr.io",
+            ),
+            (format!("alpine@{digest}"), "alpine", "registry-1.docker.io"),
+        ] {
+            let p = ParsedRef::parse(&input).unwrap();
+            assert_eq!(p.selector, digest, "{input}");
+            assert_eq!(p.name, expected_name, "{input}");
+            assert_eq!(p.host, expected_host, "{input}");
+        }
+    }
+
+    fn descriptor(os: &str, arch: &str, variant: Option<&str>, digest: &str) -> serde_json::Value {
+        let mut platform = serde_json::json!({"os": os, "architecture": arch});
+        if let Some(variant) = variant {
+            platform["variant"] = variant.into();
+        }
+        serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": digest,
+            "size": 1,
+            "platform": platform,
+        })
+    }
+
+    fn digests(entries: &[serde_json::Value], platform: &Platform) -> Option<String> {
+        index_manifest_digest(entries, platform)
+    }
+
+    /// The pure selector must be host-architecture correct irrespective of the
+    /// machine running the test, and must match native acquisition's
+    /// first-eligible rule — not a last-match search.
+    #[test]
+    fn index_selection_is_host_platform_first_eligible() {
+        for arch in ["arm64", "amd64"] {
+            let host = Platform::new("linux", arch);
+            let other = if arch == "arm64" { "amd64" } else { "arm64" };
+            // Foreign before host: the foreign child must not be selected.
+            assert_eq!(
+                digests(
+                    &[
+                        descriptor("linux", other, None, "sha256:foreign"),
+                        descriptor("linux", arch, None, "sha256:host"),
+                    ],
+                    &host
+                )
+                .as_deref(),
+                Some("sha256:host")
+            );
+            // Host before foreign.
+            assert_eq!(
+                digests(
+                    &[
+                        descriptor("linux", arch, None, "sha256:host"),
+                        descriptor("linux", other, None, "sha256:foreign"),
+                    ],
+                    &host
+                )
+                .as_deref(),
+                Some("sha256:host")
+            );
+            // Wrong OS and no matching architecture: nothing comparable.
+            assert_eq!(
+                digests(&[descriptor("windows", arch, None, "sha256:w")], &host),
+                None
+            );
+            assert_eq!(
+                digests(&[descriptor("linux", other, None, "sha256:f")], &host),
+                None
+            );
+            // Two eligible host children: the first wins, in either order.
+            for (first, second) in [
+                ("sha256:first", "sha256:second"),
+                ("sha256:second", "sha256:first"),
+            ] {
+                assert_eq!(
+                    digests(
+                        &[
+                            descriptor("linux", arch, None, first),
+                            descriptor("linux", arch, None, second),
+                        ],
+                        &host
+                    )
+                    .as_deref(),
+                    Some(first)
+                );
+            }
+            // Attestation and platform-less descriptors are skipped.
+            let mut attestation = descriptor("linux", arch, None, "sha256:attestation");
+            attestation["mediaType"] =
+                "application/vnd.oci.image.manifest.v1+json.attestation".into();
+            let platform_less = serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:no-platform",
+                "size": 1,
+            });
+            assert_eq!(
+                digests(
+                    &[
+                        attestation,
+                        platform_less,
+                        descriptor("linux", arch, None, "sha256:host"),
+                    ],
+                    &host
+                )
+                .as_deref(),
+                Some("sha256:host")
+            );
+        }
+    }
+
+    /// With a target variant: first exact match wins, otherwise the first
+    /// same-OS/arch fallback — again in both orders.
+    #[test]
+    fn variant_selection_prefers_an_exact_match_then_the_first_fallback() {
+        let host = Platform::with_variant("linux", "arm64", "v8");
+        assert_eq!(
+            digests(
+                &[
+                    descriptor("linux", "arm64", Some("v7"), "sha256:fallback"),
+                    descriptor("linux", "arm64", Some("v8"), "sha256:exact"),
+                ],
+                &host
+            )
+            .as_deref(),
+            Some("sha256:exact")
+        );
+        // Duplicate exact variants: the first one.
+        for (first, second) in [("sha256:x", "sha256:y"), ("sha256:y", "sha256:x")] {
+            assert_eq!(
+                digests(
+                    &[
+                        descriptor("linux", "arm64", Some("v8"), first),
+                        descriptor("linux", "arm64", Some("v8"), second),
+                    ],
+                    &host
+                )
+                .as_deref(),
+                Some(first)
+            );
+        }
+        // No exact variant: first eligible fallback, in either order.
+        for (first, second) in [("sha256:v7", "sha256:v6"), ("sha256:v6", "sha256:v7")] {
+            assert_eq!(
+                digests(
+                    &[
+                        descriptor("linux", "arm64", Some("v7"), first),
+                        descriptor("linux", "arm64", None, second),
+                    ],
+                    &host
+                )
+                .as_deref(),
+                Some(first)
+            );
+        }
+        // A foreign architecture never becomes the fallback.
+        assert_eq!(
+            digests(
+                &[
+                    descriptor("linux", "amd64", Some("v8"), "sha256:foreign"),
+                    descriptor("linux", "arm64", None, "sha256:host"),
+                ],
+                &host
+            )
+            .as_deref(),
+            Some("sha256:host")
+        );
     }
 
     #[test]
