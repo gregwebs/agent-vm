@@ -11,6 +11,12 @@ rationale cited `shell`'s `credentials`). Builds on **Tool**, **Credential
 provider**, **Provisioning set** and **Available tools** in
 [CONTEXT.md](../../CONTEXT.md).
 
+[ADR-0046](0046-user-owned-configured-mounts.md) accepts a **not-yet-implemented**
+amendment: resolve tool references within each configuration tier before merging
+launch verbs, retain hidden definitions in their own reference scopes, and
+inherit tool mounts through that closure. Its cross-tier reference prohibition
+will replace the explicit cross-file opt-in described below.
+
 ## Context
 
 #81/#82 preserved a deliberate asymmetry: `Anthropic`/`OpenAi` capture ran on

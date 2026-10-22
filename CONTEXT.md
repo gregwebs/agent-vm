@@ -273,13 +273,15 @@ are the two whose provisioning set is wider).
 
 ### Available tools
 
-The catalog tools a tool names in `tools = [...]`: the tools it wants
+The tool declarations a tool names in `tools = [...]`: the tools it wants
 **available in its guest**. They name *tools*, never credential providers.
-`["*"]` — which must be the sole entry, and is the default for a tool named
-`shell` — closes over the tools declared in the **same configuration file** as
-the declaring tool, not the merged catalog. A tool in a *different* file is
-reachable only by **naming it explicitly**. An omitted `tools` is `[]` for
-every other name. A name no catalog tool provides is a hard config error.
+References stay within the declaring tool's **Tool reference scope**, including
+definitions hidden from launch-verb selection. `["*"]` — which must be the sole
+entry, and is the default for a tool named `shell` — means every tool in that
+scope. An omitted `tools` is `[]` for every other name. Unknown names and
+cross-tier references are hard config errors. See
+[ADR-0046](docs/adr/0046-user-owned-configured-mounts.md) for this accepted,
+not-yet-implemented scope change.
 
 _Avoid_: "dependencies" — a named tool is provisioned, not required, and
 nothing is installed or built for it.
@@ -290,11 +292,13 @@ Everything one launch provisions: the least fixed point of
 
     provisioning(t) = credentials(t) ∪ ⋃ { provisioning(u) | u ∈ tools(t) }
 
-over the launch catalog, where a `"*"` entry expands to the declaring tool's
-own configuration file. It is the **single** gate on every provider-owned
-facet, and the same closure also folds the tools' `persist` paths into
-guest-HOME links. A cycle is a fixed point, not an error. See
-[ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
+over the declaring tool's **Tool reference scope**, where a `"*"` entry expands
+to that scope's tools. It is the **single** gate on every provider-owned facet.
+The same tool closure also selects `persist` paths and tool mount declarations.
+A tool-reference cycle is a fixed point, not an error; this differs from a
+**Mount set** reference cycle, which is invalid. See
+[ADR-0017](docs/adr/0017-tool-declared-provisioning.md) and the accepted,
+not-yet-implemented [ADR-0046](docs/adr/0046-user-owned-configured-mounts.md).
 
 _Avoid_: "the selected tool's providers" / "when selected". Gating is
 membership in the provisioning set, which is not the launched tool's own
@@ -340,9 +344,11 @@ host.
 
 It also carries its default `argv`, a list of **credential providers**
 (`credentials`, the requirement set), a list of **available tools** (`tools`,
-driving the provisioning set), extra guest-HOME-relative `persist` paths, a
-guest `env` map, an `interactive_shell` flag, and the **tool config tier** it
-came from.
+driving the provisioning set), extra guest-HOME-relative `persist` paths, mount
+selections (direct paths or **Mount sets**), a guest `env` map, an
+`interactive_shell` flag, and the **tool config tier** it came from. Mount
+selections are part of the accepted, not-yet-implemented
+[ADR-0046](docs/adr/0046-user-owned-configured-mounts.md).
 
 `env` is published into the guest **before** the launcher's own environment and
 cannot override `PATH`, `IS_SANDBOX` or `LANG`; `HOME`/`USER`/`LOGNAME` are
@@ -364,10 +370,12 @@ One of the two ordered, optional config files resolved by `config::load`: the
 (`<cwd>/.agent-vm/config.toml`). Each is parsed and validated independently
 before merging. Their merge is a **union of whole definitions**, not a field
 overlay: the user tier is authoritative for every name it declares, the
-project tier may only add names, and a differing project declaration yields a
-`doctor` warning (user definition wins). Only when both tiers declare **zero**
-tools do the compiled-in defaults apply. `[network]` authority is user-tier only;
-project declarations remain non-authoritative.
+project tier may only add launch names, and a differing project declaration
+yields a `doctor` warning (user definition wins). A hidden definition remains in
+its own **Tool reference scope** under the accepted
+[ADR-0046](docs/adr/0046-user-owned-configured-mounts.md) design. Only when both
+tiers declare **zero** tools do the compiled-in defaults apply. `[network]`
+authority is user-tier only; project declarations remain non-authoritative.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
 and the in-guest `clipboard`/`_intercept-hook` keep working, and a launch verb
@@ -518,6 +526,23 @@ read-only bind). See
 
 _Avoid_: "bind mount", which remains connected to the host path; "copy-on-write
 mount", which implies lazy shared backing storage.
+
+## Tool reference scope
+
+The configuration tier within which a tool's `tools` references resolve,
+including definitions hidden from launch-verb selection by another tier.
+Cross-tier tool references are outside that scope.
+
+## Mount set
+
+A user-defined, named collection of mount declarations or other mount sets,
+selectable as a unit for a launch. Selecting a set selects its mounts, not a
+tool or credentials.
+
+## Default mount
+
+A user-defined mount selected for every tool launch, including `shell`, unless
+configuration-selected mounts are disabled for that launch.
 
 ## Protected config directory
 

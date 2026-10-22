@@ -108,6 +108,8 @@ for builder prerequisites and host-build trust.
 - [PLAN.md](PLAN.md) — what is left to do for v1.
 - [Credential shielding specification](docs/specs/credential-shielding.md) —
   agreed user contract and Docker-shaped YAML/CLI design (not yet implemented).
+- [Configured mounts design](docs/adr/0046-user-owned-configured-mounts.md) —
+  user defaults, tool mounts, and named mount sets (accepted; not implemented).
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
   the way they do.
 - [CODING_STANDARDS.md](CODING_STANDARDS.md) — repo coding standards.
