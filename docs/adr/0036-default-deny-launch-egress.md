@@ -30,8 +30,12 @@ Public plus gateway DNS; LAN grants Private; host grants the sandbox gateway.
 LAN/host never imply Public. Publishing ports never grants egress.
 `NetworkPolicy::from_profiles` is deliberately not used: it authorizes DNS with
 LAN, contrary to this boundary. `none()` also denies ingress, which would break
-published ports. `setup`/`pull` temporary guests are outside this
-policy builder and still use the SDK Public+DNS default.
+published ports. `setup`'s verification guest is outside this
+policy builder and still uses the SDK Public+DNS default.
+
+> Amended by #389: the removed temporary image-acquisition guest no longer
+exists. `image refresh` performs native acquisition and boots no guest; only
+setup's optional verification guest remains outside this policy.
 
 ```text
 CLI grants → validated EgressAuthority → base policy → credential overlay → boot

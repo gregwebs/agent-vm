@@ -266,6 +266,36 @@ fn msb_forwards_trailing_args_verbatim_including_hyphenated_flags() {
     assert!(record.contains("ARG3=--extra=1"), "record:\n{record}");
 }
 
+/// Native `msb pull` is not agent-vm's refresh: the child receives the exact
+/// argv, including `--force`, under agent-vm's private `MSB_HOME`. agent-vm
+/// must not intercept or reinterpret it (ADR-0043).
+#[test]
+fn msb_native_pull_argv_is_forwarded_unchanged() {
+    let h = Harness::new();
+    for (args, argc) in [
+        (vec!["pull", "ghcr.io/example/image:tag"], 2),
+        (vec!["pull", "--force", "ghcr.io/example/image:tag"], 3),
+    ] {
+        let out = h.run_msb(&args, &[]);
+        assert!(out.status.success(), "stderr:\n{}", stderr_of(&out));
+        let record = h.read_record();
+        assert!(
+            record.contains(&format!("ARGC={argc}")),
+            "record:\n{record}"
+        );
+        for (index, arg) in args.iter().enumerate() {
+            assert!(
+                record.contains(&format!("ARG{}={arg}", index + 1)),
+                "record:\n{record}"
+            );
+        }
+        assert!(
+            record.contains(&format!("MSB_HOME={}\n", h.msb_home().display())),
+            "record:\n{record}"
+        );
+    }
+}
+
 /// Regression test for `#[command(disable_help_flag = true)]`, at the real
 /// binary level: `agent-vm msb --help` must reach the fake msb (proven by
 /// the stdout marker and the record file), not be intercepted by clap and

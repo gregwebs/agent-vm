@@ -9,7 +9,7 @@
 //! --image  >  AGENT_VM_IMAGE_TAG (empty = unset)  >  user image  >  project image  >  default
 //! ```
 //!
-//! — so `run`, `pull`, `setup`, `doctor`, `image show` and import's completion
+//! — so `run`, `image refresh`, `setup`, `doctor`, `image show` and import's completion
 //! check cannot disagree about which image a session boots. The **catalog is deliberately not an input**: changing the
 //! runtime tool declaration must never change the image (issue #259).
 //!
@@ -30,7 +30,7 @@
 //!   compatible recommendation (e.g. a future multiarch release) can rescue the
 //!   user instead of stranding them on bytes their host cannot boot.
 //!
-//! Explicit [`upgrade`] acquisition can replace the retained fallback after
+//! Explicit set-default acquisition can replace the retained fallback after
 //! native success and host-platform validation; ordinary adoption stays
 //! write-once. Neither path changes overrides or running sessions.
 //!
@@ -465,6 +465,13 @@ pub(crate) struct ImageArgs {
 }
 
 impl ImageArgs {
+    /// A test-only constructor for a reconciled argument, so a caller's unit
+    /// tests can exercise its own preflight without building a clap parser.
+    #[cfg(test)]
+    pub(crate) fn for_test(image: Option<String>, origin: Option<OverrideSource>) -> Self {
+        Self { image, origin }
+    }
+
     /// Record whether the value came from the command line or the environment,
     /// and apply ADR-0028's surviving rule: an **empty** `AGENT_VM_IMAGE_TAG`
     /// counts as unset. A typed `--image ''` stays present (and fails at the

@@ -1,11 +1,22 @@
-//! `agent-vm setup` — pull the selected OCI image and verify it under microsandbox.
+//! `agent-vm setup` — acquire the selected OCI image and verify it under
+//! microsandbox.
 //!
-//! Standard-image releases belong to the independent agent-vm-images repo. Setup just
-//! pulls into microsandbox's cache and verifies by booting a
-//! throwaway sandbox.
+//! Standard-image releases belong to the independent agent-vm-images repo. Setup
+//! acquires the selected reference natively (no VM, no Docker) and then verifies
+//! the tools it declares by booting **one** throwaway `agent-vm-setup-verify`
+//! sandbox. `--no-verify` stops after acquisition, so setup is boot-free in that
+//! mode but never generally.
+//!
+//! # Acquisition is OCI-only
+//!
+//! A local rootfs directory or disk image is a supported *launch* target
+//! (`agent-vm --image PATH <tool>`), but not an acquisition target: setup has
+//! nothing to fetch and cannot verify a host path under microsandbox's registry
+//! policy. A CLI/env local target therefore fails with fixed advice to use a
+//! local launch. Config-file images are already OCI-only.
 //!
 //! Local source builds and cache-only image imports are separate root
-//! workflows; setup intentionally pulls the selected registry image.
+//! workflows; setup intentionally acquires the selected registry image.
 //!
 //! # Which image it verifies
 //!
@@ -53,6 +64,26 @@ use microsandbox::{ExecOutput, MicrosandboxError, Sandbox, sandbox::PullPolicy};
 
 use crate::boot_image;
 use crate::config::{self, Catalog, ConfiguredImages, LaunchCatalog};
+use crate::image_acquire::{OciTarget, OciTargetError};
+
+/// The fixed refusal for a setup target that is a local rootfs or disk path.
+/// Names no value: the rejected text is user input.
+const LOCAL_TARGET_REASON: &str = "`agent-vm setup` acquires and verifies OCI image references only; \
+     a local rootfs or disk image is a launch target, not an acquisition target — use \
+     agent-vm --image PATH <tool> to launch it";
+
+/// The fixed refusal for a target that is not a usable OCI reference at all.
+/// Never suggests a local launch: the user typed a malformed reference.
+const INVALID_TARGET_REASON: &str = "`agent-vm setup` needs a valid OCI image reference to acquire \
+     and verify, e.g. ghcr.io/owner/name:tag or repo@sha256:…";
+
+/// Render this command's value-free refusal for a rejected target.
+fn target_error(error: OciTargetError) -> anyhow::Error {
+    match error {
+        OciTargetError::LocalPath => anyhow::anyhow!(LOCAL_TARGET_REASON),
+        OciTargetError::InvalidReference => anyhow::anyhow!(INVALID_TARGET_REASON),
+    }
+}
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -134,10 +165,16 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
         }
     };
 
-    // The one image selection for this session (D1), shared with launch/pull.
+    // The one image selection for this session (D1), shared with launch/refresh.
     let boot = boot_image::select(args.image.requested()?, &images)?;
     let label = boot.label();
     let image = boot.reference().as_str().to_string();
+
+    // Documented OCI-only setup policy, checked *before* the native acquisition
+    // so a rejected local target causes no registry request, sandbox, marker or
+    // adoption. Setup may already have created runtime state by now; only
+    // `image refresh` promises pre-prologue rejection.
+    OciTarget::parse(&image).map_err(target_error)?;
 
     // The verification scope is the resolved configuration's *declarations*,
     // the same on the default boot image and on any image the user selected:
@@ -146,7 +183,10 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
     // or broken.
     let targets = verification_targets(&verify_catalog);
 
-    println!("==> Pulling {} into the microsandbox cache", label.text());
+    println!(
+        "==> Acquiring {} into the microsandbox image cache",
+        label.text()
+    );
     crate::pull::pull_image(&image, &label).await?;
     // Success-before-adoption (#261): record a default-tier selection only
     // after its forced acquisition succeeded, and before verification.
@@ -166,8 +206,8 @@ async fn verify_image(boot: &boot_image::BootImage, targets: &[VerifyTarget]) ->
     let image = boot.reference().as_str();
     println!("==> Verifying {}", label.text());
     println!("==> Booting throwaway sandbox (this is the first VM cold-start; ~3s on a warm host)");
-    // The pull step above already pulled the new manifest, so IfMissing
-    // is fine here.
+    // The native acquisition above already landed the new manifest, so
+    // IfMissing is fine here.
     let is_local = crate::pull::is_plain_http_registry(image);
     let config = Sandbox::builder("agent-vm-setup-verify")
         .image(image)
@@ -428,7 +468,7 @@ fn report(
     bail!(
         "{verbs}: command {command} is {because} — this configuration boots {}. \
          agent-vm does not install tools; add the program to your image or change the \
-         tool's command, pull a newer tag (`agent-vm pull`), or report at \
+         tool's command, refresh a newer tag (`agent-vm image refresh`), or report at \
          https://github.com/wirenboard/agent-vm/issues",
         label.text()
     )

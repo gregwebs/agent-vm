@@ -17,16 +17,17 @@ half of the pair whose other half is the **in-guest** side (`intercept_hook`,
 agentd).
 
 _Avoid_: using it for the image builder alone (the launcher consumes finished images; `agent-vm image` builds/imports
-them and launches nothing); for the `agent-vm` binary in its non-launching verbs (`doctor`,
-`pull`, `setup`, `image`), which share the binary but launch nothing; or for
-microsandbox.
+them without launching a tool); for the `agent-vm` binary in its non-tool-launching
+verbs (`doctor`, `setup`, `image`), even though setup can boot a verification
+guest; or for microsandbox.
 
 ## Launch option
 
 An `agent-vm` flag that configures a launch (`--mount`, `--image`, `-p`, …).
 Written before the tool verb: `agent-vm --mount ~/ref pi`. Built-in verbs
-(`pull`, `doctor`, …) take their own flags after the verb and accept no launch
-options.
+(`setup`, `doctor`, …) take their own flags after the verb and accept no launch
+options. Nested image operations take flags after the subcommand:
+`agent-vm image refresh --image REF`.
 
 ## Tool argument
 
@@ -378,6 +379,15 @@ The finished image selected for a guest session, independently of **tool**
 declarations and how the image was built. It contains the software used in the
 guest; tool declarations do not install that software.
 
+## Image refresh
+
+Explicit native acquisition of the selected OCI image reference into the
+**image cache**, checking whether the registry now serves different content,
+without booting a guest. Configuration is unchanged: a refresh never changes
+which reference is selected. A default-tier refresh keeps the existing
+exception — a successful acquisition of an **absent** retained default
+initializes it (success-before-adoption); it never replaces an existing record.
+
 ## Image cache
 
 agent-vm's own microsandbox image cache (the ambient backend's cache dir,
@@ -424,10 +434,12 @@ user-scoped `$HOME/.config/agent-vm/default-image.json`. A *bookmark* naming
 exact content, not a download cache: it is independent of the msb image cache,
 `AGENT_VM_STATE_DIR` and any project, and it is written **only after** the image
 was acquired (success-before-adoption). Automatic initialization is write-once,
-so no failed or concurrent first launch overwrites it. A **deliberate default-image
-upgrade** is successful native acquisition and host-platform validation followed
-by replacement of this retained fallback; it affects future default-image
-sessions only. See [explicit upgrade](USAGE.md#explicitly-upgrading-the-default). Distinguished from the **initial recommendation**
+so no failed or concurrent first launch overwrites it. A **deliberate
+`image set-default`** is successful native acquisition and host-platform
+validation followed by replacement of this retained fallback; it affects future
+default-image sessions only. See
+[USAGE.md#explicitly-setting-the-default](USAGE.md#explicitly-setting-the-default).
+Distinguished from the **initial recommendation**
 below. See
 [USAGE.md#the-retained-default](USAGE.md#the-retained-default). _Avoid_: cache
 entry, default config, pinned layer.

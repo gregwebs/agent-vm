@@ -20,9 +20,13 @@ locates the verb.
 
 - Launch options are documented in `agent-vm --help`; `agent-vm help <tool>`
   shows a one-line description and examples.
-- Built-in verbs (`pull`, `setup`, `doctor`, …) keep their flags after the verb
+- Built-in verbs (`setup`, `doctor`, …) keep their flags after the verb
   and reject launch options before it. `--image` is therefore written before
-  the verb for a launch and after it for `pull`/`setup`.
+  the verb for a launch and after it for `image refresh`/`setup`.
+
+> Amended by #389: the image operations are now `agent-vm image refresh
+> [--image REF]` and `agent-vm image set-default --image REF`, so their flags
+> follow the nested subcommand. `pull`/`upgrade` are no longer built-ins.
 
 ## Considered Options
 

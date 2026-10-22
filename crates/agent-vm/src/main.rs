@@ -22,6 +22,7 @@ mod github_graphql;
 mod guest_home;
 mod guest_paths;
 mod host_paths;
+mod image_acquire;
 mod image_build;
 mod image_capabilities;
 mod image_check;
@@ -222,32 +223,16 @@ fn main() -> Result<()> {
                 catalog,
                 images,
             } => setup::run(args, catalog, images).await,
-            Dispatch::Builtin {
-                cmd: Cmd::Pull(args),
-                catalog,
-                images,
-            } => pull::run(args, catalog, images).await,
-            Dispatch::Builtin {
-                cmd: Cmd::Upgrade(args),
-                ..
-            } => boot_image::upgrade::run(args).await,
-            // Explicit user-owned build/import (#260, #359); `show` returned
-            // above, before the runtime. `build` reads no catalog and no image
-            // selection; `import` keeps the configuration result so it can
-            // *observe* the selection after publishing (#385) without a second
-            // config load and without silently substituting empty tiers for a
-            // failed load.
+            // The image group: `refresh` acquires natively and `set-default`
+            // retains explicitly (both carry the original catalog/images, so
+            // their documented broken-config recovery is preserved), while
+            // `build`/`import` are the explicit user-owned publication verbs
+            // (#260, #359). `show` returned above, before the runtime.
             Dispatch::Builtin {
                 cmd: Cmd::Image(args),
                 catalog,
                 images,
-            } => {
-                let configured = match &catalog {
-                    config::Catalog::Ready(_) => Ok(&images),
-                    config::Catalog::Broken(error) => Err(anyhow::anyhow!("{error:#}")),
-                };
-                exit_with(image_cmd::run(args, configured).await?)
-            }
+            } => exit_with(image_cmd::run(args, catalog, images).await?),
             Dispatch::Builtin {
                 cmd: Cmd::Clipboard(args),
                 ..

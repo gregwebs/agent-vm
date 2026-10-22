@@ -130,7 +130,9 @@ keeps guests out of ancestors, within #321/#322.
 - ACLs are not checked. Credentials-file hard links (#319), nested mount
   aliases (#321), runtime replacement races (#322), and a third home directory
   remain outside this change.
-- `setup`/`pull` temporary guests ignore `[network]` (#303).
+- `setup`'s optional verification guest ignores `[network]` (#303). #389 removes
+  the temporary acquisition guest: `image refresh` uses native registry access,
+  not a guest or the tool-launch network policy.
 - Saved hostnames with a selected ambient host HTTP proxy refuse every launch
   until the proxy or saved hostname is removed. `--allow-*=false` does not
   clear `allow_egress`; adding a numeric allowance does not bypass the refusal,

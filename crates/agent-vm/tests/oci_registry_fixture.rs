@@ -58,25 +58,51 @@ impl RawResponse {
 }
 
 fn split_response(bytes: &[u8]) -> RawResponse {
-    let split = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("response header terminator");
+    let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+        // A bare `expect` here reported only the missing terminator, which is
+        // indistinguishable between an empty response (the handler bailed
+        // before writing) and a truncated one. Carry the bytes themselves.
+        panic!(
+            "response header terminator missing in {} bytes: {:?}",
+            bytes.len(),
+            String::from_utf8_lossy(bytes)
+        );
+    };
     RawResponse {
         head: String::from_utf8(bytes[..split].to_vec()).unwrap(),
         body: bytes[split + 4..].to_vec(),
     }
 }
 
-fn request(raw: &str, host: &str) -> RawResponse {
-    let mut stream = TcpStream::connect(host).expect("connect fixture registry");
+fn request(raw: &str, server: &Server) -> RawResponse {
+    let started = std::time::Instant::now();
+    let mut stream = TcpStream::connect(&server.host).expect("connect fixture registry");
+    let local = stream.local_addr().ok();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
+    let connected = started.elapsed();
     stream.write_all(raw.as_bytes()).unwrap();
+    let written = started.elapsed();
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).unwrap();
-    split_response(&bytes)
+    let finished = started.elapsed();
+    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+        return split_response(&bytes);
+    }
+    // Protocol diagnostics belong with the request that produced them: whether
+    // the fixture saw the request at all separates a client-side send/close
+    // race from a handler that returned before answering.
+    panic!(
+        "fixture answered {:?} with {} bytes and no header terminator: {:?}; \
+         local={local:?} connect={connected:?} write={written:?} eof={finished:?}; \
+         accepted requests={:?} recorded errors={:?}",
+        raw.lines().next().unwrap_or_default(),
+        bytes.len(),
+        String::from_utf8_lossy(&bytes),
+        server.requests(),
+        server.errors()
+    );
 }
 
 /// Read one response head plus `body` body bytes without waiting for EOF. Used
@@ -97,13 +123,13 @@ fn read_head_and_body(stream: &mut TcpStream, body: usize) -> Vec<u8> {
     bytes
 }
 
-fn get(host: &str, path: &str, range: Option<&str>) -> RawResponse {
-    let mut raw = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n");
+fn get(server: &Server, path: &str, range: Option<&str>) -> RawResponse {
+    let mut raw = format!("GET {path} HTTP/1.1\r\nHost: {}\r\n", server.host);
     if let Some(range) = range {
         raw.push_str(&format!("Range: {range}\r\n"));
     }
     raw.push_str("\r\n");
-    request(&raw, host)
+    request(&raw, server)
 }
 
 /// Send one request but leave the stream open, so a stalled response can be
@@ -126,7 +152,7 @@ fn open_get(host: &str, path: &str, range: Option<&str>) -> TcpStream {
 fn open_ended_range_serves_byte_exact_suffix() {
     let blob = patterned(2048);
     let server = server_with_blob(&blob);
-    let response = get(&server.host, BLOB_PATH, Some("bytes=1024-"));
+    let response = get(&server, BLOB_PATH, Some("bytes=1024-"));
     assert_eq!(response.status(), "HTTP/1.1 206 Partial Content");
     assert_eq!(
         response.header("content-range"),
@@ -141,7 +167,7 @@ fn open_ended_range_serves_byte_exact_suffix() {
 fn bounded_range_serves_byte_exact_slice() {
     let blob = patterned(2048);
     let server = server_with_blob(&blob);
-    let response = get(&server.host, BLOB_PATH, Some("bytes=100-199"));
+    let response = get(&server, BLOB_PATH, Some("bytes=100-199"));
     assert_eq!(response.status(), "HTTP/1.1 206 Partial Content");
     assert_eq!(response.header("content-range"), Some("bytes 100-199/2048"));
     assert_eq!(response.header("content-length"), Some("100"));
@@ -153,7 +179,7 @@ fn bounded_range_serves_byte_exact_slice() {
 fn suffix_range_serves_last_bytes() {
     let blob = patterned(2048);
     let server = server_with_blob(&blob);
-    let response = get(&server.host, BLOB_PATH, Some("bytes=-16"));
+    let response = get(&server, BLOB_PATH, Some("bytes=-16"));
     assert_eq!(response.status(), "HTTP/1.1 206 Partial Content");
     assert_eq!(
         response.header("content-range"),
@@ -168,7 +194,7 @@ fn suffix_range_serves_last_bytes() {
 fn range_past_end_is_unsatisfiable() {
     let blob = patterned(2048);
     let server = server_with_blob(&blob);
-    let response = get(&server.host, BLOB_PATH, Some("bytes=4096-"));
+    let response = get(&server, BLOB_PATH, Some("bytes=4096-"));
     assert_eq!(response.status(), "HTTP/1.1 416 Range Not Satisfiable");
     assert_eq!(response.header("content-range"), Some("bytes */2048"));
     assert_eq!(response.header("content-length"), Some("0"));
@@ -184,7 +210,7 @@ fn rejected_request_is_not_stalled() {
     let blob = patterned(2048);
     let server = server_with_blob(&blob);
     let ready = server.stall_blob(BLOB_PATH);
-    let response = get(&server.host, BLOB_PATH, Some("bytes=4096-"));
+    let response = get(&server, BLOB_PATH, Some("bytes=4096-"));
     assert_eq!(response.status(), "HTTP/1.1 416 Range Not Satisfiable");
     assert_eq!(response.header("content-range"), Some("bytes */2048"));
     assert_eq!(
@@ -198,7 +224,7 @@ fn unsupported_range_is_recorded_and_worker_keeps_serving() {
     let blob = patterned(2048);
     let server = server_with_blob(&blob);
     for range in ["bytes=0-9,20-29", "items=0-1", "bytes=abc-"] {
-        let response = get(&server.host, BLOB_PATH, Some(range));
+        let response = get(&server, BLOB_PATH, Some(range));
         assert_eq!(response.status(), "HTTP/1.1 416 Range Not Satisfiable");
         assert_eq!(response.header("content-range"), Some("bytes */2048"));
     }
@@ -214,7 +240,7 @@ fn unsupported_range_is_recorded_and_worker_keeps_serving() {
     );
     assert!(errors.iter().any(|error| error.contains("malformed Range")));
     // The worker survived every bad request and still serves correctly.
-    let response = get(&server.host, BLOB_PATH, None);
+    let response = get(&server, BLOB_PATH, None);
     assert_eq!(response.status(), "HTTP/1.1 200 OK");
     assert_eq!(response.body.as_slice(), blob.as_slice());
 }
@@ -313,7 +339,7 @@ fn handler_panic_is_recorded_and_worker_keeps_serving() {
         "recorded: {errors:?}"
     );
     // The accept loop survived and still serves.
-    let response = get(&host, BLOB_PATH, None);
+    let response = get(&server, BLOB_PATH, None);
     assert_eq!(response.status(), "HTTP/1.1 200 OK");
     assert_eq!(response.body.as_slice(), blob.as_slice());
 }
@@ -325,7 +351,7 @@ fn handler_panic_is_recorded_and_worker_keeps_serving() {
 fn dropping_a_server_with_recorded_errors_fails_the_test() {
     let blob = patterned(2048);
     let server = server_with_blob(&blob);
-    let response = get(&server.host, BLOB_PATH, Some("bytes=5-4"));
+    let response = get(&server, BLOB_PATH, Some("bytes=5-4"));
     assert_eq!(response.status(), "HTTP/1.1 416 Range Not Satisfiable");
     // No `take_errors()`: `Drop` must surface the recorded error.
 }
@@ -339,7 +365,7 @@ fn dropping_a_server_with_recorded_errors_fails_the_test() {
 fn drop_during_unwind_does_not_mask_the_original_failure() {
     let blob = patterned(2048);
     let server = server_with_blob(&blob);
-    let response = get(&server.host, BLOB_PATH, Some("bytes=5-4"));
+    let response = get(&server, BLOB_PATH, Some("bytes=5-4"));
     assert_eq!(response.status(), "HTTP/1.1 416 Range Not Satisfiable");
     panic!("original failure");
 }
@@ -349,28 +375,28 @@ fn range_edge_cases_are_handled() {
     let blob = patterned(2048);
     let server = server_with_blob(&blob);
     // An end past the blob clamps to the last byte.
-    let response = get(&server.host, BLOB_PATH, Some("bytes=0-99999"));
+    let response = get(&server, BLOB_PATH, Some("bytes=0-99999"));
     assert_eq!(response.status(), "HTTP/1.1 206 Partial Content");
     assert_eq!(response.header("content-range"), Some("bytes 0-2047/2048"));
     assert_eq!(response.body.as_slice(), blob.as_slice());
     // A suffix longer than the blob returns the whole blob.
-    let response = get(&server.host, BLOB_PATH, Some("bytes=-5000"));
+    let response = get(&server, BLOB_PATH, Some("bytes=-5000"));
     assert_eq!(response.status(), "HTTP/1.1 206 Partial Content");
     assert_eq!(response.header("content-range"), Some("bytes 0-2047/2048"));
     assert_eq!(response.body.as_slice(), blob.as_slice());
     // `bytes=-0` is valid but selects no bytes.
-    let response = get(&server.host, BLOB_PATH, Some("bytes=-0"));
+    let response = get(&server, BLOB_PATH, Some("bytes=-0"));
     assert_eq!(response.status(), "HTTP/1.1 416 Range Not Satisfiable");
     assert_eq!(response.header("content-range"), Some("bytes */2048"));
     // `M < N` is an invalid range-spec: recorded, not a silent 416.
-    let response = get(&server.host, BLOB_PATH, Some("bytes=5-4"));
+    let response = get(&server, BLOB_PATH, Some("bytes=5-4"));
     assert_eq!(response.status(), "HTTP/1.1 416 Range Not Satisfiable");
     let errors = server.take_errors();
     assert_eq!(errors.len(), 1, "recorded: {errors:?}");
     assert!(errors[0].contains("before start"), "recorded: {errors:?}");
     // An empty blob has no satisfiable byte.
     let empty = server_with_blob(&[]);
-    let response = get(&empty.host, BLOB_PATH, Some("bytes=0-"));
+    let response = get(&empty, BLOB_PATH, Some("bytes=0-"));
     assert_eq!(response.status(), "HTTP/1.1 416 Range Not Satisfiable");
     assert_eq!(response.header("content-range"), Some("bytes */0"));
     assert_eq!(empty.take_errors(), Vec::<String>::new());
@@ -392,4 +418,44 @@ fn write_executable_is_executable_and_leaves_no_temporary() {
     let output = Command::new(&path).output().unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"fixture-shim\n");
+}
+
+/// Teardown accounting: a connection handler is joined by the accept worker
+/// before `Drop` reads the recorded-error oracle. Without the join, `Drop`
+/// returns while a handler is still parked in its 10s stream read, so a late
+/// handler error could be recorded after the oracle had already passed.
+///
+/// The parked handler is held open deliberately (request headers without the
+/// terminating blank line), which makes the join observable: `Drop` must wait
+/// for the stream timeout instead of returning immediately.
+#[test]
+fn drop_joins_an_inflight_connection_handler_before_reading_errors() {
+    let blob = patterned(2048);
+    let server = server_with_blob(&blob);
+    let host = server.host.clone();
+    let mut parked = TcpStream::connect(&host).expect("connect the fixture");
+    parked
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    parked
+        .write_all(b"GET /v2/fixture/blobs/sha256:aaaa HTTP/1.1\r\nHost: fixture\r\n")
+        .unwrap();
+    // Wait for the accept loop to hand this connection to its worker, which
+    // then parks in `read_line` (no blank line, no body) until the stream
+    // timeout. A fixed sleep would race that acceptance: if `Drop` sets `stop`
+    // first, the loop takes the connection and breaks without spawning the
+    // handler this test exists to observe.
+    server.wait_for_handler();
+    let started = std::time::Instant::now();
+    drop(server);
+    let elapsed = started.elapsed();
+    drop(parked);
+    assert!(
+        elapsed >= Duration::from_secs(5),
+        "Drop returned after {elapsed:?}: it did not join the parked handler"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "Drop exceeded the bounded stream timeouts: {elapsed:?}"
+    );
 }

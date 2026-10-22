@@ -23,7 +23,7 @@ group) and Node 18+. macOS and Windows aren't supported yet.
 ## Quick start
 
 ```bash
-agent-vm setup            # pull the selected image, verify configured tools
+agent-vm setup            # acquire the selected image, verify configured tools
 cd ~/your-project
 agent-vm claude           # or codex / opencode / copilot / pi / shell
 ```
