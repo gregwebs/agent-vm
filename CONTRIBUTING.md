@@ -307,23 +307,29 @@ native logs. Guest `--network none` is not proof of host-offline acquisition.
 `tests/default_image_upgrade.rs` exercises the actual CLI and native registry
 against genuine OCI bytes on a bound loopback listener, without Docker or a VM.
 It covers both boot-free paths — `image refresh` (selection, A→B tag movement,
-layer reuse, advisory markers, automatic adoption, and the two-process
-same-cache/same-reference coordination schedules) and `image set-default`
-(explicit target, immutable pin, retained record) — plus failure preservation.
-It isolates HOME/state/cwd and Docker config (empty auths, no helpers), but
-native-entry automatic auth may still perform read-only OS keyring lookup, and machine-wide
-managed policy still applies. Require a noninteractive credential environment
-with no matching loopback credential and absent/compatible managed policy; never
-modify host keyring items or policy for tests. Failure preservation hashes old
-metadata and referenced EROFS/fsmeta/VMDK artifacts independently, including a
-shared-layer failure; native cache completeness alone is not an unchanged-byte
-oracle. The custom group also tests explicit release `image set-default` A→B, an unchanged
-live A in a different project, new/warm/offline B, all override boundaries,
-failed-acquisition byte preservation and explicitly bootable cached A. Its
-registry publication uses empty test-owned Docker auth configuration and only
-the operator daemon's Unix endpoint (Colima/Docker Desktop), not copied
-credentials/helpers. This requires the same signed launchers, Docker/network and dedicated serial native
-host as the retained-default check. It is manual evidence, not CI VM coverage.
+layer reuse, first-pin and default adoption, candidate approval, and the
+two-process same-cache/same-reference coordination schedules) and
+`image set-default` (explicit target, approved host child, retained record) —
+plus failure preservation. A launch never probes a tag: the removed update check
+has no test seam and no environment fallback. The suite drives the host pin
+store through the compiled CLI with isolated HOME/state/cwd and Docker config
+(empty auths, no helpers); native-entry automatic auth may still perform
+read-only OS keyring lookup, and machine-wide managed policy still applies.
+Require a noninteractive credential environment with no matching loopback
+credential and absent/compatible managed policy; never modify host keyring items
+or policy for tests. Replacement consent is exercised through a real PTY
+(`tests/image_pin_approval.rs`) for yes/no/empty/EOF/interruption, `--yes`, and
+nonterminal refusal, with every prompt/child wait bounded at 60s. Failure
+preservation hashes old metadata and referenced EROFS/fsmeta/VMDK artifacts
+independently, including a shared-layer failure; native cache completeness alone
+is not an unchanged-byte oracle. The custom group also tests explicit release
+`image set-default` A→B, an unchanged live A in a different project,
+new/warm/offline B, all override boundaries, failed-acquisition byte
+preservation, and explicitly bootable cached A. Its registry publication uses
+empty test-owned Docker auth configuration and only the operator daemon's Unix
+endpoint (Colima/Docker Desktop), not copied credentials/helpers. This requires
+the same signed launchers, Docker/network and dedicated serial native host as
+the retained-default check. It is manual evidence, not CI VM coverage.
 
 `tests/image_build.rs` covers `image build` and `image import` through the
 actual native importer under fake Docker without a VM; native e2e is manual, never a substitute for those CLI tests.
@@ -368,6 +374,33 @@ absence is meaningful. The custom group always runs against a fresh private
 cache under the default msb config sources: it neutralizes an inherited
 `AGENT_VM_SHARE_MSB_CACHE`, `AGENT_VM_MSB_CACHE_DIR` and `MSB_CONFIG_PATH`, while #260 uses a separate fresh shared cache. It makes no released-default or lineage
 claim.
+
+The custom group also runs `custom-image-host-pins` (#390, always-run): launch
+and pin registry content A before the SDK create, then observe exactly one
+approval naming the selected reference and the measured `linux/arm64` platform;
+observe guest A and zero registry requests on a warm launch that inherits the
+removed advisory variable; reacquire A by digest into a fresh independent
+state/cache and confirm neither record's bytes changed; decline (`n`, empty) and
+fail a candidate and still boot A; approve B with `--yes` and boot B; and show
+that an import alias over the pinned tag cannot move the guest. A live A guest
+runs throughout: its PID, its own rootfs content and its booted image stamp must
+be unchanged after both update verbs, and a new B guest in the same project must
+read back the project-state, declared-state and launch-HOME files that the first
+A launch wrote. A local rootfs selection proves only the local/OCI boundary (no
+approval lookup, no store write); a boot from it is not claimed here because this
+host's SDK rejects a managed `root_disk` for a non-OCI image. Fixture A/B are the
+existing `marker-free` and `stamp-present` targets pushed to the run's local
+registry, so the guest stamp — not printed text — proves which image booted. It
+needs the same two validated launchers and Docker endpoint as the other rows.
+
+#### Evidence location
+
+Manual evidence lives in the PR body and the workflow `verifications.md`
+artifact: row/check ID, exact command, candidate and runtime identities (path,
+version, hash/signature, msb + libkrunfw), host/platform, A/B digests, expected
+vs actual observable, and log paths. Do not add a `docs/verification/` directory
+or a new tracked evidence convention; a blocked row is recorded as
+`BLOCKED: <exact command> -> <exact error>`, never as a pass.
 
 #### Default-deny egress harness
 
@@ -558,11 +591,12 @@ There is no `--lib` target, so `--bin agent-vm` is required.
 
 #### Test seams
 
-Two debug-only seams are compiled out of release builds: `AGENT_VM_TEST_CREDENTIAL`
-(credential provisioning) and `AGENT_VM_TEST_DEFAULT_IMAGE` (the boot-image
+Several debug-only seams are compiled out of release builds: `AGENT_VM_TEST_CREDENTIAL`
+(credential provisioning), `AGENT_VM_TEST_DEFAULT_IMAGE` (the boot-image
 default slot, so a boot-free CLI test that falls through to the default does not
-start a real multi-GB pull). Neither is read by a release build; a test pins the
-release exclusion.
+start a real multi-GB pull), and the two coordination gates below
+(`AGENT_VM_TEST_ACQUIRE_GATE`, `AGENT_VM_TEST_PIN_GATE`). None is read by a
+release build; tests pin each release exclusion.
 
 `AGENT_VM_TEST_DEFAULT_IMAGE` is an **initial recommendation**, not an override:
 it is parsed with the same immutable-reference rule as production (an
@@ -591,6 +625,16 @@ invocations keep dependency logging unchanged. The CLI regression
 default-tier `RUST_LOG=trace image refresh` leaks no repository marker and includes a
 positive explicit-source control.
 
+The host approval store is a third seam. A test that wants a pre-approved host
+writes `$HOME/.config/agent-vm/image-pins.json` (strict version 1, one entry per
+canonical reference + platform) through the compiled CLI or by copying
+CLI-produced bytes; a hand-built store must satisfy the same strict schema, or
+the test is asserting corruption, not approval. Pin lookups take a shared lock
+and create nothing, so an absent store is a legal read-only state; mutations
+create the directory and lock. A changed pin needs `--yes` or both stdin and
+stderr on a real PTY. Native cache/receipt bytes are never approval, and a
+test must not delete approvals to work around a cache problem.
+
 #### Acquisition and publication test fixtures
 
 Image lifecycle tests drive the compiled CLI against a deterministic loopback
@@ -611,9 +655,14 @@ seams make the coordination behaviour orderable without sleeps:
   republished for it yet — the one window in which a peer's tag publication is
   still ahead of this consumer), `canonical-readback` and `receipt` stages. A
   missing or malformed reply is a failure, never a skip.
-- `AGENT_VM_TEST_PIN_GATE` is the same shape for the pin-journal stages. No
-  production stage is wired yet (the approval store does not exist); the
-  harness control is exercised directly.
+- `AGENT_VM_TEST_PIN_GATE` is the same shape for the host approval transaction.
+  It reports `candidate-ready`, `before-pin-lock`, `pin-locked`,
+  `before-intent-save`, `intent-saved`, `default-saved`, `before-pin-save` and
+  `pin-committed`, and accepts `continue`, or `fail-before-save` only at the two
+  write-preceding stages (the seam is one atomic save, so a rename fault is not a
+  separate stage). Stages name no reference, digest or
+  path, so a gate can neither forge content nor grant approval. Release builds
+  ignore the variable entirely; a test pins that exclusion.
 - The publication barrier is a real `flock`; tests probe it with an independent
   descriptor instead of inferring ownership. One row holds it shared behind a
   stalled acquisition and proves an unrelated warm launch still reaches create;
@@ -638,7 +687,8 @@ while ordinary `setup` intentionally creates a verification guest.
 |---|---|---|
 | `cargo test --workspace` | yes (`ci.yml`) | `#[ignore]`d e2e excluded |
 | `cargo check --release -p agent-vm --tests` | yes (`ci.yml`) | type-check only; pins that the release test profile still compiles under the test cfg, since CI's run is the debug profile |
-| `script/test/e2e.sh` | **no** | native installed registry/archive joins; custom/all additionally require Apple Silicon and Docker |
+| `script/test/e2e.sh` | **no** | native installed registry/archive joins; custom/all additionally require Apple Silicon and Docker; `custom-image` includes the always-run host-pin A/B rows |
+| `cargo test --test image_pin_approval` | yes (`cargo test -p agent-vm`) | boot-free compiled-CLI approval matrix: PTY yes/no/empty/EOF/interruption, `--yes`, nonterminal refusal, frozen candidate, CAS/stale revision, journal recovery, cache-loss digest reacquisition. No VM evidence |
 | `cargo test … -- --ignored` | **no** | keychain round-trip; operator opt-in, never ordinary CI |
 | `script/test/single-binary-contract.sh` | yes (`ci.yml`) | fake payload; lone copy, reuse, concurrency, tamper, unwritable, rejected-launch state, and `image show` unpacking nothing (C12); the only `embedded-runtime` clippy pass, which is what lints the payload build module |
 | `cargo test --test image_show` | yes (`cargo test -p agent-vm`) | boot-free black-box `image show` matrix: precedence, provenance, damaged/unused fallback, escaping, help/argument surface, and no runtime/cache/state/network observation. No VM evidence |

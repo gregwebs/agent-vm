@@ -2197,14 +2197,6 @@ mod tests {
         for args in [
             vec!["agent-vm", "image", "set-default"],
             vec!["agent-vm", "image", "set-default", "--image", "/path"],
-            vec![
-                "agent-vm",
-                "image",
-                "set-default",
-                "--image",
-                "a:tag",
-                "--yes",
-            ],
             // Launch options precede the verb; `image` is not a tool verb.
             vec!["agent-vm", "--image", "a:tag", "image", "set-default"],
         ] {
@@ -2268,6 +2260,7 @@ mod tests {
                 "localhost:1/a:tag",
             ],
             vec!["agent-vm", "image", "refresh"],
+            vec!["agent-vm", "image", "refresh", "--yes"],
             vec!["agent-vm", "image", "refresh", "--help"],
             vec!["agent-vm", "help", "image", "refresh"],
         ] {
@@ -2288,7 +2281,6 @@ mod tests {
                 "localhost:1/a:tag",
                 "refresh",
             ],
-            vec!["agent-vm", "image", "refresh", "--yes"],
             vec!["agent-vm", "image", "refresh", "--dockerfile", "x"],
         ] {
             let error = build_command(&Catalog::Ready(default_catalog()))
@@ -2307,6 +2299,60 @@ mod tests {
                 .try_get_matches_from(args.clone())
                 .unwrap_err();
             assert_eq!(error.exit_code(), 2, "{args:?}");
+        }
+    }
+
+    /// The removed launch-time advisory leaves no alias, no deprecation hint and
+    /// no environment authority. The routing rule itself is unchanged: an
+    /// unknown launch option *before* the tool verb is a usage error, and every
+    /// token *after* the verb is forwarded to the tool verbatim.
+    #[test]
+    fn removed_update_check_leaves_no_alias_and_forwards_after_the_verb() {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        for argv in [
+            vec!["agent-vm", "--update-check", "shell"],
+            vec!["agent-vm", "--update-check", "pi", "--flag"],
+            // No no-op alias and no hint spelling either.
+            vec!["agent-vm", "--no-update-check", "shell"],
+            vec!["agent-vm", "--update-checks", "shell"],
+        ] {
+            let error = build_command(&Catalog::Ready(default_catalog()))
+                .try_get_matches_from(argv.clone())
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{argv:?}");
+            let text = error.to_string();
+            assert!(!text.contains("deprecat"), "{argv:?}: {text}");
+            assert!(!text.contains("UpdateCheck"), "{argv:?}: {text}");
+        }
+        // After the verb it is the tool's argument, deliberately unremarked.
+        let (_, forwarded) = launch_of(
+            parse_from(
+                ["agent-vm", "shell", "--update-check", "--"],
+                Ok(report_from(
+                    "[[tools]]\nname = \"probe\"\ncommand = \"probe\"\n",
+                )),
+            )
+            .unwrap(),
+        );
+        assert_eq!(forwarded, ["--update-check", "--"]);
+        // `--yes` is nested only: the launch and `setup` refuse it, the two
+        // explicit update verbs accept it.
+        let error = build_command(&Catalog::Ready(default_catalog()))
+            .try_get_matches_from(["agent-vm", "--yes", "shell"])
+            .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        for argv in [
+            vec!["agent-vm", "setup", "--yes"],
+            vec!["agent-vm", "image", "import", "--yes"],
+            vec!["agent-vm", "image", "build", "--yes"],
+        ] {
+            let error = build_command(&Catalog::Ready(default_catalog()))
+                .try_get_matches_from(argv.clone())
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{argv:?}");
         }
     }
 

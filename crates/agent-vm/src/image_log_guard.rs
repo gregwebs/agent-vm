@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn only_the_agent_vm_namespace_is_owned() {
         assert!(is_agent_vm_owned_target("agent_vm"));
-        assert!(is_agent_vm_owned_target("agent_vm::image_check"));
+        assert!(is_agent_vm_owned_target("agent_vm::image_acquire"));
         assert!(is_agent_vm_owned_target("agent_vm::run::launch"));
         assert!(!is_agent_vm_owned_target("agent_vmfoo::x"));
         assert!(!is_agent_vm_owned_target("agent_vm_extra"));

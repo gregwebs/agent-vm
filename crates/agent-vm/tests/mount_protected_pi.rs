@@ -3,10 +3,12 @@
 //! every mount mode.
 //!
 //! Modeled on `tests/mount_fork.rs` — same controlled
-//! `$HOME`/`AGENT_VM_STATE_DIR`/cwd, fake patched `msb`, deliberately-bogus
-//! `localhost:1/...` registry, and `AGENT_VM_DEBUG_CONFIG` `SandboxConfig` JSON
-//! dump. Hermetic and fast: no DNS, no image pull, no Hypervisor.framework.
-//! Everything here is a *rejection* or a *pre-pull build*, so no VM ever boots.
+//! `$HOME`/`AGENT_VM_STATE_DIR`/cwd, fake patched `msb`, and
+//! `AGENT_VM_DEBUG_CONFIG` `SandboxConfig` JSON dump. Launch now prepares OCI
+//! selections before the builder, so the harness imports genuine host-valid
+//! bytes through the public `image import` verb first. Hermetic and fast: no
+//! DNS, no registry, no Hypervisor.framework. Everything here is a *rejection*
+//! or a *pre-create build*, so no VM ever boots.
 
 use std::{
     io::Read,
@@ -17,10 +19,8 @@ use std::{
 
 mod support;
 
-/// Never resolves; only used to drive execution far enough into `launch()` to
-/// prove `builder.build()` already ran (its debug JSON dump happens right
-/// before the pull, which is what fails here).
-const BOGUS_IMAGE: &str = "localhost:1/does-not-exist:latest";
+#[path = "support/image_archive.rs"]
+mod image_archive;
 
 /// Subcommands `build_command` registers that are not launch verbs
 /// (`cli::BUILTIN_SUBCOMMANDS`, which integration tests cannot import).
@@ -86,11 +86,49 @@ struct Harness {
     home: tempfile::TempDir,
     state: tempfile::TempDir,
     project: tempfile::TempDir,
+    /// The imported fixture reference every launch selects.
+    image: String,
+    /// State entries the harness's own fixture import created.
+    seeded_state: std::collections::BTreeSet<std::ffi::OsString>,
     fake_msb: PathBuf,
 }
 
 impl Harness {
+    /// A harness whose launches select a genuine host-valid image imported
+    /// through the public CLI, so preparation succeeds and `builder.build()` is
+    /// reachable without a registry.
     fn new() -> Self {
+        let h = Self::bare();
+        let archive = h.home.path().join("fixture-boot.tar");
+        image_archive::write(&archive, &image_archive::ArchiveSpec::default());
+        let mut import = Command::new(agent_vm_bin());
+        import
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", h.home.path())
+            .env("AGENT_VM_STATE_DIR", h.state.path())
+            .env("MSB_PATH", &h.fake_msb)
+            .current_dir(h.project.path())
+            .args([
+                "image",
+                "import",
+                "--input",
+                archive.to_str().unwrap(),
+                "--tag",
+                &h.image,
+            ]);
+        let out = run_with_timeout(import, Duration::from_secs(60));
+        assert!(
+            out.status.success(),
+            "fixture import failed: {}",
+            stderr_of(&out)
+        );
+        let mut h = h;
+        h.seeded_state = state_entries(&h.state.path().canonicalize().unwrap());
+        h
+    }
+
+    fn bare() -> Self {
         // The relay socket lives below the state directory, so keep that one
         // under `/tmp` for the Unix socket-path limit. `$HOME` stays on the
         // workspace filesystem, and the project helper fails fast if
@@ -104,6 +142,8 @@ impl Harness {
             home,
             state,
             project,
+            image: "fixture:boot".to_string(),
+            seeded_state: std::collections::BTreeSet::new(),
             fake_msb,
         }
     }
@@ -155,7 +195,7 @@ impl Harness {
         for mount in mounts {
             cmd.arg("--mount").arg(mount);
         }
-        cmd.args(["--image", BOGUS_IMAGE]).arg(verb);
+        cmd.args(["--image", &self.image]).arg(verb);
         run_with_timeout(cmd, Duration::from_secs(15))
     }
 
@@ -175,6 +215,13 @@ impl Harness {
         let entry = std::fs::read_dir(&forks).ok()?.next()?.ok()?;
         Some(entry.path().join("data"))
     }
+}
+
+fn state_entries(state: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
+    std::fs::read_dir(state)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect()
 }
 
 fn stderr_of(out: &Output) -> String {
@@ -229,13 +276,10 @@ fn assert_no_launch_side_effects(harness: &Harness, stderr: &str) {
             "a rejected plan must not emit {notice:?}: {stderr}"
         );
     }
-    let entries = std::fs::read_dir(harness.state.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect::<Vec<_>>();
-    assert!(
-        entries.is_empty(),
-        "a rejected plan must not create session, fork, credential, or builder state: {entries:?}"
+    let entries = state_entries(&harness.state.path().canonicalize().unwrap());
+    assert_eq!(
+        entries, harness.seeded_state,
+        "a rejected plan must not create session, fork, credential, or builder state"
     );
 }
 
@@ -377,12 +421,11 @@ fn unset_home_with_a_mount_uses_the_account_record() {
         h.project.path(),
     );
     let stderr = stderr_of(&launched);
-    assert!(!stderr.contains("$HOME is not set"), "{stderr}");
-    assert!(
-        !stderr.contains("neither $HOME nor the account record"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("[debug] sandbox config JSON"), "{stderr}");
+    // Host-wide approval lives at `$HOME/.config/agent-vm`, so a launch with no
+    // `$HOME` fails closed before the builder rather than proceeding unapproved.
+    assert!(!launched.status.success(), "{stderr}");
+    assert!(stderr.contains("image pin authority"), "{stderr}");
+    assert!(!stderr.contains("[debug] sandbox config JSON"), "{stderr}");
 }
 
 /// The other half of MF1: with `$HOME` unset the account record still supplies

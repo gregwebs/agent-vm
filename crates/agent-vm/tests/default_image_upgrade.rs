@@ -17,44 +17,6 @@ mod image_archive;
 #[path = "support/oci_registry.rs"]
 mod oci_registry;
 mod support;
-// The real launch update probe, compiled into this target unchanged so the S1
-// producer/consumer test runs production platform selection, transport and
-// comparison instead of a reimplementation. Its only crate-local dependency is
-// the advisory marker read, adapted below to this harness's isolated root.
-#[path = "../src/image_check.rs"]
-mod image_check;
-
-/// Test-local `pulled_marker` for the production probe above: the same file
-/// layout under whichever isolated state root the current test thread scoped in.
-mod pulled_marker {
-    use std::cell::RefCell;
-    use std::path::{Path, PathBuf};
-
-    thread_local! {
-        static ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-    }
-
-    /// Restores the previous root on drop, including while unwinding, so one
-    /// test's root can never leak into another test on the same thread.
-    pub struct ScopedRoot(Option<PathBuf>);
-
-    impl Drop for ScopedRoot {
-        fn drop(&mut self) {
-            ROOT.with(|root| *root.borrow_mut() = self.0.take());
-        }
-    }
-
-    pub fn scoped_root(root: &Path) -> ScopedRoot {
-        ScopedRoot(ROOT.with(|cell| cell.replace(Some(root.to_owned()))))
-    }
-
-    pub fn read(image_ref: &str) -> Option<String> {
-        let root = ROOT.with(|cell| cell.borrow().clone())?;
-        std::fs::read_to_string(super::pulled_marker_path(&root, image_ref))
-            .ok()
-            .map(|text| text.trim().to_owned())
-    }
-}
 use acquisition_gate::{
     AcquisitionGate, AcquisitionStage, GateReply, Peer, assert_guard_free, assert_guard_held,
     guard_path,
@@ -115,6 +77,11 @@ impl Harness {
                 fake_msb::VERSION_LINE
             ),
         );
+        fs::write(
+            bin.join(microsandbox_utils::libkrunfw_filename(std::env::consts::OS)),
+            b"fixture",
+        )
+        .unwrap();
         for name in ["docker", "buildx", "curl", "wget"] {
             fake_msb::write_executable(
                 &bin.join(name),
@@ -173,11 +140,25 @@ impl Harness {
     fn set_default(&self, target: &str) -> Output {
         self.run(&["image", "set-default", "--image", target])
     }
+    /// `image set-default --yes`: the pre-authorization a *replacement* of an
+    /// established approval needs when no terminal is attached.
+    fn set_default_yes(&self, target: &str) -> Output {
+        self.run(&["image", "set-default", "--image", target, "--yes"])
+    }
     /// `image refresh [--image REF]`: native acquisition only, no VM.
     fn refresh(&self, target: Option<&str>) -> Output {
         match target {
             Some(target) => self.run(&["image", "refresh", "--image", target]),
             None => self.run(&["image", "refresh"]),
+        }
+    }
+    /// `image refresh --yes` for a reference this home already approved at
+    /// different content: a first pin needs no such consent, so only rows that
+    /// expect a *replacement* may use this.
+    fn refresh_yes(&self, target: Option<&str>) -> Output {
+        match target {
+            Some(target) => self.run(&["image", "refresh", "--image", target, "--yes"]),
+            None => self.run(&["image", "refresh", "--yes"]),
         }
     }
     fn record(&self) -> PathBuf {
@@ -230,99 +211,18 @@ fn success(out: &Output) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
-/// The advisory marker's content, derived from the producer's documented path
-/// (state root + the first 8 bytes of SHA-256 of the selected reference).
-fn pulled_marker_path(state: &Path, reference: &str) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(reference.as_bytes());
-    let digest = hasher.finalize();
-    let mut name = String::new();
-    for byte in &digest[..8] {
-        use std::fmt::Write as _;
-        write!(name, "{byte:02x}").unwrap();
-    }
-    state.join("pulled-digests").join(name)
-}
-
-fn pulled_marker_digest(h: &Harness, reference: &str) -> Option<String> {
-    fs::read_to_string(pulled_marker_path(&h.state, reference))
-        .ok()
-        .map(|text| text.trim().to_owned())
-}
-
-/// The marker file's exact bytes, so a failure row can prove it did not move.
-fn pulled_marker_bytes(h: &Harness, reference: &str) -> Option<Vec<u8>> {
-    fs::read(pulled_marker_path(&h.state, reference)).ok()
-}
-
-/// The production launch update probe, run on this thread against the harness's
-/// isolated state root. Its real HTTP request, platform selection and comparison
-/// are what the S1 assertions read.
-fn probe_update_state(h: &Harness, reference: &str) -> Option<image_check::UpdateState> {
-    let _root = pulled_marker::scoped_root(&h.state);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime
-        .block_on(image_check::check_for_update(reference, false))
-        .unwrap()
-}
-
-fn describe_update_state(state: &Option<image_check::UpdateState>) -> String {
-    match state {
-        None => "None (the probe was undecided or unreachable)".to_string(),
-        Some(image_check::UpdateState::NotCached) => "NotCached".to_string(),
-        Some(image_check::UpdateState::UpToDate) => "UpToDate".to_string(),
-        Some(image_check::UpdateState::UpdateAvailable { cached, remote }) => {
-            format!("UpdateAvailable {{ cached: {cached}, remote: {remote} }}")
-        }
-    }
-}
-
-/// Open and drop one real TCP connection to the fixture's listener.
-fn warm_loopback(host: &str) {
-    let address = host.parse().expect("fixture host:port");
-    std::net::TcpStream::connect_timeout(&address, Duration::from_secs(30))
-        .expect("the fixture listener must accept its first loopback connection");
-}
-
-fn assert_up_to_date(h: &Harness, reference: &str, context: &str) {
-    let state = probe_update_state(h, reference);
-    assert!(
-        matches!(state, Some(image_check::UpdateState::UpToDate)),
-        "{context}: the launch update probe disagrees with the refresh marker: {} (marker: {:?})",
-        describe_update_state(&state),
-        pulled_marker_digest(h, reference)
-    );
-}
-
-fn assert_update_available(h: &Harness, reference: &str, context: &str) {
-    match probe_update_state(h, reference) {
-        // Both banner fields are read here so this target also proves they carry
-        // the two distinct digests (and keeps them live for `-D warnings`).
-        Some(image_check::UpdateState::UpdateAvailable { cached, remote }) => {
-            assert_ne!(cached, remote, "{context}: the banner must name a move");
-            assert!(!cached.is_empty() && !remote.is_empty(), "{context}");
-        }
-        _ => panic!("{context}: the launch update probe must see the moved host child"),
-    }
-}
-
 /// R9: every path under the isolated state root **except** the native image
-/// cache and the advisory marker directory, with file sizes. A boot-free
-/// acquisition must not add sandbox directories, guest disks or other runtime
-/// state; the expected native EROFS/fsmeta/VMDK artifacts live under the cache
-/// and are inventoried separately by `ReferenceSnapshot`.
+/// cache, with file sizes. A boot-free acquisition must not add sandbox
+/// directories, guest disks or other runtime state; the expected native
+/// EROFS/fsmeta/VMDK artifacts live under the cache and are inventoried
+/// separately by `ReferenceSnapshot`.
 fn non_cache_state(h: &Harness) -> BTreeMap<PathBuf, Option<u64>> {
     fn walk(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Option<u64>>) {
         for entry in fs::read_dir(path).expect("read the state inventory directory") {
             let entry = entry.expect("read a state inventory entry");
             let path = entry.path();
             let relative = path.strip_prefix(root).unwrap();
-            let excluded =
-                relative.starts_with("msb-home/cache") || relative.starts_with("pulled-digests");
+            let excluded = relative.starts_with("msb-home/cache");
             if excluded {
                 continue;
             }
@@ -363,6 +263,7 @@ fn complete(cache: &GlobalCache, pin: &str) {
 /// hashed: structurally valid replacement EROFS is still a failure.
 struct Snapshot {
     record: Vec<u8>,
+    pins: Vec<u8>,
     files: BTreeMap<PathBuf, (u64, String)>,
 }
 impl Snapshot {
@@ -371,11 +272,16 @@ impl Snapshot {
         let (metadata, others) = artifact_paths(&cache, pin, image);
         Self {
             record: fs::read(h.record()).unwrap(),
+            pins: fs::read(h.home.join(".config/agent-vm/image-pins.json")).unwrap(),
             files: hash_paths(std::iter::once(metadata).chain(others)),
         }
     }
     fn unchanged(&self, h: &Harness, pin: &str) {
         assert_eq!(fs::read(h.record()).unwrap(), self.record);
+        assert_eq!(
+            fs::read(h.home.join(".config/agent-vm/image-pins.json")).unwrap(),
+            self.pins
+        );
         self.artifacts_unchanged(h, pin);
     }
     fn artifacts_unchanged(&self, h: &Harness, pin: &str) {
@@ -507,7 +413,9 @@ fn explicit_tag_and_index_set_default_populate_pin_and_preserve_old_artifacts() 
     complete(&h.cache(), &pin_a);
     let snapshot = Snapshot::take(&h, &pin_a, &a);
     let pin_b = server.image("private-repo", "moving", &b);
-    success(&h.set_default(&tag));
+    // A moves to B: a replacement of the established approval, so this row
+    // pre-authorizes exactly the candidate it is about to resolve.
+    success(&h.set_default_yes(&tag));
     assert_eq!(h.selected(), pin_b);
     complete(&h.cache(), &pin_b);
     // Compare the A inventory while permitting the intended record change.
@@ -664,7 +572,11 @@ fn every_native_failure_preserves_a_record_metadata_and_artifact_hashes() {
     let before = Snapshot::take(&h, &pin_a, &a);
     let out = h.set_default(&pin_b);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("publishing"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("image pin authority"),
+        "a failed default transaction names the authority: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     complete(&h.cache(), &pin_b);
     before.unchanged(&h, &pin_a);
 }
@@ -680,7 +592,6 @@ fn actual_usage_health_and_config_boundaries_do_not_choose_set_default_target() 
         vec!["help", "image", "set-default"],
         vec!["image", "set-default"],
         vec!["image", "set-default", "--image", "/path"],
-        vec!["image", "set-default", "--image", "a:tag", "--yes"],
     ] {
         let out = h.run(&args);
         assert_eq!(
@@ -697,6 +608,12 @@ fn actual_usage_health_and_config_boundaries_do_not_choose_set_default_target() 
         assert!(!h.record().exists());
         assert_eq!(server.count(), 0);
     }
+    // `--yes` is accepted (and is the only pre-authorization this verb has); an
+    // unreachable target then fails at acquisition, not at parsing.
+    let out = h.run(&["image", "set-default", "--image", "a:tag", "--yes"]);
+    assert_ne!(out.status.code(), Some(2), "`--yes` must parse");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!h.record().exists());
     let user = h.home.join(".config/agent-vm/config.toml");
     fs::create_dir_all(user.parent().unwrap()).unwrap();
     fs::write(&user, "broken = [").unwrap();
@@ -1093,9 +1010,10 @@ fn old_artifact_hash_oracle_detects_a_structurally_valid_overwrite() {
 
 // -- `image refresh`: boot-free native acquisition -------------------------
 
-/// R3/R10: re-resolving a moving tag lands the new manifest under the same cache
-/// key, reuses cached layer bytes, keeps the old content intact and records the
-/// *acquired* digest in the advisory marker.
+/// R3/R10: an unchanged refresh reuses cached layer bytes; re-resolving a moving
+/// tag lands the new manifest under the same cache key, keeps the old content
+/// intact, and — because it replaces the established approval — needs the
+/// command's own `--yes`.
 #[test]
 fn refresh_reacquires_a_moving_tag_without_destroying_cached_artifacts() {
     let h = Harness::new();
@@ -1135,7 +1053,7 @@ fn refresh_reacquires_a_moving_tag_without_destroying_cached_artifacts() {
     // artifacts byte-identical, and mark the acquired digest.
     let _pin_b = server.image("images", "mutable", &b);
     let before_move = server.requests().len();
-    success(&h.refresh(Some(&tag)));
+    success(&h.refresh_yes(Some(&tag)));
     assert_eq!(
         cached_manifest_digest(&h.cache(), &tag),
         b.written.manifest_digest
@@ -1149,8 +1067,6 @@ fn refresh_reacquires_a_moving_tag_without_destroying_cached_artifacts() {
         "refresh must re-resolve the manifest of the requested tag: {after_move:?}"
     );
     old.unchanged();
-    let marker = pulled_marker_digest(&h, &tag);
-    assert_eq!(marker.as_deref(), Some(b.written.manifest_digest.as_str()));
     // R9: a further refresh allocates no runtime guest state outside the cache.
     let state = non_cache_state(&h);
     success(&h.refresh(Some(&tag)));
@@ -1319,27 +1235,20 @@ fn refresh_refuses_local_targets_before_any_state() {
 struct RefreshBaseline {
     metadata: Vec<u8>,
     artifacts: ReferenceSnapshot,
-    marker: Option<Vec<u8>>,
 }
 
 impl RefreshBaseline {
     fn take(h: &Harness, reference: &str, image: &Image) -> Self {
         let cache = h.cache();
         let metadata_path = cache.image_metadata_path(&reference.parse::<Reference>().unwrap());
-        // Every call site seeds this baseline from a *successful* refresh, which
-        // must have written the advisory marker. Failing to read it must not
-        // masquerade as "no marker" in the unchanged comparison below.
-        let marker = pulled_marker_bytes(h, reference)
-            .unwrap_or_else(|| panic!("refresh wrote no advisory marker for {reference}"));
         Self {
             metadata: fs::read(metadata_path).expect("cached metadata before the failure"),
             artifacts: ReferenceSnapshot::take(&cache, reference, image),
-            marker: Some(marker),
         }
     }
 
-    /// Exact cached-key bytes, the acquired image's artifact hashes, Never
-    /// completeness and the advisory marker all survive; no VM/daemon fallback.
+    /// Exact cached-key bytes, the acquired image's artifact hashes and Never
+    /// completeness all survive; no VM/daemon fallback.
     fn unchanged(&self, h: &Harness, reference: &str) {
         let cache = h.cache();
         let metadata_path = cache.image_metadata_path(&reference.parse::<Reference>().unwrap());
@@ -1347,11 +1256,6 @@ impl RefreshBaseline {
             fs::read(metadata_path).expect("cached metadata after the failure"),
             self.metadata,
             "the failed refresh rewrote the cached key's metadata"
-        );
-        assert_eq!(
-            pulled_marker_bytes(h, reference),
-            self.marker,
-            "the failed refresh moved the advisory marker"
         );
         self.artifacts.unchanged();
         complete(&cache, reference);
@@ -1793,11 +1697,6 @@ fn refresh_resolves_an_immutable_index_to_the_host_child_without_retaining_m() {
             ))
     );
     assert!(!h.record().exists(), "an explicit refresh never retains");
-    // The advisory marker names the acquired child under the selected key.
-    assert_eq!(
-        pulled_marker_digest(&h, &index_pin).as_deref(),
-        Some(child_digest.as_str())
-    );
 
     // A fresh bare refresh retains I, not M. A later recommendation J must
     // not move the retained selection, even while Always reacquires I.
@@ -1849,175 +1748,6 @@ fn refresh_resolves_an_immutable_index_to_the_host_child_without_retaining_m() {
     h.no_fallback();
 }
 
-/// Publish an index under `tag` whose `manifests` are exactly `children`, in
-/// order. Each child's manifest/config/layer routes are registered first, so the
-/// index is the only thing that decides which child a pull lands.
-fn ordered_index(server: &Server, tag: &str, children: &[(&str, &Image)]) -> String {
-    let mut index: serde_json::Value = serde_json::from_slice(&children[0].1.index).unwrap();
-    let descriptors: Vec<serde_json::Value> = children
-        .iter()
-        .map(|(route, image)| {
-            server.image("images", route, image);
-            serde_json::from_slice::<serde_json::Value>(&image.index).unwrap()["manifests"][0]
-                .clone()
-        })
-        .collect();
-    index["manifests"] = serde_json::Value::Array(descriptors);
-    server.index("images", tag, serde_json::to_vec(&index).unwrap())
-}
-
-/// S1: the marker `image refresh` writes and the digest the launch update probe
-/// compares must be the same *host* child, in both positions, for a mutable tag
-/// and for an immutable index, and with two independently known host children in
-/// both index orders. Before the fix the producer recorded the host child while
-/// the consumer compared an `linux/amd64` entry, so an arm64 host saw a permanent
-/// "update available" banner that the suggested refresh could never clear.
-#[test]
-fn refresh_marker_and_host_update_probe_agree() {
-    let h = Harness::new();
-    let server = Server::new();
-    // This host delays the test process's *first* loopback connect past the
-    // probe's own 5s timeout (observed ~13s); warm the path once so the consumer
-    // assertions below read a real probe decision instead of that startup delay.
-    warm_loopback(&server.host);
-    let host = h.image(&ArchiveSpec::default());
-    let foreign = h.image(&ArchiveSpec {
-        marker: "s1-foreign".into(),
-        config_platform: PlatformSpec::Foreign,
-        descriptor_platform: PlatformSpec::Foreign,
-        ..Default::default()
-    });
-    let host_digest = host.written.manifest_digest.clone();
-    assert_ne!(
-        host_digest, foreign.written.manifest_digest,
-        "the fixture needs two distinct children"
-    );
-
-    // A foreign descriptor must not be selected merely because it comes first.
-    for (tag, foreign_first) in [("s1-foreign-first", true), ("s1-host-first", false)] {
-        let (first, second) = if foreign_first {
-            (("s1-foreign-a", &foreign), ("s1-host-a", &host))
-        } else {
-            (("s1-host-a", &host), ("s1-foreign-a", &foreign))
-        };
-        ordered_index(&server, tag, &[first, second]);
-        let reference = format!("{}/images:{tag}", server.host);
-        success(&h.refresh(Some(&reference)));
-        assert_eq!(cached_manifest_digest(&h.cache(), &reference), host_digest);
-        complete(&h.cache(), &reference);
-        assert_eq!(
-            pulled_marker_digest(&h, &reference).as_deref(),
-            Some(host_digest.as_str())
-        );
-        assert_up_to_date(&h, &reference, tag);
-    }
-
-    // Move **only** the host child (the foreign descriptor stays as it was): the
-    // probe must now report an update, and the refresh it suggests must clear it.
-    let next = h.image(&ArchiveSpec {
-        marker: "s1-next".into(),
-        ..Default::default()
-    });
-    let next_digest = next.written.manifest_digest.clone();
-    assert_ne!(next_digest, host_digest);
-    let moved = format!("{}/images:s1-foreign-first", server.host);
-    ordered_index(
-        &server,
-        "s1-foreign-first",
-        &[("s1-foreign-a", &foreign), ("s1-next", &next)],
-    );
-    assert_update_available(&h, &moved, "moved host child");
-    success(&h.refresh(Some(&moved)));
-    assert_eq!(cached_manifest_digest(&h.cache(), &moved), next_digest);
-    assert_eq!(
-        pulled_marker_digest(&h, &moved).as_deref(),
-        Some(next_digest.as_str())
-    );
-    complete(&h.cache(), &moved);
-    assert_up_to_date(&h, &moved, "after refreshing the moved tag");
-
-    // The immutable index consumer: the manifests selector is the index digest,
-    // the marker still records the resolved host child.
-    let immutable = ordered_index(
-        &server,
-        "s1-immutable",
-        &[("s1-immutable-host", &host), ("s1-foreign-a", &foreign)],
-    );
-    success(&h.refresh(Some(&immutable)));
-    complete(&h.cache(), &immutable);
-    assert_eq!(
-        cached_manifest_digest(&h.cache(), &immutable),
-        host_digest,
-        "the requested index key must identify its resolved host child"
-    );
-    assert_eq!(
-        pulled_marker_digest(&h, &immutable).as_deref(),
-        Some(host_digest.as_str())
-    );
-    assert!(!h.record().exists(), "an explicit refresh never retains");
-    assert_up_to_date(&h, &immutable, "immutable index");
-
-    // Two independently known host children in both orders: the cache key and
-    // marker must name the **first** eligible descriptor, not the last, and the
-    // production consumer must agree with whatever real resolution chose.
-    let first_host = h.image(&ArchiveSpec {
-        marker: "s1-m1".into(),
-        ..Default::default()
-    });
-    let second_host = h.image(&ArchiveSpec {
-        marker: "s1-m2".into(),
-        ..Default::default()
-    });
-    assert_ne!(
-        first_host.written.manifest_digest,
-        second_host.written.manifest_digest
-    );
-    for (tag, first, second) in [
-        ("s1-duplicate-12", &first_host, &second_host),
-        ("s1-duplicate-21", &second_host, &first_host),
-    ] {
-        let expected = first.written.manifest_digest.clone();
-        let first_route = format!("{tag}-first");
-        let second_route = format!("{tag}-second");
-        let pin = ordered_index(
-            &server,
-            tag,
-            &[
-                (first_route.as_str(), first),
-                (second_route.as_str(), second),
-            ],
-        );
-        let reference = format!("{}/images:{tag}", server.host);
-        success(&h.refresh(Some(&reference)));
-        assert_eq!(
-            cached_manifest_digest(&h.cache(), &reference),
-            expected,
-            "{tag}: native resolution must land the first host child"
-        );
-        assert_eq!(
-            pulled_marker_digest(&h, &reference).as_deref(),
-            Some(expected.as_str()),
-            "{tag}: the marker must record the same child"
-        );
-        assert_ne!(pin.rsplit('@').next().unwrap(), expected);
-        complete(&h.cache(), &reference);
-        assert_up_to_date(&h, &reference, tag);
-    }
-    h.no_fallback();
-}
-
-// ===========================================================================
-//
-// R15 — same-cache/same-reference coordination between helper writers.
-//
-// Two real CLI processes share one cache and one normalized reference. The
-// winner must publish and validate under the launcher guard; a peer must
-// snapshot only *after* it acquires the guard, and a failed peer must never
-// restore or delete the winner's bytes. Stages are advanced one acknowledged
-// checkpoint at a time: no sleeps decide a race, and the guard is probed with a
-// real independent `flock`.
-
-/// The mutable reference used by one coordination schedule.
 struct Coordinated {
     h: Harness,
     server: Server,
@@ -2068,11 +1798,13 @@ impl Coordinated {
         guard_path(&self.h.cache(), &self.tag)
     }
 
+    /// A contending refresh of the same tag. A peer here re-resolves to
+    /// different content, so it carries the command's own `--yes`.
     fn spawn(&self, gate: &AcquisitionGate) -> Peer {
         Peer::spawn(
             self.h.command(),
             gate,
-            &["image", "refresh", "--image", &self.tag],
+            &["image", "refresh", "--image", &self.tag, "--yes"],
         )
     }
 }
@@ -2127,17 +1859,11 @@ fn coordination_success_then_native_failure_keeps_the_winners_bytes() {
             "{initial}: P must publish B"
         );
         let published = c.metadata_bytes();
-        let marker = pulled_marker_digest(&c.h, &c.tag);
 
         // Q gets its snapshot only now, and it is B — never the pre-wait state.
         let q_snapshot = gate.expect(AcquisitionStage::Snapshot);
         assert_guard_held(&c.guard());
         assert_eq!(c.metadata_bytes(), published, "{initial}: Q snapshot B");
-        assert_eq!(
-            pulled_marker_digest(&c.h, &c.tag),
-            marker,
-            "{initial}: no Q marker before acquisition"
-        );
 
         // A genuine native failure for Q: its manifest route is gone.
         c.server.remove("/v2/images/manifests/coordinated");
@@ -2162,11 +1888,6 @@ fn coordination_success_then_native_failure_keeps_the_winners_bytes() {
         if let Some((snapshot, _)) = old {
             snapshot.unchanged();
         }
-        assert_eq!(
-            pulled_marker_digest(&c.h, &c.tag),
-            marker,
-            "{initial}: Q failure must not move the marker"
-        );
         assert!(
             !c.h.record().exists(),
             "{initial}: explicit refresh retains nothing"
@@ -2204,7 +1925,6 @@ fn coordination_postvalidation_failure_restores_the_winners_bytes() {
         success(&p.wait());
         let published = c.metadata_bytes();
         let b_artifacts = ReferenceSnapshot::take(&c.h.cache(), &c.tag, &b);
-        let marker = pulled_marker_digest(&c.h, &c.tag);
         assert_eq!(
             cached_manifest_digest(&c.h.cache(), &c.tag),
             b.written.manifest_digest
@@ -2251,7 +1971,6 @@ fn coordination_postvalidation_failure_restores_the_winners_bytes() {
         if let Some((snapshot, _)) = old {
             snapshot.unchanged();
         }
-        assert_eq!(pulled_marker_digest(&c.h, &c.tag), marker);
         assert!(!c.h.record().exists());
         assert_guard_free(&c.guard());
         c.h.no_fallback();
@@ -2395,7 +2114,6 @@ fn coordination_restore_failure_reports_both_stages_and_recovers() {
         success(&p.wait());
         let published = c.metadata_bytes();
         let b_artifacts = ReferenceSnapshot::take(&c.h.cache(), &c.tag, &b);
-        let marker = pulled_marker_digest(&c.h, &c.tag);
 
         let q_snapshot = gate.expect(AcquisitionStage::Snapshot);
         assert_eq!(c.metadata_bytes(), published);
@@ -2424,12 +2142,11 @@ fn coordination_restore_failure_reports_both_stages_and_recovers() {
             !stderr.contains("previous reference metadata was restored"),
             "a failed restore must not claim restoration:\n{stderr}"
         );
-        // B's content and every old A artifact survive, and the marker is unmoved.
+        // B's content and every old A artifact survive.
         b_artifacts.unchanged();
         if let Some(old) = old {
             old.unchanged();
         }
-        assert_eq!(pulled_marker_digest(&c.h, &c.tag), marker);
         assert!(!c.h.record().exists());
         // Recovery: the tag serves B again and a clean acquisition succeeds.
         c.server.image("images", "coordinated", &b);
@@ -2821,8 +2538,9 @@ fn coordination_setup_and_set_default_enter_the_same_guard() {
 }
 
 /// B2: `setup --no-verify` retains the exact selected immutable index on a
-/// fresh host, and a host already retaining I reacquires I — never a changed
-/// recommendation J — preserving record bytes.
+/// fresh host, and a host already approving I consumes I's approved host child
+/// — never a changed recommendation J, and never a second resolution of the
+/// index — preserving record bytes.
 #[test]
 fn setup_no_verify_adopts_a_fresh_index_and_reacquires_a_retained_one() {
     let fresh = Harness::new();
@@ -2863,7 +2581,7 @@ fn setup_no_verify_adopts_a_fresh_index_and_reacquires_a_retained_one() {
     let _child_j = server.image("images", "child-j", &j);
     let index_j = multiarch_index(&h, &server, "indexed-j", &j);
     assert_ne!(index_j, index_pin);
-    let index_digest = index_pin.rsplit('@').next().unwrap().to_owned();
+    let child_digest = a.written.manifest_digest.clone();
     let index_j_digest = index_j.rsplit('@').next().unwrap().to_owned();
     let before = server.requests().len();
     success(&bounded(
@@ -2878,18 +2596,21 @@ fn setup_no_verify_adopts_a_fresh_index_and_reacquires_a_retained_one() {
     );
     assert_eq!(h.selected(), index_pin);
     let since = &server.requests()[before..];
-    assert!(
-        since
-            .iter()
-            .any(|(_, path)| *path == format!("/v2/images/manifests/{index_digest}")),
-        "the retained index digest must be re-resolved: {since:?}"
-    );
+    // The approved host child is already cached, so an approved preparation
+    // makes NO registry request at all — it neither re-resolves the index from
+    // the record nor looks at the changed recommendation.
     assert!(
         !since
             .iter()
             .any(|(_, path)| *path == format!("/v2/images/manifests/{index_j_digest}")),
         "the changed recommendation must never be acquired: {since:?}"
     );
+    assert!(
+        since.is_empty(),
+        "an approved warm preparation contacts no registry: {since:?}"
+    );
+    assert_eq!(h.selected(), index_pin);
+    let _ = child_digest;
     complete(&h.cache(), &index_pin);
     h.no_fallback();
 }
@@ -2969,7 +2690,6 @@ fn postvalidation_faults_keep_explicit_causes_and_redact_default_operations() {
             );
         }
         assert!(!h.record().exists());
-        assert!(pulled_marker_digest(&h, &pin).is_none());
         assert_guard_free(&lock);
         h.no_fallback();
     }
@@ -3246,7 +2966,6 @@ fn refresh_rejects_complete_cache_result_identity_disagreement_and_restores_meta
     let cache = h.cache();
     let metadata = cache.image_metadata_path(&tag.parse::<Reference>().unwrap());
     let prior = fs::read(&metadata).unwrap();
-    let marker = pulled_marker_digest(&h, &tag);
     let mut gate = AcquisitionGate::new(h.root.path());
     let peer = Peer::spawn(h.command(), &gate, &["image", "refresh", "--image", &tag]);
     gate.expect(AcquisitionStage::BeforeLock)
@@ -3275,7 +2994,6 @@ fn refresh_rejects_complete_cache_result_identity_disagreement_and_restores_meta
     let out = peer.wait();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("identity"));
-    assert_eq!(pulled_marker_digest(&h, &tag), marker);
     assert!(!h.record().exists());
     complete(&cache, &tag);
     h.no_fallback();
@@ -3283,43 +3001,60 @@ fn refresh_rejects_complete_cache_result_identity_disagreement_and_restores_meta
 
 /// Retention publication and advisory marker writes have different policies:
 /// a failed record lock fails refresh; a failed marker write only warns.
+/// A default-tier `image refresh` initializes the retained default from
+/// acquisition success alone — not from a launch — and does it inside the same
+/// transaction as the first pin. A default slot that cannot be written fails the
+/// whole operation: no approval, no record.
 #[test]
-fn default_refresh_requires_adoption_but_not_a_writable_advisory_marker() {
-    for fail_record in [false, true] {
-        let h = Harness::new();
-        let server = Server::new();
-        let image = h.image(&ArchiveSpec::default());
-        let pin = server.image("images", "publication", &image);
-        if fail_record {
-            fs::create_dir_all(h.record().parent().unwrap()).unwrap();
-            fs::create_dir(h.record().with_file_name("default-image.lock")).unwrap();
-        } else {
-            fs::create_dir_all(&h.state).unwrap();
-            fs::write(h.state.join("pulled-digests"), b"not a directory").unwrap();
-        }
-        let out = bounded(
-            h.command()
-                .env("AGENT_VM_TEST_DEFAULT_IMAGE", &pin)
-                .args(["image", "refresh"]),
+fn default_refresh_adopts_from_acquisition_success_in_one_transaction() {
+    let h = Harness::new();
+    let server = Server::new();
+    let image = h.image(&ArchiveSpec::default());
+    let pin = server.image("images", "publication", &image);
+    let out = bounded(
+        h.command()
+            .env("AGENT_VM_TEST_DEFAULT_IMAGE", &pin)
+            .args(["image", "refresh"]),
+    );
+    success(&out);
+    complete(&h.cache(), &pin);
+    assert_eq!(h.selected(), pin, "the recommendation is retained");
+    let pins = h.home.join(".config/agent-vm/image-pins.json");
+    let store: serde_json::Value = serde_json::from_slice(&fs::read(&pins).unwrap()).unwrap();
+    assert_eq!(store["pins"].as_array().unwrap().len(), 1);
+    assert!(store["pending_default"].is_null());
+    h.no_fallback();
+
+    // The default slot cannot be written (its lock path is a directory): the
+    // acquisition succeeded, but nothing was approved or retained.
+    let h = Harness::new();
+    let server = Server::new();
+    let image = h.image(&ArchiveSpec::default());
+    let pin = server.image("images", "publication", &image);
+    fs::create_dir_all(h.record().parent().unwrap()).unwrap();
+    fs::create_dir(h.record().with_file_name("default-image.lock")).unwrap();
+    let out = bounded(
+        h.command()
+            .env("AGENT_VM_TEST_DEFAULT_IMAGE", &pin)
+            .args(["image", "refresh"]),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!h.record().exists());
+    // Refused before the first write, so the authority holds no approval and no
+    // journal intent (the file may not exist at all).
+    let pins = fs::read(h.home.join(".config/agent-vm/image-pins.json"));
+    if let Ok(bytes) = pins {
+        let store: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            store["pins"].as_array().unwrap().is_empty(),
+            "a failed default transaction must not approve the candidate: {store}"
         );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.success(), !fail_record, "{stderr}");
-        complete(&h.cache(), &pin);
-        if fail_record {
-            assert!(!h.record().exists());
-            assert!(
-                stderr.contains("retaining the selected default boot image"),
-                "{stderr}"
-            );
-        } else {
-            assert_eq!(h.selected(), pin);
-            assert!(
-                stderr.contains("failed to record the refreshed image digest"),
-                "{stderr}"
-            );
-        }
-        h.no_fallback();
+        assert!(
+            store["pending_default"].is_null(),
+            "no journal intent: {store}"
+        );
     }
+    h.no_fallback();
 }
 
 // ---------------------------------------------------------------------------
@@ -3610,8 +3345,8 @@ fn receipt_is_cache_only_and_alias_overwrite_is_repaired() {
         "the receipt belongs to the cache, not HOME"
     );
     assert!(
-        !h.home.join(".config/agent-vm/image-pins.json").exists(),
-        "this stage creates no host approval store"
+        h.home.join(".config/agent-vm/image-pins.json").exists(),
+        "the first acquisition approves the content it validated"
     );
 
     // A genuine archive publication under the digest-spelled alias replaces the
@@ -3708,10 +3443,10 @@ fn gate_io_failure_is_a_failure_not_a_skip() {
     );
 }
 
-/// No image verb creates a host approval store yet, and the pin gate
-/// protocol is bounded and single-reply (no approval semantics).
+/// Every mutating image verb establishes the host approval store, a read-only
+/// verb creates nothing, and the pin gate protocol is bounded and single-reply.
 #[test]
-fn no_pin_store_is_created_and_the_pin_gate_control_is_bounded() {
+fn only_mutating_verbs_create_the_pin_store_and_the_gate_control_is_bounded() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
@@ -3720,24 +3455,22 @@ fn no_pin_store_is_created_and_the_pin_gate_control_is_bounded() {
     let a = h.image(&ArchiveSpec::default());
     let tag = format!("{}/images:nopin", server.host);
     let pin = server.image("images", "nopin", &a);
+    // A read-only verb creates no authority file, even after a mutating one.
+    let pins = h.home.join(".config/agent-vm/image-pins.json");
+    let before = fs::read(&pins).ok();
+    success(&h.run(&["image", "show"]));
+    assert_eq!(fs::read(&pins).ok(), before);
     success(&h.refresh(Some(&tag)));
+    let approved = fs::read_to_string(&pins).expect("refresh approved the acquired content");
+    let value: serde_json::Value = serde_json::from_str(&approved).unwrap();
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["pins"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        value["pins"][0]["manifest_digest"],
+        pin.as_str().rsplit_once('@').unwrap().1
+    );
     success(&h.set_default(&pin));
     success(&h.run(&["setup", "--no-verify"]));
-    let mut stack = vec![h.home.clone()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            assert!(
-                !name.starts_with("image-pins"),
-                "no host pin store may be created yet: {}",
-                path.display()
-            );
-            if path.is_dir() {
-                stack.push(path);
-            }
-        }
-    }
 
     // The gate protocol: one stage, one reply, exact stage matching. This
     // exercises the harness control the production stages will be wired to.
@@ -4138,4 +3871,214 @@ fn lying_child_and_lying_config_are_integrity_failures() {
         "a lying config must not publish the requested key"
     );
     h.no_fallback();
+}
+
+#[test]
+fn failed_candidates_preserve_approval_hashes_and_fresh_cli_preparation() {
+    enum Cleanup {
+        File(PathBuf),
+        Directory(PathBuf),
+        RestoreDirectory { path: PathBuf, saved: PathBuf },
+    }
+    for failure in [
+        "invalid-layer",
+        "invalid-archive",
+        "metadata",
+        "os",
+        "arch",
+        "auth",
+        "direct-lie",
+        "child-lie",
+        "config-lie",
+        "trust",
+        "receipt-write",
+        "canonical-write",
+    ] {
+        let h = Harness::new();
+        let server = Server::new();
+        let a = h.image(&ArchiveSpec::default());
+        let pin_a = server.image("images", "preserve", &a);
+        let tag = format!("{}/images:preserve", server.host);
+        success(&h.set_default(&tag));
+        let before = Snapshot::take(&h, &pin_a, &a);
+        let spec = match failure {
+            "invalid-layer" => ArchiveSpec {
+                marker: failure.into(),
+                layer: LayerContent::DigestMismatch,
+                ..Default::default()
+            },
+            "invalid-archive" => ArchiveSpec {
+                marker: failure.into(),
+                layer: LayerContent::NotATar,
+                ..Default::default()
+            },
+            "os" => ArchiveSpec {
+                marker: failure.into(),
+                config_platform: PlatformSpec::OsArch(
+                    "windows".into(),
+                    image_archive::host_arch().into(),
+                ),
+                ..Default::default()
+            },
+            "arch" => ArchiveSpec {
+                marker: failure.into(),
+                config_platform: PlatformSpec::Foreign,
+                ..Default::default()
+            },
+            _ => ArchiveSpec {
+                marker: failure.into(),
+                ..Default::default()
+            },
+        };
+        let b = h.image(&spec);
+        let pin_b = server.image("images", "preserve", &b);
+        let mut cleanup = None;
+        match failure {
+            "metadata" => server.put(
+                "/v2/images/manifests/preserve",
+                b"{broken".to_vec(),
+                "application/vnd.oci.image.manifest.v1+json",
+                &image_archive::sha256_hex(b"{broken"),
+            ),
+            "auth" => server.deny_manifest("/v2/images/manifests/preserve"),
+            "direct-lie" => server.put_with_header(
+                "/v2/images/manifests/preserve",
+                &b.blobs[&b.written.manifest_digest],
+                "application/vnd.oci.image.manifest.v1+json",
+                &a.written.manifest_digest,
+            ),
+            "child-lie" => {
+                let mut index: serde_json::Value = serde_json::from_slice(&b.index).unwrap();
+                let lie = format!("sha256:{}", "e".repeat(64));
+                index["manifests"][0]["digest"] = lie.clone().into();
+                server.put_with_header(
+                    &format!("/v2/images/manifests/{lie}"),
+                    &b.blobs[&b.written.manifest_digest],
+                    "application/vnd.oci.image.manifest.v1+json",
+                    &lie,
+                );
+                server.index("images", "preserve", serde_json::to_vec(&index).unwrap());
+            }
+            "trust" => {
+                let ca = h.root.path().join("invalid-ca.pem");
+                fs::write(&ca, b"not a certificate").unwrap();
+                let path = h.state.join("msb-home/config.json");
+                fs::write(
+                    &path,
+                    serde_json::to_vec(&serde_json::json!({"registries":{"ca_certs":[ca]}}))
+                        .unwrap(),
+                )
+                .unwrap();
+                cleanup = Some(Cleanup::File(path));
+            }
+            "config-lie" => server.put(
+                &format!("/v2/images/blobs/{}", b.written.config_digest),
+                b"{}".to_vec(),
+                "application/octet-stream",
+                &b.written.config_digest,
+            ),
+            "receipt-write" => {
+                // Block receipt publication after validation, then restore A's
+                // directory before comparing its independently inventoried bytes.
+                let path = h.state.join("msb-home/cache/agent-vm-content-metadata");
+                let saved = path.with_extension("saved");
+                fs::rename(&path, &saved).unwrap();
+                fs::write(&path, b"not a directory").unwrap();
+                cleanup = Some(Cleanup::RestoreDirectory { path, saved });
+            }
+            "canonical-write" => {
+                let path = h.cache().image_metadata_path(&pin_b.parse().unwrap());
+                fs::create_dir(&path).unwrap();
+                cleanup = Some(Cleanup::Directory(path));
+            }
+            _ => {}
+        }
+        let out = h.set_default_yes(&tag);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{failure}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        match cleanup {
+            Some(Cleanup::File(path)) => fs::remove_file(path).unwrap(),
+            Some(Cleanup::Directory(path)) => fs::remove_dir(path).unwrap(),
+            Some(Cleanup::RestoreDirectory { path, saved }) => {
+                fs::remove_file(&path).unwrap();
+                fs::rename(saved, path).unwrap();
+            }
+            None => {}
+        }
+        before.unchanged(&h, &pin_a);
+        let start = server.count();
+        // The preparation used by launch, without a VM: this cannot repair A by
+        // asking the moved source or by adopting B from its mutable alias.
+        let out = h.run(&["setup", "--image", &tag, "--no-verify"]);
+        success(&out);
+        assert_eq!(
+            server.count(),
+            start,
+            "{failure}: old A was not usable offline"
+        );
+        before.unchanged(&h, &pin_a);
+    }
+}
+
+#[test]
+fn update_and_import_leave_project_persist_and_runtime_state_unchanged() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    server.image("images", "state", &a);
+    let tag = format!("{}/images:state", server.host);
+    success(&h.set_default(&tag));
+    let project = h.root.path().join("owned-project");
+    let persist = h.state.join("persist");
+    let sandbox = h.state.join("owned-running-rootfs");
+    for path in [&project, &persist, &sandbox] {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("sentinel"), b"owned persistent A bytes\0\xff").unwrap();
+    }
+    fs::create_dir(project.join(".agent-vm")).unwrap();
+    fs::write(
+        project.join(".agent-vm/config.toml"),
+        b"# preserve project config\n",
+    )
+    .unwrap();
+    let snapshots: Vec<_> = [&project, &persist, &sandbox]
+        .map(|p| (p, tree_snapshot(p)))
+        .into();
+    let state_snapshot = || {
+        let mut snapshot = tree_snapshot(&h.state);
+        snapshot.retain(|path, _| !path.starts_with("msb-home/cache"));
+        snapshot
+    };
+    let state = state_snapshot();
+    let b = h.image(&ArchiveSpec {
+        marker: "state-b".into(),
+        ..Default::default()
+    });
+    server.image("images", "state", &b);
+    for operation in ["refresh", "set-default", "import"] {
+        let archive = h.root.path().join("state-b.tar");
+        let args = match operation {
+            "refresh" => vec!["image", "refresh", "--image", &tag, "--yes"],
+            "set-default" => vec!["image", "set-default", "--image", &tag, "--yes"],
+            _ => vec![
+                "image",
+                "import",
+                "--input",
+                archive.to_str().unwrap(),
+                "--tag",
+                &tag,
+            ],
+        };
+        let out = bounded(h.command().current_dir(&project).args(args));
+        success(&out);
+        for (path, snapshot) in &snapshots {
+            assert_eq!(&tree_snapshot(path), snapshot);
+        }
+        assert_eq!(state_snapshot(), state);
+        h.no_fallback();
+    }
 }

@@ -7,6 +7,11 @@ slice 2 of [agent-vm #257](https://github.com/gregwebs/agent-vm/issues/257);
 the retained-default decision below is [agent-vm
 #261](https://github.com/gregwebs/agent-vm/issues/261), slice 4 (amended, see
 *Decision*). Explicit replacement is implemented by [#262](https://github.com/gregwebs/agent-vm/issues/262).
+Amended for **all-source host-wide approval** by [agent-vm
+#390](https://github.com/gregwebs/agent-vm/issues/390) and
+[ADR-0047](0047-host-wide-oci-image-approval.md): every OCI selection is now
+pinned, a changed pin needs candidate-scoped consent, and launches consume only
+approved child content.
 Supersedes [ADR-0003](0003-project-tooling-layers.md),
 [ADR-0019](0019-tool-free-base-and-per-tool-layers.md),
 [ADR-0028](0028-explicit-image-flag-beats-the-other-environment-variable.md),
@@ -62,6 +67,23 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   `--image` > `AGENT_VM_IMAGE_TAG` (empty = unset) > user config `image` >
   project config `image` > the default boot image. `run`, `image refresh`, `setup` and
   `doctor` all resolve through one function (`boot_image::select`).
+- **Every OCI selection is host-approved (#390, amended).** Selection precedence
+  is unchanged, but winning is not authorization. Each of the six tiers is keyed
+  by its canonical OCI reference plus the measured host Linux platform, and a
+  launch or `setup` consumes the approved host-platform **child** digest
+  (`repo@child`), never the selected tag or index. The first pin is established
+  only after successful acquisition and validation and **before** the SDK create;
+  a changed pin requires candidate-scoped consent (escaped source, full old/new
+  digests, default No) from `--yes` on either `image refresh` or
+  `image set-default`, or from an interactive terminal on both ends of either
+  verb. The approval store is host-wide in
+  `$HOME/.config/agent-vm/image-pins.json`, independent of projects, the cache
+  and `AGENT_VM_STATE_DIR`. A digest selection keeps its stated identity —
+  mismatching content is an integrity failure, never an approvable replacement —
+  while a multiarch index may resolve to its verified child. Equivalence for “no
+  replacement needed” is native guest content (verified config digest plus
+  ordered layer diff IDs), so an alternate digest algorithm does not disturb the
+  stored approval. See [ADR-0047](0047-host-wide-oci-image-approval.md).
 - **The default is a retained, user-scoped selection (#261, this ADR).** The
   bootstrap/digest fallback is a **retained default**: an immutable OCI
   reference (`repo@sha256:…`) in the user-scoped
@@ -71,19 +93,23 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   reference) offered only when no record exists; `select` reads the record
   lazily and writes nothing, and the record is **adopted only after the image
   was successfully acquired** (success-before-adoption), write-once under an
-  exclusive `flock` so concurrent first launches cannot overwrite each other. A
+  exclusive `flock` so concurrent first launches cannot overwrite each other. The
+  first pin follows the same success-before-adoption rule for every tier:
+  acquisition success, not boot success, establishes it. A
   failed initial acquisition therefore leaves no record, so a later compatible
   recommendation (e.g. a multiarch release) can rescue the host instead of
   stranding it. A retained record is never silently replaced; replacing a
-  *working* one requires explicit `image set-default --image REF` (#262): native target
+  *working* one requires explicit `image set-default --image REF [--yes]` (#262): native target
   acquisition, canonical manifest pin acquisition, complete pinned-cache and
   host-Linux config validation precede replacement/initialization under the same
-  lock and record. Same-pin success preserves record bytes. Only future default
-  sessions change; overrides, running sessions and previous cache remain intact. A
+  lock and journaled transaction. Same-pin success preserves record bytes. Only
+  future default sessions change; overrides, running sessions and previous cache
+  remain intact. A
   missing/corrupt/unreadable record fails the verbs that need the default with a
   fixed reason and an escaped path; it is never auto-reset. The record is not a
   download cache: msb owns the bytes, so cache loss, `AGENT_VM_STATE_DIR` or a
-  new project does not move the selection.
+  new project does not move the selection. It also stays digest-only: the source
+  tag is not retained here (#392).
 - **Config-file images are OCI references only.** A config `image` that the SDK
   would classify as a host path (`/`, `./`, `../`, `.`, `..`) is rejected, so a
   repo-supplied `.agent-vm/config.toml` cannot boot the host root filesystem as
@@ -94,20 +120,31 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   falls back to a build. A registry acquisition failure for an explicit mutable
   tag prints an import hint; it is text, never an action (ADR-0043).
 - **No legacy detection or shims.** The removed `--layer`, `--base-image` and
-  `--yes` flags, the removed `layer` config field, `.agent-vm/layers/` discovery
-  and the `AGENT_VM_BASE_IMAGE`/`AGENT_VM_LAYER`/`AGENT_VM_YES` variables are
-  gone, not migrated.
+  the *old* build/global `--yes`/`-y`, the removed `layer` config field,
+  `.agent-vm/layers/` discovery and the
+  `AGENT_VM_BASE_IMAGE`/`AGENT_VM_LAYER`/`AGENT_VM_YES` variables are gone, not
+  migrated and never restored. #390 adds a different, nested `--yes` on exactly
+  `image refresh` and `image set-default`; it is consent to replace one resolved
+  digest, not a launch/build/composition flag, and no launcher build prompt
+  returns. The opt-in launch update check (`--update-check`,
+  `AGENT_VM_UPDATE_CHECK`) and its banner/marker were removed outright under the
+  same no-shim rule: before the tool verb an unknown option is a usage error
+  (status 2), after it the token is forwarded to the tool.
 - **Ordinary Docker `FROM`/multistage is the customization mechanism.** A user
   extends the default boot image with a Dockerfile, imports it, and selects it
   with `--image`/`image =`.
 
 ## Consequences
 
-- Removed: `--layer`, `--base-image`, `--yes`/`-y`, the `layer` field,
+- Removed: `--layer`, `--base-image`, the old build/global `--yes`/`-y`, the
+  `layer` field,
   `.agent-vm/layers/` discovery, the legacy `.agent-vm/layer` check,
   `AGENT_VM_BASE_IMAGE`/`AGENT_VM_LAYER`/`AGENT_VM_YES`, `DEFAULT_BASE_IMAGE_REF`,
-  the launcher's `include_dir!` image embed, and the composition machinery
-  (`layer.rs`, `layer/contract.rs`, `tool_layer.rs`).
+  the launcher's `include_dir!` image embed, the composition machinery
+  (`layer.rs`, `layer/contract.rs`, `tool_layer.rs`), and (from #390) the
+  launch-time update check with `--update-check`, `AGENT_VM_UPDATE_CHECK`, its
+  banner and its pulled-digest marker. Importing over a tag does not approve it;
+  explicit import approval remains #391.
 - **`setup` verifies declared tools only, and is fatal on any image.** The
   verification targets are exactly the tools the configuration declares (the
   synthesized `shell` fallback is not among them); a command the configuration
@@ -143,7 +180,16 @@ the contributor gitlink and launcher recommendation, without a runtime source de
   launcher release is held pending amd64 evidence and maintainer image
   promotion or explicit risk acceptance. Merge is not image promotion.
 - **#262 fulfilled.** Explicit replacement remains separate from write-once
-  automatic adoption. See [USAGE](../../USAGE.md#explicitly-setting-the-default).
+  automatic adoption, and from #390 on it is a revision-checked
+  compare-and-swap with candidate consent. See
+  [USAGE](../../USAGE.md#explicitly-setting-the-default).
+- **#390 fulfilled.** Every OCI tier is pinned host-wide; warm launches are
+  registry-free; cache loss reacquires the approved digest; refresh/set-default
+  are the only movement checks. The retained default stays digest-only (#392)
+  and import/build cannot silently approve content (#391). Native behaviour and
+  live-guest observations are manual evidence; boot-free checks cannot prove
+  guest execution. See
+  [USAGE](../../USAGE.md#host-wide-approval-of-oci-image-content).
 - Follow-up evidence: [#265](https://github.com/gregwebs/agent-vm/issues/265)
   (native installed consumption on both architectures).
 

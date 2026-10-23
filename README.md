@@ -110,4 +110,7 @@ for builder prerequisites and host-build trust.
   agreed user contract and Docker-shaped YAML/CLI design (not yet implemented).
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
   the way they do.
+- [Host-wide OCI image approval](docs/adr/0047-host-wide-oci-image-approval.md) —
+  why every selected image is pinned per host platform and how a digest change is
+  approved.
 - [CODING_STANDARDS.md](CODING_STANDARDS.md) — repo coding standards.

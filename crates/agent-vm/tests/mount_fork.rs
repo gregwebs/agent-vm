@@ -29,13 +29,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// A bogus-but-well-formed image ref. Never resolves; only used to drive
-/// execution far enough into `launch()` to prove `builder.build()` already
-/// ran (its debug JSON dump happens right before the pull, which is what
-/// fails here).
-const BOGUS_IMAGE: &str = "localhost:1/does-not-exist:latest";
-
 mod support;
+
+#[path = "support/image_archive.rs"]
+mod image_archive;
 
 fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
@@ -128,11 +125,81 @@ struct Harness {
     home: tempfile::TempDir,
     state: tempfile::TempDir,
     project: tempfile::TempDir,
+    /// The imported fixture reference every launch selects.
+    image: String,
+    /// State entries the harness's own fixture import created. A rejected
+    /// launch must add nothing to this set.
+    seeded_state: std::collections::BTreeSet<std::ffi::OsString>,
     fake_msb: PathBuf,
 }
 
 impl Harness {
+    /// A harness whose project selects a genuine host-valid image imported
+    /// through the public CLI. Launch preparation has something to approve, so
+    /// `builder.build()` and its debug dump are reachable without a registry.
     fn new() -> Self {
+        let h = Self::bare();
+        let archive = h.home.path().join("fixture-boot.tar");
+        image_archive::write(&archive, &image_archive::ArchiveSpec::default());
+        let mut import = Command::new(agent_vm_bin());
+        import
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", h.home.path())
+            .env("AGENT_VM_STATE_DIR", h.state.path())
+            .env("MSB_PATH", &h.fake_msb)
+            .current_dir(h.project.path())
+            .args([
+                "image",
+                "import",
+                "--input",
+                archive.to_str().unwrap(),
+                "--tag",
+                &h.image,
+            ]);
+        let out = run_with_timeout(import, Duration::from_secs(60));
+        assert!(
+            out.status.success(),
+            "fixture import failed: {}",
+            stderr_of(&out)
+        );
+        let mut h = h;
+        h.seeded_state = state_entries(&h.state.path().canonicalize().unwrap());
+        h
+    }
+
+    /// Seed the same fixture image into another state root (a fresh or
+    /// symlinked one) so a launch there has approved content in its own cache.
+    fn seed_image_at_state(&self, state: &Path) {
+        let archive = self.home.path().join("fixture-custom-state.tar");
+        image_archive::write(&archive, &image_archive::ArchiveSpec::default());
+        let mut import = Command::new(agent_vm_bin());
+        import
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", self.home.path())
+            .env("AGENT_VM_STATE_DIR", state)
+            .env("MSB_PATH", &self.fake_msb)
+            .current_dir(self.project.path())
+            .args([
+                "image",
+                "import",
+                "--input",
+                archive.to_str().unwrap(),
+                "--tag",
+                &self.image,
+            ]);
+        let out = run_with_timeout(import, Duration::from_secs(60));
+        assert!(
+            out.status.success(),
+            "custom-state fixture import failed: {}",
+            stderr_of(&out)
+        );
+    }
+
+    /// A harness with no imported image: for tests whose whole point is that a
+    /// rejected launch creates no state.
+    fn bare() -> Self {
         // The relay socket lives below the state directory, so keep that one
         // under `/tmp` to stay within Unix's socket-path limit. `$HOME` and the
         // project dir live on the workspace filesystem instead; the project
@@ -147,6 +214,8 @@ impl Harness {
             home,
             state,
             project,
+            image: "fixture:boot".to_string(),
+            seeded_state: std::collections::BTreeSet::new(),
             fake_msb,
         }
     }
@@ -232,7 +301,7 @@ impl Harness {
         for m in mounts {
             cmd.arg("--mount").arg(m);
         }
-        cmd.args(["--image", BOGUS_IMAGE]).arg("shell");
+        cmd.arg("--image").arg(&self.image).arg("shell");
         run_with_timeout(cmd, Duration::from_secs(15))
     }
 }
@@ -330,6 +399,8 @@ fn absent_state_root_supports_directory_fork_seed_and_reuse() {
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("seed"), "seed").unwrap();
     let mount = format!("{}:/guest:fork", source.display());
+    // A fresh state root has no cache; seed the approved content into it.
+    h.seed_image_at_state(&state);
 
     let seeded = h.run_shell_at_state(&[&mount], &state);
     let seeded_stderr = stderr_of(&seeded);
@@ -529,15 +600,19 @@ fn exact_core_followed_collision_fails_before_launch_side_effects() {
     assert_no_launch_side_effects(&h, &stderr);
 }
 
-fn assert_no_launch_side_effects(harness: &Harness, stderr: &str) {
-    assert_no_notices(stderr);
-    let state_entries = std::fs::read_dir(harness.state.path())
+fn state_entries(state: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
+    std::fs::read_dir(state)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
-        .collect::<Vec<_>>();
-    assert!(
-        state_entries.is_empty(),
-        "a rejected topology must not create session, fork, credential, or builder state: {state_entries:?}"
+        .collect()
+}
+
+fn assert_no_launch_side_effects(harness: &Harness, stderr: &str) {
+    assert_no_notices(stderr);
+    let state_entries = state_entries(&harness.state.path().canonicalize().unwrap());
+    assert_eq!(
+        state_entries, harness.seeded_state,
+        "a rejected topology must not create session, fork, credential, or builder state"
     );
 }
 
@@ -845,16 +920,12 @@ fn follow_links_root_mode_enforces_home_guardrail() {
     );
 }
 
-/// `--root` with `$HOME` unset resolves the launch's home from the account
-/// record (`user::host_home_dir` → `getpwuid_r(geteuid()).pw_dir`) when the
-/// environment does not carry one, so the guardrail has a home to compare
-/// against. This exercises `run.rs`'s `mount_home` wiring end to end — the
-/// dumped config proves the launch got past `expand_follow_links` and
-/// `builder.build()` with a home in hand. The `home: None` case (reached only
-/// when the account record fails too) stays pinned by the `mount.rs` unit
-/// tests, and the guardrail's own refusal by the sibling test above.
+/// `--root` with `$HOME` unset cannot name the host-wide approval record, so an
+/// OCI launch fails closed before the builder. The mount guardrail's
+/// account-record fallback (`user::host_home_dir`) remains covered by the
+/// `mount.rs` unit tests and by the sibling guardrail test with `$HOME` set.
 #[test]
-fn follow_links_root_mode_falls_back_to_the_account_record_when_home_is_unset() {
+fn follow_links_root_mode_without_home_refuses_the_approval_store() {
     let h = Harness::new();
     let host_mount = h.project.path().join("m");
     std::fs::create_dir_all(&host_mount).unwrap();
@@ -867,13 +938,14 @@ fn follow_links_root_mode_falls_back_to_the_account_record_when_home_is_unset() 
     );
 
     let err = stderr_of(&out);
+    assert!(!out.status.success(), "stderr:\n{err}");
     assert!(
-        !err.contains("required for --mount follow-links"),
-        "the account record must supply the home, stderr:\n{err}"
+        err.contains("image pin authority"),
+        "a launch without $HOME must refuse the host-wide approval store, stderr:\n{err}"
     );
     assert!(
-        err.contains("[debug] sandbox config JSON"),
-        "the guardrail must have had a $HOME to run with, stderr:\n{err}"
+        !err.contains("[debug] sandbox config JSON"),
+        "the refusal must precede builder.build(), stderr:\n{err}"
     );
 }
 
@@ -1227,6 +1299,7 @@ fn core_sources_are_canonical_and_keep_root_follow_default() {
     std::os::unix::fs::symlink(&real_state_parent, &link).unwrap();
     let state = link.join("absent-root");
     let canonical_state = real_state_parent.join("absent-root");
+    h.seed_image_at_state(&state);
 
     let output = h.run_shell_at_state(&[], &state);
     let stderr = stderr_of(&output);

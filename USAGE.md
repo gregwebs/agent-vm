@@ -67,9 +67,12 @@ image build --tag REF [OPTIONS] [CONTEXT]
                                     explicitly build + import a user Dockerfile
 image import (--docker REF [--tag REF] | --input FILE --tag REF)
                                     import a finished image into agent-vm's cache
-image refresh [--image REF]         acquire the selected OCI image, without
-                                    booting a VM or changing the retained default
-image set-default --image REF       acquire and retain a new digest-pinned default
+image refresh [--image REF] [--yes]
+                                    approve/acquire the selected OCI image,
+                                    without booting a VM or changing the
+                                    retained default
+image set-default --image REF [--yes]
+                                    approve and retain a new digest-pinned default
 setup                               acquire the selected image + verify boot
 doctor                              report host credentials + microsandbox state
                                     + the resolved tool configuration
@@ -102,16 +105,22 @@ configured tool may now use either name.
 
 Flags follow their subcommand: `agent-vm image refresh --image REF` works,
 `agent-vm --image REF image refresh` and `agent-vm image --image REF refresh`
-do not.
+do not. The rule is positional: an unknown or spaced flag *before* the tool
+verb is an unknown-option usage error (status 2), while a token *after* the
+verb is forwarded to the tool verbatim (and a built-in verb rejects it). There
+is no compatibility alias for a flag agent-vm no longer has: before the verb it
+is an unknown option, after it the tool sees it.
 
 `image refresh` is **boot-free native acquisition**: it resolves the selected
 reference (or `--image REF`), checks its current manifest, reuses unchanged
 cached layers, and publishes a complete host-Linux cache entry using the
 ambient microsandbox cache with native registry auth, trust and managed HTTP
 policy. It creates no sandbox, boots no guest and touches no project or running
-guest. Selection, precedence and recovery are unchanged; the opt-in launch
-update banner compares against a marker recording the digest it actually
-acquired, and that marker is neither an approval nor an identity guarantee.
+guest. Selection, precedence and recovery are unchanged. Every OCI selection
+is also a host-wide **image approval** (next section); refresh is one of the
+two explicit operations allowed to re-resolve a source and ask for consent. A
+launch never checks a tag for movement: there is no launch-time update check,
+flag, environment variable, banner or marker.
 
 `image set-default` is the renamed deliberate default operation (below), with
 the same acquisition-before-publication safety. Refresh and set-default accept
@@ -214,6 +223,142 @@ no local build.
 does not contain the tool's `command`, the launch prints a contract diagnostic
 and exits 127.
 
+### Host-wide approval of OCI image content
+
+Every OCI image you select — `--image`, `AGENT_VM_IMAGE_TAG`, user or project
+`image`, or the default tier — is **approved once per host and platform**.
+agent-vm keeps that approval in:
+
+```text
+$HOME/.config/agent-vm/image-pins.json   approvals (private, version 1)
+$HOME/.config/agent-vm/image-pins.lock   coordination
+```
+
+One entry binds the canonical OCI reference plus the host Linux platform
+(`linux/arm64`, `linux/amd64`) to the approved host-platform manifest **child**
+digest. The store is host-wide: every project and every launch `HOME` share it,
+and it is independent of the microsandbox cache, of `AGENT_VM_STATE_DIR` and of
+project files. Approvals are never written into `config.toml`. Selection
+precedence is unchanged (table above): a pin never chooses the image; it fixes
+what an already-selected reference may resolve to.
+
+**Acquisition precedes the guest, approval precedes create.** On the first
+selection of a reference, agent-vm acquires and validates the image, commits
+the first pin, and only then hands `repo@approved-digest` to the SDK. The pin
+therefore records measured content, not a successful boot: a later builder,
+credential or runtime failure leaves it in place, and no launch consumes bytes
+it did not approve. A first pin needs no prompt. `setup` prepares the same way;
+its verification guest boots the approved child (or the first pin it just
+committed), and `--no-verify` stops after preparation without a VM.
+
+What this buys:
+
+- **Warm launches are offline and registry-free.** An existing approval is
+  consumed as `repo@child`; the mutable tag is never queried. A registry
+  outage, a moved tag or a tag deleted upstream does not change a warm launch.
+- **Clearing cache cannot upgrade content.** With the cache or state root
+  gone, the approved digest is reacquired from its registry. If that content is
+  unavailable the launch fails; it never falls back to whatever the tag serves
+  now. The approval lives outside every cache and state root, so only moving
+  `HOME` or deleting the store loses it.
+- **Only two verbs check for movement.** `agent-vm image refresh` and
+  `agent-vm image set-default` resolve their target's current registry content
+  even when a pin exists. No launch, setup or background probe does.
+- **Host checks are not guest compatibility.** Platform, manifest and digest
+  validation say which bytes are approved; they do not promise the applications
+  inside them work. That remains the [boot image contract](#boot-image-contract).
+
+A digest you type yourself keeps its stated identity: mismatching content is an
+integrity failure, never an invitation to approve the replacement. A multiarch
+**index** selection may resolve to its verified host-platform child, and the
+approval names that child; equivalent guest content reached under a different
+manifest digest or digest algorithm keeps the stored approval and asks nothing.
+
+Local rootfs directories and disk images are launched but never pinned: a local
+path passes through unchanged and touches neither the store nor the cache
+barrier. `image refresh` and `image set-default` reject local paths as targets.
+
+#### Replacing an approval
+
+When an explicit refresh or set-default resolves different content for an
+existing mutable pin, agent-vm prints the change and asks on stderr:
+
+```text
+Replace the approved image for ghcr.io/owner/app:dev (linux/arm64)?
+  old: sha256:<full old digest>
+  new: sha256:<full current digest>
+Approve this exact image change? [y/N]
+```
+
+The default is **No**. One line is read (at most 64 bytes); `y` or `yes`,
+ASCII-case-insensitive after surrounding whitespace, approves. Empty input,
+`n`, an invalid or overlong line, end-of-file or an I/O error declines with
+status 1 and no reprompt. The operation is repeatable, so declining is cheap.
+The exact validated candidate is frozen before the prompt: a registry that
+moves again during the decision cannot substitute content under the same
+consent. The approval binds that candidate's digest plus the pin revision and
+digest that were displayed; a concurrent writer that moved the pin first fails
+the compare-and-swap and asks you to retry, rather than silently authorizing
+the wrong predecessor.
+
+`--yes` pre-authorizes exactly the resolved candidate:
+
+```sh
+agent-vm image refresh --yes
+agent-vm image refresh --image ghcr.io/owner/app:dev --yes
+agent-vm image set-default --image ghcr.io/owner/app:dev --yes
+```
+
+`--yes` exists only on these two verbs (no `-y`, no environment variable and no
+launch, setup, build or import flag). The change is still printed, so the old
+and new digests appear in the log without a human at the terminal. A first pin
+or an unchanged digest never prompts and does not need `--yes`.
+
+Without `--yes`, a replacement needs **both stdin and stderr to be terminals**.
+Pipes, files, CI runners and `2>log` all refuse a changed pin with status 1,
+fixed guidance naming the `--yes` form, and the stored approval untouched;
+stdin is not read, so a piped script cannot answer a question it was never
+shown. A first pin or an unchanged digest succeeds without a terminal. Cloud
+and CI automation must therefore use `--yes`, which authorizes one exact
+candidate rather than "whatever is current".
+
+#### Damaged or reset approvals
+
+A damaged store (wrong schema, unknown field, duplicate key, oversized,
+non-UTF-8, symlink, FIFO, unreadable, or a lock that is not a regular file) is
+a hard error, never "no approvals yet". OCI launches, setup and updates fail
+until it is repaired, because silently re-pinning would authorize content
+nobody approved. The damaged bytes are left in place. Recovery: restore the
+file from a backup; or, to deliberately **reset approvals**, move
+`image-pins.json` aside and leave the cache alone. A reset makes the next
+selection of each reference a first selection again — it re-approves whatever
+that reference resolves to at that moment. Never delete approvals to work
+around a cache problem: cache records have their own restore/reacquire
+recovery, and an approval is not cache evidence.
+
+#### Retained default and staging boundaries
+
+The [retained default](#the-retained-default) keeps its existing digest-only
+storage: `default-image.json` never records a source tag, platform or tool
+metadata. `image set-default` stores its approved host child there, so a bare
+`image refresh` still reacquires the retained digest rather than following the
+tag it was originally selected from (issue #392). Automatic adoption is
+unchanged in *when* it may happen: an absent record is retained only after
+successful acquisition — for any successful default-tier preparation, not only a
+first pin — and an existing record is never moved by a launch.
+
+`image build` and `image import` publish cache aliases but never create or
+replace a pin or the retained default (issue #391). Importing over a tag you
+once approved does **not** approve the imported bytes: a launch keeps using the
+approved digest until you run `image refresh --image REF` and approve the
+change. A daemon-only image may not be available from a registry, so it cannot
+be registry-refreshed; the import itself remains the supported way to get it
+into the cache.
+
+The store holds at most 4096 approvals of at most 4096 source bytes each, and
+the record may not exceed 4 MiB; exceeding a bound is a schema error, not a
+partial load.
+
 ### Inspecting the selected boot image
 
 `agent-vm image show` prints the image a launch in this project would select,
@@ -245,11 +390,18 @@ file-backed source, escaped the same way:
 These are the [selection table](#selecting-the-boot-image) rows in the same
 order; `AGENT_VM_IMAGE_TAG=""` counts as unset, exactly as for a launch.
 
+`Image:` reports the selected **source**, not the approved guest content. The
+digest a launch would actually consume is a separate host approval and is not
+printed here.
+
 The command is read-only and offline. It consults no cached image, Docker,
 msb, registry, keychain or VM, and creates no record, lock, configuration
 directory, cache or runtime state; it needs neither an installed runtime nor
 image sources. It therefore makes no claim about whether the selected image
-exists, can be downloaded or can boot.
+exists, can be downloaded or can boot. When the default tier is the observed
+source, the report depends on a healthy pin store and a bounded shared-lock
+read, because the store's journal defines the logical fallback; a damaged store
+fails that observation safely while a higher explicit source still prints.
 
 Failures use the diagnostics selection already has, on stderr with an empty
 stdout. An unreadable or invalid configuration is fatal **even when the
@@ -302,8 +454,13 @@ multiarch index, and a newer release may change it). How the two interact:
   successful launch. Nothing is stranded on bytes your host cannot boot.
 - **A retained default is never silently replaced.** A different recommendation,
   a launcher upgrade, a project image, or a cache loss leaves the retained
-  digest alone. automatic `adopt` is write-once (first writer wins), so concurrent first
-  launches cannot overwrite each other.
+  digest alone. Automatic adoption is insert-if-absent under the host lock, so
+  concurrent first launches cannot overwrite each other.
+- **The digest is also a host approval.** The default tier participates in the
+  same [host-wide approval](#host-wide-approval-of-oci-image-content) as every
+  other source: once pinned, a launch consumes the approved child and makes no
+  registry contact. The record still holds only the digest (#392), so a bare
+  `image refresh` reacquires it rather than following a tag.
 - **The digest must resolve.** A retained digest whose content is unavailable
   (registry gone, content deleted) fails the launch with the same error a
   user-typed reference would; it is not silently redirected to another image.
@@ -321,8 +478,9 @@ reference's current manifest and reuses unchanged layers.
 registry serves now*: after a cache loss a `:latest` launch may fetch different
 bytes than before. A digest names exact content. That is why the retained record
 and the initial recommendation are digest-pinned, and why the launcher never
-polls a tag to "refresh" your default (the opt-in `--update-check`/
-`AGENT_VM_UPDATE_CHECK` freshness banner is unrelated and stays opt-in).
+polls a tag: a launch makes no registry contact beyond acquiring what an
+[approval](#host-wide-approval-of-oci-image-content) already names, and
+checking for movement is the explicit `agent-vm image refresh` operation's job.
 
 **Observing and recovering.** `agent-vm doctor` prints a fixed label —
 `retained default` or `not selected; initial recommendation` — and the record
@@ -339,7 +497,9 @@ corrupt, unreadable (a symlink, FIFO, directory, oversized or non-UTF-8 file)
 or names a non-digest reference, every verb that needs the default fails and
 names the escaped path with a fixed reason; nothing is auto-reset. To recover,
 restore the intended digest record from backup, or deliberately move the file
-aside to reinitialize from the current recommendation.
+aside to reinitialize from the current recommendation. That is separate from a
+damaged [pin store](#damaged-or-reset-approvals), which needs its own repair or
+deliberate reset.
 
 ### Explicitly setting the default
 
@@ -351,30 +511,43 @@ agent-vm --no-git shell bash -c 'my-program --version'
 `--image REF` is required and accepts an OCI tag or digest, not a local path.
 Environment/config launch images do not choose the set-default target, even with
 broken tool configuration. There is no automatic latest discovery; explicitly
-requesting `:latest` resolves it only for this invocation.
+requesting `:latest` resolves it only for this invocation. A changed approval
+needs consent — the terminal prompt, or `--yes` for unattended use
+([Replacing an approval](#replacing-an-approval)).
 
 ```text
-explicit OCI target → native acquire → immutable host manifest pin
-                    → native pinned-cache acquire → host-Linux config check
-                    → selection flock → atomic retained-record replacement
+explicit OCI target → resolve current registry content once → validated candidate
+                    → approval (first/unchanged: none; changed: prompt or --yes)
+                    → revalidate the frozen candidate under a shared barrier
+                    → shared cache barrier → pin EX → default EX (journaled)
+                        atomic pin store  {old pins, pending_default}
+                        atomic default    {approved host child}
+                        atomic pin store  {new pins, no pending_default}  ← commit
+                    → release; future launches consume the approved child
 ```
 
 The command uses the ambient **local** microsandbox cache and native registry
 auth/TLS settings. It consumes registry content without Docker and **does not
 boot or replace a VM**. Only future sessions falling through to the default
 change: CLI, environment, user and project image overrides and running sessions
-are untouched. Acquisition or publication failure exits nonzero and leaves the
-old selection and cached image usable; unused new artifacts may remain cached.
-No old images are deleted. A successfully re-acquired same digest leaves valid
-record bytes unchanged. Atomic rename protects against interruption, not
-power-loss durability (`fsync` is not added).
+are untouched. Acquisition, approval or publication failure exits nonzero and
+leaves the old selection and cached image usable; unused new artifacts may
+remain cached. A declined or nonterminal refusal also leaves the previous
+fallback in place. No old images are deleted. A successfully re-acquired same
+digest leaves valid record bytes unchanged and asks nothing. Interruption
+before the final pin write is repaired by the next *write* to the store — an
+explicit image command, or a launch or `setup` that has to record a first pin or
+retain the fallback — which restores the old logical default; readers never
+recover, and no fsync/power-loss durability is claimed.
 
 An absent record can be initialized directly, without consulting the initial
 recommendation. A damaged record is rejected, not automatically repaired; use
-the recovery procedure above. Concurrent explicit publications serialize under
-the same lock as ordinary adoption; the last successful explicit commit wins,
-and a delayed ordinary adopter cannot overwrite it. A launch that already
-selected the previous default may still boot it.
+the recovery procedure above. Approval and fallback commit together under the
+host lock; an explicit replacement is a compare-and-swap on the revision and
+digest you were shown, so a concurrent writer that moved the pin first makes
+this operation fail instead of overwriting it, and a delayed ordinary adopter
+cannot overwrite an established pin. A launch that already selected the
+previous default may still boot it.
 
 Roll back by passing a known previous full digest reference to the same
 `image set-default --image` command. Acquisition must succeed again before
@@ -520,12 +693,14 @@ hint and retains the registry error chain. It does not prove the image exists
 in Docker. Digests and the redacted default image get no hint; launch never
 runs Docker or automatically imports.
 
-Neither verb writes configuration or a retained default, adopts a default,
-boots a guest, installs runtime tools or triggers a launch build. Build does not
-consult image selection at all. Import observes it — read-only, with the same
-selector and environment rule as `image show` — once, after the native
+Neither verb writes configuration, a host pin or a retained default, adopts a
+default, boots a guest, installs runtime tools or triggers a launch build. Build
+does not consult image selection at all. Import observes it — read-only, with
+the same selector and environment rule as `image show` — once, after the native
 publication succeeds, and only to decide that guidance. The observation is a
-snapshot: a later config edit or launch decides what actually boots.
+snapshot: a later config edit or launch decides what actually boots. Import
+publishing a name does not approve that name's content (#391); see
+[Retained default and staging boundaries](#retained-default-and-staging-boundaries).
 Successful import is **not** proof of the boot image contract;
 `shell`/`setup` diagnose unusable software.
 
@@ -636,7 +811,6 @@ Available launch options:
 | `--memory N` | VM memory GiB (default 2) |
 | `--cpus N` | vCPUs (default 2) |
 | `--image REF` | boot this image instead of the configured one (env `AGENT_VM_IMAGE_TAG`); see [Selecting the boot image](#selecting-the-boot-image) |
-| `--update-check` | check the registry for a newer image on launch (off by default) |
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
 | `--allow-missing-credentials` | warn and launch when a requested YAML credential is missing or unreadable, instead of refusing — see [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection). Never covers a built-in provider's own missing host credential |
@@ -808,7 +982,6 @@ included, enables it.
 | `AGENT_VM_NO_CHROME_MCP` | disable Chrome MCP auto-configuration for a Chrome-capable image |
 | `AGENT_VM_IMAGE_TAG` | override the OCI image (same as `--image`; outranks any config `image`; an empty value counts as unset) |
 | `AGENT_VM_MEMORY_GIB` / `AGENT_VM_CPUS` | same as `--memory` / `--cpus` |
-| `AGENT_VM_UPDATE_CHECK` | opt into the launch-time registry update check (accepted: `1`/`true`/`yes`/`on`) |
 | `AGENT_VM_ROOT` | same as `--root` (accepted: `1`/`true`/`yes`/`on`) |
 
 `AGENT_VM_BASE_IMAGE`, `AGENT_VM_LAYER` and `AGENT_VM_YES` are no longer read.

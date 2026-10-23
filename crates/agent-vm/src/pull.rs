@@ -7,25 +7,25 @@
 //! sandbox, VM, temporary disk, Docker or alternate download backend is
 //! involved, and nothing about a project or a running guest changes.
 //!
-//! Retention is a *separate* decision made by the caller after acquisition
-//! succeeds ([`boot_image::adopt_default_selection`]): a default-tier refresh may
-//! initialize an absent retained default, and neither `--image`, env nor a
-//! config tier ever replaces one.
+//! This is the explicit operation that *checks for movement*: it re-resolves the
+//! selected source even when the cache is warm, then hands the validated
+//! candidate to the host approval authority ([`crate::image_pin::update`]). A
+//! replaced approval needs the user's consent — this command's own `--yes`, or a
+//! default-No prompt on a terminal — and a decline, an interruption or any
+//! acquisition/publication failure leaves the previous approval and default
+//! logically unchanged. Nothing about a project or a running guest changes.
 //!
-//! The advisory marker (`pulled_marker`) records the resolved manifest digest
-//! this acquisition actually landed, keyed by the selected reference. It exists
-//! so the launch banner can say "an update is available"; it is not an approval
-//! record, not proof of cached identity, and a failed acquisition leaves it
-//! untouched.
+//! Retention is a *separate* decision the same authority makes: a default-tier
+//! refresh may initialize an absent retained default from acquisition success
+//! alone, and neither `--image`, env nor a config tier ever replaces one.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use clap::Args as ClapArgs;
 
 use crate::boot_image;
 use crate::config::{Catalog, ConfiguredImages};
-use crate::image_acquire::{
-    AcquireError, AcquireMode, OciTarget, OciTargetError, PreparedNativeImage, acquire,
-};
+use crate::image_acquire::{OciTarget, OciTargetError};
+use crate::image_pin::{ApprovalMode, ExplicitOperation};
 
 /// The fixed refusal for a refresh target that is a local rootfs or disk path.
 /// Names no value: the rejected text is user input.
@@ -54,6 +54,11 @@ pub struct Args {
     /// boot image" in USAGE.md.
     #[command(flatten)]
     pub(crate) image: boot_image::ImageArgs,
+
+    /// Replace an existing approval without asking. Exactly the resolved
+    /// candidate is authorized; a first pin or an unchanged one never asks.
+    #[arg(long)]
+    pub(crate) yes: bool,
 }
 
 pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Result<()> {
@@ -75,14 +80,14 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
     let label = boot.label();
     println!("==> {label} is the image this configuration boots from");
     // The explicit refresh resolves the current source even when the cache is
-    // warm; a returned token holds the shared barrier only until this statement
-    // ends, and refresh never boots anything.
-    drop(pull_image(boot.reference().as_str(), &label).await?);
-    // Success-before-adoption (#261): only after the acquisition succeeded may a
-    // default-tier selection become the retained default. An explicit, env or
-    // config refresh never adopts its target.
-    boot_image::adopt_default_selection(&boot)
-        .context("retaining the selected default boot image")?;
+    // warm, then approves (or reports) exactly what it resolved. It never boots
+    // anything, and it holds no cache barrier and no host lock by the time it
+    // returns.
+    crate::image_pin::update(
+        ExplicitOperation::Refresh(&boot),
+        ApprovalMode::of_flag(args.yes),
+    )
+    .await?;
     println!(
         "==> {} acquired into the microsandbox image cache",
         label.text()
@@ -103,60 +108,6 @@ pub(crate) fn preflight(args: &Args) -> Result<()> {
     OciTarget::parse(requested.reference().as_str())
         .map(|_| ())
         .map_err(target_error)
-}
-
-/// Acquire `image` into the image cache, without booting. Shared by
-/// `image refresh` and `setup`'s pull step.
-///
-/// `label` is the selection's safe output policy: when it is redacted (the
-/// default tier) the debug dump, progress display and any acquisition error
-/// carry the fixed label instead of the record/recommendation reference.
-pub async fn pull_image(
-    image: &str,
-    label: &boot_image::ImageLabel,
-) -> Result<PreparedNativeImage> {
-    let target = OciTarget::parse(image).map_err(target_error)?;
-    let prepared = acquire(&target, label, AcquireMode::ResolveCurrent)
-        .await
-        .map_err(|error| acquisition_error(label, image, error))?;
-    // Only a successful, validated acquisition updates the advisory marker, and
-    // it records *this* pull's acquired digest rather than a second registry
-    // probe: a probe could race a moving tag and assumes an index layout.
-    if let Err(error) =
-        crate::pulled_marker::write(image, prepared.image().acquired_digest().as_str())
-    {
-        // A trusted-host state path error, never the image reference, so it is
-        // printed as-is for debugging (not escaped).
-        eprintln!("warn: failed to record the refreshed image digest: {error:#}");
-    }
-    Ok(prepared)
-}
-
-/// Render an acquisition failure for this selection without leaking a redacted
-/// reference.
-///
-/// A redacted selection may not disclose a reference, and a postvalidation
-/// failure's sources can name one, so its closed safe text is chosen *before*
-/// the generic redactor (which would flatten it into a registry message and lose
-/// the failed-restore stage). It keeps its recovery requirement. Explicit
-/// sources keep both stages, the native chain and the import hint.
-fn acquisition_error(
-    label: &boot_image::ImageLabel,
-    image: &str,
-    error: AcquireError,
-) -> anyhow::Error {
-    if label.is_redacted() {
-        return match error {
-            AcquireError::Native { .. } | AcquireError::RegistrySettings(_) => {
-                label.redact_error("pulling", anyhow!(error.redacted_message()))
-            }
-            // These closed diagnostics carry no reference-bearing source chain.
-            // Preserve coordination stages and publication-uncertain recovery
-            // advice rather than flattening them into a registry failure.
-            _ => anyhow!(error.redacted_message()),
-        };
-    }
-    crate::image_miss::attach(error.into_explicit_error(), image, label)
 }
 
 /// Decide whether the registry needs `--insecure` (plain HTTP).
@@ -257,6 +208,7 @@ mod tests {
                 value.map(str::to_string),
                 value.map(|_| OverrideSource::CommandLine),
             ),
+            yes: false,
         }
     }
 
@@ -278,52 +230,6 @@ mod tests {
             assert!(!error.to_string().contains("agent-vm --image PATH <tool>"));
             assert!(!error.to_string().contains(malformed));
         }
-    }
-
-    #[test]
-    fn redacted_coordination_and_task_failures_keep_actionable_stages() {
-        use crate::image_acquire::ReferenceStage;
-
-        let label = boot_image::ImageLabel::for_default_upgrade();
-        let sentinel = "https://private.example/secret-repository\u{1b}";
-        for (stage, expected) in [
-            (
-                ReferenceStage::LockOpen,
-                "opening the image-cache coordination lock",
-            ),
-            (
-                ReferenceStage::LockAcquire,
-                "acquiring the image-cache coordination lock",
-            ),
-            (
-                ReferenceStage::Snapshot,
-                "snapshotting cached reference metadata",
-            ),
-        ] {
-            let error = acquisition_error(
-                &label,
-                sentinel,
-                AcquireError::ReferenceState {
-                    stage,
-                    source: anyhow!(sentinel),
-                },
-            );
-            let text = format!("{error:#}");
-            assert!(text.contains(expected), "{text}");
-            assert!(!text.contains("private.example"), "{text}");
-            assert!(!text.contains('\u{1b}'), "{text}");
-        }
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let join = runtime.block_on(async {
-            tokio::spawn(async { panic!("private source") })
-                .await
-                .unwrap_err()
-        });
-        let error = acquisition_error(&label, sentinel, AcquireError::Task(join));
-        let text = format!("{error:#}");
-        assert!(text.contains("publication is uncertain"), "{text}");
-        assert!(text.contains("check the cache and retry"), "{text}");
-        assert!(!text.contains("private source"), "{text}");
     }
 
     #[test]

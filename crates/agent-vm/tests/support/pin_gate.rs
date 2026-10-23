@@ -1,10 +1,10 @@
 //! Test-owned control for the **pin publication** stages of #390.
 //!
-//! No production pin store exists yet, so no stage is wired: the approval
-//! store's own work wires these same stage names around its real
-//! pre-write/rename points. Keeping the wire protocol here now means that
-//! implementation cannot invent a test-only stage or relax the bounded,
-//! single-reply handshake after the fact.
+//! [`crate::image_pin::store`] emits exactly these stage names from its real
+//! transaction points, and the debug-only gate is the only reader: a test can
+//! order a launch against the moment an approval is committed without a sleep.
+//! The stage list is closed here, so production cannot invent a test-only stage
+//! or relax the bounded, single-reply handshake after the fact.
 //!
 //! Guarantees the control itself enforces:
 //!
@@ -12,14 +12,13 @@
 //!   test rather than silently passing it;
 //! - a stage name is parsed against the closed enum, so an unexpected stage is
 //!   a test failure, not an ignored line;
-//! - fault replies are only accepted for the stage that describes them
-//!   ([`Reply::FailBeforeSave`]/[`Reply::FailRename`] at the save stages), so a
-//!   control cannot inject a failure at a stage production never offers;
+//! - a fault reply is only accepted for the stage that describes it
+//!   ([`Reply::FailBeforeSave`] at the save stages), so a control cannot inject a
+//!   failure at a stage production never offers;
 //! - the gate carries stage names only — never a reference, digest, path or
 //!   consent value — so it can neither forge content nor grant approval.
 //!
-//! `PinGate` is exercised against a direct emitter until production wires it;
-//! it is `dead_code`-allowed because not every including binary uses it.
+//! `PinGate` is `dead_code`-allowed because not every including binary uses it.
 
 #![allow(dead_code)]
 
@@ -87,10 +86,9 @@ impl PinStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reply {
     Continue,
-    /// Simulate the atomic save failing before it mutates the file.
+    /// Simulate the atomic save failing before it mutates the file. The seam is
+    /// the save as a whole, so this covers a rename fault too.
     FailBeforeSave,
-    /// Simulate the rename step failing after the temporary was written.
-    FailRename,
 }
 
 impl Reply {
@@ -98,7 +96,6 @@ impl Reply {
         match self {
             Self::Continue => "continue",
             Self::FailBeforeSave => "fail-before-save",
-            Self::FailRename => "fail-rename",
         }
     }
 }

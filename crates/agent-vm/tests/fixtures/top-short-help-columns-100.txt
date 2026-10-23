@@ -55,8 +55,7 @@ Network egress:
           resolver. Does not itself grant internet [possible values: true, false]
 
 Image:
-      --image <REF>   Boot this image instead of the configured one [env: AGENT_VM_IMAGE_TAG]
-      --update-check  Check the registry for a newer image at launch (opt-in)
+      --image <REF>  Boot this image instead of the configured one [env: AGENT_VM_IMAGE_TAG]
 
 Guest user:
       --root  Run the guest as root (uid 0) instead of the default host user

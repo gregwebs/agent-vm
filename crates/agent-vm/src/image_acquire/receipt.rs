@@ -69,6 +69,12 @@ const MAX_PLATFORM_VARIANT_BYTES: usize = 64;
 /// non-ASCII.
 const PRINTABLE_ASCII: std::ops::RangeInclusive<u8> = 0x21..=0x7e;
 
+/// The one printable-variant alphabet, shared with the host approval store so the
+/// receipt schema and the pin schema cannot accept different variant spellings.
+pub(crate) fn is_printable_variant_byte(byte: u8) -> bool {
+    PRINTABLE_ASCII.contains(&byte)
+}
+
 /// The one repair instruction for any unusable receipt. Written once and used by
 /// every rendering, including the launch path's. Cache-side only: a receipt is
 /// cache content, and HOME approval records are a different store that ignoring
@@ -628,7 +634,7 @@ fn validate_platform(platform: &ReceiptPlatform) -> Result<(), ReceiptError> {
         variant_is_printable: platform
             .variant
             .as_ref()
-            .is_none_or(|variant| variant.bytes().all(|byte| PRINTABLE_ASCII.contains(&byte))),
+            .is_none_or(|variant| variant.bytes().all(is_printable_variant_byte)),
     };
     if platform_is_acceptable(facts) {
         Ok(())

@@ -412,7 +412,6 @@ Environment:
   AGENT_VM_MEMORY_GIB / AGENT_VM_CPUS   same as --memory / --cpus
   AGENT_VM_IMAGE_TAG                    same as --image (outranks configured images)
   AGENT_VM_ROOT                         same as --root (1|true|yes|on)
-  AGENT_VM_UPDATE_CHECK                 check the registry for a newer image (1|true|yes|on)
   AGENT_VM_INSECURE_REGISTRY            allow plain-HTTP registry pulls (1|true|yes|on)
   AGENT_VM_STATE_DIR                    override the per-project state dir
   AGENT_VM_PROFILE                      print per-phase boot timings
@@ -553,16 +552,6 @@ pub struct Args {
     /// config > default).
     #[command(flatten)]
     pub(crate) image: ImageArgs,
-
-    /// Check the registry for a newer image at launch (opt-in).
-    ///
-    /// HEADs the registry manifest and prints the "==> A newer image is
-    /// available …" banner if the cached image is stale. Off by default so a
-    /// normal launch makes no registry contact; run `agent-vm image refresh` to
-    /// fetch an update. Can also be enabled persistently with a truthy
-    /// `AGENT_VM_UPDATE_CHECK` (1|true|yes|on).
-    #[arg(long = "update-check", default_value_t = false, help_heading = "Image")]
-    update_check: bool,
 
     /// Run the guest as root (uid 0) instead of the default host user.
     ///
@@ -762,22 +751,13 @@ pub(crate) async fn launch(
     // `reap_stale_project_sandboxes` for the full rationale.
     reap_stale_project_sandboxes(&session.project_hash).await;
 
-    // The selected boot image, used by the notices, the update check and the
-    // boot builder. No launch invokes Docker or builds an image; a custom
-    // image is selected with `--image`/`AGENT_VM_IMAGE_TAG`/config and booted
-    // verbatim (`boot_image::select` above is the sole selection owner).
+    // The selected boot image's own text, kept as this session's source
+    // identity for notices and the guest command line. What the SDK is given is
+    // decided by the preparation below. No launch invokes Docker or builds an
+    // image; a custom image is selected with
+    // `--image`/`AGENT_VM_IMAGE_TAG`/config and booted verbatim
+    // (`boot_image::select` above is the sole selection owner).
     let image = boot.reference().as_str().to_string();
-    // Parsed once: the SDK and the cache are keyed by the *canonical* OCI
-    // reference, so the equivalent spellings (`alpine`,
-    // `registry-1.docker.io/alpine`, `docker.io/library/alpine:latest`) select
-    // one cache entry. The original text stays the session's source identity for
-    // notices and redaction. A local rootfs/disk reference is not an OCI target
-    // and passes through verbatim, unchanged.
-    let oci_target = crate::image_acquire::OciTarget::parse(&image).ok();
-    let sdk_image = match &oci_target {
-        Some(target) => target.reference().whole(),
-        None => image.clone(),
-    };
 
     let memory_mib: u32 = args
         .memory
@@ -812,46 +792,10 @@ pub(crate) async fn launch(
         ))?;
     }
     let mut patch_builder_steps = mkdir_chain(Path::new(&project_guest_path));
-    // PullPolicy::IfMissing keeps the slow part (pull + materialize) off
-    // every launch. We separately HEAD the manifest at the registry via
-    // image_check::check_for_update and print a banner if there's a newer
-    // image available — but only when opted in via `--update-check` /
-    // `AGENT_VM_UPDATE_CHECK`; otherwise a normal launch makes no registry
-    // contact at all. The user runs `agent-vm image refresh` explicitly to fetch it.
-    let update_check_env = std::env::var("AGENT_VM_UPDATE_CHECK").ok();
-    if should_check_update(args.update_check, update_check_env.as_deref()) {
-        // The update banner is purely informational, so keep it OFF the
-        // launch critical path: seed the baseline pulled-digest marker
-        // (so the banner has something to compare against on this launch,
-        // not just future ones) and probe the registry in the background.
-        // The banner prints if the ~0.9s ghcr.io round-trip resolves
-        // during boot; otherwise it's simply skipped and the next launch
-        // catches up.
-        //
-        // Probes the **selected** boot image (D10), which is the only image a
-        // session can boot. There is no separate published/composed tag to
-        // prefer.
-        let img = image.clone();
-        let redact_reference = label.is_redacted();
-        tokio::spawn(async move {
-            seed_pulled_marker_if_absent(&img, redact_reference).await;
-            // Detached task: there is no launch error boundary to reach
-            // from here (the launch may finish first), and an undeliverable
-            // *informational* banner must not kill an otherwise-healthy
-            // launch. Handle it here — the task is its own top level —
-            // instead of discarding the Result. The trace itself also goes
-            // to stderr, so on a fully broken stderr this is silent; that
-            // is the accepted floor for a background banner (issue #70).
-            let mut notices = LaunchNotices::to_stderr();
-            if let Err(error) =
-                notify_if_update_available(&img, redact_reference, &mut notices).await
-            {
-                // The banner error is agent-vm's own fixed text (never the
-                // reference); a trace of it is not record data.
-                tracing::debug!(error = %format!("{error:#}"), "update banner not delivered");
-            }
-        });
-    }
+    // PullPolicy::IfMissing keeps the slow part (pull + materialize) off every
+    // launch. There is no launch-time registry probe of any kind: a warm launch
+    // must not query a mutable tag, and checking for movement is the explicit
+    // `agent-vm image refresh` operation's job.
 
     // Snapshot host credentials into per-project token files and place
     // placeholder credentials.json files where the in-VM agents will
@@ -1041,6 +985,18 @@ pub(crate) async fn launch(
     // `mount_plan` is closed: launch translates its typed instructions but
     // never reclassifies a source or makes another mount-policy decision.
 
+    // The one image preparation, before the builder and before create. A local
+    // rootfs/disk selection passes through with its original text and touches
+    // no approval record; an OCI selection is acquired, validated and (on a
+    // first pin) committed to this host's approval authority *before* anything
+    // is handed to the SDK, so a later create failure cannot leave a launch on
+    // unapproved bytes. The returned value holds the shared publication barrier
+    // across both create variants.
+    let prepared = crate::image_pin::prepare_selected(&boot)
+        .await
+        .context("preparing the boot image")?;
+    let sdk_image = prepared.sdk_reference().to_owned();
+    let acquisition_reference = sdk_image.clone();
     let is_local_registry = crate::pull::is_plain_http_registry(&sdk_image);
     // `.workdir()` becomes libkrun's `KRUN_WORKDIR`, which rides the
     // printable-ASCII-only kernel command line. When the real project path
@@ -1246,27 +1202,20 @@ pub(crate) async fn launch(
     // launches proceed concurrently; exclusive archive publication cannot move
     // an alias under the cache consumption below.
     //
-    // The warm cache is validated here, under that barrier: a present entry must
-    // be complete, identity-consistent and host-platform, or the launch fails
-    // closed instead of letting `IfMissing` silently re-resolve it. An absent
-    // entry is still the SDK's acquisition (this stage never queries a
-    // registry). A local rootfs/disk launch has no OCI cache participation at
-    // all and takes no barrier.
-    let prepared = match &oci_target {
-        Some(target) => Some(
-            crate::image_acquire::prepare_cached(target)
-                .await
-                .map_err(|error| error.for_label(&label))
-                .context("preparing the boot image from the image cache")?,
-        ),
-        None => None,
-    };
+    // The image preparation above already validated the content this create
+    // consumes, under that barrier: a present entry is complete,
+    // identity-consistent and host-platform, and an approved selection is
+    // reacquired by its approved digest rather than re-resolved from a tag. A
+    // local rootfs/disk launch has no OCI cache participation at all and takes
+    // no barrier.
     if launch_credentials.needs_image_env_check() {
-        // A validated warm entry is the bytes this create will consume, so its
-        // environment is the answer. Only a cold cache falls back to the
-        // metadata read (which may consult a different cache root).
-        let image_env = match prepared.as_ref().and_then(|prepared| prepared.image()) {
-            Some(validated) => Some(validated.image_env().to_vec()),
+        // The preparation validated exactly the content this create consumes, so
+        // its environment is the answer — including on a cold first acquisition,
+        // which is what makes the check real rather than a best-effort cache
+        // read. Only a local path (no OCI config at all) keeps the historical
+        // metadata read, which still fails closed.
+        let image_env = match prepared.image_env() {
+            Some(image_env) => Some(image_env.to_vec()),
             None => image_config_env(&sdk_image).await,
         };
         match image_env {
@@ -1286,22 +1235,15 @@ pub(crate) async fn launch(
                 }
             }
             None => {
-                // `image refresh` acquires OCI references only, so it is a
-                // working suggestion only for an OCI launch target. A local
-                // rootfs/disk launch keeps only the `sentinelEnv: true`
-                // alternative rather than naming a command that always refuses
-                // the user's own image.
-                let acquire = if oci_target.is_some() {
-                    format!(
-                        "Cache the image's metadata (`agent-vm image refresh --image {image}`) and \
-                         re-run the launch, or alternatively declare"
-                    )
-                } else {
-                    "Alternatively declare".to_string()
-                };
+                // Only a local rootfs/disk selection reaches this: an OCI
+                // selection's environment always comes from the preparation, so
+                // there is nothing to cache and no `image refresh` to suggest —
+                // that command acquires OCI references and always refuses the
+                // user's own image.
                 anyhow::bail!(
                     "the boot image's environment could not be read, so agent-vm cannot verify that a \
-                     `sentinelEnv: false` variable is unset in the guest for `{image}`. {acquire} \
+                     `sentinelEnv: false` variable is unset in the guest for `{image}`. Use an OCI \
+                     image so agent-vm can read its environment. Alternatively declare \
                      `sentinelEnv: true` in credentials.yaml"
                 )
             }
@@ -1410,28 +1352,12 @@ pub(crate) async fn launch(
         Err(error) => {
             let error = crate::image_miss::attach(
                 translate_create_error(error),
-                boot.reference().as_str(),
+                &acquisition_reference,
                 &label,
             );
             return Err(label.redact_error("booting a sandbox from", error));
         }
     };
-    // Success-before-adoption (#261): the image's content is now materialized,
-    // so a default-tier selection may be retained. This is write-once and a
-    // no-op for every higher source or an already-retained default. If it
-    // cannot be recorded we do NOT run the guest command on an unretained
-    // default; the sandbox is torn down rather than leaked.
-    if let Err(error) = boot_image::adopt_default_selection(&boot) {
-        // A sandbox exists but must not run the guest command: report both the
-        // retention failure and any teardown failure rather than dropping one.
-        return Err(match cleanup_exec_sandbox(&sandbox).await {
-            Ok(()) => error.context("retaining the selected default boot image"),
-            Err(cleanup_error) => error.context(format!(
-                "retaining the selected default boot image; the sandbox could not be cleaned up \
-                 ({cleanup_error:#})"
-            )),
-        });
-    }
     if profile {
         notices.emit(format!("[profile] create: {:?}", t_create.elapsed()))?;
     }
@@ -2471,101 +2397,6 @@ fn shell_escape(s: &str) -> String {
     out
 }
 
-/// Seed the pulled-digest marker from microsandbox's cache when we have
-/// no record yet, so the update banner has a baseline to diff against on
-/// this very launch.
-///
-/// The marker (what the banner compares to the registry) was historically
-/// written only by `agent-vm image refresh`. A user who acquired the image via a
-/// launch's `IfMissing` auto-pull — or via an older agent-vm that never
-/// wrote it — had no baseline, so the banner could never fire. Here, if
-/// the image is already cached and unmarked, we record its per-platform
-/// manifest digest. Then a stale cache trips the banner on the next probe
-/// (i.e. immediately, since the call below seeds before we probe).
-///
-/// Safe on the launch path: `IfMissing` never re-pulls, so `Image::get`'s
-/// digest is accurate (the re-pull staleness that makes `image refresh`
-/// avoid `Image::get` — see pulled_marker.rs — can't apply here). Verified
-/// empirically that `Image::get(...).manifest_digest()` is the same
-/// per-platform digest `image_check::fetch_remote_digest` returns, so the
-/// comparison is apples-to-apples. Only ever *seed* — never overwrite an
-/// existing marker, which is the best available advisory record of the last
-/// acquisition (not an identity check).
-async fn seed_pulled_marker_if_absent(image: &str, redact_reference: bool) {
-    if crate::pulled_marker::read(image).is_some() {
-        return;
-    }
-    // Not cached yet (genuine first run) → Image::get errors → nothing to
-    // seed, and there's correctly nothing newer to flag: the imminent
-    // IfMissing pull lands the current image.
-    //
-    // Baseline 0.7.x's Image::get resolves the active local backend
-    // internally (crate::backend::default_backend()), so no separate
-    // LocalBackend handle is needed here any more.
-    if let Ok(handle) = microsandbox::Image::get(image).await
-        && let Some(digest) = handle.manifest_digest()
-    {
-        match crate::pulled_marker::write(image, digest) {
-            Ok(()) => {
-                if redact_reference {
-                    tracing::debug!(digest, "seeded pulled-digest baseline from cache");
-                } else {
-                    tracing::debug!(image, digest, "seeded pulled-digest baseline from cache");
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "failed to seed pulled-digest marker"),
-        }
-    }
-}
-
-async fn notify_if_update_available<W: std::io::Write>(
-    image: &str,
-    redact_reference: bool,
-    notices: &mut LaunchNotices<W>,
-) -> Result<()> {
-    use crate::image_check::{UpdateState, check_for_update};
-    // The probe does up to three sequential registry round-trips for a
-    // token-auth registry (manifest GET → 401 → token → authed GET),
-    // each carrying its own 5s per-request timeout. This runs inline on
-    // the launch hot path before boot, so cap the whole thing: a slow or
-    // flaky registry must never delay launch by more than a single
-    // request's worth of wait. The banner is best-effort — on timeout we
-    // simply stay quiet and continue with the cached image.
-    let probe = tokio::time::timeout(
-        UPDATE_PROBE_BUDGET,
-        check_for_update(image, redact_reference),
-    );
-    // Every other outcome is deliberately silent:
-    //   UpToDate / NotCached: nothing to say.
-    //   Ok(Err)/None: registry unreachable etc. — stay quiet.
-    //   Err(Elapsed): probe exceeded the budget — stay quiet.
-    if let Ok(Ok(Some(UpdateState::UpdateAvailable { cached, remote }))) = probe.await {
-        notices.emit(format!(
-            "==> A newer image is available in the registry (cached {cached}, registry {remote})"
-        ))?;
-        notices.emit(
-            "==> Run `agent-vm image refresh` to fetch it. Continuing with the cached image.",
-        )?;
-    }
-    Ok(())
-}
-
-/// Whether to run the launch-time registry update probe.
-///
-/// Off by default. Enabled by the `--update-check` flag OR a truthy
-/// `AGENT_VM_UPDATE_CHECK` env var. `env_val` is the raw value of that
-/// variable (`None` when unset), so this stays pure and unit-testable.
-/// Truthy values match the shared `env_flag` convention (`1|true|yes|on`).
-fn should_check_update(flag: bool, env_val: Option<&str>) -> bool {
-    flag || env_val.is_some_and(crate::env_flag::is_truthy)
-}
-
-/// Wall-clock budget for the launch-path update probe. Bounds the worst
-/// case across all of the probe's registry round-trips so a slow or
-/// unreachable registry can't stall boot; matches a single request's
-/// per-request timeout in `image_check`.
-const UPDATE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
 // Keep home selection in the same constructor exercised by the subprocess test:
 // root mode must not discard raw HOME merely because Pi requires UTF-8.
 fn launch_mount_context(
@@ -2982,9 +2813,8 @@ mod tests {
     /// opens at `#[cfg(test)]` and closes with the only column-0 `}` inside
     /// it (everything nested is indented), so locating that span isolates
     /// the test module from the production code that follows it in this
-    /// file (`seed_pulled_marker_if_absent`, `notify_if_update_available`,
-    /// etc. — see issue #70's plan D10; a prefix-only scan would miss
-    /// these). Unlike an earlier version of this test, the scan below walks
+    /// file (see issue #70's plan D10; a prefix-only scan would miss these).
+    /// Unlike an earlier version of this test, the scan below walks
     /// `src.lines().enumerate()` once directly — real 1-based line numbers
     /// throughout — and skips lines inside the test module's span, rather
     /// than concatenating head+tail into a separate buffer and reporting
@@ -3329,25 +3159,6 @@ mod tests {
     }
 
     #[test]
-    fn update_check_is_off_by_default_and_opt_in() {
-        // Default: no flag, no env → no probe.
-        assert!(!should_check_update(false, None));
-        assert!(!should_check_update(false, Some("")));
-        assert!(!should_check_update(false, Some("0")));
-        assert!(!should_check_update(false, Some("false")));
-        assert!(!should_check_update(false, Some("garbage")));
-        // Flag opt-in.
-        assert!(should_check_update(true, None));
-        // Env opt-in (repo truthy set).
-        assert!(should_check_update(false, Some("1")));
-        assert!(should_check_update(false, Some("true")));
-        assert!(should_check_update(false, Some("yes")));
-        assert!(should_check_update(false, Some("on")));
-        // Either input enables (flag OR env).
-        assert!(should_check_update(true, Some("0")));
-    }
-
-    #[test]
     fn root_flag_parses_via_clap() {
         let mut env = crate::test_env::guard();
         for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
@@ -3367,21 +3178,6 @@ mod tests {
         assert!(cli.args.root);
     }
 
-    #[test]
-    fn should_check_update_accepts_the_shared_truthy_set() {
-        // Delegates to `env_flag::is_truthy`, which is trimmed and fully
-        // ASCII-case-insensitive — the exact-case exclusion this test used
-        // to assert was an artefact of the pre-#65 copy-paste, not a
-        // decision, so every case variant now enables the probe.
-        for truthy in ["TRUE", "YES", "ON", "True", "Yes", "On", "TrUe", " 1 "] {
-            assert!(
-                should_check_update(false, Some(truthy)),
-                "{truthy:?} should enable the update probe"
-            );
-        }
-        assert!(!should_check_update(false, Some("garbage")));
-    }
-
     /// Doc/help lockstep: the `Environment:` block's value-parsing rows
     /// must render the same set `env_flag::TRUTHY` actually accepts, or a
     /// future change to one and not the other would silently document a
@@ -3390,11 +3186,7 @@ mod tests {
     fn environment_help_block_lists_the_shared_truthy_set() {
         let rendered = format!("({})", crate::env_flag::TRUTHY.join("|"));
         let long_help = LAUNCH_OPTIONS_LONG_HELP;
-        for var in [
-            "AGENT_VM_ROOT",
-            "AGENT_VM_UPDATE_CHECK",
-            "AGENT_VM_INSECURE_REGISTRY",
-        ] {
+        for var in ["AGENT_VM_ROOT", "AGENT_VM_INSECURE_REGISTRY"] {
             let line = long_help
                 .lines()
                 .find(|line| line.contains(var))
@@ -3404,33 +3196,6 @@ mod tests {
                 "{var}'s help line {line:?} does not list env_flag::TRUTHY ({rendered})"
             );
         }
-    }
-
-    #[test]
-    fn update_check_flag_parses_via_clap() {
-        let mut env = crate::test_env::guard();
-        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
-            env.remove_var(name);
-        }
-        // `Args` is flattened into the top-level CLI.
-        #[derive(clap::Parser)]
-        struct TestCli {
-            #[command(flatten)]
-            args: Args,
-        }
-        use clap::Parser as _;
-
-        // No flag → off by default.
-        let cli = TestCli::try_parse_from(["agent-vm"]).expect("parses with no flags");
-        assert!(!cli.args.update_check);
-
-        // `--update-check` parses and flips the field on.
-        let cli =
-            TestCli::try_parse_from(["agent-vm", "--update-check"]).expect("parses --update-check");
-        assert!(cli.args.update_check);
-
-        // Unknown flags among launch options are clap errors.
-        assert!(TestCli::try_parse_from(["agent-vm", "--no-update-check"]).is_err());
     }
 
     #[test]

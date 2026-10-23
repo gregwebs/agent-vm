@@ -48,7 +48,7 @@ fn refuse(raw: &str) -> OciTargetError {
 /// Opaque by construction: the only ways to obtain one are
 /// [`CanonicalOciReference::parse`] and [`CanonicalOciReference::with_digest`],
 /// both of which reparse their result and require identical components.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalOciReference {
     reference: Reference,
     /// The stated digest, already measured strict, so no consumer re-parses it
@@ -60,7 +60,7 @@ pub(crate) struct CanonicalOciReference {
 ///
 /// Only [`CanonicalOciReference::with_digest`] constructs one, so a receipt, a
 /// cache key or an approved identity can never be handed a tag by mistake.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PinnedReference {
     canonical: CanonicalOciReference,
     digest: ValidatedDigest,
@@ -385,6 +385,17 @@ pub(crate) fn digest_is_acceptable(facts: DigestFacts) -> (accepted: bool)
 }
 
 } // verus!
+
+impl fmt::Debug for CanonicalOciReference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CanonicalOciReference(<redacted>)")
+    }
+}
+impl fmt::Debug for PinnedReference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PinnedReference(<redacted>)")
+    }
+}
 
 #[cfg(test)]
 mod tests {
