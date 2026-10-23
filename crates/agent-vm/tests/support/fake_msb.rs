@@ -290,6 +290,30 @@ pub fn ensure_private_dir(dir: &Path) {
     }
 }
 
+/// Run a freshly installed fixture, retrying the kernel's `ETXTBSY` race.
+///
+/// `execve` refuses a file that is still open for writing by any process,
+/// including a write descriptor another thread duplicated across `fork`. The
+/// installer already renames into place, which closes the window for its own
+/// descriptor; this bounds the remaining kernel-timing race instead of turning
+/// a parallel test into an intermittent failure. Every other error is final,
+/// and a retry never masks a fixture that did run.
+pub fn output_retrying_busy(mut command: std::process::Command) -> std::process::Output {
+    const ATTEMPTS: usize = 50;
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match command.output() {
+            Ok(output) => return output,
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt < ATTEMPTS => {
+                std::thread::sleep(DELAY);
+            }
+            Err(error) => panic!("running the fixture failed after {attempt} attempts: {error}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,10 +328,11 @@ mod tests {
                 fixture.library.exists(),
                 "{mode:?} must install the adjacent libkrunfw"
             );
-            let output = std::process::Command::new(&fixture.path)
-                .arg("--version")
-                .output()
-                .unwrap();
+            let output = output_retrying_busy({
+                let mut command = std::process::Command::new(&fixture.path);
+                command.arg("--version");
+                command
+            });
             assert!(output.status.success());
             assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), VERSION_LINE);
         }
@@ -317,10 +342,11 @@ mod tests {
     fn strict_acquisition_fails_every_non_version_call_and_logs_it() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = install_pair(dir.path(), Mode::StrictAcquisition);
-        let output = std::process::Command::new(&fixture.path)
-            .arg("image")
-            .output()
-            .unwrap();
+        let output = output_retrying_busy({
+            let mut command = std::process::Command::new(&fixture.path);
+            command.arg("image");
+            command
+        });
         assert_eq!(output.status.code(), Some(93));
         assert_eq!(
             std::fs::read_to_string(&fixture.invocations)
@@ -334,18 +360,20 @@ mod tests {
     fn launch_seam_answers_the_protocol_and_never_fakes_a_vm() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = install_pair(dir.path(), Mode::LaunchSeam);
-        let protocol = std::process::Command::new(&fixture.path)
-            .arg("__launch-protocol")
-            .output()
-            .unwrap();
+        let protocol = output_retrying_busy({
+            let mut command = std::process::Command::new(&fixture.path);
+            command.arg("__launch-protocol");
+            command
+        });
         assert!(protocol.status.success());
         let body = String::from_utf8_lossy(&protocol.stdout);
         assert!(body.contains("\"protocols\":[1,2]"), "{body}");
         assert!(body.contains("\"header_credentials\":true"), "{body}");
-        let launch = std::process::Command::new(&fixture.path)
-            .arg("__run")
-            .output()
-            .unwrap();
+        let launch = output_retrying_busy({
+            let mut command = std::process::Command::new(&fixture.path);
+            command.arg("__run");
+            command
+        });
         assert_eq!(launch.status.code(), Some(93));
         let log = std::fs::read_to_string(&fixture.invocations).unwrap();
         assert!(log.contains("__launch-protocol"), "{log}");
