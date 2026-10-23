@@ -1,25 +1,20 @@
-//! Deliberate acquisition followed by publication of a user-owned default.
-//! Two native pulls populate the canonical digest cache key without inventing
-//! aliases; acquisition never holds the selection lock or creates a VM.
+//! Deliberate acquisition of one explicit target and publication of it as the
+//! user-owned default. The acquisition path, the candidate approval and both
+//! records belong to [`crate::image_pin`]: this module owns only the command's
+//! argument shape and the words it prints.
 //!
-//! Both pulls go through [`crate::image_acquire`]'s guarded validating helper,
-//! so the requested key is proven complete, host-Linux and identity-consistent
-//! before this command constructs a success token or touches the retained
-//! record. The second equality below is justified by construction: the child
-//! target is derived from the first result, so it must resolve to the same
-//! resolved identity. An index requested on the first pull is valid even when
-//! its digest differs from the resolved host child.
+//! The target is required and typed (`--image REF`), so no ambient selection,
+//! image override, broken catalog or current recommendation can choose it. The
+//! same pin that a launch would consume is approved here, and the retained
+//! fallback then stores the approved host child — never the source tag (#392).
 
 use std::io::Write;
 use std::str::FromStr;
 
-use super::{AcquiredDefaultImage, DefaultUpgradeOutcome, ImageLabel, ImageRef, default_selection};
-use crate::image_acquire::{AcquireError, AcquireMode, OciTarget, OciTargetError, acquire};
-use anyhow::{Result, anyhow};
-
-/// Fixed text for an acquired identity with no usable immutable reference. It
-/// names no value: the target may be a private registry reference.
-const IMMUTABLE_IDENTITY_UNAVAILABLE: &str = "the acquired image did not yield a usable immutable reference; this command did not change the retained default";
+use super::ImageRef;
+use crate::image_acquire::{OciTarget, OciTargetError};
+use crate::image_pin::{ApprovalMode, ExplicitOperation, UpdateOutcome};
+use anyhow::Result;
 
 /// The fixed refusal for a local rootfs/disk `--image` target. Names no value:
 /// the rejected text is user input.
@@ -35,6 +30,11 @@ pub(crate) struct Args {
     /// OCI image to acquire and retain for future default-image sessions.
     #[arg(long = "image", value_name = "REF", value_parser = SetDefaultTargetParser)]
     target: SetDefaultTarget,
+
+    /// Replace an existing approval without asking. Exactly the resolved
+    /// candidate is authorized; a first pin or an unchanged one never asks.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Clone)]
@@ -102,62 +102,60 @@ impl clap::builder::TypedValueParser for SetDefaultTargetParser {
 pub(crate) async fn run(args: Args) -> Result<()> {
     crate::msb_preflight::ensure_db_not_ahead().await?;
     crate::image_log_guard::activate();
-    // Health only: explicit initialization must not evaluate a recommendation.
-    default_selection::load()?;
-    let acquired = acquire_target(&args.target).await?;
-    let outcome = default_selection::replace(&acquired)
-        .map_err(|error| anyhow!("publishing the default boot image failed: {error}; this command did not change the retained default"))?;
-    let notice = match outcome {
-        DefaultUpgradeOutcome::Changed => {
-            "Default boot image selected for future default-image sessions; image overrides and running sessions are unchanged."
-        }
-        DefaultUpgradeOutcome::Unchanged => {
-            "Default boot image is already selected; image overrides and running sessions are unchanged."
-        }
-    };
+    let outcome = crate::image_pin::update(
+        ExplicitOperation::SetDefault(&args.target.0),
+        ApprovalMode::of_flag(args.yes),
+    )
+    .await?;
+    let notice = notice(outcome);
     // Publication already committed: output failure cannot turn success into error.
     let _ = writeln!(std::io::stderr(), "{notice}");
     Ok(())
 }
 
-async fn acquire_target(target: &SetDefaultTarget) -> Result<AcquiredDefaultImage> {
-    let native_target = OciTarget::parse(target.0.as_str()).map_err(|error| {
-        anyhow!(
-            "{}; this command did not change the retained default",
-            target_reason(error)
-        )
-    })?;
-    let label = ImageLabel::for_default_upgrade();
-    // One acquisition resolves the explicit target's current content and
-    // preserves the validated host child (`repo@C`) as canonical cache
-    // metadata. The duplicate second pull this command used to derive the pin
-    // is gone: `AcquireMode::ResolveCurrent` plus canonical preservation own
-    // identity, and a moving index cannot be resolved twice.
-    let prepared = acquire(&native_target, &label, AcquireMode::ResolveCurrent)
-        .await
-        .map_err(set_default_error)?;
-    let reference = prepared
-        .image()
-        .immutable_reference()
-        .map_err(|_| anyhow!(IMMUTABLE_IDENTITY_UNAVAILABLE))?;
-    drop(prepared);
-    Ok(AcquiredDefaultImage { reference })
-}
-
-/// Explicit set-default failures are always rendered as fixed, reference-free
-/// text (a valid but private target is still the user's own input we must not
-/// echo on failure), with the "no retained change" guarantee spelled out.
-fn set_default_error(error: AcquireError) -> anyhow::Error {
-    anyhow!(
-        "{}; this command did not change the retained default",
-        error.redacted_message()
-    )
+/// What the user is told. The retained fallback is reported independently of the
+/// approval: a matching pin that still moved the fallback is a change, and
+/// saying "already selected" after moving it would be false.
+fn notice(outcome: UpdateOutcome) -> &'static str {
+    if outcome.changed_anything() {
+        "Default boot image selected for future default-image sessions; image overrides and running sessions are unchanged."
+    } else {
+        "Default boot image is already selected; image overrides and running sessions are unchanged."
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::boot_image::ImmutableImageRef;
+    use crate::image_pin::{ApprovalChange, DefaultChange};
+
+    #[test]
+    fn a_moved_fallback_is_never_reported_as_already_selected() {
+        for approval in [
+            ApprovalChange::FirstPin,
+            ApprovalChange::Unchanged,
+            ApprovalChange::Replaced,
+        ] {
+            for retained_default in [
+                DefaultChange::Unchanged,
+                DefaultChange::Initialized,
+                DefaultChange::Replaced,
+            ] {
+                let text = notice(UpdateOutcome {
+                    approval,
+                    retained_default,
+                });
+                let changed = approval != ApprovalChange::Unchanged
+                    || retained_default != DefaultChange::Unchanged;
+                assert_eq!(
+                    text.contains("already selected"),
+                    !changed,
+                    "{approval:?}/{retained_default:?}: {text}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn derived_child_is_canonical_and_immutable() {

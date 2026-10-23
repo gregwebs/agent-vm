@@ -65,6 +65,7 @@ use microsandbox::{ExecOutput, MicrosandboxError, Sandbox, sandbox::PullPolicy};
 use crate::boot_image;
 use crate::config::{self, Catalog, ConfiguredImages, LaunchCatalog};
 use crate::image_acquire::{OciTarget, OciTargetError};
+use crate::image_pin::{PreparedSelection, prepare_selected};
 
 /// The fixed refusal for a setup target that is a local rootfs or disk path.
 /// Names no value: the rejected text is user input.
@@ -187,18 +188,18 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
         "==> Acquiring {} into the microsandbox image cache",
         label.text()
     );
-    // The returned token holds the shared publication barrier across the
-    // acquisition and, when verification is requested, across the SDK's verify
-    // create. With `--no-verify` it is dropped here, before anything else.
-    let prepared = crate::pull::pull_image(&image, &label).await?;
-    // Success-before-adoption (#261): record a default-tier selection only
-    // after its forced acquisition succeeded, and before verification.
-    boot_image::adopt_default_selection(&boot)
-        .context("retaining the selected default boot image")?;
+    // The one ordinary preparation, shared with a launch: an existing approval
+    // is consumed as its approved child, an absent one acquires cache-first and
+    // commits the first pin before anything is created. The returned value holds
+    // the shared publication barrier across the acquisition and, when
+    // verification is requested, across the SDK's verify create.
+    let prepared = prepare_selected(&boot).await?;
 
     if !args.no_verify {
         verify_image(&boot, &targets, prepared).await?;
     } else {
+        // `--no-verify` is boot-free: nothing consumes the cache after the
+        // preparation, so the barrier is released here.
         drop(prepared);
     }
 
@@ -209,20 +210,15 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
 async fn verify_image(
     boot: &boot_image::BootImage,
     targets: &[VerifyTarget],
-    prepared: crate::image_acquire::PreparedNativeImage,
+    prepared: PreparedSelection,
 ) -> Result<()> {
     let label = boot.label();
-    // The verification create must consume the bytes the acquisition just
-    // validated, which means the acquired immutable child
-    // (`repo@digest`), not the selected spelling. Any other spelling
-    // (`registry-1.docker.io/...`, an uppercase digest hex) keys a different
-    // native cache entry, so its `IfMissing` create would resolve the source
-    // again — unvalidated, and possibly at a tag that has since moved.
-    let image = prepared
-        .image()
-        .immutable_reference()
-        .map_err(|error| error.for_label(&label))?;
-    let image = image.as_str();
+    // The verification create must consume the bytes the preparation just
+    // validated, which is the approved immutable child (`repo@digest`), not the
+    // selected spelling. Any other spelling keys a different native cache entry,
+    // so its `IfMissing` create would resolve the source again — unvalidated,
+    // and possibly at a tag that has since moved.
+    let image = prepared.sdk_reference();
     println!("==> Verifying {}", label.text());
     println!("==> Booting throwaway sandbox (this is the first VM cold-start; ~3s on a warm host)");
     // The native acquisition above already landed the new manifest, so
@@ -257,8 +253,8 @@ async fn verify_image(
     crate::pull_progress::await_render(render_task).await;
     let sandbox = result
         .map_err(|error| label.redact_error("booting the verification sandbox from", error))?;
-    // The verification create consumed the cache; the barrier is no longer
-    // needed for the in-guest probes, which touch no cache metadata.
+    // The verification create consumed the cache; the barrier is released
+    // before the in-guest probes, which touch no cache metadata.
     drop(prepared);
 
     // Per-tool `--version` checks, run independently so the error names which

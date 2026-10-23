@@ -28,18 +28,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// A bogus-but-well-formed image ref. Never resolves; only used to drive
-/// execution far enough into `launch()` to prove `builder.build()` already
-/// ran (its debug JSON dump happens right before the pull, which is what
-/// fails here).
-const BOGUS_IMAGE: &str = "localhost:1/does-not-exist:latest";
-
 fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
 }
 
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
+#[path = "support/image_archive.rs"]
+mod image_archive;
 
 /// Run `child` to completion, killing it if it doesn't exit within
 /// `timeout`. Reads stdout/stderr on separate threads so a full pipe can't
@@ -94,13 +90,15 @@ struct Harness {
     home: tempfile::TempDir,
     state: tempfile::TempDir,
     project: tempfile::TempDir,
+    /// The imported fixture reference every launch selects.
+    image: String,
     fake_msb: PathBuf,
 }
 
 impl Harness {
-    fn new() -> Self {
-        // The relay socket lives below the state directory. macOS's default
-        // temporary root is long enough to exceed Unix's socket-path limit.
+    /// A harness with no imported image: for tests whose whole point is that
+    /// the launch is rejected before any state exists.
+    fn bare() -> Self {
         let home = tempfile::tempdir_in("/tmp").unwrap();
         let state = tempfile::tempdir_in("/tmp").unwrap();
         let project = tempfile::tempdir_in("/tmp").unwrap();
@@ -109,8 +107,41 @@ impl Harness {
             home,
             state,
             project,
+            image: "fixture:boot".to_string(),
             fake_msb,
         }
+    }
+
+    /// A harness whose project selects a genuine host-valid image imported
+    /// through the public CLI. Launch preparation has something to approve, so
+    /// `builder.build()` and its debug dump are reachable without a registry.
+    fn new() -> Self {
+        let h = Self::bare();
+        let archive = h.home.path().join("fixture-boot.tar");
+        image_archive::write(&archive, &image_archive::ArchiveSpec::default());
+        let mut import = Command::new(agent_vm_bin());
+        import
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", h.home.path())
+            .env("AGENT_VM_STATE_DIR", h.state.path())
+            .env("MSB_PATH", &h.fake_msb)
+            .current_dir(h.project.path())
+            .args([
+                "image",
+                "import",
+                "--input",
+                archive.to_str().unwrap(),
+                "--tag",
+                &h.image,
+            ]);
+        let out = run_with_timeout(import, Duration::from_secs(60));
+        assert!(
+            out.status.success(),
+            "fixture import failed: {}",
+            stderr_of(&out)
+        );
+        h
     }
 
     fn home_path(&self) -> PathBuf {
@@ -158,7 +189,7 @@ impl Harness {
         for m in mounts {
             cmd.arg("--mount").arg(m);
         }
-        cmd.args(["--image", BOGUS_IMAGE]).arg("shell");
+        cmd.arg("--image").arg(&self.image).arg("shell");
         run_with_timeout(cmd, Duration::from_secs(15))
     }
 }
@@ -403,7 +434,8 @@ fn follow_links_with_exclusions_rejects_at_parse() {
         "{source}:/guest:follow-links:exclude=alias/secret:ro",
         "/no/such/source:/guest:ro:follow-links:exclude=alias/secret",
     ] {
-        let h = Harness::new();
+        // No import: this test's whole point is that nothing is created.
+        let h = Harness::bare();
         let source = h.home_path().join("source");
         std::fs::create_dir(&source).unwrap();
         let raw = template.replace("{source}", &source.display().to_string());
@@ -581,16 +613,14 @@ fn follow_links_root_mode_enforces_home_guardrail() {
     );
 }
 
-/// `--root` with `$HOME` unset resolves the launch's home from the account
-/// record (`user::host_home_dir` → `getpwuid_r(geteuid()).pw_dir`) when the
-/// environment does not carry one, so the guardrail has a home to compare
-/// against. This exercises `run.rs`'s `mount_home` wiring end to end — the
-/// dumped config proves the launch got past `expand_follow_links` and
-/// `builder.build()` with a home in hand. The `home: None` case (reached only
-/// when the account record fails too) stays pinned by the `mount.rs` unit
-/// tests, and the guardrail's own refusal by the sibling test above.
+/// `--root` with `$HOME` unset cannot name the host-wide approval record, so an
+/// OCI launch now fails closed before the builder. The mount guardrail's
+/// account-record fallback (`user::host_home_dir`) remains covered by the
+/// `mount.rs` unit tests and by the sibling guardrail test with `$HOME` set;
+/// what this test pins is that no launch proceeds without an authority it can
+/// read.
 #[test]
-fn follow_links_root_mode_falls_back_to_the_account_record_when_home_is_unset() {
+fn follow_links_root_mode_without_home_refuses_the_approval_store() {
     let h = Harness::new();
     let host_mount = h.project.path().join("m");
     std::fs::create_dir_all(&host_mount).unwrap();
@@ -603,12 +633,13 @@ fn follow_links_root_mode_falls_back_to_the_account_record_when_home_is_unset() 
     );
 
     let err = stderr_of(&out);
+    assert!(!out.status.success(), "stderr:\n{err}");
     assert!(
-        !err.contains("required for --mount follow-links"),
-        "the account record must supply the home, stderr:\n{err}"
+        err.contains("image pin authority"),
+        "a launch without $HOME must refuse the host-wide approval store, stderr:\n{err}"
     );
     assert!(
-        err.contains("[debug] sandbox config JSON"),
-        "the guardrail must have had a $HOME to run with, stderr:\n{err}"
+        !err.contains("[debug] sandbox config JSON"),
+        "the refusal must precede builder.build(), stderr:\n{err}"
     );
 }

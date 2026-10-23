@@ -1986,10 +1986,22 @@ custom_image_nonstandard_cold_warm() {
   assert_eq "cold root direct state owner" "direct_owner_after_write=0:0" \
     "$(grep '^direct_owner_after_write=' <<<"$(launch_output custom-cold-root)")" || result=1
 
-  # Acquisition must have recorded the refs in the image catalog, and the
-  # custom cache must still be private (no config redirect).
-  image_catalog_has "$ref_nonroot" "$suffix_n" present || result=1
-  image_catalog_has "$ref_root" "$suffix_r" present || result=1
+  # Acquisition must have recorded the approved child in the image catalog. A
+  # pinned launch consumes `repo@digest`; the mutable tag is not a cache key, so
+  # the catalog entry is content-addressed rather than tag-named (#390).
+  local digest_n digest_r
+  digest_n="$(jq -r --arg ref "$ref_nonroot" \
+    '.pins[] | select(.reference == $ref) | .manifest_digest' \
+    "$CUSTOM_HOME/.config/agent-vm/image-pins.json")" || result=1
+  digest_r="$(jq -r --arg ref "$ref_root" \
+    '.pins[] | select(.reference == $ref) | .manifest_digest' \
+    "$CUSTOM_HOME/.config/agent-vm/image-pins.json")" || result=1
+  if [ -z "$digest_n" ] || [ -z "$digest_r" ]; then
+    echo "    FAIL: no pin recorded for the cold refs"
+    result=1
+  fi
+  image_catalog_has "$ref_nonroot" "e2e-258-$RUN_ID@$digest_n" present || result=1
+  image_catalog_has "$ref_root" "e2e-258-$RUN_ID@$digest_r" present || result=1
   assert_custom_cache_isolated "after cold launches" yes || result=1
 
   docker rm -f "$container" >/dev/null 2>&1 ||
@@ -2358,7 +2370,8 @@ EOF
     # warm launch consumes it; a registry manifest/blob read here would mean the
     # tag did not survive the acquisition as a usable cache entry.
     local reads_before reads_after
-    reads_before="$(registry_read_count "$container")" || result=1
+    reads_before="$(registry_read_count_calibrated "$container" \
+      "http://127.0.0.1:$port/v2/$repo/manifests/selected")" || result=1
     capture_custom_launch "custom-setup-warm" "$proj" --no-git hello-258 || result=1
     require_launch_ok "custom-setup-warm" || result=1
     assert_no_host_calls || result=1
@@ -2556,13 +2569,49 @@ registry_manifest_digest() {
   printf '%s' "$digest"
 }
 
-# Manifest/blob read requests the registry served, from its own access log. A
-# `docker logs` failure is a failure, never a vacuous zero.
+# Manifest/blob read requests the registry served, from its own access log. Only
+# the anchored Apache combined record counts: registry v3 also emits trace spans
+# whose names contain the request path, and counting those doubled every figure.
+# A `docker logs` failure is a failure, never a vacuous zero. The optional second
+# argument narrows the count to one exact manifest path (tag, index or digest).
 registry_read_count() {
-  local container="$1" logs count
+  local container="$1" path="${2:-}" pattern logs count status=0
+  if [ -n "$path" ]; then
+    pattern="^[^ ]+ - - \[.*\] \"(GET|HEAD) /v2/$path "
+  else
+    pattern='^[^ ]+ - - \[.*\] "(GET|HEAD) /v2/[^ ]*/(manifests|blobs)/'
+  fi
   logs="$(docker logs "$container" 2>&1)" || return 1
-  count="$(grep -cE '"(GET|HEAD) /v2/[^ ]*/(manifests|blobs)/' <<<"$logs")" || count=0
-  printf '%s' "$count"
+  count="$(grep -cE "$pattern" <<<"$logs")" || status=$?
+  case "$status" in
+    0) printf '%s' "$count" ;;
+    1) printf '0' ;;
+    *) return "$status" ;;
+  esac
+}
+
+# Registry access logs flush asynchronously, so an earlier acquisition's records
+# can land after that launch exits. A zero-delta claim is only meaningful behind
+# an ordered barrier: make one calibration request and wait until its own access
+# record is visible. Any earlier record must already be visible at that point.
+registry_read_count_calibrated() {
+  local container="$1" url="$2" path="${3:-}" before target count deadline
+  before="$(registry_read_count "$container" "$path")" || return 1
+  target=$((before + 1))
+  curl -fsS -o /dev/null \
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "$url" || return 1
+  deadline=$(( $(date +%s) + 15 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    count="$(registry_read_count "$container" "$path")" || return 1
+    if [ "$count" -ge "$target" ]; then
+      printf '%s' "$count"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "    FAIL: the calibration read was never recorded" >&2
+  return 1
 }
 
 # The retained-default check's own private HOME/state (never the shared custom
@@ -2773,7 +2822,8 @@ custom_image_retained_default() {
   # and a warm ordinary launch makes NO registry manifest/blob request: the
   # default is not tag-polled or re-probed.
   local reads_before reads_after
-  reads_before="$(registry_read_count "$container")" || result=1
+  reads_before="$(registry_read_count_calibrated "$container" \
+    "http://127.0.0.1:$port/v2/$repo/manifests/default-a")" || result=1
   retained_env "$ref_b"
   retained_launch "retained-warm-b" "$proj" --no-git hello-258
   require_launch_ok "retained-warm-b" || result=1
@@ -2815,12 +2865,14 @@ custom_image_retained_default() {
   fi
   out="$(launch_output retained-adopt-fail)"
   assert_no_match "adopt-fail: the guest command must not run" "hello-258=ok" "$out" || result=1
-  # The failure must be the *retention/lock* stage, not an acquisition failure:
-  # assert both the retention context and the lock reason are named.
-  assert_match "adopt-fail: names the retention stage" \
-    "retaining the selected default boot image" "$out" || result=1
-  assert_match "adopt-fail: names the lock failure" \
-    "could not be opened for locking" "$out" || result=1
+  # The failure must be the *retention/storage* stage, not an acquisition
+  # failure: #390's journaled transaction reports one closed pin-authority
+  # storage error when the fallback lock cannot be opened.
+  assert_match "adopt-fail: names the pin authority stage" \
+    'image pin authority at \$HOME/\.config/agent-vm/image-pins\.json could not be accessed or saved' \
+    "$out" || result=1
+  assert_match "adopt-fail: the acquisition itself succeeded" \
+    '"kind": "native-image-acquire"' "$out" || result=1
   if [ -f "$fail_home/.config/agent-vm/default-image.json" ]; then
     echo "    FAIL: a failed adoption must leave the record absent"
     result=1
@@ -3160,6 +3212,750 @@ custom_image_default_upgrade() {
   return "$result"
 }
 
+# ------------------------------------------- host-wide image pins (#390) ---
+
+PINS_HOME=""
+PINS_STATE=""
+PINS_BIN=""
+PINS_ENV=()
+PINS_OBSERVER_PID=""
+
+# Every command here runs under one private HOME/state pair, with the inherited
+# image/cache overrides cleared and the host decoys first on PATH.
+pins_env() {
+  local home="$1" state="$2"
+  PINS_HOME="$home"
+  PINS_STATE="$state"
+  PINS_ENV=(env
+    -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u AGENT_VM_SHARE_MSB_CACHE
+    -u AGENT_VM_MSB_CACHE_DIR -u MSB_CONFIG_PATH -u AGENT_VM_TEST_DEFAULT_IMAGE
+    HOME="$home" AGENT_VM_STATE_DIR="$state")
+}
+
+pins_launch() {
+  local name="$1" proj="$2"
+  shift 2
+  observe_launch "$name" "$proj" "$WORK/$name.out" -- \
+    "${PINS_ENV[@]}" "${OFFLINE_ENV[@]}" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" "$PINS_BIN" "$@"
+}
+
+pins_avm() {
+  "${PINS_ENV[@]}" "$PINS_BIN" "$@"
+}
+
+pins_store() {
+  printf '%s' "$PINS_HOME/.config/agent-vm/image-pins.json"
+}
+
+pins_record() {
+  printf '%s' "$PINS_HOME/.config/agent-vm/default-image.json"
+}
+
+# One exact registry access-record count for a manifest path (tag, index or
+# digest): the shared counter narrowed to that path.
+pins_registry_count() {
+  registry_read_count "$1" "$2"
+}
+
+# One debug-gate observer for both sockets (#390 test seams). It reports every
+# stage, replies `continue`, and holds one named pin stage until the release
+# file exists. The log is the ordering oracle.
+pins_observer_body() {
+  python3 - "$@" <<'PY'
+import os, selectors, socket, sys, time
+
+pin_path, acquire_path, log_path, hold, release = sys.argv[1:6]
+
+def listener(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    server.listen(64)
+    server.setblocking(False)
+    return server
+
+log = open(log_path, "a", buffering=1)
+selector = selectors.DefaultSelector()
+for name, path in (("pin", pin_path), ("acquire", acquire_path)):
+    selector.register(listener(path), selectors.EVENT_READ, name)
+
+while True:
+    for key, _ in selector.select(timeout=1.0):
+        connection, _ = key.fileobj.accept()
+        connection.settimeout(60)
+        data = b""
+        while not data.endswith(b"\n") and len(data) < 4096:
+            chunk = connection.recv(256)
+            if not chunk:
+                break
+            data += chunk
+        stage = data.decode("utf-8", "replace").strip()
+        log.write(f"{key.data} {stage}\n")
+        log.flush()
+        if key.data == "pin" and stage == hold:
+            deadline = time.time() + 90
+            while not os.path.exists(release) and time.time() < deadline:
+                time.sleep(0.05)
+        connection.sendall(b"continue\n")
+        connection.close()
+PY
+}
+
+start_pin_observer() {
+  local log="$1" hold="$2" release="$3" pin="$WORK/pin-gate.sock" acq="$WORK/acq-gate.sock" deadline
+  stop_pin_observer
+  rm -f "$pin" "$acq" "$release" "$log"
+  pins_observer_body "$pin" "$acq" "$log" "$hold" "$release" >"$WORK/pins-observer.out" 2>&1 &
+  PINS_OBSERVER_PID=$!
+  deadline=$(( $(date +%s) + 15 ))
+  while { [ ! -S "$pin" ] || [ ! -S "$acq" ]; } && [ "$(date +%s)" -lt "$deadline" ]; do sleep 0.1; done
+  [ -S "$pin" ] && [ -S "$acq" ]
+}
+
+stop_pin_observer() {
+  [ -n "${PINS_OBSERVER_PID:-}" ] || return 0
+  kill "$PINS_OBSERVER_PID" 2>/dev/null || true
+  wait "$PINS_OBSERVER_PID" 2>/dev/null || true
+  PINS_OBSERVER_PID=""
+}
+
+# A candidate whose blobs are present but whose layer is not a valid archive:
+# the tag resolves and the config parses, then native validation fails before
+# approval. Deterministic, Docker/buildx-free and unlike a manifest with missing
+# blobs (which the registry itself rejects on PUT).
+pins_push_unbootable_candidate() {
+  local port="$1" repo="$2" tag="$3"
+  python3 - "$port" "$repo" "$tag" <<'PY'
+import hashlib, json, sys, urllib.request
+
+port, repo, tag = sys.argv[1:4]
+base = f"http://127.0.0.1:{port}"
+
+
+def upload(data):
+    request = urllib.request.Request(
+        f"{base}/v2/{repo}/blobs/uploads/", data=b"", method="POST"
+    )
+    location = urllib.request.urlopen(request).headers["Location"]
+    if location.startswith("/"):
+        location = base + location
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    separator = "&" if "?" in location else "?"
+    request = urllib.request.Request(
+        f"{location}{separator}digest={digest}",
+        data=data,
+        method="PUT",
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    urllib.request.urlopen(request).read()
+    return digest, len(data)
+
+
+layer = b"not-a-tarball"
+layer_digest, layer_size = upload(layer)
+config = json.dumps(
+    {
+        "architecture": "arm64",
+        "os": "linux",
+        "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
+        "config": {},
+    }
+).encode()
+config_digest, config_size = upload(config)
+manifest = {
+    "schemaVersion": 2,
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "config": {
+        "mediaType": "application/vnd.oci.image.config.v1+json",
+        "digest": config_digest,
+        "size": config_size,
+    },
+    "layers": [
+        {
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "digest": layer_digest,
+            "size": layer_size,
+        }
+    ],
+}
+request = urllib.request.Request(
+    f"{base}/v2/{repo}/manifests/{tag}",
+    data=json.dumps(manifest).encode(),
+    method="PUT",
+    headers={"Content-Type": "application/vnd.oci.image.manifest.v1+json"},
+)
+urllib.request.urlopen(request).read()
+PY
+}
+
+# Snapshot the approval store while a debug launch is held at a pin stage. The
+# SDK-consumption stage is then provably absent at pin commit.
+pins_snapshot_at_hold() {
+  local log="$1" hold="$2" release="$3" snapdir="$4" deadline
+  deadline=$(( $(date +%s) + 90 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if grep -qxF "pin $hold" "$log" 2>/dev/null; then
+      mkdir -p "$snapdir" || return 1
+      cp "$(pins_store)" "$snapdir/store.json" 2>/dev/null || return 1
+      cp "$log" "$snapdir/gate.log" || return 1
+      : >"$release" || return 1
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "    FAIL: never observed pin stage $hold" >&2
+  : >"$release"
+  return 1
+}
+
+# Deliberate create failure after the pin commit: while the launch is held at
+# `pin-committed`, replace its state root with a regular file. Acquisition and
+# approval already happened; the SDK's create cannot use the state root.
+pins_break_state_at_hold() {
+  local log="$1" release="$2" state="$3" marker="$4" deadline
+  deadline=$(( $(date +%s) + 90 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if grep -qxF "pin pin-committed" "$log" 2>/dev/null; then
+      mv "$state" "$state.held" || return 1
+      : >"$state" || return 1
+      : >"$marker" || return 1
+      : >"$release" || return 1
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "    FAIL: never observed the pin commit for the create-failure case" >&2
+  : >"$release"
+  return 1
+}
+
+pins_restore_state() {
+  local state="$1" marker="$2"
+  [ -f "$marker" ] || return 0
+  rm -f "$state"
+  if [ -d "$state.held" ] && ! mv "$state.held" "$state"; then
+    return 1
+  fi
+  return 0
+}
+
+pins_hold_marker() {
+  local snapdir="$1" stage="$2" lines
+  [ -f "$snapdir/gate.log" ] || return 1
+  grep -qxF "pin $stage" "$snapdir/gate.log" || return 1
+  if grep -qF "acquire before-sdk-consume" "$snapdir/gate.log"; then
+    echo "    FAIL: the SDK consumed the image before the pin was committed"
+    return 1
+  fi
+  lines="$(wc -l <"$snapdir/gate.log" | tr -d ' ')"
+  [ "${lines:-0}" -gt 0 ] || return 1
+}
+
+pins_stamp() {
+  grep '^stamp=' "$WORK/$1.out" || true
+}
+
+# One PTY replacement attempt: stdin is piped into `script`, which gives the
+# child a real terminal on both ends. The answer text is the input.
+pins_pty_update() {
+  local name="$1" input="$2"
+  shift 2
+  rm -f "$WORK/$name.pty"
+  local status=0
+  printf '%s' "$input" | /usr/bin/script -q "$WORK/$name.pty" \
+    "${PINS_ENV[@]}" "${OFFLINE_ENV[@]}" "$PINS_BIN" "$@" \
+    >"$WORK/$name.out" 2>&1 || status=$?
+  PIN_PTY_STATUS=$status
+  tr -d '\r' <"$WORK/$name.pty" >"$WORK/$name.pty.txt" 2>/dev/null || true
+}
+
+pins_pty_text() {
+  cat "$WORK/$1.pty.txt" 2>/dev/null || true
+}
+
+pins_live_advanced() {
+  local dir="$1" pid="$2" old_tick="$3" deadline=$(( $(date +%s) + 15 ))
+  while [ "$(date +%s)" -lt "$deadline" ] && kill -0 "$pid" 2>/dev/null; do
+    if [ -f "$dir/tick" ] && [ "$(cat "$dir/tick")" != "$old_tick" ]; then return 0; fi
+    sleep 1
+  done
+  echo '    FAIL: live A guest did not advance its tick'
+  return 1
+}
+
+# 12. #390: every OCI selection is approved host-wide. One registry tag moves
+# A→B; the guest stamp (`marker-free` = A prints stamp=absent, `stamp-present` =
+# B prints stamp=present) proves which content booted, and exact registry
+# access-request counts prove what was (not) consulted. A live A guest runs
+# throughout so both update verbs are shown not to touch it.
+custom_image_host_pins() {
+  local result=0 container="" port repo tag ref_a ref_b digest_a digest_b
+  local reg="registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8"
+  local proj live out reads_before reads_after deadline target ready=0
+  local live_pid=0 identity="" tick="" rootid="" tag_before digest_before b_before
+  local cold_state cold_proj default_home default_state rootfs pin_snapshot default_snapshot docker_host
+  # The group's own precondition is Apple Silicon, so the measured host platform
+  # these pins are keyed by is exactly linux/arm64.
+  local host_arch="arm64"
+
+  if [ ! -x "$AGENT_VM_DEV_BIN" ] || [ ! -x "$AGENT_VM_RELEASE_BIN" ]; then
+    echo "    BLOCKER: custom-image-host-pins needs AGENT_VM_DEV_BIN and AGENT_VM_RELEASE_BIN"
+    return 1
+  fi
+  retained_bin_honors_seam "$AGENT_VM_DEV_BIN" || {
+    echo "    BLOCKER: AGENT_VM_DEV_BIN does not honour the debug recommendation seam"
+    return 1
+  }
+  retained_bin_ignores_seam "$AGENT_VM_RELEASE_BIN" || {
+    echo "    BLOCKER: AGENT_VM_RELEASE_BIN honours the debug recommendation seam"
+    return 1
+  }
+  PINS_BIN="$AGENT_VM_DEV_BIN"
+  proj="$(custom_project pins-main)" || return 1
+  live="$(custom_project pins-live)" || return 1
+  pins_env "$WORK/pins-home" "$WORK/pins-state"
+  mkdir -p "$PINS_HOME" "$PINS_STATE/msb-home" || return 1
+  "${PINS_ENV[@]}" "$PINS_BIN" msb --version >/dev/null 2>&1 ||
+    { echo "    BLOCKER: could not initialize the private state root"; return 1; }
+  docker_host="${DOCKER_HOST:-$(docker context inspect --format '{{.Endpoints.docker.Host}}')}" || return 1
+
+  container="$(docker run -d --rm -e REGISTRY_STORAGE_DELETE_ENABLED=true \
+    -p 127.0.0.1::5000 "$reg")" ||
+    { echo "    BLOCKER: could not start the local registry container"; return 1; }
+  port="$(docker port "$container" 5000/tcp | head -1 | sed 's/.*://')"
+  if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+    echo "    BLOCKER: no single numeric mapped registry port"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    return 1
+  fi
+  deadline=$(( $(date +%s) + 30 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo "    BLOCKER: registry not ready on 127.0.0.1:$port"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  repo="e2e-390-$RUN_ID"
+  tag="localhost:$port/$repo:pin"
+  docker tag "$CUSTOM_MARKER" "$tag" || result=1
+  docker push "$tag" >/dev/null || result=1
+  digest_a="$(registry_host_manifest_digest "$port" "$repo" pin)" || result=1
+  docker tag "$CUSTOM_STAMP" "localhost:$port/$repo:b" || result=1
+  docker push "localhost:$port/$repo:b" >/dev/null || result=1
+  digest_b="$(registry_host_manifest_digest "$port" "$repo" b)" || result=1
+  if [ "$result" -ne 0 ] || [ -z "$digest_a" ] || [ -z "$digest_b" ] || [ "$digest_a" = "$digest_b" ]; then
+    echo "    BLOCKER: could not publish or resolve distinct A/B fixture digests"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    return 1
+  fi
+  ref_a="localhost:$port/$repo@$digest_a"
+  ref_b="localhost:$port/$repo@$digest_b"
+  # Name the identities this row's assertions are about, so the log itself
+  # records the A/B content and the platform every pin below is keyed by.
+  echo "    A=$ref_a"
+  echo "    B=$ref_b platform=linux/$host_arch"
+
+  # ---- the first launch acquires, pins, and only then reaches the SDK ----
+  start_pin_observer "$WORK/pins-gate.log" pin-committed "$WORK/pins-release" ||
+    { echo "    FAIL: could not start the debug pin observer"; result=1; }
+  pins_snapshot_at_hold "$WORK/pins-gate.log" pin-committed "$WORK/pins-release" \
+    "$WORK/pins-hold" &
+  local watcher=$!
+  AGENT_VM_TEST_PIN_GATE="$WORK/pin-gate.sock" \
+  AGENT_VM_TEST_ACQUIRE_GATE="$WORK/acq-gate.sock" \
+    pins_launch pins-first "$proj" --image "$tag" hello-258 write pins-sentinel || result=1
+  wait "$watcher" || result=1
+  stop_pin_observer
+  require_launch_ok pins-first || result=1
+  assert_no_host_calls || result=1
+  out="$(launch_output pins-first)"
+  assert_eq "first launch boots fixture A" "stamp=absent" "$(grep '^stamp=' <<<"$out")" || result=1
+  assert_eq "first launch runs the program" "hello-258=ok" "$(grep '^hello-258=ok$' <<<"$out")" || result=1
+  pins_hold_marker "$WORK/pins-hold" pin-committed || result=1
+  # The approval key is the reference *and* the measured host Linux platform: the
+  # group runs only on Apple Silicon (`linux/arm64`), so naming that architecture
+  # is a real assertion rather than a restatement of "an entry exists". A variant
+  # is optional in the schema and must be a printable spelling when it is present.
+  if ! jq -e --arg ref "$tag" --arg digest "$digest_a" --arg arch "$host_arch" \
+    '.version == 1 and (.pins | length) == 1
+     and .pins[0].reference == $ref and .pins[0].manifest_digest == $digest
+     and .pins[0].platform.os == "linux"
+     and .pins[0].platform.architecture == $arch
+     and (.pins[0].platform | has("variant"))
+     and ((.pins[0].platform.variant == null)
+          or (.pins[0].platform.variant | test("^[!-~]{1,64}$")))
+     and .pins[0].revision >= 1' \
+    "$WORK/pins-hold/store.json" >/dev/null 2>&1; then
+    echo "    FAIL: the first pin was not committed for the selected reference and host platform before create"
+    cat "$WORK/pins-hold/store.json" 2>/dev/null || true
+    result=1
+  fi
+  if [ -e "$(pins_record)" ]; then
+    echo "    FAIL: an explicit CLI selection must not adopt the retained default"
+    result=1
+  fi
+
+  # A warm pinned launch reads no registry and no mutable tag, even with the
+  # removed advisory environment inherited as truthy.
+  target="$(registry_read_count_calibrated "$container" \
+    "http://127.0.0.1:$port/v2/$repo/manifests/pin" "$repo/manifests/pin")" || result=1
+  assert_eq "one live tag read increments the access oracle" "$target" \
+    "$(pins_registry_count "$container" "$repo/manifests/pin")" || result=1
+  reads_before="$(registry_read_count_calibrated "$container" \
+    "http://127.0.0.1:$port/v2/$repo/manifests/$digest_a")" || result=1
+  AGENT_VM_UPDATE_CHECK=1 pins_launch pins-warm "$proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-warm || result=1
+  assert_no_host_calls || result=1
+  assert_eq "warm pinned launch boots A" "stamp=absent" "$(pins_stamp pins-warm)" || result=1
+  reads_after="$(registry_read_count "$container")" || result=1
+  assert_eq "warm pinned launch makes zero registry reads" "$reads_before" "$reads_after" || result=1
+
+  # ---- acquisition and approval survive a failed create ----
+  pins_env "$WORK/pkh" "$WORK/pkx"
+  mkdir -p "$PINS_HOME" "$PINS_STATE/msb-home" || result=1
+  "${PINS_ENV[@]}" "$PINS_BIN" msb --version >/dev/null 2>&1 || result=1
+  start_pin_observer "$WORK/pins-create-gate.log" pin-committed "$WORK/pins-create-release" ||
+    { echo "    FAIL: could not start the create-failure observer"; result=1; }
+  pins_break_state_at_hold "$WORK/pins-create-gate.log" "$WORK/pins-create-release" \
+    "$PINS_STATE" "$WORK/pins-create-held" &
+  watcher=$!
+  AGENT_VM_TEST_PIN_GATE="$WORK/pin-gate.sock" \
+  AGENT_VM_TEST_ACQUIRE_GATE="$WORK/acq-gate.sock" \
+    pins_launch pins-create-fail "$proj" --image "$tag" hello-258 || result=1
+  wait "$watcher" || result=1
+  stop_pin_observer
+  pins_restore_state "$PINS_STATE" "$WORK/pins-create-held" || result=1
+  [ -f "$WORK/pins-create-held" ] || { echo "    FAIL: the create-failure stage was not reached"; result=1; }
+  if [ "$CAPTURE_STATUS" -eq 0 ]; then
+    echo "    FAIL: a deliberately broken state root must fail the create"
+    result=1
+  fi
+  assert_no_match "failed create: the guest must not run" "hello-258=ok" \
+    "$(launch_output pins-create-fail)" || result=1
+  if ! jq -e --arg ref "$tag" --arg digest "$digest_a" \
+    '.pins | length == 1 and .[0].reference == $ref and .[0].manifest_digest == $digest' \
+    "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: a post-acquisition create failure must leave the first pin"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
+
+  # ---- an import alias over the pinned tag does not switch the guest ----
+  pins_env "$WORK/pins-home" "$WORK/pins-state"
+  pin_snapshot="$(cat "$(pins_store)")"
+  DOCKER_HOST="$docker_host" DOCKER_CONFIG="$PINS_HOME/docker" \
+    pins_avm image import --docker "$CUSTOM_STAMP" --tag "$tag" \
+    >"$WORK/pins-import.out" 2>&1 || {
+    echo "    FAIL: importing fixture B over the pinned tag failed"
+    cat "$WORK/pins-import.out"
+    result=1
+  }
+  assert_eq "import leaves the approval bytes unchanged" "$pin_snapshot" "$(cat "$(pins_store)")" || result=1
+  pins_launch pins-after-import "$proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-after-import || result=1
+  assert_eq "an import alias cannot swap the pinned guest" "stamp=absent" \
+    "$(pins_stamp pins-after-import)" || result=1
+
+  # ---- a live A guest keeps running while the tag moves and nothing probes it ----
+  (cd "$live" || exit 1; exec "${PINS_ENV[@]}" "${OFFLINE_ENV[@]}" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" \
+    "$PINS_BIN" --no-git --image "$tag" --mount "$live:/probe" shell bash -c \
+    'printf "%s\n" live-sentinel > "$HOME/.hello-258.plain" || exit 3
+     for ((i=0;i<240;i++)); do
+       printf "%s\n" "$$" > /probe/identity
+       hello-258 > /probe/status.tmp 2>/dev/null || true
+       mv /probe/status.tmp /probe/status
+       printf "%s\n" "$i" > /probe/tick
+       [ ! -e /probe/stop ] || exit 0
+       sleep 1
+     done; exit 94') \
+    >"$WORK/pins-live.out" 2>&1 </dev/null &
+  live_pid=$!
+  deadline=$(( $(date +%s) + 90 ))
+  while { [ ! -f "$live/status" ] || [ ! -f "$live/tick" ]; } &&
+    [ "$(date +%s)" -lt "$deadline" ] && kill -0 "$live_pid" 2>/dev/null; do sleep 1; done
+  if [ ! -f "$live/status" ] || [ ! -f "$live/tick" ]; then
+    echo "    FAIL: the live A guest did not start"
+    result=1
+  else
+    identity="$(cat "$live/identity")"
+    tick="$(cat "$live/tick")"
+    assert_eq "live guest is A" "stamp=absent" "$(grep '^stamp=' "$live/status")" || result=1
+    # The guest's own resolved identity: the uid/gid it runs as and the HOME and
+    # PATH its rootfs supplies. These are read by the booted guest, so they are
+    # the rootfs/identity stamp this row compares after both update verbs.
+    rootid="$(grep -E '^(uid|gid|home|path)=' "$live/status")" || result=1
+  fi
+  docker tag "$CUSTOM_STAMP" "$tag" || result=1
+  docker push "$tag" >/dev/null || result=1
+  reads_before="$(registry_read_count_calibrated "$container" \
+    "http://127.0.0.1:$port/v2/$repo/manifests/$digest_b")" || result=1
+  # The removed advisory is inherited by the launch that follows the move too,
+  # so "a moved tag is not probed" is measured with the variable set throughout.
+  AGENT_VM_UPDATE_CHECK=1 pins_launch pins-moved-warm "$proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-moved-warm || result=1
+  assert_eq "a moved tag does not change the approved guest" "stamp=absent" \
+    "$(pins_stamp pins-moved-warm)" || result=1
+  reads_after="$(registry_read_count "$container")" || result=1
+  assert_eq "a moved tag is not probed" "$reads_before" "$reads_after" || result=1
+
+  # ---- A cold, independent state/cache reacquires A and changes no record --
+  pin_snapshot="$(cat "$(pins_store)")"
+  if [ -e "$(pins_record)" ]; then default_snapshot="$(cat "$(pins_record)")"; else default_snapshot="<absent>"; fi
+  cold_state="$WORK/pcs"
+  cold_proj="$(custom_project pins-cold)" || result=1
+  mkdir -p "$cold_state/msb-home" || result=1
+  tag_before="$(pins_registry_count "$container" "$repo/manifests/pin")" || result=1
+  digest_before="$(pins_registry_count "$container" "$repo/manifests/$digest_a")" || result=1
+  pins_env "$WORK/pins-home" "$cold_state"
+  pins_launch pins-cold "$cold_proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-cold || result=1
+  assert_eq "a cold independent cache reacquires A" "stamp=absent" "$(pins_stamp pins-cold)" || result=1
+  assert_eq "a cold cache never queries the moved tag" "$tag_before" \
+    "$(pins_registry_count "$container" "$repo/manifests/pin")" || result=1
+  if [ "$(pins_registry_count "$container" "$repo/manifests/$digest_a")" -le "$digest_before" ]; then
+    echo "    FAIL: the cold cache did not request the approved digest A"
+    result=1
+  fi
+  # Take A out of the registry. Warm A stays usable; a new cold state must fail
+  # without requesting the tag or B.
+  curl -fsS -X DELETE "http://127.0.0.1:$port/v2/$repo/manifests/$digest_a" >/dev/null || result=1
+  pins_env "$WORK/pins-home" "$WORK/pins-state"
+  pins_launch pins-warm-unavailable "$proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-warm-unavailable || result=1
+  assert_eq "warm A remains usable after its registry content is gone" "stamp=absent" \
+    "$(pins_stamp pins-warm-unavailable)" || result=1
+  cold_state="$WORK/pcm"
+  cold_proj="$(custom_project pins-cold-missing)" || result=1
+  mkdir -p "$cold_state/msb-home" || result=1
+  digest_before="$(pins_registry_count "$container" "$repo/manifests/$digest_a")" || result=1
+  tag_before="$(pins_registry_count "$container" "$repo/manifests/pin")" || result=1
+  b_before="$(pins_registry_count "$container" "$repo/manifests/$digest_b")" || result=1
+  pins_env "$WORK/pins-home" "$cold_state"
+  pins_launch pins-cold-missing "$cold_proj" --image "$tag" hello-258 || result=1
+  if [ "$CAPTURE_STATUS" -eq 0 ]; then
+    echo "    FAIL: an unavailable approved digest must fail the cold launch"
+    result=1
+  fi
+  assert_no_match "cold unavailable: the guest must not run" "hello-258=ok" \
+    "$(launch_output pins-cold-missing)" || result=1
+  if [ "$(pins_registry_count "$container" "$repo/manifests/$digest_a")" -le "$digest_before" ]; then
+    echo "    FAIL: the failing cold launch did not request approved digest A"
+    result=1
+  fi
+  assert_eq "cold unavailable: the moved tag is not requested" "$tag_before" \
+    "$(pins_registry_count "$container" "$repo/manifests/pin")" || result=1
+  assert_eq "cold unavailable: B is not requested" "$b_before" \
+    "$(pins_registry_count "$container" "$repo/manifests/$digest_b")" || result=1
+  # None of the three cold/independent runs may rewrite either record.
+  assert_eq "cold/warm steps leave the approval bytes identical" "$pin_snapshot" \
+    "$(cat "$(pins_store)")" || result=1
+  if [ "$default_snapshot" = "<absent>" ]; then
+    if [ -e "$(pins_record)" ]; then
+      echo "    FAIL: a CLI-selection launch initialized the retained default"
+      result=1
+    fi
+  else
+    assert_eq "cold/warm steps leave the retained default bytes identical" \
+      "$default_snapshot" "$(cat "$(pins_record)")" || result=1
+  fi
+
+  # ---- decline, fail, approve; the live A guest is untouched ----
+  pins_env "$WORK/pins-home" "$WORK/pins-state"
+  pin_snapshot="$(cat "$(pins_store)")"
+  pins_pty_update pins-decline $'n\n' image refresh --image "$tag"
+  assert_eq "a declined replacement exits nonzero" "1" "$PIN_PTY_STATUS" || result=1
+  assert_match "decline prompt names the escaped source and its platform" \
+    "Replace the approved image for localhost:$port/$repo:pin \\(linux/$host_arch\\)" \
+    "$(pins_pty_text pins-decline)" || result=1
+  assert_match "decline prompt shows the full old digest" "old: $digest_a" \
+    "$(pins_pty_text pins-decline)" || result=1
+  assert_match "decline prompt shows the full new digest" "new: $digest_b" \
+    "$(pins_pty_text pins-decline)" || result=1
+  assert_eq "declining leaves the approval unchanged" "$pin_snapshot" "$(cat "$(pins_store)")" || result=1
+  pins_pty_update pins-decline-empty $'\n' image refresh --image "$tag"
+  assert_eq "an empty answer exits nonzero" "1" "$PIN_PTY_STATUS" || result=1
+  assert_match "empty answer still renders the full old digest" "old: $digest_a" \
+    "$(pins_pty_text pins-decline-empty)" || result=1
+  assert_match "empty answer still renders the full new digest" "new: $digest_b" \
+    "$(pins_pty_text pins-decline-empty)" || result=1
+  assert_eq "empty input declines and leaves the approval unchanged" "$pin_snapshot" \
+    "$(cat "$(pins_store)")" || result=1
+  if [ "$live_pid" -gt 0 ]; then
+    kill -0 "$live_pid" 2>/dev/null || { echo "    FAIL: the live A guest died"; result=1; }
+    pins_live_advanced "$live" "$live_pid" "$tick" || result=1
+  fi
+  # A candidate that cannot be validated keeps A, even with --yes.
+  pins_push_unbootable_candidate "$port" "$repo" pin || {
+    echo "    FAIL: could not publish an unbootable candidate"
+    result=1
+  }
+  pins_env "$WORK/pins-home" "$WORK/pins-state"
+  pins_avm image refresh --image "$tag" --yes >"$WORK/pins-broken.out" 2>&1 && {
+    echo "    FAIL: a broken candidate must fail the approved refresh"
+    result=1
+  }
+  assert_eq "a failed candidate leaves the approval unchanged" "$pin_snapshot" \
+    "$(cat "$(pins_store)")" || result=1
+  pins_launch pins-after-failure "$proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-after-failure || result=1
+  assert_eq "A still boots after declined/failed candidates" "stamp=absent" \
+    "$(pins_stamp pins-after-failure)" || result=1
+  # Approve B explicitly.
+  docker tag "$CUSTOM_STAMP" "$tag" || result=1
+  docker push "$tag" >/dev/null || result=1
+  pins_avm image refresh --image "$tag" --yes >"$WORK/pins-approve.out" 2>&1 || {
+    echo "    FAIL: approving the resolved candidate failed"
+    cat "$WORK/pins-approve.out"
+    result=1
+  }
+  if ! jq -e --arg ref "$tag" --arg digest "$digest_b" \
+    '.pins[0].reference == $ref and .pins[0].manifest_digest == $digest
+     and .pins[0].revision >= 2' "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: the approved pin does not name the frozen candidate B"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
+  reads_before="$(registry_read_count_calibrated "$container" \
+    "http://127.0.0.1:$port/v2/$repo/manifests/$digest_b")" || result=1
+  pins_launch pins-approved "$proj" --image "$tag" hello-258 || result=1
+  require_launch_ok pins-approved || result=1
+  assert_eq "future launches boot approved B" "stamp=present" "$(pins_stamp pins-approved)" || result=1
+  reads_after="$(registry_read_count "$container")" || result=1
+  assert_eq "warm approved B makes zero registry reads" "$reads_before" "$reads_after" || result=1
+  # set-default: the explicit target ignores ambient selection, stores the
+  # approved host child, and future precedence is unchanged.
+  pins_avm image set-default --image "$tag" --yes >"$WORK/pins-set-default.out" 2>&1 || {
+    echo "    FAIL: set-default of the approved target failed"
+    cat "$WORK/pins-set-default.out"
+    result=1
+  }
+  if ! jq -e --arg ref "$ref_b" '.version == 1 and .image == $ref' "$(pins_record)" >/dev/null 2>&1; then
+    echo "    FAIL: set-default did not retain the approved host child B"
+    cat "$(pins_record)" 2>/dev/null || true
+    result=1
+  fi
+  pins_launch pins-default-b "$proj" hello-258 || result=1
+  require_launch_ok pins-default-b || result=1
+  assert_eq "the retained fallback boots B" "stamp=present" "$(pins_stamp pins-default-b)" || result=1
+  pins_launch pins-override-a "$proj" --image "$ref_a" hello-258 || result=1
+  require_launch_ok pins-override-a || result=1
+  assert_eq "an explicit override still outranks the fallback" "stamp=absent" \
+    "$(pins_stamp pins-override-a)" || result=1
+  # A live guest keeps running across the tag move, both decline paths and B's
+  # approval: its PID, the identity its own rootfs resolves, and the booted image
+  # stamp must all be unchanged, which is what "changed pins affect future
+  # launches only" means.
+  if [ "$live_pid" -gt 0 ]; then
+    kill -0 "$live_pid" 2>/dev/null || { echo "    FAIL: the live A guest died"; result=1; }
+    pins_live_advanced "$live" "$live_pid" "$tick" || result=1
+    assert_eq "live A process identity is unchanged" "$identity" "$(cat "$live/identity")" || result=1
+    assert_eq "live A rootfs identity is unchanged" "$rootid" \
+      "$(grep -E '^(uid|gid|home|path)=' "$live/status")" || result=1
+    assert_eq "live A booted image stamp is unchanged" "stamp=absent" "$(grep '^stamp=' "$live/status")" || result=1
+  fi
+  # B is a *new* guest in the first launch's project: it must read back the
+  # program-visible state that launch wrote through the launcher's own
+  # project/state/HOME plumbing. A host bind of the project directory would prove
+  # only that the host filesystem is shared, which is not the claim.
+  pins_launch pins-b-reads "$proj" hello-258 read nonroot || result=1
+  require_launch_ok pins-b-reads || result=1
+  out="$(launch_output pins-b-reads)"
+  assert_eq "the sentinel-reading guest is B" "stamp=present" \
+    "$(pins_stamp pins-b-reads)" || result=1
+  assert_eq "B reads the first launch's project state file" "project=pins-sentinel" \
+    "$(grep '^project=' <<<"$out")" || result=1
+  assert_eq "B reads the first launch's declared state file" "declared=pins-sentinel" \
+    "$(grep '^declared=' <<<"$out")" || result=1
+  assert_eq "B reads the first launch's HOME file" "plain=pins-sentinel" \
+    "$(grep '^plain=' <<<"$out")" || result=1
+
+  # ---- local paths bypass approval (one invariant) ----
+  # The invariant this row proves is the local/OCI boundary itself: a local
+  # rootfs selection performs no approval lookup and neither reads nor repairs a
+  # damaged approval store. Whether the launch then boots is not claimed here —
+  # this host's SDK rejects a managed `root_disk` for a non-OCI image, a
+  # pre-existing limitation recorded as not-run in the acceptance evidence.
+  rootfs="$WORK/plr"
+  mkdir -p "$rootfs" || result=1
+  default_home="$WORK/plh"
+  pins_env "$default_home" "$WORK/pins-state"
+  mkdir -p "$PINS_HOME/.config/agent-vm" || result=1
+  printf 'not-json\n' >"$(pins_store)" || result=1
+  pin_snapshot="$(cat "$(pins_store)")"
+  pins_launch pins-local "$proj" --image "$rootfs" hello-258 || result=1
+  assert_no_match "a local launch performs no approval lookup" "image pin authority" \
+    "$(launch_output pins-local)" || result=1
+  assert_eq "a local launch neither reads nor repairs a damaged store" "$pin_snapshot" \
+    "$(cat "$(pins_store)")" || result=1
+  if [ "$CAPTURE_STATUS" -eq 0 ]; then
+    echo "    observed: the local-path launch booted (stamp: $(pins_stamp pins-local))"
+  else
+    echo "    observed: the local-path launch stopped at the SDK's non-OCI root_disk boundary"
+  fi
+
+  # ---- a default-tier acquisition adopts the retained digest once ----
+  default_home="$WORK/pdh"
+  default_state="$WORK/pds"
+  mkdir -p "$default_home" "$default_state/msb-home" || result=1
+  pins_env "$default_home" "$default_state"
+  observe_launch pins-default-first "$proj" "$WORK/pins-default-first.out" -- \
+    "${PINS_ENV[@]}" "${OFFLINE_ENV[@]}" AGENT_VM_TEST_DEFAULT_IMAGE="$ref_b" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" "$PINS_BIN" hello-258 || result=1
+  require_launch_ok pins-default-first || result=1
+  assert_eq "a first default-tier launch boots the acquired content" "stamp=present" \
+    "$(pins_stamp pins-default-first)" || result=1
+  if ! grep -qF "$ref_b" "$(pins_record)"; then
+    echo "    FAIL: the default-tier acquisition did not adopt its record"
+    result=1
+  fi
+  if ! jq -e --arg digest "$digest_b" \
+    '.pins | length == 1 and .[0].manifest_digest == $digest' "$(pins_store)" >/dev/null 2>&1; then
+    echo "    FAIL: the default-tier selection did not establish its pin"
+    cat "$(pins_store)" 2>/dev/null || true
+    result=1
+  fi
+  # The release candidate honours the retained digest (the seam is debug-only).
+  PINS_BIN="$AGENT_VM_RELEASE_BIN"
+  reads_before="$(registry_read_count_calibrated "$container" \
+    "http://127.0.0.1:$port/v2/$repo/manifests/$digest_b")" || result=1
+  pins_launch pins-default-release "$proj" hello-258 || result=1
+  require_launch_ok pins-default-release || result=1
+  assert_eq "the release launcher boots the retained digest" "stamp=present" \
+    "$(pins_stamp pins-default-release)" || result=1
+  reads_after="$(registry_read_count "$container")" || result=1
+  assert_eq "the release retained-default launch makes zero registry reads" \
+    "$reads_before" "$reads_after" || result=1
+  PINS_BIN="$AGENT_VM_DEV_BIN"
+
+  # Stop the live guest before the registry/fixtures go away.
+  if [ "$live_pid" -gt 0 ]; then
+    touch "$live/stop"
+    deadline=$(( $(date +%s) + 30 ))
+    while kill -0 "$live_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do sleep 1; done
+    if kill -0 "$live_pid" 2>/dev/null; then
+      kill -TERM "$live_pid" 2>/dev/null || true
+      sleep 5
+      kill -KILL "$live_pid" 2>/dev/null || true
+      result=1
+    fi
+    wait "$live_pid" || result=1
+  fi
+  docker rm -f "$container" >/dev/null 2>&1 || { echo "    FAIL: registry removal failed"; result=1; }
+  return "$result"
+}
+
 # --------------------------------------------------------------- run all ----
 
 echo "e2e: group=$GROUP"
@@ -3380,7 +4176,14 @@ custom_explicit_build_workflow() {
     "$AGENT_VM" image build --tag "$BUILD_REF" --builder "$BUILDER" --target stamp-present "$FIXTURE_DIR") || return 1
   [ ! -e "$WORK/rebuild260.oci.tar.error" ] || return 1
   python3 "$REPO_ROOT/script/test/fixtures/build-archive-oracle.py" "$WORK/rebuild260.oci.tar" > "$WORK/rebuild260.report.json" || return 1
-  explicit_boot build260-replaced present --no-git --image "$BUILD_REF" shell hello-258 || return 1
+  # #391 staging: the successful build published a new alias, but an established
+  # pin is not replaced by a cache publication. The launch stays on the approved
+  # marker-free child; a fresh HOME with no approval sees the rebuilt content.
+  explicit_boot build260-replaced absent --no-git --image "$BUILD_REF" shell hello-258 || return 1
+  local rebuilt_home="$WORK/bh-rebuilt"
+  BUILD_HOME="$rebuilt_home" BUILD_STATE="$original_state" BUILD_PROJECT="$original_project"
+  explicit_boot build260-rebuilt-fresh present --no-git --image "$BUILD_REF" shell hello-258 || return 1
+  BUILD_HOME="$original_home" BUILD_STATE="$original_state" BUILD_PROJECT="$original_project"
   explicit_boot build260-retained absent --no-git shell hello-258 || return 1
   cmp "$record" "$WORK/record260.before" || return 1
   cmp "$BUILD_PROJECT/.agent-vm/config.toml" "$WORK/config260.before" || return 1
@@ -3414,6 +4217,7 @@ run_check "custom-image-nonstandard-imported" custom_image_nonstandard_imported
 run_check "custom-image-nonstandard-cold-warm" custom_image_nonstandard_cold_warm
 run_check "custom-image-retained-default" custom_image_retained_default
 run_check "custom-image-default-upgrade" custom_image_default_upgrade
+run_check "custom-image-host-pins" custom_image_host_pins
 run_check "custom-image-no-bash-attach" check_custom_no_bash_attach
 run_check "custom-image-user-home-attach-nonroot" check_custom_user_home_attach nonroot
 run_check "custom-image-user-home-attach-root" check_custom_user_home_attach root

@@ -383,7 +383,9 @@ guest; tool declarations do not install that software.
 
 Explicit native acquisition of the selected OCI image reference into the
 **image cache**, checking whether the registry now serves different content,
-without booting a guest. Configuration is unchanged: a refresh never changes
+without booting a guest. It is one of the two operations allowed to re-resolve a
+mutable source; a changed **image pin** requires an **image approval** (the
+terminal prompt or `--yes`). Configuration is unchanged: a refresh never changes
 which reference is selected. A default-tier refresh keeps the existing
 exception — a successful acquisition of an **absent** retained default
 initializes it (success-before-adoption); it never replaces an existing record.
@@ -396,6 +398,10 @@ a registry. `agent-vm image build` and `agent-vm image import` publish into it
 under a mutable **result reference** — `--tag`, or for import the `--docker`
 source when no tag is given — plus any names the archive carries. The Docker
 daemon store is not it.
+
+It is not an approval authority: publishing an alias, deleting the cache or
+redirecting it never changes an **image pin**, and a pinned launch reacquires
+the approved digest rather than trusting whatever an alias names.
 
 _Avoid_: "local images" without saying which store.
 
@@ -425,7 +431,10 @@ the image. A config-file `image` must be an OCI reference; `--image`
 additionally accepts whatever msb accepts (a local rootfs or disk image). No
 launch builds an image. See
 [USAGE.md#selecting-the-boot-image](USAGE.md#selecting-the-boot-image) and
-[ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md).
+[ADR-0035](docs/adr/0035-consume-user-owned-boot-images.md). Winning is not
+authorization: every OCI source is recorded as an **image pin**, and a launch
+consumes the approved child digest. Precedence only chooses which pin's source
+is looked up. Local paths remain unpinned.
 
 ## Retained default boot image
 
@@ -433,16 +442,61 @@ The digest-pinned image a host keeps as its default after acquiring it, in the
 user-scoped `$HOME/.config/agent-vm/default-image.json`. A *bookmark* naming
 exact content, not a download cache: it is independent of the msb image cache,
 `AGENT_VM_STATE_DIR` and any project, and it is written **only after** the image
-was acquired (success-before-adoption). Automatic initialization is write-once,
-so no failed or concurrent first launch overwrites it. A **deliberate
-`image set-default`** is successful native acquisition and host-platform
-validation followed by replacement of this retained fallback; it affects future
-default-image sessions only. See
-[USAGE.md#explicitly-setting-the-default](USAGE.md#explicitly-setting-the-default).
-Distinguished from the **initial recommendation**
-below. See
+was acquired (success-before-adoption). Automatic initialization is
+insert-if-absent, so no failed or concurrent first launch overwrites it. The
+default tier also has an **image pin**, so warm launches consume the approved
+child without registry contact. A **deliberate `image set-default`** is
+successful native acquisition, candidate approval and a journaled transaction
+that replaces this retained fallback and its shared pin together; it affects
+future default-image sessions only. The record holds a digest only — no source
+tag, platform or tool metadata — so a bare `image refresh` reacquires that
+digest rather than following a tag (issue #392). See
+[USAGE.md#explicitly-setting-the-default](USAGE.md#explicitly-setting-the-default)
+and [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md).
+Distinguished from the **initial recommendation** below. See
 [USAGE.md#the-retained-default](USAGE.md#the-retained-default). _Avoid_: cache
 entry, default config, pinned layer.
+
+## Image pin
+
+One host-wide approval record: the canonical OCI reference plus the measured
+host Linux platform (`linux/<arch>[/<variant>]`) of the **boot image**, mapped to
+the approved host-platform manifest **child** digest and a monotonic revision.
+Stored in the user-scoped `$HOME/.config/agent-vm/image-pins.json` (with
+`image-pins.lock`), shared by every project and independent of the **image
+cache**, `AGENT_VM_STATE_DIR` and the **retained default boot image**. A launch
+or `setup` consumes `repo@child`, never the selected tag or index. Only
+`image refresh` and `image set-default` re-resolve a source and request an
+**image approval**. Local rootfs/disk launches are never pinned.
+
+_Avoid_: "lock file"; "tag pin" (a pin names a child digest, not a tag); "cache
+entry" (cache evidence is not approval).
+
+## Image candidate
+
+Content acquired and validated by a native operation but **not yet approved**:
+the resolved host-platform child plus the measured guest content identity
+(verified config digest and ordered layer diff IDs). A candidate exists only
+long enough to be approved or declined, and it is frozen before any replacement
+prompt, so a registry moving during the decision cannot substitute content.
+
+_Avoid_: "pending image"; "download" (a candidate is validated, not merely
+fetched).
+
+## Image approval
+
+The deliberate, candidate-scoped replacement of an **image pin**: the escaped
+source, platform and full old/new digests are shown, the default answer is No,
+and `--yes` (only on `image refresh` / `image set-default`) pre-authorizes
+exactly that resolved candidate. Distinct from **credential authorization**
+(which host credential may be injected) and from cache repair. Without a
+terminal on stdin and stderr a changed pin is refused (status 1) without reading
+input; a first pin or an unchanged digest needs no approval. An immutable
+source that resolves to different content is an integrity failure, never an
+approvable change.
+
+_Avoid_: "confirmation prompt" (it is a recorded host decision); "update check"
+(there is no launch-time probe); "cache approval".
 
 ## Initial recommendation
 

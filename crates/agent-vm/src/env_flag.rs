@@ -158,8 +158,8 @@ mod tests {
     }
 
     /// Doc lockstep, written so it cannot pass vacuously: assert both that
-    /// USAGE.md marks exactly the four value-parsing vars with `(accepted:`
-    /// AND that every one of those rows renders the current `TRUTHY` set.
+    /// USAGE.md marks exactly the value-parsing vars with `(accepted:` AND that
+    /// every one of those rows renders the current `TRUTHY` set.
     /// A future reformat that silently empties the loop fails the count
     /// assertion instead of passing for the wrong reason.
     #[test]
@@ -171,8 +171,8 @@ mod tests {
             .collect();
         assert_eq!(
             rows.len(),
-            3,
-            "USAGE.md must mark exactly the three value-parsing vars with `(accepted:`, found: {rows:?}"
+            2,
+            "USAGE.md must mark exactly the two value-parsing vars with `(accepted:`, found: {rows:?}"
         );
         for row in rows {
             assert!(

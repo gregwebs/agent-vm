@@ -1,6 +1,6 @@
 //! Shared pseudo-terminal driver for boot-free interactive tests.
 //!
-//! Extracted from `secret_pty.rs` so a future approval prompt and the hidden
+//! Extracted from `secret_pty.rs` so the image-approval prompt and the hidden
 //! secret prompt run the same harness rather than drifting copies. The helper
 //! owns only the terminal: the caller builds and isolates the `Command` (env,
 //! cwd, arguments) and names the prompt bytes it waits for. No environment is

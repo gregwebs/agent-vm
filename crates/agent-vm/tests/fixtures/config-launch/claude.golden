@@ -2,7 +2,7 @@
   "name": "agent-vm-normalized",
   "image": {
     "Oci": {
-      "reference": "localhost:1/does-not-exist:latest",
+      "reference": "localhost:1/does-not-exist@$FIXTURE_DIGEST",
       "root_disk": {
         "kind": "managed",
         "size_mib": 16384

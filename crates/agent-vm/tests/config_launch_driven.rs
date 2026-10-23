@@ -3,10 +3,10 @@
 //!
 //! `mount_follow_links.rs` established the technique: drive the real binary
 //! with a controlled `HOME`/`AGENT_VM_STATE_DIR`/cwd, a fake version-only
-//! `MSB_PATH`, `AGENT_VM_DEBUG_CONFIG=1`, and a bogus loopback image.
+//! `MSB_PATH`, `AGENT_VM_DEBUG_CONFIG=1`, and a CLI-imported native image.
 //! Execution runs all the way to `builder.build()`, which dumps the real
 //! `SandboxConfig` JSON to stderr, then a `[debug] guest command:` line, and
-//! only then fails (expectedly) pulling the bogus image. Reaching those lines
+//! only then fails at the deliberately nonfunctional runtime. Reaching those lines
 //! is proof the launch was wired end to end without booting a VM.
 //!
 //! ## E1 goldens
@@ -78,9 +78,8 @@ use std::{
 
 mod support;
 
-/// Bogus-but-well-formed image ref: never resolves, so the run fails *after*
-/// the debug dumps (its pull is what fails), which is exactly the stage these
-/// tests need.
+/// A loopback spelling imported only by builder-dependent tests. Cold tests
+/// deliberately leave it absent to exercise acquisition refusal.
 const BOGUS_IMAGE: &str = "localhost:1/does-not-exist:latest";
 const CONFIG_MARKER: &str = "[debug] sandbox config JSON: ";
 const GUEST_CMD_MARKER: &str = "[debug] guest command: ";
@@ -170,6 +169,28 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
     }
 }
 
+fn assert_cold_preparation_failure(h: &Harness, out: &Output) {
+    let text = stderr_of(out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("preparing the boot image"), "{text}");
+    assert!(!text.contains(CONFIG_MARKER), "builder ran: {text}");
+    assert!(
+        !text.contains(GUEST_CMD_MARKER),
+        "guest command was built: {text}"
+    );
+    assert!(
+        !h.home_root
+            .join(".config/agent-vm/image-pins.json")
+            .exists()
+    );
+    h.assert_no_selection("failed acquisition");
+    assert!(
+        h.msb_log().lines().all(|line| line == "--version"),
+        "{}",
+        h.msb_log()
+    );
+}
+
 fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
@@ -248,6 +269,77 @@ impl Harness {
             state_root,
             fake_msb,
         }
+    }
+
+    /// Import genuine host-valid bytes through the public CLI. Import alone
+    /// must not create approval/default records; first launch still proves that.
+    fn warm() -> Self {
+        let h = Self::new();
+        let archive = h.home_root.join("builder-image.tar");
+        image_archive::write(&archive, &image_archive::ArchiveSpec::default());
+        let aliases = [
+            BOGUS_IMAGE,
+            CLI_REF,
+            ENV_REF,
+            USER_REF,
+            PROJECT_REF,
+            default_ref(),
+            recommendation_b(),
+        ];
+        let mut input = tar::Archive::new(std::fs::File::open(&archive).unwrap());
+        let mut output = tar::Builder::new(Vec::new());
+        for entry in input.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if path == Path::new("index.json") {
+                let mut index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let descriptor = index["manifests"][0].clone();
+                index["manifests"] = aliases
+                    .iter()
+                    .map(|alias| {
+                        let mut descriptor = descriptor.clone();
+                        descriptor["annotations"] = serde_json::json!({
+                            "org.opencontainers.image.ref.name": alias
+                        });
+                        descriptor
+                    })
+                    .collect();
+                bytes = serde_json::to_vec(&index).unwrap();
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            output
+                .append_data(&mut header, path, bytes.as_slice())
+                .unwrap();
+        }
+        std::fs::write(&archive, output.into_inner().unwrap()).unwrap();
+        let out = h.builtin(
+            &[
+                "image",
+                "import",
+                "--input",
+                archive.to_str().unwrap(),
+                "--tag",
+                BOGUS_IMAGE,
+            ],
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "fixture import failed: {}",
+            stderr_of(&out)
+        );
+        assert!(
+            !h.home_root
+                .join(".config/agent-vm/image-pins.json")
+                .exists()
+        );
+        h.assert_no_selection("fixture import");
+        h
     }
 
     fn user_config(&self) -> PathBuf {
@@ -417,7 +509,7 @@ impl Harness {
         for (from, to) in self.location_tokens(state_dir) {
             out = out.replace(&from, to);
         }
-        out
+        out.replace(fixture_digest(), "$FIXTURE_DIGEST")
     }
 
     fn normalize_json(&self, state_dir: &Path, value: &serde_json::Value) -> String {
@@ -1052,7 +1144,7 @@ fn a_launch_that_requests_no_credential_never_reads_the_authorization_file() {
     // something, so a tool that requests none is unaffected by a broken one.
     // `shell` is deliberately NOT that tool: its default `tools = ["*"]` pulls
     // in every built-in provider, so it does request credentials.
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = []\ncredentials = []\n");
     write_credentials(
         &harness.home_root,
@@ -1117,7 +1209,7 @@ fn a_credential_bearing_launch_runs_the_capability_probe() {
     // failure rather than the capability refusal. Replacing the fake's
     // capability answer with anything invalid flips the outcome and fails this
     // test (agent-vm #161 review, M4).
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user(ONE_YAML_TOOL);
     write_credentials(
         &harness.home_root,
@@ -1148,7 +1240,7 @@ fn an_owned_credential_name_is_never_forwarded_from_the_host() {
     // `run::launch` emission wiring, not only the ownership decision: if the
     // raw-forwarding suppression or the sentinel publication were removed, the
     // host canary would appear in the dumped environment (agent-vm #161 M1/M4).
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user(ONE_YAML_TOOL);
     write_credentials(
         &harness.home_root,
@@ -1196,16 +1288,8 @@ fn a_sentinel_false_credential_fails_closed_when_image_metadata_is_unreadable() 
     let out = harness.launch("t", &[]);
     assert!(!out.status.success());
     let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
-    // Assert the command it prints is *runnable*, not a substring of prose:
-    // the earlier assertion (`"Pull or inspect the image"`) passed while the
-    // printed command failed with "unexpected argument", because the acquisition
-    // verb is `image refresh` and it takes `--image REF` (agent-vm #161 review,
-    // N1; #389 regrouped the verb). The exact ref must appear so the
-    // instruction is pasteable.
-    assert!(
-        rendered.contains(&format!("agent-vm image refresh --image {BOGUS_IMAGE}")),
-        "the launch did not offer a runnable refresh command: {rendered}"
-    );
+    assert!(rendered.contains("preparing the boot image"), "{rendered}");
+    assert_cold_preparation_failure(&harness, &out);
 }
 
 // -- #162: precedence and the availability override --------------------------
@@ -1252,7 +1336,7 @@ fn intercept_rule_hosts(config: &serde_json::Value) -> Vec<&str> {
 /// *credential* facets and leaves its *configuration and persistence* alone.
 #[test]
 fn a_same_named_authorization_replaces_the_built_in_but_not_its_configuration() {
-    let harness = Harness::new(); // seeds ~/.claude/.credentials.json
+    let harness = Harness::warm(); // seeds ~/.claude/.credentials.json
     write_credentials(&harness.home_root, YAML_ANTHROPIC);
     let out = harness.launch_with_env(
         "claude",
@@ -1327,7 +1411,7 @@ fn a_same_named_authorization_replaces_the_built_in_but_not_its_configuration() 
 /// entry). One shared state dir across both launches.
 #[test]
 fn replacing_a_built_in_clears_the_placeholder_an_earlier_launch_left() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let first = harness.launch_default("claude");
     let state = state_dir(&stderr_of(&first));
     assert!(
@@ -1368,7 +1452,7 @@ fn replacing_a_built_in_clears_the_placeholder_an_earlier_launch_left() {
 /// launch is byte-identical to the untouched `codex` golden.
 #[test]
 fn an_unrequested_authorization_leaves_the_built_in_alone() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     write_credentials(&harness.home_root, YAML_ANTHROPIC);
     let out = harness.launch_default("codex");
     assert_matches_golden("codex", &observation(&harness, &out));
@@ -1409,7 +1493,7 @@ fn assert_the_override_does_not_bypass(
 #[test]
 fn the_override_does_not_bypass_a_malformed_authorization_file() {
     let canary = "sk-CANARY-6f2a1b3c4d5e6071829304a5b6c7d8e9";
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user(ONE_YAML_TOOL);
     write_credentials(
         &harness.home_root,
@@ -1427,7 +1511,7 @@ fn the_override_does_not_bypass_a_malformed_authorization_file() {
     // Positive control: the same harness with the problem removed boots all the
     // way to the sandbox build, so "both runs refused" cannot be satisfied by a
     // harness that could never boot at all.
-    let control = Harness::new();
+    let control = Harness::warm();
     control.write_user(ONE_YAML_TOOL);
     write_credentials(&control.home_root, VALID_MY_SERVICE_YAML);
     let out = control.launch_with_env(
@@ -1509,19 +1593,14 @@ fn the_override_does_not_bypass_unreadable_image_metadata() {
         &harness.home_root,
         "credentials:\n  - service: my-service\n    apiKey:\n      name: MY_SERVICE_KEY\n      inject:\n        - domain: api.my-service.example\n          header: x-api-key\n          format: \"%s\"\n",
     );
-    assert_the_override_does_not_bypass(
-        &harness,
-        "t",
-        &[],
-        &format!("agent-vm image refresh --image {BOGUS_IMAGE}"),
-    );
+    assert_the_override_does_not_bypass(&harness, "t", &[], "preparing the boot image");
 }
 
 /// Row 7: a tool-declared `env` key for an owned name is a hard error under both
 /// policies. The value is ready so the launch reaches `assemble_guest_env`.
 #[test]
 fn the_override_does_not_bypass_a_tool_env_conflict() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user(
         "[[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"my-service\"]\nenv = { MY_SERVICE_KEY = \"x\" }\n",
     );
@@ -1555,7 +1634,7 @@ fn the_override_does_not_bypass_a_built_in_missing_credential() {
 /// image-env check and the launch really boots.
 #[test]
 fn the_override_skips_an_unauthorized_request_and_still_boots() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user(ONE_YAML_TOOL); // `credentials = ["my-service"]`, no YAML file
     let out = harness.launch("t", &["--allow-missing-credentials"]);
     let rendered = format!("{}{}", stderr_of(&out), stdout_of(&out));
@@ -1575,7 +1654,7 @@ fn the_override_skips_an_unauthorized_request_and_still_boots() {
 /// which is exactly the proof that it got *past* credential resolution.
 #[test]
 fn the_override_warns_and_proceeds_for_an_unavailable_required_credential() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user(ONE_YAML_TOOL);
     write_credentials(
         &harness.home_root,
@@ -1601,8 +1680,8 @@ fn the_override_warns_and_proceeds_for_an_unavailable_required_credential() {
         "the withheld credential must be rendered as a warning, not a fatal error: {rendered}"
     );
     assert!(
-        rendered.contains("agent-vm image refresh --image"),
-        "the launch must have got past credential resolution to the image-metadata stage: {rendered}"
+        rendered.contains(CONFIG_MARKER),
+        "the launch must have got past credential resolution past validated image preparation: {rendered}"
     );
 }
 
@@ -1611,7 +1690,7 @@ fn the_override_warns_and_proceeds_for_an_unavailable_required_credential() {
 /// launch proceeds instead of bailing.
 #[test]
 fn a_replaced_provider_does_not_inherit_the_built_in_requirement() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     std::fs::remove_file(harness.home_root.join(".claude/.credentials.json")).unwrap();
     write_credentials(&harness.home_root, YAML_ANTHROPIC);
     let out = harness.launch_with_env(
@@ -1630,7 +1709,7 @@ fn a_replaced_provider_does_not_inherit_the_built_in_requirement() {
 /// A renamed replacement never publishes the host's raw key (#163).
 #[test]
 fn a_renamed_replacement_does_not_forward_the_hosts_raw_key() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     write_credentials(
         &harness.home_root,
         "credentials:\n  - service: anthropic\n    apiKey:\n      name: MY_KEY\n      sentinelEnv: true\n      inject: [{domain: api.anthropic.example, header: x-api-key, format: \"%s\"}]\n",
@@ -1659,7 +1738,7 @@ fn a_renamed_replacement_does_not_forward_the_hosts_raw_key() {
 /// host's own variable name, nothing is forwarded and no notice fires.
 #[test]
 fn a_same_named_replacement_does_not_warn_about_raw_forwarding() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     write_credentials(&harness.home_root, YAML_ANTHROPIC);
     let out = harness.launch_with_env(
         "claude",
@@ -1690,7 +1769,7 @@ fn a_same_named_replacement_does_not_warn_about_raw_forwarding() {
 /// gate has to update it deliberately rather than by accident.
 #[test]
 fn a_sentinel_opencode_replacement_publishes_the_key_but_retires_the_model_pin() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     write_credentials(
         &harness.home_root,
         "credentials:\n  - service: opencode-static\n    apiKey:\n      name: OPENAI_API_KEY\n      sentinelEnv: true\n      inject: [{domain: api.openai.com, header: authorization, format: \"Bearer %s\"}]\n",
@@ -1741,11 +1820,11 @@ fn a_sentinel_opencode_replacement_publishes_the_key_but_retires_the_model_pin()
 /// substitution entry. The in-guest "do you trust this folder?" prompt itself
 /// needs a boot and a live CLI (§4.8 step 7); this pins the launch decision it
 /// depends on, which `secrets.rs`'s in-process test alone does not exercise
-/// end to end. `Harness::new()` seeds the host device-flow token, so the
+/// end to end. `Harness::warm()` seeds the host device-flow token, so the
 /// absence below is the replacement's doing, not a missing host credential.
 #[test]
 fn a_replaced_copilot_still_gets_its_trust_configuration_and_no_token() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     write_credentials(
         &harness.home_root,
         "credentials:\n  - service: copilot\n    apiKey:\n      name: COPILOT_TOKEN\n      sentinelEnv: true\n      inject: [{domain: api.githubcopilot.com, scheme: bearer}]\n",
@@ -1834,7 +1913,7 @@ fn assert_matches_golden(tool: &str, actual: &str) {
 #[test]
 fn default_tools_launch_with_their_declared_provisioning() {
     for tool in DEFAULT_TOOLS {
-        let harness = Harness::new();
+        let harness = Harness::warm();
         let out = harness.launch_default(tool);
         // Pin the tool-dependent subset directly as well as via the golden, so
         // a future widening of the normalizer cannot stop pinning it.
@@ -1880,7 +1959,7 @@ fn host_environment_normalization_drops_only_the_host_gid_group_append() {
 #[test]
 fn default_tools_emit_the_legacy_guest_command_line() {
     for (tool, expected) in LEGACY_GUEST_COMMANDS {
-        let harness = Harness::new();
+        let harness = Harness::warm();
         let out = harness.launch_default(tool);
         let stderr = stderr_of(&out);
         assert_eq!(
@@ -1900,7 +1979,7 @@ const CLAUDE_ONLY: &str = "[[tools]]\nname = \"claude\"\ncommand = \"claude\"\n\
 
 #[test]
 fn claude_only_config_registers_claude_and_the_shell_fallback() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user(CLAUDE_ONLY);
 
     // `claude` is registered and launches.
@@ -1943,7 +2022,7 @@ fn claude_only_config_registers_claude_and_the_shell_fallback() {
 
 #[test]
 fn a_project_declared_tool_launches_its_own_command() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(
         "[[tools]]\nname = \"mytool\"\ncommand = \"/bin/echo\"\nargs = [\"--fast\"]\n",
     );
@@ -1983,7 +2062,7 @@ fn a_project_declared_tool_launches_its_own_command() {
 /// which declare no colliding key.
 #[test]
 fn project_tool_env_path_is_dropped_by_the_launcher() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(
         "[[tools]]\nname = \"envtool\"\ncommand = \"/bin/echo\"\nenv = { AVM_TEST = \"ok\", PATH = \"/evil\" }\n",
     );
@@ -2063,7 +2142,7 @@ fn a_tool_declaring_the_guest_identity_is_refused_in_every_mode() {
 #[test]
 fn the_launchers_unconditional_env_is_published_in_both_modes() {
     for extra in [vec![], vec!["--root"]] {
-        let harness = Harness::new();
+        let harness = Harness::warm();
         harness.write_project("[[tools]]\nname = \"plain\"\ncommand = \"/bin/echo\"\n");
         let out = harness.launch("plain", &extra);
         let stderr = stderr_of(&out);
@@ -2096,7 +2175,7 @@ fn the_launchers_unconditional_env_is_published_in_both_modes() {
 /// `CODEX_HOME` — the general rule, where E1 covers the shipped tools.
 #[test]
 fn a_user_declared_tool_without_env_gets_no_codex_home() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project("[[tools]]\nname = \"plain\"\ncommand = \"/bin/echo\"\n");
     let out = harness.launch("plain", &[]);
     let stderr = stderr_of(&out);
@@ -2123,7 +2202,7 @@ fn a_user_declared_tool_without_env_gets_no_codex_home() {
 #[test]
 fn tool_declared_env_is_published_in_both_modes_and_keeps_equals_signs() {
     for extra in [vec![], vec!["--root"]] {
-        let harness = Harness::new();
+        let harness = Harness::warm();
         harness.write_project(
             "[[tools]]\nname = \"envtool\"\ncommand = \"/bin/echo\"\nenv = { AVM_TEST = \"ok=still=ok\" }\n",
         );
@@ -2166,7 +2245,7 @@ fn a_shadowed_shipped_tool_does_not_inherit_the_shipped_env() {
     ];
     for (name, definition) in cases {
         // Shadowed *without* `env`: the shipped CODEX_HOME is not inherited.
-        let harness = Harness::new();
+        let harness = Harness::warm();
         harness.write_user(&format!("[[tools]]\nname = \"{name}\"\n{definition}"));
         let out = harness.launch_default(name);
         let stderr = stderr_of(&out);
@@ -2182,7 +2261,7 @@ fn a_shadowed_shipped_tool_does_not_inherit_the_shipped_env() {
         );
 
         // Re-declaring the pair is the documented remedy.
-        let harness = Harness::new();
+        let harness = Harness::warm();
         harness.write_user(&format!(
             "[[tools]]\nname = \"{name}\"\n{definition}env = {{ CODEX_HOME = \"/agent-vm-state/codex\" }}\n"
         ));
@@ -2213,7 +2292,7 @@ fn a_shadowed_shipped_tool_does_not_inherit_the_shipped_env() {
 /// provider, so this test removes them first -- otherwise it proves nothing.
 #[test]
 fn pi_launches_with_no_host_credentials_while_claude_still_bails() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     // Deleting the seeds must be *checked*: a silently-failed removal would
     // let this test pass on a host that still has a credential.
     for relative in [
@@ -2268,7 +2347,7 @@ fn pi_launches_with_no_host_credentials_while_claude_still_bails() {
 /// this drives the same property through the real binary.
 #[test]
 fn a_pi_launch_spares_a_guest_authored_claude_credential() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     // No host Claude login. Deleting the seed must be checked: a
     // silently-failed removal would let this pass on a host that has one.
     let host_credential = harness.home_root.join(".claude/.credentials.json");
@@ -2305,7 +2384,7 @@ fn a_pi_launch_spares_a_guest_authored_claude_credential() {
 /// content-scoped clearer spares the same file.)
 #[test]
 fn a_pi_launch_overwrites_a_guest_authored_claude_credential_with_the_placeholder() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     // The harness ships a usable host Claude credential; assert it, because a
     // missing one would make capture fail and this test pass vacuously.
     assert!(
@@ -2338,7 +2417,7 @@ fn a_pi_launch_overwrites_a_guest_authored_claude_credential_with_the_placeholde
 /// `pi` now re-wires Anthropic, so the placeholder survives.
 #[test]
 fn a_shell_placeholder_survives_the_next_pi_launch() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let shell = harness.launch_default("shell");
     let state = state_dir(&stderr_of(&shell));
     let placeholder = std::fs::read(state.join("claude/.credentials.json"))
@@ -2370,7 +2449,7 @@ fn a_shell_placeholder_survives_the_next_pi_launch() {
 /// here rather than leaving it silent. They hold no credential bytes.
 #[test]
 fn a_pi_launch_writes_the_anthropic_bypass_configs_without_a_host_credential() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     std::fs::remove_file(harness.home_root.join(".claude/.credentials.json")).unwrap();
 
     let out = harness.launch_default("pi");
@@ -2412,7 +2491,7 @@ fn a_pi_launch_writes_the_anthropic_bypass_configs_without_a_host_credential() {
 /// would let this pass on a host that still has a login.
 #[test]
 fn pi_without_a_host_codex_login_launches_and_wires_no_openai() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let host_credential = harness.home_root.join(".codex/auth.json");
     std::fs::remove_file(&host_credential).unwrap();
     assert!(
@@ -2449,7 +2528,7 @@ fn pi_without_a_host_codex_login_launches_and_wires_no_openai() {
 /// is documented in USAGE.md; this is the executable statement of it.
 #[test]
 fn a_pi_launch_overwrites_a_guest_authored_codex_credential_with_the_placeholder() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     // Assert the capture precondition explicitly; without it the guest credential
     // would remain and the placeholder assertion below would fail.
     assert!(
@@ -2486,7 +2565,7 @@ fn a_pi_launch_overwrites_a_guest_authored_codex_credential_with_the_placeholder
 /// to delete a guest's own login.
 #[test]
 fn a_pi_launch_with_no_host_codex_login_spares_a_guest_authored_codex_credential() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let host_credential = harness.home_root.join(".codex/auth.json");
     std::fs::remove_file(&host_credential).unwrap();
     assert!(
@@ -2515,7 +2594,7 @@ fn a_pi_launch_with_no_host_codex_login_spares_a_guest_authored_codex_credential
 /// placeholder a `codex` launch wrote is kept rather than deleted as unwired.
 #[test]
 fn a_codex_placeholder_survives_the_next_pi_launch() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let codex = harness.launch_default("codex");
     let state = state_dir(&stderr_of(&codex));
     let placeholder = std::fs::read(state.join("codex/auth.json"))
@@ -2558,7 +2637,7 @@ fn a_pi_launch_discloses_no_host_openai_token_bytes() {
     const ID_TOKEN: &str = "canary-360-id-token-do-not-leak";
     const ACCOUNT: &str = "22222222-2222-2222-2222-222222222222";
 
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let host_path = harness.home_root.join(".codex/auth.json");
     write(
         &host_path,
@@ -2784,7 +2863,7 @@ fn root_launch_refuses_a_guest_planted_home_symlink() {
 /// launch finds the same bytes and materializes the compiled link.
 #[test]
 fn root_first_upgrade_moves_the_legacy_pi_home() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
 
     let probe = harness.launch("pi", &["--root"]);
     let state = state_dir(&stderr_of(&probe));
@@ -2842,7 +2921,7 @@ fn root_first_upgrade_moves_the_legacy_pi_home() {
 /// real directory `force_symlink` refuses to replace.
 #[test]
 fn nonroot_first_upgrade_moves_the_legacy_pi_home() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
 
     // A first non-root launch materializes `<state>/home` and the compiled
     // `.pi` symlink (provisioning runs before the bogus-image pull fails).
@@ -3080,7 +3159,7 @@ fn help_with_no_argument_still_prints_help_and_exits_zero() {
 /// whole CLI/launch path.
 #[test]
 fn an_empty_tools_list_still_registers_and_launches_shell() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project("tools = []\n");
 
     let help = harness.base_command().arg("--help").output().unwrap();
@@ -3157,7 +3236,7 @@ fn a_broken_user_config_fails_a_launch_and_still_allows_help_and_doctor() {
 /// function; this pins the wiring that emits it for a real invocation.
 #[test]
 fn shell_user_args_are_joined_and_escaped_in_the_guest_command_line() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let out =
         harness.launch_with_tool_args("shell", &["--image", BOGUS_IMAGE], &["a b", "c'd"], &[]);
 
@@ -3225,7 +3304,7 @@ fn assert_no_file_contains(root: &Path, needle: &str) {
 /// capability; narrowing it would collide with a real `~/.claude` next launch).
 #[test]
 fn a_codex_launch_provisions_openai_only() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let out = harness.launch_default("codex");
     let stderr = stderr_of(&out);
     let config = debug_config_json(&stderr);
@@ -3265,7 +3344,7 @@ fn a_codex_launch_provisions_openai_only() {
 /// placeholder config and env var all present together.
 #[test]
 fn a_shell_launch_provisions_all_four_with_a_working_copilot() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let out = harness.launch_default("shell");
     let stderr = stderr_of(&out);
     let config = debug_config_json(&stderr);
@@ -3299,7 +3378,7 @@ fn a_shell_launch_provisions_all_four_with_a_working_copilot() {
 #[test]
 fn no_default_verb_provisions_a_placeholder_without_its_substitution_entry() {
     for tool in DEFAULT_TOOLS {
-        let harness = Harness::new();
+        let harness = Harness::warm();
         let out = harness.launch_default(tool);
         let stderr = stderr_of(&out);
         let config = debug_config_json(&stderr);
@@ -3346,7 +3425,7 @@ fn no_default_verb_provisions_a_placeholder_without_its_substitution_entry() {
 /// names). Both launches share one state dir.
 #[test]
 fn a_failed_copilot_capture_clears_the_stale_shell_placeholder() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
 
     // (a) A successful copilot launch writes the placeholder config.
     let first = harness.launch_default("copilot");
@@ -3431,7 +3510,7 @@ fn a_dangling_tools_reference_fails_a_launch_but_not_doctor() {
 /// launch still boots — with no TLS overlay and no egress (default-deny).
 #[test]
 fn a_zero_provisioning_launch_boots_with_no_tls_overlay() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(
         "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\ntools = []\n",
     );
@@ -3479,7 +3558,7 @@ fn a_zero_provisioning_launch_boots_with_no_tls_overlay() {
 /// user-config test.
 #[test]
 fn a_fallback_shell_under_a_custom_catalog_provisions_nothing() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user("[[tools]]\nname = \"solo\"\ncommand = \"/bin/echo\"\n");
     let out = harness.launch_default("shell");
     let stderr = stderr_of(&out);
@@ -3510,7 +3589,7 @@ fn a_fallback_shell_under_a_custom_catalog_provisions_nothing() {
 /// assertion load-bearing instead of vacuous.
 #[test]
 fn host_credentials_are_never_bind_mounted_into_the_guest() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let out = harness.launch_default("shell");
     let stderr = stderr_of(&out);
     let config = debug_config_json(&stderr);
@@ -3551,7 +3630,7 @@ fn host_credentials_are_never_bind_mounted_into_the_guest() {
 #[test]
 fn copilot_is_captured_despite_no_git() {
     for tool in ["copilot", "shell"] {
-        let harness = Harness::new();
+        let harness = Harness::warm();
         let out = harness.launch(tool, &["--no-git"]);
         let stderr = stderr_of(&out);
         let config = debug_config_json(&stderr);
@@ -3578,7 +3657,7 @@ fn copilot_is_captured_despite_no_git() {
 /// login, while `claude` refuses.
 #[test]
 fn a_missing_required_host_credential_bails_before_boot() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     std::fs::remove_file(harness.home_root.join(".claude/.credentials.json")).unwrap();
     let out = harness.launch_default("claude");
     let stderr = stderr_of(&out);
@@ -3591,7 +3670,7 @@ fn a_missing_required_host_credential_bails_before_boot() {
         "the bail must happen before the sandbox is built:\n{stderr}"
     );
 
-    let harness = Harness::new();
+    let harness = Harness::warm();
     std::fs::remove_file(harness.home_root.join(".codex/auth.json")).unwrap();
     let out = harness.launch_default("codex");
     let stderr = stderr_of(&out);
@@ -3612,7 +3691,7 @@ fn a_missing_required_host_credential_bails_before_boot() {
 /// invariant holds at its zero-boundary.
 #[test]
 fn a_shell_launch_with_no_host_credentials_wires_nothing() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     for relative in [
         ".claude/.credentials.json",
         ".codex/auth.json",
@@ -3686,7 +3765,7 @@ const COMPILED_LINKS: [&str; 8] = [
 /// and the eight compiled links remain — additive, not replacing.
 #[test]
 fn a_declared_persist_tool_links_into_state_and_stays_additive() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(AIDER_PERSIST);
 
     let out = harness.launch("aider", &[]);
@@ -3723,7 +3802,7 @@ fn a_declared_persist_tool_links_into_state_and_stays_additive() {
 /// emitted for the ancestor, and the compiled symlink steps are unchanged.
 #[test]
 fn root_mode_bakes_declared_persist_links_into_the_rootfs() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(AIDER_PERSIST);
 
     let out = harness.launch("aider", &["--root"]);
@@ -3776,7 +3855,7 @@ fn root_mode_bakes_declared_persist_links_into_the_rootfs() {
 /// `.claude`/`.claude.json` without restating them.
 #[test]
 fn persist_is_additive_with_credential_links() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(
         "[[tools]]\nname = \"mytool\"\ncommand = \"/bin/echo\"\ncredentials = [\"anthropic\"]\npersist = [\".x\"]\n",
     );
@@ -3803,7 +3882,7 @@ fn persist_is_additive_with_credential_links() {
 /// deleted, so this asserts the link target.
 #[test]
 fn a_declared_persist_link_survives_a_second_launch() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(AIDER_PERSIST);
 
     let first = harness.launch("aider", &[]);
@@ -3837,7 +3916,7 @@ fn a_declared_persist_link_survives_a_second_launch() {
 /// never deleted.
 #[test]
 fn a_pre_existing_home_file_is_migrated_into_the_persist_namespace() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(AIDER_PLAIN);
     let first = harness.launch("aider", &[]);
     let state = state_dir(&stderr_of(&first));
@@ -3967,7 +4046,7 @@ fn probe_state_dir(harness: &Harness, tool: &str) -> PathBuf {
 /// image (this is not "assert nonzero and hope").
 #[test]
 fn every_launch_warns_on_guest_managed_pi_credentials() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let state = probe_state_dir(&harness, "shell");
     seed_pi(
         &state,
@@ -4104,7 +4183,7 @@ fn legacy_pi_home_is_migrated_before_the_scan() {
 /// never have appended its marker.
 #[test]
 fn every_launch_scan_resolves_nothing() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let state = probe_state_dir(&harness, "shell");
 
     let sentinel_dir = harness.home_root.join("credential-sentinels");
@@ -4217,12 +4296,41 @@ const PROJECT_REF: &str = "localhost:1/project:latest";
 /// The default-slot seam value: an immutable (digest-pinned) loopback ref, so a
 /// default fallthrough does not start a real multi-GB pull. `AGENT_VM_TEST_DEFAULT_IMAGE`
 /// is an *initial recommendation* only, so it must be a valid immutable reference.
-const DEFAULT_REF: &str =
-    "localhost:1/default@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+fn default_ref() -> &'static str {
+    static REFERENCE: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("localhost:1/default@{}", fixture_digest()));
+    &REFERENCE
+}
 /// A second immutable recommendation, for tests that change what a launcher
 /// offers *after* a default was already retained.
-const RECOMMENDATION_B: &str =
-    "localhost:1/other@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+fn recommendation_b() -> &'static str {
+    static REFERENCE: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("localhost:1/other@{}", fixture_digest()));
+    &REFERENCE
+}
+
+fn fixture_digest() -> &'static str {
+    static DIGEST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let dir = tempfile::tempdir().unwrap();
+        image_archive::write(
+            &dir.path().join("fixture.tar"),
+            &image_archive::ArchiveSpec::default(),
+        )
+        .manifest_digest
+    });
+    &DIGEST
+}
+
+fn fixture_sdk_reference(source: &str) -> String {
+    if source == default_ref() || source == recommendation_b() {
+        return REDACTED_DEFAULT_MARKER.to_owned();
+    }
+    format!(
+        "{}@{}",
+        source.strip_suffix(":latest").unwrap_or(source),
+        fixture_digest()
+    )
+}
 
 /// A custom runtime tool the project can declare; its command exists as a guest
 /// command name only, so the launch reaches `builder.build()`.
@@ -4246,7 +4354,7 @@ const REDACTED_DEFAULT_MARKER: &str = "<redacted default boot image>";
 /// is redacted in the debug dump, so its exact reference is asserted in memory
 /// (`boot_image` unit tests) and here only the marker is observable.
 fn observable_reference(expected: &str) -> &str {
-    if expected == DEFAULT_REF {
+    if expected == default_ref() {
         REDACTED_DEFAULT_MARKER
     } else {
         expected
@@ -4395,7 +4503,7 @@ fn acquisition_config_oracle_rejects_notice_only_and_wrong_reference() {
     harness.write_project(&format!("image = \"{PROJECT_REF}\"\n"));
     let out = harness.builtin(
         &["image", "refresh"],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     let stderr = stderr_of(&out);
     check_pull_acquisition(&stderr, PROJECT_REF).expect("the real refresh is observable");
@@ -4511,7 +4619,7 @@ fn precedence_rows() -> [Precedence; 10] {
             env: None,
             user: None,
             project: None,
-            expected: DEFAULT_REF,
+            expected: default_ref(),
             source: "default",
         },
         Precedence {
@@ -4538,7 +4646,7 @@ fn precedence_rows() -> [Precedence; 10] {
             env: Some(""),
             user: None,
             project: None,
-            expected: DEFAULT_REF,
+            expected: default_ref(),
             source: "default",
         },
         Precedence {
@@ -4566,7 +4674,7 @@ fn precedence_rows() -> [Precedence; 10] {
 fn image_precedence_at_every_cli_boundary() {
     for row in precedence_rows() {
         // --- launch (a declared custom verb and the shipped `shell`) ---
-        let harness = Harness::new();
+        let harness = Harness::warm();
         write_image_tiers(
             &harness,
             ImageTiers {
@@ -4578,7 +4686,7 @@ fn image_precedence_at_every_cli_boundary() {
         let decoys = harness.builder_decoys();
         for tool in ["probe", "shell"] {
             let mut cmd = harness.command_with_decoys(&decoys);
-            cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+            cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref());
             if let Some(env) = row.env {
                 cmd.env("AGENT_VM_IMAGE_TAG", env);
             }
@@ -4595,7 +4703,7 @@ fn image_precedence_at_every_cli_boundary() {
                 "{} ({tool}): the bogus image must fail acquisition, stderr:\n{stderr}",
                 row.name
             );
-            if row.expected == DEFAULT_REF {
+            if row.expected == default_ref() {
                 assert!(
                     stderr.contains("==> Boot image: the default boot image"),
                     "{} ({tool}): default notice missing:\n{stderr}",
@@ -4613,7 +4721,7 @@ fn image_precedence_at_every_cli_boundary() {
             }
             assert_eq!(
                 oci_reference(&debug_config_json(&stderr)),
-                observable_reference(row.expected),
+                fixture_sdk_reference(row.expected),
                 "{} ({tool})",
                 row.name
             );
@@ -4635,7 +4743,7 @@ fn image_precedence_at_every_cli_boundary() {
 
         // --- image refresh and setup (initial acquisition) ---
         for verb in ACQUISITION_VERBS {
-            let harness = Harness::new();
+            let harness = Harness::warm();
             write_image_tiers(
                 &harness,
                 ImageTiers {
@@ -4646,7 +4754,7 @@ fn image_precedence_at_every_cli_boundary() {
             );
             let decoys = harness.builder_decoys();
             let mut cmd = harness.command_with_decoys(&decoys);
-            cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+            cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref());
             if let Some(env) = row.env {
                 cmd.env("AGENT_VM_IMAGE_TAG", env);
             }
@@ -4664,7 +4772,7 @@ fn image_precedence_at_every_cli_boundary() {
                 "{} ({verb}): the bogus image must fail, stderr:\n{stderr}",
                 row.name
             );
-            if row.expected == DEFAULT_REF {
+            if row.expected == default_ref() {
                 let safe = if verb == "image refresh" {
                     "==> the default boot image is the image this configuration boots from"
                 } else {
@@ -4691,16 +4799,28 @@ fn image_precedence_at_every_cli_boundary() {
                     row.name
                 );
             }
-            check_pull_acquisition(&stderr, row.expected)
-                .unwrap_or_else(|problem| panic!("{} ({verb}): {problem}\n{stderr}", row.name));
-            // setup's unreachable ref fails at its native acquisition, so there
-            // must be no verification dump.
+            // Imported content lets setup prepare successfully and verify the
+            // acquired child; refresh still explicitly probes the selected source.
             let configs = acquisition_configs(&stderr).expect("dumps parse");
-            assert!(
-                acquisition_config(&configs, "agent-vm-setup-verify").is_err(),
-                "{} ({verb}): no verification dump may appear for an unreachable ref:\n{stderr}",
-                row.name
-            );
+            if verb == "setup" {
+                let config = acquisition_config(&configs, "agent-vm-setup-verify")
+                    .unwrap_or_else(|problem| panic!("{}: {problem}\n{stderr}", row.name));
+                assert_eq!(oci_reference(config), fixture_sdk_reference(row.expected));
+                assert!(
+                    stderr.contains("booting verify sandbox")
+                        || stderr.contains(
+                            "booting the verification sandbox from the default boot image failed"
+                        ),
+                    "{stderr}"
+                );
+            } else {
+                check_pull_acquisition(&stderr, row.expected)
+                    .unwrap_or_else(|problem| panic!("{} ({verb}): {problem}\n{stderr}", row.name));
+                assert!(
+                    configs.is_empty(),
+                    "refresh must not build a sandbox: {stderr}"
+                );
+            }
             assert_eq!(
                 harness.decoy_log(&decoys),
                 "",
@@ -4711,7 +4831,7 @@ fn image_precedence_at_every_cli_boundary() {
 
         // --- doctor (no `--image`): rows without a typed override only ---
         if row.cli.is_none() {
-            let harness = Harness::new();
+            let harness = Harness::warm();
             write_image_tiers(
                 &harness,
                 ImageTiers {
@@ -4720,13 +4840,13 @@ fn image_precedence_at_every_cli_boundary() {
                     declares_tool: false,
                 },
             );
-            let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)];
+            let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())];
             if let Some(env) = row.env {
                 envs.push(("AGENT_VM_IMAGE_TAG", env));
             }
             let out = harness.builtin(&["doctor"], &envs);
             let stdout = stdout_of(&out);
-            if row.expected == DEFAULT_REF {
+            if row.expected == default_ref() {
                 assert!(
                     stdout.contains(
                         "selected (without --image): not selected; initial recommendation ["
@@ -4765,7 +4885,7 @@ fn image_whitespace_and_empty_values_do_not_fall_through() {
         );
         let decoys = harness.builder_decoys();
         let mut cmd = harness.command_with_decoys(&decoys);
-        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)
+        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())
             .env("AGENT_VM_IMAGE_TAG", present);
         let out = Harness::run_on(cmd, &["probe"]);
         let stderr = stderr_of(&out);
@@ -4776,7 +4896,7 @@ fn image_whitespace_and_empty_values_do_not_fall_through() {
         assert!(
             !stderr.contains(USER_REF)
                 && !stderr.contains(PROJECT_REF)
-                && !stderr.contains(DEFAULT_REF),
+                && !stderr.contains(default_ref()),
             "{present:?} fell through to a lower tier:\n{stderr}"
         );
         assert!(
@@ -4797,7 +4917,7 @@ fn image_whitespace_and_empty_values_do_not_fall_through() {
             );
             let decoys = harness.builder_decoys();
             let mut cmd = harness.command_with_decoys(&decoys);
-            cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)
+            cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())
                 .env("AGENT_VM_IMAGE_TAG", present);
             let out = Harness::run_on(cmd, verb);
             let verb = verb_name(verb);
@@ -4825,7 +4945,7 @@ fn image_whitespace_and_empty_values_do_not_fall_through() {
         let out = harness.builtin(
             &["doctor"],
             &[
-                ("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF),
+                ("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref()),
                 ("AGENT_VM_IMAGE_TAG", present),
             ],
         );
@@ -4843,7 +4963,7 @@ fn image_whitespace_and_empty_values_do_not_fall_through() {
     let out = harness.launch_argv(
         "probe",
         &["--image", spaced],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     let stderr = stderr_of(&out);
     assert!(
@@ -4869,7 +4989,7 @@ fn image_whitespace_and_empty_values_do_not_fall_through() {
     let out = harness.launch_argv(
         "probe",
         &["--image", ""],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     assert!(!out.status.success(), "a typed empty --image must fail");
     let stderr = stderr_of(&out);
@@ -4949,7 +5069,7 @@ fn config_images_reject_local_paths_and_empty_values() {
     let out = harness.launch_argv(
         "shell",
         &["--image", CLI_REF],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     assert!(
         !out.status.success(),
@@ -5005,15 +5125,19 @@ fn help_tool_order(text: &str) -> Vec<String> {
 
 #[test]
 fn image_only_config_keeps_all_shipped_runtime_tools() {
+    // Normalized SDK dumps tokenize the acquired digest, not the selected tag.
     // Baseline: the shipped defaults, booting a named image via `--image`.
-    let baseline_harness = Harness::new();
+    let baseline_harness = Harness::warm();
     let baseline_out = baseline_harness.launch_argv(
         "claude",
         &["--image", PROJECT_REF],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     let baseline = normalized_config(&baseline_harness, &baseline_out);
-    assert_eq!(oci_reference(&baseline), PROJECT_REF);
+    assert_eq!(
+        oci_reference(&baseline),
+        "localhost:1/project@$FIXTURE_DIGEST"
+    );
 
     // Every image-only shape keeps the shipped tools and changes only the image.
     let variants: [(&str, Option<&str>, Option<&str>, bool); 4] = [
@@ -5023,7 +5147,7 @@ fn image_only_config_keeps_all_shipped_runtime_tools() {
         ("project with tools=[]", None, Some(PROJECT_REF), true),
     ];
     for (name, user, project, explicit_empty) in variants {
-        let harness = Harness::new();
+        let harness = Harness::warm();
         if let Some(user) = user {
             harness.write_user(&format!("image = \"{user}\"\n"));
         }
@@ -5041,10 +5165,14 @@ fn image_only_config_keeps_all_shipped_runtime_tools() {
         let out = harness.launch_argv(
             "claude",
             &[],
-            &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+            &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
         );
         let config = normalized_config(&harness, &out);
-        assert_eq!(oci_reference(&config), PROJECT_REF, "{name}");
+        assert_eq!(
+            oci_reference(&config),
+            "localhost:1/project@$FIXTURE_DIGEST",
+            "{name}"
+        );
         assert_eq!(config, baseline, "{name}: only the image field may change");
 
         // Help and doctor still list all seven shipped verbs, in order.
@@ -5064,7 +5192,7 @@ fn image_only_config_keeps_all_shipped_runtime_tools() {
 
     // A user image-only tier plus project custom tools: the project tools still
     // replace the shipped tools (ADR-0015), and the user image still wins.
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user(&format!("image = \"{USER_REF}\"\n"));
     harness.write_project(&format!(
         "image = \"{PROJECT_REF}\"\n[[tools]]\nname = \"hello\"\ncommand = \"hello-258\"\n"
@@ -5072,18 +5200,18 @@ fn image_only_config_keeps_all_shipped_runtime_tools() {
     let out = harness.launch_argv(
         "hello",
         &[],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     let config = normalized_config(&harness, &out);
     assert_eq!(
         oci_reference(&config),
-        USER_REF,
+        "localhost:1/user@$FIXTURE_DIGEST",
         "the user image outranks the project's"
     );
     let claude = harness.launch_argv(
         "claude",
         &[],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     assert!(
         stderr_of(&claude).contains("unrecognized subcommand"),
@@ -5093,7 +5221,7 @@ fn image_only_config_keeps_all_shipped_runtime_tools() {
 
 #[test]
 fn custom_catalog_and_tool_edits_do_not_change_the_boot_image() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(
         "[[tools]]\nname = \"hello\"\ncommand = \"hello-258\"\nargs = [\"probe\", \"two words\"]\n",
     );
@@ -5101,7 +5229,7 @@ fn custom_catalog_and_tool_edits_do_not_change_the_boot_image() {
     // No image configured: both the custom verb and the shell fallback choose
     // the default boot image.
     for tool in ["hello", "shell"] {
-        let out = harness.launch_argv(tool, &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+        let out = harness.launch_argv(tool, &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())]);
         assert_eq!(
             oci_reference(&debug_config_json(&stderr_of(&out))),
             REDACTED_DEFAULT_MARKER,
@@ -5111,7 +5239,7 @@ fn custom_catalog_and_tool_edits_do_not_change_the_boot_image() {
     let hello = harness.launch_argv(
         "hello",
         &[],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     assert_eq!(
         debug_guest_command(&stderr_of(&hello)),
@@ -5123,10 +5251,10 @@ fn custom_catalog_and_tool_edits_do_not_change_the_boot_image() {
         "image = \"localhost:1/project:latest\"\n[[tools]]\nname = \"hello\"\ncommand = \"hello-258\"\nargs = [\"probe\", \"two words\"]\n",
     );
     for tool in ["hello", "shell"] {
-        let out = harness.launch_argv(tool, &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+        let out = harness.launch_argv(tool, &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())]);
         assert_eq!(
             oci_reference(&debug_config_json(&stderr_of(&out))),
-            PROJECT_REF,
+            fixture_sdk_reference(PROJECT_REF),
             "{tool}"
         );
     }
@@ -5141,10 +5269,13 @@ fn custom_catalog_and_tool_edits_do_not_change_the_boot_image() {
     let edited = harness.launch_argv(
         "hello",
         &[],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     let stderr = stderr_of(&edited);
-    assert_eq!(oci_reference(&debug_config_json(&stderr)), PROJECT_REF);
+    assert_eq!(
+        oci_reference(&debug_config_json(&stderr)),
+        fixture_sdk_reference(PROJECT_REF)
+    );
     assert_eq!(debug_guest_command(&stderr), "hello-edited one");
     let config = debug_config_json(&stderr);
     assert!(
@@ -5159,17 +5290,17 @@ fn custom_catalog_and_tool_edits_do_not_change_the_boot_image() {
     let out = harness.launch_argv(
         "hello",
         &[],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     assert_eq!(
         oci_reference(&debug_config_json(&stderr_of(&out))),
-        PROJECT_REF
+        fixture_sdk_reference(PROJECT_REF)
     );
 }
 
 #[test]
 fn help_doctor_pull_setup_and_launch_agree_on_image_selection() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user(&format!("image = \"{USER_REF}\"\n"));
     harness.write_project(&format!(
         "image = \"{PROJECT_REF}\"\n[[tools]]\nname = \"hello\"\ncommand = \"hello-258\"\n"
@@ -5218,7 +5349,7 @@ fn help_doctor_pull_setup_and_launch_agree_on_image_selection() {
             text.contains("AGENT_VM_IMAGE_TAG"),
             "{what} must bind AGENT_VM_IMAGE_TAG:\n{text}"
         );
-        for removed in ["--base-image", "--layer", "--yes"] {
+        for removed in ["--base-image", "--layer"] {
             assert!(
                 !text.contains(removed),
                 "{what} must not mention {removed}:\n{text}"
@@ -5317,9 +5448,14 @@ fn refresh_and_setup_reject_removed_composition_flags_as_usage_errors() {
         for argv in [
             vec!["--layer", "/tmp/x"],
             vec!["--base-image", "x"],
-            vec!["--yes"],
+            // `--yes` is a nested consent flag of the two explicit update verbs;
+            // `setup` still has none, and the old global `-y` remains gone.
+            // (`image refresh --yes` is asserted below as an accepted parse.)
             vec!["-y"],
         ] {
+            if verb_name(verb) == "setup" && argv == ["-y"] {
+                // covered by the loop body; `setup --yes` is asserted below
+            }
             let harness = Harness::new();
             let mut full = verb.to_vec();
             full.extend_from_slice(&argv);
@@ -5338,6 +5474,14 @@ fn refresh_and_setup_reject_removed_composition_flags_as_usage_errors() {
             );
         }
     }
+    // The nested consent flag: `image refresh --yes` parses (asserted through
+    // `--help`, so no registry work happens); `setup --yes` does not.
+    let harness = Harness::new();
+    let accepted = harness.builtin(&["image", "refresh", "--yes", "--help"], &[]);
+    assert_eq!(accepted.status.code(), Some(0), "{}", stderr_of(&accepted));
+    assert!(stdout_of(&accepted).contains("--yes"));
+    let refused = harness.builtin(&["setup", "--yes"], &[]);
+    assert_eq!(refused.status.code(), Some(2), "{}", stderr_of(&refused));
 }
 
 /// Every token after the verb is forwarded verbatim (ADR-0042).
@@ -5358,11 +5502,11 @@ fn launch_forwards_tool_arguments_verbatim() {
         ),
     ];
     for (argv, expected) in cases {
-        let harness = Harness::new();
+        let harness = Harness::warm();
         harness.write_project(&format!("image = \"{PROJECT_REF}\"\n{PROBE_TOOL}"));
         let decoys = harness.builder_decoys();
         let mut cmd = harness.command_with_decoys(&decoys);
-        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref());
         let mut full = vec!["probe"];
         full.extend_from_slice(&argv);
         let out = Harness::run_on(cmd, &full);
@@ -5376,8 +5520,12 @@ fn launch_forwards_tool_arguments_verbatim() {
             !stderr.contains("no longer supported") && !stderr.contains("migrat"),
             "probe {argv:?} must emit no migration advice:\n{stderr}"
         );
-        assert_eq!(oci_reference(&debug_config_json(&stderr)), PROJECT_REF);
         assert_eq!(
+            oci_reference(&debug_config_json(&stderr)),
+            fixture_sdk_reference(PROJECT_REF)
+        );
+        assert_eq!(
+            // Image preparation rewrites the image only, never tool arguments.
             debug_guest_command(&stderr),
             expected,
             "probe {argv:?} must forward its args verbatim to the tool:\n{stderr}"
@@ -5425,12 +5573,12 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
     for (cli, env, expected) in [
         (Some(CLI_REF), None, CLI_REF),
         (None, Some(ENV_REF), ENV_REF),
-        (None, None, DEFAULT_REF),
+        (None, None, default_ref()),
     ] {
         for verb in ACQUISITION_VERBS {
             let harness = Harness::new();
             harness.write_user(broken);
-            let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)];
+            let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())];
             if let Some(env) = env {
                 envs.push(("AGENT_VM_IMAGE_TAG", env));
             }
@@ -5463,19 +5611,21 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
         "image = \"{PROJECT_REF}\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n"
     ));
     for verb in ACQUISITION_VERBS {
-        let out = harness.builtin(verb, &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+        let out = harness.builtin(verb, &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())]);
         let stderr = stderr_of(&out);
         check_pull_acquisition(&stderr, PROJECT_REF)
             .unwrap_or_else(|problem| panic!("{}: {problem}\n{stderr}", verb_name(verb)));
     }
-    let doctor =
-        stdout_of(&harness.builtin(&["doctor"], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]));
+    let doctor = stdout_of(&harness.builtin(
+        &["doctor"],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
+    ));
     assert!(
         doctor.contains(&format!("selected (without --image): {PROJECT_REF}")),
         "doctor keeps the readable image:\n{doctor}"
     );
     // The launch still reports the tool-resolution error.
-    let launch = harness.launch_argv("t", &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+    let launch = harness.launch_argv("t", &[], &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())]);
     let launch_stderr = stderr_of(&launch);
     assert!(!launch.status.success());
     assert!(
@@ -5541,7 +5691,6 @@ fn failed_image_acquisition_never_invokes_a_builder() {
         project,
     } in sources
     {
-        let expected = cli.or(env).or(user).or(project).unwrap_or(DEFAULT_REF);
         let harness = Harness::new();
         write_image_tiers(
             &harness,
@@ -5553,7 +5702,7 @@ fn failed_image_acquisition_never_invokes_a_builder() {
         );
         let decoys = harness.builder_decoys();
         let mut cmd = harness.command_with_decoys(&decoys);
-        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref());
         if let Some(env) = env {
             cmd.env("AGENT_VM_IMAGE_TAG", env);
         }
@@ -5565,19 +5714,10 @@ fn failed_image_acquisition_never_invokes_a_builder() {
         argv.push("probe");
         let out = Harness::run_on(cmd, &argv);
         let stderr = stderr_of(&out);
+        assert_cold_preparation_failure(&harness, &out);
         assert!(
-            !out.status.success(),
-            "{name}: must exit nonzero after the dump"
-        );
-        assert_eq!(
-            oci_reference(&debug_config_json(&stderr)),
-            observable_reference(expected),
-            "{name}"
-        );
-        // Absence of a prompt and of any fallback image are supplemental.
-        assert!(
-            !stderr.contains("Build project tooling layer"),
-            "{name}: no prompt"
+            stderr.contains("preparing the boot image"),
+            "{name}: {stderr}"
         );
         assert!(
             harness.decoy_log(&decoys).is_empty(),
@@ -5588,13 +5728,13 @@ fn failed_image_acquisition_never_invokes_a_builder() {
 
 #[test]
 fn former_layer_directories_are_inert() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(&format!("image = \"{PROJECT_REF}\"\n{PROBE_TOOL}"));
     let decoys = harness.builder_decoys();
 
     let run = |envs: &[(&str, &str)]| {
         let mut cmd = harness.command_with_decoys(&decoys);
-        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+        cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref());
         for (key, value) in envs {
             cmd.env(key, value);
         }
@@ -5604,7 +5744,7 @@ fn former_layer_directories_are_inert() {
     let baseline = run(&[]);
     assert_eq!(
         oci_reference(&debug_config_json(&stderr_of(&baseline))),
-        PROJECT_REF
+        fixture_sdk_reference(PROJECT_REF)
     );
     let baseline_config = normalized_config(&harness, &baseline);
 
@@ -5628,7 +5768,7 @@ fn former_layer_directories_are_inert() {
     let poisoned = run(&[]);
     assert_eq!(
         oci_reference(&debug_config_json(&stderr_of(&poisoned))),
-        PROJECT_REF
+        fixture_sdk_reference(PROJECT_REF)
     );
     assert_eq!(
         normalized_config(&harness, &poisoned),
@@ -5660,7 +5800,7 @@ fn former_layer_directories_are_inert() {
         let stderr = stderr_of(&out);
         assert_eq!(
             oci_reference(&debug_config_json(&stderr)),
-            PROJECT_REF,
+            fixture_sdk_reference(PROJECT_REF),
             "{key}={value:?} must not change selection"
         );
         assert!(
@@ -5690,7 +5830,7 @@ fn run_builtin_acquisition(row: &Precedence, verb: &[&str]) -> Result<String, St
     );
     let decoys = harness.builder_decoys();
     let mut cmd = harness.command_with_decoys(&decoys);
-    cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF);
+    cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref());
     if let Some(env) = row.env {
         cmd.env("AGENT_VM_IMAGE_TAG", env);
     }
@@ -5833,7 +5973,7 @@ fn setup_refuses_local_cli_env_targets_either_way() {
         ] {
             let harness = Harness::new();
             let mut argv = vec!["setup"];
-            let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)];
+            let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())];
             let target;
             if let Some(cli) = cli {
                 argv.push("--image");
@@ -5926,7 +6066,7 @@ fn malformed_oci_references_are_refused_value_free_while_local_paths_keep_their_
             if no_verify {
                 argv.push("--no-verify");
             }
-            let out = harness.builtin(&argv, &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+            let out = harness.builtin(&argv, &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())]);
             let stderr = stderr_of(&out);
             let context = format!("setup {raw:?} (no_verify: {no_verify})");
             assert!(!out.status.success(), "{context}: {stderr}");
@@ -5999,7 +6139,7 @@ fn malformed_oci_references_are_refused_value_free_while_local_paths_keep_their_
 #[test]
 fn diagnostics_and_help_never_create_a_selection() {
     let harness = Harness::new();
-    let envs = [("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)];
+    let envs = [("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())];
 
     let doctor = harness.builtin(&["doctor"], &envs);
     let stdout = stdout_of(&doctor);
@@ -6013,7 +6153,7 @@ fn diagnostics_and_help_never_create_a_selection() {
         "doctor must report an uninitialized recommendation, not a retained selection:\n{stdout}"
     );
     assert!(
-        !stdout.contains(DEFAULT_REF),
+        !stdout.contains(default_ref()),
         "doctor must not echo the recommendation reference:\n{stdout}"
     );
     harness.assert_no_selection("doctor");
@@ -6051,16 +6191,17 @@ fn a_failed_initial_acquisition_leaves_the_selection_absent() {
     ] {
         let harness = Harness::new();
         harness.write_project(PROBE_TOOL);
-        let out = harness.builtin(&argv, &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+        let out = harness.builtin(&argv, &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())]);
         assert!(
             !out.status.success(),
             "{verb}: an unreachable default must fail:\n{}",
             stderr_of(&out)
         );
         harness.assert_no_selection(verb);
-        let doctor = stdout_of(
-            &harness.builtin(&["doctor"], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]),
-        );
+        let doctor = stdout_of(&harness.builtin(
+            &["doctor"],
+            &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
+        ));
         assert!(
             doctor.contains("not selected; initial recommendation"),
             "{verb}: doctor must still report an uninitialized default:\n{doctor}"
@@ -6073,13 +6214,13 @@ fn a_retained_selection_survives_a_changed_recommendation() {
     // The saved bookmark, not the launcher's current recommendation, decides a
     // default launch. Changing the seam (a simulated launcher upgrade) and then
     // removing it must not move the selection or rewrite the record.
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(PROBE_TOOL);
-    harness.write_selection_ref(DEFAULT_REF);
+    harness.write_selection_ref(default_ref());
     let before = harness.selection_bytes().unwrap();
 
     for envs in [
-        vec![("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+        vec![("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())],
         vec![],
     ] {
         let out = harness.launch_argv("probe", &[], &envs);
@@ -6094,7 +6235,7 @@ fn a_retained_selection_survives_a_changed_recommendation() {
             "the retained image, not the recommendation, must be booted:\n{stderr}"
         );
         assert!(
-            !stderr.contains(DEFAULT_REF) && !stderr.contains(RECOMMENDATION_B),
+            !stderr.contains(default_ref()) && !stderr.contains(recommendation_b()),
             "neither the retained record nor the recommendation may leak:\n{stderr}"
         );
         assert_eq!(
@@ -6113,26 +6254,26 @@ fn a_retained_selection_survives_a_changed_recommendation() {
             "doctor must select the retained image safely:\n{doctor}"
         );
         assert!(
-            !doctor.contains(DEFAULT_REF) && !doctor.contains(RECOMMENDATION_B),
+            !doctor.contains(default_ref()) && !doctor.contains(recommendation_b()),
             "doctor must not echo a default-tier reference:\n{doctor}"
         );
     }
 
     // A *separate* fresh HOME initialized with B yields B: the recommendation is
     // still what an uninitialized host is offered.
-    let other = Harness::new();
+    let other = Harness::warm();
     other.write_project(PROBE_TOOL);
     let out = other.launch_argv(
         "probe",
         &[],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())],
     );
     assert_eq!(
         oci_reference(&debug_config_json(&stderr_of(&out))),
         REDACTED_DEFAULT_MARKER
     );
     assert!(
-        !stderr_of(&out).contains(RECOMMENDATION_B),
+        !stderr_of(&out).contains(recommendation_b()),
         "an uninitialized recommendation must not leak either"
     );
 }
@@ -6142,11 +6283,11 @@ fn the_historical_interim_selection_survives_the_standard_recommendation() {
     // Observation must not acquire the historic published image: ordinary Cargo
     // tests remain boot-free and never download production image content.
     const HISTORIC: &str = "ghcr.io/wirenboard/agent-vm-template@sha256:fd05aaa697c2488e9f7384d069ba2244078faf6b5320998b546c93f98f8d5f18";
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_selection_ref(HISTORIC);
     let before = harness.selection_bytes().unwrap();
     for envs in [
-        vec![("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+        vec![("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())],
         vec![],
     ] {
         let out = harness.builtin(&["doctor"], &envs);
@@ -6161,7 +6302,7 @@ fn the_historical_interim_selection_survives_the_standard_recommendation() {
         (None, None, Some(USER_REF), None, USER_REF),
         (None, None, None, Some(PROJECT_REF), PROJECT_REF),
     ] {
-        let harness = Harness::new();
+        let harness = Harness::warm();
         harness.write_selection_ref(HISTORIC);
         let before = harness.selection_bytes().unwrap();
         write_image_tiers(
@@ -6172,7 +6313,7 @@ fn the_historical_interim_selection_survives_the_standard_recommendation() {
                 declares_tool: true,
             },
         );
-        let mut envs = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)];
+        let mut envs = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())];
         if let Some(env) = env {
             envs.push(("AGENT_VM_IMAGE_TAG", env));
         }
@@ -6183,7 +6324,7 @@ fn the_historical_interim_selection_survives_the_standard_recommendation() {
         let out = harness.launch_argv("probe", &argv, &envs);
         assert_eq!(
             oci_reference(&debug_config_json(&stderr_of(&out))),
-            expected
+            fixture_sdk_reference(expected)
         );
         assert_eq!(harness.selection_bytes().unwrap(), before);
     }
@@ -6199,7 +6340,7 @@ fn explicit_sources_leave_the_selection_untouched() {
         ("user", None, None, Some(USER_REF), None, USER_REF),
         ("project", None, None, None, Some(PROJECT_REF), PROJECT_REF),
     ] {
-        let harness = Harness::new();
+        let harness = Harness::warm();
         write_image_tiers(
             &harness,
             ImageTiers {
@@ -6208,9 +6349,9 @@ fn explicit_sources_leave_the_selection_untouched() {
                 declares_tool: true,
             },
         );
-        harness.write_selection_ref(DEFAULT_REF);
+        harness.write_selection_ref(default_ref());
         let before = harness.selection_bytes().unwrap();
-        let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)];
+        let mut envs: Vec<(&str, &str)> = vec![("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())];
         if let Some(env) = env {
             envs.push(("AGENT_VM_IMAGE_TAG", env));
         }
@@ -6223,7 +6364,7 @@ fn explicit_sources_leave_the_selection_untouched() {
         let stderr = stderr_of(&out);
         assert_eq!(
             oci_reference(&debug_config_json(&stderr)),
-            expected,
+            fixture_sdk_reference(expected),
             "{name}: the higher source must win"
         );
         assert_eq!(
@@ -6234,7 +6375,7 @@ fn explicit_sources_leave_the_selection_untouched() {
     }
 
     // With the record absent, an explicit source must not create one.
-    let harness = Harness::new();
+    let harness = Harness::warm();
     write_image_tiers(
         &harness,
         ImageTiers {
@@ -6246,11 +6387,11 @@ fn explicit_sources_leave_the_selection_untouched() {
     let out = harness.launch_argv(
         "probe",
         &[],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     assert_eq!(
         oci_reference(&debug_config_json(&stderr_of(&out))),
-        PROJECT_REF
+        fixture_sdk_reference(PROJECT_REF)
     );
     harness.assert_no_selection("explicit project image with an absent record");
 }
@@ -6258,7 +6399,7 @@ fn explicit_sources_leave_the_selection_untouched() {
 #[test]
 fn a_corrupt_selection_fails_closed_and_never_repairs() {
     const CORRUPT: &str = "{\"version\":1,\"image\":\"sk-SENSITIVE-TOKEN\"}\n";
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(PROBE_TOOL);
     harness.write_selection(CORRUPT);
     let before = harness.selection_bytes().unwrap();
@@ -6268,7 +6409,7 @@ fn a_corrupt_selection_fails_closed_and_never_repairs() {
     let out = harness.launch_argv(
         "probe",
         &[],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())],
     );
     let stderr = stderr_of(&out);
     assert!(
@@ -6294,15 +6435,21 @@ fn a_corrupt_selection_fails_closed_and_never_repairs() {
     let out = harness.launch_argv(
         "probe",
         &["--image", CLI_REF],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
     );
     let stderr = stderr_of(&out);
-    assert_eq!(oci_reference(&debug_config_json(&stderr)), CLI_REF);
+    assert_eq!(
+        oci_reference(&debug_config_json(&stderr)),
+        fixture_sdk_reference(CLI_REF)
+    );
     assert_eq!(harness.selection_bytes().unwrap(), before);
 
     // Doctor reports the damage and exits nonzero while still rendering every
     // section it can.
-    let doctor = harness.builtin(&["doctor"], &[("AGENT_VM_TEST_DEFAULT_IMAGE", DEFAULT_REF)]);
+    let doctor = harness.builtin(
+        &["doctor"],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", default_ref())],
+    );
     let stdout = stdout_of(&doctor);
     assert!(
         !doctor.status.success(),
@@ -6332,7 +6479,7 @@ fn a_default_tier_invocation_suppresses_dependency_image_tracing() {
     harness.write_selection_ref(SENSITIVE);
     let mut cmd = harness.base_command();
     cmd.env("RUST_LOG", "trace")
-        .env("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B);
+        .env("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b());
     let out = Harness::run_on(cmd, &["image", "refresh"]);
     assert!(
         !out.status.success(),
@@ -6416,7 +6563,7 @@ fn a_default_tier_reference_is_redacted_across_output() {
     let out = harness.launch_argv(
         "probe",
         &[],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())],
     );
     let stderr = stderr_of(&out);
     assert!(!out.status.success(), "{stderr}");
@@ -6425,17 +6572,13 @@ fn a_default_tier_reference_is_redacted_across_output() {
         stderr.contains("==> Boot image: the default boot image"),
         "the default notice must be a fixed label:\n{stderr}"
     );
-    assert_eq!(
-        oci_reference(&debug_config_json(&stderr)),
-        REDACTED_DEFAULT_MARKER,
-        "the display copy must redact the image reference:\n{stderr}"
-    );
+    assert!(!stderr.contains(CONFIG_MARKER));
     assert!(
-        stderr.contains("booting a sandbox from the default boot image failed"),
+        stderr.contains("pulling the default boot image failed"),
         "acquisition failure must be a fixed, stage-specific reason:\n{stderr}"
     );
     assert!(
-        !stderr.contains(SENSITIVE) && !stderr.contains(RECOMMENDATION_B),
+        !stderr.contains(SENSITIVE) && !stderr.contains(recommendation_b()),
         "neither the retained record nor the recommendation may leak:\n{stderr}"
     );
     assert_eq!(harness.selection_bytes().unwrap(), before);
@@ -6444,7 +6587,7 @@ fn a_default_tier_reference_is_redacted_across_output() {
     // to stderr.
     let refresh = harness.builtin(
         &["image", "refresh"],
-        &[("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)],
+        &[("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())],
     );
     assert!(!refresh.status.success());
     let combined = format!("{}{}", stdout_of(&refresh), stderr_of(&refresh));
@@ -6458,7 +6601,7 @@ fn a_default_tier_reference_is_redacted_across_output() {
         "refresh's display copy must redact the reference:\n{combined}"
     );
     assert!(
-        !combined.contains(SENSITIVE) && !combined.contains(RECOMMENDATION_B),
+        !combined.contains(SENSITIVE) && !combined.contains(recommendation_b()),
         "refresh leaked a default-tier reference:\n{combined}"
     );
 
@@ -6471,25 +6614,22 @@ fn a_default_tier_reference_is_redacted_across_output() {
         !stderr.contains(SENSITIVE),
         "the initial recommendation leaked:\n{stderr}"
     );
-    assert_eq!(
-        oci_reference(&debug_config_json(&stderr)),
-        REDACTED_DEFAULT_MARKER
-    );
+    assert!(!stderr.contains(CONFIG_MARKER));
 }
 
 #[test]
 fn the_selection_is_scoped_to_user_home_not_state_or_cwd() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(PROBE_TOOL);
-    harness.write_selection_ref(DEFAULT_REF);
+    harness.write_selection_ref(default_ref());
     let before = harness.selection_bytes().unwrap();
 
     // A different project cwd and a different state root must not move the
     // bookmark: it is user-scoped, not cache- or project-scoped. The state root
     // stays short, or the sandbox control socket exceeds `sun_path`.
     let elsewhere = tempfile::tempdir_in("/tmp").unwrap();
-    let mut cmd = harness.base_command();
-    cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", RECOMMENDATION_B)
+    let mut cmd = harness.shared_command(&harness.state_root.join("msb-home/cache"));
+    cmd.env("AGENT_VM_TEST_DEFAULT_IMAGE", recommendation_b())
         .env("AGENT_VM_STATE_DIR", elsewhere.path())
         .current_dir(elsewhere.path());
     let out = Harness::run_on(cmd, &["shell"]);
@@ -6502,7 +6642,7 @@ fn the_selection_is_scoped_to_user_home_not_state_or_cwd() {
     assert_eq!(harness.selection_bytes().unwrap(), before);
 
     // A different HOME is genuinely independent.
-    let other = Harness::new();
+    let other = Harness::warm();
     other.assert_no_selection("a different HOME");
 }
 
@@ -6554,7 +6694,7 @@ fn dir_contains(root: &Path, name: &str, contents: &str) -> bool {
 fn network_flags_reach_the_sandbox_config() {
     // The bracketed-CIDR typo is rejected at parse time, so this launch never
     // reaches the builder and creates no launch state.
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let out = harness.launch(
         "shell",
         &[
@@ -6581,7 +6721,7 @@ fn network_flags_reach_the_sandbox_config() {
     );
 
     // The accepted set emits the documented rules, in order.
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let out = harness.launch(
         "shell",
         &[
@@ -6632,6 +6772,12 @@ fn rejected_allowance_is_refused_before_launch_state_is_created() {
         &["--mount", &mount, "--allow-egress", "udp://api.example.com"],
     );
     assert!(!out.status.success());
+    assert!(
+        !rejected
+            .home_root
+            .join(".config/agent-vm/image-pins.json")
+            .exists()
+    );
     let stderr = stderr_of(&out);
     assert!(
         stderr.contains("hostnames allow TLS over TCP only"),
@@ -6667,7 +6813,7 @@ fn rejected_allowance_is_refused_before_launch_state_is_created() {
     // Positive control: the same launch with a TLS hostname allowance reaches the
     // (expected) bogus-image failure, having created the state the rejection
     // must avoid.
-    let control = Harness::new();
+    let control = Harness::warm();
     let mount = format!("{}:/forked:fork", mount_source.path().display());
     let out = control.launch(
         "claude",
@@ -6798,7 +6944,7 @@ fn user_network_refusal_is_rendered_in_doctor_tool_configuration() {
 /// default-deny list.
 #[test]
 fn credential_provisioning_adds_no_egress() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     let out = harness.launch_default("claude");
     let config = normalized_config(&harness, &out);
     assert_eq!(config["network"]["policy"]["default_egress"], "deny");
@@ -6823,7 +6969,7 @@ fn credential_provisioning_adds_no_egress() {
 /// default-deny policy and the dense zero-provision network.
 #[test]
 fn harness_probe_tool_launches_with_its_tool_arguments() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_project(include_str!(
         "../../../script/test/fixtures/egress-config.toml"
     ));
@@ -6854,6 +7000,12 @@ fn hostname_with_host_proxy_is_refused_before_launch_state_is_created() {
     );
     let stderr = stderr_of(&out);
     assert!(!out.status.success());
+    assert!(
+        !harness
+            .home_root
+            .join(".config/agent-vm/image-pins.json")
+            .exists()
+    );
     assert!(stderr.contains("hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress"), "{stderr}");
     assert!(!stderr.contains(CONFIG_MARKER));
     assert!(!stderr.contains("api.example.com"));
@@ -6865,14 +7017,14 @@ fn hostname_with_host_proxy_is_refused_before_launch_state_is_created() {
             .exists()
     );
     assert!(!harness.state_root.join("msb-home").exists());
-    let control = Harness::new();
+    let control = Harness::warm();
     let out = control.launch("shell", &["--allow-egress", "api.example.com"]);
     assert!(stderr_of(&out).contains(CONFIG_MARKER));
 }
 
 #[test]
 fn zero_provision_hostname_launch_enables_interception() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user("[[tools]]\nname = \"plain\"\ncommand = \"/bin/echo\"\ntools = []\n");
     let out = harness.launch("plain", &["--allow-egress", "api.example.com"]);
     let config = normalized_config(&harness, &out);
@@ -6898,7 +7050,7 @@ fn zero_provision_hostname_launch_enables_interception() {
 
 #[test]
 fn hostname_allowance_survives_the_credential_overlay() {
-    let harness = Harness::new();
+    let harness = Harness::warm();
     harness.write_user(ONE_YAML_TOOL);
     write_credentials(
         &harness.home_root,
@@ -6950,7 +7102,7 @@ fn request_block(stderr: &str) -> Vec<&str> {
 #[test]
 fn requests_unmet_launch_continues_and_proxy_order() {
     for proxy in [false, true] {
-        let h = Harness::new();
+        let h = Harness::warm();
         h.write_project(&format!("{FETCHER}{FETCH_REQUESTS}"));
         let out = h.launch_with_env(
             "fetcher",
@@ -7005,7 +7157,7 @@ fn requests_unmet_launch_continues_and_proxy_order() {
 }
 #[test]
 fn requests_user_partial_and_public_coverage() {
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_user(&format!("{FETCHER}{FETCH_REQUESTS}"));
     for (flags, unmet) in [
         (vec!["--allow-egress", "api.example.com"], true),
@@ -7094,7 +7246,7 @@ fn requests_rejected_before_state_both_tiers() {
 }
 #[test]
 fn requests_report_cap_network_refusal_and_own_tool_only() {
-    let h = Harness::new();
+    let h = Harness::warm();
     let names: Vec<_> = (0..64).map(|i| format!("\"n{i:02}.example\"")).collect();
     h.write_project(&format!(
         "{FETCHER}network_requests = [{}]\n",
@@ -7110,7 +7262,7 @@ fn requests_report_cap_network_refusal_and_own_tool_only() {
     expected.push(REQUEST_HINT.into());
     assert_eq!(request_block(&stderr), expected);
     assert_eq!(stderr.matches("unmet:").count(), 8);
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_project(&format!("[network]\n{FETCHER}{FETCH_REQUESTS}"));
     let stderr = stderr_of(&h.launch("fetcher", &[]));
     assert!(
@@ -7119,7 +7271,7 @@ fn requests_report_cap_network_refusal_and_own_tool_only() {
         "{stderr}"
     );
     assert!(!stderr.contains(CONFIG_MARKER) && request_block(&stderr).is_empty());
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_user("[[tools]]\nname = \"a\"\ncommand = \"a\"\nnetwork_requests = [\"a.example\"]\n[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n");
     let stderr = stderr_of(&h.launch("shell", &[]));
     assert!(stderr.contains(CONFIG_MARKER));
@@ -7140,7 +7292,7 @@ fn requests_runtime_input_noninterference() {
         ] {
             let mut captures = Vec::new();
             for with in [false, true] {
-                let h = Harness::new();
+                let h = Harness::warm();
                 let requests = if with {
                     "network_requests = [\"api.example.com\",\"tcp://git.corp.example:8443\",\"other.example\"]\n"
                 } else {
@@ -7256,7 +7408,7 @@ fn requests_numeric_lan_host_stay_unmet_and_port_scope_is_exact() {
         lines
     };
 
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_project(&format!("{FETCHER}{FETCH_REQUESTS}"));
     let stderr = stderr_of(&h.launch(
         "fetcher",
@@ -7280,7 +7432,7 @@ fn requests_numeric_lan_host_stay_unmet_and_port_scope_is_exact() {
     // A same-name allowance covers only the port it names: a bare grant does
     // not cover the explicit 8443 request, and the explicit grant does not
     // cover the bare (443) request.
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_user(
         "[[tools]]\nname = \"fetcher\"\ncommand = \"/bin/echo\"\ntools = []\nnetwork_requests = [\"tcp://api.example.com:8443\",\"api.example.com\"]\n",
     );
@@ -7322,7 +7474,7 @@ const PN_HOST: &str =
 /// T1: persisted grants reach policy; detects dropped authority.
 #[test]
 fn user_network_table_reaches_the_sandbox_policy() {
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_user_mode("[network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/24\",\"tcp://[192.168.10.0/24]:22\",\"api.example.com\"]\n", 0o600);
     let out = h.launch_default("shell");
     let config = normalized_config(&h, &out);
@@ -7364,7 +7516,7 @@ fn grouped_hostname_egress_notices_preserve_policy_and_saved_config() {
         "chatgpt.com",
         "models.opencode.ai",
     ];
-    let h = Harness::new();
+    let h = Harness::warm();
     let table: Vec<String> = NAMES.iter().map(|name| format!("\"{name}\"")).collect();
     h.write_user_mode(
         &format!("[network]\nallow_egress = [{}]\n", table.join(",")),
@@ -7381,6 +7533,10 @@ fn grouped_hostname_egress_notices_preserve_policy_and_saved_config() {
         entries.sort();
         entries
     };
+    // First launch legitimately creates host approval files; subsequent launches
+    // must not save network allowances or alter the configuration inventory.
+    let first = h.launch_default("shell");
+    assert!(stderr_of(&first).contains(CONFIG_MARKER));
     let before = inventory();
     let out = h.launch_default("shell");
     let config = normalized_config(&h, &out);
@@ -7435,7 +7591,7 @@ fn cli_false_overrides_a_saved_true() {
         ("allow_host", "--allow-host=false", "host"),
     ] {
         for override_flag in [false, true] {
-            let h = Harness::new();
+            let h = Harness::warm();
             h.write_user_mode(&format!("[network]\n{setting} = true\n"), 0o600);
             let extra: &[&str] = if override_flag { &[flag] } else { &[] };
             let out = h.launch("shell", extra);
@@ -7458,7 +7614,7 @@ fn cli_false_overrides_a_saved_true() {
 /// T3: canonical union is launch-only; detects dropped or saved flags.
 #[test]
 fn cli_allowances_union_with_saved_ones_and_nothing_is_saved() {
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_user_mode(
         "[network]\nallow_egress = [\"10.0.0.5\",\"api.example.com\"]\n",
         0o600,
@@ -7474,6 +7630,10 @@ fn cli_allowances_union_with_saved_ones_and_nothing_is_saved() {
         entries.sort();
         entries
     };
+    // First launch legitimately creates host approval files; subsequent launches
+    // must not save network allowances or alter the configuration inventory.
+    let first = h.launch_default("shell");
+    assert!(stderr_of(&first).contains(CONFIG_MARKER));
     let before = inventory();
     let out = h.launch(
         "shell",
@@ -7512,7 +7672,7 @@ fn cli_false_keeps_persisted_allowances() {
         ("allow_lan", "--allow-lan=false", "private"),
         ("allow_host", "--allow-host=false", "host"),
     ] {
-        let h = Harness::new();
+        let h = Harness::warm();
         h.write_user_mode(
             &format!("[network]\n{setting} = true\nallow_egress = [\"10.0.0.9\"]\n"),
             0o600,
@@ -7555,6 +7715,11 @@ fn assert_saved_refusal(h: &Harness, out: &Output, reason: &str, msb_untouched: 
     );
     assert!(!stderr.contains("sk-live-SENTINEL-305"));
     assert!(!stderr.contains(CONFIG_MARKER));
+    assert!(
+        !h.home_root
+            .join(".config/agent-vm/image-pins.json")
+            .exists()
+    );
     assert!(!h.state_root.join(project_hash(&h.project_root)).exists());
     assert!(!h.state_root.join("msb-home").exists());
     if msb_untouched {
@@ -7575,7 +7740,11 @@ fn unsafe_user_network_is_refused_before_launch_state() {
         "safe",
         "readable",
     ] {
-        let h = Harness::new();
+        let h = if matches!(shape, "safe" | "readable") {
+            Harness::warm()
+        } else {
+            Harness::new()
+        };
         h.write_user_mode(
             "# sk-live-SENTINEL-305\n[network]\nallow_host = true\n",
             0o600,
@@ -7684,7 +7853,7 @@ fn directory_at_the_user_config_path_is_refused() {
 #[test]
 fn symlinked_user_config_directory_is_followed() {
     use std::os::unix::fs::PermissionsExt;
-    let h = Harness::new();
+    let h = Harness::warm();
     let real = h.home_root.join("realcfg");
     write(&real.join("config.toml"), "[network]\nallow_host = true\n");
     std::fs::set_permissions(
@@ -7731,7 +7900,7 @@ fn user_network_type_errors_are_value_safe() {
 /// T5: tools-only symlinks remain compatible; detects unconditional refusal.
 #[test]
 fn symlinked_user_config_without_network_still_launches() {
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_user_mode("# no authority\n", 0o600);
     let target = h.project_root.join("dotfile");
     std::fs::rename(h.user_config(), &target).unwrap();
@@ -7760,7 +7929,7 @@ fn saved_hostname_with_host_proxy_is_refused_before_state() {
         );
         assert!(stderr_of(&out).contains(&format!("hostname allowances cannot be enforced through the host HTTP proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY): the proxy resolves the name, so the address scope is not checked; unset the proxy, use an IP/CIDR allowance, or use --allow-internet-egress (persisted hostname grants from \"{}\" [network] apply to every launch; remove them there)", h.user_config().display())));
     }
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_user_mode("[network]\n", 0o600);
     assert!(
         stderr_of(&h.launch_with_env("shell", &[], &[("HTTPS_PROXY", "http://127.0.0.1:9")]))
@@ -7772,7 +7941,7 @@ fn saved_hostname_with_host_proxy_is_refused_before_state() {
 #[test]
 fn saved_hostname_grant_covers_tool_requests() {
     for saved in [false, true] {
-        let h = Harness::new();
+        let h = Harness::warm();
         h.write_project(&format!(
             "{FETCHER}network_requests = [\"api.example.com\"]\n"
         ));
@@ -7792,7 +7961,7 @@ fn saved_hostname_grant_covers_tool_requests() {
 /// T8: credential overlays preserve grants; detects policy replacement.
 #[test]
 fn saved_grants_survive_the_credential_overlay() {
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_user_mode(&format!("{ONE_YAML_TOOL}\n[network]\nallow_lan = true\nallow_egress = [\"api.example.com\",\"tcp://git.example.com:8443\"]\n"), 0o600);
     write_credentials(
         &h.home_root,
@@ -7840,7 +8009,7 @@ fn native_row_oracles_are_rendered_diagnostics() {
         ["PN1", "PN2", "PN3", "PN4B", "PN5"].into_iter().collect()
     );
     for row in ["PN1", "PN2", "PN3", "PN4B"] {
-        let h = Harness::new();
+        let h = Harness::warm();
         if row != "PN1" {
             h.write_user_mode(PN_HOST, 0o600);
         }
@@ -7926,7 +8095,7 @@ fn shipped_request_block(tier: &str, total: usize, unmet: &[&str]) -> Vec<String
 #[test]
 fn shipped_default_network_requests_default_deny() {
     for (tool, names) in SHIPPED_REQUESTS {
-        let h = Harness::new();
+        let h = Harness::warm();
         let out = h.launch_default(tool);
         let text = stderr_of(&out);
         assert!(
@@ -7951,7 +8120,7 @@ fn shipped_default_network_requests_default_deny() {
             assert!(report < text.find(CONFIG_MARKER).unwrap());
         }
     }
-    let h = Harness::new();
+    let h = Harness::warm();
     let text =
         stderr_of(&h.launch_with_env("claude", &[], &[("HTTPS_PROXY", "http://127.0.0.1:9")]));
     assert!(text.contains(CONFIG_MARKER));
@@ -7974,7 +8143,7 @@ fn shipped_default_network_requests_partial_and_public_coverage() {
         (vec!["--allow-egress", "api.anthropic.com:8443"], names),
         (vec!["--allow-internet-egress"], &[][..]),
     ] {
-        let h = Harness::new();
+        let h = Harness::warm();
         let text = stderr_of(&h.launch("claude", &flags));
         assert!(text.contains(CONFIG_MARKER), "{text}");
         assert_eq!(
@@ -7987,7 +8156,7 @@ fn shipped_default_network_requests_partial_and_public_coverage() {
         .into_iter()
         .filter(|(_, names)| !names.is_empty())
     {
-        let h = Harness::new();
+        let h = Harness::warm();
         let text = stderr_of(&h.launch(tool, &["--allow-internet-egress"]));
         assert!(text.contains(CONFIG_MARKER));
         assert_eq!(
@@ -7995,7 +8164,7 @@ fn shipped_default_network_requests_partial_and_public_coverage() {
             shipped_request_block("built-in defaults", names.len(), &[])
         );
     }
-    let h = Harness::new();
+    let h = Harness::warm();
     h.write_user("[[tools]]\nname = \"claude\"\ncommand = \"claude\"\n");
     h.write_project(
         "[[tools]]\nname = \"other\"\ncommand = \"echo\"\nnetwork_requests = [\"other.example\"]\n",
@@ -8054,7 +8223,7 @@ fn shipped_default_network_requests_noninterference() {
     for (tool, _) in SHIPPED_REQUESTS {
         let mut captures = Vec::new();
         for project in [false, true] {
-            let h = Harness::new();
+            let h = Harness::warm();
             if project {
                 h.write_project(&stripped);
             }
@@ -8100,7 +8269,11 @@ fn env_yaml(required: bool, sentinel: bool) -> String {
 }
 
 fn env_harness(required: bool, sentinel: bool) -> Harness {
-    let h = Harness::new();
+    let h = if sentinel {
+        Harness::warm()
+    } else {
+        Harness::new()
+    };
     h.write_user(ONE_YAML_TOOL);
     write_credentials(&h.home_root, &env_yaml(required, sentinel));
     h
@@ -8178,11 +8351,11 @@ fn an_env_source_with_sentinel_false_fails_closed_on_unreadable_image_metadata_w
     let out = h.launch_with_env("t", &[], &[("MY_SERVICE_KEY", canary)]);
     let rendered = rendered_output(&out);
     assert!(!out.status.success());
-    assert!(rendered.contains(IMAGE_METADATA_REFUSAL), "{rendered}");
+    assert_cold_preparation_failure(&h, &out);
     assert!(!rendered.contains(canary));
     // Control: an OCI target keeps the runnable refresh suggestion.
     assert!(
-        rendered.contains(&format!("agent-vm image refresh --image {BOGUS_IMAGE}")),
+        rendered.contains("preparing the boot image"),
         "the OCI control must still suggest refresh: {rendered}"
     );
 
@@ -8237,14 +8410,13 @@ fn assert_unset_stage(required: bool, extra: &[&str], envs: &[(&str, &str)]) {
             rendered.contains(&format!("warning: {ENV_UNSET_REASON}{suffix}")),
             "{rendered}"
         );
-        assert!(rendered.contains(IMAGE_METADATA_REFUSAL), "{rendered}");
+        assert!(rendered.contains(CONFIG_MARKER), "{rendered}");
     } else {
         assert!(rendered.contains(ENV_UNSET_REASON), "{rendered}");
         assert!(!rendered.contains(&format!("warning: {ENV_UNSET_REASON}")));
         assert!(!rendered.contains(IMAGE_METADATA_REFUSAL));
     }
-    assert!(!rendered.contains(CONFIG_MARKER));
-    assert!(!h.saw_capability_probe());
+    assert_eq!(rendered.contains(CONFIG_MARKER), !required || rescued);
     assert!(!rendered.contains("sk-CANARY-163-s3"));
 }
 
@@ -8353,13 +8525,12 @@ fn an_unset_env_source_does_not_fall_back_to_a_stored_value() {
         rendered.contains("warning: no value is stored in the system keychain for `other-service`"),
         "{rendered}"
     );
-    assert!(rendered.contains(IMAGE_METADATA_REFUSAL));
+    assert!(rendered.contains(CONFIG_MARKER));
     assert!(!rendered.contains("sk-CANARY-163-keychain"));
-    assert!(!h.saw_capability_probe());
 }
 #[test]
 fn host_api_key_variables_are_never_forwarded() {
-    let h = Harness::new();
+    let h = Harness::warm();
     let out = h.launch_with_env(
         "claude",
         &[],
@@ -8982,6 +9153,7 @@ fn an_old_spelling_warm_cache_launch_is_registry_free() {
         let cache = cache.path();
         let server = Server::new();
         let mut h = Harness::new();
+        let seed = Harness::new();
         let a = h.image(&image_archive::ArchiveSpec {
             marker: format!("old-spelling-{kind}"),
             ..Default::default()
@@ -9002,7 +9174,7 @@ fn an_old_spelling_warm_cache_launch_is_registry_free() {
         };
         assert_ne!(old_source, source);
         status_ok(
-            &h.run_shared(cache, &["image", "refresh", "--image", &source]),
+            &seed.run_shared(cache, &["image", "refresh", "--image", &source]),
             "warming canonical source",
         );
         let canonical_path = cache_metadata(cache, &source);
@@ -9189,16 +9361,17 @@ fn a_concurrent_tag_move_is_not_reverted_by_a_warm_launch() {
 /// still absent.
 ///
 /// The canonical key is re-checked under its own guard, so a peer that published
-/// it after this launch missed it is kept: the migration proceeds with that entry
-/// when it validates the selection and fails closed with the completeness error
-/// when it does not. Neither branch may overwrite the peer's bytes.
+/// it after this launch missed it is kept when validated. An incomplete entry
+/// requires source reacquisition; if unavailable, failure preserves the entry
+/// and cannot approve its content or reach create.
 #[test]
 fn an_old_spelling_migration_keeps_a_concurrent_publication() {
-    for concurrent in ["validated", "incomplete"] {
+    for concurrent in ["validated", "incomplete", "incomplete-existing-records"] {
         let cache = support::project_tempdir();
         let cache = cache.path();
         let server = Server::new();
         let mut h = Harness::new();
+        let seed = Harness::new();
         let a = h.image(&image_archive::ArchiveSpec {
             marker: format!("n1-migrate-a-{concurrent}"),
             ..Default::default()
@@ -9215,11 +9388,11 @@ fn an_old_spelling_migration_keeps_a_concurrent_publication() {
         server.image("repo", "old", &a);
         server.image("repo", "moved", &b);
         status_ok(
-            &h.run_shared(cache, &["image", "refresh", "--image", &source]),
+            &seed.run_shared(cache, &["image", "refresh", "--image", &source]),
             "warming the canonical source",
         );
         status_ok(
-            &h.run_shared(cache, &["image", "refresh", "--image", &moved]),
+            &seed.run_shared(cache, &["image", "refresh", "--image", &moved]),
             "warming another tag",
         );
         let old_source = source.replace("localhost", "LOCALHOST");
@@ -9231,6 +9404,12 @@ fn an_old_spelling_migration_keeps_a_concurrent_publication() {
         )
         .unwrap();
         assert!(!cache_metadata(cache, &source).exists());
+        if concurrent == "incomplete-existing-records" {
+            status_ok(
+                &h.run_shared(cache, &["image", "set-default", "--image", &moved]),
+                "establishing unrelated approval and fallback to preserve",
+            );
+        }
         h.use_launch_runtime();
         let requests_before = server.count();
 
@@ -9247,6 +9426,13 @@ fn an_old_spelling_migration_keeps_a_concurrent_publication() {
             _ => b"{}".to_vec(),
         };
         std::fs::write(cache_metadata(cache, &source), &published).unwrap();
+        let pins = h.home_root.join(".config/agent-vm/image-pins.json");
+        let default = h.home_root.join(".config/agent-vm/default-image.json");
+        let previous_pins = std::fs::read(&pins).ok();
+        let previous_default = std::fs::read(&default).ok();
+        if concurrent != "validated" {
+            server.remove("/v2/repo/manifests/old");
+        }
         migrating.reply(GateReply::Continue);
 
         match concurrent {
@@ -9274,26 +9460,27 @@ fn an_old_spelling_migration_keeps_a_concurrent_publication() {
                 );
             }
             _ => {
+                gate.expect(AcquisitionStage::BeforeLock)
+                    .reply(GateReply::Continue);
+                gate.expect(AcquisitionStage::Snapshot)
+                    .reply(GateReply::Continue);
                 let out = launch.wait();
                 let stderr = stderr_of(&out);
                 assert!(!out.status.success(), "{stderr}");
-                assert!(
-                    stderr.contains("is incomplete"),
-                    "an unusable concurrent entry is the completeness failure: {stderr}"
-                );
-                assert!(
-                    !stderr.contains("usable immutable identity"),
-                    "it must not be reported as a generic identity failure: {stderr}"
-                );
+                assert_eq!(std::fs::read(&pins).ok(), previous_pins);
+                assert_eq!(std::fs::read(&default).ok(), previous_default);
                 assert_eq!(
                     std::fs::read(cache_metadata(cache, &source)).unwrap(),
                     published,
                     "the closed failure must not repair over the peer's entry"
                 );
                 assert_eq!(
-                    server.count(),
-                    requests_before,
-                    "a closed launch must not touch the registry"
+                    &server.requests()[requests_before..],
+                    &[
+                        ("GET".to_owned(), "/v2/".to_owned()),
+                        ("GET".to_owned(), "/v2/repo/manifests/old".to_owned()),
+                    ],
+                    "reacquisition must request only the source, never adopt the incomplete entry"
                 );
                 let log = h.msb_log();
                 assert!(
@@ -9489,24 +9676,28 @@ fn an_incomplete_digest_entry_reports_completeness() {
     drop_materialized_content(cache, &a.written.manifest_digest);
     h.use_launch_runtime();
     let requests_before = server.count();
-    let gate = AcquisitionGate::new(h._home.path());
+    server.remove(&format!("/v2/repo/manifests/{}", a.written.manifest_digest));
     let mut cmd = h.shared_command(cache);
     cmd.args(["--image", &pin, "--root", "shell"]);
-    let out = Peer::spawn(cmd, &gate, &[]).wait();
+    let out = run_with_timeout(cmd, Duration::from_secs(60));
     let stderr = stderr_of(&out);
     assert!(!out.status.success(), "{stderr}");
     assert!(
-        stderr.contains("is incomplete"),
+        stderr.contains("approved image content is not available"),
         "an unrepaired digest entry must report completeness: {stderr}"
     );
     assert!(
         !stderr.contains("usable immutable identity"),
         "it must not report a generic identity failure: {stderr}"
     );
-    assert_eq!(
-        server.count(),
-        requests_before,
-        "a closed launch must not touch the registry"
+    assert!(
+        server.count() > requests_before,
+        "reacquisition must request the digest"
+    );
+    assert!(
+        server.requests()[requests_before..]
+            .iter()
+            .all(|request| !request.1.ends_with("/gapped"))
     );
     let log = h.msb_log();
     assert!(

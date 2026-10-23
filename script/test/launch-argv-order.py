@@ -44,7 +44,6 @@ LAUNCH_OPTIONS = [
     "--allow-lan",
     "--allow-host",
     "--image",
-    "--update-check",
     "--root",
 ]
 TOOL_VERBS = ["shell", "dsh", "pi", "codex", "opencode", "claude", "copilot"]

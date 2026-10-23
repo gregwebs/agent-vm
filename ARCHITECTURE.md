@@ -42,8 +42,11 @@ crates/agent-vm/src/
 ├── network_requests.rs     # tool requests: parse, coverage report (never authority)
 ├── mount.rs                # --mount grammar and volume wiring
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
-│   ├── default_selection.rs#   retained record: read-only load, automatic adopt, explicit replace
-│   └── upgrade.rs          #   set-default flow: one validated acquisition, then replace
+│   ├── default_selection.rs#   journal-aware logical default read (bounded shared lock)
+│   └── upgrade.rs          #   set-default command shape: explicit typed target
+├── image_pin.rs            # host-wide OCI approval: prepare before create, explicit update
+│   ├── store.rs            #   strict HOME pin store, CAS kernel, journaled default transaction
+│   └── approval.rs         #   candidate-scoped terminal consent (--yes or a real TTY)
 ├── image_acquire.rs        # shared boot-free acquisition: canonical target, validated token, barrier
 │   ├── reference.rs        #   the one canonical OCI target (cache/acquisition key)
 │   ├── receipt.rs          #   cache-only validated-content receipt (never approval)
@@ -628,13 +631,15 @@ selected image verbatim (see
 
 ```text
 [CLI/env/config tiers] ─┐
-                        ├─► boot_image::select ──► SandboxBuilder.image(ref) ──► msb acquire (IfMissing)
-[retained default] ─────┘        (lazy, fallible)           │                              │
-   │  UserConfig/ProjectConfig win over it;                 │                              │ content cached
-   │  an absent record falls back to the                     │                              ▼
-   │  initial recommendation (no write)                      │                       adopt the ref into
-   ▼                                                         │                       default-image.json
-$HOME/.config/agent-vm/default-image.json ◄──────────────────┴───── (only after a *successful* default-tier acquire)
+                        ├─► boot_image::select ─► image_pin::prepare_selected ─► SandboxBuilder.image(repo@child)
+[retained default] ─────┘       (lazy, fallible)               │                              │
+   │  user/project config wins over it; an absent              │  no pin: acquire source      │ create (IfMissing)
+   │  record falls back to the recommendation                  │  validate · commit first pin  ▼
+   ▼                                                           │  with pin: consume child    guest
+$HOME/.config/agent-vm/default-image.json ◄───────────────────┴─ (default-tier first pin only,
+   (digest-only fallback, #392)                                    after acquisition success)
+$HOME/.config/agent-vm/image-pins.json ◄────────────────────────── host approval, every OCI source
+$HOME/.config/agent-vm/image-pins.lock
 ```
 
 The **saved selection is not the image cache.** The record names exact content;
@@ -642,10 +647,22 @@ msb owns the bytes and may refetch a missing layer. It is also not a project or
 launcher-version artifact: it lives with the user-scoped settings, so a new
 project, a cleared cache or a new `AGENT_VM_STATE_DIR` leaves it alone. Reading
 it is lazy and read-only, which is why `help` and `doctor` touch nothing;
-automatic adoption happens once, after a default-tier image is actually acquired.
+automatic adoption happens only after a default-tier image is actually acquired,
+and it happens for every successful default-tier preparation — not only a first
+pin — while staying write-once, so an existing record is never moved by a launch.
+
+**Approval is not cache evidence either.** Every OCI selection — from any tier —
+is keyed by its canonical reference plus the host Linux platform in
+`image-pins.json`. A launch or setup consumes the approved host child and never
+resolves the selected tag; only `image refresh` and `image set-default`
+re-resolve and ask. The store is host-wide (projects and state roots share it)
+and holds no cache path, timestamp or launcher version: deleting the cache
+reacquires the approved digest, and deleting the store is a deliberate approval
+reset. Local rootfs/disk launches bypass this path with their text unchanged.
 `agent-vm image show` is the one *disclosure* edge: it returns the selected
-reference and its provenance from the same selector (and the same single default
-observation), before runtime discovery, and creates or acquires nothing.
+source and its provenance from the same selector (and the same single
+journal-aware default observation), before runtime discovery, and creates or
+acquires nothing. It does not print the approved child digest.
 `agent-vm image import` observes the same selector after publishing, but decides
 only whether to print guidance and never discloses the selection (#385).
 
@@ -658,11 +675,15 @@ Explicit `image set-default` adds a separate edge:
 
 ```text
 image set-default --image REF
-  → canonical target → shared publication barrier
-  → native resolve once (Always, force=false) under the source reference guard
-  → complete source cache + resolved-child identity + raw host-Linux config
-  → preserve canonical repo@child metadata + cache-only receipt under its guard
-  → AcquiredDefaultImage → same record flock → atomic replace(record)
+  → canonical typed target (ambient selection ignored)
+  → healthy pin/default snapshot → resolve current registry content ONCE
+  → validated candidate → approval (first/unchanged: none; changed: prompt or --yes)
+  → revalidate the frozen candidate under a fresh shared barrier
+  → shared cache barrier → pin EX → default EX (journaled transaction)
+      atomic pin store {old pins, pending_default}
+      atomic default    {approved host child}
+      atomic pin store {new pins, no intent}          ← commit
+  → release; completion output is best-effort
 ```
 
 One resolution per invocation: `AcquireMode::ResolveCurrent` preserves the
@@ -671,34 +692,38 @@ resolved twice and no duplicate derived pull is needed. The returned host
 manifest digest, not an index digest or moving tag, is retained. Native auth/TLS, OCI integrity,
 materialization and cache I/O are trusted runtime operations. The small platform
 conjunction is proved; JSON decoding and platform comparisons are trusted.
-Acquisition runs outside the selection lock. Publication rechecks record health
-under the lock: same-pin replacement preserves bytes, explicit writers are
-last-commit-wins, and automatic adoption stays first-writer-wins. Rename is the
-last fallible write; completion output is best-effort. Interruption leaves the
-old or complete new record; no fsync/power-loss guarantee is added. Old cache
+Acquisition, the prompt and revalidation run outside the HOME locks. The host
+transaction is a compare-and-swap on the revision and digest that were
+displayed: same-pin replacement preserves bytes, a peer that moved the pin first
+makes this operation fail, and automatic adoption stays insert-if-absent.
+Interruption before the final pin write leaves the old pins plus a bounded
+`pending_default` intent; the next mutating image command restores the old
+logical default (idempotently) before doing its own work. Readers never recover,
+clear or write: they observe the old logical state. No fsync/power-loss guarantee
+is claimed, and older binaries do not participate in the journal. Old cache
 artifacts and active sessions are never removed by set-default. See
-[USAGE](USAGE.md#the-retained-default) for the operational details.
+[USAGE](USAGE.md#host-wide-approval-of-oci-image-content) for the operational details.
 
 `image refresh` acquires without launching or replacing a retained record;
 only a successful default-tier acquisition may initialize an absent record:
 
 ```text
-image refresh [--image REF]
+image refresh [--image REF] [--yes]
   → the same boot_image selector and broken-config recovery
-  → image_acquire::acquire(ResolveCurrent) (ambient backend's cache; native auth/trust/HTTP policy)
-      shared publication barrier → launcher guard on the canonical reference key
-      snapshot prior metadata → native pull (Always, force=false; native lock internal)
-      → complete requested-key cache + resolved-child identity + raw host-Linux config
-          pass → release the source guard; preserve repo@child metadata/receipt
-                 under the child's own guard | fail → restore the source snapshot
-  → advisory pulled-digest marker (the acquired digest)
-  → adopt the selected immutable reference only if this was a default-tier success
+  → image_pin::update(Refresh) → resolve current registry content once
+      → candidate approval (first/unchanged: none; changed: prompt or --yes)
+      → revalidate the frozen candidate under a fresh shared barrier
+      → journaled pin/default transaction (future launches consume the child)
+  → a default-tier preparation also retains an absent record (write-once)
+  → completion notice (best-effort; no policy work after commit)
 ```
 
 No sandbox, guest disk, VM execution, Docker/buildx, curl/wget or alternate
 download backend is on this path; a nonbootable OCI image with the right host
 platform refreshes successfully. Layer reuse is native: an unchanged manifest
 downloads no layer blob and never deletes old artifacts to force freshness.
+Refresh is not a launch-time probe and records no marker: a launch makes no
+registry request for content it has already approved.
 
 ### Canonical target, validated token, cache-only receipt
 
@@ -722,34 +747,43 @@ and the replacement persists until preparation restores validated metadata from
 the child receipt, or an explicit immutable acquisition repairs it when no
 receipt exists. What protects a launch is that it validates the cached entry
 before the SDK consumes it (below): an entry that cannot be repaired and
-validated is a closed failure, never silently booted content.
+validated is never silently booted content — it is reacquired from the
+selection's stated digest, or the launch fails.
 
-A **launch** canonicalizes its selected reference once and then validates the
-cached entry under the shared barrier, before the SDK's `IfMissing` create reads
-anything: complete, self-consistent digest, host-Linux platform, and — for an
-immutable source whose cached digest differs — a receipt proving the
-association. A present entry that fails any of those fails the launch closed
-instead of being treated as a miss, because the create would otherwise re-resolve
-the reference and replace content the cache was supposed to describe. An absent
-entry is still a miss: an ordinary launch does not acquire from a registry
-before create.
+A **launch or setup** canonicalizes its selected reference once, then
+`image_pin::prepare_selected` decides what the SDK may consume. An existing
+approval is prepared as `repo@approved-child` and validated under the shared
+barrier, before the SDK's `IfMissing` create reads anything: complete,
+self-consistent digest, host-Linux platform, and the approved digest's own
+content identity. The tag/index the user selected is never re-resolved. An
+*absent* approval acquires cache-first (`CachedOrAcquire`), validates, and
+commits the first pin before create — so a cold first launch does contact a
+registry, but only to establish content it (or a concurrent peer) will approve.
+A present entry that fails validation is a *miss* for this cache-first read,
+which then reacquires the selection's **stated digest** — never its tag — so an
+unusable entry can neither be booted nor used to re-resolve mutable content. The
+one closed failure is an entry that contradicts its preserved receipt, because
+relaxing that would boot content nothing measured. Every OCI consumer — launch,
+setup, refresh, set-default — shares this path, so none can quietly consume
+unapproved content.
 
 A canonical-source cache hit never rewrites the source key: the entry is already
 there and validated, and rewriting a *tag* from metadata read moments earlier
 would revert a concurrent `image refresh` that moved the tag. A canonical miss
-also tries the *original* (pre-canonical) spelling once, so a cache an older
-launcher wrote under `registry-1.docker.io/...` or an uppercase digest hex is
-reused: its validated metadata is republished under the acquired child key (which
-is content-addressed, so it cannot revert a tag) and — only while that key is
-still absent — under the canonical source key (tag, index or direct digest), with
-guarded native readback. The absence is re-checked under the canonical key's own
-guard, because a tag may have moved in the gap; a peer's publication then wins,
-and is used when it validates this selection and is the closed completeness
-failure when it does not. The original spelling must still be supplied for that
-first compatibility read; we do not scan arbitrary historical spellings. A first
-launch after upgrade may reacquire if neither the canonical key nor that original
-key has a validated, complete entry. After migration, canonical-only warm
-launches need no registry.
+*(a first pin)* also tries the *original* (pre-canonical) spelling once, so a
+cache an older launcher wrote under `registry-1.docker.io/...` or an uppercase
+digest hex is reused: its validated metadata is republished under the acquired
+child key (which is content-addressed, so it cannot revert a tag) and — only
+while that key is still absent — under the canonical source key (tag, index or
+direct digest), with guarded native readback. The absence is re-checked under
+the canonical key's own guard, because a tag may have moved in the gap; a peer's
+publication then wins, and is used when it validates this selection, and is a
+miss — reacquiring the stated digest — when it does not; a peer's *pin* wins in
+the same way and its frozen digest is prepared instead. The original spelling must still
+be supplied for that first compatibility read; we do not scan arbitrary
+historical spellings. A first launch after upgrade may reacquire if neither the
+canonical key nor that original key has a validated, complete entry. After
+migration, canonical-only warm launches need no registry for an approved pin.
 
 A warm launch writes only what it repairs. A digest selection republishes its own
 child key from the receipt only when the cache no longer holds that content there
@@ -785,6 +819,78 @@ cannot account for. The rendered text names only cache-side recovery (restore th
 image cache from a backup, or remove the receipt and re-acquire) and never
 suggests deleting HOME approval records, a store acquisition does not touch.
 
+### Host-wide approval: store, candidate and journal
+
+`image_pin` is the only module that answers "may this content be consumed?".
+It owns two small HOME files, separate from the retained-default record:
+
+```json
+{"version":1,
+ "pins":[{"reference":"docker.io/library/alpine:latest",
+           "platform":{"os":"linux","architecture":"arm64","variant":null},
+           "manifest_digest":"sha256:<64 hex>","revision":1}],
+ "pending_default":null}
+```
+
+`image-pins.json` is strict version-1 JSON: unknown, duplicate or missing fields,
+duplicate canonical keys, unsupported versions, invalid/zero/overflow revisions,
+non-canonical spellings, non-regular/symlink/oversized files and trailing bytes
+are closed corruption errors. Only `ENOENT` means "absent". Bounds are 4 MiB,
+4096 pins and 4096 source bytes, checked on read and before every write.
+`image-pins.lock` is a stable private flock: a bounded shared snapshot for
+lookups, one exclusive read-modify-write for a commit. A missing lock beside a
+store is damage, not absence; a lock without a store is a valid first-writer
+state. Platform entries for a foreign architecture are preserved verbatim but
+never borrowed as native approval.
+
+**Candidate-scoped consent.** `ValidatedCandidate` can only be minted from a
+complete native acquisition; `Approval` binds that candidate's digest and the
+predecessor revision/digest that were displayed. The prompt renders the escaped
+source, the platform and both full digests, defaults to No, reads one bounded
+line and never reprompts. `--yes` skips the read but not the rendering. Both
+stdin and stderr must be terminals for an interactive replacement; otherwise the
+operation refuses with status 1 without reading stdin. The mutation is a pure
+decision on one measured under-lock snapshot (`insert only if expected and
+current are absent`, `replace only for a mutable source with consent and a
+matching predecessor`), so a concurrent writer cannot be overwritten and
+`--yes` cannot authorize a different predecessor.
+
+**Approval equivalence is guest content, not index identity.** Two manifests are
+the same approval when their verified config digest and ordered layer diff IDs
+match. An alternate digest algorithm, or index movement that changes only
+unrelated platforms, therefore keeps the stored identity and revision; new guest
+content needs a replacement approval. An immutable source that resolves to
+different content is an integrity failure with no approval path.
+
+**Why two files and a journal, rather than one record.** `set-default` updates
+both the approval and the retained fallback. Writing either first and failing the
+second would return an error with changed state, and rollback can itself fail. A
+bounded `pending_default` intent (`previous`/`proposed` exact v1 bytes, each
+≤16 KiB) records the logical pair across three atomic writes; a failure before
+the final commit restores the previous fallback bytes (or their absence), and a
+failed restoration leaves the old pins plus the intent authoritative as a
+recovery-required error rather than a false "nothing changed". Recovery is
+idempotent, verifies the physical fallback equals the intended side of the pair,
+and only the next *write* performs it: an explicit image command, or a launch or
+`setup` that has to record a first pin or retain an absent fallback. Readers —
+launch of an approved selection, `image show`, `doctor`, import's
+post-publication inspection — never recover, clear intent or create the lock;
+they take the shared lock (2 s) and
+observe the old logical state or the complete new one. A damaged store is never
+treated as absent: re-pinning would authorize content nobody approved. Moving
+it aside is a deliberate approval reset, never cache repair. This journal is
+specifically for failed-operation preservation; it is not a durability claim
+against power loss, and older binaries do not know about it.
+
+**What stays outside approval.** The cache receipt is cache evidence: it proves
+which child a digest-stated source was validated against and repairs metadata an
+alias overwrote, and deleting the cache deletes only receipts. Native cache
+publication from import/build takes the exclusive barrier but can never create or
+replace a HOME pin or fallback (#391). Local rootfs/disk launches never enter
+this module. See
+[ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md) for the decision and
+its rejected alternatives.
+
 ### Same-cache publication barrier and reference guards
 
 `<actual backend cache>/.agent-vm-publication.lock` is one stable `flock`:
@@ -800,6 +906,18 @@ native content locks. A second, derived reference guard is taken only after the
 source guard is released, so two peers cannot invert the order. Warm unrelated
 preparations share the barrier and proceed while a cold acquisition is stalled
 in a registry stream; a shared holder never upgrades in place.
+
+The HOME transaction is a **separate hierarchy entered after acquisition**, never
+nested inside a cache reference guard: `image-pins.lock` (exclusive) → retained
+`default-image.lock` (exclusive), held together for one bounded read-modify-write
+(30 s combined), released before any completion output. A launch or setup first
+pin commits while the preparation still holds the shared barrier, so validated
+content cannot be republished away between validation and commit; an explicit
+update revalidates its frozen candidate under a fresh shared barrier immediately
+before the transaction. Network I/O and the human prompt
+never run under a HOME lock; a shared cache holder therefore never blocks on a
+human, and an EX cache publisher cannot starve a bounded reader beyond its
+deadline.
 
 The reference guard is a persistent sibling of the native reference metadata in
 the **actual backend cache**, keyed by the canonical reference. It serializes
@@ -1377,6 +1495,7 @@ directories the user never asked for. The state-root precedence is in
 | Authority config-directory exposure guard | [ADR-0038](docs/adr/0038-config-dir-exposure-guard.md) |
 | Non-authoritative tool network requests | [ADR-0039](docs/adr/0039-non-authoritative-tool-network-requests.md) |
 | Pi reaches host Codex through an image-owned provider | [ADR-0044](docs/adr/0044-pi-reaches-host-codex-through-an-image-owned-provider.md) |
+| Host-wide OCI image approval and pinned consumption (#390) | [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md) |
 
 ## Deliberate non-goals
 

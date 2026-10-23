@@ -6,7 +6,10 @@ Accepted. Breaking in **0.5.0**. Amends ADR-0035's explicit build/import
 decision (#260); implements #359. Amended in **0.6.9** by #385 (defaulted
 import tag, selection-aware import completion). Amended in **0.7.0** by #389:
 `image refresh` (boot-free native acquisition) and `image set-default` join the
-group, and no top-level `pull`/`upgrade` alias exists.
+group, and no top-level `pull`/`upgrade` alias exists. Amended in **0.7.2** by
+#390: both update verbs take a nested `--yes` (candidate replacement consent),
+and import/build publication is explicitly outside the host approval authority
+(#391).
 
 ## Context
 
@@ -39,6 +42,22 @@ Docker daemon / archive → image import ─────────────
 - Launch/`image refresh`/setup registry failures for explicit mutable tags get a text-only
   import hint, with the original error chain retained. Digests and redacted
   defaults get no hint. Launch never runs Docker or falls back to import.
+- **Nested `--yes` on the update verbs (#390).** `image refresh [--yes]` and
+  `image set-default --image REF [--yes]` use `--yes` to pre-authorize exactly
+  the one current registry candidate they resolved and displayed. It never
+  bypasses the resolved-candidate freeze or the revision compare-and-swap, and
+  there is no `-y`, environment variable, global, launch, setup, build or import
+  `--yes`. A first pin or an unchanged digest ignores it. This is digest-
+  replacement consent, not the removed composition/build `--yes` [ADR-0035](0035-consume-user-owned-boot-images.md)
+  rejected.
+- **Import/build are outside approval (#391 staging).** Both verbs remain
+  cache-publication surfaces: they create no host pin and never replace an
+  existing approval or the retained default. Importing over a tag that is
+  already approved therefore does not approve the imported bytes; only an
+  explicit `image refresh --image REF` (prompt or `--yes`) moves the pin. A
+  daemon-only image may have no registry content to refresh, so it cannot be
+  approved through refresh — a documented limitation rather than a reason to
+  let an alias publication decide.
 
 ### Publication semantics
 
@@ -50,7 +69,11 @@ On failure, `image_publish` restores the requested tag's previous metadata (or
 removes it if new). Aliases are not restored; native blobs may remain. A failed
 rollback reports both errors. Process termination mid-import and concurrent
 publication of the same reference are not covered: rollback can revert a
-concurrent writer, and the native loader takes no publication lock.
+concurrent writer, and the native loader takes no publication lock. **None of
+this can change launch content under an existing pin**: the approval is
+separate from the cache, and a pinned launch validates the approved `repo@child`
+entry before the SDK consumes it (restoring it from its cache-only receipt when
+an alias overwrote the metadata).
 
 ### Output and diagnostics
 
@@ -80,6 +103,9 @@ own diagnostics.
 
 - Auto-import or `docker image inspect` at launch: rejected, violates ADR-0035.
 - Keep `build` as an alias: rejected, violates ADR-0042's single surface.
+- Give import/build an automatic or implicit approval: rejected; an archive can
+  name an unknown alias set, and silently authorizing one would recreate the
+  #390 defect. An explicit import approval, if wanted, is #391.
 - Replace the registry error with the hint: rejected, loses network/TLS detail.
 - Patch the vendored loader or reimplement one-target import: rejected; keep
   native `msb image load` parity and accept documented aliases (user decision).
@@ -93,3 +119,11 @@ Scripts reading its notice from stderr must read stdout. See the
 [0.5.0 migration note](../../USAGE.md#explicit-builds-and-archive-import).
 Importing `--docker src --tag dst` also leaves `src` in agent-vm's cache.
 The `msb image load` passthrough is unchanged and still has catalog semantics.
+
+From #390, an import or build that publishes over an approved tag does not switch
+a launch to the new bytes: approve the change explicitly with
+`agent-vm image refresh --image REF` (prompt or `--yes`), or select the imported
+result with `--image`. A daemon-only image has no registry source to refresh; it
+must be selected explicitly and its first selection becomes the pin. The
+multi-alias rollback limitation above still applies to the cache, not to
+approval.

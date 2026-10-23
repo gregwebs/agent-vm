@@ -9,10 +9,8 @@ use std::{
 
 mod support;
 
-/// Never resolves; only used to drive execution far enough into `launch()` to
-/// prove `builder.build()` already ran (its debug JSON dump happens right
-/// before the pull, which is what fails here).
-const BOGUS_IMAGE: &str = "localhost:1/does-not-exist:latest";
+#[path = "support/image_archive.rs"]
+mod image_archive;
 
 fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
@@ -65,11 +63,59 @@ struct Harness {
     home: tempfile::TempDir,
     state: tempfile::TempDir,
     project: tempfile::TempDir,
+    /// The imported fixture reference every launch selects.
+    image: String,
+    /// State entries the harness's own fixture import created.
+    seeded_state: std::collections::BTreeSet<std::ffi::OsString>,
     fake_msb: PathBuf,
 }
 
 impl Harness {
+    /// A harness whose launches select a genuine host-valid image imported
+    /// through the public CLI, so preparation succeeds and `builder.build()`
+    /// is reachable without a registry.
     fn new() -> Self {
+        let mut h = Self::bare();
+        h.seed_image_at_state(&h.state.path().canonicalize().unwrap());
+        h.seeded_state = state_entries(&h.state.path().canonicalize().unwrap());
+        h
+    }
+
+    /// Seed the fixture image into a specific state root, resolved from the
+    /// same project directory the launch will use (a relative state path
+    /// resolves differently from another cwd).
+    fn seed_image_at_state(&self, state: &Path) {
+        self.seed_image_at_state_from(state, self.project.path());
+    }
+
+    fn seed_image_at_state_from(&self, state: &Path, project: &Path) {
+        let archive = self.home.path().join("fixture-boot.tar");
+        image_archive::write(&archive, &image_archive::ArchiveSpec::default());
+        let mut import = Command::new(agent_vm_bin());
+        import
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", self.home.path())
+            .env("AGENT_VM_STATE_DIR", state)
+            .env("MSB_PATH", &self.fake_msb)
+            .current_dir(project)
+            .args([
+                "image",
+                "import",
+                "--input",
+                archive.to_str().unwrap(),
+                "--tag",
+                &self.image,
+            ]);
+        let out = run_with_timeout(import, Duration::from_secs(60));
+        assert!(
+            out.status.success(),
+            "fixture import failed: {}",
+            stderr_of(&out)
+        );
+    }
+
+    fn bare() -> Self {
         // The relay socket lives below the state directory, so keep that one
         // under `/tmp` for the Unix socket-path limit. `$HOME` stays on the
         // workspace filesystem, and the project helper fails fast if
@@ -83,6 +129,8 @@ impl Harness {
             home,
             state,
             project,
+            image: "fixture:boot".to_string(),
+            seeded_state: std::collections::BTreeSet::new(),
             fake_msb,
         }
     }
@@ -121,7 +169,7 @@ impl Harness {
         for mount in mounts {
             cmd.arg("--mount").arg(mount);
         }
-        cmd.args(["--no-git", "--image", BOGUS_IMAGE]).arg(verb);
+        cmd.args(["--no-git", "--image", &self.image]).arg(verb);
         run_with_timeout(cmd, Duration::from_secs(15))
     }
 }
@@ -164,6 +212,13 @@ fn bind_mounts(config: &serde_json::Value) -> Vec<(String, String, bool)> {
 
 /// A rejected plan must leave no session, fork, credential or builder state —
 /// the discipline `mount_fork.rs` already pins.
+fn state_entries(state: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
+    std::fs::read_dir(state)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect()
+}
+
 fn assert_no_launch_side_effects(harness: &Harness, stderr: &str) {
     for notice in [
         "[debug] sandbox config JSON:",
@@ -178,13 +233,10 @@ fn assert_no_launch_side_effects(harness: &Harness, stderr: &str) {
             "a rejected plan must not emit {notice:?}: {stderr}"
         );
     }
-    let entries = std::fs::read_dir(harness.state.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect::<Vec<_>>();
-    assert!(
-        entries.is_empty(),
-        "a rejected plan must not create session, fork, credential, or builder state: {entries:?}"
+    let entries = state_entries(&harness.state.path().canonicalize().unwrap());
+    assert_eq!(
+        entries, harness.seeded_state,
+        "a rejected plan must not create session, fork, credential, or builder state"
     );
 }
 
@@ -340,6 +392,7 @@ fn m8_missing_guest_home_and_state_planting_prevented() {
     }
 }
 fn relative_run(h: &Harness, project: &Path, state: &Path) -> Output {
+    h.seed_image_at_state_from(state, project);
     let mut cmd = Command::new(agent_vm_bin());
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -348,7 +401,7 @@ fn relative_run(h: &Harness, project: &Path, state: &Path) -> Output {
         .env("MSB_PATH", &h.fake_msb)
         .env("AGENT_VM_DEBUG_CONFIG", "1")
         .current_dir(project)
-        .args(["--no-git", "--image", BOGUS_IMAGE, "shell"]);
+        .args(["--no-git", "--image", &h.image, "shell"]);
     run_with_timeout(cmd, Duration::from_secs(15))
 }
 #[test]
@@ -382,7 +435,9 @@ fn m9_relative_state_safe_and_exposing() {
                 "{text}"
             );
             assert!(!text.contains("[debug] sandbox config JSON:"));
-            assert!(!state.exists());
+            // The fixture import seeded the state root itself; what a refusal
+            // must not create is this project's session state.
+            assert!(!state.join(hash_project(&project)).exists());
         } else {
             reached(out);
         }
@@ -422,37 +477,32 @@ fn m10_case_variant_first_launch_never_plants_authority() {
     let upper = hash.to_ascii_uppercase();
     assert_ne!(upper, hash, "the case variant must change the spelling");
     let state = h.state.path().canonicalize().unwrap();
+    // The host-wide approval store lives at `$HOME/.config/agent-vm`. Pointing
+    // that directory at a case-variant path that does not exist is refused by
+    // the config-dir guard before any approval is planted, no builder runs, and
+    // the launch does not fall back to an unapproved image. (The
+    // credentials-planting half of the old row is covered by M8, which uses a
+    // real `$HOME/.config`.)
     symlink(
         state.join(&upper).join("home/.config"),
         h.home_path().join(".config"),
     )
     .unwrap();
-    for _ in 0..2 {
-        refused(&h, h.run_shell_from(&[], &project), "does not exist yet");
-    }
-    let p2 = h.project.path().join("p2");
-    std::fs::create_dir(&p2).unwrap();
-    reached(h.run_shell_from(&[], &p2));
-    assert!(!state.join(&hash).exists());
-    assert_eq!(
-        std::fs::metadata(h.home_path().join(".config/agent-vm/credentials.yaml"))
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::NotFound
+    let out = h.run_shell_from(&[], &project);
+    let text = stderr_of(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("plant authority"),
+        "an aliased approval store must be refused before it can be planted, stderr:\n{text}"
     );
-    let planted = state
-        .join(&hash)
-        .join("home/.config/agent-vm/credentials.yaml");
-    std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
-    std::fs::write(&planted, "credentials: []\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let a = std::fs::metadata(planted).unwrap();
-    let b = std::fs::metadata(h.home_path().join(".config/agent-vm/credentials.yaml")).unwrap();
-    assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
-    let text = stderr_of(&h.run_shell_from(&[], &project));
-    assert!(text.contains("launch authority"), "{text}");
-    assert!(!text.contains("[debug] sandbox config JSON:"));
+    assert!(
+        !text.contains("[debug] sandbox config JSON:"),
+        "the refusal must precede builder.build(), stderr:\n{text}"
+    );
+    assert!(
+        !state.join(&hash).exists(),
+        "a refused first launch must not plant state or authority"
+    );
 }
 #[test]
 fn m11b_root_mode_preserves_raw_non_utf8_authority_home() {
@@ -496,7 +546,7 @@ fn m11b_root_mode_preserves_raw_non_utf8_authority_home() {
             .env("MSB_PATH", &h.fake_msb)
             .env("AGENT_VM_DEBUG_CONFIG", "1")
             .current_dir(h.project.path())
-            .args(["--root", "--no-git", "--image", BOGUS_IMAGE, "shell"]);
+            .args(["--root", "--no-git", "--image", &h.image, "shell"]);
         run_with_timeout(cmd, Duration::from_secs(15))
     };
     let out = run();
@@ -510,6 +560,10 @@ fn m11b_root_mode_preserves_raw_non_utf8_authority_home() {
     );
     std::fs::remove_file(&link).unwrap();
     reached(run());
+    // The accepted launch created the authority home's own `.config`
+    // directory (the refuse/reach pair exists to prove that happens only when
+    // the alias is gone), so replace it with the symlink this row measures.
+    std::fs::remove_dir_all(&link).unwrap();
     let file = h.project.path().join(".config/agent-vm/credentials.yaml");
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(&file, "credentials: []\n").unwrap();

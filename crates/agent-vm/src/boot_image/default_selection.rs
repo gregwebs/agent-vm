@@ -13,32 +13,28 @@
 //! the user tier outrank the project tier, which is a precedence change, not a
 //! retention.
 //!
-//! # Automatic adoption and explicit replacement, after acquisition
+//! # Why this module only encodes, decodes and snapshots now
 //!
-//! [`load`] is read-only and never repairs: a genuinely absent file is
-//! `Ok(None)`, and anything else that cannot be turned into a validated
-//! immutable reference is an error naming a recovery. [`adopt`] is the
-//! automatic mutator, called only after successful acquisition. It is
-//! first-writer-wins under an exclusive `flock`: a concurrent second adopter
-//! (or a changed launcher recommendation) cannot replace a record already on disk. Replacing a
-//! *working* retained default requires [`replace`] with an acquisition token (#262).
-//! It shares the lock/record, rechecks health, preserves same-pin bytes, and
-//! publishes last-commit-wins without changing ordinary adoption semantics.
-//!
-//! [`adopt`] checks for an existing valid record **before** it creates the
-//! config directory, the lock file or any temporary file: a steady-state
-//! default launch neither needs nor is blocked by a writable config directory.
-//! The check is repeated under the lock so a peer that won the race is honoured
-//! (first writer wins).
+//! The record's *decisions* belong to the host approval authority: the first pin
+//! and the fallback are committed as one journaled transaction
+//! ([`crate::image_pin`]), because a fallback can only be retained for content
+//! that was measured and approved. So the mutators that used to live here are
+//! gone, and what remains is the byte-level schema: [`decode_snapshot`],
+//! [`encode_snapshot`], [`snapshot_at`] and [`load`], which is a read of the
+//! logical record through that authority. Keeping the encoding here is what lets
+//! the pin store preserve a user's own formatting and a legacy spelling without
+//! a second schema.
 //!
 //! # Failure and atomicity contract
 //!
 //! Reads are bounded and no-follow: a symlink, FIFO, directory, oversize file
 //! or permission error is a hard error, never a silent reset. Writes go through
-//! [`host_paths::atomic_write`], so a process killed mid-adopt leaves either no
-//! file or a complete one — never an empty "already selected" file. That
-//! primitive does not `fsync`, so this module promises the repository's existing
-//! trusted-host interruption atomicity, not power-loss durability.
+//! [`crate::host_paths::atomic_write`], so a process killed mid-write leaves
+//! either no file or a complete one — never an empty "already selected" file.
+//! That primitive does not `fsync`, so this module promises the repository's
+//! existing trusted-host interruption atomicity, not power-loss durability. The
+//! pin store's `pending_default` journal is what makes the *pair* of records
+//! survive an interruption.
 //!
 //! # Diagnostic safety
 //!
@@ -52,28 +48,25 @@
 //! control-character `$HOME`). Callers may format the returned error freely:
 //! its `Display` and its debug chain are the same safe text.
 
-use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use rustix::fs::{FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
+use vstd::prelude::*;
 
-use crate::boot_image::{AcquiredDefaultImage, DefaultUpgradeOutcome, ImmutableImageRef};
+use crate::boot_image::ImmutableImageRef;
 use crate::config;
 use crate::host_paths;
 
-/// The record's file name inside the user config directory. A sibling lock file
-/// keeps the write-once check and the save from interleaving.
-const SELECTION_FILE: &str = "default-image.json";
-const LOCK_FILE: &str = "default-image.lock";
+/// The record's file name inside the user config directory. The pin store's
+/// journal publishes the same file, so this is its one spelling.
+pub(crate) const SELECTION_FILE: &str = "default-image.json";
 
 /// One OCI reference plus a schema tag fits in a few hundred bytes; 16 KiB is
 /// bounded and generous, so an oversized file is refused before it is parsed.
 const MAX_SELECTION_FILE_BYTES: u64 = 16 * 1024;
 
-const SELECTION_FILE_MODE: u32 = 0o600;
 const SELECTION_VERSION: u32 = 1;
 
 /// The on-disk schema. `deny_unknown_fields` plus serde's duplicate/missing
@@ -88,30 +81,11 @@ struct SelectionFile {
     image: String,
 }
 
-/// The user config directory and the two files the record uses. A named value
-/// (rather than ambient `$HOME` reads at each call) keeps path construction in
-/// one place and lets tests exercise the same code against a temp directory.
-struct SelectionPaths {
-    directory: PathBuf,
-}
-
-impl SelectionPaths {
-    fn new(directory: PathBuf) -> Self {
-        Self { directory }
-    }
-
-    fn record(&self) -> PathBuf {
-        self.directory.join(SELECTION_FILE)
-    }
-
-    fn lock(&self) -> PathBuf {
-        self.directory.join(LOCK_FILE)
-    }
-}
-
+/// The retained record's path inside the user config directory.
+///
 /// `$HOME/.config/agent-vm`, through the shared `$HOME` discipline. Deliberately
 /// ignores `XDG_CONFIG_HOME`, matching the user config and credential inventory.
-fn selection_paths() -> Result<SelectionPaths> {
+pub(super) fn record_path() -> Result<PathBuf> {
     let home = match config::host_home_dir() {
         Ok(Some(home)) => home,
         Ok(None) => {
@@ -127,15 +101,9 @@ fn selection_paths() -> Result<SelectionPaths> {
             ));
         }
     };
-    Ok(SelectionPaths::new(
-        home.join(config::USER_CONFIG_DIR_RELATIVE),
-    ))
-}
-
-/// The resolved record path, for diagnostics that must name where the retained
-/// selection lives.
-pub(super) fn record_path() -> Result<PathBuf> {
-    Ok(selection_paths()?.record())
+    Ok(home
+        .join(config::USER_CONFIG_DIR_RELATIVE)
+        .join(SELECTION_FILE))
 }
 
 /// The retained default, or `None` when no record exists yet.
@@ -145,11 +113,11 @@ pub(super) fn record_path() -> Result<PathBuf> {
 /// the user's choice (and, on a shared host, could pick a different image than
 /// a concurrent session).
 pub(super) fn load() -> Result<Option<ImmutableImageRef>> {
-    load_from(&selection_paths()?)
+    crate::image_pin::load_default()
 }
 
-/// The image this launcher offers when no record exists. Not persisted here;
-/// [`adopt`] records it only after the content is acquired.
+/// The image this launcher offers when no record exists. Not persisted here:
+/// a default-tier preparation retains it only after the content is acquired.
 pub(super) fn initial_recommendation() -> Result<ImmutableImageRef> {
     #[cfg(debug_assertions)]
     if let Some(raw) = std::env::var_os("AGENT_VM_TEST_DEFAULT_IMAGE") {
@@ -173,172 +141,46 @@ pub(super) fn initial_recommendation() -> Result<ImmutableImageRef> {
         .map_err(|reason| anyhow!("the compiled-in initial recommendation is unusable: {reason}"))
 }
 
-/// Retain `reference` as the user's default. Write-once: a valid record that
-/// already exists is left byte-for-byte untouched, so a second concurrent
-/// adopter (or a launcher whose recommendation changed) cannot overwrite it.
-pub(super) fn adopt(reference: &ImmutableImageRef) -> Result<()> {
-    adopt_to(&selection_paths()?, reference)
+verus! {
+fn selection_bytes_within_limit(bytes: usize) -> (ok: bool)
+    ensures ok == (bytes <= 16 * 1024),
+{ bytes <= 16 * 1024 }
 }
 
-fn adopt_to(paths: &SelectionPaths, reference: &ImmutableImageRef) -> Result<()> {
-    adopt_to_with_checkpoint(paths, reference, || {}).map(|_wrote| ())
-}
-
-/// [`adopt_to`] with a test-only checkpoint between the under-lock recheck and
-/// the save. The checkpoint holds the exclusive lock, so it is the deterministic
-/// point at which a competing adopter must be blocked by `flock`; it exists so
-/// the concurrency test can tell `flock` from its absence without a sleep, a
-/// process-wide pause env, or a timing assumption.
-fn adopt_to_with_checkpoint(
-    paths: &SelectionPaths,
-    reference: &ImmutableImageRef,
-    after_recheck: impl FnOnce(),
-) -> Result<bool> {
-    // Fast path: a valid record already exists, so do no work — not even a
-    // directory or lock. A damaged record still fails closed here.
-    if load_from(paths)?.is_some() {
-        return Ok(false);
+/// Narrow transaction helpers. Callers hold the pin lock before the default
+/// lock; these never recursively enter the coordinated reader.
+pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<ImmutableImageRef> {
+    if !selection_bytes_within_limit(bytes.len()) {
+        return Err(anyhow!("retained default exceeds the size limit"));
     }
-    std::fs::create_dir_all(&paths.directory)
-        .map_err(|_| selection_error(&paths.directory, "could not be created"))?;
-    let lock = open_lock(&paths.lock())?;
-    host_paths::flock_exclusive(&lock)
-        .map_err(|_| selection_error(&paths.lock(), "could not be locked"))?;
-    // First writer wins, even a different reference: the peer that wrote while
-    // this process waited for the lock is the retained default.
-    if load_from(paths)?.is_some() {
-        return Ok(false);
+    let file: SelectionFile =
+        serde_json::from_slice(bytes).map_err(|_| anyhow!("retained default schema is invalid"))?;
+    if file.version != SELECTION_VERSION {
+        return Err(anyhow!("retained default version is unsupported"));
     }
-    after_recheck();
-    let bytes = serialize_v1(reference)
-        .map_err(|_| selection_error(&paths.record(), "could not be encoded for saving"))?;
-    host_paths::atomic_write(&paths.record(), &bytes, SELECTION_FILE_MODE)
-        .map_err(|_| selection_error(&paths.record(), "could not be saved"))?;
-    Ok(true)
+    ImmutableImageRef::parse(&file.image).map_err(|_| anyhow!("retained default digest is invalid"))
 }
 
-/// Explicit publication is separate from ordinary first-writer adoption. Only
-/// upgrade's native acquisition path can produce the success token.
-pub(super) fn replace(acquired: &AcquiredDefaultImage) -> Result<DefaultUpgradeOutcome> {
-    replace_to(&selection_paths()?, acquired)
-}
-
-fn replace_to(
-    paths: &SelectionPaths,
-    acquired: &AcquiredDefaultImage,
-) -> Result<DefaultUpgradeOutcome> {
-    replace_to_with_checkpoint(paths, acquired, || {}, host_paths::atomic_write)
-}
-
-fn replace_to_with_checkpoint(
-    paths: &SelectionPaths,
-    acquired: &AcquiredDefaultImage,
-    after_recheck: impl FnOnce(),
-    save: impl FnOnce(&Path, &[u8], u32) -> Result<()>,
-) -> Result<DefaultUpgradeOutcome> {
-    replace_to_with_lock_checkpoint(paths, acquired, || {}, after_recheck, save)
-}
-
-fn replace_to_with_lock_checkpoint(
-    paths: &SelectionPaths,
-    acquired: &AcquiredDefaultImage,
-    after_lock: impl FnOnce(),
-    after_recheck: impl FnOnce(),
-    save: impl FnOnce(&Path, &[u8], u32) -> Result<()>,
-) -> Result<DefaultUpgradeOutcome> {
-    load_from(paths)?;
-    std::fs::create_dir_all(&paths.directory)
-        .map_err(|_| selection_error(&paths.directory, "could not be created"))?;
-    let lock = open_lock(&paths.lock())?;
-    host_paths::flock_exclusive(&lock)
-        .map_err(|_| selection_error(&paths.lock(), "could not be locked"))?;
-    after_lock();
-    if load_from(paths)?.as_ref() == Some(&acquired.reference) {
-        return Ok(DefaultUpgradeOutcome::Unchanged);
-    }
-    after_recheck();
-    let bytes = serialize_v1(&acquired.reference)
-        .map_err(|_| selection_error(&paths.record(), "could not be encoded for saving"))?;
-    save(&paths.record(), &bytes, SELECTION_FILE_MODE)
-        .map_err(|_| selection_error(&paths.record(), "could not be saved"))?;
-    Ok(DefaultUpgradeOutcome::Changed)
-}
-
-/// Open (creating if needed) the sibling lock file as a regular file, refusing
-/// to follow a final-component symlink. `O_NOFOLLOW` turns the symlink into an
-/// error rather than a stat-then-open race. Every failure is a fixed reason
-/// naming only the escaped lock path.
-fn open_lock(path: &Path) -> Result<File> {
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(|_| selection_error(path, "could not be opened for locking"))?;
-    let stat =
-        rustix::fs::fstat(&fd).map_err(|_| selection_error(path, "could not be examined"))?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        return Err(selection_error(path, "is not a regular file"));
-    }
-    Ok(File::from(fd))
-}
-
-fn load_from(paths: &SelectionPaths) -> Result<Option<ImmutableImageRef>> {
-    load_from_with_checkpoint(paths, || {})
-}
-
-/// [`load_from`] with a test-only checkpoint between the stat-first validation
-/// and the bounded read. The checkpoint deterministically reproduces the
-/// stat-then-open race a concurrent symlink swap creates, without a sleep.
-fn load_from_with_checkpoint(
-    paths: &SelectionPaths,
-    after_stat: impl FnOnce(),
-) -> Result<Option<ImmutableImageRef>> {
-    let path = paths.record();
-    // Stat first so "absent" is a fact, not an inference from a failed open,
-    // and so a symlink/FIFO/directory/oversize file gets a reason rather than a
-    // generic read error.
+pub(crate) fn snapshot_at(directory: &Path) -> Result<Option<Vec<u8>>> {
+    let path = directory.join(SELECTION_FILE);
     match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(selection_error(&path, "could not be examined")),
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(selection_error(&path, "is a symbolic link"));
-            }
-            if !metadata.file_type().is_file() {
-                return Err(selection_error(&path, "is not a regular file"));
-            }
-            if metadata.len() > MAX_SELECTION_FILE_BYTES {
-                return Err(selection_error(
-                    &path,
-                    &format!("is larger than {MAX_SELECTION_FILE_BYTES} bytes"),
-                ));
-            }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(selection_error(&path, "could not be examined")),
+        Ok(_) => {
+            let (bytes, _) =
+                host_paths::read_bounded_regular_file_no_follow(&path, MAX_SELECTION_FILE_BYTES)
+                    .map_err(|_| selection_error(&path, "could not be read"))?;
+            decode_snapshot(&bytes)
+                .map_err(|_| selection_error(&path, "is not a valid version 1 digest record"))?;
+            Ok(Some(bytes))
         }
     }
-    after_stat();
-    // The reader's own error text embeds the path (and its chain embeds it
-    // again, raw), so it is discarded in favour of one fixed reason. The race
-    // here is exactly how a symlink swap can otherwise leak a control-character
-    // `$HOME` into the diagnostic.
-    let (bytes, _facts) =
-        host_paths::read_bounded_regular_file_no_follow(&path, MAX_SELECTION_FILE_BYTES)
-            .map_err(|_| selection_error(&path, "could not be read"))?;
-    let text =
-        std::str::from_utf8(&bytes).map_err(|_| selection_error(&path, "is not valid UTF-8"))?;
-    // serde's error Display is value-bearing for a wrong JSON type, so it is
-    // never formatted into the diagnostic.
-    let file: SelectionFile = serde_json::from_str(text)
-        .map_err(|_| selection_error(&path, "is not the expected JSON schema"))?;
-    if file.version != SELECTION_VERSION {
-        return Err(selection_error(
-            &path,
-            &format!("has an unsupported version, expected {SELECTION_VERSION}"),
-        ));
-    }
-    ImmutableImageRef::parse(&file.image)
-        .map(Some)
-        .map_err(|reason| selection_error(&path, reason))
+}
+
+pub(crate) fn encode_snapshot(reference: &ImmutableImageRef) -> Result<Vec<u8>> {
+    let bytes = serialize_v1(reference)?;
+    decode_snapshot(&bytes)?;
+    Ok(bytes)
 }
 
 fn serialize_v1(reference: &ImmutableImageRef) -> Result<Vec<u8>> {
@@ -369,401 +211,33 @@ fn selection_error(path: &Path, reason: &str) -> anyhow::Error {
 mod tests {
     use super::*;
 
-    fn token(raw: &str) -> AcquiredDefaultImage {
-        AcquiredDefaultImage {
-            reference: parsed(raw),
-        }
-    }
-
-    #[test]
-    fn replacement_initializes_changes_and_preserves_same_pin_bytes() {
-        use std::os::unix::fs::PermissionsExt;
-        let (_dir, paths) = temp_paths();
-        assert_eq!(
-            replace_to(&paths, &token(A)).unwrap(),
-            DefaultUpgradeOutcome::Changed
-        );
-        assert_eq!(
-            replace_to(&paths, &token(B)).unwrap(),
-            DefaultUpgradeOutcome::Changed
-        );
-        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), B);
-        assert_eq!(
-            std::fs::metadata(paths.record())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        let formatted = format!("{{ \"image\": \"{B}\", \"version\": 1 }}");
-        std::fs::write(paths.record(), &formatted).unwrap();
-        assert_eq!(
-            replace_to(&paths, &token(B)).unwrap(),
-            DefaultUpgradeOutcome::Unchanged
-        );
-        assert_eq!(std::fs::read(paths.record()).unwrap(), formatted.as_bytes());
-        adopt_to(&paths, &parsed(A)).unwrap();
-        assert_eq!(std::fs::read(paths.record()).unwrap(), formatted.as_bytes());
-    }
-
-    #[test]
-    fn replacement_failures_preserve_old_record_and_do_not_chain_sources() {
-        let (_dir, paths) = temp_paths();
-        adopt_to(&paths, &parsed(A)).unwrap();
-        let old = std::fs::read(paths.record()).unwrap();
-        let error = replace_to_with_checkpoint(
-            &paths,
-            &token(B),
-            || {},
-            |_, _, _| Err(anyhow!("private source")),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("could not be saved"));
-        assert!(!format!("{error:#}").contains("private source"));
-        assert_eq!(std::fs::read(paths.record()).unwrap(), old);
-        std::fs::remove_file(paths.lock()).unwrap();
-        std::fs::create_dir(paths.lock()).unwrap();
-        assert!(replace_to(&paths, &token(B)).is_err());
-        assert_eq!(std::fs::read(paths.record()).unwrap(), old);
-    }
-
-    #[test]
-    fn replacement_rejects_every_damaged_record_before_writing_a_lock() {
-        for bytes in [
-            b"not json".to_vec(),
-            vec![0xff],
-            vec![b'x'; MAX_SELECTION_FILE_BYTES as usize + 1],
-            format!("{{\"version\":2,\"image\":\"{A}\"}}").into_bytes(),
-        ] {
-            let (_dir, paths) = temp_paths();
-            std::fs::write(paths.record(), &bytes).unwrap();
-            assert!(replace_to(&paths, &token(B)).is_err());
-            assert_eq!(std::fs::read(paths.record()).unwrap(), bytes);
-            assert!(!paths.lock().exists());
-        }
-        for kind in ["symlink", "directory", "fifo"] {
-            let (dir, paths) = temp_paths();
-            match kind {
-                "symlink" => {
-                    std::os::unix::fs::symlink(dir.path().join("absent"), paths.record()).unwrap()
-                }
-                "directory" => std::fs::create_dir(paths.record()).unwrap(),
-                _ => {
-                    use std::os::unix::ffi::OsStrExt;
-                    let path =
-                        std::ffi::CString::new(paths.record().as_os_str().as_bytes()).unwrap();
-                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-                }
-            }
-            assert!(replace_to(&paths, &token(B)).is_err());
-            assert!(std::fs::symlink_metadata(paths.record()).is_ok());
-            assert!(!paths.lock().exists());
-        }
-    }
-
-    #[test]
-    fn replacement_holds_same_flock_and_last_explicit_writer_wins() {
-        use std::sync::{Arc, mpsc};
-        let (_dir, paths) = temp_paths();
-        adopt_to(&paths, &parsed(A)).unwrap();
-        let paths = Arc::new(paths);
-        let (at_tx, at_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let writer_paths = Arc::clone(&paths);
-        let writer = std::thread::spawn(move || {
-            replace_to_with_checkpoint(
-                &writer_paths,
-                &token(B),
-                || {
-                    at_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                },
-                host_paths::atomic_write,
-            )
-        });
-        at_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap();
-        let probe = std::fs::File::open(paths.lock()).unwrap();
-        let locked =
-            rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive);
-        release_tx.send(()).unwrap();
-        writer.join().unwrap().unwrap();
-        assert_eq!(locked, Err(rustix::io::Errno::WOULDBLOCK));
-        adopt_to(&paths, &parsed(A)).unwrap();
-        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), B);
-        replace_to(&paths, &token(C)).unwrap();
-        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), C);
-    }
-
-    #[test]
-    fn concurrent_replacement_readers_never_see_partial_json() {
-        use std::sync::{Arc, Barrier};
-        let (_dir, paths) = temp_paths();
-        adopt_to(&paths, &parsed(A)).unwrap();
-        let paths = Arc::new(paths);
-        let start = Arc::new(Barrier::new(3));
-        std::thread::scope(|scope| {
-            for reference in [A, B] {
-                let paths = Arc::clone(&paths);
-                let start = Arc::clone(&start);
-                scope.spawn(move || {
-                    start.wait();
-                    for _ in 0..100 {
-                        replace_to(&paths, &token(reference)).unwrap();
-                    }
-                });
-            }
-            start.wait();
-            for _ in 0..1000 {
-                assert!([A, B].contains(&load_from(&paths).unwrap().unwrap().as_str()));
-            }
-        });
-    }
-
-    #[test]
-    fn replacement_rechecks_damage_under_lock() {
-        let (_dir, paths) = temp_paths();
-        adopt_to(&paths, &parsed(A)).unwrap();
-        let error = replace_to_with_lock_checkpoint(
-            &paths,
-            &token(B),
-            || {
-                std::fs::write(paths.record(), b"damaged while waiting").unwrap();
-            },
-            || panic!("must reject before saving"),
-            host_paths::atomic_write,
-        )
-        .unwrap_err();
-        assert_safe(&error, &paths.record());
-        assert_eq!(
-            std::fs::read(paths.record()).unwrap(),
-            b"damaged while waiting"
-        );
-    }
-
-    #[test]
-    fn replacement_refuses_symlink_lock_with_escaped_path() {
-        let (dir, _) = temp_paths();
-        let paths = SelectionPaths::new(dir.path().join("unsafe\u{1b}path"));
-        std::fs::create_dir(paths.directory.clone()).unwrap();
-        adopt_to(&paths, &parsed(A)).unwrap();
-        let old = std::fs::read(paths.record()).unwrap();
-        std::fs::remove_file(paths.lock()).unwrap();
-        std::os::unix::fs::symlink(dir.path().join("target"), paths.lock()).unwrap();
-        let error = replace_to(&paths, &token(B)).unwrap_err();
-        assert_safe(&error, &paths.lock());
-        assert_eq!(std::fs::read(paths.record()).unwrap(), old);
-        assert!(!dir.path().join("target").exists());
-    }
-
-    #[test]
-    fn adoption_before_upgrade_is_superseded_not_the_reverse() {
-        use std::sync::{Arc, mpsc};
-        let (_dir, paths) = temp_paths();
-        let paths = Arc::new(paths);
-        let (at_tx, at_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let adopter_paths = Arc::clone(&paths);
-        let adopter = std::thread::spawn(move || {
-            adopt_to_with_checkpoint(&adopter_paths, &parsed(A), || {
-                at_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            })
-        });
-        at_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap();
-        let writer_paths = Arc::clone(&paths);
-        let writer = std::thread::spawn(move || replace_to(&writer_paths, &token(B)));
-        release_tx.send(()).unwrap();
-        adopter.join().unwrap().unwrap();
-        writer.join().unwrap().unwrap();
-        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), B);
-        adopt_to(&paths, &parsed(A)).unwrap();
-        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), B);
-    }
-
     const A: &str =
         "localhost:1/a@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str =
         "localhost:1/b@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const C: &str =
-        "localhost:1/c@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    fn temp_paths() -> (tempfile::TempDir, SelectionPaths) {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = SelectionPaths::new(dir.path().to_path_buf());
-        (dir, paths)
-    }
 
     fn parsed(reference: &str) -> ImmutableImageRef {
-        ImmutableImageRef::parse(reference).unwrap()
+        ImmutableImageRef::parse(reference).expect("the fixture is immutable")
     }
 
-    /// No diagnostic may carry an unsafe source chain: `{error:#}` must equal
-    /// the top-level `{error}` (there is no source), and the raw path bytes must
-    /// not appear (only the escaped form).
-    fn assert_safe(error: &anyhow::Error, path: &Path) {
-        let display = format!("{error}");
-        assert_eq!(
-            format!("{error:#}"),
-            display,
-            "the diagnostic must not chain a source error"
-        );
-        let raw = path.display().to_string();
-        if raw != config::escape_path(path) {
-            assert!(
-                !display.contains(&raw),
-                "the diagnostic leaked the raw path: {display}"
-            );
-        }
-    }
-
+    /// The snapshot helpers are the pin store's only view of this record: a
+    /// complete version 1 file round-trips byte-for-byte, and `None` means the
+    /// file is genuinely absent rather than unreadable.
     #[test]
-    fn absent_record_is_none_and_creates_nothing() {
-        let (_dir, paths) = temp_paths();
-        assert!(load_from(&paths).unwrap().is_none());
-        assert!(!paths.record().exists());
-        assert!(!paths.lock().exists());
+    fn snapshot_round_trips_and_absence_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(snapshot_at(dir.path()).unwrap(), None);
+        let bytes = encode_snapshot(&parsed(A)).unwrap();
+        std::fs::write(dir.path().join(SELECTION_FILE), &bytes).unwrap();
+        assert_eq!(snapshot_at(dir.path()).unwrap().unwrap(), bytes);
+        assert_eq!(decode_snapshot(&bytes).unwrap().as_str(), A);
+        // A hand-formatted but valid record is preserved exactly: formatting is
+        // the user's, not the launcher's.
+        let hand = format!("{{ \"version\" : 1 , \"image\" : \"{A}\" }}\n");
+        std::fs::write(dir.path().join(SELECTION_FILE), &hand).unwrap();
+        assert_eq!(snapshot_at(dir.path()).unwrap().unwrap(), hand.into_bytes());
     }
 
-    #[test]
-    fn adopt_round_trips_and_writes_a_complete_v1_record() {
-        let (_dir, paths) = temp_paths();
-        adopt_to(&paths, &parsed(A)).unwrap();
-        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), A);
-        let bytes = std::fs::read(paths.record()).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<SelectionFile>(&bytes)
-                .unwrap()
-                .version,
-            1
-        );
-        assert!(bytes.ends_with(b"\n"));
-    }
-
-    /// A retained record is immutable: a different recommendation must never
-    /// overwrite it, whether the peer adopts before, after or concurrently.
-    #[test]
-    fn adopt_is_first_writer_wins() {
-        let (_dir, paths) = temp_paths();
-        adopt_to(&paths, &parsed(A)).unwrap();
-        let before = std::fs::read(paths.record()).unwrap();
-        adopt_to(&paths, &parsed(B)).unwrap();
-        assert_eq!(std::fs::read(paths.record()).unwrap(), before);
-        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), A);
-    }
-
-    /// An existing valid record is a no-op *before* any directory/lock work:
-    /// with the record stored read-only (and with no writable config directory
-    /// needed), adoption must still succeed and must not create the lock.
-    #[test]
-    fn adopt_with_an_existing_record_does_no_work() {
-        let (dir, paths) = temp_paths();
-        std::fs::create_dir_all(&paths.directory).unwrap();
-        std::fs::write(
-            paths.record(),
-            format!("{{\"version\":1,\"image\":\"{A}\"}}\n"),
-        )
-        .unwrap();
-        std::fs::remove_file(paths.lock()).ok();
-        adopt_to(&paths, &parsed(B)).unwrap();
-        assert!(
-            !paths.lock().exists(),
-            "an existing valid record must not require or create the lock"
-        );
-        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), A);
-        drop(dir);
-    }
-
-    /// Deterministic proof that the adopter holds the exclusive `flock` across
-    /// the under-lock recheck: thread A pauses at the checkpoint (inside the
-    /// critical section); an **independently opened descriptor** on the same
-    /// lock file must fail a non-blocking exclusive lock with `WOULDBLOCK`.
-    /// Removing `flock` makes the probe succeed, so the test fails without any
-    /// timing window. A always releases in bounded time.
-    #[test]
-    fn adopt_holds_the_exclusive_lock_across_the_recheck() {
-        use std::sync::mpsc;
-
-        let (_dir, paths) = temp_paths();
-        let paths = std::sync::Arc::new(paths);
-        let (at_checkpoint_tx, at_checkpoint_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-
-        let a = {
-            let paths = std::sync::Arc::clone(&paths);
-            std::thread::spawn(move || {
-                adopt_to_with_checkpoint(&paths, &parsed(A), || {
-                    at_checkpoint_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                })
-            })
-        };
-        at_checkpoint_rx.recv().unwrap();
-
-        // The independent descriptor must not be able to take the lock A holds.
-        let probe = std::fs::File::open(paths.lock()).unwrap();
-        let probe_result =
-            rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive);
-        // Always release A before asserting/joining, so a failing assertion
-        // cannot leave the helper thread blocked.
-        release_tx.send(()).unwrap();
-        let a_wrote = a.join().unwrap().unwrap();
-
-        assert_eq!(
-            probe_result,
-            Err(rustix::io::Errno::WOULDBLOCK),
-            "the adopter held no exclusive lock across the recheck"
-        );
-        assert!(a_wrote, "the first writer must save");
-        assert_eq!(load_from(&paths).unwrap().unwrap().as_str(), A);
-    }
-
-    /// The under-lock recheck's first-writer property: concurrent first adopters
-    /// serialize on the lock, so exactly one of them saves and the surviving
-    /// record is that writer's. (Missing-`flock` discrimination is the job of
-    /// `adopt_holds_the_exclusive_lock_across_the_recheck`, which has no timing
-    /// assumption.)
-    #[test]
-    fn concurrent_first_adoption_keeps_exactly_one_record() {
-        use std::sync::{Arc, Barrier};
-
-        let (_dir, paths) = temp_paths();
-        let paths = Arc::new(paths);
-        let start = Arc::new(Barrier::new(3));
-        let handles: Vec<_> = [A, B, C]
-            .into_iter()
-            .map(|reference| {
-                let paths = Arc::clone(&paths);
-                let start = Arc::clone(&start);
-                std::thread::spawn(move || {
-                    start.wait();
-                    adopt_to_with_checkpoint(&paths, &parsed(reference), || {})
-                })
-            })
-            .collect();
-        let writes: Vec<bool> = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap().unwrap())
-            .collect();
-        assert_eq!(
-            writes.iter().filter(|wrote| **wrote).count(),
-            1,
-            "exactly one adopter must save: {writes:?}"
-        );
-        let retained = load_from(&paths)
-            .unwrap()
-            .expect("exactly one adopter must have written");
-        assert!(
-            [A, B, C].contains(&retained.as_str()),
-            "the surviving record must be the writer's: {}",
-            retained.as_str()
-        );
-    }
-
-    /// Every rejection is a hard error, and the original bytes are untouched.
     #[test]
     fn invalid_records_fail_closed_without_repair() {
         let cases: [(&str, &str); 11] = [
@@ -798,101 +272,54 @@ mod tests {
             ),
         ];
         for (contents, label) in cases {
-            let (_dir, paths) = temp_paths();
-            std::fs::write(paths.record(), contents).unwrap();
-            let error = load_from(&paths).expect_err(label);
+            let error = decode_snapshot(contents.as_bytes()).expect_err(label);
             assert!(
                 !format!("{error:#}").contains(contents) || contents.is_empty(),
                 "{label}: the diagnostic echoed the record bytes"
             );
-            assert_safe(&error, &paths.record());
-            assert_eq!(std::fs::read(paths.record()).unwrap(), contents.as_bytes());
         }
+        assert!(decode_snapshot(&vec![b' '; 16 * 1024 + 1]).is_err());
+        assert!(decode_snapshot(b"\xff\xfe").is_err());
     }
 
+    /// A record path that is a symlink, a directory or an oversized file is a
+    /// hard error naming only the escaped path — never a silent reset.
+    #[cfg(unix)]
     #[test]
-    fn non_utf8_short_digest_and_oversize_are_rejected() {
-        let (_dir, paths) = temp_paths();
-        std::fs::write(paths.record(), b"\xff\xfe").unwrap();
-        assert!(load_from(&paths).is_err());
+    fn damaged_record_paths_fail_closed_with_an_escaped_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        std::fs::write(&target, "{}").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(SELECTION_FILE)).unwrap();
+        let error = snapshot_at(dir.path()).expect_err("a symlink record must fail");
+        assert!(!format!("{error:#}").contains('\u{1b}'));
 
-        let (_dir, paths) = temp_paths();
-        std::fs::write(
-            paths.record(),
-            r#"{"version":1,"image":"localhost:1/a@sha256:00ff"}"#,
-        )
-        .unwrap();
-        assert!(load_from(&paths).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(SELECTION_FILE)).unwrap();
+        assert!(snapshot_at(dir.path()).is_err());
 
-        let (_dir, paths) = temp_paths();
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            paths.record(),
+            dir.path().join(SELECTION_FILE),
             vec![b' '; MAX_SELECTION_FILE_BYTES as usize + 1],
         )
         .unwrap();
-        assert!(load_from(&paths).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_and_directory_records_are_rejected() {
-        let (dir, paths) = temp_paths();
-        let target = dir.path().join("target.json");
-        std::fs::write(&target, "{}").unwrap();
-        std::os::unix::fs::symlink(&target, paths.record()).unwrap();
-        assert!(load_from(&paths).is_err());
-
-        let (dir, paths) = temp_paths();
-        std::fs::create_dir(paths.record()).unwrap();
-        assert!(load_from(&paths).is_err());
-        drop(dir);
-    }
-
-    /// A valid, hand-formatted record must not be rewritten just to normalize
-    /// it: formatting is the user's, not the launcher's.
-    #[test]
-    fn a_valid_record_is_never_rewritten_by_adoption() {
-        let (_dir, paths) = temp_paths();
-        let hand = format!("{{ \"version\" : 1 , \"image\" : \"{A}\" }}\n");
-        std::fs::write(paths.record(), &hand).unwrap();
-        adopt_to(&paths, &parsed(B)).unwrap();
-        assert_eq!(std::fs::read_to_string(paths.record()).unwrap(), hand);
-    }
-
-    /// A save that fails after the under-lock recheck (the record path becomes a
-    /// directory between the check and the rename) must fail loudly with a safe
-    /// reason, not pretend to retain and not leak the raw path or a source chain.
-    #[test]
-    fn adoption_save_failure_is_a_safe_fixed_reason() {
-        let (_dir, paths) = temp_paths();
-        let record = paths.record();
-        let error = adopt_to_with_checkpoint(&paths, &parsed(A), || {
-            std::fs::create_dir(&record).unwrap();
-        })
-        .expect_err("a save that cannot replace the record must fail");
-        let message = format!("{error}");
-        assert!(
-            message.contains("could not be saved"),
-            "the reason must be fixed and closed: {message}"
-        );
-        assert_safe(&error, &record);
+        assert!(snapshot_at(dir.path()).is_err());
     }
 
     /// A control-character `$HOME` (hence record path) must never reach the
-    /// diagnostic raw. The record is a symlink here, exercising the stat-first
-    /// branch; the ESC in the path must be escaped.
+    /// diagnostic raw.
     #[cfg(unix)]
     #[test]
     fn a_control_character_path_is_escaped_not_raw() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home-\u{1b}[31m");
-        let paths = SelectionPaths::new(home.join(".config/agent-vm"));
-        std::fs::create_dir_all(&paths.directory).unwrap();
+        let config = dir.path().join("home-\u{1b}[31m").join("agent-vm");
+        std::fs::create_dir_all(&config).unwrap();
         let target = dir.path().join("target.json");
         std::fs::write(&target, "{}").unwrap();
-        std::os::unix::fs::symlink(&target, paths.record()).unwrap();
+        std::os::unix::fs::symlink(&target, config.join(SELECTION_FILE)).unwrap();
 
-        let error = load_from(&paths).expect_err("a symlink record must fail");
+        let error = snapshot_at(&config).expect_err("a symlink record must fail");
         let display = format!("{error}");
         assert!(
             !display.contains('\u{1b}'),
@@ -902,49 +329,11 @@ mod tests {
             display.contains("\\x1b"),
             "the path must be escaped, not dropped: {display:?}"
         );
-        assert_safe(&error, &paths.record());
-    }
-
-    /// A symlink swapped in *after* the stat-first validation reaches the
-    /// no-follow reader, whose `ELOOP` guard embeds `path.display()` raw. With a
-    /// control-character `$HOME`, that must still be a fixed reason — never the
-    /// raw ESC of the record path or a source chain.
-    #[cfg(unix)]
-    #[test]
-    fn a_symlink_swapped_after_the_stat_is_a_safe_fixed_reason() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home-\u{1b}[31m");
-        let paths = SelectionPaths::new(home.join(".config/agent-vm"));
-        std::fs::create_dir_all(&paths.directory).unwrap();
-        std::fs::write(paths.record(), "{}").unwrap();
-        let target = dir.path().join("target.json");
-        std::fs::write(&target, "{}").unwrap();
-
-        let error = load_from_with_checkpoint(&paths, || {
-            std::fs::remove_file(paths.record()).unwrap();
-            std::os::unix::fs::symlink(&target, paths.record()).unwrap();
-        })
-        .expect_err("a symlink swapped in after the stat must be refused");
-        let display = format!("{error}");
-        assert!(
-            !display.contains('\u{1b}'),
-            "the raw ESC reached the diagnostic: {display:?}"
+        assert_eq!(
+            decode_snapshot(&encode_snapshot(&parsed(B)).unwrap())
+                .unwrap()
+                .as_str(),
+            B
         );
-        assert!(
-            display.contains("could not be read"),
-            "the reason must be fixed: {display:?}"
-        );
-        assert_safe(&error, &paths.record());
-    }
-
-    #[test]
-    fn a_final_component_symlink_lock_is_refused() {
-        let (dir, paths) = temp_paths();
-        std::fs::create_dir_all(&paths.directory).unwrap();
-        let elsewhere = dir.path().join("elsewhere.lock");
-        std::fs::write(&elsewhere, b"").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, paths.lock()).unwrap();
-        let error = open_lock(&paths.lock()).expect_err("a symlink lock must be refused");
-        assert_safe(&error, &paths.lock());
     }
 }

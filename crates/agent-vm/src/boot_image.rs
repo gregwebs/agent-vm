@@ -74,19 +74,8 @@ use vstd::prelude::*;
 
 use crate::config::ConfiguredImages;
 
-mod default_selection;
+pub(crate) mod default_selection;
 pub(crate) mod upgrade;
-
-/// Native acquisition and host-platform validation must precede publication.
-pub(crate) struct AcquiredDefaultImage {
-    reference: ImmutableImageRef,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DefaultUpgradeOutcome {
-    Changed,
-    Unchanged,
-}
 
 /// A boot-image reference, validated at its boundary.
 ///
@@ -678,25 +667,6 @@ fn render_inspection(selected: &BootImage) -> Result<String> {
         report.push_str(&format!("File: {}\n", crate::config::escape_path(file)));
     }
     Ok(report)
-}
-
-/// Record the selected default image as the user's retained default.
-///
-/// A no-op unless `image` came from the default tier, and a first-writer-wins
-/// no-op inside [`default_selection::adopt`] when a valid record already
-/// exists. Callers invoke this **after** the image content is acquired:
-/// retaining a reference whose bytes were never obtained would strand the user
-/// on an unbootable default.
-pub(crate) fn adopt_default_selection(image: &BootImage) -> Result<()> {
-    if !image.is_default() {
-        return Ok(());
-    }
-    // Only the default tier reaches here, and [`default_slot`] produced its
-    // reference through [`ImmutableImageRef::parse`]; a rejection is an
-    // internal invariant break, not user input.
-    let reference = ImmutableImageRef::parse(image.reference().as_str())
-        .map_err(|reason| anyhow::anyhow!("selected default image cannot be retained: {reason}"))?;
-    default_selection::adopt(&reference)
 }
 
 /// One read-only snapshot of the default slot, for diagnostics.
@@ -1297,6 +1267,21 @@ mod tests {
     }
 
     /// `ConfiguredImages`/`ConfiguredImage` need a public path to file for the
+    /// Seed the physical retained-default record the coordinated reader observes,
+    /// so these selection tests need no approval store of their own.
+    fn retain(home: &Path, reference: &str) {
+        let directory = home.join(crate::config::USER_CONFIG_DIR_RELATIVE);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("default-image.json"),
+            super::default_selection::encode_snapshot(
+                &ImmutableImageRef::parse(reference).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     /// doctor section: the source must name the declaring file.
     #[test]
     fn user_tier_names_its_file_in_the_source() {
@@ -1325,7 +1310,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         env.set_var("HOME", home.path());
         env.set_var("AGENT_VM_TEST_DEFAULT_IMAGE", B);
-        super::default_selection::adopt(&ImmutableImageRef::parse(A).unwrap()).unwrap();
+        retain(home.path(), A);
 
         let empty = ConfiguredImages::for_test(ImageTierFixture {
             user: None,
@@ -1366,12 +1351,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         env.set_var("HOME", home.path());
         env.set_var("AGENT_VM_TEST_DEFAULT_IMAGE", B);
-        super::default_selection::adopt(&ImmutableImageRef::parse(A).unwrap()).unwrap();
-
-        super::default_selection::replace(&AcquiredDefaultImage {
-            reference: ImmutableImageRef::parse(B).unwrap(),
-        })
-        .unwrap();
+        // A retained default that already names B: the selection must hand the
+        // SDK exactly that digest, not the recommendation the seam offers.
+        retain(home.path(), B);
         let empty = ConfiguredImages::for_test(ImageTierFixture {
             user: None,
             project: None,
@@ -1395,6 +1377,7 @@ mod tests {
             serde_json::json!(B),
             "the SDK config must carry the retained digest"
         );
+        assert!(boot.reference().as_str() != A);
     }
 
     #[test]

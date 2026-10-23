@@ -122,7 +122,7 @@ use rustix::fs::{FileType, Mode, OFlags};
 use std::path::Path;
 use vstd::prelude::*;
 
-use crate::boot_image::{ImageLabel, ImmutableImageRef};
+use crate::boot_image::ImageLabel;
 use crate::host_paths::{FlockAttempt, FlockMode};
 use receipt::RECEIPT_REPAIR_GUIDANCE;
 
@@ -131,7 +131,7 @@ mod receipt;
 mod reference;
 
 pub(crate) use barrier::{BarrierError, PublicationBarrier};
-pub(crate) use receipt::{ContentIdentity, SourceBinding};
+pub(crate) use receipt::{ContentIdentity, SourceBinding, is_printable_variant_byte};
 use receipt::{MergedBinding, Receipt, ReceiptError};
 pub(crate) use reference::{
     CanonicalOciReference, OciTarget, OciTargetError, PinnedReference, ValidatedDigest,
@@ -223,29 +223,17 @@ pub(crate) struct ValidatedImage {
 }
 
 impl ValidatedImage {
-    /// The approved-content reference for this acquisition: canonical
-    /// `repo@<acquired digest>`.
-    ///
-    /// A `PinnedReference` is already canonical, so this parse re-measures an
-    /// identity this module minted; it is reported rather than assumed.
-    pub(crate) fn immutable_reference(&self) -> Result<ImmutableImageRef, AcquireError> {
-        ImmutableImageRef::parse(&self.acquired.whole()).map_err(|_| AcquireError::Identity)
-    }
-
-    /// The acquired immutable digest, measured strict at mint time.
+    /// The acquired identity: the measured native manifest digest, which is what
+    /// an approval pins and what a cache rebuild reacquires.
     pub(crate) fn acquired_digest(&self) -> &ValidatedDigest {
         self.acquired.digest()
     }
 
-    // These accessors support the future approval-store consumer; each is
-    // exercised by this module's tests.
-    #[allow(dead_code)]
     /// The guest environment from these exact validated bytes.
     pub(crate) fn image_env(&self) -> &[String] {
         &self.metadata.config.env
     }
 
-    #[allow(dead_code)]
     /// The canonical selected source (a tag or a stated digest).
     pub(crate) fn source(&self) -> &CanonicalOciReference {
         &self.source
@@ -257,22 +245,10 @@ impl ValidatedImage {
         &self.source_text
     }
 
-    #[allow(dead_code)]
-    /// The source's stated immutable digest, when it named one.
-    pub(crate) fn stated_digest(&self) -> Option<&ValidatedDigest> {
-        self.source.digest()
-    }
-
-    #[allow(dead_code)]
-    /// The source→acquired binding this acquisition proved.
-    pub(crate) fn source_binding(&self) -> SourceBinding {
-        SourceBinding::of(&self.source)
-    }
-
-    #[allow(dead_code)]
     /// The verified guest content identity: config digest plus ordered layer
-    /// diff IDs. Approval equivalence in the follow-on work compares this, not
-    /// manifest bytes.
+    /// diff IDs. Approval equivalence compares this, not manifest bytes, so an
+    /// alternate digest algorithm or unrelated index movement cannot demand a
+    /// replacement.
     pub(crate) fn content_identity(&self) -> ContentIdentity {
         ContentIdentity::of(&self.metadata)
     }
@@ -332,14 +308,15 @@ impl AcquireStage {
     }
 }
 
-/// Why a present cached entry cannot back a launch.
+/// Why a present cached entry cannot back this selection.
+///
+/// An incomplete entry, or one whose content is not the identity an immutable
+/// selection states, is a *miss* that the cache-first policy then reacquires —
+/// by the stated digest, never by a tag. A contradiction with a preserved
+/// receipt is different: it means the cache no longer accounts for content a
+/// later launch might boot, so it is a closed hard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CachedEntryError {
-    /// The entry exists but is not a complete, self-consistent host image.
-    Incomplete,
-    /// The entry's content is not the immutable identity the selection states
-    /// and no validated receipt proves the association.
-    Association,
     /// A preserved receipt exists for this content and the entry now
     /// contradicts it. Content consistency is never relaxed, not even for a
     /// launch that merely consumes the cache.
@@ -349,12 +326,6 @@ pub(crate) enum CachedEntryError {
 impl CachedEntryError {
     fn describe(self) -> &'static str {
         match self {
-            Self::Incomplete => {
-                "the cached image entry for this selection is incomplete or does not match its own metadata; re-acquire the image (for example with `agent-vm image refresh`) or remove the cache entry before launching"
-            }
-            Self::Association => {
-                "the cached image is not the immutable identity this selection states; re-acquire the image before launching"
-            }
             Self::Conflict => {
                 "the cached image contradicts its preserved content identity; repair or remove the cache entry (for example with `agent-vm image refresh`) before launching"
             }
@@ -566,21 +537,6 @@ impl AcquireError {
     }
 }
 
-impl AcquireError {
-    /// Render for a selection whose label may be redacted.
-    ///
-    /// The default tier gets the closed reason only; an explicit selection keeps
-    /// its native/validation cause chain. Callers never choose between the two
-    /// renderings themselves, so no caller can widen a redacted one by accident.
-    pub(crate) fn for_label(self, label: &ImageLabel) -> anyhow::Error {
-        if label.is_redacted() {
-            anyhow!(self.redacted_message())
-        } else {
-            self.into_explicit_error()
-        }
-    }
-}
-
 impl PlatformRejection {
     fn describe(self) -> &'static str {
         match self {
@@ -659,8 +615,10 @@ enum CacheLookup {
     Hit(Box<CachedImageMetadata>),
     /// No entry under the canonical or the pre-canonical key.
     Absent,
-    /// A present entry that cannot back this selection.
-    Unusable(CachedEntryError),
+    /// A present entry that cannot back this selection. The reason stays on
+    /// [`CanonicalPublication`], where it decides whether a peer's publication
+    /// can be reused; a cache-first *read* only needs to know it is a miss.
+    Unusable,
 }
 
 /// Whether a digest selection had to republish its own child key.
@@ -681,7 +639,7 @@ enum CanonicalPublication {
     /// A peer published that key first; this is the peer's validated entry.
     Concurrent(Box<CachedImageMetadata>),
     /// A peer's entry is under the canonical key but cannot back this selection.
-    Unusable(CachedEntryError),
+    Unusable,
 }
 
 /// One native cache for a single registry host.
@@ -788,27 +746,7 @@ impl NativeAcquisition {
     ) -> Result<Option<ValidatedImage>, AcquireError> {
         match self.lookup(target, policy).await? {
             CacheLookup::Hit(metadata) => Ok(Some(self.validated(target, *metadata)?)),
-            CacheLookup::Absent | CacheLookup::Unusable(_) => Ok(None),
-        }
-    }
-
-    /// [`Self::cached`] for a launcher: the same lookup, but a *present* entry
-    /// that cannot back this selection is a closed failure rather than a miss.
-    ///
-    /// The launcher hands the SDK an `IfMissing` create. Treating an unusable
-    /// entry as a miss would let that create re-resolve the reference and
-    /// replace content the cache was supposed to describe, unvalidated and
-    /// possibly moved. An absent entry is still a miss: this stage deliberately
-    /// does not acquire from a registry.
-    async fn cached_documented(
-        &self,
-        target: &OciTarget,
-        policy: AssociationPolicy,
-    ) -> Result<Option<ValidatedImage>, AcquireError> {
-        match self.lookup(target, policy).await? {
-            CacheLookup::Hit(metadata) => Ok(Some(self.validated(target, *metadata)?)),
-            CacheLookup::Absent => Ok(None),
-            CacheLookup::Unusable(reason) => Err(AcquireError::CachedEntry(reason)),
+            CacheLookup::Absent | CacheLookup::Unusable => Ok(None),
         }
     }
 
@@ -831,7 +769,7 @@ impl NativeAcquisition {
         let canonical_path = self.cache.image_metadata_path(canonical.reference());
         let canonical_guard = ReferenceGuard::acquire_quiet(&canonical_path).await?;
         if self.repair_child_key(canonical).await? == Repair::Incomplete {
-            return Ok(CacheLookup::Unusable(CachedEntryError::Incomplete));
+            return Ok(CacheLookup::Unusable);
         }
         let canonical_present = canonical_path.exists();
         let canonical_cached = self.cached_complete(canonical.reference())?;
@@ -839,7 +777,7 @@ impl NativeAcquisition {
         match canonical_cached {
             Some(metadata) => {
                 if !self.association_accepted(target, &metadata, policy)? {
-                    return Ok(CacheLookup::Unusable(CachedEntryError::Association));
+                    return Ok(CacheLookup::Unusable);
                 }
                 gate::detail(gate::Stage::CacheValidated).map_err(AcquireError::TestGate)?;
                 self.preserve(target, &metadata, Preservation::ValidatedCache)
@@ -847,7 +785,7 @@ impl NativeAcquisition {
                 return Ok(CacheLookup::Hit(Box::new(metadata)));
             }
             None if canonical_present => {
-                return Ok(CacheLookup::Unusable(CachedEntryError::Incomplete));
+                return Ok(CacheLookup::Unusable);
             }
             None => {}
         }
@@ -868,13 +806,13 @@ impl NativeAcquisition {
         drop(guard);
         let Some(metadata) = metadata else {
             return Ok(if present {
-                CacheLookup::Unusable(CachedEntryError::Incomplete)
+                CacheLookup::Unusable
             } else {
                 CacheLookup::Absent
             });
         };
         if !self.association_accepted(target, &metadata, policy)? {
-            return Ok(CacheLookup::Unusable(CachedEntryError::Association));
+            return Ok(CacheLookup::Unusable);
         }
         gate::detail(gate::Stage::CacheValidated).map_err(AcquireError::TestGate)?;
         self.preserve(target, &metadata, Preservation::ValidatedCache)
@@ -885,7 +823,7 @@ impl NativeAcquisition {
         {
             CanonicalPublication::Published => Ok(CacheLookup::Hit(Box::new(metadata))),
             CanonicalPublication::Concurrent(metadata) => Ok(CacheLookup::Hit(metadata)),
-            CanonicalPublication::Unusable(reason) => Ok(CacheLookup::Unusable(reason)),
+            CanonicalPublication::Unusable => Ok(CacheLookup::Unusable),
         }
     }
 
@@ -950,12 +888,12 @@ impl NativeAcquisition {
                 return Ok(if self.association_accepted(target, &published, policy)? {
                     CanonicalPublication::Concurrent(Box::new(published))
                 } else {
-                    CanonicalPublication::Unusable(CachedEntryError::Association)
+                    CanonicalPublication::Unusable
                 });
             }
             None if path.exists() => {
                 drop(guard);
-                return Ok(CanonicalPublication::Unusable(CachedEntryError::Incomplete));
+                return Ok(CanonicalPublication::Unusable);
             }
             None => {}
         }
@@ -1322,56 +1260,6 @@ pub(crate) async fn acquire(
     })
 }
 
-/// A launch's validated view of the native cache.
-///
-/// The image is present only when a complete, identity-consistent,
-/// host-platform entry was found. The shared barrier is held either way: on a
-/// hit it covers the SDK's consumption of the validated bytes, and on a miss it
-/// covers the create's own `IfMissing` acquisition.
-pub(crate) struct PreparedLaunch {
-    image: Option<ValidatedImage>,
-    _barrier: PublicationBarrier,
-}
-
-impl PreparedLaunch {
-    /// The validated cached entry, when one was present and usable.
-    pub(crate) fn image(&self) -> Option<&ValidatedImage> {
-        self.image.as_ref()
-    }
-}
-
-/// Validate the cached entry a launch is about to consume, under the shared
-/// publication barrier the create needs anyway.
-///
-/// This deliberately does not acquire from a registry: a cold launch still
-/// reaches the SDK's `IfMissing` create, which is today's behaviour. What it
-/// does add is that a *warm* launch consumes bytes this module measured — and
-/// republishes an old-spelling entry under the canonical key instead of letting
-/// the SDK miss and re-resolve it. It consumes under
-/// [`AssociationPolicy::Consume`]: the entry it validates is the entry the SDK
-/// boots, so an unprovable source→child association must not turn a warm launch
-/// that works today into a failure.
-pub(crate) async fn prepare_cached(target: &OciTarget) -> Result<PreparedLaunch, AcquireError> {
-    let acquisition = NativeAcquisition::open(target).await?;
-    let barrier = PublicationBarrier::shared(acquisition.cache_dir())
-        .await
-        .map_err(AcquireError::Barrier)?;
-    let image = acquisition
-        .cached_documented(target, AssociationPolicy::Consume)
-        .await?;
-    Ok(PreparedLaunch {
-        image,
-        _barrier: barrier,
-    })
-}
-
-impl std::fmt::Debug for PreparedLaunch {
-    /// Never renders the reference: a launch target can name a private registry.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("PreparedLaunch(<redacted reference>)")
-    }
-}
-
 /// The previous bytes of a reference's metadata, read under the guard.
 enum PriorMetadata {
     Present(Vec<u8>),
@@ -1550,9 +1438,12 @@ struct ConfigPlatform {
 /// manifest's config, and `PullResult.config` omits the OS/architecture facts,
 /// so the complete cached metadata's raw JSON is the input here.
 fn check_host_platform(raw_config: &str) -> Result<(), PlatformRejection> {
+    check_platform(raw_config, &Platform::host_linux())
+}
+
+fn check_platform(raw_config: &str, host: &Platform) -> Result<(), PlatformRejection> {
     let config: ConfigPlatform =
         serde_json::from_str(raw_config).map_err(|_| PlatformRejection::InvalidMetadata)?;
-    let host = Platform::host_linux();
     if !acquired_platform_is_acceptable(PlatformFacts {
         os_matches: config.os == host.os.to_string(),
         arch_matches: config.architecture == host.arch.to_string(),
@@ -1783,6 +1674,15 @@ mod tests {
                 check_host_platform(&serde_json::json!({"os":os,"architecture":arch}).to_string()),
                 Err(PlatformRejection::HostMismatch)
             );
+        }
+    }
+
+    #[test]
+    fn required_variant_is_checked_by_the_acquisition_adapter() {
+        let host = Platform::with_variant("linux", "arm64", "v8");
+        for (variant, accepted) in [(None, false), (Some("v7"), false), (Some("v8"), true)] {
+            let raw = serde_json::json!({"os":"linux", "architecture":"arm64", "variant":variant});
+            assert_eq!(check_platform(&raw.to_string(), &host).is_ok(), accepted);
         }
     }
 
@@ -2091,15 +1991,18 @@ mod tests {
             .unwrap();
         assert_eq!(image.source().whole(), "localhost:5000/a:Tag");
         assert_eq!(image.source_text(), "localhost:5000/a:Tag");
-        assert!(image.stated_digest().is_none());
+        assert!(image.source().digest().is_none());
         assert_eq!(image.acquired_digest().as_str(), digest);
         assert_eq!(image.image_env(), ["FROM_BYTES=1".to_string()]);
         assert_eq!(
-            image.immutable_reference().unwrap().as_str(),
+            image
+                .source()
+                .with_digest(&image.acquired_digest().clone())
+                .unwrap()
+                .whole(),
             format!("localhost:5000/a@{digest}")
         );
         assert_eq!(image.content_identity().diff_ids.len(), 1);
-        assert_eq!(image.source_binding(), SourceBinding::of(image.source()));
         let rendered = format!("{image:?}");
         assert!(!rendered.contains("localhost"));
         assert!(!rendered.contains(&digest));
@@ -2178,11 +2081,11 @@ mod tests {
         }
     }
 
-    /// A present but unusable entry is a closed failure for a launch, not a
-    /// miss: a miss would let the SDK re-resolve the reference unvalidated. Both
-    /// policies agree here — completeness is not an association claim.
+    /// A present entry that cannot back the selection is a *miss* for the
+    /// cache-first policy, which then reacquires the stated digest — never a tag.
+    /// The one closed failure is a contradiction with a preserved receipt.
     #[tokio::test]
-    async fn a_present_but_incomplete_entry_fails_a_launch_closed() {
+    async fn a_present_but_incomplete_entry_is_a_cache_miss() {
         let directory = tempfile::tempdir().unwrap();
         let acquisition = fixture_acquisition(directory.path());
         let digest = format!("sha256:{}", "a".repeat(64));
@@ -2191,23 +2094,22 @@ mod tests {
         let metadata_path = acquisition.cache.image_metadata_path(target.reference());
         std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
         std::fs::write(&metadata_path, b"{}").unwrap();
-        for policy in [AssociationPolicy::Consume, AssociationPolicy::RequireProof] {
-            assert!(
-                matches!(
-                    acquisition.cached_documented(&target, policy).await,
-                    Err(AcquireError::CachedEntry(CachedEntryError::Incomplete))
-                ),
-                "{policy:?}: an incomplete entry is closed, not a miss"
-            );
-        }
-        let rendered = AcquireError::CachedEntry(CachedEntryError::Incomplete).redacted_message();
+        assert!(
+            acquisition
+                .cached(&target, AssociationPolicy::RequireProof)
+                .await
+                .unwrap()
+                .is_none(),
+            "an unusable entry must be a miss so the digest is reacquired"
+        );
+        let rendered = AcquireError::CachedEntry(CachedEntryError::Conflict).redacted_message();
         assert!(!rendered.contains("localhost"), "{rendered}");
         assert!(!rendered.contains(&digest), "{rendered}");
-        // An absent entry is still a miss.
+        // An absent entry is a miss too.
         std::fs::remove_file(&metadata_path).unwrap();
         assert!(
             acquisition
-                .cached_documented(&target, AssociationPolicy::Consume)
+                .cached(&target, AssociationPolicy::RequireProof)
                 .await
                 .unwrap()
                 .is_none(),
@@ -2216,9 +2118,8 @@ mod tests {
     }
 
     /// Only the cache-first acquisition mode reads the cache here, and it is the
-    /// one that establishes content, so it keeps the strict rule. A launch is not
-    /// an acquisition: `prepare_cached` consumes instead (proved end to end by
-    /// `config_launch_driven`'s warm index launch).
+    /// one that establishes content, so it keeps the strict association rule.
+    /// A deliberate resolution never short-circuits on cache contents.
     #[test]
     fn only_the_establishing_mode_reads_the_cache_strictly() {
         assert_eq!(
