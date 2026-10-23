@@ -26,34 +26,55 @@ use std::time::Duration;
 /// One checkpoint the production acquisition routine reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquisitionStage {
+    PublicationContended,
     BeforeLock,
     LockContended,
     Snapshot,
+    CacheHit,
+    CacheValidated,
     NativeOk,
+    CanonicalReadback,
+    Receipt,
     BeforeRestore,
     AfterRestore,
+    BeforeSdkConsume,
+    CreateReturned,
 }
 
 impl AcquisitionStage {
     fn wire(self) -> &'static str {
         match self {
+            Self::PublicationContended => "publication-contended",
             Self::BeforeLock => "before-lock",
             Self::LockContended => "lock-contended",
             Self::Snapshot => "snapshot",
+            Self::CacheHit => "cache-hit",
+            Self::CacheValidated => "cache-validated",
             Self::NativeOk => "native-ok",
+            Self::CanonicalReadback => "canonical-readback",
+            Self::Receipt => "receipt",
             Self::BeforeRestore => "before-restore",
             Self::AfterRestore => "after-restore",
+            Self::BeforeSdkConsume => "before-sdk-consume",
+            Self::CreateReturned => "create-returned",
         }
     }
 
     fn parse(text: &str) -> Option<Self> {
         [
+            Self::PublicationContended,
             Self::BeforeLock,
             Self::LockContended,
             Self::Snapshot,
+            Self::CacheHit,
+            Self::CacheValidated,
             Self::NativeOk,
+            Self::CanonicalReadback,
+            Self::Receipt,
             Self::BeforeRestore,
             Self::AfterRestore,
+            Self::BeforeSdkConsume,
+            Self::CreateReturned,
         ]
         .into_iter()
         .find(|stage| stage.wire() == text)
@@ -168,6 +189,35 @@ impl AcquisitionGate {
             observed.wire()
         );
         Checkpoint { stream }
+    }
+
+    /// Advance through checkpoints, releasing each with `Continue`, until `stage`
+    /// arrives.
+    ///
+    /// Only for stages whose *predecessors* are implementation detail a test must
+    /// not depend on (e.g. a repair that may or may not have needed a write). The
+    /// number of intermediate checkpoints is bounded, so a stage that never
+    /// arrives fails instead of hanging.
+    pub fn expect_eventually(&mut self, stage: AcquisitionStage) -> Checkpoint {
+        for _ in 0..32 {
+            let stream = match self.received.recv_timeout(BOUND) {
+                Ok(stream) => stream,
+                Err(error) => panic!("no `{}` checkpoint arrived: {error}", stage.wire()),
+            };
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone the gate stream"))
+                .read_line(&mut line)
+                .expect("read the checkpoint line");
+            let observed = line.trim();
+            let observed = AcquisitionStage::parse(observed)
+                .unwrap_or_else(|| panic!("malformed acquisition stage {observed:?}"));
+            let checkpoint = Checkpoint { stream };
+            if observed == stage {
+                return checkpoint;
+            }
+            checkpoint.reply(GateReply::Continue);
+        }
+        panic!("`{}` never arrived", stage.wire());
     }
 
     /// Assert that no further checkpoint is pending within `within`. Used to

@@ -47,6 +47,28 @@ impl Image {
         }
     }
 }
+/// The `algorithm:hex` digest of `bytes`, computed with the named hash. Only
+/// the three OCI algorithms the fixture uses are supported.
+pub fn digest_hex(algorithm: &str, bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256, Sha384, Sha512};
+    let hex = match algorithm {
+        "sha256" => hex_lower(&Sha256::digest(bytes)),
+        "sha384" => hex_lower(&Sha384::digest(bytes)),
+        "sha512" => hex_lower(&Sha512::digest(bytes)),
+        other => panic!("unsupported fixture digest algorithm {other}"),
+    };
+    format!("{algorithm}:{hex}")
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from_digit(u32::from(byte >> 4), 16).expect("high nibble"));
+        out.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("low nibble"));
+    }
+    out
+}
+
 #[derive(Clone)]
 struct Response {
     bytes: Vec<u8>,
@@ -343,6 +365,53 @@ impl Server {
         }
         format!("{}/{repo}@{digest}", self.host)
     }
+    /// Route `bytes` under a digest computed with `algorithm` (sha256/sha384/
+    /// sha512), with a matching `Docker-Content-Digest` header. The manifest
+    /// body itself still names its own sha256 config/layer blobs, which the
+    /// caller must have registered separately: mixed algorithms are valid OCI.
+    pub fn put_manifest_under_algorithm(
+        &self,
+        repo: &str,
+        bytes: &[u8],
+        algorithm: &str,
+    ) -> String {
+        let digest = digest_hex(algorithm, bytes);
+        self.put(
+            &format!("/v2/{repo}/manifests/{digest}"),
+            bytes.to_vec(),
+            "application/vnd.oci.image.manifest.v1+json",
+            &digest,
+        );
+        format!("{}/{repo}@{digest}", self.host)
+    }
+
+    /// Route `bytes` at a caller-chosen digest key and header, independently of
+    /// the bytes' own hash. Used only to build a lying-header oracle.
+    pub fn put_with_header(&self, path: &str, bytes: &[u8], media: &'static str, header: &str) {
+        self.put(path, bytes.to_vec(), media, header);
+    }
+
+    /// Route an index under a digest computed with `algorithm`, at both the
+    /// digest path and a mutable tag, with a matching header.
+    pub fn index_under_algorithm(
+        &self,
+        repo: &str,
+        tag: &str,
+        bytes: &[u8],
+        algorithm: &str,
+    ) -> String {
+        let digest = digest_hex(algorithm, bytes);
+        for key in [tag, digest.as_str()] {
+            self.put(
+                &format!("/v2/{repo}/manifests/{key}"),
+                bytes.to_vec(),
+                "application/vnd.oci.image.index.v1+json",
+                &digest,
+            );
+        }
+        format!("{}/{repo}@{digest}", self.host)
+    }
+
     pub fn put(&self, path: &str, bytes: Vec<u8>, media: &'static str, digest: &str) {
         self.shared
             .routes

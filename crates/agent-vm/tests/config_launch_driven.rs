@@ -111,46 +111,27 @@ fn agent_vm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agent-vm"))
 }
 
+#[path = "support/acquisition_gate.rs"]
+mod acquisition_gate;
 #[path = "support/fake_msb.rs"]
 mod fake_msb;
+#[path = "support/image_archive.rs"]
+mod image_archive;
+#[path = "support/oci_registry.rs"]
+mod oci_registry;
 
 fn write_fake_msb(dir: &Path) -> PathBuf {
-    let path = dir.join("msb");
     // A credential-bearing launch makes the SDK probe `<msb> __launch-protocol`
     // and require `header_credentials: true` in the JSON reply (microsandbox
     // 0.7.x replaced the 0.6.x `__capabilities` + `header-credential-launch-v1`
     // line; see the vendored sdk/rust/lib/runtime/launch_contract.rs).
-    // `protocols` must contain 2 for a restore-backed launch. Any other argv
-    // must still answer with the version line, BYTE FOR BYTE as before, or
-    // `msb_install`'s patched-build check would start refusing the fake and
-    // every launch golden here would fail for the wrong reason.
-    //
-    // Every invocation is appended to a sibling log so a test can assert the
-    // probe *actually happened* rather than inferring it from the absence of an
-    // error (agent-vm #161 review, M4).
-    fake_msb::write_executable(
-        &path,
-        &format!(
-            "#!/bin/sh\n\
-             echo \"$*\" >> \"$(dirname \"$0\")/msb-invocations.log\"\n\
-             env >> \"$(dirname \"$0\")/msb-environ.log\"\n\
-             if [ \"$1\" = \"__launch-protocol\" ]; then\n\
-             \x20 echo '{{\"protocols\":[1,2],\"required_restore_backing\":true,\"header_credentials\":true}}'\n\
-             \x20 exit 0\n\
-             fi\n\
-             echo '{}'\nexit 0\n",
-            fake_msb::VERSION_LINE
-        ),
-    );
-    // 0.7.4's runtime resolver refuses an `msb` with no adjacent libkrunfw
-    // ("has no matching libkrunfw"), so the fixture has to be a complete pair.
-    // The name is platform-specific (`libkrunfw.5.dylib` on macOS,
-    // `libkrunfw.so.<version>` elsewhere), hence the vendored helper rather
-    // than a literal. Nothing reads the file's contents here -- the resolver
-    // only checks that it exists.
-    let library = dir.join(microsandbox_utils::libkrunfw_filename(std::env::consts::OS));
-    std::fs::write(&library, b"fixture").unwrap();
-    path
+    // `protocols` must contain 2 for a restore-backed launch. Every invocation
+    // is logged (argv and environment) by the shared installer, so a test can
+    // assert the probe actually happened rather than inferring it from the
+    // absence of an error. The pair fixture is complete: 0.7.4's resolver
+    // refuses an `msb` with no adjacent libkrunfw, and a version-only script is
+    // not a launch seam.
+    fake_msb::install_pair(dir, fake_msb::Mode::LaunchSeam).path
 }
 
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
@@ -295,6 +276,40 @@ impl Harness {
             .env("GIT_CEILING_DIRECTORIES", env!("CARGO_TARGET_TMPDIR"))
             .current_dir(&self.project_root);
         cmd
+    }
+
+    /// Replace the shell fixture with a real compiled runtime binary so the
+    /// SDK selects its modern launch contract and `create` reaches native cache
+    /// consumption. See `fake_msb::install_launch_binary` for why a script is
+    /// not sufficient.
+    fn use_launch_runtime(&mut self) {
+        let dir = self.fake_msb.parent().unwrap();
+        let fixture = fake_msb::install_launch_binary(
+            dir,
+            &self.fake_msb.with_file_name("msb-invocations.log"),
+            &self.fake_msb.with_file_name("msb-environ.log"),
+        );
+        self.fake_msb = fixture.path;
+    }
+
+    /// The ambient cache a shared-cache launch uses.
+    fn shared_command(&self, cache: &Path) -> Command {
+        let mut cmd = self.base_command();
+        cmd.env("AGENT_VM_SHARE_MSB_CACHE", "1")
+            .env("AGENT_VM_MSB_CACHE_DIR", cache);
+        cmd
+    }
+
+    /// Run a boot-free image verb against an explicit shared cache.
+    fn run_shared(&self, cache: &Path, args: &[&str]) -> Output {
+        let mut cmd = self.shared_command(cache);
+        cmd.args(args);
+        run_with_timeout(cmd, Duration::from_secs(60))
+    }
+
+    fn image(&self, spec: &image_archive::ArchiveSpec) -> oci_registry::Image {
+        let path = self.home_root.join(format!("{}.tar", spec.marker));
+        oci_registry::Image::from_archive(&path, spec)
     }
 
     fn write_user(&self, contents: &str) {
@@ -8553,4 +8568,1113 @@ fn a_digest_pinned_registry_miss_has_no_hint() {
             "{verb}: {stderr}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The shared/exclusive publication barrier and the launcher's cache validation
+// ---------------------------------------------------------------------------
+
+use acquisition_gate::{AcquisitionGate, AcquisitionStage, GateReply, Peer};
+use oci_registry::Server;
+
+/// The barrier's lock file in `cache`.
+fn publication_lock(cache: &Path) -> PathBuf {
+    cache.join(".agent-vm-publication.lock")
+}
+
+/// Assert a real `flock` attempt on the publication lock finds it held.
+fn assert_barrier_held(cache: &Path) {
+    let path = publication_lock(cache);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Err(rustix::io::Errno::WOULDBLOCK) => {}
+        Ok(()) => panic!("the publication lock was free while a preparation held it"),
+        Err(error) => panic!("probe {}: {error}", path.display()),
+    }
+}
+
+/// Assert a real `flock` attempt on the publication lock can be taken *shared*:
+/// the holder is a preparation, not an exclusive publisher, and another reader
+/// would coexist with it.
+fn assert_barrier_held_shared(cache: &Path) {
+    let path = publication_lock(cache);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared).unwrap_or_else(
+        |error| {
+            panic!(
+                "{} was not held in a mode a reader may share: {error}",
+                path.display()
+            )
+        },
+    );
+}
+
+/// Hold the exclusive publication lock in this test process (a faithful
+/// publisher stand-in using the real syscall).
+fn hold_exclusive_publication(cache: &Path) -> std::fs::File {
+    std::fs::create_dir_all(cache).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(publication_lock(cache))
+        .unwrap();
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("the test must take the exclusive publication lock");
+    file
+}
+
+fn status_ok(out: &Output, context: &str) {
+    assert!(
+        out.status.success(),
+        "{context}:\nstdout: {}\nstderr: {}",
+        stdout_of(out),
+        stderr_of(out)
+    );
+}
+
+fn cache_metadata(cache: &Path, raw: &str) -> PathBuf {
+    microsandbox_image::GlobalCache::new(cache)
+        .unwrap()
+        .image_metadata_path(&raw.parse().unwrap())
+}
+
+/// The manifest digest the native cache currently holds for `raw`'s key.
+fn cached_manifest_digest(cache: &Path, raw: &str) -> String {
+    let path = cache_metadata(cache, raw);
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+    )
+    .unwrap();
+    metadata["manifest_digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no manifest digest in {metadata}"))
+        .to_owned()
+}
+
+/// A cold acquisition stalled in a registry stream holds the **shared** barrier
+/// (proved by an independent shared `flock` that succeeds); an unrelated warm
+/// launch on the same cache still reaches the SDK's cache consumption (create),
+/// with zero registry traffic of its own measured after the create attempt.
+#[test]
+fn unrelated_stall_does_not_block_a_warm_launch() {
+    let cache = support::project_tempdir();
+    let cache = cache.path();
+    let server = Server::new();
+
+    // Two projects: distinct HOME/state, one shared cache.
+    let x = Harness::new();
+    let y = Harness::new();
+    let x_image = x.image(&image_archive::ArchiveSpec {
+        marker: "a06-x".into(),
+        ..Default::default()
+    });
+    let x_tag = format!("{}/repo:x", server.host);
+    server.image("repo", "x", &x_image);
+    let y_image = y.image(&image_archive::ArchiveSpec {
+        marker: "a06-y".into(),
+        ..Default::default()
+    });
+    let y_tag = format!("{}/repo:y", server.host);
+    server.image("repo", "y", &y_image);
+    status_ok(
+        &x.run_shared(cache, &["image", "refresh", "--image", &y_tag]),
+        "warming Y in the shared cache",
+    );
+
+    // Calibrate Y independently: no X exists to mask a missing launch hold.
+    let mut y = y;
+    y.use_launch_runtime();
+    let mut solo_gate = AcquisitionGate::new(y._home.path());
+    let mut solo_cmd = y.shared_command(cache);
+    solo_cmd.args(["--image", &y_tag, "--root", "shell"]);
+    let solo = Peer::spawn(solo_cmd, &solo_gate, &[]);
+    let parked = solo_gate.expect(AcquisitionStage::BeforeSdkConsume);
+    assert_barrier_held(cache);
+    assert_barrier_held_shared(cache);
+    parked.reply(GateReply::Continue);
+    solo_gate
+        .expect(AcquisitionStage::CreateReturned)
+        .reply(GateReply::Continue);
+    assert!(!solo.wait().status.success());
+
+    // Cold X stalls mid-blob, holding the shared barrier.
+    let ready = server.stall_blob(&format!("/v2/repo/blobs/{}", x_image.written.layer_digest));
+    let mut x_cmd = x.shared_command(cache);
+    x_cmd
+        .args(["image", "refresh", "--image", &x_tag])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let x_child = x_cmd.spawn().expect("spawn the stalled acquisition");
+    ready
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the stalled blob handshake must arrive");
+    assert_barrier_held(cache);
+
+    // Warm Y launch with a real runtime pair: it must reach the SDK
+    // consumption gate while X is still stalled.
+    let mut gate = AcquisitionGate::new(y._home.path());
+    let mut y_cmd = y.shared_command(cache);
+    // Root mode skips the non-root identity append, which the tiny fixture
+    // rootfs cannot satisfy; the launch still consumes the cached image.
+    y_cmd.args(["--image", &y_tag, "--root", "shell"]);
+    let requests_before = server.count();
+    let consumed_before = y
+        .msb_log()
+        .lines()
+        .filter(|line| line.starts_with("machine "))
+        .count();
+    let launch = Peer::spawn(y_cmd, &gate, &[]);
+    let parked = gate.expect(AcquisitionStage::BeforeSdkConsume);
+    // Still stalled. The barrier is held in a mode this reader may share, which
+    // an exclusive holder (or a launched create that took EX) could not offer.
+    assert_barrier_held(cache);
+    assert_barrier_held_shared(cache);
+
+    parked.reply(GateReply::Continue);
+
+    // Let create run (the fake runtime fails 93 by design) and release. The
+    // request delta is read *after* the create attempt, because create is the
+    // only step that could reach the registry.
+    gate.expect(AcquisitionStage::CreateReturned)
+        .reply(GateReply::Continue);
+    let launch_out = launch.wait();
+    assert_eq!(
+        server.count(),
+        requests_before,
+        "a warm launch must not query the registry (delta measured after create)"
+    );
+    assert!(
+        !launch_out.status.success(),
+        "the fixture runtime never fakes a successful VM"
+    );
+    // X is still stalled: Y progressed while X legitimately owns the shared
+    // barrier. The stalled stream is abandoned (the fixture's release closes
+    // it), so reap it rather than pretend it can complete.
+    let mut x_child = x_child;
+    assert!(
+        x_child.try_wait().unwrap().is_none(),
+        "the unrelated acquisition finished without being released"
+    );
+    let _ = x_child.kill();
+    let _ = x_child.wait();
+    server.release_blob();
+
+    // The launch reached native cache consumption: the runtime was invoked
+    // with something other than the version/protocol probes.
+    let log = y.msb_log();
+    let consumed = log
+        .lines()
+        .filter(|line| line.starts_with("machine "))
+        .count()
+        > consumed_before;
+    assert!(
+        consumed,
+        "the SDK never invoked the runtime for a warm cache; log: {log}; stderr: {}",
+        stderr_of(&launch_out)
+    );
+}
+
+/// Archive publication cannot cross a validated SDK consumption.
+///
+/// A launch parked after its cache validation and before the SDK consumes the
+/// cache holds the barrier shared. Independent `flock` probes show that (shared
+/// succeeds, exclusive contends), an import's exclusive publication cannot
+/// proceed, and the aliases stay byte-identical until create returns. Only
+/// release lets the import complete and the alias actually change. The reverse
+/// order also holds: a held exclusive publisher blocks preparation before its
+/// first cache read.
+#[test]
+fn archive_publication_cannot_cross_validated_sdk_consumption() {
+    let cache = support::project_tempdir();
+    let cache = cache.path();
+    let server = Server::new();
+    let h = Harness::new();
+    let a = h.image(&image_archive::ArchiveSpec {
+        marker: "a07-a".into(),
+        ..Default::default()
+    });
+    let tag = format!("{}/repo:tag", server.host);
+    server.image("repo", "tag", &a);
+    status_ok(
+        &h.run_shared(cache, &["image", "refresh", "--image", &tag]),
+        "warming A",
+    );
+    let mut h = h;
+    h.use_launch_runtime();
+    let a_digest = a.written.manifest_digest.clone();
+    let canonical_a = format!("{}/repo@{a_digest}", server.host);
+    let tag_bytes = std::fs::read(cache_metadata(cache, &tag)).unwrap();
+    let canonical_bytes = std::fs::read(cache_metadata(cache, &canonical_a)).unwrap();
+
+    // Launch paused after validation, before the SDK consumes the cache.
+    let mut gate = AcquisitionGate::new(h._home.path());
+    let mut launch_cmd = h.shared_command(cache);
+    launch_cmd.args(["--image", &tag, "--root", "shell"]);
+    let launch = Peer::spawn(launch_cmd, &gate, &[]);
+    let before_consume = gate.expect(AcquisitionStage::BeforeSdkConsume);
+    assert_barrier_held(cache);
+    assert_barrier_held_shared(cache);
+
+    assert!(
+        !h.msb_log().lines().any(|line| line.starts_with("machine ")),
+        "the SDK must not have consumed the cache while parked before consumption"
+    );
+
+    // Import B under the same tag AND the digest-spelled alias of A. The
+    // publisher must block on the exclusive barrier, leaving both aliases
+    // untouched while the launcher still owns its validated snapshot.
+    let save = image_archive::write_docker_save(
+        &h.home_root.join("a07-b.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "a07-b".into(),
+            repo_tags: Some(vec![tag.clone(), canonical_a.clone()]),
+        }],
+    );
+    let import_tag = format!("{}/repo:imported", server.host);
+    let mut import_gate = AcquisitionGate::new(h._home.path());
+    let mut import_cmd = h.shared_command(cache);
+    import_cmd
+        .args([
+            "image",
+            "import",
+            "--input",
+            &save[0].path.to_string_lossy(),
+            "--tag",
+            &import_tag,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let import_child = Peer::spawn(import_cmd, &import_gate, &[]);
+    let waiting = import_gate.expect(AcquisitionStage::PublicationContended);
+    assert_barrier_held(cache);
+    assert_barrier_held_shared(cache);
+    assert_eq!(
+        std::fs::read(cache_metadata(cache, &tag)).unwrap(),
+        tag_bytes
+    );
+    assert_eq!(
+        std::fs::read(cache_metadata(cache, &canonical_a)).unwrap(),
+        canonical_bytes
+    );
+    waiting.reply(GateReply::Continue);
+    before_consume.reply(GateReply::Continue);
+
+    // Create consumes the cache and fails (fixture runtime), releasing.
+    gate.expect(AcquisitionStage::CreateReturned)
+        .reply(GateReply::Continue);
+    let launch_out = launch.wait();
+    assert!(!launch_out.status.success());
+    let import_out = import_child.wait();
+    status_ok(
+        &import_out,
+        "the import after the launch released the barrier",
+    );
+    let log = h.msb_log();
+    assert!(
+        log.lines().any(|line| {
+            let first = line.split_whitespace().next().unwrap_or("");
+            !first.is_empty() && first != "--version" && first != "__launch-protocol"
+        }),
+        "the SDK never consumed the cache before the import ran; log: {log}"
+    );
+    // The alias overwrite really happened (the test is not vacuous) and the
+    // next explicit preparation repairs canonical A.
+    assert_ne!(
+        std::fs::read(cache_metadata(cache, &canonical_a)).unwrap(),
+        canonical_bytes,
+        "the import fixture must overwrite the digest-spelled alias"
+    );
+    let requests_before = server.count();
+    let mut repair_gate = AcquisitionGate::new(h._home.path());
+    let mut repair_cmd = h.shared_command(cache);
+    repair_cmd.args(["--image", &canonical_a, "--root", "shell"]);
+    let repair = Peer::spawn(repair_cmd, &repair_gate, &[]);
+    repair_gate
+        .expect(AcquisitionStage::BeforeSdkConsume)
+        .reply(GateReply::Continue);
+    repair_gate
+        .expect(AcquisitionStage::CreateReturned)
+        .reply(GateReply::Continue);
+    assert!(!repair.wait().status.success());
+    assert_eq!(
+        server.count(),
+        requests_before,
+        "receipt repair must be offline"
+    );
+    let receipt = std::fs::read_dir(cache.join("agent-vm-content-metadata"))
+        .unwrap()
+        .map(|entry| {
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(entry.unwrap().path()).unwrap(),
+            )
+            .unwrap()
+        })
+        .find(|value| value["acquired_reference"] == canonical_a)
+        .unwrap();
+    assert_eq!(receipt["metadata"]["manifest_digest"], a_digest);
+    assert_eq!(
+        receipt["metadata"]["config_digest"],
+        a.written.config_digest
+    );
+    assert_eq!(
+        receipt["content_identity"]["config_digest"],
+        receipt["metadata"]["config_digest"]
+    );
+    let repaired: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cache_metadata(cache, &canonical_a)).unwrap())
+            .unwrap();
+    assert_eq!(repaired["manifest_digest"], a_digest);
+    assert_eq!(repaired["config_digest"], a.written.config_digest);
+
+    // Reverse order: an exclusive publisher blocks shared preparation before
+    // its first cache read (no acquisition checkpoint at all).
+    let held = hold_exclusive_publication(cache);
+    let mut gate = AcquisitionGate::new(h._home.path());
+    let mut blocked_cmd = h.shared_command(cache);
+    blocked_cmd.args(["image", "refresh", "--image", &tag]);
+    let blocked = Peer::spawn(blocked_cmd, &gate, &[]);
+    let waiting = gate.expect(AcquisitionStage::PublicationContended);
+    // The real shared attempt contended while our independent exclusive fd holds.
+    waiting.reply(GateReply::Continue);
+    drop(held);
+    gate.expect(AcquisitionStage::BeforeLock)
+        .reply(GateReply::Continue);
+    gate.expect(AcquisitionStage::Snapshot)
+        .reply(GateReply::Continue);
+    gate.expect(AcquisitionStage::NativeOk)
+        .reply(GateReply::Continue);
+    let blocked_out = blocked.wait();
+    status_ok(
+        &blocked_out,
+        "preparation after the exclusive publisher released",
+    );
+}
+
+/// The uppercase-hex spelling of `pin`'s digest: a real OCI reference the native
+/// parser accepts that canonicalizes to `pin`. It stands in for an entry an old
+/// launcher wrote under its own spelling.
+fn upper_hex_spelling(pin: &str) -> String {
+    let (head, hex) = pin.rsplit_once(':').expect("repo@algorithm:hex");
+    format!("{head}:{}", hex.to_ascii_uppercase())
+}
+
+/// A warm cache entry written under an old spelling is reused offline: the
+/// launcher validates it, republishes it under the canonical key, and the SDK's
+/// `IfMissing` create therefore makes no registry request at all.
+#[test]
+fn an_old_spelling_warm_cache_launch_is_registry_free() {
+    for kind in ["child", "tag", "index"] {
+        let cache = support::project_tempdir();
+        let cache = cache.path();
+        let server = Server::new();
+        let mut h = Harness::new();
+        let a = h.image(&image_archive::ArchiveSpec {
+            marker: format!("old-spelling-{kind}"),
+            ..Default::default()
+        });
+        let child = server.image("repo", "old", &a);
+        let index = server.index("repo", "index", a.index.clone());
+        let local_host = format!("localhost:{}", server.host.rsplit_once(':').unwrap().1);
+        let source = match kind {
+            "child" => child,
+            "index" => index,
+            _ => format!("{}/repo:old", server.host),
+        }
+        .replace(&server.host, &local_host);
+        let old_source = if kind == "tag" {
+            source.replace("localhost", "LOCALHOST")
+        } else {
+            upper_hex_spelling(&source)
+        };
+        assert_ne!(old_source, source);
+        status_ok(
+            &h.run_shared(cache, &["image", "refresh", "--image", &source]),
+            "warming canonical source",
+        );
+        let canonical_path = cache_metadata(cache, &source);
+        let old_path = cache_metadata(cache, &old_source);
+        std::fs::rename(&canonical_path, &old_path).unwrap();
+        h.use_launch_runtime();
+        let requests_before = server.count();
+        // The original spelling provides the bounded compatibility key; the
+        // SDK consumes its canonical form, then later canonical-only launches
+        // no longer need that compatibility spelling.
+        for selected in [&old_source, &source] {
+            let mut gate = AcquisitionGate::new(h._home.path());
+            let mut cmd = h.shared_command(cache);
+            cmd.args(["--image", selected, "--root", "shell"]);
+            let launch = Peer::spawn(cmd, &gate, &[]);
+            gate.expect(AcquisitionStage::BeforeSdkConsume)
+                .reply(GateReply::Continue);
+            assert!(
+                canonical_path.exists(),
+                "{kind}: canonical source must be republished"
+            );
+            gate.expect(AcquisitionStage::CreateReturned)
+                .reply(GateReply::Continue);
+            assert!(!launch.wait().status.success());
+            assert_eq!(
+                server.count(),
+                requests_before,
+                "{kind}: warm create must be registry-free"
+            );
+        }
+        let receipts = cache.join("agent-vm-content-metadata");
+        if kind == "tag" {
+            // A native warm entry is usable without a receipt, but must not
+            // invent fresh registry evidence while migrating cache metadata.
+            for entry in std::fs::read_dir(&receipts).unwrap() {
+                std::fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+        }
+        drop(server);
+        // Registry is now unavailable, not merely returning a cache-friendly response.
+        let mut gate = AcquisitionGate::new(h._home.path());
+        let mut cmd = h.shared_command(cache);
+        cmd.args(["--image", &source, "--root", "shell"]);
+        let launch = Peer::spawn(cmd, &gate, &[]);
+        gate.expect(AcquisitionStage::BeforeSdkConsume)
+            .reply(GateReply::Continue);
+        gate.expect(AcquisitionStage::CreateReturned)
+            .reply(GateReply::Continue);
+        assert!(!launch.wait().status.success());
+        if kind == "tag" {
+            assert_eq!(
+                std::fs::read_dir(&receipts).unwrap().count(),
+                0,
+                "cache-only validation must not invent a source binding"
+            );
+        }
+        assert!(
+            h.msb_log()
+                .lines()
+                .filter(|line| line.starts_with("machine "))
+                .count()
+                >= 3,
+            "{kind}: each warm launch must reach the fake runtime, including offline"
+        );
+    }
+}
+
+/// A warm tag hit must not republish the tag key from metadata it read before a
+/// concurrent `image refresh` moved the tag.
+///
+/// Both live exactly once in the window between the launcher's validated read and
+/// its return, and both hold the barrier shared, so nothing else excludes them.
+/// Only the pre-canonical migration may publish a source key, which is what makes
+/// this a deterministic interleaving instead of a race report.
+#[test]
+fn a_concurrent_tag_move_is_not_reverted_by_a_warm_launch() {
+    let cache = support::project_tempdir();
+    let cache = cache.path();
+    let server = Server::new();
+    let mut h = Harness::new();
+    let a = h.image(&image_archive::ArchiveSpec {
+        marker: "n1-a".into(),
+        ..Default::default()
+    });
+    let b = h.image(&image_archive::ArchiveSpec {
+        marker: "n1-b".into(),
+        ..Default::default()
+    });
+    let tag = format!("{}/repo:tag", server.host);
+    let moved = format!("{}/repo:moved", server.host);
+    server.image("repo", "tag", &a);
+    server.image("repo", "moved", &b);
+    assert_ne!(a.written.manifest_digest, b.written.manifest_digest);
+    status_ok(
+        &h.run_shared(cache, &["image", "refresh", "--image", &tag]),
+        "warming A under the tag",
+    );
+    status_ok(
+        &h.run_shared(cache, &["image", "refresh", "--image", &moved]),
+        "warming B under another tag",
+    );
+    assert_eq!(
+        cached_manifest_digest(cache, &tag),
+        a.written.manifest_digest
+    );
+    h.use_launch_runtime();
+
+    // Park the launcher once it has validated A for this selection, before it
+    // publishes anything.
+    let mut gate = AcquisitionGate::new(h._home.path());
+    let mut cmd = h.shared_command(cache);
+    cmd.env("AGENT_VM_TEST_ACQUIRE_GATE_DETAIL", "1");
+    cmd.args(["--image", &tag, "--root", "shell"]);
+    let launch = Peer::spawn(cmd, &gate, &[]);
+    let validated = gate.expect(AcquisitionStage::CacheValidated);
+    assert_eq!(
+        cached_manifest_digest(cache, &tag),
+        a.written.manifest_digest,
+        "the parked launcher must have read A"
+    );
+    // The tag moves to B exactly as a concurrent `image refresh` would leave it.
+    let moved_bytes = std::fs::read(cache_metadata(cache, &moved)).unwrap();
+    std::fs::write(cache_metadata(cache, &tag), &moved_bytes).unwrap();
+    validated.reply(GateReply::Continue);
+    gate.expect_eventually(AcquisitionStage::BeforeSdkConsume)
+        .reply(GateReply::Continue);
+    assert_eq!(
+        cached_manifest_digest(cache, &tag),
+        b.written.manifest_digest,
+        "a warm launch reverted the tag to A"
+    );
+    gate.expect_eventually(AcquisitionStage::CreateReturned)
+        .reply(GateReply::Continue);
+    assert!(!launch.wait().status.success());
+
+    // The next warm launch consumes B: it validates the tag key that names B and
+    // reaches the fake runtime with no registry traffic at all.
+    let requests_before = server.count();
+    let consumed_before = h
+        .msb_log()
+        .lines()
+        .filter(|line| line.starts_with("machine "))
+        .count();
+    let mut gate = AcquisitionGate::new(h._home.path());
+    let mut cmd = h.shared_command(cache);
+    cmd.args(["--image", &tag, "--root", "shell"]);
+    let launch = Peer::spawn(cmd, &gate, &[]);
+    gate.expect(AcquisitionStage::BeforeSdkConsume)
+        .reply(GateReply::Continue);
+    assert_eq!(
+        cached_manifest_digest(cache, &tag),
+        b.written.manifest_digest,
+        "the launch must validate the entry the tag now names"
+    );
+    gate.expect(AcquisitionStage::CreateReturned)
+        .reply(GateReply::Continue);
+    let out = launch.wait();
+    assert!(
+        !out.status.success(),
+        "the fixture runtime never boots a VM"
+    );
+    assert_eq!(
+        cached_manifest_digest(cache, &tag),
+        b.written.manifest_digest,
+        "consuming B must leave the tag naming B"
+    );
+    assert_eq!(
+        server.count(),
+        requests_before,
+        "a warm launch of B must be registry-free"
+    );
+    assert!(
+        h.msb_log()
+            .lines()
+            .filter(|line| line.starts_with("machine "))
+            .count()
+            > consumed_before,
+        "the launch never reached the runtime: {}",
+        stderr_of(&out)
+    );
+}
+
+/// The pre-canonical migration publishes the canonical source key only while it is
+/// still absent.
+///
+/// The canonical key is re-checked under its own guard, so a peer that published
+/// it after this launch missed it is kept: the migration proceeds with that entry
+/// when it validates the selection and fails closed with the completeness error
+/// when it does not. Neither branch may overwrite the peer's bytes.
+#[test]
+fn an_old_spelling_migration_keeps_a_concurrent_publication() {
+    for concurrent in ["validated", "incomplete"] {
+        let cache = support::project_tempdir();
+        let cache = cache.path();
+        let server = Server::new();
+        let mut h = Harness::new();
+        let a = h.image(&image_archive::ArchiveSpec {
+            marker: format!("n1-migrate-a-{concurrent}"),
+            ..Default::default()
+        });
+        let b = h.image(&image_archive::ArchiveSpec {
+            marker: format!("n1-migrate-b-{concurrent}"),
+            ..Default::default()
+        });
+        // The loopback spelling the acquisition cache is honestly keyed by; the
+        // uppercase host is a real OCI reference that canonicalizes to it.
+        let local_host = format!("localhost:{}", server.host.rsplit_once(':').unwrap().1);
+        let source = format!("{local_host}/repo:old");
+        let moved = format!("{local_host}/repo:moved");
+        server.image("repo", "old", &a);
+        server.image("repo", "moved", &b);
+        status_ok(
+            &h.run_shared(cache, &["image", "refresh", "--image", &source]),
+            "warming the canonical source",
+        );
+        status_ok(
+            &h.run_shared(cache, &["image", "refresh", "--image", &moved]),
+            "warming another tag",
+        );
+        let old_source = source.replace("localhost", "LOCALHOST");
+        assert_ne!(old_source, source);
+        // An old launcher's entry: only the original spelling can find it.
+        std::fs::rename(
+            cache_metadata(cache, &source),
+            cache_metadata(cache, &old_source),
+        )
+        .unwrap();
+        assert!(!cache_metadata(cache, &source).exists());
+        h.use_launch_runtime();
+        let requests_before = server.count();
+
+        let mut gate = AcquisitionGate::new(h._home.path());
+        let mut cmd = h.shared_command(cache);
+        cmd.env("AGENT_VM_TEST_ACQUIRE_GATE_DETAIL", "1");
+        cmd.args(["--image", &old_source, "--root", "shell"]);
+        let launch = Peer::spawn(cmd, &gate, &[]);
+        let migrating = gate.expect(AcquisitionStage::CacheValidated);
+        // The peer's publication lands after this launch missed the canonical key
+        // but before the migration would publish it.
+        let published = match concurrent {
+            "validated" => std::fs::read(cache_metadata(cache, &moved)).unwrap(),
+            _ => b"{}".to_vec(),
+        };
+        std::fs::write(cache_metadata(cache, &source), &published).unwrap();
+        migrating.reply(GateReply::Continue);
+
+        match concurrent {
+            "validated" => {
+                gate.expect_eventually(AcquisitionStage::BeforeSdkConsume)
+                    .reply(GateReply::Continue);
+                assert_eq!(
+                    cached_manifest_digest(cache, &source),
+                    b.written.manifest_digest,
+                    "the migration overwrote a concurrent publication"
+                );
+                gate.expect_eventually(AcquisitionStage::CreateReturned)
+                    .reply(GateReply::Continue);
+                let out = launch.wait();
+                assert!(!out.status.success(), "the fixture runtime never boots");
+                assert_eq!(
+                    std::fs::read(cache_metadata(cache, &source)).unwrap(),
+                    published,
+                    "the peer's entry must survive byte-for-byte"
+                );
+                assert_eq!(
+                    server.count(),
+                    requests_before,
+                    "using the peer's entry must stay registry-free"
+                );
+            }
+            _ => {
+                let out = launch.wait();
+                let stderr = stderr_of(&out);
+                assert!(!out.status.success(), "{stderr}");
+                assert!(
+                    stderr.contains("is incomplete"),
+                    "an unusable concurrent entry is the completeness failure: {stderr}"
+                );
+                assert!(
+                    !stderr.contains("usable immutable identity"),
+                    "it must not be reported as a generic identity failure: {stderr}"
+                );
+                assert_eq!(
+                    std::fs::read(cache_metadata(cache, &source)).unwrap(),
+                    published,
+                    "the closed failure must not repair over the peer's entry"
+                );
+                assert_eq!(
+                    server.count(),
+                    requests_before,
+                    "a closed launch must not touch the registry"
+                );
+                let log = h.msb_log();
+                assert!(
+                    log.lines().all(|line| {
+                        let first = line.split_whitespace().next().unwrap_or("");
+                        first.is_empty() || first == "--version" || first == "__launch-protocol"
+                    }),
+                    "a closed launch created a sandbox; log: {log}"
+                );
+            }
+        }
+    }
+}
+
+/// A warm digest launch rewrites nothing: the entry that validated is the entry
+/// the launch consumes, and rewriting a validated file is not a repair.
+///
+/// The oracle is the inode of the preserved metadata and of its receipt. Both are
+/// published by atomic rename, so any write replaces the inode; nothing else in
+/// the launch does.
+#[test]
+fn a_warm_digest_launch_repairs_nothing() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cache = support::project_tempdir();
+    let cache = cache.path();
+    let server = Server::new();
+    let mut h = Harness::new();
+    let a = h.image(&image_archive::ArchiveSpec::default());
+    let pin = server.image("repo", "digest", &a);
+    status_ok(
+        &h.run_shared(cache, &["image", "refresh", "--image", &pin]),
+        "warming the immutable digest",
+    );
+    let metadata_path = cache_metadata(cache, &pin);
+    let receipt_path = std::fs::read_dir(cache.join("agent-vm-content-metadata"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap())
+                .unwrap()
+                .get("acquired_reference")
+                .and_then(|value| value.as_str())
+                .is_some_and(|reference| reference == pin)
+        })
+        .unwrap_or_else(|| panic!("no receipt for {pin}"));
+    let metadata_inode = std::fs::metadata(&metadata_path).unwrap().ino();
+    let receipt_inode = std::fs::metadata(&receipt_path).unwrap().ino();
+
+    h.use_launch_runtime();
+    let requests_before = server.count();
+    let mut gate = AcquisitionGate::new(h._home.path());
+    let mut cmd = h.shared_command(cache);
+    cmd.args(["--image", &pin, "--root", "shell"]);
+    let launch = Peer::spawn(cmd, &gate, &[]);
+    // A write would have needed a checkpoint-free readback, but the launch is
+    // parked only at the SDK boundary either way: the inode is the proof.
+    gate.expect(AcquisitionStage::BeforeSdkConsume)
+        .reply(GateReply::Continue);
+    gate.expect(AcquisitionStage::CreateReturned)
+        .reply(GateReply::Continue);
+    let out = launch.wait();
+    assert!(
+        !out.status.success(),
+        "the fixture runtime never boots a VM"
+    );
+    assert_eq!(
+        std::fs::metadata(&metadata_path).unwrap().ino(),
+        metadata_inode,
+        "a warm digest launch rewrote validated cache metadata"
+    );
+    assert_eq!(
+        std::fs::metadata(&receipt_path).unwrap().ino(),
+        receipt_inode,
+        "a warm digest launch rewrote its own receipt"
+    );
+    assert_eq!(
+        server.count(),
+        requests_before,
+        "a warm digest launch must be registry-free"
+    );
+}
+
+/// A retained *index* digest whose cached entry is the resolved host child, with
+/// no receipt proving that association, still boots offline. A launch *consumes*
+/// the cache: the entry it validates is the entry the SDK's `IfMissing` create
+/// would boot, so it claims nothing new about where the entry came from.
+///
+/// This is the state a cold launch leaves behind -- the acquisition went through
+/// the SDK, which stores the resolved child under the stated index key and writes
+/// no receipt -- and dropping the receipt of an otherwise complete acquisition
+/// reproduces exactly it. Without consumption, the launch refuses the entry as
+/// "not the immutable identity" before any create, which is the regression.
+#[test]
+fn a_warm_index_launch_without_a_receipt_consumes_the_child() {
+    let cache = support::project_tempdir();
+    let cache = cache.path();
+    let server = Server::new();
+    let mut h = Harness::new();
+    let a = h.image(&image_archive::ArchiveSpec::default());
+    let child = server.image("repo", "child", &a);
+    let index = server.index("repo", "indexed", a.index.clone());
+    assert_ne!(
+        index.rsplit('@').next().unwrap(),
+        child,
+        "the stated index digest must be the envelope, not the child"
+    );
+    status_ok(
+        &h.run_shared(cache, &["image", "refresh", "--image", &index]),
+        "establishing the index association",
+    );
+    let receipts = cache.join("agent-vm-content-metadata");
+    assert!(
+        receipts.is_dir(),
+        "the acquisition must have written the receipt this test removes"
+    );
+    std::fs::remove_dir_all(&receipts).unwrap();
+
+    // Offline: the association is unprovable, and the launch must still consume
+    // the entry the SDK would. `BeforeSdkConsume` is only reachable through a
+    // preparation that accepted the cached entry.
+    drop(server);
+    h.use_launch_runtime();
+    let mut gate = AcquisitionGate::new(h._home.path());
+    let mut cmd = h.shared_command(cache);
+    cmd.args(["--image", &index, "--root", "shell"]);
+    let launch = Peer::spawn(cmd, &gate, &[]);
+    gate.expect(AcquisitionStage::BeforeSdkConsume)
+        .reply(GateReply::Continue);
+    gate.expect(AcquisitionStage::CreateReturned)
+        .reply(GateReply::Continue);
+    let out = launch.wait();
+    let stderr = stderr_of(&out);
+    assert!(
+        !out.status.success(),
+        "the fixture runtime never boots a VM: {stderr}"
+    );
+    assert!(
+        !stderr.contains("usable immutable identity"),
+        "a launch consuming an unprovable association must not refuse it: {stderr}"
+    );
+    assert!(
+        !receipts.exists(),
+        "consuming the cache must record no new identity claim"
+    );
+}
+
+/// Remove the materialized content behind a cached entry, keeping its metadata and
+/// receipt: the entry is then present, validated by its receipt, and incomplete.
+fn drop_materialized_content(cache: &Path, digest: &str) {
+    let handle = microsandbox_image::GlobalCache::new(cache).unwrap();
+    let manifest = digest.parse().unwrap();
+    for path in [
+        handle.vmdk_path(&manifest),
+        handle.fsmeta_erofs_path(&manifest),
+    ] {
+        std::fs::remove_file(&path)
+            .unwrap_or_else(|error| panic!("remove {}: {error}", path.display()));
+    }
+    let now = microsandbox_image::Registry::pull_cached(
+        &handle,
+        &digest_reference(digest),
+        &microsandbox_image::PullOptions {
+            pull_policy: microsandbox_image::PullPolicy::Never,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !matches!(now, Ok(Some(_))),
+        "the fixture must really leave the entry incomplete"
+    );
+}
+
+fn digest_reference(digest: &str) -> microsandbox_image::Reference {
+    format!("localhost:1/x@{digest}").parse().unwrap()
+}
+
+/// A digest entry whose content the cache no longer holds is the *completeness*
+/// failure, not the generic immutable-identity one: the receipt proves what the
+/// key should hold, and the layers behind it are gone.
+#[test]
+fn an_incomplete_digest_entry_reports_completeness() {
+    let cache = support::project_tempdir();
+    let cache = cache.path();
+    let server = Server::new();
+    let mut h = Harness::new();
+    let a = h.image(&image_archive::ArchiveSpec::default());
+    let pin = server.image("repo", "gapped", &a);
+    status_ok(
+        &h.run_shared(cache, &["image", "refresh", "--image", &pin]),
+        "warming the immutable digest",
+    );
+    drop_materialized_content(cache, &a.written.manifest_digest);
+    h.use_launch_runtime();
+    let requests_before = server.count();
+    let gate = AcquisitionGate::new(h._home.path());
+    let mut cmd = h.shared_command(cache);
+    cmd.args(["--image", &pin, "--root", "shell"]);
+    let out = Peer::spawn(cmd, &gate, &[]).wait();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("is incomplete"),
+        "an unrepaired digest entry must report completeness: {stderr}"
+    );
+    assert!(
+        !stderr.contains("usable immutable identity"),
+        "it must not report a generic identity failure: {stderr}"
+    );
+    assert_eq!(
+        server.count(),
+        requests_before,
+        "a closed launch must not touch the registry"
+    );
+    let log = h.msb_log();
+    assert!(
+        log.lines().all(|line| {
+            let first = line.split_whitespace().next().unwrap_or("");
+            first.is_empty() || first == "--version" || first == "__launch-protocol"
+        }),
+        "an incomplete entry must not create a sandbox; log: {log}"
+    );
+}
+
+/// Two independently acquired sources of one child share preservation without
+/// evicting either association. The immutable index is checked again after the
+/// tag, so an implementation that only remembers the last source is rejected.
+#[test]
+fn multiple_sources_of_one_child_remain_launchable_offline() {
+    for tag_first in [true, false] {
+        let cache = support::project_tempdir();
+        let cache = cache.path();
+        let server = Server::new();
+        let mut h = Harness::new();
+        let image = h.image(&image_archive::ArchiveSpec::default());
+        let child = server.image("repo", "tag", &image);
+        let tag = format!("{}/repo:tag", server.host);
+        let index = server.index("repo", "index", image.index.clone());
+        let sources = if tag_first {
+            [&tag, &index]
+        } else {
+            [&index, &tag]
+        };
+        // Acquire S1 -> C, then S2 -> C; the very next preparation of S1 is
+        // offline, with no intervening refresh that could recreate its binding.
+        for source in sources {
+            status_ok(
+                &h.run_shared(cache, &["image", "refresh", "--image", source]),
+                "acquiring another source of C",
+            );
+        }
+        let records: Vec<serde_json::Value> =
+            std::fs::read_dir(cache.join("agent-vm-content-metadata"))
+                .unwrap()
+                .map(|entry| {
+                    serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap()
+                })
+                .collect();
+        assert_eq!(records.len(), 1, "content preservation is child-keyed");
+        assert_eq!(records[0]["acquired_reference"], child);
+        // Only the immutable source records a binding: the association check never
+        // consults one for a mutable tag, so the tag must not spend a slot.
+        let bindings = records[0]["source_bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 1, "one immutable source, one binding");
+        assert_eq!(bindings[0]["reference"], index.as_str());
+        assert!(
+            !bindings
+                .iter()
+                .any(|binding| binding["reference"] == tag.as_str()),
+            "a mutable tag has no association to prove"
+        );
+        h.use_launch_runtime();
+        drop(server);
+        for source in sources {
+            let mut gate = AcquisitionGate::new(h._home.path());
+            let mut cmd = h.shared_command(cache);
+            cmd.args(["--image", source, "--root", "shell"]);
+            let launch = Peer::spawn(cmd, &gate, &[]);
+            gate.expect(AcquisitionStage::BeforeSdkConsume)
+                .reply(GateReply::Continue);
+            gate.expect(AcquisitionStage::CreateReturned)
+                .reply(GateReply::Continue);
+            assert!(!launch.wait().status.success());
+        }
+        assert_eq!(
+            h.msb_log()
+                .lines()
+                .filter(|line| line.starts_with("machine "))
+                .count(),
+            2
+        );
+    }
+}
+
+/// A receipt that describes a different identity under this key is corruption.
+///
+/// A receipt copied from another identity's position is internally consistent,
+/// so only the key comparison can reject it. A launch consuming an unequal
+/// immutable association must report the corrupt receipt — not treat the entry
+/// as an unproven association — and must not create, repair or query anything.
+#[test]
+fn a_receipt_for_another_identity_fails_the_launch_closed() {
+    let cache = support::project_tempdir();
+    let cache = cache.path();
+    let server = Server::new();
+    let mut h = Harness::new();
+    let x = h.image(&image_archive::ArchiveSpec {
+        marker: "receipt-x".into(),
+        ..Default::default()
+    });
+    let y = h.image(&image_archive::ArchiveSpec {
+        marker: "receipt-y".into(),
+        ..Default::default()
+    });
+    // Two immutable index sources resolving to different host children: the
+    // cached entry's digest legitimately differs from the stated one, so only a
+    // receipt can prove each association.
+    let x_child = server.image("repo", "x-child", &x);
+    let x_index = server.index("repo", "x-index", x.index.clone());
+    let y_child = server.image("repo", "y-child", &y);
+    let y_index = server.index("repo", "y-index", y.index.clone());
+    assert_ne!(x_child, y_child);
+    for index in [&x_index, &y_index] {
+        status_ok(
+            &h.run_shared(cache, &["image", "refresh", "--image", index]),
+            "warming an index association",
+        );
+    }
+    let receipts = cache.join("agent-vm-content-metadata");
+    let receipt_for = |pin: &str| {
+        std::fs::read_dir(&receipts)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap())
+                    .unwrap()
+                    .get("acquired_reference")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|reference| reference == pin)
+            })
+            .unwrap_or_else(|| panic!("no receipt for {pin}"))
+    };
+    let x_receipt = receipt_for(&x_child);
+    let y_receipt = receipt_for(&y_child);
+    // Same file position, different (internally consistent) identity.
+    std::fs::copy(&x_receipt, &y_receipt).unwrap();
+
+    h.use_launch_runtime();
+    let mut gate = AcquisitionGate::new(h._home.path());
+    let mut launch_cmd = h.shared_command(cache);
+    launch_cmd.args(["--image", &y_index, "--root", "shell"]);
+    let requests_before = server.count();
+    let launch = Peer::spawn(launch_cmd, &gate, &[]);
+    let output = launch.wait();
+    assert!(
+        !output.status.success(),
+        "a corrupt receipt must fail the launch: {}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("receipt is corrupt"),
+        "the receipt's own key must be what fails, not an unproven association: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not the immutable identity"),
+        "a mis-keyed receipt is corruption, not a plain association mismatch: {stderr}"
+    );
+    assert_eq!(
+        server.count(),
+        requests_before,
+        "a corrupt receipt must not be repaired by a registry request"
+    );
+    // No create: the only runtime invocations are the version/protocol probes.
+    let log = h.msb_log();
+    assert!(
+        log.lines().all(|line| {
+            let first = line.split_whitespace().next().unwrap_or("");
+            first.is_empty() || first == "--version" || first == "__launch-protocol"
+        }),
+        "the launch created a sandbox despite the corrupt receipt; log: {log}"
+    );
+    gate.expect_none(Duration::from_millis(200));
 }

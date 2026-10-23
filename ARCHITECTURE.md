@@ -43,8 +43,11 @@ crates/agent-vm/src/
 ├── mount.rs                # --mount grammar and volume wiring
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   ├── default_selection.rs#   retained record: read-only load, automatic adopt, explicit replace
-│   └── upgrade.rs          #   set-default flow: native target + pinned child, then replace
-├── image_acquire.rs        # shared boot-free native acquisition: guard, snapshot, validate, rollback
+│   └── upgrade.rs          #   set-default flow: one validated acquisition, then replace
+├── image_acquire.rs        # shared boot-free acquisition: canonical target, validated token, barrier
+│   ├── reference.rs        #   the one canonical OCI target (cache/acquisition key)
+│   ├── receipt.rs          #   cache-only validated-content receipt (never approval)
+│   └── barrier.rs          #   shared/exclusive cache publication flock
 ├── image_build.rs          # explicit user Dockerfile export
 ├── image_cmd.rs            # image verb group: read-only `show`, `refresh`, `set-default`, build/import
 ├── image_import.rs         # daemon/archive import
@@ -655,15 +658,17 @@ Explicit `image set-default` adds a separate edge:
 
 ```text
 image set-default --image REF
-  → native target pull (under the shared reference guard)
-  → manifest pin → native pinned pull (its own guard)
-  → complete pinned cache + host-Linux config
-  → AcquiredDefaultImage → same flock → atomic replace(record)
+  → canonical target → shared publication barrier
+  → native resolve once (Always, force=false) under the source reference guard
+  → complete source cache + resolved-child identity + raw host-Linux config
+  → preserve canonical repo@child metadata + cache-only receipt under its guard
+  → AcquiredDefaultImage → same record flock → atomic replace(record)
 ```
 
-Two native pulls trade redundant manifest requests for a populated digest cache
-key; no native cache alias is hand-published. The returned host manifest digest,
-not an index digest or moving tag, is retained. Native auth/TLS, OCI integrity,
+One resolution per invocation: `AcquireMode::ResolveCurrent` preserves the
+validated host child (and its receipt) itself, so a moving index cannot be
+resolved twice and no duplicate derived pull is needed. The returned host
+manifest digest, not an index digest or moving tag, is retained. Native auth/TLS, OCI integrity,
 materialization and cache I/O are trusted runtime operations. The small platform
 conjunction is proved; JSON decoding and platform comparisons are trusted.
 Acquisition runs outside the selection lock. Publication rechecks record health
@@ -680,12 +685,13 @@ only a successful default-tier acquisition may initialize an absent record:
 ```text
 image refresh [--image REF]
   → the same boot_image selector and broken-config recovery
-  → image_acquire::NativeAcquisition (ambient backend's cache; native auth/trust/HTTP policy)
-  → launcher guard on the actual cache + normalized reference key
+  → image_acquire::acquire(ResolveCurrent) (ambient backend's cache; native auth/trust/HTTP policy)
+      shared publication barrier → launcher guard on the canonical reference key
       snapshot prior metadata → native pull (Always, force=false; native lock internal)
       → complete requested-key cache + resolved-child identity + raw host-Linux config
-          pass → success | fail → restore the under-guard snapshot
-  → advisory pulled-digest marker (that result's manifest digest)
+          pass → release the source guard; preserve repo@child metadata/receipt
+                 under the child's own guard | fail → restore the source snapshot
+  → advisory pulled-digest marker (the acquired digest)
   → adopt the selected immutable reference only if this was a default-tier success
 ```
 
@@ -694,22 +700,116 @@ download backend is on this path; a nonbootable OCI image with the right host
 platform refreshes successfully. Layer reuse is native: an unchanged manifest
 downloads no layer blob and never deletes old artifacts to force freshness.
 
-### Same-cache acquisition coordination limits
+### Canonical target, validated token, cache-only receipt
 
-The launcher guard is a persistent sibling of the native reference metadata in
-the **actual backend cache**, keyed by the SDK's normalized reference. It
-serializes only callers of this shared helper — refresh, setup's acquisition and
-each set-default pull — including processes with different state roots or `HOME`
-that share one writable cache. Lock order is launcher guard → native
-per-reference pull lock → native content locks; set-default releases a target
-guard before acquiring its derived-digest guard so same-key input cannot
-deadlock. Unmodified `msb pull`, ordinary launch cache writers, direct SDK
-clients, archive import/build publication, cache deletion/GC and older launchers
-do **not** take it, and readers/launches can observe the native publication
-before wrapper validation. Those writers must be quiescent for the rollback
-guarantee; this is not an all-writer transaction, no fsync/power-loss or
-process-kill rollback is claimed, and selection/adoption still happens strictly
-after successful validation.
+One spelling selects one cache entry. `image_acquire::reference` is the only
+canonicalizer: it lowercases the DNS host, folds the unported Hub endpoints
+(`docker.io`, `index.docker.io`, `registry-1.docker.io`) to `docker.io`, then
+applies the Hub `library/` rewrite, validates a strict lowercase
+sha256/384/512 digest and reparses its own output to prove identical components.
+The canonical text keys native acquisition and the cache; the user's original
+text survives only as provenance/display.
+
+Native success returns an opaque `ValidatedImage` token rather than a raw
+`PullResult`. It keeps the **source binding** (canonical source plus its stated
+immutable digest) separate from the **acquired identity** (`repo@child`), and
+only this module can mint one. After validation the acquired digest's canonical
+metadata is preserved and read back complete.
+
+Preservation is a repair this module performs, not a lock the loader honours: an
+archive import that publishes a digest-spelled alias *does* replace that entry,
+and the replacement persists until preparation restores validated metadata from
+the child receipt, or an explicit immutable acquisition repairs it when no
+receipt exists. What protects a launch is that it validates the cached entry
+before the SDK consumes it (below): an entry that cannot be repaired and
+validated is a closed failure, never silently booted content.
+
+A **launch** canonicalizes its selected reference once and then validates the
+cached entry under the shared barrier, before the SDK's `IfMissing` create reads
+anything: complete, self-consistent digest, host-Linux platform, and — for an
+immutable source whose cached digest differs — a receipt proving the
+association. A present entry that fails any of those fails the launch closed
+instead of being treated as a miss, because the create would otherwise re-resolve
+the reference and replace content the cache was supposed to describe. An absent
+entry is still a miss: an ordinary launch does not acquire from a registry
+before create.
+
+A canonical-source cache hit never rewrites the source key: the entry is already
+there and validated, and rewriting a *tag* from metadata read moments earlier
+would revert a concurrent `image refresh` that moved the tag. A canonical miss
+also tries the *original* (pre-canonical) spelling once, so a cache an older
+launcher wrote under `registry-1.docker.io/...` or an uppercase digest hex is
+reused: its validated metadata is republished under the acquired child key (which
+is content-addressed, so it cannot revert a tag) and — only while that key is
+still absent — under the canonical source key (tag, index or direct digest), with
+guarded native readback. The absence is re-checked under the canonical key's own
+guard, because a tag may have moved in the gap; a peer's publication then wins,
+and is used when it validates this selection and is the closed completeness
+failure when it does not. The original spelling must still be supplied for that
+first compatibility read; we do not scan arbitrary historical spellings. A first
+launch after upgrade may reacquire if neither the canonical key nor that original
+key has a validated, complete entry. After migration, canonical-only warm
+launches need no registry.
+
+A warm launch writes only what it repairs. A digest selection republishes its own
+child key from the receipt only when the cache no longer holds that content there
+anymore, and a readback that is still incomplete afterwards is the *completeness*
+error (the entry exists but cannot back a launch), not a generic identity
+failure — the two have different recoveries.
+
+A strict, bounded, no-follow **receipt** lives under
+`<cache>/agent-vm-content-metadata/`, never under HOME. It records the preserved
+native metadata, platform, content identity (verified config digest plus ordered
+layer diff IDs) and up to 256 source bindings, keyed by acquired child and host
+platform. Several sources share one preserved metadata record, rather than
+replicating metadata per source. Only a source that **states an immutable digest**
+is ever bound, because that is the only case the association check consults: a
+mutable tag would spend one of the bounded slots on evidence nothing reads, and
+per-commit tags would exhaust it for no gain. Bindings are best-effort provenance,
+never authority: a fresh acquisition adds its binding idempotently, and a full set
+keeps every association it proves and leaves the new source unproven (a later
+unequal cache association then reacquires that immutable source) rather than
+evicting a proven one or failing content this process already validated. Conflicting
+content for the same child is still an integrity error. A digest launch can
+restore its own child key from this record even if that digest was never learned as
+a source. Native readback checks complete artifacts before SDK consumption. Cache
+completeness alone cannot prove that an immutable source resolves to a different
+digest; only a successful native acquisition or a previously validated receipt can.
+The receipt is not an approval store and deleting the cache deletes only receipts.
+
+A present receipt that cannot be read, or that describes an identity other than
+its own key, is a hard error — including on a warm tag launch, which would succeed
+without consulting a receipt at all. That is the planned policy: a corrupt record
+is never treated as absent, because ignoring it would boot content the cache
+cannot account for. The rendered text names only cache-side recovery (restore the
+image cache from a backup, or remove the receipt and re-acquire) and never
+suggests deleting HOME approval records, a store acquisition does not touch.
+
+### Same-cache publication barrier and reference guards
+
+`<actual backend cache>/.agent-vm-publication.lock` is one stable `flock`:
+
+- **shared** for acquisition/validation, canonical metadata and receipt writes,
+  launch and setup through the SDK's cache consumption, and explicit refresh;
+- **exclusive** for archive publication (import/build) from the requested-alias
+  snapshot through the loader or its rollback.
+
+Lock order is one hierarchy, never host→cache: publication barrier → reference
+guards sorted by native metadata-key bytes → native per-reference pull lock →
+native content locks. A second, derived reference guard is taken only after the
+source guard is released, so two peers cannot invert the order. Warm unrelated
+preparations share the barrier and proceed while a cold acquisition is stalled
+in a registry stream; a shared holder never upgrades in place.
+
+The reference guard is a persistent sibling of the native reference metadata in
+the **actual backend cache**, keyed by the canonical reference. It serializes
+only callers of this helper — refresh, setup's acquisition, set-default — even
+across state roots or `HOME`, and covers snapshot → native pull → validation →
+rollback. Unmodified `msb pull`, direct SDK clients, cache deletion/GC and older
+launchers do **not** take it; the barrier is what excludes archive publication
+from a launch, not those writers. No fsync/power-loss or process-kill rollback
+is claimed, and selection/adoption still happens strictly after successful
+validation.
 
 - **Standard OCI semantics.** microsandbox's layer cache, GC, snapshotting, and
   metadata DB all key off OCI references. Going through that path means getting
@@ -735,6 +835,7 @@ not recompile the launcher. Users explicitly build/import through
 
 ```text
 main input preflight → MSB prologue → ambient cache → completed export/save/archive
+  → exclusive publication barrier
   → native materialization → sequential tag/alias publication
                             → on failure: restore requested tag only
 ```

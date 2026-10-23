@@ -591,6 +591,47 @@ invocations keep dependency logging unchanged. The CLI regression
 default-tier `RUST_LOG=trace image refresh` leaks no repository marker and includes a
 positive explicit-source control.
 
+#### Acquisition and publication test fixtures
+
+Image lifecycle tests drive the compiled CLI against a deterministic loopback
+OCI server and the real native cache; nothing about acquisition is mocked. Three
+seams make the coordination behaviour orderable without sleeps:
+
+- `AGENT_VM_TEST_ACQUIRE_GATE` (debug only) is a Unix socket reporting
+  stage names. The protocol is deterministic and single-reply. Always reported:
+  `before-lock`, `lock-contended`, `snapshot`, `native-ok`, `before-restore`,
+  `after-restore`, and — whichever consumer is running — `before-sdk-consume`
+  (a launch has validated its cache entry and is about to hand it to the SDK)
+  and `create-returned` (the create call returned, so the shared barrier is
+  about to be released). `publication-contended` is emitted once, only after
+  a real shared/exclusive publication-lock attempt contends; it blocks for the
+  same reply before resuming the lock wait. `AGENT_VM_TEST_ACQUIRE_GATE_DETAIL`
+  additionally enables the observation-only `cache-hit`, `cache-validated` (a
+  complete, associated cached entry was validated and nothing has been
+  republished for it yet — the one window in which a peer's tag publication is
+  still ahead of this consumer), `canonical-readback` and `receipt` stages. A
+  missing or malformed reply is a failure, never a skip.
+- `AGENT_VM_TEST_PIN_GATE` is the same shape for the pin-journal stages. No
+  production stage is wired yet (the approval store does not exist); the
+  harness control is exercised directly.
+- The publication barrier is a real `flock`; tests probe it with an independent
+  descriptor instead of inferring ownership. One row holds it shared behind a
+  stalled acquisition and proves an unrelated warm launch still reaches create;
+  another pauses a validated launch and proves an import blocks, with the
+  reverse order also asserted.
+
+`tests/support/fake_msb.rs` installs a **complete runtime pair**: a fake `msb`
+plus the adjacent `libkrunfw` the runtime resolver requires. A shell script is
+enough for boot-free acquisition (`StrictAcquisition`: `--version` only,
+everything else fails 93) but not for a launch: the SDK reads the Cargo version
+from an embedded executable section to select its launch contract. Tests that
+must reach real native cache consumption use `install_launch_binary`, which
+compiles a tiny fixture with `rustc`; it answers `--version` and
+`__launch-protocol` exactly and **fails every actual launch**. It is evidence of
+cache consumption, never of a working VM. Guest/boot evidence stays manual in
+the custom-image e2e group; `setup --no-verify` is the boot-free setup path,
+while ordinary `setup` intentionally creates a verification guest.
+
 #### What runs where
 
 | Harness | Runs on CI | Notes |

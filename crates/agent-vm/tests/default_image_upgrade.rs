@@ -2761,7 +2761,7 @@ fn coordination_setup_and_set_default_enter_the_same_guard() {
     complete(&h.cache(), &pin);
     h.no_fallback();
 
-    // A tag target: the target key, then the derived child key, each guarded.
+    // A tag target: one guarded acquisition resolves and preserves the child.
     let h2 = Harness::new();
     let server2 = Server::new();
     let a2 = h2.image(&ArchiveSpec::default());
@@ -2773,17 +2773,15 @@ fn coordination_setup_and_set_default_enter_the_same_guard() {
         &gate2,
         &["image", "set-default", "--image", &tag],
     );
-    for _ in 0..2 {
-        gate2
-            .expect(AcquisitionStage::BeforeLock)
-            .reply(GateReply::Continue);
-        gate2
-            .expect(AcquisitionStage::Snapshot)
-            .reply(GateReply::Continue);
-        gate2
-            .expect(AcquisitionStage::NativeOk)
-            .reply(GateReply::Continue);
-    }
+    gate2
+        .expect(AcquisitionStage::BeforeLock)
+        .reply(GateReply::Continue);
+    gate2
+        .expect(AcquisitionStage::Snapshot)
+        .reply(GateReply::Continue);
+    gate2
+        .expect(AcquisitionStage::NativeOk)
+        .reply(GateReply::Continue);
     success(&sd.wait());
     assert_eq!(
         h2.selected(),
@@ -2795,8 +2793,8 @@ fn coordination_setup_and_set_default_enter_the_same_guard() {
     );
     h2.no_fallback();
 
-    // A digest input derives the same key twice; sequential guards must not
-    // deadlock and the record keeps the direct manifest reference.
+    // A digest input resolves once and the record keeps the direct manifest
+    // reference; no derived second key is requested.
     let h3 = Harness::new();
     let server3 = Server::new();
     let a3 = h3.image(&ArchiveSpec::default());
@@ -2807,17 +2805,15 @@ fn coordination_setup_and_set_default_enter_the_same_guard() {
         &gate3,
         &["image", "set-default", "--image", &pin3],
     );
-    for _ in 0..2 {
-        gate3
-            .expect(AcquisitionStage::BeforeLock)
-            .reply(GateReply::Continue);
-        gate3
-            .expect(AcquisitionStage::Snapshot)
-            .reply(GateReply::Continue);
-        gate3
-            .expect(AcquisitionStage::NativeOk)
-            .reply(GateReply::Continue);
-    }
+    gate3
+        .expect(AcquisitionStage::BeforeLock)
+        .reply(GateReply::Continue);
+    gate3
+        .expect(AcquisitionStage::Snapshot)
+        .reply(GateReply::Continue);
+    gate3
+        .expect(AcquisitionStage::NativeOk)
+        .reply(GateReply::Continue);
     success(&sd3.wait());
     assert_eq!(h3.selected(), pin3);
     complete(&h3.cache(), &pin3);
@@ -3324,4 +3320,822 @@ fn default_refresh_requires_adoption_but_not_a_writable_advisory_marker() {
         }
         h.no_fallback();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Validated acquisition, canonical publication and the debug seams
+// ---------------------------------------------------------------------------
+
+#[path = "support/pin_gate.rs"]
+mod pin_gate;
+
+/// The receipt directory under the harness's actual native cache.
+fn receipt_dir(h: &Harness) -> PathBuf {
+    h.state.join("msb-home/cache/agent-vm-content-metadata")
+}
+
+fn receipts(h: &Harness) -> Vec<(PathBuf, serde_json::Value)> {
+    let Ok(entries) = fs::read_dir(receipt_dir(h)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let bytes = fs::read(&path).unwrap();
+            out.push((path, serde_json::from_slice(&bytes).unwrap()));
+        }
+    }
+    out
+}
+
+/// The opaque validated token exposes only what a consumer may use, and
+/// its debug rendering never names either reference. Unit-level because the
+/// token is (deliberately) not constructible through the CLI.
+#[test]
+fn validated_token_separates_source_and_acquired_identity() {
+    // The public contract is exercised by every acquisition test in this file:
+    // refresh/setup/set-default return only after validation. This row pins the
+    // *shape* decisions that the CLI cannot expose: a mutable source keeps its
+    // canonical text and no stated digest, while the acquired reference is
+    // repo@digest. It also pins the binding policy: a mutable tag records no
+    // source binding (nothing would ever consult it), while the receipt still
+    // preserves the validated content under the child key.
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let tag = format!("{}/images:opaque", server.host);
+    server.image("images", "opaque", &a);
+    success(&h.refresh(Some(&tag)));
+    let found = receipts(&h);
+    assert_eq!(found.len(), 1, "one acquisition, one receipt: {found:?}");
+    let receipt = &found[0].1;
+    assert_eq!(receipt["version"], 1);
+    assert_eq!(
+        receipt["acquired_reference"],
+        format!("{}/images@{}", server.host, a.written.manifest_digest)
+    );
+    assert_eq!(
+        receipt["metadata"]["manifest_digest"],
+        a.written.manifest_digest
+    );
+    assert_eq!(
+        receipt["source_bindings"],
+        serde_json::Value::Array(Vec::new()),
+        "a mutable tag has no immutable association to prove: {receipt:?}"
+    );
+    // The positive control for the same policy: an immutable source does record
+    // its association, because only that is ever consulted.
+    let pin = format!("{}/images@{}", server.host, a.written.manifest_digest);
+    success(&h.refresh(Some(&pin)));
+    let bound = receipts(&h)
+        .into_iter()
+        .map(|(_, value)| value)
+        .find(|value| value["source_bindings"][0]["reference"] == pin.as_str())
+        .expect("an immutable acquisition must preserve its source binding");
+    assert_eq!(bound["acquired_reference"], pin);
+    assert_eq!(
+        bound["source_bindings"][0]["stated_digest"],
+        a.written.manifest_digest
+    );
+}
+
+/// A full binding set never fails an acquisition whose native pull has already
+/// moved the source key, never evicts a proven association and never exceeds its
+/// own bound.
+///
+/// Two immutable index sources resolve to one host child, so both record a
+/// binding. The stored set is filled to the bound first; learning the second
+/// source is then provenance exhaustion, which must leave the acquisition
+/// successful, the receipt byte-identical and the first association intact.
+#[test]
+fn a_full_binding_set_keeps_the_acquisition_successful() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let child = server.image("images", "bound-child", &a);
+    let index: serde_json::Value = serde_json::from_slice(&a.index).unwrap();
+    let index_bytes = serde_json::to_vec(&index).unwrap();
+    let first = server.index_under_algorithm("images", "bound-one", &index_bytes, "sha256");
+    let second = server.index_under_algorithm("images", "bound-two", &index_bytes, "sha384");
+    assert_ne!(first, second);
+    success(&h.refresh(Some(&first)));
+    let (path, receipt) = receipts(&h)
+        .into_iter()
+        .find(|(_, value)| value["acquired_reference"] == child.as_str())
+        .expect("the immutable index must preserve a child receipt");
+    let proven = receipt["source_bindings"].as_array().unwrap().clone();
+    assert_eq!(proven.len(), 1, "one immutable source, one binding");
+    assert_eq!(proven[0]["reference"], first.as_str());
+
+    // Fill the bounded set with otherwise-valid immutable associations, keeping
+    // the source this acquisition really proved.
+    let repo = first.rsplit_once('@').unwrap().0;
+    let mut filled = proven.clone();
+    for slot in 1..256u32 {
+        let digest = format!("sha256:{slot:064x}");
+        filled.push(serde_json::json!({
+            "reference": format!("{repo}@{digest}"),
+            "stated_digest": digest,
+        }));
+    }
+    let mut stored = receipt.clone();
+    stored["source_bindings"] = serde_json::Value::Array(filled);
+    let bytes = serde_json::to_vec(&stored).unwrap();
+    fs::write(&path, &bytes).unwrap();
+
+    let requests_before = server.count();
+    success(&h.refresh(Some(&second)));
+    assert!(
+        server.requests()[requests_before..]
+            .iter()
+            .any(|(_, route)| route.contains(second.rsplit_once('@').unwrap().1)),
+        "the acquisition must really have resolved the second immutable source"
+    );
+    complete(&h.cache(), &child);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "a full set must keep every proven binding and add nothing"
+    );
+    let read: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let bindings = read["source_bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), 256, "the bound is never exceeded");
+    assert!(
+        bindings.iter().any(|bound| bound == &proven[0]),
+        "the source this content proved first must stay associated"
+    );
+    assert!(
+        !bindings
+            .iter()
+            .any(|bound| bound["reference"] == second.as_str()),
+        "an unadmitted source must not be recorded as proven"
+    );
+    h.no_fallback();
+}
+
+/// A direct manifest is acquirable under every supported digest algorithm,
+/// and the acquired identity is the requested digest, not a substituted one.
+#[test]
+fn direct_manifest_acquisition_binds_each_digest_algorithm() {
+    for algorithm in ["sha256", "sha384", "sha512"] {
+        let h = Harness::new();
+        let server = Server::new();
+        let a = h.image(&ArchiveSpec::default());
+        server.image("images", "algo", &a);
+        let manifest = &a.blobs[&a.written.manifest_digest];
+        let pin = server.put_manifest_under_algorithm("images", manifest, algorithm);
+        success(&h.refresh(Some(&pin)));
+        let digest = pin.rsplit('@').next().unwrap().to_owned();
+        assert_eq!(cached_manifest_digest(&h.cache(), &pin), digest);
+        // The canonical repo@digest entry is complete and preserves the
+        // validated native metadata.
+        complete(&h.cache(), &pin);
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(h.cache().image_metadata_path(&pin.parse().unwrap())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["manifest_digest"], digest);
+        assert!(
+            receipts(&h).iter().any(|(_, value)| {
+                value["acquired_reference"] == pin.as_str()
+                    && value["source_bindings"][0]["stated_digest"] == digest.as_str()
+            }),
+            "{algorithm}: the receipt must keep the stated immutable binding"
+        );
+        h.no_fallback();
+    }
+}
+
+/// An immutable index resolves to its verified host child while keeping the
+/// index as the source binding; no mutable tag is requested.
+#[test]
+fn index_acquisition_preserves_the_immutable_source_binding() {
+    for algorithm in ["sha256", "sha384", "sha512"] {
+        let h = Harness::new();
+        let server = Server::new();
+        let a = h.image(&ArchiveSpec::default());
+        let child_pin = server.image("images", "index-child", &a);
+        let index: serde_json::Value = serde_json::from_slice(&a.index).unwrap();
+        let bytes = serde_json::to_vec(&index).unwrap();
+        let index_pin = server.index_under_algorithm("images", "indexed", &bytes, algorithm);
+        let index_digest = index_pin.rsplit('@').next().unwrap().to_owned();
+        assert_ne!(index_digest, a.written.manifest_digest);
+        success(&h.refresh(Some(&index_pin)));
+        // The *source* key keeps the resolved child; the canonical child key is
+        // complete under its own digest.
+        assert_eq!(
+            cached_manifest_digest(&h.cache(), &index_pin),
+            a.written.manifest_digest
+        );
+        complete(&h.cache(), &index_pin);
+        complete(&h.cache(), &child_pin);
+        assert!(
+            receipts(&h).iter().any(|(_, value)| {
+                value["acquired_reference"] == child_pin.as_str()
+                    && value["source_bindings"][0]["reference"] == index_pin.as_str()
+                    && value["source_bindings"][0]["stated_digest"] == index_digest.as_str()
+            }),
+            "{algorithm}: the receipt must bind the index source to the host child"
+        );
+        let requests = server.requests();
+        assert!(
+            !requests
+                .iter()
+                .any(|(_, path)| path == "/v2/images/manifests/indexed"),
+            "{algorithm}: an immutable index must not be re-resolved through a tag"
+        );
+        h.no_fallback();
+    }
+}
+
+/// A header or body that lies about the requested digest is an integrity
+/// failure. Nothing is published under the lying key.
+#[test]
+fn lying_header_and_body_are_integrity_failures() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    server.image("images", "lying", &a);
+    let manifest = a.blobs[&a.written.manifest_digest].clone();
+    let claimed = format!("sha512:{}", "9".repeat(128));
+    // The body hashes to its sha256 but the route claims sha512.
+    server.put_with_header(
+        &format!("/v2/images/manifests/{claimed}"),
+        &manifest,
+        "application/vnd.oci.image.manifest.v1+json",
+        &claimed,
+    );
+    let pin = format!("{}/images@{claimed}", server.host);
+    let out = h.refresh(Some(&pin));
+    assert!(
+        !out.status.success(),
+        "a lying digest header must fail:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let key = h
+        .cache()
+        .image_metadata_path(&pin.parse::<Reference>().unwrap());
+    assert!(
+        !key.exists(),
+        "a failed integrity check must not publish the lying key"
+    );
+    h.no_fallback();
+}
+
+/// The receipt is cache-only (0600, strict schema, not under HOME) and a
+/// digest-spelled alias overwrite is repaired by the next explicit acquisition.
+#[test]
+fn receipt_is_cache_only_and_alias_overwrite_is_repaired() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let tag = format!("{}/images:receipt", server.host);
+    server.image("images", "receipt", &a);
+    success(&h.refresh(Some(&tag)));
+    let canonical = format!("{}/images@{}", server.host, a.written.manifest_digest);
+    let found = receipts(&h);
+    assert_eq!(found.len(), 1, "one acquisition, one receipt: {found:?}");
+    let (path, value) = &found[0];
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["acquired_reference"], canonical);
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(
+        path.starts_with(&h.state),
+        "the receipt belongs to the cache, not HOME"
+    );
+    assert!(
+        !h.home.join(".config/agent-vm/image-pins.json").exists(),
+        "this stage creates no host approval store"
+    );
+
+    // A genuine archive publication under the digest-spelled alias replaces the
+    // canonical metadata. The receipt still describes A.
+    let b = image_archive::write_docker_save(
+        &h.root.path().join("a04-b.tar"),
+        &[image_archive::DockerSaveImage {
+            marker: "a04-b".into(),
+            repo_tags: Some(vec![canonical.clone()]),
+        }],
+    );
+    let imported = h.run(&[
+        "image",
+        "import",
+        "--input",
+        &b[0].path.to_string_lossy(),
+        "--tag",
+        &format!("{}/images:imported", server.host),
+    ]);
+    success(&imported);
+    let overwritten: serde_json::Value = serde_json::from_slice(
+        &fs::read(h.cache().image_metadata_path(&canonical.parse().unwrap())).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        overwritten["config_digest"], a.written.config_digest,
+        "the fixture must really overwrite the alias"
+    );
+
+    // Receipt loss must not prevent explicit immutable reacquisition. This is
+    // distinct from a warm launch repairing from an extant child receipt.
+    fs::remove_file(path).unwrap();
+    assert!(receipts(&h).is_empty());
+    let requests_before = server.count();
+    success(&h.refresh(Some(&canonical)));
+    assert!(
+        server.requests()[requests_before..]
+            .iter()
+            .any(|(_, route)| {
+                route == &format!("/v2/images/manifests/{}", a.written.manifest_digest)
+            }),
+        "without a receipt, explicit repair must freshly acquire the immutable digest"
+    );
+    let repaired: serde_json::Value = serde_json::from_slice(
+        &fs::read(h.cache().image_metadata_path(&canonical.parse().unwrap())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(repaired["config_digest"], a.written.config_digest);
+    assert_eq!(repaired["manifest_digest"], a.written.manifest_digest);
+    complete(&h.cache(), &canonical);
+    assert!(
+        receipts(&h).iter().any(|(_, value)| {
+            value["acquired_reference"] == canonical
+                && value["metadata"]["config_digest"] == a.written.config_digest
+        }),
+        "the repair must rewrite a validated receipt"
+    );
+    h.no_fallback();
+}
+
+/// A configured but unreachable acquisition gate is a hard failure, never a
+/// silent skip of the coordination seam. (A release build ignores the seam; the
+/// release contract is type-checked, not run.)
+#[test]
+fn gate_io_failure_is_a_failure_not_a_skip() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let tag = format!("{}/images:gate", server.host);
+    server.image("images", "gate", &a);
+    let missing = h.root.path().join("no-such-gate.sock");
+    let mut cmd = h.command();
+    cmd.env("AGENT_VM_TEST_ACQUIRE_GATE", &missing)
+        .args(["image", "refresh", "--image", &tag]);
+    let out = bounded(&mut cmd);
+    assert!(
+        !out.status.success(),
+        "a missing gate listener must fail the acquisition"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("test gate failed"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        server.count(),
+        0,
+        "the gate checkpoints precede any registry request"
+    );
+    assert!(
+        !h.cache()
+            .image_metadata_path(&tag.parse::<Reference>().unwrap())
+            .exists()
+    );
+}
+
+/// No image verb creates a host approval store yet, and the pin gate
+/// protocol is bounded and single-reply (no approval semantics).
+#[test]
+fn no_pin_store_is_created_and_the_pin_gate_control_is_bounded() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let tag = format!("{}/images:nopin", server.host);
+    let pin = server.image("images", "nopin", &a);
+    success(&h.refresh(Some(&tag)));
+    success(&h.set_default(&pin));
+    success(&h.run(&["setup", "--no-verify"]));
+    let mut stack = vec![h.home.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with("image-pins"),
+                "no host pin store may be created yet: {}",
+                path.display()
+            );
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+
+    // The gate protocol: one stage, one reply, exact stage matching. This
+    // exercises the harness control the production stages will be wired to.
+    let dir = h.root.path().join("pin-gate");
+    let mut gate = pin_gate::PinGate::new(&dir);
+    let mut stream = UnixStream::connect(gate.path()).unwrap();
+    writeln!(stream, "candidate-ready").unwrap();
+    stream.flush().unwrap();
+    gate.expect(pin_gate::PinStage::CandidateReady)
+        .reply(pin_gate::Reply::Continue);
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).unwrap();
+    assert_eq!(reply.trim(), "continue");
+    gate.expect_none(Duration::from_millis(100));
+    h.no_fallback();
+}
+
+/// A malformed stage from a peer is a test failure, not an ignored line.
+#[test]
+#[should_panic(expected = "malformed pin stage")]
+fn pin_gate_rejects_a_malformed_stage() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut gate = pin_gate::PinGate::new(dir.path());
+    let mut stream = UnixStream::connect(gate.path()).unwrap();
+    writeln!(stream, "approve-everything").unwrap();
+    stream.flush().unwrap();
+    let _ = gate.expect(pin_gate::PinStage::CandidateReady);
+}
+
+// ---------------------------------------------------------------------------
+// Setup's verification create consumes the acquisition's validated identity
+// ---------------------------------------------------------------------------
+
+/// The dumped `SandboxConfig`s, decoded from the debug marker.
+fn sandbox_configs(stderr: &str) -> Vec<serde_json::Value> {
+    const MARKER: &str = "[debug] sandbox config JSON: ";
+    let mut out = Vec::new();
+    let mut rest = stderr;
+    while let Some(index) = rest.find(MARKER) {
+        let after = &rest[index + MARKER.len()..];
+        let mut stream = serde_json::Deserializer::from_str(after).into_iter::<serde_json::Value>();
+        let Some(Ok(value)) = stream.next() else {
+            break;
+        };
+        rest = &after[stream.byte_offset()..];
+        out.push(value);
+    }
+    out
+}
+
+/// `setup`'s verification create must consume the bytes the acquisition just
+/// validated: the acquired immutable child, not the selected spelling.
+///
+/// The uppercase-hex digest is a real OCI reference that canonicalizes to the
+/// lowercase one, so using it verbatim would key a different native cache entry
+/// and the `IfMissing` create would request the manifest again (unvalidated, and
+/// at a tag that may have moved).
+#[test]
+fn setup_verification_uses_the_validated_canonical_reference() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let pin = server.image("images", "verify", &a);
+    let (head, hex) = pin.rsplit_once(':').expect("repo@algorithm:hex");
+    let old_spelling = format!("{head}:{}", hex.to_ascii_uppercase());
+    assert_ne!(old_spelling, pin);
+    // `Sandbox::build` resolves the runtime pair; the fixture is a complete pair
+    // whose shell script answers only `--version`, so create fails after the
+    // config dump. Nothing here fakes a successful VM.
+    let library = h
+        .msb
+        .with_file_name(microsandbox_utils::libkrunfw_filename(std::env::consts::OS));
+    std::fs::write(&library, b"fixture").unwrap();
+
+    let mut cmd = h.command();
+    cmd.env("AGENT_VM_DEBUG_CONFIG", "1")
+        .args(["setup", "--image", &old_spelling]);
+    let out = bounded(&mut cmd);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !out.status.success(),
+        "the fixture runtime never boots a verification guest: {stderr}"
+    );
+    let configs = sandbox_configs(&stderr);
+    let verification = configs
+        .iter()
+        .find(|config| config["name"].as_str() == Some("agent-vm-setup-verify"))
+        .unwrap_or_else(|| panic!("no verification sandbox config: {stderr}"));
+    let reference = verification["image"]["Oci"]["reference"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no OCI reference in {verification}"));
+    assert_eq!(
+        reference, pin,
+        "the verification create must consume the validated canonical identity"
+    );
+    // Exactly one acquisition, and no request for the selected spelling.
+    let manifests: Vec<String> = server
+        .requests()
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|path| path.contains("/manifests/"))
+        .collect();
+    let digest_path = format!("/v2/images/manifests/sha256:{hex}");
+    let old_path = format!(
+        "/v2/images/manifests/sha256:{hex_upper}",
+        hex_upper = hex.to_ascii_uppercase()
+    );
+    assert!(
+        !manifests.contains(&old_path),
+        "the verification create re-resolved the selected spelling: {manifests:?}"
+    );
+    assert_eq!(
+        manifests
+            .iter()
+            .filter(|path| **path == digest_path)
+            .count(),
+        1,
+        "exactly one manifest acquisition: {manifests:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Immutable-digest acquisition permutations
+// ---------------------------------------------------------------------------
+
+/// A `Docker-Content-Digest` header naming the *same* bytes under a different
+/// algorithm must not change the acquired identity, and a header naming
+/// *different* bytes must never authorize them.
+#[test]
+fn alternate_algorithm_headers_do_not_substitute_content_or_identity() {
+    // The benign permutation: the header is another hash of the same bytes.
+    for (request, header) in [("sha512", "sha256"), ("sha256", "sha512")] {
+        let h = Harness::new();
+        let server = Server::new();
+        let a = h.image(&ArchiveSpec::default());
+        let manifest = a.blobs[&a.written.manifest_digest].clone();
+        let requested = oci_registry::digest_hex(request, &manifest);
+        let header_digest = oci_registry::digest_hex(header, &manifest);
+        assert_ne!(requested, header_digest);
+        server.put_with_header(
+            &format!("/v2/images/manifests/{requested}"),
+            &manifest,
+            "application/vnd.oci.image.manifest.v1+json",
+            &header_digest,
+        );
+        for (digest, bytes) in &a.blobs {
+            if digest != &a.written.manifest_digest {
+                server.put(
+                    &format!("/v2/images/blobs/{digest}"),
+                    bytes.clone(),
+                    "application/octet-stream",
+                    digest,
+                );
+            }
+        }
+        let pin = format!("{}/images@{requested}", server.host);
+        success(&h.refresh(Some(&pin)));
+        // Whatever digest the header reports, the bytes behind the requested
+        // key are the requested ones, and the receipt binds the requested
+        // immutable source to that acquired content.
+        complete(&h.cache(), &pin);
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                h.cache()
+                    .image_metadata_path(&pin.parse::<Reference>().unwrap()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata["raw_manifest_json"].as_str().unwrap().as_bytes(),
+            manifest.as_slice(),
+            "{request}/{header}: the bytes under the requested key are not the requested bytes"
+        );
+        assert!(
+            receipts(&h).iter().any(|(_, value)| {
+                value["source_bindings"][0]["reference"] == pin.as_str()
+                    && value["source_bindings"][0]["stated_digest"] == requested.as_str()
+                    && value["metadata"]["manifest_digest"] == metadata["manifest_digest"]
+            }),
+            "{request}/{header}: the receipt must bind the requested immutable source"
+        );
+        h.no_fallback();
+    }
+
+    // The lying permutation: the header names bytes the request does not.
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let mut lying: serde_json::Value =
+        serde_json::from_slice(&a.blobs[&a.written.manifest_digest]).unwrap();
+    lying["layers"][0]["size"] = serde_json::Value::from(4242);
+    let lying = serde_json::to_vec(&lying).unwrap();
+    let requested = oci_registry::digest_hex("sha512", &a.blobs[&a.written.manifest_digest]);
+    let header_digest = oci_registry::digest_hex("sha256", &lying);
+    server.put_with_header(
+        &format!("/v2/images/manifests/{requested}"),
+        &lying,
+        "application/vnd.oci.image.manifest.v1+json",
+        &header_digest,
+    );
+    // The manifest's own config and layer descriptors are A's, and A's blobs are
+    // routed, so the *only* defect is that the body is not what was requested.
+    for (digest, bytes) in &a.blobs {
+        if digest != &a.written.manifest_digest {
+            server.put(
+                &format!("/v2/images/blobs/{digest}"),
+                bytes.clone(),
+                "application/octet-stream",
+                digest,
+            );
+        }
+    }
+    let pin = format!("{}/images@{requested}", server.host);
+    let out = h.refresh(Some(&pin));
+    assert!(
+        !out.status.success(),
+        "a header naming different bytes must not authorize them:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !h.cache()
+            .image_metadata_path(&pin.parse::<Reference>().unwrap())
+            .exists(),
+        "the requested sha512 key must not be published from unrelated bytes"
+    );
+    assert!(
+        !h.cache()
+            .image_metadata_path(
+                &format!("{}/images@{header_digest}", server.host)
+                    .parse::<Reference>()
+                    .unwrap()
+            )
+            .exists(),
+        "the header identity must not be published either"
+    );
+    h.no_fallback();
+}
+
+/// An index may name its host child under a different digest algorithm. The
+/// source binding stays the index; the acquired identity is the child's own
+/// algorithm.
+#[test]
+fn index_child_may_cross_digest_algorithms() {
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let manifest = a.blobs[&a.written.manifest_digest].clone();
+    let child = oci_registry::digest_hex("sha512", &manifest);
+    assert!(child.starts_with("sha512:"));
+    // The child manifest bytes, routed and hashed with sha512.
+    let child_pin = server.put_manifest_under_algorithm("images", &manifest, "sha512");
+    assert_eq!(child_pin, format!("{}/images@{child}", server.host));
+    // Its config and layer blobs keep their own sha256 keys.
+    for (digest, bytes) in &a.blobs {
+        if digest != &a.written.manifest_digest {
+            server.put(
+                &format!("/v2/images/blobs/{digest}"),
+                bytes.clone(),
+                "application/octet-stream",
+                digest,
+            );
+        }
+    }
+    // An index whose single descriptor names the sha512 child, itself routed
+    // under sha256: the index→child pair crosses algorithms.
+    let mut index: serde_json::Value = serde_json::from_slice(&a.index).unwrap();
+    index["manifests"][0]["digest"] = serde_json::Value::String(child.clone());
+    index["manifests"][0]["size"] = serde_json::Value::from(manifest.len() as u64);
+    let index_bytes = serde_json::to_vec(&index).unwrap();
+    let index_pin = server.index_under_algorithm("images", "cross", &index_bytes, "sha256");
+    success(&h.refresh(Some(&index_pin)));
+    assert_eq!(
+        cached_manifest_digest(&h.cache(), &index_pin),
+        child,
+        "the source key must keep the cross-algorithm child"
+    );
+    complete(&h.cache(), &index_pin);
+    complete(&h.cache(), &child_pin);
+    let index_digest = index_pin.rsplit('@').next().unwrap().to_owned();
+    assert!(
+        receipts(&h).iter().any(|(_, value)| {
+            value["acquired_reference"] == child_pin.as_str()
+                && value["source_bindings"][0]["reference"] == index_pin.as_str()
+                && value["source_bindings"][0]["stated_digest"] == index_digest.as_str()
+        }),
+        "the receipt must bind the sha256 index to its sha512 child"
+    );
+    h.no_fallback();
+}
+
+/// A child whose bytes do not hash to the digest its index names, and a config
+/// whose bytes do not hash to the digest its manifest names, are integrity
+/// failures. Nothing is published under the lying key.
+#[test]
+fn lying_child_and_lying_config_are_integrity_failures() {
+    // A lying child: the index names digest D, but the route serves other bytes.
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let mut index: serde_json::Value = serde_json::from_slice(&a.index).unwrap();
+    let lying_child = format!("sha256:{}", "e".repeat(64));
+    index["manifests"][0]["digest"] = serde_json::Value::String(lying_child.clone());
+    let index_bytes = serde_json::to_vec(&index).unwrap();
+    server.put_with_header(
+        &format!("/v2/images/manifests/{lying_child}"),
+        &a.blobs[&a.written.manifest_digest],
+        "application/vnd.oci.image.manifest.v1+json",
+        &lying_child,
+    );
+    for (digest, bytes) in &a.blobs {
+        if digest != &a.written.manifest_digest {
+            server.put(
+                &format!("/v2/images/blobs/{digest}"),
+                bytes.clone(),
+                "application/octet-stream",
+                digest,
+            );
+        }
+    }
+    let index_pin = server.index("images", "lying-child", index_bytes);
+    let child_key = h.cache().image_metadata_path(
+        &format!("{}/images@{lying_child}", server.host)
+            .parse::<Reference>()
+            .unwrap(),
+    );
+    // Calibrate the absence oracle against the actual descriptor route before
+    // acquisition: a bare `sha256:...` parses as a different repository/tag.
+    let descriptor_reference: Reference = format!(
+        "{}/images@{}",
+        server.host,
+        index["manifests"][0]["digest"].as_str().unwrap()
+    )
+    .parse()
+    .unwrap();
+    let descriptor_key = h.cache().image_metadata_path(&descriptor_reference);
+    fs::create_dir_all(descriptor_key.parent().unwrap()).unwrap();
+    fs::write(
+        &descriptor_key,
+        b"oracle calibration: forbidden publication",
+    )
+    .unwrap();
+    assert!(
+        child_key.exists(),
+        "the oracle must observe publication at the descriptor child key"
+    );
+    fs::remove_file(&descriptor_key).unwrap();
+    let out = h.refresh(Some(&index_pin));
+    assert!(
+        !out.status.success(),
+        "a child that does not hash to its descriptor must fail:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|(_, path)| path == &format!("/v2/images/manifests/{lying_child}")),
+        "the real lying child route must have been exercised"
+    );
+    assert!(
+        !child_key.exists(),
+        "a lying child must not be published under its claimed digest"
+    );
+    h.no_fallback();
+
+    // A lying config: the manifest names digest D, but the route serves a
+    // different (still well-formed JSON) config body.
+    let h = Harness::new();
+    let server = Server::new();
+    let a = h.image(&ArchiveSpec::default());
+    let pin = server.image("images", "lying-config", &a);
+    // Override the config route *after* the genuine routing above, so the only
+    // defect is the config body no longer hashing to its descriptor.
+    let config_digest = a.written.config_digest.clone();
+    let mut tampered: serde_json::Value = serde_json::from_slice(&a.blobs[&config_digest]).unwrap();
+    tampered["config"]["Env"] = serde_json::json!(["TAMPERED=1"]);
+    server.put(
+        &format!("/v2/images/blobs/{config_digest}"),
+        serde_json::to_vec(&tampered).unwrap(),
+        "application/octet-stream",
+        &config_digest,
+    );
+    let out = h.refresh(Some(&pin));
+    assert!(
+        !out.status.success(),
+        "a config that does not hash to its descriptor must fail:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let source_key = h
+        .cache()
+        .image_metadata_path(&pin.parse::<Reference>().unwrap());
+    assert!(
+        !source_key.exists(),
+        "a lying config must not publish the requested key"
+    );
+    h.no_fallback();
 }

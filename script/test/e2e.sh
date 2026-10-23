@@ -1189,6 +1189,26 @@ check_harness_negative() {
     fi
   done
 
+  # The split form: the acquisition carries the selection, while the
+  # verification config carries the immutable child the acquisition validated.
+  # The stale expectation (the selected tag in both records) and a swap between
+  # the two records must both fail, so the two-reference form cannot degrade
+  # into "any entry".
+  local acquired='localhost:1/project@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+  local split=$'native-image-acquire\tlocalhost:1/project:latest\nagent-vm-setup-verify\tlocalhost:1/project@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+  if ! assert_dump "$split" "$verify_name" "$ref" "$acquired" >/dev/null 2>&1; then
+    echo "    FAIL: assert_dump rejected the split accepted capture"
+    result=1
+  fi
+  for bad in "$good" \
+      $'native-image-acquire\tlocalhost:1/project@sha256:0000000000000000000000000000000000000000000000000000000000000000\nagent-vm-setup-verify\tlocalhost:1/project:latest'; do
+    if assert_dump "$bad" "$verify_name" "$ref" "$acquired" >/dev/null 2>&1; then
+      echo "    FAIL: assert_dump accepted a stale or swapped two-reference capture:"
+      printf '%s\n' "$bad"
+      result=1
+    fi
+  done
+
   # The zero-builder oracle must reject a missing, unreadable and non-empty log,
   # and accept a readable empty one.
   local oracle_log="$probe_dir/builder.log"
@@ -2160,11 +2180,15 @@ PY
 # setup-verification sandbox config, each carrying the expected reference. Fields
 # are compared **whole**, never as a substring: a wrong-reference suffix, a
 # duplicated name, a missing name, an extra name, a stale `agent-vm-pull` sandbox
-# record, or any other reference all fail. `$3` is the reference both records
-# must carry (the refresh and the setup verification select the same image);
-# `$2` names the row this call is primarily asserting, for the message.
+# record, or any other reference all fail. `$3` is the reference the native
+# acquisition must carry; `$4`, when given, is the reference the verification
+# config must carry *instead*. They differ exactly when the acquisition validated
+# an immutable child: setup boots the verification sandbox from that validated
+# `repo@child` so its `IfMissing` create consumes the entry the acquisition
+# measured instead of re-resolving the selected spelling. `$2` names the row this
+# call is primarily asserting, for the message.
 assert_dump() {
-  local dumps="$1" expected_name="$2" ref="$3"
+  local dumps="$1" expected_name="$2" ref="$3" verify_ref="${4:-$3}"
   local -a rows=()
   local line
   while IFS= read -r line; do
@@ -2190,8 +2214,10 @@ assert_dump() {
         return 1
         ;;
     esac
-    if [ "$dumped" != "$ref" ]; then
-      echo "    FAIL: the $name dump carries [$dumped], want exactly [$ref]"
+    local want="$ref"
+    if [ "$name" = agent-vm-setup-verify ]; then want="$verify_ref"; fi
+    if [ "$dumped" != "$want" ]; then
+      echo "    FAIL: the $name dump carries [$dumped], want exactly [$want]"
       printf '%s\n' "$dumps"
       return 1
     fi
@@ -2201,7 +2227,9 @@ assert_dump() {
     names+=("$name")
   done
   if [ "$matched" -ne 1 ]; then
-    echo "    FAIL: want exactly one $expected_name dump with reference [$ref], found $matched"
+    local want_ref="$ref"
+    if [ "$expected_name" = agent-vm-setup-verify ]; then want_ref="$verify_ref"; fi
+    echo "    FAIL: want exactly one $expected_name dump with reference [$want_ref], found $matched"
     printf '%s\n' "$dumps"
     return 1
   fi
@@ -2213,10 +2241,21 @@ assert_dump() {
 }
 
 # #259: a reachable selected image reaches setup's verification step. The two
-# built acquisition configs (initial pull, then verify) must each carry the
-# exact selected reference -- not the decoy or the default. The verify-only
-# mutation overrides verify_image's `.image(image)`, which this check then fails
-# on, while the initial pull stays correct.
+# built acquisition configs (initial pull, then verify) must each carry an exact
+# reference -- not the decoy or the default: the initial pull the *selected*
+# spelling, and the verification sandbox the immutable `repo@child` the
+# acquisition validated (setup consumes those exact bytes, so its `IfMissing`
+# create cannot re-resolve the selected spelling). The verify-only mutation
+# overrides verify_image's `.image(image)`, which this check then fails on, while
+# the initial pull stays correct.
+#
+# The child digest is read from the registry (`registry_host_manifest_digest`,
+# the same envelope→child resolution a pull performs), never from the dump being
+# checked. `msb image list` holds that child identity after a cold setup -- the
+# verification create persisted it -- and no row for the selected tag, because a
+# native acquisition does not write the SDK's reference table. The tag must still
+# be launchable, so a warm launch of it afterwards must consume the cached entry
+# with zero registry manifest/blob reads.
 #
 # setup verifies exactly the *declared* tools and fails on any of them, on any
 # image. The synthesized `shell` fallback is not a declaration, so this config
@@ -2229,7 +2268,7 @@ custom_image_setup_verification_uses_selected_ref() {
   local name="custom-setup-verify" proj="$WORK/custom-setup-verify-proj"
   mkdir -p "$proj/.agent-vm" || return 1
   local reg="registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8"
-  local container port selected decoy suffix result=0
+  local container port repo selected decoy suffix child acquired result=0
   container="$(docker run -d --rm -p 127.0.0.1::5000 "$reg")" ||
     { echo "    BLOCKER: could not start the local registry container"; return 1; }
   [ -n "$container" ] || { echo "    BLOCKER: no registry container id"; return 1; }
@@ -2239,9 +2278,10 @@ custom_image_setup_verification_uses_selected_ref() {
     docker rm -f "$container" >/dev/null 2>&1 || true
     return 1
   fi
-  selected="localhost:$port/e2e-259-$RUN_ID:selected"
-  decoy="localhost:$port/e2e-259-$RUN_ID:decoy"
-  suffix="e2e-259-$RUN_ID:selected"
+  repo="e2e-259-$RUN_ID"
+  selected="localhost:$port/$repo:selected"
+  decoy="localhost:$port/$repo:decoy"
+  suffix="$repo:selected"
 
   local deadline=$(( $(date +%s) + 30 )) ready=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -2269,14 +2309,24 @@ custom_image_setup_verification_uses_selected_ref() {
   fi
 
   # Only `hello-258` is declared, and every declared tool must answer
-  # `--version`; the `shell` fallback is not verified.
+  # `--version`; the `shell` fallback is not verified. `persist` is what makes the
+  # fixture's no-argument mode reach its completion sentinel: the warm launch below
+  # asserts a real guest run, not merely a resolved image.
   cat >"$proj/.agent-vm/config.toml" <<EOF || result=1
 image = "$selected"
 [[tools]]
 name = "hello-258"
 command = "hello-258"
+persist = [".hello-258.state"]
 EOF
   image_catalog_has "$selected" "$suffix" absent || result=1
+  # The immutable identity the acquisition will validate, from the registry.
+  child="$(registry_host_manifest_digest "$port" "$repo" selected)" || result=1
+  if [ -z "$child" ]; then
+    echo "    FAIL: could not read the selected tag's host child digest from the registry"
+    result=1
+  fi
+  acquired="localhost:$port/$repo@$child"
 
   if [ "$result" -eq 0 ]; then
     observe_launch "$name" "$proj" "$WORK/$name.out" -- \
@@ -2292,13 +2342,32 @@ EOF
     require_launch_ok "$name" || result=1
     assert_no_host_calls || result=1
     dumps="$(parse_acquisition_dumps "$WORK/$name.out")" || result=1
-    assert_dump "$dumps" "native-image-acquire" "$selected" || result=1
-    assert_dump "$dumps" "agent-vm-setup-verify" "$selected" || result=1
+    assert_dump "$dumps" "native-image-acquire" "$selected" "$acquired" || result=1
+    assert_dump "$dumps" "agent-vm-setup-verify" "$selected" "$acquired" || result=1
     out="$(launch_output "$name")"
     assert_match "setup reports the selected image ready" "^==> $selected ready$" "$out" || result=1
     assert_no_match "setup never selects the decoy" "$decoy" "$out" || result=1
-    image_catalog_has "$selected" "$suffix" present || result=1
+    # The catalog holds the identity the verification create persisted, and the
+    # decoy was never acquired at all.
+    image_catalog_has "$acquired" "/$repo@$child" present || result=1
+    image_catalog_has "$decoy" "/$repo:decoy" absent || result=1
     assert_custom_cache_isolated "after setup verification" yes || result=1
+
+    # The selected tag must stay launchable after the setup acquisition. The
+    # native pull stored the resolved child under the *selected* key, so this
+    # warm launch consumes it; a registry manifest/blob read here would mean the
+    # tag did not survive the acquisition as a usable cache entry.
+    local reads_before reads_after
+    reads_before="$(registry_read_count "$container")" || result=1
+    capture_custom_launch "custom-setup-warm" "$proj" --no-git hello-258 || result=1
+    require_launch_ok "custom-setup-warm" || result=1
+    assert_no_host_calls || result=1
+    out="$(launch_output custom-setup-warm)"
+    assert_eq "a warm launch of the selected tag runs the declared tool" "hello-258=ok" \
+      "$(grep '^hello-258=ok$' <<<"$out")" || result=1
+    reads_after="$(registry_read_count "$container")" || result=1
+    assert_eq "a warm launch of the selected tag makes zero registry manifest/blob reads" \
+      "$reads_before" "$reads_after" || result=1
   fi
 
   # F5: the two failure diagnoses, with real guest evidence, against the same

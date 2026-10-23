@@ -23,7 +23,9 @@ use clap::Args as ClapArgs;
 
 use crate::boot_image;
 use crate::config::{Catalog, ConfiguredImages};
-use crate::image_acquire::{AcquireError, NativeAcquisition, OciTarget, OciTargetError};
+use crate::image_acquire::{
+    AcquireError, AcquireMode, OciTarget, OciTargetError, PreparedNativeImage, acquire,
+};
 
 /// The fixed refusal for a refresh target that is a local rootfs or disk path.
 /// Names no value: the rejected text is user input.
@@ -72,7 +74,10 @@ pub async fn run(args: Args, catalog: Catalog, images: ConfiguredImages) -> Resu
     let boot = boot_image::select(args.image.requested()?, &images)?;
     let label = boot.label();
     println!("==> {label} is the image this configuration boots from");
-    pull_image(boot.reference().as_str(), &label).await?;
+    // The explicit refresh resolves the current source even when the cache is
+    // warm; a returned token holds the shared barrier only until this statement
+    // ends, and refresh never boots anything.
+    drop(pull_image(boot.reference().as_str(), &label).await?);
     // Success-before-adoption (#261): only after the acquisition succeeded may a
     // default-tier selection become the retained default. An explicit, env or
     // config refresh never adopts its target.
@@ -106,24 +111,25 @@ pub(crate) fn preflight(args: &Args) -> Result<()> {
 /// `label` is the selection's safe output policy: when it is redacted (the
 /// default tier) the debug dump, progress display and any acquisition error
 /// carry the fixed label instead of the record/recommendation reference.
-pub async fn pull_image(image: &str, label: &boot_image::ImageLabel) -> Result<()> {
+pub async fn pull_image(
+    image: &str,
+    label: &boot_image::ImageLabel,
+) -> Result<PreparedNativeImage> {
     let target = OciTarget::parse(image).map_err(target_error)?;
-    let acquisition = NativeAcquisition::open(&target)
-        .await
-        .map_err(|error| acquisition_error(label, image, error))?;
-    let result = acquisition
-        .pull(&target, label)
+    let prepared = acquire(&target, label, AcquireMode::ResolveCurrent)
         .await
         .map_err(|error| acquisition_error(label, image, error))?;
     // Only a successful, validated acquisition updates the advisory marker, and
-    // it records *this* pull's resolved digest rather than a second registry
+    // it records *this* pull's acquired digest rather than a second registry
     // probe: a probe could race a moving tag and assumes an index layout.
-    if let Err(error) = crate::pulled_marker::write(image, &result.manifest_digest.to_string()) {
+    if let Err(error) =
+        crate::pulled_marker::write(image, prepared.image().acquired_digest().as_str())
+    {
         // A trusted-host state path error, never the image reference, so it is
         // printed as-is for debugging (not escaped).
         eprintln!("warn: failed to record the refreshed image digest: {error:#}");
     }
-    Ok(())
+    Ok(prepared)
 }
 
 /// Render an acquisition failure for this selection without leaking a redacted
