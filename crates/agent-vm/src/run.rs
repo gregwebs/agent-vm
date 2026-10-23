@@ -767,6 +767,17 @@ pub(crate) async fn launch(
     // image is selected with `--image`/`AGENT_VM_IMAGE_TAG`/config and booted
     // verbatim (`boot_image::select` above is the sole selection owner).
     let image = boot.reference().as_str().to_string();
+    // Parsed once: the SDK and the cache are keyed by the *canonical* OCI
+    // reference, so the equivalent spellings (`alpine`,
+    // `registry-1.docker.io/alpine`, `docker.io/library/alpine:latest`) select
+    // one cache entry. The original text stays the session's source identity for
+    // notices and redaction. A local rootfs/disk reference is not an OCI target
+    // and passes through verbatim, unchanged.
+    let oci_target = crate::image_acquire::OciTarget::parse(&image).ok();
+    let sdk_image = match &oci_target {
+        Some(target) => target.reference().whole(),
+        None => image.clone(),
+    };
 
     let memory_mib: u32 = args
         .memory
@@ -1030,7 +1041,7 @@ pub(crate) async fn launch(
     // `mount_plan` is closed: launch translates its typed instructions but
     // never reclassifies a source or makes another mount-policy decision.
 
-    let is_local_registry = crate::pull::is_plain_http_registry(&image);
+    let is_local_registry = crate::pull::is_plain_http_registry(&sdk_image);
     // `.workdir()` becomes libkrun's `KRUN_WORKDIR`, which rides the
     // printable-ASCII-only kernel command line. When the real project path
     // isn't cmdline-safe (non-ASCII / whitespace) we hand libkrun `/` and
@@ -1046,7 +1057,7 @@ pub(crate) async fn launch(
         "/".to_string()
     };
     let mut builder = Sandbox::builder(&session.sandbox_name)
-        .image(image.as_str())
+        .image(sdk_image.as_str())
         // AC#3 (agent-vm issue #40): explicitly size the writable OCI
         // upper instead of relying on the SDK default. `root_disk()`
         // requires an OCI image to already be set, hence chained right
@@ -1230,8 +1241,35 @@ pub(crate) async fn launch(
     // ignored. The metadata read must fail **closed**: logging is not handling
     // an error (CODING_STANDARDS), and a cold cache is exactly when an
     // image-defined value for an owned name would otherwise survive.
+    // The shared publication barrier covers every image-cache read this launch
+    // makes through both SDK create variants. Shared, so unrelated warm
+    // launches proceed concurrently; exclusive archive publication cannot move
+    // an alias under the cache consumption below.
+    //
+    // The warm cache is validated here, under that barrier: a present entry must
+    // be complete, identity-consistent and host-platform, or the launch fails
+    // closed instead of letting `IfMissing` silently re-resolve it. An absent
+    // entry is still the SDK's acquisition (this stage never queries a
+    // registry). A local rootfs/disk launch has no OCI cache participation at
+    // all and takes no barrier.
+    let prepared = match &oci_target {
+        Some(target) => Some(
+            crate::image_acquire::prepare_cached(target)
+                .await
+                .map_err(|error| error.for_label(&label))
+                .context("preparing the boot image from the image cache")?,
+        ),
+        None => None,
+    };
     if launch_credentials.needs_image_env_check() {
-        match image_config_env(&image).await {
+        // A validated warm entry is the bytes this create will consume, so its
+        // environment is the answer. Only a cold cache falls back to the
+        // metadata read (which may consult a different cache root).
+        let image_env = match prepared.as_ref().and_then(|prepared| prepared.image()) {
+            Some(validated) => Some(validated.image_env().to_vec()),
+            None => image_config_env(&sdk_image).await,
+        };
+        match image_env {
             Some(image_env) => {
                 let image_env: BTreeSet<String> = image_env.into_iter().collect();
                 if let Some(name) = launch_credentials
@@ -1253,7 +1291,7 @@ pub(crate) async fn launch(
                 // rootfs/disk launch keeps only the `sentinelEnv: true`
                 // alternative rather than naming a command that always refuses
                 // the user's own image.
-                let acquire = if crate::image_acquire::OciTarget::parse(&image).is_ok() {
+                let acquire = if oci_target.is_some() {
                     format!(
                         "Cache the image's metadata (`agent-vm image refresh --image {image}`) and \
                          re-run the launch, or alternatively declare"
@@ -1339,6 +1377,7 @@ pub(crate) async fn launch(
     // authorized credential. The `render`/`await_render` dance below is
     // unchanged: the two create entry points share the same
     // `(PullProgressHandle, JoinHandle)` shape.
+    crate::image_acquire::gate_before_sdk_consume().context("preparing sandbox creation")?;
     let (progress, task) = match credential_source {
         Some(source) if !launch_credentials.ready().is_empty() => {
             Sandbox::create_with_pull_progress_and_resolver(
@@ -1358,6 +1397,11 @@ pub(crate) async fn launch(
         .context("create-with-pull-progress join")
         .and_then(|inner| inner.context("creating sandbox"));
     crate::pull_progress::await_render(render_task).await;
+    // The SDK has finished consuming the image cache. Release the barrier
+    // before guest hooks, commands and the session: a long-running guest must
+    // never hold image publication.
+    crate::image_acquire::gate_create_returned().context("creating sandbox")?;
+    drop(prepared);
     let sandbox = match result {
         Ok(sandbox) => sandbox,
         // A redacted (default-tier) failure must not chain the registry URL

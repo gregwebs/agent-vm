@@ -182,6 +182,26 @@ fn read_regular_no_follow_fd(
     Ok((data, facts))
 }
 
+/// [`read_bounded_regular_file_no_follow`] where only `ENOENT` is "absent".
+///
+/// Cache receipts are optional but must never be reached through a symlink or an
+/// unbounded read: an absent file is `Ok(None)`, and every other failure —
+/// including `ELOOP`, a non-regular entry and an oversized file — is an error.
+pub(crate) fn read_optional_bounded_regular_file_no_follow(
+    path: &Path,
+    max: u64,
+) -> Result<Option<Vec<u8>>> {
+    match rfs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => read_regular_no_follow_fd(fd, path, max).map(|(bytes, _)| Some(bytes)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(error) => Err(anyhow!(error).context(format!("opening {}", path.display()))),
+    }
+}
+
 /// No descriptor facts vouch for bytes reached through a final symlink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FinalComponent {
@@ -304,6 +324,72 @@ pub(crate) enum FlockWait {
     TimedOut,
 }
 
+/// The `flock(2)` mode a caller wants. Shared locks coexist; at most one
+/// exclusive lock is held at a time. A held shared lock is never upgraded in
+/// place — that would deadlock two upgraders — so callers release and retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlockMode {
+    Shared,
+    Exclusive,
+}
+
+impl FlockMode {
+    fn operation(self) -> rustix::fs::FlockOperation {
+        match self {
+            Self::Shared => rustix::fs::FlockOperation::NonBlockingLockShared,
+            Self::Exclusive => rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        }
+    }
+}
+
+/// One non-blocking `flock` attempt in `mode`.
+///
+/// `Contended` means the attempt was refused with `WOULDBLOCK`; an interrupted
+/// attempt is reported as its own error rather than as contention, because only
+/// `WOULDBLOCK` proves another holder exists.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlockAttempt {
+    Acquired,
+    Contended,
+}
+
+/// Open a stable coordination lock file: create-if-missing, no truncation, no
+/// final-component symlink, close-on-exec, mode 0600.
+///
+/// The inode must stay stable (never unlinked or truncated): a lock file that a
+/// peer recreates is a different inode, so two holders would not contend at all.
+pub(crate) fn open_lock_file(path: &Path) -> Result<std::fs::File> {
+    let fd = rfs::open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|error| anyhow!(error))
+    .context("opening a coordination lock file")?;
+    let stat = rfs::fstat(&fd)
+        .map_err(|error| anyhow!(error))
+        .context("stating a coordination lock file")?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(anyhow!("the coordination lock path is not a regular file"));
+    }
+    Ok(std::fs::File::from(fd))
+}
+
+/// Attempt `flock` in `mode` without waiting.
+pub(crate) fn try_flock(file: &std::fs::File, mode: FlockMode) -> Result<FlockAttempt> {
+    loop {
+        match rustix::fs::flock(file, mode.operation()) {
+            Ok(()) => return Ok(FlockAttempt::Acquired),
+            Err(Errno::WOULDBLOCK) => return Ok(FlockAttempt::Contended),
+            // A signal during a non-blocking acquisition attempt is not
+            // contention; retry immediately rather than failing the caller.
+            Err(Errno::INTR) => continue,
+            Err(error) => return Err(anyhow!(error)).context("flock(LOCK_NB) failed"),
+        }
+    }
+}
+
 /// Take an exclusive `flock(2)` on `file`, waiting at most `wait` for a peer to
 /// release it.
 ///
@@ -329,9 +415,19 @@ pub(crate) fn flock_exclusive_within(
     wait: Duration,
     on_contention: impl FnMut(Duration),
 ) -> Result<FlockWait> {
-    flock_exclusive_within_using(
+    flock_within(file, FlockMode::Exclusive, wait, on_contention)
+}
+
+/// [`flock_exclusive_within`] for either [`FlockMode`].
+pub(crate) fn flock_within(
+    file: &std::fs::File,
+    mode: FlockMode,
+    wait: Duration,
+    on_contention: impl FnMut(Duration),
+) -> Result<FlockWait> {
+    flock_within_using(
         wait,
-        || rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive),
+        || rustix::fs::flock(file, mode.operation()),
         || {},
         on_contention,
     )
@@ -341,7 +437,7 @@ pub(crate) fn flock_exclusive_within(
 /// the caller's observer. Tests inject errno sequences, pause after the first
 /// contended attempt as default_selection's *_with_checkpoint helpers do, or
 /// record the observer's elapsed samples.
-fn flock_exclusive_within_using(
+fn flock_within_using(
     wait: Duration,
     mut attempt: impl FnMut() -> std::result::Result<(), Errno>,
     after_first_contention: impl FnOnce(),
@@ -1184,7 +1280,7 @@ mod tests {
         let (proceed_tx, proceed_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = flock_exclusive_within_using(
+            let outcome = flock_within_using(
                 Duration::from_secs(5),
                 || rfs::flock(&b, rfs::FlockOperation::NonBlockingLockExclusive),
                 || {
@@ -1227,7 +1323,7 @@ mod tests {
         let (proceed_tx, proceed_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = flock_exclusive_within_using(
+            let outcome = flock_within_using(
                 SHORT,
                 || rfs::flock(&b, rfs::FlockOperation::NonBlockingLockExclusive),
                 || {
@@ -1291,17 +1387,13 @@ mod tests {
     fn the_contention_observer_is_not_called_without_contention() {
         within("uncontended observer", || {
             let mut calls = 0;
-            let outcome = flock_exclusive_within_using(
-                Duration::from_secs(5),
-                || Ok(()),
-                || {},
-                |_| calls += 1,
-            )
-            .unwrap();
+            let outcome =
+                flock_within_using(Duration::from_secs(5), || Ok(()), || {}, |_| calls += 1)
+                    .unwrap();
             assert_eq!(outcome, FlockWait::Acquired);
             assert_eq!(calls, 0);
 
-            let error = flock_exclusive_within_using(
+            let error = flock_within_using(
                 Duration::from_secs(5),
                 || Err(Errno::IO),
                 || {},
@@ -1311,20 +1403,16 @@ mod tests {
             assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::IO));
             assert_eq!(calls, 0);
 
-            let error = flock_exclusive_within_using(
-                Duration::ZERO,
-                || Err(Errno::INTR),
-                || {},
-                |_| calls += 1,
-            )
-            .unwrap_err();
+            let error =
+                flock_within_using(Duration::ZERO, || Err(Errno::INTR), || {}, |_| calls += 1)
+                    .unwrap_err();
             assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::INTR));
             assert_eq!(calls, 0);
 
             // A zero wait is exactly one attempt, and it is already at the
             // deadline, so even a contended attempt reports nothing.
             let mut attempts = 0;
-            let outcome = flock_exclusive_within_using(
+            let outcome = flock_within_using(
                 Duration::ZERO,
                 || {
                     attempts += 1;
@@ -1360,7 +1448,7 @@ mod tests {
         let (resume_tx, resume_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = flock_exclusive_within_using(
+            let outcome = flock_within_using(
                 ACQUISITION_ENTRY_BUDGET,
                 || rfs::flock(&waiter, rfs::FlockOperation::NonBlockingLockExclusive),
                 // Controlled overhead exceeds the former 200 ms entry window;
@@ -1434,7 +1522,7 @@ mod tests {
         let (observed_tx, observed_rx) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = flock_exclusive_within_using(
+            let outcome = flock_within_using(
                 Duration::from_secs(30),
                 || rfs::flock(&waiter, rfs::FlockOperation::NonBlockingLockExclusive),
                 || {},
@@ -1472,7 +1560,7 @@ mod tests {
         within("interrupted then acquired", || {
             let mut attempts = [Err(Errno::INTR), Ok(())].into_iter();
             let mut count = 0;
-            let outcome = flock_exclusive_within_using(
+            let outcome = flock_within_using(
                 Duration::from_secs(5),
                 || {
                     count += 1;
@@ -1489,13 +1577,9 @@ mod tests {
             within("repeating interruption", move || {
                 let mut errors = std::iter::once(first).chain(std::iter::repeat(Errno::INTR));
                 let started = Instant::now();
-                let error = flock_exclusive_within_using(
-                    SHORT,
-                    || Err(errors.next().unwrap()),
-                    || {},
-                    |_| {},
-                )
-                .unwrap_err();
+                let error =
+                    flock_within_using(SHORT, || Err(errors.next().unwrap()), || {}, |_| {})
+                        .unwrap_err();
                 assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::INTR));
                 assert!(format!("{error:#}").contains("interrupted at the wait deadline"));
                 assert_short(started.elapsed());
@@ -1503,7 +1587,7 @@ mod tests {
         }
         within("zero interrupted wait", || {
             let mut count = 0;
-            let error = flock_exclusive_within_using(
+            let error = flock_within_using(
                 Duration::ZERO,
                 || {
                     count += 1;

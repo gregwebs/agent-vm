@@ -59,10 +59,10 @@
 
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn agent_vm_bin() -> PathBuf {
@@ -96,52 +96,16 @@ fn unique_name(tag: &str) -> String {
     format!("avm-pty-{tag}-{}-{seq}", std::process::id())
 }
 
-fn open_pty() -> io::Result<(RawFd, RawFd)> {
-    let mut master: RawFd = -1;
-    let mut slave: RawFd = -1;
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((master, slave))
-}
+#[path = "support/pty.rs"]
+mod pty;
 
-/// A child running against a fresh pty, with both ends kept in the parent so the
-/// test can inspect the terminal state and any input the child left queued.
-struct Pty {
-    master: OwnedFd,
-    slave: OwnedFd,
-    child: Option<Child>,
-    status: Option<ExitStatus>,
-    /// The terminal's user flags sampled between `openpty` and `spawn`, so the
-    /// restoration assertions compare against the real baseline rather than a
-    /// value the child may already have made raw (review finding R6).
-    baseline_flags: libc::tcflag_t,
-}
+use pty::{Action, Pty};
 
-impl Drop for Pty {
-    fn drop(&mut self) {
-        // Cleanup on every path, including a panic in the test body: reap a
-        // still-running child so a failing test cannot leak a process.
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
+/// The hidden prompt the secret reader prints. Named here, not in the shared
+/// helper: the helper is program-agnostic.
+const PROMPT: &[u8] = b"(input is hidden)";
 
-/// Spawn `command` with a fresh pty on stdio (the slave end), kept in the
-/// parent as well so the test can inspect the terminal state and any queued
-/// input. `HOME` is relocated; `record`, when present, enables the debug-only
-/// recording backend.
+/// Spawn `command` under a fresh pty after applying this harness's isolation.
 ///
 /// The child is deliberately **not** made a session leader or given the slave
 /// as a controlling terminal: `is_terminal()` only needs the fds to be a tty,
@@ -149,40 +113,17 @@ impl Drop for Pty {
 /// the terminal state this harness exists to measure. This also matches how a
 /// shell actually runs the binary (a foreground member of an existing session).
 fn spawn_under_pty(home: &Path, command: &mut Command, record: Option<&Path>) -> io::Result<Pty> {
-    let (master, slave) = open_pty()?;
-    // Capture the baseline here, while the child cannot yet have run: sampling
-    // the flags after `spawn` races the child's `RawHiddenTerminal::enable` and
-    // could record the *raw* value, making the restoration assertion vacuous
-    // (review finding R6).
-    let baseline_flags = terminal_user_flags(slave);
-    let dup = |fd: RawFd| unsafe { libc::dup(fd) };
     command
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("AGENT_VM_STATE_DIR", home.join("state"))
         .env("NO_COLOR", "1")
-        .current_dir(home)
-        .stdin(unsafe { Stdio::from_raw_fd(dup(slave)) })
-        .stdout(unsafe { Stdio::from_raw_fd(dup(slave)) })
-        .stderr(unsafe { Stdio::from_raw_fd(dup(slave)) });
+        .current_dir(home);
     if let Some(record) = record {
         command.env("AGENT_VM_TEST_SECRET_RECORD", record);
     }
-    let child = command.spawn()?;
-    // The child owns its copies; the parent keeps `slave` for attribute/queue
-    // inspection. `master` is nonblocking; `slave` must stay blocking because a
-    // nonblocking flag is shared with the child's stdio.
-    let master = unsafe { OwnedFd::from_raw_fd(master) };
-    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-    set_nonblocking(master.as_raw_fd())?;
-    Ok(Pty {
-        master,
-        slave,
-        child: Some(child),
-        status: None,
-        baseline_flags,
-    })
+    Pty::spawn(command, PROMPT)
 }
 
 fn spawn_secret_set(home: &Path, name: &str, record: &Path) -> io::Result<Pty> {
@@ -196,324 +137,6 @@ fn spawn_stand_in(home: &Path, script: &str) -> io::Result<Pty> {
     command.args(["-c", script]);
     spawn_under_pty(home, &mut command, None)
 }
-
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn read_some(fd: RawFd, output: &mut Vec<u8>) -> io::Result<bool> {
-    let mut buffer = [0_u8; 4096];
-    loop {
-        let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
-        if read > 0 {
-            output.extend_from_slice(&buffer[..read as usize]);
-            continue;
-        }
-        if read == 0 {
-            // EOF: the slave side is gone.
-            return Ok(false);
-        }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            // EOF on a pty master is reported as EIO once the slave closes.
-            Some(libc::EIO) => return Ok(false),
-            // No more bytes right now.
-            Some(libc::EAGAIN) => return Ok(true),
-            _ if error.kind() == io::ErrorKind::Interrupted => continue,
-            _ => return Err(error),
-        }
-    }
-}
-
-fn write_some(fd: RawFd, payload: &[u8]) -> io::Result<usize> {
-    let written = unsafe { libc::write(fd, payload.as_ptr().cast(), payload.len()) };
-    if written >= 0 {
-        return Ok(written as usize);
-    }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::EAGAIN) => Ok(0),
-        // The child is already gone; stop trying to feed it.
-        Some(libc::EIO) => Ok(payload.len()),
-        _ if error.kind() == io::ErrorKind::Interrupted => Ok(0),
-        _ => Err(error),
-    }
-}
-
-/// What the driver does once the prompt is visible.
-enum Action<'a> {
-    /// Write these bytes to the child's stdin.
-    Write(&'a [u8]),
-    /// Deliver this signal to the child.
-    Signal(libc::c_int),
-}
-
-/// Drive the child: wait for the prompt, perform `action`, then read until the
-/// child exits (which `try_wait` detects, so the loop cannot hang when Linux
-/// reports `POLLHUP` with no further output) plus a short final drain.
-///
-/// `deadline` bounds the whole interaction, including process reaping.
-fn drive(pty: &mut Pty, action: &Action, deadline: Duration) -> io::Result<(ExitStatus, Vec<u8>)> {
-    const PROMPT: &[u8] = b"(input is hidden)";
-    let fd = pty.master.as_raw_fd();
-    let start = Instant::now();
-    let mut output = Vec::new();
-    let mut prompt_seen = false;
-    let mut acted = false;
-    let mut payload_sent = 0usize;
-    while pty.child.is_some() {
-        if start.elapsed() > deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "the child did not finish within {deadline:?}; output so far: {:?}",
-                    String::from_utf8_lossy(&output)
-                ),
-            ));
-        }
-        let mut events = libc::POLLIN;
-        if prompt_seen && !acted && matches!(action, Action::Write(_)) {
-            events |= libc::POLLOUT;
-        }
-        let mut pollfd = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        };
-        // A short tick, so a `POLLHUP`-only state (no readable data) still lets
-        // the loop notice a finished child and reap it within the deadline.
-        let ready = unsafe { libc::poll(&mut pollfd, 1, 50) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            // `read_some` returning `false` means EOF, which is fine here: the
-            // `try_wait` below is what ends the loop.
-            let _ = read_some(fd, &mut output)?;
-        }
-        if !prompt_seen && output.windows(PROMPT.len()).any(|window| window == PROMPT) {
-            prompt_seen = true;
-        }
-        if prompt_seen && !acted {
-            match action {
-                Action::Write(payload) => {
-                    if pollfd.revents & libc::POLLOUT != 0 && payload_sent < payload.len() {
-                        payload_sent += write_some(fd, &payload[payload_sent..])?;
-                    }
-                    if payload_sent >= payload.len() {
-                        acted = true;
-                    }
-                }
-                Action::Signal(signal) => {
-                    if let Some(child) = pty.child.as_ref() {
-                        unsafe { libc::kill(child.id() as libc::pid_t, *signal) };
-                    }
-                    acted = true;
-                }
-            }
-        }
-        if let Some(child) = pty.child.as_mut()
-            && let Some(status) = child.try_wait()?
-        {
-            pty.status = Some(status);
-            pty.child = None;
-        }
-    }
-    drain_after_exit(fd, &mut output)?;
-    let status = pty.status.expect("a reaped child has a status");
-    Ok((status, output))
-}
-
-/// Read the last buffered bytes after the child exits, bounded so a stalled
-/// producer cannot keep the test alive.
-fn drain_after_exit(fd: RawFd, output: &mut Vec<u8>) -> io::Result<()> {
-    let end = Instant::now() + Duration::from_millis(500);
-    loop {
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut pollfd, 1, 50) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if ready > 0 && !read_some(fd, output)? {
-            return Ok(());
-        }
-        if Instant::now() >= end {
-            return Ok(());
-        }
-    }
-}
-
-/// Write the whole payload to the master, retrying only while the master would
-/// block. The child is alive in every caller, so a short retry loop is enough.
-fn write_all_to_pty(fd: RawFd, payload: &[u8]) {
-    let mut sent = 0;
-    while sent < payload.len() {
-        match write_some(fd, &payload[sent..]) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(10)),
-            Ok(written) => sent += written,
-            Err(error) => panic!("writing to the pty: {error}"),
-        }
-    }
-}
-
-/// Poll the master until the hidden prompt appears, returning the output so far.
-/// Errors if the child exits first or the deadline passes.
-fn wait_for_prompt(pty: &mut Pty, deadline: Duration) -> io::Result<Vec<u8>> {
-    const PROMPT: &[u8] = b"(input is hidden)";
-    let fd = pty.master.as_raw_fd();
-    let start = Instant::now();
-    let mut output = Vec::new();
-    while start.elapsed() <= deadline {
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut pollfd, 1, 50) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            let _ = read_some(fd, &mut output)?;
-        }
-        if output.windows(PROMPT.len()).any(|window| window == PROMPT) {
-            return Ok(output);
-        }
-        if let Some(child) = pty.child.as_mut()
-            && let Some(status) = child.try_wait()?
-        {
-            pty.status = Some(status);
-            pty.child = None;
-            return Err(io::Error::other(format!(
-                "the child exited before the prompt: {status:?}"
-            )));
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "the hidden prompt did not appear",
-    ))
-}
-
-/// Reap the child within `deadline`, draining output, and return its status.
-/// Bounded like `drive`: `try_wait` ends the loop, so a `POLLHUP`-only state
-/// cannot spin to the deadline.
-fn wait_for_exit(
-    pty: &mut Pty,
-    output: &mut Vec<u8>,
-    deadline: Duration,
-) -> io::Result<ExitStatus> {
-    let fd = pty.master.as_raw_fd();
-    let start = Instant::now();
-    while pty.child.is_some() {
-        if start.elapsed() > deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "the child did not exit within {deadline:?}; output so far: {:?}",
-                    String::from_utf8_lossy(output)
-                ),
-            ));
-        }
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut pollfd, 1, 50) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            let _ = read_some(fd, output)?;
-        }
-        if let Some(child) = pty.child.as_mut()
-            && let Some(status) = child.try_wait()?
-        {
-            pty.status = Some(status);
-            pty.child = None;
-        }
-    }
-    drain_after_exit(fd, output)?;
-    Ok(pty.status.expect("a reaped child has a status"))
-}
-
-/// Block until the child's terminal attributes return to the recorded baseline.
-/// The reader's guard restores them when the read loop ends, so this is the
-/// deterministic signal that the process has moved *past* the hidden read — the
-/// window the R1 regression is about.
-fn wait_for_restored_terminal(pty: &mut Pty, deadline: Duration) {
-    let start = Instant::now();
-    while start.elapsed() <= deadline {
-        if terminal_user_flags(pty.slave.as_raw_fd()) == pty.baseline_flags {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("the terminal was not restored within {deadline:?}");
-}
-
-/// Read anything the child left in the terminal's input queue — what the
-/// caller's shell would receive next.
-fn read_leftover(slave: RawFd) -> Vec<u8> {
-    let mut buffer = [0_u8; 4096];
-    let mut pollfd = libc::pollfd {
-        fd: slave,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ready = unsafe { libc::poll(&mut pollfd, 1, 200) };
-    if ready <= 0 {
-        return Vec::new();
-    }
-    let read = unsafe { libc::read(slave, buffer.as_mut_ptr().cast(), buffer.len()) };
-    if read > 0 {
-        buffer[..read as usize].to_vec()
-    } else {
-        Vec::new()
-    }
-}
-
-fn terminal_user_flags(fd: RawFd) -> libc::tcflag_t {
-    let mut attrs = std::mem::MaybeUninit::<libc::termios>::uninit();
-    let rc = unsafe { libc::tcgetattr(fd, attrs.as_mut_ptr()) };
-    assert_eq!(
-        rc,
-        0,
-        "tcgetattr on fd {fd}: {}",
-        io::Error::last_os_error()
-    );
-    let flags = unsafe { attrs.assume_init() }.c_lflag;
-    flags & (libc::ECHO | libc::ICANON | libc::ISIG | libc::IEXTEN)
-}
-
 /// Assert the hidden reader handles `len` bytes: completes, does not echo, and
 /// delivers exactly the supplied bytes (or rejects exactly the over-limit case).
 fn assert_boundary(len: usize, expect_length_error: bool) {
@@ -524,7 +147,8 @@ fn assert_boundary(len: usize, expect_length_error: bool) {
     let mut payload = expected.clone();
     payload.push(b'\n');
     let mut pty = spawn_secret_set(home.path(), &name, &record).expect("spawn under a pty");
-    let (status, output) = drive(&mut pty, &Action::Write(&payload), Duration::from_secs(30))
+    let (status, output) = pty
+        .drive(&Action::Write(&payload), Duration::from_secs(30))
         .unwrap_or_else(|error| panic!("len {len}: {error}"));
     let text = String::from_utf8_lossy(&output);
 
@@ -600,8 +224,9 @@ fn the_hidden_prompt_does_not_repeat_a_key_shaped_name() {
     let record = home.path().join("record");
     let mut pty = spawn_secret_set(home.path(), typed, &record).expect("spawn under a pty");
     // Cancel with Escape once the prompt appears.
-    let (status, output) =
-        drive(&mut pty, &Action::Write(b"\x1b"), Duration::from_secs(30)).expect("drive the pty");
+    let (status, output) = pty
+        .drive(&Action::Write(b"\x1b"), Duration::from_secs(30))
+        .expect("drive the pty");
     let text = String::from_utf8_lossy(&output);
     assert_ne!(status.code(), Some(0), "a cancelled read must fail: {text}");
     assert!(
@@ -632,8 +257,9 @@ fn cancelling_discards_a_queued_paste_suffix() {
     payload.push(0x03);
     payload.extend_from_slice(NEEDLE);
     payload.push(b'\n');
-    let (status, output) =
-        drive(&mut pty, &Action::Write(&payload), Duration::from_secs(30)).expect("drive the pty");
+    let (status, output) = pty
+        .drive(&Action::Write(&payload), Duration::from_secs(30))
+        .expect("drive the pty");
     let text = String::from_utf8_lossy(&output);
     assert_ne!(status.code(), Some(0), "a cancelled read must fail: {text}");
     assert!(
@@ -644,7 +270,7 @@ fn cancelling_discards_a_queued_paste_suffix() {
         !output.windows(NEEDLE.len()).any(|window| window == NEEDLE),
         "the queued suffix was echoed: {text}"
     );
-    let leftover = read_leftover(pty.slave.as_raw_fd());
+    let leftover = pty.read_leftover();
     assert!(
         leftover.is_empty(),
         "the queued suffix was left for the caller's shell: {leftover:?}"
@@ -666,15 +292,16 @@ fn external_termination_signals_restore_the_terminal() {
             .expect("spawn under a pty");
         // The baseline was captured before the child could make the terminal raw
         // (review finding R6).
-        let before = pty.baseline_flags;
-        let (status, _output) = drive(&mut pty, &Action::Signal(signal), Duration::from_secs(30))
+        let before = pty.baseline_flags();
+        let (status, _output) = pty
+            .drive(&Action::Signal(signal), Duration::from_secs(30))
             .unwrap_or_else(|error| panic!("signal {signal}: {error}"));
         assert_eq!(
             status.signal(),
             Some(signal),
             "expected termination by the delivered signal (status {status:?})"
         );
-        let after = terminal_user_flags(pty.slave.as_raw_fd());
+        let after = pty.terminal_flags();
         assert_eq!(
             before, after,
             "signal {signal} left the terminal raw (lflag {before} -> {after})"
@@ -705,21 +332,23 @@ fn sigterm_terminates_after_the_hidden_read_while_the_store_lock_is_held() {
     let record = home.path().join("record");
     let mut pty = spawn_secret_set(home.path(), &unique_name("postread"), &record)
         .expect("spawn under a pty");
-    let _prompt = wait_for_prompt(&mut pty, Duration::from_secs(30)).expect("the prompt");
+    let _prompt = pty
+        .wait_for_prompt(Duration::from_secs(30))
+        .expect("the prompt");
     let payload = {
         let mut value = synthetic_value(16);
         value.push(b'\n');
         value
     };
-    write_all_to_pty(pty.master.as_raw_fd(), &payload);
+    pty.write_all(&payload);
     // The reader's guard restores the terminal the moment the read loop returns,
     // so this is past the read and into the store's `flock`.
-    wait_for_restored_terminal(&mut pty, Duration::from_secs(10));
+    pty.wait_for_restored_terminal(Duration::from_secs(10));
     // Let the guard drop finish (it restores the saved dispositions) before
     // relying on the restored one.
     std::thread::sleep(Duration::from_millis(200));
     assert!(
-        pty.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+        pty.is_running(),
         "the child should still be blocked on the inventory lock"
     );
 
@@ -728,12 +357,12 @@ fn sigterm_terminates_after_the_hidden_read_while_the_store_lock_is_held() {
     // signal caught there is swallowed by design. A process that has restored
     // its default disposition dies on one of these; one that has not, never
     // does (the historical R1 bug).
-    let pid = pty.child.as_ref().unwrap().id() as libc::pid_t;
+    let pid = pty.id().unwrap() as libc::pid_t;
     let mut output = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-        match wait_for_exit(&mut pty, &mut output, Duration::from_millis(200)) {
+        match pty.wait_for_exit(&mut output, Duration::from_millis(200)) {
             Ok(status) => {
                 assert_eq!(
                     status.signal(),
@@ -778,12 +407,14 @@ fn an_inherited_sig_ign_is_not_converted_into_termination() {
         }
         let mut pty =
             spawn_under_pty(home.path(), &mut command, Some(&record)).expect("spawn under a pty");
-        let _prompt = wait_for_prompt(&mut pty, Duration::from_secs(30)).expect("the prompt");
-        let pid = pty.child.as_ref().unwrap().id() as libc::pid_t;
+        let _prompt = pty
+            .wait_for_prompt(Duration::from_secs(30))
+            .expect("the prompt");
+        let pid = pty.id().unwrap() as libc::pid_t;
         assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
         std::thread::sleep(Duration::from_millis(300));
         assert!(
-            pty.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+            pty.is_running(),
             "signal {signal} terminated a process that had it set to SIG_IGN"
         );
 
@@ -793,9 +424,10 @@ fn an_inherited_sig_ign_is_not_converted_into_termination() {
             value.push(b'\n');
             value
         };
-        write_all_to_pty(pty.master.as_raw_fd(), &payload);
+        pty.write_all(&payload);
         let mut output = Vec::new();
-        let status = wait_for_exit(&mut pty, &mut output, Duration::from_secs(30))
+        let status = pty
+            .wait_for_exit(&mut output, Duration::from_secs(30))
             .unwrap_or_else(|error| panic!("signal {signal}: {error}"));
         assert_eq!(
             status.code(),
@@ -830,14 +462,17 @@ fn an_inherited_sig_ign_is_not_converted_into_termination() {
     }
     let mut pty =
         spawn_under_pty(home.path(), &mut command, Some(&record)).expect("spawn under a pty");
-    let before = pty.baseline_flags;
-    let _prompt = wait_for_prompt(&mut pty, Duration::from_secs(30)).expect("the prompt");
-    let pid = pty.child.as_ref().unwrap().id() as libc::pid_t;
+    let before = pty.baseline_flags();
+    let _prompt = pty
+        .wait_for_prompt(Duration::from_secs(30))
+        .expect("the prompt");
+    let pid = pty.id().unwrap() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     let mut output = Vec::new();
-    let status =
-        wait_for_exit(&mut pty, &mut output, Duration::from_secs(10)).unwrap_or_else(|error| {
+    let status = pty
+        .wait_for_exit(&mut output, Duration::from_secs(10))
+        .unwrap_or_else(|error| {
             panic!("an inherited SIG_IGN must not swallow a later default signal: {error}")
         });
     assert_eq!(
@@ -846,7 +481,7 @@ fn an_inherited_sig_ign_is_not_converted_into_termination() {
         "expected termination by the default-disposition SIGTERM, got {status:?}: {}",
         String::from_utf8_lossy(&output)
     );
-    let after = terminal_user_flags(pty.slave.as_raw_fd());
+    let after = pty.terminal_flags();
     assert_eq!(
         before, after,
         "the back-to-back signals left the terminal raw (lflag {before} -> {after})"
@@ -863,7 +498,8 @@ fn harness_tolerates_a_delayed_exit() {
         r#"printf '(input is hidden): \r\nno value was supplied\r\n'; sleep 0.2; exit 1"#,
     )
     .expect("spawn sh");
-    let (status, output) = drive(&mut pty, &Action::Write(b""), Duration::from_secs(10))
+    let (status, output) = pty
+        .drive(&Action::Write(b""), Duration::from_secs(10))
         .expect("a delayed exit must not time the harness out");
     assert_eq!(status.code(), Some(1));
     assert!(
@@ -879,7 +515,85 @@ fn harness_tolerates_a_closed_peer_without_further_output() {
     let home = tempfile::tempdir().unwrap();
     let mut pty =
         spawn_stand_in(home.path(), r#"printf '(input is hidden): '; exit 7"#).expect("spawn sh");
-    let (status, _output) = drive(&mut pty, &Action::Write(b""), Duration::from_secs(10))
+    let (status, _output) = pty
+        .drive(&Action::Write(b""), Duration::from_secs(10))
         .expect("a POLLHUP-only peer must not time the harness out");
     assert_eq!(status.code(), Some(7));
+}
+
+/// The shared PTY harness kills and reaps a child that is still running
+/// when the test ends. A leaked process would outlive the suite; a `Drop` that
+/// blocks would hang it.
+#[test]
+fn harness_cleanup_reaps_a_hung_child() {
+    let home = tempfile::tempdir().unwrap();
+    let mut pty = spawn_stand_in(home.path(), "printf '(input is hidden)'; sleep 60").unwrap();
+    pty.wait_for_prompt(Duration::from_secs(10))
+        .expect("the stand-in prompt");
+    let started = Instant::now();
+    drop(pty);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "dropping the harness must not block on a live child"
+    );
+}
+
+/// Ctrl-D is the canonical end-of-input under a terminal: it must finish the
+/// hidden read within the deadline, never hang. Alone it supplies no value (a
+/// closed error, no record); after a value it terminates the line, so the value
+/// is stored exactly as `Enter` would store it.
+#[test]
+fn ctrl_d_ends_the_hidden_read_without_hanging() {
+    // Ctrl-D with nothing before it: no value, closed error, no record.
+    let home = tempfile::tempdir().unwrap();
+    let record = home.path().join("record");
+    let name = unique_name("ctrl-d-empty");
+    let mut pty = spawn_secret_set(home.path(), &name, &record).expect("spawn under a pty");
+    let started = Instant::now();
+    let (status, output) = pty
+        .drive(&Action::Write(b"\x04"), Duration::from_secs(30))
+        .expect("Ctrl-D must end the read, not hang");
+    let text = String::from_utf8_lossy(&output);
+    assert_ne!(status.code(), Some(0), "no value must fail: {text}");
+    assert!(
+        text.contains("no value was supplied"),
+        "Ctrl-D alone must report the abort message: {text}"
+    );
+    assert!(
+        !record.exists(),
+        "Ctrl-D with no value must not create a record"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "Ctrl-D must complete within the deadline"
+    );
+    pty.wait_for_restored_terminal(Duration::from_secs(5));
+
+    // Ctrl-D after a value ends the line: the value is delivered as if Enter.
+    let home = tempfile::tempdir().unwrap();
+    let record = home.path().join("record");
+    let value = synthetic_value(32);
+    let mut payload = value.clone();
+    payload.push(0x04);
+    let mut pty =
+        spawn_secret_set(home.path(), &unique_name("ctrl-d"), &record).expect("spawn under a pty");
+    let (status, output) = pty
+        .drive(&Action::Write(&payload), Duration::from_secs(30))
+        .expect("Ctrl-D must end the read, not hang");
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a value ended by Ctrl-D must be accepted: {text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&record).unwrap_or_default(),
+        expected_record(32),
+        "the stored value must be exactly the bytes before Ctrl-D"
+    );
+    assert!(
+        !output.windows(value.len()).any(|window| window == value),
+        "the hidden value was echoed: {text}"
+    );
+    pty.wait_for_restored_terminal(Duration::from_secs(5));
 }

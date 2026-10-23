@@ -52,7 +52,7 @@ pub(crate) fn sandbox_config(
 }
 
 /// The `[debug] native image acquisition JSON: ` line for one
-/// [`crate::image_acquire::NativeAcquisition::pull`], or `None` when the
+/// native pull inside [`crate::image_acquire::acquire`], or `None` when the
 /// opt-in is absent.
 ///
 /// Rendered immediately before the actual native call from the exact target and

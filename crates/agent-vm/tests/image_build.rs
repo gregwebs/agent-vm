@@ -2745,3 +2745,31 @@ fn non_ascii_tag_guidance_keeps_its_shell_word_with_the_show_hint() {
         std::str::from_utf8(&shell.stdout).unwrap()
     ));
 }
+
+/// The explicit result reference is the one canonical acquisition key.
+/// Importing under an equivalent Hub spelling must land where a launch or
+/// refresh looks, and must not create the old native spelling as a second key.
+#[test]
+fn import_primary_tag_uses_the_canonical_cache_key() {
+    let harness = Harness::new();
+    let written = image_archive::write(&harness.home.join("a01.tar"), &ArchiveSpec::default());
+    let out = import_input(&harness, &written.path, "registry-1.docker.io/alpine:dev");
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+
+    let cache = cache(&harness.cache_dir());
+    let canonical = reference("docker.io/library/alpine:dev");
+    assert_imported(
+        &harness.cache_dir(),
+        "docker.io/library/alpine:dev",
+        &written,
+    );
+    assert!(
+        cache.image_metadata_path(&canonical).exists(),
+        "the canonical Hub key must be populated"
+    );
+    let old = reference("registry-1.docker.io/alpine:dev");
+    assert!(
+        !cache.image_metadata_path(&old).exists(),
+        "the pre-canonical spelling must not become a second cache entry"
+    );
+}

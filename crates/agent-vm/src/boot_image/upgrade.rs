@@ -13,13 +13,13 @@
 use std::io::Write;
 use std::str::FromStr;
 
-use super::{
-    AcquiredDefaultImage, DefaultUpgradeOutcome, ImageLabel, ImageRef, ImmutableImageRef,
-    default_selection,
-};
-use crate::image_acquire::{AcquireError, NativeAcquisition, OciTarget, OciTargetError};
+use super::{AcquiredDefaultImage, DefaultUpgradeOutcome, ImageLabel, ImageRef, default_selection};
+use crate::image_acquire::{AcquireError, AcquireMode, OciTarget, OciTargetError, acquire};
 use anyhow::{Result, anyhow};
-use microsandbox_image::{PullResult, Reference};
+
+/// Fixed text for an acquired identity with no usable immutable reference. It
+/// names no value: the target may be a private registry reference.
+const IMMUTABLE_IDENTITY_UNAVAILABLE: &str = "the acquired image did not yield a usable immutable reference; this command did not change the retained default";
 
 /// The fixed refusal for a local rootfs/disk `--image` target. Names no value:
 /// the rejected text is user input.
@@ -128,44 +128,20 @@ async fn acquire_target(target: &SetDefaultTarget) -> Result<AcquiredDefaultImag
         )
     })?;
     let label = ImageLabel::for_default_upgrade();
-    let acquisition = NativeAcquisition::open(&native_target)
+    // One acquisition resolves the explicit target's current content and
+    // preserves the validated host child (`repo@C`) as canonical cache
+    // metadata. The duplicate second pull this command used to derive the pin
+    // is gone: `AcquireMode::ResolveCurrent` plus canonical preservation own
+    // identity, and a moving index cannot be resolved twice.
+    let prepared = acquire(&native_target, &label, AcquireMode::ResolveCurrent)
         .await
         .map_err(set_default_error)?;
-    let resolved = acquisition
-        .pull(&native_target, &label)
-        .await
-        .map_err(set_default_error)?;
-    let pinned_native = pin_reference(native_target.reference(), &resolved);
-    let pin = ImmutableImageRef::parse(&pinned_native.whole()).map_err(|_| anyhow!(
-        "the acquired image did not yield a usable immutable reference; this command did not change the retained default"
-    ))?;
-    let pinned_target = OciTarget::parse(&pinned_native.whole()).map_err(|_| anyhow!(
-        "the acquired image did not yield a usable immutable reference; this command did not change the retained default"
-    ))?;
-    // The target guard is released by the first `pull`; the derived digest key
-    // is acquired fresh, even when both keys normalize identically.
-    let acquired = acquisition
-        .pull(&pinned_target, &label)
-        .await
-        .map_err(set_default_error)?;
-    if acquired.manifest_digest != resolved.manifest_digest {
-        return Err(identity_error());
-    }
-    Ok(AcquiredDefaultImage { reference: pin })
-}
-
-fn pin_reference(target: &Reference, resolved: &PullResult) -> Reference {
-    Reference::with_digest(
-        target.registry().to_owned(),
-        target.repository().to_owned(),
-        resolved.manifest_digest.to_string(),
-    )
-}
-
-fn identity_error() -> anyhow::Error {
-    anyhow!(
-        "validating the pinned native cache failed: immutable identity or complete cache unavailable; this command did not change the retained default"
-    )
+    let reference = prepared
+        .image()
+        .immutable_reference()
+        .map_err(|_| anyhow!(IMMUTABLE_IDENTITY_UNAVAILABLE))?;
+    drop(prepared);
+    Ok(AcquiredDefaultImage { reference })
 }
 
 /// Explicit set-default failures are always rendered as fixed, reference-free
@@ -181,36 +157,26 @@ fn set_default_error(error: AcquireError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boot_image::ImmutableImageRef;
 
     #[test]
-    fn native_pin_preserves_normalized_repository_and_child_identity() {
+    fn derived_child_is_canonical_and_immutable() {
         let child = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let config = microsandbox_image::ImageConfig::parse(
-            br#"{"os":"linux","architecture":"arm64","rootfs":{"type":"layers","diff_ids":[]}}"#,
-        )
-        .unwrap()
-        .0;
-        let resolved = PullResult {
-            layer_diff_ids: vec![],
-            config,
-            manifest_digest: child.parse().unwrap(),
-            cached: false,
-        };
-        for (input, expected_repo) in [
-            ("localhost:1234/a:tag", "a"),
-            ("alpine:latest", "library/alpine"),
+        for (input, expected) in [
+            ("localhost:1234/a:tag", "localhost:1234/a@"),
+            ("alpine:latest", "docker.io/library/alpine@"),
             (
                 "localhost:1234/a@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "a",
+                "localhost:1234/a@",
             ),
         ] {
-            let target: Reference = input.parse().unwrap();
-            let pin = pin_reference(&target, &resolved);
-            assert_eq!(pin.registry(), target.registry());
-            assert_eq!(pin.repository(), expected_repo);
-            assert_eq!(pin.digest(), Some(child));
-            assert!(pin.tag().is_none());
-            assert!(ImmutableImageRef::parse(&pin.whole()).is_ok());
+            let target = OciTarget::parse(input).unwrap();
+            let pinned = target
+                .canonical()
+                .with_digest(&crate::image_acquire::ValidatedDigest::parse(child).unwrap())
+                .unwrap();
+            assert_eq!(pinned.whole(), format!("{expected}{child}"));
+            assert!(ImmutableImageRef::parse(&pinned.whole()).is_ok());
         }
     }
 

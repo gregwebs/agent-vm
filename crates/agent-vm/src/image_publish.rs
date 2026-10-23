@@ -24,8 +24,9 @@
 //! # Publication guarantees
 //! On import failure only the requested reference is restored. Archive aliases
 //! may remain changed. No rollback covers process termination mid-import.
-//! Concurrent writers are not serialized: rollback can revert another writer,
-//! the same last-writer-wins exposure as the native loader today.
+//! Publication takes the cache-wide **exclusive** publication barrier, so no
+//! shared preparation is reading metadata while aliases move and two
+//! publications cannot interleave their rollbacks.
 
 use crate::boot_image::ImageRef;
 use crate::config::escape_str;
@@ -176,8 +177,31 @@ impl ImageTarget {
     /// Only `result` is restored: an alias the archive named may already have
     /// changed (user decision, see the module's publication guarantees).
     pub(crate) async fn publish(&self, archive: &Path, result: &ResultReference) -> Result<()> {
+        // The requested reference is the ONE canonical acquisition key, so an
+        // import under an equivalent spelling (`alpine:dev`,
+        // `registry-1.docker.io/alpine:dev`) lands where a launch/refresh will
+        // look. Archive-supplied aliases keep the native loader's semantics and
+        // are not rewritten.
+        //
+        // This re-parses an already-validated `ResultReference` because the
+        // loader takes a native `microsandbox_image::Reference` and nothing in
+        // this crate can construct one without the native parser. Keeping the
+        // parsed value (rather than the text) is what makes the barrier's
+        // requested-alias snapshot and the loader's tag agree.
+        let target = crate::image_acquire::OciTarget::parse(result.as_str())
+            .map_err(|_| anyhow!("the result reference is not a usable OCI target"))?;
+        let requested = target.canonical().whole();
+        // Exclusive for the whole requested-alias snapshot → loader → rollback
+        // interval: the native loader publishes every archive alias one at a
+        // time, and a shared preparation must never observe (or boot from) a
+        // cache whose metadata is mid-publication. Docker build/save/export
+        // staging deliberately happens before this barrier is taken.
+        let _publication = crate::image_acquire::PublicationBarrier::exclusive(&self.cache_dir)
+            .await
+            .map_err(crate::image_acquire::BarrierError::into_explicit_error)
+            .context("coordinating image-cache publication")?;
         let cache = microsandbox_image::GlobalCache::new_async(&self.cache_dir).await?;
-        let reference = result.as_str().parse::<microsandbox_image::Reference>()?;
+        let reference = target.reference().clone();
         let path = cache.image_metadata_path(&reference);
         let prior = Prior::read(&path).with_context(|| {
             format!(
@@ -189,7 +213,7 @@ impl ImageTarget {
             &self.cache_dir,
             archive,
             microsandbox_image::ImageLoadOptions {
-                tags: vec![result.as_str().to_string()],
+                tags: vec![requested],
                 progress: None,
             },
         )
