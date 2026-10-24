@@ -74,6 +74,45 @@ def fail(message: str) -> None:
     sys.exit(1)
 
 
+def shell_line_hits(line: str) -> list[str]:
+    """Every `tool … launch-option` pair on one shell line, in order.
+
+    The pure line-matching seam behind the sweep, so its controls below need no
+    tracked file. `agent-vm run PROBE --mount /x` is deliberately not a hit:
+    `run` is the direct runner and the trailing options belong to the guest
+    program (#398), so only a *tool verb* followed by a launch option is the old
+    order this contract forbids.
+    """
+    return [
+        f"`{tool.group(1)} … {launch.group(1)}`"
+        for tool in TOOL_RE.finditer(line)
+        for launch in LAUNCH_RE.finditer(line)
+        if launch.start() > tool.end()
+    ]
+
+
+def check_line_matching_controls() -> None:
+    """Controls for the sweep's line matching, independent of tracked files."""
+    accepted = [
+        # The existing helper line (single-binary-contract.sh): options first.
+        '(cd "$tmp/project" && run env GIT_CEILING_DIRECTORIES="$tmp" "$binary" '
+        '--no-git --image localhost:1/does-not-exist:latest --mount "$home/.config" '
+        'shell) >"$tmp/out" 2>"$tmp/err" || status=$?',
+        # Direct launches: launcher options before `run`, literal guest options
+        # after it. Neither is the old order.
+        "agent-vm run probe --mount /guest --root",
+        "agent-vm --memory 4 run probe --mount /9",
+    ]
+    for line in accepted:
+        hits = shell_line_hits(line)
+        if hits:
+            fail(f"control line wrongly flagged {hits}: {line}")
+    detected = ["agent-vm shell --memory 4", "agent-vm claude --root"]
+    for line in detected:
+        if not shell_line_hits(line):
+            fail(f"control line missed the old order: {line}")
+
+
 def sweep_tracked_callers() -> None:
     """Check 1: no tracked shell caller or user-facing doc uses the old order."""
     hits: list[str] = []
@@ -81,10 +120,8 @@ def sweep_tracked_callers() -> None:
         for lineno, line in enumerate(
             (REPO_ROOT / path).read_text(errors="replace").splitlines(), 1
         ):
-            for tool in TOOL_RE.finditer(line):
-                for launch in LAUNCH_RE.finditer(line):
-                    if launch.start() > tool.end():
-                        hits.append(f"{path}:{lineno}: `{tool.group(1)} … {launch.group(1)}`")
+            for hit in shell_line_hits(line):
+                hits.append(f"{path}:{lineno}: {hit}")
     for path in tracked_files(".md"):
         if path.startswith("docs/adr/"):
             continue  # Historical records: ADRs describe the grammar they replaced.
@@ -139,6 +176,7 @@ def check_measure_variants_create_argv() -> None:
 
 
 def main() -> None:
+    check_line_matching_controls()
     sweep_tracked_callers()
     check_measure_variants_create_argv()
     print("launch-argv-order: OK (no old-order caller; create() puts --memory before shell)")

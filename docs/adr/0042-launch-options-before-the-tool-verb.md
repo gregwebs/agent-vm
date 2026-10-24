@@ -28,6 +28,16 @@ locates the verb.
 > [--image REF]` and `agent-vm image set-default --image REF`, so their flags
 > follow the nested subcommand. `pull`/`upgrade` are no longer built-ins.
 
+> Amended by #398 (0.7.3): `run` is a built-in **launch** route, so this ADR's
+> option boundary applies to it unchanged — `agent-vm [launch options] run
+> PROGRAM [ARG…]`. `agent-vm [launch options] -- PROGRAM [ARG…]` is the same
+> route: only that one top-level separator is consumed, and it is rewritten to
+> the `run` verb when the prefix parses as launch options alone. Everything
+> after the program is raw argv by the same rule as a tool argument, including
+> `--help` and later `--` tokens, so `agent-vm help run` (never `run --help`)
+> shows the runner's help. `run` is therefore also a reserved tool name; a
+> configured tool using it is refused with a rename diagnostic.
+
 ## Considered Options
 
 - **Accept launch options in both positions.** Rejected: keeps the name

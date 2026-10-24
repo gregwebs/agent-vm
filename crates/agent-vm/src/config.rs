@@ -125,6 +125,10 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     "secret",
     "image",
     "_intercept-hook",
+    // The direct runner (issue #398). Reserved in every config tier, like a
+    // built-in: a tool by that name could not be reached, and the runner is
+    // the escape hatch from catalog launches.
+    "run",
     // clap synthesizes a `help` subcommand unconditionally. A second one
     // panics in debug builds and silently shadows clap's in release.
     "help",
@@ -1447,6 +1451,19 @@ fn validate_name(raw: &str, origin: &ToolOrigin, index: usize) -> Result<ToolNam
             index,
             Some(raw),
             "name `*` is reserved: it is the wildcard in a tool's `tools` list",
+        ));
+    }
+    // `run` is reserved for the direct runner, and a generic "reserved"
+    // message would leave the user with no migration path (issue #398). This
+    // precedes the set check so the rename advice is specific.
+    if raw == crate::launch_target::DIRECT_RUN_VERB {
+        return Err(declaration_error(
+            origin,
+            index,
+            Some(raw),
+            "name `run` is reserved: `agent-vm run PROGRAM [ARG...]` runs a guest \
+             program directly. Rename this tool (for example `run-tool`) and launch \
+             it by the new name.",
         ));
     }
     if RESERVED_TOOL_NAMES.contains(&raw) {

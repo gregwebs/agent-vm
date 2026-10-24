@@ -1,0 +1,85 @@
+#!/bin/sh
+# #398 fixture program: the direct-launch probe.
+#
+# It deliberately declares no persist, reads no provider file and writes nothing
+# in either mode, so a direct launch's identity/argv evidence cannot be produced
+# by catalog provisioning.
+#
+# Two modes:
+#   direct-probe-398 identity        identity, cwd, HOME, PATH, program resolution
+#   direct-probe-398 argv ARG...     argument count, then each argument NUL-delimited
+#
+# Every capture is checked with `set -eu` plus an explicit failure line: a failed
+# `id`/`pwd`/`command -v` must not hide inside a printf that still succeeds.
+set -eu
+
+mode="${1:-identity}"
+
+identity() {
+  uid="$(id -u)" || { printf 'uid=id-failed\n'; exit 1; }
+  gid="$(id -g)" || { printf 'gid=id-failed\n'; exit 1; }
+  printf 'uid=%s\n' "$uid"
+  printf 'gid=%s\n' "$gid"
+  cwd="$(pwd -P)" || { printf 'cwd=pwd-failed\n'; exit 1; }
+  printf 'cwd=%s\n' "$cwd"
+  printf 'home=%s\n' "$HOME"
+  printf 'path=%s\n' "$PATH"
+  bash_path="$(command -v bash 2>/dev/null)" || bash_path=none
+  printf 'bash=%s\n' "$bash_path"
+  # The program's own resolution, so the PATH oracle rejects a runtime prefix
+  # that shadows the probe itself.
+  probe_path="$(command -v direct-probe-398 2>/dev/null)" || probe_path=none
+  printf 'probe=%s\n' "$probe_path"
+  # A catalog-declared persist link would be a symlink in HOME; the probe
+  # declares none, so its absence is the direct route's own evidence.
+  # `-L` is required, not redundant with `-e`: a persist link is created
+  # *before* the target exists (a new project's
+  # `/agent-vm-state/persist/<name>` is not created until the tool writes it),
+  # so it is a dangling symlink and `-e` alone reports absent for a link that
+  # is really there. `zero-provisioning`'s control launch demonstrates the
+  # `present` branch on exactly such a dangling link.
+  if [ -L "$HOME/.hello-258.state" ] || [ -e "$HOME/.hello-258.state" ]; then
+    printf 'hello_persist=present\n'
+  else
+    printf 'hello_persist=absent\n'
+  fi
+  # The catalog-declared persist link of the hostile same-name catalog the
+  # zero-provisioning row uses (`persist = ["direct-398.state"]` would link
+  # `$HOME/direct-398.state` into the persist namespace). A direct launch
+  # declares none, so its absence is the guest's own observation. Same `-L`
+  # rule as above.
+  if [ -L "$HOME/direct-398.state" ] || [ -e "$HOME/direct-398.state" ]; then
+    printf 'direct_persist=present\n'
+  else
+    printf 'direct_persist=absent\n'
+  fi
+  # Provider/tool environment a direct launch must not inherit. Only the *names*
+  # of variables that are set are printed, never their values.
+  for key in CODEX_HOME COPILOT_GITHUB_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL \
+    CLAUDE_CONFIG_DIR OPENAI_API_KEY OPENCODE_CONFIG PROBE_CATALOG_ENV SHELL_CATALOG_ENV; do
+    if printenv "$key" >/dev/null 2>&1; then
+      printf 'inherited_env=%s\n' "$key"
+    fi
+  done
+}
+
+case "$mode" in
+identity)
+  identity
+  ;;
+argv)
+  shift
+  printf 'argv-count=%s\n' "$#"
+  # NUL-delimited so empty arguments, quotes, newlines and metacharacters keep
+  # their exact bytes; the caller compares file bytes, never shell words.
+  for argument in "$@"; do
+    printf '%s\0' "$argument"
+  done
+  ;;
+*)
+  printf 'mode=unknown\n' >&2
+  exit 2
+  ;;
+esac
+
+printf 'direct-probe-398=ok\n'

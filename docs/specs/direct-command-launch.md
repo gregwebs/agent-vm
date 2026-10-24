@@ -1,6 +1,10 @@
 # Direct command launches
 
-Status: agreed design; not implemented.
+Status: partially implemented — #398 (`run` / top-level `--`, literal Unicode
+argv without catalog selection or provisioning, and the 127/126/125 status
+distinctions) landed in 0.7.3. #399 (streamed stdin), #400 (terminal policy)
+and #401 (signals) are pending; the sections below describe the whole
+four-slice feature and are not all delivered yet.
 
 ## Purpose
 
@@ -133,7 +137,7 @@ command completion. These conventions apply to direct launches; leave existing
 
 ## References
 
-- [Domain vocabulary](../../CONTEXT.md#direct-command-launch)
+- [Domain vocabulary](../../CONTEXT.md#direct-command)
 - [Launch option boundary](../adr/0042-launch-options-before-the-tool-verb.md)
 - [Provider provisioning](../adr/0017-tool-declared-provisioning.md)
 - [Boot image ownership and contract](../adr/0035-consume-user-owned-boot-images.md)

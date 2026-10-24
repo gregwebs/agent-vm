@@ -33,6 +33,7 @@ mod image_miss;
 mod image_pin;
 mod image_publish;
 mod intercept_hook;
+mod launch_target;
 mod mount;
 mod msb_cmd;
 mod msb_install;
@@ -73,10 +74,68 @@ fn main() -> Result<()> {
     let config = config::ConfigPaths::discover().and_then(|paths| config::load(&paths));
     let dispatch = match cli::parse_from(std::env::args_os(), config) {
         Ok(dispatch) => dispatch,
-        // Post-parse usage errors use clap's formatter and exit status too.
-        Err(error) => error.downcast::<clap::Error>()?.exit(),
+        // Parse failures already know their status: clap's own formatter and
+        // status for a usage error, and 125 for a deferred direct configuration
+        // failure (#398).
+        Err(error) => return Err(report_dispatch_failure(error, false)),
     };
 
+    // The status policy of everything below depends on the route, recorded
+    // while it is still observable on the dispatch itself.
+    let direct = dispatch.is_direct_launch();
+    run_dispatch(dispatch).map_err(|error| report_dispatch_failure(error, direct))
+}
+
+/// Report a dispatch failure with its status, ending the process here when the
+/// status is not anyhow's ordinary 1.
+///
+/// clap's own usage errors exit themselves (status 2, and 0 for help/version).
+/// A direct launch's ordinary returned failure is reported and exits 125
+/// (#398); every other error is returned so `main` reports it with anyhow's
+/// status 1, exactly as before. Writing the 125 message is best effort: a broken
+/// stderr must not turn 125 into a panic, and 125 remains the report when
+/// nothing can be written.
+fn report_dispatch_failure(error: anyhow::Error, direct: bool) -> anyhow::Error {
+    match error.downcast::<clap::Error>() {
+        Ok(usage) => usage.exit(),
+        Err(error) => match failure_status(&error, direct) {
+            FailureStatus::DirectLauncher => {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "Error: {error:#}");
+                std::process::exit(launch_target::DIRECT_LAUNCHER_FAILURE_EXIT);
+            }
+            FailureStatus::Ordinary => error,
+        },
+    }
+}
+
+/// What status a returned dispatch failure must produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureStatus {
+    /// anyhow's own `Error: …` report and status 1 (every shell/tool/admin path).
+    Ordinary,
+    /// A direct launch's ordinary failure: 125 (#398).
+    DirectLauncher,
+}
+
+/// The pure half of the status policy, so the mapping is unit-tested without
+/// exiting a test process. A deferred direct configuration failure carries its
+/// own marker, because the route is no longer observable after a parse failure.
+fn failure_status(error: &anyhow::Error, direct: bool) -> FailureStatus {
+    if direct
+        || error
+            .downcast_ref::<launch_target::DirectLaunchFailure>()
+            .is_some()
+    {
+        FailureStatus::DirectLauncher
+    } else {
+        FailureStatus::Ordinary
+    }
+}
+
+/// Everything after parsing, separated so `main` owns the exit-status policy for
+/// whatever this returns.
+fn run_dispatch(dispatch: Dispatch) -> Result<()> {
     // `doctor` is a **diagnostic** and must not depend on a healthy runtime to
     // inspect state (issue #93): dispatching it here, before `point_at_msb` /
     // `ensure_msb_home`, keeps it independent of MSB_HOME setup and the
@@ -142,8 +201,8 @@ fn main() -> Result<()> {
     // Capture while no child has inherited selected values and removal cannot
     // race a Tokio worker's environment read (#163).
     let credential_preflight = match &dispatch {
-        Dispatch::Launch { entry, .. } => {
-            credential_resolver::CredentialPreflight::capture(entry.requested_names())
+        Dispatch::Launch { target, .. } => {
+            credential_resolver::CredentialPreflight::capture(target.requested_names())
         }
         Dispatch::Builtin { .. } => credential_resolver::CredentialPreflight::none(),
     };
@@ -201,19 +260,17 @@ fn main() -> Result<()> {
     runtime.block_on(async move {
         match dispatch {
             Dispatch::Launch {
-                entry,
+                target,
                 images,
                 user_network,
                 args,
-                tool_args,
             } => exit_with(
                 run::launch(
-                    &entry,
+                    target,
                     &images,
                     user_network.as_ref(),
                     credential_preflight,
                     *args,
-                    tool_args,
                 )
                 .await?,
             ),
@@ -293,4 +350,32 @@ fn init_tracing() {
 
 fn exit_with(code: i32) -> Result<()> {
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::launch_target::DirectLaunchFailure;
+
+    #[test]
+    fn only_a_direct_route_or_its_deferred_marker_maps_to_125() {
+        let transport = anyhow::anyhow!("transport failed");
+        assert_eq!(
+            failure_status(&transport, true),
+            FailureStatus::DirectLauncher
+        );
+        assert_eq!(
+            failure_status(&transport, false),
+            FailureStatus::Ordinary,
+            "shell/tool/administrative errors keep status 1"
+        );
+        let deferred = anyhow::Error::new(DirectLaunchFailure(anyhow::anyhow!("broken catalog")));
+        assert_eq!(
+            failure_status(&deferred, false),
+            FailureStatus::DirectLauncher,
+            "a parse-time direct config failure has no dispatch to ask"
+        );
+        // The marker reports the underlying configuration error, not itself.
+        assert_eq!(format!("{deferred}"), "broken catalog");
+    }
 }

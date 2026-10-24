@@ -1,7 +1,6 @@
 //! `agent-vm <agent> [args...]` — boot a per-project sandbox and attach to
 //! the chosen agent (or a shell).
 //!
-use crate::network_requests::RequestTier;
 use std::{
     collections::BTreeSet,
     env,
@@ -15,10 +14,11 @@ use clap::Args as ClapArgs;
 use microsandbox::{Sandbox, sandbox::PullPolicy};
 
 use crate::boot_image::{self, ImageArgs};
-use crate::config::{self, CatalogEntry, ConfiguredImages, Tool};
+use crate::config::{self, ConfiguredImages, Tool};
 use crate::credential_provider;
 use crate::credential_resolver::{CredentialPreflight, MissingCredentialPolicy};
 use crate::image_contract;
+use crate::launch_target::{LaunchTarget, ProgramGuard};
 use crate::mount;
 use crate::protected_host_files::CoreHostSource;
 use crate::session::ProjectSession;
@@ -361,6 +361,57 @@ fn mkdir_chain(project: &Path) -> Vec<String> {
     out
 }
 
+/// The direct runner's fixed usage lines: both spellings, and never rendered
+/// argv. Used for `help run` and for every direct usage error (status 2).
+pub(crate) const DIRECT_USAGE: &str = "\
+agent-vm [launch options] run PROGRAM [ARG]...
+       agent-vm [launch options] -- PROGRAM [ARG]...";
+
+/// Footer under `agent-vm help run`. The program is user-supplied argv, so this
+/// text names no specific executable.
+pub(crate) const DIRECT_AFTER_HELP: &str = "\
+Examples:
+  agent-vm run make test               run the guest make with these arguments
+  agent-vm --memory 4 run bash -c 'echo ok'
+  agent-vm -- make test                the top-level `--` spelling is equivalent
+  agent-vm run printf '%s\\n' '$HOME'   literal argv: prints $HOME, no expansion
+  agent-vm run bash -c 'echo $HOME'    shell syntax needs an explicit shell
+
+Launch options go before `run` or the top-level `--`. Every argument after the
+program is literal: no expansion, splitting, globbing, deduplication, tool
+default arguments, tool environment or catalog provisioning. The program may be a
+bare name resolved on the guest PATH or an explicit path. `--help` and `--` after
+it belong to it, and `run` itself takes no options.
+
+Statuses: 127 when the executable is absent from the effective guest PATH, 126
+when it is present but not executable (or is a directory named by path), 125 for
+an ordinary direct launcher failure, otherwise the program's own status. A bare
+name that resolves to a directory counts as not found (127).
+
+Slice 1: no streamed stdin, terminal overrides or signal forwarding yet; see
+USAGE.md (issues #399-#401).";
+
+/// Fixed text for a scrubbed parse error on a known-direct route: no supplied
+/// value can be among it, and the direct usage line replaces administrative
+/// image-import wording.
+pub(crate) const DIRECT_SCRUB_ERROR: &str = "\
+`agent-vm run` could not parse its arguments. The arguments are not shown, \
+because a value among them may be secret. Supported forms:
+  agent-vm [launch options] run PROGRAM [ARG]...
+  agent-vm [launch options] -- PROGRAM [ARG]...";
+
+/// Fixed text for a scrubbed parse error on a known-direct route that the
+/// `secret` predicate selected: value-free like [`DIRECT_SCRUB_ERROR`], but it
+/// must not explain the administrative `agent-vm secret …` forms. Those are not
+/// what a guest command vector containing the token `secret` could have meant.
+pub(crate) const DIRECT_SECRET_SCRUB_ERROR: &str = "\
+`agent-vm run` could not parse its arguments. The arguments are not shown, \
+because one of them is `secret` and a secret value may have been among them. \
+Launch options go before `run` or the top-level `--`, and everything after the \
+program is literal guest argv. Supported forms:
+  agent-vm [launch options] run PROGRAM [ARG]...
+  agent-vm [launch options] -- PROGRAM [ARG]...";
+
 /// Footer under `agent-vm help <tool>`. Shared by every tool verb, so it names no tool.
 pub(crate) const LAUNCH_AFTER_HELP: &str = "\
 Examples:
@@ -376,6 +427,8 @@ pub(crate) const LAUNCH_OPTIONS_LONG_HELP: &str = "\
 Examples:
   agent-vm <tool>                                  launch in the current project
   agent-vm <tool> --model opus --resume            forward args to the tool
+  agent-vm run make test                           run a guest executable directly
+  agent-vm -- make test                            same program, top-level `--` form
   agent-vm shell <command>                         run one command, then exit
   agent-vm --memory 8 --cpus 4 <tool>              a bigger sandbox
   agent-vm --mount ~/ref:ro <tool>                 read-only extra mount
@@ -567,22 +620,24 @@ pub struct Args {
     pub(crate) root: bool,
 }
 
-/// Take the resolved **catalog entry**, which carries both the tool and the
-/// provisioning set the launch catalog resolved for it. The set is *read from
-/// the entry*, never recomputed from the tool: it is the transitive closure
-/// over the catalog the tool was declared in, which a single [`Tool`] cannot
-/// see. Passing the entry whole is deliberate — the two facts can never be
-/// mismatched here.
+/// Lower the selected target once, then retain the shared setup and exec path.
 pub(crate) async fn launch(
-    entry: &CatalogEntry,
+    target: LaunchTarget,
     images: &ConfiguredImages,
     user_network: Option<&crate::user_network::UserNetwork>,
     credential_preflight: CredentialPreflight,
     args: Args,
-    tool_args: Vec<String>,
 ) -> Result<i32> {
-    let tool = entry.tool();
-    let provisioned = entry.provisioned();
+    let (grant, invocation) = target.into_parts();
+    // The output policy belongs to the target, not to the sink: a direct launch
+    // answers a broken stdout/stderr pipe as its own failure (#398), while a
+    // tool/shell launch keeps the legacy best-effort sink so its status cannot
+    // change (see `forward_stream_bytes`).
+    let output_policy = match invocation.guard() {
+        ProgramGuard::Direct => OutputErrorPolicy::DirectChecked,
+        ProgramGuard::ImageContract => OutputErrorPolicy::LegacyBestEffort,
+    };
+    let provisioned = grant.provisioned();
     // The one image selection for this session — a property of the session,
     // not of the launched tool. Resolved first, before any side effect:
     // an invalid override (a typed empty `--image`) or an unreadable
@@ -606,7 +661,7 @@ pub(crate) async fn launch(
     // link per `persist` path in this launch's provisioning closure. Computed
     // once and threaded to both provisioning sites and the root-mode rootfs
     // patch, so they cannot drift (CONTEXT.md → *Guest HOME*).
-    let home_links = crate::guest_home::links(entry.persist());
+    let home_links = crate::guest_home::links(grant.persist());
 
     // Resolve root vs. non-root guest mode up front — it gates dir
     // provisioning, the rootfs patch block, and the guest env/exec wiring
@@ -929,7 +984,7 @@ pub(crate) async fn launch(
     // accepts `grant_type=refresh_token` with the placeholder refresh token
     // *only*, so an authorization-code exchange is rejected and Claude Code
     // surfaces a bare "OAuth error ... status code 400".
-    for provider in tool.credential_providers().iter() {
+    for provider in grant.required().iter() {
         // A replaced provider's requirement is the authorization's `required`,
         // already enforced in phase 1 (spec lines 207-208: "YAML entries use
         // the YAML `required` semantics, rather than inheriting the old
@@ -1159,11 +1214,13 @@ pub(crate) async fn launch(
         .emit_launch_notices()
         .context("writing launch networking notices")?;
     // Compare declarations to the authority just printed, before applying it.
-    for line in network_plan
-        .request_report(tool.network_requests(), RequestTier::from(tool.origin()))
-        .lines()
-    {
-        notices.emit(line)?;
+    if let Some(declared) = grant.requests() {
+        for line in network_plan
+            .request_report(&declared.requests, declared.tier)
+            .lines()
+        {
+            notices.emit(line)?;
+        }
     }
 
     let executable =
@@ -1277,7 +1334,7 @@ pub(crate) async fn launch(
     // rejects those three keys outright at config time (ADR-0016).
     let assembled = launch_credentials
         .assemble_guest_env(crate::credential_resolver::GuestEnvSources {
-            tool_env: tool.guest_env(),
+            tool_env: grant.guest_env(),
             path: None,
             identity: &identity,
             always: GUEST_ALWAYS_ENV,
@@ -1294,15 +1351,12 @@ pub(crate) async fn launch(
         label.text()
     ))?;
     let t_create = Instant::now();
-    // The resolved guest command line is computed here (rather than at its use
-    // site below) purely so this debug line and the sandbox-config dump stay
-    // adjacent; it depends only on the tool and the user's args, not on the
-    // sandbox. The guest command line travels over the exec request *after*
-    // boot, so it is absent from the `SandboxConfig` dump below — this line is
-    // the only observable form of it. The tool arguments can appear here, the
-    // same exposure class as the dump, behind the same opt-in flag.
-    let inner_cmd = tool.command();
-    let inner_argv = inner_argv(tool, tool_args);
+    // Keep command debug output adjacent to the config dump. The invocation
+    // travels over exec only after boot, so SandboxConfig does not contain it.
+    // Arguments have the dump's exposure class behind the same opt-in flag.
+    let inner_cmd = invocation.program();
+    let command_display = invocation.display();
+    let inner_argv = invocation.argv();
     let config = builder.build().await.context("preparing sandbox config")?;
     if let Some(dump) = crate::debug_config::sandbox_config(&config, label.is_redacted())? {
         notices.emit(dump)?;
@@ -1452,10 +1506,11 @@ pub(crate) async fn launch(
     // unit-tested directly. The IPv6-nameserver strip is the
     // `STRIP_IPV6_NAMESERVERS` const (see its doc comment / PLAN.md B3).
     let shell_line = AgentShellLine {
+        guard: invocation.guard(),
         project_guest_path: &project_guest_path,
         image: &image,
         command: inner_cmd,
-        args: &inner_argv,
+        args: inner_argv,
     }
     .render();
     let cmd = image_contract::LAUNCH_SHELL;
@@ -1463,7 +1518,7 @@ pub(crate) async fn launch(
 
     let t_run = Instant::now();
     let exit = if std::io::stdin().is_terminal() {
-        notices.emit(format!("==> Attaching to {inner_cmd}"))?;
+        notices.emit(format!("==> Attaching to {command_display}"))?;
         // Pin the agent's cwd to the real project path via the exec request
         // (vsock, byte-safe), NOT libkrun's `KRUN_WORKDIR` — which may be the
         // ASCII `/` placeholder for a non-ASCII project. `attach()` alone
@@ -1491,9 +1546,14 @@ pub(crate) async fn launch(
                 let error = anyhow::Error::new(error);
                 let primary = exec_failure_primary(
                     contract_spawn_diagnostic(&image, &error),
-                    error.context(format!("attaching to {inner_cmd}")),
+                    error.context(format!("attaching to {command_display}")),
                 );
-                return Err(finish_failed_exec(&sandbox, primary).await);
+                return Err(finish_failed_exec(
+                    &sandbox,
+                    primary,
+                    &sandbox_log_dir(&session.sandbox_name).display().to_string(),
+                )
+                .await);
             }
         }
     } else {
@@ -1505,11 +1565,9 @@ pub(crate) async fn launch(
         // lets us inspect partial output when the user Ctrl-Cs or the
         // shell times out.
         notices.emit(format!(
-            "==> Running {inner_cmd} in sandbox (no TTY; streaming output)"
+            "==> Running {command_display} in sandbox (no TTY; streaming output)"
         ))?;
-        use microsandbox::sandbox::exec::ExecEvent;
-        use tokio::io::AsyncWriteExt as _;
-        let mut handle = match sandbox
+        let handle = match sandbox
             .exec_stream_with(cmd, |e| {
                 e.args(shell_argv)
                     .cwd(project_guest_path.clone())
@@ -1523,97 +1581,38 @@ pub(crate) async fn launch(
                 let error = anyhow::Error::new(error);
                 let primary = exec_failure_primary(
                     contract_spawn_diagnostic(&image, &error),
-                    error.context(format!("running {inner_cmd} in sandbox")),
+                    error.context(format!("running {command_display} in sandbox")),
                 );
-                return Err(finish_failed_exec(&sandbox, primary).await);
+                return Err(finish_failed_exec(
+                    &sandbox,
+                    primary,
+                    &sandbox_log_dir(&session.sandbox_name).display().to_string(),
+                )
+                .await);
             }
         };
         let mut stdout = tokio::io::stdout();
         let mut stderr = tokio::io::stderr();
         // Race the exec event stream against the sandbox's own runtime exit
-        // (issue #41): if the msb VMM child dies mid-session, the relay
-        // socket closing should already end the event stream (`recv()` ->
-        // `None`), but that relies on the SDK's reader loop observing the
-        // socket EOF promptly. This is the belt-and-suspenders backstop —
-        // `sandbox.wait()` resolving first means the exec await can never
-        // hang on a VMM that's already gone, no matter how the event stream
-        // behaves.
-        //
-        // Follow-up fix (verified live, see verifications.md item 3): on a
-        // real VMM kill, the relay socket EOFs essentially instantly, so
-        // `events.recv() -> None` wins this race against `sandbox.wait()`
-        // completing almost every time. If we reported a plain
-        // "stream ended" diagnostic right there, `sandbox.wait()`'s exit
-        // classification — and the `msb-exit.log` post-mortem write it
-        // performs — would never happen, because the future backing this
-        // race would be dropped mid-flight. `next_exec_step` now gives
-        // `runtime_exit` a bounded chance to finish *after* observing the
-        // stream close, so the classification/log-write reliably happens
-        // before we report anything.
-        let mut runtime_exit: RuntimeExit = Box::pin(sandbox.wait());
-        // The loop classifies every exit explicitly: `Ok(0)` from a real
-        // `Exited`, or an `Err` carrying the primary diagnostic. No branch
-        // performs teardown here — the pending `runtime_exit` (which owns the
-        // child-handle mutex after polling) must be dropped first, on **every**
-        // path, or the following stop/wait deadlocks (#258).
-        let stream_result: anyhow::Result<i32> = loop {
-            match next_exec_step(
-                &mut handle,
-                &mut runtime_exit,
-                STREAM_END_RUNTIME_EXIT_GRACE,
-            )
-            .await
-            {
-                ExecStep::Event(ExecEvent::Stdout(b)) => {
-                    stdout.write_all(&b).await.ok();
-                    stdout.flush().await.ok();
-                }
-                ExecStep::Event(ExecEvent::Stderr(b)) => {
-                    stderr.write_all(&b).await.ok();
-                    stderr.flush().await.ok();
-                }
-                ExecStep::Event(ExecEvent::Exited { code: c }) => break Ok(c),
-                ExecStep::Event(ExecEvent::Failed(payload)) => {
-                    // A contract breach (missing/unrunnable `bash`) becomes the
-                    // image diagnostic; anything else keeps an escaped message
-                    // rather than the Rust `Debug` dump of the payload (#258).
-                    let primary = exec_failure_primary(
-                        image_contract::launch_shell_spawn_diagnostic(&image, &payload),
-                        anyhow::anyhow!(
-                            "exec session failed: {}",
-                            config::escape_str(&payload.message)
-                        ),
-                    );
-                    break Err(primary);
-                }
-                ExecStep::Event(ExecEvent::Started { .. } | ExecEvent::StdinError(_)) => {}
-                ExecStep::StreamEnded => {
-                    break Err(anyhow::anyhow!(
-                        "exec session event stream ended without Exited (agentd disconnect or \
-                     microsandbox bug; partial output above; full logs: {})",
-                        sandbox_log_dir(&session.sandbox_name).display()
-                    ));
-                }
-                ExecStep::RuntimeExited(detail) => {
-                    break Err(anyhow::anyhow!(
-                        "sandbox process exited unexpectedly while the exec stream was still \
-                     open ({detail}); partial output above; see msb-exit.log under {} for \
-                     the VMM's post-mortem record",
-                        sandbox_log_dir(&session.sandbox_name).display()
-                    ));
-                }
-            }
-        };
-        // Cancels a future potentially holding the child-handle mutex. This is
-        // NOT conditional on a borrow error, and it precedes EVERY streaming
-        // teardown path (both the success continue and the `finish_failed_exec`
-        // return below).
-        drop(runtime_exit);
-        drop(handle);
-        match stream_result {
-            Ok(code) => code,
-            Err(primary) => return Err(finish_failed_exec(&sandbox, primary).await),
-        }
+        // (issue #41): if the msb VMM child dies mid-session, the relay socket
+        // closing should already end the event stream (`recv()` -> `None`), but
+        // that relies on the SDK's reader loop observing the socket EOF promptly.
+        // `sandbox.wait()` resolving first means the exec await can never hang on
+        // a VMM that's already gone, no matter how the event stream behaves.
+        let runtime_exit: RuntimeExit = Box::pin(sandbox.wait());
+        stream_exec_with_cleanup(
+            &sandbox,
+            handle,
+            runtime_exit,
+            &mut stdout,
+            &mut stderr,
+            output_policy,
+            ExecContext {
+                image: &image,
+                log_dir: &sandbox_log_dir(&session.sandbox_name).display().to_string(),
+            },
+        )
+        .await?
     };
 
     if profile {
@@ -1626,18 +1625,189 @@ pub(crate) async fn launch(
     if profile {
         notices.emit(format!("[profile] stop+remove: {:?}", t_stop.elapsed()))?;
     }
-    if let Err(error) = cleanup {
-        return Err(error.context(format!(
-            "guest command `{}` exited {exit}, but the sandbox could not be cleaned up",
-            config::escape_str(inner_cmd)
-        )));
-    }
+    cleanup_after_exit(inner_cmd, exit, cleanup)?;
 
     // Phase 5 safety net (host-cred mutation check) runs via the
     // SnapshotGuard above, which drops at end of scope including
     // any `?`-propagated error path.
 
     Ok(exit)
+}
+
+/// Who owns a guest stream sink failure.
+///
+/// The legacy sink deliberately swallows `write_all`/`flush` errors: a tool or
+/// shell launch whose output pipe dies keeps reporting the guest's own status,
+/// and this ticket must not change that. A direct launch checks both, because a
+/// lost stdout is a launcher failure (125) there — the one deliberate,
+/// local, regression-tested exception (#398).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputErrorPolicy {
+    LegacyBestEffort,
+    DirectChecked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestStream {
+    Stdout,
+    Stderr,
+}
+
+impl GuestStream {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+/// Write then flush one event's bytes, in exactly the legacy order (both are
+/// attempted even when the write fails). Never includes payload bytes in an
+/// error: the guest decides what the stream contains.
+async fn forward_stream_bytes(
+    sink: &mut (impl tokio::io::AsyncWrite + Unpin),
+    bytes: &[u8],
+    stream: GuestStream,
+    policy: OutputErrorPolicy,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let written = sink.write_all(bytes).await;
+    let flushed = sink.flush().await;
+    if policy == OutputErrorPolicy::LegacyBestEffort {
+        return Ok(());
+    }
+    written.map_err(|error| anyhow::anyhow!("writing guest {} failed: {error}", stream.name()))?;
+    flushed.map_err(|error| anyhow::anyhow!("flushing guest {} failed: {error}", stream.name()))?;
+    Ok(())
+}
+
+/// The named launch context the exec lifecycle diagnostics are built from.
+struct ExecContext<'a> {
+    image: &'a str,
+    log_dir: &'a str,
+}
+
+/// The exec lifecycle for a streamed (non-TTY) launch.
+///
+/// It **owns** the event handle and the pinned runtime wait future, borrows the
+/// sinks, and returns the guest status or the primary failure. Both handles are
+/// dropped unconditionally before teardown: the wait future may hold the
+/// child-handle mutex, so a teardown that ran first would deadlock (#258).
+async fn stream_exec_with_cleanup<T: ExecTeardown>(
+    teardown: &T,
+    mut handle: impl ExecEventSource,
+    mut runtime_exit: RuntimeExit<'_>,
+    stdout: &mut (impl tokio::io::AsyncWrite + Unpin),
+    stderr: &mut (impl tokio::io::AsyncWrite + Unpin),
+    policy: OutputErrorPolicy,
+    context: ExecContext<'_>,
+) -> Result<i32> {
+    use microsandbox::sandbox::exec::ExecEvent;
+    let stream_result: Result<i32> = loop {
+        match next_exec_step(
+            &mut handle,
+            &mut runtime_exit,
+            STREAM_END_RUNTIME_EXIT_GRACE,
+        )
+        .await
+        {
+            ExecStep::Event(ExecEvent::Stdout(bytes)) => {
+                // Break through the loop result, never `?` out: the wait future
+                // and handle must be dropped by this function before teardown.
+                if let Err(primary) =
+                    forward_stream_bytes(stdout, &bytes, GuestStream::Stdout, policy).await
+                {
+                    break Err(primary);
+                }
+            }
+            ExecStep::Event(ExecEvent::Stderr(bytes)) => {
+                // Break through the loop result, never `?` out: the wait future
+                // and handle must be dropped by this function before teardown.
+                if let Err(primary) =
+                    forward_stream_bytes(stderr, &bytes, GuestStream::Stderr, policy).await
+                {
+                    break Err(primary);
+                }
+            }
+            ExecStep::Event(ExecEvent::Exited { code }) => break Ok(code),
+            ExecStep::Event(ExecEvent::Failed(payload)) => {
+                // A contract breach (missing/unrunnable `bash`) becomes the
+                // image diagnostic; anything else keeps an escaped message
+                // rather than the Rust `Debug` dump of the payload (#258).
+                break Err(exec_failure_primary(
+                    image_contract::launch_shell_spawn_diagnostic(context.image, &payload),
+                    anyhow::anyhow!(
+                        "exec session failed: {}",
+                        config::escape_str(&payload.message)
+                    ),
+                ));
+            }
+            ExecStep::Event(ExecEvent::Started { .. } | ExecEvent::StdinError(_)) => {}
+            ExecStep::StreamEnded => {
+                break Err(anyhow::anyhow!(
+                    "exec session event stream ended without Exited (agentd disconnect or \
+                     microsandbox bug; partial output above; full logs: {})",
+                    context.log_dir
+                ));
+            }
+            ExecStep::RuntimeExited(detail) => {
+                break Err(anyhow::anyhow!(
+                    "sandbox process exited unexpectedly while the exec stream was still \
+                     open ({detail}); partial output above; see msb-exit.log under {} for \
+                     the VMM's post-mortem record",
+                    context.log_dir
+                ));
+            }
+        }
+    };
+    // Cancels futures that may hold the child-handle mutex. Unconditional, and
+    // before every streaming teardown path.
+    drop(runtime_exit);
+    drop(handle);
+    match stream_result {
+        Ok(code) => Ok(code),
+        Err(primary) => Err(finish_failed_exec(teardown, primary, context.log_dir).await),
+    }
+}
+
+/// The teardown operations the exec lifecycle performs.
+///
+/// A seam, not a new lifecycle: [`Sandbox`]'s adapter delegates to the current
+/// SDK calls and keeps their error display, so a test can drive the *production*
+/// failure schedule (stop/kill/reap/remove errors and timeouts) without a booted
+/// VM or a fake `msb`. Bounded timeouts stay in
+/// [`cleanup_exec_sandbox_failures`], the one owner of the order.
+trait ExecTeardown: Sync {
+    async fn stop_and_wait(&self) -> Result<()>;
+    async fn kill_with_timeout(&self, timeout: Duration) -> Result<()>;
+    async fn wait(&self) -> Result<()>;
+    async fn remove(&self) -> Result<()>;
+}
+
+impl ExecTeardown for Sandbox {
+    async fn stop_and_wait(&self) -> Result<()> {
+        Sandbox::stop_and_wait(self)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::new)
+    }
+    async fn kill_with_timeout(&self, timeout: Duration) -> Result<()> {
+        Sandbox::kill_with_timeout(self, timeout)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+    async fn wait(&self) -> Result<()> {
+        Sandbox::wait(self)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::new)
+    }
+    async fn remove(&self) -> Result<()> {
+        Sandbox::remove(self.name())
+            .await
+            .map_err(anyhow::Error::new)
+    }
 }
 
 /// Bounded teardown deadlines for the exec lifecycle. Named and local: a wedged
@@ -1676,9 +1846,9 @@ fn exec_failure_primary(contract: Option<String>, fallback: anyhow::Error) -> an
 /// graceful stop is tried first; only its failure escalates to a bounded
 /// kill+reap. The sandbox is removed either way, so a failed launch never
 /// leaves a hidden VM behind (#258).
-async fn cleanup_exec_sandbox_failures(sandbox: &Sandbox) -> Vec<String> {
+async fn cleanup_exec_sandbox_failures(teardown: &impl ExecTeardown) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
-    let stopped = match tokio::time::timeout(EXEC_STOP_TIMEOUT, sandbox.stop_and_wait()).await {
+    let stopped = match tokio::time::timeout(EXEC_STOP_TIMEOUT, teardown.stop_and_wait()).await {
         Ok(Ok(_)) => true,
         Ok(Err(error)) => {
             failures.push(format!("stop: {error}"));
@@ -1695,7 +1865,7 @@ async fn cleanup_exec_sandbox_failures(sandbox: &Sandbox) -> Vec<String> {
         // bounds the dispatch itself, not just the kill it performs.
         match tokio::time::timeout(
             EXEC_KILL_TIMEOUT,
-            sandbox.kill_with_timeout(EXEC_KILL_TIMEOUT),
+            teardown.kill_with_timeout(EXEC_KILL_TIMEOUT),
         )
         .await
         {
@@ -1704,13 +1874,13 @@ async fn cleanup_exec_sandbox_failures(sandbox: &Sandbox) -> Vec<String> {
             Err(_) => failures.push(format!("kill: timed out after {EXEC_KILL_TIMEOUT:?}")),
         }
         // Reap even if the kill failed, so no wedged process is left owned.
-        match tokio::time::timeout(EXEC_REAP_TIMEOUT, sandbox.wait()).await {
+        match tokio::time::timeout(EXEC_REAP_TIMEOUT, teardown.wait()).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => failures.push(format!("reap: {error}")),
             Err(_) => failures.push(format!("reap: timed out after {EXEC_REAP_TIMEOUT:?}")),
         }
     }
-    match tokio::time::timeout(EXEC_REMOVE_TIMEOUT, Sandbox::remove(sandbox.name())).await {
+    match tokio::time::timeout(EXEC_REMOVE_TIMEOUT, teardown.remove()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => failures.push(format!("remove: {error}")),
         Err(_) => failures.push(format!("remove: timed out after {EXEC_REMOVE_TIMEOUT:?}")),
@@ -1722,13 +1892,26 @@ async fn cleanup_exec_sandbox_failures(sandbox: &Sandbox) -> Vec<String> {
 /// teardown step succeeded, otherwise one error listing the failures in
 /// operation order. A successful forced cleanup never hides a failed graceful
 /// stop.
-async fn cleanup_exec_sandbox(sandbox: &Sandbox) -> anyhow::Result<()> {
-    let failures = cleanup_exec_sandbox_failures(sandbox).await;
+async fn cleanup_exec_sandbox(teardown: &impl ExecTeardown) -> anyhow::Result<()> {
+    let failures = cleanup_exec_sandbox_failures(teardown).await;
     if failures.is_empty() {
         Ok(())
     } else {
         Err(anyhow::anyhow!("{}", failures.join("; ")))
     }
+}
+
+/// Apply the shared cleanup path after a **known** guest status: a teardown
+/// failure is still an error (never a silent success), and it names the command
+/// and the status the guest had already produced. Extracted so the cleanup
+/// after a known exit is driven by the same code in tests as in a launch.
+fn cleanup_after_exit(command: &str, exit: i32, cleanup: anyhow::Result<()>) -> anyhow::Result<()> {
+    cleanup.map_err(|error| {
+        error.context(format!(
+            "guest command `{}` exited {exit}, but the sandbox could not be cleaned up",
+            config::escape_str(command)
+        ))
+    })
 }
 
 /// Render a failed launch's teardown outcome. The primary contract diagnostic
@@ -1749,12 +1932,15 @@ fn failed_exec_message(primary: &str, cleanup_failures: &[String], log_dir: &str
 /// Finish a failed exec by tearing the sandbox down and returning the primary
 /// failure with any teardown failures **appended**: the contract breach stays
 /// visible even when cleanup also fails (#258).
-async fn finish_failed_exec(sandbox: &Sandbox, primary: anyhow::Error) -> anyhow::Error {
-    let log_dir = sandbox_log_dir(sandbox.name()).display().to_string();
-    let failures = cleanup_exec_sandbox_failures(sandbox).await;
+async fn finish_failed_exec(
+    teardown: &impl ExecTeardown,
+    primary: anyhow::Error,
+    log_dir: &str,
+) -> anyhow::Error {
+    let failures = cleanup_exec_sandbox_failures(teardown).await;
     anyhow::anyhow!(
         "{}",
-        failed_exec_message(&format!("{primary:#}"), &failures, &log_dir)
+        failed_exec_message(&format!("{primary:#}"), &failures, log_dir)
     )
 }
 
@@ -2310,6 +2496,7 @@ struct AgentShellLine<'a> {
     image: &'a str,
     command: &'a str,
     args: &'a [String],
+    guard: ProgramGuard,
 }
 
 impl AgentShellLine<'_> {
@@ -2356,6 +2543,69 @@ impl AgentShellLine<'_> {
     /// exits through the normal teardown with the contract message and
     /// [`image_contract::MISSING_PROGRAM_EXIT`] (#258).
     fn program_guard(&self) -> String {
+        match self.guard {
+            ProgramGuard::ImageContract => self.image_contract_guard(),
+            ProgramGuard::Direct => self.direct_guard(),
+        }
+    }
+
+    /// Direct-launch guard: a real `PATH` search after the hook, keeping the
+    /// looked-up pathname bytes intact, then 127 (not found) versus 126 (found
+    /// but not executable).
+    ///
+    /// Clearing the hash is the first line deliberately. `type -P` answers from
+    /// the hash table without consulting `PATH`, and the seed/project hooks run
+    /// before this guard, so a hook that hashed a pathname and then moved,
+    /// removed or `hash -p`-overrode it would otherwise look missing (127) or
+    /// directory-replaced (126) although the effective `PATH` has the program.
+    /// No second clear is needed: `type -P` does not populate the table and only
+    /// builtins run before `exec`, which repeats the same search. `|| builtin :`
+    /// discards `hash -r`'s one failure mode — a hook's `set +h`, where the table
+    /// is ignored anyway — because a hook's `set -e` would otherwise abort with a
+    /// bare status 1 and no direct diagnostic.
+    fn direct_guard(&self) -> String {
+        let command = shell_escape(self.command);
+        let not_found = shell_escape(&format!(
+            "agent-vm: executable not found: {}",
+            config::escape_str(self.command)
+        ));
+        let not_executable = shell_escape(&format!(
+            "agent-vm: not executable: {}",
+            config::escape_str(self.command)
+        ));
+        format!(
+            "builtin hash -r 2>/dev/null || builtin :\n\
+             _avm_command={command}\n\
+             _avm_external=\n\
+             _avm_lookup_status=0\n\
+             case \"$_avm_command\" in\n\
+             \t*/*) _avm_external=$_avm_command ;;\n\
+             \t*)\n\
+             \t\tif _avm_external=$(\n\
+             \t\t\tbuiltin type -P -- \"$_avm_command\"\n\
+             \t\t\t_avm_status=$?\n\
+             \t\t\tbuiltin printf '.'\n\
+             \t\t\texit \"$_avm_status\"\n\
+             \t\t); then _avm_lookup_status=0; else _avm_lookup_status=$?; fi\n\
+             \t\t_avm_external=${{_avm_external%.}}\n\
+             \t\t_avm_external=${{_avm_external%$'\\n'}}\n\
+             \t\t;;\n\
+             esac\n\
+             if [ \"$_avm_lookup_status\" -ne 0 ] || [ -z \"$_avm_external\" ] || [ ! -e \"$_avm_external\" ]; then\n\
+             \tbuiltin printf '%s\\n' {not_found} >&2\n\
+             \texit {missing}\n\
+             fi\n\
+             if [ -d \"$_avm_external\" ] || [ ! -x \"$_avm_external\" ]; then\n\
+             \tbuiltin printf '%s\\n' {not_executable} >&2\n\
+             \texit {unrunnable}\n\
+             fi\n\
+             unset _avm_command _avm_external _avm_lookup_status",
+            missing = crate::launch_target::DIRECT_NOT_FOUND_EXIT,
+            unrunnable = crate::launch_target::DIRECT_NOT_EXECUTABLE_EXIT,
+        )
+    }
+
+    fn image_contract_guard(&self) -> String {
         let command = shell_escape(self.command);
         let message = shell_escape(&image_contract::missing_program_message(
             self.image,
@@ -3223,7 +3473,7 @@ mod tests {
         assert!(plan < position("mount::prepare("));
         assert!(plan < position("ensure_msb_home("));
         assert!(plan < notices);
-        let report = position("network_plan\n        .request_report(");
+        let report = position("network_plan\n            .request_report(");
         assert!(notices < report && report < base_network);
         assert!(base_network < credential_network);
         assert!(credential_network < build);
@@ -3345,8 +3595,401 @@ mod tests {
 
     // ── IPv6 resolv.conf strip (PLAN.md B3 / upstream issue #5) ───
 
+    fn direct_args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// One execution of the composed production direct tail: which shell, which
+    /// program and argv, the prefix script that stands in for the hook, and the
+    /// `PATH` it runs under. Named fields, because every one of them is a string
+    /// that must not be swapped with its neighbour.
+    struct DirectTail<'a> {
+        bash: &'a str,
+        program: &'a str,
+        args: &'a [String],
+        before: &'a str,
+        path: &'a str,
+    }
+
+    // Execute precisely the composed production tail, never the host-mutating prelude.
+    fn direct_tail(tail: DirectTail<'_>) -> std::process::Output {
+        let DirectTail {
+            bash,
+            program,
+            args,
+            before,
+            path,
+        } = tail;
+        let line = AgentShellLine {
+            guard: ProgramGuard::Direct,
+            project_guest_path: "/work",
+            image: "unused",
+            command: program,
+            args,
+        };
+        std::process::Command::new(bash)
+            .args([
+                "-c",
+                &format!("{before}\n{}{}", line.program_guard(), line.exec_line()),
+            ])
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    }
+
+    fn host_bashes() -> Vec<&'static str> {
+        let mut bashes = vec!["/bin/bash"];
+        if Path::new("/opt/homebrew/bin/bash").is_file() {
+            bashes.push("/opt/homebrew/bin/bash");
+        }
+        bashes
+    }
+
+    #[test]
+    fn direct_guard_preserves_literal_argv_and_guest_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("probe");
+        std::fs::write(&probe, "#!/bin/sh\nprintf '%s\\0' \"$@\"\nexit 23\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let vector = direct_args(&[
+            "",
+            "a b",
+            "'\"",
+            "日本語",
+            "$HOME",
+            "*",
+            ";",
+            "|",
+            "--",
+            "--help",
+            "x",
+            "x",
+            "a\nb",
+            "end\n\n",
+        ]);
+        let expected: Vec<u8> = vector
+            .iter()
+            .flat_map(|s| s.as_bytes().iter().copied().chain([0]))
+            .collect();
+        for bash in host_bashes() {
+            let output = direct_tail(DirectTail {
+                bash,
+                program: probe.to_str().unwrap(),
+                args: &vector,
+                before: "",
+                path: "/usr/bin:/bin",
+            });
+            assert_eq!(output.status.code(), Some(23), "{bash}: {output:?}");
+            assert_eq!(output.stdout, expected);
+            assert!(output.stderr.is_empty());
+            let output = direct_tail(DirectTail {
+                bash,
+                program: "printf",
+                args: &direct_args(&["%s\\n", "$HOME"]),
+                before: "",
+                path: "/usr/bin:/bin",
+            });
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"$HOME\n");
+        }
+    }
+
+    #[test]
+    fn direct_guard_lookup_preserves_pathname_bytes_and_distinguishes_statuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        for directory in ["bin", "bin\n"] {
+            let bin = temp.path().join(directory);
+            std::fs::create_dir(&bin).unwrap();
+            for name in ["probe", "probe\n", "probe\n\n", "日本'語\t"] {
+                let file = bin.join(name);
+                std::fs::write(&file, "#!/bin/sh\nprintf 'executed\\n'\nexit 23\n").unwrap();
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+                for bash in host_bashes() {
+                    for program in [name, file.to_str().unwrap()] {
+                        let output = direct_tail(DirectTail {
+                            bash,
+                            program,
+                            args: &[],
+                            before: "set -e",
+                            path: bin.to_str().unwrap(),
+                        });
+                        assert_eq!(
+                            output.status.code(),
+                            Some(23),
+                            "{bash}, {program:?}: {output:?}"
+                        );
+                        assert_eq!(output.stdout, b"executed\n");
+                        assert!(output.stderr.is_empty());
+                    }
+                }
+            }
+            let nonexec = bin.join("nonexec");
+            std::fs::write(&nonexec, "not executable").unwrap();
+            std::fs::set_permissions(&nonexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let directory = bin.join("directory");
+            std::fs::create_dir(&directory).unwrap();
+            std::os::unix::fs::symlink(bin.join("absent"), bin.join("broken")).unwrap();
+            for bash in host_bashes() {
+                for (program, status) in [
+                    ("missing", 127),
+                    (bin.join("missing").to_str().unwrap(), 127),
+                    ("nonexec", 126),
+                    (nonexec.to_str().unwrap(), 126),
+                    ("directory", 127),
+                    (directory.to_str().unwrap(), 126),
+                    ("broken", 127),
+                ] {
+                    let output = direct_tail(DirectTail {
+                        bash,
+                        program,
+                        args: &[],
+                        before: "set -e",
+                        path: bin.to_str().unwrap(),
+                    });
+                    assert_eq!(
+                        output.status.code(),
+                        Some(status),
+                        "{bash}, {program:?}: {output:?}"
+                    );
+                    assert!(output.stdout.is_empty());
+                    assert!(
+                        String::from_utf8(output.stderr)
+                            .unwrap()
+                            .starts_with("agent-vm: ")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_guard_uses_post_hook_path_not_functions_aliases_or_stale_hash() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let bin = bin.to_str().unwrap();
+        let file = Path::new(bin).join("probe");
+        std::fs::write(&file, "#!/bin/sh\nprintf external\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for bash in host_bashes() {
+            // The hash entry is created after the prefix's last PATH assignment:
+            // assigning PATH empties the table itself, so an earlier `hash -p`
+            // would prove nothing about the guard.
+            let before = format!(
+                "export PATH={}\n\
+                 hash -p /missing/probe probe\n\
+                 builtin type -P -- probe >&2\n\
+                 probe() {{ exit 99; }}\n\
+                 alias probe='exit 98'",
+                shell_escape(bin)
+            );
+            let output = direct_tail(DirectTail {
+                bash,
+                program: "probe",
+                args: &[],
+                before: &before,
+                path: "/usr/bin:/bin",
+            });
+            assert!(output.status.success(), "{bash}: {output:?}");
+            assert_eq!(output.stdout, b"external");
+            // The negative control proves the stale pathname reaches the guard:
+            // the external program running can only follow the guard's own clear.
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                "/missing/probe\n",
+                "{bash}"
+            );
+            let output = direct_tail(DirectTail {
+                bash,
+                program: "absent",
+                args: &[],
+                before: "absent() { exit 99; }; alias absent='exit 98'",
+                path: bin,
+            });
+            assert_eq!(output.status.code(), Some(127), "{bash}: {output:?}");
+            assert!(output.stdout.is_empty());
+        }
+    }
+
+    #[test]
+    fn direct_guard_ignores_a_hook_left_stale_hash_after_a_move_or_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let mut case = 0;
+        for bash in host_bashes() {
+            for later in [Some("later"), None] {
+                for replaced_by_directory in [false, true] {
+                    case += 1;
+                    let root = temp.path().join(format!("case{case}"));
+                    let earlier = root.join("earlier");
+                    let later_bin = root.join("later");
+                    std::fs::create_dir_all(&earlier).unwrap();
+                    std::fs::create_dir_all(&later_bin).unwrap();
+                    let earlier_probe = earlier.join("probe");
+                    std::fs::write(&earlier_probe, "#!/bin/sh\nprintf earlier\n").unwrap();
+                    std::fs::set_permissions(
+                        &earlier_probe,
+                        std::fs::Permissions::from_mode(0o755),
+                    )
+                    .unwrap();
+                    if let Some(body) = later {
+                        let file = later_bin.join("probe");
+                        std::fs::write(&file, format!("#!/bin/sh\nprintf {body}\n")).unwrap();
+                        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+                            .unwrap();
+                    }
+                    // Hook shape: run a PATH program (hashing it), then remove or
+                    // directory-replace it with no further PATH assignment.
+                    let earlier_probe = shell_escape(earlier_probe.to_str().unwrap());
+                    let mutation = if replaced_by_directory {
+                        format!("rm {earlier_probe}\nmkdir {earlier_probe}")
+                    } else {
+                        format!("rm {earlier_probe}")
+                    };
+                    let before = format!(
+                        "export PATH={}:/usr/bin:/bin\nprobe >/dev/null\n{mutation}",
+                        shell_escape(&format!("{}:{}", earlier.display(), later_bin.display()))
+                    );
+                    let context =
+                        format!("{bash}, later={later:?}, directory={replaced_by_directory}");
+                    let output = direct_tail(DirectTail {
+                        bash,
+                        program: "probe",
+                        args: &[],
+                        before: &before,
+                        path: "/usr/bin:/bin",
+                    });
+                    match later {
+                        Some(body) => {
+                            assert!(output.status.success(), "{context}: {output:?}");
+                            assert_eq!(output.stdout, body.as_bytes(), "{context}");
+                        }
+                        None => {
+                            assert_eq!(output.status.code(), Some(127), "{context}: {output:?}");
+                            assert!(output.stdout.is_empty(), "{context}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_guard_tolerates_a_hook_disabling_hashing_under_errexit() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().to_str().unwrap();
+        let file = temp.path().join("probe");
+        std::fs::write(&file, "#!/bin/sh\nprintf external\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nonexec = temp.path().join("nonexec");
+        std::fs::write(&nonexec, "not executable").unwrap();
+        std::fs::set_permissions(&nonexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for bash in host_bashes() {
+            let output = direct_tail(DirectTail {
+                bash,
+                program: "probe",
+                args: &[],
+                before: "set -e\nset +h",
+                path: bin,
+            });
+            assert!(output.status.success(), "{bash}: {output:?}");
+            assert_eq!(output.stdout, b"external");
+            assert_eq!(output.stderr, b"", "{bash}");
+            for (program, status) in [("missing", 127), ("nonexec", 126)] {
+                let output = direct_tail(DirectTail {
+                    bash,
+                    program,
+                    args: &[],
+                    before: "set -e\nset +h",
+                    path: bin,
+                });
+                assert_eq!(
+                    output.status.code(),
+                    Some(status),
+                    "{bash}, {program}: {output:?}"
+                );
+                assert!(output.stdout.is_empty());
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(!stderr.contains("hashing disabled"), "{bash}: {stderr}");
+                assert!(stderr.starts_with("agent-vm: "), "{bash}: {stderr}");
+            }
+        }
+    }
+
+    #[test]
+    fn direct_guard_clears_the_hash_once_before_the_lookup() {
+        let guard = AgentShellLine {
+            guard: ProgramGuard::Direct,
+            project_guest_path: "/work",
+            image: "unused",
+            command: "probe --help",
+            args: &[],
+        }
+        .program_guard();
+        assert_eq!(guard.matches("hash -r").count(), 1, "{guard}");
+        let clear = guard.find("hash -r").unwrap();
+        assert!(
+            clear < guard.find("case \"$_avm_command\"").unwrap(),
+            "{guard}"
+        );
+        assert!(clear < guard.find("builtin type -P").unwrap(), "{guard}");
+        let checks = guard.find("if [ \"$_avm_lookup_status\"").unwrap();
+        assert!(!guard[checks..].contains("hash -r"), "{guard}");
+        assert!(
+            guard.starts_with("builtin hash -r 2>/dev/null || builtin :\n"),
+            "{guard}"
+        );
+    }
+
+    #[test]
+    fn direct_guard_follows_hook_and_hook_failure_prevents_exec() {
+        let line = AgentShellLine {
+            guard: ProgramGuard::Direct,
+            project_guest_path: "/work",
+            image: "unused",
+            command: "printf",
+            args: &[],
+        }
+        .render();
+        assert!(
+            line.find(STRIP_IPV6_NAMESERVERS).unwrap() < line.find(RUN_IMAGE_SEED_HOOKS).unwrap()
+        );
+        assert!(line.find("[ -t 0 ] || exec < /dev/null").unwrap() < line.find("_hook=").unwrap());
+        assert!(line.find(". \"$_hook\"").unwrap() < line.find("_avm_command=").unwrap());
+        assert!(line.find("_avm_command=").unwrap() < line.find("; exec --").unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let hook = temp.path().join(".agent-vm.runtime.sh");
+        for body in ["return 9", "exit 9"] {
+            std::fs::write(&hook, body).unwrap();
+            let line = AgentShellLine {
+                guard: ProgramGuard::Direct,
+                project_guest_path: temp.path().to_str().unwrap(),
+                image: "unused",
+                command: "printf",
+                args: &["EXECUTED".into()],
+            }
+            .render();
+            let safe_tail = &line[line.find("_hook=").unwrap()..];
+            for bash in host_bashes() {
+                let output = std::process::Command::new(bash)
+                    .args(["-c", safe_tail])
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(9));
+                assert!(output.stdout.is_empty());
+                if body == "return 9" {
+                    assert!(String::from_utf8_lossy(&output.stderr).contains("failed (exit 9)"));
+                }
+            }
+        }
+    }
     fn shell_line(project: &str, image: &str, command: &str, args: &[String]) -> String {
         AgentShellLine {
+            guard: ProgramGuard::ImageContract,
             project_guest_path: project,
             image,
             command,
@@ -3426,6 +4069,7 @@ mod tests {
         extra_env: &[(&str, &str)],
     ) -> std::process::Output {
         let line = AgentShellLine {
+            guard: ProgramGuard::ImageContract,
             project_guest_path: "/work/proj",
             image: "e2e-258/img with spaces",
             command,
@@ -4221,5 +4865,623 @@ options ndots:2 timeout:1";
         let slugs = parse_gitmodules_github_slugs(&tmp);
         std::fs::remove_dir_all(&tmp).ok();
         assert!(slugs.is_empty(), "no .gitmodules → no slugs, got {slugs:?}");
+    }
+
+    // ── The production stream/failed-exec lifecycle, with injected failures ──
+
+    /// Exec events plus a drop receipt: teardown must not run while this is
+    /// alive, because dropping it releases the child-handle mutex.
+    struct TrackingEvents {
+        events: tokio::sync::mpsc::Receiver<microsandbox::sandbox::exec::ExecEvent>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ExecEventSource for TrackingEvents {
+        async fn recv(&mut self) -> Option<microsandbox::sandbox::exec::ExecEvent> {
+            self.events.recv().await
+        }
+    }
+
+    impl Drop for TrackingEvents {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A sink whose write and flush can each fail, with a per-poll **write
+    /// schedule**: `Ok(n)` accepts one short write (a real partial write, which
+    /// `write_all` retries) and `Err(kind)` is a later poll failing. An empty
+    /// schedule accepts everything.
+    #[derive(Default)]
+    struct StubSink {
+        accepted: Vec<u8>,
+        flushes: usize,
+        write_steps: Vec<Result<usize, std::io::ErrorKind>>,
+        flush_error: Option<std::io::ErrorKind>,
+    }
+
+    impl StubSink {
+        /// The schedule a real `write_all` partial-write-then-error produces:
+        /// the first poll accepts `bytes` and a later poll fails.
+        fn partial_then_error(bytes: usize, kind: std::io::ErrorKind) -> Self {
+            Self {
+                write_steps: vec![Ok(bytes), Err(kind)],
+                ..Self::default()
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for StubSink {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let step = if self.write_steps.is_empty() {
+                Ok(buffer.len())
+            } else {
+                self.write_steps.remove(0)
+            };
+            match step {
+                Ok(written) => {
+                    let written = written.min(buffer.len());
+                    self.accepted.extend_from_slice(&buffer[..written]);
+                    std::task::Poll::Ready(Ok(written))
+                }
+                Err(kind) => std::task::Poll::Ready(Err(std::io::Error::new(kind, "stub write"))),
+            }
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(kind) = self.flush_error {
+                return std::task::Poll::Ready(Err(std::io::Error::new(kind, "stub flush")));
+            }
+            self.flushes += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A teardown that records its operations, injects one failure per stage and
+    /// can hold a stage pending so the cleanup deadline (not an immediate error)
+    /// cancels it.
+    struct StubTeardown {
+        log: std::sync::Mutex<Vec<String>>,
+        failures: Vec<(&'static str, &'static str)>,
+        pending: Vec<&'static str>,
+        handle_dropped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        runtime_dropped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    impl StubTeardown {
+        fn new() -> Self {
+            Self {
+                log: std::sync::Mutex::new(Vec::new()),
+                failures: Vec::new(),
+                pending: Vec::new(),
+                handle_dropped: None,
+                runtime_dropped: None,
+            }
+        }
+
+        /// Hold `stage` pending until its outer deadline cancels it.
+        fn pending_at(mut self, stage: &'static str) -> Self {
+            self.pending.push(stage);
+            self
+        }
+
+        /// Await forever for a scheduled-pending stage.
+        async fn hold(&self, stage: &'static str) {
+            if self.pending.contains(&stage) {
+                std::future::pending::<()>().await
+            }
+        }
+
+        fn failing(stage: &'static str, detail: &'static str) -> Self {
+            Self {
+                failures: vec![(stage, detail)],
+                ..Self::new()
+            }
+        }
+
+        fn failing_at(mut self, stage: &'static str, detail: &'static str) -> Self {
+            self.failures.push((stage, detail));
+            self
+        }
+
+        fn tracking_handle(
+            mut self,
+            handle_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
+            self.handle_dropped = Some(handle_dropped);
+            self
+        }
+
+        fn tracking_runtime(
+            mut self,
+            runtime_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
+            self.runtime_dropped = Some(runtime_dropped);
+            self
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn stage(&self, stage: &'static str) -> Result<()> {
+            // Both must already be released: teardown takes the child-handle
+            // mutex a still-live wait future (or the handle it belongs to)
+            // would hold.
+            if let Some(dropped) = &self.handle_dropped {
+                assert!(
+                    dropped.load(std::sync::atomic::Ordering::SeqCst),
+                    "{stage} ran before the exec handle was dropped"
+                );
+            }
+            if let Some(dropped) = &self.runtime_dropped {
+                assert!(
+                    dropped.load(std::sync::atomic::Ordering::SeqCst),
+                    "{stage} ran before the polled runtime wait future was dropped"
+                );
+            }
+            self.log.lock().unwrap().push(stage.to_string());
+            match self.failures.iter().find(|(name, _)| *name == stage) {
+                Some((_, detail)) => Err(anyhow::anyhow!("{detail}")),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl ExecTeardown for StubTeardown {
+        async fn stop_and_wait(&self) -> Result<()> {
+            self.stage("stop")?;
+            self.hold("stop").await;
+            Ok(())
+        }
+        async fn kill_with_timeout(&self, _timeout: Duration) -> Result<()> {
+            self.stage("kill")?;
+            self.hold("kill").await;
+            Ok(())
+        }
+        async fn wait(&self) -> Result<()> {
+            self.stage("reap")?;
+            self.hold("reap").await;
+            Ok(())
+        }
+        async fn remove(&self) -> Result<()> {
+            self.stage("remove")?;
+            self.hold("remove").await;
+            Ok(())
+        }
+    }
+
+    /// A `RuntimeExit` future that never resolves and records its own drop, so a
+    /// teardown can prove the **polled** wait future was cancelled, not merely
+    /// that the event handle was.
+    struct PendingRuntimeExit {
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::future::Future for PendingRuntimeExit {
+        type Output = microsandbox::MicrosandboxResult<std::process::ExitStatus>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingRuntimeExit {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn stub_context() -> ExecContext<'static> {
+        ExecContext {
+            image: "stub-image",
+            log_dir: "/logs/stub-sandbox",
+        }
+    }
+
+    /// The two guest sinks of one stream run, named so they cannot be swapped.
+    struct StreamSinks<'a> {
+        stdout: &'a mut StubSink,
+        stderr: &'a mut StubSink,
+    }
+
+    /// The caller-owned drop receipts a teardown asserts against.
+    struct StreamReceipts {
+        handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        runtime: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    impl StreamReceipts {
+        fn none() -> Self {
+            Self {
+                handle: None,
+                runtime: None,
+            }
+        }
+    }
+
+    /// Drive the production wrapper with a queued event list.
+    async fn run_stream(
+        teardown: &StubTeardown,
+        events: Vec<microsandbox::sandbox::exec::ExecEvent>,
+        sinks: StreamSinks<'_>,
+        policy: OutputErrorPolicy,
+    ) -> Result<i32> {
+        run_stream_with_receipt(teardown, events, sinks, policy, StreamReceipts::none()).await
+    }
+
+    /// [`run_stream`] with caller-owned drop receipts for the event handle and
+    /// the polled runtime wait future, so a teardown can assert both were
+    /// released before it ran.
+    async fn run_stream_with_receipt(
+        teardown: &StubTeardown,
+        events: Vec<microsandbox::sandbox::exec::ExecEvent>,
+        sinks: StreamSinks<'_>,
+        policy: OutputErrorPolicy,
+        receipts: StreamReceipts,
+    ) -> Result<i32> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(events.len().max(1) + 1);
+        for event in events {
+            sender.send(event).await.unwrap();
+        }
+        drop(sender);
+        let handle = TrackingEvents {
+            events: receiver,
+            dropped: receipts
+                .handle
+                .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        };
+        let runtime_exit: RuntimeExit<'_> = match receipts.runtime {
+            Some(dropped) => Box::pin(PendingRuntimeExit { dropped }),
+            None => runtime_never_exits(),
+        };
+        let StreamSinks { stdout, stderr } = sinks;
+        stream_exec_with_cleanup(
+            teardown,
+            handle,
+            runtime_exit,
+            stdout,
+            stderr,
+            policy,
+            stub_context(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_direct_sink_failure_is_a_launcher_failure_and_never_a_guest_success() {
+        use microsandbox::sandbox::exec::ExecEvent;
+        for (stream, then_flush, expected) in [
+            ("stdout", false, "writing guest stdout failed"),
+            ("stdout", true, "flushing guest stdout failed"),
+            ("stderr", false, "writing guest stderr failed"),
+            ("stderr", true, "flushing guest stderr failed"),
+        ] {
+            let teardown = StubTeardown::new();
+            let mut stdout = StubSink::default();
+            let mut stderr = StubSink::default();
+            let bytes = b"secret-payload".to_vec().into();
+            let sink = match stream {
+                "stdout" => &mut stdout,
+                _ => &mut stderr,
+            };
+            if then_flush {
+                sink.flush_error = Some(std::io::ErrorKind::BrokenPipe);
+            } else {
+                // A real `write_all` partial-write schedule: the first poll
+                // accepts three bytes and a later poll fails.
+                *sink = StubSink::partial_then_error(3, std::io::ErrorKind::BrokenPipe);
+            }
+            let event = match stream {
+                "stdout" => ExecEvent::Stdout(bytes),
+                _ => ExecEvent::Stderr(bytes),
+            };
+            let result = run_stream(
+                &teardown,
+                vec![event, ExecEvent::Exited { code: 0 }],
+                StreamSinks {
+                    stdout: &mut stdout,
+                    stderr: &mut stderr,
+                },
+                OutputErrorPolicy::DirectChecked,
+            )
+            .await;
+            // A checked sink failure is an error; a queued Exited(0) never
+            // overwrites it.
+            assert!(result.is_err(), "{stream}");
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(message.contains(expected), "{stream}: {message}");
+            // No guest payload bytes appear in the diagnostic…
+            assert!(!message.contains("secret-payload"), "{stream}: {message}");
+            // …the write failure followed a real partial write, not a
+            // zero-byte refusal…
+            let accepted = match stream {
+                "stdout" => &stdout.accepted,
+                _ => &stderr.accepted,
+            };
+            let expected_accepted: &[u8] = if then_flush {
+                b"secret-payload"
+            } else {
+                b"sec"
+            };
+            assert_eq!(accepted, expected_accepted, "{stream}");
+            // …and the real teardown ran, in order.
+            assert_eq!(teardown.log(), ["stop", "remove"], "{stream}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_legacy_sink_policy_keeps_a_guest_status_and_still_tries_flush() {
+        use microsandbox::sandbox::exec::ExecEvent;
+        let teardown = StubTeardown::new();
+        let mut stdout = StubSink {
+            write_steps: vec![Err(std::io::ErrorKind::BrokenPipe)],
+            ..StubSink::default()
+        };
+        let mut stderr = StubSink {
+            flush_error: Some(std::io::ErrorKind::BrokenPipe),
+            ..StubSink::default()
+        };
+        let result = run_stream(
+            &teardown,
+            vec![
+                ExecEvent::Stdout(b"out".to_vec().into()),
+                ExecEvent::Stderr(b"err".to_vec().into()),
+                ExecEvent::Exited { code: 7 },
+            ],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::LegacyBestEffort,
+        )
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        // Flush is still attempted after the failed write, exactly as before.
+        assert_eq!(stdout.flushes, 1);
+        assert_eq!(stderr.flushes, 0);
+        assert_eq!(stderr.accepted, b"err");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_without_exited_is_a_bounded_primary_failure() {
+        use microsandbox::sandbox::exec::ExecEvent;
+        let teardown = StubTeardown::new();
+        let mut stdout = StubSink::default();
+        let mut stderr = StubSink::default();
+        let result = run_stream(
+            &teardown,
+            vec![ExecEvent::Stdout(b"partial".to_vec().into())],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+        )
+        .await;
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains("event stream ended without Exited"),
+            "{message}"
+        );
+        assert!(message.contains("/logs/stub-sandbox"), "{message}");
+        assert_eq!(teardown.log(), ["stop", "remove"]);
+    }
+
+    #[tokio::test]
+    async fn a_known_guest_status_survives_cleanup_and_a_cleanup_failure_does_not() {
+        use microsandbox::sandbox::exec::ExecEvent;
+        // Clean cleanup: the guest status is the result and the shared
+        // after-exit cleanup accepts it.
+        let teardown = StubTeardown::new();
+        let mut stdout = StubSink::default();
+        let mut stderr = StubSink::default();
+        let exit = run_stream(
+            &teardown,
+            vec![ExecEvent::Exited { code: 7 }],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit, 7);
+        let cleanup = cleanup_exec_sandbox(&teardown).await;
+        assert!(cleanup.is_ok());
+        assert!(cleanup_after_exit("probe", exit, cleanup).is_ok());
+
+        // A stop failure escalates to kill+reap, is reported, and makes the
+        // known guest status a launcher failure.
+        let failing = StubTeardown::failing("stop", "stop went wrong");
+        let exit = run_stream(
+            &failing,
+            vec![ExecEvent::Exited { code: 0 }],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit, 0);
+        let cleanup = cleanup_exec_sandbox(&failing).await;
+        let error = format!(
+            "{:#}",
+            cleanup_after_exit("probe", exit, cleanup).unwrap_err()
+        );
+        assert!(error.contains("guest command `probe` exited 0"), "{error}");
+        assert!(error.contains("stop: stop went wrong"), "{error}");
+        assert_eq!(failing.log(), ["stop", "kill", "reap", "remove"]);
+    }
+
+    #[tokio::test]
+    async fn every_cleanup_step_is_attempted_and_each_failure_is_reported_in_order() {
+        let teardown = StubTeardown::new()
+            .failing_at("stop", "stop failed")
+            .failing_at("kill", "kill failed")
+            .failing_at("reap", "reap failed")
+            .failing_at("remove", "remove failed");
+        let cleanup = cleanup_exec_sandbox(&teardown).await;
+        let message = format!("{:#}", cleanup.unwrap_err());
+        assert_eq!(teardown.log(), ["stop", "kill", "reap", "remove"]);
+        for expected in [
+            "stop: stop failed",
+            "kill: kill failed",
+            "reap: reap failed",
+            "remove: remove failed",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+        // A removal failure after a mostly-successful stop is still an error.
+        let removal = StubTeardown::failing("remove", "removal failed");
+        let message = format!("{:#}", cleanup_exec_sandbox(&removal).await.unwrap_err());
+        assert!(message.contains("remove: removal failed"), "{message}");
+        assert_eq!(removal.log(), ["stop", "remove"]);
+    }
+
+    #[tokio::test]
+    async fn a_primary_sink_failure_and_a_cleanup_failure_keep_both_diagnostics() {
+        use microsandbox::sandbox::exec::ExecEvent;
+        let teardown = StubTeardown::failing("remove", "removal failed");
+        let mut stdout = StubSink {
+            write_steps: vec![Err(std::io::ErrorKind::BrokenPipe)],
+            ..StubSink::default()
+        };
+        let mut stderr = StubSink::default();
+        let result = run_stream(
+            &teardown,
+            vec![
+                ExecEvent::Stdout(b"x".to_vec().into()),
+                ExecEvent::Exited { code: 0 },
+            ],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+        )
+        .await;
+        let message = format!("{:#}", result.unwrap_err());
+        let primary = message.find("writing guest stdout failed").unwrap();
+        let cleanup = message.find("cleanup failed").unwrap();
+        assert!(primary < cleanup, "{message}");
+        assert!(message.contains("remove: removal failed"), "{message}");
+        assert!(
+            message.contains("full logs: /logs/stub-sandbox"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_exec_handle_is_dropped_before_any_teardown_step() {
+        use microsandbox::sandbox::exec::ExecEvent;
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let teardown = StubTeardown::new()
+            .tracking_handle(dropped.clone())
+            .failing_at("remove", "removal failed");
+        let mut stdout = StubSink::default();
+        let mut stderr = StubSink::default();
+        let result = run_stream_with_receipt(
+            &teardown,
+            vec![
+                ExecEvent::Stdout(b"x".to_vec().into()),
+                ExecEvent::Exited { code: 3 },
+            ],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::LegacyBestEffort,
+            StreamReceipts {
+                handle: Some(dropped.clone()),
+                runtime: None,
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 3);
+        // The known guest status hands teardown to the shared cleanup path; the
+        // teardown's own stage assertion requires the handle to be gone first.
+        let cleanup = cleanup_exec_sandbox(&teardown).await;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(teardown.log(), ["stop", "remove"]);
+        assert!(cleanup.is_err(), "the injected removal failure is reported");
+    }
+
+    /// A teardown step left pending is cancelled by its bounded deadline, every
+    /// later step still runs, and both exec handles the lifecycle owns — the
+    /// event handle **and** the polled runtime wait future — are dropped before
+    /// any teardown step begins. Paused time makes the real 10 s deadline
+    /// deterministic instead of a slow sleep.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_teardown_step_hits_its_deadline_after_both_exec_handles_are_dropped() {
+        use microsandbox::sandbox::exec::ExecEvent;
+        let handle_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let teardown = StubTeardown::new()
+            .tracking_handle(handle_dropped.clone())
+            .tracking_runtime(runtime_dropped.clone())
+            .pending_at("stop")
+            .failing_at("remove", "removal failed");
+        let mut stdout = StubSink::default();
+        let mut stderr = StubSink {
+            flush_error: Some(std::io::ErrorKind::BrokenPipe),
+            ..StubSink::default()
+        };
+        let result = run_stream_with_receipt(
+            &teardown,
+            vec![
+                ExecEvent::Stderr(b"err".to_vec().into()),
+                ExecEvent::Exited { code: 0 },
+            ],
+            StreamSinks {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+            OutputErrorPolicy::DirectChecked,
+            StreamReceipts {
+                handle: Some(handle_dropped.clone()),
+                runtime: Some(runtime_dropped.clone()),
+            },
+        )
+        .await;
+        let message = format!("{:#}", result.unwrap_err());
+        // The primary failure stays first, the deadline and the later removal
+        // failure follow in operation order.
+        assert!(
+            message.contains("flushing guest stderr failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("stop: timed out after {EXEC_STOP_TIMEOUT:?}")),
+            "{message}"
+        );
+        assert!(message.contains("remove: removal failed"), "{message}");
+        assert_eq!(teardown.log(), ["stop", "kill", "reap", "remove"]);
+        // Both receipts were observed by the teardown's own stage assertion; the
+        // read here keeps the requirement visible in this test too.
+        assert!(handle_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(runtime_dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

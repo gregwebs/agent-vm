@@ -27,6 +27,7 @@ side, is [USAGE.md](USAGE.md); what is still unbuilt is [PLAN.md](PLAN.md).
 crates/agent-vm/src/
 ├── main.rs                 # clap entry; pins MSB_PATH/MSB_HOME before the runtime
 ├── run.rs                  # launch(): build the sandbox, attach or stream-exec
+├── launch_target.rs        # lower a selected target once: catalog Tool or Direct command
 ├── session.rs              # project hash, state dirs, sandbox name, guest home
 ├── secrets.rs              # capture host credentials; write guest placeholders
 ├── credential_injection.rs # overlay host mappings + file-backed sources on the network plan
@@ -81,18 +82,37 @@ policy ──> hostname ──> dns_name
 
 A launch is one pass, and the ordering is load-bearing:
 
-1. `main()` resolves and version-verifies the bundled `msb`, then points
+0. `main` discovers and loads the tool config **before** parsing, because the
+   resolved catalog determines which subcommands exist. `cli::parse_from` then
+   **selects** the launch target: a catalog `Tool { entry, tool_args }` from that
+   catalog, or a `Direct` command (`agent-vm … run PROGRAM`, or the equivalent
+   top-level `--`). Selection is parse time: argv and catalog reads only, no side
+   effect.
+1. `main()` captures the target's requested credential names, before any child or
+   worker exists.
+2. `main()` resolves and version-verifies the bundled `msb`, then points
    `MSB_PATH`/`MSB_HOME` at it — **before** constructing the tokio runtime,
    because those are `setenv` calls and `setenv` is not thread-safe under POSIX.
-2. `msb_preflight` refuses to continue against a `msb.db` newer than the
-   bundled schema.
-3. `session` derives the project hash, state dir, and sandbox name from the cwd.
-4. `secrets` captures host credentials into host-only files and writes
-   placeholder credentials into the guest state dir.
-5. `run::launch` builds the sandbox — image, mounts, guest user, PATH, network
-   plan, then the credential-injection overlay — and creates it.
-6. The agent runs, attached to a PTY or through a streaming exec.
-7. Teardown stops the sandbox, removes it, and re-checks the credential
+3. `run::launch` **lowers** the target first thing (`target.into_parts()`) into
+   the catalog facts the rest of the pipeline consumes (`CatalogGrant`) and the
+   guest invocation (program, literal argv, guard). Lowering is therefore *not*
+   before every side effect: `main` has already captured credentials and set up
+   `msb`/the runtime. What it guarantees is that no later stage reads a catalog
+   entry at multiple sites, and that a `Direct` target reads none at all.
+4. Still inside `run::launch`, in order: image selection, the network plan, the
+   guest-HOME links and the root-mode decision; `session` derives the project
+   hash, state dir, and sandbox name from the cwd; the side-effect-free mount
+   topology rejection; then `ensure_msb_home` (which opens Microsandbox state),
+   `msb_preflight` refusing a `msb.db` newer than the bundled schema, the
+   socket-path fit check, the legacy Pi-home migration and the banner.
+5. `main`'s deferred credential preflight resolves the requirements, then
+   `secrets` captures the target's requested host credentials into host-only
+   files and writes placeholder credentials into the guest state dir. A `Direct`
+   target requests nothing, so nothing is captured or written for it.
+6. The sandbox is built and created — image, mounts, guest user, PATH, network
+   plan, then the credential-injection overlay.
+7. The agent runs, attached to a PTY or through a streaming exec.
+8. Teardown stops the sandbox, removes it, and re-checks the credential
    snapshot.
 
 ### Tool configuration drives the CLI and the guest-HOME links
@@ -444,6 +464,41 @@ boundary/high/cmdline/stress constants, command-line declaration
 ordering/count proof, and split-irqchip/IOAPIC diagnostics. Darwin evidence
 satisfies none of those.
 
+### Launch targets: one pipeline, two lowerings
+
+```text
+                      agent-vm [launch options] <tool> [args…]
+                                     │
+                       run / top-level -- PROGRAM [arg…]
+                                     │
+              ┌──────────────────────┴───────────────────────┐
+              ▼                                              ▼
+   LaunchTarget::Tool { entry, tool_args }      LaunchTarget::Direct(DirectCommand)
+   inner_argv + ImageContract guard             literal argv + Direct guard
+              └──────────────────────┬───────────────────────┘
+                                     ▼
+              CatalogGrant (snapshot adapter) + GuestInvocation
+                                     ▼
+        shared setup → hook → target guard → literal exec → teardown
+```
+
+`launch_target.rs` is a **snapshot adapter**, not a second pipeline and not an
+authorization layer: its only decisiveness is that `Direct` holds no
+`CatalogEntry` at all, so no catalog command, default args, environment,
+credential requirement, network request, transitive tool or `persist`
+declaration can be read for it. The credential resolver and network policy
+remain the authority; `Direct` simply requests an empty name set, which makes
+their decisions empty (ADR-0017). `GuestInvocation` carries the program, argv,
+display text and a `ProgramGuard`; `AgentShellLine` branches only in
+`program_guard()`, so `ImageContract` rendering stays byte-identical for every
+existing tool.
+
+Shared state is unchanged: image selection, cwd, identity, mounts, HOME links,
+default-deny network, GitHub policy, bootstrap and the project hook all still
+apply to `Direct`. Image-capability furniture (the owned Chrome DevTools MCP
+entry) is image-derived, not catalog-derived, so it is retained for a direct
+launch too.
+
 ### Interactive attach vs. non-TTY streaming exec
 
 `Sandbox::attach()` needs a real controlling TTY — it puts stdin in raw mode and
@@ -460,6 +515,16 @@ non-interactive run look hung.
 The exec loop races the event stream against `Sandbox::wait()` so a VMM that
 dies mid-stream produces a diagnostic rather than a hang on `recv()`; see
 [Sandbox liveness](#sandbox-liveness-idle-detection-and-runtime-exits).
+
+`stream_exec_with_cleanup` owns that loop. It also owns the sink policy: a
+catalog tool or the fallback shell keeps the legacy **best-effort** sink (a
+write or flush error is dropped, so a broken pipe never changes its status), and
+a direct command uses the **checked** policy (a write or flush failure becomes
+the primary error and still tears the sandbox down). The exception is local and
+deliberate — making the legacy path strict would change existing shell/tool
+statuses. Teardown itself is generic over a private `ExecTeardown` adapter
+implemented by `Sandbox`, so failure schedules are unit-testable without a
+booted VM.
 
 ### Guest `PATH`
 

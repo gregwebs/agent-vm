@@ -52,7 +52,8 @@ use vstd::prelude::*;
 
 #[cfg(test)]
 use crate::boot_image::OverrideSource;
-use crate::config::{Catalog, CatalogEntry, ConfigReport, ConfiguredImages, Tool};
+use crate::config::{Catalog, ConfigReport, ConfiguredImages, Tool};
+use crate::launch_target::LaunchTarget;
 use crate::run;
 use crate::{clipboard, doctor, intercept_hook, msb_cmd, secret, setup};
 
@@ -177,12 +178,17 @@ Getting started:
   agent-vm setup       fetch and verify the boot image (run once first)
   cd ~/your-project
   agent-vm <tool>      launch one of the tools listed above
+  agent-vm run <program> [arguments...]
+                       run a guest executable directly; its arguments are literal
 
-Launch options go before the tool: agent-vm [launch options] <tool> [tool arguments...]
-Every argument after the tool is forwarded to it verbatim, including --help and --.
+Launch options go before the tool or the runner:
+  agent-vm [launch options] <tool> [tool arguments...]
+  agent-vm [launch options] run PROGRAM [ARG...]
+  agent-vm [launch options] -- PROGRAM [ARG...]
+Every argument after the tool or program is forwarded verbatim, including --help and --.
 Built-in commands take their own options after the command and no launch options.
-`agent-vm help <tool>` shows examples; `agent-vm doctor` shows which config files were
-found and what they resolved to.";
+`agent-vm help <tool>` and `agent-vm help run` show examples; `agent-vm doctor` shows
+which config files were found and what they resolved to.";
 
 /// Shown under `agent-vm --help` when the config could not be read, so the
 /// absent verb list is explained rather than silently empty.
@@ -261,20 +267,31 @@ pub(crate) enum Dispatch {
         /// so they can select the same image a launch would.
         images: ConfiguredImages,
     },
-    // `entry` and `args` are boxed so `Dispatch` does not carry the two large
-    // launch-side values inline (clippy `large_enum_variant`); `entry` grew
-    // when #161 added the launch's requested credential names.
+    // Large launch-side values are boxed to keep dispatch compact.
     Launch {
-        entry: Box<CatalogEntry>,
+        target: LaunchTarget,
         /// The two tiers' `image` settings (see the `Builtin` arm).
         images: ConfiguredImages,
         /// Verified user authority captured before consuming the report, like images.
         user_network: Option<crate::user_network::UserNetwork>,
         /// The launch options.
         args: Box<run::Args>,
-        /// Every argv token after the tool verb, verbatim.
-        tool_args: Vec<String>,
     },
+}
+
+impl Dispatch {
+    /// Whether this dispatch executes a direct command (`run` / top-level `--`,
+    /// issue #398). Main's exit-status policy is the only consumer: a returned
+    /// failure on a direct route is 125, on every other route anyhow's 1.
+    ///
+    /// A closed (fully stated) match, so a new variant must say whether it is
+    /// direct.
+    pub(crate) fn is_direct_launch(&self) -> bool {
+        match self {
+            Self::Launch { target, .. } => target.is_direct(),
+            Self::Builtin { .. } => false,
+        }
+    }
 }
 
 /// Every subcommand name `build_command` registers that is not a tool,
@@ -289,6 +306,9 @@ pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "secret",
     "image",
     "_intercept-hook",
+    // The direct runner (issue #398) is a fixed launch route, so it is a
+    // built-in *name* even though its target is user-supplied argv.
+    "run",
     "help",
 ];
 
@@ -299,6 +319,12 @@ pub(crate) const BUILTIN_SUBCOMMANDS: &[&str] = &[
 /// `parse_from` hands those to `error.exit()`, where no downstream handler can
 /// intervene. So the whole `secret` subtree gets a value-free error instead.
 /// Help and version still render (see the kind whitelist in `parse_from`).
+///
+/// Only the administrative route uses this text. A **known-direct** route whose
+/// argv merely contains the token `secret` answers with
+/// [`run::DIRECT_SECRET_SCRUB_ERROR`]: also value-free, but with the direct usage
+/// and without these `agent-vm secret …` forms, which cannot describe a guest
+/// command vector (issue #398).
 const SECRET_ARGV_ERROR: &str = "\
 `agent-vm secret` could not parse its arguments. The arguments are not shown, \
 because a secret value may have been among them. Supported forms:
@@ -341,8 +367,18 @@ where
     // Collected so the `secret` scrub below can look at the verb without
     // consuming the iterator twice; the bound is already `Into<OsString>`.
     let argv: Vec<OsString> = argv.into_iter().map(Into::into).collect();
+    // The scrub predicates and the route hint read the **original** argv:
+    // replacing `--` with `run` neither creates nor deletes a `secret` or
+    // `image import` witness, and the hint is only error classification.
     let secret_route = is_secret_route(&argv);
     let import_route = is_image_import_route(&argv);
+    let route_hint = launch_route_hint(&argv);
+    let mut argv = argv;
+    // A top-level `--` whose launch-option prefix does not parse is not
+    // rewritten, so clap would answer with "unrecognized subcommand" for the
+    // first payload word. Its prefix error is the useful diagnostic, and it is
+    // returned below instead of that route noise.
+    let refused_prefix = rewrite_direct_separator(&mut argv, route_hint);
 
     let mut command = build_command(&catalog);
     if argv.len() <= 1 {
@@ -361,11 +397,47 @@ where
                 // replace every non-help, non-version error in that subtree with a
                 // fixed value-free message. A whitelist of *kinds*, not of argv
                 // shapes, so a future clap error variant is scrubbed by default.
+                let direct_route = matches!(route_hint, LaunchRouteHint::Direct { .. });
                 if secret_route && !clap_outcome_is_help_or_version(error.kind()) {
-                    return Err(anyhow!(SECRET_ARGV_ERROR));
+                    // Same fixed, value-free selection on both routes; only a
+                    // known-direct route answers with clap's formatter and
+                    // status 2 (issue #398), because a direct launch must never
+                    // turn a usage error into an ordinary launcher failure. Its
+                    // text is direct-specific: the administrative `agent-vm
+                    // secret …` forms are not what a guest command vector
+                    // containing the token `secret` could have meant.
+                    let kind = error.kind();
+                    let scrubbed = if direct_route {
+                        anyhow::Error::new(direct_usage_error(kind, run::DIRECT_SECRET_SCRUB_ERROR))
+                    } else {
+                        anyhow!(SECRET_ARGV_ERROR)
+                    };
+                    return Err(scrubbed);
                 }
                 if import_route && !clap_outcome_is_help_or_version(error.kind()) {
-                    return Err(anyhow::Error::new(import_argv_error(&command, &error)));
+                    let kind = error.kind();
+                    let scrubbed = if direct_route {
+                        anyhow::Error::new(direct_usage_error(kind, run::DIRECT_SCRUB_ERROR))
+                    } else {
+                        anyhow::Error::new(import_argv_error(&command, &error))
+                    };
+                    return Err(scrubbed);
+                }
+                // A known-direct route whose separator was refused already has
+                // the real cause: its launch-option prefix. clap reported the
+                // first payload word as an unknown subcommand instead, which
+                // names neither the option nor its value.
+                if direct_route
+                    && error.kind() == clap::error::ErrorKind::InvalidSubcommand
+                    && let Some(prefix_error) = refused_prefix
+                {
+                    return Err(anyhow::Error::new(prefix_error));
+                }
+                // Any other syntax error on a known-direct route: clap's own
+                // usage error and status 2, returned rather than exiting so the
+                // caller applies the same policy to every route.
+                if direct_route {
+                    return Err(anyhow::Error::new(error));
                 }
                 // On the broken path `allow_external_subcommands` absorbs every
                 // unknown verb, so the only `InvalidSubcommand` clap can raise is
@@ -396,6 +468,12 @@ where
         // even with external subcommands enabled, so `error.exit()` above has
         // already handled it. Kept as an explicit error rather than a panic.
         (None, _) => Err(anyhow!("no subcommand")),
+        // The direct runner is checked first: `run` is never a catalog entry, so
+        // it must not take one (not even shell's fallback) and must not consult
+        // the catalog for anything but its health.
+        (Some((name, sub)), catalog) if name == crate::launch_target::DIRECT_RUN_VERB => {
+            direct_dispatch(&argv, sub, catalog, &matches, images, user_network)
+        }
         // The catalog is authoritative (checked first) so a future built-in
         // added without updating `RESERVED_TOOL_NAMES` fails a test rather
         // than silently shadowing a user's tool.
@@ -405,16 +483,18 @@ where
                     let mut args = run::Args::from_arg_matches(&matches)?;
                     args.image.reconcile(&matches);
                     Ok(Dispatch::Launch {
-                        entry: Box::new(entry),
                         images,
                         user_network,
                         args: Box::new(args),
-                        tool_args: tool_args(
-                            &argv,
-                            sub.get_many::<String>(TOOL_ARGS)
-                                .map(|values| values.cloned().collect())
-                                .unwrap_or_default(),
-                        ),
+                        target: LaunchTarget::Tool {
+                            entry: Box::new(entry),
+                            tool_args: tool_args(
+                                &argv,
+                                sub.get_many::<String>(TOOL_ARGS)
+                                    .map(|values| values.cloned().collect())
+                                    .unwrap_or_default(),
+                            ),
+                        },
                     })
                 }
                 // Not a tool, so a fixed built-in: the two name sets are disjoint
@@ -454,6 +534,45 @@ where
                 Err(_) => Err(config_error_with_hint(&config_error, name)),
             }
         }
+    }
+}
+
+/// The direct runner's dispatch (issue #398).
+///
+/// Validation order is fixed: the raw suffix is restored, the newtype rejects a
+/// missing/empty/non-Unicode program as a usage error (2), and only then does a
+/// broken catalog surface its own failure (125). A ready catalog is dropped
+/// without taking an entry, so no tool command, argv transform, environment,
+/// provisioning closure or declared request can be inherited.
+fn direct_dispatch(
+    argv: &[OsString],
+    sub: &clap::ArgMatches,
+    catalog: Catalog,
+    matches: &clap::ArgMatches,
+    images: ConfiguredImages,
+    user_network: Option<crate::user_network::UserNetwork>,
+) -> Result<Dispatch> {
+    let vector = after_raw_verb(
+        argv,
+        sub.get_many::<OsString>(DIRECT_PROGRAM)
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default(),
+        || OsString::from("--"),
+    );
+    let direct = crate::launch_target::DirectCommand::from_os_args(vector)
+        .map_err(|error| anyhow::Error::new(direct_program_error(&error)))?;
+    let mut args = run::Args::from_arg_matches(matches)?;
+    args.image.reconcile(matches);
+    match catalog {
+        Catalog::Broken(config_error) => Err(anyhow::Error::new(
+            crate::launch_target::DirectLaunchFailure(config_error),
+        )),
+        Catalog::Ready(_) => Ok(Dispatch::Launch {
+            target: LaunchTarget::Direct(direct),
+            images,
+            user_network,
+            args: Box::new(args),
+        }),
     }
 }
 
@@ -509,7 +628,10 @@ fn clap_outcome_is_help_or_version(kind: clap::error::ErrorKind) -> bool {
 /// config error. Pure over its inputs so the help fixtures are pinned without
 /// touching `$HOME` or the cwd.
 pub(crate) fn build_command(catalog: &Catalog) -> clap::Command {
-    let mut command = refresh_image_help(Cli::command());
+    // Registered for every catalog state and before the catalog verbs: the
+    // direct route must exist even when the config is broken (its own dispatch
+    // reports the config failure as 125), and a tool can never share the name.
+    let mut command = refresh_image_help(Cli::command()).subcommand(direct_run_subcommand());
     match catalog {
         Catalog::Ready(catalog) => {
             for entry in catalog.as_slice() {
@@ -649,15 +771,272 @@ const TOOL_ARGS: &str = "tool_args";
 /// itself is never `--` (a tool name cannot start with `-`), so a `--` just
 /// before the suffix is the consumed one and is restored.
 fn tool_args(argv: &[OsString], values: Vec<String>) -> Vec<String> {
+    after_raw_verb(argv, values, || "--".to_owned())
+}
+
+/// The one clap limitation shared by every raw verb: a `--` immediately after
+/// the verb is consumed, so it is restored from the argv **token count** rather
+/// than by inspecting values (which would make a literal payload `--`
+/// indistinguishable from the consumed one). The verb cannot itself end in
+/// `--`, so the token just before the suffix is the only candidate.
+fn after_raw_verb<T>(argv: &[OsString], values: Vec<T>, escape: impl FnOnce() -> T) -> Vec<T> {
     let consumed_escape = argv
         .len()
         .checked_sub(values.len() + 1)
         .is_some_and(|index| argv[index] == *"--");
     if consumed_escape {
-        std::iter::once("--".to_owned()).chain(values).collect()
+        std::iter::once(escape()).chain(values).collect()
     } else {
         values
     }
+}
+
+/// The id of the direct runner's single positional: the program and its args.
+const DIRECT_PROGRAM: &str = "program";
+
+/// The direct runner (`agent-vm [launch options] run PROGRAM [ARG...]`).
+///
+/// Help is disabled so `run --help` is the guest's argument, not ours; the
+/// program is not `required` so an absent PROGRAM is our own newtype error with
+/// the direct usage line rather than clap's rendering. `help run` still works:
+/// clap synthesizes it for every subcommand.
+fn direct_run_subcommand() -> clap::Command {
+    clap::Command::new(crate::launch_target::DIRECT_RUN_VERB)
+        .about("Run a guest executable directly; every argument after it is literal")
+        .override_usage(run::DIRECT_USAGE)
+        .disable_help_flag(true)
+        .arg(
+            clap::Arg::new(DIRECT_PROGRAM)
+                .value_name("PROGRAM")
+                .help("Guest executable and its arguments, verbatim; --help and -- belong to it")
+                .num_args(0..)
+                .action(clap::ArgAction::Append)
+                .value_parser(clap::builder::OsStringValueParser::new())
+                .trailing_var_arg(true)
+                .allow_hyphen_values(true),
+        )
+        .after_help(run::DIRECT_AFTER_HELP)
+}
+
+/// One launch option's argv shape, derived from clap metadata so the route
+/// walker below cannot drift from the real parser's own list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptionShape {
+    /// Never consumes a following token (`--root`).
+    Flag,
+    /// Consumes the next token unless the value is attached (`--memory 4`).
+    RequiredValue,
+    /// Takes a value only in the `--name=value` form (`require_equals`).
+    EqualsOnlyValue,
+}
+
+struct LaunchOption {
+    long: String,
+    short: Option<char>,
+    shape: OptionShape,
+}
+
+fn launch_option_table() -> Vec<LaunchOption> {
+    launch_options()
+        .iter()
+        .map(|option| LaunchOption {
+            long: option
+                .get_long()
+                .expect("every launch option has a long name")
+                .to_owned(),
+            short: option.get_short(),
+            shape: match option.get_action() {
+                clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count => {
+                    OptionShape::Flag
+                }
+                _ if option.is_require_equals_set() => OptionShape::EqualsOnlyValue,
+                _ => OptionShape::RequiredValue,
+            },
+        })
+        .collect()
+}
+
+/// Which spelling of the direct route a token vector uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectSpelling {
+    /// `agent-vm [launch options] run PROGRAM`
+    Verb,
+    /// `agent-vm [launch options] -- PROGRAM`
+    Separator,
+}
+
+/// What the **original** argv says about the route.
+///
+/// Computed before the separator rewrite and used only to classify a clap error
+/// (issue #398): a known-direct route answers a usage error with status 2 and
+/// the direct usage line instead of a legacy value-free plain error with status
+/// 1. It authorizes nothing — the real parse and the dispatch decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchRouteHint {
+    Direct {
+        /// Index in argv of the route token itself.
+        boundary: usize,
+        spelling: DirectSpelling,
+    },
+    /// The first positional is a verb other than `run`, an option without a
+    /// value, or no positional at all.
+    Other,
+    /// A token that is not valid UTF-8 where an option or verb would be.
+    Unknown,
+}
+
+/// Walk launch options by **arity**, then stop at the first positional.
+///
+/// Only enough of clap's grammar to find the route: env, value validation,
+/// repetition and conflicts are ignored, but option consumption is respected so
+/// an option value is never mistaken for a verb or a separator. An unknown
+/// hyphen option is traversed as a flag — the real parse still rejects it — and
+/// its possible separate value is deliberately not guessed, so a later `run`
+/// never relabels an unknown-verb route.
+fn launch_route_hint(argv: &[OsString]) -> LaunchRouteHint {
+    let options = launch_option_table();
+    let mut index = 1;
+    while index < argv.len() {
+        let Some(token) = argv[index].to_str() else {
+            return LaunchRouteHint::Unknown;
+        };
+        if token == "--" {
+            return LaunchRouteHint::Direct {
+                boundary: index,
+                spelling: DirectSpelling::Separator,
+            };
+        }
+        if let Some(body) = token.strip_prefix("--") {
+            let (name, value_attached) = match body.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (body, false),
+            };
+            if matches!(name, "help" | "version") {
+                return LaunchRouteHint::Other;
+            }
+            index += match options.iter().find(|option| option.long == name) {
+                Some(option) => consumed(option.shape, value_attached),
+                None => 1,
+            };
+            continue;
+        }
+        if token.len() > 1 && token.starts_with('-') {
+            let mut characters = token.chars();
+            characters.next();
+            // The only short launch option takes a value, so a cluster cannot
+            // hide a second one; the first character decides.
+            let short = characters.next().unwrap_or('-');
+            if matches!(short, 'h' | 'V') {
+                return LaunchRouteHint::Other;
+            }
+            index += match options.iter().find(|option| option.short == Some(short)) {
+                Some(option) => consumed(option.shape, characters.next().is_some()),
+                None => 1,
+            };
+            continue;
+        }
+        return if token == crate::launch_target::DIRECT_RUN_VERB {
+            LaunchRouteHint::Direct {
+                boundary: index,
+                spelling: DirectSpelling::Verb,
+            }
+        } else {
+            LaunchRouteHint::Other
+        };
+    }
+    LaunchRouteHint::Other
+}
+
+/// How many argv tokens one launch option consumes.
+fn consumed(shape: OptionShape, value_attached: bool) -> usize {
+    match (shape, value_attached) {
+        (OptionShape::RequiredValue, false) => 2,
+        _ => 1,
+    }
+}
+
+/// Rewrite the top-level separator into the verb, so both spellings share one
+/// parse and one dispatch. Only a separator that clap accepts as the end of an
+/// options-only prefix is rewritten; `--mount --` (a value) and a prefix with
+/// its own syntax error keep clap's own diagnostics.
+///
+/// A prefix that does not parse returns its own error instead of being dropped:
+/// leaving the separator in place makes clap report the first **payload** word
+/// as an unrecognized subcommand, which names neither the launcher option nor
+/// the value that was actually wrong.
+fn rewrite_direct_separator(argv: &mut [OsString], hint: LaunchRouteHint) -> Option<clap::Error> {
+    let LaunchRouteHint::Direct {
+        boundary,
+        spelling: DirectSpelling::Separator,
+    } = hint
+    else {
+        return None;
+    };
+    match launch_prefix_error(&argv[..boundary]) {
+        None => {
+            argv[boundary] = OsString::from(crate::launch_target::DIRECT_RUN_VERB);
+            None
+        }
+        Some(error) if reportable_prefix_error(error.kind()) => Some(error),
+        Some(_) => None,
+    }
+}
+
+/// The launch-option prefix as clap itself reads it: `Err` is that prefix's own
+/// parse error, already formatted with the direct usage line.
+fn launch_prefix_error(prefix: &[OsString]) -> Option<clap::Error> {
+    launch_prefix_command().try_get_matches_from(prefix).err()
+}
+
+/// The command a launch-option prefix is read with: the launch options alone,
+/// no positional/subcommand grammar, no help/version flag, and the direct usage
+/// line so a surfaced prefix error names the direct forms. Environment bindings
+/// are removed so the check is about argv only; the full parse still validates
+/// the environment.
+fn launch_prefix_command() -> clap::Command {
+    command_without_launch_env(
+        &run::Args::augment_args(clap::Command::new("agent-vm"))
+            .disable_help_flag(true)
+            .disable_version_flag(true)
+            .override_usage(run::DIRECT_USAGE),
+    )
+}
+
+/// The prefix error kinds whose text names launcher options and the typed value
+/// supplied to them, never a free-form token. Surfacing these cannot echo argv
+/// that a scrubbed route withheld; a prefix that failed on any other shape keeps
+/// clap's separator-form diagnostic instead.
+fn reportable_prefix_error(kind: clap::error::ErrorKind) -> bool {
+    use clap::error::ErrorKind;
+    matches!(
+        kind,
+        ErrorKind::InvalidValue
+            | ErrorKind::ValueValidation
+            | ErrorKind::ArgumentConflict
+            | ErrorKind::MissingRequiredArgument
+            | ErrorKind::NoEquals
+    )
+}
+
+/// A fixed-value direct usage error: the direct usage lines, never rendered
+/// argv and never a value-bearing clap context.
+fn direct_usage_error(kind: clap::error::ErrorKind, text: impl std::fmt::Display) -> clap::Error {
+    clap::Command::new("agent-vm")
+        .override_usage(run::DIRECT_USAGE)
+        .error(kind, text)
+}
+
+/// The newtype's own validation as a usage error (status 2). The message names
+/// the position of an invalid argument, never its bytes.
+fn direct_program_error(error: &crate::launch_target::DirectCommandError) -> clap::Error {
+    use crate::launch_target::DirectCommandError;
+    let kind = match error {
+        DirectCommandError::MissingProgram => clap::error::ErrorKind::MissingRequiredArgument,
+        DirectCommandError::EmptyProgram | DirectCommandError::NonUnicode { .. } => {
+            clap::error::ErrorKind::ValueValidation
+        }
+    };
+    direct_usage_error(kind, error)
 }
 
 /// Every **launch option**, read from [`run::Args`] itself so a new launch
@@ -697,7 +1076,12 @@ fn reparse_without_launch_env(
         .try_get_matches_from(argv)
         .ok()?;
     let verb = matches.subcommand_name()?;
-    let launches = matches!(catalog, Catalog::Ready(_)) && !BUILTIN_SUBCOMMANDS.contains(&verb);
+    // `run` launches even though it is a fixed subcommand name, so malformed
+    // launch environment fails a ready direct launch instead of being retried
+    // away. A broken catalog keeps the retry precedence and then reports the
+    // actual config failure.
+    let launches = matches!(catalog, Catalog::Ready(_))
+        && (verb == crate::launch_target::DIRECT_RUN_VERB || !BUILTIN_SUBCOMMANDS.contains(&verb));
     (!launches).then_some(matches)
 }
 
@@ -850,9 +1234,11 @@ mod tests {
     fn launch_of(dispatch: Dispatch) -> (Box<run::Args>, Vec<String>) {
         match dispatch {
             Dispatch::Launch {
-                args, tool_args, ..
+                args,
+                target: LaunchTarget::Tool { tool_args, .. },
+                ..
             } => (args, tool_args),
-            Dispatch::Builtin { .. } => panic!("expected a launch"),
+            _ => panic!("expected a tool launch"),
         }
     }
 
@@ -1236,14 +1622,14 @@ mod tests {
         let dispatch = parse_from(["agent-vm", "t"], Ok(report)).expect("t parses");
         match dispatch {
             Dispatch::Launch {
-                entry,
+                target: LaunchTarget::Tool { entry, .. },
                 images: carried,
                 ..
             } => {
                 assert_eq!(entry.tool().name(), "t");
                 assert_eq!(carried, images);
             }
-            Dispatch::Builtin { .. } => panic!("t is a launch verb"),
+            _ => panic!("t is a tool launch verb"),
         }
     }
 
@@ -1426,13 +1812,14 @@ mod tests {
             .expect("mytool parses");
         match dispatch {
             Dispatch::Launch {
-                entry, tool_args, ..
+                target: LaunchTarget::Tool { entry, tool_args },
+                ..
             } => {
                 assert_eq!(entry.tool().name(), "mytool");
                 assert_eq!(entry.tool().command(), "my-agent");
                 assert_eq!(tool_args, ["--resume"]);
             }
-            Dispatch::Builtin { .. } => panic!("mytool should dispatch as a launch"),
+            _ => panic!("mytool should dispatch as a tool launch"),
         }
 
         // A built-in still dispatches as a built-in.
@@ -1708,6 +2095,7 @@ mod tests {
                 "secret",
                 "image",
                 "_intercept-hook",
+                "run",
                 "shell",
                 "help"
             ]
@@ -1757,6 +2145,11 @@ mod tests {
             "help-shell-columns-100.txt",
             &render(&["agent-vm", "help", "shell"]),
             include_str!("../tests/fixtures/help-shell-columns-100.txt"),
+        );
+        assert_help_fixture(
+            "help-run-columns-100.txt",
+            &render(&["agent-vm", "help", "run"]),
+            include_str!("../tests/fixtures/help-run-columns-100.txt"),
         );
     }
 
@@ -1809,6 +2202,12 @@ mod tests {
                 "help shell",
                 include_str!("../tests/fixtures/help-shell-columns-100.txt"),
             ),
+            (
+                "help run",
+                include_str!("../tests/fixtures/help-run-columns-100.txt"),
+            ),
+            ("the runner footer", run::DIRECT_AFTER_HELP),
+            ("the runner usage", run::DIRECT_USAGE),
             ("the short launch footer", short),
             ("the long launch footer", long),
             (
@@ -2616,5 +3015,597 @@ mod tests {
             help.contains("Manage agent-vm's own values in the host system keychain"),
             "{help}"
         );
+    }
+
+    // -- #398: the direct runner (`run` / top-level `--`) -------------------
+
+    fn clear_launch_env() -> crate::test_env::EnvGuard {
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        env
+    }
+
+    /// The lowered invocation of a direct launch: program, literal argv and the
+    /// guard the shared pipeline will render.
+    fn direct_of(dispatch: Dispatch) -> (crate::launch_target::GuestInvocation, Vec<String>) {
+        let Dispatch::Launch { target, .. } = dispatch else {
+            panic!("expected a launch");
+        };
+        assert!(target.is_direct(), "expected a direct launch");
+        let (_, invocation) = target.into_parts();
+        let argv = invocation.argv().to_vec();
+        (invocation, argv)
+    }
+
+    fn argv_of(tokens: &[&str]) -> Vec<OsString> {
+        tokens.iter().map(OsString::from).collect()
+    }
+
+    /// The usage error a direct route returns, with its status.
+    fn usage_error(dispatch: Result<Dispatch>) -> clap::Error {
+        let error = dispatch.err().expect("a usage error");
+        error
+            .downcast::<clap::Error>()
+            .expect("a clap usage error, not a plain launcher error")
+    }
+
+    #[test]
+    fn both_direct_forms_agree_on_the_program_and_its_literal_argv() {
+        let _env = clear_launch_env();
+        let config = || Ok(report_from(MYTOOL));
+        for (program, rest) in [
+            ("p", vec!["--help"]),
+            ("p", vec!["-h"]),
+            ("p", vec!["help"]),
+            ("p", vec!["-V"]),
+            ("p", vec!["--"]),
+            ("p", vec!["--", "x"]),
+            ("p", vec![]),
+            (
+                "p",
+                vec![
+                    "",
+                    "x",
+                    "x",
+                    "  spaced  ",
+                    "日本語",
+                    "$HOME",
+                    "*",
+                    ";",
+                    "|",
+                    "a\nb",
+                    "trail\n\n",
+                ],
+            ),
+            ("--", vec![]),
+            ("--", vec!["x"]),
+            ("--", vec!["--", "x"]),
+        ] {
+            let mut by_verb = argv_of(&["agent-vm", "run", program]);
+            by_verb.extend(rest.iter().map(OsString::from));
+            let mut by_separator = argv_of(&["agent-vm", "--", program]);
+            by_separator.extend(rest.iter().map(OsString::from));
+            let (verb, verb_args) = direct_of(parse_from(by_verb, config()).unwrap());
+            let (separator, separator_args) =
+                direct_of(parse_from(by_separator, config()).unwrap());
+            assert_eq!(
+                (verb.program(), verb.argv(), verb.guard()),
+                (separator.program(), separator.argv(), separator.guard()),
+                "program {program:?} args {rest:?}"
+            );
+            assert_eq!(verb.program(), program);
+            assert_eq!(verb_args, rest, "program {program:?}");
+            assert_eq!(separator_args, rest);
+        }
+    }
+
+    #[test]
+    fn launch_options_precede_either_direct_spelling_and_stay_launcher_side() {
+        let _env = clear_launch_env();
+        for route in [
+            vec!["run", "p", "--memory", "9"],
+            vec!["--", "p", "--memory", "9"],
+        ] {
+            let argv: Vec<OsString> = argv_of(&["agent-vm"])
+                .into_iter()
+                .chain(argv_of(&[
+                    "--mount",
+                    "/x",
+                    "--memory",
+                    "4",
+                    "-p",
+                    "8080:3000",
+                ]))
+                .chain(argv_of(&["--root"]))
+                .chain(route.iter().map(OsString::from))
+                .collect();
+            match parse_from(argv, Ok(report_from(MYTOOL))).unwrap() {
+                Dispatch::Launch { target, args, .. } => {
+                    assert!(target.is_direct());
+                    let (_, invocation) = target.into_parts();
+                    // Only the launch side sees the option; the guest argv keeps
+                    // its own identically named token.
+                    assert_eq!(args.mount, ["/x"]);
+                    assert_eq!(args.memory, 4);
+                    assert!(args.root);
+                    assert_eq!(invocation.program(), "p");
+                    assert_eq!(invocation.argv(), ["--memory", "9"]);
+                }
+                _ => panic!("expected a launch"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_absent_or_empty_program_is_a_direct_usage_error_in_both_forms() {
+        let _env = clear_launch_env();
+        for (tokens, expected) in [
+            (vec!["agent-vm", "run"], "a program is required"),
+            (vec!["agent-vm", "--"], "a program is required"),
+            (vec!["agent-vm", "run", ""], "must not be empty"),
+            (vec!["agent-vm", "--", ""], "must not be empty"),
+        ] {
+            let error = usage_error(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))));
+            assert_eq!(error.exit_code(), 2, "{tokens:?}");
+            let text = error.to_string();
+            assert!(text.contains(expected), "{tokens:?}: {text}");
+            assert!(
+                text.contains("agent-vm [launch options] run PROGRAM [ARG]...")
+                    && text.contains("agent-vm [launch options] -- PROGRAM [ARG]..."),
+                "{tokens:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_unicode_direct_argv_is_rejected_by_position_without_replacement() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let _env = clear_launch_env();
+        let invalid = || OsString::from_vec(vec![0xff, 0xfe]);
+        for (tokens, expected) in [
+            (
+                vec!["agent-vm", "run"],
+                "the program name is not valid UTF-8",
+            ),
+            (
+                vec!["agent-vm", "--"],
+                "the program name is not valid UTF-8",
+            ),
+            (
+                vec!["agent-vm", "run", "--"],
+                "argument 1 is not valid UTF-8",
+            ),
+            (
+                vec!["agent-vm", "--", "--"],
+                "argument 1 is not valid UTF-8",
+            ),
+            (
+                vec!["agent-vm", "run", "p", "--"],
+                "argument 2 is not valid UTF-8",
+            ),
+            (
+                vec!["agent-vm", "--", "p", "--"],
+                "argument 2 is not valid UTF-8",
+            ),
+        ] {
+            let mut argv = argv_of(&tokens);
+            argv.push(invalid());
+            let error = usage_error(parse_from(argv, Ok(report_from(MYTOOL))));
+            assert_eq!(error.exit_code(), 2, "{tokens:?}");
+            let text = error.to_string();
+            assert!(text.contains(expected), "{tokens:?}: {text}");
+            // No rejected bytes and no lossy replacement.
+            assert!(!text.contains('\u{fffd}'), "{tokens:?}: {text}");
+            assert!(!text.contains("255"), "{tokens:?}: {text}");
+        }
+        // An empty program wins over an invalid later argument.
+        let mut argv = argv_of(&["agent-vm", "run", ""]);
+        argv.push(invalid());
+        let error = usage_error(parse_from(argv, Ok(report_from(MYTOOL))));
+        assert!(error.to_string().contains("must not be empty"));
+        // Non-Unicode *before* the route is never guessed as a direct verb: the
+        // separator rewrite leaves argv alone, and clap keeps its own verb
+        // error (which `parse_from` passes to `error.exit()`, so it is pinned
+        // here rather than through an exit inside the test process).
+        let mut argv = argv_of(&["agent-vm"]);
+        argv.push(invalid());
+        argv.push(OsString::from("run"));
+        assert_eq!(launch_route_hint(&argv), LaunchRouteHint::Unknown);
+        let mut rewritten = argv.clone();
+        rewrite_direct_separator(&mut rewritten, launch_route_hint(&argv));
+        assert_eq!(rewritten, argv);
+        assert_eq!(
+            build_command(&Catalog::Ready(default_catalog()))
+                .try_get_matches_from(&argv)
+                .expect_err("clap's own verb error")
+                .kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
+    }
+
+    #[test]
+    fn run_of_a_catalog_tool_name_is_direct_and_takes_no_entry() {
+        let _env = clear_launch_env();
+        let argv = argv_of(&["agent-vm", "run", "claude", "--x", "x", "", "x"]);
+        let (command, args) = direct_of(parse_from(argv, Ok(report_from(MYTOOL))).unwrap());
+        assert_eq!(command.program(), "claude");
+        assert_eq!(args, ["--x", "x", "", "x"]);
+        // Launch options before the runner are not administrative misuse.
+        let argv = argv_of(&["agent-vm", "--mount", "/x", "run", "p"]);
+        assert!(matches!(
+            parse_from(argv, Ok(report_from(MYTOOL))).unwrap(),
+            Dispatch::Launch {
+                target: LaunchTarget::Direct(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_broken_catalog_fails_a_direct_launch_without_clap_noise() {
+        let _env = clear_launch_env();
+        for tokens in [vec!["agent-vm", "run", "p"], vec!["agent-vm", "--", "p"]] {
+            let error = parse_from(argv_of(&tokens), Err(anyhow!("broken catalog")))
+                .err()
+                .expect("a direct launch failure");
+            // Not clap's "unrecognized subcommand" and no did-you-mean tip.
+            assert!(error.downcast_ref::<clap::Error>().is_none(), "{tokens:?}");
+            assert!(
+                error.to_string().contains("broken catalog"),
+                "{tokens:?}: {error}"
+            );
+            let failure = error
+                .downcast::<crate::launch_target::DirectLaunchFailure>()
+                .expect("the deferred direct failure marker");
+            assert!(failure.to_string().contains("broken catalog"));
+            // The program is still validated first.
+            let error = usage_error(parse_from(
+                argv_of(&["agent-vm", "run"]),
+                Err(anyhow!("broken catalog")),
+            ));
+            assert_eq!(error.exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn an_invalid_unused_tool_still_blocks_a_direct_launch() {
+        let _env = clear_launch_env();
+        // `run` is reserved, and so is any invalid declaration: a direct launch
+        // must not proceed with an unreadable catalog.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("config.toml");
+        std::fs::write(&project, "[[tools]]\nname = \"run\"\ncommand = \"x\"\n").unwrap();
+        let load = || {
+            crate::config::load(&crate::config::ConfigPaths {
+                user: Some(dir.path().join("no-user.toml")),
+                project: dir.path().join("config.toml"),
+            })
+        };
+        let error = parse_from(argv_of(&["agent-vm", "run", "p"]), load())
+            .err()
+            .expect("the reserved name breaks the catalog");
+        assert!(
+            error
+                .downcast_ref::<crate::launch_target::DirectLaunchFailure>()
+                .is_some()
+        );
+        // Built-ins keep working with that broken catalog.
+        assert!(matches!(
+            parse_from(argv_of(&["agent-vm", "doctor"]), load()).unwrap(),
+            Dispatch::Builtin {
+                cmd: Cmd::Doctor(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_route_hint_never_turns_a_value_or_a_later_token_into_a_direct_route() {
+        let run_hint = |tokens: &[&str]| launch_route_hint(&argv_of(tokens));
+        assert_eq!(
+            run_hint(&["agent-vm", "--mount", "run", "secret"]),
+            LaunchRouteHint::Other
+        );
+        assert_eq!(
+            run_hint(&["agent-vm", "--mount", "--"]),
+            LaunchRouteHint::Other
+        );
+        assert_eq!(
+            run_hint(&["agent-vm", "--unknown", "x", "run", "secret"]),
+            LaunchRouteHint::Other
+        );
+        assert_eq!(
+            run_hint(&["agent-vm", "shell", "run", "secret"]),
+            LaunchRouteHint::Other
+        );
+        assert_eq!(run_hint(&["agent-vm"]), LaunchRouteHint::Other);
+        assert_eq!(run_hint(&["agent-vm", "--help"]), LaunchRouteHint::Other);
+        assert_eq!(run_hint(&["agent-vm", "-V"]), LaunchRouteHint::Other);
+        assert_eq!(
+            run_hint(&["agent-vm", "--unknown", "run", "secret"]),
+            LaunchRouteHint::Direct {
+                boundary: 2,
+                spelling: DirectSpelling::Verb
+            }
+        );
+        for tokens in [
+            vec!["agent-vm", "--"],
+            vec!["agent-vm", "--memory", "4", "--"],
+            vec!["agent-vm", "-p", "1:2", "--root", "--"],
+        ] {
+            assert_eq!(
+                run_hint(&tokens),
+                LaunchRouteHint::Direct {
+                    boundary: tokens.len() - 1,
+                    spelling: DirectSpelling::Separator
+                },
+                "{tokens:?}"
+            );
+        }
+        for tokens in [
+            vec!["agent-vm", "--memory", "4", "run", "p"],
+            vec!["agent-vm", "--allow-internet-egress=true", "run", "p"],
+            vec!["agent-vm", "-p1:2", "run", "p"],
+        ] {
+            let boundary = tokens.iter().position(|token| *token == "run").unwrap();
+            assert_eq!(
+                run_hint(&tokens),
+                LaunchRouteHint::Direct {
+                    boundary,
+                    spelling: DirectSpelling::Verb
+                },
+                "{tokens:?}"
+            );
+        }
+        // A single token that is not UTF-8 where an option or verb would be.
+        use std::os::unix::ffi::OsStringExt as _;
+        assert_eq!(
+            launch_route_hint(&[OsString::from("agent-vm"), OsString::from_vec(vec![0xff])]),
+            LaunchRouteHint::Unknown
+        );
+        // Invalid bytes *after* a recognized boundary stay direct argv.
+        assert_eq!(
+            launch_route_hint(&[
+                OsString::from("agent-vm"),
+                OsString::from("run"),
+                OsString::from_vec(vec![0xff])
+            ]),
+            LaunchRouteHint::Direct {
+                boundary: 1,
+                spelling: DirectSpelling::Verb
+            }
+        );
+    }
+
+    #[test]
+    fn launch_option_metadata_shapes_are_pinned_for_the_route_walker() {
+        let _env = clear_launch_env();
+        let table: Vec<(String, Option<char>, OptionShape)> = launch_option_table()
+            .into_iter()
+            .map(|option| (option.long, option.short, option.shape))
+            .collect();
+        assert_eq!(
+            table,
+            [
+                ("memory".to_string(), None, OptionShape::RequiredValue),
+                ("cpus".to_string(), None, OptionShape::RequiredValue),
+                ("no-git".to_string(), None, OptionShape::Flag),
+                ("repo".to_string(), None, OptionShape::RequiredValue),
+                (
+                    "allow-missing-credentials".to_string(),
+                    None,
+                    OptionShape::Flag
+                ),
+                ("mount".to_string(), None, OptionShape::RequiredValue),
+                ("publish".to_string(), Some('p'), OptionShape::RequiredValue),
+                ("auto-publish".to_string(), None, OptionShape::Flag),
+                ("allow-egress".to_string(), None, OptionShape::RequiredValue),
+                (
+                    "allow-internet-egress".to_string(),
+                    None,
+                    OptionShape::EqualsOnlyValue
+                ),
+                ("allow-lan".to_string(), None, OptionShape::EqualsOnlyValue),
+                ("allow-host".to_string(), None, OptionShape::EqualsOnlyValue),
+                ("image".to_string(), None, OptionShape::RequiredValue),
+                ("root".to_string(), None, OptionShape::Flag),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_route_hint_agrees_with_clap_on_every_accepted_prefix() {
+        let _env = clear_launch_env();
+        // A prefix clap accepts as options-only must be classified Other (no
+        // route yet) and must be rewritable-safe: only a separator after it is
+        // ever replaced.
+        for tokens in [
+            vec!["agent-vm"],
+            vec!["agent-vm", "--memory", "4"],
+            vec!["agent-vm", "--root", "--no-git"],
+            vec!["agent-vm", "-p", "1:2"],
+            vec!["agent-vm", "--allow-lan", "--allow-host=true"],
+            vec!["agent-vm", "--image", "x", "--recipe-dir", "y"],
+        ] {
+            let accepted = launch_prefix_error(&argv_of(&tokens)).is_none();
+            if tokens.contains(&"--recipe-dir") {
+                assert!(!accepted, "{tokens:?} is not a launch option");
+                continue;
+            }
+            assert!(accepted, "{tokens:?} should be an accepted prefix");
+            assert_eq!(launch_route_hint(&argv_of(&tokens)), LaunchRouteHint::Other);
+        }
+        // A `--` consumed as an option value is not a separator, and the prefix
+        // before the *first* `--` is not options-only either way.
+        assert_eq!(
+            launch_route_hint(&argv_of(&["agent-vm", "--mount", "--", "run", "p"])),
+            LaunchRouteHint::Direct {
+                boundary: 3,
+                spelling: DirectSpelling::Verb
+            }
+        );
+        assert!(launch_prefix_error(&argv_of(&["agent-vm", "--mount"])).is_some());
+    }
+
+    #[test]
+    fn direct_routes_classify_b5_scrub_and_syntax_errors_as_usage() {
+        let mut env = clear_launch_env();
+        // 1. A malformed launch environment reaches no launch on a ready catalog.
+        env.set_var("AGENT_VM_MEMORY_GIB", "abc");
+        for tokens in [
+            vec!["agent-vm", "run", "secret"],
+            vec!["agent-vm", "--", "secret"],
+            vec!["agent-vm", "run", "image", "import"],
+            vec!["agent-vm", "--", "image", "import"],
+        ] {
+            let error = usage_error(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))));
+            assert_eq!(error.exit_code(), 2, "{tokens:?}");
+            let text = error.to_string();
+            assert!(!text.contains("abc"), "{tokens:?}: {text}");
+            assert!(
+                text.contains("agent-vm [launch options] run PROGRAM [ARG]..."),
+                "{tokens:?}: {text}"
+            );
+        }
+        env.remove_var("AGENT_VM_MEMORY_GIB");
+        // 2. An invalid typed value, an unknown option and a repeated conflict
+        //    are all usage errors on both spellings.
+        for tokens in [
+            vec!["agent-vm", "--memory", "abc", "run", "p"],
+            vec!["agent-vm", "--memory", "abc", "--", "p"],
+            vec!["agent-vm", "--unknown=CANARY", "run", "p"],
+            vec!["agent-vm", "--memory", "4", "--memory", "8", "run", "p"],
+        ] {
+            let error = usage_error(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))));
+            assert_eq!(error.exit_code(), 2, "{tokens:?}");
+            let text = error.to_string();
+            assert!(!text.contains("CANARY"), "{tokens:?}: {text}");
+            // The separator spelling reports the invalid launch option, not the
+            // first payload word as an unknown subcommand (#398 review SP4).
+            if tokens.contains(&"--memory") && tokens.contains(&"abc") {
+                assert!(
+                    text.contains("invalid value 'abc' for '--memory"),
+                    "{tokens:?}: {text}"
+                );
+                assert!(
+                    !text.contains("unrecognized subcommand"),
+                    "{tokens:?}: {text}"
+                );
+            }
+        }
+        // 2b. A known-direct route whose argv contains the token `secret` gets
+        //     direct-specific, value-free text: the administrative
+        //     `agent-vm secret …` forms are not what a guest command vector
+        //     could have meant (#398 review SP4).
+        for tokens in [
+            vec!["agent-vm", "--memory", "abc", "run", "secret"],
+            vec!["agent-vm", "--memory", "abc", "--", "secret"],
+        ] {
+            let error = usage_error(parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))));
+            assert_eq!(error.exit_code(), 2, "{tokens:?}");
+            let text = error.to_string();
+            for administrative in ["agent-vm secret set", "agent-vm secret ls", "secret rm"] {
+                assert!(!text.contains(administrative), "{tokens:?}: {text}");
+            }
+            assert!(
+                text.contains("agent-vm [launch options] run PROGRAM [ARG]..."),
+                "{tokens:?}: {text}"
+            );
+        }
+        // 3. A genuine `secret` or `image import` route keeps its legacy status.
+        for tokens in [
+            vec!["agent-vm", "secret", "set", "svc", "--help=CANARY"],
+            vec!["agent-vm", "image", "import"],
+        ] {
+            let error = parse_from(argv_of(&tokens), Ok(report_from(MYTOOL)))
+                .err()
+                .expect("a scrubbed route error");
+            let is_clap = error.downcast_ref::<clap::Error>().is_some();
+            // A genuine `secret` route keeps its legacy plain-anyhow scrub
+            // (status 1); the administrative import route keeps clap's text.
+            assert_eq!(is_clap, !tokens.contains(&"secret"), "{tokens:?}");
+            assert!(!error.to_string().contains("CANARY"), "{tokens:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_direct_payload_named_run_secret_or_import_is_never_diverted() {
+        let _env = clear_launch_env();
+        for (tokens, program) in [
+            (vec!["agent-vm", "run", "secret", "p"], "secret"),
+            (vec!["agent-vm", "run", "image", "import"], "image"),
+            (vec!["agent-vm", "--", "secret"], "secret"),
+            (vec!["agent-vm", "run", "--"], "--"),
+        ] {
+            match parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap() {
+                Dispatch::Launch {
+                    target: LaunchTarget::Direct(command),
+                    ..
+                } => assert_eq!(command.program(), program, "{tokens:?}"),
+                _ => panic!("{tokens:?} should be a direct launch"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_command_builds_without_clap_conflicts_on_either_catalog_path() {
+        let _env = clear_launch_env();
+        build_command(&Catalog::Ready(default_catalog())).debug_assert();
+        build_command(&Catalog::Broken(anyhow!("broken"))).debug_assert();
+        // A configured `run` is rejected by the catalog, so it can never become
+        // a second `run` subcommand: the command stays a valid clap tree.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("config.toml");
+        std::fs::write(&project, "[[tools]]\nname = \"run\"\ncommand = \"x\"\n").unwrap();
+        let config = crate::config::load(&crate::config::ConfigPaths {
+            user: Some(dir.path().join("no-user.toml")),
+            project,
+        });
+        let catalog = match config {
+            Ok(report) => match report.into_launch_catalog() {
+                Ok(catalog) => Catalog::Ready(catalog),
+                Err(error) => Catalog::Broken(error),
+            },
+            Err(error) => Catalog::Broken(error),
+        };
+        assert!(matches!(catalog, Catalog::Broken(_)));
+        build_command(&catalog).debug_assert();
+        assert_eq!(
+            subcommand_names(&build_command(&catalog))
+                .iter()
+                .filter(|name| *name == "run")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn run_is_reserved_in_every_config_tier_with_a_rename_diagnostic() {
+        let _env = clear_launch_env();
+        let body = "[[tools]]\nname = \"run\"\ncommand = \"x\"\n";
+        let dir = tempfile::tempdir().unwrap();
+        let user_config = dir.path().join("user.toml");
+        std::fs::write(&user_config, body).unwrap();
+        let user = crate::config::load(&ConfigPaths {
+            user: Some(user_config),
+            project: dir.path().join("no-project.toml"),
+        })
+        .unwrap_err()
+        .to_string();
+        let project_config = dir.path().join("project.toml");
+        std::fs::write(&project_config, body).unwrap();
+        let project = crate::config::load(&ConfigPaths {
+            user: Some(dir.path().join("no-user.toml")),
+            project: project_config,
+        })
+        .unwrap_err()
+        .to_string();
+        for rendered in [user, project] {
+            assert!(rendered.contains("name `run` is reserved"), "{rendered}");
+            assert!(rendered.contains("run-tool"), "{rendered}");
+        }
+        assert_eq!(nearest_builtin("rnu"), Some("run"));
     }
 }

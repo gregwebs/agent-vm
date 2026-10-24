@@ -390,9 +390,20 @@ reset_host_shim_log() {
 }
 
 assert_no_host_calls() {
-  if [[ -s "$HOST_SHIM_LOG" ]]; then
+  local log="${1:-$HOST_SHIM_LOG}"
+  # A missing or unreadable log is a failed observation, not a vacuous zero: the
+  # run's log is created (and emptied) by run_check before every check.
+  if [[ ! -e "$log" ]]; then
+    echo "    FAIL: host decoy log $log is missing; absence not proven"
+    return 1
+  fi
+  if [[ ! -r "$log" ]]; then
+    echo "    FAIL: host decoy log $log is unreadable; absence not proven"
+    return 1
+  fi
+  if [[ -s "$log" ]]; then
     echo "    FAIL: a host decoy was invoked:"
-    cat "$HOST_SHIM_LOG"
+    cat "$log"
     return 1
   fi
 }
@@ -756,7 +767,14 @@ observe_launch() {
   local before
   before="$(runtime_pids)" || return 1
 
-  (cd "$proj" || exit 1; exec "$@") >"$out" 2>&1 </dev/null &
+  # Opt-in split capture (#398): a caller that needs guest stdout bytes apart
+  # from the launcher's stderr sets OBSERVE_STDOUT_FILE for its own call. Every
+  # other row keeps the merged stream it has always read.
+  if [ -n "${OBSERVE_STDOUT_FILE:-}" ]; then
+    (cd "$proj" || exit 1; exec "$@") >"$OBSERVE_STDOUT_FILE" 2>"$out" </dev/null &
+  else
+    (cd "$proj" || exit 1; exec "$@") >"$out" 2>&1 </dev/null &
+  fi
   local pid=$!
   (
     local i=0
@@ -858,6 +876,284 @@ capture_custom_launch() {
     HOME="$CUSTOM_HOME" \
     HOST_SHIM_LOG="$HOST_SHIM_LOG" \
     "$AGENT_VM" "$@"
+}
+
+# Extra host environment for one direct capture (#398): a row that needs it sets
+# `K=V` words here for the duration of its own capture calls (e.g.
+# `AGENT_VM_DEBUG_CONFIG=1`) and clears them immediately after. Empty otherwise,
+# so no other row's launches change.
+DIRECT_CAPTURE_ENV=()
+
+# Direct-launch capture (#398): guest stdout goes to its own file so byte-exact
+# argv evidence is never mixed with launcher notices, and the launcher's stderr
+# stays in the row log. The split is scoped to this call only.
+capture_custom_direct() {
+  local name="$1" proj="$2"
+  shift 2
+  local OBSERVE_STDOUT_FILE="$WORK/$name.stdout"
+  : >"$OBSERVE_STDOUT_FILE" || return 1
+  observe_launch "$name" "$proj" "$WORK/$name.out" -- \
+    "${CUSTOM_ENV[@]}" "${OFFLINE_ENV[@]}" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOME="$CUSTOM_HOME" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" \
+    ${DIRECT_CAPTURE_ENV[@]+"${DIRECT_CAPTURE_ENV[@]}"} \
+    "$AGENT_VM" "$@"
+}
+
+# Path of a direct capture's guest stdout.
+direct_stdout_file() {
+  local name="$1"
+  [ -f "$WORK/$name.stdout" ] ||
+    { echo "    FAIL: no guest stdout capture for $name"; return 1; }
+  printf '%s' "$WORK/$name.stdout"
+}
+
+# Guest stdout decoded with NUL as newline for line-oriented assertions only.
+# A missing or unreadable capture is a failure, never empty evidence; the
+# byte-exact checks read the file itself (see assert_direct_stdout_bytes).
+# shellcheck disable=SC2317,SC2329  # invoked indirectly from the direct rows,
+# which run_check dispatches by name; 0.9 (the Ubuntu CI version) reports the
+# function as unreachable instead.
+direct_stdout() {
+  local name="$1" out
+  direct_stdout_file "$name" >/dev/null || return 1
+  if ! out="$(tr '\0' '\n' <"$WORK/$name.stdout")"; then
+    echo "    FAIL: could not read the guest stdout capture for $name"
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+# Byte-exact comparison of a capture's guest stdout with an expected string.
+# `$(cat file)` would strip trailing newlines and hide a read error, so the
+# expected bytes go into their own file and `cmp` decides.
+assert_direct_stdout_bytes() {
+  local desc="$1" name="$2" expected="$3" expected_file result=0
+  direct_stdout_file "$name" >/dev/null || return 1
+  expected_file="$WORK/$name.expected"
+  printf '%s' "$expected" >"$expected_file" || return 1
+  if ! cmp -s "$expected_file" "$WORK/$name.stdout"; then
+    echo "    FAIL: $desc (guest stdout bytes differ)"
+    cmp -l "$expected_file" "$WORK/$name.stdout" | head -5 || true
+    od -c "$WORK/$name.stdout" | head -5 || result=1
+    result=1
+  fi
+  return "$result"
+}
+
+# Exactly zero bytes on guest stdout. Existence is checked first, so a missing
+# capture is never "empty".
+assert_direct_stdout_empty() {
+  local desc="$1" name="$2"
+  direct_stdout_file "$name" >/dev/null || return 1
+  if [ -s "$WORK/$name.stdout" ]; then
+    echo "    FAIL: $desc (expected an empty guest stdout)"
+    od -c "$WORK/$name.stdout" | head -5 || true
+    return 1
+  fi
+}
+
+# The single state directory this run owns for `proj`: exactly one 12-hex child
+# of the private state root (session::hash_path's first 12 hex chars). A
+# resolution surprise (a parent, `..`, a nested or non-hex name) is reported and
+# never becomes a delete target, so the guard enforces what it advertises.
+direct_state_child() {
+  local proj="$1" state child
+  if ! state="$(host_state_dir "$proj")"; then
+    echo "    cleanup: could not resolve the state dir for $proj" >&2
+    return 1
+  fi
+  case "$state" in
+  "$CUSTOM_STATE"/*) child="${state#"$CUSTOM_STATE"/}" ;;
+  *)
+    echo "    cleanup: $state is outside $CUSTOM_STATE; not removing" >&2
+    return 1
+    ;;
+  esac
+  case "$child" in
+  '' | */* | . | ..)
+    echo "    cleanup: $state is not one child of $CUSTOM_STATE; not removing" >&2
+    return 1
+    ;;
+  esac
+  if [ "${#child}" -ne 12 ]; then
+    echo "    cleanup: $state has a ${#child}-character name, not 12 hex; not removing" >&2
+    return 1
+  fi
+  case "$child" in
+  *[!0-9a-f]*)
+    echo "    cleanup: $state is not a 12-hex state child; not removing" >&2
+    return 1
+    ;;
+  esac
+  printf '%s' "$state"
+}
+
+# Finalize one direct row. `ref` is the image the row launched and `outcome` the
+# row body's own status. A row that failed, or that cannot prove its owned
+# runtime and catalog record are gone, removes NOTHING: the captured stdout, the
+# launcher log and the state it was diagnosed from stay for the
+# failure-preservation trap to report. Only once that proof holds does a passing
+# row remove its own state child and the sibling host-only `.secrets`
+# directory. Any cleanup failure fails the row.
+direct_cleanup() {
+  local name="$1" proj="$2" ref="$3" outcome="$4" state result=0
+  if ! state="$(direct_state_child "$proj")"; then
+    echo "    cleanup: keeping $name evidence (state identity unresolved)"
+    return 1
+  fi
+  if [ "$outcome" -ne 0 ]; then
+    echo "    cleanup: keeping $name evidence: $WORK/$name.stdout $WORK/$name.out $state"
+    return 1
+  fi
+  # No owned sandbox may survive before its state is deleted: process absence
+  # alone is not catalog absence. A survivor is itself the failure being
+  # diagnosed, so its state stays.
+  if ! assert_no_catalog_entry "$ref"; then
+    echo "    cleanup: keeping $name evidence: a sandbox for $ref survives; $state"
+    return 1
+  fi
+  if [ -e "$state" ]; then
+    rm -rf "$state" || { echo "    cleanup: could not remove $state"; result=1; }
+  fi
+  if [ -e "$state.secrets" ]; then
+    rm -rf "$state.secrets" || { echo "    cleanup: could not remove $state.secrets"; result=1; }
+  fi
+  rm -f "$WORK/$name.stdout" "$WORK/$name.expected" || result=1
+  return "$result"
+}
+
+# Proof that none of the named state entries exists, distinguishing absence from
+# a failed observation: only ENOENT is evidence.
+assert_state_entries_absent() {
+  local desc="$1" state="$2"
+  shift 2
+  python3 - "$desc" "$state" "$@" <<'ABSENT'
+import os
+import sys
+
+desc, state = sys.argv[1], sys.argv[2]
+failed = False
+for relative in sys.argv[3:]:
+    path = os.path.join(state, relative)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        continue
+    except OSError as error:
+        print(f"    FAIL: {desc}: could not observe {path}: {error}", file=sys.stderr)
+        failed = True
+    else:
+        print(f"    FAIL: {desc}: {path} must not exist", file=sys.stderr)
+        failed = True
+raise SystemExit(1 if failed else 0)
+ABSENT
+}
+
+# The exact generic guest-HOME furniture: `name<TAB>target`, sorted. Compared as
+# a whole set so an unexpected link (a catalog `persist` declaration, or a
+# provider link this oracle does not know) fails rather than passing as "some
+# path under the state root".
+direct_home_links() {
+  python3 - "$1" <<'LINKS'
+import os
+import sys
+
+root = os.path.join(sys.argv[1], "home")
+rows = []
+try:
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                rows.append(f"{os.path.relpath(path, root)}\t{os.readlink(path)}")
+except OSError as error:
+    print(f"    FAIL: could not walk {root}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+for row in sorted(rows):
+    print(row)
+LINKS
+}
+
+assert_direct_state_furniture() {
+  local desc="$1" state="$2" expected actual
+  expected="$(printf '%s\t%s\n' \
+    .bash_history /agent-vm-state/bash_history \
+    .claude /agent-vm-state/claude \
+    .claude.json /agent-vm-state/claude.json \
+    .config/gh /agent-vm-state/gh-config \
+    .config/opencode /agent-vm-state/opencode-config \
+    .copilot /agent-vm-state/copilot \
+    .gitconfig /agent-vm-state/gitconfig \
+    .local/share/opencode /agent-vm-state/opencode \
+    .pi /agent-vm-state/pi | LC_ALL=C sort)" || return 1
+  if ! actual="$(direct_home_links "$state" | LC_ALL=C sort)"; then
+    echo "    FAIL: $desc: could not read the guest HOME links"
+    return 1
+  fi
+  if [ "$actual" != "$expected" ]; then
+    echo "    FAIL: $desc: guest HOME links are not exactly the generic furniture"
+    printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual"
+    return 1
+  fi
+}
+
+# The sandbox config the launcher actually handed the SDK, from its own
+# `[debug] sandbox config JSON` record. A missing, unreadable or malformed record
+# is a failure, never an empty observation.
+direct_debug_config() {
+  local name="$1"
+  [ -r "$WORK/$name.out" ] ||
+    { echo "    FAIL: no launcher log for $name"; return 1; }
+  python3 - "$WORK/$name.out" <<'CONFIG'
+import json
+import sys
+
+marker = "[debug] sandbox config JSON: "
+try:
+    with open(sys.argv[1], encoding="utf-8", errors="surrogateescape") as handle:
+        text = handle.read()
+except OSError as error:
+    print(f"    FAIL: could not read {sys.argv[1]}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+index = text.find(marker)
+if index < 0:
+    print("    FAIL: the launch emitted no sandbox config dump", file=sys.stderr)
+    raise SystemExit(1)
+try:
+    config, _ = json.JSONDecoder().raw_decode(text[index + len(marker):].lstrip())
+except ValueError as error:
+    print(f"    FAIL: the sandbox config dump is not JSON: {error}", file=sys.stderr)
+    raise SystemExit(1)
+json.dump(config, sys.stdout)
+CONFIG
+}
+
+# Default-deny authority with an empty grant, asserted on the config the native
+# launch really used: no declared request rule, secret, intercept route or TLS
+# intercept, and no catalog tool/shell environment.
+assert_direct_default_deny() {
+  local desc="$1" name="$2" config
+  config="$(direct_debug_config "$name")" || return 1
+  if ! jq -e '
+      (.network.policy.default_egress == "deny")
+      and (.network.policy.default_ingress == "allow")
+      and ((.network.policy.rules | length) == 0)
+      and ((.network.secrets.secrets | length) == 0)
+      and ((.network.intercept.rules | length) == 0)
+      and (.network.intercept.hook == null)
+      and (.network.tls.enabled == false)
+      and ([.env[].key] | index("PROBE_CATALOG_ENV") == null)
+      and ([.env[].key] | index("SHELL_CATALOG_ENV") == null)
+      and ([.env[].key] | index("CODEX_HOME") == null)
+      and ([.env[].key] | index("COPILOT_GITHUB_TOKEN") == null)
+    ' <<<"$config" >/dev/null; then
+    echo "    FAIL: $desc: the launch config is not the empty default-deny grant"
+    printf '%s\n' "$config" | jq -c '{policy: .network.policy, secrets: .network.secrets, intercept: .network.intercept.rules, env: [.env[].key]}' ||
+      true
+    return 1
+  fi
 }
 
 # Attach-branch launch under a real PTY (macOS BSD `script`). `script`'s exit
@@ -1263,6 +1559,141 @@ check_harness_negative() {
   ) >/dev/null 2>&1 || oracle_status=$?
   assert_eq "access-record oracle propagates a matcher error" "2" "$oracle_status" || result=1
 
+  # (h) #398: the direct-row helpers own their own negative controls.
+  #
+  # (h1) `direct_state_child` accepts exactly one 12-hex child of the private
+  # state root and refuses every other resolution, so the delete target cannot
+  # widen from a resolution surprise.
+  local state_case stub accepted_state
+  for state_case in \
+    'outside:$CUSTOM_STATE/../escape' \
+    'root:$CUSTOM_STATE' \
+    'short:$CUSTOM_STATE/abc' \
+    'nested:$CUSTOM_STATE/0123456789ab/child' \
+    'nonhex:$CUSTOM_STATE/0123456789az'; do
+    stub="${state_case#*:}"
+    if (
+      host_state_dir() { printf '%s' "$stub"; }
+      direct_state_child "/proj"
+    ) >/dev/null 2>&1; then
+      echo "    FAIL: direct_state_child accepted ${state_case%%:*} path $stub"
+      result=1
+    fi
+  done
+  if ! accepted_state="$(
+    host_state_dir() { printf '%s' "$CUSTOM_STATE/0123456789ab"; }
+    direct_state_child "/proj"
+  )" || [ "$accepted_state" != "$CUSTOM_STATE/0123456789ab" ]; then
+    echo "    FAIL: direct_state_child rejected a valid 12-hex state child"
+    result=1
+  fi
+
+  # (h2) A failed row keeps its evidence: `rm` must not be called at all. A
+  # passed row removes exactly the verified child and its sibling `.secrets`.
+  # A fake child of the *real* private state root, created and removed here: the
+  # helper resolves through host_state_dir, and nothing global is reassigned in a
+  # subshell.
+  local fake_state="$CUSTOM_STATE/0123456789ab" removals="$probe_dir/direct-removals.txt"
+  mkdir -p "$fake_state" "$fake_state.secrets" || result=1
+  : >"$removals" || result=1
+  if (
+    # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly; see the notes
+    # on direct_stdout above.
+    host_state_dir() { printf '%s' "$CUSTOM_STATE/0123456789ab"; }
+    assert_no_catalog_entry() { return 0; }
+    rm() { printf '%s\n' "$*" >>"$removals"; }
+    direct_cleanup "probe" "/proj" "ref" 1
+  ) >/dev/null 2>&1; then
+    echo "    FAIL: direct_cleanup reported success for a failed row"
+    result=1
+  fi
+  if [ -s "$removals" ]; then
+    echo "    FAIL: direct_cleanup removed a failed row's evidence:"
+    cat "$removals"
+    result=1
+  fi
+  if ! (
+    # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly
+    host_state_dir() { printf '%s' "$CUSTOM_STATE/0123456789ab"; }
+    assert_no_catalog_entry() { return 0; }
+    rm() { printf '%s\n' "$*" >>"$removals"; }
+    direct_cleanup "probe" "/proj" "ref" 0
+  ) >/dev/null 2>&1; then
+    echo "    FAIL: direct_cleanup failed for a passed row"
+    result=1
+  fi
+  for expected_removal in \
+    "-rf $fake_state" \
+    "-rf $fake_state.secrets"; do
+    if ! grep -qxF -- "$expected_removal" "$removals"; then
+      echo "    FAIL: direct_cleanup did not remove exactly $expected_removal"
+      cat "$removals"
+      result=1
+    fi
+  done
+  rm -rf "$fake_state" "$fake_state.secrets" || result=1
+
+  # (h3) A surviving catalog record fails cleanup and removes nothing: the state
+  # is the evidence for the leak, so the status alone is not the observation.
+  mkdir -p "$fake_state" || result=1
+  : >"$removals" || result=1
+  if (
+    # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly
+    host_state_dir() { printf '%s' "$CUSTOM_STATE/0123456789ab"; }
+    assert_no_catalog_entry() { return 1; }
+    rm() { printf '%s\n' "$*" >>"$removals"; }
+    direct_cleanup "probe" "/proj" "ref" 0
+  ) >/dev/null 2>&1; then
+    echo "    FAIL: direct_cleanup ignored a surviving catalog record"
+    result=1
+  fi
+  if [ -s "$removals" ]; then
+    echo "    FAIL: direct_cleanup removed state despite a surviving catalog record:"
+    cat "$removals"
+    result=1
+  fi
+  rm -rf "$fake_state" || result=1
+
+  # (h4) The absence oracle fails on an existing entry and passes on a missing
+  # one; only ENOENT counts as evidence.
+  mkdir -p "$probe_dir/absent-probe" || result=1
+  : >"$probe_dir/absent-probe/exists" || result=1
+  if assert_state_entries_absent "probe-existing" "$probe_dir/absent-probe" \
+    "exists" >/dev/null 2>&1; then
+    echo "    FAIL: assert_state_entries_absent accepted an existing entry"
+    result=1
+  fi
+  if ! assert_state_entries_absent "probe-missing" "$probe_dir/absent-probe" \
+    "missing" >/dev/null 2>&1; then
+    echo "    FAIL: assert_state_entries_absent rejected a missing entry"
+    result=1
+  fi
+
+  # (h5) The byte-exact stdout oracle rejects a trailing-newline difference that
+  # `$(cat …)` would have hidden.
+  printf '%s' '$HOME' >"$WORK/probe-bytes.stdout" || result=1
+  if assert_direct_stdout_bytes "probe-bytes" "probe-bytes" $'$HOME\n' >/dev/null 2>&1; then
+    echo "    FAIL: the byte-exact oracle accepted a missing trailing newline"
+    result=1
+  fi
+  if ! assert_direct_stdout_bytes "probe-bytes" "probe-bytes" '$HOME' >/dev/null 2>&1; then
+    echo "    FAIL: the byte-exact oracle rejected the exact bytes"
+    result=1
+  fi
+  rm -f "$WORK/probe-bytes.stdout" "$WORK/probe-bytes.expected" || result=1
+
+  # (h6) A missing host-decoy log is a failed observation, not a vacuous zero.
+  rm -f "$probe_dir/missing-shim.log" || result=1
+  if assert_no_host_calls "$probe_dir/missing-shim.log" >/dev/null 2>&1; then
+    echo "    FAIL: assert_no_host_calls accepted a missing decoy log"
+    result=1
+  fi
+  : >"$probe_dir/present-shim.log" || result=1
+  if ! assert_no_host_calls "$probe_dir/present-shim.log" >/dev/null 2>&1; then
+    echo "    FAIL: assert_no_host_calls rejected a readable empty decoy log"
+    result=1
+  fi
+
   local observed_pass="$PASSED" observed_fail="$FAILED"
   if [ "$observed_pass" -ne 0 ] || [ "$observed_fail" -ne 2 ]; then
     echo "    FAIL: harness negative expected 0 pass / 2 fail, got $observed_pass/$observed_fail"
@@ -1297,9 +1728,8 @@ require_launch_ok() {
 
 # jq assertions over the launcher-owned state file, read from the host state
 # dir. A jq error or a missing file is a failure, never an "absent" tolerance.
-assert_state_json() {
-  local desc="$1" filter="$2" state
-  state="$(host_state_dir "$INTEG_PROJ")" || return 1
+assert_state_json_at() {
+  local desc="$1" filter="$2" state="$3"
   if [ ! -f "$state/claude.json" ]; then
     echo "    FAIL: $desc (claude.json absent at $state)"
     return 1
@@ -1309,6 +1739,12 @@ assert_state_json() {
     jq -c . "$state/claude.json" || true
     return 1
   fi
+}
+
+assert_state_json() {
+  local desc="$1" filter="$2" state
+  state="$(host_state_dir "$INTEG_PROJ")" || return 1
+  assert_state_json_at "$desc" "$filter" "$state"
 }
 
 # 1. marker-free hello runs as host identity (nonroot) and 0:0 (root), and the
@@ -4190,6 +4626,597 @@ custom_explicit_build_workflow() {
   [ ! -e "$BUILD_STATE/msb-home/config.json" ] || return 1
 }
 
+# ---------------------------------------------------------------------------
+# #398 — direct launches (`run` and top-level `--`)
+# ---------------------------------------------------------------------------
+
+# 1. Both spellings launch the same program with the same identity, cwd, HOME
+# and PATH, nonroot and root. The oracles are literal, not a comparison of two
+# possibly-wrong runs.
+custom_image_direct_both_forms() {
+  local mode form name proj out result=0
+  for mode in nonroot root; do
+    local -a root_flag=()
+    [ "$mode" = root ] && root_flag=(--root)
+    for form in run separator; do
+      name="custom-direct-ident-$mode-$form"
+      proj="$(custom_project "$name")" ||
+        { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+      local route=run
+      [ "$form" = separator ] && route=--
+      if ! capture_custom_direct "$name" "$proj" --no-git \
+        ${root_flag[@]+"${root_flag[@]}"} --image "$CUSTOM_MARKER" \
+        "$route" direct-probe-398 identity; then
+        result=1
+      else
+        out="$(direct_stdout "$name")" || result=1
+        local host_uid host_gid want_uid want_gid want_home
+        host_uid="$(id -u)"
+        host_gid="$(id -g)"
+        if [ "$mode" = root ]; then want_uid=0; want_gid=0; want_home=/root
+        else want_uid="$host_uid"; want_gid="$host_gid"; want_home="$CUSTOM_HOME"; fi
+        assert_eq "$name: guest exit status" "0" "$CAPTURE_STATUS" || result=1
+        assert_eq "$name: uid" "uid=$want_uid" "$(grep '^uid=' <<<"$out")" || result=1
+        assert_eq "$name: gid" "gid=$want_gid" "$(grep '^gid=' <<<"$out")" || result=1
+        assert_eq "$name: guest HOME" "home=$want_home" "$(grep '^home=' <<<"$out")" || result=1
+        assert_eq "$name: cwd is the mounted project" \
+          "cwd=$(cd "$proj" && pwd -P)" "$(grep '^cwd=' <<<"$out")" || result=1
+        assert_eq "$name: program resolves under the image PATH" \
+          "probe=/usr/local/bin/direct-probe-398" "$(grep '^probe=' <<<"$out")" || result=1
+        assert_eq "$name: completion sentinel" \
+          "direct-probe-398=ok" "$(grep '^direct-probe-398=ok$' <<<"$out")" || result=1
+        # Zero catalog provisioning: no catalog persist link, no provider or
+        # custom tool/shell environment reached the guest.
+        assert_eq "$name: no catalog persist link" \
+          "hello_persist=absent" "$(grep '^hello_persist=' <<<"$out")" || result=1
+        assert_no_match "$name: no inherited provider/tool env" \
+          "^inherited_env=" "$out" || result=1
+        assert_single_boot_ref "$name boots only the selected image" \
+          "$CUSTOM_MARKER" "$(launch_output "$name")" || result=1
+        assert_no_host_calls || result=1
+      fi
+      direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+    done
+  done
+  return "$result"
+}
+
+# 2. Literal argv in both spellings: byte-exact count and arguments, including
+# an empty argument, spaces, quotes, Unicode, shell metacharacters, a literal
+# `$HOME`, `--help`, a later `--` and duplicates.
+direct_argv_expectation() {
+  python3 - "$1" <<'ARGVCHECK'
+import sys
+
+expected_args = [
+    "",
+    "a b",
+    "q'\"uote",
+    "日本語",
+    "$HOME",
+    "*",
+    ";",
+    "|",
+    "--help",
+    "--",
+    "x",
+    "x",
+    "line\nbreak",
+]
+expected = b"argv-count=%d\n" % len(expected_args)
+for argument in expected_args:
+    expected += argument.encode() + b"\0"
+expected += b"direct-probe-398=ok\n"
+actual = open(sys.argv[1], "rb").read()
+if actual != expected:
+    print("    FAIL: direct argv bytes differ from the exact expected vector")
+    print("    expected:", expected)
+    print("    actual:  ", actual)
+    raise SystemExit(1)
+ARGVCHECK
+}
+
+custom_image_direct_argv() {
+  local form name proj result=0
+  for form in run separator; do
+    name="custom-direct-argv-$form"
+    proj="$(custom_project "$name")" ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+    local route=run
+    [ "$form" = separator ] && route=--
+    if ! capture_custom_direct "$name" "$proj" --no-git --image "$CUSTOM_MARKER" \
+      "$route" direct-probe-398 argv '' 'a b' "q'\"uote" '日本語' '$HOME' '*' ';' '|' \
+      '--help' '--' 'x' 'x' 'line
+break'; then
+      result=1
+    else
+      assert_eq "$name: guest exit status" "0" "$CAPTURE_STATUS" || result=1
+      direct_argv_expectation "$WORK/$name.stdout" || result=1
+      assert_no_host_calls || result=1
+    fi
+    direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+  done
+
+  # An external program receives `$HOME` literally; shell syntax needs an
+  # explicit shell.
+  for form in run separator; do
+    name="custom-direct-printf-$form"
+    proj="$(custom_project "$name")" ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+    local route=run
+    [ "$form" = separator ] && route=--
+    if ! capture_custom_direct "$name" "$proj" --no-git --image "$CUSTOM_MARKER" \
+      "$route" printf '%s\n' '$HOME'; then
+      result=1
+    else
+      assert_eq "$name: literal printf status" "0" "$CAPTURE_STATUS" || result=1
+      # Exactly `$HOME` plus one newline, compared as bytes.
+      assert_direct_stdout_bytes "$name: literal \$HOME bytes" "$name" $'$HOME\n' || result=1
+    fi
+    direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+  done
+  return "$result"
+}
+
+# 3. The status table: 127 for an absent executable (bare name and path), 126
+# for a present non-executable file and for a directory named by path, 127 for
+# a bare name that resolves to a PATH directory, and pass-through of the
+# program's own status.
+custom_image_direct_statuses() {
+  local form name proj result=0
+  for form in run separator; do
+    local route=run
+    [ "$form" = separator ] && route=--
+    local spec program expected slug
+    for spec in \
+      'missing-398:127' \
+      '/nonexistent/direct-398:127' \
+      'noexec-258:126' \
+      '/usr/local/bin/noexec-258:126' \
+      '/usr:126' \
+      'sh|exit 7:7' \
+      'false:1'; do
+      program="${spec%:*}"
+      expected="${spec##*:}"
+      slug="$(printf '%s' "$program" | tr -c 'a-zA-Z0-9' '-')"
+      name="custom-direct-status-$form-$slug"
+      proj="$(custom_project "$name")" ||
+        { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; result=1; continue; }
+      local -a argv=()
+      case "$program" in
+      'sh|exit 7') argv=(sh -c 'exit 7') ;;
+      *) argv=("$program") ;;
+      esac
+      if ! capture_custom_direct "$name" "$proj" --no-git --image "$CUSTOM_MARKER" \
+        "$route" "${argv[@]}"; then
+        result=1
+      else
+        assert_eq "$name: status for $program" "$expected" "$CAPTURE_STATUS" || result=1
+        case "$expected" in
+        127 | 126)
+          assert_match "$name: direct stderr diagnostic" \
+            "agent-vm: (executable not found|not executable)" \
+            "$(launch_output "$name")" || result=1
+          # Launcher diagnostics never reach guest stdout.
+          assert_direct_stdout_empty "$name: stdout stays empty" "$name" || result=1
+          ;;
+        esac
+        assert_no_host_calls || result=1
+      fi
+      direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+    done
+  done
+  return "$result"
+}
+
+# 4. The project runtime hook is retained for direct launches: its exports
+# affect the effective PATH and executable lookup, and its status passes
+# through with the command never executed.
+custom_image_direct_hook() {
+  local form name proj out result=0
+  for form in run separator; do
+    local route=run
+    [ "$form" = separator ] && route=--
+    name="custom-direct-hook-$form"
+    proj="$(custom_project "$name")" ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+    mkdir -p "$proj/bin" ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+    cat >"$proj/bin/hooked-398" <<'HOOKED' ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+#!/bin/sh
+printf 'hooked-path=%s\n' "$1"
+printf 'hooked-env=%s\n' "${DIRECT_HOOK_ENV:-unset}"
+printf 'hooked=ok\n'
+HOOKED
+    chmod 0755 "$proj/bin/hooked-398" ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+    cat >"$proj/.agent-vm.runtime.sh" <<'HOOK' ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+DIRECT_HOOK_ENV=hooked
+export DIRECT_HOOK_ENV
+PATH="$PWD/bin:$PATH"
+export PATH
+HOOK
+    if ! capture_custom_direct "$name" "$proj" --no-git --image "$CUSTOM_MARKER" \
+      "$route" hooked-398 hook-arg; then
+      result=1
+    else
+      out="$(direct_stdout "$name")" || result=1
+      assert_eq "$name: hook-exported program status" "0" "$CAPTURE_STATUS" || result=1
+      assert_eq "$name: hook argv" "hooked-path=hook-arg" "$(grep '^hooked-path=' <<<"$out")" || result=1
+      assert_eq "$name: hook-exported env" "hooked-env=hooked" "$(grep '^hooked-env=' <<<"$out")" || result=1
+      assert_eq "$name: hook completion sentinel" "hooked=ok" "$(grep '^hooked=ok$' <<<"$out")" || result=1
+      # No launcher notice leaks into guest stdout.
+      assert_no_match "$name: no launcher notices on stdout" "^==>" "$out" || result=1
+    fi
+    rm -f "$proj/.agent-vm.runtime.sh" || result=1
+    direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+  done
+
+  # A failing hook passes its status through and the command never runs.
+  local body slug
+  for body in 'return 9' 'exit 9'; do
+    slug="$(printf '%s' "$body" | tr -c 'a-zA-Z0-9' '-')"
+    name="custom-direct-hook-fail-$slug"
+    proj="$(custom_project "$name")" ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+    printf '%s\n' "$body" >"$proj/.agent-vm.runtime.sh" ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+    if ! capture_custom_direct "$name" "$proj" --no-git --image "$CUSTOM_MARKER" \
+      run direct-probe-398 identity; then
+      result=1
+    else
+      assert_eq "$name: hook status passes through" "9" "$CAPTURE_STATUS" || result=1
+      assert_no_match "$name: the command never ran" "direct-probe-398=ok" \
+        "$(direct_stdout "$name")" || result=1
+      if [ "$body" = 'return 9' ]; then
+        assert_match "$name: failed-hook diagnostic" "failed \(exit 9\)" \
+          "$(launch_output "$name")" || result=1
+      fi
+    fi
+    rm -f "$proj/.agent-vm.runtime.sh" || result=1
+    direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+  done
+  return "$result"
+}
+
+# 5. A host executable that shares the program's name is never executed: the
+# direct route reaches the guest lookup. The decoy is calibrated first on the
+# exact child PATH, then reset, so "unchanged" is not vacuous.
+custom_image_direct_host_decoy() {
+  local form name proj result=0
+  local decoy="$SHIM_DIR/direct-decoy-398"
+  cat >"$decoy" <<'DECOY' || return 1
+#!/bin/sh
+printf 'host-decoy\n' >>"$HOST_SHIM_LOG"
+exit 96
+DECOY
+  chmod 0755 "$decoy" || return 1
+  # Wiring control on the exact PATH (and env) the launch's children get. The
+  # decoy exits 96 by contract, so that status (not zero) is the reachable proof.
+  : >"$HOST_SHIM_LOG" || return 1
+  local control_status=0
+  (PATH="$SHIM_DIR:/usr/bin:/bin" HOST_SHIM_LOG="$HOST_SHIM_LOG" "$decoy") >/dev/null 2>&1 ||
+    control_status=$?
+  if [ "$control_status" -ne 96 ]; then
+    echo "    FAIL: the host decoy did not exit 96 on the child PATH (got $control_status)"
+    return 1
+  fi
+  if ! grep -q '^host-decoy$' "$HOST_SHIM_LOG"; then
+    echo "    FAIL: the host decoy did not log on the child PATH"
+    return 1
+  fi
+  : >"$HOST_SHIM_LOG" || return 1
+  for form in run separator; do
+    local route=run
+    [ "$form" = separator ] && route=--
+    name="custom-direct-decoy-$form"
+    proj="$(custom_project "$name")" ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; return 1; }
+    if ! capture_custom_direct "$name" "$proj" --no-git --image "$CUSTOM_MARKER" \
+      "$route" direct-decoy-398; then
+      result=1
+    else
+      assert_eq "$name: host decoy is not a guest program" "127" "$CAPTURE_STATUS" || result=1
+      assert_direct_stdout_empty "$name: guest stdout stays empty" "$name" || result=1
+      # A read error is a failed observation, never proof that the decoy log is
+      # empty (assert_no_host_calls owns that distinction).
+      assert_no_host_calls || result=1
+    fi
+    direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+  done
+  rm -f "$decoy" || result=1
+  return "$result"
+}
+
+# 6. The nonstandard-PATH fixture, launched directly in both spellings: the
+# probe and Bash resolve only under /opt/e2e-258/bin, with no fallback copy.
+custom_image_direct_nonstandard() {
+  local form name proj out result=0
+  name="custom-direct-nonstandard"
+  proj="$(custom_project "$name")" ||
+    { direct_cleanup "$name" "$proj" "$CUSTOM_NONSTANDARD" 1; return 1; }
+  for form in run separator; do
+    local route=run
+    [ "$form" = separator ] && route=--
+    if ! capture_custom_direct "$name-$form" "$proj" --no-git --image "$CUSTOM_NONSTANDARD" \
+      "$route" direct-probe-398 identity; then
+      result=1
+    else
+      # The recorded child status is part of the row: output that looks right
+      # after a launcher cleanup failure is not a pass.
+      assert_eq "$name-$form: guest exit status" "0" "$CAPTURE_STATUS" || result=1
+      out="$(direct_stdout "$name-$form")" || result=1
+      assert_eq "$name-$form: nonstandard program resolves" \
+        "probe=/opt/e2e-258/bin/direct-probe-398" "$(grep '^probe=' <<<"$out")" || result=1
+      assert_eq "$name-$form: nonstandard bash resolves" \
+        "bash=/opt/e2e-258/bin/bash" "$(grep '^bash=' <<<"$out")" || result=1
+      assert_eq "$name-$form: completion sentinel" \
+        "direct-probe-398=ok" "$(grep '^direct-probe-398=ok$' <<<"$out")" || result=1
+      assert_no_host_calls || result=1
+    fi
+  done
+  direct_cleanup "$name" "$proj" "$CUSTOM_NONSTANDARD" "$result" || result=1
+  return "$result"
+}
+
+# 7. Native zero provider provisioning. The project's catalog declares a hostile
+# definition that *shares the direct program's name* (its own command, default
+# args, env, provider credential, transitive tool, network request and persist
+# declaration) plus a hostile configured `shell`, and a *usable* synthetic
+# provider credential is seeded in the private launcher HOME. A direct launch
+# must still provision nothing. Four independent directions are asserted: the
+# guest's own environment/identity output, the launcher's credential notice, the
+# config it handed the SDK, and the host state it left behind. The control tool
+# proves the credential really was usable, so "no capture" is not "inert seed".
+write_direct_hostile_config() {
+  local dir="$1"
+  mkdir -p "$dir/.agent-vm" || return 1
+  cat >"$dir/.agent-vm/config.toml" <<'EOF' || return 1
+[[tools]]
+name = "direct-probe-398"
+command = "probe-from-catalog"
+args = ["--from-catalog"]
+env = { PROBE_CATALOG_ENV = "yes" }
+credentials = ["anthropic"]
+tools = ["direct-helper-398"]
+persist = ["direct-398.state"]
+network_requests = ["api.example.test"]
+
+[[tools]]
+name = "direct-helper-398"
+command = "direct-helper-398"
+
+[[tools]]
+name = "prov-control"
+command = "direct-probe-398"
+credentials = ["anthropic"]
+# A catalog-declared persist link for the probe's own `hello_persist` line, so
+# the control launch proves that line can observe a link at all (see the
+# control's `hello_persist=present` assertion).
+persist = [".hello-258.state"]
+
+[[tools]]
+name = "shell"
+command = "hostile-shell"
+args = ["--hostile"]
+interactive_shell = true
+env = { SHELL_CATALOG_ENV = "yes" }
+credentials = ["anthropic"]
+network_requests = ["api.example.test"]
+persist = ["shell-state"]
+EOF
+}
+
+custom_image_direct_zero_provisioning() {
+  local form route name proj out state host_uid host_gid result=0
+  local control control_proj control_state
+  host_uid="$(id -u)"
+  host_gid="$(id -g)"
+  write_custom_credential_seed ||
+    { echo "    FAIL: could not seed the synthetic host credential"; return 1; }
+  for form in run separator; do
+    route=run
+    [ "$form" = separator ] && route=--
+    name="custom-direct-prov-$form"
+    proj="$WORK/$name"
+    write_direct_hostile_config "$proj" ||
+      { direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" 1; result=1; continue; }
+    state="$(direct_state_child "$proj")" ||
+      { echo "    FAIL: could not resolve the state dir for $name"; result=1; continue; }
+    # The launcher's own sandbox config is part of this row's evidence, so this
+    # capture (and only this one) opts into the debug dump.
+    local capture=0
+    DIRECT_CAPTURE_ENV=(AGENT_VM_DEBUG_CONFIG=1)
+    capture_custom_direct "$name" "$proj" --no-git --image "$CUSTOM_MARKER" \
+      "$route" direct-probe-398 identity || capture=1
+    DIRECT_CAPTURE_ENV=()
+    if [ "$capture" -ne 0 ]; then
+      result=1
+    else
+      assert_eq "$name: guest exit status" "0" "$CAPTURE_STATUS" || result=1
+      out="$(direct_stdout "$name")" || result=1
+      # The literal program ran with the launch identity, and the probe's
+      # variable-NAME report proves no catalog tool/shell environment reached it.
+      assert_eq "$name: uid" "uid=$host_uid" "$(grep '^uid=' <<<"$out")" || result=1
+      assert_eq "$name: gid" "gid=$host_gid" "$(grep '^gid=' <<<"$out")" || result=1
+      assert_eq "$name: guest HOME" "home=$CUSTOM_HOME" "$(grep '^home=' <<<"$out")" || result=1
+      assert_eq "$name: completion sentinel" "direct-probe-398=ok" \
+        "$(grep '^direct-probe-398=ok$' <<<"$out")" || result=1
+      assert_no_match "$name: no inherited provider/tool env" "^inherited_env=" "$out" || result=1
+      assert_eq "$name: no catalog persist link in the guest" "direct_persist=absent" \
+        "$(grep '^direct_persist=' <<<"$out")" || result=1
+      # No credential capture, although the catalog declares one and a usable
+      # seed exists.
+      assert_match "$name: no agent credentials captured" "^==> Agent credentials: <none>" \
+        "$(launch_output "$name")" || result=1
+      # The exact empty default-deny grant in the config the launch handed the
+      # SDK (no request rule, secret, intercept route or TLS intercept).
+      assert_direct_default_deny "$name: default-deny empty grant" "$name" || result=1
+      # The host state a direct launch leaves behind: exactly the generic
+      # furniture, no declared persist path, no provider token/placeholder/
+      # bypass file, no launcher-owned Chrome entry on an incapable image.
+      assert_direct_state_furniture "$name: generic HOME furniture" "$state" || result=1
+      assert_state_entries_absent "$name: no provisioned state" "$state" \
+        home/direct-398.state home/shell-state \
+        persist/direct-398.state persist/shell-state \
+        claude/.credentials.json claude/settings.json \
+        codex/auth.json codex/config.toml copilot/config.json \
+        opencode-config/opencode.json || result=1
+      assert_state_entries_absent "$name: no captured provider token" "$CUSTOM_STATE" \
+        "$(basename "$state").secrets/anthropic" \
+        "$(basename "$state").secrets/openai" \
+        "$(basename "$state").secrets/copilot" || result=1
+      if [ -f "$state/claude.json" ] &&
+        ! jq -e '(.mcpServers["chrome-devtools"] // null) == null' \
+          "$state/claude.json" >/dev/null; then
+        echo "    FAIL: $name: the launcher-owned Chrome MCP entry must not be provisioned"
+        jq -c '.mcpServers // {}' "$state/claude.json" || true
+        result=1
+      fi
+      if [ -f "$state/opencode/auth.json" ] &&
+        ! jq -e '(type == "object") and (length == 0)' "$state/opencode/auth.json" >/dev/null; then
+        echo "    FAIL: $name: no OpenCode provider entry may be provisioned"
+        jq -c . "$state/opencode/auth.json" || true
+        result=1
+      fi
+      assert_no_host_calls || result=1
+    fi
+    direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+  done
+
+  # Positive control: the same catalog definition *is* provisioned when it is
+  # launched as a catalog tool, so the direct row's "no capture" cannot pass
+  # because the seeded credential was unusable.
+  control="custom-direct-prov-control"
+  control_proj="$WORK/$control"
+  write_direct_hostile_config "$control_proj" || result=1
+  control_state="$(direct_state_child "$control_proj")" || result=1
+  if capture_custom_direct "$control" "$control_proj" --no-git --image "$CUSTOM_MARKER" \
+    prov-control; then
+    assert_eq "$control: guest exit status" "0" "$CAPTURE_STATUS" || result=1
+    assert_match "$control: the seeded credential is usable" "^==> Agent credentials: claude" \
+      "$(launch_output "$control")" || result=1
+    if [ ! -f "$control_state.secrets/anthropic" ]; then
+      echo "    FAIL: $control: the catalog tool captured no host token from the seed"
+      result=1
+    fi
+    if [ ! -f "$control_state/claude/.credentials.json" ]; then
+      echo "    FAIL: $control: the catalog tool wrote no guest placeholder"
+      result=1
+    fi
+    # The guest-side persist oracle is not vacuous: the same probe reports
+    # `present` for this catalog tool, whose persist link is a *dangling*
+    # symlink on a fresh project's first launch. Without `-L` in the probe the
+    # direct rows' `absent` lines could not distinguish "no link" from
+    # "dangling link".
+    assert_eq "$control: the persist oracle sees a catalog persist link" \
+      "hello_persist=present" \
+      "$(grep '^hello_persist=' <<<"$(direct_stdout "$control")")" || result=1
+    assert_eq "$control: the same oracle sees no direct persist link" \
+      "direct_persist=absent" \
+      "$(grep '^direct_persist=' <<<"$(direct_stdout "$control")")" || result=1
+  else
+    result=1
+  fi
+  rm -f "$CUSTOM_CREDENTIAL_SEED" || result=1
+  # The control's own state and captured token are this test's: remove both.
+  direct_cleanup "$control" "$control_proj" "$CUSTOM_MARKER" "$result" || result=1
+  return "$result"
+}
+
+# 8. The image-owned Chrome MCP `claude.json` entry through direct launches:
+# capable -> incapable -> capable, with an unrelated user MCP entry and an
+# unrelated top-level key surviving every sync. The capable phases run the
+# image's own `verify-mcp-258`, which reads the configured entry back from guest
+# state and executes it, so the entry is proven guest-visible, not just present
+# on the host. No provider grant, no captured credential, no catalog entry.
+assert_direct_chrome_state() {
+  local desc="$1" state="$2" expected="$3"
+  if [ "$expected" = owned ]; then
+    assert_state_json_at "$desc: owned entry configured" "$OWNED_STATE" "$state" || return 1
+  else
+    assert_state_json_at "$desc: owned entry removed" "$NO_OWNED_STATE" "$state" || return 1
+  fi
+  assert_state_json_at "$desc: unrelated entries intact" "$UNRELATED_STATE" "$state"
+}
+
+custom_image_direct_chrome_furniture() {
+  local name="custom-direct-chrome" proj state result=0 phase
+  local seed='{"mcpServers":{"user-owned":{"command":"user-cmd"}},"unrelatedTopKey":{"keep":true}}'
+  proj="$WORK/$name"
+  write_custom_tools_config "$proj" || return 1
+  state="$(direct_state_child "$proj")" ||
+    { echo "    FAIL: could not resolve the state dir for $name"; return 1; }
+
+  # Seed the user's own MCP state with a direct launch on the incapable image.
+  if capture_custom_direct "$name-seed" "$proj" --no-git --image "$CUSTOM_MARKER" \
+    run bash -c "printf '%s' '$seed' > /agent-vm-state/claude.json"; then
+    assert_eq "$name-seed: guest exit status" "0" "$CAPTURE_STATUS" || result=1
+    assert_state_json_at "$name-seed: seeded user entries" "$UNRELATED_STATE" "$state" || result=1
+  else
+    result=1
+  fi
+
+  # Capable: the owned entry appears and the configured command really runs.
+  if capture_custom_direct "$name-capable" "$proj" --no-git --image "$CUSTOM_INTEGRATIONS" \
+    run verify-mcp-258; then
+    assert_eq "$name-capable: guest exit status" "0" "$CAPTURE_STATUS" || result=1
+    assert_match "$name-capable: the configured entry executed" "^verify-mcp-258: OK$" \
+      "$(direct_stdout "$name-capable")" || result=1
+    assert_direct_chrome_state "$name-capable" "$state" owned || result=1
+    assert_match "$name-capable: no agent credentials" "^==> Agent credentials: <none>" \
+      "$(launch_output "$name-capable")" || result=1
+  else
+    result=1
+  fi
+
+  # Incapable: only the owned entry is removed; the user's state survives.
+  if capture_custom_direct "$name-incapable" "$proj" --no-git --image "$CUSTOM_MARKER" \
+    -- direct-probe-398 identity; then
+    assert_eq "$name-incapable: guest exit status" "0" "$CAPTURE_STATUS" || result=1
+    assert_eq "$name-incapable: the direct program ran" "direct-probe-398=ok" \
+      "$(grep '^direct-probe-398=ok$' <<<"$(direct_stdout "$name-incapable")")" || result=1
+    assert_direct_chrome_state "$name-incapable" "$state" absent || result=1
+  else
+    result=1
+  fi
+
+  # Capable again: the entry comes back exactly as before.
+  if capture_custom_direct "$name-capable-again" "$proj" --no-git \
+    --image "$CUSTOM_INTEGRATIONS" run verify-mcp-258; then
+    assert_eq "$name-capable-again: guest exit status" "0" "$CAPTURE_STATUS" || result=1
+    assert_match "$name-capable-again: the configured entry executed again" \
+      "^verify-mcp-258: OK$" "$(direct_stdout "$name-capable-again")" || result=1
+    assert_direct_chrome_state "$name-capable-again" "$state" owned || result=1
+    assert_match "$name-capable-again: no agent credentials" \
+      "^==> Agent credentials: <none>" "$(launch_output "$name-capable-again")" || result=1
+  else
+    result=1
+  fi
+
+  # No provider grant in either phase: no captured token beside the state.
+  assert_state_entries_absent "$name: no captured provider token" "$CUSTOM_STATE" \
+    "$(basename "$state").secrets/anthropic" \
+    "$(basename "$state").secrets/openai" \
+    "$(basename "$state").secrets/copilot" || result=1
+  # No owned runtime survives for either image before the state is removed.
+  assert_no_catalog_entry "$CUSTOM_INTEGRATIONS" || result=1
+  assert_no_catalog_entry "$CUSTOM_MARKER" || result=1
+  assert_no_host_calls || result=1
+  if direct_cleanup "$name" "$proj" "$CUSTOM_INTEGRATIONS" "$result"; then
+    # This row's evidence is one capture per phase, none of them named after the
+    # row, so `direct_cleanup` removes only the state here.
+    for phase in seed capable incapable capable-again; do
+      rm -f "$WORK/$name-$phase.stdout" "$WORK/$name-$phase.expected" || result=1
+    done
+  else
+    result=1
+  fi
+  return "$result"
+}
+
 run_check "explicit-build-archive-workflow" custom_explicit_build_workflow
 
 prepare_custom_fixtures || die "could not build/import the custom-image fixtures"
@@ -4203,6 +5230,14 @@ run_check "custom-image-setup-verification-selected-ref" custom_image_setup_veri
 
 run_check "custom-image-runs-program" custom_image_runs_program
 run_check "custom-image-stamp-present-nonnumeric" custom_image_stamp_present
+run_check "custom-image-direct-both-forms" custom_image_direct_both_forms
+run_check "custom-image-direct-argv" custom_image_direct_argv
+run_check "custom-image-direct-statuses" custom_image_direct_statuses
+run_check "custom-image-direct-hook" custom_image_direct_hook
+run_check "custom-image-direct-host-decoy" custom_image_direct_host_decoy
+run_check "custom-image-direct-nonstandard" custom_image_direct_nonstandard
+run_check "custom-image-direct-zero-provisioning" custom_image_direct_zero_provisioning
+run_check "custom-image-direct-chrome-furniture" custom_image_direct_chrome_furniture
 run_check "custom-image-state-persists-nonroot" custom_image_state_persists nonroot
 run_check "custom-image-state-persists-root" custom_image_state_persists root
 run_check "custom-image-user-home-set-nonroot" custom_image_user_home_set nonroot

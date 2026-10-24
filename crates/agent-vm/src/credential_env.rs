@@ -175,6 +175,23 @@ mod tests {
         crate::credential_yaml::load(home.path()).unwrap()
     }
 
+    /// The direct launch (#398) requests no service, so it must read and remove
+    /// no host variable even when an authorization for the *same* name exists:
+    /// the variable therefore stays set for the process that launched it.
+    #[test]
+    fn an_empty_request_set_reads_and_removes_nothing() {
+        let set = authorization(true);
+        let capture = EnvCapture::take_with(&BTreeSet::new(), &set, |name| {
+            panic!("a direct launch must not read {}", name.as_str());
+        });
+        assert!(!capture.selects(&service()));
+        assert!(matches!(capture.resolve(&service()), Resolved::Missing));
+        // Positive control for the same name: a requesting launch does select
+        // it, so the empty-set result above is not vacuous.
+        let selected = EnvCapture::take_with(&names(), &set, |_| Some("sk-value".into()));
+        assert!(selected.selects(&service()));
+    }
+
     #[test]
     fn selection_is_exactly_requested_authorized_and_env() {
         for requested in [false, true] {
