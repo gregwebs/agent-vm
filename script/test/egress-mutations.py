@@ -339,6 +339,12 @@ def matrix():
         rust("claim_decision_matches_the_oracle_table"))
     add("config-mounts-claim-conflict-merged-proof", mounts, conflict_merged, conflict_merged_mutant,
         gate, "verification results::")
+    # The launch half of the same rule: a config/argv pair that disagrees must
+    # refuse, so the mutant's silent merge is observable as a launch that
+    # reaches builder wiring instead of naming both origins.
+    add("config-mounts-claim-conflict-merged-launch", mounts, conflict_merged,
+        conflict_merged_mutant,
+        rust("config_and_cli_conflicts_are_refused_naming_both", MOUNTS))
     # `~` may expand for user `mounts` and never for `--mount`: the shell already
     # expanded argv, so a quoted `~/x` must stay "must be absolute".
     home_on_cli = "else if home == HomeExpansion::Enabled && bytes.len() >= 2"
@@ -357,9 +363,13 @@ def matrix():
     persist_skipped_mutant = "    let _ = &destinations;"
     add("config-mounts-persist-check-skipped", mounts, persist_skipped, persist_skipped_mutant,
         rust("persist_collision_refuses_before_any_fork_store"))
+    # The launch row kills through the config route: the declaration that
+    # causes the collision *and* the fork are both in the user file, so this is
+    # the path a user actually hits (the two CLI-only rows above stay as the
+    # declaration-source-independent red tests they were written as).
     add("config-mounts-persist-check-skipped-launch", mounts, persist_skipped,
         persist_skipped_mutant,
-        rust("a_cli_fork_shadowing_a_persist_path_publishes_no_fork", MOUNTS))
+        rust("a_config_fork_shadowing_a_persist_path_is_refused_before_any_fork", MOUNTS))
     # `--no-config-mounts` withholds the user config's declarations and nothing
     # else (ADR-0046 Decision 5). The anchor is the kernel *body*: its `ensures`
     # spells the same rule as `r == (f.declared && !f.suppressed)`, a shape the
