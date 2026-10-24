@@ -511,6 +511,8 @@ mod tests {
         config::load(&ConfigPaths {
             user: Some(dir.path().join("no-user-config.toml")),
             project,
+
+            home: None,
         })
         .expect("the fixture config parses")
         .into_launch_catalog()

@@ -2751,6 +2751,7 @@ mod tests {
         crate::config::load(&crate::config::ConfigPaths {
             user: Some(dir.path().join("no-user-config.toml")),
             project: dir.path().join("no-project-config.toml"),
+            home: None,
         })
         .expect("the embedded default catalog parses")
         .into_launch_catalog()
@@ -3558,6 +3559,8 @@ mod tests {
         let catalog = crate::config::load(&crate::config::ConfigPaths {
             user: None,
             project,
+
+            home: None,
         })
         .unwrap()
         .into_launch_catalog()

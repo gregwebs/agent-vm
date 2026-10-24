@@ -72,14 +72,17 @@
 //! [`guest_paths_overlap`] backs the within-tool, cross-tool and reserved-link
 //! checks, and `guest_home::links` turns the surviving paths into the one
 //! guest-HOME link list both guest-user modes provision from.
-//! # Network authority is user-tier only
+//! # Network and mount authority are user-tier only
 //!
-//! ADR-0040 permits verified user [network] tables; project and built-in tiers cannot grant access.
+//! ADR-0040 permits verified user [network] tables and ADR-0046 a verified user
+//! top-level `mounts` list; project and built-in tiers cannot declare either.
 //! Whether the file holding one may be trusted is [`crate::config_authority`]'s
-//! decision, shared with every other authority-bearing field, so this module
-//! only decides *what* a trusted table says.
+//! decision, taken here once per user file from the *presence* of either key, so
+//! this module and [`crate::config_mounts`] only decide *what* a trusted file
+//! says.
 
 use crate::config_authority::{self, AuthorityTriggers};
+use crate::config_mounts::{self, UserMounts};
 use crate::user_network::{self, UserNetwork};
 
 use crate::network_requests::{NetworkRequests, RequestTier};
@@ -153,6 +156,11 @@ const DEFAULT_TOOLS_TOML: &str = include_str!("default-tools.toml");
 pub(crate) struct ConfigPaths {
     pub(crate) user: Option<PathBuf>,
     pub(crate) project: PathBuf,
+    /// The `$HOME` [`Self::user`] was derived from: the only base a `~/` in that
+    /// file's `mounts` may expand against (ADR-0046). Captured once, with the
+    /// path, so a launch cannot read one `config.toml` and expand `~/` against a
+    /// different home.
+    pub(crate) home: Option<PathBuf>,
 }
 
 impl ConfigPaths {
@@ -161,9 +169,11 @@ impl ConfigPaths {
     /// There is deliberately no `XDG_CONFIG_HOME` or override variable in
     /// this PR — the ticket names the literal `$HOME` location.
     pub(crate) fn discover() -> Result<Self> {
+        let home = discover_home()?;
         Ok(Self {
-            user: discover_user_path()?,
+            user: home.as_ref().map(|home| home.join(USER_CONFIG_RELATIVE)),
             project: discover_project_path()?,
+            home,
         })
     }
 }
@@ -177,6 +187,11 @@ pub(crate) struct ConfigReport {
     resolved: ResolvedTools,
     images: ConfiguredImages,
     user_network: Option<UserNetwork>,
+    // No launch reads config mounts yet: `mount_selection` threads them into a
+    // launch as the next change in #394. Loading stays the only reader today,
+    // and reading them *earlier* than selection would be the wrong seam.
+    #[allow(dead_code)]
+    user_mounts: Option<UserMounts>,
     uses_defaults: bool,
     conflicts: Vec<ConfigConflict>,
 }
@@ -208,6 +223,15 @@ impl ConfigReport {
     /// Read before into_launch_catalog consumes the report, like images.
     pub(crate) fn user_network(&self) -> Option<&UserNetwork> {
         self.user_network.as_ref()
+    }
+
+    /// The verified user `mounts`, `Some` even when the list is empty: a file
+    /// that declared the key is authority-bearing and its declarations (zero or
+    /// more) belong to every launch. Read before `into_launch_catalog` consumes
+    /// the report, like [`Self::images`].
+    #[allow(dead_code)] // `mount_selection` is its first launch-side caller
+    pub(crate) fn user_mounts(&self) -> Option<&UserMounts> {
+        self.user_mounts.as_ref()
     }
 
     /// True when neither file declared a tool and the compiled-in defaults
@@ -848,7 +872,11 @@ impl ConfigConflict {
 /// there is no fallback to defaults.
 pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
     let (user, user_contents) = match &paths.user {
-        Some(path) => read_file_tier(path, FileTierKind::User)?,
+        Some(path) => read_file_tier(TierSource {
+            path,
+            kind: FileTierKind::User,
+            home: paths.home.as_deref(),
+        })?,
         None => (
             TierReport {
                 path: None,
@@ -857,7 +885,13 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
             TierContents::empty(),
         ),
     };
-    let (project, project_contents) = read_file_tier(&paths.project, FileTierKind::Project)?;
+    // The project tier can declare no `mounts` (refused), so it has no `~/` base.
+    let (project, project_contents) = read_file_tier(TierSource {
+        path: &paths.project,
+        kind: FileTierKind::Project,
+        home: None,
+    })?;
+    let mounts = user_contents.mounts.clone();
 
     let (resolved, uses_defaults, conflicts) =
         if user_contents.tools.is_empty() && project_contents.tools.is_empty() {
@@ -878,6 +912,7 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
             project: project_contents.image,
         },
         user_network: user_contents.network,
+        user_mounts: mounts,
         uses_defaults,
         conflicts,
     })
@@ -888,6 +923,8 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
 /// parses.
 struct TierContents {
     network: Option<UserNetwork>,
+    /// The user tier's verified `mounts`, present-empty included.
+    mounts: Option<UserMounts>,
     tools: Vec<Tool>,
     image: Option<ConfiguredImage>,
 }
@@ -898,6 +935,7 @@ impl TierContents {
             tools: Vec::new(),
             image: None,
             network: None,
+            mounts: None,
         }
     }
 }
@@ -917,11 +955,24 @@ impl FileTierKind {
     }
 }
 
+/// One file-backed tier to read: its path, which tier it is, and — for the user
+/// tier — the `$HOME` a `~/` in its `mounts` expands against.
+///
+/// A named bundle rather than three positional arguments, because two of them
+/// would be an `Option<&Path>` the callee could not tell apart from the file it
+/// reads.
+struct TierSource<'a> {
+    path: &'a Path,
+    kind: FileTierKind,
+    home: Option<&'a Path>,
+}
+
 /// Read, decode, and validate one file-backed tier. Only a `NotFound` from
 /// the initial `symlink_metadata` means absent; a present-but-dangling
 /// symlink or a file that vanishes before the read is an error, not a quiet
 /// fallback.
-fn read_file_tier(path: &Path, kind: FileTierKind) -> Result<(TierReport, TierContents)> {
+fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> {
+    let TierSource { path, kind, home } = source;
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -945,17 +996,17 @@ fn read_file_tier(path: &Path, kind: FileTierKind) -> Result<(TierReport, TierCo
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
     // Authority is decided by the *presence* of an authority-bearing field, from
     // the same verified read the bytes came from, before any of it is parsed.
+    // Presence, not contents: `mounts = []` and an empty `[network]` grant
+    // nothing yet are exactly the bytes an attacker would plant.
     let triggers = AuthorityTriggers {
         network: raw.network.is_some(),
-        mounts: false,
+        mounts: raw.mounts.is_some(),
     };
     let authorized = match kind {
         FileTierKind::User => config_authority::verify(&read, triggers)
             .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,
         FileTierKind::Project => {
-            if let Some(table) = raw.network.as_ref() {
-                return Err(network_refusal(table, path, RefusingTier::Project));
-            }
+            refuse_project_authority(&raw, path)?;
             None
         }
     };
@@ -978,6 +1029,23 @@ fn read_file_tier(path: &Path, kind: FileTierKind) -> Result<(TierReport, TierCo
         }
         None => None,
     };
+    let mounts = match raw.mounts.as_ref() {
+        Some(value) => {
+            // The same invariant as `[network]`: a present `mounts` is a
+            // trigger, so the token exists.
+            let Some(authorized) = authorized.as_ref() else {
+                return Err(anyhow!(
+                    "config: {}: mounts: authority was not measured",
+                    quoted_path(path)
+                ));
+            };
+            Some(
+                config_mounts::from_verified_value(authorized, value, home)
+                    .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,
+            )
+        }
+        None => None,
+    };
     let image = validate_image(raw.image.as_deref(), path)?;
     let tools = validate_tools(raw.tools, kind.origin(path))?;
 
@@ -992,8 +1060,21 @@ fn read_file_tier(path: &Path, kind: FileTierKind) -> Result<(TierReport, TierCo
             tools,
             image,
             network,
+            mounts,
         },
     ))
+}
+
+/// A project file may not grant anything. Network is checked first so a file
+/// that declares both keeps today's `[network]` bytes.
+fn refuse_project_authority(raw: &RawConfig, path: &Path) -> Result<()> {
+    if let Some(table) = raw.network.as_ref() {
+        return Err(network_refusal(table, path, RefusingTier::Project));
+    }
+    if raw.mounts.is_some() {
+        return Err(mounts_refusal(path, RefusingTier::Project));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1019,6 +1100,19 @@ fn network_refusal(table: &toml::Table, file: &Path, tier: RefusingTier) -> anyh
     };
     anyhow!(
         "config: {}: {setting}: {reason}; use --allow-* launch flags, or [network] in the user config",
+        quoted_path(file)
+    )
+}
+
+/// The `mounts` twin of [`network_refusal`], for the two tiers that may not
+/// declare one.
+fn mounts_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
+    let reason = match tier {
+        RefusingTier::Project => "mounts cannot be declared by the project config",
+        RefusingTier::BuiltIn => "mounts cannot be declared by the built-in config",
+    };
+    anyhow!(
+        "config: {}: mounts: {reason}; use --mount launch options, or mounts in the user config",
         quoted_path(file)
     )
 }
@@ -1051,21 +1145,19 @@ fn tools_from_builtin_text(text: &str) -> Result<Vec<Tool>> {
     if let Some(table) = raw.network.as_ref() {
         return Err(network_refusal(table, path, RefusingTier::BuiltIn));
     }
+    if raw.mounts.is_some() {
+        return Err(mounts_refusal(path, RefusingTier::BuiltIn));
+    }
     validate_tools(raw.tools, ToolOrigin::BuiltIn)
 }
 
-fn discover_user_path() -> Result<Option<PathBuf>> {
-    let home = match host_home_dir() {
-        Ok(Some(home)) => home,
-        Ok(None) => return Ok(None),
-        Err(error) => {
-            return Err(anyhow!(
-                "config: {error}; cannot locate {}",
-                quoted_str(USER_CONFIG_RELATIVE)
-            ));
-        }
-    };
-    Ok(Some(home.join(USER_CONFIG_RELATIVE)))
+fn discover_home() -> Result<Option<PathBuf>> {
+    host_home_dir().map_err(|error| {
+        anyhow!(
+            "config: {error}; cannot locate {}",
+            quoted_str(USER_CONFIG_RELATIVE)
+        )
+    })
 }
 
 /// `$HOME` as an absolute, non-empty path, or `None` when it is unset. The
@@ -1340,9 +1432,15 @@ fn launch_closure(tools: &[Tool], index: &HashMap<String, usize>, start: usize) 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    // User tier: verified by user_network; project/built-in: value-safe refusal.
+    // User tier: verified by config_authority; project/built-in: value-safe refusal.
     #[serde(default)]
     network: Option<toml::Table>,
+    // User tier: verified (ADR-0046) when present, even `[]`; project/built-in:
+    // refused. A `toml::Value`, not `Vec<String>`, so presence survives to the
+    // authority decision — the value may be a table or a number, and deciding
+    // *that* is a value-free `mounts[N]` diagnostic rather than a serde message.
+    #[serde(default)]
+    mounts: Option<toml::Value>,
     /// The session's **boot image**, an OCI reference (D4). Optional: an
     /// image-only file declares no tools and keeps the shipped defaults.
     #[serde(default)]
@@ -1966,7 +2064,9 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
         "config: {}{location}: invalid TOML or tool schema; check syntax and field types. \
          Required: a string `name` and `command`; `args`, `credentials`, `tools`, `persist` and `network_requests` are \
          arrays of strings; `env` is a table of string values; the top-level `image` and each \
-         tool's `command` are strings.",
+         tool's `command` are strings. A top-level `mounts` is an array of strings and is accepted \
+         only at the top of the user file; TOML assigns keys to the most recent `[table]` header, \
+         so write it before the first one.",
         quoted_path(file)
     )
 }
@@ -2222,6 +2322,419 @@ mod tests {
         assert_eq!(after, before);
     }
 
+    // -- user mounts (#394 / ADR-0046) -------------------------------------
+
+    /// A mount-bearing file is authority-bearing even when the list is empty:
+    /// presence, not contents, is what makes it so. The positive control (the
+    /// same symlink without the key) is what proves the refusal is about the
+    /// key rather than about symlinks.
+    #[test]
+    fn present_empty_mounts_through_a_symlink_is_refused() {
+        let f = Fixture::new();
+        f.symlinked_user("mounts = []\n");
+        let error = f.load().unwrap_err().to_string();
+        assert!(
+            error.contains("mounts requires config.toml to be a regular file"),
+            "{error}"
+        );
+        assert!(error.contains("review the mounts list"), "{error}");
+        assert!(!error.contains("[network]"), "{error}");
+
+        let f = Fixture::new();
+        f.symlinked_user("");
+        let report = f.load().unwrap();
+        assert!(report.user_mounts().is_none());
+        // The same file, once it declares `mounts`, is refused.
+        write_file(&f.user.with_file_name("dotfile"), "mounts = []\n");
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("mounts requires config.toml to be a regular file")
+        );
+    }
+
+    /// Omitted and present-empty are different facts, and both are readable
+    /// before the report is consumed.
+    #[test]
+    fn omitted_mounts_are_none_and_present_empty_selects_nothing() {
+        let f = Fixture::new();
+        let report = f.user(&one_tool("custom")).load().unwrap();
+        assert!(report.user_mounts().is_none());
+        assert!(!report.uses_defaults());
+
+        let report = f
+            .user(&format!("mounts = []\n{}", one_tool("custom")))
+            .load()
+            .unwrap();
+        let mounts = report.user_mounts().expect("present-empty is present");
+        assert_eq!(mounts.len(), 0);
+        assert_eq!(mounts.file(), f.user.as_path());
+        assert!(mounts.requests().is_empty());
+        // A mounts-only file declares no tools, so the shipped defaults stand.
+        let report = f.user("mounts = [\"/a\"]\n").load().unwrap();
+        assert!(report.uses_defaults());
+        assert_eq!(report.user_mounts().map(UserMounts::len), Some(1));
+    }
+
+    /// `[network]` diagnostics keep their pre-#394 bytes; the subject only
+    /// changes when `mounts` is the field that made the file authority-bearing.
+    #[test]
+    fn refusal_subject_names_exactly_the_declared_fields() {
+        for (body, label, object, without) in [
+            (
+                "[network]\n",
+                "[network]",
+                "review the [network] table",
+                "without [network] still",
+            ),
+            (
+                "mounts = []\n",
+                "mounts",
+                "review the mounts list",
+                "without mounts still",
+            ),
+            (
+                "mounts = []\n[network]\n",
+                "[network] and mounts",
+                "review the [network] table and mounts list",
+                "without [network] or mounts still",
+            ),
+        ] {
+            let f = Fixture::new();
+            f.symlinked_user(body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(
+                error.contains(&format!(
+                    ": {label} requires config.toml to be a regular file"
+                )),
+                "{label}: {error}"
+            );
+            assert!(error.contains(object), "{label}: {error}");
+            assert!(error.contains(without), "{label}: {error}");
+        }
+    }
+
+    /// A project file may not grant mounts, empty or not, and `[network]` is
+    /// still the field named when the file declares both.
+    #[test]
+    fn project_mounts_are_refused_even_when_empty() {
+        for body in ["mounts = []\n", "mounts = [\"/a\"]\n", "mounts = \"x\"\n"] {
+            let f = Fixture::new();
+            f.project(body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(
+                error.contains(&format!(
+                    "config: {:?}: mounts: mounts cannot be declared by the project config; use \
+                     --mount launch options, or mounts in the user config",
+                    f.project
+                )),
+                "{body}: {error}"
+            );
+        }
+        let f = Fixture::new();
+        f.project("mounts = []\n[network]\nallow_host = true\n");
+        let error = f.load().unwrap_err().to_string();
+        assert!(
+            error.contains("network access cannot be granted by the project config"),
+            "{error}"
+        );
+        assert!(!error.contains("mounts cannot be declared"), "{error}");
+    }
+
+    /// The built-in catalog cannot declare mounts either, and `[network]` still
+    /// wins on a body that declares both.
+    #[test]
+    fn builtin_mounts_are_refused() {
+        for body in ["mounts = []\n", "mounts = [\"/a\"]\n", "[mounts]\n"] {
+            let error = tools_from_builtin_text(body).unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "config: \"default-tools.toml\": mounts: mounts cannot be declared by the \
+                     built-in config; use --mount launch options, or mounts in the user config"
+                ),
+                "{body}: {error}"
+            );
+        }
+        let error =
+            tools_from_builtin_text("mounts = []\n[network]\nallow_host = true\n").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("network access cannot be granted by the built-in config")
+        );
+    }
+
+    /// A `mounts`-only user file keeps the seven shipped tools (and `shell`),
+    /// because declaring no tool is not the same as declaring an empty list.
+    #[test]
+    fn a_mounts_only_user_config_keeps_the_defaults() {
+        let f = Fixture::new();
+        let report = f.user("mounts = [\"/a\"]\n").load().unwrap();
+        assert!(report.uses_defaults());
+        let names: Vec<String> = report
+            .into_launch_catalog()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .map(|entry| entry.tool.name().to_string())
+            .collect();
+        let shipped: Vec<String> = default_launch_catalog()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .map(|entry| entry.tool.name().to_string())
+            .collect();
+        assert_eq!(names, shipped);
+        assert_eq!(names.len(), 7, "the seven shipped tools, `shell` included");
+    }
+
+    /// `~/` expands against [`ConfigPaths::home`] and nothing else: not the
+    /// process `HOME`, and never the config file's parent directory.
+    #[test]
+    fn user_mount_home_comes_from_config_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("cfg/config.toml");
+        write_file(&user, "mounts = [\"~/ref\", \"/abs/ref\"]\n");
+        let project = root.path().join("absent.toml");
+        let with_home = |home: Option<PathBuf>| ConfigPaths {
+            user: Some(user.clone()),
+            project: project.clone(),
+            home,
+        };
+
+        // `/h/` keeps its trailing slash (`//`), and the process `HOME` is not
+        // involved: it is the real home, not `/h/`.
+        let report = load(&with_home(Some(PathBuf::from("/h/")))).unwrap();
+        let spellings: Vec<&str> = report
+            .user_mounts()
+            .unwrap()
+            .requests()
+            .iter()
+            .map(|request| request.mount.source_spelling.as_str())
+            .collect();
+        assert_eq!(spellings, ["/h//ref", "/abs/ref"]);
+        assert_ne!(std::env::var("HOME").ok(), Some("/h/".to_string()));
+
+        // No captured home: `~/` is refused rather than derived from the user
+        // path's parent (`<tmp>/cfg`), and an absolute entry still loads.
+        assert_eq!(
+            load(&with_home(None)).unwrap_err().to_string(),
+            format!(
+                "config: {:?}: mounts[0]: a ~/ host path needs a UTF-8 $HOME",
+                user
+            )
+        );
+        write_file(&user, "mounts = [\"/abs/ref\"]\n");
+        let report = load(&with_home(None)).unwrap();
+        assert_eq!(report.user_mounts().map(UserMounts::len), Some(1));
+
+        // A non-UTF-8 home refuses only the `~/` entry.
+        use std::os::unix::ffi::OsStrExt;
+        write_file(&user, "mounts = [\"~/ref\"]\n");
+        let non_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/h/\xff"));
+        assert!(
+            load(&with_home(Some(non_utf8)))
+                .unwrap_err()
+                .to_string()
+                .contains("mounts[0]: a ~/ host path needs a UTF-8 $HOME")
+        );
+    }
+
+    /// A self-contradictory `mounts` list is a *load* error: the claim runs
+    /// before any launch state exists, and identical declarations merge.
+    #[test]
+    fn conflicting_user_mounts_are_a_load_error() {
+        let f = Fixture::new();
+        f.user("mounts = [\"/a:/g:ro\", \"/b:/g:ro\"]\n");
+        let error = f.load().unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "config: {:?}: mounts[1]: claims the same guest path as mounts[0] with a \
+                 different declaration",
+                f.user
+            )
+        );
+        f.user("mounts = [\"/a:/g:ro\", \"/a:/g//./:ro\"]\n");
+        assert_eq!(
+            f.load().unwrap().user_mounts().map(UserMounts::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn user_mount_exclude_on_a_live_bind_is_a_load_error() {
+        let f = Fixture::new();
+        f.user("mounts = [\"/a:/g:exclude=hidden\"]\n");
+        let error = f.load().unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "config: {:?}: mounts[0]: :exclude is only supported on :fork mounts",
+                f.user
+            )
+        );
+    }
+
+    /// No mount value ever reaches a diagnostic, and every message names the
+    /// index and the file.
+    #[test]
+    fn user_mounts_errors_name_the_index_and_never_echo_values() {
+        const SENTINEL: &str = "s3cr3t-SENTINEL-305";
+        for body in [
+            format!("mounts = [\"{SENTINEL}\"]\n"),
+            format!("mounts = [\"{SENTINEL}\", \"/a\"]\n"),
+            format!("mounts = [\"/a:{SENTINEL}\"]\n"),
+            format!("mounts = [\"/a:/g:{SENTINEL}\"]\n"),
+            format!("mounts = [\"/a:/g:exclude={SENTINEL}/../x\"]\n"),
+            format!("mounts = [\"/a:/g\", \"{SENTINEL}:/g\"]\n"),
+            format!("mounts = [1, \"{SENTINEL}\"]\n"),
+            format!("mounts = {{ {SENTINEL} = 1 }}\n"),
+        ] {
+            let f = Fixture::new();
+            f.user(&body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(!error.contains(SENTINEL), "value echoed: {error}");
+            assert!(error.contains("mounts"), "{error}");
+            assert!(error.contains(&format!("{:?}", f.user)), "{error}");
+        }
+        // The index is the entry's position, not a constant.
+        let f = Fixture::new();
+        f.user("mounts = [\"/a\", \"/b\", 7]\n");
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("mounts[2]: must be a string")
+        );
+    }
+
+    /// Load performs no filesystem inspection of mount sources: whether one
+    /// exists is a launch-time question about selected mounts only.
+    #[test]
+    fn user_mounts_never_touch_the_filesystem() {
+        let f = Fixture::new();
+        f.user("mounts = [\"/nonexistent-agent-vm-config-mounts:/g:ro\"]\n");
+        let report = f.load().unwrap();
+        assert_eq!(report.user_mounts().map(UserMounts::len), Some(1));
+    }
+
+    /// `[[tools]]` keeps `deny_unknown_fields`, so a per-tool `mounts` stays a
+    /// schema error — value-free, and pointing at TOML's scoping rule.
+    #[test]
+    fn a_tool_level_mounts_field_is_a_schema_error() {
+        for body in [
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"s3cr3t-SENTINEL-305\"]\n",
+        ] {
+            let f = Fixture::new();
+            f.user(body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(error.contains("invalid TOML or tool schema"), "{error}");
+            assert!(
+                error.contains("so write it before the first one"),
+                "{error}"
+            );
+            assert!(!error.contains("s3cr3t-SENTINEL-305"), "{error}");
+        }
+    }
+
+    /// TOML assigns keys to the most recent table header, so *where* a `mounts`
+    /// key is written decides which construct it lands in. One row per shape.
+    #[test]
+    fn mounts_toml_scoping_is_characterized() {
+        enum Expected {
+            /// Loads, and the user tier declared this many claimed mounts.
+            Mounts(usize),
+            /// Loads with no user `mounts` at all.
+            Absent,
+            /// Refused, with this text in the message.
+            Refused(&'static str),
+        }
+        for (label, body, expected) in [
+            ("top-level", "mounts = []\n", Expected::Mounts(0)),
+            (
+                "top-level after dotted keys",
+                "network.allow_host = false\nmounts = []\n",
+                Expected::Mounts(0),
+            ),
+            (
+                "after [network]",
+                "[network]\nallow_host = true\nmounts = []\n",
+                Expected::Refused(
+                    "[network]: mounts is not a network setting; a top-level mounts list must be \
+                     written before the first table header",
+                ),
+            ),
+            (
+                "after [[tools]]",
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
+                Expected::Refused("invalid TOML or tool schema"),
+            ),
+            (
+                "[tools.env] array",
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\n[tools.env]\nmounts = []\n",
+                Expected::Refused("invalid TOML or tool schema"),
+            ),
+            (
+                "table form",
+                "[mounts]\npath = \"/a\"\n",
+                Expected::Refused("mounts: must be an array of strings"),
+            ),
+            (
+                "[tools.env] string is an ordinary env value",
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\n[tools.env]\nmounts = \"~/private:ro\"\n",
+                Expected::Absent,
+            ),
+        ] {
+            let f = Fixture::new();
+            f.user(body);
+            match (f.load(), expected) {
+                (Ok(report), Expected::Mounts(len)) => {
+                    assert_eq!(
+                        report.user_mounts().map(UserMounts::len),
+                        Some(len),
+                        "{label}"
+                    );
+                }
+                (Ok(report), Expected::Absent) => {
+                    assert!(report.user_mounts().is_none(), "{label}");
+                    assert_eq!(report.user_network(), None, "{label}");
+                    let tool = &report.resolved().as_slice()[0];
+                    assert_eq!(
+                        tool.guest_env().get("mounts").map(String::as_str),
+                        Some("~/private:ro"),
+                        "{label}"
+                    );
+                }
+                (Err(error), Expected::Refused(needle)) => assert!(
+                    error.to_string().contains(needle),
+                    "{label}: {needle} not in {error}"
+                ),
+                (result, _) => panic!("{label}: unexpected outcome {result:?}"),
+            }
+        }
+
+        // `[tools.env] mounts` is an ordinary env value, so it triggers no
+        // authority policy at all: the same body works through a symlink.
+        let f = Fixture::new();
+        f.symlinked_user(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\n[tools.env]\nmounts = \"~/private:ro\"\n",
+        );
+        assert!(f.load().is_ok());
+        // `[mounts]` is top-level and present, so its presence alone triggers
+        // the authority check.
+        let f = Fixture::new();
+        f.symlinked_user("[mounts]\npath = \"/a\"\n");
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("mounts requires config.toml to be a regular file")
+        );
+    }
+
     // -- fixture helpers ---------------------------------------------------
 
     fn write_file(path: &Path, contents: &str) {
@@ -2264,11 +2777,21 @@ mod tests {
             ConfigPaths {
                 user: Some(self.user.clone()),
                 project: self.project.clone(),
+                home: None,
             }
         }
 
         fn load(&self) -> Result<ConfigReport> {
             load(&self.paths())
+        }
+
+        /// The user config as a same-directory dotfile symlink — the shape a
+        /// guest- or project-authored file is planted through.
+        fn symlinked_user(&self, contents: &str) -> &Self {
+            let target = self.user.with_file_name("dotfile");
+            write_file(&target, contents);
+            std::os::unix::fs::symlink(&target, &self.user).unwrap();
+            self
         }
 
         fn user(&self, contents: &str) -> &Self {
@@ -4239,6 +4762,8 @@ mod tests {
         let paths = ConfigPaths {
             user: None,
             project: evil.join(".agent-vm/config.toml"),
+
+            home: None,
         };
         let error = load(&paths).unwrap_err();
         for rendered in [
@@ -4278,6 +4803,8 @@ mod tests {
         let paths = ConfigPaths {
             user: None,
             project: evil.join(".agent-vm/config.toml"),
+
+            home: None,
         };
         let rendered = format!("{:#}", load(&paths).unwrap_err());
         assert!(!rendered.contains('\x1b'), "raw ESC leaked: {rendered:?}");

@@ -1877,6 +1877,7 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
         crate::config::load(&crate::config::ConfigPaths {
             user: user.map(Path::to_path_buf),
             project: project.to_path_buf(),
+            home: None,
         })
         .expect("fixture config should load")
     }
