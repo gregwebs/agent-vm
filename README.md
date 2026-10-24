@@ -85,8 +85,19 @@ cd ~/your-project
 agent-vm --allow-internet-egress claude
 ```
 
+Run a guest executable directly — no catalog entry, defaults, environment or
+credential provisioning (partially implemented: stdin, terminal overrides and
+signal forwarding are tracked in #399–#401):
+
+```sh
+agent-vm run make test
+agent-vm -- make test        # the same, with the top-level separator
+```
+
 Full flag, subcommand, networking, and troubleshooting reference:
-**[USAGE.md](USAGE.md)**.
+**[USAGE.md](USAGE.md)** — direct commands are in
+[Direct commands](USAGE.md#direct-commands), with the approved contract in
+[docs/specs/direct-command-launch.md](docs/specs/direct-command-launch.md).
 
 Build and select your own finished image; launches never run Docker:
 

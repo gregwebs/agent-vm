@@ -63,6 +63,16 @@ identical to the pre-#82 binary.
   credential. Named tools are *provisioned*, never *required* — a tool that
   connects to another through a bridge pulls in that tool's credential without
   inheriting its hard bail.
+- **A direct command has no provisioning decision at all** (amended by #398,
+  0.7.3). `agent-vm run PROGRAM` / `agent-vm -- PROGRAM` selects no catalog
+  entry, so its requirement set, provisioning set, declared network requests
+  and `persist` list are all empty: the launch requests no service name, which
+  makes the resolver capture nothing and the network plan grant nothing. The
+  empty set is supplied at one normalization point, not by substituting any
+  entry — in particular not the `shell` fallback. Shared **image** furniture is
+  not a grant: the image-capability Chrome DevTools MCP entry in `claude.json`
+  is written from the image, not from a catalog declaration, and a direct
+  launch keeps it.
 - **One predicate gates every provider-owned facet**: host credential capture,
   the guest placeholder files, the proxy secret and its intercept route, the
   first-run bypass configs, and the provider guest env. `Scope`,

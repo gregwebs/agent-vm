@@ -17,6 +17,9 @@ RUN ! command -v bash
 FROM ${ALPINE} AS marker-free
 RUN apk add --no-cache bash
 COPY --chmod=0755 hello-258 /usr/local/bin/hello-258
+# #398 direct-launch probe: no declared persist, no provider files, no writes in
+# its identity/argv modes (see the script's own header).
+COPY --chmod=0755 direct-probe-398 /usr/local/bin/direct-probe-398
 # A file on PATH that is deliberately NOT executable, so the setup verification
 # diagnostic's "present but not executable" case is covered with real guest
 # evidence (mode fixed here, not by the source file's mode).
@@ -58,5 +61,7 @@ USER app
 FROM marker-free AS nonstandard-path
 RUN mkdir -p /opt/e2e-258/bin && mv /bin/bash /opt/e2e-258/bin/bash \
     && mv /usr/local/bin/hello-258 /opt/e2e-258/bin/hello-258 \
-    && test ! -e /bin/bash && test ! -e /usr/bin/bash
+    && mv /usr/local/bin/direct-probe-398 /opt/e2e-258/bin/direct-probe-398 \
+    && test ! -e /bin/bash && test ! -e /usr/bin/bash \
+    && test ! -e /usr/local/bin/hello-258 && test ! -e /usr/local/bin/direct-probe-398
 ENV PATH=/opt/e2e-258/bin:/usr/bin:/bin

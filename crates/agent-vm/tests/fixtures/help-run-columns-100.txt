@@ -1,0 +1,28 @@
+Run a guest executable directly; every argument after it is literal
+
+Usage: agent-vm [launch options] run PROGRAM [ARG]...
+       agent-vm [launch options] -- PROGRAM [ARG]...
+
+Arguments:
+  [PROGRAM]...  Guest executable and its arguments, verbatim; --help and -- belong to it
+
+Examples:
+  agent-vm run make test               run the guest make with these arguments
+  agent-vm --memory 4 run bash -c 'echo ok'
+  agent-vm -- make test                the top-level `--` spelling is equivalent
+  agent-vm run printf '%s\n' '$HOME'   literal argv: prints $HOME, no expansion
+  agent-vm run bash -c 'echo $HOME'    shell syntax needs an explicit shell
+
+Launch options go before `run` or the top-level `--`. Every argument after the
+program is literal: no expansion, splitting, globbing, deduplication, tool
+default arguments, tool environment or catalog provisioning. The program may be a
+bare name resolved on the guest PATH or an explicit path. `--help` and `--` after
+it belong to it, and `run` itself takes no options.
+
+Statuses: 127 when the executable is absent from the effective guest PATH, 126
+when it is present but not executable (or is a directory named by path), 125 for
+an ordinary direct launcher failure, otherwise the program's own status. A bare
+name that resolves to a directory counts as not found (127).
+
+Slice 1: no streamed stdin, terminal overrides or signal forwarding yet; see
+USAGE.md (issues #399-#401).

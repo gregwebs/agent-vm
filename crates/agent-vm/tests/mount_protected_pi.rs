@@ -32,6 +32,10 @@ const BUILTIN_SUBCOMMANDS: &[&str] = &[
     "doctor",
     "secret",
     "_intercept-hook",
+    // The direct runner (#398) is a fixed built-in name whose target is
+    // user-supplied argv; `every_launch_verb_refuses_the_same_mount` runs each
+    // *catalog* verb, and the direct route's own case is asserted separately.
+    "run",
     "help",
 ];
 
@@ -163,6 +167,27 @@ impl Harness {
         std::fs::create_dir_all(pi_home.join("extensions")).unwrap();
         std::fs::write(pi_home.join("extensions/x.js"), "x").unwrap();
         pi_home
+    }
+
+    /// `agent-vm [options…] run PROGRAM` (#398): the direct route, which must
+    /// keep the same mount protections as a catalog verb.
+    fn run_direct(&self, mounts: &[&str]) -> Output {
+        let mut cmd = Command::new(agent_vm_bin());
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env(
+                "AGENT_VM_STATE_DIR",
+                self.state.path().canonicalize().unwrap(),
+            )
+            .env("MSB_PATH", &self.fake_msb)
+            .env("AGENT_VM_DEBUG_CONFIG", "1")
+            .env("HOME", self.home.path())
+            .current_dir(self.project.path());
+        for mount in mounts {
+            cmd.arg("--mount").arg(mount);
+        }
+        cmd.args(["--image", &self.image, "run", "probe"]);
+        run_with_timeout(cmd, Duration::from_secs(15))
     }
 
     fn run_shell(&self, mounts: &[&str]) -> Output {
@@ -353,6 +378,21 @@ fn every_launch_verb_refuses_the_same_mount() {
         assert!(stderr.contains(":fork"), "{verb}: {stderr}");
         assert_no_launch_side_effects(&h, &stderr);
     }
+}
+
+/// The direct route inherits the shared mount protections: the same protected
+/// host path is refused before any state is created.
+#[test]
+fn the_direct_runner_refuses_the_same_mount() {
+    let h = Harness::new();
+    let pi_home = h.seed_pi_home();
+    let mount = format!("{}:/pi:ro", pi_home.display());
+    let refused = h.run_direct(&[&mount]);
+    let stderr = stderr_of(&refused);
+    assert!(!refused.status.success(), "{stderr}");
+    assert!(stderr.contains("would expose"), "{stderr}");
+    assert!(stderr.contains(":fork"), "{stderr}");
+    assert_no_launch_side_effects(&h, &stderr);
 }
 
 #[test]

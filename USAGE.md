@@ -61,6 +61,10 @@ for how it is chosen and for the default invalidation limits.
 <tool>                              launch a configured tool in a per-project sandbox
                                     (the verbs come from your tool configuration;
                                     run `agent-vm --help` for the exact list)
+run PROGRAM [ARG...]                run a guest executable directly; no catalog
+                                    entry, defaults, environment or provisioning
+                                    (see Direct commands below)
+-- PROGRAM [ARG...]                 the same, spelled with the top-level separator
 image show                          print the boot image a launch here would
                                     select, with its source (read-only, offline)
 image build --tag REF [OPTIONS] [CONTEXT]
@@ -796,6 +800,9 @@ Or push to a registry and use its reference directly with `--image`.
 
 Launch options go before the tool verb: `agent-vm [launch options] <tool> [tool arguments…]`.
 Every tool argument is forwarded verbatim, including `--help` and `--`.
+The direct runner takes them in the same position: `agent-vm [launch options] run PROGRAM [ARG…]`,
+or the equivalent `agent-vm [launch options] -- PROGRAM [ARG…]` — see
+[Direct commands](#direct-commands).
 
 > **Changed in 0.4.0:** launch options moved before the tool verb. Write
 > `agent-vm --mount ~/ref pi`, not `agent-vm pi --mount ~/ref`. Old-order flags are now
@@ -817,6 +824,76 @@ Available launch options:
 | `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). A live bind that would expose a host Pi credential file is refused — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted). Capacity is host-specific. |
 | `--allow-internet-egress`, `--allow-lan`, `--allow-host`, `--allow-egress`, `--publish`, `--auto-publish` | see [Ports & egress](#ports--egress); egress is denied by default |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
+
+### Direct commands
+
+Run a guest executable without a catalog entry:
+
+```
+agent-vm [launch options] run PROGRAM [ARG...]
+agent-vm [launch options] -- PROGRAM [ARG...]
+```
+
+Both spellings are the same route: they execute exactly the program and argv you
+write. Nothing about a same-named catalog tool is used — no command, default
+`args`, `env`, credentials, network requests, transitive tools or declared
+`persist`. `agent-vm [launch options] -- PROGRAM` consumes only that one
+top-level separator.
+
+Arguments are literal. No expansion, word splitting, globbing or deduplication
+happens, and empty arguments are preserved:
+
+```
+agent-vm run printf '%s\n' '$HOME'   # prints the literal text $HOME
+agent-vm run bash -c 'echo $HOME'    # shell syntax needs an explicit shell
+agent-vm run make test -- --verbose --help   # --help belongs to make
+```
+
+`run` itself takes no options and has no help flag, so `run --help` is the
+guest program `--help`; use `agent-vm help run` for the runner's help. A
+non-Unicode argument is rejected with its position and never replaced; an absent
+or empty PROGRAM is a usage error (status 2) before anything boots.
+
+**Statuses.** The program's own status is passed through, including a nonzero or
+reserved-looking one. The direct route adds only its own failures:
+
+| status | meaning |
+|---|---|
+| 127 | the executable is absent from the effective guest `PATH` (also: a bare name that resolves to a *directory*, which `type -P` does not treat as an executable) |
+| 126 | the path exists but is not executable, or a directory named by path |
+| 125 | the launcher itself failed: configuration, guest setup, transport/output or cleanup |
+| 2 | a pre-boot usage error (absent/empty PROGRAM, invalid UTF-8, malformed launch options) |
+
+125 does not cover panics, aborts or signals. Sink failures count as 125: a
+direct launch whose stdout/stderr cannot be written fails instead of reporting a
+guest success. Shell and catalog-tool launches keep their existing best-effort
+output and their existing statuses.
+
+**What is retained.** Image selection, the project cwd, guest identity
+(`--root` or the host user), mounts, the persistent HOME/state, default-deny
+network authority, independent GitHub handling, bootstrap and the optional
+project-root `.agent-vm.runtime.sh` hook all apply to a direct launch exactly as
+to a tool. The hook runs before the executable lookup, so its `PATH` exports
+affect it; a failing hook passes its status through and the program does not
+run. A host executable with the same name is never run: the lookup happens in
+the guest.
+
+**What is not inherited.** No catalog entry is selected (not even the `shell`
+fallback), so no catalog-declared credential capture, substitution route, bypass
+configuration or `persist` link applies. Generic HOME/state furniture and
+credentials the guest itself stored earlier remain — direct launches are not a
+fresh-state guarantee. Image-capability furniture such as the Chrome DevTools MCP
+entry in `claude.json` is retained: it belongs to the image, not to a catalog
+entry.
+
+> **Changed in 0.7.3: `run` is reserved.** A tool declared with `name = "run"`
+> is refused with a rename diagnostic. Rename it (for example `run-tool`) and
+> launch it by the new name, or use `agent-vm run PROGRAM` for a direct launch.
+
+> **Slice 1.** Streamed stdin, terminal overrides (`-t`/`-T`) and signal
+> forwarding are not implemented yet; see issues #399–#401. Piped input to
+> `agent-vm run cat` does not reach the guest, and the PTY choice is still the
+> host stdin's.
 
 ### Extra and forked mounts
 
@@ -1184,7 +1261,7 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
   whitespace/control characters, no `/` (a name is not a path), not an
   all-dots spelling (`.`/`..`), no leading `-`, and not one of the reserved
   subcommands `image`, `setup`, `msb`, `clipboard`, `doctor`, `secret`,
-  `_intercept-hook`, `help`. Names are case-sensitive. Naming a tool `claude`
+  `_intercept-hook`, `run`, `help`. Names are case-sensitive. Naming a tool `claude`
   is normal — that is the point. `pull` and `upgrade` are no longer reserved
   (they were removed as built-ins in 0.7.0), so a configured tool may use them.
 - `command` — required, nonempty, NUL-free. The guest command name; it is
@@ -1984,9 +2061,11 @@ its holder.
 
 ## Project hook
 If the project root contains an executable `.agent-vm.runtime.sh`,
-the launcher sources it inside the guest before exec'ing the agent.
-Use for `npm install`, env exports, dev-server startup. Non-zero
-exit aborts the launch.
+the launcher sources it inside the guest before exec'ing the agent or a
+[direct command](#direct-commands). Use for `npm install`, env exports,
+dev-server startup. Non-zero exit aborts the launch and the program does not
+run. Its exports affect the effective `PATH`, so a hook can add a project bin
+directory that a direct launch then resolves.
 
 ## Clipboard
 

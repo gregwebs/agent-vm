@@ -14,6 +14,7 @@ Commands:
   image      Inspect the selected boot image, acquire it into the image cache, explicitly retain a
              default, or build/import a finished image. Only `show` is offline; only build/import
              may invoke Docker
+  run        Run a guest executable directly; every argument after it is literal
   shell      Launch shell in a per-project sandbox; tool arguments are forwarded verbatim
   help       Print this message or the help of the given subcommand(s)
 
@@ -64,9 +65,14 @@ Getting started:
   agent-vm setup       fetch and verify the boot image (run once first)
   cd ~/your-project
   agent-vm <tool>      launch one of the tools listed above
+  agent-vm run <program> [arguments...]
+                       run a guest executable directly; its arguments are literal
 
-Launch options go before the tool: agent-vm [launch options] <tool> [tool arguments...]
-Every argument after the tool is forwarded to it verbatim, including --help and --.
+Launch options go before the tool or the runner:
+  agent-vm [launch options] <tool> [tool arguments...]
+  agent-vm [launch options] run PROGRAM [ARG...]
+  agent-vm [launch options] -- PROGRAM [ARG...]
+Every argument after the tool or program is forwarded verbatim, including --help and --.
 Built-in commands take their own options after the command and no launch options.
-`agent-vm help <tool>` shows examples; `agent-vm doctor` shows which config files were
-found and what they resolved to.
+`agent-vm help <tool>` and `agent-vm help run` show examples; `agent-vm doctor` shows
+which config files were found and what they resolved to.

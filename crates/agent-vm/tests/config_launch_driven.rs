@@ -215,6 +215,26 @@ fn decoys_path(decoys: &Path) -> String {
 /// usable host credential for every provider a default tool selects, so each
 /// tool reaches the debug dumps instead of its pre-boot "sign in on the host"
 /// bail.
+/// Which spelling of the direct route (#398) a launch uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Form {
+    /// `agent-vm [launch options] run PROGRAM [ARG...]`
+    Run,
+    /// `agent-vm [launch options] -- PROGRAM [ARG...]`
+    Separator,
+}
+
+const DIRECT_FORMS: [Form; 2] = [Form::Run, Form::Separator];
+
+/// One direct launch: the spelling, the launch options before it, the guest
+/// command vector after it, and any extra host environment.
+struct DirectInvocation<'a> {
+    form: Form,
+    options: &'a [&'a str],
+    vector: &'a [&'a str],
+    envs: &'a [(&'a str, &'a str)],
+}
+
 struct Harness {
     _home: tempfile::TempDir,
     _state: tempfile::TempDir,
@@ -443,6 +463,29 @@ impl Harness {
     /// Exact launch options, so image-selection tests can omit the typed override.
     fn launch_argv(&self, tool: &str, options: &[&str], envs: &[(&str, &str)]) -> Output {
         self.launch_with_tool_args(tool, options, &[], envs)
+    }
+
+    /// `agent-vm [options…] run PROGRAM [ARG…]` or `… -- PROGRAM [ARG…]`
+    /// (issue #398). Both spellings are the same direct route. Named fields
+    /// because the launch options and the guest vector are both `&[&str]`.
+    fn direct(&self, invocation: DirectInvocation<'_>) -> Output {
+        let DirectInvocation {
+            form,
+            options,
+            vector,
+            envs,
+        } = invocation;
+        let mut cmd = self.base_command();
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.args(options);
+        cmd.arg(match form {
+            Form::Run => "run",
+            Form::Separator => "--",
+        });
+        cmd.args(vector);
+        run_with_timeout(cmd, Duration::from_secs(20))
     }
 
     /// `agent-vm <options…> <tool> <tool_args…>`: the full launch shape.
@@ -5092,13 +5135,16 @@ fn doctor_tool_order(text: &str) -> Vec<String> {
 /// the fixed built-ins. Command entries start with exactly two spaces;
 /// wrapped description lines are indented further.
 fn help_tool_order(text: &str) -> Vec<String> {
-    const BUILTINS: [&str; 7] = [
+    // Fixed built-ins, including the direct runner (`run`, #398): the point of
+    // this helper is the *catalog* launch verbs and their order.
+    const BUILTINS: [&str; 8] = [
         "setup",
         "msb",
         "clipboard",
         "doctor",
         "secret",
         "image",
+        "run",
         "help",
     ];
     let mut out = Vec::new();
@@ -9868,4 +9914,679 @@ fn a_receipt_for_another_identity_fails_the_launch_closed() {
         "the launch created a sandbox despite the corrupt receipt; log: {log}"
     );
     gate.expect_none(Duration::from_millis(200));
+}
+
+// ---------------------------------------------------------------------------
+// #398 — the direct runner provisions nothing and inherits no catalog entry
+// ---------------------------------------------------------------------------
+
+/// The exact generic HOME furniture of every launch: `(link name, guest
+/// target)`. The set is asserted both ways — every one of these links must
+/// exist with exactly this target, and no other symlink may appear under the
+/// guest HOME tree — so a catalog-declared persist link or a provider link this
+/// oracle does not expect is a failure rather than "some state path".
+///
+/// Identical to the `link:` rows of `direct-run.golden`; the golden is compared
+/// separately and is not the oracle for isolation.
+const GENERIC_HOME_LINKS: [(&str, &str); 9] = [
+    (".bash_history", "/agent-vm-state/bash_history"),
+    (".claude", "/agent-vm-state/claude"),
+    (".claude.json", "/agent-vm-state/claude.json"),
+    (".config/gh", "/agent-vm-state/gh-config"),
+    (".config/opencode", "/agent-vm-state/opencode-config"),
+    (".copilot", "/agent-vm-state/copilot"),
+    (".gitconfig", "/agent-vm-state/gitconfig"),
+    (".local/share/opencode", "/agent-vm-state/opencode"),
+    (".pi", "/agent-vm-state/pi"),
+];
+
+/// Provider-owned credential, placeholder and bypass files, relative to the
+/// project state dir. A direct launch writes none of them: they exist only for
+/// a catalog tool's declared provisioning.
+///
+/// Two provider files are **not** in this list because they are written on
+/// every launch for a different reason, and are asserted on their own terms
+/// instead: `claude.json` (image-owned Chrome MCP entry, and the user's own
+/// file) and `opencode/auth.json` (OpenCode's stale-placeholder clearer runs
+/// even when nothing is captured, and writes an empty object).
+const FORBIDDEN_PROVIDER_STATE: [&str; 6] = [
+    "claude/.credentials.json",
+    "claude/settings.json",
+    "codex/auth.json",
+    "codex/config.toml",
+    "copilot/config.json",
+    "opencode-config/opencode.json",
+];
+
+/// The `persist` declarations of this suite's hostile custom catalog, and the
+/// state namespace every declared persist link targets. Both the link name under
+/// the guest HOME and the state-side path must stay absent.
+const FORBIDDEN_DECLARED_PERSIST: [&str; 2] = ["probe-state", "shell-state"];
+const DECLARED_PERSIST_NAMESPACE: &str = "persist";
+
+/// Proof that a path does not exist that distinguishes *absence* from a failed
+/// observation: only `NotFound` is evidence, any other error is a failed test.
+fn assert_path_absent(path: &Path, context: &str) {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "{context}: could not observe {} ({}); absence not proven",
+            path.display(),
+            error
+        ),
+        Ok(_) => panic!("{context}: {} must not exist", path.display()),
+    }
+}
+
+/// Every symlink under `dir`, recursively.
+fn collect_symlink_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+        let path = entry.path();
+        let file_type = entry.file_type().unwrap();
+        if file_type.is_symlink() {
+            out.push(path);
+        } else if file_type.is_dir() {
+            collect_symlink_paths(&path, out);
+        }
+    }
+}
+
+/// Create the generic furniture tree for the negative control below. Never the
+/// oracle itself: [`assert_direct_state_is_unprovisioned`] is.
+fn write_generic_home_furniture(state: &Path) {
+    for (name, target) in GENERIC_HOME_LINKS {
+        let path = state.join("home").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, &path).unwrap();
+    }
+}
+
+/// The launcher-owned Chrome MCP entry is image-capability furniture, not
+/// catalog provisioning. The file may exist (it is also the user's own
+/// `~/.claude.json`); what must not appear is the entry the launcher owns when
+/// the image cannot provide it. Any other content is out of scope here.
+fn assert_chrome_mcp_entry_not_provisioned(state: &Path, context: &str) {
+    let path = state.join("claude.json");
+    match std::fs::read(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "{context}: could not observe {} ({}); absence not proven",
+            path.display(),
+            error
+        ),
+        Ok(bytes) => {
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                panic!("{context}: {} is not JSON: {error}", path.display())
+            });
+            assert!(
+                json.pointer("/mcpServers/chrome-devtools").is_none(),
+                "{context}: the launcher-owned Chrome MCP entry must not be provisioned: {json}"
+            );
+        }
+    }
+}
+
+/// OpenCode's `auth.json` is rewritten by the launcher's stale-placeholder
+/// clearer on *every* launch, including one that captures nothing, so absence is
+/// not the invariant. The invariant is content: an existing file must hold no
+/// provider entry at all (the clearer's empty object), never a placeholder or a
+/// value.
+fn assert_opencode_auth_cleared(state: &Path, context: &str) {
+    let path = state.join("opencode/auth.json");
+    match std::fs::read(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "{context}: could not observe {} ({}); absence not proven",
+            path.display(),
+            error
+        ),
+        Ok(bytes) => {
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                panic!("{context}: {} is not JSON: {error}", path.display())
+            });
+            let object = json.as_object().unwrap_or_else(|| {
+                panic!("{context}: {} is not a JSON object: {json}", path.display())
+            });
+            assert!(
+                object.is_empty(),
+                "{context}: no OpenCode provider entry may be provisioned: {json}"
+            );
+        }
+    }
+}
+
+/// The state-side zero-provisioning oracle for one launch's state dir: exact
+/// generic furniture, no declared persist link or state path, no provider
+/// token/placeholder/bypass file, no owned Chrome entry and a cleared OpenCode
+/// auth file. Reused by its negative control, so each assertion is proved able
+/// to fail.
+fn assert_direct_state_is_unprovisioned(state: &Path, context: &str) {
+    let mut expected: Vec<PathBuf> = Vec::new();
+    for (name, target) in GENERIC_HOME_LINKS {
+        let path = state.join("home").join(name);
+        match std::fs::read_link(&path) {
+            Ok(actual) => assert_eq!(
+                actual.to_string_lossy(),
+                target,
+                "{context}: home link {name} must target {target}"
+            ),
+            Err(error) => panic!(
+                "{context}: home link {name} is missing or unreadable ({}); the furniture oracle \
+                 cannot pass vacuously",
+                error
+            ),
+        }
+        expected.push(path);
+    }
+    let mut found = Vec::new();
+    collect_symlink_paths(&state.join("home"), &mut found);
+    found.sort();
+    for path in &found {
+        assert!(
+            expected.contains(path),
+            "{context}: unexpected guest HOME link {} (generic furniture is exact)",
+            path.display()
+        );
+    }
+    for name in FORBIDDEN_DECLARED_PERSIST {
+        assert_path_absent(&state.join("home").join(name), context);
+        assert_path_absent(&state.join(DECLARED_PERSIST_NAMESPACE).join(name), context);
+    }
+    for relative in FORBIDDEN_PROVIDER_STATE {
+        assert_path_absent(&state.join(relative), context);
+    }
+    // The host-only token files sit beside the state dir, never inside it.
+    let host_secrets = PathBuf::from(format!("{}.secrets", state.display()));
+    for provider in ["anthropic", "openai", "copilot"] {
+        assert_path_absent(&host_secrets.join(provider), context);
+    }
+    assert_chrome_mcp_entry_not_provisioned(state, context);
+    assert_opencode_auth_cleared(state, context);
+}
+
+/// Everything a direct launch must not inherit from any catalog entry,
+/// asserted independently of the golden.
+///
+/// The golden records only the normalized config/state observation; argv,
+/// notices, stdout and the process status are asserted here.
+fn assert_direct_zero_provision(out: &Output, context: &str) {
+    let stderr = stderr_of(out);
+    let config = debug_config_json(&stderr);
+
+    // 2. Exact default-deny authority, unchanged by any declared request.
+    assert_default_deny_zero_provision_network(&config["network"], context);
+    assert!(
+        registered_secret_env_vars(&config).is_empty(),
+        "{context}: no provider is provisioned"
+    );
+
+    // 3. No provider/tool/shell environment.
+    let keys: Vec<&str> = env_pairs(&config).into_iter().map(|(key, _)| key).collect();
+    for forbidden in [
+        "CODEX_HOME",
+        "COPILOT_GITHUB_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CONFIG_DIR",
+        "OPENCODE_CONFIG",
+    ] {
+        assert!(
+            !keys.contains(&forbidden),
+            "{context}: {forbidden} must not reach the guest: {keys:?}"
+        );
+    }
+
+    // 3. No provider token, placeholder, bypass configuration or catalog-declared
+    //    persist file: one exact state-side oracle, shared with its negative
+    //    control so it cannot decay into "anything under the state dir".
+    assert_direct_state_is_unprovisioned(&state_dir(&stderr), context);
+
+    // 4. `--no-git`: no agent credentials, and no request-report lines.
+    assert!(
+        stderr.contains("==> Agent credentials: <none>"),
+        "{context}: {stderr}"
+    );
+    assert!(
+        !stderr.contains("request(s) allowed"),
+        "{context}: no declared request report: {stderr}"
+    );
+}
+
+/// A direct launch's program is literal: a catalog tool name selects no entry,
+/// so no default argument, environment or provisioning applies — and the
+/// failed runtime is a direct launcher failure (125), not anyhow's 1.
+#[test]
+fn direct_run_of_a_catalog_tool_name_provisions_nothing() {
+    let harness = Harness::warm();
+    let options = ["--image", BOGUS_IMAGE, "--no-git"];
+    let out = harness.direct(DirectInvocation {
+        form: Form::Run,
+        options: &options,
+        vector: &["claude", "--x"],
+        envs: &[],
+    });
+    assert_direct_zero_provision(&out, "run claude --x");
+
+    // 1. The exact debug guest command line, with the catalog's default
+    //    argument absent.
+    let command = debug_guest_command(&stderr_of(&out));
+    assert_eq!(
+        command, "claude --x",
+        "the guest command must be the literal program and argv"
+    );
+    assert!(
+        !command.contains("--dangerously-skip-permissions"),
+        "the claude catalog default must not be inserted: {command}"
+    );
+
+    // 5. Empty stdout and the direct launcher failure status.
+    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
+    assert_eq!(out.status.code(), Some(125), "{}", stderr_of(&out));
+    assert_matches_golden("direct-run", &observation(&harness, &out));
+}
+
+/// Both spellings reach the same config and state, and each one independently
+/// satisfies the zero-provisioning expectations.
+#[test]
+fn both_direct_spellings_share_one_observation() {
+    let mut observations = Vec::new();
+    for form in DIRECT_FORMS {
+        let harness = Harness::warm();
+        let out = harness.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE, "--memory", "3", "--no-git"],
+            vector: &["claude", "--x"],
+            envs: &[],
+        });
+        assert_direct_zero_provision(&out, &format!("{form:?}"));
+        assert_eq!(out.status.code(), Some(125), "{form:?}");
+        let config = normalized_config(&harness, &out);
+        assert_eq!(
+            debug_guest_command(&stderr_of(&out)),
+            "claude --x",
+            "{form:?}"
+        );
+        assert_eq!(
+            config["resources"]["memory_mib"],
+            serde_json::json!(3 * 1024),
+            "{form:?}"
+        );
+        observations.push(observation(&harness, &out));
+    }
+    assert_eq!(observations[0], observations[1]);
+}
+
+/// The failed runtime is a direct launcher failure for the direct route and
+/// keeps anyhow's status 1 for a catalog tool, in the same harness.
+#[test]
+fn only_the_direct_route_maps_a_failed_runtime_to_125() {
+    let harness = Harness::warm();
+    let direct = harness.direct(DirectInvocation {
+        form: Form::Separator,
+        options: &["--image", BOGUS_IMAGE, "--no-git"],
+        vector: &["probe"],
+        envs: &[],
+    });
+    assert_eq!(direct.status.code(), Some(125), "{}", stderr_of(&direct));
+    let tool = harness.launch_argv("claude", &["--image", BOGUS_IMAGE, "--no-git"], &[]);
+    assert_eq!(tool.status.code(), Some(1), "{}", stderr_of(&tool));
+}
+
+/// A custom catalog — and a hostile configured `shell` — grants a direct launch
+/// nothing: no command, default arguments, environment, provider, network
+/// request, transitive tool or persist declaration is inherited.
+#[test]
+fn a_hostile_custom_catalog_grants_a_direct_launch_nothing() {
+    let harness = Harness::warm();
+    harness.write_user(
+        "[[tools]]\n\
+         name = \"probe\"\n\
+         command = \"probe-from-catalog\"\n\
+         args = [\"--from-catalog\"]\n\
+         env = { PROBE_CATALOG_ENV = \"yes\" }\n\
+         credentials = [\"anthropic\"]\n\
+         tools = [\"probe-helper\"]\n\
+         persist = [\"probe-state\"]\n\
+         network_requests = [\"api.example.test\"]\n\
+         \n\
+         [[tools]]\n\
+         name = \"probe-helper\"\n\
+         command = \"probe-helper\"\n\
+         \n\
+         [[tools]]\n\
+         name = \"shell\"\n\
+         command = \"hostile-shell\"\n\
+         args = [\"--hostile\"]\n\
+         interactive_shell = true\n\
+         env = { SHELL_CATALOG_ENV = \"yes\" }\n\
+         credentials = [\"anthropic\"]\n\
+         network_requests = [\"api.example.test\"]\n\
+         persist = [\"shell-state\"]\n",
+    );
+    for form in DIRECT_FORMS {
+        let out = harness.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE, "--no-git"],
+            vector: &["probe", "a"],
+            envs: &[],
+        });
+        assert_direct_zero_provision(&out, &format!("hostile catalog {form:?}"));
+        let command = debug_guest_command(&stderr_of(&out));
+        // The catalog's `probe` command and default argument appear nowhere,
+        // and neither does a fallback shell lookup.
+        assert_eq!(command, "probe a", "{form:?}");
+        for absent in [
+            "probe-from-catalog",
+            "--from-catalog",
+            "hostile-shell",
+            "--hostile",
+        ] {
+            assert!(!command.contains(absent), "{form:?}: {absent} in {command}");
+        }
+        let config = normalized_config(&harness, &out);
+        let keys: Vec<&str> = env_pairs(&config).into_iter().map(|(key, _)| key).collect();
+        for absent in ["PROBE_CATALOG_ENV", "SHELL_CATALOG_ENV"] {
+            assert!(!keys.contains(&absent), "{form:?}: {keys:?}");
+        }
+        // And a hostile catalog changes nothing observable at all: the whole
+        // config/state observation equals a default-catalog direct launch's.
+        assert_matches_golden("direct-run", &observation(&harness, &out));
+    }
+}
+
+/// A test oracle that cannot fail is not evidence. The zero-provisioning state
+/// oracle is driven here against the two leaks it exists to catch — a
+/// catalog-declared persist link and a provider bypass file — and against the
+/// image-owned Chrome entry it must treat separately, then re-checked on the
+/// clean furniture so the control is not simply "always fails".
+#[test]
+fn the_direct_state_oracle_rejects_a_persist_link_a_bypass_file_and_an_owned_chrome_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path();
+    write_generic_home_furniture(state);
+    assert_direct_state_is_unprovisioned(state, "clean furniture control");
+
+    // The custom catalog's forbidden `persist = ["probe-state"]` link, whose
+    // target is the state-side persist namespace.
+    let persist_link = state.join("home/probe-state");
+    std::os::unix::fs::symlink("/agent-vm-state/persist/probe-state", &persist_link).unwrap();
+    let leaked = std::panic::catch_unwind(|| {
+        assert_direct_state_is_unprovisioned(state, "persist link leak")
+    });
+    assert!(
+        leaked.is_err(),
+        "the oracle accepted a catalog-declared persist link"
+    );
+    std::fs::remove_file(&persist_link).unwrap();
+
+    // ...and its state-side counterpart without the link, so neither half of
+    // the persist claim can pass alone.
+    std::fs::create_dir_all(state.join("persist/probe-state")).unwrap();
+    let leaked = std::panic::catch_unwind(|| {
+        assert_direct_state_is_unprovisioned(state, "persist state leak")
+    });
+    assert!(
+        leaked.is_err(),
+        "the oracle accepted a catalog-declared persist state path"
+    );
+    std::fs::remove_dir_all(state.join("persist")).unwrap();
+
+    // A provider bypass file that a catalog tool's provisioning would write.
+    let bypass = state.join("claude/settings.json");
+    std::fs::create_dir_all(bypass.parent().unwrap()).unwrap();
+    std::fs::write(&bypass, br#"{"skipDangerousModePermissionPrompt":true}"#).unwrap();
+    let leaked = std::panic::catch_unwind(|| {
+        assert_direct_state_is_unprovisioned(state, "bypass file leak")
+    });
+    assert!(
+        leaked.is_err(),
+        "the oracle accepted a provider bypass file"
+    );
+    std::fs::remove_file(&bypass).unwrap();
+
+    // The host-only captured provider token.
+    let token = PathBuf::from(format!("{}.secrets/anthropic", state.display()));
+    std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+    std::fs::write(&token, "sk-ant-synthetic").unwrap();
+    let leaked = std::panic::catch_unwind(|| {
+        assert_direct_state_is_unprovisioned(state, "captured token leak")
+    });
+    assert!(
+        leaked.is_err(),
+        "the oracle accepted a captured provider token"
+    );
+    std::fs::remove_file(&token).unwrap();
+
+    // OpenCode's cleared file is allowed; a provider entry inside it is not.
+    let opencode_auth = state.join("opencode/auth.json");
+    std::fs::create_dir_all(opencode_auth.parent().unwrap()).unwrap();
+    std::fs::write(&opencode_auth, b"{}").unwrap();
+    assert_direct_state_is_unprovisioned(state, "cleared opencode auth control");
+    std::fs::write(
+        &opencode_auth,
+        br#"{"openai":{"type":"api","key":"msb-opencode-placeholder"}}"#,
+    )
+    .unwrap();
+    let leaked = std::panic::catch_unwind(|| {
+        assert_direct_state_is_unprovisioned(state, "opencode placeholder leak")
+    });
+    assert!(
+        leaked.is_err(),
+        "the oracle accepted an OpenCode provider entry"
+    );
+    std::fs::remove_file(&opencode_auth).unwrap();
+
+    // The image-owned Chrome MCP entry: `claude.json` itself is allowed (it is
+    // also the user's file), the launcher-owned entry inside it is not.
+    let claude_json = state.join("claude.json");
+    std::fs::write(
+        &claude_json,
+        br#"{"mcpServers":{"user-owned":{"command":"x"}}}"#,
+    )
+    .unwrap();
+    assert_direct_state_is_unprovisioned(state, "user-owned claude.json control");
+    std::fs::write(
+        &claude_json,
+        br#"{"mcpServers":{"chrome-devtools":{"command":"/usr/local/bin/agent-vm-chrome-mcp"}}}"#,
+    )
+    .unwrap();
+    let leaked = std::panic::catch_unwind(|| {
+        assert_direct_state_is_unprovisioned(state, "owned chrome entry leak")
+    });
+    assert!(
+        leaked.is_err(),
+        "the oracle accepted the launcher-owned Chrome MCP entry"
+    );
+    std::fs::remove_file(&claude_json).unwrap();
+
+    // Back to the clean control: every failure above came from the injected
+    // leak, not from the oracle rejecting the furniture itself.
+    assert_direct_state_is_unprovisioned(state, "clean furniture control after");
+}
+
+/// GitHub handling stays orthogonal: `--repo` widens the GitHub allow-list for a
+/// direct launch exactly as for a tool, without granting any catalog request.
+#[test]
+fn a_direct_launch_keeps_independent_github_handling() {
+    let harness = Harness::warm();
+    let out = harness.direct(DirectInvocation {
+        form: Form::Run,
+        options: &["--image", BOGUS_IMAGE, "--repo", "owner/other-repo"],
+        vector: &["probe"],
+        envs: &[],
+    });
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("owner/other-repo"),
+        "the GitHub allow-list notice names the repo: {stderr}"
+    );
+    assert_default_deny_zero_provision_network(
+        &debug_config_json(&stderr)["network"],
+        "direct --repo",
+    );
+}
+
+/// An invalid *unused* tool still blocks a direct launch before any boot, while
+/// `doctor` keeps diagnosing and a usage error stays status 2.
+#[test]
+fn an_invalid_unused_tool_blocks_a_direct_launch_before_the_banner() {
+    let harness = Harness::warm();
+    harness.write_user("[[tools]]\nname = \"run\"\ncommand = \"x\"\n");
+    let out = harness.direct(DirectInvocation {
+        form: Form::Run,
+        options: &["--image", BOGUS_IMAGE],
+        vector: &["probe"],
+        envs: &[],
+    });
+    assert_eq!(out.status.code(), Some(125), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("name `run` is reserved"), "{stderr}");
+    assert!(stdout_of(&out).is_empty());
+    // No launch banner and no runtime launch.
+    assert!(!stderr.contains("==> agent-vm-"), "{stderr}");
+    assert!(
+        harness.msb_log().lines().all(|line| line == "--version"),
+        "{}",
+        harness.msb_log()
+    );
+    // The same broken catalog still lets `doctor` diagnose.
+    let doctor = harness.builtin(&["doctor"], &[]);
+    assert!(
+        stderr_of(&doctor).contains("name `run` is reserved")
+            || stdout_of(&doctor).contains("name `run` is reserved"),
+        "{}",
+        stderr_of(&doctor)
+    );
+    // A usage error is 2, before any of this.
+    let usage = harness.direct(DirectInvocation {
+        form: Form::Run,
+        options: &["--image", BOGUS_IMAGE],
+        vector: &[],
+        envs: &[],
+    });
+    assert_eq!(usage.status.code(), Some(2), "{}", stderr_of(&usage));
+}
+
+/// A missing host credential is never the reason a direct launch fails: the
+/// direct target requests no service, so an unreadable `credentials.yaml` is
+/// inert here while a catalog tool that requests the same name still fails.
+#[test]
+fn a_malformed_credentials_file_is_inert_for_a_direct_launch() {
+    let harness = Harness::warm();
+    harness.write_user(
+        "[[tools]]\nname = \"wants\"\ncommand = \"wants\"\ncredentials = [\"same-name\"]\n",
+    );
+    write(
+        &harness.home_root.join(".config/agent-vm/credentials.yaml"),
+        "this: is: not: yaml: [\n",
+    );
+    for form in DIRECT_FORMS {
+        let out = harness.direct(DirectInvocation {
+            form,
+            options: &["--image", BOGUS_IMAGE],
+            vector: &["probe"],
+            envs: &[],
+        });
+        let stderr = stderr_of(&out);
+        // It reaches the runtime failure, not a YAML failure.
+        assert!(
+            stderr.contains(CONFIG_MARKER),
+            "{form:?}: the launch reached the debug config: {stderr}"
+        );
+        assert_eq!(out.status.code(), Some(125), "{form:?}: {stderr}");
+    }
+    // Positive control: a catalog tool that *requests* the name does fail on
+    // the malformed YAML.
+    let requested = harness.launch_argv("wants", &["--image", BOGUS_IMAGE], &[]);
+    assert_ne!(
+        requested.status.code(),
+        Some(125),
+        "a requested catalog credential must fail like before: {}",
+        stderr_of(&requested)
+    );
+    assert!(
+        stderr_of(&requested).contains("credentials.yaml"),
+        "{}",
+        stderr_of(&requested)
+    );
+}
+
+/// The B5 audit's binary half (#398): a known-direct route's usage failures are
+/// status 2 with a value-free message, on both spellings, and no launch, state
+/// or stdout is produced. A genuine administrative route keeps its legacy
+/// outcome.
+#[test]
+fn direct_usage_failures_are_status_2_and_value_free() {
+    let harness = Harness::warm();
+    let cases: [(&str, &[&str], &[&str], &str); 5] = [
+        (
+            "invalid launch env",
+            &["--image", BOGUS_IMAGE],
+            &["run", "secret"],
+            "abc",
+        ),
+        (
+            // A typed value is echoed by clap's own message (legacy behavior for
+            // every verb); only a scrubbed route promises value-free text.
+            "invalid typed value",
+            &["--image", BOGUS_IMAGE, "--memory", "abc"],
+            &["run", "p"],
+            "",
+        ),
+        (
+            "unknown option with a canary",
+            &["--image", BOGUS_IMAGE, "--unknown=CANARY-398"],
+            &["--", "p"],
+            "CANARY-398",
+        ),
+        (
+            "repeated conflicting scalar",
+            &["--image", BOGUS_IMAGE, "--memory", "4", "--memory", "8"],
+            &["run", "image", "import"],
+            "CANARY",
+        ),
+        // `run --` is the program `--` by the raw-escape rule, so an absent
+        // program is the zero-value vector, not a literal separator.
+        ("missing program", &["--image", BOGUS_IMAGE], &[], ""),
+    ];
+    for (context, options, vector, canary) in cases {
+        for form in DIRECT_FORMS {
+            let mut envs: Vec<(&str, &str)> = Vec::new();
+            if context == "invalid launch env" {
+                envs.push(("AGENT_VM_MEMORY_GIB", "abc"));
+            }
+            let out = harness.direct(DirectInvocation {
+                form,
+                options,
+                vector,
+                envs: &envs,
+            });
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{context} {form:?}: {}",
+                stderr_of(&out)
+            );
+            assert!(stdout_of(&out).is_empty(), "{context} {form:?}");
+            let text = stderr_of(&out);
+            if !canary.is_empty() {
+                assert!(!text.contains(canary), "{context} {form:?}: {text}");
+            }
+            // No launch banner: nothing booted.
+            assert!(
+                !text.contains("==> agent-vm-"),
+                "{context} {form:?}: {text}"
+            );
+        }
+    }
+    // The same malformed environment is not a usage error for the legacy
+    // administrative route, and a genuine `secret` scrub keeps status 1.
+    let secret = harness.builtin(&["secret", "set", "svc", "--help=CANARY-398"], &[]);
+    assert_eq!(secret.status.code(), Some(1), "{}", stderr_of(&secret));
+    assert!(!stderr_of(&secret).contains("CANARY-398"));
 }

@@ -164,6 +164,11 @@ keyring = { version = "3.6.3", features = ["apple-native"] }
 keyring = { version = "3.6.3", features = ["crypto-rust", "linux-native-sync-persistent"] }
 
 [dev-dependencies]
+# `test-util` adds `tokio::time::pause`, so the bounded exec-teardown deadlines
+# (10 s stop, 5 s kill/reap/remove) are reached deterministically instead of by
+# sleeping. Cargo adds features from a duplicate declaration for test targets
+# only; production builds and the lockfile are unchanged.
+tokio = { version = "1.42", features = ["test-util"] }
 # Names the durable/resolved credential types a `credential_injection` unit
 # test constructs to drive the runtime's *config-level* fail-closed validation
 # (`SmoltcpNetwork::new_with_profile_and_credentials` via `microsandbox-network`,

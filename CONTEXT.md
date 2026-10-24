@@ -24,15 +24,39 @@ guest; or for microsandbox.
 ## Launch option
 
 An `agent-vm` flag that configures a launch (`--mount`, `--image`, `-p`, …).
-Written before the tool verb: `agent-vm --mount ~/ref pi`. Built-in verbs
-(`setup`, `doctor`, …) take their own flags after the verb and accept no launch
-options. Nested image operations take flags after the subcommand:
-`agent-vm image refresh --image REF`.
+Written before the route: `agent-vm --mount ~/ref pi`, or `agent-vm --mount
+~/ref run make test`. The routes a launch option may precede are the catalog
+tool verbs and the [direct command](#direct-command) runner (including its
+top-level `--` spelling). Built-in verbs (`setup`, `doctor`, …) take their own
+flags after the verb and accept no launch options. Nested image operations take
+flags after the subcommand: `agent-vm image refresh --image REF`.
 
 ## Tool argument
 
 An argv token after the tool verb. Forwarded to the tool verbatim — including
 `--help` and `--` — and never interpreted by `agent-vm`.
+
+## Direct command
+
+A guest executable and its argv launched without a catalog entry:
+`agent-vm [launch options] run PROGRAM [ARG...]`, or the equivalent
+`agent-vm [launch options] -- PROGRAM [ARG...]`. The program name is looked up
+in the guest (or used as an explicit path); its arguments are literal, with no
+expansion, splitting, deduplication or catalog defaults. A direct command has
+**no target entry**, so no catalog-declared command, environment, credential
+request, network request or persist link applies. Distinct from a *shell
+launch*: the `shell` fallback is a catalog entry with its own command and argv,
+which a direct command neither selects nor inherits. Direct statuses: 127 for an
+absent executable, 126 for a non-executable one, 125 for the launcher's own
+ordinary failure.
+
+## Program guard
+
+The rendered in-guest check immediately before `exec`: `ImageContract` (the
+legacy catalog-tool guard, which reports a missing program against the boot
+image) or `Direct` (the direct-launch guard, which searches the post-hook
+`PATH`, preserves the looked-up pathname bytes and exits 127/126). Both are
+rendered by `AgentShellLine`.
 
 _Avoid_: "agent args", "trailing args".
 
