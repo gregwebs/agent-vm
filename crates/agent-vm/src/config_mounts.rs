@@ -39,18 +39,12 @@ use std::{
 /// [`Self::requests`] is already normalized and deduplicated (identical
 /// declarations at one guest path merged into the first), so a later claim
 /// against `--mount` needs no second pass over this list.
-// Load is the only reader until `mount_selection` threads these into a launch
-// (#394's next slice). The fields are the whole point of the type — a selection
-// needs the file it names and the declarations it carries — so they are kept,
-// not deleted.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct UserMounts {
     file: PathBuf,
     requests: Vec<MountRequest>,
 }
 
-#[allow(dead_code)] // `mount_selection` is the first launch-side caller
 impl UserMounts {
     pub(crate) fn file(&self) -> &Path {
         &self.file

@@ -274,6 +274,10 @@ pub(crate) enum Dispatch {
         images: ConfiguredImages,
         /// Verified user authority captured before consuming the report, like images.
         user_network: Option<crate::user_network::UserNetwork>,
+        /// Verified user `mounts`, captured the same way (ADR-0046). `None` when
+        /// the file declared none, so a launch can tell "no declarations" from
+        /// "an empty list" — but both select nothing.
+        user_mounts: Option<crate::config_mounts::UserMounts>,
         /// The launch options.
         args: Box<run::Args>,
     },
@@ -346,7 +350,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let (catalog, images, user_network) = match config {
+    let (catalog, images, user_network, user_mounts) = match config {
         // A dangling `tools` reference is *user* input, so it must degrade to
         // the deferred-error path (ADR-0015) rather than `?`-propagate and take
         // `doctor`/`--help`/`clipboard` down with it. The readable `image` is
@@ -354,14 +358,20 @@ where
         Ok(report) => {
             let images = report.images().clone();
             let user_network = report.user_network().cloned();
+            let user_mounts = report.user_mounts().cloned();
             match report.into_launch_catalog() {
-                Ok(catalog) => (Catalog::Ready(catalog), images, user_network),
-                Err(error) => (Catalog::Broken(error), images, None),
+                Ok(catalog) => (Catalog::Ready(catalog), images, user_network, user_mounts),
+                Err(error) => (Catalog::Broken(error), images, None, None),
             }
         }
         // The configured tiers are unknown, so the recovery builtins fall back
         // to `--image`/env or the default boot image (D7).
-        Err(error) => (Catalog::Broken(error), ConfiguredImages::default(), None),
+        Err(error) => (
+            Catalog::Broken(error),
+            ConfiguredImages::default(),
+            None,
+            None,
+        ),
     };
 
     // Collected so the `secret` scrub below can look at the verb without
@@ -472,7 +482,15 @@ where
         // it must not take one (not even shell's fallback) and must not consult
         // the catalog for anything but its health.
         (Some((name, sub)), catalog) if name == crate::launch_target::DIRECT_RUN_VERB => {
-            direct_dispatch(&argv, sub, catalog, &matches, images, user_network)
+            direct_dispatch(
+                &argv,
+                sub,
+                catalog,
+                &matches,
+                images,
+                user_network,
+                user_mounts,
+            )
         }
         // The catalog is authoritative (checked first) so a future built-in
         // added without updating `RESERVED_TOOL_NAMES` fails a test rather
@@ -485,6 +503,7 @@ where
                     Ok(Dispatch::Launch {
                         images,
                         user_network,
+                        user_mounts,
                         args: Box::new(args),
                         target: LaunchTarget::Tool {
                             entry: Box::new(entry),
@@ -551,6 +570,7 @@ fn direct_dispatch(
     matches: &clap::ArgMatches,
     images: ConfiguredImages,
     user_network: Option<crate::user_network::UserNetwork>,
+    user_mounts: Option<crate::config_mounts::UserMounts>,
 ) -> Result<Dispatch> {
     let vector = after_raw_verb(
         argv,
@@ -571,6 +591,7 @@ fn direct_dispatch(
             target: LaunchTarget::Direct(direct),
             images,
             user_network,
+            user_mounts,
             args: Box::new(args),
         }),
     }
@@ -1938,6 +1959,126 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parse_from_carries_the_user_mounts_into_a_launch() {
+        let _env = clear_launch_env();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("user.toml");
+        std::fs::write(&file, "mounts = [\"/ref:ro\", \"/srv/data:/data:rw\"]\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let load = || {
+            crate::config::load(&crate::config::ConfigPaths {
+                user: Some(file.clone()),
+                project: dir.path().join("absent.toml"),
+                home: None,
+            })
+        };
+        // `UserMounts` compares by the facts a launch reads, not by value: it is
+        // not `PartialEq` because no production caller compares two of them.
+        let describe = |mounts: &Option<crate::config_mounts::UserMounts>| {
+            mounts
+                .as_ref()
+                .map(|mounts| (mounts.file().to_path_buf(), mounts.len()))
+        };
+        let expected = load().unwrap().user_mounts().cloned();
+        assert_eq!(describe(&expected), Some((file.clone(), 2)));
+        // Tool and direct arms alike: config mounts are ambient, so they reach
+        // every launch route, and `--mount` is not required.
+        for tokens in [
+            vec!["agent-vm", "shell"],
+            vec!["agent-vm", "run", "probe"],
+            vec!["agent-vm", "--", "probe"],
+        ] {
+            let Dispatch::Launch { user_mounts, .. } =
+                parse_from(argv_of(&tokens), load()).unwrap()
+            else {
+                panic!("expected a launch: {tokens:?}")
+            };
+            assert_eq!(describe(&user_mounts), describe(&expected), "{tokens:?}");
+        }
+
+        // A file without `mounts` selects nothing: `None`, not an empty list.
+        std::fs::write(&file, "image = \"localhost:1/only:latest\"\n").unwrap();
+        let Dispatch::Launch { user_mounts, .. } =
+            parse_from(["agent-vm", "shell"], load()).unwrap()
+        else {
+            panic!("launch")
+        };
+        assert!(user_mounts.is_none());
+
+        // A `mounts` file whose catalog is broken never reaches a launch, so the
+        // deferred-error path (not selection) is what a broken config reports.
+        std::fs::write(
+            &file,
+            "mounts = [\"/ref:ro\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"nope\"]\n",
+        )
+        .unwrap();
+        let error = parse_from(["agent-vm", "shell"], load())
+            .err()
+            .expect("a dangling tools reference still fails the launch")
+            .to_string();
+        assert!(
+            error.contains("names no tool in the resolved catalog"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn no_config_mounts_is_a_launch_option_before_the_verb() {
+        let _env = clear_launch_env();
+        use crate::mount_selection::ConfigMountPolicy;
+        for tokens in [
+            vec!["agent-vm", "--no-config-mounts", "shell"],
+            vec!["agent-vm", "--no-config-mounts", "run", "probe"],
+            vec!["agent-vm", "--no-config-mounts", "--", "probe"],
+        ] {
+            let Dispatch::Launch { args, target, .. } =
+                parse_from(argv_of(&tokens), Ok(report_from(MYTOOL))).unwrap()
+            else {
+                panic!("expected a launch: {tokens:?}")
+            };
+            assert_eq!(
+                args.config_mount_policy(),
+                ConfigMountPolicy::Suppress,
+                "{tokens:?}"
+            );
+            // Launcher-side only: the guest program and its argv are untouched.
+            if target.is_direct() {
+                let (_, invocation) = target.into_parts();
+                assert_eq!(invocation.program(), "probe", "{tokens:?}");
+                assert!(invocation.argv().is_empty(), "{tokens:?}");
+            }
+        }
+
+        // After the verb it belongs to the tool, which is why the opt-out is
+        // documented as a launch option and never read from the forwarded list.
+        let (args, tool_args) = launch_of(
+            parse_from(
+                ["agent-vm", "mytool", "--no-config-mounts"],
+                Ok(report_from(MYTOOL)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(args.config_mount_policy(), ConfigMountPolicy::Apply);
+        assert_eq!(tool_args, ["--no-config-mounts"]);
+
+        // Before a built-in it is a launch option used where built-ins take
+        // none, so clap's existing rejection names it.
+        let error = usage_error(parse_from(
+            ["agent-vm", "--no-config-mounts", "doctor"],
+            Ok(report_from(MYTOOL)),
+        ));
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error
+                .to_string()
+                .contains("the launch option '--no-config-mounts' cannot be used with 'doctor'"),
+            "{error}"
+        );
     }
 
     // -- T10: the asymmetric broken-config acceptance criterion -----------
@@ -3412,6 +3553,7 @@ mod tests {
                     OptionShape::Flag
                 ),
                 ("mount".to_string(), None, OptionShape::RequiredValue),
+                ("no-config-mounts".to_string(), None, OptionShape::Flag),
                 ("publish".to_string(), Some('p'), OptionShape::RequiredValue),
                 ("auto-publish".to_string(), None, OptionShape::Flag),
                 ("allow-egress".to_string(), None, OptionShape::RequiredValue),

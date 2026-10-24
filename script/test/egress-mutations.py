@@ -360,6 +360,19 @@ def matrix():
     add("config-mounts-persist-check-skipped-launch", mounts, persist_skipped,
         persist_skipped_mutant,
         rust("a_cli_fork_shadowing_a_persist_path_publishes_no_fork", MOUNTS))
+    # `--no-config-mounts` withholds the user config's declarations and nothing
+    # else (ADR-0046 Decision 5). The anchor is the kernel *body*: its `ensures`
+    # spells the same rule as `r == (f.declared && !f.suppressed)`, a shape the
+    # body never uses, so the `-proof` twin still catches a mutated body.
+    selection = SRC + "mount_selection.rs"
+    opt_out = "if f.suppressed { false } else { f.declared }"
+    opt_out_mutant = "if false { false } else { f.declared }"
+    add("config-mounts-opt-out-ignored", selection, opt_out, opt_out_mutant,
+        rust("config_mounts_selected_matches_the_four_rows"))
+    add("config-mounts-opt-out-ignored-proof", selection, opt_out, opt_out_mutant,
+        gate, "verification results::")
+    add("config-mounts-opt-out-ignored-launch", selection, opt_out, opt_out_mutant,
+        rust("opt_out_keeps_cli_core_and_persisted_paths", MOUNTS))
     add("user-allowances-dropped", EGRESS,
         "for entry in user_entries.iter().chain(&cli_entries) {",
         "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", LAUNCH))

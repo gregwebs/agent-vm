@@ -37,6 +37,7 @@ mod image_publish;
 mod intercept_hook;
 mod launch_target;
 mod mount;
+mod mount_selection;
 mod msb_cmd;
 mod msb_install;
 mod msb_preflight;
@@ -265,12 +266,14 @@ fn run_dispatch(dispatch: Dispatch) -> Result<()> {
                 target,
                 images,
                 user_network,
+                user_mounts,
                 args,
             } => exit_with(
                 run::launch(
                     target,
                     &images,
                     user_network.as_ref(),
+                    user_mounts.as_ref(),
                     credential_preflight,
                     *args,
                 )
