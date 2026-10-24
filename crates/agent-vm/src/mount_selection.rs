@@ -20,6 +20,7 @@
 //! runs.
 
 use crate::{
+    config::quoted_path,
     config_mounts::UserMounts,
     mount::{MountRequest, MountRequests, parse_extra_mounts},
 };
@@ -135,11 +136,13 @@ impl Selection {
         mem::take(&mut self.requests)
     }
 
-    /// D5: one line naming the file and how many declarations it contributed.
+    /// One line naming the file and how many declarations it contributed.
     ///
-    /// `None` when the file declared nothing (no `mounts` key, or an empty
-    /// list) or when the declarations were skipped by the opt-out: a launch with
-    /// nothing from the config must not print a "0" row on every run.
+    /// `None` only when the file contributes nothing: no `mounts` key, or an
+    /// empty list. A launch with nothing from the config must not print a "0"
+    /// row on every run. A non-empty list the opt-out skipped still reports, as
+    /// `skipped N` — that is the one case where the reader has to be told the
+    /// file declared mounts and this launch ignored them.
     pub(crate) fn notice(&self) -> Option<String> {
         let (file, count, skipped) = match &self.config {
             ConfigUse::NotDeclared => return None,
@@ -150,9 +153,12 @@ impl Selection {
             return None;
         }
         Some(if skipped {
-            format!("==> Config mounts: skipped {count} from {file:?} (--no-config-mounts)")
+            format!(
+                "==> Config mounts: skipped {count} from {} (--no-config-mounts)",
+                quoted_path(file)
+            )
         } else {
-            format!("==> Config mounts: {count} from {file:?}")
+            format!("==> Config mounts: {count} from {}", quoted_path(file))
         })
     }
 
@@ -165,7 +171,8 @@ impl Selection {
     pub(crate) fn preparation_context(&self) -> String {
         match &self.config {
             ConfigUse::Selected { file, count } if *count > 0 => format!(
-                "preparing mounts (including mounts from {file:?}; --no-config-mounts skips them)"
+                "preparing mounts (including mounts from {}; --no-config-mounts skips them)",
+                quoted_path(file)
             ),
             ConfigUse::NotDeclared | ConfigUse::Selected { .. } | ConfigUse::Skipped { .. } => {
                 "preparing --mount".to_owned()
@@ -312,13 +319,13 @@ mod tests {
         assert_eq!(
             selection.preparation_context(),
             format!(
-                "preparing mounts (including mounts from {:?}; --no-config-mounts skips them)",
-                user.file()
+                "preparing mounts (including mounts from {}; --no-config-mounts skips them)",
+                quoted_path(user.file())
             )
         );
     }
 
-    /// D5's two lines, and silence when the file contributes nothing.
+    /// Both lines, and silence when the file contributes nothing.
     #[test]
     fn notice_names_the_file_and_the_skipped_count() {
         let empty = user_mounts(&[]);
@@ -346,15 +353,18 @@ mod tests {
             select(Some(&user), ConfigMountPolicy::Apply, &[])
                 .unwrap()
                 .notice(),
-            Some(format!("==> Config mounts: 2 from {:?}", user.file()))
+            Some(format!(
+                "==> Config mounts: 2 from {}",
+                quoted_path(user.file())
+            ))
         );
         assert_eq!(
             select(Some(&user), ConfigMountPolicy::Suppress, &[])
                 .unwrap()
                 .notice(),
             Some(format!(
-                "==> Config mounts: skipped 2 from {:?} (--no-config-mounts)",
-                user.file()
+                "==> Config mounts: skipped 2 from {} (--no-config-mounts)",
+                quoted_path(user.file())
             ))
         );
     }

@@ -1,4 +1,4 @@
-//! The default mounts a verified user config selects for every launch.
+//! The config mounts a verified user config selects for every launch.
 //!
 //! ADR-0046 accepts one top-level `mounts` array in the *user* config. It is a
 //! declaration list, not a trust source of its own: the file must first pass
@@ -17,9 +17,12 @@
 //!   question about *selected* mounts only, so a config naming a path that does
 //!   not exist still loads (an opt-out launch must not care).
 //!
-//! Diagnostics name the field and the index and never the value: a `mounts`
-//! entry can carry an attacker-chosen path, and the sentence is printed to a
-//! user deciding whether to trust the file.
+//! Load-time diagnostics name the field and the index and never the value: a
+//! `mounts` entry can carry an attacker-chosen path, and the sentence is printed
+//! to a user deciding whether to trust the file. A *launch-time* refusal is a
+//! different question — it has to name the host or guest path it could not
+//! prepare, or the user cannot fix it — so those sentences render the path with
+//! the config module's escaping and the declaration as `mounts[N] in "<file>"`.
 
 use crate::{
     config_authority::AuthorizedConfig,
@@ -256,10 +259,10 @@ mod tests {
         result.unwrap_err().to_string()
     }
 
-    /// §2.4's table: `~/` is plain concatenation onto the captured home, `//` is
-    /// preserved, nothing else is expanded, and every other relative spelling is
-    /// refused. The oracle is `starts_with` plus `format!`, not the kernel's own
-    /// predicate.
+    /// ADR-0046 Decision 3's spelling table: `~/` is plain concatenation onto
+    /// the captured home, `//` is preserved, nothing else is expanded, and every
+    /// other relative spelling is refused. The oracle is `starts_with` plus
+    /// `format!`, not the kernel's own predicate.
     #[test]
     fn home_expansion_cases() {
         let plain = Path::new("/h");

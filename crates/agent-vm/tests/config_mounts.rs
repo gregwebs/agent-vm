@@ -1,4 +1,4 @@
-//! Boot-free integration harness for verified user-wide default mounts
+//! Boot-free integration harness for verified user config mounts
 //! (issue #394 / ADR-0046) and for the launch-order guarantees they share with
 //! `--mount`.
 //!
@@ -6,11 +6,12 @@
 //! are duplicated per test binary on purpose — the same rule `tests/mount_fork.rs`
 //! documents. Only a genuine cross-harness precondition lives in `tests/support/`.
 //!
-//! The file starts with the two **CLI-only** persisted-guest-HOME cases from
-//! review finding B1 / decision D4: a mount that shadows a declared `persist`
-//! path must be refused *inside* `mount::prepare`, i.e. before any fork is
-//! published. They are CLI-only so they can be written (and observed failing)
-//! before the config route exists at all; the config-mount rows land with it.
+//! The file starts with the two **CLI-only** persisted-guest-HOME cases for
+//! ADR-0046 Decision 6: a mount that shadows a declared `persist` path must be
+//! refused *inside* `mount::prepare`, i.e. before any fork is published. They
+//! are CLI-only so the boundary they assert — which does not depend on which
+//! source declared the mount — stays pinned independently of the config rows
+//! that follow them.
 //!
 //! Every refusal assertion goes through
 //! [`Harness::assert_refused_before_launch_state`], whose oracle is calibrated by
@@ -508,7 +509,7 @@ fn persist_collision_message(guest_home: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// B1 / D4 — a plan that would shadow a persist link never publishes a fork
+// ADR-0046 Decision 6 — a plan that would shadow a persist link publishes no fork
 // ---------------------------------------------------------------------------
 
 /// A `:fork` declaration whose guest path shadows a declared `persist` link must
@@ -902,6 +903,13 @@ fn config_notice(h: &Harness, count: usize) -> String {
     )
 }
 
+/// How a launch-time refusal names the config declaration at `index`, the same
+/// rendering `config::load`'s diagnostics use for one: the label a config author
+/// searches their file with, not just `--mount` and the outer file context.
+fn config_declaration(h: &Harness, index: usize) -> String {
+    format!("mounts[{index}] in \"{}\"", h.user_config().display())
+}
+
 /// Source-tree fixture: `$HOME/<name>/content` = `<name>`, so a bind's host
 /// path identifies which source was selected.
 fn seed_source(h: &Harness, name: &str) -> PathBuf {
@@ -1187,7 +1195,7 @@ fn writable_config_mount_containing_the_config_dir_is_refused() {
         stderr.contains(&config_dir.display().to_string()),
         "{stderr}"
     );
-    h.assert_refused_before_launch_state(&out, &before, "would let the guest change what");
+    h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
 }
 
 /// A config live bind of the host Pi home would expose real credentials.
@@ -1207,7 +1215,7 @@ fn live_config_mount_of_pi_home_is_refused() {
         )),
         "{stderr}"
     );
-    h.assert_refused_before_launch_state(&out, &before, "would expose the host Pi credential file");
+    h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
     assert_eq!(
         std::fs::read_to_string(&auth).unwrap(),
         "{\"token\":\"host\"}",
@@ -1229,7 +1237,7 @@ fn writable_config_file_mount_is_refused() {
         stderr.contains("a file can only be mounted read-only"),
         "{stderr}"
     );
-    h.assert_refused_before_launch_state(&out, &before, "a file can only be mounted read-only");
+    h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
 }
 
 /// `:follow-links` discovery applies to a config declaration too: each
@@ -1265,6 +1273,108 @@ fn config_follow_links_discovers_targets() {
             .iter()
             .any(|(host, _, _)| host == &skills.join("link").display().to_string()),
         "a symlink is not itself a bind source: {binds:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Repo-scan parity: a config mount's remotes widen the allow-list
+// ---------------------------------------------------------------------------
+
+/// A git checkout under `$HOME` whose `origin` is a GitHub remote. That remote
+/// is the only input [`run::detect_github_repos`] reads, so it is what makes a
+/// mounted root widen the launch's allow-list.
+fn seed_github_checkout(h: &Harness, name: &str, slug: &str) -> PathBuf {
+    let path = seed_source(h, name);
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(args)
+            .output()
+            .expect("git must be runnable");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        &format!("https://github.com/{slug}.git"),
+    ]);
+    path
+}
+
+/// The launch's `==> GitHub repo scope` line — the allow-list as the launch
+/// reports and uses it, rather than a plan internal.
+fn repo_scope(stderr: &str) -> String {
+    stderr
+        .lines()
+        .find(|line| line.starts_with("==> GitHub repo scope"))
+        .unwrap_or_else(|| panic!("no repo scope line in stderr:\n{stderr}"))
+        .to_string()
+}
+
+/// A config mount's git remotes widen the GitHub allow-list exactly as the
+/// equivalent `--mount` does (ADR-0046's accepted *repo-scan parity* gap). The
+/// comparison is the two launches' scope lines, byte for byte: a config route
+/// that scanned less, or under a different rule, would be a second policy.
+#[test]
+fn a_config_mount_widens_the_github_allow_list_like_its_cli_twin() {
+    let h = Harness::new();
+    let checkout = seed_github_checkout(&h, "checkout", "example/visible");
+
+    h.write_user("mounts = [\"~/checkout:ro\"]\n");
+    let configured = stderr_of(&h.launch(&[], "shell", &[]));
+    assert!(
+        configured.contains(CONFIG_MARKER),
+        "the launch must get past preparation: {configured}"
+    );
+    let from_config = repo_scope(&configured);
+    assert_eq!(
+        from_config, "==> GitHub repo scope (1): example/visible",
+        "a config mount's remote must reach the allow-list"
+    );
+
+    // The same directory declared as an argv mount, with no config in play.
+    std::fs::remove_file(h.user_config()).unwrap();
+    let cli = h.launch(
+        &["--mount", &format!("{}:ro", checkout.display())],
+        "shell",
+        &[],
+    );
+    let cli = stderr_of(&cli);
+    assert!(
+        cli.contains(CONFIG_MARKER),
+        "the launch must get past preparation: {cli}"
+    );
+    assert_eq!(
+        repo_scope(&cli),
+        from_config,
+        "the config mount and its --mount twin must widen the allow-list identically"
+    );
+}
+
+/// The opt-out removes that widening too: the unselected declaration contributes
+/// no scan root, so the launch reaches no repository the file named.
+#[test]
+fn opt_out_removes_a_config_mounts_github_scope() {
+    let h = Harness::new();
+    seed_github_checkout(&h, "checkout", "example/visible");
+    h.write_user("mounts = [\"~/checkout:ro\"]\n");
+
+    let stderr = stderr_of(&h.launch(&["--no-config-mounts"], "shell", &[]));
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "the launch must get past preparation: {stderr}"
+    );
+    assert_eq!(
+        repo_scope(&stderr),
+        "==> GitHub repo scope: <none> (no api.github.com access)",
+        "a suppressed config mount must not widen the allow-list: {stderr}"
+    );
+    assert!(
+        stderr.contains("==> Config mounts: skipped 1 from"),
+        "the launch must say the declaration was skipped: {stderr}"
     );
 }
 
@@ -1614,7 +1724,7 @@ fn a_selected_missing_config_source_fails_before_state() {
         stderr.contains(&missing.display().to_string()),
         "the refusal must name the missing source: {stderr}"
     );
-    h.assert_refused_before_launch_state(&out, &before, "canonicalizing --mount host");
+    h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
     assert!(h.mount_store().is_none());
 }
 
@@ -2040,7 +2150,7 @@ fn project_mounts_fail_every_launch() {
         assert!(!out.status.success(), "{verb}: {stderr}");
         assert!(
             stderr.contains(&format!(
-                "config: \"{}\": mounts: mounts cannot be declared by the project config",
+                "config: \"{}\": mounts cannot be declared by the project config",
                 h.project_config().display()
             )),
             "{verb}: {stderr}"

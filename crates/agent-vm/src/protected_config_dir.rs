@@ -461,8 +461,13 @@ impl ProtectedConfigDir {
         }
         Ok(())
     }
+    /// Refuse a writable live bind that could change, or change what something
+    /// resolves to, where agent-vm reads its launch authority. `subject` names
+    /// the declaration: `--mount` for argv, the config entry's own
+    /// `mounts[N] in "<file>"` for a verified user entry.
     pub(crate) fn check_writable_mount(
         &self,
+        subject: &str,
         spelling: &str,
         spelled_host: &Path,
         host: &Path,
@@ -474,9 +479,9 @@ impl ProtectedConfigDir {
                     self.decide(Some(spelled_host), &canonical, Some((m.dev(), m.ino())))
                 {
                     bail!(
-                        "--mount \"{}\" would let the guest change what \"{}\" contains or resolves to, where agent-vm reads launch authority. Mount it read-only (:ro), or mount a narrower path that does not contain it.",
-                        config::escape_path(Path::new(spelling)),
-                        config::escape_path(&d.spelled)
+                        "{subject} {} would let the guest change what {} contains or resolves to, where agent-vm reads launch authority. Mount it read-only (:ro), or mount a narrower path that does not contain it.",
+                        config::quoted_path(Path::new(spelling)),
+                        config::quoted_path(&d.spelled)
                     );
                 }
             }
@@ -780,7 +785,7 @@ mod tests {
             }));
         }
         let msg = guard
-            .check_writable_mount("/decl", &t.home, &t.home)
+            .check_writable_mount("--mount", "/decl", &t.home, &t.home)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("contains or resolves to"));

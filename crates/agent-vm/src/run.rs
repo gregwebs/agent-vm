@@ -713,7 +713,7 @@ pub(crate) async fn launch(
     // host HOME otherwise. Needed *before* mount preparation: it is what turns "a
     // mount at this guest path" into "a mount that shadows a `persist` link",
     // and that collision has to be refused before any fork is published
-    // (ADR-0046 / #394 D4).
+    // (ADR-0046 Decision 6).
     let guest_home_path = guest_identity
         .as_ref()
         .map(|identity| PathBuf::from(identity.host_home()))
@@ -921,7 +921,7 @@ pub(crate) async fn launch(
     // complete mount plan before it creates fork state, scans repositories,
     // snapshots credentials, or hands anything to the sandbox builder.
     //
-    // D5 names the config half first: a reader must be able to tell which host
+    // The config half is named first: a reader must be able to tell which host
     // paths this launch exposed *because of the file* before any per-mount
     // notice describes them. Both lines print after the banner, so a rejected
     // topology still emits nothing.

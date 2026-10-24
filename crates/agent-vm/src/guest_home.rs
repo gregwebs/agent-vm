@@ -156,11 +156,16 @@ pub(crate) fn mount_conflicts<'a>(
 /// `run::launch` builds one per launch from the same link list it hands to both
 /// provisioning sites, so the check and the links cannot drift.
 ///
-/// [`Default`] is the "no persisted HOME" context of mount contexts that declare
-/// no `persist` paths: `links` is empty, and [`mount_conflicts`] never reports a
-/// conflict over an empty link list, so a default value can never refuse a
-/// launch. It stands in for the absence of a persisted HOME, not for one.
-#[derive(Clone, Debug, Default)]
+/// There is deliberately no `Default`: the empty value is the "no persisted
+/// HOME" context of a mount context that cannot have `persist` paths, which is
+/// a test fixture, not a state production can reach. [`Self::none`] is
+/// `#[cfg(test)]` because every production caller builds a real one through
+/// [`Self::new`] (a guest HOME exists whether or not it declares `persist`
+/// paths). An empty value could never refuse a launch — `links` is empty and
+/// [`mount_conflicts`] reports nothing over an empty list — so the cost of
+/// getting that wrong is a silently skipped check, which is exactly why the
+/// type refuses to offer one by accident.
+#[derive(Clone, Debug)]
 pub(crate) struct PersistedHome {
     guest_home: PathBuf,
     links: Vec<GuestHomeLink>,
@@ -181,13 +186,15 @@ impl PersistedHome {
         }
     }
 
-    /// No guest HOME and no declared links — for contexts that cannot have
-    /// `persist` paths. Every production caller builds a real one through
-    /// [`Self::new`] (a guest HOME exists whether or not it declares `persist`
-    /// paths), so this is test-only by construction rather than by allowance.
+    /// No guest HOME and no declared links — for test contexts that cannot have
+    /// `persist` paths. See the type's comment for why this is `#[cfg(test)]`
+    /// rather than a `Default` any production caller could reach.
     #[cfg(test)]
     pub(crate) fn none() -> Self {
-        Self::default()
+        Self {
+            guest_home: PathBuf::new(),
+            links: Vec::new(),
+        }
     }
 
     /// [`mount_conflicts`] over the complete destination list; the first

@@ -886,7 +886,7 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
         kind: FileTierKind::Project,
         home: None,
     })?;
-    let mounts = user_contents.mounts.clone();
+    let mounts = user_contents.mounts;
 
     let (resolved, uses_defaults, conflicts) =
         if user_contents.tools.is_empty() && project_contents.tools.is_empty() {
@@ -1107,7 +1107,7 @@ fn mounts_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
         RefusingTier::BuiltIn => "mounts cannot be declared by the built-in config",
     };
     anyhow!(
-        "config: {}: mounts: {reason}; use --mount launch options, or mounts in the user config",
+        "config: {}: {reason}; use --mount launch options, or mounts in the user config",
         quoted_path(file)
     )
 }
@@ -2132,7 +2132,11 @@ fn escape_bytes(bytes: &[u8]) -> String {
     out
 }
 
-fn quoted_path(path: &Path) -> String {
+/// Render a path the one way every diagnostic does: double-quoted, with
+/// [`escape_bytes`]'s control-byte escaping. `mount` renders a declaration's
+/// origin through this rather than `{:?}`, so one launch cannot show two
+/// escapings of the same config file.
+pub(crate) fn quoted_path(path: &Path) -> String {
     format!("\"{}\"", escape_bytes(path.as_os_str().as_bytes()))
 }
 
@@ -2420,7 +2424,7 @@ mod tests {
             let error = f.load().unwrap_err().to_string();
             assert!(
                 error.contains(&format!(
-                    "config: {:?}: mounts: mounts cannot be declared by the project config; use \
+                    "config: {:?}: mounts cannot be declared by the project config; use \
                      --mount launch options, or mounts in the user config",
                     f.project
                 )),
@@ -2445,7 +2449,7 @@ mod tests {
             let error = tools_from_builtin_text(body).unwrap_err().to_string();
             assert!(
                 error.contains(
-                    "config: \"default-tools.toml\": mounts: mounts cannot be declared by the \
+                    "config: \"default-tools.toml\": mounts cannot be declared by the \
                      built-in config; use --mount launch options, or mounts in the user config"
                 ),
                 "{body}: {error}"

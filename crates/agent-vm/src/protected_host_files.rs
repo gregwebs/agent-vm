@@ -493,12 +493,19 @@ impl ProtectedHostFiles {
     /// Human-readable refusal for an explicit or `follow-links`-discovered
     /// live bind. One place, so tests assert one string.
     ///
+    /// `subject` is how the offending *declaration* is named: `--mount` for
+    /// argv, and the config entry's own `mounts[N] in "<file>"` for a verified
+    /// user `mounts` entry, so a launch-time refusal names the field the author
+    /// has to edit. The remedy below stays `--mount`-shaped: it is advice about
+    /// a format, and the config spelling is the same grammar.
+    ///
     /// `discovered_by` is the *rendered* provenance of a discovered bind
     /// (e.g. ``--mount ~/code:follow-links``), not a spelling to wrap: two
     /// `:follow-links` declarations can discover one bind, and the caller is
     /// the only place that knows whether the attribution is unambiguous.
     pub(crate) fn message(
         &self,
+        subject: &str,
         source_spelling: &str,
         exposure: &Exposure,
         discovered_by: Option<&str>,
@@ -514,7 +521,7 @@ impl ProtectedHostFiles {
             None => String::new(),
         };
         format!(
-            "--mount {source_spelling} would expose the {} {}{}{discovered}\n\
+            "{subject} {source_spelling} would expose the {} {}{}{discovered}\n\
              agent-vm keeps host Pi credentials host-side and gives the guest placeholders.\n\
              {}",
             exposure.file.description(),
@@ -1203,7 +1210,7 @@ mod tests {
         // The Pi home itself: `:fork` is exactly the remedy (a fork omits the
         // protected files and copies everything else).
         assert_eq!(
-            protected.message("~/.pi", &exposure, None),
+            protected.message("--mount", "~/.pi", &exposure, None),
             format!(
                 "--mount ~/.pi would expose the host Pi credential file {home}/.pi/agent/auth.json \
                  (as agent/auth.json inside {home}/.pi)\n\
@@ -1216,7 +1223,12 @@ mod tests {
         // A discovered bind names the declaration it came from.
         assert!(
             protected
-                .message("~/.pi", &exposure, Some("--mount ~/code:follow-links"))
+                .message(
+                    "--mount",
+                    "~/.pi",
+                    &exposure,
+                    Some("--mount ~/code:follow-links")
+                )
                 .contains("(discovered by --mount ~/code:follow-links)")
         );
 
@@ -1224,7 +1236,7 @@ mod tests {
         // every other secret under it into project state, so the message must
         // lead with a narrower path and must not present `:fork` as the fix.
         let broad = protected.exposure(&home).unwrap().unwrap();
-        let message = protected.message(&home.display().to_string(), &broad, None);
+        let message = protected.message("--mount", &home.display().to_string(), &broad, None);
         assert!(message.contains("Mount a narrower path"), "{message}");
         assert!(
             !message.contains(&format!("Use `--mount {}:fork`", home.display())),
@@ -1244,7 +1256,7 @@ mod tests {
             .exposure(&home.join(".pi/agent/auth.json"))
             .unwrap()
             .unwrap();
-        let message = protected.message("~/.pi/agent/auth.json", &file, None);
+        let message = protected.message("--mount", "~/.pi/agent/auth.json", &file, None);
         assert!(message.contains("cannot be mounted at all"), "{message}");
         assert!(!message.contains(":fork"), "{message}");
     }
