@@ -411,6 +411,29 @@ mod tests {
         );
     }
 
+    /// The `PersistCollision` sentence is the pre-#394 text byte for byte. It is
+    /// returned *unwrapped* by `mount::prepare` precisely because it already
+    /// reads as a complete error, so any rewording changes what a user sees on
+    /// the first line of a refused launch.
+    #[test]
+    fn persist_collision_display_is_byte_identical() {
+        let error = PersistedHome {
+            guest_home: PathBuf::from("/home/user"),
+            links: vec![declared("code")],
+        };
+        let error = error
+            .refuse_conflicts(&[PathBuf::from("/home/user/code")])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "config: persist path code would collide with the guest mount point \
+             /home/user/code; rename the persist path or move the mount"
+        );
+        // And it is the typed error, so `run` can tell it apart from every
+        // wrapper it might otherwise gain.
+        assert!(error.is::<PersistCollision>());
+    }
+
     #[test]
     fn compiled_links_are_never_reported_as_mount_conflicts() {
         let home = Path::new("/Users/claude");
