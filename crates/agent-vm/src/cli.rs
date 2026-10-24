@@ -1500,6 +1500,8 @@ mod tests {
         crate::config::load(&ConfigPaths {
             user: Some(dir.path().join("no-user-config.toml")),
             project,
+
+            home: None,
         })
         .expect("the fixture config parses")
     }
@@ -1511,6 +1513,7 @@ mod tests {
         crate::config::load(&ConfigPaths {
             user: Some(dir.path().join("no-user-config.toml")),
             project: dir.path().join("no-project-config.toml"),
+            home: None,
         })
         .expect("the embedded default catalog parses")
         .into_launch_catalog()
@@ -1616,6 +1619,8 @@ mod tests {
         let report = crate::config::load(&ConfigPaths {
             user: Some(dir.path().join("no-user-config.toml")),
             project,
+
+            home: None,
         })
         .unwrap();
         let images = report.images().clone();
@@ -1868,6 +1873,8 @@ mod tests {
             crate::config::load(&crate::config::ConfigPaths {
                 user: None,
                 project: project.clone(),
+
+                home: None,
             })
         };
         assert!(matches!(
@@ -1913,6 +1920,8 @@ mod tests {
             crate::config::load(&crate::config::ConfigPaths {
                 user: Some(file.clone()),
                 project: dir.path().join("absent.toml"),
+
+                home: None,
             })
         };
         let expected = load().unwrap().user_network().cloned();
@@ -2506,6 +2515,8 @@ mod tests {
         let error = crate::config::load(&ConfigPaths {
             user: Some(dir.path().join("no-user-config.toml")),
             project,
+
+            home: None,
         })
         .expect_err("a tool named image must be refused");
         assert!(format!("{error:#}").contains("reserved"));
@@ -3281,6 +3292,8 @@ mod tests {
             crate::config::load(&crate::config::ConfigPaths {
                 user: Some(dir.path().join("no-user.toml")),
                 project: dir.path().join("config.toml"),
+
+                home: None,
             })
         };
         let error = parse_from(argv_of(&["agent-vm", "run", "p"]), load())
@@ -3562,6 +3575,8 @@ mod tests {
         let config = crate::config::load(&crate::config::ConfigPaths {
             user: Some(dir.path().join("no-user.toml")),
             project,
+
+            home: None,
         });
         let catalog = match config {
             Ok(report) => match report.into_launch_catalog() {
@@ -3591,6 +3606,8 @@ mod tests {
         let user = crate::config::load(&ConfigPaths {
             user: Some(user_config),
             project: dir.path().join("no-project.toml"),
+
+            home: None,
         })
         .unwrap_err()
         .to_string();
@@ -3599,6 +3616,8 @@ mod tests {
         let project = crate::config::load(&ConfigPaths {
             user: Some(dir.path().join("no-user.toml")),
             project: project_config,
+
+            home: None,
         })
         .unwrap_err()
         .to_string();

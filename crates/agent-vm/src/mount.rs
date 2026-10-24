@@ -133,9 +133,8 @@ impl ExtraMount {
 pub(crate) enum MountOrigin {
     Cli,
     /// A verified user `mounts` entry: the file it came from and its index.
-    /// `config_mounts` constructs it; argv is the only source a launch has
-    /// today, so the constructor lands with that route.
-    #[allow(dead_code)]
+    /// Built only by [`crate::config_mounts`], from the verified read that
+    /// authority was measured on.
     UserConfig {
         file: PathBuf,
         index: usize,
@@ -306,10 +305,9 @@ fn segment_is_guest_path(seg: &str) -> bool {
 pub(crate) enum HostSyntax<'a> {
     /// `--mount`: absolute host paths only (the shell already expanded `~`).
     AbsoluteOnly,
-    /// Verified user config: absolute, or `~/` + `home`. `config_mounts`
-    /// constructs it once verified user `mounts` exist; argv is the only source
-    /// of declarations until then.
-    #[allow(dead_code)]
+    /// Verified user config: absolute, or `~/` + `home`. [`crate::config_mounts`]
+    /// is the only caller; `None` means the host has no UTF-8 home, so only a
+    /// `~/` entry is refused.
     AbsoluteOrHome { home: Option<&'a str> },
 }
 
@@ -370,9 +368,44 @@ impl MountSpecError {
 
     /// The config route renders this instead of the CLI sentence, so a `mounts`
     /// entry's value never reaches a diagnostic.
-    #[allow(dead_code)] // no production caller until `config_mounts` renders it
     pub(crate) fn kind(&self) -> MountSpecErrorKind {
         self.kind
+    }
+}
+
+impl fmt::Display for MountSpecErrorKind {
+    /// The config route's sentence for one rejection: the *kind*, never the
+    /// declaration text. A `mounts` entry can carry an attacker-chosen path, so
+    /// it must not reach a diagnostic the user is asked to trust; `--mount`
+    /// keeps [`MountSpecError::into_cli`]'s bytes instead.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyHost => {
+                f.write_str("mount declaration must be HOST[:GUEST][:MODE]... (non-empty)")
+            }
+            Self::HostNotAccepted => f.write_str(
+                "host path must be absolute or start with ~/ (environment variables and other \
+                 relative paths are not expanded)",
+            ),
+            Self::HomeUnavailable => f.write_str("a ~/ host path needs a UTF-8 $HOME"),
+            Self::GuestNotAbsolute => f.write_str("guest path must be absolute"),
+            Self::GuestUnmountable => f.write_str(
+                "guest path contains control characters that can't be carried into the guest",
+            ),
+            Self::EmptySegment => {
+                f.write_str("empty segment (stray `:`); expected HOST[:GUEST][:MODE]...")
+            }
+            Self::UnknownMode => f.write_str(
+                "unknown mode keyword (expected ro, rw, fork, follow-links, or exclude=REL)",
+            ),
+            Self::ConflictingModes(first, second) => {
+                write!(f, "conflicting modes `{first}` and `{second}`")
+            }
+            Self::BadExclusion => {
+                f.write_str("exclude must be a non-empty relative path of normal components")
+            }
+            Self::ExcludeOnLiveBind => f.write_str(":exclude is only supported on :fork mounts"),
+        }
     }
 }
 

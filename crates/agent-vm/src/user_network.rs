@@ -24,6 +24,9 @@ const INTERNET_SETTING: &str = "allow_internet_egress";
 const LAN_SETTING: &str = "allow_lan";
 const HOST_SETTING: &str = "allow_host";
 const EGRESS_SETTING: &str = "allow_egress";
+/// Not a setting: the one key whose presence here means the user wrote a
+/// top-level `mounts` *after* a table header, so TOML scoped it into this table.
+const MOUNTS_KEY: &str = "mounts";
 pub(crate) const SETTINGS: [&str; 4] =
     [INTERNET_SETTING, LAN_SETTING, HOST_SETTING, EGRESS_SETTING];
 
@@ -94,6 +97,10 @@ pub(crate) enum SettingReason {
     NotArray,
     NotString,
     Unknown,
+    /// `mounts` landed inside `[network]` because TOML assigns keys to the most
+    /// recent table header. Names the fix instead of calling it an unknown
+    /// setting; the value is never read, let alone echoed.
+    TopLevelMounts,
     Allowance(AllowanceError),
 }
 
@@ -120,6 +127,11 @@ impl fmt::Display for UserNetworkError {
                         "unknown setting; supported settings are {} and {}",
                         SETTINGS[..3].join(", "),
                         SETTINGS[3]
+                    ),
+                    SettingReason::TopLevelMounts => write!(
+                        f,
+                        "{MOUNTS_KEY} is not a network setting; a top-level mounts list must be \
+                         written before the first table header (keys after [network] belong to it)"
                     ),
                     SettingReason::Allowance(error) => error.fmt(f),
                 }
@@ -174,9 +186,14 @@ fn parse_table(file: &Path, table: &toml::Table) -> Result<UserNetwork, UserNetw
                 }
             }
             _ => {
+                let reason = if key.as_str() == MOUNTS_KEY {
+                    SettingReason::TopLevelMounts
+                } else {
+                    SettingReason::Unknown
+                };
                 return Err(UserNetworkError::Setting {
                     setting: SettingPath::Table,
-                    reason: SettingReason::Unknown,
+                    reason,
                 });
             }
         }
@@ -278,6 +295,36 @@ allow_egress = ["10.0.0.5", "10.0.0.5/32", "API.example.com.", "api.example.com"
             (Some(false), Some(true), Some(true))
         );
         assert_eq!(view.allowances.len(), 2);
+    }
+
+    /// TOML scopes `mounts` into `[network]` when it is written after that
+    /// header. The hint names the fix; every other unknown key keeps the
+    /// unknown-setting text, and neither echoes the value.
+    #[test]
+    fn mounts_key_in_network_table_gets_the_top_level_hint() {
+        const SENTINEL: &str = "sk-live-SENTINEL-mounts";
+        let error = parse_table(
+            Path::new("user.toml"),
+            &table(&format!("mounts = \"{SENTINEL}\"")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "[network]: mounts is not a network setting; a top-level mounts list must be \
+             written before the first table header (keys after [network] belong to it)"
+        );
+        assert!(!error.contains(SENTINEL));
+        // Any other key, and a sentinel key, keep today's bytes.
+        for key in ["mount", "mounts2", SENTINEL] {
+            assert_eq!(
+                parse_table(Path::new("user.toml"), &table(&format!("{key} = true")))
+                    .unwrap_err()
+                    .to_string(),
+                "[network]: unknown setting; supported settings are allow_internet_egress, \
+                 allow_lan, allow_host and allow_egress"
+            );
+        }
     }
 
     #[test]

@@ -367,6 +367,31 @@ def matrix():
                   '            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,')
     add("verify-always-skipped", SRC + "config.rs", verify_arm,
         'FileTierKind::User => None,', rust("unsafe_user_network_is_refused_before_launch_state", LAUNCH))
+    # A present `mounts` key makes a user file authority-bearing, empty list
+    # included: the trigger reads the *presence* of the field, so both mutants
+    # below keep the field but drop its effect, and a symlinked `mounts = []`
+    # file then loads through the compatibility path meant for tools-only files.
+    mounts_present = "        mounts: raw.mounts.is_some(),\n    };"
+    mounts_absent_mutant = "        mounts: false,\n    };"
+    mounts_nonempty_mutant = (
+        "        mounts: raw.mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),\n    };")
+    add("config-mounts-presence-ignored", SRC + "config.rs", mounts_present,
+        mounts_absent_mutant, rust("present_empty_mounts_through_a_symlink_is_refused"))
+    add("config-mounts-presence-ignored-launch", SRC + "config.rs", mounts_present,
+        mounts_absent_mutant, rust("unsafe_user_mounts_are_refused_before_launch_state", MOUNTS))
+    add("config-mounts-empty-unverified", SRC + "config.rs", mounts_present,
+        mounts_nonempty_mutant, rust("present_empty_mounts_through_a_symlink_is_refused"))
+    add("config-mounts-empty-unverified-launch", SRC + "config.rs", mounts_present,
+        mounts_nonempty_mutant, rust("empty_mounts_still_requires_a_verified_file", MOUNTS))
+    add("config-mounts-verify-skipped-launch", SRC + "config.rs", verify_arm,
+        'FileTierKind::User => None,', rust("unsafe_user_mounts_are_refused_before_launch_state", MOUNTS))
+    # The project tier may not declare mounts at all (ADR-0046 is user-scope), so
+    # the refusal is a boundary in its own right: without it a project checkout
+    # would hand every launch of it a host bind.
+    add("config-mounts-project-mounts-accepted", SRC + "config.rs",
+        "    if raw.mounts.is_some() {\n        return Err(mounts_refusal(path, RefusingTier::Project));\n    }",
+        "    if false {\n        return Err(mounts_refusal(path, RefusingTier::Project));\n    }",
+        rust("project_mounts_are_refused_even_when_empty"))
     add("descriptor-reopen", SRC + "host_paths.rs", "            after_open();",
         "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;",
         rust("noting_symlink_takes_bytes_and_facts_from_the_opened_descriptor"))
