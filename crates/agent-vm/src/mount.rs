@@ -1728,6 +1728,134 @@ mod tests {
             discovered.is_readonly()
         ));
     }
+
+    /// Every rejection `--mount` can produce today, byte for byte.
+    ///
+    /// The declaration grammar is about to be shared with user-config `mounts`
+    /// (which must render value-free, index-named text for the same failures),
+    /// so the parse moves behind a typed error. These pins are what prove that
+    /// refactor cannot reword a CLI diagnostic: the other `--mount` parse tests
+    /// only assert `contains`, which cannot see a changed sentence.
+    ///
+    /// The rendering pinned is `{:#}`, the full `anyhow` chain, because the
+    /// `exclude=` context adds an outer frame that `Display` (`{}`) drops.
+    /// An exhaustive pin is also what makes `HostSyntax` honest: a `~/x` host
+    /// stays "must be absolute" on the CLI, so only the config route may ever
+    /// expand it.
+    #[test]
+    fn cli_parse_errors_are_pinned() {
+        const CASES: &[(&str, &str)] = &[
+            (
+                ":/guest",
+                "--mount value \":/guest\" must be HOST[:GUEST] (non-empty)",
+            ),
+            ("", "--mount value \"\" must be HOST[:GUEST] (non-empty)"),
+            (
+                "relative-host",
+                "--mount host path \"relative-host\" must be absolute",
+            ),
+            ("~/x", "--mount host path \"~/x\" must be absolute"),
+            (
+                "/host:./rel",
+                "--mount guest path \"./rel\" must be absolute",
+            ),
+            (
+                "/abs-host:relative-guest",
+                "--mount \"/abs-host:relative-guest\": unknown mode keyword \"relative-guest\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)",
+            ),
+            (
+                "/:/mnt/a\tb",
+                "--mount guest path \"/mnt/a\\tb\" contains control characters that can't be carried into the guest; pass a guest path without tabs/newlines",
+            ),
+            (
+                "/host:",
+                "--mount \"/host:\": empty segment (stray `:`); expected HOST[:GUEST][:MODE]...",
+            ),
+            (
+                "/h::ro",
+                "--mount \"/h::ro\": empty segment (stray `:`); expected HOST[:GUEST][:MODE]...",
+            ),
+            (
+                "/:bogus-mode",
+                "--mount \"/:bogus-mode\": unknown mode keyword \"bogus-mode\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)",
+            ),
+            (
+                "/:ro:rw",
+                "--mount \"/:ro:rw\": conflicting modes `ro` and `rw` — pick one",
+            ),
+            (
+                "/:rw:ro",
+                "--mount \"/:rw:ro\": conflicting modes `rw` and `ro` — pick one",
+            ),
+            (
+                "/x:fork:ro",
+                "--mount \"/x:fork:ro\": conflicting modes `fork` and `ro` — pick one",
+            ),
+            (
+                "/x:fork:follow-links:rw",
+                "--mount \"/x:fork:follow-links:rw\": conflicting modes `fork` and `rw` — pick one",
+            ),
+            (
+                "/x:fork:exclude=",
+                "--mount \"/x:fork:exclude=\": exclude must be a non-empty relative path",
+            ),
+            (
+                "/x:fork:exclude=..",
+                "--mount \"/x:fork:exclude=..\": exclude must contain only normal relative components",
+            ),
+            (
+                "/x:fork:exclude=./hidden",
+                "--mount \"/x:fork:exclude=./hidden\": exclude must contain only normal relative components",
+            ),
+            (
+                "/x:fork:exclude=a::b",
+                "--mount \"/x:fork:exclude=a::b\": empty segment (stray `:`); expected HOST[:GUEST][:MODE]...",
+            ),
+            (
+                "/x:exclude=hidden",
+                "--mount /x:exclude=hidden: :exclude is only supported on :fork mounts;\nlive binds cannot hide nested paths.",
+            ),
+            (
+                "/x:ro:exclude=hidden",
+                "--mount /x:ro:exclude=hidden: :exclude is only supported on :fork mounts;\nlive binds cannot hide nested paths.",
+            ),
+        ];
+        for (input, pinned) in CASES {
+            let error = parse_extra_mounts(&[(*input).to_string()]).expect_err(input);
+            assert_eq!(&format!("{error:#}"), pinned, "for --mount {input:?}");
+            // A stray `:` in a whole-entry rejection must not be mistaken for
+            // the excluded-path shape: only the exclusion contexts drop the
+            // quoted entry from the outer frame.
+            if !pinned.contains("exclude must") {
+                assert_eq!(&format!("{error}"), pinned, "for --mount {input:?}");
+            }
+        }
+        // The `exclude=` context is the outer frame, and the reason is the
+        // cause: a refactor that returned the bare reason would keep `{:#}`
+        // identical only by accident, so pin both frames separately.
+        for (input, cause) in [
+            (
+                "/x:fork:exclude=",
+                "exclude must be a non-empty relative path",
+            ),
+            (
+                "/x:fork:exclude=..",
+                "exclude must contain only normal relative components",
+            ),
+        ] {
+            let error = parse_extra_mounts(&[(*input).to_string()]).expect_err(input);
+            assert_eq!(format!("{error}"), format!("--mount {input:?}"));
+            let mut chain = error.chain();
+            assert_eq!(
+                chain.next().map(ToString::to_string),
+                Some(format!("--mount {input:?}"))
+            );
+            assert_eq!(
+                chain.next().map(ToString::to_string),
+                Some(cause.to_string())
+            );
+        }
+    }
 }
 
 /// A classified source used by the launch layer.  `prepare` is the only
@@ -3237,6 +3365,64 @@ mod prepare_tests {
         visit(root, root, &mut entries);
         entries.sort();
         entries
+    }
+
+    /// The two claim verdicts `--mount` reports today, byte for byte.
+    ///
+    /// `prepare`'s normalize/claim head is about to be extracted so user-config
+    /// `mounts` share it; those two refusals are the ones that must stay
+    /// identical for a CLI-only launch while gaining an origin for the config
+    /// route. The positive controls below pin the other half of the same rule —
+    /// identical declarations merge, and only the *normalized* guest spelling
+    /// participates — so a refactor cannot trade one for the other.
+    #[test]
+    fn cli_claim_errors_are_pinned() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let mut with_core = context(store.path());
+        with_core.core_guest_mounts = vec![PathBuf::from("/core")];
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/core:ro", first.display())]).unwrap(),
+            &with_core,
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "--mount guest path /core collides with an agent-vm core mount"
+        );
+
+        let error = prepare(
+            parse_extra_mounts(&[
+                format!("{}:/g//./x:ro", first.display()),
+                format!("{}:/g/x:ro", second.display()),
+            ])
+            .unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "--mount guest path /g/x is claimed by different declarations"
+        );
+
+        // Identical declarations merge: one volume, and the guest spelling is
+        // the normalized one for both routes into it.
+        let plan = prepare(
+            parse_extra_mounts(&[
+                format!("{}:/g//./x:ro", first.display()),
+                format!("{}:/g/x:ro", first.display()),
+            ])
+            .unwrap(),
+            &context(store.path()),
+        )
+        .unwrap();
+        assert_eq!(plan.volumes.len(), 1);
+        assert_eq!(plan.volumes[0].guest, PathBuf::from("/g/x"));
     }
 
     #[test]
