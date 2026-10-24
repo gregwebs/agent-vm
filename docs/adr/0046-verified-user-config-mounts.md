@@ -65,7 +65,7 @@ discovered:
 |---|---|
 | `mounts = [...]` before any header | top-level, verified, selected |
 | `[network]` then `mounts = [...]` | lands in the network table; refused with `[network]: mounts is not a network setting; a top-level mounts list must be written before the first table header` (`[network]` presence has already asked for verification) |
-| `[[tools]]` … then `mounts = [...]` | strict tool schema: `unknown field`, with the line and column and the "before the first table header" sentence in the fixed schema-repair text |
+| `[[tools]]` … then `mounts = [...]` | strict tool schema: the fixed schema-repair paragraph (serde's own text is dropped, because a wrong-type message can echo a value), with the line and column and the "before the first table header" sentence |
 | `[tools.env]` with `mounts = "~/private:ro"` | **accepted**: an ordinary environment variable named `mounts`. It is not a mount list and does not ask for authority |
 | `[mounts]` (table form) | top-level and present, so verified, then `mounts: must be an array of strings` |
 

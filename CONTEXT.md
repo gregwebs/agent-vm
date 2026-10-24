@@ -620,7 +620,7 @@ copy is persisted but is not a config mount.
 ## Protected config directory
 
 `~/.config/agent-vm`, where `credentials.yaml`, `[network]` and `mounts`
-authorize launch secrets, egress and default mounts, respectively. This
+authorize launch secrets, egress and config mounts, respectively. This
 directory is never
 inside a writable live bind. Protection includes directories its lookup searches
 and prospective directories reached through missing components, measuring raw

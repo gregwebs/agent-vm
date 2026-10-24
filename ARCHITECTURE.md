@@ -253,7 +253,7 @@ table.
 
 **Two declaration sources, one seam.** `--mount` is not the only way a launch
 can ask for a mount: a verified user config's top-level `mounts` selects
-[defaults for every launch](docs/adr/0046-verified-user-config-mounts.md).
+[mounts for every launch](docs/adr/0046-verified-user-config-mounts.md).
 `mount_selection::select` is the only place that decides *which sources* one
 launch requests — the user config's declarations unless `--no-config-mounts`,
 then argv — and it does no I/O, so an unselected declaration can name a path
@@ -287,7 +287,7 @@ is, after a fork could already have been published. The check now runs inside
 normalized core + explicit + followed destinations, for `--mount` and config
 declarations alike. Its message bytes and its unwrapped error are unchanged, so
 the reading of a refusal does not depend on which source declared the mount
-(#394 D4).
+(ADR-0046 Decision 6).
 
 `fork` is an eager, project-scoped copy rather than a live bind. `mount::prepare`
 owns parsing, READY-first policy and topology validation, host-side copying, and

@@ -584,8 +584,12 @@ allocated:
 - the bundle's sibling `msb` and `../lib/libkrunfw.5.dylib` (the harness passes
   `MSB_PATH` explicitly and builds its environment from scratch, so an inherited
   `MSB_LIBKRUNFW_PATH`, `AGENT_VM_MSB_CACHE_DIR` or `MSB_CONFIG_PATH` cannot
-  redirect the launch);
-- a reachable registry for the first acquisition.
+  redirect the launch).
+
+The first launch also needs a reachable registry to acquire that image. Nothing
+can establish reachability before scratch exists — a probe would be a second,
+different network path from the acquisition — so an unreachable registry
+surfaces as that first launch's own error, with its receipted evidence retained.
 
 The run asserts provenance before it does any native work: the harness source
 must be its own Git top level, `tracked-status.txt` is captured by direct
@@ -601,8 +605,10 @@ The retained evidence set is self-identifying: `source.txt`,
 `candidate.txt` (realpath, SHA-256, `codesign -dv --verbose=4`), `runtime.txt`
 (the sibling `msb` and `libkrunfw`: realpath, SHA-256, signature, `msb
 --version`), `host.txt` (`sw_vers`, `uname -a`, `hw.model`/CPU), `image.txt`,
-`image-pins.json` (the launch's own first pin, whose digest is asserted equal to
-the reference's), `summary.tsv` with a retained expected-versus-actual row per
+`image-pins.json` (the launch's own first pin, whose recorded reference and
+manifest digest must **contain** the requested digest — a containment check,
+deliberately not equality; see `script/test/lib/config-mounts.py`),
+`summary.tsv` with a retained expected-versus-actual row per
 row, per-launch logs, `owned.jsonl` and `errors.json`.
 
 CM-N1 proves a `:ro` default is readable and unwritable while the host tree is

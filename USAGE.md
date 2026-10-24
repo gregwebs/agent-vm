@@ -1023,10 +1023,13 @@ gaps.
 **A missing source is not a config error.** Load never looks at a mount source,
 so a config naming a path you have not created loads, `doctor`, `--help` and
 `--no-config-mounts` launches all work. A *selected* declaration with a missing
-source fails that launch in preflight (`validating --mount source …`, under
-`preparing mounts (including mounts from "…"; --no-config-mounts skips them)`)
-rather than being skipped silently. A `:fork` whose copy is already READY is
-reused without reading the original source, exactly as a `--mount` fork is.
+source fails that launch in preflight (`canonicalizing mounts[0] in "…" host
+…`, under `preparing mounts (including mounts from "…"; --no-config-mounts
+skips them)`) rather than being skipped silently. Every preflight refusal that
+can be caused by a config declaration names it as `mounts[N] in "<file>"`, so
+the sentence points at the entry to edit and not only at the file. A `:fork`
+whose copy is already READY is reused without reading the original source,
+exactly as a `--mount` fork is.
 
 **`--no-config-mounts`** skips the automatic selection for one launch:
 
@@ -1053,7 +1056,7 @@ recent `[table]` header, so write it **before the first one**:
 |---|---|
 | `mounts = ["~/ref:ro"]` before any header | top-level; verified and selected |
 | `[network]` then `mounts = [...]` | a network setting: refused with `[network]: mounts is not a network setting; a top-level mounts list must be written before the first table header` |
-| `[[tools]]` … then `mounts = [...]` | a tool field: schema error (`unknown field`) naming the line and column |
+| `[[tools]]` … then `mounts = [...]` | a tool field: the fixed schema-repair paragraph, with the line and column and the same "write it before the first table header" sentence |
 | `[mounts]` (table form) | top-level and present, so verified, then `mounts: must be an array of strings` |
 | `[tools.env]` with `mounts = "~/private:ro"` | a legitimate **environment variable** named `mounts`; no mount is selected and no authority is asked for |
 
@@ -1379,7 +1382,7 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
   shipped defaults. Only OCI references are accepted here; a local path is
   rejected (use `--image` for a local rootfs).
 - `mounts` — optional top-level array of strings, **user config only** and only
-  before the first `[table]` header: default mounts for every launch, with
+  before the first `[table]` header: config mounts for every launch, with
   `--mount`'s `HOST[:GUEST][:MODE]...` grammar. The project and built-in tiers
   refuse the key even when it is empty. See
   [Config mounts](#config-mounts-user-config).
