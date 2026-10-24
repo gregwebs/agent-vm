@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 #[cfg(test)]
 use microsandbox::sandbox::MountBuilder;
 
-use crate::config::quoted_path;
+use crate::config::{quoted_path, quoted_str};
 use crate::host_paths::flock_exclusive;
 #[cfg(test)]
 use crate::protected_host_files::CoreBind;
@@ -143,6 +143,10 @@ pub(crate) enum MountOrigin {
     },
 }
 
+/// The *name* of an origin, for text that has no rendering policy to choose.
+/// [`prepare`]'s refusals go through [`Declaration`] instead, because they must
+/// also pick between the byte-pinned argv spelling and the escaped config one;
+/// this impl is the `--mount` / `mounts[N] in "<file>"` half alone.
 impl fmt::Display for MountOrigin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -227,13 +231,87 @@ impl From<Vec<ExtraMount>> for MountRequests {
 /// refusal keeps its historical text.
 type DeclaredOrigins = BTreeMap<PathBuf, MountOrigin>;
 
-/// The subject a preparation refusal names for `mount`: its own declaration, or
-/// `--mount` for a `:follow-links`-discovered bind (see [`DeclaredOrigins`]).
-fn declaration_origin(mount: &ExtraMount, origins: &DeclaredOrigins) -> MountOrigin {
-    origins
-        .get(&mount.guest)
-        .cloned()
-        .unwrap_or(MountOrigin::Cli)
+/// How one preparation refusal names the declaration it is about, together with
+/// the rendering policy that declaration's source requires.
+///
+/// Two renderings, because the two sources have different contracts. An argv
+/// `--mount` diagnostic is byte-pinned (ADR-0018: `cli_claim_errors_are_pinned`),
+/// so every argv site below prints exactly the text it printed before
+/// declarations could come from a file: the debug rendering where the old text
+/// used it, `Path::display` where it printed a resolved host, and the bare
+/// declared spelling where the old text had no quotes. A config entry is
+/// attacker-chosen text that also has to stay one line, so those sites escape it
+/// with the config module's [`quoted_path`]/[`quoted_str`].
+#[derive(Clone, Copy, Debug)]
+enum Declaration<'a> {
+    /// An argv `--mount`.
+    Argv,
+    /// A verified user `mounts` entry: index `index` of `file`.
+    UserConfig { file: &'a Path, index: usize },
+}
+
+impl Declaration<'_> {
+    /// `--mount` or `mounts[N] in "<file>"`: the name a refusal starts with.
+    fn subject(self) -> String {
+        match self {
+            Self::Argv => "--mount".to_string(),
+            Self::UserConfig { file, index } => {
+                format!("mounts[{index}] in {}", quoted_path(file))
+            }
+        }
+    }
+
+    /// A declared spelling as this source's refusal prints it: bare for argv (the
+    /// two sentences that print one never quoted it), escaped for a config entry
+    /// so a newline in the spelling cannot forge a second diagnostic line.
+    fn spelling(self, spelling: &str) -> String {
+        match self {
+            Self::Argv => spelling.to_string(),
+            Self::UserConfig { .. } => quoted_str(spelling),
+        }
+    }
+}
+
+/// The declaration a preparation refusal names for `mount`: its own declaration,
+/// or `--mount` for a `:follow-links`-discovered bind (see [`DeclaredOrigins`]).
+fn declaration_origin<'a>(mount: &ExtraMount, origins: &'a DeclaredOrigins) -> Declaration<'a> {
+    match origins.get(&mount.guest) {
+        Some(MountOrigin::UserConfig { file, index }) => Declaration::UserConfig {
+            file,
+            index: *index,
+        },
+        // A discovered bind is not a declaration, and `MountOrigin::Cli` is an
+        // argv one; both keep the historical `--mount` text.
+        Some(MountOrigin::Cli) | None => Declaration::Argv,
+    }
+}
+
+/// The `canonicalizing …` context for a source [`expand_follow_links`] could not
+/// resolve. Named so the argv rendering (`{:?}`) and the config rendering
+/// (escaped, so `café` stays one word) can be pinned without a filesystem race.
+fn canonicalizing_context(declaration: Declaration<'_>, spelling: &str) -> String {
+    match declaration {
+        Declaration::Argv => format!("canonicalizing --mount host {spelling:?}"),
+        _ => format!(
+            "canonicalizing {} host {}",
+            declaration.subject(),
+            quoted_str(spelling)
+        ),
+    }
+}
+
+/// The `validating … source` context for a source `prepare` could not classify.
+/// Same split as [`canonicalizing_context`], with `Path::display` on the argv
+/// side: this sentence never quoted the path.
+fn validating_source_context(declaration: Declaration<'_>, host: &Path) -> String {
+    match declaration {
+        Declaration::Argv => format!("validating --mount source {}", host.display()),
+        _ => format!(
+            "validating {} source {}",
+            declaration.subject(),
+            quoted_path(host)
+        ),
+    }
 }
 
 // The pure decisions this module makes about a declaration. Three of them decide
@@ -1125,11 +1203,7 @@ pub(crate) fn expand_follow_links(
     // is already an owned committed path and is intentionally not resolved.
     for mount in mounts.iter_mut().filter(|m| !m.is_fork()) {
         mount.host = mount.host.canonicalize().with_context(|| {
-            format!(
-                "canonicalizing {} host {}",
-                declaration_origin(mount, origins),
-                quoted_path(Path::new(&mount.source_spelling))
-            )
+            canonicalizing_context(declaration_origin(mount, origins), &mount.source_spelling)
         })?;
     }
     if !mounts.iter().any(|m| m.follows_links() && !m.is_fork()) {
@@ -1467,6 +1541,7 @@ mod tests {
             store.path(),
             &std::collections::HashMap::new(),
             &ProtectedHostFiles::measure(None).unwrap(),
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1485,6 +1560,7 @@ mod tests {
             store.path(),
             &std::collections::HashMap::new(),
             &ProtectedHostFiles::measure(None).unwrap(),
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         assert_eq!(
@@ -2912,7 +2988,7 @@ pub(crate) fn prepare(
     // rejected before discovery/transaction. A missing source is left for
     // the locked transaction, so a waiter can still reuse a fork another
     // initializer publishes while it waits.
-    let known_fork_kinds = preflight_forks(&mut unique, &context.mount_store)?;
+    let known_fork_kinds = preflight_forks(&mut unique, &context.mount_store, &origins)?;
 
     // Live binds are the only sources that can contribute followed links, so
     // discovery runs after fork preflight and never over a fork.
@@ -2935,25 +3011,22 @@ pub(crate) fn prepare(
                 // locked transaction rechecks before it publishes.
                 .unwrap_or(PreparedNodeKind::Directory)
         } else {
-            let metadata = fs::symlink_metadata(&mount.host).with_context(|| {
-                format!(
-                    "validating {} source {}",
-                    declaration_origin(mount, &origins),
-                    quoted_path(&mount.host)
-                )
-            })?;
-            node_kind(&metadata, &mount.host)?
+            let declaration = declaration_origin(mount, &origins);
+            let metadata = fs::symlink_metadata(&mount.host)
+                .with_context(|| validating_source_context(declaration, &mount.host))?;
+            node_kind(&metadata, &mount.host, declaration)?
         };
         // A regular file cannot be a writable bind: the runtime's writable
         // file staging is intentionally unreachable from agent-vm (issue
         // #113). Reject here, after canonicalization, so a symlink-to-file
         // root is caught too.
         if kind == PreparedNodeKind::File && !mount.is_readonly() {
+            let declaration = declaration_origin(mount, &origins);
             anyhow::bail!(
                 "{} {}: a file can only be mounted read-only.\n\
                  Use :ro, or :fork its containing directory for a writable copy.",
-                declaration_origin(mount, &origins),
-                mount.source_spelling
+                declaration.subject(),
+                declaration.spelling(&mount.source_spelling)
             );
         }
         let source = if mount.is_readonly() {
@@ -2985,7 +3058,7 @@ pub(crate) fn prepare(
     )?;
     for mount in expanded.iter().filter(|m| !m.is_readonly() && !m.is_fork()) {
         config_dir.check_writable_mount(
-            &declaration_origin(mount, &origins).to_string(),
+            &declaration_origin(mount, &origins).subject(),
             &mount.source_spelling,
             &mount.spelled_host,
             &mount.host,
@@ -3025,6 +3098,7 @@ pub(crate) fn prepare(
         &context.mount_store,
         &known_fork_kinds,
         &protected,
+        &origins,
     )?);
     sync_fork_representations(&unique, &mut expanded)?;
     notices.extend(warnings.into_iter().map(|warning| format!("==> {warning}")));
@@ -3045,7 +3119,7 @@ pub(crate) fn prepare(
         volume.source = PreparedVolumeSource::WritableBind(mount.host.clone());
         let metadata = fs::symlink_metadata(&mount.host)
             .with_context(|| format!("validating committed fork {}", mount.host.display()))?;
-        volume.node_kind = node_kind(&metadata, &mount.host)?;
+        volume.node_kind = node_kind(&metadata, &mount.host, declaration_origin(mount, &origins))?;
     }
 
     // The prepared explicit declarations in order: live binds carry their
@@ -3090,13 +3164,14 @@ fn enforce_protected_files(
     if expanded.is_empty() {
         return Ok(());
     }
-    let declarations: Vec<(MountOrigin, String)> = expanded[..explicit_count]
+    let declarations: Vec<(String, String)> = expanded[..explicit_count]
         .iter()
         .filter(|mount| mount.follows_links() && !mount.is_fork())
         .map(|mount| {
+            let declaration = declaration_origin(mount, origins);
             (
-                declaration_origin(mount, origins),
-                mount.source_spelling.clone(),
+                declaration.subject(),
+                declaration.spelling(&mount.source_spelling),
             )
         })
         .collect();
@@ -3111,9 +3186,10 @@ fn enforce_protected_files(
             && let Some(exposure) = protected.exposure(&mount.host)?
         {
             let discovered = (index >= explicit_count).then(|| discovered_by(&declarations));
+            let declaring = declaration_origin(mount, origins);
             let message = protected.message(
-                &declaration_origin(mount, origins).to_string(),
-                &mount.source_spelling,
+                &declaring.subject(),
+                &declaring.spelling(&mount.source_spelling),
                 &exposure,
                 discovered.as_deref(),
             );
@@ -3128,8 +3204,13 @@ fn enforce_protected_files(
         // A fork needs only the platform-artifact advisory: its content is the
         // copy engine's decision, and `:fork` is what it already is.
         let live_bind = !mount.is_fork();
-        for advisory in protected.mount_advisories(&declaration, &mount.source_spelling, live_bind)
-        {
+        let declaring = declaration_origin(mount, origins);
+        let advisories = protected.mount_advisories(
+            &declaration,
+            &declaring.spelling(&mount.source_spelling),
+            live_bind,
+        );
+        for advisory in advisories {
             push_notice(notices, &mut seen, advisory);
         }
     }
@@ -3142,9 +3223,9 @@ fn enforce_protected_files(
 /// same bind — so naming every candidate would blame declarations that did not
 /// contribute it. Naming the sole candidate, or naming none of them, is never
 /// wrong.
-fn discovered_by(declarations: &[(MountOrigin, String)]) -> String {
+fn discovered_by(declarations: &[(String, String)]) -> String {
     match declarations {
-        [(origin, only)] => format!("{origin} {only}:follow-links"),
+        [(subject, only)] => format!("{subject} {only}:follow-links"),
         // The multi-candidate sentence names no origin on purpose: the origins
         // may differ, and a phrase naming the wrong one is worse than naming
         // none. The launch's outer context still names the config file.
@@ -3185,9 +3266,11 @@ fn legacy_fork_dir(mount: &ExtraMount, mount_store: &Path) -> Option<PathBuf> {
 fn preflight_forks(
     mounts: &mut [ExtraMount],
     mount_store: &Path,
+    origins: &DeclaredOrigins,
 ) -> Result<std::collections::HashMap<PathBuf, PreparedNodeKind>> {
     let mut kinds = std::collections::HashMap::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
+        let declaration = declaration_origin(mount, origins);
         let id = fork_id(mount, IDENTITY_VERSION);
         let final_dir = mount_store.join("forks").join(&id);
         if final_dir_exists(&final_dir)? {
@@ -3202,10 +3285,10 @@ fn preflight_forks(
         // store/lock side effect. A vanished source is deliberately deferred:
         // a concurrent initializer may publish READY while this waiter blocks
         // on the per-fork lock (see the process tests).
-        let Some(kind) = try_fork_source_kind(&mount.host)? else {
+        let Some(kind) = try_fork_source_kind(&mount.host, declaration)? else {
             continue;
         };
-        require_fork_directory(kind, &mount.source_spelling)?;
+        require_fork_directory(kind, declaration, &mount.source_spelling)?;
         kinds.insert(mount.guest.clone(), kind);
     }
     Ok(kinds)
@@ -3213,19 +3296,28 @@ fn preflight_forks(
 
 /// A `:fork` root is always a directory (issue #113). Shared between the
 /// preflight classification and the locked recheck so both emit one message.
-fn require_fork_directory(kind: PreparedNodeKind, source: &str) -> Result<()> {
+fn require_fork_directory(
+    kind: PreparedNodeKind,
+    declaration: Declaration<'_>,
+    source: &str,
+) -> Result<()> {
     if kind != PreparedNodeKind::Directory {
         anyhow::bail!(
-            "--mount {source}: a :fork source must be a directory.\n\
-             Fork the containing directory, or bind the file read-only with :ro."
+            "{} {}: a :fork source must be a directory.\n\
+             Fork the containing directory, or bind the file read-only with :ro.",
+            declaration.subject(),
+            declaration.spelling(source)
         );
     }
     Ok(())
 }
 
-fn try_fork_source_kind(source: &Path) -> Result<Option<PreparedNodeKind>> {
+fn try_fork_source_kind(
+    source: &Path,
+    declaration: Declaration<'_>,
+) -> Result<Option<PreparedNodeKind>> {
     match fs::symlink_metadata(source) {
-        Ok(_) => fork_source_kind(source).map(Some),
+        Ok(_) => fork_source_kind(source, declaration).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => {
             Err(error).with_context(|| format!("validating fork root {}", source.display()))
@@ -3233,13 +3325,13 @@ fn try_fork_source_kind(source: &Path) -> Result<Option<PreparedNodeKind>> {
     }
 }
 
-fn fork_source_kind(source: &Path) -> Result<PreparedNodeKind> {
+fn fork_source_kind(source: &Path, declaration: Declaration<'_>) -> Result<PreparedNodeKind> {
     let resolved = source
         .canonicalize()
         .with_context(|| format!("resolving fork root {}", source.display()))?;
     let metadata = fs::symlink_metadata(&resolved)
         .with_context(|| format!("validating fork root {}", source.display()))?;
-    node_kind(&metadata, source)
+    node_kind(&metadata, source, declaration)
 }
 
 /// Keep the follow-link-expanded representation aligned with the declaration
@@ -3284,13 +3376,28 @@ fn same_declaration(a: &ExtraMount, b: &ExtraMount) -> bool {
     })
 }
 
-fn node_kind(metadata: &fs::Metadata, path: &Path) -> Result<PreparedNodeKind> {
+fn node_kind(
+    metadata: &fs::Metadata,
+    path: &Path,
+    declaration: Declaration<'_>,
+) -> Result<PreparedNodeKind> {
     if metadata.is_file() {
         Ok(PreparedNodeKind::File)
     } else if metadata.is_dir() {
         Ok(PreparedNodeKind::Directory)
     } else {
-        anyhow::bail!("{} must be a regular file or directory", path.display())
+        // This sentence has never named `--mount` for an argv source, so that
+        // half stays byte-identical; a config entry is named, because otherwise
+        // the launch context mentions only the file.
+        anyhow::bail!(
+            "{} must be a regular file or directory",
+            match declaration {
+                Declaration::Argv => path.display().to_string(),
+                Declaration::UserConfig { .. } => {
+                    format!("{} {}", declaration.subject(), quoted_path(path))
+                }
+            }
+        )
     }
 }
 
@@ -3576,9 +3683,11 @@ pub(crate) fn prepare_forks(
     mount_store: &Path,
     expected_kinds: &std::collections::HashMap<PathBuf, PreparedNodeKind>,
     protected: &ProtectedHostFiles,
+    origins: &DeclaredOrigins,
 ) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
+        let declaration = declaration_origin(mount, origins);
         let id = fork_id(mount, IDENTITY_VERSION);
         let final_dir = mount_store.join("forks").join(&id);
         ensure_store(mount_store)?;
@@ -3599,14 +3708,14 @@ pub(crate) fn prepare_forks(
         clean_stale_staging(&mount_store.join("staging"), &id)?;
         // The root kind is source-dependent, so resolve it only after the
         // waiter has acquired the transaction lock and rechecked READY.
-        let source_kind = fork_source_kind(&mount.host)?;
-        require_fork_directory(source_kind, &mount.source_spelling)?;
+        let source_kind = fork_source_kind(&mount.host, declaration)?;
+        require_fork_directory(source_kind, declaration, &mount.source_spelling)?;
         if let Some(expected) = expected_kinds.get(&mount.guest)
             && *expected != source_kind
         {
             anyhow::bail!(
                 "fork root kind changed while preparing {}; retry the launch",
-                mount.source_spelling
+                declaration.spelling(&mount.source_spelling)
             );
         }
         let staging_parent = mount_store.join("staging");
@@ -3632,14 +3741,19 @@ pub(crate) fn prepare_forks(
             protected,
         };
         let mut report = CopyReport::default();
-        let kind = copy_root(&mount.host, &staged_data, &policy, &mut report)
-            .with_context(|| format!("initializing fork from {}", mount.source_spelling))?;
+        let kind =
+            copy_root(&mount.host, &staged_data, &policy, &mut report).with_context(|| {
+                format!(
+                    "initializing fork from {}",
+                    declaration.spelling(&mount.source_spelling)
+                )
+            })?;
         for (relative, file) in &report.omitted {
             notices.push(format!(
                 "==> Omitted {} {} from the fork of {}",
                 file.description(),
                 relative.display(),
-                mount.source_spelling
+                declaration.spelling(&mount.source_spelling)
             ));
         }
         let manifest = ForkManifest {
@@ -3671,7 +3785,7 @@ pub(crate) fn prepare_forks(
         mount.host = final_dir.join("data");
         notices.push(format!(
             "==> Initialized fork {} -> {} (reset: {})",
-            mount.source_spelling,
+            declaration.spelling(&mount.source_spelling),
             mount.host.display(),
             final_dir.display()
         ));
@@ -4417,6 +4531,127 @@ mod prepare_tests {
         .unwrap();
         assert_eq!(plan.volumes.len(), 1);
         assert_eq!(plan.volumes[0].guest, PathBuf::from("/g/x"));
+    }
+
+    /// One refusal, two renderings: the argv half of every sentence the config
+    /// route rewrote, and the config half it gained.
+    ///
+    /// Two spellings are pinned because they are easy to "unify": `{:?}` for a
+    /// declared spelling in the canonicalization context and `Path::display` for
+    /// a resolved host. Neither may become the config escape policy, which turns
+    /// `café` into `caf\xc3\xa9` and would silently change every argv launch's
+    /// wording.
+    #[test]
+    fn refusal_contexts_are_pinned_per_declaration_source() {
+        let config = Declaration::UserConfig {
+            file: Path::new("/home/u/.config/agent-vm/config.toml"),
+            index: 2,
+        };
+        // argv: `{:?}` quotes and keeps non-ASCII; `display()` prints it bare.
+        assert_eq!(
+            canonicalizing_context(Declaration::Argv, "/srv/café"),
+            "canonicalizing --mount host \"/srv/café\""
+        );
+        assert_eq!(
+            validating_source_context(Declaration::Argv, Path::new("/srv/café")),
+            "validating --mount source /srv/café"
+        );
+        // config: named by index and file, value escaped.
+        assert_eq!(
+            canonicalizing_context(config, "/srv/café"),
+            "canonicalizing mounts[2] in \"/home/u/.config/agent-vm/config.toml\" host \
+             \"/srv/caf\\xc3\\xa9\""
+        );
+        assert_eq!(
+            validating_source_context(config, Path::new("/srv/café")),
+            "validating mounts[2] in \"/home/u/.config/agent-vm/config.toml\" source \
+             \"/srv/caf\\xc3\\xa9\""
+        );
+        assert_eq!(
+            config.subject(),
+            "mounts[2] in \"/home/u/.config/agent-vm/config.toml\""
+        );
+        assert_eq!(config.spelling("/srv/café"), "\"/srv/caf\\xc3\\xa9\"");
+        // The same spelling stays one line in a config refusal.
+        assert_eq!(config.spelling("/srv/a\nb"), "\"/srv/a\\x0ab\"");
+    }
+
+    /// The argv sentences end to end: a non-ASCII source spelling reaches the
+    /// user exactly as typed, and each keeps the quoting it has always had.
+    ///
+    /// The `validating … source` sentence is deliberately absent: it is reachable
+    /// only when a source vanishes between canonicalization and the kind check, so
+    /// both of its renderings are pinned through
+    /// [`refusal_contexts_are_pinned_per_declaration_source`] instead of through a
+    /// filesystem race.
+    #[test]
+    fn argv_refusals_print_a_non_ascii_source_as_typed() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        // A missing source: `{:?}` on the declared spelling, quotes and all.
+        let missing = home.join("café-missing");
+        let spelling = missing.display().to_string();
+        let error = prepare(
+            parse_extra_mounts(&[format!("{spelling}:/g:ro")]).unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.starts_with(&format!("canonicalizing --mount host {spelling:?}")),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(r"\xc3"), "{rendered}");
+
+        // A regular file mounted writable: the bare spelling, no quotes.
+        let file = home.join("café-file");
+        fs::write(&file, "seed").unwrap();
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/f:rw", file.display())]).unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "--mount {}: a file can only be mounted read-only.\n\
+                 Use :ro, or :fork its containing directory for a writable copy.",
+                file.display()
+            )
+        );
+
+        // A `:fork` over a regular file: the bare spelling again.
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/fk:fork", file.display())]).unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "--mount {}: a :fork source must be a directory.\n\
+                 Fork the containing directory, or bind the file read-only with :ro.",
+                file.display()
+            )
+        );
+
+        // A FIFO: this sentence has never named `--mount`, and still does not, so
+        // the argv text is unchanged even though the config route now names
+        // `mounts[N]` here.
+        let fifo = home.join("café-fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/p:ro", fifo.display())]).unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!("{} must be a regular file or directory", fifo.display())
+        );
     }
 
     #[test]
@@ -6019,6 +6254,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &original,
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         assert!(
@@ -6054,6 +6290,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &stale,
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         let data = &mounts[0].host;
@@ -6083,7 +6320,8 @@ mod prepare_tests {
         let lock = open_regular_lock(&store.join("fork.lock")).unwrap();
         flock_exclusive(&lock).unwrap();
         require_fork_directory(
-            fork_source_kind(root_spelling).unwrap(),
+            fork_source_kind(root_spelling, Declaration::Argv).unwrap(),
+            Declaration::Argv,
             &root_spelling.display().to_string(),
         )
         .unwrap();
@@ -6551,6 +6789,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         let data = &mounts[0].host;
@@ -6614,6 +6853,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         );
         clear_copy_checkpoint();
 
@@ -6674,6 +6914,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         );
         clear_copy_checkpoint();
 
@@ -6736,6 +6977,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &ProtectedHostFiles::measure(Some(&home)).unwrap(),
+            &DeclaredOrigins::new(),
         );
         clear_resolve_checkpoint();
         clear_copy_checkpoint();
@@ -6805,6 +7047,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         );
         clear_resolve_checkpoint();
         clear_copy_checkpoint();
@@ -6928,6 +7171,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         let data = &mounts[0].host;
@@ -6978,6 +7222,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &ProtectedHostFiles::measure(Some(&home)).unwrap(),
+            &DeclaredOrigins::new(),
         );
 
         result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
@@ -7040,6 +7285,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &ProtectedHostFiles::measure(Some(&home)).unwrap(),
+            &DeclaredOrigins::new(),
         );
 
         result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
@@ -7114,6 +7360,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         );
         clear_copy_checkpoint();
 

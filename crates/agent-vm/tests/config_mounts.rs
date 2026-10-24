@@ -1240,6 +1240,126 @@ fn writable_config_file_mount_is_refused() {
     h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
 }
 
+/// A config `:fork` over a regular file names its declaration, not only the
+/// file: `--mount …` in a config launch would point at the wrong entry, and the
+/// author has a `mounts[N]` to fix.
+#[test]
+fn config_fork_of_a_file_names_the_declaration() {
+    let h = Harness::new();
+    let file = h.home_root.join("bare");
+    std::fs::write(&file, "bare").unwrap();
+    h.write_user("mounts = [\"~/bare:/guest:fork\"]\n");
+    let before = h.snapshot();
+    let out = h.launch(&[], "shell", &[]);
+    let stderr = stderr_of(&out);
+    h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
+    let refusal = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains(":fork source must be a directory"))
+        .unwrap_or_else(|| panic!("no :fork refusal in:\n{stderr}"));
+    assert_eq!(
+        refusal,
+        format!(
+            // The config's `~/` expansion is a literal concatenation of `$HOME`,
+            // so the refusal spells the source exactly as the mount will.
+            "{} \"{}\": a :fork source must be a directory.",
+            config_declaration(&h, 0),
+            file.display()
+        ),
+        "a config refusal names the declaration and no bare --mount:\n{stderr}"
+    );
+    assert!(!stderr.contains("--mount "), "{stderr}");
+    assert!(h.mount_store().is_none());
+}
+
+/// A source that is neither a regular file nor a directory (a FIFO) is refused
+/// by the kind check; a config entry names its declaration there too, instead of
+/// printing a bare host path under a launch that mentions only the file.
+///
+/// The FIFO lives outside `$HOME` and outside the state root on purpose: the
+/// refusal oracle's snapshot reads every non-directory, non-symlink entry as a
+/// file, and `read(2)` on a FIFO blocks until a writer appears. Production never
+/// opens the source — `canonicalize` and `symlink_metadata` classify it without a
+/// descriptor — so an absolute spelling outside the snapshotted trees tests the
+/// same sentence without making the harness able to hang.
+#[test]
+fn config_fifo_source_names_the_declaration() {
+    let h = Harness::new();
+    let outside = tempfile::tempdir_in(support::workspace_tmpdir()).unwrap();
+    let fifo = outside.path().canonicalize().unwrap().join("fifo");
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    // The classification input is the same one a `~/` spelling gives: a path that
+    // exists and is a FIFO.
+    use std::os::unix::fs::FileTypeExt as _;
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    h.write_user(&format!("mounts = [\"{}:/guest:ro\"]\n", fifo.display()));
+    let before = h.snapshot();
+    let out = h.launch(&[], "shell", &[]);
+    let stderr = stderr_of(&out);
+    h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
+    let refusal = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains("must be a regular file or directory"))
+        .unwrap_or_else(|| panic!("no kind refusal in:\n{stderr}"));
+    assert_eq!(
+        refusal,
+        format!(
+            "{} \"{}\" must be a regular file or directory",
+            config_declaration(&h, 0),
+            fifo.display()
+        ),
+        "{stderr}"
+    );
+    assert!(h.mount_store().is_none());
+}
+
+/// A config source spelling can carry a newline (TOML basic strings escape
+/// one), and the refusal must still be one diagnostic: the value is rendered
+/// with the config module's escaping, so it cannot forge a second line that the
+/// reader would take for agent-vm's own output.
+#[test]
+fn a_config_source_spelling_cannot_forge_a_diagnostic_line() {
+    let h = Harness::new();
+    let forged = h.home_root.join("bad\nFORGED-LINE");
+    std::fs::write(&forged, "x").unwrap();
+    h.write_user("mounts = [\"~/bad\\nFORGED-LINE:/guest:rw\"]\n");
+    let before = h.snapshot();
+    let out = h.launch(&[], "shell", &[]);
+    let stderr = stderr_of(&out);
+    h.assert_refused_before_launch_state(&out, &before, &config_declaration(&h, 0));
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    let index = lines
+        .iter()
+        .position(|line| line.contains("a file can only be mounted read-only"))
+        .unwrap_or_else(|| panic!("no file refusal in:\n{stderr}"));
+    assert_eq!(
+        lines[index],
+        format!(
+            "{} \"{}/bad\\x0aFORGED-LINE\": a file can only be mounted read-only.",
+            config_declaration(&h, 0),
+            h.home_root.display()
+        ),
+        "the spelling must be escaped, not interpolated raw:\n{stderr}"
+    );
+    assert!(
+        lines[index + 1].starts_with("Use :ro, or :fork"),
+        "a value forged a diagnostic line:\n{stderr}"
+    );
+    assert!(
+        !lines.contains(&"FORGED-LINE: a file can only be mounted read-only."),
+        "{stderr}"
+    );
+}
+
 /// `:follow-links` discovery applies to a config declaration too: each
 /// discovered real directory is bound read-only at its own host path.
 #[test]
@@ -1401,6 +1521,16 @@ fn only_fork_data(h: &Harness) -> PathBuf {
     forks[0].join("data")
 }
 
+/// The `==> Initialized fork …` notice for a **config** declaration: the declared
+/// spelling is escaped and quoted the way every config-facing message renders
+/// one, so a source carrying a newline cannot forge a notice line. (An argv fork
+/// keeps its historical bare spelling; that text is byte-pinned.) The fixtures
+/// below contain no byte the escaper would rewrite, so quoting is the whole
+/// difference.
+fn initialized_fork(spelling: &str) -> String {
+    format!("==> Initialized fork \"{spelling}\" ")
+}
+
 /// `:exclude` on a config fork omits the named paths from the committed copy
 /// only; the host source keeps them.
 #[test]
@@ -1412,7 +1542,7 @@ fn config_fork_omits_excluded_files() {
     let out = h.launch(&[], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
-        stderr.contains(&format!("==> Initialized fork {}", src.display())),
+        stderr.contains(&initialized_fork(&src.display().to_string())),
         "{stderr}"
     );
     let data = only_fork_data(&h);
@@ -1518,7 +1648,7 @@ fn a_config_fork_shadowing_a_persist_path_is_refused_before_any_fork() {
     let accepted = h.launch(&[], "aider", &[]);
     let accepted_stderr = stderr_of(&accepted);
     assert!(
-        accepted_stderr.contains(&format!("==> Initialized fork {}", src.display())),
+        accepted_stderr.contains(&initialized_fork(&src.display().to_string())),
         "the control must publish the fork: {accepted_stderr}"
     );
     assert_eq!(h.fork_dirs().len(), 1);
@@ -1609,7 +1739,7 @@ fn config_fork_is_reused_after_its_source_is_removed() {
     let seeded = h.launch(&[], "shell", &[]);
     let seeded_stderr = stderr_of(&seeded);
     assert!(
-        seeded_stderr.contains(&format!("==> Initialized fork {}", src.display())),
+        seeded_stderr.contains(&initialized_fork(&src.display().to_string())),
         "{seeded_stderr}"
     );
     let committed = only_fork_data(&h);
@@ -1655,7 +1785,7 @@ fn config_fork_identity_keeps_the_home_spelling() {
     let out = h.launch_with_home(&alias, &[], "shell", &[]);
     let stderr = stderr_of(&out);
     assert!(
-        stderr.contains(&format!("==> Initialized fork {}/src", alias.display())),
+        stderr.contains(&initialized_fork(&format!("{}/src", alias.display()))),
         "the notice must keep the expanded spelling: {stderr}"
     );
     let manifest = |fork: &Path| -> serde_json::Value {

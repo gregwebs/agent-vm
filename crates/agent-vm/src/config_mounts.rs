@@ -21,8 +21,16 @@
 //! `mounts` entry can carry an attacker-chosen path, and the sentence is printed
 //! to a user deciding whether to trust the file. A *launch-time* refusal is a
 //! different question — it has to name the host or guest path it could not
-//! prepare, or the user cannot fix it — so those sentences render the path with
-//! the config module's escaping and the declaration as `mounts[N] in "<file>"`.
+//! prepare, or the user cannot fix it — so those sentences name the declaration
+//! as `mounts[N] in "<file>"` and render the **declared host spelling** with
+//! `config`'s escaping (`quoted_str`/`quoted_path`), never raw. That is what keeps
+//! a refusal, a fork notice or an error context to one line when a spelling
+//! carries a newline: the value is echoed escaped, so a config cannot forge a
+//! second diagnostic. (`--mount` keeps its historical unescaped renderings on
+//! purpose; they are byte-pinned and a shell's argv is not a trusted-file
+//! question. A guest path is escaped-or-refused by the shared grammar, which
+//! rejects control characters, and paths taken from the host's own measurement
+//! are not config text at all.)
 
 use crate::{
     config_authority::AuthorizedConfig,
