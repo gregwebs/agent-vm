@@ -2027,6 +2027,69 @@ mod tests {
         );
     }
 
+    /// A `mounts` value that fails its own checks is a *deferred* catalog error:
+    /// every built-in still dispatches, help renders with the broken-config
+    /// note, and a launch reports the mounts sentence rather than an
+    /// unknown-subcommand failure.
+    #[test]
+    fn a_broken_mounts_config_is_a_deferred_catalog_error() {
+        let _env = clear_launch_env();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("user.toml");
+        std::fs::write(&file, "mounts = [1]\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let load = || {
+            crate::config::load(&crate::config::ConfigPaths {
+                user: Some(file.clone()),
+                project: dir.path().join("absent.toml"),
+                home: None,
+            })
+        };
+        for (tokens, check) in [
+            (
+                vec!["agent-vm", "doctor"],
+                matches!(
+                    parse_from(["agent-vm", "doctor"], load()).unwrap(),
+                    Dispatch::Builtin {
+                        cmd: Cmd::Doctor(_),
+                        ..
+                    }
+                ),
+            ),
+            (
+                vec!["agent-vm", "msb", "--version"],
+                matches!(
+                    parse_from(["agent-vm", "msb", "--version"], load()).unwrap(),
+                    Dispatch::Builtin {
+                        cmd: Cmd::Msb(_),
+                        ..
+                    }
+                ),
+            ),
+        ] {
+            assert!(check, "{tokens:?} must still dispatch");
+        }
+        let help = build_command(&Catalog::Broken(load().unwrap_err()))
+            .try_get_matches_from(["agent-vm", "--help"])
+            .unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains(CONFIG_BROKEN_NOTE));
+        for argv in [
+            vec!["agent-vm", "shell"],
+            vec!["agent-vm", "run", "true"],
+            vec!["agent-vm", "--", "true"],
+        ] {
+            let error = parse_from(argv_of(&argv), load())
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must report the config error"))
+                .to_string();
+            assert!(error.contains("mounts[0]: must be a string"), "{error}");
+            assert!(!error.contains("unrecognized subcommand"), "{error}");
+        }
+    }
+
     #[test]
     fn no_config_mounts_is_a_launch_option_before_the_verb() {
         let _env = clear_launch_env();
