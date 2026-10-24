@@ -2505,12 +2505,12 @@ mod tests {
         // `/h/` keeps its trailing slash (`//`), and the process `HOME` is not
         // involved: it is the real home, not `/h/`.
         let report = load(&with_home(Some(PathBuf::from("/h/")))).unwrap();
-        let spellings: Vec<&str> = report
+        let spellings: Vec<crate::mount::Spelling> = report
             .user_mounts()
             .unwrap()
             .requests()
             .iter()
-            .map(|request| request.mount.source_spelling.as_str())
+            .map(|request| request.mount.source_spelling.clone())
             .collect();
         assert_eq!(spellings, ["/h//ref", "/abs/ref"]);
         assert_ne!(std::env::var("HOME").ok(), Some("/h/".to_string()));

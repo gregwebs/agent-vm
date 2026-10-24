@@ -187,7 +187,7 @@ mod tests {
     use crate::config_authority::{AuthorityTriggers, verify};
     use crate::config_mounts::from_verified_value;
     use crate::host_paths::read_bounded_regular_file_noting_symlink;
-    use crate::mount::MountOrigin;
+    use crate::mount::{MountOrigin, Spelling};
     use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
     const HOME: &str = "/home/selection";
@@ -221,7 +221,7 @@ mod tests {
             .expect("the fixture entries parse")
     }
 
-    fn described(selection: &mut Selection) -> Vec<(MountOrigin, String)> {
+    fn described(selection: &mut Selection) -> Vec<(MountOrigin, Spelling)> {
         selection
             .take_requests()
             .into_inner()
@@ -272,10 +272,10 @@ mod tests {
         assert_eq!(
             described(&mut selection),
             [
-                (config_origin(0), format!("{HOME}/ref")),
-                (config_origin(1), "/srv/data".to_owned()),
-                (MountOrigin::Cli, "/cli".to_owned()),
-                (MountOrigin::Cli, "/cli2".to_owned()),
+                (config_origin(0), Spelling::new(format!("{HOME}/ref"))),
+                (config_origin(1), Spelling::new("/srv/data")),
+                (MountOrigin::Cli, Spelling::new("/cli")),
+                (MountOrigin::Cli, Spelling::new("/cli2")),
             ]
         );
     }
@@ -292,7 +292,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             described(&mut selection),
-            [(MountOrigin::Cli, "/cli".to_owned())]
+            [(MountOrigin::Cli, Spelling::new("/cli"))]
         );
     }
 

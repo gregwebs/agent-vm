@@ -204,7 +204,7 @@ mod tests {
     use super::*;
     use crate::config_authority::{AuthorityTriggers, verify};
     use crate::host_paths::read_bounded_regular_file_noting_symlink;
-    use crate::mount::MountPolicy;
+    use crate::mount::{MountPolicy, Spelling};
     use std::{fs, os::unix::fs::PermissionsExt};
 
     const GUEST_NOT_MOUNTABLE: &str = "mounts[0]: guest path must be absolute, must not be /, and \
@@ -247,7 +247,7 @@ mod tests {
         with_authorized(|authorized, _| from_verified_value(authorized, &value(text), home))
     }
 
-    fn sources(mounts: &UserMounts) -> Vec<String> {
+    fn sources(mounts: &UserMounts) -> Vec<Spelling> {
         mounts
             .requests()
             .iter()
