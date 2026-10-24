@@ -866,7 +866,23 @@ fn symlinked_user_config_without_mounts_still_launches() {
         "/bin/probe",
         "the user tool must be registered from the symlinked file: {stderr}"
     );
+    // A config with no mounts must add nothing: the bind set is exactly the
+    // three core binds (state, persisted home, project).
     let binds = sorted_binds(&debug_config_json(&stderr));
+    let state = state_dir(&stderr);
+    for guest in [
+        PathBuf::from("/agent-vm-state"),
+        h.home_root.clone(),
+        h.project_root.clone(),
+    ] {
+        assert!(
+            binds
+                .iter()
+                .any(|(_, bind_guest, _)| *bind_guest == guest.display().to_string()),
+            "the core bind at {guest:?} is missing: {binds:?} (state {})",
+            state.display()
+        );
+    }
     assert_eq!(
         binds.len(),
         3,
@@ -1022,6 +1038,7 @@ fn config_and_cli_conflicts_are_refused_naming_both() {
             [unrelated.as_str(), conflicting.as_str()]
         };
         let options: Vec<&str> = argv.iter().flat_map(|mount| ["--mount", *mount]).collect();
+        let before = h.snapshot();
         let out = h.launch(&options, "shell", &[]);
         let stderr = stderr_of(&out);
         assert!(
@@ -1037,10 +1054,7 @@ fn config_and_cli_conflicts_are_refused_naming_both() {
             stderr.contains("--no-config-mounts skips them"),
             "{argv:?}: the opt-out must be offered: {stderr}"
         );
-        assert!(
-            !stderr.contains(CONFIG_MARKER),
-            "{argv:?}: no conflict may reach builder wiring: {stderr}"
-        );
+        h.assert_refused_before_launch_state(&out, &before, "is claimed by different declarations");
         assert!(
             h.mount_store().is_none(),
             "{argv:?}: a conflict must not create the store"
