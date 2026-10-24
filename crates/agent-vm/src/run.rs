@@ -714,11 +714,12 @@ pub(crate) async fn launch(
             .map(|volume| CoreHostSource::new(volume.bind, volume.host_path.clone()))
             .collect(),
     )?;
-    let mount_plan = mount::prepare(
+    // `--mount` is the only declaration source a launch has until verified user
+    // `mounts` are selected here (ADR-0046), so the whole list is argv-tagged.
+    let mount_requests = mount::MountRequests::from_cli(
         mount::parse_extra_mounts(&args.mount).context("parsing --mount")?,
-        &mount_context,
-    )
-    .context("preparing --mount")?;
+    );
+    let mount_plan = mount::prepare(mount_requests, &mount_context).context("preparing --mount")?;
 
     // A `persist` path that overlaps a guest mount point (the project bind, when
     // it lives under HOME, or any `--mount` under HOME) would be silently
