@@ -668,6 +668,16 @@ pub(crate) async fn launch(
     // further down, so it has to be known before any of that runs.
     let root_mode = user::should_run_root(args.root, env::var("AGENT_VM_ROOT").ok().as_deref());
     let guest_identity = user::resolve_guest_identity(root_mode)?;
+    // The guest HOME those links live under: `/root` in root mode (whose rootfs
+    // bakes them in, so nothing real is ever at a link path) and the mirrored
+    // host HOME otherwise. Needed *before* mount preparation: it is what turns "a
+    // mount at this guest path" into "a mount that shadows a `persist` link",
+    // and that collision has to be refused before any fork is published
+    // (ADR-0046 / #394 D4).
+    let guest_home_path = guest_identity
+        .as_ref()
+        .map(|identity| PathBuf::from(identity.host_home()))
+        .unwrap_or_else(|| PathBuf::from("/root"));
     // Independent of `guest_identity` (which is `None` under `--root`) so
     // the `--mount …:follow-links` $HOME guardrail is still enforced in
     // root mode instead of silently no-op'ing. See `mount::expand_follow_links`.
@@ -713,41 +723,25 @@ pub(crate) async fn launch(
             .iter()
             .map(|volume| CoreHostSource::new(volume.bind, volume.host_path.clone()))
             .collect(),
+        // The same link list both provisioning sites consume, so the pre-fork
+        // collision check cannot drift from the links that are actually created.
+        crate::guest_home::PersistedHome::new(guest_home_path, &home_links),
     )?;
     // `--mount` is the only declaration source a launch has until verified user
     // `mounts` are selected here (ADR-0046), so the whole list is argv-tagged.
     let mount_requests = mount::MountRequests::from_cli(
         mount::parse_extra_mounts(&args.mount).context("parsing --mount")?,
     );
-    let mount_plan = mount::prepare(mount_requests, &mount_context).context("preparing --mount")?;
-
-    // A `persist` path that overlaps a guest mount point (the project bind, when
-    // it lives under HOME, or any `--mount` under HOME) would be silently
-    // shadowed: agentd mounts HOME first, then creates the project mountpoint
-    // *inside* the already-mounted HOME and mounts over it (ADR-0002). Checked
-    // here — after the mount plan is resolved, before anything is provisioned —
-    // because the project path is not a config fact, and a rejected launch must
-    // not create state.
-    let guest_home_path = guest_identity
-        .as_ref()
-        .map(|identity| PathBuf::from(identity.host_home()))
-        .unwrap_or_else(|| PathBuf::from("/root"));
-    let mut guest_mount_paths: Vec<PathBuf> = core_volumes
-        .iter()
-        .map(|volume| PathBuf::from(&volume.guest_path))
-        .collect();
-    guest_mount_paths.extend(mount_plan.volumes.iter().map(|volume| volume.guest.clone()));
-    if let Some((link, mount)) =
-        crate::guest_home::mount_conflicts(&home_links, &guest_home_path, &guest_mount_paths)
-            .first()
-    {
-        anyhow::bail!(
-            "config: persist path {} would collide with the guest mount point {}; \
-             rename the persist path or move the mount",
-            crate::config::escape_path(&link.home_relative),
-            crate::config::escape_path(mount)
-        );
-    }
+    let mount_plan = mount::prepare(mount_requests, &mount_context).map_err(|error| {
+        // A persisted-HOME collision is not a `--mount` failure — the core
+        // project bind alone can cause it — and its own sentence already names
+        // the remedy, so it keeps its exact bytes and its own top line.
+        if error.is::<crate::guest_home::PersistCollision>() {
+            error
+        } else {
+            error.context("preparing --mount")
+        }
+    })?;
 
     // These checks open/create Microsandbox state, so they must remain after
     // the side-effect-free mount rejection boundary.
@@ -2655,6 +2649,7 @@ fn launch_mount_context(
     host_home: Option<PathBuf>,
     core_guest_mounts: Vec<PathBuf>,
     core_host_sources: Vec<CoreHostSource>,
+    persisted_home: crate::guest_home::PersistedHome,
 ) -> Result<mount::MountContext> {
     let authority_home = config::host_home_dir().context("locating the authority home")?;
     Ok(mount::MountContext {
@@ -2664,6 +2659,7 @@ fn launch_mount_context(
         account_home: user::account_home_dir(),
         core_guest_mounts,
         core_host_sources,
+        persisted_home,
     })
 }
 
@@ -2726,6 +2722,7 @@ mod tests {
             user::host_home_dir(),
             Vec::new(),
             Vec::new(),
+            crate::guest_home::PersistedHome::none(),
         )
         .unwrap();
         let selected = context.authority_home.as_ref().expect("raw authority HOME");
@@ -4751,6 +4748,7 @@ options ndots:2 timeout:1";
                     host_home: Some(test_home()),
                     core_guest_mounts: Vec::new(),
                     core_host_sources: Vec::new(),
+                    persisted_home: crate::guest_home::PersistedHome::none(),
                 },
             )
             .unwrap();
@@ -4796,6 +4794,7 @@ options ndots:2 timeout:1";
             host_home: Some(test_home()),
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
+            persisted_home: crate::guest_home::PersistedHome::none(),
         };
         let first = mount::prepare(
             mount::parse_extra_mounts(std::slice::from_ref(&raw)).unwrap(),
@@ -4844,6 +4843,7 @@ options ndots:2 timeout:1";
                 host_home: Some(test_home()),
                 core_guest_mounts: Vec::new(),
                 core_host_sources: Vec::new(),
+                persisted_home: crate::guest_home::PersistedHome::none(),
             },
         )
         .unwrap();
