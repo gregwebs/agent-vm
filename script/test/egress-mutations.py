@@ -326,6 +326,26 @@ def matrix():
         rust("authority_required_matches_the_four_rows"))
     add("config-mounts-authority-or-proof", persisted, authority_or, authority_or_mutant,
         gate, "verification results::")
+    # The merge/refuse rule decides whether a declaration is silently dropped
+    # (a last-wins override) or refused, now that config and argv claims meet.
+    # Both anchors are kernel *bodies*; their `ensures` clauses spell the same
+    # rules in a shape the bodies never use, so the `-proof` twins still catch a
+    # mutated implementation rather than a weakened contract.
+    mounts = SRC + "mount.rs"
+    conflict_merged = "else { ClaimDecision::Conflict }"
+    conflict_merged_mutant = "else { ClaimDecision::Merge }"
+    add("config-mounts-claim-conflict-merged", mounts, conflict_merged, conflict_merged_mutant,
+        rust("claim_decision_matches_the_oracle_table"))
+    add("config-mounts-claim-conflict-merged-proof", mounts, conflict_merged, conflict_merged_mutant,
+        gate, "verification results::")
+    # `~` may expand for user `mounts` and never for `--mount`: the shell already
+    # expanded argv, so a quoted `~/x` must stay "must be absolute".
+    home_on_cli = "else if home == HomeExpansion::Enabled && bytes.len() >= 2"
+    home_on_cli_mutant = "else if bytes.len() >= 2"
+    add("config-mounts-home-expanded-on-cli", mounts, home_on_cli, home_on_cli_mutant,
+        rust("host_spelling_matches_the_oracle_table"))
+    add("config-mounts-home-expanded-on-cli-proof", mounts, home_on_cli, home_on_cli_mutant,
+        gate, "verification results::")
     add("user-allowances-dropped", EGRESS,
         "for entry in user_entries.iter().chain(&cli_entries) {",
         "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", LAUNCH))
