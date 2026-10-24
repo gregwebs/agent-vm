@@ -4,6 +4,7 @@ mod boot_image;
 mod cli;
 mod clipboard;
 mod config;
+mod config_authority;
 mod credential_env;
 mod credential_injection;
 mod credential_provider;

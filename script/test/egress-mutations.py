@@ -54,14 +54,21 @@ GRAMMAR = SRC + "egress_grammar.rs"
 NETWORK = SRC + "network.rs"
 FIXTURE = "script/test/lib/egress-fixtures.py"
 PROBE = "script/test/fixtures/egress-probe.sh"
+LAUNCH = "config_launch_driven"
+MOUNTS = "config_mounts"
 
 
-def rust(pattern, integration=False):
+def rust(pattern, test=None):
+    """A unit row (`--bin agent-vm`) or an integration row in one named target.
+
+    The target is named explicitly rather than inferred, so a row cannot pass by
+    running a test of the same name in a different binary.
+    """
     # JSON messages are how the harness learns whether cargo recompiled the
     # package or answered from an artifact it did not compile from the mutation.
     return [
         "cargo", "test", "--locked", "-p", "agent-vm", "--message-format=json-render-diagnostics",
-        *(["--test", "config_launch_driven"] if integration else ["--bin", "agent-vm"]), pattern,
+        *(["--test", test] if test else ["--bin", "agent-vm"]), pattern,
     ]
 
 
@@ -106,6 +113,12 @@ def outcome(name, command, marker, exit_code, text, package, target):
             return "FAIL", f"cargo reused a fresh {target} artifact; the mutation was never compiled"
         if not any(not message.get("fresh") for message in artifacts):
             return "FAIL", f"cargo reported no {target} compilation; the mutation was never compiled"
+        if exit_code == 0 and not re.search(r"^running [1-9]\d* tests?$", text, re.MULTILINE):
+            # A filter that matches nothing exits 0 with a green "test result: ok"
+            # line, which is indistinguishable from a surviving mutant unless it
+            # is named. A typo'd filter must never read as "the test did not
+            # detect the mutation".
+            return "FAIL", "the killing filter matched no test (harness failure)"
     return ("PASS", None) if killed else ("FAIL", None)
 
 
@@ -178,8 +191,8 @@ def matrix():
     dense = rust("network::tests::default_plan_denies_all_egress_and_preserves_non_policy_network_config")
     early = "if self.publish_ports.is_empty() && !self.auto_publish { return builder; }\n        let policy = self.egress.policy();"
     add("early-return", NETWORK, "let policy = self.egress.policy();", early, dense)
-    add("early-return-g1", NETWORK, "let policy = self.egress.policy();", early, rust("default_tools_launch_with_their_declared_provisioning", True))
-    add("early-return-g2", NETWORK, "let policy = self.egress.policy();", early, rust("a_zero_provisioning_launch_boots_with_no_tls_overlay", True))
+    add("early-return-g1", NETWORK, "let policy = self.egress.policy();", early, rust("default_tools_launch_with_their_declared_provisioning", LAUNCH))
+    add("early-return-g2", NETWORK, "let policy = self.egress.policy();", early, rust("a_zero_provisioning_launch_boots_with_no_tls_overlay", LAUNCH))
     for name, expression in (
         ("strict", "network.strict(false)"),
         ("tls", "network.tls(|tls| tls.enabled(true))"),
@@ -194,7 +207,7 @@ def matrix():
     add("unknown-key", NETWORK, 'applied.as_object_mut().unwrap().remove("policy");', 'applied["unknown_mutation"] = serde_json::json!(true);\n        applied.as_object_mut().unwrap().remove("policy");', dense)
     # Inject into the applied object, never expected defaults or launch goldens.
     # The shared G1/G2 helper is faulted through both actual launch callers.
-    zero = rust("a_zero_provisioning_launch_boots_with_no_tls_overlay", True)
+    zero = rust("a_zero_provisioning_launch_boots_with_no_tls_overlay", LAUNCH)
     for name, injection in (
         ("secret", 'network["secrets"]["secrets"] = serde_json::json!([{ "env_var": "MSB_MUTANT" }]);'),
         ("header", 'network["secrets"]["header_credentials"] = serde_json::json!([{ "id": "mutant" }]);'),
@@ -206,7 +219,7 @@ def matrix():
         ("missing-secrets", 'network["secrets"].as_object_mut().unwrap().remove("secrets");'),
         ("missing-rules", 'network["intercept"].as_object_mut().unwrap().remove("rules");'),
     ):
-        for prefix, command in (("zero-", zero), ("g1-", rust("default_tools_launch_with_their_declared_provisioning", True))):
+        for prefix, command in (("zero-", zero), ("g1-", rust("default_tools_launch_with_their_declared_provisioning", LAUNCH))):
             add(prefix + name, TEST,
                 'fn assert_default_deny_zero_provision_network(network: &serde_json::Value, context: &str) {',
                 'fn assert_default_deny_zero_provision_network(network: &serde_json::Value, context: &str) {\n    let mut changed = network.clone();\n    let network = &mut changed;\n    ' + injection, command)
@@ -215,7 +228,7 @@ def matrix():
         'let base_ports = intercepted_ports_of(&network)?;\n        network = network.policy(serde_json::from_value(serde_json::json!({"default_egress":"deny","default_ingress":"allow","rules": [\n' +
         ','.join(['{"direction":"egress","destination":{"group":"public"},"protocols":[],"ports":[],"action":"allow"}'] * 4) +
         ']})).unwrap());', rust("credential_overlay_preserves_base_network_plan"))
-    g4 = rust("rejected_allowance_is_refused_before_launch_state_is_created", True)
+    g4 = rust("rejected_allowance_is_refused_before_launch_state_is_created", LAUNCH)
     for name, suffix in (("project", ""), ("mounts", ".mounts"), ("secrets", ".secrets")):
         add("preparse-" + name, SRC + "run.rs",
             "\n    let network_plan = crate::network::Plan::from_args(args.network, user_network)?;",
@@ -278,7 +291,7 @@ def matrix():
     add("account-home-dropped", SRC + "mount.rs",
         "        .chain(context.account_home.iter())",
         "", rust("mount"))
-    persisted = SRC + "user_network.rs"
+    persisted = SRC + "config_authority.rs"
     grant_old = """    match cli.0 {
         Some(c) => ResolvedGrant { enabled: c, source: GrantSource::Cli },
         None => match saved.0 {
@@ -295,21 +308,31 @@ def matrix():
     }"""
     for name, path, old, new, tests in (
         ("saved-beats-cli", EGRESS, grant_old, grant_new, egress),
-        ("directory-owner-ignored", persisted, "if dir.uid != euid { return Some(AuthorityRefusal::DirOwner); }", "if false { return Some(AuthorityRefusal::DirOwner); }", rust("user_network::tests")),
-        ("directory-writable-ignored", persisted, "if dir.mode & 0o022 != 0 { return Some(AuthorityRefusal::DirWritable); }", "if false { return Some(AuthorityRefusal::DirWritable); }", rust("user_network::tests")),
-        ("file-owner-ignored", persisted, "if f.uid != euid { Some(AuthorityRefusal::FileOwner) }", "if false { Some(AuthorityRefusal::FileOwner) }", rust("user_network::tests")),
-        ("symlink-trusted", persisted, "Reached::ThroughSymlink => Some(AuthorityRefusal::ThroughSymlink)", "Reached::ThroughSymlink => None", rust("user_network::tests")),
-        ("links-ignored", persisted, "else if !authority_file_singly_linked(f.nlink) { Some(AuthorityRefusal::FileLinks(f.nlink)) }", "else if false { Some(AuthorityRefusal::FileLinks(f.nlink)) }", rust("user_network::tests")),
-        ("mask-other-only", persisted, "else if f.mode & 0o022 != 0", "else if f.mode & 0o002 != 0", rust("user_network::tests")),
+        ("directory-owner-ignored", persisted, "if dir.uid != euid { return Some(AuthorityRefusal::DirOwner); }", "if false { return Some(AuthorityRefusal::DirOwner); }", rust("config_authority::tests")),
+        ("directory-writable-ignored", persisted, "if dir.mode & 0o022 != 0 { return Some(AuthorityRefusal::DirWritable); }", "if false { return Some(AuthorityRefusal::DirWritable); }", rust("config_authority::tests")),
+        ("file-owner-ignored", persisted, "if f.uid != euid { Some(AuthorityRefusal::FileOwner) }", "if false { Some(AuthorityRefusal::FileOwner) }", rust("config_authority::tests")),
+        ("symlink-trusted", persisted, "Reached::ThroughSymlink => Some(AuthorityRefusal::ThroughSymlink)", "Reached::ThroughSymlink => None", rust("config_authority::tests")),
+        ("links-ignored", persisted, "else if !authority_file_singly_linked(f.nlink) { Some(AuthorityRefusal::FileLinks(f.nlink)) }", "else if false { Some(AuthorityRefusal::FileLinks(f.nlink)) }", rust("config_authority::tests")),
+        ("mask-other-only", persisted, "else if f.mode & 0o022 != 0", "else if f.mode & 0o002 != 0", rust("config_authority::tests")),
     ):
         add(name, path, old, new, tests)
         add(name + "-proof", path, old, new, gate, "verification results::")
+    # Presence, not contents, is what makes a user file authority-bearing
+    # (ADR-0040/0046). The anchor is the kernel body, never its `ensures`
+    # clause, so replacing it cannot weaken the contract it is checked against.
+    authority_or = "if t.network { true } else { t.mounts }"
+    authority_or_mutant = "if t.network { t.mounts } else { false }"
+    add("config-mounts-authority-or", persisted, authority_or, authority_or_mutant,
+        rust("authority_required_matches_the_four_rows"))
+    add("config-mounts-authority-or-proof", persisted, authority_or, authority_or_mutant,
+        gate, "verification results::")
     add("user-allowances-dropped", EGRESS,
         "for entry in user_entries.iter().chain(&cli_entries) {",
-        "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", True))
-    add("verify-always-skipped", SRC + "config.rs",
-        'FileTierKind::User => user_network::from_user_tier(read, table)\n            .map(Some)\n            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(read.path()))),',
-        'FileTierKind::User => Ok(None),', rust("unsafe_user_network_is_refused_before_launch_state", True))
+        "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", LAUNCH))
+    verify_arm = ('FileTierKind::User => config_authority::verify(&read, triggers)\n'
+                  '            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,')
+    add("verify-always-skipped", SRC + "config.rs", verify_arm,
+        'FileTierKind::User => None,', rust("unsafe_user_network_is_refused_before_launch_state", LAUNCH))
     add("descriptor-reopen", SRC + "host_paths.rs", "            after_open();",
         "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;",
         rust("noting_symlink_takes_bytes_and_facts_from_the_opened_descriptor"))
