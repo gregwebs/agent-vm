@@ -12,10 +12,12 @@
 //! * **Presence, not contents.** `mounts = []` still makes the file
 //!   authority-bearing (that is `config_authority`'s trigger, decided before
 //!   this module runs); an empty list simply selects nothing.
-//! * **No filesystem access.** Parsing, `~/` expansion, guest normalization and
-//!   the intra-config claim are pure. Whether a source exists is a launch-time
-//!   question about *selected* mounts only, so a config naming a path that does
-//!   not exist still loads (an opt-out launch must not care).
+//! * **No source access.** Parsing, `~/` expansion, guest normalization and the
+//!   intra-config claim read no mount source: nothing in this module opens,
+//!   stats or canonicalizes a declared path. Whether a source exists is a
+//!   launch-time question about *selected* mounts only, so a config naming a
+//!   path that does not exist — or one that cannot be reached — still loads (an
+//!   opt-out launch must not care).
 //!
 //! Load-time diagnostics name the field and the index and never the value: a
 //! `mounts` entry can carry an attacker-chosen path, and the sentence is printed

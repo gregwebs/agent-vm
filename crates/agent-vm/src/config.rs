@@ -2609,16 +2609,22 @@ mod tests {
         );
     }
 
-    /// Load performs no filesystem inspection of mount sources: whether one
-    /// exists is a launch-time question about selected mounts only.
+    /// Load needs no source: it neither requires a mount source to exist nor to
+    /// be reachable, so a config naming a path you have not created still loads
+    /// — which is what an opt-out launch must not care about.
     ///
+    /// This is the strongest claim a black-box row can support, and no stronger.
     /// A *missing* path alone is a weak probe: it also passes for a loader that
     /// stats sources and ignores the failure. The second row therefore seals the
-    /// source's directory with mode `000`, so any `stat` of the source fails
-    /// `EACCES` for a non-root user — a load that inspected the value could not
-    /// succeed here. The calibration assertion keeps that from being vacuous.
+    /// source's directory with mode `000`, so a `stat` of the source fails
+    /// `EACCES` for a non-root user and a loader that *propagates* the error
+    /// cannot succeed here; the calibration assertion keeps that from being
+    /// vacuous. It still cannot tell "inspected and tolerated" from "not
+    /// inspected": `exists()` and `canonicalize().unwrap_or(..)` are inspections
+    /// that pass this row too. "Never inspects" is a property of the code, not
+    /// something this test measures.
     #[test]
-    fn user_mounts_never_touch_the_filesystem() {
+    fn user_mounts_load_needs_no_source_to_exist_or_be_reachable() {
         let f = Fixture::new();
         f.user("mounts = [\"/nonexistent-agent-vm-config-mounts:/g:ro\"]\n");
         let report = f.load().unwrap();
@@ -2650,7 +2656,7 @@ mod tests {
         assert_eq!(
             loaded.unwrap().user_mounts().map(UserMounts::len),
             Some(1),
-            "load must not inspect a mount source"
+            "load must not require the source to be reachable"
         );
     }
 

@@ -1020,16 +1020,21 @@ carries `mounts` is refused with the reason and the field. See [Persisted
 grants](#persisted-grants-user-config) for the exact policy and its accepted
 gaps.
 
-**A missing source is not a config error.** Load never looks at a mount source,
-so a config naming a path you have not created loads, `doctor`, `--help` and
-`--no-config-mounts` launches all work. A *selected* declaration with a missing
-source fails that launch in preflight (`canonicalizing mounts[0] in "…" host
-…`, under `preparing mounts (including mounts from "…"; --no-config-mounts
-skips them)`) rather than being skipped silently. Every preflight refusal that
-can be caused by a config declaration names it as `mounts[N] in "<file>"`, so
-the sentence points at the entry to edit and not only at the file. A `:fork`
-whose copy is already READY is reused without reading the original source,
-exactly as a `--mount` fork is.
+**A missing source is not a config error.** Load needs no mount source: a config
+naming a path you have not created — or one you cannot reach — loads, `doctor`,
+`--help` and `--no-config-mounts` launches all work. A *selected* declaration
+with a missing source fails that launch in preflight (`canonicalizing mounts[0]
+in "…" host …`, under `preparing mounts (including mounts from "…";
+--no-config-mounts skips them)`) rather than being skipped silently. A preflight
+refusal *about a declaration* names it as `mounts[N] in "<file>"` and escapes
+the spelling it echoes, so the sentence points at the entry to edit and not only
+at the file, and a newline in an entry cannot add a line to it. Two exceptions,
+both because the thing refused is not a declaration: a `:follow-links`-discovered
+bind is refused as `--mount "<discovered path>"` and names the entry that made it
+discoverable only in its `(discovered by …)` phrase, and the fork notices
+(`==> Initialized fork …`, `==> Omitted …`) escape the spelling without
+repeating `mounts[N]`. A `:fork` whose copy is already READY is reused without
+reading the original source, exactly as a `--mount` fork is.
 
 **`--no-config-mounts`** skips the automatic selection for one launch:
 
