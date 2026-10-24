@@ -197,9 +197,52 @@ mv "$work/bundle/bin/msb.away" "$work/bundle/bin/msb"
 
 # The full preflight reaches provenance, which must refuse this fixture binary
 # and still leave no scratch: provenance precedes allocation.
+#
+# The refusal must be the *checker's*. Every `reject()` in the wrapper prints
+# `provenance: …` too, so matching that prefix alone would pass on a run where
+# `build-provenance.py` never executed. The fixture reports
+# `agent-vm 0.0.0 (deadbeef)`, whose revision is not a 40/64-hex commit, so the
+# checker's own reason is this exact sentence.
+provenance_reason='provenance: not one agent-vm version line'
 evidence="$(run_live provenance AGENT_VM_BIN="$work/bundle/bin/agent-vm" AGENT_VM_LIVE_TEST_IMAGE="$digest_image")"
-grep -q 'provenance: ' "$work/provenance.log" || fail 'provenance: the refusal was not receipted'
+grep -qF "$provenance_reason" "$work/provenance.log" ||
+    fail 'provenance: the refusal did not come from build-provenance.py'
 [[ -s "$evidence/provenance-check.txt" ]] || fail 'provenance: no retained provenance-check.txt'
+
+# Negative control for that guard, in the style of the ci-contract mutations
+# below: break the checker's precondition and require the guard to fail for the
+# exact reason it names. A bundle whose `--version` fails is refused by the
+# wrapper's own `reject` before the checker runs — the weak prefix guard would
+# still match it, so the specific assertion must not.
+mv "$work/bundle/bin/agent-vm" "$work/bundle/bin/agent-vm.real"
+printf '#!/bin/sh\nexit 1\n' > "$work/bundle/bin/agent-vm"
+chmod 0755 "$work/bundle/bin/agent-vm"
+run_live provenance-early-reject AGENT_VM_BIN="$work/bundle/bin/agent-vm" \
+    AGENT_VM_LIVE_TEST_IMAGE="$digest_image" >/dev/null
+mv "$work/bundle/bin/agent-vm.real" "$work/bundle/bin/agent-vm"
+grep -q 'provenance: ' "$work/provenance-early-reject.log" ||
+    fail 'provenance control: the early refusal was not receipted as provenance'
+if grep -qF "$provenance_reason" "$work/provenance-early-reject.log"; then
+    fail 'provenance control: the checker-specific guard accepted an early reject'
+fi
+
+# An unset prerequisite is the first refusal a caller can hit, and it must be
+# receipted like the rest — the run is blocked, so it owes the reader a reason.
+# Only the variable under test is unset; the other keeps its valid value so this
+# control cannot pass because of a different refusal.
+evidence="$(run_live unset-agent-vm-bin env -u AGENT_VM_BIN \
+    AGENT_VM_LIVE_TEST_IMAGE="$digest_image")"
+grep -q 'rejected: set AGENT_VM_BIN' "$work/unset-agent-vm-bin.log" ||
+    fail 'unset-agent-vm-bin: an unset AGENT_VM_BIN was not refused by name'
+grep -q 'rejected: ' "$evidence/rejection.txt" ||
+    fail 'unset-agent-vm-bin: an unset prerequisite left no rejection.txt'
+evidence="$(run_live unset-live-test-image env -u AGENT_VM_LIVE_TEST_IMAGE \
+    AGENT_VM_BIN="$work/bundle/bin/agent-vm")"
+grep -q 'rejected: set AGENT_VM_LIVE_TEST_IMAGE' "$work/unset-live-test-image.log" ||
+    fail 'unset-live-test-image: an unset image was not refused by name'
+grep -q 'rejected: ' "$evidence/rejection.txt" ||
+    fail 'unset-live-test-image: an unset prerequisite left no rejection.txt'
+
 # Each refusal is receipted for the reader, not only printed.
 for name in relative-binary tagged-image linux-host missing-msb; do
     grep -q 'rejected: ' "$work/evidence-$name/rejection.txt" ||

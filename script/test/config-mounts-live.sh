@@ -12,14 +12,18 @@ mkdir -p "$evidence"
 evidence="$(cd "$evidence" && pwd -P)"
 printf 'Evidence: %s\n' "$evidence"
 # Every refusal below is receipted in the evidence directory: a blocked run must
-# leave the reason behind, not just a non-zero exit.
+# leave the reason behind, not just a non-zero exit. That includes the two
+# "unset" refusals, which are the first ones a caller can hit — `refuse` is
+# defined before either is read, and the evidence directory already exists, so no
+# exit path is unreceipted.
 refuse() {
     printf 'rejected: %s\n' "$1" | tee "$evidence/rejection.txt" >&2
     exit 1
 }
 
-: "${AGENT_VM_BIN:?set an absolute native bundle binary}"
-: "${AGENT_VM_LIVE_TEST_IMAGE:?set a digest-pinned OCI image}"
+[[ -n "${AGENT_VM_BIN:-}" ]] || refuse 'set AGENT_VM_BIN to an absolute native bundle binary'
+[[ -n "${AGENT_VM_LIVE_TEST_IMAGE:-}" ]] ||
+    refuse 'set AGENT_VM_LIVE_TEST_IMAGE to a digest-pinned OCI image'
 [[ "$AGENT_VM_BIN" = /* && -x "$AGENT_VM_BIN" ]] ||
     refuse 'AGENT_VM_BIN must be an absolute path to an executable'
 # A tag would make every row depend on what the registry serves later. The
