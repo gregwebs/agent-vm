@@ -4,7 +4,8 @@ Run inside a per-project [microsandbox](https://docs.microsandbox.dev/) (libkrun
 
 - **Filesystem protection.**
   The working directory is bind-mounted at its host path and you can mount other directories.
-  Choose read-only, write, or fork (copied) mounts.
+  Choose read-only, write, or fork (copied) mounts, per launch or as verified
+  user-wide defaults.
 - **Default-deny egress.**
   Opt in to the public internet, LAN, host, or specific IPs/CIDRs (with protocol/port).
 - **Dropped User or root**

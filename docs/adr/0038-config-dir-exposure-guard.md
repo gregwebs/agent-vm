@@ -130,7 +130,7 @@ While the directory guard holds, an already linked file cannot be laundered
 through a launch by this build. Host-created links mid-session remain trusted.
 `credentials.yaml` link counts are deliberately excluded (#319).
 `authority_file_singly_linked` and `authority_file_singly_linked_spec` share the
-one-name rule with `user_network::network_authority_refusal` (ADR-0040), in both
+one-name rule with `config_authority::authority_refusal` (ADR-0040), in both
 its executable and spec. A read-time-only rule is insufficient.
 
 ## Trusted boundary and accepted gaps

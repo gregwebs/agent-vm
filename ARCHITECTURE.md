@@ -42,6 +42,9 @@ crates/agent-vm/src/
 ├── network.rs              # published ports, proxy notice, launch Plan
 ├── network_requests.rs     # tool requests: parse, coverage report (never authority)
 ├── mount.rs                # --mount grammar and volume wiring
+├── config_mounts.rs        # user-tier `mounts`: typed schema, `~/` expansion, load-time claim
+├── mount_selection.rs      # one launch's declarations: verified user `mounts`, then --mount
+├── config_authority.rs     # ADR-0040 verified read, one gate for [network] and mounts
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   ├── default_selection.rs#   journal-aware logical default read (bounded shared lock)
 │   └── upgrade.rs          #   set-default command shape: explicit typed target
@@ -99,12 +102,16 @@ A launch is one pass, and the ordering is load-bearing:
    before every side effect: `main` has already captured credentials and set up
    `msb`/the runtime. What it guarantees is that no later stage reads a catalog
    entry at multiple sites, and that a `Direct` target reads none at all.
-4. Still inside `run::launch`, in order: image selection, the network plan, the
-   guest-HOME links and the root-mode decision; `session` derives the project
-   hash, state dir, and sandbox name from the cwd; the side-effect-free mount
-   topology rejection; then `ensure_msb_home` (which opens Microsandbox state),
-   `msb_preflight` refusing a `msb.db` newer than the bundled schema, the
-   socket-path fit check, the legacy Pi-home migration and the banner.
+4. Still inside `run::launch`, in order: image selection, the network plan,
+   the launch's mount selection (`mount_selection::select`: the verified user
+   config's `mounts` unless `--no-config-mounts`, then argv `--mount`) and
+   `mount::prepare` (which owns the side-effect-free topology rejection and the
+   persisted guest-HOME collision, and publishes forks only after both pass),
+   the guest-HOME links and the root-mode decision; `session` derives the project
+   hash, state dir, and sandbox name from the cwd; then `ensure_msb_home` (which
+   opens Microsandbox state), `msb_preflight` refusing a `msb.db` newer than the
+   bundled schema, the socket-path fit check, the legacy Pi-home migration and
+   the banner.
 5. `main`'s deferred credential preflight resolves the requirements, then
    `secrets` captures the target's requested host credentials into host-only
    files and writes placeholder credentials into the guest state dir. A `Direct`
@@ -244,6 +251,44 @@ table.
 
 ### Extra and forked mounts: `ro`, `rw`, `fork`, `follow-links`
 
+**Two declaration sources, one seam.** `--mount` is not the only way a launch
+can ask for a mount: a verified user config's top-level `mounts` selects
+[defaults for every launch](docs/adr/0046-verified-user-config-mounts.md).
+`mount_selection::select` is the only place that decides *which sources* one
+launch requests — the user config's declarations unless `--no-config-mounts`,
+then argv — and it does no I/O, so an unselected declaration can name a path
+that does not exist without blocking a launch, `doctor` or `--help`. Everything
+after it is shared: `mount::prepare` receives one ordered `MountRequests` whose
+elements carry their origin, applies one claim rule (identical declarations at
+one guest path merge; different ones are refused, config-versus-CLI included),
+and runs the same protections and topology checks. Nothing downstream can tell a
+config declaration from a CLI one except the origin string in a diagnostic.
+
+```text
+BEFORE                                       AFTER
+config.toml ──read──> RawConfig              config.toml ──read──> RawConfig
+  [network]? ─yes─> verify+parse (network)     triggers = {network?, mounts?}   (presence, not contents)
+                                               any? ─yes─> config_authority::verify(read)  ONE check
+                                                  ├─ [network] → user_network::from_verified_table
+                                                  └─ mounts    → config_mounts::from_verified_value
+                                                                  (~/ expansion, shared grammar,
+                                                                   normalize + claim among config)
+argv --mount ──> parse_extra_mounts          mount_selection::select(user_mounts, policy, &args.mount)
+             └─> prepare(Vec<ExtraMount>)      → MountRequests [config…, cli…] with origins
+                 └─ run.rs: persist check      → mount::prepare(requests, ctx{.., persisted_home})
+                    AFTER prepare_forks            claim → protections → … → validate_plan
+                                                   → persisted-HOME check → prepare_forks
+```
+
+**The persisted guest-HOME collision moved.** A mount that shadows a declared
+`persist` path used to be refused in `run.rs` *after* `prepare` returned — that
+is, after a fork could already have been published. The check now runs inside
+`prepare`, after `validate_plan` and before `prepare_forks`, over the complete
+normalized core + explicit + followed destinations, for `--mount` and config
+declarations alike. Its message bytes and its unwrapped error are unchanged, so
+the reading of a refusal does not depend on which source declared the mount
+(#394 D4).
+
 `fork` is an eager, project-scoped copy rather than a live bind. `mount::prepare`
 owns parsing, READY-first policy and topology validation, host-side copying, and
 publication; `run` receives only typed prepared volumes and does not re-stat or
@@ -326,12 +371,13 @@ gaps* name both.
 prepare()
   measure protected route set (from MountContext.host_home)   [fail closed on EACCES/ELOOP]
   enforce core binds (project = canonicalized cwd)            [refuse: "run from a project dir"]
-  normalize_guest / core collision / dedup
+  normalize_guest / core collision / dedup                    [config-vs-CLI claim: merge or refuse]
   preflight_forks (READY forks repointed at owned data)
   expand_follow_links (live hosts canonicalized; targets appended)
   build volumes
   enforce_protected_files(expanded)                           [refuse a live bind; collect advisories]
   validate_plan
+  persisted_home.refuse_conflicts(core + every volume)         [refuse a shadowed `persist` path]
   prepare_forks -> copy_root resolves the root, then copy_opened(NodePolicy { identities + relatives })  [omit, notice]
 ```
 
