@@ -37,6 +37,7 @@ LAUNCH_OPTIONS = [
     "--repo",
     "--allow-missing-credentials",
     "--mount",
+    "--no-config-mounts",
     "--publish",
     "--auto-publish",
     "--allow-egress",
@@ -102,12 +103,22 @@ def check_line_matching_controls() -> None:
         # after it. Neither is the old order.
         "agent-vm run probe --mount /guest --root",
         "agent-vm --memory 4 run probe --mount /9",
+        # #394's opt-out is a launch option like any other: before the verb it is
+        # the launcher's, after it the tool's (see `detected` below).
+        "agent-vm --no-config-mounts shell",
+        "agent-vm --no-config-mounts run probe",
     ]
     for line in accepted:
         hits = shell_line_hits(line)
         if hits:
             fail(f"control line wrongly flagged {hits}: {line}")
-    detected = ["agent-vm shell --memory 4", "agent-vm claude --root"]
+    detected = [
+        "agent-vm shell --memory 4",
+        "agent-vm claude --root",
+        # Post-verb is a forwarded tool argument, so config mounts would still
+        # apply: the sweep must keep flagging it rather than learn to accept it.
+        "agent-vm shell --no-config-mounts",
+    ]
     for line in detected:
         if not shell_line_hits(line):
             fail(f"control line missed the old order: {line}")

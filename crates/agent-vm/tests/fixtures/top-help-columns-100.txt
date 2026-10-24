@@ -115,6 +115,19 @@ Mounts & ports:
           budget up to 2x the symlink count, not 1x. Capacity depends on the host interrupt model
           and runtime; do not treat a measurement from one platform as a portable mount limit.
 
+          Adds to the user config's `mounts`; identical declarations merge and different ones at the
+          same guest path are refused (no override).
+
+      --no-config-mounts
+          Skip this launch's config mounts (`mounts` in `~/.config/agent-vm/config.toml`).
+
+          Only the automatic selection is skipped: explicit `--mount` still applies, and
+          credentials, persisted paths, agent-vm's own mounts, and every config check (schema, mount
+          syntax, file authority) are unchanged. A broken or untrusted config still fails the
+          launch. There is deliberately no environment variable: skipping ambient host exposure is a
+          per-launch decision made at the command line, and the same option placed after the tool
+          verb is forwarded to the tool.
+
   -p, --publish <[BIND:]HOST_PORT:GUEST_PORT>
           Publish a guest TCP port to the host, docker-style (repeatable).
 
@@ -234,6 +247,10 @@ Fork mounts:
   (a bare or `:rw` file mount is rejected). Forks use disk space for the full initial copy in the
   host-managed project mount store beside `/agent-vm-state`. To reset/reseed, stop users of the
   fork, remove the exact directory printed at launch, then launch the same declaration again.
+
+Config mounts:
+  mounts = ["~/ref:ro", ...] in ~/.config/agent-vm/config.toml apply to every launch
+  (verified file, like [network]); --no-config-mounts skips them for one launch.
 
 Networking (deny-by-default; flags compose):
   --publish                host  → guest     open an inbound port to a guest service

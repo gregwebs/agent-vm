@@ -187,10 +187,6 @@ pub(crate) struct ConfigReport {
     resolved: ResolvedTools,
     images: ConfiguredImages,
     user_network: Option<UserNetwork>,
-    // No launch reads config mounts yet: `mount_selection` threads them into a
-    // launch as the next change in #394. Loading stays the only reader today,
-    // and reading them *earlier* than selection would be the wrong seam.
-    #[allow(dead_code)]
     user_mounts: Option<UserMounts>,
     uses_defaults: bool,
     conflicts: Vec<ConfigConflict>,
@@ -229,7 +225,6 @@ impl ConfigReport {
     /// that declared the key is authority-bearing and its declarations (zero or
     /// more) belong to every launch. Read before `into_launch_catalog` consumes
     /// the report, like [`Self::images`].
-    #[allow(dead_code)] // `mount_selection` is its first launch-side caller
     pub(crate) fn user_mounts(&self) -> Option<&UserMounts> {
         self.user_mounts.as_ref()
     }

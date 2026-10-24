@@ -37,6 +37,8 @@ Credentials:
 Mounts & ports:
       --mount <HOST[:GUEST][:MODE]...>
           Bind an extra host path into the guest, or seed a persistent fork (repeatable)
+      --no-config-mounts
+          Skip this launch's config mounts (`mounts` in `~/.config/agent-vm/config.toml`)
   -p, --publish <[BIND:]HOST_PORT:GUEST_PORT>
           Publish a guest TCP port to the host, docker-style (repeatable)
       --auto-publish

@@ -176,11 +176,12 @@ impl MountRequests {
         Self(requests)
     }
 
-    /// Every declaration is an argv entry.
+    /// Every declaration in `mounts` is an argv entry.
     ///
-    /// `--mount` is the only source of declarations a launch has until
-    /// `mount_selection::select` supplies the verified user `mounts` ones, so
-    /// `run.rs` tags its whole list here.
+    /// Two callers, one meaning: `mount_selection::select` tags the argv half of
+    /// a launch's declarations here (the config half arrives tagged by
+    /// `config_mounts`), and `#[cfg(test)] From<Vec<ExtraMount>>` lets a test
+    /// hand `prepare` a plan with no config provenance at all.
     pub(crate) fn from_cli(mounts: Vec<ExtraMount>) -> Self {
         Self::new(
             mounts
