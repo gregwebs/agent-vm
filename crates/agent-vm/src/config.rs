@@ -2611,12 +2611,47 @@ mod tests {
 
     /// Load performs no filesystem inspection of mount sources: whether one
     /// exists is a launch-time question about selected mounts only.
+    ///
+    /// A *missing* path alone is a weak probe: it also passes for a loader that
+    /// stats sources and ignores the failure. The second row therefore seals the
+    /// source's directory with mode `000`, so any `stat` of the source fails
+    /// `EACCES` for a non-root user — a load that inspected the value could not
+    /// succeed here. The calibration assertion keeps that from being vacuous.
     #[test]
     fn user_mounts_never_touch_the_filesystem() {
         let f = Fixture::new();
         f.user("mounts = [\"/nonexistent-agent-vm-config-mounts:/g:ro\"]\n");
         let report = f.load().unwrap();
         assert_eq!(report.user_mounts().map(UserMounts::len), Some(1));
+
+        // Root ignores the mode, so the sealed row proves nothing there.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("SKIPPED EACCES: running as root cannot seal a directory");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let sealed_dir = tempfile::tempdir().unwrap();
+        let parent = sealed_dir.path().canonicalize().unwrap().join("sealed");
+        std::fs::create_dir(&parent).unwrap();
+        let source = parent.join("source");
+        std::fs::write(&source, "x").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&source).is_err(),
+            "the sealed directory must deny stat, or this row proves nothing"
+        );
+        let f = Fixture::new();
+        f.user(&format!("mounts = [\"{}:/g:ro\"]\n", source.display()));
+        // Load first, restore the mode second: an assertion failure inside
+        // `load` must not leave an unreadable directory behind for the tempdir
+        // drop (nor hide the failure itself).
+        let loaded = f.load();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            loaded.unwrap().user_mounts().map(UserMounts::len),
+            Some(1),
+            "load must not inspect a mount source"
+        );
     }
 
     /// `[[tools]]` keeps `deny_unknown_fields`, so a per-tool `mounts` stays a
