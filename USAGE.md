@@ -971,8 +971,8 @@ with the same modes (`ro`, `rw`, `fork`, `follow-links`, fork-only
 `exclude=REL`), the same guest-path rules (absolute, not `/`, no `..`, `:`,
 `;`, `,` or control characters), and the same checks (host Pi credential files,
 the [protected config directory](#agent-vms-config-directory-is-never-writable-from-the-guest),
-core-mount collisions, the file-mount restriction, persisted-`persist`-path
-collisions). Only `HOST` differs:
+core-mount collisions, the file-mount restriction, and collisions with a declared
+`persist` path). Only `HOST` differs:
 
 - `~/` is replaced by your `$HOME` **text**, exactly as an unquoted
   `--mount ~/ref` is expanded by the shell. Nothing else relative is accepted:
@@ -1035,10 +1035,10 @@ agent-vm --no-config-mounts shell       # this launch: no config mounts
 agent-vm --no-config-mounts --mount ~/x:ro shell   # --mount still applies
 ```
 
-It is a launch option, so write `agent-vm --no-config-mounts shell`, not
-`agent-vm shell --no-config-mounts` — after the tool verb it is a tool argument,
-forwarded verbatim, and the config mounts still apply ([launch options go before
-the tool verb](#launch-options)). It disables selection and preparation only.
+It is a launch option, so it goes before the verb ([launch options go before the
+tool verb](#launch-options)): write `agent-vm --no-config-mounts shell`, not `agent-vm shell --no-config-mounts`,
+because after the tool verb it is a tool argument forwarded verbatim and the
+config mounts still apply. It disables selection and preparation only.
 Explicit `--mount`, credentials, persisted paths, agent-vm's own project/state
 mounts, egress authority, and every config check (schema, mount syntax, file
 trust) are unchanged: a broken or untrusted `mounts` config still fails the
