@@ -13,6 +13,7 @@
 //! lives here rather than in `credential_provider` because `config` already
 //! depends on `credential_provider`; the reverse edge would cycle.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::config::{PersistPath, guest_paths_overlap};
@@ -144,6 +145,94 @@ pub(crate) fn mount_conflicts<'a>(
     }
     conflicts
 }
+
+/// The declared persist links and the guest HOME they live under: what the
+/// mount planner needs to refuse a shadowing mount before any fork exists.
+///
+/// This is the *pre-plan* half of the persisted-HOME story: [`mount_conflicts`]
+/// answers "which mount shadows a link", and this type answers "does this
+/// complete normalized destination set do so" at the boundary where that can
+/// still be refused without publishing anything ([`crate::mount::prepare`]).
+/// `run::launch` builds one per launch from the same link list it hands to both
+/// provisioning sites, so the check and the links cannot drift.
+///
+/// [`Default`] is the "no persisted HOME" context of mount contexts that declare
+/// no `persist` paths: `links` is empty, and [`mount_conflicts`] never reports a
+/// conflict over an empty link list, so a default value can never refuse a
+/// launch. It stands in for the absence of a persisted HOME, not for one.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PersistedHome {
+    guest_home: PathBuf,
+    links: Vec<GuestHomeLink>,
+}
+
+impl PersistedHome {
+    /// The links a launch will actually create: the compiled-in providers are
+    /// config-time checked and deliberately not part of this contract, so only
+    /// [`LinkSource::Declared`] entries are kept.
+    pub(crate) fn new(guest_home: PathBuf, links: &[GuestHomeLink]) -> Self {
+        Self {
+            guest_home,
+            links: links
+                .iter()
+                .filter(|link| link.source == LinkSource::Declared)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// No guest HOME and no declared links — for contexts that cannot have
+    /// `persist` paths. Every production caller builds a real one through
+    /// [`Self::new`] (a guest HOME exists whether or not it declares `persist`
+    /// paths), so this is test-only by construction rather than by allowance.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self::default()
+    }
+
+    /// [`mount_conflicts`] over the complete destination list; the first
+    /// conflict is the error, exactly as `run::launch` reported it before the
+    /// check moved into mount preparation.
+    ///
+    /// **Precondition:** every entry of `guest_mount_paths` is a normalized
+    /// guest path — see [`mount_conflicts`].
+    pub(crate) fn refuse_conflicts(&self, guest_mount_paths: &[PathBuf]) -> anyhow::Result<()> {
+        let conflicts = mount_conflicts(&self.links, &self.guest_home, guest_mount_paths);
+        let Some((link, mount)) = conflicts.first() else {
+            return Ok(());
+        };
+        Err(anyhow::Error::new(PersistCollision {
+            home_relative: link.home_relative.clone(),
+            mount: mount.clone(),
+        }))
+    }
+}
+
+/// A declared `persist` path that a guest mount point would shadow (or be
+/// shadowed by).
+///
+/// `Display` is byte-identical to the pre-#394 `run::launch` refusal, and no
+/// caller wraps it: it is not a `--mount` failure, because the core project bind
+/// alone can cause it, and its own sentence already names what to fix.
+#[derive(Debug)]
+pub(crate) struct PersistCollision {
+    home_relative: PathBuf,
+    mount: PathBuf,
+}
+
+impl fmt::Display for PersistCollision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "config: persist path {} would collide with the guest mount point {}; rename the \
+             persist path or move the mount",
+            crate::config::escape_path(&self.home_relative),
+            crate::config::escape_path(&self.mount)
+        )
+    }
+}
+
+impl std::error::Error for PersistCollision {}
 
 #[cfg(test)]
 mod tests {

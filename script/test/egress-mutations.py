@@ -44,7 +44,8 @@ CLEAN_PACKAGE = ["cargo", "clean", "-p", "agent-vm"]
 # Build the units the matrix runs, so its cold dependency build happens once,
 # outside every per-control timeout.
 WARMUP = ["cargo", "test", "--locked", "-p", "agent-vm", "--no-run",
-          "--bin", "agent-vm", "--test", "config_launch_driven"]
+          "--bin", "agent-vm", "--test", "config_launch_driven",
+          "--test", "config_mounts"]
 WARMUP_TIMEOUT = 3600
 CONTROL_TIMEOUT = 240
 SRC = "crates/agent-vm/src/"
@@ -346,6 +347,19 @@ def matrix():
         rust("host_spelling_matches_the_oracle_table"))
     add("config-mounts-home-expanded-on-cli-proof", mounts, home_on_cli, home_on_cli_mutant,
         gate, "verification results::")
+    # A mount that shadows a declared `persist` link is refused inside
+    # `mount::prepare`, ahead of `prepare_forks` (ADR-0046 / #394 D4). Skipping
+    # the check does not merely move a message: the plan publishes a fork copy of
+    # the user's directory for a launch that is then refused. Both rows kill on
+    # "a fork store exists after a refusal", the unit one through `prepare`'s
+    # absent store path and the launch one through the whole-process snapshot.
+    persist_skipped = "    context.persisted_home.refuse_conflicts(&destinations)?;"
+    persist_skipped_mutant = "    let _ = &destinations;"
+    add("config-mounts-persist-check-skipped", mounts, persist_skipped, persist_skipped_mutant,
+        rust("persist_collision_refuses_before_any_fork_store"))
+    add("config-mounts-persist-check-skipped-launch", mounts, persist_skipped,
+        persist_skipped_mutant,
+        rust("a_cli_fork_shadowing_a_persist_path_publishes_no_fork", MOUNTS))
     add("user-allowances-dropped", EGRESS,
         "for entry in user_entries.iter().chain(&cli_entries) {",
         "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", LAUNCH))

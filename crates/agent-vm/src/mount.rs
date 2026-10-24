@@ -2575,6 +2575,10 @@ pub(crate) struct MountContext {
     /// canonicalized cwd and is writable (`session.rs:45`): `cd ~ && agent-vm
     /// shell` would hand the guest the whole host `$HOME`.
     pub(crate) core_host_sources: Vec<CoreHostSource>,
+    /// Declared `persist` links and the guest HOME they live under; checked
+    /// against every destination before any fork is published
+    /// ([`crate::guest_home::PersistedHome`]).
+    pub(crate) persisted_home: crate::guest_home::PersistedHome,
 }
 
 /// Normalize the guest spelling before it participates in identity or
@@ -2750,8 +2754,9 @@ pub(crate) fn claim(
 }
 
 /// Prepare a complete, closed mount plan.  This is deliberately the only
-/// boundary allowed to inspect mount sources or create fork state. Both the
-/// Pi-file and config-directory guards run before any fork/session mutation.
+/// boundary allowed to inspect mount sources or create fork state. The
+/// Pi-file, config-directory and persisted-guest-HOME guards all run before any
+/// fork/session mutation.
 ///
 /// Declarations arrive as [`MountRequests`] so every one names the source it
 /// came from, whichever route produced it; from here on a config mount and a
@@ -2896,6 +2901,17 @@ pub(crate) fn prepare(
         }
     }
     validate_plan(&mut volumes, &context.core_guest_mounts)?;
+
+    // ADR-0046 / #394 D4: a mount that shadows a declared persist path is
+    // refused here, over the complete normalized core + explicit + followed
+    // destinations, so a rejected plan never publishes a fork.
+    let destinations: Vec<PathBuf> = context
+        .core_guest_mounts
+        .iter()
+        .cloned()
+        .chain(volumes.iter().map(|volume| volume.guest.clone()))
+        .collect();
+    context.persisted_home.refuse_conflicts(&destinations)?;
 
     // Only a validated complete set of core, explicit, and followed claims
     // may publish any host-managed state. The first state mutation happens
@@ -4106,6 +4122,20 @@ mod prepare_tests {
             host_home: Some(home),
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
+            persisted_home: crate::guest_home::PersistedHome::none(),
+        }
+    }
+
+    /// A context whose guest HOME is `home` and which declares `persist =
+    /// ["code"]` under it — the one way a `persist` link can exist, and the
+    /// collision target of `persist_collision_refuses_before_any_fork_store`.
+    fn persisted_context(store: &Path, home: &Path) -> MountContext {
+        MountContext {
+            persisted_home: crate::guest_home::PersistedHome::new(
+                home.to_path_buf(),
+                &crate::guest_home::links(&[crate::config::PersistPath::for_test("code")]),
+            ),
+            ..context_with_home(store, home.to_path_buf())
         }
     }
 
@@ -4118,7 +4148,68 @@ mod prepare_tests {
             host_home: None,
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
+            persisted_home: crate::guest_home::PersistedHome::none(),
         }
+    }
+
+    /// B1 / D4: the persisted-guest-HOME refusal is a *pre-fork* boundary. The
+    /// store path is deliberately absent, so "the store still does not exist" is
+    /// a real assertion about `prepare` rather than about an empty directory: a
+    /// plan that published first would leave `<store>/forks/<id>` behind.
+    #[test]
+    fn persist_collision_refuses_before_any_fork_store() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap().join("home");
+        fs::create_dir(&home).unwrap();
+        let source = home.join("src");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("seed"), "seed").unwrap();
+        let live = home.join("live");
+        fs::create_dir(&live).unwrap();
+        let store = root.path().join("store");
+        assert!(!store.exists(), "the store path must start absent");
+        let mount_context = persisted_context(&store, &home);
+
+        // 1. A `:fork` whose own guest path is the declared `persist` link.
+        let shadowing = format!("{}:{}/code:fork", source.display(), home.display());
+        let error = prepare(parse_extra_mounts(&[shadowing]).unwrap(), &mount_context)
+            .expect_err("a fork that shadows a persist link is not a valid plan");
+        assert!(
+            error.is::<crate::guest_home::PersistCollision>(),
+            "{error:#}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "config: persist path code would collide with the guest mount point {}/code; \
+                 rename the persist path or move the mount",
+                home.display()
+            )
+        );
+        assert!(
+            !store.exists(),
+            "a refused plan must not publish a fork store"
+        );
+
+        // 2. An unrelated fork at `/f` plus a *live* bind that shadows the link.
+        // Neither declaration is invalid alone, so only a check over the
+        // complete normalized destination set can refuse this before `/f`'s
+        // fork is published.
+        let fork = format!("{}:/f:fork", source.display());
+        let live_bind = format!("{}:{}/code:ro", live.display(), home.display());
+        let error = prepare(
+            parse_extra_mounts(&[fork, live_bind]).unwrap(),
+            &mount_context,
+        )
+        .expect_err("the live bind's guest path shadows the persist link");
+        assert!(
+            error.is::<crate::guest_home::PersistCollision>(),
+            "{error:#}"
+        );
+        assert!(
+            !store.exists(),
+            "the unrelated fork must not have been published"
+        );
     }
 
     fn store_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
@@ -4431,6 +4522,7 @@ mod prepare_tests {
                 host_home: Some(home),
                 core_guest_mounts: vec![target],
                 core_host_sources: Vec::new(),
+                persisted_home: crate::guest_home::PersistedHome::none(),
             };
 
             let error =
@@ -4578,6 +4670,7 @@ mod prepare_tests {
                         host_home: Some(root.path().to_path_buf()),
                         core_guest_mounts: vec![root.path().join("core-child")],
                         core_host_sources: Vec::new(),
+                        persisted_home: crate::guest_home::PersistedHome::none(),
                     },
                 );
                 assert!(
@@ -4665,6 +4758,7 @@ mod prepare_tests {
                 host_home: Some(home_path.clone()),
                 core_guest_mounts: Vec::new(),
                 core_host_sources: Vec::new(),
+                persisted_home: crate::guest_home::PersistedHome::none(),
             },
         )
         .unwrap_err();
@@ -7072,6 +7166,7 @@ mod config_dir_guard_tests {
                 account_home: None,
                 core_guest_mounts: vec![],
                 core_host_sources: sources,
+                persisted_home: crate::guest_home::PersistedHome::none(),
             }
         }
         fn refused(&self, requests: Vec<ExtraMount>, context: &MountContext, text: &str) {
