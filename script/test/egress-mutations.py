@@ -339,6 +339,20 @@ def matrix():
         rust("claim_decision_matches_the_oracle_table"))
     add("config-mounts-claim-conflict-merged-proof", mounts, conflict_merged, conflict_merged_mutant,
         gate, "verification results::")
+    # `declarations_equivalent` is the merge half of the same rule, and every one
+    # of its six facts is load-bearing. `exclusions` is the fact a reader is
+    # least likely to notice: dropping it merges two fork declarations that
+    # differ only in what they leave out of the copy, so one declaration
+    # disappears and its exclusions silently stop applying. The anchor is the
+    # kernel *body*; its `ensures` spells the same conjunction in a shape the
+    # body never uses, so the `-proof` twin catches the mutated body rather than
+    # a weakened contract.
+    equivalent_exclusions = "    if !f.fork { return false; }\n    f.exclusions"
+    equivalent_exclusions_mutant = "    if !f.fork { return false; }\n    true"
+    add("config-mounts-equivalent-exclusions-dropped", mounts, equivalent_exclusions,
+        equivalent_exclusions_mutant, rust("declarations_equivalent_matches_the_oracle_table"))
+    add("config-mounts-equivalent-exclusions-dropped-proof", mounts, equivalent_exclusions,
+        equivalent_exclusions_mutant, gate, "verification results::")
     # The launch half of the same rule: a config/argv pair that disagrees must
     # refuse, so the mutant's silent merge is observable as a launch that
     # reaches builder wiring instead of naming both origins.
@@ -354,7 +368,7 @@ def matrix():
     add("config-mounts-home-expanded-on-cli-proof", mounts, home_on_cli, home_on_cli_mutant,
         gate, "verification results::")
     # A mount that shadows a declared `persist` link is refused inside
-    # `mount::prepare`, ahead of `prepare_forks` (ADR-0046 / #394 D4). Skipping
+    # `mount::prepare`, ahead of `prepare_forks` (ADR-0046 Decision 6). Skipping
     # the check does not merely move a message: the plan publishes a fork copy of
     # the user's directory for a launch that is then refused. Both rows kill on
     # "a fork store exists after a refusal", the unit one through `prepare`'s
