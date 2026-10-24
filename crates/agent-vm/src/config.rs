@@ -75,7 +75,11 @@
 //! # Network authority is user-tier only
 //!
 //! ADR-0040 permits verified user [network] tables; project and built-in tiers cannot grant access.
+//! Whether the file holding one may be trusted is [`crate::config_authority`]'s
+//! decision, shared with every other authority-bearing field, so this module
+//! only decides *what* a trusted table says.
 
+use crate::config_authority::{self, AuthorityTriggers};
 use crate::user_network::{self, UserNetwork};
 
 use crate::network_requests::{NetworkRequests, RequestTier};
@@ -939,7 +943,41 @@ fn read_file_tier(path: &Path, kind: FileTierKind) -> Result<(TierReport, TierCo
     let text = std::str::from_utf8(read.bytes()).map_err(|_| utf8_error(path))?;
     let raw: RawConfig =
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
-    let network = network_for_tier(raw.network.as_ref(), kind, &read)?;
+    // Authority is decided by the *presence* of an authority-bearing field, from
+    // the same verified read the bytes came from, before any of it is parsed.
+    let triggers = AuthorityTriggers {
+        network: raw.network.is_some(),
+        mounts: false,
+    };
+    let authorized = match kind {
+        FileTierKind::User => config_authority::verify(&read, triggers)
+            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,
+        FileTierKind::Project => {
+            if let Some(table) = raw.network.as_ref() {
+                return Err(network_refusal(table, path, RefusingTier::Project));
+            }
+            None
+        }
+    };
+    let network = match raw.network.as_ref() {
+        Some(table) => {
+            // A present field always produced a token above (presence *is* the
+            // trigger), so this arm cannot be reached with `None`. Refusing
+            // rather than skipping keeps that invariant load-bearing: dropping
+            // the grants a file declares must never be the quiet outcome.
+            let Some(authorized) = authorized.as_ref() else {
+                return Err(anyhow!(
+                    "config: {}: [network]: authority was not measured",
+                    quoted_path(path)
+                ));
+            };
+            Some(
+                user_network::from_verified_table(authorized, table)
+                    .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,
+            )
+        }
+        None => None,
+    };
     let image = validate_image(raw.image.as_deref(), path)?;
     let tools = validate_tools(raw.tools, kind.origin(path))?;
 
@@ -956,20 +994,6 @@ fn read_file_tier(path: &Path, kind: FileTierKind) -> Result<(TierReport, TierCo
             network,
         },
     ))
-}
-
-fn network_for_tier(
-    table: Option<&toml::Table>,
-    kind: FileTierKind,
-    read: &crate::host_paths::VerifiedRead,
-) -> Result<Option<UserNetwork>> {
-    let Some(table) = table else { return Ok(None) };
-    match kind {
-        FileTierKind::User => user_network::from_user_tier(read, table)
-            .map(Some)
-            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(read.path()))),
-        FileTierKind::Project => Err(network_refusal(table, read.path(), RefusingTier::Project)),
-    }
 }
 
 #[derive(Clone, Copy)]
