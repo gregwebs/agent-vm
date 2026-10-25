@@ -1400,3 +1400,33 @@ fn mount_mode_matrix_sets_readonly_and_root_follow() {
         );
     }
 }
+
+/// The project-path remap notice fires *because* the host path cannot be
+/// carried into the guest — and one of the two reasons is a control character —
+/// so it is the notice most likely to carry the byte that ends a line. It names
+/// the canonicalized cwd, which is measured.
+#[test]
+fn a_project_path_cannot_forge_the_remap_notice() {
+    let h = Harness::new();
+    let project = h.home_path().join("pro\nj");
+    std::fs::create_dir(&project).unwrap();
+
+    let out = h.run_shell_from(&[], &project);
+    let err = stderr_of(&out);
+    let notice = err
+        .lines()
+        .find(|line| line.contains("==> Project path"))
+        .unwrap_or_else(|| panic!("no remap notice in:\n{err}"));
+    assert!(
+        notice.contains("pro\\x0aj"),
+        "the measured project path must be escaped: {notice}"
+    );
+    assert!(
+        notice.contains("mounting at /workspace instead"),
+        "{notice}"
+    );
+    assert!(
+        !err.lines().any(|line| line.trim() == "j contains control characters that can't be carried into the guest; mounting at /workspace instead"),
+        "the path forged a notice line:\n{err}"
+    );
+}

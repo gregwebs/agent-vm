@@ -122,8 +122,8 @@ impl Spelling {
         Self(spelling.into())
     }
 
-    /// The spelling as `declaration`'s diagnostics print it: bare for an argv
-    /// `--mount`, escaped and attributed for a config entry.
+    /// The spelling as `declaration`'s diagnostics print it: unquoted for an argv
+    /// `--mount`, quoted and attributed for a config entry.
     pub(crate) fn render(&self, declaration: Declaration<'_>) -> String {
         declaration.spelling(&self.0)
     }
@@ -349,14 +349,21 @@ impl Declaration<'_> {
     }
 
     /// A declared spelling as this source's refusal prints it: bare for argv (the
-    /// two sentences that print one never quoted it), escaped for a config entry
-    /// so a newline in the spelling cannot forge a second diagnostic line.
+    /// two sentences that print one never quoted it), quoted and attributed for a
+    /// config entry.
+    ///
+    /// Both arms escape control characters, so a spelling can never end the line
+    /// it is printed on. The argv arm used to be verbatim, on the theory that argv
+    /// is text the user typed; but a spelling is the *expanded* value — `~/repo`
+    /// becomes `$HOME/repo` — so it inherits whatever bytes the environment
+    /// carries, and `discovered by --mount …` printed such a path raw. For an
+    /// ordinary path the bytes are unchanged, which is the part ADR-0018 pins.
     ///
     /// Private on purpose: every caller goes through [`Spelling::render`], which
     /// is the only way to reach it from a declaration's own bytes.
     fn spelling(self, spelling: &str) -> String {
         match self {
-            Self::Argv => spelling.to_string(),
+            Self::Argv => crate::one_line::text(spelling),
             Self::UserConfig { .. } => quoted_str(spelling),
         }
     }
@@ -372,20 +379,30 @@ impl Declaration<'_> {
         }
     }
 
-    /// A host path as this source's diagnostics print it: unquoted `display` for
-    /// argv (byte-pinned), `quoted_path` for a config entry, whose path is
-    /// derived from attacker-chosen text and must not break the line.
+    /// A host path as this source's diagnostics print it: one line for argv, and
+    /// `quoted_path` for a config entry, whose path is derived from
+    /// attacker-chosen text and must not break the line.
+    ///
+    /// The argv arm escapes control characters too. It used to be `display()`,
+    /// which is not a declaration rendering at all: the follow-links walk passes
+    /// **measured** names through this function — a directory entry, a symlink
+    /// target — and nobody chose those bytes. A symlink named
+    /// `l<LF>==> Mounting /etc -> /etc` in a cloned repo forged a notice under an
+    /// `--mount …:follow-links` root. Ordinary paths are unchanged, so the argv
+    /// diagnostics ADR-0018 pins stay byte-identical.
     fn host_path(self, path: &Path) -> String {
         match self {
-            Self::Argv => path.display().to_string(),
+            Self::Argv => crate::one_line::path(path),
             Self::UserConfig { .. } => quoted_path(path),
         }
     }
 
     /// What `resolving fork root …` prints in place of the root path.
     ///
-    /// That sentence never carried a flag name, so an argv entry keeps its bare
-    /// `display()` rendering byte for byte. A config entry has to name itself —
+    /// That sentence never carried a flag name, so an argv entry stays unquoted;
+    /// it is escaped by the one-line policy, because the path handed here is the
+    /// *canonicalized* fork root, which `protected_host_files` measured. A config
+    /// entry has to name itself —
     /// otherwise the author of `mounts = [...]` cannot tell which entry failed —
     /// and has to escape the path, which at this point is the *expanded* spelling
     /// and therefore carries the attacker-chosen bytes.
@@ -393,7 +410,7 @@ impl Declaration<'_> {
     /// Exposed to [`crate::protected_host_files`], which owns the resolve step.
     pub(crate) fn fork_root(self, path: &Path) -> String {
         match self {
-            Self::Argv => path.display().to_string(),
+            Self::Argv => crate::one_line::path(path),
             Self::UserConfig { file, index } => format!(
                 "mounts[{index}] in {} {}",
                 quoted_path(file),
@@ -429,11 +446,15 @@ fn canonicalizing_context(declaration: Declaration<'_>, spelling: &Spelling) -> 
 }
 
 /// The `validating … source` context for a source `prepare` could not classify.
-/// Same split as [`canonicalizing_context`], with `Path::display` on the argv
-/// side: this sentence never quoted the path.
+/// Same split as [`canonicalizing_context`]: unquoted on the argv side, because
+/// this sentence never quoted the path, and escaped there by the one-line policy
+/// — `expanded` includes `:follow-links`-discovered binds, whose paths the walk
+/// measured. Ordinary paths are byte-identical, so the pinned argv sentence holds.
 fn validating_source_context(declaration: Declaration<'_>, host: &Path) -> String {
     match declaration {
-        Declaration::Argv => format!("validating --mount source {}", host.display()),
+        Declaration::Argv => {
+            format!("validating --mount source {}", crate::one_line::path(host))
+        }
         _ => format!(
             "validating {} source {}",
             declaration.subject(),
@@ -967,6 +988,10 @@ impl From<BindPath> for ExtraMount {
     /// appended after discovery, so the marker cannot trigger another pass.
     fn from(p: BindPath) -> ExtraMount {
         ExtraMount {
+            // A discovered bind is not a declaration: this is a canonical target
+            // the walk measured. It carries no declaration text at all, which is why
+            // every renderer escapes control characters rather than trusting that
+            // the bytes here were typed by someone.
             source_spelling: Spelling::new(p.host.display().to_string()),
             spelled_host: p.host.clone(),
             host: p.host,
@@ -1350,8 +1375,11 @@ fn discover_followed_targets(
 
 /// The refusal for a guest path two different declarations claim.
 ///
-/// Two argv declarations keep the historical sentence byte-for-byte
-/// (`--mount: guest path … (host and host)`, `Path::display`). As soon as one
+/// Two argv declarations keep the historical sentence (`--mount: guest path …
+/// (host and host)`), rendering each path through the one-line policy: for an
+/// ordinary path that is byte-for-byte the old `Path::display`, and a control
+/// character can no longer end the line — one side may be a followed bind, whose
+/// paths the walk measured. As soon as one
 /// side is a config entry the sentence names each side's declaration and renders
 /// each spelling for its own source, because a config spelling is
 /// attacker-chosen text: printed bare, the host it expands to could forge a
@@ -1372,9 +1400,9 @@ fn claim_conflict(
     match (existing_declaration, other_declaration) {
         (Declaration::Argv, Declaration::Argv) => anyhow::anyhow!(
             "--mount: guest path {} is claimed by different declarations ({} and {})",
-            other.guest.display(),
-            existing.host.display(),
-            other.host.display()
+            crate::one_line::path(&other.guest),
+            crate::one_line::path(&existing.host),
+            crate::one_line::path(&other.host)
         ),
         _ => anyhow::anyhow!(
             "guest path {} is claimed by different declarations ({} and {})",
@@ -3184,7 +3212,7 @@ pub(crate) fn prepare(
                 // separate wording decision.
                 let advisory = protected.message(
                     "--mount",
-                    &source.path.display().to_string(),
+                    &crate::one_line::path(&source.path),
                     &exposure,
                     None,
                 );
@@ -3311,7 +3339,7 @@ pub(crate) fn prepare(
             notices.push(format!(
                 "==> A fork from an earlier agent-vm build is no longer used: {}. It may \
                  contain a copy of a host credential file — remove it.",
-                orphan.display()
+                crate::one_line::path(&orphan)
             ));
         }
     }
@@ -3351,12 +3379,16 @@ pub(crate) fn prepare(
         else {
             anyhow::bail!(
                 "prepared fork at {} lost its explicit claim",
-                mount.guest.display()
+                crate::one_line::path(&mount.guest)
             );
         };
         volume.source = PreparedVolumeSource::WritableBind(mount.host.clone());
-        let metadata = fs::symlink_metadata(&mount.host)
-            .with_context(|| format!("validating committed fork {}", mount.host.display()))?;
+        let metadata = fs::symlink_metadata(&mount.host).with_context(|| {
+            format!(
+                "validating committed fork {}",
+                crate::one_line::path(&mount.host)
+            )
+        })?;
         volume.node_kind = node_kind(&metadata, &mount.host, declaration_origin(mount, &origins))?;
     }
 
@@ -3610,7 +3642,7 @@ fn sync_fork_representations(unique: &[ExtraMount], expanded: &mut [ExtraMount])
             .with_context(|| {
                 format!(
                     "prepared fork at {} lost its declaration representation",
-                    mount.guest.display()
+                    crate::one_line::path(&mount.guest)
                 )
             })?;
         mount.host = prepared.host.clone();
@@ -3649,7 +3681,7 @@ fn node_kind(
         anyhow::bail!(
             "{} must be a regular file or directory",
             match declaration {
-                Declaration::Argv => path.display().to_string(),
+                Declaration::Argv => crate::one_line::path(path),
                 Declaration::UserConfig { .. } => {
                     format!("{} {}", declaration.subject(), quoted_path(path))
                 }
@@ -3675,7 +3707,7 @@ fn validate_plan(volumes: &mut Vec<PreparedVolume>, core: &[PathBuf]) -> Result<
         {
             anyhow::bail!(
                 "mount plan has conflicting claims at {}",
-                volume.guest.display()
+                crate::one_line::path(&volume.guest)
             );
         }
         unique.push(volume);
@@ -3689,15 +3721,15 @@ fn validate_plan(volumes: &mut Vec<PreparedVolume>, core: &[PathBuf]) -> Result<
             if volume.guest != file.guest && volume.guest.starts_with(&file.guest) {
                 anyhow::bail!(
                     "mount at {} is below file mount {}",
-                    volume.guest.display(),
-                    file.guest.display()
+                    crate::one_line::path(&volume.guest),
+                    crate::one_line::path(&file.guest)
                 );
             }
         }
         if core.iter().any(|path| path == &volume.guest) {
             anyhow::bail!(
                 "mount plan collides with an agent-vm core mount at {}",
-                volume.guest.display()
+                crate::one_line::path(&volume.guest)
             );
         }
         if core.iter().any(|path| path.starts_with(&volume.guest))
@@ -3706,7 +3738,10 @@ fn validate_plan(volumes: &mut Vec<PreparedVolume>, core: &[PathBuf]) -> Result<
                 .iter()
                 .any(|path| path != &volume.guest && path.starts_with(&volume.guest))
         {
-            anyhow::bail!("core mount is below file mount {}", volume.guest.display());
+            anyhow::bail!(
+                "core mount is below file mount {}",
+                crate::one_line::path(&volume.guest)
+            );
         }
     }
     *volumes = unique;
@@ -3956,8 +3991,8 @@ pub(crate) fn prepare_forks(
             mount.host = final_dir.join("data");
             notices.push(format!(
                 "==> Reusing fork at {} (reset: {})",
-                mount.host.display(),
-                final_dir.display()
+                crate::one_line::path(&mount.host),
+                crate::one_line::path(&final_dir)
             ));
             let _ = kind;
             continue;
@@ -4009,7 +4044,7 @@ pub(crate) fn prepare_forks(
             notices.push(format!(
                 "==> Omitted {} {} from the fork of {}",
                 file.description(),
-                relative.display(),
+                crate::one_line::path(relative),
                 mount.source_spelling.render(declaration)
             ));
         }
@@ -4039,16 +4074,17 @@ pub(crate) fn prepare_forks(
         match fs::rename(&stage_path, &final_dir) {
             Ok(()) => {}
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("publishing fork {}", final_dir.display()));
+                return Err(error).with_context(|| {
+                    format!("publishing fork {}", crate::one_line::path(&final_dir))
+                });
             }
         }
         mount.host = final_dir.join("data");
         notices.push(format!(
             "==> Initialized fork {} -> {} (reset: {})",
             mount.source_spelling.render(declaration),
-            mount.host.display(),
-            final_dir.display()
+            crate::one_line::path(&mount.host),
+            crate::one_line::path(&final_dir)
         ));
     }
     Ok(notices)
@@ -4110,8 +4146,12 @@ fn ensure_private_parent_tree(parent: &Path) -> Result<()> {
         Ok(_) => return validate_private_directory(parent, "mount store parent"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("validating mount store parent {}", parent.display()));
+            return Err(error).with_context(|| {
+                format!(
+                    "validating mount store parent {}",
+                    crate::one_line::path(parent)
+                )
+            });
         }
     }
 
@@ -4128,8 +4168,12 @@ fn ensure_private_parent_tree(parent: &Path) -> Result<()> {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("creating mount store parent {}", parent.display()));
+            return Err(error).with_context(|| {
+                format!(
+                    "creating mount store parent {}",
+                    crate::one_line::path(parent)
+                )
+            });
         }
     };
     validate_private_directory(parent, "mount store parent")?;
@@ -4144,7 +4188,8 @@ fn ensure_private_store_directory(path: &Path) -> Result<()> {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("creating mount store {}", path.display()));
+            return Err(error)
+                .with_context(|| format!("creating mount store {}", crate::one_line::path(path)));
         }
     }
     validate_private_directory(path, "mount store")?;
@@ -4163,11 +4208,11 @@ fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .with_context(|| format!("validating {description} {}", path.display()))?;
+    .with_context(|| format!("validating {description} {}", crate::one_line::path(path)))?;
     if FileType::from_raw_mode(rfs::fstat(&dir)?.st_mode) != FileType::Directory {
         anyhow::bail!(
             "{description} entry {} must be a real directory",
-            path.display()
+            crate::one_line::path(path)
         );
     }
     Ok(())
@@ -4177,13 +4222,16 @@ fn secure_directory(path: &Path, description: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("securing {description} {}", path.display()))
+        .with_context(|| format!("securing {description} {}", crate::one_line::path(path)))
 }
 fn final_dir_exists(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                anyhow::bail!("corrupt fork {}; remove it to reset", path.display())
+                anyhow::bail!(
+                    "corrupt fork {}; remove it to reset",
+                    crate::one_line::path(path)
+                )
             }
             Ok(true)
         }
@@ -4200,12 +4248,12 @@ fn open_regular_lock(path: &Path) -> Result<std::fs::File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .with_context(|| format!("opening fork lock {}", path.display()))?;
+        .with_context(|| format!("opening fork lock {}", crate::one_line::path(path)))?;
     if !file.metadata()?.is_file() {
-        anyhow::bail!("fork lock {} is not regular", path.display());
+        anyhow::bail!("fork lock {} is not regular", crate::one_line::path(path));
     }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("securing fork lock {}", path.display()))?;
+        .with_context(|| format!("securing fork lock {}", crate::one_line::path(path)))?;
     Ok(file)
 }
 fn clean_stale_staging(staging: &Path, id: &str) -> Result<()> {
@@ -4215,7 +4263,10 @@ fn clean_stale_staging(staging: &Path, id: &str) -> Result<()> {
         if name.to_string_lossy().starts_with(&format!("{id}.stage-")) {
             let metadata = fs::symlink_metadata(entry.path())?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                anyhow::bail!("unsafe stale fork staging entry {}", entry.path().display());
+                anyhow::bail!(
+                    "unsafe stale fork staging entry {}",
+                    crate::one_line::path(&entry.path())
+                );
             }
             fs::remove_dir_all(entry.path())?;
         }
@@ -4236,7 +4287,12 @@ fn write_manifest(path: &Path, manifest: &ForkManifest) -> Result<()> {
     Ok(())
 }
 fn validate_ready(dir: &Path, mount: &ExtraMount, id: &str) -> Result<PreparedNodeKind> {
-    let reset = || format!("corrupt fork {}; remove it to reset", dir.display());
+    let reset = || {
+        format!(
+            "corrupt fork {}; remove it to reset",
+            crate::one_line::path(dir)
+        )
+    };
     let metadata = fs::symlink_metadata(dir).map_err(|_| anyhow::anyhow!(reset()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         anyhow::bail!("{}", reset());
@@ -4291,7 +4347,7 @@ fn validate_ready(dir: &Path, mount: &ExtraMount, id: &str) -> Result<PreparedNo
         ("file", true, false) => anyhow::bail!(
             "unsupported file fork {} (this build mounts directory forks only); \
              remove it to reset",
-            dir.display()
+            crate::one_line::path(dir)
         ),
         _ => anyhow::bail!("{}", reset()),
     }
@@ -4513,11 +4569,17 @@ fn copy_opened(
         return Ok(CopiedNode::Copied(PreparedNodeKind::File));
     }
     if ty != FileType::Directory {
-        anyhow::bail!("{} is not a regular file or directory", relative.display());
+        anyhow::bail!(
+            "{} is not a regular file or directory",
+            crate::one_line::path(relative)
+        );
     }
     let identity = (stat.st_dev as u64, stat.st_ino as u64);
     if active.contains(&identity) {
-        anyhow::bail!("symlink cycle while copying {}", relative.display());
+        anyhow::bail!(
+            "symlink cycle while copying {}",
+            crate::one_line::path(relative)
+        );
     }
     active.push(identity);
     fs::create_dir(destination)?;
@@ -4547,7 +4609,7 @@ fn copy_opened(
                 if depth >= FORK_MAX_LINK_DEPTH {
                     anyhow::bail!(
                         "maximum symlink follow depth exceeded at {}",
-                        child_relative.display()
+                        crate::one_line::path(&child_relative)
                     );
                 }
                 // openat resolves the link relative to the already-pinned
@@ -4562,7 +4624,7 @@ fn copy_opened(
                     OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
                     Mode::empty(),
                 )
-                .with_context(|| format!("following {}", child_relative.display()))?;
+                .with_context(|| format!("following {}", crate::one_line::path(&child_relative)))?;
                 copy_opened(
                     &target,
                     &child_dst,
@@ -6407,6 +6469,121 @@ mod prepare_tests {
         assert!(store_tree(store.path()).is_empty(), "{error}");
     }
 
+    /// The A3 regression guard at the site that was actually wrong: a
+    /// `:follow-links` target inside the Pi home is refused, and that refusal
+    /// prints the discovered bind's own spelling — which the walk measured. When
+    /// that spelling is filed as argv text it renders verbatim, and a `$HOME`
+    /// whose name carries a newline forges a diagnostic line.
+    #[test]
+    fn a_discovered_binds_spelling_is_escaped_in_a_refusal() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("ho\nme");
+        fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        fs::write(home.join(".pi/agent/auth.json"), "{\"token\":\"t\"}").unwrap();
+        let home = home.canonicalize().unwrap();
+        let repo = home.join("repo");
+        fs::create_dir(&repo).unwrap();
+        // The symlink's target is the Pi home itself, so the discovered bind is a
+        // live bind of host Pi state and preparation refuses it.
+        symlink(home.join(".pi"), repo.join("link")).unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/r:ro:follow-links", repo.display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err();
+
+        let rendered = format!("{error:#}");
+        // The refusal is three lines by construction: the finding, the
+        // explanation, and the remedy. A newline in `$HOME` must add none.
+        assert_eq!(
+            rendered.lines().count(),
+            3,
+            "the refusal's own three lines, and no forged one: {rendered}"
+        );
+        assert!(
+            rendered.contains("ho\\x0ame"),
+            "the measured spelling is escaped: {rendered}"
+        );
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with("me/")),
+            "the spelling forged a line: {rendered}"
+        );
+    }
+
+    /// A spelling is the *expanded* value (`~/repo` becomes `$HOME/repo`), so it
+    /// carries whatever bytes the environment has, and a `:follow-links` bind's
+    /// spelling is a canonical target nobody typed at all. Both renderers escape
+    /// control characters, so no spelling can end the line it is printed on.
+    /// Ordinary and non-ASCII paths are unchanged, which is what the pinned
+    /// diagnostics hold to.
+    #[test]
+    fn a_spelling_cannot_end_the_line_it_is_printed_on() {
+        let spelling = Spelling::new("/srv/ok\nFORGED-SPELLING");
+        assert_eq!(
+            spelling.render(Declaration::Argv),
+            "/srv/ok\\x0aFORGED-SPELLING"
+        );
+        // The quoted form was already line-safe: `{:?}` renders a control
+        // character as Rust's escape (`\n`), not as the byte.
+        assert_eq!(
+            spelling.render_quoted(Declaration::Argv),
+            "\"/srv/ok\\nFORGED-SPELLING\""
+        );
+        assert_eq!(
+            Spelling::new("/srv/ok").render(Declaration::Argv),
+            "/srv/ok"
+        );
+        assert_eq!(
+            Spelling::new("/srv/проект").render(Declaration::Argv),
+            "/srv/проект"
+        );
+    }
+
+    /// The copier reports the name it *measured*, which no declaration check has
+    /// seen: a fork source is a directory, so anything inside it — including a
+    /// FIFO whose name carries a newline — is named by the walk itself. It is
+    /// escaped for the same reason declared spellings are, or the refusal ends
+    /// and everything after the newline starts at column 0.
+    #[test]
+    fn a_fork_copy_refusal_escapes_the_measured_name() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let source = home.join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("kept"), "seed").unwrap();
+        // A FIFO rather than a socket or device: cheap, and a non-directory
+        // non-regular node is exactly what the walk refuses. The copier opens
+        // with NONBLOCK, so a reader that never arrives cannot hang it.
+        let fifo = source.join("p\nFORGED5");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/g:fork", source.display())]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err();
+
+        let rendered = format!("{error:#}");
+        assert_eq!(
+            rendered.lines().count(),
+            1,
+            "one line, never a forged second: {rendered}"
+        );
+        assert!(rendered.contains("p\\x0aFORGED5"), "{rendered}");
+        assert!(
+            !rendered.lines().any(|line| line.trim() == "FORGED5"),
+            "the measured name is escaped, not printed as a line: {rendered}"
+        );
+    }
+
     #[test]
     fn fork_of_pi_home_omits_both_files_and_copies_everything_else() {
         let (_home, home) = pi_home();
@@ -6707,6 +6884,36 @@ mod prepare_tests {
             "{:?}",
             reused.notices
         );
+    }
+
+    /// A fork's own notices name paths this run *measured* — the store's fork
+    /// directory and its committed data. `AGENT_VM_STATE_DIR` is the user's to
+    /// choose, so a newline in it must not end a notice and start a forged one.
+    /// (The legacy-fork warning is a third such notice; it has its own test.)
+    #[test]
+    fn a_fork_notice_escapes_the_measured_store_path() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let store = home.join("st\ngore");
+        fs::create_dir_all(&store).unwrap();
+        let source = home.join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("visible"), "seed").unwrap();
+        let requests = || parse_extra_mounts(&[format!("{}:/g:fork", source.display())]).unwrap();
+
+        let seeded = prepare(requests(), &context_with_home(&store, home.clone())).unwrap();
+        let reused = prepare(requests(), &context_with_home(&store, home.clone())).unwrap();
+        let notices = seeded
+            .notices
+            .iter()
+            .chain(reused.notices.iter())
+            .filter(|notice| notice.contains("fork at") || notice.contains("Initialized fork"))
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 2, "both fork notices: {:?}", notices);
+        for notice in notices {
+            assert!(!notice.contains('\n'), "one line: {notice}");
+            assert!(notice.contains("st\\x0agore"), "escaped: {notice}");
+        }
     }
 
     #[test]

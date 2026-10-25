@@ -20,6 +20,7 @@ use crate::credential_resolver::{CredentialPreflight, MissingCredentialPolicy};
 use crate::image_contract;
 use crate::launch_target::{LaunchTarget, ProgramGuard};
 use crate::mount;
+use crate::one_line;
 use crate::protected_host_files::CoreHostSource;
 use crate::session::ProjectSession;
 use crate::user;
@@ -186,12 +187,17 @@ impl<W: std::io::Write> LaunchNotices<W> {
 }
 
 /// `==> agent-vm-<hash>-<pid> in /home/dev/proj (state: /…/state/<hash>)`
+///
+/// Both directories are *measured* (the canonicalized cwd and a hashed state
+/// path), not declared text, so they are the one thing this line prints that a
+/// host file name can influence: a directory whose name holds a newline would
+/// otherwise end the banner and start a forged `==>` line at column 0.
 fn launch_banner(session: &ProjectSession) -> String {
     format!(
         "==> {} in {} (state: {})",
         session.sandbox_name,
-        session.project_dir.display(),
-        session.state_dir.display(),
+        one_line::path(&session.project_dir),
+        one_line::path(&session.state_dir),
     )
 }
 
@@ -837,8 +843,8 @@ pub(crate) async fn launch(
         volume.host_path = volume.host_path.canonicalize().with_context(|| {
             format!(
                 "canonicalizing core bind source {} for {}",
-                volume.host_path.display(),
-                volume.guest_path
+                one_line::path(&volume.host_path),
+                one_line::path(Path::new(&volume.guest_path))
             )
         })?;
     }
@@ -884,7 +890,8 @@ pub(crate) async fn launch(
     // would shadow.
     if let Some(reason) = remap_reason {
         notices.emit(format!(
-            "==> Project path {host_path} {reason}; mounting at /workspace instead"
+            "==> Project path {} {reason}; mounting at /workspace instead",
+            one_line::text(host_path)
         ))?;
     }
     let mut patch_builder_steps = mkdir_chain(Path::new(&project_guest_path));
@@ -1156,6 +1163,15 @@ pub(crate) async fn launch(
     // Prepared mount instructions carry the already-classified node kind;
     // file leaves get only their parents patched so agentd can safely create
     // the target without writing through a readonly parent.
+    //
+    // Both halves go through the one-line policy. The host is a measured
+    // canonical path, so a directory name can carry any byte including a
+    // newline. A *declared* guest is already free of control characters
+    // (`guest_path_is_mountable` refuses the boot-params framing characters), and
+    // a guest discovered by `:follow-links` is a measured canonical target, which
+    // was the one case this invariant did not cover. Rendering it through the
+    // same one-line policy costs nothing for the declared case — an ordinary
+    // path is byte-identical — and cannot forge a line in either.
     let mut extra_mount_mkdirs: Vec<String> = Vec::new();
     for volume in &mount_plan.volumes {
         let guest = volume.guest.clone();
@@ -1167,8 +1183,8 @@ pub(crate) async fn launch(
             mount::PreparedVolumeSource::WritableBind(host) => {
                 notices.emit(format!(
                     "==> Mounting {} -> {}",
-                    host.display(),
-                    guest.display()
+                    one_line::path(host),
+                    one_line::path(&guest)
                 ))?;
                 let host = host.clone();
                 builder =
@@ -1177,8 +1193,8 @@ pub(crate) async fn launch(
             mount::PreparedVolumeSource::ReadOnlyBind(host) => {
                 notices.emit(format!(
                     "==> Mounting {} -> {} (read-only)",
-                    host.display(),
-                    guest.display()
+                    one_line::path(host),
+                    one_line::path(&guest)
                 ))?;
                 let host = host.clone();
                 builder = builder.volume(guest_str, move |m| {
@@ -3051,6 +3067,25 @@ mod tests {
             launch_banner(&session),
             "==> agent-vm-abc-42 in /home/dev/proj (state: /state/abc)"
         );
+    }
+
+    /// A launch banner carries two *measured* directories — the canonicalized
+    /// cwd and the hashed state dir — so a project directory whose name holds a
+    /// newline must not end the banner and start a forged one.
+    #[test]
+    fn notice_launch_banner_escapes_measured_directories() {
+        let session = ProjectSession {
+            project_dir: PathBuf::from("/home/dev/pro\nj"),
+            project_hash: "abc".to_string(),
+            state_dir: PathBuf::from("/state/a\tb"),
+            sandbox_name: "agent-vm-abc-42".to_string(),
+        };
+        let banner = launch_banner(&session);
+        assert_eq!(
+            banner,
+            "==> agent-vm-abc-42 in /home/dev/pro\\x0aj (state: /state/a\\x09b)"
+        );
+        assert!(!banner.contains('\n'), "{banner}");
     }
 
     #[test]

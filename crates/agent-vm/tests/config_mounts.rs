@@ -1322,6 +1322,69 @@ fn config_fifo_source_names_the_declaration() {
     assert!(h.mount_store().is_none());
 }
 
+/// A prepared volume's host path is *measured* — the canonicalized path of
+/// whatever the declaration resolved to — so the launch notice escapes it. A
+/// directory whose name carries a newline would otherwise end the notice and
+/// start a line the reader would take for agent-vm's own output.
+#[test]
+fn a_mount_notice_escapes_the_measured_host_path() {
+    let h = Harness::new();
+    let dir = h.home_root.join("ok\nFORGED-MOUNT");
+    std::fs::create_dir(&dir).unwrap();
+    h.write_user("mounts = [\"~/ok\\nFORGED-MOUNT:/g/x:rw\"]\n");
+    let out = h.launch(&[], "shell", &[]);
+    let stderr = stderr_of(&out);
+    // A forged continuation does not contain `==> Mounting`, so counting lines
+    // that do would count one either way. What sees the forgery is the exact
+    // string below plus the two absence checks: the raw newline, and the forged
+    // second line it would have produced.
+    assert!(
+        !stderr.contains("\nFORGED-MOUNT"),
+        "the notice ended at the newline in the directory name:\n{stderr}"
+    );
+    let notice = stderr
+        .lines()
+        .find(|line| line.contains("==> Mounting"))
+        .unwrap_or_else(|| panic!("no mount notice in:\n{stderr}"));
+    assert_eq!(
+        notice.trim(),
+        format!(
+            "==> Mounting {}/ok\\x0aFORGED-MOUNT -> /g/x",
+            h.home_root.display()
+        ),
+        "the measured host path is escaped, not interpolated raw:\n{stderr}"
+    );
+    assert!(
+        !stderr
+            .lines()
+            .any(|line| line.trim() == "FORGED-MOUNT -> /g/x"),
+        "a directory name forged a launch notice:\n{stderr}"
+    );
+}
+
+/// The other half of the policy: escaping exists to keep a notice on one line,
+/// not to make it unreadable. This repository supports non-ASCII project and
+/// mount paths, so a Cyrillic directory must print as itself — escaping it to
+/// `\xd0\xbf…` would hand a user a path they cannot read or copy.
+#[test]
+fn a_non_ascii_mount_path_is_printed_as_itself() {
+    let h = Harness::new();
+    let dir = h.home_root.join("проект-тест");
+    std::fs::create_dir(&dir).unwrap();
+    h.write_user("mounts = [\"~/проект-тест:/g/п:rw\"]\n");
+    let out = h.launch(&[], "shell", &[]);
+    let stderr = stderr_of(&out);
+    let notice = stderr
+        .lines()
+        .find(|line| line.contains("==> Mounting"))
+        .unwrap_or_else(|| panic!("no mount notice in:\n{stderr}"));
+    assert_eq!(
+        notice.trim(),
+        format!("==> Mounting {}/проект-тест -> /g/п", h.home_root.display()),
+        "a non-ASCII path must be byte-identical, not escaped:\n{stderr}"
+    );
+}
+
 /// A config source spelling can carry a newline (TOML basic strings escape
 /// one), and the refusal must still be one diagnostic: the value is rendered
 /// with the config module's escaping, so it cannot forge a second line that the
