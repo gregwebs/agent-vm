@@ -56,7 +56,7 @@ present user `[network]` table invokes authority checks:
    has exactly one hard link.
 
 Directory refusals precede file refusals; file owner precedes mode, then links.
-`network_authority_refusal` uses ADR-0038's proved
+`config_authority::authority_refusal` uses ADR-0038's proved
 `authority_file_singly_linked` and its shared spec, not a duplicate link rule.
 
 A symlinked dotfile config **without** `[network]` still works for tools/image.
@@ -108,7 +108,7 @@ everyone. This change does not soften, duplicate or condition that guard.
 ## Trusted versus proved
 
 [ADR-0018](0018-machine-checked-boundary-contracts.md) records the two kernels:
-`network_authority_refusal` proves acceptance and refusal precedence from
+`config_authority::authority_refusal` proves acceptance and refusal precedence from
 measured facts, sharing ADR-0038's executable and spec one-name rule;
 `resolve_grant` proves value and source precedence. Syscalls,
 TOML parsing, mode conversion, canonical union, notices and runtime policy
@@ -179,3 +179,31 @@ of a name's entries, the `(persisted grants)` / `(--allow-egress)` /
 `(persisted grants and --allow-egress)` tags, and no tag without a user table —
 and the notices describe exactly the same rules. The rendering contract is
 [USAGE](../../USAGE.md#hostname-allowance-grammar).
+
+## Amendment: mounts share the verified read (ADR-0046)
+
+#394 adds a second authority-bearing user field, a top-level `mounts` list
+([ADR-0046](0046-verified-user-config-mounts.md)), and it uses Decision 2's read
+unchanged. Nothing in this ADR's threat model, rule sequence or accepted gaps
+changes; what changes is the name of the gate and the set of fields that reach
+it.
+
+- The decision moved to `config_authority::authority_refusal` — `user_network`'s
+  copy is gone — with its contract and executable body unchanged.
+  `protected_config_dir::authority_file_singly_linked`'s one-name rule is still
+  *shared*, in both its executable and spec form, not duplicated.
+- `config_authority::verify` is now the only producer of the authorized-read
+  token, and every authority-bearing parser takes that token. A new proved
+  kernel decides whether the check runs at all:
+  `authority_required({network, mounts}) == (network || mounts)`. Presence, not
+  contents, is still the rule — for both fields.
+- Decision 2's "only a present user `[network]` table invokes authority checks"
+  now reads "a present `[network]` **or** `mounts`", and one file declaring both
+  is verified once.
+- Diagnostics name the field(s) that made the file authority-bearing:
+  `[network]`, `mounts`, or `[network] and mounts`. The per-variant sentences are
+  templated from those three subjects; the `[network]`-only bytes are unchanged,
+  pinned by the existing tests and the PN4B/PN5 joins.
+- The gaps are unchanged, and now cover mounts too: mode `0600` is still not
+  required, an immediate parent that is a symlink is still followed, and
+  ancestors, ACLs and replacement races are still accepted.

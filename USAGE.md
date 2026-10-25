@@ -823,6 +823,7 @@ Available launch options:
 | `--allow-missing-credentials` | warn and launch when a requested YAML credential is missing or unreadable, instead of refusing — see [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection). Never covers a built-in provider's own missing host credential |
 | `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). A live bind that would expose a host Pi credential file is refused — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted). Capacity is host-specific. |
 | `--allow-internet-egress`, `--allow-lan`, `--allow-host`, `--allow-egress`, `--publish`, `--auto-publish` | see [Ports & egress](#ports--egress); egress is denied by default |
+| `--no-config-mounts` | skip this launch's [config mounts](#config-mounts-user-config) (the user config's `mounts`); explicit `--mount`, credentials, persisted paths and every config check still apply |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 
 ### Direct commands
@@ -954,6 +955,130 @@ directory is removed**; there is no acknowledgement, because acknowledging it
 would leave a directory that may hold a plaintext credential. A v2 fork whose
 original source is gone cannot be reseeded: the launch errors on the missing
 source, and the printed orphan is what you remove.
+
+### Config mounts (user config)
+
+`~/.config/agent-vm/config.toml` can name mounts for **every** launch in every
+project:
+
+```toml
+# at the top of the file, before any [table] header
+mounts = ["~/reference:ro", "~/scratch:/work/scratch:rw"]
+```
+
+The grammar is [`--mount`](#extra-and-forked-mounts)'s — `HOST[:GUEST][:MODE]...`
+with the same modes (`ro`, `rw`, `fork`, `follow-links`, fork-only
+`exclude=REL`), the same guest-path rules (absolute, not `/`, no `..`, `:`,
+`;`, `,` or control characters), and the same checks (host Pi credential files,
+the [protected config directory](#agent-vms-config-directory-is-never-writable-from-the-guest),
+core-mount collisions, the file-mount restriction, and collisions with a declared
+`persist` path). Only `HOST` differs:
+
+- `~/` is replaced by your `$HOME` **text**, exactly as an unquoted
+  `--mount ~/ref` is expanded by the shell. Nothing else relative is accepted:
+  `$HOME/x`, `${HOME}/x`, `~`, `~user/x`, `rel` and `./x` are rejected — there is
+  no environment expansion. A `$HOME` ending in `/` therefore produces `//`,
+  which is also what the shell gives you.
+- The spelling is preserved, never canonicalized, because fork identity depends
+  on it: `~/ref` and an equivalent absolute path name the same source only if
+  they are the same bytes.
+- **These mounts reach every project you launch in, including repositories you
+  have not read.** Prefer `:ro` and `:fork`; a `:rw` config mount is a standing
+  invitation to every future checkout. Their git remotes join the GitHub
+  allow-list exactly as a `--mount`'s do, for the launch that mounts them.
+- `:fork` config mounts are per project, like every fork: the copy lives in that
+  project's state, and a second project seeds its own.
+
+**Identical declarations merge; different ones are refused.** A config entry and
+a `--mount`, or two config entries, that claim the same guest path are merged
+when they are the same declaration (same host spelling, mode, follow policy and
+fork exclusions) and rejected otherwise — naming both, for example
+`guest path /work/scratch is claimed by different declarations (mounts[1] in
+"/Users/you/.config/agent-vm/config.toml" and --mount); identical declarations
+are merged and different ones are refused`. There is no last-wins and no CLI
+override, so a repository cannot silently replace what you declared. Guest
+spellings are normalized first (`/g//./x` is `/g/x`), host spellings are not, so
+`~/ref` and `~/ref/` at one guest path are a refusal — the same refusal two
+`--mount` arguments produce today. Parent and child guest directories remain
+distinct mounts.
+
+Selected config mounts apply to catalog tools (including the shipped ones), your
+own project-defined tools, `shell`, and the [direct](#direct-commands) `run` /
+`--` routes. `setup`'s verification guest ignores them, and `image refresh` boots
+no guest. Project (`.agent-vm/config.toml`) and built-in configs may not declare
+`mounts` at all: an empty `mounts = []` is refused there too, because mere
+presence, not non-empty contents, is what asks for authority.
+
+**The file must be trusted.** A user config that contains `mounts` — even
+`mounts = []` — must pass the same verified-file policy as `[network]`: a regular
+file, reached directly, with one hard link, owned by you and not
+group/other-writable, in an immediate directory owned by you and not
+group/other-writable. The rule is about *presence*, because the file an attacker
+would plant is cheapest to plant empty. A tools/image-only symlinked config keeps
+working; a symlinked, hard-linked, foreign-owned, `go-w` or dangling one that
+carries `mounts` is refused with the reason and the field. See [Persisted
+grants](#persisted-grants-user-config) for the exact policy and its accepted
+gaps.
+
+**A missing source is not a config error.** Load needs no mount source: a config
+naming a path you have not created — or one you cannot reach — loads, `doctor`,
+`--help` and `--no-config-mounts` launches all work. A *selected* declaration
+with a missing source fails that launch in preflight (`canonicalizing mounts[0]
+in "…" host …`, under `preparing mounts (including mounts from "…";
+--no-config-mounts skips them)`) rather than being skipped silently. A preflight
+refusal *about a declaration* names it as `mounts[N] in "<file>"` and escapes
+the spelling it echoes, so the sentence points at the entry to edit and not only
+at the file, and a newline in an entry cannot add a line to it. Two exceptions,
+both because the thing refused is not a declaration: a `:follow-links`-discovered
+bind is refused as `--mount "<discovered path>"` and names the entry that made it
+discoverable only in its `(discovered by …)` phrase, and the fork notices
+(`==> Initialized fork …`, `==> Omitted …`) escape the spelling without
+repeating `mounts[N]`. A `:fork` whose copy is already READY is reused without
+reading the original source, exactly as a `--mount` fork is.
+
+**`--no-config-mounts`** skips the automatic selection for one launch:
+
+```sh
+agent-vm --no-config-mounts shell       # this launch: no config mounts
+agent-vm --no-config-mounts --mount ~/x:ro shell   # --mount still applies
+```
+
+It is a launch option, so it goes before the verb ([launch options go before the
+tool verb](#launch-options)): write `agent-vm --no-config-mounts shell`, not `agent-vm shell --no-config-mounts`,
+because after the tool verb it is a tool argument forwarded verbatim and the
+config mounts still apply. It disables selection and preparation only.
+Explicit `--mount`, credentials, persisted paths, agent-vm's own project/state
+mounts, egress authority, and every config check (schema, mount syntax, file
+trust) are unchanged: a broken or untrusted `mounts` config still fails the
+launch, because that is a `config::load` error and the flag cannot run before it.
+It is also a usage error on a built-in verb (`agent-vm --no-config-mounts
+doctor`), like every other launch option.
+
+**Where `mounts` lands in the file matters.** TOML assigns a key to the most
+recent `[table]` header, so write it **before the first one**:
+
+| written as | result |
+|---|---|
+| `mounts = ["~/ref:ro"]` before any header | top-level; verified and selected |
+| `[network]` then `mounts = [...]` | a network setting: refused with `[network]: mounts is not a network setting; a top-level mounts list must be written before the first table header` |
+| `[[tools]]` … then `mounts = [...]` | a tool field: the fixed schema-repair paragraph, with the line and column and the same "write it before the first table header" sentence |
+| `[mounts]` (table form) | top-level and present, so verified, then `mounts: must be an array of strings` |
+| `[tools.env]` with `mounts = "~/private:ro"` | a legitimate **environment variable** named `mounts`; no mount is selected and no authority is asked for |
+
+A launch that selected config mounts prints one line, naming the file and how
+many declarations it contributed:
+
+```text
+==> Config mounts: 2 from "/Users/you/.config/agent-vm/config.toml"
+==> Config mounts: skipped 2 from "/Users/you/.config/agent-vm/config.toml" (--no-config-mounts)
+```
+
+Expect no such line when the list is empty or absent, or when a skipped list was
+empty: there is nothing to report.
+
+> **Added in 0.7.4.** ADR-0046 records why the file-trust rule, the merge rule
+> and the preflight order are what they are; named mount sets and per-tool mount
+> fields are deliberately not part of this release.
 
 ### agent-vm's config directory is never writable from the guest
 
@@ -1225,12 +1350,16 @@ override are deliberately **not** honored.
 
 ### Schema
 
-`[network]` authority is user-tier only, from a verified file. The project tier
-refuses it. See [Persisted grants](#persisted-grants-user-config).
+`[network]` authority and `mounts` are user-tier only, from a verified file. The
+project tier refuses both. See [Persisted grants](#persisted-grants-user-config)
+and [Config mounts](#config-mounts-user-config).
 
 ```toml
 # Top-level, optional: the boot image for every session (an OCI reference).
 image = "ghcr.io/gregwebs/agent-vm-standard:v0.1.3"
+
+# Optional, USER CONFIG ONLY, and it must come before the first table header:
+# mounts = ["~/reference:ro", "~/scratch:/work/scratch:rw"]
 
 # Optional, USER CONFIG ONLY (never put this in project config):
 # [network]
@@ -1257,6 +1386,11 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
   the tools: a file that sets only `image` declares zero tools and keeps the
   shipped defaults. Only OCI references are accepted here; a local path is
   rejected (use `--image` for a local rootfs).
+- `mounts` — optional top-level array of strings, **user config only** and only
+  before the first `[table]` header: config mounts for every launch, with
+  `--mount`'s `HOST[:GUEST][:MODE]...` grammar. The project and built-in tiers
+  refuse the key even when it is empty. See
+  [Config mounts](#config-mounts-user-config).
 - `name` — required; a single command-name token: nonempty, no
   whitespace/control characters, no `/` (a name is not a path), not an
   all-dots spelling (`.`/`..`), no leading `-`, and not one of the reserved
@@ -2163,6 +2297,13 @@ directory must be owned by you and not group/other-writable (`0700` is fine).
 Keep `~` and `~/.config` writable only by you: ancestors and ACLs are **not**
 checked. A tools/image-only symlink still works; review the file's `[network]`
 table before replacing it with the file itself to carry authority.
+
+This one policy covers **every** authority-bearing user field: the same check
+runs for `[network]`, for [`mounts`](#config-mounts-user-config), and for a file
+containing both. Presence decides it, not contents — `mounts = []` and an empty
+`[network]` grant nothing yet are exactly the bytes worth planting, so a file
+that carries either is verified. A tools/image-only symlink keeps working;
+adding authority to it does not.
 
 Notices name the file and each grant's source, for example:
 

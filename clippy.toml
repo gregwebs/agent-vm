@@ -1,0 +1,17 @@
+# Repo-wide clippy configuration. Read by every `cargo clippy` invocation from
+# the workspace root, which is where CI and the local gates run it.
+#
+# `mount::Spelling` is a declaration's host spelling (the text a user typed, or a
+# config entry's text after `~/` expansion). Printing one is a *policy* decision
+# — an `--mount` diagnostic is byte-pinned (ADR-0018), a config entry has to be
+# escaped and attributed to `mounts[N] in "<file>"` — so the only rendering route
+# is `Spelling::render`, which takes the `Declaration` that decides. The three
+# accessors below exist for identity logic (the fork hash, the fork manifest) and
+# for filesystem calls on the declaration's own source. Each is disallowed
+# everywhere and allowed at its call site with its reason, so a new use cannot be
+# added without a visible, reviewable `#[allow]`.
+disallowed-methods = [
+  { path = "agent_vm::mount::Spelling::stored_str", reason = "identity only (fork manifest); render a spelling with Spelling::render(Declaration)" },
+  { path = "agent_vm::mount::Spelling::stored_bytes", reason = "identity only (fork hash); render a spelling with Spelling::render(Declaration)" },
+  { path = "agent_vm::mount::Spelling::as_source_path", reason = "filesystem calls and quoted_path only; render a spelling with Spelling::render(Declaration)" },
+]

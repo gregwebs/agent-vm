@@ -23,7 +23,8 @@ guest; or for microsandbox.
 
 ## Launch option
 
-An `agent-vm` flag that configures a launch (`--mount`, `--image`, `-p`, …).
+An `agent-vm` flag that configures a launch (`--mount`, `--image`, `-p`,
+`--no-config-mounts`, …).
 Written before the route: `agent-vm --mount ~/ref pi`, or `agent-vm --mount
 ~/ref run make test`. The routes a launch option may precede are the catalog
 tool verbs and the [direct command](#direct-command) runner (including its
@@ -390,8 +391,10 @@ before merging. Their merge is a **union of whole definitions**, not a field
 overlay: the user tier is authoritative for every name it declares, the
 project tier may only add names, and a differing project declaration yields a
 `doctor` warning (user definition wins). Only when both tiers declare **zero**
-tools do the compiled-in defaults apply. `[network]` authority is user-tier only;
-project declarations remain non-authoritative.
+tools do the compiled-in defaults apply. The authority-bearing fields are
+user-tier only: `[network]` ([persisted grant](#egress-authority)) and `mounts`
+([config mount](#config-mount)). A project or built-in declaration of either is
+refused, even when empty, because presence is what asks for authority.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
 and the in-guest `clipboard`/`_intercept-hook` keep working, and a launch verb
@@ -597,10 +600,28 @@ read-only bind). See
 _Avoid_: "bind mount", which remains connected to the host path; "copy-on-write
 mount", which implies lazy shared backing storage.
 
+## Config mount
+
+A mount declaration from the user tier's top-level `mounts`, selected for every
+launch unless `--no-config-mounts` suppresses it. It is parsed, claimed and
+prepared exactly like a `--mount` (same grammar, guest-path rules, merge/refuse
+rule and protections); it differs in host spelling (`~/` expands to the `$HOME`
+text, and no other relative form is accepted) and in origin, which diagnostics
+report as `mounts[N] in "<file>"`. Its declarations are read only from a
+**verified file**: the presence of the field, not its contents, is what makes
+the user config authority-bearing under ADR-0040's read policy. See
+[ADR-0046](docs/adr/0046-verified-user-config-mounts.md).
+
+_Avoid_: "default mount" — agent-vm's own project/state/home mounts are not
+this, and a config mount can be read-only or forked; "persisted mount" — a
+config mount is re-selected at each launch, not stored per project, and a fork
+copy is persisted but is not a config mount.
+
 ## Protected config directory
 
-`~/.config/agent-vm`, where `credentials.yaml` and `[network]` authorize
-launch secrets and egress, respectively. This directory is never
+`~/.config/agent-vm`, where `credentials.yaml`, `[network]` and `mounts`
+authorize launch secrets, egress and config mounts, respectively. This
+directory is never
 inside a writable live bind. Protection includes directories its lookup searches
 and prospective directories reached through missing components, measuring raw
 `$HOME` and the account home. Read-only binds and fork copies are exempt.

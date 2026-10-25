@@ -40,6 +40,11 @@ Also consider creating a new type to encapsulate trait behavior.
 
 Use clippy for linting.
 
+Where a type exists to make one mistake impossible, finish the job with
+`clippy.toml`'s `disallowed-methods`: ban the escape hatches and allow them at
+each call site with its reason, so a new use is a visible edit rather than a
+silent one.
+
 ## Modules
 
 Don't pile on new concepts to existing modules.

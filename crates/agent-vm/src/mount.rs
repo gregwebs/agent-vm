@@ -2,7 +2,15 @@
 //! preparation it feeds. [`parse_extra_mounts`] and [`prepare`] are the
 //! entry points `run.rs`'s `launch()` calls; everything else here is a
 //! private implementation detail of the mount contract.
+//!
+//! The grammar ([`parse_mount_spec`]) and the claim rule ([`claim`]) are shared
+//! with verified user-config `mounts` (ADR-0046), which is why they are separate
+//! from the CLI wrapper and carry an origin: the same rejection must be able to
+//! render as `--mount …` for argv and as `mounts[N] in "…"` for a config file
+//! without either route owning a second copy of the rules.
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -11,6 +19,7 @@ use anyhow::{Context, Result};
 #[cfg(test)]
 use microsandbox::sandbox::MountBuilder;
 
+use crate::config::{quoted_path, quoted_str};
 use crate::host_paths::flock_exclusive;
 #[cfg(test)]
 use crate::protected_host_files::CoreBind;
@@ -18,6 +27,7 @@ use crate::protected_host_files::{
     CoreHostSource, ProtectedFile, ProtectedHostFiles, ResolvedRoot, Severity,
 };
 use crate::run::guest_path_is_mountable;
+use vstd::prelude::*;
 
 /// A recognized `--mount` mode keyword: `ro`, `rw`, `fork`, or `follow-links`
 /// (issue #11 — auto-discover and bind-mount the real directories that
@@ -84,12 +94,89 @@ pub(crate) enum MountPolicy {
     Fork { follow_links: bool },
 }
 
+/// A declaration's host spelling, exactly as its author wrote it: after the one
+/// expansion the grammar allows a config entry (`~/` → `$HOME/`), and never
+/// canonicalized, because it is part of fork identity.
+///
+/// Deliberately not a `String`. Turning a spelling into text is a *policy*
+/// decision that depends on which declaration it came from — an `--mount`
+/// diagnostic is byte-pinned (ADR-0018), while a config entry is
+/// attacker-chosen text that must be escaped *and* attributed to
+/// `mounts[N] in "<file>"` — so [`Spelling::render`] is the only conversion this
+/// type offers, and it takes the [`Declaration`] that decides. While the field
+/// was a `String`, `format!("{}", mount.source_spelling)` compiled silently, and
+/// every site that did it dropped the attribution and let a newline in a
+/// filename forge a diagnostic line. Such a site no longer compiles.
+///
+/// The raw bytes stay reachable, because fork identity needs them, through three
+/// accessors named for their one legitimate use — [`Spelling::stored_str`] (the
+/// manifest), [`Spelling::stored_bytes`] (the fork hash) and
+/// [`Spelling::as_source_path`] (this declaration's own path). `clippy.toml`
+/// bans all three as `disallowed-methods`; each of the five call sites carries
+/// an explicit `#[allow]` with its reason, so a new one cannot be added quietly.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Spelling(String);
+
+impl Spelling {
+    pub(crate) fn new(spelling: impl Into<String>) -> Self {
+        Self(spelling.into())
+    }
+
+    /// The spelling as `declaration`'s diagnostics print it: bare for an argv
+    /// `--mount`, escaped and attributed for a config entry.
+    pub(crate) fn render(&self, declaration: Declaration<'_>) -> String {
+        declaration.spelling(&self.0)
+    }
+
+    /// The spelling quoted the way the sentence that prints it has always quoted
+    /// it: `{:?}` for argv, `quoted_str` for a config entry.
+    pub(crate) fn render_quoted(&self, declaration: Declaration<'_>) -> String {
+        declaration.spelling_quoted(&self.0)
+    }
+
+    /// The stored bytes, for the fork manifest only. Never a diagnostic.
+    pub(crate) fn stored_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The stored bytes, for the fork hash only. Never a diagnostic.
+    pub(crate) fn stored_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// This declaration's own source path, for filesystem calls and for
+    /// `quoted_path`, which escapes. Never `display`ed into a message.
+    pub(crate) fn as_source_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+// Comparison against the bytes is comparison, not rendering: tests and the
+// fork-identity check may ask whether a spelling *is* `"/srv/x"` without owning
+// a rendering policy, so these impls add no way to print one.
+impl PartialEq<str> for Spelling {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+impl PartialEq<&str> for Spelling {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+impl PartialEq<String> for Spelling {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == *other
+    }
+}
+
 /// One `--mount HOST[:GUEST][:MODE][:MODE]...` argument resolved into
 /// separate paths plus its validated policy.
 #[derive(Clone, Debug)]
 pub(crate) struct ExtraMount {
-    /// Exact source spelling. It is part of fork identity and deliberately not canonicalized.
-    pub(crate) source_spelling: String,
+    /// Exact source spelling. It is part of fork identity, deliberately not
+    /// canonicalized, and never rendered without a [`Declaration`].
+    pub(crate) source_spelling: Spelling,
     pub(crate) host: PathBuf,
     pub(crate) spelled_host: PathBuf,
     pub(crate) guest: PathBuf,
@@ -115,6 +202,349 @@ impl ExtraMount {
     }
 }
 
+/// Where a declaration came from.
+///
+/// Diagnostics only: never part of [`same_declaration`] or [`fork_id`]. A config
+/// mount that a shell-expanded `--mount` declares identically is the *same*
+/// declaration, so provenance must not be able to change the fork a launch
+/// reuses (ADR-0046).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MountOrigin {
+    Cli,
+    /// A verified user `mounts` entry: the file it came from and its index.
+    /// Built only by [`crate::config_mounts`], from the verified read that
+    /// authority was measured on.
+    UserConfig {
+        file: PathBuf,
+        index: usize,
+    },
+}
+
+/// The *name* of an origin, for text that has no rendering policy to choose.
+/// [`prepare`]'s refusals go through [`Declaration`] instead, because they must
+/// also pick between the byte-pinned argv spelling and the escaped config one;
+/// this impl is the `--mount` / `mounts[N] in "<file>"` half alone.
+impl fmt::Display for MountOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cli => f.write_str("--mount"),
+            // Rendering the file through `quoted_path` escapes it the way the
+            // rest of the config diagnostics do, so an entry point cannot forge
+            // the rest of the sentence and one launch never shows two escapings
+            // of the same file.
+            Self::UserConfig { file, index } => {
+                write!(f, "mounts[{index}] in {}", quoted_path(file))
+            }
+        }
+    }
+}
+
+/// One declaration a launch asks [`prepare`] for, with the provenance its
+/// diagnostics need.
+#[derive(Clone, Debug)]
+pub(crate) struct MountRequest {
+    pub(crate) origin: MountOrigin,
+    pub(crate) mount: ExtraMount,
+}
+
+/// The ordered declarations one launch asks [`prepare`] for: config selections
+/// first, then argv, in the order the launch decided (see
+/// `mount_selection::select`).
+///
+/// A newtype rather than a bare `Vec<MountRequest>`: `impl Into<MountRequests>`
+/// needs one concrete target to hang the `#[cfg(test)] From<Vec<ExtraMount>>` on,
+/// and the type name is where the invariant lives — every element names the
+/// source it came from.
+#[derive(Debug, Default)]
+pub(crate) struct MountRequests(Vec<MountRequest>);
+
+impl MountRequests {
+    pub(crate) fn new(requests: Vec<MountRequest>) -> Self {
+        Self(requests)
+    }
+
+    /// Every declaration in `mounts` is an argv entry.
+    ///
+    /// Two callers, one meaning: `mount_selection::select` tags the argv half of
+    /// a launch's declarations here (the config half arrives tagged by
+    /// `config_mounts`), and `#[cfg(test)] From<Vec<ExtraMount>>` lets a test
+    /// hand `prepare` a plan with no config provenance at all.
+    pub(crate) fn from_cli(mounts: Vec<ExtraMount>) -> Self {
+        Self::new(
+            mounts
+                .into_iter()
+                .map(|mount| MountRequest {
+                    origin: MountOrigin::Cli,
+                    mount,
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn into_inner(self) -> Vec<MountRequest> {
+        self.0
+    }
+}
+
+#[cfg(test)]
+impl From<Vec<ExtraMount>> for MountRequests {
+    fn from(mounts: Vec<ExtraMount>) -> Self {
+        Self::from_cli(mounts)
+    }
+}
+
+/// Which declaration each explicit mount of one `prepare` came from, keyed by
+/// the guest path it claimed.
+///
+/// A guest path names exactly one declaration: `claim` has already merged
+/// identical declarations at one guest path and refused differing ones, which is
+/// what makes the lookup total for the declarations `prepare` was given. The
+/// key is the normalized guest path, so a later stage that reassigns `host` (fork
+/// preflight) keeps its origin.
+///
+/// A `:follow-links`-discovered bind is appended after the declarations and has
+/// no entry — it is not a declaration, and the launching context names the config
+/// file for it — so [`declaration_origin`] falls back to `--mount` there and the
+/// refusal keeps its historical text.
+///
+/// That fallback is only the *lookup's* answer. A discovered target can land on a
+/// guest path a declaration already claimed — that is exactly the conflict
+/// `expand_follow_links` refuses — and then the map would name the declaring
+/// entry for a bind it did not discover. A caller that knows the split (the
+/// declarations are the elements it passed in; everything after is discovered)
+/// must say so itself rather than ask this map.
+type DeclaredOrigins = BTreeMap<PathBuf, MountOrigin>;
+
+/// How one preparation refusal names the declaration it is about, together with
+/// the rendering policy that declaration's source requires.
+///
+/// Two renderings, because the two sources have different contracts. An argv
+/// `--mount` diagnostic is byte-pinned (ADR-0018: `cli_claim_errors_are_pinned`),
+/// so every argv site below prints exactly the text it printed before
+/// declarations could come from a file: the debug rendering where the old text
+/// used it, `Path::display` where it printed a resolved host, and the bare
+/// declared spelling where the old text had no quotes. A config entry is
+/// attacker-chosen text that also has to stay one line, so those sites escape it
+/// with the config module's [`quoted_path`]/[`quoted_str`].
+///
+/// This is the argument [`Spelling::render`] demands, so a site cannot print a
+/// declared spelling without having decided which source it belongs to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Declaration<'a> {
+    /// An argv `--mount`.
+    Argv,
+    /// A verified user `mounts` entry: index `index` of `file`.
+    UserConfig { file: &'a Path, index: usize },
+}
+
+impl Declaration<'_> {
+    /// `--mount` or `mounts[N] in "<file>"`: the name a refusal starts with.
+    fn subject(self) -> String {
+        match self {
+            Self::Argv => "--mount".to_string(),
+            Self::UserConfig { file, index } => {
+                format!("mounts[{index}] in {}", quoted_path(file))
+            }
+        }
+    }
+
+    /// A declared spelling as this source's refusal prints it: bare for argv (the
+    /// two sentences that print one never quoted it), escaped for a config entry
+    /// so a newline in the spelling cannot forge a second diagnostic line.
+    ///
+    /// Private on purpose: every caller goes through [`Spelling::render`], which
+    /// is the only way to reach it from a declaration's own bytes.
+    fn spelling(self, spelling: &str) -> String {
+        match self {
+            Self::Argv => spelling.to_string(),
+            Self::UserConfig { .. } => quoted_str(spelling),
+        }
+    }
+
+    /// The same spelling in the *quoted* form one context sentence (and one argv
+    /// sentence) has always used: `{:?}` for argv, which is quoted with Rust's
+    /// escapes and is byte-pinned, and `quoted_str` for a config entry, which is
+    /// quoted with the config module's escapes and cannot forge a line.
+    fn spelling_quoted(self, spelling: &str) -> String {
+        match self {
+            Self::Argv => format!("{spelling:?}"),
+            Self::UserConfig { .. } => quoted_str(spelling),
+        }
+    }
+
+    /// A host path as this source's diagnostics print it: unquoted `display` for
+    /// argv (byte-pinned), `quoted_path` for a config entry, whose path is
+    /// derived from attacker-chosen text and must not break the line.
+    fn host_path(self, path: &Path) -> String {
+        match self {
+            Self::Argv => path.display().to_string(),
+            Self::UserConfig { .. } => quoted_path(path),
+        }
+    }
+
+    /// What `resolving fork root …` prints in place of the root path.
+    ///
+    /// That sentence never carried a flag name, so an argv entry keeps its bare
+    /// `display()` rendering byte for byte. A config entry has to name itself —
+    /// otherwise the author of `mounts = [...]` cannot tell which entry failed —
+    /// and has to escape the path, which at this point is the *expanded* spelling
+    /// and therefore carries the attacker-chosen bytes.
+    ///
+    /// Exposed to [`crate::protected_host_files`], which owns the resolve step.
+    pub(crate) fn fork_root(self, path: &Path) -> String {
+        match self {
+            Self::Argv => path.display().to_string(),
+            Self::UserConfig { file, index } => format!(
+                "mounts[{index}] in {} {}",
+                quoted_path(file),
+                quoted_path(path)
+            ),
+        }
+    }
+}
+
+/// The declaration a preparation refusal names for `mount`: its own declaration,
+/// or `--mount` for a `:follow-links`-discovered bind (see [`DeclaredOrigins`]).
+fn declaration_origin<'a>(mount: &ExtraMount, origins: &'a DeclaredOrigins) -> Declaration<'a> {
+    match origins.get(&mount.guest) {
+        Some(MountOrigin::UserConfig { file, index }) => Declaration::UserConfig {
+            file,
+            index: *index,
+        },
+        // A discovered bind is not a declaration, and `MountOrigin::Cli` is an
+        // argv one; both keep the historical `--mount` text.
+        Some(MountOrigin::Cli) | None => Declaration::Argv,
+    }
+}
+
+/// The `canonicalizing …` context for a source [`expand_follow_links`] could not
+/// resolve. Named so the argv rendering (`{:?}`) and the config rendering
+/// (escaped, so `café` stays one word) can be pinned without a filesystem race.
+fn canonicalizing_context(declaration: Declaration<'_>, spelling: &Spelling) -> String {
+    format!(
+        "canonicalizing {} host {}",
+        declaration.subject(),
+        spelling.render_quoted(declaration)
+    )
+}
+
+/// The `validating … source` context for a source `prepare` could not classify.
+/// Same split as [`canonicalizing_context`], with `Path::display` on the argv
+/// side: this sentence never quoted the path.
+fn validating_source_context(declaration: Declaration<'_>, host: &Path) -> String {
+    match declaration {
+        Declaration::Argv => format!("validating --mount source {}", host.display()),
+        _ => format!(
+            "validating {} source {}",
+            declaration.subject(),
+            quoted_path(host)
+        ),
+    }
+}
+
+/// The `resolving … fork root` / `validating … fork root` context for a `:fork`
+/// source that could not be canonicalized or classified. The argv sentence has
+/// never named `--mount` and never quoted the path, so that half stays
+/// byte-identical; a config entry names itself and escapes the host path it
+/// expanded to, because the path is the entry's text and a newline in it would
+/// otherwise forge a second diagnostic line.
+fn fork_root_context(verb: &str, declaration: Declaration<'_>, source: &Path) -> String {
+    match declaration {
+        Declaration::Argv => format!("{verb} fork root {}", source.display()),
+        Declaration::UserConfig { .. } => format!(
+            "{verb} {} fork root {}",
+            declaration.subject(),
+            quoted_path(source)
+        ),
+    }
+}
+
+// The pure decisions this module makes about a declaration. Three of them decide
+// what a launch is allowed to do — which host spelling the grammar accepts, and
+// whether two claims at one guest path merge or are refused — so per ADR-0018
+// they are kernels and every byte outside them is a trusted adapter. A kernel
+// body is written in a shape its `ensures` clause does not use, so a mutation
+// control can name the body alone (see `script/test/egress-mutations.py`);
+// `host_spelling` is the one documented exception, just below.
+verus! {
+/// Which host spellings a grammar accepts.
+///
+/// `--mount` gets `Disabled`: the shell already expanded `~`, so a quoted `~/x`
+/// is a relative path and must stay "must be absolute" (ADR-0046 pins that).
+/// User-config `mounts` gets `Enabled`, which is the only place `~/` means HOME.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
+pub enum HomeExpansion { Disabled, Enabled }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
+pub enum HostSpelling { Literal, ExpandHome, Refused }
+
+pub open spec fn starts_slash(b: Seq<u8>) -> bool { b.len() >= 1 && b[0] == 0x2fu8 }
+pub open spec fn starts_tilde_slash(b: Seq<u8>) -> bool {
+    b.len() >= 2 && b[0] == 0x7eu8 && b[1] == 0x2fu8 }
+
+// The exception to the shape rule above: this body is deliberately spelled the
+// way `starts_slash` is, so the proof is a case split rather than a lemma about a
+// different formulation; the same allow and the same reason as
+// `credential_yaml::header_name_is_valid_bytes`. A mutation control therefore
+// anchors on the home-expansion arm's own byte tests rather than on a single
+// expression the `ensures` also spells.
+#[allow(clippy::len_zero)]
+pub fn host_spelling(bytes: &[u8], home: HomeExpansion) -> (d: HostSpelling)
+    ensures
+        (d == HostSpelling::Literal) == starts_slash(bytes@),
+        (d == HostSpelling::ExpandHome) == (home == HomeExpansion::Enabled && starts_tilde_slash(bytes@)),
+        home == HomeExpansion::Disabled ==> d != HostSpelling::ExpandHome,
+{
+    if bytes.len() >= 1 && bytes[0] == 0x2f { HostSpelling::Literal }
+    else if home == HomeExpansion::Enabled && bytes.len() >= 2 && bytes[0] == 0x7e && bytes[1] == 0x2f { HostSpelling::ExpandHome }
+    else { HostSpelling::Refused }
+}
+
+/// The six facts [`same_declaration`] measures. Named fields rather than six
+/// adjacent booleans, so a call site cannot transpose two of them and merge
+/// declarations that differ in policy.
+#[derive(Clone, Copy, Debug)]
+pub struct DeclarationFacts {
+    pub spelling: bool,
+    pub host: bool,
+    pub readonly: bool,
+    pub follow: bool,
+    pub fork: bool,
+    pub exclusions: bool,
+}
+
+pub fn declarations_equivalent(f: DeclarationFacts) -> (r: bool)
+    ensures r == (f.spelling && f.host && f.readonly && f.follow && f.fork && f.exclusions),
+{
+    if !f.spelling { return false; }
+    if !f.host { return false; }
+    if !f.readonly { return false; }
+    if !f.follow { return false; }
+    if !f.fork { return false; }
+    f.exclusions
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClaimFacts { pub same_guest: bool, pub equivalent: bool }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
+pub enum ClaimDecision { Distinct, Merge, Conflict }
+
+/// ADR-0046: identical declarations merge, and differing ones at one guest path
+/// are refused whatever their origins. There is no third outcome, so no caller
+/// can implement a last-wins override of a config or project declaration.
+pub fn claim_decision(f: ClaimFacts) -> (d: ClaimDecision)
+    ensures
+        (d == ClaimDecision::Distinct) == !f.same_guest,
+        (d == ClaimDecision::Merge) == (f.same_guest && f.equivalent),
+        (d == ClaimDecision::Conflict) == (f.same_guest && !f.equivalent),
+{
+    if !f.same_guest { ClaimDecision::Distinct }
+    else if f.equivalent { ClaimDecision::Merge }
+    else { ClaimDecision::Conflict }
+}
+} // verus!
+
 /// A `GUEST` segment must start with `/` or `.`; anything trailing that
 /// doesn't is a mode keyword. This is the sole rule that disambiguates
 /// `HOST:GUEST` from `HOST:MODE` (e.g. `HOST:ro`) since both are a single
@@ -123,10 +553,124 @@ fn segment_is_guest_path(seg: &str) -> bool {
     seg.starts_with('/') || seg.starts_with('.')
 }
 
-/// Parse the raw `--mount` argv strings into `ExtraMount`s.
+/// Which host spellings one caller's grammar accepts.
+///
+/// Three states, not a bool: `--mount` is absolute-only, user-config `mounts`
+/// also accepts `~/`, and a `~/` entry is only decidable once `$HOME` is known
+/// (`None` = the host has no usable home, which is a rejection, not a silent
+/// relative path).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HostSyntax<'a> {
+    /// `--mount`: absolute host paths only (the shell already expanded `~`).
+    AbsoluteOnly,
+    /// Verified user config: absolute, or `~/` + `home`. [`crate::config_mounts`]
+    /// is the only caller; `None` means the host has no UTF-8 home, so only a
+    /// `~/` entry is refused.
+    AbsoluteOrHome { home: Option<&'a str> },
+}
+
+impl HostSyntax<'_> {
+    fn expansion(&self) -> HomeExpansion {
+        match self {
+            Self::AbsoluteOnly => HomeExpansion::Disabled,
+            Self::AbsoluteOrHome { .. } => HomeExpansion::Enabled,
+        }
+    }
+
+    fn home(&self) -> Option<&str> {
+        match self {
+            Self::AbsoluteOnly => None,
+            Self::AbsoluteOrHome { home } => *home,
+        }
+    }
+}
+
+/// Why a declaration was rejected, without any value from the declaration.
+///
+/// The CLI renders [`MountSpecError::into_cli`] and keeps today's bytes (pinned
+/// by `cli_parse_errors_are_pinned`). A config route renders the kind instead,
+/// because echoing a `mounts` entry could print an attacker-chosen path into a
+/// diagnostic the user is asked to trust.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MountSpecErrorKind {
+    EmptyHost,
+    HostNotAccepted,
+    HomeUnavailable,
+    GuestNotAbsolute,
+    GuestUnmountable,
+    EmptySegment,
+    UnknownMode,
+    ConflictingModes(&'static str, &'static str),
+    BadExclusion,
+    ExcludeOnLiveBind,
+}
+
+/// The kind, plus the `anyhow` chain `--mount` has always reported for it.
+#[derive(Debug)]
+pub(crate) struct MountSpecError {
+    kind: MountSpecErrorKind,
+    cli: anyhow::Error,
+}
+
+impl MountSpecError {
+    fn new(kind: MountSpecErrorKind, cli: anyhow::Error) -> Self {
+        Self { kind, cli }
+    }
+
+    /// The `--mount` rendering: character for character what `bail!` produced
+    /// at this point before the grammar was shared, including the outer
+    /// `--mount "…"` frame a `.with_context(..)` contributes.
+    pub(crate) fn into_cli(self) -> anyhow::Error {
+        self.cli
+    }
+
+    /// The config route renders this instead of the CLI sentence, so a `mounts`
+    /// entry's value never reaches a diagnostic.
+    pub(crate) fn kind(&self) -> MountSpecErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for MountSpecErrorKind {
+    /// The config route's sentence for one rejection: the *kind*, never the
+    /// declaration text. A `mounts` entry can carry an attacker-chosen path, so
+    /// it must not reach a diagnostic the user is asked to trust; `--mount`
+    /// keeps [`MountSpecError::into_cli`]'s bytes instead.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyHost => {
+                f.write_str("mount declaration must be HOST[:GUEST][:MODE]... (non-empty)")
+            }
+            Self::HostNotAccepted => f.write_str(
+                "host path must be absolute or start with ~/ (environment variables and other \
+                 relative paths are not expanded)",
+            ),
+            Self::HomeUnavailable => f.write_str("a ~/ host path needs a UTF-8 $HOME"),
+            Self::GuestNotAbsolute => f.write_str("guest path must be absolute"),
+            Self::GuestUnmountable => f.write_str(
+                "guest path contains control characters that can't be carried into the guest",
+            ),
+            Self::EmptySegment => {
+                f.write_str("empty segment (stray `:`); expected HOST[:GUEST][:MODE]...")
+            }
+            Self::UnknownMode => f.write_str(
+                "unknown mode keyword (expected ro, rw, fork, follow-links, or exclude=REL)",
+            ),
+            Self::ConflictingModes(first, second) => {
+                write!(f, "conflicting modes `{first}` and `{second}`")
+            }
+            Self::BadExclusion => {
+                f.write_str("exclude must be a non-empty relative path of normal components")
+            }
+            Self::ExcludeOnLiveBind => f.write_str(":exclude is only supported on :fork mounts"),
+        }
+    }
+}
+
+/// One declaration string, in whichever syntax the caller's source allows.
 ///
 /// Grammar: `HOST[:GUEST][:MODE][:MODE]...`. `HOST` alone defaults `GUEST`
-/// to the same absolute path (mirror), read-write. `GUEST`, if present,
+/// to the same path (mirror), read-write. `GUEST`, if present,
 /// must be the segment immediately after `HOST` and must start with `/` or
 /// `.` (see [`segment_is_guest_path`]); everything after that is a mode
 /// keyword (`ro`/`rw` — see [`MountMode`]). Path validity is checked before
@@ -142,136 +686,200 @@ fn segment_is_guest_path(seg: &str) -> bool {
 /// error, just a different message. Both are pinned by
 /// `parse_extra_mounts_colon_in_guest_now_mode_error` and
 /// `parse_extra_mounts_rejects_relative_paths`.
-pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
-    let mut out = Vec::with_capacity(raw.len());
-    for entry in raw {
-        let mut segs = entry.split(':').map(str::trim);
-        let host_s = segs.next().unwrap_or_default().to_string();
-        let mut tail: Vec<&str> = segs.collect();
+pub(crate) fn parse_mount_spec(
+    entry: &str,
+    syntax: HostSyntax<'_>,
+) -> Result<ExtraMount, MountSpecError> {
+    let mut segs = entry.split(':').map(str::trim);
+    let host_s = segs.next().unwrap_or_default().to_string();
+    let mut tail: Vec<&str> = segs.collect();
 
-        // Optional GUEST: only the first tail segment, and only if it
-        // looks like a path. Otherwise GUEST mirrors HOST (today's default).
-        let guest_s = if tail.first().is_some_and(|s| segment_is_guest_path(s)) {
-            tail.remove(0).to_string()
-        } else {
-            host_s.clone()
-        };
+    // --- Path validation first, so path errors beat mode errors. ---
+    if host_s.is_empty() {
+        return Err(MountSpecError::new(
+            MountSpecErrorKind::EmptyHost,
+            anyhow::anyhow!("--mount value {entry:?} must be HOST[:GUEST] (non-empty)"),
+        ));
+    }
+    // The host decision, before `GUEST` mirrors it: a mirror must be the path
+    // the mount really names, so `~/ref` mirrors the *expanded* host.
+    let host_s = match host_spelling(host_s.as_bytes(), syntax.expansion()) {
+        HostSpelling::Literal => host_s,
+        HostSpelling::ExpandHome => match syntax.home() {
+            // Replace exactly the one leading `~`; the rest (starting with `/`)
+            // is kept byte-for-byte, so a trailing-slash HOME keeps its `//`.
+            Some(home) => format!("{home}{}", &host_s[1..]),
+            None => {
+                return Err(MountSpecError::new(
+                    MountSpecErrorKind::HomeUnavailable,
+                    anyhow::anyhow!(
+                        "--mount host path {host_s:?} needs a UTF-8 $HOME to expand `~`"
+                    ),
+                ));
+            }
+        },
+        HostSpelling::Refused => {
+            return Err(MountSpecError::new(
+                MountSpecErrorKind::HostNotAccepted,
+                anyhow::anyhow!("--mount host path {host_s:?} must be absolute"),
+            ));
+        }
+    };
 
-        // --- Path validation first, so path errors beat mode errors. ---
-        if host_s.is_empty() {
-            anyhow::bail!("--mount value {entry:?} must be HOST[:GUEST] (non-empty)");
-        }
-        let host = PathBuf::from(&host_s);
-        let guest = PathBuf::from(&guest_s);
-        if !host.is_absolute() {
-            anyhow::bail!("--mount host path {host_s:?} must be absolute");
-        }
-        if !guest.is_absolute() {
-            anyhow::bail!("--mount guest path {guest_s:?} must be absolute");
-        }
-        // The guest mount point reaches agentd via the boot-params side
-        // channel (not the kernel command line), so non-ASCII and spaces
-        // are fine — but a control character (TAB/newline) would break the
-        // `KEY\tVALUE\n` framing, so reject those. See
-        // `guest_path_is_mountable`.
-        if !guest_path_is_mountable(&guest_s) {
-            anyhow::bail!(
+    // Optional GUEST: only the first tail segment, and only if it
+    // looks like a path. Otherwise GUEST mirrors HOST (today's default).
+    let guest_s = if tail.first().is_some_and(|s| segment_is_guest_path(s)) {
+        tail.remove(0).to_string()
+    } else {
+        host_s.clone()
+    };
+
+    let host = PathBuf::from(&host_s);
+    let guest = PathBuf::from(&guest_s);
+    // Unreachable for `--mount`, and for a config `~/` only if the caller hands
+    // us a relative HOME: kept so a relative host can never be constructed by
+    // trusting the caller.
+    if !host.is_absolute() {
+        return Err(MountSpecError::new(
+            MountSpecErrorKind::HostNotAccepted,
+            anyhow::anyhow!("--mount host path {host_s:?} must be absolute"),
+        ));
+    }
+    if !guest.is_absolute() {
+        return Err(MountSpecError::new(
+            MountSpecErrorKind::GuestNotAbsolute,
+            anyhow::anyhow!("--mount guest path {guest_s:?} must be absolute"),
+        ));
+    }
+    // The guest mount point reaches agentd via the boot-params side
+    // channel (not the kernel command line), so non-ASCII and spaces
+    // are fine — but a control character (TAB/newline) would break the
+    // `KEY\tVALUE\n` framing, so reject those. See
+    // `guest_path_is_mountable`.
+    if !guest_path_is_mountable(&guest_s) {
+        return Err(MountSpecError::new(
+            MountSpecErrorKind::GuestUnmountable,
+            anyhow::anyhow!(
                 "--mount guest path {guest_s:?} contains control characters that can't be \
                  carried into the guest; pass a guest path without tabs/newlines"
-            );
-        }
+            ),
+        ));
+    }
 
-        // --- Then classify the remaining tail segments as mode keywords. ---
-        let mut modes: Vec<MountMode> = Vec::new();
-        for kw in tail {
-            if kw.is_empty() {
-                // e.g. `/h::ro` — a stray `::`. Point at it rather than
-                // reporting "unknown mode keyword \"\"".
-                anyhow::bail!(
+    // --- Then classify the remaining tail segments as mode keywords. ---
+    let mut modes: Vec<MountMode> = Vec::new();
+    for kw in tail {
+        if kw.is_empty() {
+            // e.g. `/h::ro` — a stray `::`. Point at it rather than
+            // reporting "unknown mode keyword \"\"".
+            return Err(MountSpecError::new(
+                MountSpecErrorKind::EmptySegment,
+                anyhow::anyhow!(
                     "--mount {entry:?}: empty segment (stray `:`); expected \
                      HOST[:GUEST][:MODE]..."
-                );
-            }
-            if kw.strip_prefix("exclude=").is_some() {
-                continue;
-            }
-            let mode = MountMode::from_keyword(kw).ok_or_else(|| {
+                ),
+            ));
+        }
+        if kw.strip_prefix("exclude=").is_some() {
+            continue;
+        }
+        let mode = MountMode::from_keyword(kw).ok_or_else(|| {
+            MountSpecError::new(
+                MountSpecErrorKind::UnknownMode,
                 anyhow::anyhow!(
                     "--mount {entry:?}: unknown mode keyword {kw:?} \
                      (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)"
-                )
-            })?;
-            if let Some(&prev) = modes.iter().find(|&&prev| modes_conflict(prev, mode)) {
-                anyhow::bail!(
+                ),
+            )
+        })?;
+        if let Some(&prev) = modes.iter().find(|&&prev| modes_conflict(prev, mode)) {
+            return Err(MountSpecError::new(
+                MountSpecErrorKind::ConflictingModes(prev.keyword(), mode.keyword()),
+                anyhow::anyhow!(
                     "--mount {entry:?}: conflicting modes `{}` and `{}` — pick one",
                     prev.keyword(),
                     mode.keyword()
-                );
-            }
-            modes.push(mode);
+                ),
+            ));
         }
-        let follow_links = modes.contains(&MountMode::FollowLinks);
-        // follow-links implies read-only; bare follow-links behaves as ro.
-        let readonly = modes.contains(&MountMode::ReadOnly) || follow_links;
+        modes.push(mode);
+    }
+    let follow_links = modes.contains(&MountMode::FollowLinks);
+    // follow-links implies read-only; bare follow-links behaves as ro.
+    let readonly = modes.contains(&MountMode::ReadOnly) || follow_links;
 
-        let fork = modes.contains(&MountMode::Fork);
-        let mut exclusions = Vec::new();
-        // Exclusion values share the suffix list with modes.  They are parsed
-        // here (before any source I/O) so an already READY fork can be reused
-        // after its source has disappeared.
-        for suffix in entry.split(':').skip(
-            if segment_is_guest_path(entry.split(':').nth(1).unwrap_or("")) {
-                2
-            } else {
-                1
-            },
-        ) {
-            let suffix = suffix.trim();
-            if let Some(value) = suffix.strip_prefix("exclude=") {
-                exclusions.push(
-                    normalize_exclusion(value).with_context(|| format!("--mount {entry:?}"))?,
-                );
-            }
-        }
-        exclusions.sort();
-        exclusions.dedup();
-        let mut collapsed = Vec::new();
-        for path in exclusions {
-            if !collapsed
-                .iter()
-                .any(|parent: &PathBuf| path.starts_with(parent))
-            {
-                collapsed.push(path);
-            }
-        }
-        let exclusions = collapsed;
-        let policy = if fork {
-            MountPolicy::Fork { follow_links }
-        } else if readonly {
-            MountPolicy::BindReadOnly { follow_links }
+    let fork = modes.contains(&MountMode::Fork);
+    let mut exclusions = Vec::new();
+    // Exclusion values share the suffix list with modes.  They are parsed
+    // here (before any source I/O) so an already READY fork can be reused
+    // after its source has disappeared.
+    for suffix in entry.split(':').skip(
+        if segment_is_guest_path(entry.split(':').nth(1).unwrap_or("")) {
+            2
         } else {
-            MountPolicy::BindReadWrite
-        };
-        // `:exclude` omits entries from a fork seed. On a live bind there is
-        // no seed to omit from, and the old opaque-mask substitute is removed
-        // (issue #113), so reject the declaration here — after normalization
-        // and mode-conflict precedence, but before any source I/O.
-        if !exclusions.is_empty() && !matches!(policy, MountPolicy::Fork { .. }) {
-            anyhow::bail!(
-                "--mount {entry}: :exclude is only supported on :fork mounts;\n\
-                 live binds cannot hide nested paths."
+            1
+        },
+    ) {
+        let suffix = suffix.trim();
+        if let Some(value) = suffix.strip_prefix("exclude=") {
+            exclusions.push(
+                normalize_exclusion(value)
+                    .with_context(|| format!("--mount {entry:?}"))
+                    .map_err(|error| {
+                        MountSpecError::new(MountSpecErrorKind::BadExclusion, error)
+                    })?,
             );
         }
-        out.push(ExtraMount {
-            source_spelling: host_s,
-            spelled_host: host.clone(),
-            host,
-            guest,
-            policy,
-            exclusions,
-        });
     }
-    Ok(out)
+    exclusions.sort();
+    exclusions.dedup();
+    let mut collapsed = Vec::new();
+    for path in exclusions {
+        if !collapsed
+            .iter()
+            .any(|parent: &PathBuf| path.starts_with(parent))
+        {
+            collapsed.push(path);
+        }
+    }
+    let exclusions = collapsed;
+    let policy = if fork {
+        MountPolicy::Fork { follow_links }
+    } else if readonly {
+        MountPolicy::BindReadOnly { follow_links }
+    } else {
+        MountPolicy::BindReadWrite
+    };
+    // `:exclude` omits entries from a fork seed. On a live bind there is
+    // no seed to omit from, and the old opaque-mask substitute is removed
+    // (issue #113), so reject the declaration here — after normalization
+    // and mode-conflict precedence, but before any source I/O.
+    if !exclusions.is_empty() && !matches!(policy, MountPolicy::Fork { .. }) {
+        return Err(MountSpecError::new(
+            MountSpecErrorKind::ExcludeOnLiveBind,
+            anyhow::anyhow!(
+                "--mount {entry}: :exclude is only supported on :fork mounts;\n\
+                 live binds cannot hide nested paths."
+            ),
+        ));
+    }
+    Ok(ExtraMount {
+        source_spelling: Spelling::new(host_s),
+        spelled_host: host.clone(),
+        host,
+        guest,
+        policy,
+        exclusions,
+    })
+}
+
+/// Parse the raw `--mount` argv strings into `ExtraMount`s.
+pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
+    raw.iter()
+        .map(|entry| {
+            parse_mount_spec(entry, HostSyntax::AbsoluteOnly).map_err(MountSpecError::into_cli)
+        })
+        .collect()
 }
 
 /// Validate an exclusion without allowing Path's lexical normalization to
@@ -359,7 +967,7 @@ impl From<BindPath> for ExtraMount {
     /// appended after discovery, so the marker cannot trigger another pass.
     fn from(p: BindPath) -> ExtraMount {
         ExtraMount {
-            source_spelling: p.host.display().to_string(),
+            source_spelling: Spelling::new(p.host.display().to_string()),
             spelled_host: p.host.clone(),
             host: p.host,
             guest: p.guest,
@@ -419,11 +1027,13 @@ enum LiteralPath {
 }
 
 /// One `Declined` warning, phrased alike for every reason: name the
-/// symlink, give the reason, state what it costs the user.
-fn declined(link: &Path, reason: String) -> String {
+/// symlink, give the reason, state what it costs the user. Every path in it is
+/// rendered for `declaration`, so a newline in a config-mount path cannot forge
+/// a warning line.
+fn declined(declaration: Declaration<'_>, link: &Path, reason: String) -> String {
     format!(
         "not mirroring symlink {} — {reason}; it may not resolve inside the sandbox",
-        link.display()
+        declaration.host_path(link)
     )
 }
 
@@ -461,11 +1071,17 @@ fn declined(link: &Path, reason: String) -> String {
 ///   can be checked against `canonical`.
 /// - a mount point outside `home`, which would let a link inside `$HOME`
 ///   place a bind anywhere in the guest's filesystem.
-fn literal_guest_path(link: &BindPath, canonical: &Path, home: &Path) -> LiteralPath {
+fn literal_guest_path(
+    link: &BindPath,
+    canonical: &Path,
+    home: &Path,
+    declaration: Declaration<'_>,
+) -> LiteralPath {
     let raw = match fs::read_link(&link.host) {
         Ok(r) => r,
         Err(e) => {
             return LiteralPath::Declined(declined(
+                declaration,
                 &link.host,
                 format!("its target text could not be read: {e}"),
             ));
@@ -480,10 +1096,11 @@ fn literal_guest_path(link: &BindPath, canonical: &Path, home: &Path) -> Literal
         lexical_link_path(&link.guest, &raw),
     ) else {
         return LiteralPath::Declined(declined(
+            declaration,
             &link.host,
             format!(
                 "its target {} folds above the filesystem root",
-                raw.display()
+                declaration.host_path(&raw)
             ),
         ));
     };
@@ -492,20 +1109,22 @@ fn literal_guest_path(link: &BindPath, canonical: &Path, home: &Path) -> Literal
     }
     if on_host.canonicalize().ok().as_deref() != Some(canonical) {
         return LiteralPath::Declined(declined(
+            declaration,
             &link.host,
             format!(
                 "its target text does not name {} on the host",
-                canonical.display()
+                declaration.host_path(canonical)
             ),
         ));
     }
     if !on_guest.starts_with(home) {
         return LiteralPath::Declined(declined(
+            declaration,
             &link.host,
             format!(
                 "the guest would look it up at {}, outside your $HOME ({})",
-                on_guest.display(),
-                home.display()
+                declaration.host_path(&on_guest),
+                declaration.host_path(home)
             ),
         ));
     }
@@ -544,7 +1163,17 @@ fn literal_guest_path(link: &BindPath, canonical: &Path, home: &Path) -> Literal
 /// `home` is the invoking user's already-canonicalized `$HOME`. A resolved
 /// directory target outside it is a hard error naming both the symlink and
 /// the target (safety guardrail — see issue #9/#11).
-fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPath>, Vec<String>)> {
+///
+/// `declaration` is the mount this walk expanded: every path in a warning or in
+/// that refusal is rendered for it, so a config entry's spelling — which is the
+/// text its paths are built from — cannot forge a line. The warnings carry no
+/// attribution of their own: they describe what the walk skipped, not a
+/// declaration, and a launch prints them inside the context naming the file.
+fn discover_followed_targets(
+    root: &BindPath,
+    home: &Path,
+    declaration: Declaration<'_>,
+) -> Result<(Vec<BindPath>, Vec<String>)> {
     let mut visited: std::collections::HashSet<BindPath> = std::collections::HashSet::new();
     let mut out: Vec<BindPath> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -570,7 +1199,7 @@ fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPa
                 // not abort the whole launch — warn and move on.
                 warnings.push(format!(
                     "skipping unreadable directory {}: {e}",
-                    dir.host.display()
+                    declaration.host_path(&dir.host)
                 ));
                 continue;
             }
@@ -581,7 +1210,7 @@ fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPa
                 Err(e) => {
                     warnings.push(format!(
                         "skipping unreadable entry under {}: {e}",
-                        dir.host.display()
+                        declaration.host_path(&dir.host)
                     ));
                     continue;
                 }
@@ -599,7 +1228,10 @@ fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPa
             let meta = match fs::symlink_metadata(&path.host) {
                 Ok(m) => m,
                 Err(e) => {
-                    warnings.push(format!("skipping {}: {e}", path.host.display()));
+                    warnings.push(format!(
+                        "skipping {}: {e}",
+                        declaration.host_path(&path.host)
+                    ));
                     continue;
                 }
             };
@@ -619,14 +1251,17 @@ fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPa
                 warnings.push(format!(
                     "skipping symlink {} — exceeded max follow depth ({MAX_LINK_DEPTH}); \
                      possible pathological symlink chain",
-                    path.host.display()
+                    declaration.host_path(&path.host)
                 ));
                 continue;
             }
             let target = match path.host.canonicalize() {
                 Ok(t) => t,
                 Err(_) => {
-                    warnings.push(format!("skipping dangling symlink {}", path.host.display()));
+                    warnings.push(format!(
+                        "skipping dangling symlink {}",
+                        declaration.host_path(&path.host)
+                    ));
                     continue;
                 }
             };
@@ -635,8 +1270,8 @@ fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPa
                 Err(e) => {
                     warnings.push(format!(
                         "skipping symlink {} -> {}: {e}",
-                        path.host.display(),
-                        target.display()
+                        declaration.host_path(&path.host),
+                        declaration.host_path(&target)
                     ));
                     continue;
                 }
@@ -644,18 +1279,19 @@ fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPa
             if !target_meta.is_dir() {
                 warnings.push(format!(
                     "skipping symlink {} -> {} (not a directory)",
-                    path.host.display(),
-                    target.display()
+                    declaration.host_path(&path.host),
+                    declaration.host_path(&target)
                 ));
                 continue;
             }
             if !target.starts_with(home) {
                 anyhow::bail!(
-                    "--mount follow-links: symlink {} resolves to {}, which is outside your \
+                    "{} follow-links: symlink {} resolves to {}, which is outside your \
                      $HOME ({}); refusing to mount it",
-                    path.host.display(),
-                    target.display(),
-                    home.display()
+                    declaration.subject(),
+                    declaration.host_path(&path.host),
+                    declaration.host_path(&target),
+                    declaration.host_path(home)
                 );
             }
             // Dedup within this walk on the guest path — the one thing
@@ -694,7 +1330,7 @@ fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPa
             // is walked too: a relative symlink inside `target` resolves
             // against whichever of the two paths the guest came in by, so
             // the alias needs its own pass to discover its own aliases.
-            match literal_guest_path(&path, &target, home) {
+            match literal_guest_path(&path, &target, home, declaration) {
                 LiteralPath::AlreadyCovered => {}
                 LiteralPath::MirrorAt(guest) => {
                     let alias = BindPath {
@@ -712,6 +1348,56 @@ fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPa
     Ok((out, warnings))
 }
 
+/// The refusal for a guest path two different declarations claim.
+///
+/// Two argv declarations keep the historical sentence byte-for-byte
+/// (`--mount: guest path … (host and host)`, `Path::display`). As soon as one
+/// side is a config entry the sentence names each side's declaration and renders
+/// each spelling for its own source, because a config spelling is
+/// attacker-chosen text: printed bare, the host it expands to could forge a
+/// second diagnostic line, and the entry would go unnamed.
+///
+/// A `:follow-links`-discovered bind is appended after the declarations and is
+/// not one, so the caller passes [`Declaration::Argv`] for that side and this
+/// sentence names it `--mount "<discovered path>"`. That is deliberate: naming a
+/// candidate declaration could blame one that did not contribute the bind — the
+/// same reason [`discovered_by`] names no single entry when there are several.
+fn claim_conflict(
+    existing: &ExtraMount,
+    other: &ExtraMount,
+    origins: &DeclaredOrigins,
+    other_declaration: Declaration<'_>,
+) -> anyhow::Error {
+    let existing_declaration = declaration_origin(existing, origins);
+    match (existing_declaration, other_declaration) {
+        (Declaration::Argv, Declaration::Argv) => anyhow::anyhow!(
+            "--mount: guest path {} is claimed by different declarations ({} and {})",
+            other.guest.display(),
+            existing.host.display(),
+            other.host.display()
+        ),
+        _ => anyhow::anyhow!(
+            "guest path {} is claimed by different declarations ({} and {})",
+            other.guest.display(),
+            claim_clause(existing_declaration, existing),
+            claim_clause(other_declaration, other)
+        ),
+    }
+}
+
+/// One side of a claim conflict: the declaration that made it and the spelling it
+/// made it with.
+///
+/// Both sides are escaped here, whichever source they came from: this sentence
+/// only exists in mixed or config form, so there are no argv bytes to preserve,
+/// and even the argv side may be a `:follow-links`-discovered bind, whose
+/// spelling is a path the walk measured rather than text a user typed.
+fn claim_clause(declaration: Declaration<'_>, mount: &ExtraMount) -> String {
+    #[allow(clippy::disallowed_methods)] // `quoted_path` escapes; nothing is printed raw.
+    let spelling = mount.source_spelling.as_source_path();
+    format!("{} {}", declaration.subject(), quoted_path(spelling))
+}
+
 /// Given the parsed mounts, append the auto-discovered read-only mounts for
 /// every `follow_links` entry, then dedup identical mounts and reject
 /// guest-path collisions. `home` is the invoking user's `$HOME` (or `None`
@@ -727,18 +1413,22 @@ fn discover_followed_targets(root: &BindPath, home: &Path) -> Result<(Vec<BindPa
 /// link text under a root whose two sides differ — a remapped
 /// `--mount HOST:GUEST`, or a `HOST` that was itself a symlink — resolves
 /// the way the guest will resolve it.
+///
+/// `origins` is [`prepare`]'s declaration map, read to name the declaration a
+/// canonicalization failure or a guest-path conflict belongs to, and to pick the
+/// rendering each walk's diagnostics use.
 pub(crate) fn expand_follow_links(
     mounts: Vec<ExtraMount>,
+    origins: &DeclaredOrigins,
     home: Option<&Path>,
 ) -> Result<(Vec<ExtraMount>, Vec<String>)> {
     let mut mounts = mounts;
     // Live bind roots retain historical canonical-path behavior. Fork data
     // is already an owned committed path and is intentionally not resolved.
     for mount in mounts.iter_mut().filter(|m| !m.is_fork()) {
-        mount.host = mount
-            .host
-            .canonicalize()
-            .with_context(|| format!("canonicalizing --mount host {:?}", mount.source_spelling))?;
+        mount.host = mount.host.canonicalize().with_context(|| {
+            canonicalizing_context(declaration_origin(mount, origins), &mount.source_spelling)
+        })?;
     }
     if !mounts.iter().any(|m| m.follows_links() && !m.is_fork()) {
         return Ok((mounts, Vec::new()));
@@ -752,6 +1442,9 @@ pub(crate) fn expand_follow_links(
     let home_canon = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
 
     let mut warnings = Vec::new();
+    // Every element so far is a declaration; everything appended below is a
+    // discovered bind, which is not one (see the finalize loop).
+    let declared_count = mounts.len();
     let mut expanded = mounts;
     let mut discovered_targets: Vec<BindPath> = Vec::new();
     for m in &expanded {
@@ -763,7 +1456,8 @@ pub(crate) fn expand_follow_links(
             guest: m.guest.clone(),
             exclusions: m.exclusions.clone(),
         };
-        let (targets, mut w) = discover_followed_targets(&root, &home_canon)?;
+        let (targets, mut w) =
+            discover_followed_targets(&root, &home_canon, declaration_origin(m, origins))?;
         warnings.append(&mut w);
         discovered_targets.extend(targets);
     }
@@ -781,7 +1475,17 @@ pub(crate) fn expand_follow_links(
     // by two *different* hosts. Preserve first-seen order for stable,
     // testable output and stable `==> Mounting …` log ordering.
     let mut finalized = Vec::with_capacity(expanded.len());
-    for mount in expanded {
+    for (index, mount) in expanded.into_iter().enumerate() {
+        // A discovered bind is not a declaration. `origin` is keyed by guest
+        // path and a discovered target can land on a *declared* one — that is
+        // exactly the conflict below — so asking the map would attribute the
+        // bind to an entry that did not discover it. Those elements are appended
+        // after the declarations, so the split is positional.
+        let declaration = if index < declared_count {
+            declaration_origin(&mount, origins)
+        } else {
+            Declaration::Argv
+        };
         if let Some(existing) = finalized
             .iter_mut()
             .find(|existing: &&mut ExtraMount| existing.guest == mount.guest)
@@ -803,12 +1507,7 @@ pub(crate) fn expand_follow_links(
                 merge_exclusions(&mut existing.exclusions, mount.exclusions);
                 continue;
             }
-            anyhow::bail!(
-                "--mount: guest path {} is claimed by different declarations ({} and {})",
-                mount.guest.display(),
-                existing.host.display(),
-                mount.host.display()
-            );
+            return Err(claim_conflict(existing, &mount, origins, declaration));
         }
         finalized.push(mount);
     }
@@ -1075,6 +1774,7 @@ mod tests {
             store.path(),
             &std::collections::HashMap::new(),
             &ProtectedHostFiles::measure(None).unwrap(),
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1093,6 +1793,7 @@ mod tests {
             store.path(),
             &std::collections::HashMap::new(),
             &ProtectedHostFiles::measure(None).unwrap(),
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1197,7 +1898,11 @@ mod tests {
     /// discovery test wants. Tests about a root that was itself a symlink
     /// call `discover_followed_targets` with an explicit [`BindPath`].
     fn walk(host: &Path, home: &Path) -> Result<(Vec<BindPath>, Vec<String>)> {
-        discover_followed_targets(&BindPath::mirrored(host.to_path_buf()), home)
+        discover_followed_targets(
+            &BindPath::mirrored(host.to_path_buf()),
+            home,
+            Declaration::Argv,
+        )
     }
 
     /// The real host directories a walk found. Most discovery tests only
@@ -1295,10 +2000,10 @@ mod tests {
         let home_path = canon(home.path());
         let host = home_path.join("host");
         let conf = home_path.join("conf");
-        let real = conf.join("skills").join("implement");
+        let real_dir = conf.join("skills").join("implement");
         let literal = conf.join(".agents").join("skills").join("implement");
         fs::create_dir_all(&host).unwrap();
-        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&real_dir).unwrap();
         fs::create_dir_all(conf.join(".agents")).unwrap();
         symlink("../skills", conf.join(".agents").join("skills")).unwrap();
         symlink(&literal, host.join("implement")).unwrap();
@@ -1306,11 +2011,15 @@ mod tests {
         let (found, warnings) = walk(&host, &home_path).expect("ok");
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(
-            found.iter().any(|d| d.host == real && d.guest == real),
+            found
+                .iter()
+                .any(|d| d.host == real_dir && d.guest == real_dir),
             "the canonical target must still be bound at its own path, got: {found:?}"
         );
         assert!(
-            found.iter().any(|d| d.host == real && d.guest == literal),
+            found
+                .iter()
+                .any(|d| d.host == real_dir && d.guest == literal),
             "the same real directory must ALSO be bound at the literal path the \
              guest's readlink() names, got: {found:?}"
         );
@@ -1369,18 +2078,19 @@ mod tests {
         //   guest resolves -> $HOME/shared
         let home = tempfile::tempdir().unwrap();
         let home_path = canon(home.path());
-        let real = home_path.join("deep").join("realskills");
+        let real_dir = home_path.join("deep").join("realskills");
         let shared = home_path.join("deep").join("shared");
-        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&real_dir).unwrap();
         fs::create_dir_all(&shared).unwrap();
-        symlink("../shared", real.join("foo")).unwrap();
+        symlink("../shared", real_dir.join("foo")).unwrap();
 
         let root = BindPath {
-            host: real.clone(),
+            host: real_dir.clone(),
             guest: home_path.join("skills"),
             exclusions: Vec::new(),
         };
-        let (found, warnings) = discover_followed_targets(&root, &home_path).expect("ok");
+        let (found, warnings) =
+            discover_followed_targets(&root, &home_path, Declaration::Argv).expect("ok");
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(
             found
@@ -1438,18 +2148,18 @@ mod tests {
         let root_path = canon(root.path());
         let home_path = root_path.join("h");
         let host = home_path.join("host");
-        let real = home_path.join("real");
+        let real_dir = home_path.join("real");
         let outside = root_path.join("outside");
         fs::create_dir_all(&host).unwrap();
-        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&real_dir).unwrap();
         fs::create_dir_all(&outside).unwrap();
         symlink("../h/real", outside.join("skills")).unwrap();
         symlink(outside.join("skills"), host.join("x")).unwrap();
 
         let (found, warnings) = walk(&host, &home_path).expect("ok");
-        assert_eq!(hosts(&found), vec![real.clone()]);
+        assert_eq!(hosts(&found), vec![real_dir.clone()]);
         assert!(
-            found.iter().all(|d| d.guest == real),
+            found.iter().all(|d| d.guest == real_dir),
             "no bind at the outside-$HOME literal path, got: {found:?}"
         );
         assert!(
@@ -1564,21 +2274,22 @@ mod tests {
         // looks.
         let home = tempfile::tempdir().unwrap();
         let home_path = canon(home.path());
-        let real = home_path.join("deep").join("realskills");
+        let real_dir = home_path.join("deep").join("realskills");
         let shared = home_path.join("deep").join("shared");
-        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&real_dir).unwrap();
         fs::create_dir_all(&shared).unwrap();
-        symlink("../shared", real.join("foo")).unwrap();
+        symlink("../shared", real_dir.join("foo")).unwrap();
 
         let mounts = vec![ExtraMount {
-            source_spelling: String::new(),
-            spelled_host: (real).clone(),
-            host: real,
+            source_spelling: Spelling::new(""),
+            spelled_host: (real_dir).clone(),
+            host: real_dir,
             guest: home_path.join("skills"),
             policy: MountPolicy::BindReadOnly { follow_links: true },
             exclusions: Vec::new(),
         }];
-        let (expanded, warnings) = expand_follow_links(mounts, Some(&home_path)).expect("ok");
+        let (expanded, warnings) =
+            expand_follow_links(mounts, &DeclaredOrigins::new(), Some(&home_path)).expect("ok");
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         let want_guest = home_path.join("shared");
         assert!(
@@ -1607,14 +2318,15 @@ mod tests {
         symlink(&target, host.join("b")).unwrap();
 
         let mounts = vec![ExtraMount {
-            source_spelling: String::new(),
+            source_spelling: Spelling::new(""),
             spelled_host: host.clone(),
             host: host.clone(),
             guest: host,
             policy: MountPolicy::BindReadOnly { follow_links: true },
             exclusions: Vec::new(),
         }];
-        let (expanded, warnings) = expand_follow_links(mounts, Some(&home_path)).expect("ok");
+        let (expanded, warnings) =
+            expand_follow_links(mounts, &DeclaredOrigins::new(), Some(&home_path)).expect("ok");
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         let target_mounts: Vec<_> = expanded.iter().filter(|m| m.host == target).collect();
         assert_eq!(
@@ -1638,7 +2350,7 @@ mod tests {
 
         let mounts = vec![
             ExtraMount {
-                source_spelling: String::new(),
+                source_spelling: Spelling::new(""),
                 spelled_host: host.clone(),
                 host: host.clone(),
                 guest: host,
@@ -1648,7 +2360,7 @@ mod tests {
             ExtraMount {
                 // An explicit mount claims the discovered target's real
                 // path as its GUEST, from a different HOST.
-                source_spelling: String::new(),
+                source_spelling: Spelling::new(""),
                 spelled_host: explicit_host.clone(),
                 host: explicit_host.clone(),
                 guest: target.clone(),
@@ -1656,7 +2368,7 @@ mod tests {
                 exclusions: Vec::new(),
             },
         ];
-        let err = expand_follow_links(mounts, Some(&home_path))
+        let err = expand_follow_links(mounts, &DeclaredOrigins::new(), Some(&home_path))
             .expect_err("two different hosts claiming the same guest must be a hard error")
             .to_string();
         assert!(err.contains(&target.display().to_string()), "got: {err}");
@@ -1669,15 +2381,15 @@ mod tests {
     #[test]
     fn expand_leaves_non_follow_mounts_untouched() {
         let mounts = vec![ExtraMount {
-            source_spelling: String::new(),
+            source_spelling: Spelling::new(""),
             spelled_host: PathBuf::from("/"),
             host: "/".into(),
             guest: "/g".into(),
             policy: MountPolicy::BindReadWrite,
             exclusions: Vec::new(),
         }];
-        let (expanded, warnings) =
-            expand_follow_links(mounts, None).expect("no follow-links entries, $HOME unneeded");
+        let (expanded, warnings) = expand_follow_links(mounts, &DeclaredOrigins::new(), None)
+            .expect("no follow-links entries, $HOME unneeded");
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].guest, std::path::Path::new("/g"));
         assert!(warnings.is_empty());
@@ -1686,14 +2398,14 @@ mod tests {
     #[test]
     fn expand_without_home_errors_only_when_follow_links_present() {
         let mounts = vec![ExtraMount {
-            source_spelling: String::new(),
+            source_spelling: Spelling::new(""),
             spelled_host: PathBuf::from("/"),
             host: "/".into(),
             guest: "/".into(),
             policy: MountPolicy::BindReadOnly { follow_links: true },
             exclusions: Vec::new(),
         }];
-        let err = expand_follow_links(mounts, None)
+        let err = expand_follow_links(mounts, &DeclaredOrigins::new(), None)
             .expect_err("follow-links with no $HOME must be a hard error")
             .to_string();
         assert!(err.contains("HOME"), "got: {err}");
@@ -1710,14 +2422,15 @@ mod tests {
         symlink(&target, host.join("a")).unwrap();
 
         let mounts = vec![ExtraMount {
-            source_spelling: String::new(),
+            source_spelling: Spelling::new(""),
             spelled_host: host.clone(),
             host: host.clone(),
             guest: host,
             policy: MountPolicy::BindReadOnly { follow_links: true },
             exclusions: Vec::new(),
         }];
-        let (expanded, _warnings) = expand_follow_links(mounts, Some(&home_path)).expect("ok");
+        let (expanded, _warnings) =
+            expand_follow_links(mounts, &DeclaredOrigins::new(), Some(&home_path)).expect("ok");
         let discovered = expanded
             .iter()
             .find(|m| m.host == target)
@@ -1727,6 +2440,473 @@ mod tests {
             discovered.host.to_str().unwrap(),
             discovered.is_readonly()
         ));
+    }
+
+    /// Every rejection `--mount` can produce today, byte for byte.
+    ///
+    /// The declaration grammar is about to be shared with user-config `mounts`
+    /// (which must render value-free, index-named text for the same failures),
+    /// so the parse moves behind a typed error. These pins are what prove that
+    /// refactor cannot reword a CLI diagnostic: the other `--mount` parse tests
+    /// only assert `contains`, which cannot see a changed sentence.
+    ///
+    /// The rendering pinned is `{:#}`, the full `anyhow` chain, because the
+    /// `exclude=` context adds an outer frame that `Display` (`{}`) drops.
+    /// An exhaustive pin is also what makes `HostSyntax` honest: a `~/x` host
+    /// stays "must be absolute" on the CLI, so only the config route may ever
+    /// expand it.
+    #[test]
+    fn cli_parse_errors_are_pinned() {
+        const CASES: &[(&str, &str)] = &[
+            (
+                ":/guest",
+                "--mount value \":/guest\" must be HOST[:GUEST] (non-empty)",
+            ),
+            ("", "--mount value \"\" must be HOST[:GUEST] (non-empty)"),
+            (
+                "relative-host",
+                "--mount host path \"relative-host\" must be absolute",
+            ),
+            ("~/x", "--mount host path \"~/x\" must be absolute"),
+            (
+                "/host:./rel",
+                "--mount guest path \"./rel\" must be absolute",
+            ),
+            (
+                "/abs-host:relative-guest",
+                "--mount \"/abs-host:relative-guest\": unknown mode keyword \"relative-guest\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)",
+            ),
+            (
+                "/:/mnt/a\tb",
+                "--mount guest path \"/mnt/a\\tb\" contains control characters that can't be carried into the guest; pass a guest path without tabs/newlines",
+            ),
+            (
+                "/host:",
+                "--mount \"/host:\": empty segment (stray `:`); expected HOST[:GUEST][:MODE]...",
+            ),
+            (
+                "/h::ro",
+                "--mount \"/h::ro\": empty segment (stray `:`); expected HOST[:GUEST][:MODE]...",
+            ),
+            (
+                "/:bogus-mode",
+                "--mount \"/:bogus-mode\": unknown mode keyword \"bogus-mode\" (expected `ro`, `rw`, `fork`, `follow-links`, or `exclude=REL`)",
+            ),
+            (
+                "/:ro:rw",
+                "--mount \"/:ro:rw\": conflicting modes `ro` and `rw` — pick one",
+            ),
+            (
+                "/:rw:ro",
+                "--mount \"/:rw:ro\": conflicting modes `rw` and `ro` — pick one",
+            ),
+            (
+                "/x:fork:ro",
+                "--mount \"/x:fork:ro\": conflicting modes `fork` and `ro` — pick one",
+            ),
+            (
+                "/x:fork:follow-links:rw",
+                "--mount \"/x:fork:follow-links:rw\": conflicting modes `fork` and `rw` — pick one",
+            ),
+            (
+                "/x:fork:exclude=",
+                "--mount \"/x:fork:exclude=\": exclude must be a non-empty relative path",
+            ),
+            (
+                "/x:fork:exclude=..",
+                "--mount \"/x:fork:exclude=..\": exclude must contain only normal relative components",
+            ),
+            (
+                "/x:fork:exclude=./hidden",
+                "--mount \"/x:fork:exclude=./hidden\": exclude must contain only normal relative components",
+            ),
+            (
+                "/x:fork:exclude=a::b",
+                "--mount \"/x:fork:exclude=a::b\": empty segment (stray `:`); expected HOST[:GUEST][:MODE]...",
+            ),
+            (
+                "/x:exclude=hidden",
+                "--mount /x:exclude=hidden: :exclude is only supported on :fork mounts;\nlive binds cannot hide nested paths.",
+            ),
+            (
+                "/x:ro:exclude=hidden",
+                "--mount /x:ro:exclude=hidden: :exclude is only supported on :fork mounts;\nlive binds cannot hide nested paths.",
+            ),
+        ];
+        for (input, pinned) in CASES {
+            let error = parse_extra_mounts(&[(*input).to_string()]).expect_err(input);
+            assert_eq!(&format!("{error:#}"), pinned, "for --mount {input:?}");
+            // A stray `:` in a whole-entry rejection must not be mistaken for
+            // the excluded-path shape: only the exclusion contexts drop the
+            // quoted entry from the outer frame.
+            if !pinned.contains("exclude must") {
+                assert_eq!(&format!("{error}"), pinned, "for --mount {input:?}");
+            }
+        }
+        // The `exclude=` context is the outer frame, and the reason is the
+        // cause: a refactor that returned the bare reason would keep `{:#}`
+        // identical only by accident, so pin both frames separately.
+        for (input, cause) in [
+            (
+                "/x:fork:exclude=",
+                "exclude must be a non-empty relative path",
+            ),
+            (
+                "/x:fork:exclude=..",
+                "exclude must contain only normal relative components",
+            ),
+        ] {
+            let error = parse_extra_mounts(&[(*input).to_string()]).expect_err(input);
+            assert_eq!(format!("{error}"), format!("--mount {input:?}"));
+            let mut chain = error.chain();
+            assert_eq!(
+                chain.next().map(ToString::to_string),
+                Some(format!("--mount {input:?}"))
+            );
+            assert_eq!(
+                chain.next().map(ToString::to_string),
+                Some(cause.to_string())
+            );
+        }
+    }
+
+    // ── shared grammar and claim kernels ─────────────────────────
+
+    /// `host_spelling` against an oracle written from the specification, not from
+    /// the kernel: `Literal` exactly for a leading `/`, `ExpandHome` exactly for a
+    /// leading `~/` *when expansion is enabled*, and `Refused` otherwise. The
+    /// specs erase under a plain build, so this table is what says the decision
+    /// is the right one.
+    #[test]
+    fn host_spelling_matches_the_oracle_table() {
+        fn oracle(home: HomeExpansion, text: &str) -> HostSpelling {
+            match (home, text.starts_with('/'), text.starts_with("~/")) {
+                (_, true, _) => HostSpelling::Literal,
+                (HomeExpansion::Enabled, false, true) => HostSpelling::ExpandHome,
+                _ => HostSpelling::Refused,
+            }
+        }
+        const TEXTS: &[&str] = &[
+            "", "/", "//", "/x", "/ ", "~", "~/", "~/x", "~x", "x", "./x", "foo/bar", "~//x",
+            "/~/x",
+        ];
+        for home in [HomeExpansion::Disabled, HomeExpansion::Enabled] {
+            for text in TEXTS {
+                assert_eq!(
+                    host_spelling(text.as_bytes(), home),
+                    oracle(home, text),
+                    "for {home:?} {text:?}"
+                );
+            }
+        }
+    }
+
+    /// `--mount` is absolute-only, so the `~/` expansion cannot be reached from
+    /// argv at all: replacing the `home == HomeExpansion::Enabled` guard with a
+    /// bare length check would turn a quoted `~/x` into an expansion instead of
+    /// the "must be absolute" the shell contract promises.
+    #[test]
+    fn only_the_config_syntax_may_expand_a_tilde() {
+        assert_eq!(
+            parse_mount_spec("/x", HostSyntax::AbsoluteOnly)
+                .expect("an absolute host is accepted")
+                .source_spelling,
+            "/x"
+        );
+        let error =
+            parse_mount_spec("~/x", HostSyntax::AbsoluteOnly).expect_err("argv never expands `~`");
+        assert_eq!(error.kind(), MountSpecErrorKind::HostNotAccepted);
+        // The same text on the config route expands, and only there.
+        let mount = parse_mount_spec(
+            "~/x",
+            HostSyntax::AbsoluteOrHome {
+                home: Some("/home/u"),
+            },
+        )
+        .expect("the config syntax expands `~/`");
+        assert_eq!(mount.source_spelling, "/home/u/x");
+    }
+
+    /// A non-UTF-8 (or otherwise unusable) HOME is a rejection, never a silent
+    /// relative path, and a caller cannot smuggle a relative host through the
+    /// config syntax either.
+    #[test]
+    fn a_tilde_host_without_a_usable_home_is_refused() {
+        // No usable HOME is its own kind — the config route tells the user the
+        // entry needs a UTF-8 `$HOME` rather than blaming the path.
+        let error = parse_mount_spec("~/x", HostSyntax::AbsoluteOrHome { home: None })
+            .expect_err("a `~/` host cannot be expanded without a home");
+        assert_eq!(error.kind(), MountSpecErrorKind::HomeUnavailable);
+        // A *relative* home is a caller bug, not a user error: it must not produce
+        // a relative host, so it falls back to the absolute-host rejection.
+        let error = parse_mount_spec("~/x", HostSyntax::AbsoluteOrHome { home: Some("rel") })
+            .expect_err("a relative home cannot make a relative host absolute");
+        assert_eq!(error.kind(), MountSpecErrorKind::HostNotAccepted);
+        let mount = parse_mount_spec(
+            "~/x",
+            HostSyntax::AbsoluteOrHome {
+                home: Some("/home/u"),
+            },
+        )
+        .expect("a usable home expands");
+        assert_eq!(mount.source_spelling, "/home/u/x");
+    }
+
+    proptest::proptest! {
+        /// `~/` is one substitution and nothing else: the expanded host is the
+        /// caller's HOME followed by the declaration from the slash on, byte for
+        /// byte. Canonicalizing, joining or substituting `$` would change the
+        /// spelling `fork_id` hashes, i.e. silently switch forks.
+        #[test]
+        fn home_expansion_is_exact_concatenation(
+            home_tail in proptest::collection::vec("[a-z]{1,6}", 1..4),
+            rest in "[a-zA-Z0-9._/$-]{1,20}",
+        ) {
+            use proptest::prop_assert_eq;
+            let home = format!("/home/{}", home_tail.join("/"));
+            let mount = parse_mount_spec(
+                &format!("~/{rest}"),
+                HostSyntax::AbsoluteOrHome { home: Some(&home) },
+            )
+            .expect("a `~/` host is accepted by the config syntax");
+            let expanded = format!("{home}/{rest}");
+            prop_assert_eq!(&mount.source_spelling, &expanded);
+            prop_assert_eq!(&mount.spelled_host, &PathBuf::from(&expanded));
+            prop_assert_eq!(&mount.host, &mount.spelled_host);
+            prop_assert_eq!(&mount.guest, &mount.host, "the mirror guest is the expanded host");
+        }
+
+        /// Differential: a config declaration and the argv declaration the
+        /// *shell* would produce from it are one declaration. They merge rather
+        /// than conflict, and they name one fork — which is the property that
+        /// keeps provenance out of fork identity.
+        #[test]
+        fn config_and_shell_expanded_cli_declarations_are_identical(
+            home_tail in proptest::collection::vec("[a-z]{1,6}", 1..4),
+            rest in "[a-zA-Z0-9._/$-]{1,12}",
+            guest in proptest::option::of("[a-z]{1,6}(/[a-z]{1,6}){0,2}"),
+            mode in proptest::sample::select(vec!["ro", "rw", "fork", "follow-links"]),
+            exclusion in proptest::option::of("[a-z]{1,6}"),
+        ) {
+            use proptest::prop_assert;
+            use proptest::prop_assert_eq;
+            let home = format!("/home/{}", home_tail.join("/"));
+            let mut suffix = String::new();
+            if let Some(guest) = &guest {
+                suffix.push_str(&format!(":/{guest}"));
+            }
+            suffix.push_str(&format!(":{mode}"));
+            // `:exclude` is fork-only, so it may only be generated there.
+            if mode == "fork"
+                && let Some(exclusion) = &exclusion
+            {
+                suffix.push_str(&format!(":exclude={exclusion}"));
+            }
+            let config_text = format!("~/{rest}{suffix}");
+            let cli_text = format!("{home}/{rest}{suffix}");
+            let from_config = parse_mount_spec(
+                &config_text,
+                HostSyntax::AbsoluteOrHome { home: Some(&home) },
+            )
+            .expect("the config syntax accepts it");
+            let from_cli = parse_extra_mounts(std::slice::from_ref(&cli_text))
+                .expect("argv accepts the shell-expanded text");
+            prop_assert!(
+                same_declaration(&from_config, &from_cli[0]),
+                "{config_text:?} and {cli_text:?} are one declaration"
+            );
+            prop_assert_eq!(
+                fork_id(&from_config, IDENTITY_VERSION),
+                fork_id(&from_cli[0], IDENTITY_VERSION)
+            );
+        }
+    }
+
+    /// The merge/refuse rule, exhaustively: only a *shared guest path* with an
+    /// equivalent declaration merges, and nothing but a shared path is distinct.
+    /// This is the machine-checked "no last-wins, no CLI override" rule.
+    #[test]
+    fn claim_decision_matches_the_oracle_table() {
+        for same_guest in [false, true] {
+            for equivalent in [false, true] {
+                let expected = match (same_guest, equivalent) {
+                    (false, false) => ClaimDecision::Distinct,
+                    (false, true) => ClaimDecision::Distinct,
+                    (true, true) => ClaimDecision::Merge,
+                    (true, false) => ClaimDecision::Conflict,
+                };
+                assert_eq!(
+                    claim_decision(ClaimFacts {
+                        same_guest,
+                        equivalent
+                    }),
+                    expected,
+                    "for same_guest={same_guest} equivalent={equivalent}"
+                );
+            }
+        }
+    }
+
+    /// All 64 fact combinations, with the oracle counting the facts rather than
+    /// restating the conjunction, so a transposed or dropped fact cannot pass.
+    #[test]
+    fn declarations_equivalent_matches_the_oracle_table() {
+        for bits in 0u8..64 {
+            let facts = [
+                bits & 1 != 0,
+                bits & 2 != 0,
+                bits & 4 != 0,
+                bits & 8 != 0,
+                bits & 16 != 0,
+                bits & 32 != 0,
+            ];
+            let [spelling, host, readonly, follow, fork, exclusions] = facts;
+            assert_eq!(
+                declarations_equivalent(DeclarationFacts {
+                    spelling,
+                    host,
+                    readonly,
+                    follow,
+                    fork,
+                    exclusions,
+                }),
+                facts.iter().all(|fact| *fact),
+                "for {facts:?}"
+            );
+        }
+    }
+
+    /// One row per rejection `--mount` can produce, asserting the *kind* rather
+    /// than the bytes (the bytes are pinned above). The config route renders its
+    /// value-free sentence from the kind, so a mis-mapped rejection would send a
+    /// user looking at the wrong field of their `mounts` list.
+    #[test]
+    fn every_rejection_reports_its_own_kind() {
+        const CASES: &[(&str, MountSpecErrorKind)] = &[
+            (":/guest", MountSpecErrorKind::EmptyHost),
+            ("", MountSpecErrorKind::EmptyHost),
+            ("relative-host", MountSpecErrorKind::HostNotAccepted),
+            ("~/x", MountSpecErrorKind::HostNotAccepted),
+            ("/host:./rel", MountSpecErrorKind::GuestNotAbsolute),
+            ("/abs-host:relative-guest", MountSpecErrorKind::UnknownMode),
+            ("/:/mnt/a\tb", MountSpecErrorKind::GuestUnmountable),
+            ("/host:", MountSpecErrorKind::EmptySegment),
+            ("/h::ro", MountSpecErrorKind::EmptySegment),
+            ("/:bogus-mode", MountSpecErrorKind::UnknownMode),
+            ("/:ro:rw", MountSpecErrorKind::ConflictingModes("ro", "rw")),
+            (
+                "/x:fork:ro",
+                MountSpecErrorKind::ConflictingModes("fork", "ro"),
+            ),
+            ("/x:fork:exclude=", MountSpecErrorKind::BadExclusion),
+            ("/x:fork:exclude=..", MountSpecErrorKind::BadExclusion),
+            ("/x:fork:exclude=a::b", MountSpecErrorKind::EmptySegment),
+            ("/x:exclude=hidden", MountSpecErrorKind::ExcludeOnLiveBind),
+        ];
+        for (entry, kind) in CASES {
+            let error = parse_mount_spec(entry, HostSyntax::AbsoluteOnly)
+                .expect_err("argv rejects it, so the shared grammar does too");
+            assert_eq!(error.kind(), *kind, "for --mount {entry:?}");
+            // The argv wrapper consumes exactly this error, so a rejection here is
+            // a rejection on the `--mount` route.
+            assert!(parse_extra_mounts(&[(*entry).to_string()]).is_err());
+        }
+    }
+
+    fn config_origin(index: usize) -> MountOrigin {
+        MountOrigin::UserConfig {
+            file: PathBuf::from("/home/u/.config/agent-vm/config.toml"),
+            index,
+        }
+    }
+
+    fn request(origin: MountOrigin, entry: &str) -> MountRequest {
+        MountRequest {
+            origin,
+            mount: parse_mount_spec(entry, HostSyntax::AbsoluteOnly)
+                .expect("the test declaration parses"),
+        }
+    }
+
+    /// The claim rule across sources, in the launch order (config first, then
+    /// argv): identical declarations merge into the first-seen origin, differing
+    /// ones are refused naming both origins, and distinct guest paths keep their
+    /// order. The kept request carries the normalized guest.
+    #[test]
+    fn claim_merges_identical_and_refuses_differing_across_origins() {
+        let merged = claim(
+            vec![
+                request(config_origin(0), "/host:/g:ro"),
+                request(MountOrigin::Cli, "/host:/g//./:ro"),
+            ],
+            &[],
+        )
+        .expect("identical declarations merge");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].origin,
+            config_origin(0),
+            "the first-seen declaration is the one kept"
+        );
+        assert_eq!(merged[0].mount.guest, PathBuf::from("/g"));
+
+        let error = claim(
+            vec![
+                request(config_origin(2), "/host:/g:ro"),
+                request(MountOrigin::Cli, "/other:/g:ro"),
+            ],
+            &[],
+        )
+        .expect_err("differing declarations at one guest path are refused");
+        assert_eq!(
+            format!("{error}"),
+            "guest path /g is claimed by different declarations \
+             (mounts[2] in \"/home/u/.config/agent-vm/config.toml\" and --mount); \
+             identical declarations are merged and different ones are refused"
+        );
+
+        let ordered = claim(
+            vec![
+                request(config_origin(0), "/a:/one:ro"),
+                request(MountOrigin::Cli, "/b:/two:ro"),
+                request(config_origin(1), "/c:/three:ro"),
+            ],
+            &[],
+        )
+        .expect("distinct guest paths are distinct claims");
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|request| request.mount.guest.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/one"),
+                PathBuf::from("/two"),
+                PathBuf::from("/three")
+            ]
+        );
+    }
+
+    /// A core path is refused before any claim is adjudicated, and the config
+    /// rendering names the escape hatch while the argv rendering keeps today's
+    /// sentence.
+    #[test]
+    fn a_core_collision_is_refused_by_origin() {
+        let core = vec![PathBuf::from("/core")];
+        let error = claim(vec![request(MountOrigin::Cli, "/host:/core:ro")], &core)
+            .expect_err("a core path is not claimable");
+        assert_eq!(
+            format!("{error}"),
+            "--mount guest path /core collides with an agent-vm core mount"
+        );
+        let error = claim(vec![request(config_origin(1), "/host:/core:ro")], &core)
+            .expect_err("a core path is not claimable");
+        assert_eq!(
+            format!("{error}"),
+            "mounts[1] in \"/home/u/.config/agent-vm/config.toml\": guest path /core \
+             collides with an agent-vm core mount; pass --no-config-mounts to launch \
+             without it"
+        );
     }
 }
 
@@ -1787,6 +2967,10 @@ pub(crate) struct MountContext {
     /// canonicalized cwd and is writable (`session.rs:45`): `cd ~ && agent-vm
     /// shell` would hand the guest the whole host `$HOME`.
     pub(crate) core_host_sources: Vec<CoreHostSource>,
+    /// Declared `persist` links and the guest HOME they live under; checked
+    /// against every destination before any fork is published
+    /// ([`crate::guest_home::PersistedHome`]).
+    pub(crate) persisted_home: crate::guest_home::PersistedHome,
 }
 
 /// Normalize the guest spelling before it participates in identity or
@@ -1817,11 +3001,160 @@ fn normalize_guest(raw: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Why a set of declarations could not be claimed, named by origin.
+///
+/// `Display` is the whole diagnostic: no caller wraps it, because a config mount
+/// refused before launch must not read as a `--mount` failure. Every variant's
+/// argv-only rendering is byte-identical to the `bail!` it replaced (pinned by
+/// `cli_claim_errors_are_pinned`).
+///
+/// `source()` is deliberately `None` (the default): `Guest` already renders the
+/// grammar's sentence into its own message, and a source frame would print it
+/// twice for a `{:#}` reader.
+#[derive(Debug)]
+pub(crate) enum ClaimError {
+    /// The guest spelling itself is unusable.
+    Guest {
+        origin: MountOrigin,
+        error: anyhow::Error,
+    },
+    /// The guest would replace one of agent-vm's own mounts.
+    Core { origin: MountOrigin, guest: PathBuf },
+    /// Two declarations named one guest path and did not agree.
+    Conflict {
+        first: MountOrigin,
+        second: MountOrigin,
+        guest: PathBuf,
+    },
+}
+
+impl fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Guest { origin, error } => match origin {
+                // The grammar's own sentence, unchanged: a config entry was
+                // already normalized at load, so only argv reaches here.
+                MountOrigin::Cli => write!(f, "{error}"),
+                config => write!(f, "{config}: {error}"),
+            },
+            Self::Core { origin, guest } => {
+                let guest = guest.display();
+                match origin {
+                    MountOrigin::Cli => write!(
+                        f,
+                        "--mount guest path {guest} collides with an agent-vm core mount"
+                    ),
+                    config => write!(
+                        f,
+                        "{config}: guest path {guest} collides with an agent-vm core mount; \
+                         pass --no-config-mounts to launch without it"
+                    ),
+                }
+            }
+            Self::Conflict {
+                first,
+                second,
+                guest,
+            } => {
+                let guest = guest.display();
+                match (first, second) {
+                    (MountOrigin::Cli, MountOrigin::Cli) => write!(
+                        f,
+                        "--mount guest path {guest} is claimed by different declarations"
+                    ),
+                    _ => write!(
+                        f,
+                        "guest path {guest} is claimed by different declarations ({first} and \
+                         {second}); identical declarations are merged and different ones are \
+                         refused"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClaimError {}
+
+/// Normalize every guest spelling, then adjudicate the claims in first-seen
+/// order: a core collision is refused, an identical re-declaration merges into
+/// the first one, and a differing one is refused naming both origins.
+///
+/// The order is the contract, not an accident. Normalizing first is what makes
+/// `/g//./x` and `/g/x` one claim; core-before-merge is what keeps today's
+/// message for a core path that is also declared twice; and keeping the first
+/// request is what makes the *first-seen* origin the one a conflict names.
+/// Nothing here touches the filesystem, so config load can call it on its own
+/// `mounts` list to reject a self-contradictory file before any launch.
+pub(crate) fn claim(
+    requests: Vec<MountRequest>,
+    core: &[PathBuf],
+) -> Result<Vec<MountRequest>, ClaimError> {
+    let mut normalized = Vec::with_capacity(requests.len());
+    for request in requests {
+        let MountRequest { origin, mount } = request;
+        let spelling = mount.guest.to_str().ok_or_else(|| ClaimError::Guest {
+            origin: origin.clone(),
+            error: anyhow::anyhow!("--mount guest path must be UTF-8"),
+        })?;
+        let guest = normalize_guest(spelling).map_err(|error| ClaimError::Guest {
+            origin: origin.clone(),
+            error,
+        })?;
+        normalized.push(MountRequest {
+            origin,
+            mount: ExtraMount { guest, ..mount },
+        });
+    }
+
+    let mut unique: Vec<MountRequest> = Vec::with_capacity(normalized.len());
+    for request in normalized {
+        if core.iter().any(|core| core == &request.mount.guest) {
+            return Err(ClaimError::Core {
+                origin: request.origin,
+                guest: request.mount.guest,
+            });
+        }
+        let Some(index) = unique
+            .iter()
+            .position(|earlier| earlier.mount.guest == request.mount.guest)
+        else {
+            unique.push(request);
+            continue;
+        };
+        let first = &unique[index];
+        // `same_guest` is true by construction — `position` just found the
+        // earlier claim — so the kernel's remaining choice is merge or refuse.
+        let decision = claim_decision(ClaimFacts {
+            same_guest: true,
+            equivalent: same_declaration(&first.mount, &request.mount),
+        });
+        match decision {
+            ClaimDecision::Merge => continue,
+            // `Distinct` is unreachable for a shared guest; treating it as a
+            // refusal keeps a wrong kernel fail-closed instead of last-wins.
+            ClaimDecision::Conflict | ClaimDecision::Distinct => {
+                return Err(ClaimError::Conflict {
+                    first: first.origin.clone(),
+                    second: request.origin,
+                    guest: request.mount.guest,
+                });
+            }
+        }
+    }
+    Ok(unique)
+}
+
 /// Prepare a complete, closed mount plan.  This is deliberately the only
-/// boundary allowed to inspect mount sources or create fork state. Both the
-/// Pi-file and config-directory guards run before any fork/session mutation.
+/// boundary allowed to inspect mount sources or create fork state. The
+/// Pi-file, config-directory and persisted-guest-HOME guards all run before any
+/// fork/session mutation.
+///
+/// Declarations arrive as [`MountRequests`] so every one names the source it
+/// came from, whichever route produced it; from here on a config mount and a
+/// `--mount` are the same kind of thing.
 pub(crate) fn prepare(
-    requests: Vec<ExtraMount>,
+    requests: impl Into<MountRequests>,
     context: &MountContext,
 ) -> Result<PreparedMountPlan> {
     // Measure the protected host-file route set once, then refuse to launch a
@@ -1845,8 +3178,16 @@ pub(crate) fn prepare(
         match exposure.severity {
             Severity::Refuse => anyhow::bail!("{}", protected.core_message(source, &exposure)),
             Severity::Advise => {
-                let advisory =
-                    protected.message(&source.path.display().to_string(), &exposure, None);
+                // Pre-existing text for an agent-vm bind, kept byte-identical:
+                // this advisory is not about a declaration, so its subject is
+                // the historical `--mount` prefix; naming the bind instead is a
+                // separate wording decision.
+                let advisory = protected.message(
+                    "--mount",
+                    &source.path.display().to_string(),
+                    &exposure,
+                    None,
+                );
                 push_notice(&mut notices, &mut seen, advisory);
             }
         }
@@ -1865,42 +3206,18 @@ pub(crate) fn prepare(
         config_dir.check_core_bind(source)?;
     }
 
-    let mut requests = requests;
-    for request in &mut requests {
-        request.guest = normalize_guest(
-            request
-                .guest
-                .to_str()
-                .context("--mount guest path must be UTF-8")?,
-        )?;
-    }
-    // Reject/deduplicate explicit claims before touching the store/source.
-    let mut unique = Vec::new();
-    for request in requests {
-        if context
-            .core_guest_mounts
-            .iter()
-            .any(|core| core == &request.guest)
-        {
-            anyhow::bail!(
-                "--mount guest path {} collides with an agent-vm core mount",
-                request.guest.display()
-            );
-        }
-        if let Some(existing) = unique
-            .iter()
-            .find(|m: &&ExtraMount| m.guest == request.guest)
-        {
-            if same_declaration(existing, &request) {
-                continue;
-            }
-            anyhow::bail!(
-                "--mount guest path {} is claimed by different declarations",
-                request.guest.display()
-            );
-        }
-        unique.push(request);
-    }
+    // Reject and deduplicate explicit claims before touching the store/source.
+    // The origins are kept beside the declarations, not thrown away with them:
+    // a source failure here is about one declaration, and a config entry has to
+    // be identifiable by `mounts[N]`, not only by the file context the launch
+    // wraps around the error.
+    let claimed = claim(requests.into().into_inner(), &context.core_guest_mounts)
+        .map_err(anyhow::Error::from)?;
+    let origins: DeclaredOrigins = claimed
+        .iter()
+        .map(|request| (request.mount.guest.clone(), request.origin.clone()))
+        .collect();
+    let mut unique: Vec<ExtraMount> = claimed.into_iter().map(|request| request.mount).collect();
 
     // Every fork is validated READY-first here, before any live-bind
     // discovery or state mutation. A READY entry is reused from its
@@ -1909,13 +3226,13 @@ pub(crate) fn prepare(
     // rejected before discovery/transaction. A missing source is left for
     // the locked transaction, so a waiter can still reuse a fork another
     // initializer publishes while it waits.
-    let known_fork_kinds = preflight_forks(&mut unique, &context.mount_store)?;
+    let known_fork_kinds = preflight_forks(&mut unique, &context.mount_store, &origins)?;
 
     // Live binds are the only sources that can contribute followed links, so
     // discovery runs after fork preflight and never over a fork.
     let explicit_count = unique.len();
     let (mut expanded, warnings) =
-        expand_follow_links(unique.clone(), context.host_home.as_deref())?;
+        expand_follow_links(unique.clone(), &origins, context.host_home.as_deref())?;
     sync_fork_representations(&unique, &mut expanded)?;
 
     let mut volumes = Vec::new();
@@ -1932,19 +3249,22 @@ pub(crate) fn prepare(
                 // locked transaction rechecks before it publishes.
                 .unwrap_or(PreparedNodeKind::Directory)
         } else {
+            let declaration = declaration_origin(mount, &origins);
             let metadata = fs::symlink_metadata(&mount.host)
-                .with_context(|| format!("validating --mount source {}", mount.host.display()))?;
-            node_kind(&metadata, &mount.host)?
+                .with_context(|| validating_source_context(declaration, &mount.host))?;
+            node_kind(&metadata, &mount.host, declaration)?
         };
         // A regular file cannot be a writable bind: the runtime's writable
         // file staging is intentionally unreachable from agent-vm (issue
         // #113). Reject here, after canonicalization, so a symlink-to-file
         // root is caught too.
         if kind == PreparedNodeKind::File && !mount.is_readonly() {
+            let declaration = declaration_origin(mount, &origins);
             anyhow::bail!(
-                "--mount {}: a file can only be mounted read-only.\n\
+                "{} {}: a file can only be mounted read-only.\n\
                  Use :ro, or :fork its containing directory for a writable copy.",
-                mount.source_spelling
+                declaration.subject(),
+                mount.source_spelling.render(declaration)
             );
         }
         let source = if mount.is_readonly() {
@@ -1967,9 +3287,16 @@ pub(crate) fn prepare(
     // and collect the Pi advisories. Runs after `expand_follow_links` (so a
     // followed alias is an ordinary discovered bind) and before
     // `validate_plan`/`prepare_forks` (so a refusal has no side effects).
-    enforce_protected_files(&expanded, explicit_count, &protected, &mut notices)?;
+    enforce_protected_files(
+        &expanded,
+        explicit_count,
+        &origins,
+        &protected,
+        &mut notices,
+    )?;
     for mount in expanded.iter().filter(|m| !m.is_readonly() && !m.is_fork()) {
         config_dir.check_writable_mount(
+            &declaration_origin(mount, &origins).subject(),
             &mount.source_spelling,
             &mount.spelled_host,
             &mount.host,
@@ -1990,6 +3317,17 @@ pub(crate) fn prepare(
     }
     validate_plan(&mut volumes, &context.core_guest_mounts)?;
 
+    // ADR-0046 Decision 6: a mount that shadows a declared persist path is
+    // refused here, over the complete normalized core + explicit + followed
+    // destinations, so a rejected plan never publishes a fork.
+    let destinations: Vec<PathBuf> = context
+        .core_guest_mounts
+        .iter()
+        .cloned()
+        .chain(volumes.iter().map(|volume| volume.guest.clone()))
+        .collect();
+    context.persisted_home.refuse_conflicts(&destinations)?;
+
     // Only a validated complete set of core, explicit, and followed claims
     // may publish any host-managed state. The first state mutation happens
     // inside `prepare_forks`; everything above is rejection or classification.
@@ -1998,6 +3336,7 @@ pub(crate) fn prepare(
         &context.mount_store,
         &known_fork_kinds,
         &protected,
+        &origins,
     )?);
     sync_fork_representations(&unique, &mut expanded)?;
     notices.extend(warnings.into_iter().map(|warning| format!("==> {warning}")));
@@ -2018,7 +3357,7 @@ pub(crate) fn prepare(
         volume.source = PreparedVolumeSource::WritableBind(mount.host.clone());
         let metadata = fs::symlink_metadata(&mount.host)
             .with_context(|| format!("validating committed fork {}", mount.host.display()))?;
-        volume.node_kind = node_kind(&metadata, &mount.host)?;
+        volume.node_kind = node_kind(&metadata, &mount.host, declaration_origin(mount, &origins))?;
     }
 
     // The prepared explicit declarations in order: live binds carry their
@@ -2052,6 +3391,7 @@ pub(crate) fn prepare(
 fn enforce_protected_files(
     expanded: &[ExtraMount],
     explicit_count: usize,
+    origins: &DeclaredOrigins,
     protected: &ProtectedHostFiles,
     notices: &mut Vec<String>,
 ) -> Result<()> {
@@ -2062,10 +3402,13 @@ fn enforce_protected_files(
     if expanded.is_empty() {
         return Ok(());
     }
-    let declarations: Vec<String> = expanded[..explicit_count]
+    let declarations: Vec<(Declaration<'_>, String)> = expanded[..explicit_count]
         .iter()
         .filter(|mount| mount.follows_links() && !mount.is_fork())
-        .map(|mount| mount.source_spelling.clone())
+        .map(|mount| {
+            let declaration = declaration_origin(mount, origins);
+            (declaration, mount.source_spelling.render(declaration))
+        })
         .collect();
     let mut seen: Vec<String> = Vec::new();
     for (index, mount) in expanded.iter().enumerate() {
@@ -2078,8 +3421,13 @@ fn enforce_protected_files(
             && let Some(exposure) = protected.exposure(&mount.host)?
         {
             let discovered = (index >= explicit_count).then(|| discovered_by(&declarations));
-            let message =
-                protected.message(&mount.source_spelling, &exposure, discovered.as_deref());
+            let declaring = declaration_origin(mount, origins);
+            let message = protected.message(
+                &declaring.subject(),
+                &mount.source_spelling.render(declaring),
+                &exposure,
+                discovered.as_deref(),
+            );
             match exposure.severity {
                 // A live window onto host bytes cannot be made safe by any
                 // overlay: `pi auth login` on the host can create
@@ -2091,8 +3439,13 @@ fn enforce_protected_files(
         // A fork needs only the platform-artifact advisory: its content is the
         // copy engine's decision, and `:fork` is what it already is.
         let live_bind = !mount.is_fork();
-        for advisory in protected.mount_advisories(&declaration, &mount.source_spelling, live_bind)
-        {
+        let declaring = declaration_origin(mount, origins);
+        let advisories = protected.mount_advisories(
+            &declaration,
+            &mount.source_spelling.render(declaring),
+            live_bind,
+        );
+        for advisory in advisories {
             push_notice(notices, &mut seen, advisory);
         }
     }
@@ -2105,10 +3458,33 @@ fn enforce_protected_files(
 /// same bind — so naming every candidate would blame declarations that did not
 /// contribute it. Naming the sole candidate, or naming none of them, is never
 /// wrong.
-fn discovered_by(declarations: &[String]) -> String {
+///
+/// `declarations` is `(declaration, rendered spelling)` pairs. The
+/// multi-candidate sentence names the *sources* that are present rather than a
+/// fixed `--mount`: an argv-only launch keeps the historical phrase, and a
+/// config entry's `mounts` is never mislabelled as a `--mount`. It still names
+/// no single entry, on purpose — the launch's outer context names the file.
+fn discovered_by(declarations: &[(Declaration<'_>, String)]) -> String {
     match declarations {
-        [only] => format!("--mount {only}:follow-links"),
-        _ => "one of your --mount …:follow-links declarations".to_string(),
+        [(declaration, only)] => format!("{} {only}:follow-links", declaration.subject()),
+        _ => {
+            let mut sources: Vec<String> = Vec::new();
+            for (declaration, _) in declarations {
+                let source = match declaration {
+                    Declaration::Argv => "--mount".to_string(),
+                    Declaration::UserConfig { file, .. } => {
+                        format!("mounts in {}", quoted_path(file))
+                    }
+                };
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+            format!(
+                "one of your {} …:follow-links declarations",
+                sources.join(" or ")
+            )
+        }
     }
 }
 
@@ -2116,9 +3492,11 @@ fn discovered_by(declarations: &[String]) -> String {
 /// fork reused after its source was removed) falls back to the literal
 /// spelling rather than failing the launch.
 fn declaration_path(mount: &ExtraMount) -> PathBuf {
-    Path::new(&mount.source_spelling)
+    #[allow(clippy::disallowed_methods)] // a filesystem call, never a message.
+    let spelling = mount.source_spelling.as_source_path();
+    spelling
         .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(&mount.source_spelling))
+        .unwrap_or_else(|_| spelling.to_path_buf())
 }
 
 fn push_notice(notices: &mut Vec<String>, seen: &mut Vec<String>, message: String) {
@@ -2145,9 +3523,11 @@ fn legacy_fork_dir(mount: &ExtraMount, mount_store: &Path) -> Option<PathBuf> {
 fn preflight_forks(
     mounts: &mut [ExtraMount],
     mount_store: &Path,
+    origins: &DeclaredOrigins,
 ) -> Result<std::collections::HashMap<PathBuf, PreparedNodeKind>> {
     let mut kinds = std::collections::HashMap::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
+        let declaration = declaration_origin(mount, origins);
         let id = fork_id(mount, IDENTITY_VERSION);
         let final_dir = mount_store.join("forks").join(&id);
         if final_dir_exists(&final_dir)? {
@@ -2162,10 +3542,10 @@ fn preflight_forks(
         // store/lock side effect. A vanished source is deliberately deferred:
         // a concurrent initializer may publish READY while this waiter blocks
         // on the per-fork lock (see the process tests).
-        let Some(kind) = try_fork_source_kind(&mount.host)? else {
+        let Some(kind) = try_fork_source_kind(&mount.host, declaration)? else {
             continue;
         };
-        require_fork_directory(kind, &mount.source_spelling)?;
+        require_fork_directory(kind, declaration, &mount.source_spelling)?;
         kinds.insert(mount.guest.clone(), kind);
     }
     Ok(kinds)
@@ -2173,33 +3553,42 @@ fn preflight_forks(
 
 /// A `:fork` root is always a directory (issue #113). Shared between the
 /// preflight classification and the locked recheck so both emit one message.
-fn require_fork_directory(kind: PreparedNodeKind, source: &str) -> Result<()> {
+fn require_fork_directory(
+    kind: PreparedNodeKind,
+    declaration: Declaration<'_>,
+    source: &Spelling,
+) -> Result<()> {
     if kind != PreparedNodeKind::Directory {
         anyhow::bail!(
-            "--mount {source}: a :fork source must be a directory.\n\
-             Fork the containing directory, or bind the file read-only with :ro."
+            "{} {}: a :fork source must be a directory.\n\
+             Fork the containing directory, or bind the file read-only with :ro.",
+            declaration.subject(),
+            source.render(declaration)
         );
     }
     Ok(())
 }
 
-fn try_fork_source_kind(source: &Path) -> Result<Option<PreparedNodeKind>> {
+fn try_fork_source_kind(
+    source: &Path,
+    declaration: Declaration<'_>,
+) -> Result<Option<PreparedNodeKind>> {
     match fs::symlink_metadata(source) {
-        Ok(_) => fork_source_kind(source).map(Some),
+        Ok(_) => fork_source_kind(source, declaration).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => {
-            Err(error).with_context(|| format!("validating fork root {}", source.display()))
+            Err(error).with_context(|| fork_root_context("validating", declaration, source))
         }
     }
 }
 
-fn fork_source_kind(source: &Path) -> Result<PreparedNodeKind> {
+fn fork_source_kind(source: &Path, declaration: Declaration<'_>) -> Result<PreparedNodeKind> {
     let resolved = source
         .canonicalize()
-        .with_context(|| format!("resolving fork root {}", source.display()))?;
+        .with_context(|| fork_root_context("resolving", declaration, source))?;
     let metadata = fs::symlink_metadata(&resolved)
-        .with_context(|| format!("validating fork root {}", source.display()))?;
-    node_kind(&metadata, source)
+        .with_context(|| fork_root_context("validating", declaration, source))?;
+    node_kind(&metadata, source, declaration)
 }
 
 /// Keep the follow-link-expanded representation aligned with the declaration
@@ -2229,22 +3618,43 @@ fn sync_fork_representations(unique: &[ExtraMount], expanded: &mut [ExtraMount])
     Ok(())
 }
 
+/// The trusted adapter for [`declarations_equivalent`]: it measures the six
+/// equalities and lets the kernel decide. Host spelling and the measured `host`
+/// are separate facts on purpose — `~/ref` and `~/ref/` can name one guest path
+/// while exposing different bytes, so spelling participates.
 fn same_declaration(a: &ExtraMount, b: &ExtraMount) -> bool {
-    a.source_spelling == b.source_spelling
-        && a.host == b.host
-        && a.is_readonly() == b.is_readonly()
-        && a.follows_links() == b.follows_links()
-        && a.is_fork() == b.is_fork()
-        && a.exclusions == b.exclusions
+    declarations_equivalent(DeclarationFacts {
+        spelling: a.source_spelling == b.source_spelling,
+        host: a.host == b.host,
+        readonly: a.is_readonly() == b.is_readonly(),
+        follow: a.follows_links() == b.follows_links(),
+        fork: a.is_fork() == b.is_fork(),
+        exclusions: a.exclusions == b.exclusions,
+    })
 }
 
-fn node_kind(metadata: &fs::Metadata, path: &Path) -> Result<PreparedNodeKind> {
+fn node_kind(
+    metadata: &fs::Metadata,
+    path: &Path,
+    declaration: Declaration<'_>,
+) -> Result<PreparedNodeKind> {
     if metadata.is_file() {
         Ok(PreparedNodeKind::File)
     } else if metadata.is_dir() {
         Ok(PreparedNodeKind::Directory)
     } else {
-        anyhow::bail!("{} must be a regular file or directory", path.display())
+        // This sentence has never named `--mount` for an argv source, so that
+        // half stays byte-identical; a config entry is named, because otherwise
+        // the launch context mentions only the file.
+        anyhow::bail!(
+            "{} must be a regular file or directory",
+            match declaration {
+                Declaration::Argv => path.display().to_string(),
+                Declaration::UserConfig { .. } => {
+                    format!("{} {}", declaration.subject(), quoted_path(path))
+                }
+            }
+        )
     }
 }
 
@@ -2530,9 +3940,11 @@ pub(crate) fn prepare_forks(
     mount_store: &Path,
     expected_kinds: &std::collections::HashMap<PathBuf, PreparedNodeKind>,
     protected: &ProtectedHostFiles,
+    origins: &DeclaredOrigins,
 ) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     for mount in mounts.iter_mut().filter(|mount| mount.is_fork()) {
+        let declaration = declaration_origin(mount, origins);
         let id = fork_id(mount, IDENTITY_VERSION);
         let final_dir = mount_store.join("forks").join(&id);
         ensure_store(mount_store)?;
@@ -2553,14 +3965,14 @@ pub(crate) fn prepare_forks(
         clean_stale_staging(&mount_store.join("staging"), &id)?;
         // The root kind is source-dependent, so resolve it only after the
         // waiter has acquired the transaction lock and rechecked READY.
-        let source_kind = fork_source_kind(&mount.host)?;
-        require_fork_directory(source_kind, &mount.source_spelling)?;
+        let source_kind = fork_source_kind(&mount.host, declaration)?;
+        require_fork_directory(source_kind, declaration, &mount.source_spelling)?;
         if let Some(expected) = expected_kinds.get(&mount.guest)
             && *expected != source_kind
         {
             anyhow::bail!(
                 "fork root kind changed while preparing {}; retry the launch",
-                mount.source_spelling
+                mount.source_spelling.render(declaration)
             );
         }
         let staging_parent = mount_store.join("staging");
@@ -2586,20 +3998,29 @@ pub(crate) fn prepare_forks(
             protected,
         };
         let mut report = CopyReport::default();
-        let kind = copy_root(&mount.host, &staged_data, &policy, &mut report)
-            .with_context(|| format!("initializing fork from {}", mount.source_spelling))?;
+        let kind = copy_root(&mount.host, &staged_data, &policy, declaration, &mut report)
+            .with_context(|| {
+                format!(
+                    "initializing fork from {}",
+                    mount.source_spelling.render(declaration)
+                )
+            })?;
         for (relative, file) in &report.omitted {
             notices.push(format!(
                 "==> Omitted {} {} from the fork of {}",
                 file.description(),
                 relative.display(),
-                mount.source_spelling
+                mount.source_spelling.render(declaration)
             ));
         }
+        // The manifest records the spelling's exact bytes: it is fork identity,
+        // and it is never printed.
+        #[allow(clippy::disallowed_methods)]
+        let source = mount.source_spelling.stored_str().to_owned();
         let manifest = ForkManifest {
             version: MANIFEST_VERSION,
             id: id.clone(),
-            source: mount.source_spelling.clone(),
+            source,
             guest: mount.guest.display().to_string(),
             follow_links: mount.follows_links(),
             exclusions: mount
@@ -2625,7 +4046,7 @@ pub(crate) fn prepare_forks(
         mount.host = final_dir.join("data");
         notices.push(format!(
             "==> Initialized fork {} -> {} (reset: {})",
-            mount.source_spelling,
+            mount.source_spelling.render(declaration),
             mount.host.display(),
             final_dir.display()
         ));
@@ -2637,7 +4058,9 @@ fn fork_id(mount: &ExtraMount, version: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(version);
-    for value in std::iter::once(mount.source_spelling.as_bytes())
+    // The hash is the spelling's exact bytes: identity, not a message.
+    #[allow(clippy::disallowed_methods)]
+    for value in std::iter::once(mount.source_spelling.stored_bytes())
         .chain(std::iter::once(mount.guest.as_os_str().as_encoded_bytes()))
         .chain(std::iter::once(if mount.follows_links() {
             b"follow".as_slice()
@@ -2830,10 +4253,13 @@ fn validate_ready(dir: &Path, mount: &ExtraMount, id: &str) -> Result<PreparedNo
     }
     let manifest: ForkManifest =
         serde_json::from_reader(file).map_err(|_| anyhow::anyhow!(reset()))?;
+    // Same bytes the fork was published under: identity, never printed.
+    #[allow(clippy::disallowed_methods)]
+    let source = mount.source_spelling.stored_str().to_owned();
     let expected = ForkManifest {
         version: MANIFEST_VERSION,
         id: id.into(),
-        source: mount.source_spelling.clone(),
+        source,
         guest: mount.guest.display().to_string(),
         follow_links: mount.follows_links(),
         exclusions: mount
@@ -2981,17 +4407,22 @@ enum CopiedNode {
 /// into a read of an external target. Explicit follow mode is deliberately
 /// opt-in. Nested regular files are still copied by [`copy_opened`]; only the
 /// root is directory-only (issue #113).
+///
+/// `declaration` decides how the root path is rendered in the three messages
+/// below. Nested paths stay `display`ed for both sources: they are the copied
+/// tree's own names, not text from the declaration.
 fn copy_root(
     source: &Path,
     destination: &Path,
     policy: &CopyPolicy<'_>,
+    declaration: Declaration<'_>,
     report: &mut CopyReport,
 ) -> Result<PreparedNodeKind> {
     use rustix::fs::{self as rfs, FileType, Mode, OFlags};
     // T1: one `canonicalize` plus one `metadata`. The canonicalized pathname is
     // the only thing the copier opens (T4), so a declaration spelling cannot
     // reach the omission signal (R4.4.1-3).
-    let root = ResolvedRoot::resolve(source)?;
+    let root = ResolvedRoot::resolve(source, declaration)?;
     #[cfg(test)]
     let _checkpoint_scope = CopyCheckpointScope::enter(root.path());
     // Test-only race in (T1, T2): the interval S3-A/S3-B use to suppress a
@@ -3015,9 +4446,12 @@ fn copy_root(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .with_context(|| format!("opening fork root {}", root.path().display()))?;
+    .with_context(|| format!("opening fork root {}", declaration.host_path(root.path())))?;
     if FileType::from_raw_mode(rfs::fstat(&fd)?.st_mode) != FileType::Directory {
-        anyhow::bail!("fork root {} must be a directory", root.path().display());
+        anyhow::bail!(
+            "fork root {} must be a directory",
+            declaration.host_path(root.path())
+        );
     }
     match copy_opened(
         &fd,
@@ -3035,7 +4469,7 @@ fn copy_root(
         CopiedNode::Omitted => {
             anyhow::bail!(
                 "fork root {} is a protected host file",
-                root.path().display()
+                declaration.host_path(root.path())
             )
         }
     }
@@ -3193,6 +4627,20 @@ mod prepare_tests {
             host_home: Some(home),
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
+            persisted_home: crate::guest_home::PersistedHome::none(),
+        }
+    }
+
+    /// A context whose guest HOME is `home` and which declares `persist =
+    /// ["code"]` under it — the one way a `persist` link can exist, and the
+    /// collision target of `persist_collision_refuses_before_any_fork_store`.
+    fn persisted_context(store: &Path, home: &Path) -> MountContext {
+        MountContext {
+            persisted_home: crate::guest_home::PersistedHome::new(
+                home.to_path_buf(),
+                &crate::guest_home::links(&[crate::config::PersistPath::for_test("code")]),
+            ),
+            ..context_with_home(store, home.to_path_buf())
         }
     }
 
@@ -3205,7 +4653,69 @@ mod prepare_tests {
             host_home: None,
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
+            persisted_home: crate::guest_home::PersistedHome::none(),
         }
+    }
+
+    /// ADR-0046 Decision 6: the persisted-guest-HOME refusal is a *pre-fork*
+    /// boundary. The store path is deliberately absent, so "the store still
+    /// does not exist" is a real assertion about `prepare` rather than about an
+    /// empty directory: a plan that published first would leave
+    /// `<store>/forks/<id>` behind.
+    #[test]
+    fn persist_collision_refuses_before_any_fork_store() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap().join("home");
+        fs::create_dir(&home).unwrap();
+        let source = home.join("src");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("seed"), "seed").unwrap();
+        let live = home.join("live");
+        fs::create_dir(&live).unwrap();
+        let store = root.path().join("store");
+        assert!(!store.exists(), "the store path must start absent");
+        let mount_context = persisted_context(&store, &home);
+
+        // 1. A `:fork` whose own guest path is the declared `persist` link.
+        let shadowing = format!("{}:{}/code:fork", source.display(), home.display());
+        let error = prepare(parse_extra_mounts(&[shadowing]).unwrap(), &mount_context)
+            .expect_err("a fork that shadows a persist link is not a valid plan");
+        assert!(
+            error.is::<crate::guest_home::PersistCollision>(),
+            "{error:#}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "config: persist path code would collide with the guest mount point {}/code; \
+                 rename the persist path or move the mount",
+                home.display()
+            )
+        );
+        assert!(
+            !store.exists(),
+            "a refused plan must not publish a fork store"
+        );
+
+        // 2. An unrelated fork at `/f` plus a *live* bind that shadows the link.
+        // Neither declaration is invalid alone, so only a check over the
+        // complete normalized destination set can refuse this before `/f`'s
+        // fork is published.
+        let fork = format!("{}:/f:fork", source.display());
+        let live_bind = format!("{}:{}/code:ro", live.display(), home.display());
+        let error = prepare(
+            parse_extra_mounts(&[fork, live_bind]).unwrap(),
+            &mount_context,
+        )
+        .expect_err("the live bind's guest path shadows the persist link");
+        assert!(
+            error.is::<crate::guest_home::PersistCollision>(),
+            "{error:#}"
+        );
+        assert!(
+            !store.exists(),
+            "the unrelated fork must not have been published"
+        );
     }
 
     fn store_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
@@ -3237,6 +4747,214 @@ mod prepare_tests {
         visit(root, root, &mut entries);
         entries.sort();
         entries
+    }
+
+    /// The two claim verdicts `--mount` reports today, byte for byte.
+    ///
+    /// `prepare`'s normalize/claim head is about to be extracted so user-config
+    /// `mounts` share it; those two refusals are the ones that must stay
+    /// identical for a CLI-only launch while gaining an origin for the config
+    /// route. The positive controls below pin the other half of the same rule —
+    /// identical declarations merge, and only the *normalized* guest spelling
+    /// participates — so a refactor cannot trade one for the other.
+    #[test]
+    fn cli_claim_errors_are_pinned() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let mut with_core = context(store.path());
+        with_core.core_guest_mounts = vec![PathBuf::from("/core")];
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/core:ro", first.display())]).unwrap(),
+            &with_core,
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "--mount guest path /core collides with an agent-vm core mount"
+        );
+
+        let error = prepare(
+            parse_extra_mounts(&[
+                format!("{}:/g//./x:ro", first.display()),
+                format!("{}:/g/x:ro", second.display()),
+            ])
+            .unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "--mount guest path /g/x is claimed by different declarations"
+        );
+
+        // Identical declarations merge: one volume, and the guest spelling is
+        // the normalized one for both routes into it.
+        let plan = prepare(
+            parse_extra_mounts(&[
+                format!("{}:/g//./x:ro", first.display()),
+                format!("{}:/g/x:ro", first.display()),
+            ])
+            .unwrap(),
+            &context(store.path()),
+        )
+        .unwrap();
+        assert_eq!(plan.volumes.len(), 1);
+        assert_eq!(plan.volumes[0].guest, PathBuf::from("/g/x"));
+    }
+
+    /// One refusal, two renderings: the argv half of every sentence the config
+    /// route rewrote, and the config half it gained.
+    ///
+    /// Two spellings are pinned because they are easy to "unify": `{:?}` for a
+    /// declared spelling in the canonicalization context and `Path::display` for
+    /// a resolved host. Neither may become the config escape policy, which turns
+    /// `café` into `caf\xc3\xa9` and would silently change every argv launch's
+    /// wording.
+    #[test]
+    fn refusal_contexts_are_pinned_per_declaration_source() {
+        let config = Declaration::UserConfig {
+            file: Path::new("/home/u/.config/agent-vm/config.toml"),
+            index: 2,
+        };
+        // argv: `{:?}` quotes and keeps non-ASCII; `display()` prints it bare.
+        assert_eq!(
+            canonicalizing_context(Declaration::Argv, &Spelling::new("/srv/café")),
+            "canonicalizing --mount host \"/srv/café\""
+        );
+        assert_eq!(
+            validating_source_context(Declaration::Argv, Path::new("/srv/café")),
+            "validating --mount source /srv/café"
+        );
+        // config: named by index and file, value escaped.
+        assert_eq!(
+            canonicalizing_context(config, &Spelling::new("/srv/café")),
+            "canonicalizing mounts[2] in \"/home/u/.config/agent-vm/config.toml\" host \
+             \"/srv/caf\\xc3\\xa9\""
+        );
+        assert_eq!(
+            validating_source_context(config, Path::new("/srv/café")),
+            "validating mounts[2] in \"/home/u/.config/agent-vm/config.toml\" source \
+             \"/srv/caf\\xc3\\xa9\""
+        );
+        assert_eq!(
+            config.subject(),
+            "mounts[2] in \"/home/u/.config/agent-vm/config.toml\""
+        );
+        assert_eq!(
+            Spelling::new("/srv/café").render(config),
+            "\"/srv/caf\\xc3\\xa9\""
+        );
+        // The same spelling stays one line in a config refusal.
+        assert_eq!(
+            Spelling::new("/srv/a\nb").render(config),
+            "\"/srv/a\\x0ab\""
+        );
+        // A `:fork` root context: argv has never named `--mount` here and never
+        // quoted the path; a config entry names itself and escapes it, so a
+        // newline in the entry cannot forge a diagnostic line.
+        for verb in ["resolving", "validating"] {
+            assert_eq!(
+                fork_root_context(verb, Declaration::Argv, Path::new("/srv/café")),
+                format!("{verb} fork root /srv/café")
+            );
+            assert_eq!(
+                fork_root_context(verb, config, Path::new("/srv/café")),
+                format!(
+                    "{verb} mounts[2] in \"/home/u/.config/agent-vm/config.toml\" fork root \
+                     \"/srv/caf\\xc3\\xa9\""
+                )
+            );
+            assert_eq!(
+                fork_root_context(verb, config, Path::new("/srv/a\nb")),
+                format!(
+                    "{verb} mounts[2] in \"/home/u/.config/agent-vm/config.toml\" fork root \
+                     \"/srv/a\\x0ab\""
+                )
+            );
+        }
+    }
+
+    /// The argv sentences end to end: a non-ASCII source spelling reaches the
+    /// user exactly as typed, and each keeps the quoting it has always had.
+    ///
+    /// The `validating … source` sentence is deliberately absent: it is reachable
+    /// only when a source vanishes between canonicalization and the kind check, so
+    /// both of its renderings are pinned through
+    /// [`refusal_contexts_are_pinned_per_declaration_source`] instead of through a
+    /// filesystem race.
+    #[test]
+    fn argv_refusals_print_a_non_ascii_source_as_typed() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        // A missing source: `{:?}` on the declared spelling, quotes and all.
+        let missing = home.join("café-missing");
+        let spelling = missing.display().to_string();
+        let error = prepare(
+            parse_extra_mounts(&[format!("{spelling}:/g:ro")]).unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.starts_with(&format!("canonicalizing --mount host {spelling:?}")),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(r"\xc3"), "{rendered}");
+
+        // A regular file mounted writable: the bare spelling, no quotes.
+        let file = home.join("café-file");
+        fs::write(&file, "seed").unwrap();
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/f:rw", file.display())]).unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "--mount {}: a file can only be mounted read-only.\n\
+                 Use :ro, or :fork its containing directory for a writable copy.",
+                file.display()
+            )
+        );
+
+        // A `:fork` over a regular file: the bare spelling again.
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/fk:fork", file.display())]).unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "--mount {}: a :fork source must be a directory.\n\
+                 Fork the containing directory, or bind the file read-only with :ro.",
+                file.display()
+            )
+        );
+
+        // A FIFO: this sentence has never named `--mount`, and still does not, so
+        // the argv text is unchanged even though the config route now names
+        // `mounts[N]` here.
+        let fifo = home.join("café-fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let error = prepare(
+            parse_extra_mounts(&[format!("{}:/p:ro", fifo.display())]).unwrap(),
+            &context(store.path()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!("{} must be a regular file or directory", fifo.display())
+        );
     }
 
     #[test]
@@ -3460,6 +5178,7 @@ mod prepare_tests {
                 host_home: Some(home),
                 core_guest_mounts: vec![target],
                 core_host_sources: Vec::new(),
+                persisted_home: crate::guest_home::PersistedHome::none(),
             };
 
             let error =
@@ -3607,6 +5326,7 @@ mod prepare_tests {
                         host_home: Some(root.path().to_path_buf()),
                         core_guest_mounts: vec![root.path().join("core-child")],
                         core_host_sources: Vec::new(),
+                        persisted_home: crate::guest_home::PersistedHome::none(),
                     },
                 );
                 assert!(
@@ -3694,6 +5414,7 @@ mod prepare_tests {
                 host_home: Some(home_path.clone()),
                 core_guest_mounts: Vec::new(),
                 core_host_sources: Vec::new(),
+                persisted_home: crate::guest_home::PersistedHome::none(),
             },
         )
         .unwrap_err();
@@ -4003,6 +5724,7 @@ mod prepare_tests {
                 exclusions: vec![PathBuf::from("hidden-link")],
             },
             home.path(),
+            Declaration::Argv,
         )
         .unwrap();
         assert!(targets.iter().all(|target_plan| target_plan.host != target));
@@ -4394,6 +6116,294 @@ mod prepare_tests {
             "{error}"
         );
         assert!(!error.contains("discovered by --mount"), "{error}");
+        assert!(store_tree(store.path()).is_empty(), "{error}");
+    }
+
+    // ── The argv sites that render a spelling themselves, printed whole ──
+
+    /// The user config file every config-declaration fixture names.
+    const CONFIG_FILE: &str = "/home/u/.config/agent-vm/config.toml";
+
+    /// One config entry as a `prepare` request, built the way
+    /// `config_mounts::from_verified_value` builds it: the entry's own origin
+    /// and the shared grammar.
+    fn config_request(index: usize, entry: &str) -> MountRequest {
+        MountRequest {
+            origin: MountOrigin::UserConfig {
+                file: PathBuf::from(CONFIG_FILE),
+                index,
+            },
+            mount: parse_mount_spec(entry, HostSyntax::AbsoluteOnly)
+                .expect("the test declaration parses"),
+        }
+    }
+
+    /// Three argv messages render a declared spelling themselves — the
+    /// Pi-credential refusal, the `Omitted` notice and the `Initialized fork`
+    /// notice — and each is asserted as a whole line, with a spelling the config
+    /// escape policy would rewrite. A regression at any one of those sites
+    /// (`mount.rs`'s `protected.message` caller, `prepare_forks`'s two notices)
+    /// changes a line here; a `contains` would not notice.
+    #[test]
+    fn argv_notices_and_refusals_print_a_spelling_as_typed() {
+        use std::os::unix::fs::symlink;
+
+        let (_home, home) = pi_home();
+        // A symlink so the *declared* spelling differs from the canonical source
+        // the exposure is measured on; `café` is what the config escape policy
+        // would rewrite, so an argv site that switched to it fails below.
+        let alias = home.join("café-pi");
+        symlink(home.join(".pi"), &alias).unwrap();
+        let spelling = alias.display().to_string();
+
+        // 1. The refusal. One line, and the spelling as typed.
+        let store = tempfile::tempdir().unwrap();
+        let error = prepare(
+            parse_extra_mounts(&[format!("{spelling}:ro")]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        let first = error.lines().next().expect("a refusal sentence");
+        assert_eq!(
+            first,
+            format!(
+                "--mount {spelling} would expose the host Pi credential file {} \
+                 (as agent/auth.json inside {})",
+                home.join(".pi/agent/auth.json").display(),
+                home.join(".pi").display()
+            ),
+            "{error}"
+        );
+
+        // 2. The two notices. The store path is read back, so the only free
+        // variable left in either line is the rendering under test.
+        let store = tempfile::tempdir().unwrap();
+        let plan = prepare(
+            parse_extra_mounts(&[format!("{spelling}:/pi:fork")]).unwrap(),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap();
+        let fork_dir = fs::read_dir(store.path().join("forks"))
+            .unwrap()
+            .next()
+            .expect("a published fork")
+            .unwrap()
+            .path();
+        let initialized = plan
+            .notices
+            .iter()
+            .find(|notice| notice.starts_with("==> Initialized fork "))
+            .unwrap_or_else(|| panic!("no initialization notice: {:?}", plan.notices));
+        assert_eq!(
+            initialized,
+            &format!(
+                "==> Initialized fork {spelling} -> {} (reset: {})",
+                fork_dir.join("data").display(),
+                fork_dir.display()
+            )
+        );
+        let omitted = plan
+            .notices
+            .iter()
+            .find(|notice| notice.starts_with("==> Omitted") && notice.contains("auth.json"))
+            .unwrap_or_else(|| panic!("no omission notice: {:?}", plan.notices));
+        assert_eq!(
+            omitted,
+            &format!(
+                "==> Omitted host Pi credential file agent/auth.json from the fork of {spelling}"
+            )
+        );
+    }
+
+    /// The provenance phrase for a config-discovered leak: one candidate names
+    /// the entry, and several name the *sources* present — never a `--mount` the
+    /// launch did not make.
+    #[test]
+    fn a_config_discovered_leak_names_config_sources_not_argv() {
+        use std::os::unix::fs::symlink;
+
+        let (_home, home) = pi_home();
+        let leak = home.join("leak");
+        let innocent = home.join("innocent");
+        fs::create_dir_all(&leak).unwrap();
+        fs::create_dir_all(&innocent).unwrap();
+        symlink(home.join(".pi"), leak.join("pi-link")).unwrap();
+
+        // One candidate: the phrase names the entry that made the bind
+        // discoverable. The *subject* stays `--mount`: a discovered bind is not a
+        // declaration, and `expand_follow_links` does not record which
+        // declaration discovered it (see `DeclaredOrigins`), so the entry is
+        // named where it is known — in the phrase — and pinned here.
+        let store = tempfile::tempdir().unwrap();
+        let error = prepare(
+            MountRequests::new(vec![config_request(
+                0,
+                &format!("{}:ro:follow-links", leak.display()),
+            )]),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error.lines().next().expect("a refusal sentence"),
+            format!(
+                "--mount {pi} would expose the host Pi credential file {auth} \
+                 (as agent/auth.json inside {pi}) (discovered by mounts[0] in \
+                 \"{CONFIG_FILE}\" \"{leak}\":follow-links)",
+                pi = home.join(".pi").display(),
+                auth = home.join(".pi/agent/auth.json").display(),
+                leak = leak.display()
+            )
+        );
+        assert!(store_tree(store.path()).is_empty(), "{error}");
+
+        // Two candidates: no single entry is blamed, and the phrase names the
+        // sources present — never a `--mount` this launch did not make.
+        let store = tempfile::tempdir().unwrap();
+        let error = prepare(
+            MountRequests::new(vec![
+                config_request(0, &format!("{}:ro:follow-links", leak.display())),
+                config_request(1, &format!("{}:ro:follow-links", innocent.display())),
+            ]),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(&format!(
+                "(discovered by one of your mounts in \"{CONFIG_FILE}\" …:follow-links \
+                 declarations)"
+            )),
+            "{error}"
+        );
+        assert!(
+            !error.contains("discovered by one of your --mount"),
+            "{error}"
+        );
+        assert!(!error.contains("discovered by mounts[0]"), "{error}");
+    }
+
+    /// A `:fork` source the entry expanded to and could not resolve: the context
+    /// names the entry and escapes the path, so a newline in the name cannot
+    /// forge a diagnostic line.
+    #[test]
+    fn a_config_fork_root_refusal_names_the_entry_and_stays_one_line() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        // A dangling symlink: `canonicalize` fails, which is the `resolving`
+        // context. The name carries the newline.
+        let source = home.join("dang\nFORGED-LINE");
+        symlink(home.join("gone"), &source).unwrap();
+
+        let error = prepare(
+            MountRequests::new(vec![config_request(
+                0,
+                &format!("{}:/g:fork", source.display()),
+            )]),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.chain().next().expect("the context").to_string(),
+            format!(
+                "resolving mounts[0] in \"{CONFIG_FILE}\" fork root \
+                 \"{}/dang\\x0aFORGED-LINE\"",
+                home.display()
+            )
+        );
+        assert!(!error.to_string().contains('\n'), "{error}");
+        assert!(
+            store_tree(store.path()).is_empty(),
+            "a refused fork must not publish state"
+        );
+    }
+
+    /// A `:follow-links` walk that finds a link escaping `$HOME`: the refusal
+    /// names the entry and escapes every path in it, including the link whose
+    /// name carries the newline.
+    #[test]
+    fn a_config_follow_links_refusal_names_the_entry_and_stays_one_line() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        let source = home.join("tree");
+        fs::create_dir(&source).unwrap();
+        symlink(&outside, source.join("escape\nFORGED2")).unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let error = prepare(
+            MountRequests::new(vec![config_request(
+                0,
+                &format!("{}:/g:ro:follow-links", source.display()),
+            )]),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "mounts[0] in \"{CONFIG_FILE}\" follow-links: symlink \
+                 \"{home}/tree/escape\\x0aFORGED2\" resolves to \"{outside}\", which is outside \
+                 your $HOME (\"{home}\"); refusing to mount it",
+                home = home.display(),
+                outside = outside.display()
+            )
+        );
+        assert!(!error.contains('\n'), "{error}");
+    }
+
+    /// Two declarations claim one guest path and one of them is a config entry:
+    /// the refusal renders each side for its own source. The explicit entry here
+    /// carries a newline in the name, so the historical bare-host text would have
+    /// forged a line; the discovered side has no declaring entry, which is why it
+    /// still reads `--mount`.
+    #[test]
+    fn a_config_claim_conflict_escapes_the_entry_and_stays_one_line() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let target = home.join("tgt");
+        let walked = home.join("walked");
+        let forged = home.join("b\nFORGED3");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&walked).unwrap();
+        fs::create_dir(&forged).unwrap();
+        // The walk discovers `tgt` at its own path, which the second entry also
+        // claims by guest path — with a different host.
+        symlink(&target, walked.join("link")).unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let error = prepare(
+            MountRequests::new(vec![
+                config_request(0, &format!("{}:/g:ro:follow-links", walked.display())),
+                config_request(1, &format!("{}:{}:ro", forged.display(), target.display())),
+            ]),
+            &context_with_home(store.path(), home.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "guest path {tgt} is claimed by different declarations (mounts[1] in \
+                 \"{CONFIG_FILE}\" \"{home}/b\\x0aFORGED3\" and --mount \"{tgt}\")",
+                tgt = target.display(),
+                home = home.display()
+            )
+        );
+        assert!(!error.contains('\n'), "{error}");
         assert!(store_tree(store.path()).is_empty(), "{error}");
     }
 
@@ -4836,6 +6846,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &original,
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         assert!(
@@ -4871,6 +6882,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &stale,
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         let data = &mounts[0].host;
@@ -4900,8 +6912,9 @@ mod prepare_tests {
         let lock = open_regular_lock(&store.join("fork.lock")).unwrap();
         flock_exclusive(&lock).unwrap();
         require_fork_directory(
-            fork_source_kind(root_spelling).unwrap(),
-            &root_spelling.display().to_string(),
+            fork_source_kind(root_spelling, Declaration::Argv).unwrap(),
+            Declaration::Argv,
+            &Spelling::new(root_spelling.display().to_string()),
         )
         .unwrap();
         at_the_resolve_point();
@@ -4912,7 +6925,14 @@ mod prepare_tests {
         };
         let data = store.join("data");
         let mut report = CopyReport::default();
-        copy_root(root_spelling, &data, &policy, &mut report).unwrap();
+        copy_root(
+            root_spelling,
+            &data,
+            &policy,
+            Declaration::Argv,
+            &mut report,
+        )
+        .unwrap();
         data
     }
 
@@ -5356,7 +7376,7 @@ mod prepare_tests {
         assert!(
             launch
                 .union(&fresh)
-                .relatives_under(&ResolvedRoot::resolve(&source).unwrap())
+                .relatives_under(&ResolvedRoot::resolve(&source, Declaration::Argv).unwrap())
                 .is_empty(),
             "no Pi path names anything under an unrelated fork root"
         );
@@ -5368,6 +7388,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         let data = &mounts[0].host;
@@ -5431,6 +7452,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         );
         clear_copy_checkpoint();
 
@@ -5491,6 +7513,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         );
         clear_copy_checkpoint();
 
@@ -5553,6 +7576,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &ProtectedHostFiles::measure(Some(&home)).unwrap(),
+            &DeclaredOrigins::new(),
         );
         clear_resolve_checkpoint();
         clear_copy_checkpoint();
@@ -5622,6 +7646,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         );
         clear_resolve_checkpoint();
         clear_copy_checkpoint();
@@ -5745,6 +7770,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         )
         .unwrap();
         let data = &mounts[0].host;
@@ -5795,6 +7821,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &ProtectedHostFiles::measure(Some(&home)).unwrap(),
+            &DeclaredOrigins::new(),
         );
 
         result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
@@ -5857,6 +7884,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &ProtectedHostFiles::measure(Some(&home)).unwrap(),
+            &DeclaredOrigins::new(),
         );
 
         result.unwrap_or_else(|error| panic!("unexpected Pi-home refusal: {error:?}"));
@@ -5931,6 +7959,7 @@ mod prepare_tests {
             store.path(),
             &std::collections::HashMap::new(),
             &launch,
+            &DeclaredOrigins::new(),
         );
         clear_copy_checkpoint();
 
@@ -6101,6 +8130,7 @@ mod config_dir_guard_tests {
                 account_home: None,
                 core_guest_mounts: vec![],
                 core_host_sources: sources,
+                persisted_home: crate::guest_home::PersistedHome::none(),
             }
         }
         fn refused(&self, requests: Vec<ExtraMount>, context: &MountContext, text: &str) {

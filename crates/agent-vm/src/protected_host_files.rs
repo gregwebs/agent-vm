@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use vstd::prelude::*;
 
+use crate::mount::Declaration;
+
 /// `$HOME`-relative directory Pi calls its home.
 const PI_HOME_NAME: &str = ".pi";
 
@@ -234,12 +236,17 @@ impl ResolvedRoot {
     /// `canonicalize` message matches `copy_root`'s pre-existing one, so a root
     /// that vanishes between the source-kind check and the copy keeps failing
     /// closed with the same error.
-    pub(crate) fn resolve(source: &Path) -> Result<Self> {
+    ///
+    /// `declaration` decides how the root is named: an argv `--mount` keeps its
+    /// bare path, while a config entry names itself as `mounts[N] in "<file>"`
+    /// and escapes the path, which at this point is the *expanded* spelling and
+    /// carries whatever bytes the entry held.
+    pub(crate) fn resolve(source: &Path, declaration: Declaration<'_>) -> Result<Self> {
         let path = source
             .canonicalize()
-            .with_context(|| format!("resolving fork root {}", source.display()))?;
+            .with_context(|| format!("resolving fork root {}", declaration.fork_root(source)))?;
         let metadata = fs::metadata(&path)
-            .with_context(|| format!("resolving fork root {}", path.display()))?;
+            .with_context(|| format!("resolving fork root {}", declaration.fork_root(&path)))?;
         Ok(Self {
             path,
             dev: metadata.dev(),
@@ -493,12 +500,19 @@ impl ProtectedHostFiles {
     /// Human-readable refusal for an explicit or `follow-links`-discovered
     /// live bind. One place, so tests assert one string.
     ///
+    /// `subject` is how the offending *declaration* is named: `--mount` for
+    /// argv, and the config entry's own `mounts[N] in "<file>"` for a verified
+    /// user `mounts` entry, so a launch-time refusal names the field the author
+    /// has to edit. The remedy below stays `--mount`-shaped: it is advice about
+    /// a format, and the config spelling is the same grammar.
+    ///
     /// `discovered_by` is the *rendered* provenance of a discovered bind
     /// (e.g. ``--mount ~/code:follow-links``), not a spelling to wrap: two
     /// `:follow-links` declarations can discover one bind, and the caller is
     /// the only place that knows whether the attribution is unambiguous.
     pub(crate) fn message(
         &self,
+        subject: &str,
         source_spelling: &str,
         exposure: &Exposure,
         discovered_by: Option<&str>,
@@ -514,7 +528,7 @@ impl ProtectedHostFiles {
             None => String::new(),
         };
         format!(
-            "--mount {source_spelling} would expose the {} {}{}{discovered}\n\
+            "{subject} {source_spelling} would expose the {} {}{}{discovered}\n\
              agent-vm keeps host Pi credentials host-side and gives the guest placeholders.\n\
              {}",
             exposure.file.description(),
@@ -1083,7 +1097,39 @@ mod tests {
     /// Construct a genuine [`ResolvedRoot`] through its only constructor
     /// against a real directory (R3.3: never a struct literal).
     fn resolve_root(path: &Path) -> ResolvedRoot {
-        ResolvedRoot::resolve(path).unwrap()
+        ResolvedRoot::resolve(path, Declaration::Argv).unwrap()
+    }
+
+    /// A config entry's fork root is named and escaped, so a newline in the
+    /// spelling cannot forge a second diagnostic line. This is the resolve step
+    /// `mount::prepare` reaches on the copy path, i.e. after every load-time
+    /// check has already accepted the entry, so it is the last place a config
+    /// spelling can reach a message.
+    #[test]
+    fn a_config_fork_root_cannot_forge_a_line() {
+        let home = tempfile::tempdir().unwrap();
+        let missing = home.path().join("dang\nFORGED-LINE");
+        let file = home.path().join("config.toml");
+        let declaration = Declaration::UserConfig {
+            file: &file,
+            index: 2,
+        };
+        let error = match ResolvedRoot::resolve(&missing, declaration) {
+            Ok(_) => panic!("a missing fork root must not resolve"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert_eq!(
+            rendered.lines().count(),
+            1,
+            "one line, and never a forged second: {rendered}"
+        );
+        assert!(rendered.contains("mounts[2] in"), "{rendered}");
+        assert!(rendered.contains("dang\\x0aFORGED-LINE"), "{rendered}");
+        assert!(
+            !rendered.lines().any(|line| line.trim() == "FORGED-LINE"),
+            "the spelling is escaped, not printed as a line: {rendered}"
+        );
     }
 
     /// The TOCTOU-defeating case: an implementation that measured only existing
@@ -1203,7 +1249,7 @@ mod tests {
         // The Pi home itself: `:fork` is exactly the remedy (a fork omits the
         // protected files and copies everything else).
         assert_eq!(
-            protected.message("~/.pi", &exposure, None),
+            protected.message("--mount", "~/.pi", &exposure, None),
             format!(
                 "--mount ~/.pi would expose the host Pi credential file {home}/.pi/agent/auth.json \
                  (as agent/auth.json inside {home}/.pi)\n\
@@ -1216,7 +1262,12 @@ mod tests {
         // A discovered bind names the declaration it came from.
         assert!(
             protected
-                .message("~/.pi", &exposure, Some("--mount ~/code:follow-links"))
+                .message(
+                    "--mount",
+                    "~/.pi",
+                    &exposure,
+                    Some("--mount ~/code:follow-links")
+                )
                 .contains("(discovered by --mount ~/code:follow-links)")
         );
 
@@ -1224,7 +1275,7 @@ mod tests {
         // every other secret under it into project state, so the message must
         // lead with a narrower path and must not present `:fork` as the fix.
         let broad = protected.exposure(&home).unwrap().unwrap();
-        let message = protected.message(&home.display().to_string(), &broad, None);
+        let message = protected.message("--mount", &home.display().to_string(), &broad, None);
         assert!(message.contains("Mount a narrower path"), "{message}");
         assert!(
             !message.contains(&format!("Use `--mount {}:fork`", home.display())),
@@ -1244,7 +1295,7 @@ mod tests {
             .exposure(&home.join(".pi/agent/auth.json"))
             .unwrap()
             .unwrap();
-        let message = protected.message("~/.pi/agent/auth.json", &file, None);
+        let message = protected.message("--mount", "~/.pi/agent/auth.json", &file, None);
         assert!(message.contains("cannot be mounted at all"), "{message}");
         assert!(!message.contains(":fork"), "{message}");
     }

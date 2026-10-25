@@ -62,6 +62,7 @@ if [[ "$guard_only" == false ]]; then
     bash "$REPO_ROOT/script/test/e2e-release-contract.sh"
     bash "$REPO_ROOT/script/test/egress-default-deny-contract.sh"
     bash "$REPO_ROOT/script/test/config-dir-guard-contract.sh"
+    bash "$REPO_ROOT/script/test/config-mounts-contract.sh"
     bash "$REPO_ROOT/script/test/build-provenance-contract.sh"
     bash "$REPO_ROOT/script/test/persisted-network-contract.sh"
     # Mutation anchors must still name lines that exist; otherwise the
@@ -107,6 +108,9 @@ syntax_check=(
     script/test/fixtures/persisted-network/guest-pn-probe.sh
     script/test/config-dir-guard-live.sh
     script/test/config-dir-guard-contract.sh
+    script/test/config-mounts-live.sh
+    script/test/config-mounts-contract.sh
+    script/test/fixtures/config-mounts/guest-cm-probe.sh
     script/test/fixtures/config-dir-guard/guest-n1a.sh
     script/test/fixtures/config-dir-guard/guest-n1b.sh
     script/test/fixtures/config-dir-guard/guest-n3.sh
@@ -154,6 +158,9 @@ shellcheck_files=(
     script/test/fixtures/persisted-network/guest-pn-probe.sh
     script/test/config-dir-guard-live.sh
     script/test/config-dir-guard-contract.sh
+    script/test/config-mounts-live.sh
+    script/test/config-mounts-contract.sh
+    script/test/fixtures/config-mounts/guest-cm-probe.sh
     script/test/fixtures/config-dir-guard/guest-n1a.sh
     script/test/fixtures/config-dir-guard/guest-n1b.sh
     script/test/fixtures/config-dir-guard/guest-n3.sh
@@ -224,6 +231,12 @@ assert_listed 'shellcheck' 'script/test/fixtures/config-dir-guard/guest-n3.sh' "
 assert_listed 'shellcheck' 'script/test/fixtures/config-dir-guard/guest-n4.sh' "${shellcheck_files[@]}"
 assert_listed 'shellcheck' 'script/test/fixtures/config-dir-guard/guest-n5.sh' "${shellcheck_files[@]}"
 assert_listed 'shellcheck' 'script/test/fixtures/config-dir-guard/guest-n7.sh' "${shellcheck_files[@]}"
+assert_listed 'bash -n' 'script/test/config-mounts-live.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/config-mounts-contract.sh' "${syntax_check[@]}"
+assert_listed 'bash -n' 'script/test/fixtures/config-mounts/guest-cm-probe.sh' "${syntax_check[@]}"
+assert_listed 'shellcheck' 'script/test/config-mounts-live.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/config-mounts-contract.sh' "${shellcheck_files[@]}"
+assert_listed 'shellcheck' 'script/test/fixtures/config-mounts/guest-cm-probe.sh' "${shellcheck_files[@]}"
 
 is_vendored() {
     [[ "$1" == vendor/microsandbox/* ]]

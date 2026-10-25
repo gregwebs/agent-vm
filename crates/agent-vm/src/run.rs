@@ -451,6 +451,10 @@ Fork mounts:
   host-managed project mount store beside `/agent-vm-state`. To reset/reseed, stop users of the
   fork, remove the exact directory printed at launch, then launch the same declaration again.
 
+Config mounts:
+  mounts = [\"~/ref:ro\", ...] in ~/.config/agent-vm/config.toml apply to every launch
+  (verified file, like [network]); --no-config-mounts skips them for one launch.
+
 Networking (deny-by-default; flags compose):
   --publish                host  → guest     open an inbound port to a guest service
   --auto-publish           guest → host      mirror guest listeners onto host loopback
@@ -590,12 +594,30 @@ pub struct Args {
     /// budget up to 2x the symlink count, not 1x. Capacity depends on the
     /// host interrupt model and runtime; do not treat a measurement from
     /// one platform as a portable mount limit.
+    ///
+    /// Adds to the user config's `mounts`; identical declarations merge and
+    /// different ones at the same guest path are refused (no override).
     #[arg(
         long = "mount",
         value_name = "HOST[:GUEST][:MODE]...",
         help_heading = "Mounts & ports"
     )]
     pub(crate) mount: Vec<String>,
+
+    /// Skip this launch's config mounts (`mounts` in `~/.config/agent-vm/config.toml`).
+    ///
+    /// Only the automatic selection is skipped: explicit `--mount` still applies, and
+    /// credentials, persisted paths, agent-vm's own mounts, and every config check
+    /// (schema, mount syntax, file authority) are unchanged. A broken or untrusted
+    /// config still fails the launch. There is deliberately no environment variable:
+    /// skipping ambient host exposure is a per-launch decision made at the command
+    /// line, and the same option placed after the tool verb is forwarded to the tool.
+    #[arg(
+        long = "no-config-mounts",
+        default_value_t = false,
+        help_heading = "Mounts & ports"
+    )]
+    no_config_mounts: bool,
 
     #[command(flatten)]
     network: crate::network::Args,
@@ -620,11 +642,24 @@ pub struct Args {
     pub(crate) root: bool,
 }
 
+impl Args {
+    /// `--no-config-mounts`, read once here so selection has one policy value to
+    /// consume instead of a flag it could reinterpret.
+    pub(crate) fn config_mount_policy(&self) -> crate::mount_selection::ConfigMountPolicy {
+        if self.no_config_mounts {
+            crate::mount_selection::ConfigMountPolicy::Suppress
+        } else {
+            crate::mount_selection::ConfigMountPolicy::Apply
+        }
+    }
+}
+
 /// Lower the selected target once, then retain the shared setup and exec path.
 pub(crate) async fn launch(
     target: LaunchTarget,
     images: &ConfiguredImages,
     user_network: Option<&crate::user_network::UserNetwork>,
+    user_mounts: Option<&crate::config_mounts::UserMounts>,
     credential_preflight: CredentialPreflight,
     args: Args,
 ) -> Result<i32> {
@@ -644,6 +679,11 @@ pub(crate) async fn launch(
     // configured image must not create state. `args.image.requested()` also
     // applies the empty-`AGENT_VM_IMAGE_TAG`-is-unset rule.
     let boot = boot_image::select(args.image.requested()?, images)?;
+    // `--no-config-mounts` is read once, here, because the network plan below
+    // moves one of `args`' fields out: the policy is a plain `Copy` decision
+    // with no bearing on the plan's order, and the selection it feeds cannot
+    // re-read the flag after the move.
+    let config_mount_policy = args.config_mount_policy();
     let network_plan = crate::network::Plan::from_args(args.network, user_network)?;
     // The one output policy for this selection: explicit sources render their
     // escaped reference; the default tier renders a fixed label and redacts the
@@ -668,6 +708,16 @@ pub(crate) async fn launch(
     // further down, so it has to be known before any of that runs.
     let root_mode = user::should_run_root(args.root, env::var("AGENT_VM_ROOT").ok().as_deref());
     let guest_identity = user::resolve_guest_identity(root_mode)?;
+    // The guest HOME those links live under: `/root` in root mode (whose rootfs
+    // bakes them in, so nothing real is ever at a link path) and the mirrored
+    // host HOME otherwise. Needed *before* mount preparation: it is what turns "a
+    // mount at this guest path" into "a mount that shadows a `persist` link",
+    // and that collision has to be refused before any fork is published
+    // (ADR-0046 Decision 6).
+    let guest_home_path = guest_identity
+        .as_ref()
+        .map(|identity| PathBuf::from(identity.host_home()))
+        .unwrap_or_else(|| PathBuf::from("/root"));
     // Independent of `guest_identity` (which is `None` under `--root`) so
     // the `--mount …:follow-links` $HOME guardrail is still enforced in
     // root mode instead of silently no-op'ing. See `mount::expand_follow_links`.
@@ -713,40 +763,31 @@ pub(crate) async fn launch(
             .iter()
             .map(|volume| CoreHostSource::new(volume.bind, volume.host_path.clone()))
             .collect(),
+        // The same link list both provisioning sites consume, so the pre-fork
+        // collision check cannot drift from the links that are actually created.
+        crate::guest_home::PersistedHome::new(guest_home_path, &home_links),
     )?;
-    let mount_plan = mount::prepare(
-        mount::parse_extra_mounts(&args.mount).context("parsing --mount")?,
-        &mount_context,
-    )
-    .context("preparing --mount")?;
-
-    // A `persist` path that overlaps a guest mount point (the project bind, when
-    // it lives under HOME, or any `--mount` under HOME) would be silently
-    // shadowed: agentd mounts HOME first, then creates the project mountpoint
-    // *inside* the already-mounted HOME and mounts over it (ADR-0002). Checked
-    // here — after the mount plan is resolved, before anything is provisioned —
-    // because the project path is not a config fact, and a rejected launch must
-    // not create state.
-    let guest_home_path = guest_identity
-        .as_ref()
-        .map(|identity| PathBuf::from(identity.host_home()))
-        .unwrap_or_else(|| PathBuf::from("/root"));
-    let mut guest_mount_paths: Vec<PathBuf> = core_volumes
-        .iter()
-        .map(|volume| PathBuf::from(&volume.guest_path))
-        .collect();
-    guest_mount_paths.extend(mount_plan.volumes.iter().map(|volume| volume.guest.clone()));
-    if let Some((link, mount)) =
-        crate::guest_home::mount_conflicts(&home_links, &guest_home_path, &guest_mount_paths)
-            .first()
-    {
-        anyhow::bail!(
-            "config: persist path {} would collide with the guest mount point {}; \
-             rename the persist path or move the mount",
-            crate::config::escape_path(&link.home_relative),
-            crate::config::escape_path(mount)
-        );
-    }
+    // Selection is pure: it decides which declaration sources this launch asks
+    // for (verified user `mounts` unless `--no-config-mounts`, then argv) and
+    // touches nothing. `prepare` below is still the only boundary that inspects
+    // a source or publishes a fork.
+    let mut selection =
+        crate::mount_selection::select(user_mounts, config_mount_policy, &args.mount)?;
+    // Captured before `prepare` so the error context and the emitted plan share
+    // one fact; named for the method, not for `mount_context` above, which is the
+    // context *value* `prepare` measures against.
+    let preparation_context = selection.preparation_context();
+    let mount_requests = selection.take_requests();
+    let mount_plan = mount::prepare(mount_requests, &mount_context).map_err(|error| {
+        // A persisted-HOME collision is not a `--mount` failure — the core
+        // project bind alone can cause it — and its own sentence already names
+        // the remedy, so it keeps its exact bytes and its own top line.
+        if error.is::<crate::guest_home::PersistCollision>() {
+            error
+        } else {
+            error.context(preparation_context)
+        }
+    })?;
 
     // These checks open/create Microsandbox state, so they must remain after
     // the side-effect-free mount rejection boundary.
@@ -879,6 +920,14 @@ pub(crate) async fn launch(
     // Parse and prepare once.  In particular, preparation validates the
     // complete mount plan before it creates fork state, scans repositories,
     // snapshots credentials, or hands anything to the sandbox builder.
+    //
+    // The config half is named first: a reader must be able to tell which host
+    // paths this launch exposed *because of the file* before any per-mount
+    // notice describes them. Both lines print after the banner, so a rejected
+    // topology still emits nothing.
+    if let Some(notice) = selection.notice() {
+        notices.emit(notice)?;
+    }
     for notice in &mount_plan.notices {
         notices.emit(notice)?;
     }
@@ -2654,6 +2703,7 @@ fn launch_mount_context(
     host_home: Option<PathBuf>,
     core_guest_mounts: Vec<PathBuf>,
     core_host_sources: Vec<CoreHostSource>,
+    persisted_home: crate::guest_home::PersistedHome,
 ) -> Result<mount::MountContext> {
     let authority_home = config::host_home_dir().context("locating the authority home")?;
     Ok(mount::MountContext {
@@ -2663,6 +2713,7 @@ fn launch_mount_context(
         account_home: user::account_home_dir(),
         core_guest_mounts,
         core_host_sources,
+        persisted_home,
     })
 }
 
@@ -2725,6 +2776,7 @@ mod tests {
             user::host_home_dir(),
             Vec::new(),
             Vec::new(),
+            crate::guest_home::PersistedHome::none(),
         )
         .unwrap();
         let selected = context.authority_home.as_ref().expect("raw authority HOME");
@@ -2753,6 +2805,7 @@ mod tests {
         crate::config::load(&crate::config::ConfigPaths {
             user: Some(dir.path().join("no-user-config.toml")),
             project: dir.path().join("no-project-config.toml"),
+            home: None,
         })
         .expect("the embedded default catalog parses")
         .into_launch_catalog()
@@ -3473,6 +3526,11 @@ mod tests {
         assert!(plan < position("mount::prepare("));
         assert!(plan < position("ensure_msb_home("));
         assert!(plan < notices);
+        // Selecting the declaration sources is pure and must stay ahead of the
+        // boundary that inspects sources and publishes forks.
+        let select = position("mount_selection::select(");
+        assert!(select < position("mount::prepare("));
+        assert!(select < position("ensure_msb_home("));
         let report = position("network_plan\n            .request_report(");
         assert!(notices < report && report < base_network);
         assert!(base_network < credential_network);
@@ -3560,6 +3618,8 @@ mod tests {
         let catalog = crate::config::load(&crate::config::ConfigPaths {
             user: None,
             project,
+
+            home: None,
         })
         .unwrap()
         .into_launch_catalog()
@@ -4750,6 +4810,7 @@ options ndots:2 timeout:1";
                     host_home: Some(test_home()),
                     core_guest_mounts: Vec::new(),
                     core_host_sources: Vec::new(),
+                    persisted_home: crate::guest_home::PersistedHome::none(),
                 },
             )
             .unwrap();
@@ -4795,6 +4856,7 @@ options ndots:2 timeout:1";
             host_home: Some(test_home()),
             core_guest_mounts: Vec::new(),
             core_host_sources: Vec::new(),
+            persisted_home: crate::guest_home::PersistedHome::none(),
         };
         let first = mount::prepare(
             mount::parse_extra_mounts(std::slice::from_ref(&raw)).unwrap(),
@@ -4843,6 +4905,7 @@ options ndots:2 timeout:1";
                 host_home: Some(test_home()),
                 core_guest_mounts: Vec::new(),
                 core_host_sources: Vec::new(),
+                persisted_home: crate::guest_home::PersistedHome::none(),
             },
         )
         .unwrap();

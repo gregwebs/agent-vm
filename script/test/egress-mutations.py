@@ -44,7 +44,8 @@ CLEAN_PACKAGE = ["cargo", "clean", "-p", "agent-vm"]
 # Build the units the matrix runs, so its cold dependency build happens once,
 # outside every per-control timeout.
 WARMUP = ["cargo", "test", "--locked", "-p", "agent-vm", "--no-run",
-          "--bin", "agent-vm", "--test", "config_launch_driven"]
+          "--bin", "agent-vm", "--test", "config_launch_driven",
+          "--test", "config_mounts"]
 WARMUP_TIMEOUT = 3600
 CONTROL_TIMEOUT = 240
 SRC = "crates/agent-vm/src/"
@@ -54,14 +55,21 @@ GRAMMAR = SRC + "egress_grammar.rs"
 NETWORK = SRC + "network.rs"
 FIXTURE = "script/test/lib/egress-fixtures.py"
 PROBE = "script/test/fixtures/egress-probe.sh"
+LAUNCH = "config_launch_driven"
+MOUNTS = "config_mounts"
 
 
-def rust(pattern, integration=False):
+def rust(pattern, test=None):
+    """A unit row (`--bin agent-vm`) or an integration row in one named target.
+
+    The target is named explicitly rather than inferred, so a row cannot pass by
+    running a test of the same name in a different binary.
+    """
     # JSON messages are how the harness learns whether cargo recompiled the
     # package or answered from an artifact it did not compile from the mutation.
     return [
         "cargo", "test", "--locked", "-p", "agent-vm", "--message-format=json-render-diagnostics",
-        *(["--test", "config_launch_driven"] if integration else ["--bin", "agent-vm"]), pattern,
+        *(["--test", test] if test else ["--bin", "agent-vm"]), pattern,
     ]
 
 
@@ -106,6 +114,12 @@ def outcome(name, command, marker, exit_code, text, package, target):
             return "FAIL", f"cargo reused a fresh {target} artifact; the mutation was never compiled"
         if not any(not message.get("fresh") for message in artifacts):
             return "FAIL", f"cargo reported no {target} compilation; the mutation was never compiled"
+        if exit_code == 0 and not re.search(r"^running [1-9]\d* tests?$", text, re.MULTILINE):
+            # A filter that matches nothing exits 0 with a green "test result: ok"
+            # line, which is indistinguishable from a surviving mutant unless it
+            # is named. A typo'd filter must never read as "the test did not
+            # detect the mutation".
+            return "FAIL", "the killing filter matched no test (harness failure)"
     return ("PASS", None) if killed else ("FAIL", None)
 
 
@@ -178,8 +192,8 @@ def matrix():
     dense = rust("network::tests::default_plan_denies_all_egress_and_preserves_non_policy_network_config")
     early = "if self.publish_ports.is_empty() && !self.auto_publish { return builder; }\n        let policy = self.egress.policy();"
     add("early-return", NETWORK, "let policy = self.egress.policy();", early, dense)
-    add("early-return-g1", NETWORK, "let policy = self.egress.policy();", early, rust("default_tools_launch_with_their_declared_provisioning", True))
-    add("early-return-g2", NETWORK, "let policy = self.egress.policy();", early, rust("a_zero_provisioning_launch_boots_with_no_tls_overlay", True))
+    add("early-return-g1", NETWORK, "let policy = self.egress.policy();", early, rust("default_tools_launch_with_their_declared_provisioning", LAUNCH))
+    add("early-return-g2", NETWORK, "let policy = self.egress.policy();", early, rust("a_zero_provisioning_launch_boots_with_no_tls_overlay", LAUNCH))
     for name, expression in (
         ("strict", "network.strict(false)"),
         ("tls", "network.tls(|tls| tls.enabled(true))"),
@@ -194,7 +208,7 @@ def matrix():
     add("unknown-key", NETWORK, 'applied.as_object_mut().unwrap().remove("policy");', 'applied["unknown_mutation"] = serde_json::json!(true);\n        applied.as_object_mut().unwrap().remove("policy");', dense)
     # Inject into the applied object, never expected defaults or launch goldens.
     # The shared G1/G2 helper is faulted through both actual launch callers.
-    zero = rust("a_zero_provisioning_launch_boots_with_no_tls_overlay", True)
+    zero = rust("a_zero_provisioning_launch_boots_with_no_tls_overlay", LAUNCH)
     for name, injection in (
         ("secret", 'network["secrets"]["secrets"] = serde_json::json!([{ "env_var": "MSB_MUTANT" }]);'),
         ("header", 'network["secrets"]["header_credentials"] = serde_json::json!([{ "id": "mutant" }]);'),
@@ -206,7 +220,7 @@ def matrix():
         ("missing-secrets", 'network["secrets"].as_object_mut().unwrap().remove("secrets");'),
         ("missing-rules", 'network["intercept"].as_object_mut().unwrap().remove("rules");'),
     ):
-        for prefix, command in (("zero-", zero), ("g1-", rust("default_tools_launch_with_their_declared_provisioning", True))):
+        for prefix, command in (("zero-", zero), ("g1-", rust("default_tools_launch_with_their_declared_provisioning", LAUNCH))):
             add(prefix + name, TEST,
                 'fn assert_default_deny_zero_provision_network(network: &serde_json::Value, context: &str) {',
                 'fn assert_default_deny_zero_provision_network(network: &serde_json::Value, context: &str) {\n    let mut changed = network.clone();\n    let network = &mut changed;\n    ' + injection, command)
@@ -215,7 +229,7 @@ def matrix():
         'let base_ports = intercepted_ports_of(&network)?;\n        network = network.policy(serde_json::from_value(serde_json::json!({"default_egress":"deny","default_ingress":"allow","rules": [\n' +
         ','.join(['{"direction":"egress","destination":{"group":"public"},"protocols":[],"ports":[],"action":"allow"}'] * 4) +
         ']})).unwrap());', rust("credential_overlay_preserves_base_network_plan"))
-    g4 = rust("rejected_allowance_is_refused_before_launch_state_is_created", True)
+    g4 = rust("rejected_allowance_is_refused_before_launch_state_is_created", LAUNCH)
     for name, suffix in (("project", ""), ("mounts", ".mounts"), ("secrets", ".secrets")):
         add("preparse-" + name, SRC + "run.rs",
             "\n    let network_plan = crate::network::Plan::from_args(args.network, user_network)?;",
@@ -278,7 +292,7 @@ def matrix():
     add("account-home-dropped", SRC + "mount.rs",
         "        .chain(context.account_home.iter())",
         "", rust("mount"))
-    persisted = SRC + "user_network.rs"
+    persisted = SRC + "config_authority.rs"
     grant_old = """    match cli.0 {
         Some(c) => ResolvedGrant { enabled: c, source: GrantSource::Cli },
         None => match saved.0 {
@@ -295,21 +309,126 @@ def matrix():
     }"""
     for name, path, old, new, tests in (
         ("saved-beats-cli", EGRESS, grant_old, grant_new, egress),
-        ("directory-owner-ignored", persisted, "if dir.uid != euid { return Some(AuthorityRefusal::DirOwner); }", "if false { return Some(AuthorityRefusal::DirOwner); }", rust("user_network::tests")),
-        ("directory-writable-ignored", persisted, "if dir.mode & 0o022 != 0 { return Some(AuthorityRefusal::DirWritable); }", "if false { return Some(AuthorityRefusal::DirWritable); }", rust("user_network::tests")),
-        ("file-owner-ignored", persisted, "if f.uid != euid { Some(AuthorityRefusal::FileOwner) }", "if false { Some(AuthorityRefusal::FileOwner) }", rust("user_network::tests")),
-        ("symlink-trusted", persisted, "Reached::ThroughSymlink => Some(AuthorityRefusal::ThroughSymlink)", "Reached::ThroughSymlink => None", rust("user_network::tests")),
-        ("links-ignored", persisted, "else if !authority_file_singly_linked(f.nlink) { Some(AuthorityRefusal::FileLinks(f.nlink)) }", "else if false { Some(AuthorityRefusal::FileLinks(f.nlink)) }", rust("user_network::tests")),
-        ("mask-other-only", persisted, "else if f.mode & 0o022 != 0", "else if f.mode & 0o002 != 0", rust("user_network::tests")),
+        ("directory-owner-ignored", persisted, "if dir.uid != euid { return Some(AuthorityRefusal::DirOwner); }", "if false { return Some(AuthorityRefusal::DirOwner); }", rust("config_authority::tests")),
+        ("directory-writable-ignored", persisted, "if dir.mode & 0o022 != 0 { return Some(AuthorityRefusal::DirWritable); }", "if false { return Some(AuthorityRefusal::DirWritable); }", rust("config_authority::tests")),
+        ("file-owner-ignored", persisted, "if f.uid != euid { Some(AuthorityRefusal::FileOwner) }", "if false { Some(AuthorityRefusal::FileOwner) }", rust("config_authority::tests")),
+        ("symlink-trusted", persisted, "Reached::ThroughSymlink => Some(AuthorityRefusal::ThroughSymlink)", "Reached::ThroughSymlink => None", rust("config_authority::tests")),
+        ("links-ignored", persisted, "else if !authority_file_singly_linked(f.nlink) { Some(AuthorityRefusal::FileLinks(f.nlink)) }", "else if false { Some(AuthorityRefusal::FileLinks(f.nlink)) }", rust("config_authority::tests")),
+        ("mask-other-only", persisted, "else if f.mode & 0o022 != 0", "else if f.mode & 0o002 != 0", rust("config_authority::tests")),
     ):
         add(name, path, old, new, tests)
         add(name + "-proof", path, old, new, gate, "verification results::")
+    # Presence, not contents, is what makes a user file authority-bearing
+    # (ADR-0040/0046). The anchor is the kernel body, never its `ensures`
+    # clause, so replacing it cannot weaken the contract it is checked against.
+    authority_or = "if t.network { true } else { t.mounts }"
+    authority_or_mutant = "if t.network { t.mounts } else { false }"
+    add("config-mounts-authority-or", persisted, authority_or, authority_or_mutant,
+        rust("authority_required_matches_the_four_rows"))
+    add("config-mounts-authority-or-proof", persisted, authority_or, authority_or_mutant,
+        gate, "verification results::")
+    # The merge/refuse rule decides whether a declaration is silently dropped
+    # (a last-wins override) or refused, now that config and argv claims meet.
+    # Both anchors are kernel *bodies*; their `ensures` clauses spell the same
+    # rules in a shape the bodies never use, so the `-proof` twins still catch a
+    # mutated implementation rather than a weakened contract.
+    mounts = SRC + "mount.rs"
+    conflict_merged = "else { ClaimDecision::Conflict }"
+    conflict_merged_mutant = "else { ClaimDecision::Merge }"
+    add("config-mounts-claim-conflict-merged", mounts, conflict_merged, conflict_merged_mutant,
+        rust("claim_decision_matches_the_oracle_table"))
+    add("config-mounts-claim-conflict-merged-proof", mounts, conflict_merged, conflict_merged_mutant,
+        gate, "verification results::")
+    # `declarations_equivalent` is the merge half of the same rule, and every one
+    # of its six facts is load-bearing. `exclusions` is the fact a reader is
+    # least likely to notice: dropping it merges two fork declarations that
+    # differ only in what they leave out of the copy, so one declaration
+    # disappears and its exclusions silently stop applying. The anchor is the
+    # kernel *body*; its `ensures` spells the same conjunction in a shape the
+    # body never uses, so the `-proof` twin catches the mutated body rather than
+    # a weakened contract.
+    equivalent_exclusions = "    if !f.fork { return false; }\n    f.exclusions"
+    equivalent_exclusions_mutant = "    if !f.fork { return false; }\n    true"
+    add("config-mounts-equivalent-exclusions-dropped", mounts, equivalent_exclusions,
+        equivalent_exclusions_mutant, rust("declarations_equivalent_matches_the_oracle_table"))
+    add("config-mounts-equivalent-exclusions-dropped-proof", mounts, equivalent_exclusions,
+        equivalent_exclusions_mutant, gate, "verification results::")
+    # The launch half of the same rule: a config/argv pair that disagrees must
+    # refuse, so the mutant's silent merge is observable as a launch that
+    # reaches builder wiring instead of naming both origins.
+    add("config-mounts-claim-conflict-merged-launch", mounts, conflict_merged,
+        conflict_merged_mutant,
+        rust("config_and_cli_conflicts_are_refused_naming_both", MOUNTS))
+    # `~` may expand for user `mounts` and never for `--mount`: the shell already
+    # expanded argv, so a quoted `~/x` must stay "must be absolute".
+    home_on_cli = "else if home == HomeExpansion::Enabled && bytes.len() >= 2"
+    home_on_cli_mutant = "else if bytes.len() >= 2"
+    add("config-mounts-home-expanded-on-cli", mounts, home_on_cli, home_on_cli_mutant,
+        rust("host_spelling_matches_the_oracle_table"))
+    add("config-mounts-home-expanded-on-cli-proof", mounts, home_on_cli, home_on_cli_mutant,
+        gate, "verification results::")
+    # A mount that shadows a declared `persist` link is refused inside
+    # `mount::prepare`, ahead of `prepare_forks` (ADR-0046 Decision 6). Skipping
+    # the check does not merely move a message: the plan publishes a fork copy of
+    # the user's directory for a launch that is then refused. Both rows kill on
+    # "a fork store exists after a refusal", the unit one through `prepare`'s
+    # absent store path and the launch one through the whole-process snapshot.
+    persist_skipped = "    context.persisted_home.refuse_conflicts(&destinations)?;"
+    persist_skipped_mutant = "    let _ = &destinations;"
+    add("config-mounts-persist-check-skipped", mounts, persist_skipped, persist_skipped_mutant,
+        rust("persist_collision_refuses_before_any_fork_store"))
+    # The launch row kills through the config route: the declaration that
+    # causes the collision *and* the fork are both in the user file, so this is
+    # the path a user actually hits (the two CLI-only rows above stay as the
+    # declaration-source-independent red tests they were written as).
+    add("config-mounts-persist-check-skipped-launch", mounts, persist_skipped,
+        persist_skipped_mutant,
+        rust("a_config_fork_shadowing_a_persist_path_is_refused_before_any_fork", MOUNTS))
+    # `--no-config-mounts` withholds the user config's declarations and nothing
+    # else (ADR-0046 Decision 5). The anchor is the kernel *body*: its `ensures`
+    # spells the same rule as `r == (f.declared && !f.suppressed)`, a shape the
+    # body never uses, so the `-proof` twin still catches a mutated body.
+    selection = SRC + "mount_selection.rs"
+    opt_out = "if f.suppressed { false } else { f.declared }"
+    opt_out_mutant = "if false { false } else { f.declared }"
+    add("config-mounts-opt-out-ignored", selection, opt_out, opt_out_mutant,
+        rust("config_mounts_selected_matches_the_four_rows"))
+    add("config-mounts-opt-out-ignored-proof", selection, opt_out, opt_out_mutant,
+        gate, "verification results::")
+    add("config-mounts-opt-out-ignored-launch", selection, opt_out, opt_out_mutant,
+        rust("opt_out_keeps_cli_core_and_persisted_paths", MOUNTS))
     add("user-allowances-dropped", EGRESS,
         "for entry in user_entries.iter().chain(&cli_entries) {",
-        "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", True))
-    add("verify-always-skipped", SRC + "config.rs",
-        'FileTierKind::User => user_network::from_user_tier(read, table)\n            .map(Some)\n            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(read.path()))),',
-        'FileTierKind::User => Ok(None),', rust("unsafe_user_network_is_refused_before_launch_state", True))
+        "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", LAUNCH))
+    verify_arm = ('FileTierKind::User => config_authority::verify(&read, triggers)\n'
+                  '            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,')
+    add("verify-always-skipped", SRC + "config.rs", verify_arm,
+        'FileTierKind::User => None,', rust("unsafe_user_network_is_refused_before_launch_state", LAUNCH))
+    # A present `mounts` key makes a user file authority-bearing, empty list
+    # included: the trigger reads the *presence* of the field, so both mutants
+    # below keep the field but drop its effect, and a symlinked `mounts = []`
+    # file then loads through the compatibility path meant for tools-only files.
+    mounts_present = "        mounts: raw.mounts.is_some(),\n    };"
+    mounts_absent_mutant = "        mounts: false,\n    };"
+    mounts_nonempty_mutant = (
+        "        mounts: raw.mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),\n    };")
+    add("config-mounts-presence-ignored", SRC + "config.rs", mounts_present,
+        mounts_absent_mutant, rust("present_empty_mounts_through_a_symlink_is_refused"))
+    add("config-mounts-presence-ignored-launch", SRC + "config.rs", mounts_present,
+        mounts_absent_mutant, rust("unsafe_user_mounts_are_refused_before_launch_state", MOUNTS))
+    add("config-mounts-empty-unverified", SRC + "config.rs", mounts_present,
+        mounts_nonempty_mutant, rust("present_empty_mounts_through_a_symlink_is_refused"))
+    add("config-mounts-empty-unverified-launch", SRC + "config.rs", mounts_present,
+        mounts_nonempty_mutant, rust("empty_mounts_still_requires_a_verified_file", MOUNTS))
+    add("config-mounts-verify-skipped-launch", SRC + "config.rs", verify_arm,
+        'FileTierKind::User => None,', rust("unsafe_user_mounts_are_refused_before_launch_state", MOUNTS))
+    # The project tier may not declare mounts at all (ADR-0046 is user-scope), so
+    # the refusal is a boundary in its own right: without it a project checkout
+    # would hand every launch of it a host bind.
+    add("config-mounts-project-mounts-accepted", SRC + "config.rs",
+        "    if raw.mounts.is_some() {\n        return Err(mounts_refusal(path, RefusingTier::Project));\n    }",
+        "    if false {\n        return Err(mounts_refusal(path, RefusingTier::Project));\n    }",
+        rust("project_mounts_are_refused_even_when_empty"))
     add("descriptor-reopen", SRC + "host_paths.rs", "            after_open();",
         "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;",
         rust("noting_symlink_takes_bytes_and_facts_from_the_opened_descriptor"))

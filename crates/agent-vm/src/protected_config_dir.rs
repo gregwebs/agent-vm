@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use vstd::prelude::*;
 
 use crate::config;
+use crate::mount::Spelling;
 use crate::protected_host_files::{CoreBind, CoreHostSource};
 
 verus! {
@@ -461,9 +462,19 @@ impl ProtectedConfigDir {
         }
         Ok(())
     }
+    /// Refuse a writable live bind that could change, or change what something
+    /// resolves to, where agent-vm reads its launch authority. `subject` names
+    /// the declaration: `--mount` for argv, the config entry's own
+    /// `mounts[N] in "<file>"` for a verified user entry.
+    ///
+    /// `spelling` is a [`Spelling`], not text: this sentence has always quoted
+    /// the declared spelling with `quoted_path` for *both* sources, so the
+    /// escaping belongs here, and taking the type means no caller has to hand
+    /// raw declaration bytes to a message.
     pub(crate) fn check_writable_mount(
         &self,
-        spelling: &str,
+        subject: &str,
+        spelling: &Spelling,
         spelled_host: &Path,
         host: &Path,
     ) -> Result<()> {
@@ -473,10 +484,12 @@ impl ProtectedConfigDir {
                 if let Some(d) =
                     self.decide(Some(spelled_host), &canonical, Some((m.dev(), m.ino())))
                 {
+                    // `quoted_path` escapes, so these bytes are never printed raw.
+                    #[allow(clippy::disallowed_methods)]
+                    let declared = config::quoted_path(spelling.as_source_path());
                     bail!(
-                        "--mount \"{}\" would let the guest change what \"{}\" contains or resolves to, where agent-vm reads launch authority. Mount it read-only (:ro), or mount a narrower path that does not contain it.",
-                        config::escape_path(Path::new(spelling)),
-                        config::escape_path(&d.spelled)
+                        "{subject} {declared} would let the guest change what {} contains or resolves to, where agent-vm reads launch authority. Mount it read-only (:ro), or mount a narrower path that does not contain it.",
+                        config::quoted_path(&d.spelled)
                     );
                 }
             }
@@ -780,7 +793,7 @@ mod tests {
             }));
         }
         let msg = guard
-            .check_writable_mount("/decl", &t.home, &t.home)
+            .check_writable_mount("--mount", &Spelling::new("/decl"), &t.home, &t.home)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("contains or resolves to"));

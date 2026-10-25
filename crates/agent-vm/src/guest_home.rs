@@ -13,6 +13,7 @@
 //! lives here rather than in `credential_provider` because `config` already
 //! depends on `credential_provider`; the reverse edge would cycle.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::config::{PersistPath, guest_paths_overlap};
@@ -144,6 +145,101 @@ pub(crate) fn mount_conflicts<'a>(
     }
     conflicts
 }
+
+/// The declared persist links and the guest HOME they live under: what the
+/// mount planner needs to refuse a shadowing mount before any fork exists.
+///
+/// This is the *pre-plan* half of the persisted-HOME story: [`mount_conflicts`]
+/// answers "which mount shadows a link", and this type answers "does this
+/// complete normalized destination set do so" at the boundary where that can
+/// still be refused without publishing anything ([`crate::mount::prepare`]).
+/// `run::launch` builds one per launch from the same link list it hands to both
+/// provisioning sites, so the check and the links cannot drift.
+///
+/// There is deliberately no `Default`: the empty value is the "no persisted
+/// HOME" context of a mount context that cannot have `persist` paths, which is
+/// a test fixture, not a state production can reach. [`Self::none`] is
+/// `#[cfg(test)]` because every production caller builds a real one through
+/// [`Self::new`] (a guest HOME exists whether or not it declares `persist`
+/// paths). An empty value could never refuse a launch — `links` is empty and
+/// [`mount_conflicts`] reports nothing over an empty list — so the cost of
+/// getting that wrong is a silently skipped check, which is exactly why the
+/// type refuses to offer one by accident.
+#[derive(Clone, Debug)]
+pub(crate) struct PersistedHome {
+    guest_home: PathBuf,
+    links: Vec<GuestHomeLink>,
+}
+
+impl PersistedHome {
+    /// The links a launch will actually create: the compiled-in providers are
+    /// config-time checked and deliberately not part of this contract, so only
+    /// [`LinkSource::Declared`] entries are kept.
+    pub(crate) fn new(guest_home: PathBuf, links: &[GuestHomeLink]) -> Self {
+        Self {
+            guest_home,
+            links: links
+                .iter()
+                .filter(|link| link.source == LinkSource::Declared)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// No guest HOME and no declared links — for test contexts that cannot have
+    /// `persist` paths. See the type's comment for why this is `#[cfg(test)]`
+    /// rather than a `Default` any production caller could reach.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self {
+            guest_home: PathBuf::new(),
+            links: Vec::new(),
+        }
+    }
+
+    /// [`mount_conflicts`] over the complete destination list; the first
+    /// conflict is the error, exactly as `run::launch` reported it before the
+    /// check moved into mount preparation.
+    ///
+    /// **Precondition:** every entry of `guest_mount_paths` is a normalized
+    /// guest path — see [`mount_conflicts`].
+    pub(crate) fn refuse_conflicts(&self, guest_mount_paths: &[PathBuf]) -> anyhow::Result<()> {
+        let conflicts = mount_conflicts(&self.links, &self.guest_home, guest_mount_paths);
+        let Some((link, mount)) = conflicts.first() else {
+            return Ok(());
+        };
+        Err(anyhow::Error::new(PersistCollision {
+            home_relative: link.home_relative.clone(),
+            mount: mount.clone(),
+        }))
+    }
+}
+
+/// A declared `persist` path that a guest mount point would shadow (or be
+/// shadowed by).
+///
+/// `Display` is byte-identical to the pre-#394 `run::launch` refusal, and no
+/// caller wraps it: it is not a `--mount` failure, because the core project bind
+/// alone can cause it, and its own sentence already names what to fix.
+#[derive(Debug)]
+pub(crate) struct PersistCollision {
+    home_relative: PathBuf,
+    mount: PathBuf,
+}
+
+impl fmt::Display for PersistCollision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "config: persist path {} would collide with the guest mount point {}; rename the \
+             persist path or move the mount",
+            crate::config::escape_path(&self.home_relative),
+            crate::config::escape_path(&self.mount)
+        )
+    }
+}
+
+impl std::error::Error for PersistCollision {}
 
 #[cfg(test)]
 mod tests {
@@ -320,6 +416,29 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// The `PersistCollision` sentence is the pre-#394 text byte for byte. It is
+    /// returned *unwrapped* by `mount::prepare` precisely because it already
+    /// reads as a complete error, so any rewording changes what a user sees on
+    /// the first line of a refused launch.
+    #[test]
+    fn persist_collision_display_is_byte_identical() {
+        let error = PersistedHome {
+            guest_home: PathBuf::from("/home/user"),
+            links: vec![declared("code")],
+        };
+        let error = error
+            .refuse_conflicts(&[PathBuf::from("/home/user/code")])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "config: persist path code would collide with the guest mount point \
+             /home/user/code; rename the persist path or move the mount"
+        );
+        // And it is the typed error, so `run` can tell it apart from every
+        // wrapper it might otherwise gain.
+        assert!(error.is::<PersistCollision>());
     }
 
     #[test]

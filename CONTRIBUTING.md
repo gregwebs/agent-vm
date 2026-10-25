@@ -560,6 +560,91 @@ in `ci-contracts.sh`; it is **not** guest-authorship or native enforcement
 evidence. CI checks the live script's syntax/lint only.
 See [ADR-0040](docs/adr/0040-persisted-user-network-authority.md).
 
+#### Config mounts live check
+
+This is the only native evidence that a user-config `mounts` list actually
+reaches a guest with the declared mode. Boot-free fake-`msb` tests are **not**
+a substitute for it: they never boot a VM.
+
+On a dedicated macOS Apple Silicon host with no concurrent VMs:
+
+```bash
+# Build from the committed source you intend to verify: the candidate must
+# report that exact clean commit, so build after committing, not before.
+./script/build/macos.sh --dev
+AGENT_VM_BIN="$PWD/target/macos-dev/bin/agent-vm" \
+AGENT_VM_LIVE_TEST_IMAGE='ghcr.io/OWNER/IMAGE@sha256:<64 hex>' \
+  bash script/test/config-mounts-live.sh
+```
+
+Prerequisites, all rejected with a receipted non-zero exit before any scratch is
+allocated:
+
+- a dedicated idle host: Darwin on arm64, with no running `agent-vm` or `msb`;
+- `AGENT_VM_BIN`, absolute and executable, built from the committed PR head;
+- `AGENT_VM_LIVE_TEST_IMAGE`, **digest-pinned** (`…@sha256:<64 hex>`): the first
+  launch acquires it into the run's private cache, and a tag would make the rows
+  depend on what the registry serves later;
+- the bundle's sibling `msb` and `../lib/libkrunfw.5.dylib` (the harness passes
+  `MSB_PATH` explicitly and builds its environment from scratch, so an inherited
+  `MSB_LIBKRUNFW_PATH`, `AGENT_VM_MSB_CACHE_DIR` or `MSB_CONFIG_PATH` cannot
+  redirect the launch).
+
+The first launch also needs a reachable registry to acquire that image. Nothing
+can establish reachability before scratch exists — a probe would be a second,
+different network path from the acquisition — so an unreachable registry
+surfaces as that first launch's own error, with its receipted evidence retained.
+
+The run asserts provenance before it does any native work: the harness source
+must be its own Git top level, `tracked-status.txt` is captured by direct
+redirection, the candidate's stdout is captured byte-for-byte as
+`binary-version.txt`, and `script/test/lib/build-provenance.py` accepts **only**
+a known full commit equal to HEAD, a self-reported `clean` state and an empty
+tracked-status file. A rejection retains `provenance-check.txt` and allocates no
+scratch.
+
+The retained evidence set is self-identifying: `source.txt`,
+`tracked-status.txt`, `all-status.txt`, `tree.diff` + `tree.diff.sha256`,
+`harness.sha256` (every file under `script/test/`), `binary-version.txt`,
+`candidate.txt` (realpath, SHA-256, `codesign -dv --verbose=4`), `runtime.txt`
+(the sibling `msb` and `libkrunfw`: realpath, SHA-256, signature, `msb
+--version`), `host.txt` (`sw_vers`, `uname -a`, `hw.model`/CPU), `image.txt`,
+`image-pins.json` (the launch's own first pin, whose recorded reference and
+manifest digest must **contain** the requested digest — a containment check,
+deliberately not equality; see `script/test/lib/config-mounts.py`),
+`summary.tsv` with a retained expected-versus-actual row per
+row, per-launch logs, `owned.jsonl` and `errors.json`.
+
+CM-N1 proves a `:ro` default is readable and unwritable while the host tree is
+unchanged; CM-N2 proves a `:rw` default writes through to the host; CM-N3a/b
+prove a `:fork` default holds the guest's own write across launches and never
+synchronizes with the host; CM-N4 proves `--no-config-mounts` removes all three
+while the project mount still works (a positive control that the guest ran);
+CM-N5 proves an equivalent `--mount` reuses the config fork's identity.
+
+Teardown is bounded and identity-checked: every launch is an owned process
+group, stopping is TERM → bounded wait → KILL, survivors are signalled only
+where their recorded identity still matches, catalog and socket-path absence is
+verified, and a fixture source is written or removed only after the previous
+launch's cleanup proved absence. On failure the owned scratch (with the fixture
+sources) is retained and its path printed; it is never `rm -rf`ed by the
+harness.
+
+If a prerequisite is missing, the PR body records
+
+```text
+BLOCKED: AGENT_VM_BIN=… AGENT_VM_LIVE_TEST_IMAGE=… bash script/test/config-mounts-live.sh -> <exact first error line>
+```
+
+and states that native enforcement evidence for #394 is **outstanding**, so the
+PR says "Part of #394", not "Closes #394".
+
+`bash script/test/config-mounts-contract.sh` is the boot-free companion: it runs
+the guest probe against a host-only synthetic layout (permission and negative
+controls included) and asserts that the wrapper rejects a relative
+`AGENT_VM_BIN` and a non-digest image without allocating scratch. It is in
+`ci-contracts.sh`; it is host-only and **never** native evidence.
+
 #### `bash -c`, not `bash -lc`, for in-guest commands
 
 When you pass a command to the guest yourself, pass it through a non-login
@@ -701,6 +786,8 @@ while ordinary `setup` intentionally creates a verification guest.
 | `script/test/persisted-network-contract.sh` | yes (`ci-contracts.sh`) | host-only snippet controls, checker P1–P5 and live-shell P6–P10; no native evidence |
 | `script/test/build-provenance-contract.sh` | yes (`ci-contracts.sh`) | real Cargo/Git build-identity controls B1–B19; no native evidence |
 | `script/test/persisted-network-live.sh` | **no** | dedicated macOS arm64 PN rows; required evidence or written waiver |
+| `script/test/config-mounts-contract.sh` | yes (`ci-contracts.sh`) | host-only probe/preflight controls; no native evidence |
+| `script/test/config-mounts-live.sh` | **no** | dedicated macOS arm64 CM rows: candidate + runtime (`msb`, `libkrunfw`) identity, host/platform, digest, expected vs actual; required evidence or a `BLOCKED:` line |
 | `script/test/verus-verification.sh` | yes | machine-checked boundary contracts |
 | Image source/build/installer/runtime/egress audits | independent image repo CI | migrated; equivalence not verified by launcher CI |
 
