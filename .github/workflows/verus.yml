@@ -21,6 +21,12 @@ env:
   VERUS_RELEASE: "0.2026.09.20.aef82ed"
   # sha256 of verus-0.2026.09.20.aef82ed-x86-linux.zip (485678212 bytes).
   VERUS_SHA256: "7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33"
+  # sha256 of verus-0.2026.09.20.aef82ed-arm64-macos.zip (449371666 bytes). CI
+  # never downloads this asset; the pin exists so `script/install-verus.sh` on a
+  # macOS host verifies the bytes instead of trusting the tag. A Verus bump that
+  # moves only the x86 digest leaves macOS installs refusing to run, which is the
+  # intended failure mode (script/check-rust-toolchain.sh checks both).
+  VERUS_SHA256_ARM64_MACOS: "3f89fd250d1e9792ed6d0c7c3ad72c03c02fdbca3f0638987af6e153d69377bc"
 
 jobs:
   verify:
