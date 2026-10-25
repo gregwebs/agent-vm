@@ -34,6 +34,45 @@
 //! (#30) now detects it up front on the boot path and the `agent-vm msb`
 //! passthrough, and its error message points here — closing the loop
 //! between "detect" (#30) and "recover" (this command, #28).
+//!
+//! ## Escaping
+//!
+//! The report is read line by line, so no line may be forged. How that is achieved
+//! is not uniform; the split is by provenance and by who else prints the value.
+//!
+//! *Values a config file chose* — tool names, commands, image references — go
+//! through [`crate::config::escape_str`] / [`crate::config::quoted_str`], which
+//! escape every non-ASCII byte so two values that differ only outside ASCII cannot
+//! print alike.
+//!
+//! *Paths this run measured* — the unpacked runtime, `MSB_HOME` and its db, the
+//! resolved project and state directories, the host credential files, the
+//! `credentials.yaml` the launch would read, and whatever `--reset-msb-db` moved —
+//! go through [`crate::one_line`], which escapes only control characters.
+//!
+//! *Measured paths that `config` or `boot_image` also render* stay on
+//! [`crate::config::escape_path`], so one report cannot show two escapings of one
+//! path: the config file locations (`describe_tier`), the conflict lines
+//! (`render_conflicts`), each tool row's `source=user:…`/`source=project:…`, the
+//! boot-image paths (`describe_configured_image`, `describe_default_observation`),
+//! and [`crate::boot_image::ImageSource::describe`] on the `selected` line.
+//! Converting them means changing those modules' own output.
+//!
+//! The visible consequence is deliberate: given non-ASCII `$HOME` and cwd, the
+//! `user:`/`project:`/`default:`/`source=` lines spell a directory out byte by
+//! byte while `dir:`, `state:` and the credential rows print it as itself.
+//!
+//! Two channels print validated names raw, because a name cannot carry a line
+//! break (`validate_name` rejects whitespace and control characters): the tool
+//! names joined into a host credential row's `replaced by credentials.yaml for …`
+//! suffix (`host_row_note`), and the authorization rows' `service`/`env_name`.
+//! They do give up the non-ASCII consistency above — a non-ASCII tool name prints
+//! as itself in that suffix and byte-escaped in its own tool row.
+//!
+//! Four sites print error text raw (`error: {error:#}`, `error: {message}`, and
+//! twice under `selected`). That is safe only because `config` and `boot_image`
+//! escape their own error text before returning it; a new error source that does
+//! not would forge a line here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -246,7 +285,7 @@ fn describe_embedded_runtime(dir: Option<&Path>, exists: bool) -> String {
     match dir {
         Some(dir) => format!(
             "==> embedded runtime\nunpacked: {} ({})",
-            dir.display(),
+            crate::one_line::path(dir),
             if exists { "present" } else { "absent" }
         ),
         None => "==> embedded runtime\nunpacked: unresolved (set XDG_CACHE_HOME or HOME)".into(),
@@ -268,8 +307,8 @@ fn describe_home(msb_home: &Path, db_exists: bool, bundled_schema: &str) -> Stri
          MSB_HOME: {}\n\
          db:       {} ({})\n\
          this build's bundled schema: {}",
-        msb_home.display(),
-        db_path.display(),
+        crate::one_line::path(msb_home),
+        crate::one_line::path(&db_path),
         if db_exists { "exists" } else { "absent" },
         bundled_schema,
     )
@@ -290,8 +329,10 @@ enum HostCred {
 /// `$HOME` or state dir, matching [`describe_home`]'s pattern.
 #[derive(Debug, PartialEq, Eq)]
 struct CredReport {
-    /// `(agent label, host path as shown, what we found)`.
-    hosts: Vec<(&'static str, String, HostCred)>,
+    /// `(agent label, host credential path, what we found)`. The path is a
+    /// measured `$HOME` child, not prose: [`describe_credentials`] escapes it, so
+    /// a directory name carrying a newline cannot split the table.
+    hosts: Vec<(&'static str, Option<PathBuf>, HostCred)>,
     /// The project `doctor` was run in, and whether its per-project
     /// host-only token files exist. `None` when the cwd can't be resolved.
     project: Option<ProjectCreds>,
@@ -301,8 +342,10 @@ struct CredReport {
 
 #[derive(Debug, PartialEq, Eq)]
 struct ProjectCreds {
-    dir: String,
-    state_dir: String,
+    /// Both measured: the resolved project cwd and this project's state dir.
+    /// Escaped by [`describe_credentials`] at the point of printing.
+    dir: PathBuf,
+    state_dir: PathBuf,
     /// Providers with a real token captured under `<hash>.secrets/`.
     captured: Vec<&'static str>,
     /// Whether the guest still holds a Claude placeholder cred file.
@@ -332,17 +375,13 @@ fn gather_credentials() -> CredReport {
             let label = provider.doctor_label();
             let want_expiry = provider.doctor_parses_expiry();
             let path = provider.host_credential_path();
-            let shown = path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<no $HOME>".to_string());
             let state = match &path {
                 None => HostCred::Unreadable {
                     why: "no $HOME".into(),
                 },
                 Some(p) => inspect_host_cred(p, want_expiry),
             };
-            (label, shown, state)
+            (label, path, state)
         })
         .collect();
 
@@ -421,8 +460,8 @@ fn gather_project_creds() -> Option<ProjectCreds> {
     .map(|(label, _)| label)
     .collect();
     Some(ProjectCreds {
-        dir: session.project_dir.display().to_string(),
-        state_dir: session.state_dir.display().to_string(),
+        dir: session.project_dir.clone(),
+        state_dir: session.state_dir.clone(),
         captured,
         guest_claude_placeholder: session.state_dir.join("claude/.credentials.json").exists(),
         pi_credentials: inspect_project(&session.state_dir),
@@ -446,7 +485,12 @@ fn describe_credentials(report: &CredReport, launch: &LaunchView) -> String {
     for (label, path, state) in &report.hosts {
         let detail = match state {
             HostCred::Missing => "absent".to_string(),
-            HostCred::Unreadable { why } => format!("UNUSABLE - {why}"),
+            // `why` is an error chain from `host_paths`, whose messages interpolate
+            // the measured path (`… is not a regular file`, `opening …`). It is
+            // escaped here, at the print site, like the path above it.
+            HostCred::Unreadable { why } => {
+                format!("UNUSABLE - {}", crate::one_line::text(why))
+            }
             HostCred::Present {
                 expires_at_ms: None,
             } => "ok".to_string(),
@@ -455,8 +499,11 @@ fn describe_credentials(report: &CredReport, launch: &LaunchView) -> String {
             } => format!("ok ({})", describe_expiry(*exp, report.now_ms)),
         };
         let disposition = launch.host_row_note(label);
+        let shown = path
+            .as_deref()
+            .map_or_else(|| "<no $HOME>".to_string(), crate::one_line::path);
         out.push_str(&format!(
-            "{label:<width$}  {path}\n{:width$}  {detail}{disposition}\n",
+            "{label:<width$}  {shown}\n{:width$}  {detail}{disposition}\n",
             ""
         ));
     }
@@ -466,8 +513,8 @@ fn describe_credentials(report: &CredReport, launch: &LaunchView) -> String {
         Some(project) => {
             out.push_str(&format!(
                 "\n==> this project\ndir:      {}\nstate:    {}\ncaptured: {}\nguest Claude cred file: {}\n",
-                project.dir,
-                project.state_dir,
+                crate::one_line::path(&project.dir),
+                crate::one_line::path(&project.state_dir),
                 if project.captured.is_empty() {
                     "<none> (nothing to substitute on the wire)".to_string()
                 } else {
@@ -665,11 +712,17 @@ fn gather_launch_view(catalog: Option<&LaunchCatalog>) -> LaunchView {
 /// storage status, because it never reads one.
 fn describe_launch_view(view: &LaunchView) -> String {
     let mut out = String::from("==> credentials.yaml (launch credentials)\n");
+    // Both carry text from `credential_yaml`, which interpolates the measured
+    // `$HOME/.config/agent-vm/credentials.yaml` (its mode warning is
+    // `{path} is group- or other-readable…`), so they are escaped at the print
+    // site. A launch that requests a credential emits the same notes through
+    // `run`'s notice channel, which still writes them raw — the launch surface's
+    // version of this bug, filed as #416 rather than fixed here.
     for note in &view.notes {
-        out.push_str(&format!("warning: {note}\n"));
+        out.push_str(&format!("warning: {}\n", crate::one_line::text(note)));
     }
     for problem in &view.problems {
-        out.push_str(&format!("error: {problem}\n"));
+        out.push_str(&format!("error: {}\n", crate::one_line::text(problem)));
     }
     let width = view
         .yaml
@@ -720,8 +773,7 @@ fn describe_launch_view(view: &LaunchView) -> String {
 ///
 /// The verb list is authoritative; it shows argument *counts* rather than
 /// values (a user may have mistakenly put a secret in `args`) and never
-/// resolves a path or builds an image. Untrusted names/paths are escaped so a
-/// config file cannot inject terminal controls.
+/// resolves a path or builds an image.
 fn describe_config(report: ConfigReport) -> (String, Option<anyhow::Error>, Option<LaunchCatalog>) {
     // Everything that needs a borrow is rendered before `report` is consumed
     // by `into_launch_catalog`.
@@ -1028,8 +1080,13 @@ fn reset_msb_db_in(msb_home: &Path, ts: &str) -> Result<ResetOutcome> {
     }
 
     let target = unique_target(msb_home, ts);
-    std::fs::rename(&db, &target)
-        .with_context(|| format!("moving {} -> {}", db.display(), target.display()))?;
+    std::fs::rename(&db, &target).with_context(|| {
+        format!(
+            "moving {} -> {}",
+            crate::one_line::path(&db),
+            crate::one_line::path(&target)
+        )
+    })?;
     Ok(ResetOutcome::Moved {
         from: db,
         to: target,
@@ -1075,16 +1132,16 @@ fn render(outcome: &ResetOutcome) -> String {
              The database will be recreated at the bundled schema on the next \
              `agent-vm shell`/`run`, and images will be re-pulled on first boot.\n\
              To undo: mv \"{}\" \"{}\"",
-            from.display(),
-            to.display(),
-            to.display(),
-            from.display(),
+            crate::one_line::path(from),
+            crate::one_line::path(to),
+            crate::one_line::path(to),
+            crate::one_line::path(from),
         ),
         ResetOutcome::NothingToMove { checked } => format!(
             "==> No microsandbox db to reset — nothing was moved.\n\
              checked: {}\n\
              A fresh database will be created on the next `agent-vm shell`/`run`.",
-            checked.display(),
+            crate::one_line::path(checked),
         ),
     }
 }
@@ -1697,6 +1754,219 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
         assert!(text.contains("m20260824_000001"), "{text}");
     }
 
+    /// `doctor`'s report is read line by line, and a measured path comes from
+    /// `$HOME`/XDG/the cwd — directories the user names, which may carry any
+    /// byte. A newline must not end the section and leave the remainder looking
+    /// like agent-vm's own output.
+    #[test]
+    fn a_measured_runtime_path_cannot_forge_a_section() {
+        let text = describe_embedded_runtime(Some(Path::new("/cache/rt\nFORGED-RUNTIME")), true);
+
+        assert_eq!(text.lines().count(), 2, "one title, one line: {text:?}");
+        assert!(
+            text.contains("/cache/rt\\x0aFORGED-RUNTIME"),
+            "the measured path is escaped: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_measured_msb_home_cannot_forge_a_section() {
+        let text = describe_home(Path::new("/state/m\nFORGED-HOME"), true, "m20260824_000001");
+
+        assert_eq!(
+            text.lines().count(),
+            4,
+            "the section's four lines: {text:?}"
+        );
+        assert!(
+            text.contains("/state/m\\x0aFORGED-HOME"),
+            "the measured home is escaped: {text:?}"
+        );
+        assert!(
+            !text.contains("\nFORGED-HOME"),
+            "the section was split: {text:?}"
+        );
+    }
+
+    /// When the move fails, the error context is what reaches the user, and it
+    /// names both paths. Same measured bytes, same rule.
+    #[test]
+    fn a_failed_reset_move_cannot_forge_a_line() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let msb_home = root.path().join("m\nFORGED-MOVE");
+        std::fs::create_dir_all(msb_home.join("db")).unwrap();
+        write_file(&msb_home.join("db/msb.db"), b"schema");
+        // Read-only parent: the rename into it fails, which is the path whose
+        // context prints both paths.
+        std::fs::set_permissions(&msb_home, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let error = reset_msb_db_in(&msb_home, "123").unwrap_err();
+        std::fs::set_permissions(&msb_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.lines().any(|line| line.starts_with("FORGED-MOVE")),
+            "the measured path split the error: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("m\\x0aFORGED-MOVE/db ->"),
+            "the source path is escaped in the context: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("m\\x0aFORGED-MOVE/db.reset-123"),
+            "so is the target: {rendered:?}"
+        );
+    }
+
+    /// The undo line has to stay one line. For a path holding a control character
+    /// that costs the pasted command its correctness — `\x0a` inside quotes names
+    /// a file that does not exist — which is the accepted trade: a forged
+    /// instruction next to a real one is the worse failure.
+    #[test]
+    fn the_reset_report_cannot_forge_a_line() {
+        let from = PathBuf::from("/state/m\nFORGED-FROM/db");
+        let to = PathBuf::from("/state/m\nFORGED-FROM/db.reset-123");
+        let text = render(&ResetOutcome::Moved {
+            from: from.clone(),
+            to,
+        });
+
+        assert!(
+            !text.lines().any(|line| line.starts_with("FORGED-FROM")),
+            "the measured path forged a line: {text:?}"
+        );
+        let undo = text
+            .lines()
+            .find(|line| line.contains("To undo:"))
+            .expect("the undo line");
+        // Written out rather than counted: the target begins with the source, so a
+        // `matches(prefix).count() == 2` would also accept `mv "{to}" "{to}"`.
+        assert_eq!(
+            undo,
+            "To undo: mv \"/state/m\\x0aFORGED-FROM/db.reset-123\" \
+             \"/state/m\\x0aFORGED-FROM/db\""
+        );
+
+        let nothing = render(&ResetOutcome::NothingToMove { checked: from });
+        assert!(
+            !nothing.lines().any(|line| line.starts_with("FORGED-FROM")),
+            "the checked path forged a line: {nothing:?}"
+        );
+    }
+
+    /// The discriminator against [`crate::config::escape_path`]: a measured path
+    /// the user has to read back — and, for `--reset-msb-db`, copy — stays
+    /// legible. Escaping every non-ASCII byte would print this as
+    /// `/home/boger/\\xd0\\xbf...`.
+    #[test]
+    fn a_measured_path_with_non_ascii_is_printed_as_itself() {
+        let text = describe_home(Path::new("/home/boger/проект"), false, "m1");
+
+        assert!(text.contains("/home/boger/проект"), "{text}");
+        assert!(!text.contains("\\xd0"), "not byte-escaped: {text}");
+    }
+
+    #[test]
+    fn a_row_without_a_home_says_so() {
+        let text = describe_credentials(
+            &report(vec![(
+                "claude",
+                None,
+                HostCred::Unreadable {
+                    why: "no $HOME".into(),
+                },
+            )]),
+            &LaunchView::default(),
+        );
+
+        assert!(text.contains("claude  <no $HOME>"), "{text}");
+        assert!(text.contains("UNUSABLE - no $HOME"), "{text}");
+    }
+
+    /// Both are `host_paths`/`credential_yaml` text that interpolates a measured
+    /// path, and both are printed inside sections that escape their own paths.
+    #[test]
+    fn credential_details_cannot_forge_a_line() {
+        let text = describe_credentials(
+            &report(vec![(
+                "claude",
+                Some(PathBuf::from("/h/.claude/.credentials.json")),
+                HostCred::Unreadable {
+                    why: "/h\nFORGED-WHY/.claude/.credentials.json is not a regular file".into(),
+                },
+            )]),
+            &LaunchView::default(),
+        );
+
+        assert!(
+            !text.lines().any(|line| line.starts_with("FORGED-WHY")),
+            "the detail split the row: {text:?}"
+        );
+        assert!(text.contains("/h\\x0aFORGED-WHY"), "{text:?}");
+
+        let launch = LaunchView {
+            notes: vec![
+                "/h\nFORGED-NOTE/.config/agent-vm/credentials.yaml is group-readable".into(),
+            ],
+            problems: vec!["/h\nFORGED-PROBLEM/.config/agent-vm/credentials.yaml: bad yaml".into()],
+            ..LaunchView::default()
+        };
+        let text = describe_launch_view(&launch);
+
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("FORGED-NOTE") || line.starts_with("FORGED-PROBLEM")),
+            "a note or problem split the section: {text:?}"
+        );
+        assert!(text.contains("/h\\x0aFORGED-NOTE"), "{text:?}");
+        assert!(text.contains("/h\\x0aFORGED-PROBLEM"), "{text:?}");
+    }
+
+    #[test]
+    fn measured_credential_rows_cannot_forge_a_line() {
+        let text = describe_credentials(
+            &report(vec![(
+                "claude",
+                Some(PathBuf::from(
+                    "/home/b\nFORGED-ROW/.claude/.credentials.json",
+                )),
+                HostCred::Missing,
+            )]),
+            &LaunchView::default(),
+        );
+
+        assert!(
+            !text.lines().any(|line| line.starts_with("FORGED-ROW")),
+            "the measured credential path forged a row: {text:?}"
+        );
+        assert!(
+            text.contains("/home/b\\x0aFORGED-ROW/.claude/.credentials.json"),
+            "the row escapes its own path: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_project_section_cannot_forge_a_line() {
+        let mut r = report(vec![]);
+        let project = r.project.as_mut().unwrap();
+        project.dir = PathBuf::from("/work/pr\nFORGED-PROJECT");
+        project.state_dir = PathBuf::from("/state/st\nFORGED-STATE");
+
+        let text = describe_credentials(&r, &LaunchView::default());
+
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("FORGED-PROJECT") || line.starts_with("FORGED-STATE")),
+            "a measured project path forged a line: {text:?}"
+        );
+        assert!(text.contains("/work/pr\\x0aFORGED-PROJECT"), "{text:?}");
+        assert!(text.contains("/state/st\\x0aFORGED-STATE"), "{text:?}");
+    }
+
     #[test]
     fn describe_home_reports_absent_db() {
         let text = describe_home(Path::new("/state/msb-home"), false, "m20260824_000001");
@@ -1806,12 +2076,12 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
         assert_eq!(describe_expiry(0, 15 * 60_000), "EXPIRED 15m ago");
     }
 
-    fn report(hosts: Vec<(&'static str, String, HostCred)>) -> CredReport {
+    fn report(hosts: Vec<(&'static str, Option<PathBuf>, HostCred)>) -> CredReport {
         CredReport {
             hosts,
             project: Some(ProjectCreds {
-                dir: "/p".into(),
-                state_dir: "/s/abc".into(),
+                dir: PathBuf::from("/p"),
+                state_dir: PathBuf::from("/s/abc"),
                 captured: vec!["claude"],
                 guest_claude_placeholder: true,
                 pi_credentials: PiCredentialReport::uninspected(),
@@ -1826,12 +2096,16 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
             &report(vec![
                 (
                     "claude",
-                    "/h/.claude/.credentials.json".into(),
+                    Some(PathBuf::from("/h/.claude/.credentials.json")),
                     HostCred::Unreadable {
                         why: "not valid JSON: x".into(),
                     },
                 ),
-                ("codex", "/h/.codex/auth.json".into(), HostCred::Missing),
+                (
+                    "codex",
+                    Some(PathBuf::from("/h/.codex/auth.json")),
+                    HostCred::Missing,
+                ),
             ]),
             &LaunchView::default(),
         );
@@ -1851,7 +2125,7 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
     fn render_calls_out_a_project_with_nothing_captured() {
         let mut r = report(vec![(
             "claude",
-            "/h/.claude/.credentials.json".into(),
+            Some(PathBuf::from("/h/.claude/.credentials.json")),
             HostCred::Present {
                 expires_at_ms: Some(HOUR_MS),
             },
@@ -2295,12 +2569,12 @@ credentials:
             &report(vec![
                 (
                     "claude",
-                    "/h/.claude/.credentials.json".into(),
+                    Some(PathBuf::from("/h/.claude/.credentials.json")),
                     HostCred::Missing,
                 ),
                 (
                     "copilot",
-                    "/h/.copilot/config.json".into(),
+                    Some(PathBuf::from("/h/.copilot/config.json")),
                     HostCred::Missing,
                 ),
             ]),

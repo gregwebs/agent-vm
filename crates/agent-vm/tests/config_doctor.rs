@@ -78,27 +78,46 @@ fn stderr_of(out: &Output) -> String {
 /// `project_config()` on macOS's `/var` → `/private/var` symlink.
 struct Harness {
     _home: tempfile::TempDir,
-    state: tempfile::TempDir,
+    state_dir: tempfile::TempDir,
     _project: tempfile::TempDir,
     home_root: PathBuf,
     project_root: PathBuf,
+    state_root: PathBuf,
     fake_msb: PathBuf,
 }
 
 impl Harness {
     fn new() -> Self {
-        let home = tempfile::tempdir_in("/tmp").unwrap();
-        let state = tempfile::tempdir_in("/tmp").unwrap();
-        let project = tempfile::tempdir_in("/tmp").unwrap();
-        let home_root = home.path().canonicalize().unwrap();
-        let project_root = project.path().canonicalize().unwrap();
-        let fake_msb = fake_msb::write(home.path());
+        Self::in_leaf("", "", "")
+    }
+
+    /// A harness whose three roots end in `home`, `state` and `project`, so a test
+    /// can put a byte a directory may legally carry — a newline, or non-ASCII —
+    /// into the paths `doctor` measures. The `TempDir`s are kept for their
+    /// lifetime; the roots point at the named child inside each.
+    fn in_leaf(home: &str, state: &str, project: &str) -> Self {
+        let home_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let state_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let project_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let child = |dir: &std::path::Path, leaf: &str| -> PathBuf {
+            if leaf.is_empty() {
+                return dir.to_path_buf();
+            }
+            let named = dir.join(leaf);
+            std::fs::create_dir(&named).unwrap();
+            named
+        };
+        let home_root = child(home_dir.path(), home).canonicalize().unwrap();
+        let project_root = child(project_dir.path(), project).canonicalize().unwrap();
+        let state_root = child(state_dir.path(), state);
+        let fake_msb = fake_msb::write(&home_root);
         Self {
-            _home: home,
-            state,
-            _project: project,
+            _home: home_dir,
+            state_dir,
+            _project: project_dir,
             home_root,
             project_root,
+            state_root,
             fake_msb,
         }
     }
@@ -132,7 +151,7 @@ impl Harness {
             .env("HOME", &self.home_root)
             .env(
                 "AGENT_VM_STATE_DIR",
-                self.state.path().canonicalize().unwrap(),
+                self.state_root.canonicalize().unwrap(),
             )
             .env("MSB_PATH", &self.fake_msb)
             .current_dir(&self.project_root);
@@ -573,13 +592,13 @@ fn doctor_never_executes_the_command_or_creates_persist_paths() {
     // not the project root — is where a materialized `cache/never` would
     // appear. `doctor` is now dispatched before msb setup, so it creates
     // nothing at all under the state dir; the whole tree must match.
-    let state_before = snapshot_tree(h.state.path());
+    let state_before = snapshot_tree(h.state_dir.path());
 
     let out = h.run_doctor();
     assert_success(&out);
     assert!(!marker.exists(), "doctor executed the declared command");
     assert_eq!(
-        snapshot_tree(h.state.path()),
+        snapshot_tree(h.state_dir.path()),
         state_before,
         "doctor created an entry under the state dir (e.g. a persist path)"
     );
@@ -974,4 +993,144 @@ fn doctor_reports_a_closed_stdout_as_an_error_not_a_panic() {
         "{stderr}"
     );
     assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+/// `doctor` reports paths it *measured*: the unpacked runtime under
+/// `$HOME`/XDG, `MSB_HOME` and its db, the project cwd, the project state dir,
+/// the host credential files and the `credentials.yaml` it read — including the
+/// error text those two files' readers produce. None is a config value, so none
+/// has been sanitized by a parser: a directory name can carry any byte, and a
+/// newline must not end a section and leave the rest reading as doctor's own
+/// output (issue #414).
+#[test]
+fn measured_paths_cannot_forge_a_doctor_section() {
+    let h = Harness::in_leaf("ho\nFORGED-HOME", "st\nFORGED-STATE", "pro\nFORGED-PROJECT");
+    // Existing-but-unreadable credential file: the `UNUSABLE` detail is error text
+    // from `host_paths` and names the same path.
+    std::fs::create_dir_all(h.home_root.join(".claude/.credentials.json")).unwrap();
+    // A valid credentials file at the mode a default umask gives it, so the section
+    // emits its mode warning — error text from `credential_yaml` naming the path.
+    write(&h.credentials(), ANTHROPIC_AUTHORIZATION);
+
+    assert_only_escaped(h.run_doctor(), &["UNUSABLE - ", "warning: "]);
+
+    // A credentials file that fails to load: the `error:` channel is the other half
+    // of that section, and names the same path.
+    h.write_credentials("credentials: [\n");
+    assert_only_escaped(h.run_doctor(), &["error: "]);
+}
+
+/// The same shape with non-ASCII names: a measured path stays legible, because the
+/// reader has to act on it. `config::escape_path` prints these byte by byte.
+///
+/// The config *file locations* and the boot-image record path are still rendered
+/// by `config`/`boot_image`'s own diagnostics, so those lines do spell non-ASCII
+/// out — that divergence is asserted here rather than papered over.
+#[test]
+fn a_non_ascii_measured_path_is_printed_as_itself() {
+    let h = Harness::in_leaf("дом", "состояние", "проект");
+
+    let out = h.run_doctor();
+
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    let project = h.project_root.canonicalize().unwrap().display().to_string();
+    assert!(
+        stdout.contains(&format!("dir:      {project}\n")),
+        "the project path prints as itself: {stdout}"
+    );
+    let state = h.state_root.canonicalize().unwrap().display().to_string();
+    assert!(
+        stdout.contains(&format!("state:    {state}")),
+        "the state path prints as itself: {stdout}"
+    );
+    for row in ["claude", "codex", "opencode", "copilot"] {
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with(row))
+            .unwrap_or_else(|| panic!("no {row} row:\n{stdout}"));
+        assert!(line.contains("дом"), "{row} row: {line}");
+        assert!(!line.contains("\\xd0"), "{row} row is byte-escaped: {line}");
+    }
+    // The other policy, on the lines that share `config`'s rendering.
+    assert!(
+        stdout.contains("/\\xd0\\xb4\\xd0\\xbe\\xd0\\xbc/.config/agent-vm/config.toml"),
+        "the config locations stay byte-escaped: {stdout}"
+    );
+}
+
+/// `--reset-msb-db` names the path it moved and prints a line to undo it. Both come
+/// from `MSB_HOME`/`AGENT_VM_STATE_DIR`, which the user names, so a newline in it
+/// must be escaped rather than ending the report — and the rest of the path keeps
+/// its ordinary bytes, since the line is meant to be pasted. The leaf carries both
+/// a newline and non-ASCII so one assertion covers the control-byte policy and the
+/// other covers "not `escape_path`".
+#[test]
+fn the_reset_report_keeps_a_measured_path_on_one_line() {
+    let h = Harness::in_leaf("", "дом\nFORGED-STATE", "");
+    let db = h.state_root.join("msb-home/db");
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(db.join("msb.db"), b"schema").unwrap();
+
+    let out = h.run_doctor_reset();
+
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("FORGED-STATE")),
+        "the measured state dir split the report:\n{stdout}"
+    );
+    // `from:`/`to:` are the authority; the undo line must name them in that order,
+    // quoted. Comparing whole lines, because `to` begins with `from`.
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no `{prefix}` line:\n{stdout}"))
+    };
+    let from = line("from: ").trim_start_matches("from: ");
+    let to = line("to:   ").trim_start_matches("to:   ");
+    assert!(from.contains("дом\\x0aFORGED-STATE"), "from: {from:?}");
+    assert!(!from.contains("\\xd0"), "not byte-escaped: {from:?}");
+    assert!(
+        from.ends_with("/msb-home/db"),
+        "from names the db: {from:?}"
+    );
+    assert!(to.contains("db.reset-"), "to: {to:?}");
+    assert_eq!(
+        line("To undo: "),
+        format!("To undo: mv \"{to}\" \"{from}\"")
+    );
+}
+
+/// Every line of `doctor`'s output must be doctor's own, so the only place a
+/// forged fragment may appear is inline after an escaped control character.
+fn assert_only_escaped(out: Output, details: &[&str]) {
+    let stdout = stdout_of(&out);
+    assert_success(&out);
+    // The two detail channels print error text that interpolates the same path:
+    // `host_paths`' "not a regular file" and `credential_yaml`'s load error. Both
+    // were raw before this change, so they are checked on their own line.
+    for detail in details {
+        let line = stdout
+            .lines()
+            .find(|line| line.contains(detail))
+            .unwrap_or_else(|| panic!("no `{detail}` line:\n{stdout}"));
+        assert!(
+            line.contains("\\x0aFORGED-HOME"),
+            "`{detail}` names the measured path raw: {line:?}"
+        );
+    }
+    for forged in ["FORGED-HOME", "FORGED-PROJECT", "FORGED-STATE"] {
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(forged)),
+            "{forged} began a line, so a measured path split the report:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("\\x0a{forged}")),
+            "{forged} should appear inline, escaped:\n{stdout}"
+        );
+    }
 }
