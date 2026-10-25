@@ -499,8 +499,8 @@ fn state_dir(stderr: &str) -> PathBuf {
 const PERSIST_CODE: &str = "[[tools]]\nname = \"aider\"\ncommand = \"/bin/echo\"\ncredentials = []\npersist = [\"code\"]\n";
 
 /// The persisted-guest-HOME refusal, byte for byte, for a `persist = ["code"]`
-/// link under `guest_home`. Escaping is the config module's (`escape_path`), and
-/// the harness's temp dirs contain no bytes it would rewrite.
+/// link under `guest_home`. Both paths take the one-line policy, and the
+/// harness's temp dirs contain no bytes it would rewrite.
 fn persist_collision_message(guest_home: &str) -> String {
     format!(
         "Error: config: persist path code would collide with the guest mount point \
@@ -584,6 +584,35 @@ fn an_unrelated_fork_with_a_colliding_live_mount_publishes_no_fork() {
         "the unrelated fork must not be published before the collision is refused: {stderr}"
     );
     h.assert_refused_before_launch_state(&out, &before, "would collide with the guest mount point");
+}
+
+/// A `persist` entry is config-chosen text, but this refusal names one file to
+/// rename, not two entries to compare, so it takes the one-line policy: a
+/// non-ASCII persist path prints as itself instead of `\xd0\xba\xd0\xbe\xd0\xb4`
+/// (issue #422). A control byte is still escaped — `a_config_source_spelling_cannot_forge_a_diagnostic_line`
+/// and the `persist` unit test in `session` cover that half.
+#[test]
+fn a_non_ascii_persist_path_is_printed_as_itself() {
+    let h = Harness::new();
+    h.write_project(
+        "[[tools]]\nname = \"aider\"\ncommand = \"/bin/echo\"\ncredentials = []\npersist = [\"код\"]\n",
+    );
+    let source = h.home_root.join("src");
+    std::fs::create_dir(&source).unwrap();
+    let guest = format!("{}/код", h.home_root.display());
+    let mount = format!("{}:{guest}:fork", source.display());
+
+    let out = h.launch(&["--mount", &mount], "aider", &[]);
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        stderr.lines().next().unwrap_or_default(),
+        format!(
+            "Error: config: persist path код would collide with the guest mount point {guest}; \
+             rename the persist path or move the mount"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("\\xd0"), "byte-escaped: {stderr}");
 }
 
 /// The oracle above is only meaningful if an accepted launch in the same harness

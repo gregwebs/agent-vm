@@ -343,7 +343,7 @@ pub(crate) enum Declaration<'a> {
 
 impl Declaration<'_> {
     /// `--mount` or `mounts[N] in "<file>"`: the name a refusal starts with.
-    fn subject(self) -> String {
+    pub(crate) fn subject(self) -> String {
         match self {
             Self::Argv => "--mount".to_string(),
             Self::UserConfig { file, index } => {
@@ -469,13 +469,16 @@ fn validating_source_context(declaration: Declaration<'_>, host: &Path) -> Strin
 
 /// The `resolving … fork root` / `validating … fork root` context for a `:fork`
 /// source that could not be canonicalized or classified. The argv sentence has
-/// never named `--mount` and never quoted the path, so that half stays
-/// byte-identical; a config entry names itself and escapes the host path it
-/// expanded to, because the path is the entry's text and a newline in it would
-/// otherwise forge a second diagnostic line.
+/// never named `--mount` and never quoted the path, so no non-ASCII byte moves
+/// there; it does escape control characters, because this source is the
+/// *canonicalized* root — a name the filesystem measured — and `display()` let a
+/// symlink called `l<LF>FORGED` end the line. A config entry names itself and
+/// byte-escapes the host path it expanded to, because there the path is the
+/// entry's own text and two entries that differ only outside ASCII must not print
+/// alike.
 fn fork_root_context(verb: &str, declaration: Declaration<'_>, source: &Path) -> String {
     match declaration {
-        Declaration::Argv => format!("{verb} fork root {}", source.display()),
+        Declaration::Argv => format!("{verb} fork root {}", crate::one_line::path(source)),
         Declaration::UserConfig { .. } => format!(
             "{verb} {} fork root {}",
             declaration.subject(),
@@ -3328,7 +3331,7 @@ pub(crate) fn prepare(
     )?;
     for mount in expanded.iter().filter(|m| !m.is_readonly() && !m.is_fork()) {
         config_dir.check_writable_mount(
-            &declaration_origin(mount, &origins).subject(),
+            declaration_origin(mount, &origins),
             &mount.source_spelling,
             &mount.spelled_host,
             &mount.host,
@@ -3681,7 +3684,10 @@ fn node_kind(
     } else {
         // This sentence has never named `--mount` for an argv source, so that
         // half stays byte-identical; a config entry is named, because otherwise
-        // the launch context mentions only the file.
+        // the launch context mentions only the file. The config half byte-escapes
+        // the path because this is a *declaration* sentence: the path is the
+        // entry's own text, and two entries that differ only outside ASCII must
+        // not print alike.
         anyhow::bail!(
             "{} must be a regular file or directory",
             match declaration {
@@ -4927,6 +4933,11 @@ mod prepare_tests {
             assert_eq!(
                 fork_root_context(verb, Declaration::Argv, Path::new("/srv/café")),
                 format!("{verb} fork root /srv/café")
+            );
+            // A measured root the filesystem named cannot end the line.
+            assert_eq!(
+                fork_root_context(verb, Declaration::Argv, Path::new("/srv/a\nb")),
+                format!("{verb} fork root /srv/a\\x0ab")
             );
             assert_eq!(
                 fork_root_context(verb, config, Path::new("/srv/café")),
