@@ -2153,11 +2153,18 @@ pub(crate) fn quoted_str(text: &str) -> String {
 /// [`crate::one_line`] is the other policy — control characters only — and it is
 /// the one new notice and refusal code should reach for, because a path a user
 /// has to read back and perhaps copy (`/home/boger/проект`) must print as itself.
-/// The two are not interchangeable, and this function's callers are not uniform:
-/// `session`, `protected_config_dir` and `guest_home` still escape measured paths
-/// this way, which spells a Cyrillic path out as `\xd0\xbf…`. That predates the
-/// one-line policy; the sites this note is about are the ones worth converting,
-/// not a claim that every caller already belongs to one camp.
+/// The two are not interchangeable, and this function's callers are not uniform.
+/// Measured paths are still escaped this way by `session`, `protected_config_dir`,
+/// `guest_home`, `network`'s hostname-proxy refusal, `egress_policy`'s
+/// `write_notices`, `boot_image` (`ImageSource::describe` and
+/// `render_inspection`), `boot_image::default_selection`, and `doctor`
+/// (`describe_tier`, `render_conflicts`, `describe_configured_image`,
+/// `describe_default_observation`, each tool row's `source=`). `doctor`'s sites
+/// keep this policy because they render the values this module's own diagnostics
+/// render, so one report cannot show two escapings of one path; the others simply
+/// predate [`crate::one_line`]. All of them spell a Cyrillic path out as
+/// `\xd0\xbf…`, which is why the one-line policy exists: this function is for text
+/// whose bytes must stay distinguishable, not for a path a user reads back.
 pub(crate) fn escape_path(path: &Path) -> String {
     escape_bytes(path.as_os_str().as_bytes())
 }
