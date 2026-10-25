@@ -45,8 +45,21 @@ cleanup() {
 trap cleanup EXIT
 
 require_cargo_verus() {
-    command -v cargo-verus >/dev/null 2>&1 ||
-        fail "cargo-verus is not on PATH; install the pinned Verus release with script/install-verus.sh"
+    if command -v cargo-verus >/dev/null 2>&1; then
+        return
+    fi
+    # "Not on PATH" and "not installed" are different problems with different
+    # fixes, and `script/install-verus.sh` installs under $HOME/.verus without
+    # touching any shell profile. Saying only "not on PATH" sends an operator
+    # looking for an install that is already there, so name the one command that
+    # fixes it.
+    local installed prefix
+    installed="$(find "${HOME:-/nonexistent}/.verus" -maxdepth 3 -type f -name cargo-verus 2>/dev/null | head -n1 || true)"
+    if [[ -n "$installed" ]]; then
+        prefix="${installed%/cargo-verus}"
+        fail "cargo-verus is installed under $prefix but is not on PATH; add it with: export PATH=\"$prefix:\$PATH\""
+    fi
+    fail "cargo-verus is not on PATH; install the pinned Verus release with script/install-verus.sh"
 }
 
 repo_gate() {

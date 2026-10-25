@@ -133,6 +133,23 @@ check_verus_yml() {
         fail_missing_anchor "$file" 'toolchain: "..." (dtolnay/rust-toolchain input)'
         return
     fi
+    # Every asset `script/install-verus.sh` can install needs a digest here, or
+    # the script refuses: CI only downloads the x86 one, so a bump that moves
+    # only that pin silently breaks every macOS install. Checked as a shape
+    # (64 lowercase hex) rather than against a copy of the value, because
+    # verus.yml is the single source of truth for the digest itself.
+    local key digest
+    for key in VERUS_SHA256 VERUS_SHA256_ARM64_MACOS; do
+        digest="$(sed -n "s/^[[:space:]]*${key}: \"\(.*\)\"$/\1/p" "$file")"
+        if [[ -z "$digest" ]]; then
+            fail_missing_anchor "$file" "${key}: \"...\" (asset digest read by script/install-verus.sh)"
+            return
+        fi
+        if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+            fail "$file ${key} is not a sha256 (64 lowercase hex): $digest"
+            return
+        fi
+    done
     if [[ "$found" == "$channel" ]]; then
         ok "$file toolchain = $found"
         return

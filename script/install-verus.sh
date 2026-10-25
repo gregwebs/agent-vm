@@ -2,13 +2,16 @@
 # Install the Verus release this repository pins, for local contract
 # verification (CONTRIBUTING.md -> "Verifying contracts locally").
 #
-# The release and its digest are read from .github/workflows/verus.yml, which
-# declares them and performs the same install in CI. That file is the single
-# source of truth, so a Verus bump is not mirrored here.
+# The release and its per-asset digests are read from
+# .github/workflows/verus.yml, which declares them and performs the same install
+# in CI. That file is the single source of truth, so a Verus bump is not
+# mirrored here.
 #
-# Only the x86-linux asset has a digest pinned in this repository, because that
-# is the asset CI uses. Elsewhere the computed digest is printed so an operator
-# can record it, rather than being silently trusted.
+# Every asset this script can install has a pinned digest, because the point of
+# installing a release by tag is defeated if the bytes behind the tag are taken
+# on faith. CI only ever downloads the x86-linux asset; the arm64-macos pin
+# exists so a local macOS install is verified too. A platform with no pinned
+# asset is a deliberate failure rather than an unverified download.
 #
 # Usage: script/install-verus.sh [--prefix DIR] [--force]
 set -euo pipefail
@@ -57,16 +60,15 @@ read_pin() {
 }
 
 RELEASE="$(read_pin VERUS_RELEASE)"
-PINNED_SHA256="$(read_pin VERUS_SHA256)"
 
 case "$(uname -s)/$(uname -m)" in
     Linux/x86_64)
         ASSET="verus-${RELEASE}-x86-linux.zip"
-        EXPECTED="$PINNED_SHA256"
+        EXPECTED="$(read_pin VERUS_SHA256)"
         ;;
     Darwin/arm64)
         ASSET="verus-${RELEASE}-arm64-macos.zip"
-        EXPECTED=""
+        EXPECTED="$(read_pin VERUS_SHA256_ARM64_MACOS)"
         ;;
     *)
         fail "no Verus asset is known for $(uname -s)/$(uname -m); see https://github.com/verus-lang/verus/releases"
@@ -91,14 +93,9 @@ else
     ACTUAL="$(shasum -a 256 "$TMP/$ASSET" | cut -d' ' -f1)"
 fi
 
-if [[ -n "$EXPECTED" ]]; then
-    [[ "$ACTUAL" == "$EXPECTED" ]] ||
-        fail "sha256 mismatch for $ASSET: expected $EXPECTED, got $ACTUAL"
-    printf 'sha256 verified against .github/workflows/verus.yml\n'
-else
-    printf 'warning: this repository pins no digest for %s, so it is NOT verified\n' "$ASSET" >&2
-    printf 'warning: its sha256 is %s -- record it if you want it enforced\n' "$ACTUAL" >&2
-fi
+[[ "$ACTUAL" == "$EXPECTED" ]] ||
+    fail "sha256 mismatch for $ASSET: expected $EXPECTED, got $ACTUAL"
+printf 'sha256 verified against .github/workflows/verus.yml\n'
 
 mkdir -p "$PREFIX"
 unzip -q "$TMP/$ASSET" -d "$PREFIX"

@@ -82,9 +82,11 @@ the contracts in [`.github/workflows/verus.yml`](.github/workflows/verus.yml), w
 the single source of truth for the pinned release, its digest, and how it is installed.
 
 To run the same check locally, install that release with `script/install-verus.sh`,
-then from the repository root:
+which verifies the downloaded asset against the digest pinned in `verus.yml` for
+your platform, then add its directory to `PATH` and run from the repository root:
 
 ```bash
+export PATH="$HOME/.verus/verus-<platform>:$PATH"
 CARGO_TARGET_DIR=target/verus cargo verus verify -p agent-vm
 ```
 
@@ -100,7 +102,9 @@ agent-vm-images after a bump here.
 
 `bash script/test/verus-verification.sh` runs exactly what CI runs: the verification
 plus the assertion that it actually verified something, then a pair of throwaway
-fixtures proving the verifier can both pass and fail.
+fixtures proving the verifier can both pass and fail. It reports an installed but
+not-on-`PATH` Verus with the `export` line that fixes it, so the two failure modes
+are never confused.
 
 ### Build identity in `agent-vm --version`
 
