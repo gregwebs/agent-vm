@@ -75,6 +75,7 @@ use vstd::prelude::*;
 
 use crate::config::USER_CONFIG_DIR_RELATIVE;
 use crate::host_paths::{HostFileFacts, read_bounded_regular_file_no_follow};
+use crate::one_line;
 use crate::secret_store::ServiceName;
 
 /// File name inside [`USER_CONFIG_DIR_RELATIVE`].
@@ -806,7 +807,7 @@ pub(crate) fn load(home: &Path) -> Result<AuthorizationSet> {
         warnings.push(format!(
             "{} is group- or other-readable; it holds no secret values, but `chmod go-r` is \
              still good hygiene",
-            path.display()
+            one_line::path(&path)
         ));
     }
 
@@ -838,8 +839,21 @@ fn check_facts(path: &Path, facts: &HostFileFacts) -> Result<()> {
     Ok(())
 }
 
+/// The loader's one refusal shape. The path is measured (it comes from
+/// `$HOME`) and `detail` is not necessarily ours — an io error, another module's
+/// cause chain — so the **whole sentence** is rendered through
+/// [`one_line::text`], never just the path.
+///
+/// `one_line::path` already escaped the path, and `text` only escapes control
+/// characters, so re-applying it to the joined sentence is an identity on the
+/// path bytes and is what neutralizes a newline in `detail`. Building
+/// `format!("{path}: {detail}")` without that second pass would leave exactly
+/// the hole #419 was opened for.
 fn file_error(path: &Path, detail: impl fmt::Display) -> anyhow::Error {
-    anyhow!("{}: {detail}", path.display())
+    anyhow!(
+        "{}",
+        one_line::text(&format!("{}: {detail}", one_line::path(path)))
+    )
 }
 
 /// A strict decoder. UTF-8 only, and no CR, NUL or BOM: a CRLF file is not one
