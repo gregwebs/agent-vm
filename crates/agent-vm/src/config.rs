@@ -999,7 +999,7 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
     };
     let authorized = match kind {
         FileTierKind::User => config_authority::verify(&read, triggers)
-            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,
+            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?,
         FileTierKind::Project => {
             refuse_project_authority(&raw, path)?;
             None
@@ -1014,12 +1014,13 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
             let Some(authorized) = authorized.as_ref() else {
                 return Err(anyhow!(
                     "config: {}: [network]: authority was not measured",
-                    quoted_path(path)
+                    crate::one_line::quoted_path(path)
                 ));
             };
             Some(
-                user_network::from_verified_table(authorized, table)
-                    .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,
+                user_network::from_verified_table(authorized, table).map_err(|error| {
+                    anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
+                })?,
             )
         }
         None => None,
@@ -1031,12 +1032,13 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
             let Some(authorized) = authorized.as_ref() else {
                 return Err(anyhow!(
                     "config: {}: mounts: authority was not measured",
-                    quoted_path(path)
+                    crate::one_line::quoted_path(path)
                 ));
             };
             Some(
-                config_mounts::from_verified_value(authorized, value, home)
-                    .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,
+                config_mounts::from_verified_value(authorized, value, home).map_err(|error| {
+                    anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
+                })?,
             )
         }
         None => None,
@@ -1095,7 +1097,7 @@ fn network_refusal(table: &toml::Table, file: &Path, tier: RefusingTier) -> anyh
     };
     anyhow!(
         "config: {}: {setting}: {reason}; use --allow-* launch flags, or [network] in the user config",
-        quoted_path(file)
+        crate::one_line::quoted_path(file)
     )
 }
 
@@ -1108,7 +1110,7 @@ fn mounts_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
     };
     anyhow!(
         "config: {}: {reason}; use --mount launch options, or mounts in the user config",
-        quoted_path(file)
+        crate::one_line::quoted_path(file)
     )
 }
 
@@ -1124,7 +1126,10 @@ fn validate_image(raw: Option<&str>, file: &Path) -> Result<Option<ConfiguredIma
             reference,
             file: file.to_path_buf(),
         })),
-        Err(reason) => Err(anyhow!("config: {}: image: {reason}", quoted_path(file))),
+        Err(reason) => Err(anyhow!(
+            "config: {}: image: {reason}",
+            crate::one_line::quoted_path(file)
+        )),
     }
 }
 
@@ -1169,7 +1174,10 @@ pub(crate) fn host_home_dir() -> Result<Option<PathBuf>> {
         return Err(anyhow!("$HOME is set but empty"));
     }
     if !home.is_absolute() {
-        return Err(anyhow!("$HOME {} is not absolute", quoted_path(&home)));
+        return Err(anyhow!(
+            "$HOME {} is not absolute",
+            crate::one_line::quoted_path(&home)
+        ));
     }
     Ok(Some(home))
 }
@@ -1289,7 +1297,10 @@ fn describe_origin(origin: &ToolOrigin) -> String {
         ToolOrigin::User(_) => "user config",
         ToolOrigin::Project(_) => "project config",
     };
-    format!("{tier} {}", quoted_path(origin_file(origin)))
+    format!(
+        "{tier} {}",
+        crate::one_line::quoted_path(origin_file(origin))
+    )
 }
 
 /// The declaring file a diagnostic names. `BuiltIn` stores no path because
@@ -2062,35 +2073,44 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
          tool's `command` are strings. A top-level `mounts` is an array of strings and is accepted \
          only at the top of the user file; TOML assigns keys to the most recent `[table]` header, \
          so write it before the first one.",
-        quoted_path(file)
+        crate::one_line::quoted_path(file)
     )
 }
 
 fn utf8_error(file: &Path) -> anyhow::Error {
     anyhow!(
         "config: {} is not valid UTF-8; config files must be UTF-8-encoded TOML",
-        quoted_path(file)
+        crate::one_line::quoted_path(file)
     )
 }
 
 /// **R2.** Reused-reader errors interpolate a raw `path.display()` and may
 /// carry a whole cause chain. Escape every link and return a fresh error with
 /// no original attached, preserving the operation and the reasons.
+///
+/// The links are *measured* text — `host_paths` builds them from a path the user
+/// named — so they take the one-line policy, not [`escape_bytes`]: control
+/// characters are escaped, which is what keeps a cause from forging a line, while
+/// a non-ASCII directory stays readable. Byte-escaping them spelled the same
+/// `$HOME` two ways in one sentence, the outer copy quoted and the cause not.
 fn safe_anyhow_error(operation: &str, path: &Path, error: &anyhow::Error) -> anyhow::Error {
     let reasons = error
         .chain()
-        .map(|cause| escape_bytes(cause.to_string().as_bytes()))
+        .map(|cause| crate::one_line::text(&cause.to_string()))
         .collect::<Vec<_>>()
         .join(": ");
-    anyhow!("config: {operation} {}: {reasons}", quoted_path(path))
+    anyhow!(
+        "config: {operation} {}: {reasons}",
+        crate::one_line::quoted_path(path)
+    )
 }
 
 /// The same boundary for direct `std::io::Error`s (HOME/cwd discovery).
 fn safe_io_error(operation: &str, path: &Path, error: &std::io::Error) -> anyhow::Error {
     anyhow!(
         "config: {operation} {}: {}",
-        quoted_path(path),
-        escape_bytes(error.to_string().as_bytes())
+        crate::one_line::quoted_path(path),
+        crate::one_line::text(&error.to_string())
     )
 }
 
@@ -2132,10 +2152,22 @@ fn escape_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// Render a path the one way every diagnostic does: double-quoted, with
-/// [`escape_bytes`]'s control-byte escaping. `mount` renders a declaration's
-/// origin through this rather than `{:?}`, so one launch cannot show two
-/// escapings of the same config file.
+/// Render a **config-chosen** path double-quoted with [`escape_bytes`]'s
+/// byte-escaping: every non-ASCII byte becomes `\xNN`, and `\` and `"` are
+/// doubled. `mount` renders a declaration's origin through this rather than
+/// `{:?}`, so one launch cannot show two escapings of the same config entry.
+///
+/// A **measured** path — a config file's own location, `$HOME`, a reader's cause
+/// text — uses [`crate::one_line::quoted_path`] instead: same quoting, but
+/// non-ASCII prints as itself, because the reader has to recognise the directory
+/// they named. The two are not interchangeable; see [`escape_path`] for the split
+/// and why it exists.
+///
+/// One caller straddles the line on purpose: `mount::claim_clause` quotes both
+/// sides of a config-origin claim conflict through this function, so an argv or
+/// follow-links-discovered spelling gets the byte policy when it shares a sentence
+/// with a config entry. Its doc says why — the sentence only exists in mixed or
+/// config form, and a conflict must not read as two different paths.
 pub(crate) fn quoted_path(path: &Path) -> String {
     format!("\"{}\"", escape_bytes(path.as_os_str().as_bytes()))
 }
@@ -2153,18 +2185,17 @@ pub(crate) fn quoted_str(text: &str) -> String {
 /// [`crate::one_line`] is the other policy — control characters only — and it is
 /// the one new notice and refusal code should reach for, because a path a user
 /// has to read back and perhaps copy (`/home/boger/проект`) must print as itself.
-/// The two are not interchangeable, and this function's callers are not uniform.
-/// Measured paths are still escaped this way by `session`, `protected_config_dir`,
-/// `guest_home`, `network`'s hostname-proxy refusal, `egress_policy`'s
-/// `write_notices`, `boot_image` (`ImageSource::describe` and
-/// `render_inspection`), `boot_image::default_selection`, and `doctor`
-/// (`describe_tier`, `render_conflicts`, `describe_configured_image`,
-/// `describe_default_observation`, each tool row's `source=`). `doctor`'s sites
-/// keep this policy because they render the values this module's own diagnostics
-/// render, so one report cannot show two escapings of one path; the others simply
-/// predate [`crate::one_line`]. All of them spell a Cyrillic path out as
-/// `\xd0\xbf…`, which is why the one-line policy exists: this function is for text
-/// whose bytes must stay distinguishable, not for a path a user reads back.
+/// The two are not interchangeable. For **measured** paths the one-line policy has
+/// won: `doctor`, `boot_image`, `boot_image`'s selection errors, every config file
+/// location in a diagnostic and every reader-cause link all render through
+/// [`crate::one_line`]. What
+/// remains here is the not-yet-converted set — `session`,
+/// `protected_config_dir`, `guest_home`, `network`'s hostname-proxy refusal, and
+/// `egress_policy`'s `write_notices` — plus the config-chosen paths
+/// [`quoted_path`] renders on purpose. Those spell a Cyrillic path out as
+/// `\xd0\xbf…`: the not-yet-converted five because their output is byte-pinned,
+/// the config-chosen ones because two entries that differ only outside ASCII must
+/// not print alike.
 pub(crate) fn escape_path(path: &Path) -> String {
     escape_bytes(path.as_os_str().as_bytes())
 }
@@ -2186,7 +2217,7 @@ mod tests {
         f.project("[network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/8\"]");
         let message = f.load().unwrap_err().to_string();
         for expected in [
-            quoted_path(&f.project),
+            crate::one_line::quoted_path(&f.project),
             "network.allow_lan".into(),
             "network.allow_egress".into(),
             "project config".into(),
@@ -3616,7 +3647,7 @@ mod tests {
             format!("{error:#}"),
             format!(
                 "config: user config {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry",
-                quoted_path(&fixture.user)
+                crate::one_line::quoted_path(&fixture.user)
             )
         );
 
@@ -3628,7 +3659,7 @@ mod tests {
             format!("{error:#}"),
             format!(
                 "config: project config {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry",
-                quoted_path(&fixture.project)
+                crate::one_line::quoted_path(&fixture.project)
             )
         );
 
@@ -3658,11 +3689,14 @@ mod tests {
         for (rendered, origin) in [
             (
                 user.load().unwrap_err().to_string(),
-                format!("user config {}", quoted_path(&user.user)),
+                format!("user config {}", crate::one_line::quoted_path(&user.user)),
             ),
             (
                 project.load().unwrap_err().to_string(),
-                format!("project config {}", quoted_path(&project.project)),
+                format!(
+                    "project config {}",
+                    crate::one_line::quoted_path(&project.project)
+                ),
             ),
             (
                 tools_from_builtin_text(body).unwrap_err().to_string(),
@@ -3681,7 +3715,7 @@ mod tests {
             unnamed.load().unwrap_err().to_string(),
             format!(
                 "config: project config {} declaration [0] tool: name must not be empty",
-                quoted_path(&unnamed.project)
+                crate::one_line::quoted_path(&unnamed.project)
             )
         );
     }
@@ -4879,6 +4913,64 @@ mod tests {
         );
     }
 
+    /// Both halves of a read failure keep the measured path legible: the quoted
+    /// file the message is about, and the cause text that repeats it (issue #420).
+    /// `safe_io_error` covers metadata discovery, `safe_anyhow_error` the reader's
+    /// cause chain; neither has another path through a test fixture.
+    #[test]
+    fn a_read_failure_names_its_non_ascii_path_once_per_copy() {
+        let path = Path::new("/home/boger/дом/.config/agent-vm/config.toml");
+        let rendered = path.display().to_string();
+
+        let io = safe_io_error(
+            "reading metadata for",
+            path,
+            &std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{rendered} is not a regular file"),
+            ),
+        )
+        .to_string();
+        let read = safe_anyhow_error(
+            "reading",
+            path,
+            &anyhow::anyhow!("{rendered} is not a regular file"),
+        )
+        .to_string();
+
+        for (site, message) in [("safe_io_error", io), ("safe_anyhow_error", read)] {
+            assert_eq!(
+                message.matches("дом").count(),
+                2,
+                "{site} should print both copies as themselves: {message}"
+            );
+            assert!(!message.contains("\\xd0"), "{site} byte-escaped: {message}");
+        }
+    }
+
+    /// The sanitizers still have to do their original job: a cause carrying a
+    /// newline or ESC must not end the line or reach the terminal.
+    #[test]
+    fn a_read_failure_cause_cannot_forge_a_line() {
+        let path = Path::new("/home/boger/config.toml");
+        let hostile = "x\nFORGED: config: user config /etc\u{1b}[31m";
+
+        let io = safe_io_error(
+            "reading metadata for",
+            path,
+            &std::io::Error::other(hostile),
+        )
+        .to_string();
+        let read = safe_anyhow_error("reading", path, &anyhow::anyhow!(hostile)).to_string();
+
+        for message in [io, read] {
+            assert!(!message.contains('\n'), "newline survived: {message:?}");
+            assert!(!message.contains('\u{1b}'), "ESC survived: {message:?}");
+            assert!(message.contains("\\x0a"), "newline escaped: {message:?}");
+            assert_eq!(message.lines().count(), 1, "one line: {message:?}");
+        }
+    }
+
     #[test]
     fn non_utf8_bytes_in_a_path_are_escaped() {
         // macOS filesystems reject invalid-UTF-8 filenames, so exercise the
@@ -5200,7 +5292,7 @@ mod tests {
                 f.load().unwrap_err().to_string(),
                 format!(
                     "config: {tier} {} declaration [0] tool \"t\": network_requests[1]: port must be a decimal number 1-65535",
-                    quoted_path(path)
+                    crate::one_line::quoted_path(path)
                 )
             );
             let body =

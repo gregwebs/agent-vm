@@ -60,10 +60,44 @@ fn escape(bytes: &[u8]) -> String {
     out
 }
 
+/// The **path** policy: escape control characters only, print everything else as
+/// itself. A measured path is one the user named and may need to read back, so a
+/// non-ASCII directory must not be spelled out byte by byte (issue #420).
+fn one_line(value: &OsStr) -> String {
+    let mut out = String::new();
+    let push = |text: &str, out: &mut String| {
+        for character in text.chars() {
+            if character.is_control() {
+                out.push_str(&format!("\\x{:02x}", character as u32));
+            } else {
+                out.push(character);
+            }
+        }
+    };
+    let mut rest = value.as_bytes();
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                push(text, &mut out);
+                return out;
+            }
+            Err(error) => {
+                let (valid, after) = rest.split_at(error.valid_up_to());
+                push(std::str::from_utf8(valid).unwrap(), &mut out);
+                let invalid = error.error_len().unwrap_or(after.len());
+                for byte in &after[..invalid] {
+                    out.push_str(&format!("\\x{byte:02x}"));
+                }
+                rest = &after[invalid..];
+            }
+        }
+    }
+}
+
 fn expected(reference: &str, label: &str, file: Option<&Path>) -> String {
     let mut text = format!("Image: {}\nSource: {label}\n", escape(reference.as_bytes()));
     if let Some(file) = file {
-        text.push_str(&format!("File: {}\n", escape(file.as_os_str().as_bytes())));
+        text.push_str(&format!("File: {}\n", one_line(file.as_os_str())));
     }
     text
 }
@@ -1391,8 +1425,12 @@ fn s14_the_report_escapes_reference_bytes_and_never_trims() {
     );
 }
 
+/// The `File:` line carries a measured path, so it keeps the control bytes off
+/// the terminal while leaving the rest of the name readable: `é` prints as `é`,
+/// not `\xc3\xa9` (issue #420). The `Image:` line above it is a config/env value
+/// and keeps the byte policy, so this fixture proves the two are not confused.
 #[test]
-fn s14_the_file_line_escapes_host_path_bytes() {
+fn s14_the_file_line_escapes_control_bytes_and_keeps_the_rest() {
     let hostile_home = OsString::from_vec("h\u{1b}o\"m\\e\n\u{e9}".as_bytes().to_vec());
     let fixture = Fixture::with_dir_names(&hostile_home, OsStr::new("project"));
     fixture.write_user_image(USER_REF);
@@ -1401,10 +1439,17 @@ fn s14_the_file_line_escapes_host_path_bytes() {
         &output,
         &expected(USER_REF, "user config", Some(&fixture.user_config())),
     );
+    let text = stdout(&output);
+    let file_line = text
+        .lines()
+        .find(|line| line.starts_with("File: "))
+        .unwrap_or_else(|| panic!("no File line: {text:?}"));
+    assert!(!file_line.contains('\u{1b}'), "raw ESC: {file_line:?}");
+    assert!(file_line.contains("\\x1b"), "ESC escaped: {file_line:?}");
+    assert!(file_line.contains('é'), "non-ASCII readable: {file_line:?}");
     assert!(
-        !stdout(&output).contains('\u{1b}'),
-        "the path is escaped, not raw: {:?}",
-        stdout(&output)
+        !file_line.contains("\\xc3"),
+        "not byte-escaped: {file_line:?}"
     );
 }
 

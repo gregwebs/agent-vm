@@ -20,7 +20,6 @@
 //! runs.
 
 use crate::{
-    config::quoted_path,
     config_mounts::UserMounts,
     mount::{MountRequest, MountRequests, parse_extra_mounts},
 };
@@ -155,10 +154,13 @@ impl Selection {
         Some(if skipped {
             format!(
                 "==> Config mounts: skipped {count} from {} (--no-config-mounts)",
-                quoted_path(file)
+                crate::one_line::quoted_path(file)
             )
         } else {
-            format!("==> Config mounts: {count} from {}", quoted_path(file))
+            format!(
+                "==> Config mounts: {count} from {}",
+                crate::one_line::quoted_path(file)
+            )
         })
     }
 
@@ -172,7 +174,7 @@ impl Selection {
         match &self.config {
             ConfigUse::Selected { file, count } if *count > 0 => format!(
                 "preparing mounts (including mounts from {}; --no-config-mounts skips them)",
-                quoted_path(file)
+                crate::one_line::quoted_path(file)
             ),
             ConfigUse::NotDeclared | ConfigUse::Selected { .. } | ConfigUse::Skipped { .. } => {
                 "preparing --mount".to_owned()
@@ -320,7 +322,7 @@ mod tests {
             selection.preparation_context(),
             format!(
                 "preparing mounts (including mounts from {}; --no-config-mounts skips them)",
-                quoted_path(user.file())
+                crate::one_line::quoted_path(user.file())
             )
         );
     }
@@ -355,7 +357,7 @@ mod tests {
                 .notice(),
             Some(format!(
                 "==> Config mounts: 2 from {}",
-                quoted_path(user.file())
+                crate::one_line::quoted_path(user.file())
             ))
         );
         assert_eq!(
@@ -364,7 +366,7 @@ mod tests {
                 .notice(),
             Some(format!(
                 "==> Config mounts: skipped 2 from {} (--no-config-mounts)",
-                quoted_path(user.file())
+                crate::one_line::quoted_path(user.file())
             ))
         );
     }

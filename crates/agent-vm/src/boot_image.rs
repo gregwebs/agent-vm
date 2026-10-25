@@ -220,10 +220,10 @@ impl ImageSource {
             ImageSource::CommandLine => "command line".to_string(),
             ImageSource::Environment => "env AGENT_VM_IMAGE_TAG".to_string(),
             ImageSource::UserConfig(file) => {
-                format!("user config {}", crate::config::escape_path(file))
+                format!("user config {}", crate::one_line::path(file))
             }
             ImageSource::ProjectConfig(file) => {
-                format!("project config {}", crate::config::escape_path(file))
+                format!("project config {}", crate::one_line::path(file))
             }
             // Both default-tier origins stay indistinguishable here: this
             // description is ordinary diagnostic/logging text. Only
@@ -664,7 +664,7 @@ fn render_inspection(selected: &BootImage) -> Result<String> {
         crate::config::escape_str(selected.reference().as_str())
     );
     if let Some(file) = file {
-        report.push_str(&format!("File: {}\n", crate::config::escape_path(file)));
+        report.push_str(&format!("File: {}\n", crate::one_line::path(file)));
     }
     Ok(report)
 }
@@ -1294,6 +1294,46 @@ mod tests {
             boot.to_string(),
             "localhost:1/u:latest (from user config /home/u/.config/agent-vm/config.toml)"
         );
+    }
+
+    /// A measured config path is printed as itself (issue #420), on both the
+    /// `selected` line's source and `image show`'s `File:` line. Byte escaping
+    /// would put `\xd0\xbf…` where the reader expects a directory they named.
+    #[test]
+    fn a_config_path_with_non_ascii_is_printed_as_itself() {
+        let path = PathBuf::from("/home/u/проект/.agent-vm/config.toml");
+
+        for source in [
+            ImageSource::UserConfig(path.clone()),
+            ImageSource::ProjectConfig(path.clone()),
+        ] {
+            let described = source.describe();
+            assert!(
+                described.contains(&path.display().to_string()),
+                "{described}"
+            );
+            assert!(!described.contains("\\xd0"), "byte-escaped: {described}");
+        }
+    }
+
+    /// `image show` prints the declaring file on its own `File:` line, and that
+    /// path is measured like the source's (issue #420).
+    #[test]
+    fn image_show_prints_a_non_ascii_config_path_as_itself() {
+        let file = Path::new("/home/u/проект/.agent-vm/config.toml");
+        let images = ConfiguredImages::for_test(ImageTierFixture {
+            user: None,
+            project: Some(ConfiguredImage::for_test("localhost:1/p:latest", file)),
+        });
+        let boot = select(None, &images).unwrap();
+
+        let report = render_inspection(&boot).unwrap();
+
+        assert!(
+            report.contains(&format!("File: {}", file.display())),
+            "{report}"
+        );
+        assert!(!report.contains("\\xd0"), "byte-escaped: {report}");
     }
 
     /// The exact default SDK reference is asserted in memory, never through
