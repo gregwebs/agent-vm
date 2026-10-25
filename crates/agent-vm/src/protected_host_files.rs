@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use vstd::prelude::*;
 
+use crate::mount::Declaration;
+
 /// `$HOME`-relative directory Pi calls its home.
 const PI_HOME_NAME: &str = ".pi";
 
@@ -234,12 +236,17 @@ impl ResolvedRoot {
     /// `canonicalize` message matches `copy_root`'s pre-existing one, so a root
     /// that vanishes between the source-kind check and the copy keeps failing
     /// closed with the same error.
-    pub(crate) fn resolve(source: &Path) -> Result<Self> {
+    ///
+    /// `declaration` decides how the root is named: an argv `--mount` keeps its
+    /// bare path, while a config entry names itself as `mounts[N] in "<file>"`
+    /// and escapes the path, which at this point is the *expanded* spelling and
+    /// carries whatever bytes the entry held.
+    pub(crate) fn resolve(source: &Path, declaration: Declaration<'_>) -> Result<Self> {
         let path = source
             .canonicalize()
-            .with_context(|| format!("resolving fork root {}", source.display()))?;
+            .with_context(|| format!("resolving fork root {}", declaration.fork_root(source)))?;
         let metadata = fs::metadata(&path)
-            .with_context(|| format!("resolving fork root {}", path.display()))?;
+            .with_context(|| format!("resolving fork root {}", declaration.fork_root(&path)))?;
         Ok(Self {
             path,
             dev: metadata.dev(),
@@ -1090,7 +1097,39 @@ mod tests {
     /// Construct a genuine [`ResolvedRoot`] through its only constructor
     /// against a real directory (R3.3: never a struct literal).
     fn resolve_root(path: &Path) -> ResolvedRoot {
-        ResolvedRoot::resolve(path).unwrap()
+        ResolvedRoot::resolve(path, Declaration::Argv).unwrap()
+    }
+
+    /// A config entry's fork root is named and escaped, so a newline in the
+    /// spelling cannot forge a second diagnostic line. This is the resolve step
+    /// `mount::prepare` reaches on the copy path, i.e. after every load-time
+    /// check has already accepted the entry, so it is the last place a config
+    /// spelling can reach a message.
+    #[test]
+    fn a_config_fork_root_cannot_forge_a_line() {
+        let home = tempfile::tempdir().unwrap();
+        let missing = home.path().join("dang\nFORGED-LINE");
+        let file = home.path().join("config.toml");
+        let declaration = Declaration::UserConfig {
+            file: &file,
+            index: 2,
+        };
+        let error = match ResolvedRoot::resolve(&missing, declaration) {
+            Ok(_) => panic!("a missing fork root must not resolve"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert_eq!(
+            rendered.lines().count(),
+            1,
+            "one line, and never a forged second: {rendered}"
+        );
+        assert!(rendered.contains("mounts[2] in"), "{rendered}");
+        assert!(rendered.contains("dang\\x0aFORGED-LINE"), "{rendered}");
+        assert!(
+            !rendered.lines().any(|line| line.trim() == "FORGED-LINE"),
+            "the spelling is escaped, not printed as a line: {rendered}"
+        );
     }
 
     /// The TOCTOU-defeating case: an implementation that measured only existing

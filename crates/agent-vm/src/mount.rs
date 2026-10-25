@@ -381,6 +381,26 @@ impl Declaration<'_> {
             Self::UserConfig { .. } => quoted_path(path),
         }
     }
+
+    /// What `resolving fork root …` prints in place of the root path.
+    ///
+    /// That sentence never carried a flag name, so an argv entry keeps its bare
+    /// `display()` rendering byte for byte. A config entry has to name itself —
+    /// otherwise the author of `mounts = [...]` cannot tell which entry failed —
+    /// and has to escape the path, which at this point is the *expanded* spelling
+    /// and therefore carries the attacker-chosen bytes.
+    ///
+    /// Exposed to [`crate::protected_host_files`], which owns the resolve step.
+    pub(crate) fn fork_root(self, path: &Path) -> String {
+        match self {
+            Self::Argv => path.display().to_string(),
+            Self::UserConfig { file, index } => format!(
+                "mounts[{index}] in {} {}",
+                quoted_path(file),
+                quoted_path(path)
+            ),
+        }
+    }
 }
 
 /// The declaration a preparation refusal names for `mount`: its own declaration,
@@ -4402,7 +4422,7 @@ fn copy_root(
     // T1: one `canonicalize` plus one `metadata`. The canonicalized pathname is
     // the only thing the copier opens (T4), so a declaration spelling cannot
     // reach the omission signal (R4.4.1-3).
-    let root = ResolvedRoot::resolve(source)?;
+    let root = ResolvedRoot::resolve(source, declaration)?;
     #[cfg(test)]
     let _checkpoint_scope = CopyCheckpointScope::enter(root.path());
     // Test-only race in (T1, T2): the interval S3-A/S3-B use to suppress a
@@ -7356,7 +7376,7 @@ mod prepare_tests {
         assert!(
             launch
                 .union(&fresh)
-                .relatives_under(&ResolvedRoot::resolve(&source).unwrap())
+                .relatives_under(&ResolvedRoot::resolve(&source, Declaration::Argv).unwrap())
                 .is_empty(),
             "no Pi path names anything under an unrelated fork root"
         );
