@@ -2161,20 +2161,26 @@ fn escape_bytes(bytes: &[u8]) -> String {
 /// text — uses [`crate::one_line::quoted_path`] instead: same quoting, but
 /// non-ASCII prints as itself, because the reader has to recognise the directory
 /// they named. The two are not interchangeable: the byte policy is for text a
-/// config file *chose* and a report may compare, and every path the runtime
-/// operates on has now moved to [`crate::one_line`] (issues #410, #414, #420,
-/// #422).
+/// config file *chose* and a report may compare, and every path the reports and
+/// runtime messages converted so far render through [`crate::one_line`] (issues
+/// #410, #414, #420, #422). Not the whole crate: `host_paths`, `credential_yaml`,
+/// `clipboard`, `embedded_runtime` and others still interpolate `Path::display()`
+/// into their own error contexts, which is #419.
 ///
-/// Two callers straddle the line on purpose. `mount::claim_clause` quotes both
-/// sides of a config-origin claim conflict through this function, so an argv or
-/// follow-links-discovered spelling gets the byte policy when it shares a sentence
-/// with a config entry; the sentence only exists in mixed or config form, and a
-/// conflict must not read as two different paths. And every `mount::Declaration`
-/// sentence that *attributes* an entry (`host_path`, `fork_root`, `node_kind`,
-/// `validating_source_context`, `fork_root_context`) byte-escapes the path it
-/// names, because that path is the entry's text. A sentence that reports an
-/// operation on a file (`unable to stat …`, `creating …`) is not a declaration
-/// rendering and takes [`crate::one_line`] instead.
+/// Two kinds of caller straddle the line on purpose. `mount::claim_clause` quotes
+/// both sides of a config-origin claim conflict through this function, so an argv
+/// or follow-links-discovered spelling gets the byte policy when it shares a
+/// sentence with a config entry; the sentence only exists in mixed or config form,
+/// and a conflict must not read as two different paths. And every
+/// `mount::Declaration` sentence that *attributes* an entry (`host_path`,
+/// `fork_root`, `node_kind`, `validating_source_context`, `fork_root_context`)
+/// byte-escapes the path it names, so that one sentence never carries two
+/// renderings of a path and an attributed entry cannot read as two entries. There
+/// the path may be the entry's own text (a declared spelling) or something the
+/// declaration was resolved to (a canonicalized target); both keep the byte
+/// policy. A sentence that reports an operation on a file (`unable to stat …`,
+/// `creating …`) is not a declaration rendering and takes [`crate::one_line`]
+/// instead.
 pub(crate) fn quoted_path(path: &Path) -> String {
     format!("\"{}\"", escape_bytes(path.as_os_str().as_bytes()))
 }

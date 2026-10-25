@@ -539,6 +539,32 @@ mod tests {
     /// three per-tool subdirectories; a dropped one breaks first-launch
     /// provisioning (virtiofs has nowhere real to point at). The golden dir
     /// list itself is asserted in `credential_provider`.
+    /// A state dir that cannot be created is the one `creating …` context a
+    /// fixture can drive without privileges: put a regular file where a parent
+    /// directory has to be. The path is measured, so it prints as itself.
+    #[test]
+    fn a_failed_creation_names_a_non_ascii_state_dir_as_itself() {
+        let base = throwaway_session();
+        let blocker = base.project_dir.join("дом");
+        std::fs::create_dir_all(&base.project_dir).unwrap();
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let session = ProjectSession {
+            project_dir: base.project_dir.clone(),
+            project_hash: base.project_hash.clone(),
+            state_dir: blocker.join("state"),
+            sandbox_name: base.sandbox_name.clone(),
+        };
+
+        let message = session
+            .ensure_dirs(&guest_home::links(&[]))
+            .expect_err("a file where the state dir's parent belongs cannot be created")
+            .to_string();
+        assert!(message.starts_with("creating "), "{message}");
+        assert!(message.contains("дом/state"), "{message}");
+        assert!(!message.contains("\\xd0"), "byte-escaped: {message}");
+        std::fs::remove_dir_all(&base.project_dir).ok();
+    }
+
     #[test]
     fn ensure_dirs_creates_state_root_and_legacy_subdirs() {
         let session = throwaway_session();
