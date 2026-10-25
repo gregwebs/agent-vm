@@ -227,11 +227,11 @@ impl Plan {
             match egress.hostname_authority() {
                 Some(HostnameAuthority::Saved(file)) => anyhow::bail!(
                     "{HOSTNAME_PROXY_REFUSAL} (persisted hostname grants from \"{}\" [network] apply to every launch; remove them there)",
-                    crate::config::escape_path(file)
+                    crate::one_line::path(file)
                 ),
                 Some(HostnameAuthority::SavedAndCli(file)) => anyhow::bail!(
                     "{HOSTNAME_PROXY_REFUSAL} (hostnames from --allow-egress apply to this launch; persisted hostname grants from \"{}\" [network] apply to every launch; remove the persisted ones there and stop passing --allow-egress)",
-                    crate::config::escape_path(file)
+                    crate::one_line::path(file)
                 ),
                 _ => anyhow::bail!(HOSTNAME_PROXY_REFUSAL),
             }
@@ -678,6 +678,47 @@ mod tests {
                 .then(|| "http://127.0.0.1:9".into()))
             .is_ok()
         );
+    }
+
+    /// The file this refusal names is a *measured* config location, so a
+    /// non-ASCII `$HOME` must read as itself. Parameterized over both arms —
+    /// `Saved` and `SavedAndCli` are separate call sites, and reverting either one
+    /// on its own leaves the other's test passing. The control-byte pin above
+    /// still holds, because one-line escaping keeps `\xNN` for control bytes.
+    #[test]
+    fn user_hostname_refusal_prints_a_non_ascii_config_path_as_itself() {
+        let file = "/home/дом/.config/agent-vm/config.toml";
+        let proxy = |v: &str| (v == "HTTPS_PROXY").then(|| "http://127.0.0.1:9".into());
+        let saved_only = crate::user_network::UserNetwork::for_test(
+            file,
+            Default::default(),
+            &["api.example.com"],
+        );
+        let mut saved_and_cli_args = args();
+        saved_and_cli_args.allow_egress = vec!["cli.example.com".into()];
+        let saved_and_cli = crate::user_network::UserNetwork::for_test(
+            file,
+            Default::default(),
+            &["api.example.com"],
+        );
+        for (input, user, clause) in [
+            (args(), &saved_only, "remove them there)"),
+            (
+                saved_and_cli_args,
+                &saved_and_cli,
+                "stop passing --allow-egress)",
+            ),
+        ] {
+            let error = Plan::from_args_with_proxy_lookup(input, Some(user), proxy)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("from \"{file}\" [network]")),
+                "{error}"
+            );
+            assert!(error.ends_with(clause), "{error}");
+            assert!(!error.contains("\\xd0"), "byte-escaped: {error}");
+        }
     }
 
     #[test]

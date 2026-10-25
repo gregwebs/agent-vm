@@ -2160,14 +2160,27 @@ fn escape_bytes(bytes: &[u8]) -> String {
 /// A **measured** path — a config file's own location, `$HOME`, a reader's cause
 /// text — uses [`crate::one_line::quoted_path`] instead: same quoting, but
 /// non-ASCII prints as itself, because the reader has to recognise the directory
-/// they named. The two are not interchangeable; see [`escape_path`] for the split
-/// and why it exists.
+/// they named. The two are not interchangeable: the byte policy is for text a
+/// config file *chose* and a report may compare, and every path the reports and
+/// runtime messages converted so far render through [`crate::one_line`] (issues
+/// #410, #414, #420, #422). Not the whole crate: `host_paths`, `credential_yaml`,
+/// `clipboard`, `embedded_runtime` and others still interpolate `Path::display()`
+/// into their own error contexts, which is #419.
 ///
-/// One caller straddles the line on purpose: `mount::claim_clause` quotes both
-/// sides of a config-origin claim conflict through this function, so an argv or
-/// follow-links-discovered spelling gets the byte policy when it shares a sentence
-/// with a config entry. Its doc says why — the sentence only exists in mixed or
-/// config form, and a conflict must not read as two different paths.
+/// Two kinds of caller straddle the line on purpose. `mount::claim_clause` quotes
+/// both sides of a config-origin claim conflict through this function, so an argv
+/// or follow-links-discovered spelling gets the byte policy when it shares a
+/// sentence with a config entry; the sentence only exists in mixed or config form,
+/// and a conflict must not read as two different paths. And every
+/// `mount::Declaration` sentence that *attributes* an entry (`host_path`,
+/// `fork_root`, `node_kind`, `validating_source_context`, `fork_root_context`)
+/// byte-escapes the path it names, so that one sentence never carries two
+/// renderings of a path and an attributed entry cannot read as two entries. There
+/// the path may be the entry's own text (a declared spelling) or something the
+/// declaration was resolved to (a canonicalized target); both keep the byte
+/// policy. A sentence that reports an operation on a file (`unable to stat …`,
+/// `creating …`) is not a declaration rendering and takes [`crate::one_line`]
+/// instead.
 pub(crate) fn quoted_path(path: &Path) -> String {
     format!("\"{}\"", escape_bytes(path.as_os_str().as_bytes()))
 }
@@ -2179,27 +2192,18 @@ pub(crate) fn quoted_str(text: &str) -> String {
     format!("\"{}\"", escape_bytes(text.as_bytes()))
 }
 
-/// Escape every non-ASCII byte as `\xNN`: the policy for **config-derived text**,
-/// where two values that differ only outside ASCII must not look identical.
+/// Escape every non-ASCII byte as `\xNN`: the policy for **config-chosen text** —
+/// tool names, commands, image references — where two values that differ only
+/// outside ASCII must not look identical in one report.
 ///
 /// [`crate::one_line`] is the other policy — control characters only — and it is
-/// the one new notice and refusal code should reach for, because a path a user
-/// has to read back and perhaps copy (`/home/boger/проект`) must print as itself.
-/// The two are not interchangeable. For **measured** paths the one-line policy has
-/// won: `doctor`, `boot_image`, `boot_image`'s selection errors, every config file
-/// location in a diagnostic and every reader-cause link all render through
-/// [`crate::one_line`]. What
-/// remains here is the not-yet-converted set — `session`,
-/// `protected_config_dir`, `guest_home`, `network`'s hostname-proxy refusal, and
-/// `egress_policy`'s `write_notices` — plus the config-chosen paths
-/// [`quoted_path`] renders on purpose. Those spell a Cyrillic path out as
-/// `\xd0\xbf…`: the not-yet-converted five because their output is byte-pinned,
-/// the config-chosen ones because two entries that differ only outside ASCII must
-/// not print alike.
-pub(crate) fn escape_path(path: &Path) -> String {
-    escape_bytes(path.as_os_str().as_bytes())
-}
-
+/// the one the modules [`crate::one_line`] lists use for every path they print,
+/// because a path a user has to read back and perhaps copy
+/// (`/home/boger/проект`) must print as itself. The two are not interchangeable: what stays here is text a config file
+/// chose and a report may compare, which is [`quoted_str`] and [`quoted_path`]'s
+/// job for the quoted forms, plus the *declaration* sentences [`quoted_path`]
+/// documents. `doctor`'s module doc lists the channels that print validated names
+/// raw instead.
 pub(crate) fn escape_str(text: &str) -> String {
     escape_bytes(text.as_bytes())
 }
@@ -4972,13 +4976,15 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_bytes_in_a_path_are_escaped() {
+    fn non_utf8_bytes_in_a_config_chosen_path_are_escaped() {
         // macOS filesystems reject invalid-UTF-8 filenames, so exercise the
-        // escape policy directly. (On Linux the same bytes can appear in a
-        // real path and flow through `safe_io_error`.)
+        // escape policy directly. A *measured* path with the same bytes is
+        // `one_line::path`'s business, which escapes them without quoting;
+        // a config-chosen one is quoted and byte-escaped, so two entries that
+        // differ only here cannot print alike.
         let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"proj\xff\xfe\x1b"));
-        let rendered = escape_path(&path);
-        assert_eq!(rendered, "proj\\xff\\xfe\\x1b");
+        let rendered = quoted_path(&path);
+        assert_eq!(rendered, "\"proj\\xff\\xfe\\x1b\"");
         assert!(!rendered.contains('\u{fffd}'));
         assert!(!rendered.contains('\x1b'));
     }

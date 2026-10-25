@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use vstd::prelude::*;
 
 use crate::config;
-use crate::mount::Spelling;
+use crate::mount::{Declaration, Spelling};
 use crate::protected_host_files::{CoreBind, CoreHostSource};
 
 verus! {
@@ -211,7 +211,7 @@ fn anchored(cwd: &Path, path: &Path) -> PathBuf {
 fn uncertain(path: &Path) -> String {
     format!(
         "cannot determine whether a mount would expose \"{}\"",
-        config::escape_path(path)
+        crate::one_line::path(path)
     )
 }
 fn route(path: &Path) -> Result<WriteRoute> {
@@ -391,7 +391,7 @@ impl ProtectedConfigDir {
             {
                 bail!(
                     "\"{}\" has {n} hard links; agent-vm will not launch while another name for it could be written from a guest and then removed. Remove the other links, or replace the file with a copy.",
-                    config::escape_path(file)
+                    crate::one_line::path(file)
                 );
             }
         }
@@ -437,8 +437,8 @@ impl ProtectedConfigDir {
                     bail!(
                         "agent-vm's {} \"{}\" is, or contains, \"{}\" or a directory agent-vm resolves through to reach it, where agent-vm reads launch authority; the guest could rewrite that authority for a later launch. {}",
                         source.bind.description(),
-                        config::escape_path(&root),
-                        config::escape_path(&d.spelled),
+                        crate::one_line::path(&root),
+                        crate::one_line::path(&d.spelled),
                         remedy(source.bind, &canonical, d)
                     );
                 }
@@ -452,8 +452,8 @@ impl ProtectedConfigDir {
                     bail!(
                         "agent-vm's {} \"{}\" does not exist yet; once created it could be, or contain, a directory in which agent-vm looks up names on the way to \"{}\", where agent-vm reads launch authority, so the guest could plant authority there for a later launch. (Names that do not exist yet are compared ignoring letter case, and a name ending in '.' or containing characters other than ASCII letters, digits, '.', '-' or '_' is assumed to match any name.) {}",
                         source.bind.description(),
-                        config::escape_path(&root),
-                        config::escape_path(&d.spelled),
+                        crate::one_line::path(&root),
+                        crate::one_line::path(&d.spelled),
                         remedy(source.bind, &root, d)
                     );
                 }
@@ -467,29 +467,29 @@ impl ProtectedConfigDir {
     /// the declaration: `--mount` for argv, the config entry's own
     /// `mounts[N] in "<file>"` for a verified user entry.
     ///
-    /// `spelling` is a [`Spelling`], not text: this sentence has always quoted
-    /// the declared spelling with `quoted_path` for *both* sources, so the
-    /// escaping belongs here, and taking the type means no caller has to hand
-    /// raw declaration bytes to a message.
+    /// `declaration` decides how the spelling is quoted: an argv `--mount` keeps
+    /// its byte-pinned `{:?}` rendering and a config entry its byte-escaped
+    /// `mounts[N] in "<file>"` attribution ([`Spelling::render_quoted`]), so one
+    /// declaration cannot print two ways depending on which refusal fires.
     pub(crate) fn check_writable_mount(
         &self,
-        subject: &str,
+        declaration: Declaration<'_>,
         spelling: &Spelling,
         spelled_host: &Path,
         host: &Path,
     ) -> Result<()> {
+        let subject = declaration.subject();
         match fs::metadata(host) {
             Ok(m) => {
                 let canonical = fs::canonicalize(host).with_context(|| uncertain(host))?;
                 if let Some(d) =
                     self.decide(Some(spelled_host), &canonical, Some((m.dev(), m.ino())))
                 {
-                    // `quoted_path` escapes, so these bytes are never printed raw.
-                    #[allow(clippy::disallowed_methods)]
-                    let declared = config::quoted_path(spelling.as_source_path());
+                    // `render_quoted` escapes, so these bytes are never printed raw.
+                    let declared = spelling.render_quoted(declaration);
                     bail!(
                         "{subject} {declared} would let the guest change what {} contains or resolves to, where agent-vm reads launch authority. Mount it read-only (:ro), or mount a narrower path that does not contain it.",
-                        config::quoted_path(&d.spelled)
+                        crate::one_line::quoted_path(&d.spelled)
                     );
                 }
             }
@@ -793,12 +793,68 @@ mod tests {
             }));
         }
         let msg = guard
-            .check_writable_mount("--mount", &Spelling::new("/decl"), &t.home, &t.home)
+            .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &t.home, &t.home)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("contains or resolves to"));
         assert!(msg.contains(":ro"));
         assert!(!msg.contains(":fork"));
+    }
+    /// `d.spelled` is `<measured home>/.config/agent-vm`, so every sentence that
+    /// names it has a measured path in it — the classification that decides the
+    /// policy here. A non-ASCII `$HOME` must read as itself in each of them.
+    #[test]
+    fn a_non_ascii_home_prints_as_itself_in_every_refusal() {
+        let t = Tree::new();
+        let home = t.cwd.join("дом");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir_all(home.join(".config/agent-vm")).unwrap();
+        let guard = ProtectedConfigDir::measure(std::slice::from_ref(&home), &t.cwd).unwrap();
+        for message in [
+            guard
+                .check_core_bind(&CoreHostSource::new(CoreBind::StateDir, home.clone()))
+                .unwrap_err()
+                .to_string(),
+            guard
+                .check_writable_mount(Declaration::Argv, &Spelling::new("/decl"), &home, &home)
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(message.contains("дом/.config/agent-vm"), "{message}");
+            assert!(!message.contains("\\xd0"), "byte-escaped: {message}");
+        }
+    }
+    /// The declared spelling is *not* measured: an argv `--mount` keeps the
+    /// `{:?}` rendering every other argv diagnostic pins, and a config entry keeps
+    /// the byte-escaped, attributed `mounts[N] in "<file>"` form, so a spelling
+    /// cannot print one way in this refusal and another in `mount`'s own.
+    #[test]
+    fn a_declared_spelling_is_rendered_by_its_declaration() {
+        let t = Tree::new();
+        fs::create_dir_all(t.home.join(".config/agent-vm")).unwrap();
+        let guard = t.guard();
+        let file = t.cwd.join(".config/agent-vm/config.toml");
+        let spelling = Spelling::new("/декларация");
+        let argv = guard
+            .check_writable_mount(Declaration::Argv, &spelling, &t.home, &t.home)
+            .unwrap_err()
+            .to_string();
+        assert!(argv.starts_with("--mount \"/декларация\""), "{argv}");
+        let user = guard
+            .check_writable_mount(
+                Declaration::UserConfig {
+                    file: &file,
+                    index: 0,
+                },
+                &spelling,
+                &t.home,
+                &t.home,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(user.starts_with("mounts[0] in"), "{user}");
+        assert!(!user.contains("декларация"), "{user}");
+        assert!(user.contains("\\xd0\\xb4"), "byte-escaped: {user}");
     }
     #[test]
     fn prospective_basic_and_dotdot() {

@@ -50,8 +50,18 @@
 //! `credentials.yaml` the launch would read, and whatever `--reset-msb-db` moved —
 //! go through [`crate::one_line`], which escapes only control characters.
 //!
-//! [`crate::config::escape_path`] and [`crate::config::quoted_path`] are not used
-//! for any measured path in this report. They previously were, on the lines whose
+//! [`crate::config::escape_str`] and [`crate::config::quoted_path`] are not used
+//! for any measured path in this report, and the modules whose error text this
+//! report prints — `session`, `protected_config_dir`, `guest_home`, `network`,
+//! `egress_policy` — now take the one-line policy too (#422). Two things remain
+//! outside it. Byte-escaped paths survive in `mount`'s *declaration* sentences,
+//! which attribute a config entry and must keep two entries that differ only
+//! outside ASCII distinguishable ([`crate::config::quoted_path`] lists them). And
+//! error text from modules that have not converted at all (`host_paths`,
+//! `credential_yaml`, …) still interpolates `Path::display()`, so it escapes
+//! nothing — that is #419, and it is why the guarantee below is about the escaping
+//! this report does rather than about every line it prints. This report used to be
+//! the exception, on the lines whose
 //! values also come from `config` and `boot_image` — the config file locations
 //! (`describe_tier`), the conflict lines (`render_conflicts`), each tool row's
 //! `source=user:…`/`source=project:…`, the boot-image paths
@@ -72,17 +82,16 @@
 //! They do give up the non-ASCII consistency above — a non-ASCII tool name prints
 //! as itself in that suffix and byte-escaped in its own tool row.
 //!
-//! The limit is error text that other modules built: `session`,
-//! `protected_config_dir`, `guest_home`, `network` and `egress_policy` still
-//! escape measured paths with [`crate::config::escape_path`], so their text can
-//! spell a non-ASCII path out on one of this report's raw `error:` lines
-//! (`error: {error:#}`, `error: {message}`, twice under `selected`). Nothing here
-//! can see the difference — the escaping already happened. What does hold for
-//! every error source: text that reaches these lines escapes its own control
-//! bytes, so a path it names cannot forge a line. `mount` is the exception that
-//! proves the rule — a *config-chosen* path there is still byte-escaped on
-//! purpose, because two mount entries that differ only outside ASCII must not
-//! print alike.
+//! Error text this report prints raw (`error: {error:#}`, `error: {message}`,
+//! twice under `selected`) is built by other modules. The five whose text this
+//! report most often prints — `session`, `protected_config_dir`, `guest_home`,
+//! `network`, `egress_policy` — render their paths the same way, so one `$HOME`
+//! reads the same on every line (#422); the modules named above as unconverted do
+//! not, and their `error:` lines can still print a path legibly here and raw
+//! there. What holds whichever module built the text: it escapes its own control
+//! bytes or it is one of the #419 modules that escape nothing, and `mount` keeps a
+//! *config-chosen* path byte-escaped on purpose, because two mount entries that
+//! differ only outside ASCII must not print alike.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1866,7 +1875,7 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
         );
     }
 
-    /// The discriminator against [`crate::config::escape_path`]: a measured path
+    /// The discriminator against [`crate::config::escape_str`]: a measured path
     /// the user has to read back — and, for `--reset-msb-db`, copy — stays
     /// legible. Escaping every non-ASCII byte would print this as
     /// `/home/boger/\\xd0\\xbf...`.

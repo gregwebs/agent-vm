@@ -113,9 +113,8 @@ impl ProjectSession {
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("stat {}", crate::config::escape_path(&self.state_dir))
-                });
+                return Err(error)
+                    .with_context(|| format!("stat {}", crate::one_line::path(&self.state_dir)));
             }
         }
 
@@ -139,7 +138,7 @@ impl ProjectSession {
         let guest = GuestStateDir::open(&self.state_dir).with_context(|| {
             format!(
                 "migrating the pre-#96 Pi home for {}",
-                crate::config::escape_path(&self.state_dir)
+                crate::one_line::path(&self.state_dir)
             )
         })?;
 
@@ -164,10 +163,10 @@ impl ProjectSession {
                         "{} is a pre-upgrade Pi home and {} already holds Pi state; agent-vm \
                          will not merge them. Move one aside on the host, e.g. \
                          `mv {} {}.pre-96`, then re-run",
-                        crate::config::escape_path(&legacy_path),
-                        crate::config::escape_path(&target_path),
-                        crate::config::escape_path(&legacy_path),
-                        crate::config::escape_path(&legacy_path)
+                        crate::one_line::path(&legacy_path),
+                        crate::one_line::path(&target_path),
+                        crate::one_line::path(&legacy_path),
+                        crate::one_line::path(&legacy_path)
                     );
                 }
             }
@@ -177,10 +176,10 @@ impl ProjectSession {
                 "{} is not a directory; agent-vm will not move the pre-upgrade Pi home {} \
                  onto it. Move it aside on the host, e.g. \
                  `mv {} {}.pre-96`, then re-run",
-                crate::config::escape_path(&target_path),
-                crate::config::escape_path(&legacy_path),
-                crate::config::escape_path(&target_path),
-                crate::config::escape_path(&target_path)
+                crate::one_line::path(&target_path),
+                crate::one_line::path(&legacy_path),
+                crate::one_line::path(&target_path),
+                crate::one_line::path(&target_path)
             ),
         }
 
@@ -199,8 +198,8 @@ impl ProjectSession {
         guest.rename_entry(legacy, target)?;
         tracing::info!(
             "moved the pre-#96 Pi home {} to {} (issue #96)",
-            crate::config::escape_path(&legacy_path),
-            crate::config::escape_path(&target_path)
+            crate::one_line::path(&legacy_path),
+            crate::one_line::path(&target_path)
         );
         Ok(())
     }
@@ -234,10 +233,11 @@ impl ProjectSession {
     /// parent is created (see the loop below).
     pub fn ensure_dirs(&self, links: &[GuestHomeLink]) -> Result<()> {
         std::fs::create_dir_all(&self.state_dir)
-            .with_context(|| format!("creating {}", self.state_dir.display()))?;
+            .with_context(|| format!("creating {}", crate::one_line::path(&self.state_dir)))?;
         for name in crate::credential_provider::eager_state_dirs() {
             let dir = self.state_dir.join(name);
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("creating {}", crate::one_line::path(&dir)))?;
         }
         // Every link's target parent, so a dangling `persist` symlink resolves
         // to a creatable path in the guest (the guest's `open(O_CREAT)` through
@@ -251,7 +251,7 @@ impl ProjectSession {
             let target = self.state_dir.join(&link.state_relative);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", crate::config::escape_path(parent)))?;
+                    .with_context(|| format!("creating {}", crate::one_line::path(parent)))?;
             }
         }
         Ok(())
@@ -294,7 +294,8 @@ impl ProjectSession {
     /// Call only in non-root mode, any time after [`Self::ensure_dirs`].
     pub fn provision_guest_home(&self, links: &[GuestHomeLink]) -> Result<()> {
         let home = self.guest_home_dir();
-        std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+        std::fs::create_dir_all(&home)
+            .with_context(|| format!("creating {}", crate::one_line::path(&home)))?;
         for dir in guest_home::link_parent_dirs(links) {
             let dir = home.join(dir);
             create_dir_all_beneath(&home, &dir)?;
@@ -303,13 +304,21 @@ impl ProjectSession {
             match link.source {
                 LinkSource::Compiled => {
                     force_symlink(&target, &link_path).with_context(|| {
-                        format!("provisioning guest home in {}", home.display())
+                        format!(
+                            "provisioning guest home in {}",
+                            crate::one_line::path(&home)
+                        )
                     })?;
                 }
                 LinkSource::Declared => {
                     let target_path = self.state_dir.join(&link.state_relative);
                     link_declared_persist(&target_path, &target, &link_path).with_context(
-                        || format!("provisioning guest home in {}", home.display()),
+                        || {
+                            format!(
+                                "provisioning guest home in {}",
+                                crate::one_line::path(&home)
+                            )
+                        },
                     )?;
                 }
             }
@@ -335,13 +344,12 @@ fn create_dir_all_beneath(home: &Path, dir: &Path) -> Result<()> {
             anyhow::bail!(
                 "refusing to provision {}: {} is a symlink, not a directory; a \
                  symlinked path under the guest HOME must not redirect host-side provisioning",
-                crate::config::escape_path(dir),
-                crate::config::escape_path(&current)
+                crate::one_line::path(dir),
+                crate::one_line::path(&current)
             );
         }
     }
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating {}", crate::config::escape_path(dir)))
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", crate::one_line::path(dir)))
 }
 
 /// Pure mapping from the resolved [`GuestHomeLink`] list to
@@ -369,44 +377,45 @@ fn guest_home_symlinks(home: &Path, links: &[GuestHomeLink]) -> Vec<(PathBuf, St
 /// is same-filesystem and atomic, and a destination that already exists is an
 /// ambiguity (two sources of truth) that is reported, not resolved.
 fn link_declared_persist(target_path: &Path, target: &str, link: &Path) -> Result<()> {
-    // Every path in a diagnostic below is config-derived (it embeds a `persist`
-    // entry, which may legally contain ESC/ANSI bytes), so it is escaped with
-    // the same rule `config`'s own diagnostics use — never printed raw.
+    // These paths mix a measured prefix (`home`, the state dir) with a
+    // config-chosen component (a `persist` entry's relative path), and these
+    // sentences operate on one file rather than comparing declarations, so the
+    // whole path takes the one-line policy: a non-ASCII `$HOME` must not print as
+    // `\xd0\xbf…` here and as itself everywhere else. Control characters are still
+    // escaped, so no `persist` value can forge a line.
     match std::fs::symlink_metadata(link) {
         Ok(meta) if meta.file_type().is_symlink() => {
             // Idempotent relaunch, or a retarget: replace the link.
-            std::fs::remove_file(link).with_context(|| {
-                format!("removing existing {}", crate::config::escape_path(link))
-            })?;
+            std::fs::remove_file(link)
+                .with_context(|| format!("removing existing {}", crate::one_line::path(link)))?;
         }
         Ok(_) => {
             if std::fs::symlink_metadata(target_path).is_ok() {
                 anyhow::bail!(
                     "guest home path {} holds real content and its persist target {} also exists; \
                      move or remove one of them",
-                    crate::config::escape_path(link),
-                    crate::config::escape_path(target_path)
+                    crate::one_line::path(link),
+                    crate::one_line::path(target_path)
                 );
             }
             std::fs::rename(link, target_path).with_context(|| {
                 format!(
                     "migrating {} into {}",
-                    crate::config::escape_path(link),
-                    crate::config::escape_path(target_path)
+                    crate::one_line::path(link),
+                    crate::one_line::path(target_path)
                 )
             })?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("stat {}", crate::config::escape_path(link)));
+            return Err(error).with_context(|| format!("stat {}", crate::one_line::path(link)));
         }
     }
     std::os::unix::fs::symlink(target, link).with_context(|| {
         format!(
             "symlinking {} -> {}",
-            crate::config::escape_path(link),
-            crate::config::escape_str(target)
+            crate::one_line::path(link),
+            crate::one_line::text(target)
         )
     })
 }
@@ -429,15 +438,20 @@ fn force_symlink(target: &str, link: &Path) -> Result<()> {
         Ok(meta) if meta.is_dir() => anyhow::bail!(
             "{} is a real directory, not a symlink or file — refusing to \
              remove it automatically; move or delete it manually and re-run",
-            link.display()
+            crate::one_line::path(link)
         ),
         Ok(_) => std::fs::remove_file(link)
-            .with_context(|| format!("removing existing {}", link.display()))?,
+            .with_context(|| format!("removing existing {}", crate::one_line::path(link)))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("stat {}", link.display())),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", crate::one_line::path(link))),
     }
-    std::os::unix::fs::symlink(target, link)
-        .with_context(|| format!("symlinking {} -> {target}", link.display()))
+    std::os::unix::fs::symlink(target, link).with_context(|| {
+        format!(
+            "symlinking {} -> {}",
+            crate::one_line::path(link),
+            crate::one_line::text(target)
+        )
+    })
 }
 
 /// Basename of the host-only advisory lock serializing the one-shot #96
@@ -525,6 +539,32 @@ mod tests {
     /// three per-tool subdirectories; a dropped one breaks first-launch
     /// provisioning (virtiofs has nowhere real to point at). The golden dir
     /// list itself is asserted in `credential_provider`.
+    /// A state dir that cannot be created is the one `creating …` context a
+    /// fixture can drive without privileges: put a regular file where a parent
+    /// directory has to be. The path is measured, so it prints as itself.
+    #[test]
+    fn a_failed_creation_names_a_non_ascii_state_dir_as_itself() {
+        let base = throwaway_session();
+        let blocker = base.project_dir.join("дом");
+        std::fs::create_dir_all(&base.project_dir).unwrap();
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let session = ProjectSession {
+            project_dir: base.project_dir.clone(),
+            project_hash: base.project_hash.clone(),
+            state_dir: blocker.join("state"),
+            sandbox_name: base.sandbox_name.clone(),
+        };
+
+        let message = session
+            .ensure_dirs(&guest_home::links(&[]))
+            .expect_err("a file where the state dir's parent belongs cannot be created")
+            .to_string();
+        assert!(message.starts_with("creating "), "{message}");
+        assert!(message.contains("дом/state"), "{message}");
+        assert!(!message.contains("\\xd0"), "byte-escaped: {message}");
+        std::fs::remove_dir_all(&base.project_dir).ok();
+    }
+
     #[test]
     fn ensure_dirs_creates_state_root_and_legacy_subdirs() {
         let session = throwaway_session();
@@ -711,6 +751,36 @@ mod tests {
         assert!(legacy.join("x").is_file());
         assert!(target.join("y").is_file());
         std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
+    /// The pre-#96 migration refuses to merge two populated homes, and the two
+    /// paths it names come from the state dir rather than from a config file, so a
+    /// non-ASCII state dir prints as itself (issue #422). Escaping every non-ASCII
+    /// byte would make the `mv` the message suggests unreadable in exactly the
+    /// line a user has to act on.
+    #[test]
+    fn migrate_legacy_pi_home_names_a_non_ascii_state_dir_as_itself() {
+        let base = throwaway_session();
+        let session = ProjectSession {
+            project_dir: base.project_dir.clone(),
+            project_hash: base.project_hash.clone(),
+            state_dir: base.project_dir.join("дом/state"),
+            sandbox_name: base.sandbox_name.clone(),
+        };
+        let legacy = session.guest_home_dir().join(".pi");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("x"), b"legacy").unwrap();
+        let target = session.state_dir.join("pi");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("y"), b"state").unwrap();
+
+        let message = session
+            .migrate_legacy_pi_home()
+            .expect_err("must refuse to merge two populated Pi homes")
+            .to_string();
+        assert!(message.contains("дом/state/home/.pi"), "{message}");
+        assert!(!message.contains("\\xd0"), "byte-escaped: {message}");
+        std::fs::remove_dir_all(&base.project_dir).ok();
     }
 
     /// U5: a regular file at `.pi` is not the migration's business —
@@ -1261,8 +1331,9 @@ mod tests {
     fn link_declared_persist_escapes_control_bytes_in_its_diagnostic() {
         // A `persist` entry may legally contain ESC/ANSI bytes (`normalize_persist`
         // rejects only empty/NUL/absolute/`..`), so the error must render them
-        // escaped, exactly as `config`'s own diagnostics do — otherwise a
-        // project config could drive the terminal.
+        // escaped — otherwise a project config could drive the terminal. Escaping
+        // control bytes is all this takes: the policy is `one_line`, not the byte
+        // escaping that would also spell out the non-ASCII path (issue #422).
         let session = throwaway_session();
         let home = session.guest_home_dir();
         std::fs::create_dir_all(&home).unwrap();
@@ -1284,6 +1355,52 @@ mod tests {
             message.contains("\\x1b"),
             "the byte was not escaped: {message:?}"
         );
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
+    /// The other half of the policy above: these sentences operate on one file,
+    /// so a path that mixes a measured prefix with a config-chosen `persist`
+    /// component prints as itself. Escaping every non-ASCII byte would make the
+    /// measured `$HOME` unreadable in these lines only, and no message here
+    /// compares two `persist` entries, so there is nothing the byte policy would
+    /// disambiguate.
+    #[test]
+    fn link_declared_persist_prints_a_non_ascii_persist_path_as_itself() {
+        let session = throwaway_session();
+        let home = session.guest_home_dir();
+        std::fs::create_dir_all(&home).unwrap();
+        let relative = "код/настройки.yml";
+        let target = session.state_dir.join("persist").join(relative);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let link = home.join(relative);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(&link, "home copy").unwrap();
+        std::fs::write(&target, "state copy").unwrap();
+
+        let err = link_declared_persist(&target, "ignored", &link)
+            .expect_err("two real copies is an ambiguity, not a migration");
+        let message = err.to_string();
+        assert!(message.contains("код/настройки.yml"), "{message}");
+        assert!(!message.contains("\\xd0"), "byte-escaped: {message}");
+        std::fs::remove_dir_all(&session.project_dir).ok();
+    }
+
+    /// The symlink refusal wraps the same mixed paths in `refusing to provision
+    /// … : … is a symlink` and `creating …`, so it takes the same policy.
+    #[test]
+    fn create_dir_all_beneath_prints_a_non_ascii_path_as_itself() {
+        let session = throwaway_session();
+        let home = session.guest_home_dir();
+        std::fs::create_dir_all(&home).unwrap();
+        let elsewhere = session.project_dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join("код")).unwrap();
+
+        let err = create_dir_all_beneath(&home, &home.join("код/настройки"))
+            .expect_err("a symlinked ancestor must be refused");
+        let message = err.to_string();
+        assert!(message.contains("код/настройки"), "{message}");
+        assert!(!message.contains("\\xd0"), "byte-escaped: {message}");
         std::fs::remove_dir_all(&session.project_dir).ok();
     }
 
