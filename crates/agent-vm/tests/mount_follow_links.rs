@@ -643,3 +643,41 @@ fn follow_links_root_mode_without_home_refuses_the_approval_store() {
         "the refusal must precede builder.build(), stderr:\n{err}"
     );
 }
+
+/// The walk names two kinds of thing nobody typed: a discovered target, which
+/// becomes a mount of its own, and a directory entry it had to skip. Both are
+/// *measured*, so both are escaped on the line they appear on — a symlink whose
+/// name holds a newline cannot forge an `==> ` notice, and a target whose name
+/// holds one cannot forge the right-hand side of a mount notice.
+#[test]
+fn a_follow_links_walk_cannot_forge_a_notice_with_a_measured_name() {
+    let h = Harness::new();
+    let home = h.home_path();
+    let root = home.join("skills");
+    let target = home.join("t\nFORGED-TARGET");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("marker.txt"), "m").unwrap();
+    std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+    // A dangling link is the cheap way to force a walk *warning*, which is the
+    // other measured name this walk prints.
+    std::os::unix::fs::symlink(home.join("gone"), root.join("d\nFORGED-WARN")).unwrap();
+
+    let out = h.run_shell(&[&format!("{}:ro:follow-links", root.display())]);
+    let err = stderr_of(&out);
+
+    assert!(
+        err.contains("t\\x0aFORGED-TARGET"),
+        "the discovered guest must be escaped:\n{err}"
+    );
+    assert!(
+        err.contains("d\\x0aFORGED-WARN"),
+        "the skipped entry must be escaped:\n{err}"
+    );
+    for forged in ["FORGED-TARGET (read-only)", "FORGED-TARGET", "FORGED-WARN"] {
+        assert!(
+            !err.lines().any(|line| line.trim() == forged),
+            "a measured name forged the line {forged:?}:\n{err}"
+        );
+    }
+}

@@ -44,6 +44,7 @@ mod msb_preflight;
 mod msb_schema;
 mod network;
 mod network_requests;
+mod one_line;
 mod pi_credential_inspection;
 mod protected_config_dir;
 mod protected_host_files;

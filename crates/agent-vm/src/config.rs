@@ -2147,8 +2147,17 @@ pub(crate) fn quoted_str(text: &str) -> String {
     format!("\"{}\"", escape_bytes(text.as_bytes()))
 }
 
-/// The escape policy for `doctor`'s own rendering, exposed so its output
-/// obeys the same control-byte rule as config diagnostics.
+/// Escape every non-ASCII byte as `\xNN`: the policy for **config-derived text**,
+/// where two values that differ only outside ASCII must not look identical.
+///
+/// [`crate::one_line`] is the other policy — control characters only — and it is
+/// the one new notice and refusal code should reach for, because a path a user
+/// has to read back and perhaps copy (`/home/boger/проект`) must print as itself.
+/// The two are not interchangeable, and this function's callers are not uniform:
+/// `session`, `protected_config_dir` and `guest_home` still escape measured paths
+/// this way, which spells a Cyrillic path out as `\xd0\xbf…`. That predates the
+/// one-line policy; the sites this note is about are the ones worth converting,
+/// not a claim that every caller already belongs to one camp.
 pub(crate) fn escape_path(path: &Path) -> String {
     escape_bytes(path.as_os_str().as_bytes())
 }

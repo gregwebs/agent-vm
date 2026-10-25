@@ -29,6 +29,7 @@ use anyhow::{Context, Result, bail};
 use vstd::prelude::*;
 
 use crate::mount::Declaration;
+use crate::one_line::path as one_line_path;
 
 /// `$HOME`-relative directory Pi calls its home.
 const PI_HOME_NAME: &str = ".pi";
@@ -138,14 +139,17 @@ impl CoreBind {
             }
             (Self::ProjectDir, Some(pi_home)) => format!(
                 "run agent-vm from a project directory outside {}",
-                pi_home.display()
+                one_line_path(pi_home)
             ),
             (Self::StateDir, Some(pi_home)) => {
-                format!("point AGENT_VM_STATE_DIR outside {}", pi_home.display())
+                format!(
+                    "point AGENT_VM_STATE_DIR outside {}",
+                    one_line_path(pi_home)
+                )
             }
             (Self::GuestHome, Some(pi_home)) => format!(
                 "move agent-vm's state directory outside {}",
-                pi_home.display()
+                one_line_path(pi_home)
             ),
             (_, None) => "run agent-vm from a directory that does not contain it".to_string(),
         }
@@ -290,7 +294,7 @@ impl ProtectedHostFiles {
             // the pre-existing "validating --mount source" check.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => home.to_path_buf(),
             Err(error) => {
-                return Err(error).context(cannot_determine(&home.display().to_string()));
+                return Err(error).context(cannot_determine(home));
             }
         };
         let pi_home = base.join(PI_HOME_NAME);
@@ -307,7 +311,7 @@ impl ProtectedHostFiles {
             Ok(_) => Severity::Refuse,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Severity::Advise,
             Err(error) => {
-                return Err(error).context(cannot_determine(&pi_home.display().to_string()));
+                return Err(error).context(cannot_determine(&pi_home));
             }
         };
         let mut routes = Vec::new();
@@ -532,7 +536,7 @@ impl ProtectedHostFiles {
              agent-vm keeps host Pi credentials host-side and gives the guest placeholders.\n\
              {}",
             exposure.file.description(),
-            exposure.host_path.display(),
+            one_line_path(&exposure.host_path),
             inside(exposure),
             self.remedy(source_spelling, exposure),
         )
@@ -576,9 +580,9 @@ impl ProtectedHostFiles {
         format!(
             "agent-vm's {} {} contains the {} {}{}; {}",
             source.bind.description(),
-            source.path.display(),
+            one_line_path(&source.path),
             exposure.file.description(),
-            exposure.host_path.display(),
+            one_line_path(&exposure.host_path),
             inside(exposure),
             source.bind.remedy(&source.path, self.pi_home()),
         )
@@ -620,7 +624,7 @@ impl ProtectedHostFiles {
             "==> agent-vm's {} {} is a live bind of host Pi state; {} so the guest cannot write \
              host Pi state and host changes cannot leak in",
             source.bind.description(),
-            source.path.display(),
+            one_line_path(&source.path),
             source.bind.remedy(&source.path, self.pi_home()),
         )];
         advisories.extend(self.platform_artifact_advisories());
@@ -637,7 +641,7 @@ impl ProtectedHostFiles {
                 vec![format!(
                     "==> Host Pi extensions and installed packages under {} may be built for this \
                      host's OS/arch and may not run in the Linux guest",
-                    pi_home.display()
+                    one_line_path(pi_home)
                 )]
             })
             .unwrap_or_default()
@@ -653,11 +657,10 @@ impl ProtectedHostFiles {
             // missing source; this is not an exposure.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
-                return Err(error).context(cannot_determine(&root.display().to_string()));
+                return Err(error).context(cannot_determine(root));
             }
         };
-        let canonical =
-            fs::canonicalize(root).context(cannot_determine(&root.display().to_string()))?;
+        let canonical = fs::canonicalize(root).context(cannot_determine(root))?;
         Ok(self.matches_at(
             &canonical,
             metadata.dev(),
@@ -744,7 +747,7 @@ fn measure_file(base: &Path, file: ProtectedFile) -> Result<Vec<Route>> {
                 // Any other resolution error stays a hard failure.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
                 Err(error) => {
-                    return Err(error).context(cannot_determine(&candidate.display().to_string()));
+                    return Err(error).context(cannot_determine(&candidate));
                 }
             },
             // The file does not exist yet: the last existing ancestor carries
@@ -752,7 +755,7 @@ fn measure_file(base: &Path, file: ProtectedFile) -> Result<Vec<Route>> {
             // `auth.json` appears only later (`pi auth login` during a boot).
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
             Err(error) => {
-                return Err(error).context(cannot_determine(&candidate.display().to_string()));
+                return Err(error).context(cannot_determine(&candidate));
             }
         }
     }
@@ -762,8 +765,7 @@ fn measure_file(base: &Path, file: ProtectedFile) -> Result<Vec<Route>> {
     let mut remainder: PathBuf = components[consumed..].iter().collect();
     let mut routes = Vec::new();
     loop {
-        let metadata =
-            fs::symlink_metadata(&node).context(cannot_determine(&node.display().to_string()))?;
+        let metadata = fs::symlink_metadata(&node).context(cannot_determine(&node))?;
         // Every canonical ancestor is a real directory; the file itself is
         // recorded even when it is not, because it carries the empty remainder.
         if metadata.is_dir() || remainder.as_os_str().is_empty() {
@@ -791,8 +793,11 @@ fn measure_file(base: &Path, file: ProtectedFile) -> Result<Vec<Route>> {
     Ok(routes)
 }
 
-fn cannot_determine(path: &str) -> String {
-    format!("cannot determine whether a mount would expose {path}")
+fn cannot_determine(path: &Path) -> String {
+    format!(
+        "cannot determine whether a mount would expose {}",
+        one_line_path(path)
+    )
 }
 
 /// Append `(relative, file)` unless an identical pair is already present — the
@@ -829,8 +834,8 @@ fn inside(exposure: &Exposure) -> String {
     } else {
         format!(
             " (as {} inside {})",
-            exposure.relative.display(),
-            exposure.root.display()
+            one_line_path(&exposure.relative),
+            one_line_path(&exposure.root)
         )
     }
 }
@@ -1129,6 +1134,38 @@ mod tests {
         assert!(
             !rendered.lines().any(|line| line.trim() == "FORGED-LINE"),
             "the spelling is escaped, not printed as a line: {rendered}"
+        );
+    }
+
+    /// The refusal names the protected file by paths this module *measured*: the
+    /// canonical file path, the root, and the file's path inside it. None of them
+    /// came from config text, and all of them can carry a newline when a
+    /// directory in the path does, so each is escaped for the same reason the
+    /// declared spelling is.
+    #[test]
+    fn a_measured_exposure_path_cannot_forge_a_line() {
+        let root = tempfile::tempdir().unwrap();
+        // The bind root sits *above* the home, so the exposure is broad and the
+        // newline lands in both the canonical file path and the relative one.
+        let home = root.path().join("d\nFORGED4");
+        write(&home.join(".pi/agent/auth.json"), "{\"token\":\"t\"}");
+        let home = home.canonicalize().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let protected = ProtectedHostFiles::measure(Some(&home)).unwrap();
+        let exposure = protected.exposure(&root).unwrap().unwrap();
+
+        let message = protected.message("--mount", &root.display().to_string(), &exposure, None);
+        assert_eq!(
+            message.lines().count(),
+            3,
+            "the refusal is its three own lines, and no forged one: {message}"
+        );
+        assert!(message.contains("d\\x0aFORGED4"), "{message}");
+        assert!(
+            !message
+                .lines()
+                .any(|line| line.trim_start().starts_with("FORGED4")),
+            "a measured directory name forged a line: {message}"
         );
     }
 
