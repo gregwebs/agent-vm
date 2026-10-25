@@ -1208,7 +1208,7 @@ fn a_non_ascii_config_path_in_a_config_error_prints_as_itself() {
 /// must be escaped rather than ending the report — and the rest of the path keeps
 /// its ordinary bytes, since the line is meant to be pasted. The leaf carries both
 /// a newline and non-ASCII so one assertion covers the control-byte policy and the
-/// other covers "not `escape_path`".
+/// other covers "not byte-escaped".
 #[test]
 fn the_reset_report_keeps_a_measured_path_on_one_line() {
     let h = Harness::in_leaf("", "дом\nFORGED-STATE", "");

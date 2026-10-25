@@ -233,8 +233,8 @@ impl fmt::Display for PersistCollision {
             f,
             "config: persist path {} would collide with the guest mount point {}; rename the \
              persist path or move the mount",
-            crate::config::escape_path(&self.home_relative),
-            crate::config::escape_path(&self.mount)
+            crate::one_line::path(&self.home_relative),
+            crate::one_line::path(&self.mount)
         )
     }
 }
@@ -439,6 +439,38 @@ mod tests {
         // And it is the typed error, so `run` can tell it apart from every
         // wrapper it might otherwise gain.
         assert!(error.is::<PersistCollision>());
+    }
+
+    /// Both sides of this sentence are user-facing paths to fix by hand, and it
+    /// compares a `persist` entry against a mount point rather than two entries of
+    /// the same kind, so a non-ASCII either side prints as itself (issue #422).
+    /// A control byte still cannot end the line.
+    #[test]
+    fn a_persist_collision_prints_non_ascii_paths_as_themselves() {
+        let error = PersistedHome {
+            guest_home: PathBuf::from("/home/дом"),
+            links: vec![declared("код")],
+        };
+        let message = error
+            .refuse_conflicts(&[PathBuf::from("/home/дом/код")])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            message,
+            "config: persist path код would collide with the guest mount point \
+             /home/дом/код; rename the persist path or move the mount"
+        );
+
+        let error = PersistedHome {
+            guest_home: PathBuf::from("/home/user"),
+            links: vec![declared("bad\ncode")],
+        };
+        let message = error
+            .refuse_conflicts(&[PathBuf::from("/home/user/bad\ncode")])
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains('\n'), "forged a line: {message:?}");
+        assert!(message.contains("bad\\x0acode"), "{message:?}");
     }
 
     #[test]

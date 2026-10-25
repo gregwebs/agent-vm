@@ -432,7 +432,7 @@ impl EgressAuthority {
             writeln!(
                 output,
                 "==> Egress authority: persisted grants from \"{}\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)",
-                crate::config::escape_path(&p.file)
+                crate::one_line::path(&p.file)
             )?;
         }
         if self.allowances.is_empty()
@@ -984,6 +984,42 @@ mod tests {
                 "{HEADER}==> Egress policy: allowing TLS to api.example.com on ports 443, 8443 (persisted grants and --allow-egress)\n{SHARED_TLS_ONLY}\n==> TLS interception: ports 443, 8443 — global to every destination (TLS ClientHello with SNI required, UDP dropped, sandbox CA must be trusted). A tcp://HOST:PORT entry widens every bare hostname to PORT.\n==> Egress DNS: only allowed hostnames resolve (others NXDOMAIN when forwarder is available; private answers need --allow-lan or a port-less numeric allowance)\n"
             )
         );
+    }
+
+    /// The header names the config file the grants came from — a measured path,
+    /// so a non-ASCII `$HOME` reads as itself there, and a control byte is still
+    /// escaped rather than ending the line (issue #422).
+    #[test]
+    fn the_provenance_header_prints_a_non_ascii_config_path_as_itself() {
+        use crate::user_network::{SavedGroups, UserNetwork};
+        for (file, expected) in [
+            (
+                "/home/дом/.config/agent-vm/config.toml",
+                "/home/дом/.config/agent-vm/config.toml",
+            ),
+            ("/home/a/bad\nconfig.toml", "/home/a/bad\\x0aconfig.toml"),
+        ] {
+            let user = UserNetwork::for_test(
+                file,
+                SavedGroups {
+                    lan: Some(true),
+                    ..Default::default()
+                },
+                &["10.0.0.5"],
+            );
+            let authority = EgressAuthority::resolve(empty_cli(), Some(user.egress())).unwrap();
+            let mut out = Vec::new();
+            authority.write_notices(&mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            let header = text.lines().next().unwrap_or_default();
+            assert_eq!(
+                header,
+                format!(
+                    "==> Egress authority: persisted grants from \"{expected}\" [network] merged with this launch's flags (flags override persisted booleans and add allowances; nothing is saved)"
+                )
+            );
+            assert!(!header.contains("\\xd0"), "byte-escaped: {header}");
+        }
     }
 
     // Grouping is display-only: a name shares a line only with names whose
