@@ -203,7 +203,7 @@ fn selection_error(path: &Path, reason: &str) -> anyhow::Error {
     anyhow!(
         "boot-image selection {} {reason}; restore the intended digest record from backup, or \
          deliberately move it aside to reinitialize from the current recommendation",
-        config::escape_path(path)
+        crate::one_line::path(path)
     )
 }
 
@@ -236,6 +236,18 @@ mod tests {
         let hand = format!("{{ \"version\" : 1 , \"image\" : \"{A}\" }}\n");
         std::fs::write(dir.path().join(SELECTION_FILE), &hand).unwrap();
         assert_eq!(snapshot_at(dir.path()).unwrap().unwrap(), hand.into_bytes());
+    }
+
+    /// The record path in a selection error is a measured path the user has to
+    /// find to repair, so it prints as itself (issue #420).
+    #[test]
+    fn a_selection_error_prints_a_non_ascii_path_as_itself() {
+        let path = Path::new("/home/u/дом/.local/state/agent-vm/default-image.json");
+
+        let message = selection_error(path, "could not be examined").to_string();
+
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(!message.contains("\\xd0"), "byte-escaped: {message}");
     }
 
     #[test]

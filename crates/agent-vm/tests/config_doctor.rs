@@ -1021,14 +1021,23 @@ fn measured_paths_cannot_forge_a_doctor_section() {
 }
 
 /// The same shape with non-ASCII names: a measured path stays legible, because the
-/// reader has to act on it. `config::escape_path` prints these byte by byte.
+/// reader has to act on it. Every path in the report is one of those — including
+/// the config file locations, the conflict warning and each tool row's `source=`,
+/// which used to be byte-escaped because `config` rendered them too (issue #420).
 ///
-/// The config *file locations* and the boot-image record path are still rendered
-/// by `config`/`boot_image`'s own diagnostics, so those lines do spell non-ASCII
-/// out — that divergence is asserted here rather than papered over.
+/// The assertion is whole-report: with non-ASCII `HOME`, state dir and cwd, no line
+/// may contain a `\xd0` escape, so a regression anywhere fails here rather than on
+/// one line somebody remembered to check.
 #[test]
 fn a_non_ascii_measured_path_is_printed_as_itself() {
     let h = Harness::in_leaf("дом", "состояние", "проект");
+    // Both tiers declare an image and a tool: `t` in both (the conflict warning and
+    // the `source=user:` row), `u` only in the project (the `source=project:` row).
+    h.write_user("image = \"127.0.0.1:1/user:dev\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n");
+    h.write_project(
+        "image = \"127.0.0.1:1/project:dev\"\n[[tools]]\nname = \"t\"\ncommand = \"other\"\n\
+         [[tools]]\nname = \"u\"\ncommand = \"u\"\n",
+    );
 
     let out = h.run_doctor();
 
@@ -1052,10 +1061,145 @@ fn a_non_ascii_measured_path_is_printed_as_itself() {
         assert!(line.contains("дом"), "{row} row: {line}");
         assert!(!line.contains("\\xd0"), "{row} row is byte-escaped: {line}");
     }
-    // The other policy, on the lines that share `config`'s rendering.
+    // The lines that take their value from `config` or `boot_image`: named here so
+    // a renamed or missing row fails loudly, then covered by the whole-report check
+    // below.
+    // Each row is located by content, not only by prefix: the tier rows and the
+    // boot-image rows share `user:`/`project:`, so a prefix-only search would
+    // re-check the tier row and let a deleted image row pass.
     assert!(
-        stdout.contains("/\\xd0\\xb4\\xd0\\xbe\\xd0\\xbc/.config/agent-vm/config.toml"),
-        "the config locations stay byte-escaped: {stdout}"
+        stdout.contains("==> boot image"),
+        "no image section: {stdout}"
+    );
+    for (site, needle, leaf) in [
+        (
+            "the user tier line",
+            format!("{} (found", h.user_config().display()),
+            "дом",
+        ),
+        (
+            "the project tier line",
+            format!("{} (found", h.project_config().display()),
+            "проект",
+        ),
+        (
+            "the user image row",
+            "127.0.0.1:1/user:dev [".to_string(),
+            "дом",
+        ),
+        (
+            "the project image row",
+            "127.0.0.1:1/project:dev [".to_string(),
+            "проект",
+        ),
+        ("the default row", "default: ".to_string(), "дом"),
+        (
+            "the selected row",
+            "selected (without --image): ".to_string(),
+            "дом",
+        ),
+    ] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(&needle))
+            .unwrap_or_else(|| panic!("no {site} ({needle}):\n{stdout}"));
+        assert!(line.contains(leaf), "{site} lost the leaf: {line}");
+        assert!(!line.contains("\\xd0"), "{site} byte-escaped it: {line}");
+    }
+    // The conflict warning names both files on two lines, and each resolved row
+    // names the file it came from.
+    for (site, needle) in [
+        (
+            "the conflict warning",
+            format!(
+                "in {} overrides",
+                h.user_config().canonicalize().unwrap().display()
+            ),
+        ),
+        (
+            "the user tool row",
+            format!("source=user:{}", h.user_config().display()),
+        ),
+        (
+            "the project tool row",
+            format!("source=project:{}", h.project_config().display()),
+        ),
+    ] {
+        assert!(
+            stdout.contains(&needle),
+            "{site} missing ({needle}): {stdout}"
+        );
+    }
+    let escaped: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains("\\xd0") || line.contains("\\xd1"))
+        .collect();
+    assert!(
+        escaped.is_empty(),
+        "no line may byte-escape a measured path: {escaped:?}"
+    );
+}
+
+/// A config that fails to parse is reported *inside* the report, on a raw
+/// `error:` line carrying the config file's path. That path is measured, so it
+/// prints as itself like every other line (issue #420).
+///
+/// A read failure is the harder half: `host_paths` builds the *cause* text from
+/// the same path, so the sentence quotes the file and then repeats it. Both copies
+/// have to be legible — the first version of this fix escaped only the quoted
+/// copy and printed `/дом/` beside `/\xd0\xb4\xd0\xbe\xd0\xbc/`. Making the config
+/// path a directory is the shortest way to reach a reader cause from doctor.
+#[test]
+fn a_non_ascii_config_path_in_a_read_cause_prints_as_itself() {
+    let h = Harness::in_leaf("дом", "состояние", "проект");
+    // A directory where the file should be: the reader fails with
+    // `… is not a regular file`, naming the same path.
+    let config = h.user_config();
+    std::fs::create_dir_all(&config).unwrap();
+
+    let out = h.run_doctor();
+
+    let combined = format!(
+        "{}{}",
+        stdout_of(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("is not a regular file"),
+        "the reader cause is reported: {combined}"
+    );
+    let cause = combined
+        .lines()
+        .find(|line| line.contains("is not a regular file"))
+        .unwrap_or_default();
+    assert!(cause.contains("дом"), "the cause names the path: {cause}");
+    assert!(
+        !cause.contains("\\xd0"),
+        "the cause byte-escapes the path: {cause}"
+    );
+}
+
+#[test]
+fn a_non_ascii_config_path_in_a_config_error_prints_as_itself() {
+    let h = Harness::in_leaf("дом", "состояние", "проект");
+    h.write_user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"missing\"]\n");
+
+    let out = h.run_doctor();
+
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let text = stdout_of(&out);
+    let combined = format!("{text}{stderr}");
+    assert!(
+        combined.contains("error:"),
+        "the config failure is reported: {combined}"
+    );
+    assert!(
+        combined.contains("дом"),
+        "the failing config's path prints as itself: {combined}"
+    );
+    assert!(
+        !combined.contains("\\xd0"),
+        "the config error byte-escapes its own path: {combined}"
     );
 }
 

@@ -233,7 +233,11 @@ impl fmt::Display for MountOrigin {
             // the rest of the sentence and one launch never shows two escapings
             // of the same file.
             Self::UserConfig { file, index } => {
-                write!(f, "mounts[{index}] in {}", quoted_path(file))
+                write!(
+                    f,
+                    "mounts[{index}] in {}",
+                    crate::one_line::quoted_path(file)
+                )
             }
         }
     }
@@ -343,7 +347,7 @@ impl Declaration<'_> {
         match self {
             Self::Argv => "--mount".to_string(),
             Self::UserConfig { file, index } => {
-                format!("mounts[{index}] in {}", quoted_path(file))
+                format!("mounts[{index}] in {}", crate::one_line::quoted_path(file))
             }
         }
     }
@@ -413,7 +417,7 @@ impl Declaration<'_> {
             Self::Argv => crate::one_line::path(path),
             Self::UserConfig { file, index } => format!(
                 "mounts[{index}] in {} {}",
-                quoted_path(file),
+                crate::one_line::quoted_path(file),
                 quoted_path(path)
             ),
         }
@@ -3505,7 +3509,7 @@ fn discovered_by(declarations: &[(Declaration<'_>, String)]) -> String {
                 let source = match declaration {
                     Declaration::Argv => "--mount".to_string(),
                     Declaration::UserConfig { file, .. } => {
-                        format!("mounts in {}", quoted_path(file))
+                        format!("mounts in {}", crate::one_line::quoted_path(file))
                     }
                 };
                 if !sources.contains(&source) {

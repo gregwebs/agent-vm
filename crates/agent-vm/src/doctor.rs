@@ -50,17 +50,20 @@
 //! `credentials.yaml` the launch would read, and whatever `--reset-msb-db` moved —
 //! go through [`crate::one_line`], which escapes only control characters.
 //!
-//! *Measured paths that `config` or `boot_image` also render* stay on
-//! [`crate::config::escape_path`], so one report cannot show two escapings of one
-//! path: the config file locations (`describe_tier`), the conflict lines
-//! (`render_conflicts`), each tool row's `source=user:…`/`source=project:…`, the
-//! boot-image paths (`describe_configured_image`, `describe_default_observation`),
-//! and [`crate::boot_image::ImageSource::describe`] on the `selected` line.
-//! Converting them means changing those modules' own output.
-//!
-//! The visible consequence is deliberate: given non-ASCII `$HOME` and cwd, the
-//! `user:`/`project:`/`default:`/`source=` lines spell a directory out byte by
-//! byte while `dir:`, `state:` and the credential rows print it as itself.
+//! [`crate::config::escape_path`] and [`crate::config::quoted_path`] are not used
+//! for any measured path in this report. They previously were, on the lines whose
+//! values also come from `config` and `boot_image` — the config file locations
+//! (`describe_tier`), the conflict lines (`render_conflicts`), each tool row's
+//! `source=user:…`/`source=project:…`, the boot-image paths
+//! (`describe_configured_image`, `describe_default_observation`), and
+//! [`crate::boot_image::ImageSource::describe`] on the `selected` line. Those are
+//! measured paths like any other, so they moved to [`crate::one_line`] too, the
+//! renderers those modules own ([`crate::boot_image::ImageSource::describe`],
+//! [`crate::boot_image::default_selection`]) moved with them, and so did the config
+//! file a `config:` error quotes ([`crate::one_line::quoted_path`]), as do the
+//! reader causes those errors repeat. A non-ASCII `$HOME` reads the same on every
+//! line, including on the `error:` line a broken config produces — once for the
+//! file the sentence is about, and again inside the cause that names it.
 //!
 //! Two channels print validated names raw, because a name cannot carry a line
 //! break (`validate_name` rejects whitespace and control characters): the tool
@@ -69,10 +72,17 @@
 //! They do give up the non-ASCII consistency above — a non-ASCII tool name prints
 //! as itself in that suffix and byte-escaped in its own tool row.
 //!
-//! Four sites print error text raw (`error: {error:#}`, `error: {message}`, and
-//! twice under `selected`). That is safe only because `config` and `boot_image`
-//! escape their own error text before returning it; a new error source that does
-//! not would forge a line here.
+//! The limit is error text that other modules built: `session`,
+//! `protected_config_dir`, `guest_home`, `network` and `egress_policy` still
+//! escape measured paths with [`crate::config::escape_path`], so their text can
+//! spell a non-ASCII path out on one of this report's raw `error:` lines
+//! (`error: {error:#}`, `error: {message}`, twice under `selected`). Nothing here
+//! can see the difference — the escaping already happened. What does hold for
+//! every error source: text that reaches these lines escapes its own control
+//! bytes, so a path it names cannot forge a line. `mount` is the exception that
+//! proves the rule — a *config-chosen* path there is still byte-escaped on
+//! purpose, because two mount entries that differ only outside ASCII must not
+//! print alike.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -836,8 +846,8 @@ fn render_conflicts(conflicts: &[ConfigConflict]) -> String {
         out.push_str(&format!(
             "warning: tool {} in {} overrides\n         {}; differing fields: {}\n",
             crate::config::quoted_str(conflict.tool()),
-            crate::config::escape_path(conflict.user_file()),
-            crate::config::escape_path(conflict.project_file()),
+            crate::one_line::path(conflict.user_file()),
+            crate::one_line::path(conflict.project_file()),
             fields,
         ));
     }
@@ -850,12 +860,12 @@ fn describe_tier(tier: &TierReport) -> String {
         TierStatus::Absent => format!(
             "{} (absent)",
             tier.path()
-                .map_or("<unknown>".to_string(), crate::config::escape_path)
+                .map_or("<unknown>".to_string(), crate::one_line::path)
         ),
         TierStatus::Found { declared_tools } => format!(
             "{} (found, {declared_tools} tool{})",
             tier.path()
-                .map_or("<unknown>".to_string(), crate::config::escape_path),
+                .map_or("<unknown>".to_string(), crate::one_line::path),
             if *declared_tools == 1 { "" } else { "s" },
         ),
     }
@@ -960,11 +970,11 @@ fn describe_boot_image(
 fn describe_default_observation(observation: &boot_image::DefaultObservation) -> String {
     match observation {
         boot_image::DefaultObservation::Retained { path, .. } => {
-            format!("retained default [{}]", crate::config::escape_path(path))
+            format!("retained default [{}]", crate::one_line::path(path))
         }
         boot_image::DefaultObservation::Uninitialized { path, .. } => format!(
             "not selected; initial recommendation [{}]",
-            crate::config::escape_path(path)
+            crate::one_line::path(path)
         ),
         boot_image::DefaultObservation::Unavailable { message } => {
             format!("error: {message}")
@@ -979,7 +989,7 @@ fn describe_configured_image(image: Option<&ConfiguredImage>) -> String {
         Some(image) => format!(
             "{} [{}]",
             crate::config::escape_str(image.reference().as_str()),
-            crate::config::escape_path(image.file())
+            crate::one_line::path(image.file())
         ),
     }
 }
@@ -996,8 +1006,8 @@ fn describe_tool(tool: &Tool, provisioned: ProviderSet) -> String {
     let provisions = provider_names(provisioned.iter());
     let source = match tool.origin() {
         ToolOrigin::BuiltIn => "built-in".to_string(),
-        ToolOrigin::User(file) => format!("user:{}", crate::config::escape_path(file)),
-        ToolOrigin::Project(file) => format!("project:{}", crate::config::escape_path(file)),
+        ToolOrigin::User(file) => format!("user:{}", crate::one_line::path(file)),
+        ToolOrigin::Project(file) => format!("project:{}", crate::one_line::path(file)),
     };
     // Only surfaced when true, so the default-config rows for the six agents
     // are byte-identical to before (`interactive_shell` is `shell`-only).
@@ -1866,6 +1876,100 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
 
         assert!(text.contains("/home/boger/проект"), "{text}");
         assert!(!text.contains("\\xd0"), "not byte-escaped: {text}");
+    }
+
+    /// Every site in this module that names a config file the run discovered —
+    /// the tier lines, the conflict warning, the per-tier `image` rows and each
+    /// resolved tool row's `source=` — renders it the same way as `dir:`/`state:`
+    /// (issue #420). One non-ASCII `$HOME` and cwd, one assertion per site.
+    #[test]
+    fn every_config_path_site_prints_a_non_ascii_path_as_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("дом");
+        let project = dir.path().join("проект");
+        std::fs::create_dir_all(home.join(".config/agent-vm")).unwrap();
+        std::fs::create_dir_all(project.join(".agent-vm")).unwrap();
+        let user = home.join(".config/agent-vm/config.toml");
+        let project_file = project.join(".agent-vm/config.toml");
+        std::fs::write(
+            &user,
+            "image = \"ghcr.io/acme/user:1\"\n[[tools]]\nname = \"t\"\ncommand = \"t\"\n",
+        )
+        .unwrap();
+        // `t` collides with the user tier (the conflict warning), `u` exists only in
+        // the project tier (the `source=project:` row).
+        std::fs::write(
+            &project_file,
+            "image = \"ghcr.io/acme/project:1\"\n[[tools]]\nname = \"t\"\ncommand = \"other\"\n\
+             [[tools]]\nname = \"u\"\ncommand = \"u\"\n",
+        )
+        .unwrap();
+
+        let (text, _, _) = describe_config(config_report(Some(&user), &project_file));
+
+        for (site, needle) in [
+            ("the user tier line", format!("{} (found", user.display())),
+            (
+                "the project tier line",
+                format!("{} (found", project_file.display()),
+            ),
+            (
+                "the conflict warning",
+                format!("in {} overrides", user.display()),
+            ),
+            (
+                "the user tool row",
+                format!("source=user:{}", user.display()),
+            ),
+            (
+                "the project tool row",
+                format!("source=project:{}", project_file.display()),
+            ),
+        ] {
+            assert!(text.contains(&needle), "{site} lost the path: {text}");
+        }
+        assert!(!text.contains("\\xd0"), "byte-escaped somewhere: {text}");
+
+        // The per-tier `image` rows belong to the boot-image section, not to
+        // `describe_config`, so cover their renderer directly.
+        let row = describe_configured_image(Some(&crate::config::ConfiguredImage::for_test(
+            "ghcr.io/acme/app:1",
+            user.clone(),
+        )));
+        assert!(row.contains(&user.display().to_string()), "{row}");
+        assert!(!row.contains("\\xd0"), "byte-escaped: {row}");
+    }
+
+    /// The `default:` rows name the retained-default record, which the boot-image
+    /// selection module owns — so those two go through the same renderer
+    /// (issue #420).
+    #[test]
+    fn the_default_record_path_prints_a_non_ascii_path_as_itself() {
+        let path = PathBuf::from("/home/boger/дом/.local/state/agent-vm/boot-image.json");
+
+        let retained = describe_default_observation(
+            &boot_image::DefaultObservation::Retained {
+                reference: boot_image::ImmutableImageRef::parse(
+                    "ghcr.io/acme/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+                path: path.clone(),
+            },
+        );
+        let uninitialized = describe_default_observation(
+            &boot_image::DefaultObservation::Uninitialized {
+                recommendation: boot_image::ImmutableImageRef::parse(
+                    "ghcr.io/acme/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+                path: path.clone(),
+            },
+        );
+
+        for text in [retained, uninitialized] {
+            assert!(text.contains(&path.display().to_string()), "{text}");
+            assert!(!text.contains("\\xd0"), "byte-escaped: {text}");
+        }
     }
 
     #[test]

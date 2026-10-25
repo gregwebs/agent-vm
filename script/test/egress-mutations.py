@@ -401,7 +401,8 @@ def matrix():
         "for entry in user_entries.iter().chain(&cli_entries) {",
         "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", LAUNCH))
     verify_arm = ('FileTierKind::User => config_authority::verify(&read, triggers)\n'
-                  '            .map_err(|error| anyhow!("config: {}: {error}", quoted_path(path)))?,')
+                  '            .map_err(|error| anyhow!("config: {}: {error}", '
+                  'crate::one_line::quoted_path(path)))?,')
     add("verify-always-skipped", SRC + "config.rs", verify_arm,
         'FileTierKind::User => None,', rust("unsafe_user_network_is_refused_before_launch_state", LAUNCH))
     # A present `mounts` key makes a user file authority-bearing, empty list
