@@ -1093,8 +1093,10 @@ file exists yet. Both raw `$HOME` and the account home are measured.
 
 Missing state/home sources are checked too: future names compare ignoring ASCII
 case, and names outside `[A-Za-z0-9._-]` or ending in `.` may match any name,
-a conservative rule that can refuse safe layouts. Relative state roots still
-work and are anchored at the launch directory.
+a conservative rule that can refuse safe layouts. The state root is always
+absolute: a relative `AGENT_VM_STATE_DIR` is refused, and a relative
+`XDG_STATE_HOME` is ignored with a note (see
+[Recovering from a forward-migrated microsandbox db](#recovering-from-a-forward-migrated-microsandbox-db)).
 
 `ro` and `:fork` are fine under this guard; a bind strictly inside the directory
 is also allowed. Pi's separate policy still applies. **0.3.0 breaks launching
@@ -1781,10 +1783,12 @@ one that needs `$'…'` is read only by bash or zsh, so the report prints
 expansion on is the one exception: if the path contains `!`, enter `set +H` on
 an earlier line first, or paste into zsh instead. The command resolves
 `MSB_HOME` the same way `agent-vm` itself does, so it only ever touches
-agent-vm's private state, never a separate `~/.microsandbox` install. The
-instruction names absolute paths, so it works from any directory — even when
-`AGENT_VM_STATE_DIR` is relative. If no `db/` exists, it prints a no-op message
-and exits 0.
+agent-vm's private state, never a separate `~/.microsandbox` install. The instruction names absolute paths, so it works
+from any directory. The state root itself is absolute by rule: a relative
+`AGENT_VM_STATE_DIR` is refused before anything moves, and a relative
+`XDG_STATE_HOME` is ignored (as the XDG spec asks) with a note on stderr naming
+the root actually used. If no `db/` exists, it prints a no-op message and exits
+0.
 
 The next `agent-vm shell`/`run` finds no `db/` and lets the bundled `msb`
 recreate it fresh at its own schema, re-pulling images on first boot — no
@@ -2327,9 +2331,10 @@ nothing has to be installed up front.
 
 It finds the per-project directories under the same state root the launcher
 uses (`AGENT_VM_STATE_DIR`, else `$XDG_STATE_HOME/agent-vm`, else
-`~/.local/state/agent-vm`). A directory whose path contains a comma is skipped
-with a warning — `CLAUDE_CONFIG_DIR` is comma-separated with no way to escape
-one.
+`~/.local/state/agent-vm`), applying the launcher's rule: a relative
+`AGENT_VM_STATE_DIR` is refused and a relative `XDG_STATE_HOME` is ignored. A
+directory whose path contains a comma is skipped with a warning —
+`CLAUDE_CONFIG_DIR` is comma-separated with no way to escape one.
 
 ## Ports & egress
 

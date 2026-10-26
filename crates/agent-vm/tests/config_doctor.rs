@@ -1285,17 +1285,14 @@ fn undo_instruction(report: &str) -> &str {
 /// catches operand reversal, display escaping reused as argv, and substitution at
 /// once. Bash runs the instruction as printed; when it needs `$'…'` the report
 /// says so, because dash reads that differently (USAGE.md).
-///
-/// `reset` runs `doctor --reset-msb-db` however the case needs to spell it — a
-/// relative `AGENT_VM_STATE_DIR`, or a cwd of its own (#433).
-fn reset_then_undo_in_bash_with(h: &Harness, reset: impl FnOnce() -> Output) -> String {
+fn reset_then_undo_in_bash(h: &Harness) -> String {
     let msb_home = h.state_root.join("msb-home");
     let db = msb_home.join("db");
     std::fs::create_dir_all(&db).unwrap();
     std::fs::write(db.join("msb.db"), DB_BYTES).unwrap();
     std::fs::write(db.join("msb.db-wal"), DB_WAL_BYTES).unwrap();
 
-    let out = reset();
+    let out = h.run_doctor_reset();
     assert_success(&out);
     let report = stdout_of(&out);
 
@@ -1343,11 +1340,6 @@ fn reset_then_undo_in_bash_with(h: &Harness, reset: impl FnOnce() -> Output) -> 
         );
     }
     report
-}
-
-/// The ordinary case: doctor runs where the harness points it.
-fn reset_then_undo_in_bash(h: &Harness) -> String {
-    reset_then_undo_in_bash_with(h, || h.run_doctor_reset())
 }
 
 /// A report whose only physical lines are doctor's own, so an operator can read
@@ -1432,37 +1424,159 @@ fn the_reset_undo_distinguishes_a_literal_backslash_from_a_control_byte() {
     assert!(from.contains("x0aFORGED-STATE"), "from: {from:?}");
 }
 
-/// `AGENT_VM_STATE_DIR` may be spelled relative to doctor's cwd, which used to
-/// leave the printed undo correct only in that one directory (#433). The
-/// instruction exists to be pasted later, elsewhere, so every path the report
-/// names is absolute and it reverses the move from any directory.
+/// A relative `AGENT_VM_STATE_DIR` used to mean "relative to wherever agent-vm
+/// ran", which left the printed undo correct only in that one directory (#433).
+/// The root is now refused at construction (#437): the operator is told which
+/// value is wrong, and nothing is moved under a root that depends on the cwd.
 #[test]
-fn a_relative_state_dir_still_prints_an_undo_that_works_from_elsewhere() {
+fn a_relative_state_dir_is_refused_before_anything_can_move() {
     let h = Harness::new();
+    let msb_home = h.state_root.join("msb-home");
+    let db = msb_home.join("db");
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(db.join("msb.db"), DB_BYTES).unwrap();
     // The state root is a child of the directory doctor runs in, named relatively.
     let cwd = h.state_root.parent().unwrap().to_path_buf();
     let leaf = h.state_root.file_name().unwrap().to_owned();
-    // Canonicalized, because a symlinked `/tmp` or `/var` makes the fixture's own
-    // spelling differ from the one `getcwd` resolves.
-    let db_absolute = cwd.canonicalize().unwrap().join(&leaf).join("msb-home/db");
 
-    let report = reset_then_undo_in_bash_with(&h, || {
-        h.base_command()
-            .env("AGENT_VM_STATE_DIR", &leaf)
-            .current_dir(&cwd)
-            .args(["doctor", "--reset-msb-db"])
-            .output()
-            .expect("failed to run agent-vm doctor --reset-msb-db")
-    });
+    let out = h
+        .base_command()
+        .env("AGENT_VM_STATE_DIR", &leaf)
+        .current_dir(&cwd)
+        .args(["doctor", "--reset-msb-db"])
+        .output()
+        .expect("failed to run agent-vm doctor --reset-msb-db");
 
-    let from = report
-        .lines()
-        .find_map(|line| line.strip_prefix("from: "))
-        .unwrap_or_else(|| panic!("no `from:` line in:\n{report}"));
+    assert!(!out.status.success(), "a relative root was accepted");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("AGENT_VM_STATE_DIR"),
+        "the refusal does not name the variable:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&leaf.to_string_lossy().into_owned()),
+        "the refusal does not name the value:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("absolute"),
+        "the refusal does not say what is wrong:\n{stderr}"
+    );
     assert_eq!(
-        Path::new(from),
-        db_absolute,
-        "the report named the state root as spelled, not the directory it moved:\n{report}"
+        std::fs::read(db.join("msb.db")).unwrap(),
+        DB_BYTES,
+        "the db was touched under a refused state root"
+    );
+    let backups: Vec<_> = std::fs::read_dir(&msb_home)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with("db.reset-"))
+        .collect();
+    assert!(
+        backups.is_empty(),
+        "a refused run moved the db: {backups:?}"
+    );
+}
+
+/// A relative `XDG_STATE_HOME` is not an error (the XDG spec says to ignore an
+/// invalid value), but ignoring it moves the state root, so the fallback and the
+/// value are announced on stderr (#437) — and the fallback is the root the
+/// command then operates under, not just something the notice claims.
+#[test]
+fn a_relative_xdg_state_home_is_ignored_and_the_fallback_is_used() {
+    let h = Harness::new();
+    // Where `msb_home_dir` lands with both overrides unusable: the short macOS
+    // default, or the long default under the ordinary state root.
+    let msb_home = if cfg!(target_os = "macos") {
+        h.home_root.join(".agent-vm-msb")
+    } else {
+        h.home_root.join(".local/state/agent-vm/msb-home")
+    };
+    let db = msb_home.join("db");
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(db.join("msb.db"), DB_BYTES).unwrap();
+
+    let out = h
+        .base_command()
+        .env_remove("AGENT_VM_STATE_DIR")
+        .env("XDG_STATE_HOME", "rel-xdg")
+        .args(["doctor", "--reset-msb-db"])
+        .output()
+        .expect("failed to run agent-vm doctor --reset-msb-db");
+
+    assert_success(&out);
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        stderr.matches("ignoring XDG_STATE_HOME").count(),
+        1,
+        "the notice must be said once:\n{stderr}"
+    );
+    assert!(stderr.contains("rel-xdg"), "{stderr}");
+    assert!(
+        stderr.contains(".local/state/agent-vm"),
+        "the notice does not name the root it used instead:\n{stderr}"
+    );
+    let report = stdout_of(&out);
+    assert!(
+        report.contains(&format!("from: {}", db.display())),
+        "the reset did not run under the announced fallback:\n{report}"
+    );
+    assert!(!report.contains("ignoring"), "the notice leaked to stdout");
+    assert!(!db.exists(), "the db was not moved: {report}");
+}
+
+/// The ignored-value notice is best effort: a stderr whose reader is already
+/// gone must not turn a valid fallback into a panic (exit 101). A closed socket
+/// pair makes the write fail with EPIPE deterministically, unlike a closed file
+/// descriptor, which Rust suppresses.
+#[test]
+fn a_closed_stderr_does_not_panic_the_notice() {
+    use std::process::Stdio;
+    let h = Harness::new();
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let writer: std::os::fd::OwnedFd = writer.into();
+
+    let out = h
+        .base_command()
+        .env_remove("AGENT_VM_STATE_DIR")
+        .env("XDG_STATE_HOME", "rel-xdg")
+        .args(["doctor", "--reset-msb-db"])
+        .stderr(Stdio::from(writer))
+        .output()
+        .expect("failed to run agent-vm doctor --reset-msb-db");
+
+    assert!(
+        out.status.success(),
+        "the notice's failed write failed the command: {:?}",
+        out.status
+    );
+    assert!(!out.stdout.is_empty(), "the report was lost too");
+}
+
+/// The notice is said once per process, and ordinary `doctor` is the case that
+/// resolves the root repeatedly (MSB home, then the project session), so a lost
+/// `Once` would print it twice here even though the reset path only asks once.
+#[test]
+fn the_ignored_value_is_reported_once_per_run() {
+    let h = Harness::new();
+    let out = h
+        .base_command()
+        .env_remove("AGENT_VM_STATE_DIR")
+        .env("XDG_STATE_HOME", "rel-xdg")
+        .args(["doctor"])
+        .output()
+        .expect("failed to run agent-vm doctor");
+
+    let stderr = stderr_of(&out);
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("ignoring XDG_STATE_HOME"))
+        .collect();
+    assert_eq!(notices.len(), 1, "notices:\n{stderr}");
+    assert!(
+        notices[0].contains(".local/state/agent-vm"),
+        "the notice does not name the root it used instead: {}",
+        notices[0]
     );
 }
 

@@ -475,16 +475,17 @@ fn write_shared_cache_config(msb_home: &Path, cache_dir: &Path) -> Result<()> {
 
 /// macOS-only short `MSB_HOME` root, used in place of
 /// `state_root()/msb-home` when neither `AGENT_VM_STATE_DIR` nor
-/// `XDG_STATE_HOME` is set. See [`msb_home_dir`]'s doc comment for why.
+/// `XDG_STATE_HOME` supplies an override `state_root()` accepts. See
+/// [`msb_home_dir`]'s doc comment for why.
 const SHORT_MACOS_MSB_HOME_DIRNAME: &str = ".agent-vm-msb";
 
 /// The private `MSB_HOME` path agent-vm pins msb at.
 ///
 /// Normally `state_root()/msb-home` — but on macOS, when neither
-/// `AGENT_VM_STATE_DIR` nor `XDG_STATE_HOME` is set (i.e. `state_root()`
-/// would fall through to its `$HOME/.local/state/agent-vm` default), this
-/// returns the much shorter `$HOME/.agent-vm-msb` instead (AC#6, agent-vm
-/// issue #40).
+/// `AGENT_VM_STATE_DIR` nor `XDG_STATE_HOME` supplies a value `state_root()`
+/// would use (i.e. it falls through to its `$HOME/.local/state/agent-vm`
+/// default, #437), this returns the much shorter `$HOME/.agent-vm-msb`
+/// instead (AC#6, agent-vm issue #40).
 ///
 /// Why: the vendored runtime's per-sandbox agent/control sockets live at
 /// `<MSB_HOME>/run/sandboxes/<24-hex-char-id>/{agent,control}.sock`
@@ -511,22 +512,26 @@ const SHORT_MACOS_MSB_HOME_DIRNAME: &str = ".agent-vm-msb";
 /// pure inputs works whether or not `point_at_msb_home()` has run in this
 /// process, and doesn't depend on the setenv-before-runtime invariant.
 pub fn msb_home_dir() -> Result<PathBuf> {
+    // Resolve the root before choosing the short macOS default, even though that
+    // default then replaces it: `state_root` is what validates the override and
+    // reports an ignored relative `XDG_STATE_HOME` (#437), and skipping it on the
+    // default path would swallow both.
+    let root = crate::host_paths::state_root()?
+        .ok_or_else(|| anyhow::anyhow!("could not resolve agent-vm state root ($HOME unset?)"))?;
     if let Some(short) = short_macos_msb_home(
         cfg!(target_os = "macos"),
-        state_root_overridden(),
+        crate::host_paths::state_root_overridden(),
         std::env::var_os("HOME").as_deref(),
     ) {
         return Ok(short);
     }
-    Ok(crate::host_paths::state_root()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve agent-vm state root ($HOME unset?)"))?
-        .join("msb-home"))
+    Ok(root.join("msb-home"))
 }
 
 /// Pure core of the macOS short-root special case in [`msb_home_dir`].
 ///
 /// `None` means "fall through to the normal `state_root()/msb-home`
-/// path" (non-macOS, an explicit override, or `$HOME` unset — the latter
+/// path" (non-macOS, an override in use, or `$HOME` unset — the latter
 /// deliberately left to `state_root()`'s own "could not resolve" error
 /// rather than duplicated here). Split out from `msb_home_dir` so tests
 /// can exercise the selection logic with explicit inputs instead of
@@ -541,16 +546,6 @@ fn short_macos_msb_home(
         return None;
     }
     home.map(|h| PathBuf::from(h).join(SHORT_MACOS_MSB_HOME_DIRNAME))
-}
-
-/// Whether the user explicitly overrode where agent-vm's state lives —
-/// the same two env vars [`crate::host_paths::state_root`] checks before
-/// falling back to its `$HOME/.local/state/agent-vm` default. Mirrored
-/// here (rather than calling `state_root()` and comparing) so
-/// [`msb_home_dir`] can special-case macOS's *default* without silently
-/// overriding a path the user asked for.
-fn state_root_overridden() -> bool {
-    std::env::var_os("AGENT_VM_STATE_DIR").is_some() || std::env::var_os("XDG_STATE_HOME").is_some()
 }
 
 // Maximum byte length of a Unix-domain socket path this platform can

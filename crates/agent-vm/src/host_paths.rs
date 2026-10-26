@@ -24,16 +24,119 @@ pub(crate) const MAX_GUEST_STATE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_HOST_CREDENTIAL_FILE_BYTES: u64 = 1024 * 1024;
 const ATOMIC_WRITE_RETRIES: usize = 16;
 
-/// `$AGENT_VM_STATE_DIR` → `$XDG_STATE_HOME/agent-vm` → `$HOME/.local/state/agent-vm`.
-pub fn state_root() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("AGENT_VM_STATE_DIR") {
-        return Some(PathBuf::from(dir));
+/// `$AGENT_VM_STATE_DIR` → `$XDG_STATE_HOME/agent-vm` → `$HOME/.local/state/agent-vm`,
+/// always absolute (#437).
+///
+/// Every caller joins, hashes, persists or prints the value, so a spelling
+/// relative to the cwd agent-vm happened to run in is a trap: `doctor`'s undo
+/// instruction only worked from the directory it was printed in (#433), and
+/// [`crate::session::ProjectSession::for_dir`] hashes the project but not the
+/// root. Each source therefore keeps its own contract, once:
+///
+/// - `AGENT_VM_STATE_DIR` is agent-vm's own override. A set but empty or
+///   relative value is an error naming it — the discipline
+///   [`crate::config::host_home_dir`] applies to `$HOME` — because falling back
+///   would move every state path somewhere the operator did not ask for.
+/// - `XDG_STATE_HOME` is the XDG basedir spec's: "all paths set in these
+///   environment variables must be absolute. If an implementation encounters a
+///   relative path in any of these variables it should consider the path
+///   invalid and ignore it". [`cache_root_from`] applies the same rule to
+///   `XDG_CACHE_HOME`. Ignoring changes which root is used, so
+///   [`state_root`] says so on stderr.
+/// - `$HOME` takes [`crate::config::host_home_dir`]'s discipline, so the
+///   documented default is absolute too rather than only under a launch.
+///
+/// `None` means only that `$HOME` is unset; an `Err` is a refused value, never a
+/// path this function would use anyway.
+pub fn state_root() -> Result<Option<PathBuf>> {
+    let (root, ignored) = state_root_from(
+        std::env::var_os("AGENT_VM_STATE_DIR").as_deref(),
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )?;
+    if let (Some(ignored), Some(root)) = (ignored, root.as_deref()) {
+        // A launch asks for the root more than once; say it once. stderr, because
+        // no machine-readable output is allowed to gain a line for this, and
+        // best-effort because a closed stderr must not turn a valid fallback into
+        // a panic. The notice names the state root, not `MSB_HOME`: on macOS the
+        // latter is the short default, and the report of whatever moved names that
+        // path itself.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = writeln!(
+                std::io::stderr(),
+                "agent-vm: ignoring {} {} because it is not an absolute path; using the state root {}",
+                ignored.variable,
+                one_line::quoted_path(&ignored.value),
+                one_line::path(root),
+            );
+        });
     }
-    if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
-        return Some(PathBuf::from(dir).join("agent-vm"));
+    Ok(root)
+}
+
+/// A state-root source that was skipped, kept as data so the rule is unit
+/// testable without reading the environment or capturing stderr.
+#[derive(Debug, PartialEq, Eq)]
+struct IgnoredSource {
+    variable: &'static str,
+    value: PathBuf,
+}
+
+/// Pure core of [`state_root`]: the precedence and both relative-value rules,
+/// with the environment already read.
+fn state_root_from(
+    agent_vm_state_dir: Option<&OsStr>,
+    xdg_state_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<(Option<PathBuf>, Option<IgnoredSource>)> {
+    if let Some(dir) = agent_vm_state_dir {
+        let dir = PathBuf::from(dir);
+        if !dir.is_absolute() {
+            return Err(anyhow!(
+                "AGENT_VM_STATE_DIR {} is not an absolute path; set it to an \
+                 absolute directory, or unset it to use the default",
+                one_line::quoted_path(&dir)
+            ));
+        }
+        return Ok((Some(dir), None));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".local/state/agent-vm"))
+    let mut ignored = None;
+    if let Some(dir) = xdg_state_home {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return Ok((Some(dir.join("agent-vm")), None));
+        }
+        ignored = Some(IgnoredSource {
+            variable: "XDG_STATE_HOME",
+            value: dir,
+        });
+    }
+    let root =
+        crate::config::absolute_home_from(home)?.map(|home| home.join(".local/state/agent-vm"));
+    Ok((root, ignored))
+}
+
+/// Whether [`state_root`] would take its value from an environment override
+/// rather than the `$HOME` default.
+///
+/// One rule with [`state_root_from`]: a relative `XDG_STATE_HOME` is ignored
+/// there, so it is not an override here either — otherwise macOS would skip its
+/// short default root for a value that was never used. A relative
+/// `AGENT_VM_STATE_DIR` does count, because [`state_root`] refuses it and
+/// substituting the default would hide that.
+pub(crate) fn state_root_overridden() -> bool {
+    state_root_overridden_from(
+        std::env::var_os("AGENT_VM_STATE_DIR").as_deref(),
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+    )
+}
+
+fn state_root_overridden_from(
+    agent_vm_state_dir: Option<&OsStr>,
+    xdg_state_home: Option<&OsStr>,
+) -> bool {
+    agent_vm_state_dir.is_some() || xdg_state_home.is_some_and(|dir| Path::new(dir).is_absolute())
 }
 
 /// Cache derived only from this binary, never launch state (ADR-0041).
@@ -1118,6 +1221,107 @@ mod tests {
         for home in [None, Some(OsStr::new("")), Some(OsStr::new("relative"))] {
             assert_eq!(cache_root_from(None, home), None);
         }
+    }
+
+    #[test]
+    fn state_root_takes_an_absolute_agent_vm_state_dir_verbatim() {
+        let (root, ignored) = state_root_from(
+            Some(OsStr::new("/state")),
+            Some(OsStr::new("/xdg")),
+            Some(OsStr::new("/home/u")),
+        )
+        .unwrap();
+        assert_eq!(root, Some(PathBuf::from("/state")));
+        // The override wins outright: the lower sources are never consulted, so
+        // there is nothing to ignore and nothing to report.
+        assert!(ignored.is_none());
+    }
+
+    #[test]
+    fn state_root_refuses_an_empty_or_relative_agent_vm_state_dir() {
+        for value in ["", "state", "./state", "../state"] {
+            let error = state_root_from(
+                Some(OsStr::new(value)),
+                Some(OsStr::new("/xdg")),
+                Some(OsStr::new("/home/u")),
+            )
+            .expect_err("a relative override must not be used");
+            let message = format!("{error}");
+            assert!(message.contains("AGENT_VM_STATE_DIR"), "{message}");
+            assert!(message.contains("not an absolute path"), "{message}");
+            // The rendered value, so the empty case is checked too: it prints as
+            // `""` and must not silently match every message.
+            assert!(
+                message.contains(&format!("\"{value}\"")),
+                "the value is not named: {message}"
+            );
+            assert!(message.contains("unset it"), "no remedy named: {message}");
+        }
+    }
+
+    #[test]
+    fn state_root_prefers_an_absolute_xdg_state_home() {
+        let (root, ignored) =
+            state_root_from(None, Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))).unwrap();
+        assert_eq!(root, Some(PathBuf::from("/xdg/agent-vm")));
+        assert!(ignored.is_none());
+    }
+
+    #[test]
+    fn state_root_ignores_a_relative_xdg_state_home_and_reports_it() {
+        for value in ["", "xdg-state"] {
+            let (root, ignored) =
+                state_root_from(None, Some(OsStr::new(value)), Some(OsStr::new("/home/u")))
+                    .unwrap();
+            assert_eq!(root, Some(PathBuf::from("/home/u/.local/state/agent-vm")));
+            let ignored = ignored.expect("an ignored value must be reported");
+            assert_eq!(ignored.variable, "XDG_STATE_HOME");
+            assert_eq!(ignored.value, PathBuf::from(value));
+        }
+    }
+
+    #[test]
+    fn state_root_uses_the_home_default_and_shares_homes_discipline() {
+        let (root, ignored) = state_root_from(None, None, Some(OsStr::new("/home/u"))).unwrap();
+        assert_eq!(root, Some(PathBuf::from("/home/u/.local/state/agent-vm")));
+        assert!(ignored.is_none());
+        for home in ["", "home/u"] {
+            let error = state_root_from(None, None, Some(OsStr::new(home)))
+                .expect_err("an unusable $HOME must not yield a relative root");
+            assert!(format!("{error}").contains("$HOME"), "{error}");
+        }
+    }
+
+    #[test]
+    fn state_root_is_none_only_when_home_is_unset() {
+        assert_eq!(state_root_from(None, None, None).unwrap(), (None, None));
+    }
+
+    /// The invariant #437 exists for: no branch can hand out a relative root.
+    #[test]
+    fn every_resolved_state_root_is_absolute() {
+        for (agent_vm, xdg, home) in [
+            (Some("/state"), None, None),
+            (None, Some("/xdg"), None),
+            (None, None, Some("/home/u")),
+        ] {
+            let (root, _) = state_root_from(
+                agent_vm.map(OsStr::new),
+                xdg.map(OsStr::new),
+                home.map(OsStr::new),
+            )
+            .unwrap();
+            assert!(root.unwrap().is_absolute());
+        }
+    }
+
+    #[test]
+    fn state_root_override_follows_the_same_rules() {
+        assert!(state_root_overridden_from(Some(OsStr::new("/state")), None));
+        assert!(state_root_overridden_from(Some(OsStr::new("state")), None));
+        assert!(state_root_overridden_from(None, Some(OsStr::new("/xdg"))));
+        assert!(!state_root_overridden_from(None, Some(OsStr::new("xdg"))));
+        assert!(!state_root_overridden_from(None, None));
     }
 
     use std::fs;
