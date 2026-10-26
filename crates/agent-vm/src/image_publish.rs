@@ -302,13 +302,14 @@ fn failed_publication(
 }
 
 impl ResultReference {
-    /// The reference as one copy-pasteable bash/zsh word.
+    /// The reference as one word of a command to paste ([`crate::shell`]).
     ///
-    /// Used by the success notices and the import hint. Diagnostics keep
-    /// `escape_str`: they are read, not pasted, and must stay ASCII-safe
+    /// Used by the success notices and the import hint, which add
+    /// [`crate::shell::bash_zsh_note`] when the word is not plain. Diagnostics
+    /// keep `escape_str`: they are read, not pasted, and must stay ASCII-safe
     /// without pretending to be a shell word.
-    pub(crate) fn shell_arg(&self) -> String {
-        crate::shell::bash_word(self.as_str().as_bytes())
+    pub(crate) fn shell_arg(&self) -> crate::shell::PastedWord {
+        crate::shell::PastedWord::new(self.as_str().as_bytes())
     }
 }
 
@@ -429,7 +430,11 @@ mod publication_tests {
     #[test]
     fn shell_arg_of_a_non_ascii_result_reference() {
         assert_eq!(
-            "app:é".parse::<ResultReference>().unwrap().shell_arg(),
+            "app:é"
+                .parse::<ResultReference>()
+                .unwrap()
+                .shell_arg()
+                .to_string(),
             "$'app:\\xc3\\xa9'"
         );
     }

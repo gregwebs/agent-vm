@@ -228,7 +228,10 @@ fn completion_notice(tag: &ResultReference, selection: Result<BootImage>) -> Opt
 
 fn launch_notice(tag: &ResultReference) -> String {
     let shown = tag.shell_arg();
-    format!("Imported {shown} into agent-vm's image cache; launch it with `--image {shown}`")
+    let shell_note = crate::shell::note_parenthetical(&[&shown]);
+    format!(
+        "Imported {shown} into agent-vm's image cache; launch it with `--image {shown}`{shell_note}"
+    )
 }
 
 fn require_regular_file(path: &Path) -> Result<()> {
