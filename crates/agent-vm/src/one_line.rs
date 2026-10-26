@@ -6,11 +6,14 @@
 //! between the byte-pinned argv rendering and the quoted config one. This module
 //! is the other half: text that was **measured** — a canonical path, a directory
 //! entry, a store path — where nobody chose the bytes and there is no
-//! declaration that could attribute them. Every path these modules print goes
-//! through here: `doctor`'s report, `boot_image`'s source description and selection
-//! errors, the config file locations and reader causes of a load failure (#420),
-//! and the operation contexts in `session`, `protected_config_dir`, `guest_home`,
-//! `network` and `egress_policy` (#422).
+//! declaration that could attribute them. Every path these modules print as
+//! diagnostic text goes through here: `doctor`'s report, `boot_image`'s source
+//! description and selection errors, the config file locations and reader causes of
+//! a load failure (#420), and the operation contexts in `session`,
+//! `protected_config_dir`, `guest_home`, `network` and `egress_policy` (#422).
+//! A path that is an **argument to a command the user pastes** is not a
+//! diagnostic: that one takes [`crate::shell::bash_word`], because the output
+//! here is read, not executed, and is deliberately not invertible.
 //!
 //! #419 converted the two producers its ticket named. `host_paths` renders every
 //! descriptor-anchored read and write, and `credential_yaml` renders `file_error`
@@ -46,7 +49,10 @@
 //! The rendering is one line, not an invertible encoding: a directory literally
 //! named `ok\x0aFORGED` prints exactly like one containing a newline. That is
 //! accepted, because the requirement is that neither can end the line the reader
-//! is looking at.
+//! is looking at. It is also why nothing printable here may be pasted into a
+//! shell: a command's operands come from the raw bytes through
+//! [`crate::shell::bash_word`], which is the only rendering that survives the
+//! round trip.
 
 use std::fmt::{self, Write as _};
 use std::path::Path;

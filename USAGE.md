@@ -1689,10 +1689,16 @@ agent-vm doctor --reset-msb-db
 
 This moves `msb-home/db/` (including the `-wal`/`-shm`/lock files) aside to
 a timestamped `db.reset-<epoch-seconds>` sibling — non-destructive, and
-reversible: the command prints the exact `mv` to undo it. It resolves
-`MSB_HOME` the same way `agent-vm` itself does, so it only ever touches
-agent-vm's private state, never a separate `~/.microsandbox` install. If no
-`db/` exists, it prints a no-op message and exits 0.
+reversible: the command prints the exact `mv` to undo it. That instruction is
+one line even when the path holds a control byte, and it names the bytes the
+filesystem actually holds (not the escaped spelling the `from:`/`to:` lines
+show): the operands are quoted for **Bash or zsh**, so paste it there.
+Interactive Bash with history expansion on is the one exception: if the path
+contains `!`, enter `set +H` on an earlier line first, or paste into zsh
+instead. The command resolves `MSB_HOME` the same way `agent-vm` itself does,
+so it only ever touches agent-vm's private state, never a separate
+`~/.microsandbox` install. If no `db/` exists, it prints a no-op message and
+exits 0.
 
 The next `agent-vm shell`/`run` finds no `db/` and lets the bundled `msb`
 recreate it fresh at its own schema, re-pulling images on first boot — no

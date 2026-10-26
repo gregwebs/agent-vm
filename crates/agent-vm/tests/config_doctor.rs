@@ -12,6 +12,7 @@
 //! sees them, not just the pure `describe_config` renderer.
 
 use std::{
+    ffi::OsStr,
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -96,10 +97,17 @@ impl Harness {
     /// into the paths `doctor` measures. The `TempDir`s are kept for their
     /// lifetime; the roots point at the named child inside each.
     fn in_leaf(home: &str, state: &str, project: &str) -> Self {
+        Self::in_os_leaf(OsStr::new(home), OsStr::new(state), OsStr::new(project))
+    }
+
+    /// [`in_leaf`] with the leaves as raw `OsStr`s, so a leaf may hold a byte a
+    /// directory can carry and a `&str` cannot — invalid UTF-8 has no spelling
+    /// that survives `Path::display()`.
+    fn in_os_leaf(home: &OsStr, state: &OsStr, project: &OsStr) -> Self {
         let home_dir = tempfile::tempdir_in("/tmp").unwrap();
         let state_dir = tempfile::tempdir_in("/tmp").unwrap();
         let project_dir = tempfile::tempdir_in("/tmp").unwrap();
-        let child = |dir: &std::path::Path, leaf: &str| -> PathBuf {
+        let child = |dir: &std::path::Path, leaf: &OsStr| -> PathBuf {
             if leaf.is_empty() {
                 return dir.to_path_buf();
             }
@@ -1203,48 +1211,223 @@ fn a_non_ascii_config_path_in_a_config_error_prints_as_itself() {
     );
 }
 
-/// `--reset-msb-db` names the path it moved and prints a line to undo it. Both come
-/// from `MSB_HOME`/`AGENT_VM_STATE_DIR`, which the user names, so a newline in it
-/// must be escaped rather than ending the report — and the rest of the path keeps
-/// its ordinary bytes, since the line is meant to be pasted. The leaf carries both
-/// a newline and non-ASCII so one assertion covers the control-byte policy and the
-/// other covers "not byte-escaped".
-#[test]
-fn the_reset_report_keeps_a_measured_path_on_one_line() {
-    let h = Harness::in_leaf("", "дом\nFORGED-STATE", "");
-    let db = h.state_root.join("msb-home/db");
+/// The bytes issue #418's acceptance names, all in one `AGENT_VM_STATE_DIR` leaf:
+/// a double quote, an apostrophe, a backslash, two substitution shapes that would
+/// create or print something if the undo line were interpolated, a newline, and
+/// the non-ASCII and forged-line coverage the earlier form of this test carried.
+/// `дом` keeps a legible non-ASCII assertion; `FORGED-STATE` follows a real LF.
+const HOSTILE_STATE_LEAF: &str =
+    "дом\"'\\$(echo pwned)$(touch INJECTED)`touch BACKTICKED`\nFORGED-STATE";
+
+/// `db/msb.db` and its `-wal` sidecar, distinct so a restore that copied one file
+/// twice cannot pass.
+const DB_BYTES: &[u8] = b"forward-migrated-schema";
+const DB_WAL_BYTES: &[u8] = b"write-ahead-log";
+
+/// The one `db.reset-*` directory under `msb_home`, found by enumerating the raw
+/// filesystem: the printed `to:` is a diagnostic, so an operand taken from it
+/// would make a wrong undo line self-confirming. Entry names are compared as
+/// bytes, never through a lossy conversion.
+fn reset_backup(msb_home: &Path) -> PathBuf {
+    let entries: Vec<PathBuf> = std::fs::read_dir(msb_home)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", msb_home.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            use std::os::unix::ffi::OsStrExt as _;
+            path.file_name()
+                .is_some_and(|name| name.as_bytes().starts_with(b"db.reset-"))
+        })
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one db.reset-* backup in {}: {entries:?}",
+        msb_home.display()
+    );
+    let backup = entries.into_iter().next().unwrap();
+    assert!(backup.is_dir(), "the backup is not a directory: {backup:?}");
+    backup
+}
+
+/// The report's undo instruction with exactly its `To undo: ` prefix removed and
+/// nothing else touched — no shell-level repair, so whatever the report prints is
+/// what Bash is asked to run.
+fn undo_instruction(report: &str) -> &str {
+    report
+        .lines()
+        .find_map(|line| line.strip_prefix("To undo: "))
+        .unwrap_or_else(|| panic!("no undo instruction in:\n{report}"))
+}
+
+/// Run the real CLI against a seeded db, execute the undo instruction it printed
+/// in Bash as-is, and assert the move was reversed byte for byte. Returns the
+/// report so a caller can assert its shape.
+///
+/// Executing (rather than comparing the line to a string) is the only oracle that
+/// catches operand reversal, display escaping reused as argv, and substitution at
+/// once. Bash is the supported paste dialect (USAGE.md); `$'…'` is not promised
+/// for dash or fish.
+fn reset_then_undo_in_bash(h: &Harness) -> String {
+    let msb_home = h.state_root.join("msb-home");
+    let db = msb_home.join("db");
     std::fs::create_dir_all(&db).unwrap();
-    std::fs::write(db.join("msb.db"), b"schema").unwrap();
+    std::fs::write(db.join("msb.db"), DB_BYTES).unwrap();
+    std::fs::write(db.join("msb.db-wal"), DB_WAL_BYTES).unwrap();
 
     let out = h.run_doctor_reset();
-
     assert_success(&out);
-    let stdout = stdout_of(&out);
-    assert!(
-        !stdout.lines().any(|line| line.starts_with("FORGED-STATE")),
-        "the measured state dir split the report:\n{stdout}"
-    );
-    // `from:`/`to:` are the authority; the undo line must name them in that order,
-    // quoted. Comparing whole lines, because `to` begins with `from`.
-    let line = |prefix: &str| {
-        stdout
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("no `{prefix}` line:\n{stdout}"))
-    };
-    let from = line("from: ").trim_start_matches("from: ");
-    let to = line("to:   ").trim_start_matches("to:   ");
-    assert!(from.contains("дом\\x0aFORGED-STATE"), "from: {from:?}");
-    assert!(!from.contains("\\xd0"), "not byte-escaped: {from:?}");
-    assert!(
-        from.ends_with("/msb-home/db"),
-        "from names the db: {from:?}"
-    );
-    assert!(to.contains("db.reset-"), "to: {to:?}");
+    let report = stdout_of(&out);
+
+    let backup = reset_backup(&msb_home);
+    assert!(!db.exists(), "the db was not moved aside:\n{report}");
+    assert_eq!(std::fs::read(backup.join("msb.db")).unwrap(), DB_BYTES);
     assert_eq!(
-        line("To undo: "),
-        format!("To undo: mv \"{to}\" \"{from}\"")
+        std::fs::read(backup.join("msb.db-wal")).unwrap(),
+        DB_WAL_BYTES
     );
+
+    let instruction = undo_instruction(&report).to_owned();
+    let undo = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", &h.home_root)
+        .current_dir(&h.project_root)
+        .args(["-c", &instruction])
+        .output()
+        .expect("bash must be on PATH for this test");
+    assert!(
+        undo.status.success(),
+        "the printed undo instruction failed ({}):\n{instruction}\nstderr: {}",
+        undo.status,
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    assert!(
+        undo.stdout.is_empty(),
+        "the printed undo instruction wrote to stdout: {:?} (for {instruction})",
+        String::from_utf8_lossy(&undo.stdout)
+    );
+
+    assert_eq!(std::fs::read(db.join("msb.db")).unwrap(), DB_BYTES);
+    assert_eq!(std::fs::read(db.join("msb.db-wal")).unwrap(), DB_WAL_BYTES);
+    assert!(!backup.exists(), "the backup survived the undo: {backup:?}");
+    for marker in ["INJECTED", "BACKTICKED"] {
+        assert!(
+            !h.project_root.join(marker).exists(),
+            "the undo instruction ran a substitution and created {marker}"
+        );
+    }
+    report
+}
+
+/// A report whose only physical lines are doctor's own, so an operator can read
+/// the undo instruction off the screen and paste it.
+fn assert_five_line_reset_report(report: &str) -> Vec<&str> {
+    let lines: Vec<&str> = report.split_terminator('\n').collect();
+    assert_eq!(lines.len(), 5, "not five physical lines:\n{report}");
+    assert!(
+        lines[0].starts_with("==> Moved microsandbox db aside"),
+        "{report}"
+    );
+    assert!(lines[1].starts_with("from: "), "{report}");
+    assert!(lines[2].starts_with("to:   "), "{report}");
+    assert!(
+        lines[3].starts_with("The database will be recreated"),
+        "{report}"
+    );
+    assert!(lines[4].starts_with("To undo: "), "{report}");
+    for line in &lines {
+        assert!(
+            !line.chars().any(char::is_control),
+            "a raw control byte survived in {line:?}"
+        );
+    }
+    assert!(
+        !report.lines().any(|line| line.starts_with("FORGED-STATE")),
+        "the measured state dir forged a line:\n{report}"
+    );
+    lines
+}
+
+/// `--reset-msb-db` names the path it moved and prints an instruction to undo it.
+/// Both come from `MSB_HOME`/`AGENT_VM_STATE_DIR`, where a name may hold any
+/// non-NUL byte. The report must stay readable — five lines, no forged one, a
+/// legible `from:` — while the instruction must still be a runnable Bash command
+/// naming the bytes the filesystem actually holds (issue #418).
+#[test]
+fn the_reset_report_keeps_a_measured_path_on_one_line() {
+    let h = Harness::in_leaf("", HOSTILE_STATE_LEAF, "");
+    let report = reset_then_undo_in_bash(&h);
+
+    let lines = assert_five_line_reset_report(&report);
+    let from = lines[1].trim_start_matches("from: ");
+    assert!(from.contains("дом"), "from: {from:?}");
+    assert!(from.contains("\\x0aFORGED-STATE"), "from: {from:?}");
+    assert!(
+        !from.contains("\\xd0"),
+        "the diagnostic byte-escaped its non-ASCII text: {from:?}"
+    );
+    assert!(from.ends_with("/msb-home/db"), "from: {from:?}");
+    assert!(lines[2].contains("db.reset-"), "to: {:?}", lines[2]);
+}
+
+/// A literal `\x0a` in the name must not alias a real newline: the diagnostic
+/// shows one as text and the other as an escape, and the executed instruction has
+/// to restore whichever the directory actually carries. Same oracle as above, so
+/// an escape scheme that decodes `\\x0a` into a control byte fails here.
+#[test]
+fn the_reset_undo_distinguishes_a_literal_backslash_from_a_control_byte() {
+    let h = Harness::in_leaf("", "дом\\x0aFORGED-STATE", "");
+    let report = reset_then_undo_in_bash(&h);
+
+    let lines = assert_five_line_reset_report(&report);
+    let from = lines[1].trim_start_matches("from: ");
+    assert!(from.contains("x0aFORGED-STATE"), "from: {from:?}");
+}
+
+/// Whether this filesystem can hold a directory name that is not valid UTF-8.
+///
+/// APFS answers `EILSEQ`; ext4 accepts the bytes. A test that needs the name to
+/// exist reports the platform limit instead of passing without running.
+fn accepts_non_utf8_names(name: &OsStr) -> bool {
+    let probe = tempfile::tempdir_in("/tmp").unwrap();
+    let path = probe.path().join(name);
+    match std::fs::create_dir(&path) {
+        Ok(()) => {
+            std::fs::remove_dir(&path).unwrap();
+            true
+        }
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => false,
+        Err(error) => panic!("probing a non-UTF-8 directory name: {error}"),
+    }
+}
+
+/// A Unix directory name may hold bytes that are not UTF-8, and the undo operand
+/// is raw bytes. `Path::display()` or `to_string_lossy()` anywhere on that path
+/// would silently rename the directory to U+FFFD; this fixture fails unless the
+/// instruction names the byte the filesystem actually holds.
+#[test]
+fn the_reset_undo_preserves_non_utf8_path_bytes() {
+    use std::os::unix::ffi::OsStringExt as _;
+    let state = std::ffi::OsString::from_vec(b"\xff\\x0a\nFORGED-STATE".to_vec());
+    if !accepts_non_utf8_names(&state) {
+        // APFS rejects every non-UTF-8 name (EILSEQ), so the filesystem half of
+        // this case cannot run on macOS. The byte-preservation property it
+        // shares with the render step is covered portably, without a directory,
+        // by `doctor::tests::the_undo_operand_decodes_to_the_raw_path_bytes`.
+        eprintln!("skipped: this filesystem refuses a non-UTF-8 directory name");
+        return;
+    }
+    let h = Harness::in_os_leaf(OsStr::new(""), &state, OsStr::new(""));
+
+    let report = reset_then_undo_in_bash(&h);
+
+    let lines = assert_five_line_reset_report(&report);
+    let from = lines[1].trim_start_matches("from: ");
+    assert!(
+        from.contains("\\xff"),
+        "the diagnostic spelled the invalid byte out: {from:?}"
+    );
+    assert!(from.ends_with("/msb-home/db"), "from: {from:?}");
 }
 
 /// Every line of `doctor`'s output must be doctor's own, so the only place a

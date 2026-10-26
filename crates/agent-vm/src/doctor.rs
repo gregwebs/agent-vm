@@ -50,6 +50,15 @@
 //! `credentials.yaml` the launch would read, and whatever `--reset-msb-db` moved —
 //! go through [`crate::one_line`], which escapes only control characters.
 //!
+//! The one value this report prints for **execution** rather than reading is
+//! `--reset-msb-db`'s undo `mv`: its two operands are argv, so they take
+//! [`crate::shell::bash_word`] on the raw path bytes, not [`crate::one_line`].
+//! The two policies are not interchangeable in either direction — the display
+//! rendering is not invertible (a path holding a newline and one literally named
+//! `\x0a` print alike), and pasting it would name the wrong file and could interpolate
+//! `$(…)`. The instruction is therefore ASCII-only, one line, and meant for Bash
+//! or zsh (`$'…'`); `from:`/`to:` above it stay the legible diagnostics.
+//!
 //! [`crate::config::escape_str`] and [`crate::config::quoted_path`] are not used
 //! for any measured path in this report, and the modules whose error text this
 //! report prints — `session`, `protected_config_dir`, `guest_home`, `network`,
@@ -1143,7 +1152,14 @@ fn timestamp_suffix(now: SystemTime) -> String {
 
 /// User-facing text for a [`ResetOutcome`]. Pure so the AC wording lives in
 /// one testable place.
+///
+/// The undo operand is not the display rendering: `from:`/`to:` are read, are
+/// not invertible, and a path holding a control byte would not be the name `mv`
+/// needs. The pasted command therefore takes raw path bytes through
+/// [`crate::shell::bash_word`], and `mv --` keeps the leading operand a path
+/// rather than an option.
 fn render(outcome: &ResetOutcome) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
     match outcome {
         ResetOutcome::Moved { from, to } => format!(
             "==> Moved microsandbox db aside (nothing was deleted)\n\
@@ -1151,11 +1167,12 @@ fn render(outcome: &ResetOutcome) -> String {
              to:   {}\n\
              The database will be recreated at the bundled schema on the next \
              `agent-vm shell`/`run`, and images will be re-pulled on first boot.\n\
-             To undo: mv \"{}\" \"{}\"",
+             To undo: mv -- {} {}",
             crate::one_line::path(from),
             crate::one_line::path(to),
-            crate::one_line::path(to),
-            crate::one_line::path(from),
+            // The reverse of the move: the backup first, the original second.
+            crate::shell::bash_word(to.as_os_str().as_bytes()),
+            crate::shell::bash_word(from.as_os_str().as_bytes()),
         ),
         ResetOutcome::NothingToMove { checked } => format!(
             "==> No microsandbox db to reset — nothing was moved.\n\
@@ -1577,7 +1594,7 @@ selected (without --image): not selected; initial recommendation [<fixture>/home
 from: <fixture>/state/msb-home/db
 to:   <fixture>/state/msb-home/db.reset-<timestamp>
 The database will be recreated at the bundled schema on the next `agent-vm shell`/`run`, and images will be re-pulled on first boot.
-To undo: mv "<fixture>/state/msb-home/db.reset-<timestamp>" "<fixture>/state/msb-home/db"
+To undo: mv -- <fixture>/state/msb-home/db.reset-<timestamp> <fixture>/state/msb-home/db
 "###
             } else {
                 r###"==> No microsandbox db to reset — nothing was moved.
@@ -1840,10 +1857,10 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
         );
     }
 
-    /// The undo line has to stay one line. For a path holding a control character
-    /// that costs the pasted command its correctness — `\x0a` inside quotes names
-    /// a file that does not exist — which is the accepted trade: a forged
-    /// instruction next to a real one is the worse failure.
+    /// The undo line has to stay one line *and* stay runnable. `from:`/`to:` are
+    /// diagnostics, so the operand is [`crate::shell::bash_word`] on the raw path
+    /// bytes: `$'…'` is what makes an escaped `\x0a` the newline the directory
+    /// actually holds rather than four characters no `mv` can find.
     #[test]
     fn the_reset_report_cannot_forge_a_line() {
         let from = PathBuf::from("/state/m\nFORGED-FROM/db");
@@ -1857,16 +1874,25 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
             !text.lines().any(|line| line.starts_with("FORGED-FROM")),
             "the measured path forged a line: {text:?}"
         );
+        // The display fields keep the one-line policy, which is not invertible.
+        assert!(
+            text.contains("from: /state/m\\x0aFORGED-FROM/db\n"),
+            "the source diagnostic escaped its control byte: {text:?}"
+        );
+        assert!(
+            text.contains("to:   /state/m\\x0aFORGED-FROM/db.reset-123\n"),
+            "so did the target diagnostic: {text:?}"
+        );
         let undo = text
             .lines()
             .find(|line| line.contains("To undo:"))
             .expect("the undo line");
         // Written out rather than counted: the target begins with the source, so a
-        // `matches(prefix).count() == 2` would also accept `mv "{to}" "{to}"`.
+        // `matches(prefix).count() == 2` would also accept `mv … "{to}" "{to}"`.
         assert_eq!(
             undo,
-            "To undo: mv \"/state/m\\x0aFORGED-FROM/db.reset-123\" \
-             \"/state/m\\x0aFORGED-FROM/db\""
+            "To undo: mv -- $'/state/m\\x0aFORGED-FROM/db.reset-123' \
+             $'/state/m\\x0aFORGED-FROM/db'"
         );
 
         let nothing = render(&ResetOutcome::NothingToMove { checked: from });
@@ -1874,6 +1900,54 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
             !nothing.lines().any(|line| line.starts_with("FORGED-FROM")),
             "the checked path forged a line: {nothing:?}"
         );
+    }
+
+    /// The operand is raw path bytes, not the `from:`/`to:` diagnostics: an
+    /// invalid UTF-8 byte has no display spelling at all, so a `display()` or
+    /// `to_string_lossy()` on the command path would silently encode U+FFFD.
+    ///
+    /// Decoded through a shell, without a filesystem — APFS refuses to create a
+    /// directory with such a name, so this is where the byte property is checked
+    /// on macOS, and `config_doctor::the_reset_undo_preserves_non_utf8_path_bytes`
+    /// checks the same property end to end where the filesystem allows it.
+    #[test]
+    fn the_undo_operand_decodes_to_the_raw_path_bytes() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        let from = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/state/\xff\\x0a\n\x7f-x/db".to_vec(),
+        ));
+        let to = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/state/\xff\\x0a\n\x7f-x/db.reset-123".to_vec(),
+        ));
+        let text = render(&ResetOutcome::Moved {
+            from: from.clone(),
+            to: to.clone(),
+        });
+
+        let operands = text
+            .lines()
+            .find_map(|line| line.strip_prefix("To undo: mv -- "))
+            .expect("the undo line");
+        // `set --` in place of the command: the shell decodes each word to one
+        // argument, and nothing is moved.
+        let probe =
+            format!("set -- {operands}; [ \"$#\" -eq 2 ] || exit 99; printf '%s\\0' \"$1\" \"$2\"");
+        let out = std::process::Command::new("bash")
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .args(["-c", &probe])
+            .output()
+            .expect("bash must be on PATH for this test");
+        assert!(
+            out.status.success(),
+            "bash rejected the undo operands ({operands}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut expected = to.as_os_str().as_bytes().to_vec();
+        expected.push(0);
+        expected.extend_from_slice(from.as_os_str().as_bytes());
+        expected.push(0);
+        assert_eq!(out.stdout, expected, "undo operands were {operands}");
     }
 
     /// The discriminator against [`crate::config::escape_str`]: a measured path
