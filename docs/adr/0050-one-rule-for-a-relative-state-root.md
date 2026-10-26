@@ -116,6 +116,10 @@ unit test per branch.
 - `state_root` can fail, so `doctor`, `session`, `msb_install` and the git
   identity cache each have a defined answer. The cache treats a refused root as
   "do not cache": the launch has already failed by then.
+- The ordinary `doctor` header (`MSB_HOME:` and the `db:` line derived from
+  it) prints absolute paths for the same reason, so it needed no change of its
+  own (#438); a CLI test pins the header for both an ignored
+  `XDG_STATE_HOME` fallback and an absolute override.
 - The printed `doctor` undo instruction is absolute because the root is, not
   because that one site repairs it, so the site's `absolute()` call is gone. The
   guarantee is split across two kinds of test, because they catch different

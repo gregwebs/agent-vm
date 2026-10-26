@@ -335,6 +335,12 @@ fn describe_embedded_runtime(dir: Option<&Path>, exists: bool) -> String {
 /// (mirroring `render`/`reset_msb_db_in`'s testable-without-env-or-fs-reads
 /// pattern above) so the wording is unit-tested without needing a real
 /// `MSB_HOME` on disk.
+///
+/// Both printed paths are absolute because `msb_home` is: `msb_home_dir()`
+/// builds it from `state_root()`, which refuses or ignores a relative value
+/// (#437), so this report needs no resolution of its own (#438). It prints the
+/// value verbatim — no canonicalisation — because it names the directory the
+/// command acts on, not a normalised spelling of it.
 fn describe_home(msb_home: &Path, db_exists: bool, bundled_schema: &str) -> String {
     let db_path = msb_home.join("db").join("msb.db");
     format!(

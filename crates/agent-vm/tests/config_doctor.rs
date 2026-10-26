@@ -1524,6 +1524,62 @@ fn a_relative_xdg_state_home_is_ignored_and_the_fallback_is_used() {
     assert!(!db.exists(), "the db was not moved: {report}");
 }
 
+/// The ordinary report names the same value the reset report moves, so it has
+/// the same invariant: #437 made the state root absolute at construction, which
+/// is what #438 asked the header lines to do. Pin what a reader sees — absolute
+/// `MSB_HOME:` and `db:` paths that agree with each other — for both ways the
+/// root can be chosen: an ignored relative `XDG_STATE_HOME` (fallback) and an
+/// absolute `AGENT_VM_STATE_DIR` (override used verbatim).
+#[test]
+fn the_ordinary_report_names_absolute_home_paths() {
+    let h = Harness::new();
+    let fallback = if cfg!(target_os = "macos") {
+        h.home_root.join(".agent-vm-msb")
+    } else {
+        h.home_root.join(".local/state/agent-vm/msb-home")
+    };
+    for value in ["rel-xdg", ""] {
+        let out = h
+            .base_command()
+            .env_remove("AGENT_VM_STATE_DIR")
+            .env("XDG_STATE_HOME", value)
+            .args(["doctor"])
+            .output()
+            .expect("failed to run agent-vm doctor");
+        assert_success(&out);
+        assert_report_paths(&stdout_of(&out), &fallback);
+    }
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    assert_report_paths(
+        &stdout_of(&out),
+        &h.state_root.canonicalize().unwrap().join("msb-home"),
+    );
+}
+
+/// The two header paths of the ordinary report: absolute, and the `db:` line
+/// derived from the `MSB_HOME:` line rather than resolved separately.
+fn assert_report_paths(stdout: &str, expected_home: &Path) {
+    let line = |key: &str| -> &str {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} line:\n{stdout}"))
+            .trim()
+    };
+    let msb_home = Path::new(line("MSB_HOME:"));
+    assert!(
+        msb_home.is_absolute(),
+        "MSB_HOME is not absolute: {msb_home:?}"
+    );
+    assert_eq!(msb_home, expected_home);
+    let db = line("db:");
+    let db = db.rsplit_once(" (").map_or(db, |(path, _)| path);
+    assert!(Path::new(db).is_absolute(), "db is not absolute: {db:?}");
+    assert_eq!(Path::new(db), msb_home.join("db").join("msb.db"));
+}
+
 /// The ignored-value notice is best effort: a stderr whose reader is already
 /// gone must not turn a valid fallback into a panic (exit 101). A closed socket
 /// pair makes the write fail with EPIPE deterministically, unlike a closed file
