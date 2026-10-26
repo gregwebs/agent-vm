@@ -1283,8 +1283,8 @@ fn undo_instruction(report: &str) -> &str {
 ///
 /// Executing (rather than comparing the line to a string) is the only oracle that
 /// catches operand reversal, display escaping reused as argv, and substitution at
-/// once. Bash is the supported paste dialect (USAGE.md); `$'…'` is not promised
-/// for dash or fish.
+/// once. Bash runs the instruction as printed; when it needs `$'…'` the report
+/// says so, because dash reads that differently (USAGE.md).
 ///
 /// `reset` runs `doctor --reset-msb-db` however the case needs to spell it — a
 /// relative `AGENT_VM_STATE_DIR`, or a cwd of its own (#433).
@@ -1351,9 +1351,14 @@ fn reset_then_undo_in_bash(h: &Harness) -> String {
 }
 
 /// A report whose only physical lines are doctor's own, so an operator can read
-/// the undo instruction off the screen and paste it.
+/// the undo instruction off the screen and paste it. The undo command may be
+/// followed by one line naming the shell that reads `$'…'`; only that line is
+/// allowed beyond doctor's own five.
 fn assert_five_line_reset_report(report: &str) -> Vec<&str> {
-    let lines: Vec<&str> = report.split_terminator('\n').collect();
+    let mut lines: Vec<&str> = report.split_terminator('\n').collect();
+    if lines.last() == Some(&"(quoted for bash or zsh)") {
+        lines.pop();
+    }
     assert_eq!(lines.len(), 5, "not five physical lines:\n{report}");
     assert!(
         lines[0].starts_with("==> Moved microsandbox db aside"),
@@ -1379,6 +1384,16 @@ fn assert_five_line_reset_report(report: &str) -> Vec<&str> {
     lines
 }
 
+/// An undo operand holding a control byte or non-ASCII text needs `$'…'`, which
+/// only bash and zsh read, so the report says so after the command.
+fn assert_names_bash_or_zsh(report: &str) {
+    assert_eq!(
+        report.split_terminator('\n').next_back(),
+        Some("(quoted for bash or zsh)"),
+        "the report did not name the shell its undo command needs:\n{report}"
+    );
+}
+
 /// `--reset-msb-db` names the path it moved and prints an instruction to undo it.
 /// Both come from `MSB_HOME`/`AGENT_VM_STATE_DIR`, where a name may hold any
 /// non-NUL byte. The report must stay readable — five lines, no forged one, a
@@ -1389,6 +1404,7 @@ fn the_reset_report_keeps_a_measured_path_on_one_line() {
     let h = Harness::in_leaf("", HOSTILE_STATE_LEAF, "");
     let report = reset_then_undo_in_bash(&h);
 
+    assert_names_bash_or_zsh(&report);
     let lines = assert_five_line_reset_report(&report);
     let from = lines[1].trim_start_matches("from: ");
     assert!(from.contains("дом"), "from: {from:?}");
@@ -1410,6 +1426,7 @@ fn the_reset_undo_distinguishes_a_literal_backslash_from_a_control_byte() {
     let h = Harness::in_leaf("", "дом\\x0aFORGED-STATE", "");
     let report = reset_then_undo_in_bash(&h);
 
+    assert_names_bash_or_zsh(&report);
     let lines = assert_five_line_reset_report(&report);
     let from = lines[1].trim_start_matches("from: ");
     assert!(from.contains("x0aFORGED-STATE"), "from: {from:?}");
@@ -1486,6 +1503,7 @@ fn the_reset_undo_preserves_non_utf8_path_bytes() {
 
     let report = reset_then_undo_in_bash(&h);
 
+    assert_names_bash_or_zsh(&report);
     let lines = assert_five_line_reset_report(&report);
     let from = lines[1].trim_start_matches("from: ");
     assert!(

@@ -689,8 +689,10 @@ retained or recommended fallback is not a configured image, so it gets only the
 launch sentence.
 
 Errors and Docker's progress go to stderr. Usage errors from `image import` do
-not echo rejected values. Printed references are bash/zsh shell words;
-non-ASCII bytes use `$'…'` escapes without changing the reference.
+not echo rejected values. A printed reference is a shell word: a plain one prints
+unchanged, and one holding non-ASCII or control bytes uses `$'…'` escapes that
+leave the reference unchanged. Those escapes are read only by bash and zsh, so
+such a notice says `(quoted for bash or zsh)`.
 
 A registry acquisition failure for an explicit mutable tag prints an import
 hint and retains the registry error chain. It does not prove the image exists
@@ -1773,14 +1775,16 @@ a timestamped `db.reset-<epoch-seconds>` sibling — non-destructive, and
 reversible: the command prints the exact `mv` to undo it. That instruction is
 one line even when the path holds a control byte, and it names the bytes the
 filesystem actually holds (not the escaped spelling the `from:`/`to:` lines
-show): the operands are quoted for **Bash or zsh**, so paste it there.
-Interactive Bash with history expansion on is the one exception: if the path
-contains `!`, enter `set +H` on an earlier line first, or paste into zsh
-instead. The command resolves `MSB_HOME` the same way `agent-vm` itself does,
-so it only ever touches agent-vm's private state, never a separate
-`~/.microsandbox` install. The instruction names absolute paths, so it works
-from any directory — even when `AGENT_VM_STATE_DIR` is relative. If no `db/`
-exists, it prints a no-op message and exits 0.
+show). A path that needs no quoting prints as itself and any shell can run it;
+one that needs `$'…'` is read only by bash or zsh, so the report prints
+`(quoted for bash or zsh)` on the next line. Interactive Bash with history
+expansion on is the one exception: if the path contains `!`, enter `set +H` on
+an earlier line first, or paste into zsh instead. The command resolves
+`MSB_HOME` the same way `agent-vm` itself does, so it only ever touches
+agent-vm's private state, never a separate `~/.microsandbox` install. The
+instruction names absolute paths, so it works from any directory — even when
+`AGENT_VM_STATE_DIR` is relative. If no `db/` exists, it prints a no-op message
+and exits 0.
 
 The next `agent-vm shell`/`run` finds no `db/` and lets the bundled `msb`
 recreate it fresh at its own schema, re-pulling images on first boot — no

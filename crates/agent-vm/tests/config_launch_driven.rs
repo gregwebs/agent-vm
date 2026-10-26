@@ -8726,6 +8726,11 @@ fn a_non_ascii_tag_hint_is_copy_pasteable() {
     assert!(!out.status.success());
     assert!(stderr.contains("registry error"), "{stderr}");
     assert!(stderr.contains("agent-vm image import --docker $'localhost:1/does-not-exist:\\xc3\\xa9' --tag $'localhost:1/does-not-exist:\\xc3\\xa9'"), "{stderr}");
+    // `$'…'` is not POSIX, so the hint names the shells that read it.
+    assert!(
+        stderr.contains("The commands above are quoted for bash or zsh."),
+        "{stderr}"
+    );
     for line in stderr
         .lines()
         .filter(|line| line.contains("agent-vm image import"))
@@ -8756,6 +8761,11 @@ fn refresh_and_setup_give_the_same_hint() {
             stderr.contains(&format!(
                 "agent-vm image import --docker {CLI_REF} --tag {CLI_REF}"
             )),
+            "{verb}: {stderr}"
+        );
+        // A plain reference needs no quoting, so no shell is named.
+        assert!(
+            !stderr.contains("quoted for bash or zsh"),
             "{verb}: {stderr}"
         );
     }

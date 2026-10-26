@@ -109,9 +109,10 @@ pub(crate) async fn run(args: Args) -> Result<i32> {
         .await
         .context("importing build result")?;
     let shown = args.tag.shell_arg();
+    let shell_note = crate::shell::note_parenthetical(&[&shown]);
     let _ = writeln!(
         std::io::stdout(),
-        "Imported build result as {shown}; launch it with `--image {shown}`"
+        "Imported build result as {shown}; launch it with `--image {shown}`{shell_note}"
     );
     Ok(0)
 }

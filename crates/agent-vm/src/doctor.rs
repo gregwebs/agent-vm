@@ -56,12 +56,10 @@
 //!
 //! The one value this report prints for **execution** rather than reading is
 //! `--reset-msb-db`'s undo `mv`: its two operands are argv, so they take
-//! [`crate::shell::bash_word`] on the raw path bytes, not [`crate::one_line`].
-//! The two policies are not interchangeable in either direction — the display
-//! rendering is not invertible (a path holding a newline and one literally named
-//! `\x0a` print alike), and pasting it would name the wrong file and could interpolate
-//! `$(…)`. The instruction is therefore ASCII-only, one line, and meant for Bash
-//! or zsh (`$'…'`); `from:`/`to:` above it stay the legible diagnostics.
+//! [`crate::shell::PastedWord`] on the raw path bytes, and the line names its
+//! shell when not every shell reads it ([`crate::shell`] holds the rule and
+//! [`crate::shell::bash_zsh_note`] the wording). `from:`/`to:` above the command
+//! stay [`crate::one_line`] diagnostics: a rendering that is read, not run.
 //!
 //! [`crate::config::escape_str`] and [`crate::config::quoted_path`] are not used
 //! for any measured path in this report, and the modules whose error text this
@@ -1168,27 +1166,33 @@ fn timestamp_suffix(now: SystemTime) -> String {
 /// User-facing text for a [`ResetOutcome`]. Pure so the AC wording lives in
 /// one testable place.
 ///
-/// The undo operand is not the display rendering: `from:`/`to:` are read, are
-/// not invertible, and a path holding a control byte would not be the name `mv`
-/// needs. The pasted command therefore takes raw path bytes through
-/// [`crate::shell::bash_word`], and `mv --` keeps the leading operand a path
-/// rather than an option.
+/// `from:`/`to:` above are [`crate::one_line`] diagnostics, so the undo `mv`
+/// takes raw path bytes through [`crate::shell::PastedWord`] instead; `mv --`
+/// keeps the leading operand a path rather than an option, and
+/// [`crate::shell::bash_zsh_note`] names the shell when not every shell reads
+/// the operand.
 fn render(outcome: &ResetOutcome) -> String {
     use std::os::unix::ffi::OsStrExt as _;
     match outcome {
-        ResetOutcome::Moved { from, to } => format!(
-            "==> Moved microsandbox db aside (nothing was deleted)\n\
-             from: {}\n\
-             to:   {}\n\
-             The database will be recreated at the bundled schema on the next \
-             `agent-vm shell`/`run`, and images will be re-pulled on first boot.\n\
-             To undo: mv -- {} {}",
-            crate::one_line::path(from),
-            crate::one_line::path(to),
+        ResetOutcome::Moved { from, to } => {
             // The reverse of the move: the backup first, the original second.
-            crate::shell::bash_word(to.as_os_str().as_bytes()),
-            crate::shell::bash_word(from.as_os_str().as_bytes()),
-        ),
+            let to_word = crate::shell::PastedWord::new(to.as_os_str().as_bytes());
+            let from_word = crate::shell::PastedWord::new(from.as_os_str().as_bytes());
+            // Its own line, so the `To undo: ` line is only the command.
+            let shell_note = crate::shell::bash_zsh_note(&[&to_word, &from_word])
+                .map(|note| format!("\n({note})"))
+                .unwrap_or_default();
+            format!(
+                "==> Moved microsandbox db aside (nothing was deleted)\n\
+                 from: {}\n\
+                 to:   {}\n\
+                 The database will be recreated at the bundled schema on the next \
+                 `agent-vm shell`/`run`, and images will be re-pulled on first boot.\n\
+                 To undo: mv -- {to_word} {from_word}{shell_note}",
+                crate::one_line::path(from),
+                crate::one_line::path(to),
+            )
+        }
         ResetOutcome::NothingToMove { checked } => format!(
             "==> No microsandbox db to reset — nothing was moved.\n\
              checked: {}\n\
@@ -1872,10 +1876,11 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
         );
     }
 
-    /// The undo line has to stay one line *and* stay runnable. `from:`/`to:` are
-    /// diagnostics, so the operand is [`crate::shell::bash_word`] on the raw path
-    /// bytes: `$'…'` is what makes an escaped `\x0a` the newline the directory
-    /// actually holds rather than four characters no `mv` can find.
+    /// The undo command has to stay runnable *and* keep the report one line per
+    /// value. `from:`/`to:` are diagnostics, so the operand is
+    /// [`crate::shell::PastedWord`] on the raw path bytes: `$'…'` is what makes
+    /// an escaped `\x0a` the newline the directory actually holds rather than
+    /// four characters no `mv` can find.
     #[test]
     fn the_reset_report_cannot_forge_a_line() {
         let from = PathBuf::from("/state/m\nFORGED-FROM/db");
@@ -1908,6 +1913,15 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
             undo,
             "To undo: mv -- $'/state/m\\x0aFORGED-FROM/db.reset-123' \
              $'/state/m\\x0aFORGED-FROM/db'"
+        );
+        // Only bash and zsh read `$'…'`, so the report says so; the note is its
+        // own line, leaving the `To undo: ` line a command and nothing else.
+        assert!(
+            text.contains(
+                "To undo: mv -- $'/state/m\\x0aFORGED-FROM/db.reset-123' \
+                 $'/state/m\\x0aFORGED-FROM/db'\n(quoted for bash or zsh)"
+            ),
+            "the undo command did not name its shell: {text:?}"
         );
 
         let nothing = render(&ResetOutcome::NothingToMove { checked: from });

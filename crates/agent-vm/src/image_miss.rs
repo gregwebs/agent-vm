@@ -63,14 +63,17 @@ fn has_registry_error(error: &anyhow::Error) -> bool {
 /// The lead line states where the acquisition failed, so the top of the message
 /// is not `Error: hint: …`; it is not a diagnosis (`image refresh` uses
 /// `PullPolicy::Always`, so a cache miss is not implied). The reference is
-/// spelled as one shell word - the same spelling in every line - so the whole
-/// hint can be pasted; for ASCII references that is byte-identical to the plain
-/// text.
+/// spelled as one shell word, the same spelling in every line, so the whole hint
+/// can be pasted; for a plain value that is byte-identical to the plain text and
+/// no shell is named, because every shell reads it.
 fn render(reference: &ResultReference) -> String {
     let shown = reference.shell_arg();
     // The remedy lines are indented by two spaces. A `\`-continuation strips
     // the *next* line's leading whitespace, so the indent must come from here.
     let indent = "  ";
+    let shell_note = crate::shell::bash_zsh_note(&[&shown])
+        .map(|note| format!("The commands above are {note}.\n"))
+        .unwrap_or_default();
     format!(
         "could not acquire {shown} from its registry\n\n\
 hint: an image that exists only in your local Docker daemon is not visible to\n\
@@ -78,6 +81,7 @@ agent-vm until it is imported into agent-vm's own image cache:\n\
 {indent}agent-vm image import --docker {shown} --tag {shown}\n\
 A completed OCI or Docker-save archive works too:\n\
 {indent}agent-vm image import --input <FILE> --tag {shown}\n\
+{shell_note}\
 The imported reference must match the --image value exactly."
     )
 }
@@ -180,5 +184,20 @@ mod tests {
         let shown = format!("{:?}", attach(registry(), raw, &ImageLabel::for_tests(raw)));
         assert!(shown.contains("agent-vm image import --docker $'localhost:1/x:\\xc3\\xa9' --tag $'localhost:1/x:\\xc3\\xa9'"));
         assert!(!shown.contains('é'));
+        // `$'…'` is not POSIX: a reader pasting into `sh`/`dash` must be told.
+        assert!(
+            shown.contains("The commands above are quoted for bash or zsh."),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_plain_reference_hint_names_no_shell() {
+        let shown = format!(
+            "{:?}",
+            attach(registry(), "app:dev", &ImageLabel::for_tests("app:dev"))
+        );
+        assert!(shown.contains("agent-vm image import --docker app:dev --tag app:dev"));
+        assert!(!shown.contains("bash"), "{shown}");
     }
 }

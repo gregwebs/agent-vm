@@ -23,6 +23,7 @@ use crate::mount;
 use crate::one_line;
 use crate::protected_host_files::CoreHostSource;
 use crate::session::ProjectSession;
+use crate::shell::guest_script_word;
 use crate::user;
 
 /// Environment variables agent-vm injects into *every* guest, regardless of
@@ -2536,7 +2537,7 @@ pub(crate) fn inner_argv(tool: &Tool, tool_args: Vec<String>) -> Vec<String> {
         // the standard fix.
         let cmd = tool_args
             .iter()
-            .map(|a| shell_escape(a))
+            .map(|a| guest_script_word(a))
             .collect::<Vec<_>>()
             .join(" ");
         inner_args.push("-c".into());
@@ -2567,7 +2568,7 @@ struct AgentShellLine<'a> {
 impl AgentShellLine<'_> {
     /// Prelude, guard, then `exec` with the configured argv.
     fn render(&self) -> String {
-        let path = shell_escape(self.project_guest_path);
+        let path = guest_script_word(self.project_guest_path);
         let prelude = format!(
             "{STRIP_IPV6_NAMESERVERS}\n\
              {RUN_IMAGE_SEED_HOOKS}\n\
@@ -2591,10 +2592,10 @@ impl AgentShellLine<'_> {
     /// `/etc/resolv.conf` (#258).
     fn exec_line(&self) -> String {
         let mut out = String::from("; exec -- ");
-        out.push_str(&shell_escape(self.command));
+        out.push_str(&guest_script_word(self.command));
         for a in self.args {
             out.push(' ');
-            out.push_str(&shell_escape(a));
+            out.push_str(&guest_script_word(a));
         }
         out
     }
@@ -2629,12 +2630,12 @@ impl AgentShellLine<'_> {
     /// is ignored anyway — because a hook's `set -e` would otherwise abort with a
     /// bare status 1 and no direct diagnostic.
     fn direct_guard(&self) -> String {
-        let command = shell_escape(self.command);
-        let not_found = shell_escape(&format!(
+        let command = guest_script_word(self.command);
+        let not_found = guest_script_word(&format!(
             "agent-vm: executable not found: {}",
             config::escape_str(self.command)
         ));
-        let not_executable = shell_escape(&format!(
+        let not_executable = guest_script_word(&format!(
             "agent-vm: not executable: {}",
             config::escape_str(self.command)
         ));
@@ -2671,8 +2672,8 @@ impl AgentShellLine<'_> {
     }
 
     fn image_contract_guard(&self) -> String {
-        let command = shell_escape(self.command);
-        let message = shell_escape(&image_contract::missing_program_message(
+        let command = guest_script_word(self.command);
+        let message = guest_script_word(&image_contract::missing_program_message(
             self.image,
             self.command,
         ));
@@ -2692,24 +2693,6 @@ impl AgentShellLine<'_> {
             exit = image_contract::MISSING_PROGRAM_EXIT,
         )
     }
-}
-
-/// Single-quote `s` for use as a single argv element in a `bash -c`
-/// line. Embedded single quotes are split out with the standard
-/// `'\''` trick. Adequate for forwarding arbitrary user-supplied agent
-/// args through the resolv.conf prelude wrapper.
-fn shell_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 // Keep home selection in the same constructor exercised by the subprocess test:
@@ -3677,17 +3660,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shell_escape_handles_simple_and_quoted() {
-        assert_eq!(shell_escape("foo"), "'foo'");
-        assert_eq!(
-            shell_escape("--flag=value with spaces"),
-            "'--flag=value with spaces'"
-        );
-        assert_eq!(shell_escape("don't"), "'don'\\''t'");
-        assert_eq!(shell_escape(""), "''");
-    }
-
     // ── IPv6 resolv.conf strip (PLAN.md B3 / upstream issue #5) ───
 
     fn direct_args(values: &[&str]) -> Vec<String> {
@@ -3879,7 +3851,7 @@ mod tests {
                  builtin type -P -- probe >&2\n\
                  probe() {{ exit 99; }}\n\
                  alias probe='exit 98'",
-                shell_escape(bin)
+                guest_script_word(bin)
             );
             let output = direct_tail(DirectTail {
                 bash,
@@ -3938,7 +3910,7 @@ mod tests {
                     }
                     // Hook shape: run a PATH program (hashing it), then remove or
                     // directory-replace it with no further PATH assignment.
-                    let earlier_probe = shell_escape(earlier_probe.to_str().unwrap());
+                    let earlier_probe = guest_script_word(earlier_probe.to_str().unwrap());
                     let mutation = if replaced_by_directory {
                         format!("rm {earlier_probe}\nmkdir {earlier_probe}")
                     } else {
@@ -3946,7 +3918,11 @@ mod tests {
                     };
                     let before = format!(
                         "export PATH={}:/usr/bin:/bin\nprobe >/dev/null\n{mutation}",
-                        shell_escape(&format!("{}:{}", earlier.display(), later_bin.display()))
+                        guest_script_word(&format!(
+                            "{}:{}",
+                            earlier.display(),
+                            later_bin.display()
+                        ))
                     );
                     let context =
                         format!("{bash}, later={later:?}, directory={replaced_by_directory}");

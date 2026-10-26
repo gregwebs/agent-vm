@@ -12,7 +12,7 @@
 //! a load failure (#420), and the operation contexts in `session`,
 //! `protected_config_dir`, `guest_home`, `network` and `egress_policy` (#422).
 //! A path that is an **argument to a command the user pastes** is not a
-//! diagnostic: that one takes [`crate::shell::bash_word`], because the output
+//! diagnostic: that one takes [`crate::shell::PastedWord`], because the output
 //! here is read, not executed, and is deliberately not invertible.
 //!
 //! #419 converted the two producers its ticket named. `host_paths` renders every
@@ -51,8 +51,7 @@
 //! accepted, because the requirement is that neither can end the line the reader
 //! is looking at. It is also why nothing printable here may be pasted into a
 //! shell: a command's operands come from the raw bytes through
-//! [`crate::shell::bash_word`], which is the only rendering that survives the
-//! round trip.
+//! [`crate::shell::PastedWord`] instead.
 
 use std::fmt::{self, Write as _};
 use std::path::Path;

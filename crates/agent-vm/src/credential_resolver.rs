@@ -461,6 +461,16 @@ pub(crate) struct Withheld {
     via_override: bool,
 }
 
+/// The `secret set` command a message tells the user to run, quoted by
+/// [`crate::shell`]. `ServiceName`'s charset keeps it plain today, so no note is
+/// ever needed; taking the encoder means widening that charset cannot print an
+/// unreadable command with no way to know.
+fn secret_set_command(service: &ServiceName) -> String {
+    let word = crate::shell::PastedWord::new(service.as_str().as_bytes());
+    let note = crate::shell::note_parenthetical(&[&word]);
+    format!("agent-vm secret set {word}{note}")
+}
+
 impl Withheld {
     /// The full, renderable reason. Names the service (user-controlled
     /// metadata, already shown by `secret ls`) and, for `Unavailable`, the
@@ -468,8 +478,9 @@ impl Withheld {
     pub(crate) fn reason(&self) -> String {
         match &self.cause {
             WithheldCause::Missing => format!(
-                "no value is stored in the system keychain for `{}`; store it with `agent-vm secret set {}`",
-                self.service, self.service
+                "no value is stored in the system keychain for `{}`; store it with `{}`",
+                self.service,
+                secret_set_command(&self.service)
             ),
             WithheldCause::Unavailable(failure) => format!(
                 "the system keychain could not be read for `{}`: {}",
@@ -863,8 +874,9 @@ fn resolve_authorized(
             // problem behind a warning.
             return Err(anyhow!(
                 "the stored value for `{service}` cannot be used: {}. Remove and \
-                 re-store it with `agent-vm secret set {service}`",
-                rejection.message()
+                 re-store it with `{}`",
+                rejection.message(),
+                secret_set_command(service)
             ));
         }
     }

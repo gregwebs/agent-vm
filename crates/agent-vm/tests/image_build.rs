@@ -2044,6 +2044,21 @@ fn build_success_notice_is_on_stdout() {
     assert!(stderr_of(&out).contains(FAKE_DOCKER_STDERR_MARKER));
     assert!(!stderr_of(&out).contains("Imported"));
 }
+
+/// The build notice prints the same pasted word as import, so it owes the same
+/// note: `$'…'` is not POSIX and a dash user would paste a different tag.
+#[test]
+fn build_success_notice_names_its_shell_for_a_non_ascii_tag() {
+    let mut harness = Harness::new();
+    let a = image_archive::write(&harness.home.join("a.tar"), &ArchiveSpec::default());
+    harness.replay(&a);
+    let out = harness.run(&["image", "build", "--tag", "app:é"]);
+    assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
+    assert_eq!(
+        stdout_of(&out),
+        "Imported build result as $'app:\\xc3\\xa9'; launch it with `--image $'app:\\xc3\\xa9'` (quoted for bash or zsh)\n"
+    );
+}
 #[test]
 fn docker_save_archive_publishes_tag_and_its_repotags() {
     for tags in [Some(vec!["z-source:dev".into()]), None] {
@@ -2173,14 +2188,16 @@ fn non_ascii_tag_notice_round_trips() {
     assert_eq!(code_of(&out), 0, "{}", stderr_of(&out));
     assert_eq!(
         stdout_of(&out),
-        "Imported $'app:\\xc3\\xa9' into agent-vm's image cache; launch it with `--image $'app:\\xc3\\xa9'`\n"
+        "Imported $'app:\\xc3\\xa9' into agent-vm's image cache; launch it with `--image $'app:\\xc3\\xa9'` (quoted for bash or zsh)\n"
     );
     let notice = stdout_of(&out);
     let word = notice
         .split("--image ")
         .nth(1)
         .unwrap()
-        .trim_end_matches("`\n");
+        .split('`')
+        .next()
+        .unwrap();
     let shell = Command::new("bash")
         .args(["-c", &format!("printf %s {word}")])
         .output()
@@ -2723,7 +2740,7 @@ fn non_ascii_tag_guidance_keeps_its_shell_word_with_the_show_hint() {
     assert_eq!(
         stdout_of(&out),
         format!(
-            "Imported $'app:\\xc3\\xa9' into agent-vm's image cache; launch it with `--image $'app:\\xc3\\xa9'`\n{SHOW_HINT}"
+            "Imported $'app:\\xc3\\xa9' into agent-vm's image cache; launch it with `--image $'app:\\xc3\\xa9'` (quoted for bash or zsh)\n{SHOW_HINT}"
         )
     );
     // The escaped word still round-trips to the published reference.
