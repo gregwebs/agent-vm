@@ -86,8 +86,21 @@ policy ──> hostname ──> dns_name
 A launch is one pass, and the ordering is load-bearing:
 
 0. `main` discovers and loads the tool config **before** parsing, because the
-   resolved catalog determines which subcommands exist. `cli::parse_from` then
-   **selects** the launch target: a catalog `Tool { entry, tool_args }` from that
+   resolved catalog determines which subcommands exist. `config::load` retains
+   **every** definition from both tiers, records which definitions win their
+   verb (the non-lossy winner IDs, from whole-definition user-wins precedence)
+   together with the cross-tier conflicts, and checks `persist` ownership over
+   all of those winners — but it binds no reference and folds no closure, so a
+   reference error is not a load error. `ConfigReport::into_launch_catalog`,
+   reached from `cli::parse_from` and from `doctor`, is what validates every
+   retained definition's `tools` references, checks and folds each launch
+   winner's closure — providers, requested names and `persist` paths over one
+   visited mask — and only then discards the definitions hidden from the verb
+   list, materializes one entry per winner and appends the isolated `shell`
+   fallback. So a definition hidden from the verb list still supplies its own
+   file's references, and selecting a verb stays lossy while recording the
+   winners does not. `cli::parse_from` then **selects** the launch target: a
+   catalog `Tool { entry, tool_args }` from that
    catalog, or a `Direct` command (`agent-vm … run PROGRAM`, or the equivalent
    top-level `--`). Selection is parse time: argv and catalog reads only, no side
    effect.
@@ -125,28 +138,47 @@ A launch is one pass, and the ordering is load-bearing:
 ### Tool configuration drives the CLI and the guest-HOME links
 
 `config.rs` reads two ordered **catalogs** — `$HOME/.config/agent-vm/config.toml`
-and `<cwd>/.agent-vm/config.toml` — validates each strictly, and resolves a
-whole-definition union (user definitions win; the project may only add names
-the user did not write). When both declare zero tools it falls back to the
-seven compiled-in defaults embedded from `default-tools.toml`. The resolved
-catalog is what the CLI builds its launch verbs from (#82), and
-`run::launch` reads back each entry's provisioning set — the credential
-providers *and*, since #83, the `persist` paths that become guest-HOME
-links (`guest_home.rs`) — so the verb list and the guest state it provisions
-share one source of truth. `agent-vm doctor` still renders the resolved
-catalog read-only:
+and `<cwd>/.agent-vm/config.toml` — validates each strictly, and retains every
+definition from both. Whole-definition user-wins precedence (`user`
+definitions, then project-only names) decides only which names are **launch
+verbs**; it is not a reference namespace. Each launch winner's closure is
+resolved over the definitions that share its **declaring file** (#395), so a
+project `helper` that names `pi` gets the project's `pi` even when the user's
+`pi` owns the verb — and a name that only another file declares is a config
+error. When both tiers declare zero tools it falls back to the seven
+compiled-in defaults embedded from `default-tools.toml`; the synthesized `shell`
+fallback is resolved from a scope holding only that one shipped definition, so
+under a custom catalog it provisions nothing. The resolved catalog is what the
+CLI builds its launch verbs from (#82), and `run::launch` reads back each
+entry's provisioning set — the credential providers *and*, since #83, the
+`persist` paths that become guest-HOME links (`guest_home.rs`) — so the verb
+list and the guest state it provisions share one source of truth.
+`agent-vm doctor` renders the same catalog read-only:
 
 ```
-user file --------> parse + validate --+
-                                       +--> ordered union --> persist
-project file -----> parse + validate --+    + conflicts       ownership
-                                                          |
-                                                   ResolvedTools
-                                                          |
-                                              LaunchCatalog  --> CLI verbs
-                                                          |       + run::launch
-                                            doctor preview (read-only)
+user file --------> parse + validate --+--> retained definitions ---> launch
+project file -----> parse + validate --+    (every definition,         verbs
+both empty? -> embedded defaults ------+     hidden losers too)          ^
+                     |                                                   |
+                     v                                                   |
+   bind references by exact (declaring file, name)                        |
+   resolve each launch winner's tier-local closure                        |
+   validate each winner's closure persist ownership                       |
+   fold providers + requested names + persist ----------------------------+
+                     |
+                     v
+              LaunchCatalog --> CLI verbs
+                     |             + run::launch
+              doctor preview (read-only)
 ```
+
+Persist ownership is checked twice on purpose: `load` keeps the historical
+winner-wide check, and catalog construction adds one check per launch winner's
+own closure. The second is what catches a conflict between two definitions
+hidden from verb selection without rejecting two tiers' mutually exclusive
+closures, which never link together in one launch. See
+[ADR-0017](docs/adr/0017-tool-declared-provisioning.md) and
+[ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md).
 
 This module resolves declarative config only. It never builds an image: the
 **boot image** is selected separately by `crates/agent-vm/src/boot_image.rs`

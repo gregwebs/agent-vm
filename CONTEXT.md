@@ -298,13 +298,18 @@ are the two whose provisioning set is wider).
 
 ### Available tools
 
-The catalog tools a tool names in `tools = [...]`: the tools it wants
+The tool declarations a tool names in `tools = [...]`: the tools it wants
 **available in its guest**. They name *tools*, never credential providers.
-`["*"]` — which must be the sole entry, and is the default for a tool named
-`shell` — closes over the tools declared in the **same configuration file** as
-the declaring tool, not the merged catalog. A tool in a *different* file is
-reachable only by **naming it explicitly**. An omitted `tools` is `[]` for
-every other name. A name no catalog tool provides is a hard config error.
+References stay within the declaring tool's **Tool reference scope**, including
+definitions hidden from launch-verb selection. `["*"]` — which must be the sole
+entry, and is the default for a tool named `shell` — means every tool in that
+scope. An omitted `tools` is `[]` for every other name. Unknown names and
+cross-tier references are hard config errors, reported with the declaring file,
+declaration index, tool and field. Every definition's references are validated,
+even one no launch verb reaches. The scope change is implemented (#395); see
+[ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md)
+for the mount half that is still pending, and
+[USAGE.md](USAGE.md#tool-references-are-local-to-their-file) for the migration.
 
 _Avoid_: "dependencies" — a named tool is provisioned, not required, and
 nothing is installed or built for it.
@@ -315,11 +320,14 @@ Everything one launch provisions: the least fixed point of
 
     provisioning(t) = credentials(t) ∪ ⋃ { provisioning(u) | u ∈ tools(t) }
 
-over the launch catalog, where a `"*"` entry expands to the declaring tool's
-own configuration file. It is the **single** gate on every provider-owned
-facet, and the same closure also folds the tools' `persist` paths into
-guest-HOME links. A cycle is a fixed point, not an error. See
-[ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
+over the declaring tool's **Tool reference scope**, where a `"*"` entry expands
+to that scope's tools. It is the **single** gate on every provider-owned facet.
+The same tool closure also selects `persist` paths, and — once the mount half
+lands — tool mount declarations. A tool-reference cycle is a fixed point, not an
+error; this differs from a **Mount set** reference cycle, which is invalid. See
+[ADR-0017](docs/adr/0017-tool-declared-provisioning.md), which is amended by the
+implemented tier-local reference half of
+[ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md).
 
 _Avoid_: "the selected tool's providers" / "when selected". Gating is
 membership in the provisioning set, which is not the launched tool's own
@@ -367,7 +375,9 @@ It also carries its default `argv`, a list of **credential providers**
 (`credentials`, the requirement set), a list of **available tools** (`tools`,
 driving the provisioning set), extra guest-HOME-relative `persist` paths, a
 guest `env` map, an `interactive_shell` flag, and the **tool config tier** it
-came from.
+came from. Mount selections (direct paths or **Mount sets**) belong to the
+accepted but not-yet-implemented mount half of
+[ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md).
 
 `env` is published into the guest **before** the launcher's own environment and
 cannot override `PATH`, `IS_SANDBOX` or `LANG`; `HOME`/`USER`/`LOGNAME` are
@@ -394,7 +404,9 @@ project tier may only add names, and a differing project declaration yields a
 tools do the compiled-in defaults apply. The authority-bearing fields are
 user-tier only: `[network]` ([persisted grant](#egress-authority)) and `mounts`
 ([config mount](#config-mount)). A project or built-in declaration of either is
-refused, even when empty, because presence is what asks for authority.
+refused, even when empty, because presence is what asks for authority. A
+definition hidden by whole-definition precedence still belongs to its own
+**tool reference scope**, so the rest of its file keeps resolving it.
 
 A load failure is **deferred**, not fatal at startup: `doctor`, the built-ins,
 and the in-guest `clipboard`/`_intercept-hook` keep working, and a launch verb
@@ -616,6 +628,18 @@ _Avoid_: "default mount" — agent-vm's own project/state/home mounts are not
 this, and a config mount can be read-only or forked; "persisted mount" — a
 config mount is re-selected at each launch, not stored per project, and a fork
 copy is persisted but is not a config mount.
+
+## Tool reference scope
+
+The definitions in the one configuration file that declares a tool, within
+which its `tools` references resolve — including definitions hidden from
+launch-verb selection by another file. A name that only another file declares is
+a config error, never an opt-in to crossing files. A tool defined in that scope
+supplies its own credentials, requested names and `persist` paths even when it
+has no verb; the synthesized fallback `shell` is not a declaration in any file's
+scope, so it cannot be named either. Implemented in #395; see
+[ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md)
+and [ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
 
 ## Protected config directory
 

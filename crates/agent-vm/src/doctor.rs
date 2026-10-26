@@ -2773,10 +2773,19 @@ credentials:
         )
         .unwrap();
         let report = config_report(Some(&user), &project);
-        assert!(
-            describe_tool(&report.resolved().as_slice()[0], ProviderSet::new([]))
-                .ends_with("; network_requests=a.example,tcp://b.example:8443")
-        );
+        // `resolved()` is the retained arena; every assertion here is about the
+        // launch winner, so it names the first one rather than an arena position.
+        let describe = |report: &crate::config::ConfigReport| {
+            describe_tool(
+                report
+                    .resolved()
+                    .launch_tools()
+                    .next()
+                    .expect("one launch winner"),
+                ProviderSet::new([]),
+            )
+        };
+        assert!(describe(&report).ends_with("; network_requests=a.example,tcp://b.example:8443"));
         let names: Vec<_> = (0..9).map(|i| format!("\"n{i}.example\"")).collect();
         std::fs::write(
             &user,
@@ -2784,7 +2793,7 @@ credentials:
         )
         .unwrap();
         let report = config_report(Some(&user), &project);
-        assert!(describe_tool(&report.resolved().as_slice()[0], ProviderSet::new([])).ends_with("; network_requests=n0.example,n1.example,n2.example,n3.example,n4.example,n5.example,n6.example,n7.example,+1 more"));
+        assert!(describe(&report).ends_with("; network_requests=n0.example,n1.example,n2.example,n3.example,n4.example,n5.example,n6.example,n7.example,+1 more"));
         std::fs::write(&project, base).unwrap();
         assert!(
             describe_config(config_report(Some(&user), &project))
@@ -2797,7 +2806,7 @@ credentials:
         )
         .unwrap();
         let report = config_report(Some(&user), &project);
-        let row = describe_tool(&report.resolved().as_slice()[0], ProviderSet::new([]));
+        let row = describe(&report);
         assert!(row.ends_with("; network_requests=sk-test-sensitivevalue"));
         assert_eq!(row.matches("sk-test-sensitivevalue").count(), 1);
     }

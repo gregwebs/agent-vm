@@ -204,6 +204,24 @@ fn assert_failure(out: &Output) {
 
 const ONE_TOOL: &str = "[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n";
 
+/// The two sentences `agent-vm --help` appends when the config cannot be read
+/// (`CONFIG_BROKEN_NOTE` in `src/cli.rs`). Duplicated as a literal because an
+/// integration test sees only the spawned binary; pinning the pair is what proves
+/// the note is rendered, where a shorter fragment would match help text that is
+/// always there (`AGENT_VM_DEBUG_CONFIG`, `~/.config/agent-vm/…`).
+const BROKEN_CONFIG_NOTE: &str = "\
+Your tool configuration could not be read, so no launch verbs are listed.
+Run `agent-vm doctor` to see the error.";
+
+/// The cause-and-fix tail of a `tools` miss whose name nothing retained declares
+/// (a typo, or an agent a custom catalog dropped).
+const TYPO_REFERENCE_SENTENCE: &str =
+    "names no tool in this configuration file; declare it in this file or remove the entry";
+
+/// The tail when another retained file declares the name: the reference crossed a
+/// file boundary, and the message names that file instead of blaming a typo.
+const CROSS_TIER_REFERENCE_SENTENCE: &str = "cross-tier tool references are not allowed; copy or redeclare the tool in this file, or remove the entry";
+
 #[test]
 fn reports_defaults_and_preserves_the_pre_existing_sections() {
     let h = Harness::new();
@@ -1277,4 +1295,277 @@ fn assert_only_escaped(out: Output, details: &[&str]) {
             "{forged} should appear inline, escaped:\n{stdout}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #395 — the preview and the CLI agree on which tier a reference resolves in
+// ---------------------------------------------------------------------------
+
+const TIER_DOCTOR_USER: &str = "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\n\
+     credentials = [\"openai\", \"user-service\"]\npersist = [\".user-pi\"]\n";
+
+const TIER_DOCTOR_PROJECT: &str = "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+     credentials = [\"anthropic\", \"project-service\"]\npersist = [\".project-pi\"]\n\
+     [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\npersist = [\".bridge\"]\n\
+     [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]\npersist = [\".helper\"]\n";
+
+/// The `N. name -> ...` rows of the `==> tool configuration` section, in order,
+/// so a hidden definition cannot hide in a warning or a note.
+fn tool_rows(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let row = line
+                .trim_start()
+                .strip_prefix(|character: char| character.is_ascii_digit())?;
+            let row = row.trim_start_matches(|character: char| character.is_ascii_digit());
+            row.strip_prefix(". ").map(str::to_string)
+        })
+        .collect()
+}
+
+/// **C1.** The preview and `--help` list the same verbs, and neither surfaces the
+/// definition hidden by the user's name conflict — while the project helper's row
+/// still provisions the hidden project `pi`'s facet.
+#[test]
+fn a_hidden_definition_is_not_a_verb_but_still_provisions_its_tier() {
+    let h = Harness::new();
+    h.write_user(TIER_DOCTOR_USER);
+    h.write_project(TIER_DOCTOR_PROJECT);
+    h.write_credentials(
+        "credentials:\n  - service: project-service\n    apiKey:\n      name: PROJECT_SERVICE_KEY\n      sentinelEnv: true\n      inject: [{domain: api.project-service.example, scheme: bearer}]\n",
+    );
+    let before = snapshot_tree(&h.home_root);
+
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    let rows = tool_rows(&stdout);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.split(" ->").next().unwrap())
+            .collect::<Vec<_>>(),
+        ["pi", "bridge", "helper", "shell"],
+        "{stdout}"
+    );
+    // The hidden project `pi` is not a row and its command is not a verb.
+    assert!(
+        !stdout.contains("project-pi"),
+        "a hidden definition must not become a verb: {stdout}"
+    );
+    // One whole-definition conflict, both files, fixed field order.
+    assert_eq!(
+        stdout.matches("warning: tool \"pi\" in").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "warning: tool \"pi\" in {} overrides\n         {}; differing fields: command, credentials, persist",
+            h.user_config().display(),
+            h.project_config().display()
+        )),
+        "{stdout}"
+    );
+    // The helper's row is its own requirement set and the project closure.
+    assert!(
+        rows.iter().any(|row| row.starts_with(
+            "helper -> \"helper\"; args=0; credentials=none; provisions=anthropic; persist=1"
+        )),
+        "{rows:?}"
+    );
+    // The user's verb provisions only its own facets.
+    assert!(
+        rows.iter().any(|row| row.starts_with(
+            "pi -> \"user-pi\"; args=0; credentials=openai; provisions=openai; persist=1"
+        )),
+        "{rows:?}"
+    );
+    // The YAML launch view shows the inherited project service, not the user's.
+    let launch = stdout
+        .split("==> credentials.yaml (launch credentials)")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no launch section: {stdout}"));
+    assert!(launch.contains("project-service"), "{launch}");
+    assert!(!launch.contains("user-service"), "{launch}");
+
+    // `--help` lists exactly those verbs.
+    let help = h.base_command().arg("--help").output().unwrap();
+    assert_success(&help);
+    let help_stdout = stdout_of(&help);
+    for verb in ["pi", "bridge", "helper", "shell"] {
+        assert!(
+            help_stdout.contains(&format!("  {verb}")),
+            "missing {verb}: {help_stdout}"
+        );
+    }
+    assert!(!help_stdout.contains("project-pi"), "{help_stdout}");
+
+    // The preview materializes nothing.
+    assert_eq!(snapshot_tree(&h.home_root), before);
+}
+
+/// **C2.** A bad (or cross-tier) reference is reported with its declaring
+/// context while every other section still renders, the launch reports the config
+/// error rather than an unknown subcommand, and the corrected file is a positive
+/// control.
+#[test]
+fn an_invalid_local_reference_is_previewed_and_recoverable() {
+    // The last fragment is the cause-and-fix sentence: only a name another file
+    // declares is cross-tier, so the two wordings are asserted apart.
+    let cases = [
+        (
+            "unknown",
+            "[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"nope\"]\n",
+            "",
+            "user config",
+            TYPO_REFERENCE_SENTENCE,
+        ),
+        (
+            "cross-tier",
+            "[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"p\"]\n",
+            "[[tools]]\nname = \"p\"\ncommand = \"p\"\n",
+            "user config",
+            CROSS_TIER_REFERENCE_SENTENCE,
+        ),
+        (
+            "hidden dangling",
+            "[[tools]]\nname = \"dup\"\ncommand = \"user-dup\"\n",
+            "[[tools]]\nname = \"dup\"\ncommand = \"project-dup\"\ntools = [\"missing\"]\n",
+            "project config",
+            TYPO_REFERENCE_SENTENCE,
+        ),
+        (
+            "fallback shell",
+            "",
+            "[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"shell\"]\n",
+            "project config",
+            TYPO_REFERENCE_SENTENCE,
+        ),
+    ];
+    for (label, user, project, tier, cause) in cases {
+        let h = Harness::new();
+        h.write_user(user);
+        h.write_project(project);
+        let before = snapshot_tree(&h.home_root);
+        let out = h.run_doctor();
+        assert_failure(&out);
+        let stdout = stdout_of(&out);
+        for heading in [
+            "==> active microsandbox home",
+            "==> host agent credentials",
+            "==> tool configuration",
+            "==> agent-vm doctor: available operations",
+        ] {
+            assert!(
+                stdout.contains(heading),
+                "{label}: missing {heading}: {stdout}"
+            );
+        }
+        for fragment in [tier, "declaration [0]", "tools[0]", "names no tool", cause] {
+            assert!(
+                stdout.contains(fragment),
+                "{label}: missing {fragment}: {stdout}"
+            );
+        }
+        assert_eq!(
+            snapshot_tree(&h.home_root),
+            before,
+            "{label}: no state writes"
+        );
+
+        // Top-level help still works with the broken-config note; the launch
+        // verb reports the config error, never an unknown subcommand.
+        let help = h.base_command().arg("--help").output().unwrap();
+        assert_success(&help);
+        let help_stdout = stdout_of(&help);
+        assert!(
+            help_stdout.contains(BROKEN_CONFIG_NOTE),
+            "{label}: --help must explain the absent verb list: {help_stdout}"
+        );
+        let launch = h.base_command().arg("shell").output().unwrap();
+        let stderr = stderr_of(&launch);
+        assert_failure(&launch);
+        assert!(
+            stderr.contains("names no tool") && stderr.contains(cause),
+            "{label}: the launch must report the same cause: {stderr}"
+        );
+        assert!(
+            !stderr.contains("unrecognized subcommand"),
+            "{label}: {stderr}"
+        );
+    }
+
+    // Positive control: declaring the target locally previews cleanly.
+    let h = Harness::new();
+    h.write_project(
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n\
+         [[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"shell\"]\n",
+    );
+    let out = h.run_doctor();
+    assert_success(&out);
+    assert!(
+        stdout_of(&out).contains("w -> \"w\""),
+        "{}",
+        stdout_of(&out)
+    );
+}
+
+/// **C3.** A user-declared `shell` with an omitted `tools` provisions exactly its
+/// own tier's set; an explicit `[]` provisions nothing beyond its own
+/// declaration. The custom-catalog fallback stays empty either way.
+#[test]
+fn shell_rows_report_the_tier_local_provisioning_set() {
+    let omitted = Harness::new();
+    omitted.write_user(
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n\
+         [[tools]]\nname = \"sib\"\ncommand = \"sib\"\ncredentials = [\"copilot\"]\n",
+    );
+    omitted.write_project(
+        "[[tools]]\nname = \"proj\"\ncommand = \"proj\"\ncredentials = [\"anthropic\"]\n",
+    );
+    let out = omitted.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("shell -> \"bash\"; args=0; credentials=none; provisions=copilot"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("proj -> \"proj\"; args=0; credentials=anthropic; provisions=anthropic"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("`shell` was not declared"), "{stdout}");
+
+    let empty = Harness::new();
+    empty.write_user(
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ntools = []\n\
+         [[tools]]\nname = \"sib\"\ncommand = \"sib\"\ncredentials = [\"copilot\"]\n",
+    );
+    empty.write_project(
+        "[[tools]]\nname = \"proj\"\ncommand = \"proj\"\ncredentials = [\"anthropic\"]\n",
+    );
+    let out = empty.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("shell -> \"bash\"; args=0; credentials=none; provisions=none"),
+        "{stdout}"
+    );
+
+    // A custom catalog with no declared shell keeps the empty fallback.
+    let fallback = Harness::new();
+    fallback.write_user("[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n");
+    let out = fallback.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("shell -> \"bash\"; args=2; credentials=none; provisions=none"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("`shell` was not declared"), "{stdout}");
+    assert!(
+        !stdout.contains("dsh"),
+        "no shipped agent may be restored: {stdout}"
+    );
 }

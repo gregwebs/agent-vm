@@ -566,6 +566,47 @@ mod tests {
     /// The scope is the *declared* tools: undeclared shipped commands are not
     /// targets, and neither is the synthesized `shell` fallback — it is a
     /// launch affordance, not a declaration.
+    /// **#395.** A definition hidden by a launch-name conflict is not a verb *or*
+    /// a verification target, even when a winning project helper references it:
+    /// `setup` verifies the commands the configuration launches, and an available
+    /// tool's command is not one of them.
+    #[test]
+    fn a_hidden_definition_is_neither_a_verb_nor_a_verification_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        std::fs::write(
+            &user,
+            "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            "[[tools]]\nname = \"pi\"\ncommand = \"hidden-command\"\ncredentials = [\"anthropic\"]\n\
+             [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
+        )
+        .unwrap();
+        let catalog = config::load(&ConfigPaths {
+            user: Some(user),
+            project,
+
+            home: None,
+        })
+        .expect("the two tiers parse")
+        .into_launch_catalog()
+        .expect("the two tiers resolve");
+
+        assert_eq!(
+            summary(&verification_targets(&catalog)),
+            vec![
+                ("pi".to_string(), "user-pi".to_string()),
+                ("helper".to_string(), "helper".to_string()),
+            ],
+            "the hidden command and the `bash` fallback must not be targets"
+        );
+        assert!(catalog.has_shell_fallback());
+    }
+
     #[test]
     fn only_declared_tools_are_verified() {
         let catalog = catalog_from("[[tools]]\nname = \"mytool\"\ncommand = \"my-agent\"\n");

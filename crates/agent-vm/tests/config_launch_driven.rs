@@ -84,6 +84,11 @@ const BOGUS_IMAGE: &str = "localhost:1/does-not-exist:latest";
 const CONFIG_MARKER: &str = "[debug] sandbox config JSON: ";
 const GUEST_CMD_MARKER: &str = "[debug] guest command: ";
 
+/// The cause-and-fix tail of a `tools` miss whose name nothing retained declares
+/// (a typo, or an agent a custom catalog dropped).
+const TYPO_REFERENCE_SENTENCE: &str =
+    "names no tool in this configuration file; declare it in this file or remove the entry";
+
 /// The seven shipped default tools, in `default-tools.toml` order.
 const DEFAULT_TOOLS: [&str; 7] = [
     "dsh", "pi", "codex", "opencode", "claude", "copilot", "shell",
@@ -3522,10 +3527,7 @@ fn a_dangling_tools_reference_fails_a_launch_but_not_doctor() {
     );
     let launch_err = stderr_of(&launch);
     assert!(launch_err.contains("config:"), "{launch_err}");
-    assert!(
-        launch_err.contains("names no tool in the resolved catalog"),
-        "{launch_err}"
-    );
+    assert!(launch_err.contains(TYPO_REFERENCE_SENTENCE), "{launch_err}");
     assert!(
         !launch_err.contains("unrecognized subcommand"),
         "it must not degrade into clap's unrecognized-subcommand: {launch_err}"
@@ -3544,7 +3546,7 @@ fn a_dangling_tools_reference_fails_a_launch_but_not_doctor() {
         assert!(stdout.contains(heading), "missing {heading}: {stdout}");
     }
     assert!(
-        stdout.contains("names no tool in the resolved catalog"),
+        stdout.contains(TYPO_REFERENCE_SENTENCE),
         "the config section must render the failure: {stdout}"
     );
 }
@@ -5675,7 +5677,7 @@ fn broken_config_pull_and_setup_explain_the_image_fallback() {
     let launch_stderr = stderr_of(&launch);
     assert!(!launch.status.success());
     assert!(
-        launch_stderr.contains("names no tool in the resolved catalog"),
+        launch_stderr.contains(TYPO_REFERENCE_SENTENCE),
         "{launch_stderr}"
     );
 }
@@ -10589,4 +10591,852 @@ fn direct_usage_failures_are_status_2_and_value_free() {
     let secret = harness.builtin(&["secret", "set", "svc", "--help=CANARY-398"], &[]);
     assert_eq!(secret.status.code(), Some(1), "{}", stderr_of(&secret));
     assert!(!stderr_of(&secret).contains("CANARY-398"));
+}
+
+// ---------------------------------------------------------------------------
+// #395 — a launch provisions its own configuration file's closure
+// ---------------------------------------------------------------------------
+
+/// The user tier: `pi` owns the verb, OpenAI and `.user-pi`.
+const TIER_LOCAL_USER_PI: &str = "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\n\
+     credentials = [\"openai\"]\npersist = [\".user-pi\"]\n";
+
+/// The project tier: a `pi` hidden by the user's name conflict, owning Anthropic
+/// and `.project-pi`, reached from `helper` through `bridge`.
+const TIER_LOCAL_PROJECT: &str = "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+     credentials = [\"anthropic\"]\npersist = [\".project-pi\"]\n\
+     [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\npersist = [\".bridge\"]\n\
+     [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]\npersist = [\".helper\"]\n";
+
+/// The same two tiers plus one named credential per tier, so a *provisionable*
+/// credential exists on both sides and the exclusion cannot be explained by an
+/// inert authorization.
+const TIER_SERVICE_USER_PI: &str = "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\n\
+     credentials = [\"openai\", \"user-service\"]\npersist = [\".user-pi\"]\n";
+
+const TIER_SERVICE_PROJECT: &str = "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+     credentials = [\"anthropic\", \"project-service\"]\npersist = [\".project-pi\"]\n\
+     [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\npersist = [\".bridge\"]\n\
+     [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]\npersist = [\".helper\"]\n";
+
+/// Both named services authorized, both `source: env` and `required: true`, so
+/// either one really is provisionable when its variable is present.
+const TIER_SERVICES_YAML: &str = "\
+credentials:
+  - service: user-service
+    source: env
+    required: true
+    apiKey:
+      name: USER_SERVICE_KEY
+      sentinelEnv: true
+      inject: [{domain: api.user-service.example, scheme: bearer}]
+  - service: project-service
+    source: env
+    required: true
+    apiKey:
+      name: PROJECT_SERVICE_KEY
+      sentinelEnv: true
+      inject: [{domain: api.project-service.example, scheme: bearer}]
+";
+
+const TIER_USER_CANARY: &str = "sk-CANARY-395-user";
+const TIER_PROJECT_CANARY: &str = "sk-CANARY-395-project";
+
+fn tier_launch_env() -> [(&'static str, &'static str); 3] {
+    [
+        ("USER_SERVICE_KEY", TIER_USER_CANARY),
+        ("PROJECT_SERVICE_KEY", TIER_PROJECT_CANARY),
+        ("PRESENT_CONTROL", "visible-395"),
+    ]
+}
+
+/// Assert exactly one header-credential record for `service`, and that the
+/// other side's host is nowhere in the launch's network policy.
+fn assert_only_header_credential(
+    config: &serde_json::Value,
+    service: &str,
+    host: &str,
+    absent_host: &str,
+) {
+    let records = config["network"]["secrets"]["header_credentials"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no header_credentials array"));
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["reference"], service);
+    assert_eq!(records[0]["origin"]["host"], host);
+    assert_eq!(records[0]["header"], "authorization");
+    assert!(
+        !intercept_rule_hosts(config).contains(&absent_host),
+        "the other tier's host must not be registered: {:?}",
+        intercept_rule_hosts(config)
+    );
+}
+
+/// The selected named service's sentinel is in the guest env and the other
+/// tier's is not.
+fn assert_only_service_sentinel(config: &serde_json::Value, selected: &str, absent: &str) {
+    let env = env_pairs(config);
+    assert!(
+        env.contains(&(selected, "proxy-managed")),
+        "{selected} must be provisioned as a proxy sentinel: {env:?}"
+    );
+    assert!(
+        !env.iter().any(|(key, _)| *key == absent),
+        "{absent} must not reach the guest env: {env:?}"
+    );
+}
+
+/// **L1.** A launch of a project helper provisions the *project* `pi`'s
+/// provider, substitution allowlist, OAuth route, placeholder and persisted
+/// paths — never the user's, even though the user's `pi` owns the verb. Both
+/// directions run on fresh, identically configured harnesses, so a stale link or
+/// placeholder cannot make an absence assertion pass.
+#[test]
+fn a_hidden_project_definition_supplies_the_selected_credentials_and_links() {
+    let project = Harness::warm();
+    project.write_user(TIER_LOCAL_USER_PI);
+    project.write_project(TIER_LOCAL_PROJECT);
+    let out = project.launch_default("helper");
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    assert_eq!(debug_guest_command(&stderr), "helper");
+
+    // Anthropic only: the hidden project `pi`'s requirement set, provisioned.
+    assert!(
+        registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "{:?}",
+        registered_secret_env_vars(&config)
+    );
+    assert!(
+        !registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_OPENAI_UNUSED"),
+        "the user `pi`'s OpenAI must not be provisioned"
+    );
+    assert!(
+        intercept_rule_hosts(&config).contains(&"platform.claude.com"),
+        "the Anthropic OAuth route follows the same closure: {:?}",
+        intercept_rule_hosts(&config)
+    );
+    // The whole substitution subdocument — env vars, placeholders, source paths
+    // and host allowlists — names Anthropic and nothing OpenAI.
+    let secrets = serde_json::to_string(&config["network"]["secrets"]).unwrap();
+    assert!(secrets.contains("anthropic"), "{secrets}");
+    assert!(
+        !secrets.to_lowercase().contains("openai"),
+        "no OpenAI substitution facet may be registered: {secrets}"
+    );
+
+    let state = state_dir(&stderr);
+    assert!(state.join("claude/.credentials.json").exists());
+    assert!(
+        !state.join("codex/auth.json").exists(),
+        "no OpenAI-side placeholder may be written"
+    );
+    assert!(
+        !PathBuf::from(format!("{}.secrets", state.display()))
+            .join("openai")
+            .exists()
+    );
+    let snap = snapshot(&state);
+    for (link, target) in [
+        (".project-pi", "/agent-vm-state/persist/.project-pi"),
+        (".bridge", "/agent-vm-state/persist/.bridge"),
+        (".helper", "/agent-vm-state/persist/.helper"),
+    ] {
+        assert_eq!(
+            snap.get(&format!("link:{link}")).map(String::as_str),
+            Some(target),
+            "{snap:?}"
+        );
+    }
+    assert!(
+        !snap.contains_key("link:.user-pi"),
+        "the user definition's persisted path must not be linked: {snap:?}"
+    );
+    for compiled in COMPILED_LINKS {
+        assert!(
+            snap.contains_key(&format!("link:{compiled}")),
+            "the compiled link {compiled} must remain: {snap:?}"
+        );
+    }
+
+    // The inverse selection, proving each direction selects its own tier.
+    let user = Harness::warm();
+    user.write_user(TIER_LOCAL_USER_PI);
+    user.write_project(TIER_LOCAL_PROJECT);
+    let out = user.launch_default("pi");
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    assert_eq!(debug_guest_command(&stderr), "user-pi");
+    assert!(registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_OPENAI_UNUSED"));
+    assert!(!registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"));
+    assert!(!intercept_rule_hosts(&config).contains(&"platform.claude.com"));
+    let snap = snapshot(&state_dir(&stderr));
+    assert_eq!(
+        snap.get("link:.user-pi").map(String::as_str),
+        Some("/agent-vm-state/persist/.user-pi")
+    );
+    for absent in [".project-pi", ".bridge", ".helper"] {
+        assert!(
+            !snap.contains_key(&format!("link:{absent}")),
+            "the project closure must not be linked on a user launch: {snap:?}"
+        );
+    }
+}
+
+/// **L2.** A named credential request follows the same tier-local closure as the
+/// built-in providers. Both services are authorized and *usable* (env-sourced,
+/// `required`, one bearer injection each) and both variables are supplied to
+/// every launch, so the exclusion is real provisioning rather than an inert
+/// authorization.
+#[test]
+fn a_named_request_follows_the_hidden_closure_and_excludes_the_usable_other_tier() {
+    let project = Harness::warm();
+    project.write_user(TIER_SERVICE_USER_PI);
+    project.write_project(TIER_SERVICE_PROJECT);
+    write_credentials(&project.home_root, TIER_SERVICES_YAML);
+    let out = project.launch_with_env("helper", &[], &tier_launch_env());
+    let stderr = stderr_of(&out);
+    let rendered = rendered_output(&out);
+    let config = debug_config_json(&stderr);
+    assert!(project.saw_capability_probe(), "{rendered}");
+    assert_eq!(debug_guest_command(&stderr), "helper");
+
+    assert_only_header_credential(
+        &config,
+        "project-service",
+        "api.project-service.example",
+        "api.user-service.example",
+    );
+    assert_only_service_sentinel(&config, "PROJECT_SERVICE_KEY", "USER_SERVICE_KEY");
+    // L1's project facets, on the same launch.
+    assert!(registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"));
+    let snap = snapshot(&state_dir(&stderr));
+    assert_eq!(
+        snap.get("link:.project-pi").map(String::as_str),
+        Some("/agent-vm-state/persist/.project-pi")
+    );
+    assert!(!snap.contains_key("link:.user-pi"));
+
+    // Value controls: neither canary is rendered, stored, or handed to the fake
+    // runtime as the *selected* credential's value.
+    for canary in [TIER_USER_CANARY, TIER_PROJECT_CANARY] {
+        assert!(!rendered.contains(canary), "{canary} leaked: {rendered}");
+        assert_no_canary_files(&project.state_root, canary);
+        let state = state_dir(&stderr);
+        assert_no_canary_files(
+            &PathBuf::from(format!("{}.secrets", state.display())),
+            canary,
+        );
+    }
+    let child = project.msb_environ();
+    assert!(
+        child
+            .lines()
+            .any(|line| line == "PRESENT_CONTROL=visible-395"),
+        "the control variable must reach the runtime child"
+    );
+    assert!(
+        !child
+            .lines()
+            .any(|line| line.starts_with("PROJECT_SERVICE_KEY=")),
+        "the captured source must be removed from the runtime child:\n{child}"
+    );
+
+    // The paired positive control: an otherwise identical *user* launch selects
+    // the user service, proving the helper excluded a genuinely usable credential.
+    let user = Harness::warm();
+    user.write_user(TIER_SERVICE_USER_PI);
+    user.write_project(TIER_SERVICE_PROJECT);
+    write_credentials(&user.home_root, TIER_SERVICES_YAML);
+    let out = user.launch_with_env("pi", &[], &tier_launch_env());
+    let stderr = stderr_of(&out);
+    let rendered = rendered_output(&out);
+    let config = debug_config_json(&stderr);
+    assert!(user.saw_capability_probe(), "{rendered}");
+    assert_eq!(debug_guest_command(&stderr), "user-pi");
+    assert_only_header_credential(
+        &config,
+        "user-service",
+        "api.user-service.example",
+        "api.project-service.example",
+    );
+    assert_only_service_sentinel(&config, "USER_SERVICE_KEY", "PROJECT_SERVICE_KEY");
+    assert!(registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_OPENAI_UNUSED"));
+    assert!(!registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"));
+    let snap = snapshot(&state_dir(&stderr));
+    assert_eq!(
+        snap.get("link:.user-pi").map(String::as_str),
+        Some("/agent-vm-state/persist/.user-pi")
+    );
+    for canary in [TIER_USER_CANARY, TIER_PROJECT_CANARY] {
+        assert!(!rendered.contains(canary), "{canary} leaked: {rendered}");
+    }
+
+    // Authorization failure control: without the project authorization the user
+    // one cannot satisfy the project request.
+    let unauthorized = Harness::warm();
+    unauthorized.write_user(TIER_SERVICE_USER_PI);
+    unauthorized.write_project(TIER_SERVICE_PROJECT);
+    write_credentials(
+        &unauthorized.home_root,
+        &TIER_SERVICES_YAML.replace("project-service", "unrelated-service"),
+    );
+    let out = unauthorized.launch_with_env("helper", &[], &tier_launch_env());
+    let rendered = rendered_output(&out);
+    assert!(!out.status.success(), "{rendered}");
+    assert!(rendered.contains("neither a built-in"), "{rendered}");
+    assert!(rendered.contains("project-service"), "{rendered}");
+    assert!(!rendered.contains(CONFIG_MARKER), "{rendered}");
+}
+
+/// **L3.** Wildcard references stay in their own tier, and a wildcard that closes
+/// over a cycle still contributes each definition once. The paired controls are
+/// the same usable two-service authorizations as L2.
+#[test]
+fn a_wildcard_root_reaches_only_its_own_tier_and_fixed_point() {
+    // The project `pi` and `bridge` close a cycle, and the wildcard root sweeps
+    // the whole project tier.
+    let project_tier = "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+         credentials = [\"anthropic\", \"project-service\"]\npersist = [\".project-pi\"]\ntools = [\"bridge\"]\n\
+         [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\npersist = [\".bridge\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"*\"]\npersist = [\".helper\"]\n";
+    let project = Harness::warm();
+    project.write_user(TIER_SERVICE_USER_PI);
+    project.write_project(project_tier);
+    write_credentials(&project.home_root, TIER_SERVICES_YAML);
+    let out = project.launch_with_env("helper", &[], &tier_launch_env());
+    let stderr = stderr_of(&out);
+    let rendered = rendered_output(&out);
+    let config = debug_config_json(&stderr);
+    assert!(project.saw_capability_probe(), "{rendered}");
+    assert_only_header_credential(
+        &config,
+        "project-service",
+        "api.project-service.example",
+        "api.user-service.example",
+    );
+    assert_only_service_sentinel(&config, "PROJECT_SERVICE_KEY", "USER_SERVICE_KEY");
+    assert!(registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"));
+    assert!(!registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_OPENAI_UNUSED"));
+    let snap = snapshot(&state_dir(&stderr));
+    for (link, target) in [
+        (".project-pi", "/agent-vm-state/persist/.project-pi"),
+        (".bridge", "/agent-vm-state/persist/.bridge"),
+        (".helper", "/agent-vm-state/persist/.helper"),
+    ] {
+        assert_eq!(
+            snap.get(&format!("link:{link}")).map(String::as_str),
+            Some(target),
+            "the cycle must contribute each definition once: {snap:?}"
+        );
+    }
+    assert!(!snap.contains_key("link:.user-pi"));
+
+    // The inverse: the user `pi` verb, same files and inputs.
+    let user = Harness::warm();
+    user.write_user(TIER_SERVICE_USER_PI);
+    user.write_project(project_tier);
+    write_credentials(&user.home_root, TIER_SERVICES_YAML);
+    let out = user.launch_with_env("pi", &[], &tier_launch_env());
+    let config = debug_config_json(&stderr_of(&out));
+    assert_only_header_credential(
+        &config,
+        "user-service",
+        "api.user-service.example",
+        "api.project-service.example",
+    );
+    assert_only_service_sentinel(&config, "USER_SERVICE_KEY", "PROJECT_SERVICE_KEY");
+
+    // A user-declared `shell` with omitted `tools` closes over its own tier only.
+    let shell = Harness::warm();
+    shell.write_user(&format!(
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\npersist = [\".shell\"]\n{TIER_SERVICE_USER_PI}"
+    ));
+    shell.write_project(TIER_SERVICE_PROJECT);
+    write_credentials(&shell.home_root, TIER_SERVICES_YAML);
+    let out = shell.launch_with_env("shell", &[], &tier_launch_env());
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    assert_only_header_credential(
+        &config,
+        "user-service",
+        "api.user-service.example",
+        "api.project-service.example",
+    );
+    let snap = snapshot(&state_dir(&stderr));
+    assert_eq!(
+        snap.get("link:.shell").map(String::as_str),
+        Some("/agent-vm-state/persist/.shell")
+    );
+    assert_eq!(
+        snap.get("link:.user-pi").map(String::as_str),
+        Some("/agent-vm-state/persist/.user-pi"),
+        "the omitted wildcard reaches this tier's sibling"
+    );
+    assert!(!snap.contains_key("link:.project-pi"), "{snap:?}");
+
+    // An explicit `tools = []` inherits nothing.
+    let empty = Harness::warm();
+    empty.write_user(&format!(
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ntools = []\npersist = [\".shell\"]\n{TIER_SERVICE_USER_PI}"
+    ));
+    empty.write_project(TIER_SERVICE_PROJECT);
+    write_credentials(&empty.home_root, TIER_SERVICES_YAML);
+    let out = empty.launch_with_env("shell", &[], &tier_launch_env());
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    assert!(
+        config["network"]["secrets"]["header_credentials"]
+            .as_array()
+            .map(|records| records.is_empty())
+            .unwrap_or(true),
+        "an explicit empty list inherits no named request"
+    );
+    let snap = snapshot(&state_dir(&stderr));
+    assert!(!snap.contains_key("link:.user-pi"), "{snap:?}");
+}
+
+/// **L3b.** A custom catalog that declares no `shell` gets the synthesized
+/// fallback: no shipped provider, no named request, no declared persist — and no
+/// restored shipped agent.
+#[test]
+fn a_custom_catalog_fallback_shell_provisions_nothing() {
+    let harness = Harness::warm();
+    harness.write_user(TIER_SERVICE_USER_PI);
+    harness.write_project("[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n");
+    write_credentials(&harness.home_root, TIER_SERVICES_YAML);
+    let out = harness.launch_with_env("shell", &[], &tier_launch_env());
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    assert_eq!(debug_guest_command(&stderr), "bash -O histappend");
+    assert!(
+        registered_secret_env_vars(&config).is_empty(),
+        "the fallback provisions no provider: {:?}",
+        registered_secret_env_vars(&config)
+    );
+    assert!(
+        config["network"]["secrets"]
+            .get("header_credentials")
+            .and_then(|records| records.as_array())
+            .map(|records| records.is_empty())
+            .unwrap_or(true),
+        "the fallback requests no named credential"
+    );
+    let env = env_pairs(&config);
+    assert!(
+        !env.iter().any(|(key, _)| key.contains("SERVICE_KEY")),
+        "{env:?}"
+    );
+    let state = state_dir(&stderr);
+    let snap = snapshot(&state);
+    for absent in [
+        "link:.user-pi",
+        "link:.project-pi",
+        "link:.dsh",
+        "link:.aider.conf.yml",
+    ] {
+        assert!(
+            !snap.contains_key(absent),
+            "the fallback must restore no declared or shipped persist link: {snap:?}"
+        );
+    }
+    for compiled in COMPILED_LINKS {
+        assert!(snap.contains_key(&format!("link:{compiled}")), "{snap:?}");
+    }
+}
+
+/// **L4.** An invalid reference fails before any launch effect: no config dump,
+/// no guest command, no runtime invocation, no project state allocation — and
+/// the diagnostic keeps the tier, file, declaration, tool and field. Recovery
+/// (`--help`, `doctor`) and a readable configured image survive.
+#[test]
+fn an_invalid_reference_fails_before_any_launch_effect() {
+    // The last fragment is the cause-and-fix sentence, so a typo is never
+    // reported as the cross-tier rule (and vice versa).
+    let cases: [(&str, &str, &str, [&str; 6]); 4] = [
+        (
+            "unknown",
+            "[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"nope\"]\n",
+            "",
+            [
+                "user config",
+                "declaration [0]",
+                "tool \"w\"",
+                "tools[0]",
+                "\"nope\" names no tool",
+                TYPO_REFERENCE_SENTENCE,
+            ],
+        ),
+        (
+            "cross-tier",
+            "[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"p\"]\n",
+            "[[tools]]\nname = \"p\"\ncommand = \"p\"\n",
+            [
+                "user config",
+                "declaration [0]",
+                "tool \"w\"",
+                "tools[0]",
+                "\"p\" names no tool",
+                "it is declared in project config ",
+            ],
+        ),
+        (
+            "hidden dangling",
+            "[[tools]]\nname = \"dup\"\ncommand = \"user-dup\"\n",
+            "[[tools]]\nname = \"dup\"\ncommand = \"project-dup\"\ntools = [\"missing\"]\n",
+            [
+                "project config",
+                "declaration [0]",
+                "tool \"dup\"",
+                "tools[0]",
+                "\"missing\" names no tool",
+                TYPO_REFERENCE_SENTENCE,
+            ],
+        ),
+        (
+            "fallback shell",
+            "",
+            "[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"shell\"]\n",
+            [
+                "project config",
+                "declaration [0]",
+                "tool \"w\"",
+                "tools[0]",
+                "\"shell\" names no tool",
+                TYPO_REFERENCE_SENTENCE,
+            ],
+        ),
+    ];
+    for (label, user, project, expected) in cases {
+        let harness = Harness::new();
+        harness.write_user(user);
+        harness.write_project(project);
+        let out = harness.launch_default("shell");
+        let stderr = stderr_of(&out);
+        let rendered = rendered_output(&out);
+        assert!(!out.status.success(), "{label}: {rendered}");
+        for fragment in expected {
+            assert!(
+                stderr.contains(fragment),
+                "{label}: missing {fragment} in {stderr}"
+            );
+        }
+        if label == "cross-tier" {
+            assert!(
+                stderr.contains(&format!(
+                    "it is declared in project config \"{}\"",
+                    harness.project_config().display()
+                )),
+                "{label}: the message must name the file that declares the tool: {stderr}"
+            );
+        }
+        assert!(!stderr.contains(CONFIG_MARKER), "{label}: {stderr}");
+        assert!(!stderr.contains(GUEST_CMD_MARKER), "{label}: {stderr}");
+        assert!(
+            harness.msb_log().is_empty(),
+            "{label}: the runtime must never be invoked: {}",
+            harness.msb_log()
+        );
+        let allocated = std::fs::read_dir(&harness.state_root)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(allocated, 0, "{label}: no project state may be allocated");
+
+        // Recovery stays usable, and the launch failure is never clap's.
+        assert!(
+            !stderr.contains("unrecognized subcommand"),
+            "{label}: {stderr}"
+        );
+        let help = harness.builtin(&["--help"], &[]);
+        assert!(help.status.success(), "{label}: {}", stderr_of(&help));
+    }
+
+    // Positive control: correcting the local declaration launches the same verb.
+    let harness = Harness::warm();
+    harness.write_user("");
+    harness.write_project("[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"shell\"]\n");
+    harness.write_project(
+        "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\n\
+         [[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"shell\"]\n",
+    );
+    let out = harness.launch_default("w");
+    assert!(
+        stderr_of(&out).contains(CONFIG_MARKER),
+        "the corrected config must launch: {}",
+        stderr_of(&out)
+    );
+}
+
+/// **L5.** An inherited provider is provisioned but never *required*: without the
+/// host Anthropic credential, a helper that reaches a hidden Anthropic-requiring
+/// definition still gets to construction, while the same requirement on the
+/// launched tool itself still bails.
+#[test]
+fn an_inherited_provider_never_imposes_its_missing_login_bail() {
+    let harness = Harness::warm();
+    std::fs::remove_file(harness.home_root.join(".claude/.credentials.json")).unwrap();
+    harness.write_user(
+        "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"anthropic\"]\n",
+    );
+    harness.write_project(
+        "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\ncredentials = [\"anthropic\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
+    );
+
+    let out = harness.launch_default("helper");
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    assert!(
+        !registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "an uncaptured provider registers no substitution entry"
+    );
+
+    // The launched tool's *own* requirement still bails, before the config dump.
+    let out = harness.launch_default("pi");
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("no usable Claude credential"), "{stderr}");
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+}
+
+/// **L6.** A hidden definition's persisted paths provision in both guest modes,
+/// migrate pre-existing content rather than deleting it, and refuse to resolve
+/// two sources of truth.
+#[test]
+fn hidden_persisted_paths_provision_in_both_guest_modes() {
+    // Non-root: the exact link target, plus the compiled furniture.
+    let harness = Harness::warm();
+    harness.write_user(TIER_LOCAL_USER_PI);
+    harness.write_project(TIER_LOCAL_PROJECT);
+    let out = harness.launch_default("helper");
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let snap = snapshot(&state_dir(&stderr));
+    assert_eq!(
+        snap.get("link:.project-pi").map(String::as_str),
+        Some("/agent-vm-state/persist/.project-pi")
+    );
+    for compiled in COMPILED_LINKS {
+        assert!(snap.contains_key(&format!("link:{compiled}")), "{snap:?}");
+    }
+
+    // Root: the same list baked into the rootfs, with the ancestor mkdir for a
+    // nested hidden path.
+    let root = Harness::warm();
+    root.write_user(TIER_LOCAL_USER_PI);
+    root.write_project(
+        "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\npersist = [\".cache/persist-pi\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
+    );
+    let out = root.launch("helper", &["--root"]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let config = debug_config_json(&stderr);
+    let patches = config["patches"].as_array().unwrap();
+    let symlinks: Vec<(&str, &str)> = patches
+        .iter()
+        .filter_map(|patch| {
+            patch.get("Symlink").map(|link| {
+                (
+                    link["target"].as_str().unwrap(),
+                    link["link"].as_str().unwrap(),
+                )
+            })
+        })
+        .collect();
+    let mkdirs: Vec<&str> = patches
+        .iter()
+        .filter_map(|patch| patch.get("Mkdir").and_then(|mkdir| mkdir["path"].as_str()))
+        .collect();
+    assert!(
+        symlinks.contains(&(
+            "/agent-vm-state/persist/.cache/persist-pi",
+            "/root/.cache/persist-pi"
+        )),
+        "{symlinks:?}"
+    );
+    assert!(mkdirs.contains(&"/root/.cache"), "{mkdirs:?}");
+    assert!(
+        symlinks.contains(&("/agent-vm-state/claude", "/root/.claude")),
+        "compiled furniture remains: {symlinks:?}"
+    );
+
+    // Migration: content a previous launch wrote into the persistent non-root
+    // HOME is moved into the persist namespace when the hidden edge appears.
+    let migrate = Harness::warm();
+    migrate.write_user(TIER_LOCAL_USER_PI);
+    migrate.write_project(
+        "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
+    );
+    let first = migrate.launch_default("helper");
+    let state = state_dir(&stderr_of(&first));
+    std::fs::write(state.join("home/.project-pi"), "old hidden content").unwrap();
+    migrate.write_project(
+        "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\npersist = [\".project-pi\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
+    );
+    let second = migrate.launch_default("helper");
+    assert!(
+        stderr_of(&second).contains(CONFIG_MARKER),
+        "{}",
+        stderr_of(&second)
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("persist/.project-pi")).unwrap(),
+        "old hidden content"
+    );
+    assert_eq!(
+        std::fs::read_link(state.join("home/.project-pi")).unwrap(),
+        PathBuf::from("/agent-vm-state/persist/.project-pi")
+    );
+
+    // Two sources of truth are refused rather than overwritten. The link holds a
+    // *guest* target, so it is replaced by real content first.
+    std::fs::remove_file(state.join("home/.project-pi")).unwrap();
+    std::fs::write(state.join("home/.project-pi"), "second source").unwrap();
+    let third = migrate.launch_default("helper");
+    let stderr = stderr_of(&third);
+    assert!(
+        stderr.contains("holds real content and its persist target"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("persist/.project-pi")).unwrap(),
+        "old hidden content",
+        "the existing target must not be overwritten"
+    );
+}
+
+/// **L7.** The hidden path keeps the same safety checks as a declared one: a
+/// guest mount overlapping it is refused before boot, and a guest-planted
+/// symlinked ancestor is refused without writing outside the state dir.
+#[test]
+fn hidden_persisted_paths_keep_the_mount_and_symlink_guards() {
+    // A mount under the mirrored HOME overlapping the hidden path.
+    for root in [false, true] {
+        let harness = Harness::new();
+        harness.write_user(TIER_LOCAL_USER_PI);
+        harness.write_project(
+            "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\npersist = [\"code\"]\n\
+             [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
+        );
+        let home = if root {
+            PathBuf::from("/root")
+        } else {
+            harness.home_root.clone()
+        };
+        let mount = format!("{}:{}/code", harness.project_root.display(), home.display());
+        let options: Vec<&str> = if root {
+            vec!["--root", "--mount", &mount]
+        } else {
+            vec!["--mount", &mount]
+        };
+        let out = harness.launch("helper", &options);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("would collide with the guest mount point"),
+            "root={root}: {stderr}"
+        );
+        assert!(!stderr.contains(CONFIG_MARKER), "root={root}: {stderr}");
+    }
+
+    // A guest-planted symlink at an ancestor of the hidden path.
+    let harness = Harness::new();
+    harness.write_user(TIER_LOCAL_USER_PI);
+    harness.write_project(
+        "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\npersist = [\".aider.conf.yml\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
+    );
+    let first = harness.launch_default("helper");
+    let state = state_dir(&stderr_of(&first));
+    let planted = harness.project_root.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::create_dir_all(state.join("home")).unwrap();
+    std::os::unix::fs::symlink(&planted, state.join("home/.cache")).unwrap();
+    harness.write_project(
+        "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\npersist = [\".cache/persist-pi\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n",
+    );
+    let second = harness.launch_default("helper");
+    let stderr = stderr_of(&second);
+    assert!(stderr.contains("symlink"), "{stderr}");
+    assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        std::fs::read_dir(&planted).unwrap().next().is_none(),
+        "provisioning followed the planted symlink"
+    );
+}
+
+/// **L8.** Exactly three facets cross a `tools` reference: built-in providers,
+/// requested credential names and `persist` paths. The provisioned definition's
+/// guest `env` and `network_requests` are *declaration metadata*, not
+/// provisioning, so a helper that names the hidden project `pi` gets that
+/// definition's credential and persisted path but neither its environment pair
+/// nor its declared destinations. Each of the three absence assertions sits next
+/// to a positive control on the same launch, so a launch that simply dropped the
+/// closure could not make this pass.
+#[test]
+fn a_provisioned_definition_supplies_credentials_and_paths_but_no_metadata() {
+    let harness = Harness::warm();
+    harness.write_user(TIER_LOCAL_USER_PI);
+    harness.write_project(
+        "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\ncredentials = [\"anthropic\"]\n\
+         persist = [\".project-pi\"]\nenv = { PI_INHERITED_ENV = \"must-not-leak\" }\n\
+         network_requests = [\"api.pi-inherited.example\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\"]\n\
+         persist = [\".helper\"]\nenv = { HELPER_OWN_ENV = \"present\" }\n\
+         network_requests = [\"api.helper-own.example\"]\n",
+    );
+    let out = harness.launch_default("helper");
+    let stderr = stderr_of(&out);
+    let config = debug_config_json(&stderr);
+    assert_eq!(debug_guest_command(&stderr), "helper");
+
+    // Positive controls: the closure was really folded into this launch.
+    assert!(
+        registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "{:?}",
+        registered_secret_env_vars(&config)
+    );
+    assert_eq!(
+        snapshot(&state_dir(&stderr))
+            .get("link:.project-pi")
+            .map(String::as_str),
+        Some("/agent-vm-state/persist/.project-pi")
+    );
+
+    // The launched tool's own metadata is published and reported.
+    let published_env = env_pairs(&config);
+    assert!(
+        published_env.contains(&("HELPER_OWN_ENV", "present")),
+        "{published_env:?}"
+    );
+    let requests = request_block(&stderr);
+    assert!(
+        requests
+            .iter()
+            .any(|line| line.contains("api.helper-own.example")),
+        "the helper's own request must still be reported: {requests:?}"
+    );
+
+    // The provisioned definition's metadata is not.
+    assert!(
+        !published_env
+            .iter()
+            .any(|(key, _)| *key == "PI_INHERITED_ENV"),
+        "a provisioned definition's env pair must not reach the guest: {published_env:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|line| line.contains("api.pi-inherited.example")),
+        "a provisioned definition's network_requests must not be reported: {requests:?}"
+    );
+    assert!(
+        !serde_json::to_string(&config)
+            .unwrap()
+            .contains("pi-inherited"),
+        "no provisioned-definition metadata may appear in the sandbox config"
+    );
 }

@@ -120,6 +120,11 @@ for builder prerequisites and host-build trust.
 - [PLAN.md](PLAN.md) — what is left to do for v1.
 - [Credential shielding specification](docs/specs/credential-shielding.md) —
   agreed user contract and Docker-shaped YAML/CLI design (not yet implemented).
+- [Named mount sets and tier-local tool references](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md) —
+  tool references resolve inside their own config file (implemented); tool
+  mounts and named mount sets (accepted; not implemented).
+- [Tool references are local to their file](USAGE.md#tool-references-are-local-to-their-file) —
+  the breaking change and how to migrate a config.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look
   the way they do.
 - [Host-wide OCI image approval](docs/adr/0047-host-wide-oci-image-approval.md) —
