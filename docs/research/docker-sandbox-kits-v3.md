@@ -6,7 +6,7 @@
 
 **Local snapshot:** `agent-vm` `bb50c45` (ADR-0032 landed).
 
-**Method:** `SPEC-v3.md` was read in full. Where the spec defers to code ("where this document and the code disagree, the code wins", `SPEC-v3.md:5-8`), the Go packages named inline were read at the same commit. No Docker binary, `sbx`, or runtime was installed or executed, so this records **specified and implemented** behaviour, not observed behaviour. Line numbers are the pinned commit's; function names are the durable reference. Related notes in this directory: [docker-compositional-systems.md](docker-compositional-systems.md) (Dagger/Earthly/Buildpacks) and [docker-sandbox-credential-ui.md](docker-sandbox-credential-ui.md) (which examined the v2 grammar and declined to adopt kit credential semantics).
+**Method:** `SPEC-v3.md` was read in full. Where the spec defers to code ("where this document and the code disagree, the code wins", `SPEC-v3.md:5-8`), the Go packages named inline were read at the same commit. No Docker binary, `sbx`, or runtime was installed or executed, so this records **specified and implemented** behaviour, not observed behaviour. Line numbers are the pinned commit's; function names are the durable reference. Related note in this directory: [docker-sandbox-credential-ui.md](docker-sandbox-credential-ui.md) (which examined the v2 grammar and declined to adopt kit credential semantics).
 
 ## Executive summary
 
@@ -153,7 +153,7 @@ Against the host, there is no mapping at all: the host "resolves the image's own
 ## 8. What I would not take
 
 - **The two-kind split.** It duplicates publication for one tool and requires a rule to refuse the resulting mistake.
-- **Registry-and-lock assembly.** Our [docker-compositional-systems.md](docker-compositional-systems.md) already concluded that registry-less local composition is "normal, not a hack"; kits pay for portability with a lock and a fetch, which we do not need while we build locally.
+- **Registry-and-lock assembly.** Registry-less local composition is the normal case, not a hack; kits pay for portability with a lock and a fetch, which we do not need while we build locally.
 - **The lock as permission gate.** Interesting — a version move whose permission surface stays within the granted one applies silently, any widening stops for approval (`SPEC-v3.md:700-736`) — but it belongs to credential work, which this map excludes and which [docker-sandbox-credential-ui.md](docker-sandbox-credential-ui.md) already declined to adopt.
 - **Any "Docker-compatible" claim.** Consistent with the earlier credential research: this remains an experimental specification. "This specification is experimental. It is published to be used and argued with, and it will keep moving as implementers find gaps" (`README.md:55-57`); releases are `v3.0.0-m.1`…`m.6` prereleases; final version targeted for Q4 2026; one maintainer.
 
