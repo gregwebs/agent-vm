@@ -1412,15 +1412,19 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
 - `tools` — optional; the names of **other tools whose credentials this tool's
   guest should have**. Not provider names. Named tools are *provisioned*, never
   *required*, so naming a tool you have no host login for degrades silently
-  rather than failing the launch. The single entry `"*"` closes over the tools
-  declared in the **same configuration file** as this tool, and must be the only
-  entry; `*` is not a legal tool `name`. A tool in a *different* file (for
-  example a tool in your user config, from inside a project config) is reached
-  only by **naming it explicitly** — that name is the opt-in. Naming a tool the
-  catalog does not provide is a hard error. **Omitted means `["*"]` for a tool
-  named `shell` and `[]` for every other name** — write `tools = []`
-  explicitly to give a `shell` no provisioning at all. `opencode-static` only
-  produces a working sign-in when `openai` is also provisioned.
+  rather than failing the launch. Every reference — an explicit name or the
+  single entry `"*"` — resolves inside the **same configuration file** as the
+  declaring tool (its *tool reference scope*), including definitions another
+  file hides from the verb list. `"*"` must be the only entry; multiple explicit
+  names are allowed. `*` is not a legal tool `name`. A name declared only in the
+  *other* tier is a hard error, never an opt-in to crossing files. The
+  synthesized `shell` fallback is not a declaration in any file, so
+  `tools = ["shell"]` needs a local `shell`.
+  **Omitted means `["*"]` for a tool named `shell` and `[]` for every other
+  name** — write `tools = []` explicitly to give a `shell` no provisioning at
+  all. `opencode-static` only produces a working sign-in when `openai` is also
+  provisioned. See
+  [Tool references are local to their file](#tool-references-are-local-to-their-file).
 - `persist` — optional; guest-`$HOME`-relative paths to keep across runs.
   Each path is symlinked into the project state dir under `<state>/persist/`,
   so the real file lives next to the rest of the project state (`agent-vm
@@ -1428,14 +1432,22 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
   paths, any `..` component, NUL, and root-equivalent spellings (`.`/`./`/empty)
   are rejected; harmless `.`/`//`/trailing-`/` spellings are normalized. Two
   paths that **overlap** — equal, or one a component-wise ancestor of the other
-  — are a hard error whether they are two entries of the same tool, two
-  different tools, or a `persist` path against one of the dotfiles agent-vm
-  itself links into the state dir (the credential/config links `agent-vm
-  doctor` lists, e.g. `.claude`, `.config/gh`, `.pi`); one would silently
-  shadow the other. `.cache` and `.cachex` do **not** overlap (components, not string
-  prefixes). Which paths a launch gets follows the same `tools` closure as its
-  credentials, so a `shell` (whose omitted `tools` is `["*"]`) sees every
-  declared path in its own file. A `persist` path that would collide with the
+  — are a hard error in each of these comparisons: the entries of one tool; the
+  paths of every definition that wins a launch verb, even two that no single
+  launch links together (the whole-catalog check `load` has always made, so a
+  broken catalog never loads); the definitions one launch actually links — each
+  winning root's resolved `tools` closure, hidden definitions included, which is
+  what catches a conflict with a definition the verb list hides; and a path
+  against one of the dotfiles agent-vm itself links into the state dir (the
+  credential/config links `agent-vm doctor` lists, e.g. `.claude`, `.config/gh`,
+  `.pi`), where one would silently shadow the other. A hidden definition's paths
+  are **not** compared against every other retained definition, and a closure no
+  winning root reaches is never checked: those definitions never link together
+  in one launch, so two tiers' mutually exclusive closures stay legal. `.cache`
+  and `.cachex` do **not** overlap (components, not string prefixes). Which
+  paths a launch gets follows the same `tools` closure as its credentials, so a
+  `shell` (whose omitted `tools` is `["*"]`) sees every declared path in its own
+  file. A `persist` path that would collide with the
   project bind mount or a `--mount` under `$HOME` is rejected at launch, before
   anything is provisioned, because agentd creates those mount points inside the
   already-mounted `$HOME`. On the first launch after an entry is added, real
@@ -1478,11 +1490,13 @@ network_requests = ["api.example.com"] # optional; destinations the tool expects
 
 Unknown keys, wrong types, malformed TOML, unknown
 provider names, duplicate tool names within one file, and **overlapping**
-`persist` entries (equal or one an ancestor of the other — within one tool,
-across tools, or against a path agent-vm itself links into the state dir) are
+`persist` entries (equal or one an ancestor of the other, in exactly the
+comparisons the `persist` entry above lists) are
 all **hard errors** — as are invalid `tools` entries: `"*"`
-mixed with other entries, an empty or NUL-containing name, a tool name no
-catalog tool provides, and a tool named `*`. They are also hard errors for
+mixed with other entries, an empty or NUL-containing name, and a tool name no
+definition in that same configuration file provides (including a name only the
+other tier, or only the shipped catalog, declares), and a tool named `*`. They
+are also hard errors for
 invalid `env` entries: a key that is empty, or contains
 `=`/NUL/whitespace/control characters, or starts with `MSB_`, or is
 `HOME`/`USER`/`LOGNAME`, and an `env` **value** containing NUL. There is no
@@ -1522,6 +1536,65 @@ default: retained default [/home/alice/.config/agent-vm/default-image.json]
 selected (without --image): ghcr.io/gregwebs/agent-vm-standard:v0.1.3 (from user config /home/alice/.config/agent-vm/config.toml)
 ```
 
+### Tool references are local to their file
+
+A `tools` reference resolves in the **file that declares the tool**, not in the
+merged verb list. This is the guarantee that keeps a repository from activating
+your credentials: naming a tool in a project config cannot pull in a tool your
+user config owns.
+
+Two consequences are worth knowing, because they are hard errors rather than
+degraded behaviour:
+
+- **A name only the other file declares is refused.** With `pi` in your user
+  config, a project tool that says `tools = ["pi"]` fails. The error names the
+  tier, the declaring file, the declaration index, the tool and the field
+  (`tools[0]`). Declaring any tools also replaces the shipped catalog, so
+  naming a shipped agent such as `claude` from a custom catalog is the same
+  error.
+- **Every definition's references are validated, including one no verb reaches.**
+  A project `pi` that loses its name to your user `pi` is not a verb, but its own
+  `tools` list must still resolve locally. Shadowing a broken definition is not a
+  way to ignore it.
+
+A definition that *is* declared locally still supplies its own provisioning even
+when it loses the verb: with a user `pi` and a project `pi`, `agent-vm pi` runs
+yours while a project `helper` that names `pi` gets the project `pi`'s
+credentials and persisted paths. The same holds transitively and for `"*"`, and
+a reference cycle is a fixed point rather than an error.
+
+Migration, per file that fails:
+
+```toml
+# Before — the project relied on the user config's `pi`.
+[[tools]]
+name = "helper"
+command = "helper"
+tools = ["pi"]
+
+# After — declare the tool (and its own `tools` references) in this file.
+[[tools]]
+name = "pi"
+command = "pi"
+credentials = ["anthropic"]
+
+[[tools]]
+name = "helper"
+command = "helper"
+tools = ["pi"]
+```
+
+Copy the definition you need rather than trimming it: `tools = []` drops the
+credentials and persisted paths the reference was there for. Nothing is merged
+field-by-field, and a name both files declare is still a whole-definition
+conflict — one `doctor` warning, and the user definition keeps the verb — while
+the project's own tools now resolve to the project copy.
+
+The same rule applies to the synthesized `shell` fallback: it is a launch
+affordance, not a declaration in your file, so `tools = ["shell"]` needs a local
+`[[tools]] name = "shell"` or that edge removed. A *declared* `shell` with an
+omitted `tools` still defaults to `"*"` over its own file.
+
 ### The `shell` fallback
 
 When the resolved catalog declares no tool named `shell`, the built-in `shell`
@@ -1531,6 +1604,14 @@ without a way into the guest. It is **conditional**: a config that *declares*
 `shell` (even as `zsh`) keeps its own definition, and the fallback does not
 fire on an unparseable config (see *Errors and recovery*). `doctor` labels the
 row with a note when the fallback is in use.
+
+Under a custom catalog the fallback provisions **nothing**: no credential
+provider, no requested credential name, no `persist` path, and no shipped agent
+restored. It is resolved from a scope holding only that one shipped `shell`
+definition, so its omitted `tools` reaches itself alone — unlike a *declared*
+`shell`, whose `"*"` covers its own file. It is also not an explicit-reference
+target (see
+[Tool references are local to their file](#tool-references-are-local-to-their-file)).
 
 Only when **both** files declare zero tools (missing, empty, or `tools = []`)
 does the compiled-in defaults list apply: `dsh`, `pi`, `codex`, `opencode`,

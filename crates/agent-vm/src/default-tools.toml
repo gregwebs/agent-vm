@@ -42,8 +42,13 @@
 # `shell` declares no `credentials`: it is not an agent and must not inherit
 # any provider's hard bail (Anthropic's and Copilot's would make `agent-vm
 # shell` fail for any user without both host logins). Its omitted `tools`
-# defaults to `["*"]`, so it *provisions* every provider the catalog's tools
-# declare without *requiring* any of them. See ADR-0017.
+# defaults to `["*"]`, so it *provisions* every provider the other tools *in its
+# own reference scope* declare without *requiring* any of them. See ADR-0017.
+#
+# This entry is also the fallback for a config that declares no `shell`, and it
+# is re-parsed into a scope holding only itself (#395): a custom catalog's
+# fallback therefore provisions nothing, while this shipped seven-tool scope
+# keeps `shell`'s wildcard covering the other six.
 
 # Network requests are TLS/TCP 443 diagnostic metadata, not grants or
 # credential effects. Scoped provider/refresh/relay/catalog baseline, not all

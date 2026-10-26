@@ -11,6 +11,13 @@ rationale cited `shell`'s `credentials`). Builds on **Tool**, **Credential
 provider**, **Provisioning set** and **Available tools** in
 [CONTEXT.md](../../CONTEXT.md).
 
+[ADR-0048](0048-named-mount-sets-and-tier-local-tool-references.md) amends this
+record in two steps. **Tier-local tool references are implemented (#395):** every
+`tools` reference — explicit name or `"*"` — resolves inside the one
+configuration file that declares the tool, including definitions hidden from
+launch-verb selection, so the explicit cross-file opt-in described below is gone.
+**Tool mount inheritance through the same closure is still pending.**
+
 ## Context
 
 #81/#82 preserved a deliberate asymmetry: `Anthropic`/`OpenAi` capture ran on
@@ -45,16 +52,30 @@ identical to the pre-#82 binary.
 
   so a cycle is harmless rather than an error. `tools` names **tools**, never
   credential providers.
-- **`"*"` must be the sole entry and is reserved as a tool name.** It closes
-  over the tools declared in the **same configuration file** as the declaring
-  tool — the tools whose `ToolOrigin` equals the declaring tool's — **not** the
-  merged catalog. A tool declared in a *different* file (any tier, including the
-  embedded built-in file) is reachable only by **naming it explicitly**; that
-  name is the cross-file opt-in. This is the user's binding amendment to the
-  original specification, which said `"*"` meant every tool the catalog
-  declares. The shipped default catalog's table is unchanged because every
-  built-in tool shares `default-tools.toml`; the difference is confined to a
-  custom catalog (see Consequences).
+- **`"*"` must be the sole entry and is reserved as a tool name.** A reference
+  resolves inside the declaring tool's **tool reference scope** — the one
+  configuration file that declares it (`ToolOrigin` equality: variant *and*
+  path, with `BuiltIn` meaning the embedded `default-tools.toml`) — and never
+  across tiers (#395, ADR-0048). That scope is resolved over **every** retained
+  definition, including a definition hidden from launch-verb selection by a
+  whole-definition user-wins conflict: the user `pi` wins the verb `agent-vm
+  pi`, while a project `helper` that names `pi` gets the *project* `pi`'s
+  credentials and persisted paths. A name the scope does not declare is a config
+  error, never an opt-in to crossing files, and every definition's references
+  are validated even when no launch verb reaches that definition. Resolution
+  happens *before* launch selection, so the three facets (providers, credential
+  names, `persist` paths) can never be folded from a lossy merge. This is the
+  user's binding amendment to the original specification, which said `"*"`
+  meant every tool the catalog declares; the shipped default catalog's table is
+  unchanged because every built-in tool shares `default-tools.toml`.
+- **The synthesized `shell` fallback is a launch affordance, not a declaration
+  in any file.** It is resolved from a scope holding only the one shipped `shell`
+  definition, so under a custom catalog it closes over itself alone and
+  provisions no provider, no requested name and no `persist` path. It is also not
+  an explicit-reference target: a tool with `tools = ["shell"]` needs a local
+  `shell` declaration or must drop that edge. Resolving the fallback out of a
+  fully provisioned shipped catalog would instead restore the shipped agents'
+  credentials and `.dsh` persistence into a catalog that declared none.
 - **Omitted `tools` is `["*"]` for a tool named `shell` and `[]` for every other
   tool**, off one shared `SHELL_TOOL_NAME` const that the catalog's shell
   fallback also uses, so the two cannot drift.
@@ -123,10 +144,17 @@ amendments below for `pi`'s two edges):
 - **`agent-vm shell` provisions a *working* Copilot**: a substitution entry, a
   `copilot/config.json` placeholder and `COPILOT_GITHUB_TOKEN`, all together.
 - **A config that declares tools but no `shell` gets a fallback shell that
-  provisions nothing.** The appended fallback is `BuiltIn`, so its wildcard
-  closes over `default-tools.toml`'s tools *present in the catalog* — and when a
-  user config replaces the defaults, the only one present is `shell` itself.
-  `USAGE.md` carries the resulting guidance.
+  provisions nothing.** The fallback is resolved from a scope holding only the
+  one shipped `shell` definition (#395), so its wildcard closes over itself
+  alone: no provider, no requested credential name, no `persist` path, and no
+  shipped agent restored. `USAGE.md` carries the resulting guidance.
+- **A `tools` reference is tier-local and validated in every definition**
+  (#395). The breaking part is explicit: a reference to a name another file
+  declares is now a config error, and so is a dangling reference inside a
+  definition hidden by a launch-name conflict — shadowing a name is no longer a
+  way to ignore its local dependency graph. Migration is to copy or redeclare
+  the referenced tool, and its transitive references, in the same file; see
+  [USAGE.md](../../USAGE.md#tool-references-are-local-to-their-file).
 
 > **Amended by [ADR-0036](0036-default-deny-launch-egress.md):** launch egress
 > is default-deny; every tool launch installs an explicit policy, including
@@ -263,12 +291,14 @@ the transport (not yet present in the pinned v0.1.3 image) and
    add `credentials = ["copilot"]` and `agent-vm shell` then captures the host
    Copilot token, registers a live substitution entry, writes
    `copilot/config.json` and exports `COPILOT_GITHUB_TOKEN` into a guest running
-   that repo's code. The file-scoped rule closes that path.
-10. **Read `"*"` as the declaring file's *full* declared set, retained across
-    the merge** (so the built-in `shell` always closes over
-    `default-tools.toml`'s four agents even when a user config replaces them).
-    Rejected: it needs the pre-merge tier vectors retained and the built-ins
-    re-parsed at resolution time, and it makes the fallback shell provision
-    credentials for verbs not in the catalog. It is the natural first fallback if
-    the chosen reading proves too narrow in practice; the change is confined to
-    `resolve_provisioning` plus two tests.
+   that repo's code. The tier-local rule closes that path, and #395 closed the
+   remaining explicit-name half of it.
+10. **Retain the pre-merge tier vectors so `"*"` reads the declaring file's full
+    declared set** — now **required and implemented** (#395, ADR-0048): a
+    definition hidden by a launch-name conflict still supplies its own file's
+    references, so the arena keeps every definition and only launch *selection*
+    applies user-wins. What stays rejected is the other half of the earlier
+    reading: **resurrecting the full shipped scope for a custom catalog's
+    fallback.** The fallback resolves from a singleton shipped `shell`, not from
+    `default-tools.toml`'s whole scope, because the latter would provision
+    credentials and persisted paths for verbs the catalog does not offer.

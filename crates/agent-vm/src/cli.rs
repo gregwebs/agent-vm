@@ -1659,6 +1659,101 @@ mod tests {
         }
     }
 
+    /// **#395 / C1's CLI half.** The entry `parse_from` hands to dispatch is the
+    /// project helper carrying the *hidden project* `pi`'s facets, never the
+    /// user's. `doctor` renders the same facts (`credentials=none;
+    /// provisions=anthropic; persist=1`) from the same `into_launch_catalog`
+    /// seam, which `tests/config_doctor.rs` asserts through the real binary; this
+    /// pins the entry the launch actually receives.
+    #[test]
+    fn a_hidden_definition_reaches_the_cli_entry_not_the_users() {
+        use crate::credential_provider::CredentialProvider;
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        std::fs::write(
+            &user,
+            "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\npersist = [\".user-pi\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+             credentials = [\"anthropic\", \"project-service\"]\npersist = [\".project-pi\"]\n\
+             [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\npersist = [\".bridge\"]\n\
+             [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]\npersist = [\".helper\"]\n",
+        )
+        .unwrap();
+        let report = crate::config::load(&ConfigPaths {
+            user: Some(user),
+            project,
+            home: None,
+        })
+        .unwrap();
+        let dispatch = parse_from(["agent-vm", "helper"], Ok(report)).expect("helper parses");
+        let Dispatch::Launch {
+            target: LaunchTarget::Tool { entry, .. },
+            ..
+        } = dispatch
+        else {
+            panic!("helper is a tool launch verb");
+        };
+
+        assert_eq!(entry.tool().name(), "helper");
+        assert_eq!(entry.tool().command(), "helper");
+        assert_eq!(
+            entry.provisioned().iter().collect::<Vec<_>>(),
+            vec![CredentialProvider::Anthropic],
+            "the hidden project `pi`'s provider, not the user's OpenAI"
+        );
+        assert_eq!(
+            entry.tool().credential_providers().iter().count(),
+            0,
+            "an available tool never becomes a requirement"
+        );
+        assert_eq!(
+            entry
+                .requested_names()
+                .iter()
+                .map(crate::secret_store::ServiceName::as_str)
+                .collect::<Vec<_>>(),
+            ["anthropic", "project-service"]
+        );
+        assert_eq!(
+            entry
+                .persist()
+                .iter()
+                .map(|path| path.as_path().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [".project-pi", ".bridge", ".helper"]
+        );
+
+        // The winning verb keeps the user definition and its own facets.
+        let report = crate::config::load(&ConfigPaths {
+            user: Some(dir.path().join("user.toml")),
+            project: dir.path().join("project.toml"),
+            home: None,
+        })
+        .unwrap();
+        let dispatch = parse_from(["agent-vm", "pi"], Ok(report)).expect("pi parses");
+        let Dispatch::Launch {
+            target: LaunchTarget::Tool { entry, .. },
+            ..
+        } = dispatch
+        else {
+            panic!("pi is a tool launch verb");
+        };
+        assert_eq!(entry.tool().command(), "user-pi");
+        assert_eq!(
+            entry.provisioned().iter().collect::<Vec<_>>(),
+            vec![CredentialProvider::OpenAi]
+        );
+    }
+
     // -- image argument: typed beats env, empty env is unset --------------
 
     /// The single `--image`/`AGENT_VM_IMAGE_TAG` precedence table, driven
@@ -1874,10 +1969,13 @@ mod tests {
         // unrecognized-subcommand, exactly like a syntactically broken config.
         let result = parse_from(["agent-vm", "t"], Ok(report_from(body)));
         let text = format!("{:#}", result.err().expect("`t` must fail"));
+        // Nothing declares `nope`, so the message names the typo cause and its
+        // fix rather than the cross-tier rule.
         assert!(
-            text.contains("names no tool in the resolved catalog"),
+            text.contains("names no tool in this configuration file; declare it in this file or remove the entry"),
             "{text}"
         );
+        assert!(!text.contains("cross-tier"), "{text}");
         assert!(!text.contains("unrecognized subcommand"), "{text}");
     }
 
@@ -2022,7 +2120,9 @@ mod tests {
             .expect("a dangling tools reference still fails the launch")
             .to_string();
         assert!(
-            error.contains("names no tool in the resolved catalog"),
+            error.contains(
+                "names no tool in this configuration file; declare it in this file or remove the entry"
+            ),
             "{error}"
         );
     }

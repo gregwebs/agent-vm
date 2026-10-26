@@ -20,17 +20,41 @@
 //! compiled-in defaults (embedded from `default-tools.toml`) apply.
 //!
 //! ```
-//! user file --------> parse + validate --+
-//!                                        +--> ordered union  --> validate
-//! project file -----> parse + validate --+    + conflicts        persist
-//!                                                              ownership
+//! user file --------> parse + validate --+--> retained definitions --> launch
+//! project file -----> parse + validate --+    every tier, hidden       verbs
+//!                                             same-name losers too
 //! both empty? -> embedded defaults ------+
 //! ```
 //!
 //! Every tier is parsed and validated *before* merging, so an invalid
-//! project declaration fails even when the user shadowed its name. The final
-//! cross-tool persist-ownership check runs *after* merging, over the winners
-//! only.
+//! project declaration fails even when the user shadowed its name.
+//!
+//! # Launch selection is not reference resolution
+//!
+//! Two questions have two different answers, and keeping them apart is what
+//! stops a project from activating a user's provider or persisted path by
+//! naming it:
+//!
+//! * *Which definition does `agent-vm pi` launch?* [`merge`] answers it: whole-
+//!   definition user-wins precedence picks the launch verbs.
+//! * *Which definition does a `tools = [...]` entry name?* the referencing
+//!   tool's **tool reference scope** answers it — the one configuration file
+//!   that declares it. A name that scope does not declare is a config error,
+//!   even when the other tier declares a *winning* verb of that name (#395).
+//!
+//! So the loser of a launch-name conflict is retained and stays resolvable from
+//! its own file; it is only ever a *verb* that it loses. Resolution therefore
+//! happens before launch selection: `ConfigReport::into_launch_catalog` folds
+//! each launch winner's closure — providers, credential names and `persist`
+//! paths over one visited mask — across the retained definitions, and only then
+//! yields the launch entries.
+//!
+//! Persist ownership is checked twice, deliberately. [`load`] checks the launch
+//! winners, as it always has, so an invalid catalog stays a load error. The
+//! catalog then checks each launch winner's *own* closure, which is the only
+//! way a conflict between two definitions hidden from verb selection is caught
+//! without also rejecting two tiers' mutually exclusive closures: those never
+//! link together in one launch.
 //!
 //! # Why the current module shape
 //!
@@ -64,8 +88,9 @@
 //! # Consumed by launch
 //!
 //! [`ConfigReport::into_launch_catalog`] is what `cli` (to register
-//! subcommands) and `doctor` (to render them) both start from: the resolved
-//! merge result plus the built-in `shell` fallback (see [`LaunchCatalog`]).
+//! subcommands) and `doctor` (to render them) both start from: the retained
+//! definitions resolved into entry provisioning, then the built-in `shell`
+//! fallback (see [`LaunchCatalog`]).
 //! [`ConfigReport::images`] carries the two tiers' boot-image settings, which
 //! `cli` reads before consuming the report so a catalog error cannot erase a
 //! readable image. Persisted-path overlap safety is defined here (#83):
@@ -201,9 +226,10 @@ impl ConfigReport {
         &self.project
     }
 
-    /// The pure merge result, without the launch fallback. Test-only: launch
-    /// and `doctor` both consume [`ConfigReport::into_launch_catalog`] so their
-    /// verb lists cannot disagree.
+    /// The retained definitions and the launch winners, without the fallback.
+    /// Test-only: launch and `doctor` both consume
+    /// [`ConfigReport::into_launch_catalog`] so their verb lists cannot
+    /// disagree.
     #[cfg(test)]
     pub(crate) fn resolved(&self) -> &ResolvedTools {
         &self.resolved
@@ -250,23 +276,34 @@ impl ConfigReport {
     /// merge result", and the fallback is not a declaration.
     pub(crate) fn into_launch_catalog(self) -> Result<LaunchCatalog> {
         let ConfigReport { resolved, .. } = self;
-        catalog_from_tools(resolved.0)
+        catalog_from_tools(resolved)
     }
 }
 
-/// Append the built-in `shell` fallback when no declared tool claims the name,
-/// then resolve every entry's provisioning facets. The one constructor for both
-/// a loaded config ([`ConfigReport::into_launch_catalog`]) and the compiled-in
-/// defaults ([`default_launch_catalog`]), so the fallback cannot differ between
-/// them.
-fn catalog_from_tools(mut tools: Vec<Tool>) -> Result<LaunchCatalog> {
-    let shell_fallback_added = !tools.iter().any(|tool| tool.name() == SHELL_TOOL_NAME);
+/// Resolve every retained definition, then select the launch verbs and append
+/// the built-in `shell` fallback when no launch winner claims that name. The one
+/// constructor for both a loaded config ([`ConfigReport::into_launch_catalog`])
+/// and the compiled-in defaults ([`default_launch_catalog`]), so the fallback
+/// cannot differ between them.
+///
+/// Resolution runs *before* selection because a hidden definition still supplies
+/// its own file's references (#395). The fallback is resolved from a singleton
+/// scope holding only the one shipped `shell`: reusing the whole shipped catalog
+/// would restore the shipped agents' providers and `.dsh` persistence under a
+/// custom catalog, which declaring any tools must replace.
+fn catalog_from_tools(tools: ResolvedTools) -> Result<LaunchCatalog> {
+    let shell_fallback_added = !tools
+        .launch_tools()
+        .any(|tool| tool.name() == SHELL_TOOL_NAME);
+    let mut entries = resolve_provisioning(tools)?;
+    let declared_len = entries.len();
     if shell_fallback_added {
-        tools.push(builtin_shell()?);
+        entries.extend(resolve_provisioning(ResolvedTools::from_defaults(vec![
+            builtin_shell()?,
+        ]))?);
     }
-    let declared_len = tools.len() - usize::from(shell_fallback_added);
     Ok(LaunchCatalog {
-        entries: resolve_provisioning(tools)?,
+        entries,
         declared_len,
     })
 }
@@ -276,7 +313,7 @@ fn catalog_from_tools(mut tools: Vec<Tool>) -> Result<LaunchCatalog> {
 /// user config is broken (a missing default entry is already a hard error, so
 /// this cannot itself fail on the shipped catalog), and by tests.
 pub(crate) fn default_launch_catalog() -> Result<LaunchCatalog> {
-    catalog_from_tools(default_tools()?)
+    catalog_from_tools(ResolvedTools::from_defaults(default_tools()?))
 }
 
 /// The outcome of loading the tool config, as data. One value rather than a
@@ -424,18 +461,47 @@ fn builtin_shell() -> Result<Tool> {
         })
 }
 
-/// The resolved tool catalog, in composition order. The inner value has no
-/// mutable access.
+/// One entry of the retained definition arena. Private: it indexes
+/// [`ResolvedTools::definitions`] and is neither a CLI identity nor a service
+/// name, so holding one says nothing about what a launch offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct DefinitionId(usize);
+
+/// Every retained tool definition plus which of them are launch verbs.
+///
+/// Retaining the losers is what makes a tier-local reference resolvable: a
+/// project definition hidden by a user name conflict still supplies that
+/// project file's `tools` references (#395). Hidden definitions are dropped once
+/// their facets are folded, so nothing downstream can mistake one for a verb. No
+/// mutator exists, and both constructors live here.
 #[derive(Debug)]
-pub(crate) struct ResolvedTools(Vec<Tool>);
+pub(crate) struct ResolvedTools {
+    /// Complete user declarations, then complete project declarations (hidden
+    /// same-name losers included); on the defaults path, every shipped
+    /// definition.
+    definitions: Vec<Tool>,
+    /// The launch winners' arena positions, unique and strictly increasing, in
+    /// launch order: user declarations first, then project-only declarations.
+    launches: Vec<DefinitionId>,
+}
 
 impl ResolvedTools {
-    /// The pure merge result, without the launch fallback. Used by the merge
-    /// tests and proptests; launch/doctor go through
-    /// [`ConfigReport::into_launch_catalog`] instead.
-    #[cfg(test)]
-    pub(crate) fn as_slice(&self) -> &[Tool] {
-        &self.0
+    /// A catalog whose every definition is a launch verb: the shipped defaults,
+    /// and the singleton fallback scope.
+    fn from_defaults(tools: Vec<Tool>) -> Self {
+        let launches = (0..tools.len()).map(DefinitionId).collect();
+        Self {
+            definitions: tools,
+            launches,
+        }
+    }
+
+    /// The launch-verb definitions, in launch order — never a retained hidden
+    /// one. The merge tests and the load-time ownership check read this;
+    /// launch and `doctor` go through [`ConfigReport::into_launch_catalog`]
+    /// instead.
+    pub(crate) fn launch_tools(&self) -> impl ExactSizeIterator<Item = &Tool> + '_ {
+        self.launches.iter().map(|id| &self.definitions[id.0])
     }
 }
 
@@ -471,8 +537,10 @@ pub(crate) enum TierStatus {
 
 /// Where a resolved tool came from. File-backed variants retain the declaring
 /// file for diagnostics; provenance is deliberately excluded from definition
-/// equality.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// equality. The exact variant *and* path are also the tool reference scope's
+/// identity, which is why `Hash` is derived: a reference binds by
+/// `(origin, name)`, never by bare name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ToolOrigin {
     BuiltIn,
     User(PathBuf),
@@ -579,9 +647,9 @@ impl Tool {
         &self.credential_names
     }
 
-    /// The catalog tools this tool declares. Names are resolved against the
-    /// **launch catalog** (which includes the appended `shell` fallback), not
-    /// against the tier that declared them.
+    /// The catalog tools this tool wants available in its guest, resolved
+    /// within **this tool's own configuration file** (its tool reference
+    /// scope), never across tiers.
     pub(crate) fn declared_tools(&self) -> &DeclaredTools {
         &self.tools
     }
@@ -698,9 +766,10 @@ impl ToolName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DeclaredTools {
     /// `tools = ["*"]`, and the default for a tool named [`SHELL_TOOL_NAME`].
-    /// Closes over the tools declared in the **same configuration file** as
-    /// this tool (origin equality; `BuiltIn` = the embedded
-    /// `default-tools.toml`) — never the merged catalog.
+    /// Closes over every retained definition in the **same configuration file**
+    /// as this tool (origin equality; `BuiltIn` = the embedded
+    /// `default-tools.toml`) — never the merged catalog, and including
+    /// definitions hidden from launch-verb selection.
     All,
     /// Declaration order preserved (definition equality is order-significant,
     /// exactly like `credentials`). May be empty; may name the tool itself.
@@ -890,18 +959,22 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
 
     let (resolved, uses_defaults, conflicts) =
         if user_contents.tools.is_empty() && project_contents.tools.is_empty() {
-            (default_tools()?, true, Vec::new())
+            (
+                ResolvedTools::from_defaults(default_tools()?),
+                true,
+                Vec::new(),
+            )
         } else {
             let (merged, conflicts) = merge(user_contents.tools, project_contents.tools);
             (merged, false, conflicts)
         };
 
-    validate_persist_ownership(&resolved)?;
+    validate_persist_ownership(resolved.launch_tools())?;
 
     Ok(ConfigReport {
         user,
         project,
-        resolved: ResolvedTools(resolved),
+        resolved,
         images: ConfiguredImages {
             user: user_contents.image,
             project: project_contents.image,
@@ -1200,21 +1273,27 @@ fn discover_project_path() -> Result<PathBuf> {
 /// if it differs, one conflict is recorded. Uses a name index for membership
 /// but never iterates it, so neither tool nor warning order can drift.
 ///
+/// Every project definition is retained in [`ResolvedTools::definitions`] even
+/// when it loses its launch verb, because the project file's other definitions
+/// may still reference it (#395). Only the winners enter
+/// [`ResolvedTools::launches`].
+///
 /// Both declaring files come from the tools' provenance rather than the
 /// caller, so a conflict warning never fabricates a placeholder path.
-fn merge(user_tools: Vec<Tool>, project_tools: Vec<Tool>) -> (Vec<Tool>, Vec<ConfigConflict>) {
+fn merge(user_tools: Vec<Tool>, project_tools: Vec<Tool>) -> (ResolvedTools, Vec<ConfigConflict>) {
     let index: HashMap<String, usize> = user_tools
         .iter()
         .enumerate()
         .map(|(position, tool)| (tool.name.as_str().to_string(), position))
         .collect();
 
-    let mut resolved = user_tools;
+    let mut launches: Vec<DefinitionId> = (0..user_tools.len()).map(DefinitionId).collect();
+    let mut definitions = user_tools;
     let mut conflicts = Vec::new();
     for project_tool in project_tools {
         match index.get(project_tool.name.as_str()) {
             Some(&position) => {
-                let winner = &resolved[position];
+                let winner = &definitions[position];
                 // A conflict is necessarily cross-tier: the winner comes from
                 // the user tier (the index only holds user names), the loser
                 // from the project tier. Naming both files from provenance
@@ -1233,19 +1312,30 @@ fn merge(user_tools: Vec<Tool>, project_tools: Vec<Tool>) -> (Vec<Tool>, Vec<Con
             }
             // Same-tier duplicate project names are rejected before merging,
             // so an absent name only ever appears here once.
-            None => resolved.push(project_tool),
+            None => launches.push(DefinitionId(definitions.len())),
         }
+        definitions.push(project_tool);
     }
-    (resolved, conflicts)
+    (
+        ResolvedTools {
+            definitions,
+            launches,
+        },
+        conflicts,
+    )
 }
 
-/// Overlap ownership across the resolved winners: two distinct tools may not
-/// claim the same guest-HOME-relative location, nor an ancestor/descendant pair
-/// (linking both would leave one path a dangling symlink and make the other
-/// uncreatable). The compiled-in link list is checked separately, per tool, in
-/// [`validate_persist`]; the launch's guest mount points are checked in
-/// `run::launch` because the project path is not a config fact.
-fn validate_persist_ownership(tools: &[Tool]) -> Result<()> {
+/// Overlap ownership across one launch: two distinct tools may not claim the
+/// same guest-HOME-relative location, nor an ancestor/descendant pair (linking
+/// both would leave one path a dangling symlink and make the other
+/// uncreatable). Called twice by design (see the module docs): once over the
+/// launch winners in [`load`], and once per launch winner's own closure in
+/// [`resolve_provisioning`], which is where a conflict between definitions
+/// hidden from verb selection is caught. The compiled-in link list is checked
+/// separately, per tool, in [`validate_persist`]; the launch's guest mount
+/// points are checked in `run::launch` because the project path is not a config
+/// fact.
+fn validate_persist_ownership<'a>(tools: impl IntoIterator<Item = &'a Tool>) -> Result<()> {
     // (path, tool) in catalog then declaration order, so the diagnostic names
     // the earlier claimant as "already claimed by" and the later tool as the
     // offender.
@@ -1313,73 +1403,217 @@ fn origin_file(origin: &ToolOrigin) -> &Path {
     }
 }
 
-/// Resolve every tool's provisioning set as the least fixed point of
+/// A tool reference's scope identity: the declaring file's origin variant and
+/// path, plus the case-sensitive tool name. Built from every retained
+/// definition, hidden ones included.
+type ScopedToolIndex<'a> = HashMap<(&'a ToolOrigin, &'a str), DefinitionId>;
+
+/// The two origins one reference crosses — named fields rather than adjacent
+/// `&ToolOrigin` arguments, which a call site could swap
+/// (`CODING_STANDARDS.md` → *Types*).
+struct ReferenceOrigins<'a> {
+    declaring: &'a ToolOrigin,
+    candidate: &'a ToolOrigin,
+}
+
+/// Measure the two facts [`reference_scope_matches`] decides on. The trusted
+/// adapter of an ADR-0018 pair: variant equality and declaring-path equality are
+/// measured here, the conjunction is proved. `BuiltIn` has exactly one embedded
+/// file, so the path half names it and `BuiltIn`/`BuiltIn` measures as one scope.
+fn same_reference_scope(origins: ReferenceOrigins<'_>) -> bool {
+    let facts = ReferenceScopeFacts {
+        same_tier: std::mem::discriminant(origins.declaring)
+            == std::mem::discriminant(origins.candidate),
+        same_file: origin_file(origins.declaring) == origin_file(origins.candidate),
+    };
+    reference_scope_matches(facts)
+}
+
+/// Index every retained definition by `(origin, name)`.
+///
+/// The exact origin — never the bare name — is what keeps a reference tier-local:
+/// a project `helper` that names `pi` finds the project's `pi`, whatever the
+/// launch catalog selected for the verb. A duplicate key would make one reference
+/// depend on arena order, so it is refused instead of last-wins. `validate_tools`
+/// already rejects duplicate names within one file, so this is a construction
+/// invariant rather than user-input validation.
+fn scoped_tool_index(definitions: &[Tool]) -> Result<ScopedToolIndex<'_>> {
+    let mut index = ScopedToolIndex::new();
+    for (position, tool) in definitions.iter().enumerate() {
+        if index
+            .insert((tool.origin(), tool.name()), DefinitionId(position))
+            .is_some()
+        {
+            return Err(tool_error(
+                &tool.origin,
+                tool.declaration_index,
+                &tool.name,
+                "internal tool-reference index already holds this file and name; \
+                 report this as an agent-vm bug",
+            ));
+        }
+    }
+    Ok(index)
+}
+
+/// The other retained file that declares a reference's name, if one does.
+/// [`describe_origin`] renders it for the diagnostic; nothing else from that file
+/// is printed.
+///
+/// A miss in the scoped index has two causes, and the advice differs by which
+/// one this returns: another retained file declares the name (the reference
+/// crossed a file boundary), or nothing retained declares it (a typo, or an agent
+/// the catalog replaced the shipped defaults to drop). Diagnostics only — the
+/// scoped lookup already decided validity, and this never feeds a resolution.
+///
+/// One scope is the whole answer: the retained arena holds the built-in file
+/// alone or the user and project files, and `scoped_tool_index` refuses a
+/// duplicate `(origin, name)`, so at most one file besides the declaring one can
+/// hold the name.
+fn reference_declared_elsewhere<'a>(
+    definitions: &'a [Tool],
+    declaring: &ToolOrigin,
+    reference: &ToolName,
+) -> Option<&'a ToolOrigin> {
+    definitions
+        .iter()
+        .find(|tool| {
+            tool.name() == reference.as_str()
+                && !same_reference_scope(ReferenceOrigins {
+                    declaring,
+                    candidate: tool.origin(),
+                })
+        })
+        .map(Tool::origin)
+}
+
+/// The error for a `tools` entry the scoped index cannot satisfy — the one place
+/// a reference miss reaches the user. Both wordings keep the tier, file,
+/// declaration index, tool name and field; only the cause and its fix differ, so
+/// a typo is never blamed on the cross-tier rule. The other declaring file is
+/// rendered by [`describe_origin`] and nothing else from it is printed.
+fn unresolved_tools_reference(
+    tool: &Tool,
+    position: usize,
+    reference: &ToolName,
+    elsewhere: Option<&ToolOrigin>,
+) -> anyhow::Error {
+    let (declared, advice) = match elsewhere {
+        Some(origin) => (
+            format!("; it is declared in {}", describe_origin(origin)),
+            "cross-tier tool references are not allowed; copy or redeclare the tool in this file, or remove the entry",
+        ),
+        None => (String::new(), "declare it in this file or remove the entry"),
+    };
+    tool_error(
+        &tool.origin,
+        tool.declaration_index,
+        &tool.name,
+        format!(
+            "tools[{position}]: {} names no tool in this configuration file{declared}; {advice}",
+            quoted_str(reference.as_str())
+        ),
+    )
+}
+
+/// The error for a reference the scoped index cannot satisfy *during a closure
+/// walk*. Every explicit reference is checked before any closure is walked, so
+/// reaching this means the index and the traversal disagree — a construction bug,
+/// not user input.
+fn unresolved_reference(tool: &Tool, reference: &ToolName) -> anyhow::Error {
+    tool_error(
+        &tool.origin,
+        tool.declaration_index,
+        &tool.name,
+        format!(
+            "tools: {} passed validation but is absent from this file's tool-reference \
+             index; report this as an agent-vm bug",
+            quoted_str(reference.as_str())
+        ),
+    )
+}
+
+/// Resolve every launch winner's provisioning set as the least fixed point of
 ///
 /// ```text
 /// provisioning(t) = credentials(t) ∪ ⋃ { provisioning(u) | u ∈ tools(t) }
 /// ```
 ///
-/// where `tools(t)` names catalog tools and a `"*"` entry expands to the tools
-/// **declared in the same configuration file as `t`** — the tools whose
-/// `ToolOrigin` equals `t`'s — not to the whole catalog.
+/// where `tools(t)` names retained definitions in `t`'s **tool reference scope** —
+/// the one configuration file that declares `t` — and a `"*"` entry expands to
+/// every definition in that scope, hidden ones included. Providers, credential
+/// names and `persist` paths are folded over one visited mask, so the three facets
+/// cannot disagree about what a launch provisions.
 ///
-/// Dangling references fail closed *before* any closure is walked, so the
-/// diagnostic names the declaring file rather than a half-resolved set. The
-/// dangling check is over the **merged catalog** (an explicit name is the
-/// cross-file opt-in), which is deliberately wider than the wildcard's group.
-fn resolve_provisioning(tools: Vec<Tool>) -> Result<Vec<CatalogEntry>> {
-    let index: HashMap<String, usize> = tools
-        .iter()
-        .enumerate()
-        .map(|(position, tool)| (tool.name.as_str().to_string(), position))
-        .collect();
+/// Every retained definition's explicit references are checked first, *including*
+/// definitions no launch verb reaches: a dangling reference is an error in the
+/// file that contains it, and another file's winning definition of that name
+/// neither satisfies it nor hides it. Each launch winner's closure is then
+/// checked for persist ownership *before* its paths escape, and the facets fold in
+/// arena order, so the result never depends on traversal order.
+fn resolve_provisioning(tools: ResolvedTools) -> Result<Vec<CatalogEntry>> {
+    let ResolvedTools {
+        definitions,
+        launches,
+    } = tools;
+    let index = scoped_tool_index(&definitions)?;
 
-    for tool in &tools {
-        if let DeclaredTools::Named(names) = tool.declared_tools() {
-            for (position, reference) in names.iter().enumerate() {
-                if !index.contains_key(reference.as_str()) {
-                    return Err(tool_error(
-                        &tool.origin,
-                        tool.declaration_index,
-                        &tool.name,
-                        format!(
-                            "tools[{position}]: {} names no tool in the resolved catalog; \
-                             declare that tool or remove the entry",
-                            quoted_str(reference.as_str())
-                        ),
-                    ));
-                }
+    for tool in &definitions {
+        let DeclaredTools::Named(names) = tool.declared_tools() else {
+            continue;
+        };
+        for (position, reference) in names.iter().enumerate() {
+            if index.contains_key(&(tool.origin(), reference.as_str())) {
+                continue;
             }
+            return Err(unresolved_tools_reference(
+                tool,
+                position,
+                reference,
+                reference_declared_elsewhere(&definitions, tool.origin(), reference),
+            ));
         }
     }
 
-    // One closure per tool, then both facets folded over it in catalog order so
-    // the result is deterministic (the closure's stack-pop order is not).
-    let closures: Vec<Vec<bool>> = (0..tools.len())
-        .map(|start| launch_closure(&tools, &index, start))
-        .collect();
+    let closures: Vec<Vec<bool>> = launches
+        .iter()
+        .map(|start| launch_closure(&definitions, &index, *start))
+        .collect::<Result<_>>()?;
+    drop(index);
+
+    // Ownership before any facet escapes: two definitions selected by the same
+    // launch may not claim one guest path or an ancestor/descendant pair, even
+    // when one of them lost its launch verb. Unguarded here, a hidden loser's
+    // paths would reach the guest-HOME link list unvalidated.
+    for visited in &closures {
+        validate_persist_ownership(closure_definitions(&definitions, visited))?;
+    }
+
     let facets: Vec<(ProviderSet, BTreeSet<ServiceName>, Vec<PersistPath>)> = closures
         .iter()
         .map(|visited| {
             let mut provisioned = ProviderSet::default();
             let mut requested_names = BTreeSet::new();
             let mut persist = Vec::new();
-            for (position, seen) in visited.iter().enumerate() {
-                if !*seen {
-                    continue;
-                }
-                provisioned = provisioned.union(tools[position].credential_providers());
-                requested_names.extend(tools[position].credential_names().iter().cloned());
-                persist.extend(tools[position].persist().iter().cloned());
+            for tool in closure_definitions(&definitions, visited) {
+                provisioned = provisioned.union(tool.credential_providers());
+                requested_names.extend(tool.credential_names().iter().cloned());
+                persist.extend(tool.persist().iter().cloned());
             }
             (provisioned, requested_names, persist)
         })
         .collect();
-    Ok(tools
+
+    // Retention ends here: only the launch winners survive. Their arena positions
+    // are found by ordered filtering, never by index arithmetic, so the strictly
+    // increasing `launches` invariant alone keeps the pairing correct.
+    Ok(definitions
         .into_iter()
+        .enumerate()
+        .filter(|(position, _)| launches.binary_search(&DefinitionId(*position)).is_ok())
         .zip(facets)
         .map(
-            |(tool, (provisioned, requested_names, persist))| CatalogEntry {
+            |((_, tool), (provisioned, requested_names, persist))| CatalogEntry {
                 tool,
                 provisioned,
                 requested_names,
@@ -1389,46 +1623,78 @@ fn resolve_provisioning(tools: Vec<Tool>) -> Result<Vec<CatalogEntry>> {
         .collect())
 }
 
-/// One tool's closure: which catalog tools a launch `start` visits, as a
-/// visited-tool mask. The least fixed point of `tools`, with `"*"` closing over
-/// the declaring tool's own configuration file. A cycle is harmless rather than
-/// an error: `visited` admits each tool at most once, so the walk terminates at
-/// the fixed point. (`shell`'s wildcard necessarily includes `shell` itself.)
-fn launch_closure(tools: &[Tool], index: &HashMap<String, usize>, start: usize) -> Vec<bool> {
+/// The retained definitions one launch selects, in arena order. The closure's
+/// membership is one fact: the ownership check and every folded facet read it
+/// through this function so they cannot disagree about what the launch covers.
+fn closure_definitions<'a>(
+    definitions: &'a [Tool],
+    visited: &'a [bool],
+) -> impl Iterator<Item = &'a Tool> + 'a {
+    definitions
+        .iter()
+        .zip(visited)
+        .filter(|(_, seen)| **seen)
+        .map(|(tool, _)| tool)
+}
+
+/// One retained definition's closure: which arena positions a launch of `start`
+/// visits, as a visited-position mask. The least fixed point of `tools`, with `"*"`
+/// closing over every definition in the declaring tool's own reference scope. A
+/// cycle is harmless rather than an error: `visited` admits each definition at
+/// most once, so the walk terminates at the fixed point. (`shell`'s wildcard
+/// necessarily includes `shell` itself.)
+///
+/// Isolation comes from the two lookups: the wildcard measures the scope pair, and
+/// a named edge uses the exact `(origin, name)` key with no bare-name retry. After
+/// that exact lookup the scope measurement on a named edge is redundant; it stays
+/// as local defence so an index built wrong cannot silently cross tiers.
+fn launch_closure(
+    tools: &[Tool],
+    index: &ScopedToolIndex<'_>,
+    start: DefinitionId,
+) -> Result<Vec<bool>> {
     let mut visited = vec![false; tools.len()];
     let mut stack = vec![start];
-    while let Some(position) = stack.pop() {
-        if std::mem::replace(&mut visited[position], true) {
+    while let Some(id) = stack.pop() {
+        if std::mem::replace(&mut visited[id.0], true) {
             continue;
         }
-        let tool = &tools[position];
+        let tool = &tools[id.0];
         match tool.declared_tools() {
-            // `"*"` closes over the declaring tool's **own configuration
-            // file** — the tools whose origin equals this tool's. In the
-            // shipped default catalog every tool is `BuiltIn` (the embedded
-            // `default-tools.toml`), so this is all seven; when a user config
-            // replaces the defaults the appended fallback shell is the only
-            // `BuiltIn` tool, so it closes over itself alone and provisions
-            // only its own (empty) `credentials`.
+            // `"*"` closes over the declaring tool's **own configuration file** —
+            // the retained definitions that share its reference scope, hidden ones
+            // included. In the shipped default catalog every tool is `BuiltIn`
+            // (the embedded `default-tools.toml`), so this is all seven; under a
+            // custom catalog the fallback shell is a scope of its own, so it closes
+            // over itself alone and provisions only its own (empty) `credentials`.
             DeclaredTools::All => {
-                let origin = tool.origin();
-                stack.extend(
-                    tools
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, candidate)| candidate.origin() == origin)
-                        .map(|(position, _)| position),
-                );
+                for (position, candidate) in tools.iter().enumerate() {
+                    if same_reference_scope(ReferenceOrigins {
+                        declaring: tool.origin(),
+                        candidate: candidate.origin(),
+                    }) {
+                        stack.push(DefinitionId(position));
+                    }
+                }
             }
             // Every name was proven present by `resolve_provisioning` above.
-            DeclaredTools::Named(names) => stack.extend(
-                names
-                    .iter()
-                    .filter_map(|reference| index.get(reference.as_str()).copied()),
-            ),
+            DeclaredTools::Named(names) => {
+                for reference in names {
+                    let Some(&target) = index.get(&(tool.origin(), reference.as_str())) else {
+                        return Err(unresolved_reference(tool, reference));
+                    };
+                    if !same_reference_scope(ReferenceOrigins {
+                        declaring: tool.origin(),
+                        candidate: tools[target.0].origin(),
+                    }) {
+                        return Err(unresolved_reference(tool, reference));
+                    }
+                    stack.push(target);
+                }
+            }
         }
     }
-    visited
+    Ok(visited)
 }
 
 // ---------------------------------------------------------------------------
@@ -1690,10 +1956,10 @@ fn validate_credentials(
     Ok((providers, names))
 }
 
-/// Validate one tool's `tools` declaration *within its tier*. Reference
-/// resolution is deliberately **not** here: a project tool may legitimately
-/// name a user tool, or the appended `shell` fallback, so the dangling check
-/// belongs to the launch catalog ([`resolve_provisioning`]).
+/// Validate one tool's `tools` declaration *within its tier*. Name binding is
+/// deliberately **not** here: it is a catalog fact, resolved by
+/// [`resolve_provisioning`], so that a reference error can be a deferred catalog
+/// error (a readable `image` survives it) rather than a load failure.
 fn validate_tool_refs(
     raw: Option<Vec<String>>,
     origin: &ToolOrigin,
@@ -1822,6 +2088,32 @@ pub fn byte_paths_overlap(a: &[u8], b: &[u8]) -> (result: bool)
         || is_separator_prefix(b@, a@)),
 {
     byte_path_contains(a, b) || byte_path_contains(b, a)
+}
+
+/// The two already-measured facts [`same_reference_scope`] decides on: the two
+/// definitions come from the same **tool config tier** and name the same
+/// declaring file. Named fields rather than adjacent `bool` parameters, so an
+/// argument swap cannot make a cross-tier reference look local.
+pub(crate) struct ReferenceScopeFacts {
+    pub(crate) same_tier: bool,
+    pub(crate) same_file: bool,
+}
+
+/// The tool-reference locality decision (#395), contracted (ADR-0018): a
+/// reference is in scope **iff** the candidate is in the declaring tool's tier
+/// *and* in its declaring file. Total over all four Boolean combinations; in
+/// scope never happens when either measured fact fails.
+///
+/// This proves the conjunction only. What actually keeps a reference tier-local
+/// is that the index is keyed by the exact `(origin, name)` pair and that the
+/// closure walk folds one visited mask; the measurement above, the index, the
+/// traversal and the fold are behaviour-tested trusted adapters.
+pub(crate) fn reference_scope_matches(facts: ReferenceScopeFacts) -> (matches: bool)
+    ensures
+        matches == (facts.same_tier && facts.same_file),
+        matches ==> facts.same_tier && facts.same_file,
+{
+    facts.same_tier && facts.same_file
 }
 
 } // verus!
@@ -2360,8 +2652,7 @@ mod tests {
         let before_report = f.load().unwrap();
         let before: Vec<_> = before_report
             .resolved()
-            .0
-            .iter()
+            .launch_tools()
             .map(tool_summary)
             .collect();
         f.user(&format!(
@@ -2369,7 +2660,11 @@ mod tests {
             one_tool("custom")
         ));
         let after_report = f.load().unwrap();
-        let after: Vec<_> = after_report.resolved().0.iter().map(tool_summary).collect();
+        let after: Vec<_> = after_report
+            .resolved()
+            .launch_tools()
+            .map(tool_summary)
+            .collect();
         assert_eq!(after, before);
     }
 
@@ -2793,7 +3088,7 @@ mod tests {
                 (Ok(report), Expected::Absent) => {
                     assert!(report.user_mounts().is_none(), "{label}");
                     assert_eq!(report.user_network(), None, "{label}");
-                    let tool = &report.resolved().as_slice()[0];
+                    let tool = first_launch(&report);
                     assert_eq!(
                         tool.guest_env().get("mounts").map(String::as_str),
                         Some("~/private:ro"),
@@ -2897,6 +3192,17 @@ mod tests {
         }
     }
 
+    /// The first launch winner. Hidden definitions are deliberately absent: a
+    /// loser of a launch-name conflict stays resolvable from its own file, but it
+    /// is never a verb.
+    fn first_launch(report: &ConfigReport) -> &Tool {
+        report
+            .resolved()
+            .launch_tools()
+            .next()
+            .expect("the catalog has a launch winner")
+    }
+
     fn one_tool(name: &str) -> String {
         format!("[[tools]]\nname = \"{name}\"\ncommand = \"{name}\"\ncredentials = [\"openai\"]\n")
     }
@@ -2929,9 +3235,9 @@ mod tests {
             TierStatus::Found { declared_tools: 0 } | TierStatus::Absent
         ));
 
-        let tools = report.resolved().as_slice();
+        let tools: Vec<&Tool> = report.resolved().launch_tools().collect();
         assert_eq!(tools.len(), 7);
-        let names: Vec<_> = tools.iter().map(Tool::name).collect();
+        let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
         assert_eq!(
             names,
             [
@@ -2973,7 +3279,7 @@ mod tests {
     fn shell_argv_keeps_two_elements_and_agents_carry_no_invented_flag() {
         let fixture = Fixture::new();
         let report = fixture.load().unwrap();
-        let tools = report.resolved().as_slice();
+        let tools: Vec<&Tool> = report.resolved().launch_tools().collect();
 
         let shell = tools.iter().find(|tool| tool.name() == "shell").unwrap();
         assert_eq!(shell.argv, ["-O", "histappend"]);
@@ -2993,7 +3299,7 @@ mod tests {
             fixture.user(user).project(project);
             let report = fixture.load().unwrap();
             assert!(report.uses_defaults(), "user={user:?} project={project:?}");
-            assert_eq!(report.resolved().as_slice().len(), 7);
+            assert_eq!(report.resolved().launch_tools().len(), 7);
             assert_eq!(
                 report.user().status(),
                 &TierStatus::Found { declared_tools: 0 }
@@ -3019,7 +3325,7 @@ mod tests {
         fixture.user(&one_tool("solo"));
         let report = fixture.load().unwrap();
         assert!(!report.uses_defaults());
-        let tools = report.resolved().as_slice();
+        let tools: Vec<&Tool> = report.resolved().launch_tools().collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "solo");
     }
@@ -3284,7 +3590,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.user(&one_tool("solo"));
         let report = fixture.load().unwrap();
-        assert_eq!(report.resolved().as_slice().len(), 1);
+        assert_eq!(report.resolved().launch_tools().len(), 1);
         let catalog = report.into_launch_catalog().unwrap();
         assert_eq!(catalog.as_slice().len(), 2);
     }
@@ -3389,6 +3695,42 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} missing from the catalog"))
             .provisioned()
             .iter()
+            .collect()
+    }
+
+    /// The catalog entry named `name` — a launch verb or the appended fallback.
+    fn entry_of<'a>(catalog: &'a LaunchCatalog, name: &str) -> &'a CatalogEntry {
+        catalog
+            .as_slice()
+            .iter()
+            .find(|entry| entry.tool().name() == name)
+            .unwrap_or_else(|| panic!("{name} missing from the catalog"))
+    }
+
+    /// The entry's provisioned paths, in fold order, rendered guest-relative.
+    fn persist_of(catalog: &LaunchCatalog, name: &str) -> Vec<String> {
+        entry_of(catalog, name)
+            .persist()
+            .iter()
+            .map(|path| path.as_path().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The entry's requested credential names, in declaration order.
+    fn names_of(catalog: &LaunchCatalog, name: &str) -> Vec<String> {
+        entry_of(catalog, name)
+            .requested_names()
+            .iter()
+            .map(|service| service.as_str().to_string())
+            .collect()
+    }
+
+    /// The catalog's verb names, in launch order.
+    fn verbs_of(catalog: &LaunchCatalog) -> Vec<String> {
+        catalog
+            .as_slice()
+            .iter()
+            .map(|entry| entry.tool().name().to_string())
             .collect()
     }
 
@@ -3517,14 +3859,51 @@ mod tests {
         use CredentialProvider::*;
         let fixture = Fixture::new();
         fixture.user(
-            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ncredentials = [\"anthropic\"]\ntools = [\"b\"]\n\
-             [[tools]]\nname = \"b\"\ncommand = \"b\"\ncredentials = [\"openai\"]\ntools = [\"a\"]\n\
-             [[tools]]\nname = \"c\"\ncommand = \"c\"\ncredentials = [\"copilot\"]\ntools = [\"c\"]\n",
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\ncredentials = [\"anthropic\"]\ntools = [\"b\"]\npersist = [\".a\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"b\"\ncredentials = [\"openai\"]\ntools = [\"a\", \"a\"]\npersist = [\".b\"]\n\
+             [[tools]]\nname = \"c\"\ncommand = \"c\"\ncredentials = [\"copilot\"]\ntools = [\"c\"]\npersist = [\".c\"]\n\
+             [[tools]]\nname = \"all\"\ncommand = \"all\"\ntools = [\"*\"]\n",
         );
         let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
         assert_eq!(provisioned_of(&catalog, "a"), vec![Anthropic, OpenAi]);
         assert_eq!(provisioned_of(&catalog, "b"), vec![Anthropic, OpenAi]);
         assert_eq!(provisioned_of(&catalog, "c"), vec![Copilot]);
+        // A cycle, a repeated edge and a wildcard that includes itself each add
+        // one contribution per definition, and the paths fold in arena order.
+        assert_eq!(persist_of(&catalog, "a"), [".a", ".b"]);
+        assert_eq!(
+            persist_of(&catalog, "b"),
+            [".a", ".b"],
+            "a repeated edge is not a repeated claim"
+        );
+        assert_eq!(persist_of(&catalog, "c"), [".c"]);
+        assert_eq!(persist_of(&catalog, "all"), [".a", ".b", ".c"]);
+        assert_eq!(
+            names_of(&catalog, "all"),
+            ["anthropic", "copilot", "openai"]
+        );
+
+        // The same shape across tiers: a hidden project `a` closes a cycle with
+        // the project `b` it names, never with the user's winning `a`.
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"a\"\ncommand = \"user-a\"\ncredentials = [\"anthropic\"]\n")
+            .project(
+                "[[tools]]\nname = \"a\"\ncommand = \"project-a\"\ncredentials = [\"openai\"]\ntools = [\"b\"]\n\
+                 [[tools]]\nname = \"b\"\ncommand = \"b\"\ncredentials = [\"copilot\"]\ntools = [\"a\"]\n",
+            );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(
+            provisioned_of(&catalog, "a"),
+            vec![Anthropic],
+            "the user verb is its own closure"
+        );
+        assert_eq!(
+            provisioned_of(&catalog, "b"),
+            vec![OpenAi, Copilot],
+            "the project's `b` closes over the hidden project `a`, not the user's"
+        );
+        assert_eq!(names_of(&catalog, "b"), ["copilot", "openai"]);
     }
 
     /// **T3 / §A1.** The wildcard closes over the declaring tool's **own
@@ -3550,21 +3929,637 @@ mod tests {
         );
     }
 
-    /// **T3 / §A1.** The cross-file opt-in is naming the tool explicitly.
+    // -- #395: tier-local tool references ----------------------------------
+
+    /// **U4 / §A1.** A name the other tier declares is a config error, not a
+    /// cross-file opt-in — in both directions, for a name only the shipped
+    /// catalog declares, and for the synthesized fallback. The positive control
+    /// redeclares the target in the referencing file, which is the documented
+    /// migration.
     #[test]
-    fn naming_another_files_tool_is_the_cross_file_opt_in() {
+    fn explicit_cross_tier_references_are_rejected_in_both_directions() {
+        use CredentialProvider::*;
+
+        // (a) the user tier naming a project-only tool.
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"p\"]\n")
+            .project("[[tools]]\nname = \"p\"\ncommand = \"p\"\ncredentials = [\"anthropic\"]\n");
+        let report = fixture
+            .load()
+            .expect("a cross-tier reference is valid schema");
+        assert_eq!(
+            format!("{:#}", report.into_launch_catalog().unwrap_err()),
+            format!(
+                "config: user config {} declaration [0] tool \"w\": tools[0]: \"p\" names no tool in this configuration file; it is declared in project config {}; cross-tier tool references are not allowed; copy or redeclare the tool in this file, or remove the entry",
+                crate::one_line::quoted_path(&fixture.user),
+                crate::one_line::quoted_path(&fixture.project)
+            )
+        );
+
+        // (b) the project tier naming a user-only tool, naming the project file.
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"p\"\ncommand = \"p\"\ncredentials = [\"anthropic\"]\n")
+            .project("[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"p\"]\n");
+        let error = format!(
+            "{:#}",
+            fixture.load().unwrap().into_launch_catalog().unwrap_err()
+        );
+        assert!(
+            error.contains(&format!(
+                "project config {} declaration [0] tool \"w\"",
+                crate::one_line::quoted_path(&fixture.project)
+            )),
+            "{error}"
+        );
+
+        // (c) a custom catalog replaces the shipped one, so its names are gone:
+        // the name is declared nowhere retained, so nothing is cross-tier and the
+        // message must not say otherwise.
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"u\"\ncommand = \"u\"\n")
+            .project("[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"claude\"]\n");
+        assert_eq!(
+            format!(
+                "{:#}",
+                fixture.load().unwrap().into_launch_catalog().unwrap_err()
+            ),
+            format!(
+                "config: project config {} declaration [0] tool \"w\": tools[0]: \"claude\" names no tool in this configuration file; declare it in this file or remove the entry",
+                crate::one_line::quoted_path(&fixture.project)
+            )
+        );
+
+        // (d) the synthesized fallback `shell` is a launch affordance, not a
+        // declaration in the referencing file, and it is declared nowhere
+        // retained either.
+        let fixture = Fixture::new();
+        fixture.project("[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"shell\"]\n");
+        assert_eq!(
+            format!(
+                "{:#}",
+                fixture.load().unwrap().into_launch_catalog().unwrap_err()
+            ),
+            format!(
+                "config: project config {} declaration [0] tool \"w\": tools[0]: \"shell\" names no tool in this configuration file; declare it in this file or remove the entry",
+                crate::one_line::quoted_path(&fixture.project)
+            )
+        );
+
+        // Positive control: the target redeclared in the referencing file.
+        let fixture = Fixture::new();
+        fixture
+            .user(
+                "[[tools]]\nname = \"w\"\ncommand = \"w\"\ntools = [\"p\"]\n\
+                   [[tools]]\nname = \"p\"\ncommand = \"p\"\ncredentials = [\"anthropic\"]\n",
+            )
+            .project("[[tools]]\nname = \"p\"\ncommand = \"p\"\ncredentials = [\"copilot\"]\n");
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(provisioned_of(&catalog, "w"), vec![Anthropic]);
+        assert_eq!(
+            provisioned_of(&catalog, "p"),
+            vec![Anthropic],
+            "the user's `p` is the winning verb and the referenced definition"
+        );
+    }
+
+    /// **U1 / §A2.** A hidden project definition supplies **its own** facets: user
+    /// `pi` wins the verb `agent-vm pi`, but the project's `helper` provisions the
+    /// *project* `pi`'s provider, requested name and persisted path, never the
+    /// user's. Commands, providers, names and paths are asymmetric on purpose, so
+    /// selecting the wrong tier — or both — cannot pass.
+    #[test]
+    fn hidden_project_definition_supplies_only_its_own_facets() {
         use CredentialProvider::*;
         let fixture = Fixture::new();
         fixture
             .user(
-                "[[tools]]\nname = \"w\"\ncommand = \"w\"\ncredentials = [\"copilot\"]\ntools = [\"p\"]\n\
-                 [[tools]]\nname = \"u\"\ncommand = \"u\"\ncredentials = [\"openai\"]\n",
+                "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\n\
+                 credentials = [\"openai\", \"user-service\"]\npersist = [\".user-pi\"]\n",
             )
             .project(
-                "[[tools]]\nname = \"p\"\ncommand = \"p\"\ncredentials = [\"anthropic\"]\n",
+                "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+                 credentials = [\"anthropic\", \"project-service\"]\npersist = [\".project-pi\"]\n\
+                 [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ntools = [\"pi\"]\npersist = [\".bridge\"]\n\
+                 [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]\npersist = [\".helper\"]\n",
+            );
+        let report = fixture.load().unwrap();
+        assert_eq!(
+            report.conflicts().len(),
+            1,
+            "a whole-definition user-wins conflict is still reported once"
+        );
+        assert_eq!(report.conflicts()[0].tool(), "pi");
+        let catalog = report.into_launch_catalog().unwrap();
+
+        assert_eq!(verbs_of(&catalog), ["pi", "bridge", "helper", "shell"]);
+
+        // The verb is the user definition, unchanged.
+        assert_eq!(entry_of(&catalog, "pi").tool().command(), "user-pi");
+        assert_eq!(
+            entry_of(&catalog, "pi").tool().origin(),
+            &ToolOrigin::User(fixture.user.clone())
+        );
+        assert_eq!(provisioned_of(&catalog, "pi"), vec![OpenAi]);
+        assert_eq!(names_of(&catalog, "pi"), ["openai", "user-service"]);
+        assert_eq!(persist_of(&catalog, "pi"), [".user-pi"]);
+
+        // The hidden project definition supplies the project closure.
+        assert_eq!(entry_of(&catalog, "helper").tool().command(), "helper");
+        assert_eq!(provisioned_of(&catalog, "helper"), vec![Anthropic]);
+        assert_eq!(
+            names_of(&catalog, "helper"),
+            ["anthropic", "project-service"]
+        );
+        assert_eq!(
+            persist_of(&catalog, "helper"),
+            [".project-pi", ".bridge", ".helper"]
+        );
+        assert!(
+            entry_of(&catalog, "helper")
+                .tool()
+                .credential_providers()
+                .iter()
+                .next()
+                .is_none(),
+            "an available tool contributes provisioning, never a requirement"
+        );
+        assert!(
+            !persist_of(&catalog, "helper").contains(&".user-pi".to_string()),
+            "a hidden project definition must never contribute the user's persisted path"
+        );
+
+        // Reverse direction: a user tool naming `pi` gets the user definition.
+        let fixture = Fixture::new();
+        fixture
+            .user(
+                "[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\npersist = [\".user-pi\"]\n\
+                 [[tools]]\nname = \"caller\"\ncommand = \"caller\"\ntools = [\"pi\"]\n",
+            )
+            .project(
+                "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+                 credentials = [\"anthropic\"]\npersist = [\".project-pi\"]\n",
             );
         let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
-        assert_eq!(provisioned_of(&catalog, "w"), vec![Anthropic, Copilot]);
+        assert_eq!(provisioned_of(&catalog, "caller"), vec![OpenAi]);
+        assert_eq!(persist_of(&catalog, "caller"), [".user-pi"]);
+    }
+
+    /// The body shared by U2's rows: a hidden project `pi`, a `bridge` that closes
+    /// a cycle with it, a `helper` two edges away and a project wildcard.
+    const PROJECT_CYCLE_BODY: &str = "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\n\
+         credentials = [\"anthropic\", \"project-service\"]\npersist = [\".project-pi\"]\ntools = [\"bridge\"]\n\
+         [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\ncredentials = [\"bridge-service\"]\n\
+         persist = [\".bridge\"]\ntools = [\"pi\"]\n\
+         [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]\npersist = [\".helper\"]\n\
+         [[tools]]\nname = \"wide\"\ncommand = \"wide\"\ntools = [\"*\"]\npersist = [\".wide\"]\n";
+
+    /// **U2 / §A3.** The rule holds transitively and through a wildcard, and all
+    /// three facets fold over the *same* visited mask. Different service names and
+    /// disjoint paths per definition make a shallow-only walk fail; the hidden
+    /// cycle makes a wrong visited mask show up as a duplicated path.
+    #[test]
+    fn hidden_transitive_and_wildcard_closures_share_all_facets() {
+        use CredentialProvider::*;
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\npersist = [\".user-pi\"]\n")
+            .project(PROJECT_CYCLE_BODY);
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+
+        // `helper -> bridge -> pi -> bridge`: the cycle terminates and every
+        // definition contributes exactly once, in arena order.
+        assert_eq!(provisioned_of(&catalog, "helper"), vec![Anthropic]);
+        assert_eq!(
+            names_of(&catalog, "helper"),
+            ["anthropic", "bridge-service", "project-service"]
+        );
+        assert_eq!(
+            persist_of(&catalog, "helper"),
+            [".project-pi", ".bridge", ".helper"]
+        );
+
+        // The wildcard closes over every project definition, hidden `pi` included,
+        // and reaches neither the user tier nor the shipped agents.
+        assert_eq!(provisioned_of(&catalog, "wide"), vec![Anthropic]);
+        assert_eq!(
+            names_of(&catalog, "wide"),
+            ["anthropic", "bridge-service", "project-service"]
+        );
+        assert_eq!(
+            persist_of(&catalog, "wide"),
+            [".project-pi", ".bridge", ".helper", ".wide"],
+            "a wildcard that includes itself still contributes each definition once"
+        );
+
+        // Edge order and duplicate edges cannot change the folded facets.
+        let reordered = PROJECT_CYCLE_BODY.replace(
+            "name = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\"]",
+            "name = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\", \"bridge\", \"wide\"]",
+        );
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\npersist = [\".user-pi\"]\n")
+            .project(&reordered);
+        let reordered_catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(
+            persist_of(&reordered_catalog, "helper"),
+            [".project-pi", ".bridge", ".helper", ".wide"],
+            "a repeated edge and a second path to `wide` add one contribution each"
+        );
+        assert_eq!(
+            provisioned_of(&reordered_catalog, "helper"),
+            vec![Anthropic]
+        );
+    }
+
+    /// **U3 / §A3.** A hidden definition's reference error keeps its **original**
+    /// declaration index, declaring file and field, and fails even when no launch
+    /// verb reaches it. Escaped control bytes never reach the terminal, while a
+    /// non-ASCII declaring directory still prints as itself.
+    #[test]
+    fn hidden_definition_errors_keep_original_declaration_index() {
+        // Project declaration 0 is hidden by the user's `pi`; declaration 2's
+        // `tools[1]` is the bad edge.
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\ncredentials = [\"openai\"]\n")
+            .project(
+                "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\ncredentials = [\"anthropic\"]\n\
+                 [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\n\
+                 [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"bridge\", \"nope\"]\n",
+            );
+        assert_eq!(
+            format!(
+                "{:#}",
+                fixture.load().unwrap().into_launch_catalog().unwrap_err()
+            ),
+            format!(
+                "config: project config {} declaration [2] tool \"helper\": tools[1]: \"nope\" names no tool in this configuration file; declare it in this file or remove the entry",
+                crate::one_line::quoted_path(&fixture.project)
+            )
+        );
+
+        // A bad edge inside a hidden declaration with no incoming edge from any
+        // winner still fails: shadowing a name is not a way to ignore its
+        // references.
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"dup\"\ncommand = \"user-dup\"\n")
+            .project(
+                "[[tools]]\nname = \"dup\"\ncommand = \"project-dup\"\ntools = [\"missing\"]\n",
+            );
+        let error = format!(
+            "{:#}",
+            fixture.load().unwrap().into_launch_catalog().unwrap_err()
+        );
+        assert!(
+            error.contains(&format!(
+                "project config {} declaration [0] tool \"dup\": tools[0]:",
+                crate::one_line::quoted_path(&fixture.project)
+            )),
+            "{error}"
+        );
+
+        // A reference carrying a control byte is byte-escaped (config-chosen
+        // text), while the declaring directory is a measured path and prints as
+        // itself.
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("проект").join(".agent-vm");
+        let project = directory.join("config.toml");
+        write_file(
+            &project,
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"a\\nb\"]\n",
+        );
+        let paths = ConfigPaths {
+            user: None,
+            project,
+            home: None,
+        };
+        let error = format!(
+            "{:#}",
+            load(&paths).unwrap().into_launch_catalog().unwrap_err()
+        );
+        assert!(error.contains("проект"), "{error}");
+        assert!(error.contains("\"a\\x0ab\""), "{error}");
+        assert!(!error.contains("a\nb"), "{error:?}");
+    }
+
+    /// **U6 / §A4.** An available tool adds provisioning, never a requirement: the
+    /// launched tool's own `credentials` stay the whole required set, so an
+    /// inherited provider's missing-login bail cannot fire. Named requests fold
+    /// over exactly the same closure as the built-in providers.
+    #[test]
+    fn inherited_providers_are_provisioned_but_never_required() {
+        use CredentialProvider::*;
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"caller\"\ncommand = \"caller\"\ncredentials = [\"openai\"]\n\
+             tools = [\"claude\", \"copilot\"]\n\
+             [[tools]]\nname = \"claude\"\ncommand = \"claude\"\ncredentials = [\"anthropic\"]\n\
+             [[tools]]\nname = \"copilot\"\ncommand = \"copilot\"\ncredentials = [\"copilot\"]\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(
+            provisioned_of(&catalog, "caller"),
+            vec![Anthropic, OpenAi, Copilot]
+        );
+        let requirement: Vec<CredentialProvider> = entry_of(&catalog, "caller")
+            .tool()
+            .credential_providers()
+            .iter()
+            .collect();
+        assert_eq!(
+            requirement,
+            vec![OpenAi],
+            "only the launched tool's own credentials are required"
+        );
+        assert_eq!(
+            names_of(&catalog, "caller"),
+            ["anthropic", "copilot", "openai"],
+            "named requests fold over the same closure as the providers"
+        );
+
+        // The shipped `pi` provisions both providers and requires neither.
+        let defaults = Fixture::new()
+            .load()
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap();
+        assert_eq!(provisioned_of(&defaults, "pi"), vec![Anthropic, OpenAi]);
+        assert!(
+            entry_of(&defaults, "pi")
+                .tool()
+                .credential_providers()
+                .iter()
+                .next()
+                .is_none()
+        );
+    }
+
+    /// **U7 / §A5.** A hidden definition's persisted paths are validated as part of
+    /// the closure that selects them, before any path reaches the guest-HOME link
+    /// list: exact and ancestor/descendant conflicts fail, naming both declaring
+    /// origins; raw per-tool path validation still applies to hidden declarations;
+    /// and a cycle revisiting one owner is not a duplicate claim.
+    #[test]
+    fn hidden_persist_conflicts_are_rejected_inside_the_selecting_closure() {
+        // Exact duplicate claim between two project definitions the same launch
+        // selects, one of them hidden from verb selection.
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\n")
+            .project(
+                "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\npersist = [\".cache\"]\n\
+                 [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\npersist = [\"./.cache//\"]\n\
+                 [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\", \"bridge\"]\n",
+            );
+        let error = format!(
+            "{:#}",
+            fixture.load().unwrap().into_launch_catalog().unwrap_err()
+        );
+        assert!(
+            error.contains("is claimed by tool \"pi\"")
+                && error.contains("tool \"bridge\"")
+                && error.contains("project config"),
+            "{error}"
+        );
+        assert_eq!(
+            error
+                .matches(&crate::one_line::quoted_path(&fixture.project).to_string())
+                .count(),
+            2,
+            "both claimants name their declaring file: {error}"
+        );
+
+        // Ancestor/descendant variant.
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\n")
+            .project(
+                "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\npersist = [\".cache\"]\n\
+                 [[tools]]\nname = \"inner\"\ncommand = \"inner\"\npersist = [\".cache/x\"]\n\
+                 [[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"pi\", \"inner\"]\n",
+            );
+        let error = format!(
+            "{:#}",
+            fixture.load().unwrap().into_launch_catalog().unwrap_err()
+        );
+        assert!(
+            error.contains("overlaps") && error.contains("tool \"inner\""),
+            "{error}"
+        );
+
+        // Raw per-tool path validation still applies to a hidden declaration: a
+        // reserved link, an absolute path, a traversal and a within-tool overlap
+        // are all load errors even though the definition has no verb.
+        for body in [
+            "persist = [\".pi\"]",
+            "persist = [\"/absolute\"]",
+            "persist = [\"../escape\"]",
+            "persist = [\".a\", \".a/b\"]",
+        ] {
+            let fixture = Fixture::new();
+            fixture
+                .user("[[tools]]\nname = \"dup\"\ncommand = \"user-dup\"\n")
+                .project(&format!(
+                    "[[tools]]\nname = \"dup\"\ncommand = \"project-dup\"\n{body}\n"
+                ));
+            assert!(
+                fixture.load().is_err(),
+                "a hidden declaration's own paths are still validated: {body}"
+            );
+        }
+
+        // A cycle revisiting one owner is one claim, not two.
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"pi\"\ncommand = \"pi\"\npersist = [\".cache\"]\ntools = [\"bridge\"]\n\
+             [[tools]]\nname = \"bridge\"\ncommand = \"bridge\"\npersist = [\".bridge\"]\ntools = [\"pi\"]\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(persist_of(&catalog, "pi"), [".cache", ".bridge"]);
+    }
+
+    /// **U8 / §A5.** The ownership partition: winners and each *selected* closure
+    /// are checked, so two tier-local closures that each own a path alone are not
+    /// simultaneous owners, and an unreachable hidden closure's internal overlap
+    /// does not fail the catalog — until a winning tool selects it.
+    #[test]
+    fn ownership_checks_cover_winners_and_each_selected_closure_only() {
+        // User `pi` and hidden project `pi` claim the same path; each is alone in
+        // its own tier-local closure, so no launch ever links both.
+        let fixture = Fixture::new();
+        fixture
+            .user("[[tools]]\nname = \"pi\"\ncommand = \"user-pi\"\npersist = [\".shared\"]\n")
+            .project(
+                "[[tools]]\nname = \"pi\"\ncommand = \"project-pi\"\npersist = [\".shared\"]\n",
+            );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(persist_of(&catalog, "pi"), [".shared"]);
+
+        // An unreachable hidden pair whose *joint* closure overlaps stays valid:
+        // the user's `a`/`b` have no edges and no paths, project `a` owns `cache`
+        // and references project `b` owning `cache/x`, and both project names are
+        // hidden.
+        const USER: &str =
+            "[[tools]]\nname = \"a\"\ncommand = \"a\"\n[[tools]]\nname = \"b\"\ncommand = \"b\"\n";
+        const PROJECT: &str = "[[tools]]\nname = \"a\"\ncommand = \"project-a\"\npersist = [\"cache\"]\ntools = [\"b\"]\n\
+             [[tools]]\nname = \"b\"\ncommand = \"project-b\"\npersist = [\"cache/x\"]\n";
+        let fixture = Fixture::new();
+        fixture.user(USER).project(PROJECT);
+        let catalog = fixture
+            .load()
+            .expect("no winner selects the overlapping closure")
+            .into_launch_catalog()
+            .expect("an unreachable hidden closure's ownership is not checked");
+        assert_eq!(verbs_of(&catalog), ["a", "b", "shell"]);
+        assert_eq!(
+            entry_of(&catalog, "a").tool().command(),
+            "a",
+            "the hidden project definition is not a verb"
+        );
+
+        // The paired rejection control: a project helper selecting that closure.
+        let fixture = Fixture::new();
+        fixture.user(USER).project(&format!(
+            "{PROJECT}[[tools]]\nname = \"helper\"\ncommand = \"helper\"\ntools = [\"a\"]\n"
+        ));
+        let error = format!(
+            "{:#}",
+            fixture.load().unwrap().into_launch_catalog().unwrap_err()
+        );
+        assert!(
+            error.contains("overlaps")
+                && error.contains("tool \"a\"")
+                && error.contains("tool \"b\""),
+            "{error}"
+        );
+    }
+
+    /// **U9 / §A6–A7.** The shipped catalog, the isolated fallback and a declared
+    /// `shell` keep three distinct contracts.
+    #[test]
+    fn shipped_fallback_and_declared_shell_keep_their_own_scopes() {
+        // The shipped catalog keeps its seven verbs and exact facets.
+        let defaults = Fixture::new()
+            .load()
+            .unwrap()
+            .into_launch_catalog()
+            .unwrap();
+        assert_eq!(
+            verbs_of(&defaults),
+            [
+                "dsh", "pi", "codex", "opencode", "claude", "copilot", "shell"
+            ]
+        );
+        assert!(!defaults.has_shell_fallback());
+        assert_eq!(persist_of(&defaults, "dsh"), [".dsh"]);
+
+        // The custom-catalog fallback provisions nothing at all — no shipped
+        // provider, no requested name, no declared persist, and no shipped agent.
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"solo\"\ncommand = \"solo\"\n");
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert!(catalog.has_shell_fallback());
+        let shell = entry_of(&catalog, "shell");
+        assert!(shell.provisioned().iter().next().is_none());
+        assert!(shell.requested_names().is_empty());
+        assert!(shell.persist().is_empty());
+        assert_eq!(shell.tool().command(), "bash");
+        assert_eq!(verbs_of(&catalog), ["solo", "shell"]);
+        assert_eq!(
+            catalog.declarations().len(),
+            1,
+            "the fallback is a launch affordance, not a declaration"
+        );
+
+        // A declared `shell` with an omitted `tools` reaches its own tier's
+        // siblings — including hidden ones — and nothing from the other tier.
+        let fixture = Fixture::new();
+        fixture
+            .user(
+                "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\npersist = [\".u\"]\n\
+                 [[tools]]\nname = \"sibling\"\ncommand = \"sibling\"\npersist = [\".s\"]\n",
+            )
+            .project("[[tools]]\nname = \"sibling\"\ncommand = \"project-sibling\"\npersist = [\".p\"]\n");
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(
+            persist_of(&catalog, "shell"),
+            [".u", ".s"],
+            "the omitted wildcard sees this tier's siblings, hidden ones included"
+        );
+        assert!(!catalog.has_shell_fallback());
+
+        // `tools = []` stays empty.
+        let fixture = Fixture::new();
+        fixture.user(
+            "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ntools = []\npersist = [\".u\"]\n\
+             [[tools]]\nname = \"sibling\"\ncommand = \"sibling\"\npersist = [\".s\"]\n",
+        );
+        let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(persist_of(&catalog, "shell"), [".u"]);
+    }
+
+    /// **Scope contract / ADR-0018.** The measured conjunction is total over its
+    /// four Boolean rows, and a real origin pair is in scope only when both the
+    /// tier and the declaring file match — so scope is never bare-name equality.
+    #[test]
+    fn reference_scope_is_the_tier_and_file_conjunction() {
+        use ReferenceScopeFacts as Facts;
+        for (facts, expected) in [
+            (
+                Facts {
+                    same_tier: false,
+                    same_file: false,
+                },
+                false,
+            ),
+            (
+                Facts {
+                    same_tier: false,
+                    same_file: true,
+                },
+                false,
+            ),
+            (
+                Facts {
+                    same_tier: true,
+                    same_file: false,
+                },
+                false,
+            ),
+            (
+                Facts {
+                    same_tier: true,
+                    same_file: true,
+                },
+                true,
+            ),
+        ] {
+            assert_eq!(reference_scope_matches(facts), expected);
+        }
+
+        let user = ToolOrigin::User(PathBuf::from("/home/u/config.toml"));
+        let other_user = ToolOrigin::User(PathBuf::from("/home/u/other.toml"));
+        let project = ToolOrigin::Project(PathBuf::from("/home/u/config.toml"));
+        let builtin = ToolOrigin::BuiltIn;
+        let scope = |declaring: &ToolOrigin, candidate: &ToolOrigin| {
+            same_reference_scope(ReferenceOrigins {
+                declaring,
+                candidate,
+            })
+        };
+        assert!(scope(&user, &user));
+        assert!(!scope(&user, &other_user), "one tier, two declaring files");
+        assert!(
+            !scope(&user, &project),
+            "equal declaring paths, different tiers"
+        );
+        assert!(!scope(&builtin, &user));
+        assert!(scope(&builtin, &builtin));
     }
 
     /// **T3 / §A1.** The synthesized fallback `shell` (BuiltIn) is the only
@@ -3651,7 +4646,7 @@ mod tests {
         assert_eq!(
             format!("{error:#}"),
             format!(
-                "config: user config {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry",
+                "config: user config {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in this configuration file; declare it in this file or remove the entry",
                 crate::one_line::quoted_path(&fixture.user)
             )
         );
@@ -3663,7 +4658,7 @@ mod tests {
         assert_eq!(
             format!("{error:#}"),
             format!(
-                "config: project config {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry",
+                "config: project config {} declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in this configuration file; declare it in this file or remove the entry",
                 crate::one_line::quoted_path(&fixture.project)
             )
         );
@@ -3734,8 +4729,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_provisioning(tools).unwrap_err().to_string(),
-            "config: built-in defaults \"default-tools.toml\" declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in the resolved catalog; declare that tool or remove the entry"
+            resolve_provisioning(ResolvedTools::from_defaults(tools))
+                .unwrap_err()
+                .to_string(),
+            "config: built-in defaults \"default-tools.toml\" declaration [0] tool \"t\": tools[0]: \"nope\" names no tool in this configuration file; declare it in this file or remove the entry"
         );
     }
 
@@ -3749,7 +4746,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_persist_ownership(&tools).unwrap_err().to_string(),
+            validate_persist_ownership(tools.iter())
+                .unwrap_err()
+                .to_string(),
             "config: guest persist path \".x\" is claimed by tool \"a\" (built-in defaults \"default-tools.toml\") and tool \"b\" (built-in defaults \"default-tools.toml\"); remove or rename one claim"
         );
     }
@@ -3767,7 +4766,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_persist_ownership(&tools).unwrap_err().to_string(),
+            validate_persist_ownership(tools.iter())
+                .unwrap_err()
+                .to_string(),
             "config: guest persist path \".x/a\" declared by tool \"b\" (built-in defaults \"default-tools.toml\") overlaps \".x\" claimed by tool \"a\" (built-in defaults \"default-tools.toml\"); one would shadow the other"
         );
 
@@ -3778,7 +4779,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_persist_ownership(&tools).unwrap_err().to_string(),
+            validate_persist_ownership(tools.iter())
+                .unwrap_err()
+                .to_string(),
             "config: guest persist path \".x\" declared by tool \"a\" (built-in defaults \"default-tools.toml\") overlaps \".x/a\" claimed by tool \"b\" (built-in defaults \"default-tools.toml\"); one would shadow the other"
         );
     }
@@ -3796,8 +4799,8 @@ mod tests {
             .user("[[tools]]\nname = \"t\"\ncommand = \"t\"\ninteractive_shell = false\n");
         let a = omitted.load().unwrap();
         let b = explicit_false.load().unwrap();
-        assert!(!a.resolved().as_slice()[0].is_interactive_shell());
-        assert!(a.resolved().as_slice()[0].same_definition(&b.resolved().as_slice()[0]));
+        assert!(!first_launch(&a).is_interactive_shell());
+        assert!(first_launch(&a).same_definition(first_launch(&b)));
         assert!(a.conflicts().is_empty());
 
         // A differing interactive_shell is a conflict, and is reported *last*
@@ -3816,7 +4819,7 @@ mod tests {
         );
         assert_eq!(ToolField::InteractiveShell.as_str(), "interactive_shell");
         // The user's definition (interactive_shell = false) wins.
-        assert!(!report.resolved().as_slice()[0].is_interactive_shell());
+        assert!(!first_launch(&report).is_interactive_shell());
     }
 
     #[test]
@@ -3829,8 +4832,11 @@ mod tests {
         );
         let a = omitted.load().unwrap();
         let b = explicit.load().unwrap();
-        let (left, right) = (a.resolved().as_slice(), b.resolved().as_slice());
-        assert!(left[0].same_definition(&right[0]));
+        let (left, right) = (
+            a.resolved().launch_tools().collect::<Vec<_>>(),
+            b.resolved().launch_tools().collect::<Vec<_>>(),
+        );
+        assert!(left[0].same_definition(right[0]));
     }
 
     // -- env --------------------------------------------------------------
@@ -3843,7 +4849,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nenv = { B = \"2\", A = \"1\" }\n");
         let report = fixture.load().unwrap();
-        let tool = &report.resolved().as_slice()[0];
+        let tool = first_launch(&report);
         let pairs: Vec<(&str, &str)> = tool
             .guest_env()
             .iter()
@@ -3855,7 +4861,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\n");
         let report = fixture.load().unwrap();
-        let tool = &report.resolved().as_slice()[0];
+        let tool = first_launch(&report);
         assert!(tool.guest_env().is_empty());
         assert_eq!(tool.env_count(), 0);
     }
@@ -4265,7 +5271,7 @@ mod tests {
             let report = fixture.load().unwrap_or_else(|error| {
                 panic!("{valid} should be valid: {error:#}");
             });
-            let tool = &report.resolved().as_slice()[0];
+            let tool = first_launch(&report);
             // Every declared name is carried forward for launch resolution,
             // whether or not a compiled-in provider claims it.
             assert_eq!(
@@ -4316,14 +5322,14 @@ mod tests {
         let fixture = Fixture::new();
         fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\"a\", \"b\"]\n");
         let report = fixture.load().unwrap();
-        assert_eq!(report.resolved().as_slice()[0].persist_count(), 2);
+        assert_eq!(first_launch(&report).persist_count(), 2);
 
         let fixture = Fixture::new();
         fixture.user(
             "[[tools]]\nname = \"t\"\ncommand = \"t\"\npersist = [\"./.cache//mytool/\", \"a..b\"]\n",
         );
         let report = fixture.load().unwrap();
-        let tool = &report.resolved().as_slice()[0];
+        let tool = first_launch(&report);
         assert_eq!(tool.persist[0].as_path(), Path::new(".cache/mytool"));
         assert_eq!(tool.persist[1].as_path(), Path::new("a..b"));
     }
@@ -4372,12 +5378,7 @@ mod tests {
                 "[[tools]]\nname = \"b\"\ncommand = \"b\"\n[[tools]]\nname = \"a\"\ncommand = \"a\"\n[[tools]]\nname = \"c\"\ncommand = \"c\"\n",
             );
         let report = fixture.load().unwrap();
-        let names: Vec<_> = report
-            .resolved()
-            .as_slice()
-            .iter()
-            .map(Tool::name)
-            .collect();
+        let names: Vec<_> = report.resolved().launch_tools().map(Tool::name).collect();
         assert_eq!(names, ["z", "a", "b", "c"]);
     }
 
@@ -4387,7 +5388,7 @@ mod tests {
         fixture.user(&one_tool("dup")).project(&one_tool("dup"));
         let report = fixture.load().unwrap();
         assert!(report.conflicts().is_empty());
-        let tools = report.resolved().as_slice();
+        let tools: Vec<&Tool> = report.resolved().launch_tools().collect();
         assert_eq!(tools.len(), 1);
         // The winner keeps user provenance.
         assert_eq!(tools[0].origin(), &ToolOrigin::User(fixture.user.clone()));
@@ -4430,9 +5431,9 @@ mod tests {
             assert_eq!(conflicts.len(), 1, "case {expected:?}");
             assert_eq!(conflicts[0].fields(), &[expected]);
             // User definition (whole) wins.
-            assert_eq!(report.resolved().as_slice().len(), 1);
+            assert_eq!(report.resolved().launch_tools().len(), 1);
             assert_eq!(
-                report.resolved().as_slice()[0].origin(),
+                first_launch(&report).origin(),
                 &ToolOrigin::User(fixture.user.clone())
             );
         }
@@ -4547,7 +5548,7 @@ mod tests {
             .user("[[tools]]\nname = \"dup\"\ncommand = \"dup\"\npersist = [\"p\"]\n[[tools]]\nname = \"other\"\ncommand = \"other\"\npersist = [\"shared/x\"]\n")
             .project("[[tools]]\nname = \"dup\"\ncommand = \"dup-different\"\npersist = [\"shared/x\"]\n");
         let report = fixture.load().unwrap();
-        assert_eq!(report.resolved().as_slice().len(), 2);
+        assert_eq!(report.resolved().launch_tools().len(), 2);
     }
 
     #[test]
@@ -4744,18 +5745,6 @@ mod tests {
     /// traversal order, and a cycle is a fixed point.
     #[test]
     fn persist_paths_fold_over_the_closure_in_catalog_order() {
-        let persist_of = |catalog: &LaunchCatalog, name: &str| -> Vec<String> {
-            catalog
-                .as_slice()
-                .iter()
-                .find(|entry| entry.tool().name() == name)
-                .unwrap_or_else(|| panic!("{name} missing"))
-                .persist()
-                .iter()
-                .map(|path| path.as_path().to_string_lossy().into_owned())
-                .collect()
-        };
-
         let fixture = Fixture::new();
         fixture.user(
             "[[tools]]\nname = \"a\"\ncommand = \"a\"\npersist = [\"x\"]\n\
@@ -5034,13 +6023,13 @@ mod tests {
                     expected.push(name.clone());
                 }
             }
-            let actual: Vec<String> = report.resolved().as_slice().iter().map(|t| t.name().to_string()).collect();
+            let actual: Vec<String> = report.resolved().launch_tools().map(|t| t.name().to_string()).collect();
             proptest::prop_assert_eq!(actual, expected);
 
             // Every overlap's definition must equal the user's.
             for name in &unique_user {
                 if unique_project.contains(name) {
-                    let tool = report.resolved().as_slice().iter().find(|t| t.name() == name).unwrap();
+                    let tool = report.resolved().launch_tools().find(|t| t.name() == name).unwrap();
                     proptest::prop_assert_eq!(tool.command(), &format!("user-{name}"));
                 }
             }
@@ -5056,7 +6045,7 @@ mod tests {
             let fixture = Fixture::new();
             fixture.user(&body).project(&body);
             let report = fixture.load().unwrap();
-            let actual: Vec<String> = report.resolved().as_slice().iter().map(|t| t.name().to_string()).collect();
+            let actual: Vec<String> = report.resolved().launch_tools().map(|t| t.name().to_string()).collect();
             proptest::prop_assert_eq!(actual, unique);
             proptest::prop_assert!(report.conflicts().is_empty());
         }
@@ -5173,6 +6162,290 @@ mod tests {
             proptest::prop_assert_eq!(provisioned_set(&catalog, "t1"), union);
         }
 
+        /// **P1.** The scoped fixed point against an independent
+        /// relation-saturation oracle. The generator duplicates every name across
+        /// the tiers and may point any edge at a same-named definition, so a
+        /// bare-name index, a winners-only arena, a wildcard over visible verbs,
+        /// a shallow fold or a duplicate contribution through a cycle all change
+        /// the result.
+        #[test]
+        fn scoped_fixed_point_matches_a_saturation_oracle(
+            user in proptest::collection::vec(generated_definition(), 1..5),
+            project in proptest::collection::vec(generated_definition(), 0..5),
+        ) {
+            let user: Vec<GeneratedDefinition> = user.into_iter().collect();
+            let project: Vec<GeneratedDefinition> = project.into_iter().collect();
+            let fixture = Fixture::new();
+            fixture.user(&render_tier('u', &user));
+            if !project.is_empty() {
+                fixture.project(&render_tier('p', &project));
+            }
+            let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+
+            let user_reach = saturation_reach(&user);
+            let project_reach = saturation_reach(&project);
+
+            let mut verbs: Vec<String> = (0..user.len()).map(|index| format!("t{index}")).collect();
+            for index in user.len()..project.len() {
+                verbs.push(format!("t{index}"));
+            }
+            verbs.push("shell".to_string());
+            proptest::prop_assert_eq!(verbs_of(&catalog), verbs);
+
+            for (index, reach) in user_reach.iter().enumerate() {
+                let name = format!("t{index}");
+                let (providers, names, persist) = expected_facets('u', &user, reach);
+                proptest::prop_assert_eq!(
+                    provisioned_set(&catalog, &name),
+                    providers,
+                    "user {}",
+                    name
+                );
+                proptest::prop_assert_eq!(
+                    names_of(&catalog, &name).into_iter().collect::<BTreeSet<_>>(),
+                    names,
+                    "user {} requested names",
+                    name
+                );
+                proptest::prop_assert_eq!(persist_of(&catalog, &name), persist, "user {}", name);
+            }
+            for (index, reach) in project_reach.iter().enumerate().skip(user.len()) {
+                let name = format!("t{index}");
+                let (providers, names, persist) = expected_facets('p', &project, reach);
+                proptest::prop_assert_eq!(
+                    provisioned_set(&catalog, &name),
+                    providers,
+                    "project {}",
+                    name
+                );
+                proptest::prop_assert_eq!(
+                    names_of(&catalog, &name).into_iter().collect::<BTreeSet<_>>(),
+                    names,
+                    "project {} requested names",
+                    name
+                );
+                proptest::prop_assert_eq!(persist_of(&catalog, &name), persist, "project {}", name);
+            }
+        }
+
+        /// **P2.** Arbitrary user definitions that shadow *every* project dependency
+        /// name cannot change a still-winning project root's facets, and a user
+        /// wildcard reaches only this tier's definitions.
+        #[test]
+        fn shadowing_project_names_cannot_change_a_winning_project_root(
+            dependencies in proptest::collection::vec(
+                (
+                    proptest::collection::vec(0u8..4, 0..3),
+                    proptest::collection::vec(0usize..4, 0..3),
+                ),
+                1..5,
+            ),
+            first_user in proptest::collection::vec(0u8..4, 0..3),
+            second_user in proptest::collection::vec(0u8..4, 0..3),
+        ) {
+            // `t0..t{n-1}` are the dependencies; `t{n}` is the root that names the
+            // first one. Every user definition shadows one dependency name, and the
+            // root's own name stays free, so the project root stays a verb.
+            let n = dependencies.len();
+            let mut project: Vec<GeneratedDefinition> = dependencies
+                .iter()
+                .map(|(providers, edges)| GeneratedDefinition {
+                    providers: providers.clone(),
+                    edges: edges.iter().map(|edge| edge % (n + 1)).collect(),
+                    wildcard: false,
+                })
+                .collect();
+            project.push(GeneratedDefinition {
+                providers: Vec::new(),
+                edges: vec![0],
+                wildcard: false,
+            });
+            let root_name = format!("t{n}");
+            let project_body = render_tier('p', &project);
+            let root_reach = saturation_reach(&project)[n].clone();
+            let expected = expected_facets('p', &project, &root_reach);
+
+            for (variant, credentials, wildcard) in [
+                ("plain", &first_user, false),
+                ("wildcard", &second_user, true),
+            ] {
+                let user: Vec<GeneratedDefinition> = (0..n)
+                    .map(|index| GeneratedDefinition {
+                        providers: credentials.clone(),
+                        edges: vec![0],
+                        // One variant makes the first user definition a wildcard, so
+                        // the check also proves the wildcard cannot reach the other
+                        // tier even when it covers this one.
+                        wildcard: wildcard && index == 0,
+                    })
+                    .collect();
+                let fixture = Fixture::new();
+                fixture
+                    .user(&render_tier('u', &user))
+                    .project(&project_body);
+                let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+                proptest::prop_assert_eq!(
+                    provisioned_set(&catalog, &root_name),
+                    expected.0.clone(),
+                    "{} providers",
+                    variant
+                );
+                proptest::prop_assert_eq!(
+                    names_of(&catalog, &root_name)
+                        .into_iter()
+                        .collect::<BTreeSet<_>>(),
+                    expected.1.clone(),
+                    "{} names",
+                    variant
+                );
+                proptest::prop_assert_eq!(
+                    persist_of(&catalog, &root_name),
+                    expected.2.clone(),
+                    "{} paths",
+                    variant
+                );
+                if wildcard {
+                    let (providers, _, persist) =
+                        expected_facets('u', &user, &saturation_reach(&user)[0]);
+                    proptest::prop_assert_eq!(provisioned_set(&catalog, "t0"), providers);
+                    proptest::prop_assert_eq!(persist_of(&catalog, "t0"), persist);
+                }
+            }
+        }
+
+        /// **P2b.** A declared `shell`'s omitted `tools` is exactly its own tier's
+        /// declared union; an explicit `[]` is its own definition only. A project
+        /// declaration of the same name is a shadowed target, not something the
+        /// user wildcard sweeps in.
+        #[test]
+        fn declared_shell_wildcard_is_its_own_tier_union(
+            credentials in proptest::collection::vec(proptest::collection::vec(0u8..4, 0..3), 2..5),
+            empty in proptest::bool::ANY,
+        ) {
+            let mut body = String::new();
+            for (index, providers) in credentials.iter().enumerate() {
+                let name = if index == 0 {
+                    "shell".to_string()
+                } else {
+                    format!("t{index}")
+                };
+                body.push_str(&format!(
+                    "[[tools]]\nname = \"{name}\"\ncommand = \"{name}\"\npersist = [\"u-path-{index}\"]\n"
+                ));
+                if index == 0 && empty {
+                    body.push_str("tools = []\n");
+                }
+                let names: Vec<String> = providers
+                    .iter()
+                    .map(|provider| format!("\"{}\"", provider_from_u8(*provider).config_name()))
+                    .collect();
+                if !names.is_empty() {
+                    body.push_str(&format!("credentials = [{}]\n", names.join(", ")));
+                }
+            }
+            let fixture = Fixture::new();
+            fixture
+                .user(&body)
+                .project("[[tools]]\nname = \"sibling\"\ncommand = \"project-sibling\"\ncredentials = [\"copilot\"]\npersist = [\"p-path-0\"]\n");
+            let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+
+            let mut provisioned = BTreeSet::new();
+            let mut persist = Vec::new();
+            for (index, providers) in credentials.iter().enumerate() {
+                if empty && index != 0 {
+                    continue;
+                }
+                for provider in providers {
+                    provisioned.insert(provider_from_u8(*provider));
+                }
+                persist.push(format!("u-path-{index}"));
+            }
+            proptest::prop_assert_eq!(provisioned_set(&catalog, "shell"), provisioned);
+            proptest::prop_assert_eq!(persist_of(&catalog, "shell"), persist);
+            proptest::prop_assert!(!catalog.has_shell_fallback());
+        }
+
+        /// **P3.** A locally absent target that only the other tier declares is a
+        /// config error, never an empty success or that other definition's facets.
+        /// Redeclaring the target and its local graph in the referencing tier
+        /// succeeds with the tier-local closure, cycles included.
+        #[test]
+        fn locally_absent_targets_fail_until_redeclared_locally(
+            specs in proptest::collection::vec(generated_definition(), 1..5),
+        ) {
+            let definitions: Vec<GeneratedDefinition> = specs.into_iter().collect();
+
+            // The user tier references a project-only `t0`.
+            let fixture = Fixture::new();
+            fixture
+                .user("[[tools]]\nname = \"root\"\ncommand = \"root\"\ntools = [\"t0\"]\n")
+                .project(&render_tier('p', &definitions));
+            let error = format!(
+                "{:#}",
+                fixture.load().unwrap().into_launch_catalog().unwrap_err()
+            );
+            proptest::prop_assert!(
+                error.contains("names no tool in this configuration file"),
+                "{}",
+                error
+            );
+            proptest::prop_assert!(
+                error.contains(&crate::one_line::quoted_path(&fixture.user).to_string()),
+                "{}",
+                error
+            );
+
+            proptest::prop_assert!(
+                error.contains(&format!(
+                    "it is declared in project config {}",
+                    crate::one_line::quoted_path(&fixture.project)
+                )),
+                "a name the other tier declares is a cross-tier reference: {}",
+                error
+            );
+
+            // The project tier references a user-only `t0`.
+            let fixture = Fixture::new();
+            fixture
+                .user(&render_tier('u', &definitions))
+                .project("[[tools]]\nname = \"root\"\ncommand = \"root\"\ntools = [\"t0\"]\n");
+            let error = format!(
+                "{:#}",
+                fixture.load().unwrap().into_launch_catalog().unwrap_err()
+            );
+            proptest::prop_assert!(
+                error.contains("names no tool in this configuration file"),
+                "{}",
+                error
+            );
+            proptest::prop_assert!(
+                error.contains(&crate::one_line::quoted_path(&fixture.project).to_string()),
+                "{}",
+                error
+            );
+            proptest::prop_assert!(
+                error.contains(&format!(
+                    "it is declared in user config {}",
+                    crate::one_line::quoted_path(&fixture.user)
+                )),
+                "a name the other tier declares is a cross-tier reference: {}",
+                error
+            );
+
+            // Redeclared locally, the same graph resolves to exactly the oracle's
+            // tier-local closure.
+            let fixture = Fixture::new();
+            fixture.user(&format!(
+                "[[tools]]\nname = \"root\"\ncommand = \"root\"\ntools = [\"t0\"]\n{}",
+                render_tier('u', &definitions)
+            ));
+            let catalog = fixture.load().unwrap().into_launch_catalog().unwrap();
+            let (providers, _, persist) =
+                expected_facets('u', &definitions, &saturation_reach(&definitions)[0]);
+            proptest::prop_assert_eq!(provisioned_set(&catalog, "root"), providers);
+            proptest::prop_assert_eq!(persist_of(&catalog, "root"), persist);
+        }
+
         /// **V1 (the erased-build half).** The overlap predicate is symmetric,
         /// and `overlap(a, b)` holds iff `a`'s components are a prefix of
         /// `b`'s (or vice versa) — restated over `Vec<String>` components, an
@@ -5253,6 +6526,121 @@ mod tests {
         }
     }
 
+    /// One generated definition for the scoped-reference properties. `edges` holds
+    /// *local* indices; both tiers use the same `t0..` names, so a bare-name index
+    /// would silently bind an edge to the other tier's definition.
+    #[derive(Debug, Clone)]
+    struct GeneratedDefinition {
+        providers: Vec<u8>,
+        edges: Vec<usize>,
+        wildcard: bool,
+    }
+
+    fn generated_definition() -> impl proptest::strategy::Strategy<Value = GeneratedDefinition> {
+        use proptest::strategy::Strategy as _;
+        (
+            proptest::collection::vec(0u8..4, 0..3),
+            proptest::collection::vec(0usize..5, 0..3),
+            proptest::bool::ANY,
+        )
+            .prop_map(|(providers, edges, wildcard)| GeneratedDefinition {
+                providers,
+                edges,
+                wildcard,
+            })
+    }
+
+    /// Render one generated tier as TOML. `tier` is the letter distinguishing the
+    /// tiers' service names and persisted paths, so a wrong-tier facet is visible
+    /// in the assertion rather than coincidentally equal.
+    fn render_tier(tier: char, definitions: &[GeneratedDefinition]) -> String {
+        let count = definitions.len();
+        let mut body = String::new();
+        for (index, definition) in definitions.iter().enumerate() {
+            body.push_str("[[tools]]\n");
+            body.push_str(&format!(
+                "name = \"t{index}\"\ncommand = \"{tier}-t{index}\"\n"
+            ));
+            let mut names: Vec<String> = definition
+                .providers
+                .iter()
+                .map(|provider| format!("\"{}\"", provider_from_u8(*provider).config_name()))
+                .collect();
+            names.dedup();
+            names.push(format!("\"{tier}-service-{index}\""));
+            body.push_str(&format!("credentials = [{}]\n", names.join(", ")));
+            body.push_str(&format!("persist = [\"{tier}-path-{index}\"]\n"));
+            if definition.wildcard {
+                body.push_str("tools = [\"*\"]\n");
+            } else if !definition.edges.is_empty() {
+                let edges: Vec<String> = definition
+                    .edges
+                    .iter()
+                    .map(|edge| format!("\"t{}\"", edge % count))
+                    .collect();
+                body.push_str(&format!("tools = [{}]\n", edges.join(", ")));
+            }
+        }
+        body
+    }
+
+    /// Every definition's tier-local reachable set, by *saturating* the edge
+    /// relation until a round adds nothing — an independent re-derivation that
+    /// never shares the production traversal.
+    fn saturation_reach(definitions: &[GeneratedDefinition]) -> Vec<Vec<usize>> {
+        let count = definitions.len();
+        (0..count)
+            .map(|start| {
+                let mut reached = vec![false; count];
+                reached[start] = true;
+                loop {
+                    let mut grew = false;
+                    for (index, definition) in definitions.iter().enumerate() {
+                        if !reached[index] {
+                            continue;
+                        }
+                        let targets: Vec<usize> = if definition.wildcard {
+                            (0..count).collect()
+                        } else {
+                            definition.edges.iter().map(|edge| edge % count).collect()
+                        };
+                        for target in targets {
+                            if !reached[target] {
+                                reached[target] = true;
+                                grew = true;
+                            }
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+                (0..count).filter(|index| reached[*index]).collect()
+            })
+            .collect()
+    }
+
+    /// The facets one tier-local closure must produce, folded in index (= arena)
+    /// order.
+    fn expected_facets(
+        tier: char,
+        definitions: &[GeneratedDefinition],
+        reached: &[usize],
+    ) -> (BTreeSet<CredentialProvider>, BTreeSet<String>, Vec<String>) {
+        let mut providers = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        let mut persist = Vec::new();
+        for index in reached {
+            for provider in &definitions[*index].providers {
+                providers.insert(provider_from_u8(*provider));
+                names.insert(provider_from_u8(*provider).config_name().to_string());
+            }
+            names.insert(format!("{tier}-service-{index}"));
+            persist.push(format!("{tier}-path-{index}"));
+        }
+        (providers, names, persist)
+    }
+
     /// `a`'s components are a prefix of `b`'s (component-wise), the independent
     /// re-derivation of `guest_paths_overlap` the proptest compares against.
     fn component_prefix(a: &[String], b: &[String]) -> bool {
@@ -5279,7 +6667,7 @@ mod tests {
                 f.project(body);
             }
             assert_eq!(
-                f.load().unwrap().resolved().as_slice()[0]
+                first_launch(&f.load().unwrap())
                     .network_requests()
                     .bounded_display(),
                 "a.example,b.example"
@@ -5326,13 +6714,9 @@ mod tests {
             report.conflicts()[0].fields(),
             &[ToolField::NetworkRequests]
         );
-        assert!(
-            report.resolved().as_slice()[0]
-                .network_requests()
-                .is_empty()
-        );
+        assert!(first_launch(&report).network_requests().is_empty());
         assert_eq!(
-            report.resolved().as_slice()[0].origin(),
+            first_launch(&report).origin(),
             &ToolOrigin::User(f.user.clone())
         );
         f.project(
