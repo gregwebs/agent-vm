@@ -1285,14 +1285,17 @@ fn undo_instruction(report: &str) -> &str {
 /// catches operand reversal, display escaping reused as argv, and substitution at
 /// once. Bash is the supported paste dialect (USAGE.md); `$'…'` is not promised
 /// for dash or fish.
-fn reset_then_undo_in_bash(h: &Harness) -> String {
+///
+/// `reset` runs `doctor --reset-msb-db` however the case needs to spell it — a
+/// relative `AGENT_VM_STATE_DIR`, or a cwd of its own (#433).
+fn reset_then_undo_in_bash_with(h: &Harness, reset: impl FnOnce() -> Output) -> String {
     let msb_home = h.state_root.join("msb-home");
     let db = msb_home.join("db");
     std::fs::create_dir_all(&db).unwrap();
     std::fs::write(db.join("msb.db"), DB_BYTES).unwrap();
     std::fs::write(db.join("msb.db-wal"), DB_WAL_BYTES).unwrap();
 
-    let out = h.run_doctor_reset();
+    let out = reset();
     assert_success(&out);
     let report = stdout_of(&out);
 
@@ -1305,11 +1308,14 @@ fn reset_then_undo_in_bash(h: &Harness) -> String {
     );
 
     let instruction = undo_instruction(&report).to_owned();
+    // Pasted later, from a terminal whose cwd is not doctor's (#433) — so the
+    // instruction is run from one it has never seen.
+    let elsewhere = tempfile::tempdir_in("/tmp").unwrap();
     let undo = Command::new("bash")
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", &h.home_root)
-        .current_dir(&h.project_root)
+        .current_dir(elsewhere.path())
         .args(["-c", &instruction])
         .output()
         .expect("bash must be on PATH for this test");
@@ -1329,12 +1335,19 @@ fn reset_then_undo_in_bash(h: &Harness) -> String {
     assert_eq!(std::fs::read(db.join("msb.db-wal")).unwrap(), DB_WAL_BYTES);
     assert!(!backup.exists(), "the backup survived the undo: {backup:?}");
     for marker in ["INJECTED", "BACKTICKED"] {
+        // In the directory Bash ran in: a substitution's `touch` lands there, not
+        // where doctor ran.
         assert!(
-            !h.project_root.join(marker).exists(),
+            !elsewhere.path().join(marker).exists(),
             "the undo instruction ran a substitution and created {marker}"
         );
     }
     report
+}
+
+/// The ordinary case: doctor runs where the harness points it.
+fn reset_then_undo_in_bash(h: &Harness) -> String {
+    reset_then_undo_in_bash_with(h, || h.run_doctor_reset())
 }
 
 /// A report whose only physical lines are doctor's own, so an operator can read
@@ -1400,6 +1413,40 @@ fn the_reset_undo_distinguishes_a_literal_backslash_from_a_control_byte() {
     let lines = assert_five_line_reset_report(&report);
     let from = lines[1].trim_start_matches("from: ");
     assert!(from.contains("x0aFORGED-STATE"), "from: {from:?}");
+}
+
+/// `AGENT_VM_STATE_DIR` may be spelled relative to doctor's cwd, which used to
+/// leave the printed undo correct only in that one directory (#433). The
+/// instruction exists to be pasted later, elsewhere, so every path the report
+/// names is absolute and it reverses the move from any directory.
+#[test]
+fn a_relative_state_dir_still_prints_an_undo_that_works_from_elsewhere() {
+    let h = Harness::new();
+    // The state root is a child of the directory doctor runs in, named relatively.
+    let cwd = h.state_root.parent().unwrap().to_path_buf();
+    let leaf = h.state_root.file_name().unwrap().to_owned();
+    // Canonicalized, because a symlinked `/tmp` or `/var` makes the fixture's own
+    // spelling differ from the one `getcwd` resolves.
+    let db_absolute = cwd.canonicalize().unwrap().join(&leaf).join("msb-home/db");
+
+    let report = reset_then_undo_in_bash_with(&h, || {
+        h.base_command()
+            .env("AGENT_VM_STATE_DIR", &leaf)
+            .current_dir(&cwd)
+            .args(["doctor", "--reset-msb-db"])
+            .output()
+            .expect("failed to run agent-vm doctor --reset-msb-db")
+    });
+
+    let from = report
+        .lines()
+        .find_map(|line| line.strip_prefix("from: "))
+        .unwrap_or_else(|| panic!("no `from:` line in:\n{report}"));
+    assert_eq!(
+        Path::new(from),
+        db_absolute,
+        "the report named the state root as spelled, not the directory it moved:\n{report}"
+    );
 }
 
 /// Whether this filesystem can hold a directory name that is not valid UTF-8.
