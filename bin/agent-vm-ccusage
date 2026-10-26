@@ -5,11 +5,58 @@
 # one summary.
 #
 # Mirrors the original Bash agent-vm's `bin/ccusage` 1:1 but resolves
-# the state root from the same precedence the Rust launcher uses.
+# the state root from the same precedence *and rules* the Rust launcher
+# uses (crates/agent-vm/src/host_paths.rs, ADR-0050): $HOME must be
+# absolute and non-empty, a relative AGENT_VM_STATE_DIR is refused, and a
+# relative XDG_STATE_HOME is ignored with a note naming the root used.
 
 set -euo pipefail
 
-state_root="${AGENT_VM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-vm}"
+# One-line, printable rendering of a value this script did not choose, so a
+# newline or ESC byte in the environment cannot forge a second diagnostic line
+# or move the terminal (the launcher uses one_line::quoted_path for the same).
+render() {
+  printf '%q' "$1"
+}
+
+die() {
+  printf 'agent-vm-ccusage: %s\n' "$*" >&2
+  exit 2
+}
+
+# $HOME's discipline, shared with the launcher's config::host_home_dir: unset,
+# set-but-empty and relative are all errors, because every fallback below is
+# built from it and a relative one would make the state root cwd-dependent.
+if [ -z "${HOME+set}" ]; then
+  die "HOME is not set; cannot locate the state root"
+fi
+if [ -z "$HOME" ]; then
+  die "HOME is set but empty; cannot locate the state root"
+fi
+case "$HOME" in
+  /*) ;;
+  *) die "HOME $(render "$HOME") is not an absolute path" ;;
+esac
+
+if [ -n "${AGENT_VM_STATE_DIR+set}" ]; then
+  case "$AGENT_VM_STATE_DIR" in
+    /*) state_root="$AGENT_VM_STATE_DIR" ;;
+    *)
+      die "AGENT_VM_STATE_DIR $(render "$AGENT_VM_STATE_DIR") is not an absolute path; set it to an absolute directory, or unset it to use the default"
+      ;;
+  esac
+elif [ -n "${XDG_STATE_HOME+set}" ]; then
+  case "$XDG_STATE_HOME" in
+    /*) state_root="$XDG_STATE_HOME/agent-vm" ;;
+    *)
+      state_root="$HOME/.local/state/agent-vm"
+      printf 'agent-vm-ccusage: ignoring XDG_STATE_HOME %s because it is not an absolute path; using the state root %s\n' \
+        "$(render "$XDG_STATE_HOME")" "$(render "$state_root")" >&2
+      ;;
+  esac
+else
+  state_root="$HOME/.local/state/agent-vm"
+fi
 
 # Each per-project state dir has the Claude session history under
 # <hash>/claude (which is symlinked into the guest as ~/.claude).
@@ -21,9 +68,10 @@ if [ -d "$state_root" ]; then
   while IFS= read -r -d '' dir; do
     # Refuse to add a path that contains a comma — CLAUDE_CONFIG_DIR
     # has no escape mechanism and silently mis-tokenizes; better to
-    # skip than to merge directories the user didn't ask for.
+    # skip than to merge directories the user didn't ask for. The path is
+    # measured, so it is rendered rather than interpolated raw.
     case "$dir" in
-      *,*) echo "agent-vm-ccusage: skipping $dir (contains ',', breaks CLAUDE_CONFIG_DIR)" >&2;;
+      *,*) printf 'agent-vm-ccusage: skipping %s (contains a comma, which CLAUDE_CONFIG_DIR cannot escape)\n' "$(render "$dir")" >&2;;
       *)   paths="$paths,$dir";;
     esac
   done < <(find "$state_root" -maxdepth 2 -type d -name claude -print0 2>/dev/null)

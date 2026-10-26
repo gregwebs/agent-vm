@@ -204,10 +204,10 @@ impl GuestHome {
 /// from [`GuestHome::new`]'s empty/invalid messages) before delegating
 /// the rest of validation to [`GuestHome::new`].
 ///
-/// Deliberately **not** a reuse of `session::state_root`'s own `$HOME`
-/// read (`session.rs:225`): that one is a fallback for the *session
-/// state root* (`~/.local/state/agent-vm`) and has nothing to do with
-/// guest identity mirroring.
+/// Deliberately **not** a reuse of [`crate::host_paths::state_root`]'s
+/// `$HOME` fallback: that one locates the *session state root*
+/// (`~/.local/state/agent-vm`) and has nothing to do with guest identity
+/// mirroring.
 fn host_home_from_env(env_val: Option<String>) -> Result<GuestHome> {
     let raw = env_val.context(
         "$HOME is not set — required in non-root mode to mirror the guest's \

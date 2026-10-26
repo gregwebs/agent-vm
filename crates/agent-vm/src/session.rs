@@ -53,7 +53,12 @@ impl ProjectSession {
 
     fn for_dir(project_dir: PathBuf) -> Result<Self> {
         let project_hash = hash_path(&project_dir);
-        let state_dir = state_root()?.join(&project_hash);
+        // One state-root rule, in `host_paths`: absolute, or an error naming
+        // the value (#437). The hash is over the canonical project dir, so the
+        // root being absolute is what makes `state_dir` cwd-independent.
+        let state_dir = crate::host_paths::state_root()?
+            .context("no $HOME set")?
+            .join(&project_hash);
         // Per-launch PID suffix so two concurrent invocations in the same
         // project boot independent sandboxes (the first one stays alive
         // instead of being SIGTERMed by the second's create()). The PID
@@ -462,17 +467,6 @@ fn force_symlink(target: &str, link: &Path) -> Result<()> {
 /// populated legacy `<state>/home/.pi` must not both `rename` it: the loser
 /// would otherwise fail with ENOENT or mis-report "two populated homes".
 const MIGRATION_LOCK: &str = ".pi-migration.lock";
-
-fn state_root() -> Result<PathBuf> {
-    if let Some(dir) = env::var_os("AGENT_VM_STATE_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    if let Some(dir) = env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(dir).join("agent-vm"));
-    }
-    let home = env::var_os("HOME").context("no $HOME set")?;
-    Ok(PathBuf::from(home).join(".local/state/agent-vm"))
-}
 
 /// 12-hex-char prefix of SHA256(canonical_path). Short enough to keep sandbox
 /// names readable; long enough that two project dirs are very unlikely to

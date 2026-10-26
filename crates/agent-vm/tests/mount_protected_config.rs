@@ -391,58 +391,55 @@ fn m8_missing_guest_home_and_state_planting_prevented() {
         assert!(!text.contains("[debug] sandbox config JSON:"));
     }
 }
-fn relative_run(h: &Harness, project: &Path, state: &Path) -> Output {
-    h.seed_image_at_state_from(state, project);
+/// A relative `AGENT_VM_STATE_DIR` used to be anchored at the launch directory,
+/// so this guard measured the cwd-joined spelling of the state root. The root is
+/// now refused at construction (#437, ADR-0050), before any launch work: the
+/// refusal names the variable and the value, and the guard never runs.
+#[test]
+fn m9_relative_state_root_is_refused_before_the_guard() {
+    use std::os::unix::fs::symlink;
+    let h = Harness::new();
+    let project = h.project.path().join("code/proj");
+    std::fs::create_dir_all(&project).unwrap();
+    // Layout that *would* trip the exposure guard: the guest home's `.config`
+    // resolves into the state root. If the guard ran before the root was
+    // validated it would have this to report.
+    let state = h.project.path().join("rel-state");
+    std::fs::create_dir_all(state.join(hash_project(&project)).join("home")).unwrap();
+    symlink(
+        state.join(hash_project(&project)).join("home/.config"),
+        h.home_path().join(".config"),
+    )
+    .unwrap();
+
     let mut cmd = Command::new(agent_vm_bin());
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", h.home.path())
-        .env("AGENT_VM_STATE_DIR", state)
+        .env("AGENT_VM_STATE_DIR", "../../rel-state")
         .env("MSB_PATH", &h.fake_msb)
         .env("AGENT_VM_DEBUG_CONFIG", "1")
-        .current_dir(project)
+        .current_dir(&project)
         .args(["--no-git", "--image", &h.image, "shell"]);
-    run_with_timeout(cmd, Duration::from_secs(15))
-}
-#[test]
-fn m9_relative_state_safe_and_exposing() {
-    use std::os::unix::fs::symlink;
-    for exposing in [false, true] {
-        let h = Harness::new();
-        let project = h.project.path().join("code/proj");
-        std::fs::create_dir_all(&project).unwrap();
-        let state = h.project.path().join("rel-state");
-        if exposing {
-            symlink(
-                state.join(hash_project(&project)).join("home/.config"),
-                h.home_path().join(".config"),
-            )
-            .unwrap();
-        }
-        let out = relative_run(&h, &project, Path::new("../../rel-state"));
-        if exposing {
-            let text = stderr_of(&out);
-            assert!(text.contains("does not exist yet"), "{text}");
-            let joined = project
-                .canonicalize()
-                .unwrap()
-                .join("../../rel-state")
-                .join(hash_project(&project))
-                .join("home");
-            assert!(text.contains("guest home bind"), "{text}");
-            assert!(
-                text.contains(&format!("\"{}\"", joined.display())),
-                "{text}"
-            );
-            assert!(!text.contains("[debug] sandbox config JSON:"));
-            // The fixture import seeded the state root itself; what a refusal
-            // must not create is this project's session state.
-            assert!(!state.join(hash_project(&project)).exists());
-        } else {
-            reached(out);
-        }
+    let out = run_with_timeout(cmd, Duration::from_secs(15));
+
+    assert!(!out.status.success(), "a relative state root was accepted");
+    assert!(
+        out.stdout.is_empty(),
+        "the launch got as far as writing a report: {out:?}"
+    );
+    let text = stderr_of(&out);
+    assert!(text.contains("AGENT_VM_STATE_DIR"), "{text}");
+    assert!(text.contains("../../rel-state"), "{text}");
+    assert!(text.contains("not an absolute path"), "{text}");
+    for later in ["guest home bind", "[debug]", "==> "] {
+        assert!(
+            !text.contains(later),
+            "the guard or launch ran before the root was refused ({later}):\n{text}"
+        );
     }
 }
+
 #[test]
 fn m10_case_variant_first_launch_never_plants_authority() {
     use std::os::unix::fs::{MetadataExt, symlink};

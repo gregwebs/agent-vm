@@ -807,8 +807,12 @@ pub fn discover_host_git_identity() -> Option<HostGitIdentity> {
 const GIT_IDENTITY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 fn identity_cache_path() -> Option<PathBuf> {
+    // A misconfigured state root fails the launch before this cache is read, so
+    // `ok()?` here only means "do not cache the identity this time".
     Some(
-        crate::host_paths::state_root()?
+        crate::host_paths::state_root()
+            .ok()
+            .flatten()?
             .join("cache")
             .join("host-git-identity"),
     )

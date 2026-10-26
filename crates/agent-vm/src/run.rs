@@ -837,9 +837,9 @@ pub(crate) async fn launch(
     // Core binds carry no follow opt-in, so a symlink in a configured state
     // root (or guest HOME) must not reach the runtime unresolved. Now that
     // provisioning has created the state root and `home`, resolve each core
-    // source once. `session.state_root()` deliberately accepts env spelling,
-    // and guest HOME's source is `<state_dir>/home`, so both can traverse a
-    // symlinked ancestor until this step.
+    // source once. The state root is absolute but may traverse a symlinked
+    // ancestor, and guest HOME's source is `<state_dir>/home`, so both are
+    // resolved here rather than assumed literal.
     for volume in &mut core_volumes {
         volume.host_path = volume.host_path.canonicalize().with_context(|| {
             format!(

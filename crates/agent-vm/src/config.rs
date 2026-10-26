@@ -113,6 +113,7 @@ use crate::user_network::{self, UserNetwork};
 use crate::network_requests::{NetworkRequests, RequestTier};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    ffi::OsStr,
     fmt,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -1236,10 +1237,18 @@ fn discover_home() -> Result<Option<PathBuf>> {
 /// `$HOME` as an absolute, non-empty path, or `None` when it is unset. The
 /// single statement of agent-vm's `$HOME` discipline — a *set but empty* or
 /// *relative* `$HOME` is a hard error rather than a silently wrong location —
-/// shared by the user config path here and [`crate::secret_store`]'s inventory
-/// path. Callers add their own context naming what could not be located.
+/// shared by the user config path here, [`crate::secret_store`]'s inventory
+/// path and [`crate::host_paths::state_root`]'s default. Callers add their own
+/// context naming what could not be located.
 pub(crate) fn host_home_dir() -> Result<Option<PathBuf>> {
-    let Some(home) = std::env::var_os("HOME") else {
+    absolute_home_from(std::env::var_os("HOME").as_deref())
+}
+
+/// Pure core of [`host_home_dir`]: the discipline without the environment read,
+/// so [`crate::host_paths::state_root`] can apply the same rule to the value it
+/// already holds instead of restating it.
+pub(crate) fn absolute_home_from(home: Option<&OsStr>) -> Result<Option<PathBuf>> {
+    let Some(home) = home else {
         return Ok(None);
     };
     let home = PathBuf::from(home);

@@ -1641,6 +1641,7 @@ directories the user never asked for. The state-root precedence is in
 | Pi reaches host Codex through an image-owned provider | [ADR-0044](docs/adr/0044-pi-reaches-host-codex-through-an-image-owned-provider.md) |
 | Host-wide OCI image approval and pinned consumption (#390) | [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md) |
 | One dialect rule for a printed command (#434) | [ADR-0049](docs/adr/0049-one-dialect-rule-for-printed-commands.md) |
+| One rule for a relative state root (#437) | [ADR-0050](docs/adr/0050-one-rule-for-a-relative-state-root.md) |
 
 ## Deliberate non-goals
 
