@@ -29,6 +29,10 @@
 //! recreates it fresh at the bundled schema and re-pulls images on first
 //! boot.
 //!
+//! Every path the reset report names is absolute, resolved before the move: the
+//! undo line is pasted later, in whatever directory the operator is in, and
+//! `AGENT_VM_STATE_DIR` may be relative (#433).
+//!
 //! Historically this ahead-of-bundle condition surfaced as an opaque raw
 //! sea-orm error the first time any command opened the db. `src/msb_preflight.rs`
 //! (#30) now detects it up front on the boot path and the `agent-vm msb`
@@ -303,6 +307,17 @@ fn run_to(
         return Ok(());
     }
 
+    // The undo line is pasted later, in a terminal whose cwd is not necessarily
+    // this one, so `MSB_HOME` cannot keep a relative spelling: a relative
+    // `AGENT_VM_STATE_DIR`, `XDG_STATE_HOME` or `$HOME` can leave it relative
+    // (#433). `absolute` drops `.` components but folds no `..` and resolves no
+    // symlink, so the printed path names exactly the directory `mv` touches.
+    let msb_home = std::path::absolute(&msb_home).with_context(|| {
+        format!(
+            "making {} absolute so the reset report is cwd-independent",
+            crate::one_line::path(&msb_home)
+        )
+    })?;
     let ts = timestamp_suffix(SystemTime::now());
     let outcome = reset_msb_db_in(&msb_home, &ts)?;
     write_line(out, &render(&outcome))?;
