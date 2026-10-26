@@ -2096,7 +2096,7 @@ fn utf8_error(file: &Path) -> anyhow::Error {
 fn safe_anyhow_error(operation: &str, path: &Path, error: &anyhow::Error) -> anyhow::Error {
     let reasons = error
         .chain()
-        .map(|cause| crate::one_line::text(&cause.to_string()))
+        .map(|cause| crate::one_line::text(&cause.to_string()).to_string())
         .collect::<Vec<_>>()
         .join(": ");
     anyhow!(
@@ -2163,9 +2163,10 @@ fn escape_bytes(bytes: &[u8]) -> String {
 /// they named. The two are not interchangeable: the byte policy is for text a
 /// config file *chose* and a report may compare, and every path the reports and
 /// runtime messages converted so far render through [`crate::one_line`] (issues
-/// #410, #414, #420, #422). Not the whole crate: `host_paths`, `credential_yaml`,
-/// `clipboard`, `embedded_runtime` and others still interpolate `Path::display()`
-/// into their own error contexts, which is #419.
+/// #410, #414, #419, #420, #422). Not the whole crate: `clipboard`,
+/// `embedded_runtime`, `msb_install` and others still interpolate
+/// `Path::display()` into their own error contexts, and the ratchet in
+/// [`crate::one_line`] records how many each module has left.
 ///
 /// Two kinds of caller straddle the line on purpose. `mount::claim_clause` quotes
 /// both sides of a config-origin claim conflict through this function, so an argv
@@ -2221,7 +2222,7 @@ mod tests {
         f.project("[network]\nallow_lan = true\nallow_egress = [\"10.0.0.0/8\"]");
         let message = f.load().unwrap_err().to_string();
         for expected in [
-            crate::one_line::quoted_path(&f.project),
+            crate::one_line::quoted_path(&f.project).to_string(),
             "network.allow_lan".into(),
             "network.allow_egress".into(),
             "project config".into(),

@@ -367,7 +367,7 @@ impl Declaration<'_> {
     /// is the only way to reach it from a declaration's own bytes.
     fn spelling(self, spelling: &str) -> String {
         match self {
-            Self::Argv => crate::one_line::text(spelling),
+            Self::Argv => crate::one_line::text(spelling).to_string(),
             Self::UserConfig { .. } => quoted_str(spelling),
         }
     }
@@ -396,7 +396,7 @@ impl Declaration<'_> {
     /// diagnostics ADR-0018 pins stay byte-identical.
     fn host_path(self, path: &Path) -> String {
         match self {
-            Self::Argv => crate::one_line::path(path),
+            Self::Argv => crate::one_line::path(path).to_string(),
             Self::UserConfig { .. } => quoted_path(path),
         }
     }
@@ -414,7 +414,7 @@ impl Declaration<'_> {
     /// Exposed to [`crate::protected_host_files`], which owns the resolve step.
     pub(crate) fn fork_root(self, path: &Path) -> String {
         match self {
-            Self::Argv => crate::one_line::path(path),
+            Self::Argv => crate::one_line::path(path).to_string(),
             Self::UserConfig { file, index } => format!(
                 "mounts[{index}] in {} {}",
                 crate::one_line::quoted_path(file),
@@ -3219,7 +3219,7 @@ pub(crate) fn prepare(
                 // separate wording decision.
                 let advisory = protected.message(
                     "--mount",
-                    &crate::one_line::path(&source.path),
+                    &crate::one_line::path(&source.path).to_string(),
                     &exposure,
                     None,
                 );
@@ -3692,7 +3692,7 @@ fn node_kind(
         anyhow::bail!(
             "{} must be a regular file or directory",
             match declaration {
-                Declaration::Argv => crate::one_line::path(path),
+                Declaration::Argv => crate::one_line::path(path).to_string(),
                 Declaration::UserConfig { .. } => {
                     format!("{} {}", declaration.subject(), quoted_path(path))
                 }

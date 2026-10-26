@@ -83,15 +83,15 @@
 //! as itself in that suffix and byte-escaped in its own tool row.
 //!
 //! Error text this report prints raw (`error: {error:#}`, `error: {message}`,
-//! twice under `selected`) is built by other modules. The five whose text this
+//! twice under `selected`) is built by other modules. The seven whose text this
 //! report most often prints — `session`, `protected_config_dir`, `guest_home`,
-//! `network`, `egress_policy` — render their paths the same way, so one `$HOME`
-//! reads the same on every line (#422); the modules named above as unconverted do
-//! not, and their `error:` lines can still print a path legibly here and raw
-//! there. What holds whichever module built the text: it escapes its own control
-//! bytes or it is one of the #419 modules that escape nothing, and `mount` keeps a
-//! *config-chosen* path byte-escaped on purpose, because two mount entries that
-//! differ only outside ASCII must not print alike.
+//! `network`, `egress_policy`, `host_paths` and `credential_yaml` — render their
+//! paths the same way, so one `$HOME` reads the same on every line (#422, #419);
+//! the modules `one_line`'s ratchet still records as unconverted can print a path
+//! legibly here and raw there. What holds whichever module built the text: it
+//! escapes its own control bytes or it is one of the unconverted modules, and
+//! `mount` keeps a *config-chosen* path byte-escaped on purpose, because two mount
+//! entries that differ only outside ASCII must not print alike.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -518,9 +518,10 @@ fn describe_credentials(report: &CredReport, launch: &LaunchView) -> String {
             } => format!("ok ({})", describe_expiry(*exp, report.now_ms)),
         };
         let disposition = launch.host_row_note(label);
-        let shown = path
-            .as_deref()
-            .map_or_else(|| "<no $HOME>".to_string(), crate::one_line::path);
+        let shown = path.as_deref().map_or_else(
+            || crate::one_line::text("<no $HOME>"),
+            crate::one_line::path,
+        );
         out.push_str(&format!(
             "{label:<width$}  {shown}\n{:width$}  {detail}{disposition}\n",
             ""
@@ -869,12 +870,12 @@ fn describe_tier(tier: &TierReport) -> String {
         TierStatus::Absent => format!(
             "{} (absent)",
             tier.path()
-                .map_or("<unknown>".to_string(), crate::one_line::path)
+                .map_or_else(|| crate::one_line::text("<unknown>"), crate::one_line::path)
         ),
         TierStatus::Found { declared_tools } => format!(
             "{} (found, {declared_tools} tool{})",
             tier.path()
-                .map_or("<unknown>".to_string(), crate::one_line::path),
+                .map_or_else(|| crate::one_line::text("<unknown>"), crate::one_line::path),
             if *declared_tools == 1 { "" } else { "s" },
         ),
     }

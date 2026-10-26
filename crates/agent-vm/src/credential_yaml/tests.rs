@@ -1132,3 +1132,61 @@ fn an_env_source_cannot_name_a_launcher_configuration_variable() {
         home.accepts(&body.replace("    apiKey:", "    source: env\n    apiKey:"));
     }
 }
+
+/// The loader's two path-bearing texts — [`file_error`] and the file-mode
+/// warning — are built as `one_line` values, so a `$HOME` the user did not
+/// choose for us still reads as one line. Driven through `load`, not through the
+/// formatter, because a consumer must not have to remember.
+///
+/// Each expected message is written out in full: an assertion on an escape
+/// fragment and a phrase would still pass for a truncated or substituted path.
+#[test]
+fn a_hostile_home_renders_one_line_in_a_real_refusal_and_warning() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home\nFORGED");
+    let config = home.join(USER_CONFIG_DIR_RELATIVE);
+    fs::create_dir_all(&config).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+    let file = path_under_home(&home);
+    // The same path with the newline spelled the way the policy spells it.
+    let expected_path = format!(
+        "{}/home\\x0aFORGED/{USER_CONFIG_DIR_RELATIVE}/{CREDENTIALS_FILE_NAME}",
+        root.path().to_str().expect("an ASCII tempdir")
+    );
+
+    // A refusal: the file's own bytes are not UTF-8.
+    fs::write(&file, b"\xff").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    let rendered = format!("{}", load(&home).unwrap_err());
+    assert_eq!(
+        rendered,
+        format!("{expected_path}: is not valid UTF-8"),
+        "the refusal is the producer's complete, one-line message"
+    );
+
+    // The warning: a valid file the group and others can read.
+    fs::write(&file, minimal("alpha")).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    let set = load(&home).unwrap();
+    assert_eq!(
+        set.warnings(),
+        [format!(
+            "{expected_path} is group- or other-readable; it holds no secret values, but \
+             `chmod go-r` is still good hygiene"
+        )],
+        "the warning is the producer's complete, one-line message"
+    );
+}
+
+/// `file_error`'s `detail` is not necessarily agent-vm's text: an io error or a
+/// caller's `format_args!` can carry a newline. The whole sentence goes through
+/// the escaper, not just the path.
+#[test]
+fn a_detail_that_forges_a_line_is_escaped_with_the_path() {
+    let path = Path::new("/home/u/.config/agent-vm/credentials.yaml");
+    let error = file_error(path, "reading detail\nFORGED");
+    assert_eq!(
+        format!("{error}"),
+        "/home/u/.config/agent-vm/credentials.yaml: reading detail\\x0aFORGED"
+    );
+}

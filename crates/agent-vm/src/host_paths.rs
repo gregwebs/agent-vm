@@ -18,6 +18,8 @@ use rustix::{
     io::{self as rio, Errno},
 };
 
+use crate::one_line::{self, Line, path_in_line};
+
 pub(crate) const MAX_GUEST_STATE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_HOST_CREDENTIAL_FILE_BYTES: u64 = 1024 * 1024;
 const ATOMIC_WRITE_RETRIES: usize = 16;
@@ -83,8 +85,8 @@ pub(crate) fn read_bounded_regular_file(path: &Path, max: u64) -> Result<Vec<u8>
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .with_context(|| format!("opening {}", path.display()))?;
-    read_regular_fd(fd, max, path.display().to_string())
+    .with_context(|| format!("opening {}", path_in_line(path)))?;
+    read_regular_fd(fd, max, path)
 }
 
 /// Ownership and mode facts read off an **opened descriptor** — never a second
@@ -127,7 +129,7 @@ pub(crate) fn read_bounded_regular_file_no_follow(
         NoFollowOpen::File(fd) => read_regular_no_follow_fd(fd, path, max),
         NoFollowOpen::Symlink => Err(anyhow!(
             "{} is a symbolic link; refusing to follow it",
-            path.display()
+            path_in_line(path)
         )),
     }
 }
@@ -145,7 +147,7 @@ fn open_no_follow(path: &Path) -> Result<NoFollowOpen> {
     ) {
         Ok(fd) => Ok(NoFollowOpen::File(fd)),
         Err(Errno::LOOP) => Ok(NoFollowOpen::Symlink),
-        Err(error) => Err(anyhow!(error).context(format!("opening {}", path.display()))),
+        Err(error) => Err(anyhow!(error).context(format!("opening {}", path_in_line(path)))),
     }
 }
 
@@ -154,9 +156,10 @@ fn read_regular_no_follow_fd(
     path: &Path,
     max: u64,
 ) -> Result<(Vec<u8>, HostFileFacts)> {
+    let display = path_in_line(path);
     let stat = rfs::fstat(&fd)
         .map_err(|error| anyhow!(error))
-        .with_context(|| format!("stating {}", path.display()))?;
+        .with_context(|| format!("stating {display}"))?;
     let facts = HostFileFacts {
         uid: stat.st_uid,
         mode: stat.st_mode,
@@ -166,18 +169,18 @@ fn read_regular_no_follow_fd(
         nlink: u64::from(stat.st_nlink),
     };
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        return Err(anyhow!("{} is not a regular file", path.display()));
+        return Err(anyhow!("{display} is not a regular file"));
     }
     if facts.size > max {
-        return Err(anyhow!("{} exceeds its size limit", path.display()));
+        return Err(anyhow!("{display} exceeds its size limit"));
     }
     let mut data = Vec::with_capacity(facts.size as usize);
     fs::File::from(fd)
         .take(max + 1)
         .read_to_end(&mut data)
-        .with_context(|| format!("reading {}", path.display()))?;
+        .with_context(|| format!("reading {display}"))?;
     if data.len() as u64 > max {
-        return Err(anyhow!("{} exceeds its size limit", path.display()));
+        return Err(anyhow!("{display} exceeds its size limit"));
     }
     Ok((data, facts))
 }
@@ -198,7 +201,7 @@ pub(crate) fn read_optional_bounded_regular_file_no_follow(
     ) {
         Ok(fd) => read_regular_no_follow_fd(fd, path, max).map(|(bytes, _)| Some(bytes)),
         Err(Errno::NOENT) => Ok(None),
-        Err(error) => Err(anyhow!(error).context(format!("opening {}", path.display()))),
+        Err(error) => Err(anyhow!(error).context(format!("opening {}", path_in_line(path)))),
     }
 }
 
@@ -272,17 +275,17 @@ pub(crate) fn current_euid() -> u32 {
 pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
+        .ok_or_else(|| anyhow!("{} has no parent", path_in_line(path)))?;
     let name = path
         .file_name()
-        .ok_or_else(|| anyhow!("{} has no file name", path.display()))?;
+        .ok_or_else(|| anyhow!("{} has no file name", path_in_line(path)))?;
     let parent_fd = rfs::open(
         parent,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .with_context(|| format!("opening parent {}", parent.display()))?;
-    atomic_write_at(&parent_fd, name, data, mode, path.display().to_string())
+    .with_context(|| format!("opening parent {}", path_in_line(parent)))?;
+    atomic_write_at(&parent_fd, name, data, mode, path)
 }
 
 /// Take a blocking exclusive `flock(2)` on `file`, looping on `EINTR` (a signal
@@ -521,7 +524,7 @@ impl GuestStateDir {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .with_context(|| format!("opening guest state root {}", root.display()))?;
+        .with_context(|| format!("opening guest state root {}", path_in_line(root)))?;
         Ok(Self {
             root: fd,
             display_root: root.to_path_buf(),
@@ -545,7 +548,7 @@ impl GuestStateDir {
             })),
             Err(Errno::NOENT) => Ok(None),
             Err(error) => Err(anyhow!(error))
-                .with_context(|| format!("opening guest state root {}", root.display())),
+                .with_context(|| format!("opening guest state root {}", path_in_line(root))),
         }
     }
 
@@ -588,7 +591,7 @@ impl GuestStateDir {
         read_regular_fd_checkpointed(
             fd,
             MAX_GUEST_STATE_FILE_BYTES,
-            self.display_path(relative),
+            &self.root_path(relative),
             after_final_open,
         )
         .map(Some)
@@ -611,7 +614,7 @@ impl GuestStateDir {
             .parent_for(&parts, true)?
             .expect("writer creates missing parent directories");
         after_parent_open();
-        atomic_write_at(&parent, name, data, mode, self.display_path(relative))
+        atomic_write_at(&parent, name, data, mode, &self.root_path(relative))
     }
 
     pub(crate) fn create(&self, relative: &Path, data: &[u8], mode: u32) -> Result<CreateOutcome> {
@@ -632,7 +635,7 @@ impl GuestStateDir {
                     .with_context(|| self.operation_path("creating", relative));
             }
         };
-        let result = write_and_chmod(fd, data, mode, self.display_path(relative));
+        let result = write_and_chmod(fd, data, mode, &self.root_path(relative));
         if result.is_err() {
             let _ = rfs::unlinkat(&parent, name, AtFlags::empty());
         }
@@ -644,7 +647,7 @@ impl GuestStateDir {
         let (parent, name) = self
             .parent_for(&parts, true)?
             .expect("writer creates missing parent directories");
-        atomic_write_at(&parent, name, data, mode, self.display_path(relative))
+        atomic_write_at(&parent, name, data, mode, &self.root_path(relative))
     }
 
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<bool> {
@@ -820,12 +823,27 @@ impl GuestStateDir {
         Ok(Some((parent, final_name)))
     }
 
-    fn display_path(&self, relative: &Path) -> String {
-        self.display_root.join(relative).display().to_string()
+    /// The host-side spelling of `relative`, for a caller that measures the path
+    /// itself (the descriptor readers and writers take a `Path`, not a string).
+    fn root_path(&self, relative: &Path) -> PathBuf {
+        self.display_root.join(relative)
     }
 
-    fn operation_path(&self, operation: &str, relative: &Path) -> String {
-        format!("{operation} guest state {}", self.display_path(relative))
+    /// That spelling rendered for a single terminal line.
+    fn display_path(&self, relative: &Path) -> Line {
+        one_line::path(&self.root_path(relative))
+    }
+
+    /// The owned context a `with_context` can carry directly. The prefix is
+    /// agent-vm's own text and the path is already a [`Line`], so re-applying the
+    /// policy in [`one_line::text`] is an identity on bytes that contain no
+    /// control character; it is done so that the whole message — not just its
+    /// path — is a `Line` by construction.
+    fn operation_path(&self, operation: &str, relative: &Path) -> Line {
+        one_line::text(&format!(
+            "{operation} guest state {}",
+            self.display_path(relative)
+        ))
     }
 }
 
@@ -870,8 +888,8 @@ fn validated_components(relative: &Path) -> Result<Vec<OsString>> {
     Ok(parts)
 }
 
-fn read_regular_fd(fd: OwnedFd, max: u64, display: String) -> Result<Vec<u8>> {
-    read_regular_fd_checkpointed(fd, max, display, || {})
+fn read_regular_fd(fd: OwnedFd, max: u64, path: &Path) -> Result<Vec<u8>> {
+    read_regular_fd_checkpointed(fd, max, path, || {})
 }
 
 /// `after_fstat` fires after the opened descriptor has been validated
@@ -880,12 +898,18 @@ fn read_regular_fd(fd: OwnedFd, max: u64, display: String) -> Result<Vec<u8>> {
 /// exploit if these operations were not descriptor-anchored. Only
 /// [`GuestStateDir::read_with_checkpoints`] passes a non-trivial
 /// closure; every other caller behaves exactly as before.
+///
+/// The path arrives as a `Path`, not as a rendered `String`: a caller that has
+/// only the path can measure it here, where the message is built, and the
+/// borrowed [`path_in_line`] renders it through `one_line` instead of
+/// `display()`.
 fn read_regular_fd_checkpointed(
     fd: OwnedFd,
     max: u64,
-    display: String,
+    path: &Path,
     after_fstat: impl FnOnce(),
 ) -> Result<Vec<u8>> {
+    let display = path_in_line(path);
     let stat = rfs::fstat(&fd)
         .map_err(|error| anyhow!(error))
         .with_context(|| format!("stating {display}"))?;
@@ -911,7 +935,8 @@ fn unix_mode(mode: u32) -> Mode {
     Mode::from_raw_mode((mode & 0o7777) as _)
 }
 
-fn write_and_chmod(fd: OwnedFd, data: &[u8], mode: u32, display: String) -> Result<()> {
+fn write_and_chmod(fd: OwnedFd, data: &[u8], mode: u32, path: &Path) -> Result<()> {
+    let display = path_in_line(path);
     let mut file = fs::File::from(fd);
     file.write_all(data)
         .with_context(|| format!("writing {display}"))?;
@@ -940,9 +965,9 @@ fn atomic_write_at(
     final_name: &OsStr,
     data: &[u8],
     mode: u32,
-    display: String,
+    path: &Path,
 ) -> Result<()> {
-    atomic_write_with_random(parent, final_name, data, mode, display, random_temp_name)
+    atomic_write_with_random(parent, final_name, data, mode, path, random_temp_name)
 }
 
 /// Fault points production never fails at, injected between the
@@ -980,7 +1005,7 @@ fn atomic_write_with_random(
     final_name: &OsStr,
     data: &[u8],
     mode: u32,
-    display: String,
+    path: &Path,
     random_name: impl FnMut() -> Result<OsString>,
 ) -> Result<()> {
     atomic_write_with_random_and_faults(
@@ -988,7 +1013,7 @@ fn atomic_write_with_random(
         final_name,
         data,
         mode,
-        display,
+        path,
         random_name,
         WriteFaults::none(),
     )
@@ -1001,7 +1026,7 @@ fn atomic_write_with_random_and_faults<W, C, R>(
     final_name: &OsStr,
     data: &[u8],
     mode: u32,
-    display: String,
+    path: &Path,
     mut random_name: impl FnMut() -> Result<OsString>,
     mut faults: WriteFaults<W, C, R>,
 ) -> Result<()>
@@ -1010,6 +1035,7 @@ where
     C: FnMut() -> Result<()>,
     R: FnMut() -> Result<()>,
 {
+    let display = path_in_line(path);
     for _ in 0..ATOMIC_WRITE_RETRIES {
         let temp_name = random_name()?;
         let fd = match rfs::openat(
@@ -1714,7 +1740,7 @@ mod tests {
             OsStr::new("target"),
             b"replacement",
             0o600,
-            "target".into(),
+            Path::new("target"),
             || Ok(names.borrow_mut().pop().unwrap()),
         )
         .unwrap();
@@ -1742,7 +1768,7 @@ mod tests {
                 OsStr::new("target"),
                 b"replacement",
                 0o600,
-                "target".into(),
+                Path::new("target"),
                 || Ok(collision.to_os_string()),
             )
             .is_err()
@@ -1966,7 +1992,7 @@ mod tests {
             OsStr::new("target"),
             b"new",
             0o600,
-            "target".into(),
+            Path::new("target"),
             || Ok(names.borrow_mut().pop().unwrap()),
             WriteFaults {
                 before_write: || Err(anyhow!("injected write fault")),
@@ -2002,7 +2028,7 @@ mod tests {
             OsStr::new("target"),
             b"new",
             0o600,
-            "target".into(),
+            Path::new("target"),
             || Ok(names.borrow_mut().pop().unwrap()),
             WriteFaults {
                 before_write: || Ok(()),
@@ -2038,7 +2064,7 @@ mod tests {
             OsStr::new("target"),
             b"new",
             0o600,
-            "target".into(),
+            Path::new("target"),
             || Ok(names.borrow_mut().pop().unwrap()),
             WriteFaults {
                 before_write: || Ok(()),
@@ -2132,5 +2158,42 @@ mod tests {
         );
         assert_ne!(metadata.ino(), before);
         assert_eq!(metadata.mode() & 0o777, 0o600);
+    }
+
+    /// A measured path reaches a real refusal and still prints as one line: the
+    /// producer renders it through `one_line` at the point the message is built,
+    /// so a newline cannot end the sentence the reader is on. Driven through the
+    /// real reader, not the formatter, and pinned as the complete message: an
+    /// escape fragment plus a phrase would also pass for a truncated path.
+    #[test]
+    fn a_hostile_path_renders_one_line_in_a_real_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        // A directory opens read-only, so the refusal comes from the
+        // descriptor's own "is this a regular file" check.
+        let directory = root.path().join("new\nline");
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            format!(
+                "{}",
+                read_bounded_regular_file(&directory, 100).unwrap_err()
+            ),
+            format!(
+                "{}/new\\x0aline is not a regular file",
+                root.path().display()
+            )
+        );
+
+        // A byte that is not UTF-8 cannot be created on every filesystem (macOS
+        // refuses the name outright), so this case needs no entry: the open
+        // fails, and the refusal must still spell the byte out rather than
+        // dropping it to a replacement character. The OS's own errno text after
+        // the colon is platform-specific, so the context agent-vm builds is
+        // pinned exactly and in full.
+        let absent = root.path().join(OsStr::from_bytes(b"invalid\xffbyte"));
+        let rendered = format!("{:#}", read_bounded_regular_file(&absent, 100).unwrap_err());
+        assert_eq!(
+            rendered.split_once(": ").map(|(context, _error)| context),
+            Some(format!("opening {}/invalid\\xffbyte", root.path().display()).as_str())
+        );
     }
 }
