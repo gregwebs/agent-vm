@@ -308,39 +308,8 @@ impl ResultReference {
     /// `escape_str`: they are read, not pasted, and must stay ASCII-safe
     /// without pretending to be a shell word.
     pub(crate) fn shell_arg(&self) -> String {
-        shell_word(self.as_str())
+        crate::shell::bash_word(self.as_str().as_bytes())
     }
-}
-
-/// Bash/zsh `$'…'` quoting for the bytes a reference may contain that the safe
-/// set does not cover.
-///
-/// The safe set is the identity, so an ordinary reference prints unchanged;
-/// everything else becomes `$'…'` with `\\`, `\'` and `\xNN` escapes, which
-/// bash and zsh turn back into the same bytes. Split out from
-/// [`ResultReference::shell_arg`] so the byte rule is testable on inputs the
-/// parser rejects.
-fn shell_word(text: &str) -> String {
-    if text
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"._/:@-".contains(&b))
-    {
-        return text.to_string();
-    }
-    let mut word = String::from("$'");
-    for byte in text.bytes() {
-        match byte {
-            b'\\' => word.push_str("\\\\"),
-            b'\'' => word.push_str("\\'"),
-            0x20..=0x7e => word.push(char::from(byte)),
-            _ => {
-                use std::fmt::Write as _;
-                let _ = write!(word, "\\x{byte:02x}");
-            }
-        }
-    }
-    word.push('\'');
-    word
 }
 
 #[cfg(test)]
@@ -455,42 +424,6 @@ mod publication_tests {
         assert_eq!(metadata.len(), 0);
         drop(stage);
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn shell_word_is_identity_for_safe_ascii() {
-        for raw in [
-            "app:dev",
-            "localhost:5000/a/b_c:V1.2-x",
-            "registry.example.com/x",
-        ] {
-            assert_eq!(shell_word(raw), raw);
-        }
-    }
-
-    #[test]
-    fn shell_word_round_trips_through_bash_and_zsh() {
-        for shell in ["bash", "zsh"] {
-            if shell == "zsh"
-                && std::process::Command::new(shell)
-                    .arg("--version")
-                    .output()
-                    .is_err()
-            {
-                eprintln!("zsh not on PATH; skipping zsh round trip");
-                continue;
-            }
-            for raw in ["app:é", "a'b", "a\\b", "a b", "a\nb", "x:\u{200d}"] {
-                let word = shell_word(raw);
-                assert!(word.is_ascii());
-                let out = std::process::Command::new(shell)
-                    .args(["-c", &format!("printf %s {word}")])
-                    .output()
-                    .unwrap();
-                assert!(out.status.success());
-                assert_eq!(out.stdout, raw.as_bytes());
-            }
-        }
     }
 
     #[test]

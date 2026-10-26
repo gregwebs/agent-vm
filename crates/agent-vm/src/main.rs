@@ -56,6 +56,7 @@ mod secret_store;
 mod secrets;
 mod session;
 mod setup;
+mod shell;
 #[cfg(test)]
 mod test_env;
 #[cfg(test)]
