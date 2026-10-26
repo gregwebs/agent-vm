@@ -8,7 +8,8 @@ changelog: when a decision was superseded, only the decision that survived is
 written down, and `git log` holds the rest. Individual decisions that needed
 their own write-up live in [`docs/adr/`](docs/adr/) and are indexed
 [at the end](#decision-record-index). What the features *do*, from a user's
-side, is [USAGE.md](USAGE.md); what is still unbuilt is [PLAN.md](PLAN.md).
+side, is [USAGE.md](USAGE.md); outstanding work and known limitations are tracked
+in [open issues](https://github.com/gregwebs/agent-vm/issues?q=is%3Aissue%20is%3Aopen).
 
 ## Contents
 
@@ -1418,7 +1419,8 @@ Allow-listed REST routes receive the bearer; off-list, malformed, and unknown
 REST routes get a synthesized 403. Off-list smart-HTTP alone may continue
 **anonymously**, with `Authorization` stripped, so a public clone still works.
 GraphQL mutations are denied outright until they can be bound soundly to an
-allow-listed repository — a deliberate compatibility cost, tracked in PLAN.md.
+allow-listed repository — a deliberate compatibility cost (see
+[ADR-0010](docs/adr/0010-wire-file-backed-credential-injection.md)).
 
 ### Static provider keys and guest-state safety
 
@@ -1454,8 +1456,7 @@ would be worse than the warning.
 launch failure into an abrupt exit-101. The notice is therefore a best-effort
 `writeln!` with its result discarded.
 
-Scope is those three files only; extending it to project integrity is tracked
-in PLAN.md.
+Scope is those three files only; project-integrity checks are not implemented.
 
 ### Verified behaviour
 
@@ -1643,8 +1644,8 @@ directories the user never asked for. The state-root precedence is in
 ## Deliberate non-goals
 
 Things that were considered and rejected, so they do not get re-proposed. These
-are settled design positions; work that is merely *unbuilt* lives in
-[PLAN.md](PLAN.md).
+are settled design positions, not the outstanding work tracked in
+[open issues](https://github.com/gregwebs/agent-vm/issues?q=is%3Aissue%20is%3Aopen).
 
 - **No proactive token-expiry timer.** The guest's own refresh attempt at
   401-time triggers the hook, which triggers the host-side refresh. If the user

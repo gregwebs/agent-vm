@@ -117,7 +117,8 @@ for builder prerequisites and host-build trust.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — building from source, the release
   version-bump, and repo conventions.
 - [macos-build.md](macos-build.md) — the Apple Silicon source-build guide.
-- [PLAN.md](PLAN.md) — what is left to do for v1.
+- [Open issues](https://github.com/gregwebs/agent-vm/issues?q=is%3Aissue%20is%3Aopen) —
+  outstanding work and known limitations.
 - [Credential shielding specification](docs/specs/credential-shielding.md) —
   agreed user contract and Docker-shaped YAML/CLI design (not yet implemented).
 - [Named mount sets and tier-local tool references](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md) —
