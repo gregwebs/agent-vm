@@ -3685,9 +3685,10 @@ fn node_kind(
         // This sentence has never named `--mount` for an argv source, so that
         // half stays byte-identical; a config entry is named, because otherwise
         // the launch context mentions only the file. The config half byte-escapes
-        // the path because this is a *declaration* sentence: the path is the
-        // entry's own text, and two entries that differ only outside ASCII must
-        // not print alike.
+        // the path because this is a *declaration* sentence: `path` may be the
+        // entry's own text or what it canonicalized to, and one attributed sentence
+        // must not mix renderings — nor let two entries that differ only outside
+        // ASCII print alike.
         anyhow::bail!(
             "{} must be a regular file or directory",
             match declaration {

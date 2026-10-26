@@ -83,14 +83,15 @@
 //! as itself in that suffix and byte-escaped in its own tool row.
 //!
 //! Error text this report prints raw (`error: {error:#}`, `error: {message}`,
-//! twice under `selected`) is built by other modules, and those modules escape
-//! their own paths the same way, so one `$HOME` reads the same on every line:
-//! `session`, `protected_config_dir`, `guest_home`, `network` and `egress_policy`
-//! moved to [`crate::one_line`] too (#422). What holds regardless of the source:
-//! text that reaches these lines escapes its own control bytes, so a path it names
-//! cannot forge a line. `mount` is the exception that proves the rule — a
-//! *config-chosen* path there is still byte-escaped on purpose, because two mount
-//! entries that differ only outside ASCII must not print alike.
+//! twice under `selected`) is built by other modules. The five whose text this
+//! report most often prints — `session`, `protected_config_dir`, `guest_home`,
+//! `network`, `egress_policy` — render their paths the same way, so one `$HOME`
+//! reads the same on every line (#422); the modules named above as unconverted do
+//! not, and their `error:` lines can still print a path legibly here and raw
+//! there. What holds whichever module built the text: it escapes its own control
+//! bytes or it is one of the #419 modules that escape nothing, and `mount` keeps a
+//! *config-chosen* path byte-escaped on purpose, because two mount entries that
+//! differ only outside ASCII must not print alike.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

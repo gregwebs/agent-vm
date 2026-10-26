@@ -152,17 +152,24 @@ mod tests {
 
     /// The conversion #422 finished is a property of these modules' *source*, not
     /// of the messages a fixture happens to reach: most of their sites are
-    /// `with_context` on a syscall that only fails under conditions a test cannot
-    /// portably create, and each of them can regress on its own. So it is checked
-    /// at the source. A new site that interpolates `Path::display()` (which escapes
-    /// nothing) or reaches for the byte policy fails here even though no test drives
-    /// it.
+    /// `with_context` on a syscall that only fails under conditions a fixture would
+    /// have to contrive, and each of them can regress on its own. So it is checked
+    /// at the source: a new site in the scanned code that interpolates
+    /// `Path::display()` (which escapes nothing) or reaches for the byte policy
+    /// fails here even though no test drives it.
     ///
-    /// `guest_home`'s one entry builds the guest-side symlink target rather than a
-    /// diagnostic, so it has no reader to protect.
+    /// Two limits worth knowing. It reads source, not behaviour, so it cannot tell
+    /// a diagnostic from anything else on the same line — the one exemption below
+    /// is matched as a whole line for that reason, not as a substring. And it scans
+    /// from the top of each file to the `#[cfg(test)] mod tests` that follows the
+    /// production code, so code placed above that module is what it sees.
+    ///
+    /// `guest_home`'s one exempt line builds the guest-side symlink target rather
+    /// than a diagnostic, so it has no reader to protect.
     #[test]
     fn converted_modules_render_every_path_through_this_module() {
-        const ALLOWED_DISPLAY: &[&str] = &["self.state_relative.display()"];
+        const ALLOWED_DISPLAY: &[&str] =
+            &["format!(\"/agent-vm-state/{}\", self.state_relative.display())"];
         for (name, source) in [
             ("session", include_str!("session.rs")),
             (
@@ -173,11 +180,10 @@ mod tests {
             ("network", include_str!("network.rs")),
             ("egress_policy", include_str!("egress_policy.rs")),
         ] {
-            let production = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
+            let production = &source[..source.find("\n#[cfg(test)]\nmod ").unwrap_or(source.len())];
             for (index, line) in production.lines().enumerate() {
-                if line.contains(".display()")
-                    && !ALLOWED_DISPLAY.iter().any(|ok| line.contains(ok))
-                {
+                let allowed = ALLOWED_DISPLAY.iter().any(|ok| line.trim() == ok.trim());
+                if line.contains(".display()") && !allowed {
                     panic!(
                         "{name}.rs:{} prints a path with display(), which escapes nothing: {line}",
                         index + 1
