@@ -2190,6 +2190,67 @@ mod tests {
         }
     }
 
+    /// #396: a tool-only mount config reaches every launch route with the opt-out
+    /// policy intact, and help describes the widened inheritance.
+    #[test]
+    fn parse_from_carries_resolved_tool_mounts_and_opt_out_policy() {
+        let _env = clear_launch_env();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("user.toml");
+        std::fs::write(
+            &file,
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a:/g:ro\"]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let load = || {
+            crate::config::load(&crate::config::ConfigPaths {
+                user: Some(file.clone()),
+                project: dir.path().join("absent.toml"),
+                home: None,
+            })
+        };
+        // A tool-only file is a mount model: the CLI must carry it, or `--mount`
+        // could not resolve a set from the same file and the opt-out could not
+        // report what it skipped.
+        assert!(load().unwrap().user_mounts().is_some());
+        for tokens in [
+            vec!["agent-vm", "t"],
+            vec!["agent-vm", "--no-config-mounts", "t"],
+            vec!["agent-vm", "--no-config-mounts", "--mount", "/x:/y:ro", "t"],
+        ] {
+            let Dispatch::Launch { .. } = parse_from(argv_of(&tokens), load()).unwrap() else {
+                panic!("expected a launch: {tokens:?}")
+            };
+        }
+    }
+
+    /// Long help names the widened inheritance and the opt-out's real scope.
+    #[test]
+    fn help_describes_tool_mount_inheritance_and_automatic_opt_out() {
+        let _env = clear_launch_env();
+        let catalog =
+            crate::config::Catalog::Ready(crate::config::default_launch_catalog().unwrap());
+        let mut command = crate::cli::build_command(&catalog);
+        let mut buffer = Vec::new();
+        command
+            .write_long_help(&mut buffer)
+            .expect("long help renders");
+        let help = String::from_utf8(buffer).unwrap();
+        for needle in [
+            "a full user [[tools]] may also declare its own mounts",
+            "then the launched tool's own list together with the lists of",
+            "every tool it transitively references (one facet, folded in file order)",
+            "inherits every same-file tool's mounts",
+            "tools = [] stops inheritance, not own mounts/defaults",
+            "skips both automatic config mount inputs",
+        ] {
+            assert!(help.contains(needle), "missing {needle:?} in:\n{help}");
+        }
+    }
+
     #[test]
     fn no_config_mounts_is_a_launch_option_before_the_verb() {
         let _env = clear_launch_env();

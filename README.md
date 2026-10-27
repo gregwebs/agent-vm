@@ -122,10 +122,11 @@ for builder prerequisites and host-build trust.
 - [Credential shielding specification](docs/specs/credential-shielding.md) —
   agreed user contract and Docker-shaped YAML/CLI design (not yet implemented).
 - [Named mount sets and tier-local tool references](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md) —
-  tool references resolve inside their own config file, and user-config mount
-  sets are selectable by name with `--mount NAME` (both implemented); tool-level
-  `mounts` remain accepted design, not implemented. See
-  [Named mount sets](USAGE.md#named-mount-sets-user-config).
+  tool references resolve inside their own config file, user-config mount sets
+  are selectable by name with `--mount NAME`, and a full user `[[tools]]` may
+  declare `mounts` that a launch of it, or of a tool referencing it, selects (all
+  implemented). See [Named mount sets](USAGE.md#named-mount-sets-user-config) and
+  [Tool-specific config mounts](USAGE.md#tool-specific-config-mounts).
 - [Tool references are local to their file](USAGE.md#tool-references-are-local-to-their-file) —
   the breaking change and how to migrate a config.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design notes; why things look

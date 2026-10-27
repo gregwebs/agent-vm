@@ -638,6 +638,69 @@ same owned synthetic `home/cm/{ro,rw,fork}` fixtures, after the N rows' cleanup:
   observable access and modes as S2, no unrelated mount, and the fork still
   holds the earlier `guest-fork` rather than the host's later write.
 
+The tool-mount rows (#396, `[[tools]]`'s own `mounts`) are a separate synthetic
+topology over the same owned fixtures, after the S rows' cleanup. Every synthetic
+tool executes `bash` with a fixed probe argv — they test catalog selection, not an
+image's installed agent version or login state — and the probe itself is the guest
+program. The two invocation forms are recorded verbatim in each row's
+`<row>-command.json`:
+
+```bash
+# A tool row: the tool's own `command`/`args` run the probe with one phase token.
+agent-vm --no-git --image "$IMAGE" <tool> <phase>
+# A declared/fallback shell row: separate argv tokens, and the product builds
+# interactive bash's `-c` argument itself (run::inner_argv → shell::guest_script_word).
+agent-vm --no-git --image "$IMAGE" shell bash ./guest-cm-probe.sh <phase>
+```
+
+The probe prefixes every path with `CM_ROOT` and defaults the Pi home to the real
+`$HOME`; the boot-free companion below points `CM_HOME` at a synthetic home, which
+is the only reason the same statements are runnable without a VM. Fork identity is
+compared **within the Pi lineage** (manifests whose guest destination ends in
+`/.pi`) so these rows can share the state root with the `CM-N`/`CM-S` fork without
+weakening either set's evidence.
+
+- CM-T1 `plain` — no automatic mount path, no Pi-fork-only marker; the project
+  marker is present, and no Pi fork was initialized.
+- CM-T2 `claude` — the shared agent parent is readable and writable, the child
+  and the separate read-only directory are readable and unwritable, and no Pi
+  marker appears.
+- CM-T3 `pi` — the same agent topology *inherited* through `tools`, plus the Pi
+  fork: the guest reads `pi-seed`, writes `pi-guest`, sees neither protected
+  synthetic file, and creates a guest-only file. CM-T3-host checks afterwards
+  that the host Pi source is still `pi-seed`, the protected sources are unchanged,
+  the guest-only file is absent on the host, the writable marker came through and
+  the read-only digests are unchanged.
+- CM-T4 `bridge` — after a host-only source mutation, the guest still reads
+  `pi-guest` and its guest-only file, proving the inherited fork is reused and
+  never re-synchronized.
+- CM-T5 declared `shell` — its omitted `tools` wildcard sees the fork and the
+  agent topology, with the same permitted and denied writes.
+- CM-T6 declared `shell` with `tools = []` — the inherited paths and the Pi marker
+  are gone, while its own list and a user-wide default remain readable and
+  unwritable.
+- CM-T7 fallback `shell` — the declared shell removed, custom catalog kept: no
+  user tool is referenced, and the deliberately user-wide default is still there.
+- CM-T8 opt-out `pi` and declared `shell` — no defaults, no shell-own, no
+  inherited agent mounts and no Pi marker; the project marker is present.
+- CM-T9 opt-out plus explicit `--mount agent` — only the explicit agent topology
+  returns, with the same rw/ro operations, and no tool is inferred from set
+  selection.
+- CM-T10 equivalent explicit Pi fork — opt-out plus an absolute CLI fork
+  declaration reads `pi-guest` and the guest-only file with the same manifest
+  identity.
+- CM-T11 default/set/tool equivalence — the same Pi declaration selected as a
+  top-level default or through a nested set reads `pi-guest` with unchanged fork
+  identity and no reseed.
+
+Absence rows test the synthetic fork-only marker and contents, never the existence
+of `$HOME/.pi`: the compiled generic `.pi` guest-home link exists even when the
+fork is not selected. The read-only-child assertions are about operations at that
+mounted destination, not a promise of isolation from a writable ancestor (see
+ADR-0048's alias/rename caveat), so a failing probe is never "fixed" by changing
+the parent to read-only or by weakening the check to a serialized-config
+assertion.
+
 The guest probe renders these phases even on failure and the driver compares
 exact whole lines, so a partial mount cannot pass. After proven cleanup the host
 oracle also asserts the read-only tree's digest is unchanged, the `:rw` marker is
@@ -656,15 +719,33 @@ launch's cleanup proved absence. On failure the owned scratch (with the fixture
 sources) is retained and its path printed; it is never `rm -rf`ed by the
 harness.
 
+**Every attempt gets a fresh evidence directory.** The wrapper accepts an existing
+directory and the driver overwrites row receipts while appending `summary.tsv`, so
+reusing one would destroy a failure record:
+
+```bash
+evidence="$(mktemp -d /tmp/avm-native/evidence-run.XXXXXX)"
+AGENT_VM_BIN=… AGENT_VM_LIVE_TEST_IMAGE=… AGENT_VM_CM_EVIDENCE="$evidence" \
+  bash script/test/config-mounts-live.sh
+```
+
+If the first catalog observation races migration (the ~3.4 ms race recorded in
+ADR-0048), keep the failure and retry with **identical** candidate, image and
+config fixture inputs but a **new empty** evidence directory. A changed candidate
+or fixture starts a new comparison, not an identical retry. Never report that
+observation race as native enforcement failure, and never erase it.
+
 If a prerequisite is missing, the PR body records
 
 ```text
 BLOCKED: AGENT_VM_BIN=… AGENT_VM_LIVE_TEST_IMAGE=… bash script/test/config-mounts-live.sh -> <exact first error line>
 ```
 
-and states that the native enforcement evidence (for #394 and/or #397, whichever
-rows were blocked) is **outstanding**, so the PR says "Part of #394"/"Part of
-#397", not "Closes …".
+and states that the native enforcement evidence (for #394, #396 and/or #397,
+whichever rows were blocked) is **outstanding**, so the PR says "Part of #394" /
+"Part of #396" / "Part of #397", not "Closes …". Existing #394/#397 receipts are
+not retroactive evidence for the tool-mount rows. macOS arm64 is what these rows
+cover; Linux/amd64 native evidence remains outstanding rather than implied.
 
 `bash script/test/config-mounts-contract.sh` is the boot-free companion: it runs
 the guest probe against a host-only synthetic layout (permission and negative

@@ -402,19 +402,57 @@ def matrix():
     add("user-allowances-dropped", EGRESS,
         "for entry in user_entries.iter().chain(&cli_entries) {",
         "for entry in cli_entries.iter() {", rust("user_network_table_reaches_the_sandbox_policy", LAUNCH))
-    verify_arm = ('FileTierKind::User => config_authority::verify(&read, triggers)\n'
-                  '            .map_err(|error| anyhow!("config: {}: {error}", '
-                  'crate::one_line::quoted_path(path)))?,')
+    # The user arm now also builds the tool-field pointer, so the anchor is the
+    # `verify` call and its whole `map_err` chain up to the `?`. Keeping the
+    # pointer inside the mutation keeps the mutant compiling and the refusal text
+    # shape intact, so a control still fails on behaviour rather than on a syntax
+    # error.
+    verify_arm = ('FileTierKind::User => config_authority::verify(&read, triggers).map_err(|error| {\n'
+                  '            // A refusal caused by a tool\'s own field names that field first: the\n'
+                  '            // reader has to find the list they must review, and a file with no\n'
+                  '            // top-level `mounts` has nothing else pointing at it. The numeric site\n'
+                  '            // is echoed, never the tool\'s name or the list\'s contents.\n'
+                  '            let pointer = match first_tool_mounts {\n'
+                  '                Some(declaration) if raw.mounts.is_none() => {\n'
+                  '                    format!("tools[{declaration}].mounts: ")\n'
+                  '                }\n'
+                  '                _ => String::new(),\n'
+                  '            };\n'
+                  '            anyhow!(\n'
+                  '                "config: {}: {pointer}{error}",\n'
+                  '                crate::one_line::quoted_path(path)\n'
+                  '            )\n'
+                  '        })?,')
     add("verify-always-skipped", SRC + "config.rs", verify_arm,
         'FileTierKind::User => None,', rust("unsafe_user_network_is_refused_before_launch_state", LAUNCH))
     # A present `mounts` key makes a user file authority-bearing, empty list
     # included: the trigger reads the *presence* of the field, so both mutants
     # below keep the field but drop its effect, and a symlinked `mounts = []`
     # file then loads through the compatibility path meant for tools-only files.
-    mounts_present = "        mounts: raw.mounts.is_some(),\n        mount_sets: raw.mount_sets.is_some(),\n    };"
-    mounts_absent_mutant = "        mounts: false,\n        mount_sets: raw.mount_sets.is_some(),\n    };"
-    mounts_nonempty_mutant = (
-        "        mounts: raw.mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),\n        mount_sets: raw.mount_sets.is_some(),\n    };")
+    # The mount trigger is one aggregate over both sites (#396), so the shared
+    # anchor is that expression. Every replacement below keeps the struct shape, so
+    # a control cannot pass (or fail) on a missing-field compile error.
+    mounts_present = (
+        "        mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {\n"
+        "            top_level: raw.mounts.is_some(),\n"
+        "            tool_field: first_tool_mounts.is_some(),\n"
+        "        }),\n"
+        "        mount_sets: raw.mount_sets.is_some(),\n    };")
+    mounts_absent_mutant = mounts_present.replace(
+        "mounts: config_authority::mount_authority_present(config_authority::MountAuthorityFacts {\n"
+        "            top_level: raw.mounts.is_some(),\n"
+        "            tool_field: first_tool_mounts.is_some(),\n"
+        "        }),",
+        "mounts: false,")
+    mounts_nonempty_mutant = mounts_present.replace(
+        "top_level: raw.mounts.is_some(),",
+        "top_level: raw.mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),")
+    mounts_top_level_only = mounts_present.replace(
+        "tool_field: first_tool_mounts.is_some(),", "tool_field: false,")
+    mounts_tool_nonempty = mounts_present.replace(
+        "tool_field: first_tool_mounts.is_some(),",
+        "tool_field: first_tool_mounts.is_some_and(|d| raw.tools[d].mounts.as_ref()"
+        ".and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty())),")
     add("config-mounts-presence-ignored", SRC + "config.rs", mounts_present,
         mounts_absent_mutant, rust("present_empty_mounts_through_a_symlink_is_refused"))
     add("config-mounts-presence-ignored-launch", SRC + "config.rs", mounts_present,
@@ -429,8 +467,8 @@ def matrix():
     # the refusal is a boundary in its own right: without it a project checkout
     # would hand every launch of it a host bind.
     add("config-mounts-project-mounts-accepted", SRC + "config.rs",
-        "    if raw.mounts.is_some() {\n        return Err(mounts_refusal(path, RefusingTier::Project));\n    }",
-        "    if false {\n        return Err(mounts_refusal(path, RefusingTier::Project));\n    }",
+        "    if raw.mounts.is_some() {\n        return Err(mounts_refusal(path, tier));\n    }",
+        "    if false {\n        return Err(mounts_refusal(path, tier));\n    }",
         rust("project_mounts_are_refused_even_when_empty"))
     # -- Named mount sets (#397) -------------------------------------------------
     # Every replacement below keeps all three `AuthorityTriggers` fields, so a
@@ -438,7 +476,8 @@ def matrix():
     # instead of on the behaviour it names.
     sets_source = SRC + "config_mounts/sets.rs"
     sets_module = SRC + "config_mounts.rs"
-    presence_sets_absent = "        mounts: raw.mounts.is_some(),\n        mount_sets: false,\n    };"
+    presence_sets_absent = mounts_present.replace(
+        "mount_sets: raw.mount_sets.is_some(),", "mount_sets: false,")
     add("mount-sets-presence-ignored", SRC + "config.rs", mounts_present,
         presence_sets_absent, rust("mount_sets_presence_requires_a_verified_file"))
     add("mount-sets-presence-ignored-launch", SRC + "config.rs", mounts_present,
@@ -447,7 +486,7 @@ def matrix():
     # Declaring a set is user-scope only; accepting a project table would let a
     # checkout plant filesystem access for every launch of it.
     project_sets = ('    if raw.mount_sets.is_some() {\n'
-                    '        return Err(mount_sets_refusal(path, RefusingTier::Project));\n'
+                    '        return Err(mount_sets_refusal(path, tier));\n'
                     '    }')
     add("mount-sets-project-accepted", SRC + "config.rs", project_sets,
         project_sets.replace("if raw.mount_sets.is_some()", "if false"),
@@ -478,8 +517,10 @@ def matrix():
         rust("reference_errors_are_named_by_site"))
     # `--no-config-mounts` removes the defaults, never an explicit name.
     explicit = "                let selected = explicit_set(user, &name)?;"
-    explicit_mutant = ("                let selected = if policy.suppressed() { Vec::new() } else { "
-                       "explicit_set(user, &name)? };")
+    # `explicit_set` now hands back a shared resolved list (#396), so the mutant
+    # returns that type's empty value rather than a `Vec`.
+    explicit_mutant = ("                let selected = if policy.suppressed() { "
+                       "ResolvedMountList::empty() } else { explicit_set(user, &name)? };")
     add("mount-sets-opt-out-drops-explicit-names", selection, explicit, explicit_mutant,
         rust("explicit_set_names_survive_the_opt_out"))
     add("mount-sets-opt-out-drops-explicit-names-launch", selection, explicit, explicit_mutant,
@@ -499,11 +540,11 @@ def matrix():
     # still agrees on every fixture (read-only differs in that pair as well). The
     # anchor is the adapter's call to the shared kernel, replaced by a hand-rolled
     # conjunction that leaves fork out.
-    equivalent_call = ("            equivalent: same_declaration(&leaves[first.0].mount, "
-                       "&leaves[candidate.0].mount),")
+    equivalent_call = ("            equivalent: same_declaration(&first.request.mount, "
+                       "&candidate.request.mount),")
     equivalent_ignores_fork = (
-        "            equivalent: { let a = &leaves[first.0].mount; "
-        "let b = &leaves[candidate.0].mount; "
+        "            equivalent: { let a = &first.request.mount; "
+        "let b = &candidate.request.mount; "
         "a.source_spelling == b.source_spelling && a.host == b.host "
         "&& matches!(a.policy, crate::mount::MountPolicy::BindReadOnly { .. }) "
         "== matches!(b.policy, crate::mount::MountPolicy::BindReadOnly { .. }) "
@@ -536,9 +577,75 @@ def matrix():
     add("descriptor-reopen", SRC + "host_paths.rs", "            after_open();",
         "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;",
         rust("noting_symlink_takes_bytes_and_facts_from_the_opened_descriptor"))
+    # The built-in tier's refusals moved into the one routine both non-user tiers
+    # share (#396), so the anchor is that routine's network arm — still the exact
+    # statement that refuses a built-in `[network]` table.
     add("builtin-network-accepted", SRC + "config.rs",
-        "return Err(network_refusal(table, path, RefusingTier::BuiltIn));", "let _ = table;",
+        "        return Err(network_refusal(table, path, tier));", "        let _ = table;",
         rust("builtin_network_table_is_refused_naming_setting_and_tier"))
+    # -- Tool-specific config mounts (#396) --------------------------------------
+    # A tool's `mounts` field makes the file authority-bearing even when empty and
+    # even on a definition no launch verb reaches: ignoring that half of the
+    # aggregate lets a symlinked `mounts = []` tool field load unverified.
+    add("tool-mounts-presence-ignored", SRC + "config.rs", mounts_present,
+        mounts_top_level_only,
+        rust("tool_mounts_presence_requires_verified_read_even_empty"))
+    add("tool-mounts-presence-ignored-launch", SRC + "config.rs", mounts_present,
+        mounts_top_level_only,
+        rust("empty_present_tool_mounts_require_authority_before_any_launch", MOUNTS))
+    add("tool-mounts-empty-unverified", SRC + "config.rs", mounts_present,
+        mounts_tool_nonempty, rust("tool_mounts_presence_requires_verified_read_even_empty"))
+    # Mount authority is user-only: skipping the tool-field refusal would let a
+    # project checkout ask for host paths through its own tool definitions.
+    tool_project_refusal = ('    if let Some(declaration) = raw.tools.iter().position(|tool| '
+                            'tool.mounts.is_some()) {\n'
+                            '        return Err(tool_mounts_refusal(path, tier, declaration));\n'
+                            '    }')
+    add("tool-mounts-project-accepted", SRC + "config.rs", tool_project_refusal,
+        "    if false {\n        return Err(tool_mounts_refusal(path, tier, 0));\n    }",
+        rust("project_and_builtin_tool_mounts_are_refused_by_presence"))
+    add("tool-mounts-project-accepted-launch", SRC + "config.rs", tool_project_refusal,
+        "    if false {\n        return Err(tool_mounts_refusal(path, tier, 0));\n    }",
+        rust("project_tool_mount_presence_is_a_load_error_even_when_hidden", MOUNTS))
+    # The fold must cover the whole visited closure, not just the launched tool's
+    # own list: an inherited declaration silently dropped is exactly the bug the
+    # closure exists to prevent.
+    closure_push = ('            if !tool.mounts().is_empty() {\n'
+                    '                lists.push(tool.mounts());\n'
+                    '            }')
+    add("tool-mounts-facet-dropped", SRC + "config.rs", closure_push,
+        '            if tool.declaration_index == definitions[start.0].declaration_index\n'
+        '                && !tool.mounts().is_empty()\n'
+        '            {\n'
+        '                lists.push(tool.mounts());\n'
+        '            }',
+        rust("tool_mount_chain_cycle_and_diamond_bind_each_declaration_once", MOUNTS))
+    # The opt-out gates both automatic inputs at one site; appending the entry
+    # facet outside that gate leaves a tool's host paths mounted under
+    # `--no-config-mounts`.
+    gate_arm = "        Some(user) if selected => ("
+    add("tool-mounts-suppression-ignored", selection, gate_arm,
+        "        Some(user) if selected || true => (",
+        rust("suppression_drops_both_automatic_inputs_but_not_cli_sets"))
+    add("tool-mounts-suppression-ignored-launch", selection, gate_arm,
+        "        Some(user) if selected || true => (",
+        rust("opt_out_removes_defaults_own_and_inherited_mounts_but_keeps_cli", MOUNTS))
+    # One budget for the whole file, continued into catalog construction: a fresh
+    # counter per tool or per launch makes the same leaves free to repeat.
+    continuing_work = '        MountExpansionWork::configured(self.work)'
+    add("tool-mounts-budget-reset", sets_source, continuing_work,
+        '        MountExpansionWork::fresh()',
+        rust("mount_budget_is_shared_by_sets_tool_lists_and_launch_folds"))
+    add("tool-mounts-budget-reset-launch", SRC + "config.rs",
+        '                mounts.continuing_work()', '                config_mounts::MountExpansionWork::fresh()',
+        rust("tool_mount_work_continues_the_verified_parser_budget"))
+    # Retained lists share leaf handles; allocating a fresh `Arc` from a cloned
+    # payload per occurrence multiplies retained memory by the entry count.
+    share_call = '    ResolvedMountList::from_leaves(unique.iter().map(|leaf| Arc::clone(leaf)).collect())'
+    add("tool-mounts-payload-deep-copied", sets_source, share_call,
+        '    ResolvedMountList::from_leaves(unique.iter().map(|leaf| Arc::new(ConfigMountLeaf { '
+        'request: leaf.request.clone(), site: leaf.site.clone() })).collect())',
+        rust("tool_closures_share_leaf_payloads_across_catalog_entries"))
     return controls
 
 

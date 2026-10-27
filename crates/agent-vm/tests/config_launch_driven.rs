@@ -11575,3 +11575,324 @@ fn named_mount_sets_join_every_launch_route_without_touching_provisioning() {
         }
     }
 }
+
+/// #396 AC-union/AC-opt-out: inheriting a tool's `mounts` adds exactly the bind
+/// facet. Every other provisioning rule — the closure's providers, requested
+/// names, persisted paths, the launching tool's own env and its own network
+/// requests — is unchanged by the mount list and by the automatic opt-out.
+///
+/// The contrast is the point: `mounts` is inherited like `credentials` and
+/// `persist`, but unlike `env` and `network_requests`, which stay own-only. A row
+/// that only compared mount sets would pass if inheritance leaked every facet.
+#[test]
+fn tool_mount_inheritance_changes_binds_not_other_provisioning_rules() {
+    let harness = Harness::warm();
+    let own = harness.home_root.join("own");
+    let inherited = harness.home_root.join("inherited");
+    for dir in [&own, &inherited] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("marker"),
+            dir.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+    }
+    harness.write_user(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\n\
+         env = { T_ONLY = \"t-value\" }\n\
+         network_requests = [\"t.example\"]\n\
+         mounts = [\"~/own:/own:ro\"]\n\
+         [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\ntools = []\n\
+         env = { U_ONLY = \"u-value\" }\n\
+         network_requests = [\"u.example\"]\n\
+         credentials = [\"anthropic\"]\n\
+         persist = [\"u-state\"]\n\
+         mounts = [\"~/inherited:/inherited:ro\"]\n",
+    );
+
+    let applied = harness.launch("t", &[]);
+    let applied_stderr = stderr_of(&applied);
+    assert!(applied_stderr.contains(CONFIG_MARKER), "{applied_stderr}");
+    // The first launch's provisioning state is captured *before* the second one
+    // starts. Both share a project, so the state path is one directory and only a
+    // retained before-image can show that the suppressed launch left every
+    // credential file and persisted link as it found it; two snapshots taken after
+    // both launches would compare that directory with itself.
+    let state = state_dir(&applied_stderr);
+    let after_applied = snapshot(&state);
+    let suppressed = harness.launch("t", &["--no-config-mounts"]);
+    let suppressed_stderr = stderr_of(&suppressed);
+    assert!(
+        suppressed_stderr.contains(CONFIG_MARKER),
+        "{suppressed_stderr}"
+    );
+    assert_eq!(
+        state_dir(&suppressed_stderr),
+        state,
+        "the two launches must share the state directory the comparison is about"
+    );
+
+    // Observation 1: the serialized bind list. Every automatic declaration is
+    // inherited — the launched tool's own leaf and the referenced tool's — and
+    // suppressing the automatic facet removes exactly those and nothing else.
+    let binds = |stderr: &str| {
+        let mut binds: Vec<(String, String, bool)> = debug_config_json(stderr)["mounts"]
+            .as_array()
+            .expect("config.mounts must be an array")
+            .iter()
+            .filter(|mount| mount["type"] == "Bind")
+            .map(|mount| {
+                (
+                    mount["host"].as_str().expect("host").to_string(),
+                    mount["guest"].as_str().expect("guest").to_string(),
+                    mount["options"]["readonly"].as_bool().expect("readonly"),
+                )
+            })
+            .collect();
+        binds.sort();
+        binds
+    };
+    let applied_binds = binds(&applied_stderr);
+    for (dir, guest) in [(&own, "/own"), (&inherited, "/inherited")] {
+        assert!(
+            applied_binds
+                .iter()
+                .any(|(host, path, readonly)| Path::new(host) == dir.as_path()
+                    && path == guest
+                    && *readonly),
+            "{guest} must bind {} read-only: {applied_binds:?}",
+            dir.display()
+        );
+    }
+    let without_automatic: Vec<_> = applied_binds
+        .iter()
+        .filter(|(_, guest, _)| guest != "/own" && guest != "/inherited")
+        .cloned()
+        .collect();
+    assert_eq!(
+        without_automatic,
+        binds(&suppressed_stderr),
+        "the opt-out must remove only the inherited tool mounts"
+    );
+
+    // Observation 2: the whole normalized sandbox config apart from `mounts`, and
+    // the provider-produced state as the *first* launch left it.
+    let strip = |out: &Output| {
+        let mut config = normalized_config(&harness, out);
+        config["mounts"] = serde_json::json!([]);
+        config
+    };
+    assert_eq!(
+        strip(&applied),
+        strip(&suppressed),
+        "only `mounts` may differ between the applied and suppressed launches"
+    );
+    assert_eq!(
+        snapshot(&state),
+        after_applied,
+        "the suppressed launch must leave every provisioning artifact as the applied \
+         launch left it"
+    );
+
+    // Observation 3: the inherited facets really are active in both launches, so
+    // the equality above is not the equality of two empty observations. The
+    // referenced tool's persist link and captured provider survive the mount
+    // opt-out, which is what makes `mounts` the only facet it changes.
+    assert!(
+        after_applied.contains_key("link:u-state"),
+        "the referenced tool's persist link is inherited: {after_applied:?}"
+    );
+    assert!(
+        snapshot(&state).contains_key("link:u-state"),
+        "the mount opt-out must not drop the inherited persist link"
+    );
+    let config = debug_config_json(&applied_stderr);
+    assert!(
+        registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "the referenced tool's provider is inherited and captured"
+    );
+    assert!(
+        registered_secret_env_vars(&debug_config_json(&suppressed_stderr))
+            .contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+        "the mount opt-out must not drop the inherited provider"
+    );
+
+    // Observation 4: env and network requests stay own-only. The launching tool's
+    // own pair is present; the referenced tool's is not leaked into the sandbox or
+    // into the request report.
+    let env = env_pairs(&config);
+    assert!(env.contains(&("T_ONLY", "t-value")), "{env:?}");
+    assert!(
+        !env.iter().any(|(name, _)| *name == "U_ONLY"),
+        "a referenced tool's env must not reach the guest: {env:?}"
+    );
+    let expected_requests = vec![
+        format!(
+            "==> Tool network requests (user config): 1 of 1 not covered by this launch's \
+             {REQUEST_SCOPE}; requests never grant access and the launch continues"
+        ),
+        "==>   unmet: t.example".to_string(),
+        REQUEST_HINT.to_string(),
+    ];
+    assert_eq!(request_block(&applied_stderr), expected_requests);
+    assert_eq!(
+        request_block(&suppressed_stderr),
+        expected_requests,
+        "the opt-out must not change the request report either"
+    );
+}
+
+/// #396 AC-opt-out/AC-shell: a declared `shell` reaching same-tier tools through
+/// its omitted `tools` wildcard keeps their whole provisioning set when the mount
+/// facet is suppressed — and loses it when the *tool* inheritance switch is turned
+/// off, which is the opposite control.
+#[test]
+fn shell_tool_mount_opt_out_does_not_disable_inherited_provisioning() {
+    let shell = |tail: &str| {
+        format!(
+            "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n{tail}\
+             [[tools]]\nname = \"agent\"\ncommand = \"/bin/echo\"\ntools = []\n\
+             credentials = [\"anthropic\"]\npersist = [\"agent-state\"]\n\
+             mounts = [\"~/own:/own:ro\"]\n"
+        )
+    };
+    // `(tail, options, expected inheritance)` rows.
+    for (label, tail, options, inherited) in [
+        ("wildcard", "", Vec::new(), true),
+        (
+            "wildcard under the opt-out",
+            "",
+            vec!["--no-config-mounts"],
+            true,
+        ),
+        ("explicit empty", "tools = []\n", Vec::new(), false),
+        (
+            "explicit empty under the opt-out",
+            "tools = []\n",
+            vec!["--no-config-mounts"],
+            false,
+        ),
+    ] {
+        let harness = Harness::warm();
+        harness.write_user(&shell(tail));
+        std::fs::create_dir_all(harness.home_root.join("own")).unwrap();
+        std::fs::write(harness.home_root.join("own/marker"), "own").unwrap();
+        let out = harness.launch("shell", &options);
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(CONFIG_MARKER), "{label}: {stderr}");
+        let state = state_dir(&stderr);
+        let config = debug_config_json(&stderr);
+        let env_vars = registered_secret_env_vars(&config);
+        assert_eq!(
+            env_vars.contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+            inherited,
+            "{label}: the wildcard, not the mount selection, governs providers: {env_vars:?}"
+        );
+        assert_eq!(
+            snapshot(&state).contains_key("link:agent-state"),
+            inherited,
+            "{label}: the same switch governs inherited persistence"
+        );
+        let binds: Vec<String> = config["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|mount| mount["type"] == "Bind")
+            .map(|mount| mount["guest"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            binds.iter().any(|guest| guest == "/own"),
+            inherited && options.is_empty(),
+            "{label}: the mount facet follows both switches: {binds:?}"
+        );
+    }
+
+    // The fallback singleton: no declared shell, so the shipped one is synthesized
+    // in its own scope and inherits nothing — with or without the mount opt-out.
+    for options in [Vec::new(), vec!["--no-config-mounts"]] {
+        let harness = Harness::warm();
+        harness.write_user(
+            "[[tools]]\nname = \"agent\"\ncommand = \"/bin/echo\"\ntools = []\n\
+             credentials = [\"anthropic\"]\npersist = [\"agent-state\"]\n\
+             mounts = [\"~/own:/own:ro\"]\n",
+        );
+        std::fs::create_dir_all(harness.home_root.join("own")).unwrap();
+        std::fs::write(harness.home_root.join("own/marker"), "own").unwrap();
+        let out = harness.launch("shell", &options);
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(CONFIG_MARKER), "{options:?}: {stderr}");
+        let config = debug_config_json(&stderr);
+        assert!(
+            !registered_secret_env_vars(&config).contains(&"MSB_AGENT_VM_ANTHROPIC_UNUSED"),
+            "{options:?}: the fallback provisions nothing"
+        );
+        assert!(
+            !snapshot(&state_dir(&stderr)).contains_key("link:agent-state"),
+            "{options:?}: the fallback inherits no persisted path"
+        );
+        assert!(
+            !config["mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| mount["guest"] == "/own"),
+            "{options:?}: the fallback inherits no mount"
+        );
+    }
+}
+
+/// #396 AC-guards: a selected topology error — a closure mount colliding with an
+/// inherited declared `persist` link — is decided before the common launch effects,
+/// even with an otherwise valid fork in the same closure.
+#[test]
+fn tool_mount_invalid_topology_precedes_common_launch_effects() {
+    let harness = Harness::warm();
+    std::fs::create_dir_all(harness.home_root.join("live")).unwrap();
+    std::fs::create_dir_all(harness.home_root.join("fork-src")).unwrap();
+    std::fs::write(harness.home_root.join("fork-src/marker"), "seed").unwrap();
+    let shadow = format!("{}/x-state", harness.home_root.display());
+    harness.write_user(&format!(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\n\
+         mounts = [\"~/fork-src:/f:fork\", \"~/live:{shadow}:ro\"]\n\
+         [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\ntools = []\npersist = [\"x-state\"]\n"
+    ));
+    // Everything the launch could have written, before it is even started.
+    let files_before = state_regular_files(&harness.state_root);
+    let names_before = top_level_state(&harness);
+    let out = harness.launch("t", &[]);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("would collide with the guest mount point"),
+        "the inherited persist collision must be named: {stderr}"
+    );
+    assert!(
+        !stderr.contains(CONFIG_MARKER),
+        "no sandbox config may be built: {stderr}"
+    );
+    assert!(
+        !stderr.contains(GUEST_CMD_MARKER),
+        "no guest command may be built: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Initialized fork"),
+        "the valid fork in the same closure must not be published: {stderr}"
+    );
+    assert_eq!(state_regular_files(&harness.state_root), files_before);
+    assert_eq!(top_level_state(&harness), names_before);
+    assert!(
+        harness.msb_log().lines().all(|line| line == "--version"),
+        "the runtime may only be version-probed: {}",
+        harness.msb_log()
+    );
+}
+
+/// The state root's top-level entry names, so a refused launch cannot have created
+/// a project state directory or a fork store even if it wrote no regular file.
+fn top_level_state(harness: &Harness) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&harness.state_root)
+        .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}

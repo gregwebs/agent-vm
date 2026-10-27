@@ -3590,3 +3590,1281 @@ fn named_mount_sets_cannot_be_declared_or_selected_by_the_project() {
         "the user set must still be the one that resolves: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tool-specific config mounts (#396)
+//
+// A full user `[[tools]]` may declare `mounts`, and a launch of that tool selects
+// its own list plus the lists of every definition in its transitive same-file
+// `tools` closure — never another tool's, never a project tool's. Every row below
+// launches the *real* CLI through the fake runtime and reads the guest volume set
+// out of the dumped `SandboxConfig`, so a notice alone can never make a row pass.
+// ---------------------------------------------------------------------------
+
+/// The launched verb's bind set as sorted `(host, guest, readonly)` triples.
+fn verb_binds(h: &Harness, options: &[&str], verb: &str) -> Vec<(String, String, bool)> {
+    let stderr = stderr_of(&h.launch(options, verb, &[]));
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "{verb} must reach builder wiring: {stderr}"
+    );
+    sorted_binds(&debug_config_json(&stderr))
+}
+
+/// The guests a launch binds, so a row can assert *which* paths appeared without
+/// pinning the generated host spelling of a mirror.
+fn verb_guests(h: &Harness, options: &[&str], verb: &str) -> Vec<String> {
+    verb_binds(h, options, verb)
+        .into_iter()
+        .map(|(_, guest, _)| guest)
+        .collect()
+}
+
+/// A directory that must exist for its declaration to be selected.
+fn seed_dir(h: &Harness, name: &str) -> PathBuf {
+    let path = h.home_root.join(name);
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("marker"), name).unwrap();
+    path
+}
+
+/// #396 AC-selector/AC-union: a verb selects **its own** list plus its transitive
+/// closure's, and an unrelated (even missing) declaration never joins it.
+#[test]
+fn user_tool_own_mounts_select_only_its_verb() {
+    let h = Harness::new();
+    let _own = seed_dir(&h, "own");
+    let _inherited = seed_dir(&h, "inherited");
+    let _other = seed_dir(&h, "other");
+    // `other` declares a source that does not exist: it must not be inspected
+    // unless `other` is the launched verb.
+    h.write_user(
+        "[[tools]]\nname = \"root\"\ncommand = \"/bin/echo\"\ntools = [\"child\"]\n\
+         mounts = [\"~/own:/own:ro\"]\n\
+         [[tools]]\nname = \"child\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"~/inherited:/inherited:rw\"]\n\
+         [[tools]]\nname = \"other\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"/nonexistent-agent-vm-396:/gone:ro\"]\n",
+    );
+    let binds = verb_binds(&h, &[], "root");
+    let our_guests: Vec<&str> = binds
+        .iter()
+        .map(|(_, guest, _)| guest.as_str())
+        .filter(|guest| ["/own", "/inherited", "/gone"].contains(guest))
+        .collect();
+    assert_eq!(our_guests, ["/inherited", "/own"], "{binds:?}");
+    // Exact modes, not just presence: the own leaf is read-only, the inherited one
+    // writable.
+    let mode = |guest: &str| {
+        binds
+            .iter()
+            .find(|(_, path, _)| path == guest)
+            .map(|(_, _, readonly)| *readonly)
+            .unwrap_or_else(|| panic!("{guest} missing from {binds:?}"))
+    };
+    assert!(mode("/own"), "the own leaf is :ro: {binds:?}");
+    assert!(!mode("/inherited"), "the inherited leaf is :rw: {binds:?}");
+    // A verb that declares no list of its own binds neither of root's, so the
+    // inheritance is directional rather than "any launch sees any tool's mounts".
+    let child_guests = verb_guests(&h, &[], "child");
+    assert!(child_guests.iter().any(|guest| guest == "/inherited"));
+    assert!(
+        !child_guests.iter().any(|guest| guest == "/own"),
+        "{child_guests:?}"
+    );
+    assert!(!child_guests.iter().any(|guest| guest == "/gone"));
+    // And the direct runner sees none of it.
+    let direct = stderr_of(&h.launch(&[], "run", &["/bin/echo", "hi"]));
+    assert!(direct.contains(CONFIG_MARKER), "{direct}");
+    let direct_binds = sorted_binds(&debug_config_json(&direct));
+    assert!(
+        !direct_binds
+            .iter()
+            .any(|(_, guest, _)| guest == "/own" || guest == "/inherited"),
+        "a direct command must receive no tool mounts: {direct_binds:?}"
+    );
+}
+
+/// #396 AC-selector: a tool list accepts mount-set names through the *same*
+/// selector as the defaults list, and a set whose name matches a tool or the cwd
+/// is still only a set.
+///
+/// The catalog deliberately contains a tool named exactly like the set, with three
+/// independently observable provisioning facts of its own: a bind, a requested
+/// name and a persisted guest-HOME link. Selecting the set must produce the set's
+/// declarations and none of those three; launching the tool itself is the
+/// positive control that each observable is live.
+#[test]
+fn tool_mounts_select_shared_named_sets_without_tool_inference() {
+    let h = Harness::new();
+    let _agent = seed_dir(&h, "agents");
+    let _nested = seed_dir(&h, "nested");
+    let _tool = seed_dir(&h, "agent-tool");
+    h.write_user(
+        "[mount_sets]\nagent = [\"~/agents:/agents:rw\", \"nested\"]\n\
+         nested = [\"~/nested:/nested:ro\"]\nempty = []\n\
+         [[tools]]\nname = \"pi\"\ncommand = \"/bin/echo\"\nmounts = [\"agent\", \"empty\"]\n\
+         [[tools]]\nname = \"plain\"\ncommand = \"/bin/echo\"\n\
+         [[tools]]\nname = \"agent\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"~/agent-tool:/agent-tool:ro\"]\n\
+         network_requests = [\"agent-tool.example\"]\n\
+         persist = [\"agent-tool-state\"]\n",
+    );
+    let guests = verb_guests(&h, &[], "pi");
+    assert!(guests.iter().any(|guest| guest == "/agents"));
+    assert!(guests.iter().any(|guest| guest == "/nested"));
+    assert!(
+        !guests.iter().any(|guest| guest == "/agent-tool"),
+        "the tool's own leaf is not selected by a set name: {guests:?}"
+    );
+
+    // A set name is never provisioned as a tool: `--mount agent` selects the set,
+    // and the same-named tool's bind, requested name and persisted link all stay
+    // out of the launch.
+    let stored = stderr_of(&h.launch(&["--mount", "agent"], "plain", &[]));
+    let binds = sorted_binds(&debug_config_json(&stored));
+    assert!(
+        binds.iter().any(|(_, guest, _)| guest == "/agents"),
+        "the explicit set must resolve: {binds:?}"
+    );
+    assert!(binds.iter().any(|(_, guest, _)| guest == "/nested"));
+    assert!(
+        !binds
+            .iter()
+            .any(|(_, guest, readonly)| guest == "/agent-tool" && *readonly),
+        "selecting the set must not provision the same-named tool: {binds:?}"
+    );
+    assert!(
+        !stored.contains("agent-tool.example"),
+        "the same-named tool's requested name must stay unrequested: {stored}"
+    );
+    // The guest-HOME link `persist = ["agent-tool-state"]` provisions, as the
+    // state tree shows it: present only when that declaration was selected.
+    let persisted = |h: &Harness| {
+        h.snapshot()
+            .into_iter()
+            .any(|(key, value)| key.ends_with("agent-tool-state") && value.starts_with("symlink:"))
+    };
+    assert!(
+        !persisted(&h),
+        "selecting the set must not provision the same-named tool's persist link"
+    );
+
+    // Positive control for all three observables: the tool itself, launched.
+    let direct = stderr_of(&h.launch(&[], "agent", &[]));
+    let direct_binds = sorted_binds(&debug_config_json(&direct));
+    assert!(
+        direct_binds
+            .iter()
+            .any(|(_, guest, readonly)| guest == "/agent-tool" && *readonly),
+        "the same-named tool's own leaf binds when it is the launch: {direct_binds:?}"
+    );
+    assert!(
+        direct.contains("agent-tool.example"),
+        "the same-named tool's requested name is reported when it is the launch: {direct}"
+    );
+    assert!(
+        persisted(&h),
+        "the same-named tool's persist link appears when it is the launch"
+    );
+}
+
+/// #396 AC-selector/AC-union at the CLI boundary: the issue's own accepted shape —
+/// one tool list mixing a set name and a `~/` direct entry — reaches the guest,
+/// and a declaration repeated across the two automatic *inputs* (the user-wide
+/// defaults and the tool facet) and inside the selected set is one bind, not
+/// three.
+///
+/// The defaults/tool split is the seam this row exists for: `materialize`
+/// concatenates the two inputs and relies on the one shared claim to merge them,
+/// and the notice counts *distinct guest paths*, not occurrences. A second claim
+/// per input, a dropped direct entry after a set name, or an occurrence count all
+/// fail here, and the per-guest `1` counts are calibrated by the four guests that
+/// must each be present.
+#[test]
+fn tool_list_mixes_set_and_direct_and_merges_with_defaults() {
+    let h = Harness::new();
+    let _own = seed_dir(&h, "own");
+    let _shared = seed_dir(&h, "shared");
+    let _default = seed_dir(&h, "default");
+    let _agents = seed_dir(&h, "agents");
+    h.write_user(
+        // The defaults and the tool list declare the *same* guest path with the
+        // same declaration; the set names it a third time.
+        "mounts = [\"~/default:/default:ro\", \"~/shared:/shared:ro\"]\n\
+         [mount_sets]\nagent = [\"~/agents:/agents:rw\", \"~/shared:/shared:ro\"]\n\
+         [[tools]]\nname = \"pi\"\ncommand = \"/bin/echo\"\ntools = []\n\
+         mounts = [\"agent\", \"~/own:/own:ro\", \"~/shared:/shared:ro\"]\n",
+    );
+    let stderr = stderr_of(&h.launch(&[], "pi", &[]));
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "the launch must reach builder wiring: {stderr}"
+    );
+    let binds = sorted_binds(&debug_config_json(&stderr));
+    for (guest, readonly) in [
+        ("/agents", false),
+        ("/own", true),
+        ("/shared", true),
+        ("/default", true),
+    ] {
+        let matching: Vec<_> = binds.iter().filter(|(_, path, _)| path == guest).collect();
+        assert_eq!(matching.len(), 1, "{guest} must bind once: {binds:?}");
+        assert_eq!(matching[0].2, readonly, "{guest}: {binds:?}");
+    }
+    // Distinct guest paths across both inputs: 2 defaults (one of them the
+    // duplicate) + 3 tool-facet entries (one of them the duplicate again).
+    assert!(
+        stderr.contains("==> Config mounts: 4 from"),
+        "the notice counts distinct guest paths, not occurrences: {stderr}"
+    );
+}
+
+/// #396 AC-union: a chain, a cycle and a diamond each bind every declaration once,
+/// and an equivalent spelling reached twice merges rather than conflicting.
+#[test]
+fn tool_mount_chain_cycle_and_diamond_bind_each_declaration_once() {
+    let h = Harness::new();
+    let _a = seed_dir(&h, "a");
+    let _b = seed_dir(&h, "b");
+    let _c = seed_dir(&h, "c");
+    h.write_user(
+        "[[tools]]\nname = \"top\"\ncommand = \"/bin/echo\"\ntools = [\"left\", \"right\"]\n\
+         mounts = [\"~/a:/a:ro\", \"~/a:/a//./:ro\"]\n\
+         [[tools]]\nname = \"left\"\ncommand = \"/bin/echo\"\ntools = [\"shared\"]\n\
+         mounts = [\"~/b:/b:ro\"]\n\
+         [[tools]]\nname = \"right\"\ncommand = \"/bin/echo\"\ntools = [\"shared\", \"top\"]\n\
+         mounts = [\"~/c:/c:ro\"]\n\
+         [[tools]]\nname = \"shared\"\ncommand = \"/bin/echo\"\ntools = [\"top\"]\n\
+         mounts = [\"~/a:/a:ro\"]\n",
+    );
+    let binds = verb_binds(&h, &[], "top");
+    for guest in ["/a", "/b", "/c"] {
+        let count = binds.iter().filter(|(_, path, _)| path == guest).count();
+        assert_eq!(count, 1, "{guest} must bind once: {binds:?}");
+    }
+}
+
+/// #396 AC-union: a conflict between two lists **the same launch's closure**
+/// selects is a load error, naming both declaring sites and offering no
+/// override — in either list order.
+#[test]
+fn tool_mount_conflicts_name_both_sites_without_overrides() {
+    // Both orders: which declaration is `tools[0]` decides which site is named
+    // first, and neither may be silently preferred.
+    for reversed in [false, true] {
+        let h = Harness::new();
+        let _p = seed_dir(&h, "p");
+        let _q = seed_dir(&h, "q");
+        let (own, inherited) = if reversed {
+            ("~/q:/g:rw", "~/p:/g:ro")
+        } else {
+            ("~/p:/g:ro", "~/q:/g:rw")
+        };
+        h.write_user(&format!(
+            "[[tools]]\nname = \"launch\"\ncommand = \"/bin/echo\"\ntools = [\"other\"]\n\
+             mounts = [\"{own}\"]\n\
+             [[tools]]\nname = \"other\"\ncommand = \"/bin/echo\"\nmounts = [\"{inherited}\"]\n"
+        ));
+        let before = h.snapshot();
+        let out = h.launch(&[], "launch", &[]);
+        h.assert_refused_before_launch_state(
+            &out,
+            &before,
+            "tools[1].mounts[0]: claims the same guest path as tools[0].mounts[0] with a \
+             different declaration",
+        );
+        // The opt-out cannot hide it: the closure is a load-time fact, and the flag
+        // only removes automatic *selection*.
+        let before = h.snapshot();
+        let out = h.launch(&["--no-config-mounts"], "launch", &[]);
+        h.assert_refused_before_launch_state(&out, &before, "claims the same guest path");
+    }
+}
+
+/// #396 AC-union: every pair of *declaration sources* has its own refusal, and the
+/// two mechanisms keep their deliberately different contexts — a pair inside one
+/// closure's fold is a load error naming both sites, while a pair across facets
+/// (defaults, tool closure, argv) is the shared preparation claim that names each
+/// declaration and offers the opt-out.
+///
+/// The six rows are the six pairs of the four sources a launch can receive a mount
+/// from: `--mount`, the defaults list, a tool list and a mount-set leaf. Covering
+/// only own-versus-inherited would leave three of the four renderings untested.
+#[test]
+fn tool_mount_conflicts_name_every_opposing_declaration_pair() {
+    /// One fixture: the launch route, the needle its own mechanism prints, and the
+    /// two exact declaration names the sentence must carry. `{file}` is the harness's
+    /// user config path.
+    type Build =
+        fn(&Harness, &Path) -> (&'static str, Vec<String>, &'static str, [&'static str; 2]);
+    let rows: [(&str, Build); 6] = [
+        // argv × defaults
+        ("argv/defaults", |h, b| {
+            h.write_user("mounts = [\"~/a:/g:ro\"]\n");
+            (
+                "shell",
+                vec!["--mount".to_string(), format!("{}:/g:ro", b.display())],
+                "is claimed by different declarations",
+                ["mounts[0] in \"{file}\"", "--mount"],
+            )
+        }),
+        // argv × set leaf
+        ("argv/set", |h, b| {
+            h.write_user(
+                "[mount_sets]\ns = [\"~/a:/g:ro\"]\n[[tools]]\nname = \"t\"\n\
+                     command = \"/bin/echo\"\ntools = []\nmounts = [\"s\"]\n",
+            );
+            (
+                "t",
+                vec!["--mount".to_string(), format!("{}:/g:ro", b.display())],
+                "is claimed by different declarations",
+                ["mount_sets[\"s\"][0] in \"{file}\"", "--mount"],
+            )
+        }),
+        // argv × tool list
+        ("argv/tool", |h, b| {
+            h.write_user(
+                "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = []\n\
+                     mounts = [\"~/a:/g:ro\"]\n",
+            );
+            (
+                "t",
+                vec!["--mount".to_string(), format!("{}:/g:ro", b.display())],
+                "is claimed by different declarations",
+                ["tools[0].mounts[0] in \"{file}\"", "--mount"],
+            )
+        }),
+        // defaults × set leaf
+        ("defaults/set", |h, _| {
+            h.write_user(
+                "mounts = [\"~/a:/g:ro\"]\n[mount_sets]\ns = [\"~/b:/g:ro\"]\n\
+                     [[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = []\n\
+                     mounts = [\"s\"]\n",
+            );
+            (
+                "t",
+                vec![],
+                "is claimed by different declarations",
+                [
+                    "mounts[0] in \"{file}\"",
+                    "mount_sets[\"s\"][0] in \"{file}\"",
+                ],
+            )
+        }),
+        // defaults × tool list
+        ("defaults/tool", |h, _| {
+            h.write_user(
+                "mounts = [\"~/a:/g:ro\"]\n[[tools]]\nname = \"t\"\n\
+                     command = \"/bin/echo\"\ntools = []\nmounts = [\"~/b:/g:ro\"]\n",
+            );
+            (
+                "t",
+                vec![],
+                "is claimed by different declarations",
+                [
+                    "mounts[0] in \"{file}\"",
+                    "tools[0].mounts[0] in \"{file}\"",
+                ],
+            )
+        }),
+        // set leaf × tool list, one closure: the fold merges them at load. The sites
+        // are rendered by the fold's own sentence, which numbers the set because it
+        // is a load-site pointer rather than the leaf's declaration.
+        ("set/tool", |h, _| {
+            h.write_user(
+                "[mount_sets]\ns = [\"~/a:/g:ro\"]\n[[tools]]\nname = \"t\"\n\
+                     command = \"/bin/echo\"\ntools = [\"u\"]\nmounts = [\"s\"]\n\
+                     [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\ntools = []\n\
+                     mounts = [\"~/b:/g:ro\"]\n",
+            );
+            (
+                "t",
+                vec![],
+                "claims the same guest path",
+                ["mount_sets[0][0]", "tools[1].mounts[0]"],
+            )
+        }),
+    ];
+    for (label, build) in rows {
+        let h = Harness::new();
+        seed_dir(&h, "a");
+        let b = seed_dir(&h, "b");
+        let (verb, argv, needle, names) = build(&h, &b);
+        let options: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let before = h.snapshot();
+        let out = h.launch(&options, verb, &[]);
+        let stderr = stderr_of(&out);
+        let claim = stderr
+            .lines()
+            .find(|line| {
+                line.contains("claimed by different declarations")
+                    || line.contains("claims the same guest path")
+            })
+            .unwrap_or_else(|| panic!("{label}: no claim sentence: {stderr}"));
+        let file = h.user_config().display().to_string();
+        for name in names {
+            let name = name.replace("{file}", &file);
+            assert!(
+                claim.contains(&name),
+                "{label}: the sentence must name {name:?}: {claim}"
+            );
+        }
+        h.assert_refused_before_launch_state(&out, &before, needle);
+    }
+}
+
+/// #396 AC-union: declaration identity includes every field two declarations agree
+/// or disagree on — host, policy, follow-links, fork exclusions and the fork mode
+/// itself — so no pair of same-guest declarations is silently merged.
+#[test]
+fn tool_mount_conflicts_cover_each_differing_declaration_field() {
+    for (label, defaults, tool_list) in [
+        ("host", "~/a:/g:ro", "~/b:/g:ro"),
+        ("policy", "~/a:/g:ro", "~/a:/g:rw"),
+        ("follow-links", "~/a:/g:ro", "~/a:/g:ro:follow-links"),
+        (
+            "fork exclusions",
+            "~/a:/g:fork:exclude=one",
+            "~/a:/g:fork:exclude=two",
+        ),
+        ("fork mode", "~/a:/g:fork", "~/a:/g:rw"),
+    ] {
+        let h = Harness::new();
+        seed_dir(&h, "a");
+        seed_dir(&h, "b");
+        let file = h.user_config().display().to_string();
+        h.write_user(&format!(
+            "mounts = [\"{defaults}\"]\n[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n\
+             tools = []\nmounts = [\"{tool_list}\"]\n"
+        ));
+        let before = h.snapshot();
+        let out = h.launch(&[], "t", &[]);
+        let stderr = stderr_of(&out);
+        let clause = format!("mounts[0] in \"{file}\"");
+        assert!(
+            stderr.contains(&format!(
+                "guest path /g is claimed by different declarations ({clause} and "
+            )) && stderr.contains(&format!("tools[0].mounts[0] in \"{file}\"")),
+            "{label}: both declarations must be named: {stderr}"
+        );
+        h.assert_refused_before_launch_state(&out, &before, "is claimed by different declarations");
+        assert!(
+            h.fork_dirs().is_empty(),
+            "{label}: no fork may be published before the claim is refused"
+        );
+    }
+}
+
+/// #396 AC-authority: a project tool's `mounts` field is a load error by presence,
+/// including when the project definition is hidden by a user name and when the
+/// list is empty.
+#[test]
+fn project_tool_mount_presence_is_a_load_error_even_when_hidden() {
+    for body in [
+        "[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\nmounts = []\n".to_string(),
+        "[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\nmounts = 7\n".to_string(),
+        "[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\nmounts = [\"~/x:/x:ro\"]\n"
+            .to_string(),
+    ] {
+        let h = Harness::new();
+        // A user declaration of the same name makes the project definition a
+        // hidden loser — refused all the same, because the field is authority.
+        h.write_user("[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
+        h.write_project(&body);
+        let before = h.snapshot();
+        let out = h.launch(&[], "hidden", &[]);
+        h.assert_refused_before_launch_state(
+            &out,
+            &before,
+            "tools[0].mounts: mounts cannot be declared by the project config",
+        );
+        // `doctor` reports it and `--help` still works: the recovery path is
+        // intact.
+        let doctor = stderr_of(&h.doctor());
+        assert!(doctor.contains("tools[0].mounts"), "{doctor}");
+        assert!(
+            h.help().status.success(),
+            "a broken config must not break --help"
+        );
+    }
+    // Anchor: removing the field launches.
+    let h = Harness::new();
+    h.write_user("[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
+    h.write_project("[[tools]]\nname = \"hidden\"\ncommand = \"/bin/echo\"\n");
+    assert!(stderr_of(&h.launch(&[], "hidden", &[])).contains(CONFIG_MARKER));
+}
+
+/// #396 AC-tier: a project launch never acquires user mount authority, by naming
+/// a user tool, by a wildcard, or transitively — while user-wide defaults and
+/// explicit `--mount` still reach it deliberately.
+#[test]
+fn project_tool_edges_never_select_user_mounts() {
+    let h = Harness::new();
+    let _pi = seed_dir(&h, "pi-home");
+    let _default = seed_dir(&h, "default");
+    h.write_user(
+        "mounts = [\"~/default:/default:ro\"]\n\
+         [[tools]]\nname = \"pi\"\ncommand = \"/bin/echo\"\nmounts = [\"~/pi-home:/pi:ro\"]\n",
+    );
+    // The project names a tool only the project declares; a project wildcard shell
+    // covers only project definitions.
+    h.write_project(
+        "[[tools]]\nname = \"local\"\ncommand = \"/bin/echo\"\ntools = [\"bridge\"]\n\
+         [[tools]]\nname = \"bridge\"\ncommand = \"/bin/echo\"\n\
+         [[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n",
+    );
+    let guests = verb_guests(&h, &[], "local");
+    assert!(
+        !guests.iter().any(|guest| guest == "/pi"),
+        "a project launch must not acquire the user's Pi mount: {guests:?}"
+    );
+    // The user-wide default *is* deliberately selected for a project launch.
+    assert!(
+        guests.iter().any(|guest| guest == "/default"),
+        "user-wide defaults still reach a project launch: {guests:?}"
+    );
+    // The project shell's wildcard likewise sees no user definition.
+    let shell_guests = verb_guests(&h, &[], "shell");
+    assert!(!shell_guests.iter().any(|guest| guest == "/pi"));
+    // A project reference to a name only the user declares is the exact
+    // cross-tier error, not a mount source.
+    h.write_project("[[tools]]\nname = \"local\"\ncommand = \"/bin/echo\"\ntools = [\"pi\"]\n");
+    let before = h.snapshot();
+    let out = h.launch(&[], "local", &[]);
+    h.assert_refused_before_launch_state(
+        &out,
+        &before,
+        "cross-tier tool references are not allowed",
+    );
+}
+
+/// #396 AC-authority: a present-empty tool list still requires the verified read,
+/// and the refusal names the tool field when the file has no top-level list.
+#[test]
+fn empty_present_tool_mounts_require_authority_before_any_launch() {
+    // Compatibility anchor: no mount field, so an ordinary (group-writable) mode
+    // is irrelevant and the launch proceeds.
+    let h = Harness::new();
+    h.write_user_mode("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n", 0o664);
+    assert!(stderr_of(&h.launch(&[], "t", &[])).contains(CONFIG_MARKER));
+
+    // The same file with `mounts = []` is authority-bearing, so the writable mode
+    // is refused — before any launch state.
+    for body in [
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
+        // A wrong type is authority-bearing before the schema is decided.
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = 7\n",
+    ] {
+        let h = Harness::new();
+        h.write_user_mode(body, 0o664);
+        let before = h.snapshot();
+        let out = h.launch(&[], "t", &[]);
+        h.assert_refused_before_launch_state(
+            &out,
+            &before,
+            "tools[0].mounts: mounts refuses a group- or other-writable config.toml",
+        );
+    }
+
+    // Through a final-component symlink, with the tool field as the only authority
+    // trigger.
+    let h = Harness::new();
+    let target = h.home_root.join("dotfiles/config.toml");
+    write_file(
+        &target,
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
+    );
+    h.symlink_user_config(&target);
+    let before = h.snapshot();
+    let out = h.launch(&[], "t", &[]);
+    h.assert_refused_before_launch_state(
+        &out,
+        &before,
+        "tools[0].mounts: mounts requires config.toml to be a regular file",
+    );
+}
+
+/// #396 AC-shell: omitted `tools` is the existing wildcard (so it inherits
+/// same-tier mounts), `tools = []` suppresses only the inheritance, and the
+/// built-in fallback references no user tool.
+#[test]
+fn declared_shell_mounts_follow_omitted_empty_and_fallback_scopes() {
+    let h = Harness::new();
+    let _agent = seed_dir(&h, "agent");
+    let _own = seed_dir(&h, "shell-own");
+    let shell = |tail: &str| {
+        format!(
+            "[[tools]]\nname = \"agent\"\ncommand = \"/bin/echo\"\nmounts = [\"~/agent:/agent:ro\"]\n\
+             [[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n\
+             mounts = [\"~/shell-own:/shell-own:ro\"]\n{tail}"
+        )
+    };
+    // Omitted: the wildcard covers the same file, so the agent's list is inherited.
+    h.write_user(&shell(""));
+    let guests = verb_guests(&h, &[], "shell");
+    assert!(guests.iter().any(|guest| guest == "/agent"), "{guests:?}");
+    assert!(guests.iter().any(|guest| guest == "/shell-own"));
+    // `tools = []`: own list only.
+    h.write_user(&shell("tools = []\n"));
+    let guests = verb_guests(&h, &[], "shell");
+    assert!(!guests.iter().any(|guest| guest == "/agent"), "{guests:?}");
+    assert!(guests.iter().any(|guest| guest == "/shell-own"));
+    // The fallback: no declared shell, so the shipped one is synthesized in a scope
+    // of its own and inherits nothing — it still receives user-wide defaults.
+    h.write_user(
+        "mounts = [\"~/default:/default:ro\"]\n\
+         [[tools]]\nname = \"agent\"\ncommand = \"/bin/echo\"\nmounts = [\"~/agent:/agent:ro\"]\n",
+    );
+    let _default = seed_dir(&h, "default");
+    let guests = verb_guests(&h, &[], "shell");
+    assert!(!guests.iter().any(|guest| guest == "/agent"), "{guests:?}");
+    assert!(
+        guests.iter().any(|guest| guest == "/default"),
+        "the fallback still gets user-wide defaults: {guests:?}"
+    );
+}
+
+/// #396 AC-opt-out: the flag removes the defaults **and** the whole tool facet,
+/// and an explicit `--mount` still applies.
+#[test]
+fn opt_out_removes_defaults_own_and_inherited_mounts_but_keeps_cli() {
+    let h = Harness::new();
+    let _default = seed_dir(&h, "default");
+    let _own = seed_dir(&h, "own");
+    let _inherited = seed_dir(&h, "inherited");
+    let _cli = seed_dir(&h, "cli");
+    h.write_user(
+        "mounts = [\"~/default:/default:ro\"]\n[mount_sets]\ns = [\"~/cli:/cli:ro\"]\n\
+         [[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\n\
+         mounts = [\"~/own:/own:ro\"]\n\
+         [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\nmounts = [\"~/inherited:/inherited:ro\"]\n",
+    );
+    // Apply: all three automatic sources appear.
+    let applied = verb_guests(&h, &[], "t");
+    for guest in ["/default", "/own", "/inherited"] {
+        assert!(
+            applied.iter().any(|path| path == guest),
+            "{guest}: {applied:?}"
+        );
+    }
+    // Suppress: none of them, and no automatic fork publication.
+    let suppressed = verb_guests(&h, &["--no-config-mounts"], "t");
+    for guest in ["/default", "/own", "/inherited"] {
+        assert!(
+            !suppressed.iter().any(|path| path == guest),
+            "{guest} must be suppressed: {suppressed:?}"
+        );
+    }
+    // The notice names what it skipped, and the count covers both automatic inputs.
+    let stderr = stderr_of(&h.launch(&["--no-config-mounts"], "t", &[]));
+    assert!(
+        stderr.contains("==> Config mounts: skipped 3 from"),
+        "the skipped count covers defaults and the tool facet: {stderr}"
+    );
+    // An explicit direct path and an explicit set still apply.
+    let cli_only = verb_guests(
+        &h,
+        &[
+            "--no-config-mounts",
+            "--mount",
+            "s",
+            "--mount",
+            &format!("{}:/direct:ro", h.home_root.join("cli").display()),
+        ],
+        "t",
+    );
+    assert!(cli_only.iter().any(|guest| guest == "/cli"), "{cli_only:?}");
+    assert!(
+        cli_only.iter().any(|guest| guest == "/direct"),
+        "{cli_only:?}"
+    );
+}
+
+/// #396 AC-opt-out: everything that is not a mount selection keeps working.
+#[test]
+fn tool_mount_opt_out_keeps_all_nonmount_facets_and_checks() {
+    let h = Harness::new();
+    let _own = seed_dir(&h, "own");
+    // An inherited persist path reaches the guest HOME whether or not the mounts
+    // are suppressed.
+    h.write_user(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\n\
+         mounts = [\"~/own:/own:ro\"]\n\
+         [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\npersist = [\"inherited-state\"]\n",
+    );
+    for options in [vec![], vec!["--no-config-mounts"]] {
+        let stderr = stderr_of(&h.launch(&options, "t", &[]));
+        assert!(
+            stderr.contains(CONFIG_MARKER),
+            "{options:?} must reach builder wiring: {stderr}"
+        );
+        let config = debug_config_json(&stderr);
+        let binds = sorted_binds(&config);
+        assert_eq!(
+            binds.iter().any(|(_, guest, _)| guest == "/own"),
+            options.is_empty(),
+            "{options:?}: only the mount facet is gated: {binds:?}"
+        );
+        // The inherited `persist` link is a host-side provisioning fact, so observe
+        // it where it is created: `<state>/<hash>/home/inherited-state`.
+        let state = state_dir(&stderr);
+        // The link is a host-side symlink into project state; `symlink_metadata`
+        // observes the link itself, so a link whose target is created on first use
+        // is still an observable provisioning fact.
+        let link = state.join("home/inherited-state");
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()),
+            "{options:?}: an inherited persist link must survive the opt-out (checked {})",
+            link.display()
+        );
+        let _ = config;
+    }
+
+    // A broken mount declaration still refuses under the opt-out: schema, set
+    // cycles and closure conflicts are load facts, not selections.
+    h.write_user(
+        "mounts = []\n[mount_sets]\ncyc = [\"cyc\"]\n\
+         [[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = []\n",
+    );
+    let before = h.snapshot();
+    let out = h.launch(&["--no-config-mounts"], "t", &[]);
+    h.assert_refused_before_launch_state(&out, &before, "mount-set reference cycle");
+    // A selected declaration whose source is missing refuses too.
+    h.write_user(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"/nonexistent-agent-vm-396:/gone:ro\"]\n",
+    );
+    let before = h.snapshot();
+    let out = h.launch(&[], "t", &[]);
+    h.assert_refused_before_launch_state(&out, &before, "tools[0].mounts[0]");
+}
+
+/// #396 AC-full-definition: a mount-only setting never patches a shipped tool, and
+/// declaring a tool replaces the shipped catalog whole.
+#[test]
+fn tool_mount_only_definition_never_patches_shipped_catalog() {
+    // Without a `command` the entry is the fixed schema error, so a mount field
+    // cannot be a partial override.
+    let h = Harness::new();
+    h.write_user("[[tools]]\nname = \"pi\"\nmounts = [\"/a:/a:ro\"]\n");
+    let before = h.snapshot();
+    let out = h.launch(&[], "pi", &[]);
+    h.assert_refused_before_launch_state(&out, &before, "invalid TOML or tool schema");
+
+    // A full custom tool replaces the shipped catalog: shipped verbs are gone, and
+    // the shipped `shell` becomes the fallback rather than a declaration.
+    let h = Harness::new();
+    let _a = seed_dir(&h, "a");
+    h.write_user("[[tools]]\nname = \"solo\"\ncommand = \"/bin/echo\"\nmounts = [\"~/a:/a:ro\"]\n");
+    let stderr = stderr_of(&h.launch(&[], "solo", &[]));
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    let help = String::from_utf8_lossy(&h.help().stdout).into_owned();
+    assert!(help.contains("solo"), "{help}");
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with("claude")),
+        "a custom catalog must not keep shipped verbs: {help}"
+    );
+}
+
+/// #396 AC-identity: an unselected tool's source is never inspected, and a
+/// *selected* missing source fails — the asymmetry that proves selection, not
+/// configuration, decides inspection.
+#[test]
+fn unselected_tool_sources_are_not_inspected_and_selected_missing_fails() {
+    let h = Harness::new();
+    let _real = seed_dir(&h, "real");
+    h.write_user(
+        "[[tools]]\nname = \"good\"\ncommand = \"/bin/echo\"\nmounts = [\"~/real:/real:ro\"]\n\
+         [[tools]]\nname = \"broken\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"/nonexistent-agent-vm-396:/gone:ro\"]\n",
+    );
+    // The unselected tool's missing source cannot block the good launch.
+    let stderr = stderr_of(&h.launch(&[], "good", &[]));
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+    assert!(
+        !sorted_binds(&debug_config_json(&stderr))
+            .iter()
+            .any(|(_, guest, _)| guest == "/gone")
+    );
+    // Selected, the same declaration fails at preparation and names its site.
+    let before = h.snapshot();
+    let out = h.launch(&[], "broken", &[]);
+    h.assert_refused_before_launch_state(&out, &before, "tools[1].mounts[0]");
+    // Under the opt-out the automatic selection is gone, so the once-failing verb
+    // reaches the config dump.
+    assert!(stderr_of(&h.launch(&["--no-config-mounts"], "broken", &[])).contains(CONFIG_MARKER));
+}
+
+/// #396 AC-identity: a fork's identity is its *declaration*, never the route that
+/// selected it. Seeding once and then selecting the same source through the
+/// defaults, a tool's own list, an inherited list, a set, a nested set and the
+/// equivalent `--mount` — with the tools and sets renamed and their edges
+/// reordered between launches — always reaches the same committed copy.
+///
+/// The source is deleted after seeding, so only a reused fork can satisfy the
+/// binding, and the committed bytes are mutated in between so a reseed would be
+/// visible as data, not just as a second directory.
+#[test]
+fn tool_and_inherited_forks_preserve_identity_across_every_selector() {
+    let h = Harness::new();
+    let src = seed_dir(&h, "src");
+    h.write_user("mounts = [\"~/src:/f:fork\"]\n");
+    let seeded = stderr_of(&h.launch(&[], "shell", &[]));
+    assert_eq!(
+        seeded.matches("==> Initialized fork").count(),
+        1,
+        "the first launch seeds exactly once: {seeded}"
+    );
+    let committed = only_fork_data(&h);
+    std::fs::write(committed.join("marker"), "committed").unwrap();
+    let manifest = committed.parent().unwrap().join("manifest.json");
+    let identity = std::fs::read(&manifest).unwrap();
+    // Remove the host source: only a reused copy can still be bound.
+    std::fs::remove_file(src.join("marker")).unwrap();
+    std::fs::remove_dir(&src).unwrap();
+
+    let cli = format!("{}:/f:fork", src.display());
+    // Every selector, each with different tool and set names and a different edge
+    // order. The declaration itself is identical in all of them.
+    let selectors: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "defaults",
+            "mounts = [\"~/src:/f:fork\"]\n\
+             [[tools]]\nname = \"solo\"\ncommand = \"/bin/echo\"\ntools = []\n"
+                .to_string(),
+            vec![],
+        ),
+        (
+            "own tool list",
+            "[[tools]]\nname = \"solo\"\ncommand = \"/bin/echo\"\ntools = []\n\
+             mounts = [\"~/src:/f:fork\"]\n"
+                .to_string(),
+            vec![],
+        ),
+        (
+            "inherited tool list",
+            "[[tools]]\nname = \"solo\"\ncommand = \"/bin/echo\"\ntools = [\"helper\"]\n\
+             mounts = []\n\
+             [[tools]]\nname = \"helper\"\ncommand = \"/bin/echo\"\ntools = []\n\
+             mounts = [\"~/src:/f:fork\"]\n"
+                .to_string(),
+            vec![],
+        ),
+        (
+            "set",
+            "[mount_sets]\nrenamed-set = [\"~/src:/f:fork\"]\n\
+             [[tools]]\nname = \"solo\"\ncommand = \"/bin/echo\"\ntools = []\n\
+             mounts = [\"renamed-set\"]\n"
+                .to_string(),
+            vec![],
+        ),
+        (
+            "nested set, reordered edges",
+            "[mount_sets]\ninner = [\"~/src:/f:fork\"]\nouter = [\"inner\"]\n\
+             [[tools]]\nname = \"solo\"\ncommand = \"/bin/echo\"\ntools = [\"helper\"]\n\
+             mounts = [\"outer\"]\n\
+             [[tools]]\nname = \"helper\"\ncommand = \"/bin/echo\"\ntools = [\"leaf\"]\nmounts = []\n\
+             [[tools]]\nname = \"leaf\"\ncommand = \"/bin/echo\"\ntools = []\nmounts = []\n"
+                .to_string(),
+            vec![],
+        ),
+        (
+            "equivalent --mount",
+            "[[tools]]\nname = \"solo\"\ncommand = \"/bin/echo\"\ntools = []\nmounts = []\n"
+                .to_string(),
+            vec!["--no-config-mounts".to_string(), "--mount".to_string(), cli.clone()],
+        ),
+    ];
+    for (label, body, cli_options) in selectors {
+        h.write_user(&body);
+        let options: Vec<&str> = cli_options.iter().map(String::as_str).collect();
+        let launch = h.launch(&options, "solo", &[]);
+        let stderr = stderr_of(&launch);
+        assert!(
+            stderr.contains("==> Reusing fork"),
+            "{label}: only reuse is allowed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Initialized"),
+            "{label}: a READY fork must not reseed: {stderr}"
+        );
+        assert!(
+            bind_mounts(&debug_config_json(&stderr))
+                .iter()
+                .any(|(host, guest, _)| Path::new(host) == committed && guest == "/f"),
+            "{label}: the committed copy must be bound"
+        );
+        assert_eq!(
+            std::fs::read_to_string(committed.join("marker")).unwrap(),
+            "committed",
+            "{label}: the same committed copy"
+        );
+        assert_eq!(h.fork_dirs().len(), 1, "{label}: one fork, not two");
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            identity,
+            "{label}: the manifest is unchanged"
+        );
+    }
+}
+
+/// #396 AC-guards: inherited mounts and declared persistence collide before any
+/// fork is published, in both directions — own mount against inherited persist and
+/// the converse — with an unrelated valid fork in the same closure so a
+/// publish-then-check bug cannot pass.
+#[test]
+fn inherited_mounts_and_persist_collide_before_any_fork() {
+    // The collide-able guest path is inside the guest HOME, which is what a
+    // declared `persist = ["x-state"]` links under — only the running host knows
+    // that prefix, so each row builds its declaration from it.
+    for mount_on_launcher in [true, false] {
+        let h = Harness::new();
+        let _live = seed_dir(&h, "live");
+        let _fork = seed_dir(&h, "fork-src");
+        let shadow = format!("{}/x-state", h.home_root.display());
+        let mount_list = format!("[\"~/live:{shadow}:ro\"]");
+        let (launcher_mounts, other_mounts, launcher_persist, other_persist) = if mount_on_launcher
+        {
+            (mount_list.as_str(), "[]", "[]", "[\"x-state\"]")
+        } else {
+            ("[]", mount_list.as_str(), "[\"x-state\"]", "[]")
+        };
+        h.write_user(&format!(
+            "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\n\
+             mounts = {launcher_mounts}\npersist = {launcher_persist}\n\
+             [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\n\
+             mounts = {other_mounts}\npersist = {other_persist}\n"
+        ));
+        let before = h.snapshot();
+        let out = h.launch(&[], "t", &[]);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("would collide with the guest mount point"),
+            "mount_on_launcher={mount_on_launcher}: inherited mounts must be checked against \
+             declared persistence: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Initialized fork"),
+            "no fork may be published before the collision is refused: {stderr}"
+        );
+        assert!(!stderr.contains(CONFIG_MARKER), "{stderr}");
+        assert_eq!(h.snapshot(), before, "{stderr}");
+        assert!(h.fork_dirs().is_empty(), "{stderr}");
+    }
+
+    // An unrelated, otherwise valid fork in the same closure is *also* not
+    // published: the check precedes every fork.
+    let h = Harness::new();
+    let _live = seed_dir(&h, "live");
+    let _fork = seed_dir(&h, "fork-src");
+    let shadow = format!("{}/x-state", h.home_root.display());
+    h.write_user(&format!(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\n\
+         mounts = [\"~/fork-src:/f:fork\", \"~/live:{shadow}:ro\"]\n\
+         [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\npersist = [\"x-state\"]\n"
+    ));
+    let before = h.snapshot();
+    let out = h.launch(&[], "t", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("would collide with the guest mount point"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Initialized fork"), "{stderr}");
+    assert!(h.fork_dirs().is_empty(), "{stderr}");
+    assert_eq!(h.snapshot(), before, "{stderr}");
+}
+
+/// #396 AC-guards: every core, config-directory, protected-Pi, file and follow-link
+/// guard runs for a tool-declared mount exactly as it does for `--mount`, and a
+/// positive twin proves each guard is selective rather than "refuse every tool
+/// mount".
+#[test]
+fn tool_mount_routes_retain_core_config_file_and_follow_guards() {
+    // A core guest destination: refused, naming the tool origin, before any state.
+    let h = Harness::new();
+    let _src = seed_dir(&h, "src");
+    h.write_user(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"~/src:/agent-vm-state:ro\"]\n",
+    );
+    let before = h.snapshot();
+    let out = h.launch(&[], "t", &[]);
+    h.assert_refused_before_launch_state(&out, &before, "tools[0].mounts[0] in");
+
+    // A writable mount that would let the guest rewrite the config it was read
+    // from: refused, and the tool's own site is named.
+    let h = Harness::new();
+    h.write_user(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = []\n\
+         mounts = [\"~/.config:rw\"]\n",
+    );
+    let before = h.snapshot();
+    let out = h.launch(&[], "t", &[]);
+    h.assert_refused_before_launch_state(&out, &before, "would let the guest change what");
+    assert!(
+        stderr_of(&out).contains(&h.user_config().parent().unwrap().display().to_string()),
+        "{}",
+        stderr_of(&out)
+    );
+
+    // A *live* bind of the host Pi home would disclose the real credentials; only
+    // the `:fork` form omits them, and that is the positive twin below.
+    let h = Harness::new();
+    let auth = h.home_root.join(".pi/agent/auth.json");
+    write_file(&auth, "{\"token\":\"host\"}");
+    h.write_user("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = [\"~/.pi:ro\"]\n");
+    let before = h.snapshot();
+    let out = h.launch(&[], "t", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!(
+            "would expose the host Pi credential file {}",
+            auth.display()
+        )),
+        "{stderr}"
+    );
+    h.assert_refused_before_launch_state(&out, &before, "tools[0].mounts[0] in");
+    assert_eq!(
+        std::fs::read_to_string(&auth).unwrap(),
+        "{\"token\":\"host\"}",
+        "the refusal must not touch the host credential"
+    );
+
+    // A regular file mounted writable is refused (naming the tool site); the
+    // read-only twin is accepted and bound read-only.
+    let h = Harness::new();
+    let file = h.home_root.join("plain.txt");
+    std::fs::write(&file, "content").unwrap();
+    h.write_user(&format!(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = [\"{}:/file:rw\"]\n",
+        file.display()
+    ));
+    let before = h.snapshot();
+    let out = h.launch(&[], "t", &[]);
+    h.assert_refused_before_launch_state(&out, &before, "a file can only be mounted read-only");
+    h.write_user(&format!(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = [\"{}:/file:ro\"]\n",
+        file.display()
+    ));
+    let binds = verb_binds(&h, &[], "t");
+    assert!(
+        binds
+            .iter()
+            .any(|(_, guest, readonly)| guest == "/file" && *readonly),
+        "{binds:?}"
+    );
+
+    // A `:fork` of a regular file is refused by the same sentence as a config
+    // default's, naming the tool's site.
+    let h = Harness::new();
+    let file = h.home_root.join("plain.txt");
+    std::fs::write(&file, "content").unwrap();
+    h.write_user(&format!(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = [\"{}:/f:fork\"]\n",
+        file.display()
+    ));
+    let before = h.snapshot();
+    let out = h.launch(&[], "t", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("a :fork source must be a directory"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("tools[0].mounts[0] in"), "{stderr}");
+    h.assert_refused_before_launch_state(&out, &before, "a :fork source must be a directory");
+
+    // Fork exclusions are a *seed* filter, not a mount: accepted through a tool
+    // route, absent from the committed copy, present on the host.
+    let h = Harness::new();
+    let source = seed_excludable_source(&h);
+    h.write_user(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"~/src:/f:fork:exclude=hidden\"]\n",
+    );
+    let stderr = stderr_of(&h.launch(&[], "t", &[]));
+    assert!(stderr.contains("Initialized fork"), "{stderr}");
+    let committed = only_fork_data(&h);
+    assert_eq!(
+        std::fs::read_to_string(committed.join("visible")).unwrap(),
+        "visible"
+    );
+    assert!(
+        !committed.join("hidden").exists(),
+        "the excluded file must not be committed"
+    );
+    assert!(
+        source.join("hidden").exists(),
+        "the host source keeps the excluded file"
+    );
+
+    // `:follow-links` discovery through a tool route: the target is appended
+    // read-only at the literal path the guest will `readlink`, and a target
+    // outside `$HOME` is refused with the tool's own escaping.
+    let h = Harness::new();
+    let farm = seed_dir(&h, "farm");
+    let real = seed_dir(&h, "real");
+    std::os::unix::fs::symlink(&real, farm.join("link")).unwrap();
+    h.write_user(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"~/farm:/farm:ro:follow-links\"]\n",
+    );
+    let binds = verb_binds(&h, &[], "t");
+    assert!(
+        binds.iter().any(
+            |(host, guest, readonly)| *host == real.display().to_string()
+                && *guest == real.display().to_string()
+                && *readonly
+        ),
+        "the discovered target must be bound read-only at its real path: {binds:?}"
+    );
+
+    // A control character in a discovered *link* name cannot forge a diagnostic
+    // line: the outside-`$HOME` refusal escapes it.
+    let h = Harness::new();
+    let farm = seed_dir(&h, "farm");
+    let outside = tempfile::tempdir_in(support::workspace_tmpdir()).unwrap();
+    let outside = outside.path().canonicalize().unwrap().join("target");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, farm.join("bad\nname")).unwrap();
+    h.write_user(
+        "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n\
+         mounts = [\"~/farm:/farm:ro:follow-links\"]\n",
+    );
+    let before = h.snapshot();
+    let out = h.launch(&[], "t", &[]);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("which is outside your $HOME"), "{stderr}");
+    assert!(
+        stderr.contains("bad\\x0aname"),
+        "the discovered link name must be escaped: {stderr}"
+    );
+    assert!(
+        !stderr
+            .lines()
+            .any(|line| line.trim() == "name\" resolves to"),
+        "the name forged a diagnostic line: {stderr}"
+    );
+    h.assert_refused_before_launch_state(&out, &before, "which is outside your $HOME");
+}
+
+/// #396 AC-guards: an inherited read-write parent with a read-only child keeps both
+/// modes in either declaration order, with the two leaves split across tools and
+/// reached through a named set as well as directly.
+///
+/// This boot-free assertion is not the native write-denial oracle (no VM boots
+/// here); it proves only that the planned modes survive the tool route.
+#[test]
+fn inherited_rw_parent_and_ro_child_keep_both_modes_in_either_order() {
+    const PARENT: &str = "\"~/parent:/p\"";
+    const CHILD: &str = "\"~/parent/child:/p/child:ro\"";
+    // Every combination the plan names: both declaration orders, and the set leaf
+    // carrying the parent or the child.
+    for (order, parent_in_set) in [(0usize, false), (0, true), (1, false), (1, true)] {
+        let h = Harness::new();
+        let parent = seed_dir(&h, "parent");
+        std::fs::create_dir(parent.join("child")).unwrap();
+        std::fs::write(parent.join("child/marker"), "child").unwrap();
+        std::fs::write(parent.join("marker"), "parent").unwrap();
+        let declared = if order == 0 {
+            [PARENT, CHILD]
+        } else {
+            [CHILD, PARENT]
+        };
+        // One leaf is direct on the launched tool, the other the same tool's set
+        // reference; the referenced tool declares no mounts of its own.
+        let direct = if parent_in_set {
+            declared[1]
+        } else {
+            declared[0]
+        };
+        let in_set = if parent_in_set {
+            declared[0]
+        } else {
+            declared[1]
+        };
+        h.write_user(&format!(
+            "[mount_sets]\nleaf = [{in_set}]\n\
+             [[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"u\"]\n\
+             mounts = [{direct}, \"leaf\"]\n\
+             [[tools]]\nname = \"u\"\ncommand = \"/bin/echo\"\ntools = []\nmounts = []\n"
+        ));
+        let binds = verb_binds(&h, &[], "t");
+        let mode = |guest: &str| {
+            binds
+                .iter()
+                .find(|(_, path, _)| path == guest)
+                .map(|(_, _, readonly)| *readonly)
+                .unwrap_or_else(|| panic!("{guest} missing: {binds:?}"))
+        };
+        assert!(
+            !mode("/p"),
+            "order {order} set={parent_in_set}: the parent stays writable: {binds:?}"
+        );
+        assert!(
+            mode("/p/child"),
+            "order {order} set={parent_in_set}: the child stays read-only: {binds:?}"
+        );
+    }
+}
+
+/// #396 AC-guards: a **direct** command receives the user-wide defaults and an
+/// explicit `--mount`, but never a tool's inherited closure — even when the
+/// requested program has the same path as a tool's `command`.
+///
+/// Both direct spellings are covered, because they are one route with two
+/// syntactic forms (issue #398).
+#[test]
+fn direct_commands_receive_no_tool_mounts() {
+    let h = Harness::new();
+    let _own = seed_dir(&h, "pi-home");
+    let _default = seed_dir(&h, "default");
+    let _cli = seed_dir(&h, "cli");
+    h.write_user(
+        "mounts = [\"~/default:/default:ro\"]\n\
+         [[tools]]\nname = \"pi\"\ncommand = \"/bin/echo\"\ntools = []\n\
+         mounts = [\"~/pi-home:/pi:ro\"]\n",
+    );
+    for form in ["run", "--"] {
+        // The token is the *tool's* command, so a launcher that inferred a tool
+        // from the program name would add the Pi closure here.
+        let out = h.launch(&[], form, &["/bin/echo", "direct"]);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(CONFIG_MARKER),
+            "{form}: a direct command must still launch: {stderr}"
+        );
+        let guests: Vec<String> = sorted_binds(&debug_config_json(&stderr))
+            .into_iter()
+            .map(|(_, guest, _)| guest)
+            .collect();
+        assert!(
+            guests.iter().any(|guest| guest == "/default"),
+            "{form}: the user-wide default applies: {guests:?}"
+        );
+        assert!(
+            !guests.iter().any(|guest| guest == "/pi"),
+            "{form}: a tool's inherited mount must not reach a direct command: {guests:?}"
+        );
+    }
+    // An explicit declaration still applies, so the negative above is not "the
+    // direct route ignores every mount".
+    let out = h.launch(
+        &[
+            "--mount",
+            &format!("{}:/explicit:ro", h.home_root.join("cli").display()),
+        ],
+        "run",
+        &["/bin/echo", "direct"],
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        sorted_binds(&debug_config_json(&stderr))
+            .iter()
+            .any(|(_, guest, _)| guest == "/explicit"),
+        "an explicit --mount reaches a direct command: {stderr}"
+    );
+}

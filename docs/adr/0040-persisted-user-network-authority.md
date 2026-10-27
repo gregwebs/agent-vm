@@ -219,6 +219,15 @@ sentences that name them, grow from two to three.
 - `authority_required({network, mounts, mount_sets}) ==
   (network || mounts || mount_sets)` — the same kernel, extended from a two-field
   to a three-field disjunction and still total over every combination.
+- **#396 aggregate:** the `mounts` fact is itself a disjunction of the two places
+  a user file may declare a mount selection,
+  `mounts == (top_level_mounts || tool_mounts)`, decided by one OR kernel before
+  any mount text is parsed. The trigger count stays three and `authority_required`
+  is unchanged; only what counts as "a mounts field" widened. A refusal caused by
+  a full tool's field with no top-level list is prefixed with that field's numeric
+  site (`tools[N].mounts: `), and a file whose only authority field is
+  `[network]` prints its previous bytes unchanged. One verified read still covers
+  the whole file, and the accepted trust gaps above are unchanged.
 - Decision 2's "a present user `[network]` table invokes authority checks" now
   reads "a present `[network]` **or** `mounts` **or** `[mount_sets]`", and one file
   declaring any subset is verified once.

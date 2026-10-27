@@ -2167,3 +2167,111 @@ fn an_unused_mount_set_error_is_reported_and_a_missing_source_is_not() {
         "an unselected source must not be read or named: {stdout}"
     );
 }
+
+/// #396: `doctor` accepts a tool-declared mount list without inspecting any
+/// source, and adds no mount-path row — a missing source in a valid declaration is
+/// a launch-time question for *selected* mounts only.
+#[test]
+fn doctor_accepts_tool_mounts_without_inspecting_sources() {
+    let h = Harness::new();
+    h.write_user(
+        "[mount_sets]\nagent = [\"/nonexistent-agent-vm-396-agent:/agents:ro\"]\n\
+         [[tools]]\nname = \"t\"\ncommand = \"t\"\ncredentials = [\"openai\"]\npersist = [\"t-state\"]\n\
+         mounts = [\"agent\", \"/nonexistent-agent-vm-396-own:/own:ro\"]\n",
+    );
+    let before = h.state_root.clone();
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    // The existing provider/persist row bytes are unchanged, and this PR adds no
+    // `mounts=` column.
+    assert!(
+        stdout.contains("t -> \"t\"; args=0; credentials=openai; provisions=openai"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("mounts="), "no new column: {stdout}");
+    // No source path leaks into the report: the declared spellings are not
+    // something `doctor` measured.
+    assert!(!stdout.contains("nonexistent-agent-vm-396"), "{stdout}");
+    // And no state or namespace files appeared.
+    let entries: std::collections::BTreeSet<std::ffi::OsString> = std::fs::read_dir(&before)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        entries
+            .iter()
+            .all(|name| !name.to_string_lossy().ends_with(".mounts")),
+        "doctor must not create a mount store: {entries:?}"
+    );
+}
+
+/// #396: a *broken* tool mount declaration is reported with the exact file and
+/// numeric field, and `--help` still works.
+#[test]
+fn doctor_reports_tool_mount_errors_with_exact_file_and_field() {
+    for (body, needle) in [
+        (
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = 7\n",
+            "tools[0].mounts: must be an array of strings",
+        ),
+        (
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"/a\", 7]\n",
+            "tools[0].mounts[1]: must be a string",
+        ),
+        (
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"nope\"]\n",
+            "tools[0].mounts[0]: unknown mount set name",
+        ),
+        (
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = [\"agent:ro\"]\n",
+            "tools[0].mounts[0]: a mount-set reference is a bare name",
+        ),
+        (
+            // A closure conflict: two valid lists that only disagree together.
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\ntools = [\"u\"]\nmounts = [\"/a:/g:ro\"]\n\
+             [[tools]]\nname = \"u\"\ncommand = \"u\"\nmounts = [\"/b:/g:rw\"]\n",
+            "tools[1].mounts[0]: claims the same guest path as tools[0].mounts[0]",
+        ),
+        (
+            // An unused set's cycle is a load error, not a selection question.
+            "[mount_sets]\ncyc = [\"cyc\"]\n[[tools]]\nname = \"t\"\ncommand = \"t\"\nmounts = []\n",
+            "mount_sets[0][0]: mount-set reference cycle",
+        ),
+        (
+            // Empty-present authority still requires a verified file.
+            "[[tools]]\nname = \"pi\"\ncommand = \"pi\"\nmounts = []\n",
+            "tools[0].mounts:",
+        ),
+    ] {
+        let h = Harness::new();
+        let body = if needle == "tools[0].mounts:" {
+            // The authority row is about *presence*, so break the file's mode and
+            // keep the declaration valid.
+            use std::os::unix::fs::PermissionsExt as _;
+            h.write_user(body);
+            std::fs::set_permissions(h.user_config(), std::fs::Permissions::from_mode(0o664))
+                .unwrap();
+            body
+        } else {
+            h.write_user(body);
+            body
+        };
+        let out = h.run_doctor();
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(needle),
+            "{body}: expected {needle:?} in doctor's refusal: {stderr}"
+        );
+        assert!(
+            stderr.contains(&h.user_config().display().to_string()),
+            "{body}: the refusal must name the declaring file: {stderr}"
+        );
+        assert!(
+            !stderr.contains("sk-live"),
+            "{body}: value echoed: {stderr}"
+        );
+        // Recovery: help still renders.
+        assert_success(&h.base_command().arg("--help").output().unwrap());
+    }
+}

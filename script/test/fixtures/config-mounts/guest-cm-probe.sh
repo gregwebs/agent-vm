@@ -9,10 +9,18 @@
 # `CM_ROOT` prefixes every path so the boot-free companion runs these exact
 # statements against a host-side layout. It is empty in the guest, where the
 # declared guest paths are /cm/ro, /cm/rw and /cm/fork.
+#
+# The tool-mount rows (#396) add `CM_HOME`, which defaults to the real `$HOME`:
+# in the guest the Pi fork is mounted at the actual `$HOME/.pi` (the compiled
+# generic `.pi` guest link exists either way, so absence rows test that
+# directory's *contents*), while the host-only companion points it at a synthetic
+# home under its scratch layout.
 set -uo pipefail
 
 root="${CM_ROOT:-}"
 probe="$root/cm"
+cm_home="${CM_HOME:-$HOME}"
+pi_home="$cm_home/.pi"
 
 die() {
     printf 'CM_ERROR %s\n' "$*" >&2
@@ -101,6 +109,163 @@ row_n5() {
     printf 'CM-N5 read=%s\n' "$(marker "$probe/fork/marker")"
 }
 
+
+# The tool-mount rows (#396). Every one of them reads and writes the *same*
+# fixtures as the N/S rows through a different selection route, and reports one
+# whole line: a mounted-as-absent topology and a genuinely absent one must not
+# print the same thing.
+
+# `<path>` or `absent`, for a whole tree. A symlink counts even when its target
+# does not resolve here: a provisioned guest-HOME link dangles on the host (its
+# target is the guest's `/agent-vm-state`) and resolves in the guest, so `-e`
+# alone would report the same link absent in the boot-free companion.
+tree() {
+    if [[ -e "$1" || -L "$1" ]]; then printf 'present'; else printf 'absent'; fi
+}
+
+# One verdict for a read-only tree: neither a new name nor its existing marker
+# may be writable. Reporting "allowed" at all is what a probe that always says
+# "denied" cannot fake.
+ro_write() {
+    local verdict=denied
+    attempt "$1/new" x && verdict=allowed
+    attempt "$1/marker" x && verdict=allowed
+    printf '%s' "$verdict"
+}
+
+rw_write() {
+    local verdict=denied
+    attempt "$1/new" "$2" && verdict=wrote
+    printf '%s' "$verdict"
+}
+
+# CM-T1: the `plain` tool declares nothing and references nothing.
+row_tool_plain() {
+    local project
+    if [[ -f ./project-marker ]]; then project=present; else project=absent; fi
+    printf 'CM-T1 agent=%s skills=%s readonly=%s pi=%s project=%s\n' \
+        "$(tree "$probe/tool/agent")" "$(tree "$probe/tool/agent/skills")" \
+        "$(tree "$probe/tool/readonly")" "$(marker "$pi_home/marker")" "$project"
+}
+
+# CM-T2: the launched `claude` tool's own set — parent writable, both read-only
+# trees refusing — and no Pi fork.
+row_tool_claude() {
+    local agent=denied skills ro
+    agent="$(rw_write "$probe/tool/agent" claude-note)"
+    skills="$(ro_write "$probe/tool/agent/skills")"
+    ro="$(ro_write "$probe/tool/readonly")"
+    printf 'CM-T2 agent=%s agent-write=%s skills=%s skills-write=%s readonly=%s readonly-write=%s pi=%s\n' \
+        "$(marker "$probe/tool/agent/marker")" "$agent" \
+        "$(marker "$probe/tool/agent/skills/marker")" "$skills" \
+        "$(marker "$probe/tool/readonly/marker")" "$ro" \
+        "$(marker "$pi_home/marker")"
+}
+
+# CM-T3: the launched `pi` inherits the agent topology through `tools` and adds
+# the fork. The Pi marker is read *before* the write, so `pi-seed` and the
+# guest's own `pi-guest` are distinguishable; the protected synthetic files must
+# be absent from the committed copy.
+row_tool_pi() {
+    local pi write auth models guest
+    pi="$(marker "$pi_home/marker")"
+    write="$( ( printf '%s' pi-guest > "$pi_home/marker" ) 2>/dev/null && printf wrote || printf denied )"
+    guest="$( ( printf '%s' guest-only > "$pi_home/guest-only" ) 2>/dev/null && printf wrote || printf denied )"
+    if [[ -f "$pi_home/agent/auth.json" ]]; then auth=present; else auth=absent; fi
+    if [[ -f "$pi_home/agent/models.json" ]]; then models=present; else models=absent; fi
+    printf 'CM-T3 agent=%s skills=%s readonly=%s pi=%s pi-write=%s auth=%s models=%s guest-file=%s\n' \
+        "$(marker "$probe/tool/agent/marker")" \
+        "$(marker "$probe/tool/agent/skills/marker")" \
+        "$(marker "$probe/tool/readonly/marker")" \
+        "$pi" "$write" "$auth" "$models" "$guest"
+}
+
+# CM-T4: after a host-only mutation of its source, the inherited fork still shows
+# the guest's own write and its own file.
+row_tool_bridge() {
+    printf 'CM-T4 pi=%s guest-file=%s\n' \
+        "$(marker "$pi_home/marker")" "$(tree "$pi_home/guest-only")"
+}
+
+# CM-T5: the declared `shell`'s omitted `tools` wildcard reaches the fork and the
+# agent topology. It reads only, so the later rows observe the same fork content.
+row_tool_shell() {
+    local project
+    if [[ -f ./project-marker ]]; then project=present; else project=absent; fi
+    printf 'CM-T5 agent=%s skills=%s ro-write=%s pi=%s project=%s\n' \
+        "$(marker "$probe/tool/agent/marker")" \
+        "$(marker "$probe/tool/agent/skills/marker")" \
+        "$(ro_write "$probe/tool/agent/skills")" \
+        "$(marker "$pi_home/marker")" "$project"
+}
+
+# CM-T6: the same declared shell with `tools = []`. Only its own list and the
+# user-wide default survive.
+row_tool_shell_own() {
+    printf 'CM-T6 agent=%s skills=%s readonly=%s pi=%s shell-own=%s shell-own-write=%s default=%s default-write=%s\n' \
+        "$(tree "$probe/tool/agent")" "$(tree "$probe/tool/agent/skills")" \
+        "$(tree "$probe/tool/readonly")" "$(marker "$pi_home/marker")" \
+        "$(marker "$probe/tool/shell-own/marker")" "$(ro_write "$probe/tool/shell-own")" \
+        "$(marker "$probe/tool/default/marker")" "$(ro_write "$probe/tool/default")"
+}
+
+# CM-T7: no declared shell at all, so the built-in fallback runs in its own scope:
+# no user tool is referenced, but the user-wide default still applies.
+row_tool_shell_fallback() {
+    local project
+    if [[ -f ./project-marker ]]; then project=present; else project=absent; fi
+    printf 'CM-T7 agent=%s skills=%s pi=%s shell-own=%s default=%s default-write=%s project=%s\n' \
+        "$(tree "$probe/tool/agent")" "$(tree "$probe/tool/agent/skills")" \
+        "$(marker "$pi_home/marker")" "$(tree "$probe/tool/shell-own")" \
+        "$(marker "$probe/tool/default/marker")" "$(ro_write "$probe/tool/default")" "$project"
+}
+
+# CM-T8: `--no-config-mounts` removes the defaults, the declaring tool's own list
+# and every inherited list, on both a tool launch and the declared shell.
+row_tool_optout() {
+    local project
+    if [[ -f ./project-marker ]]; then project=present; else project=absent; fi
+    printf 'CM-T8 agent=%s skills=%s readonly=%s pi=%s shell-own=%s default=%s project=%s\n' \
+        "$(tree "$probe/tool/agent")" "$(tree "$probe/tool/agent/skills")" \
+        "$(tree "$probe/tool/readonly")" "$(marker "$pi_home/marker")" \
+        "$(tree "$probe/tool/shell-own")" "$(tree "$probe/tool/default")" "$project"
+}
+
+# CM-T9: an explicit `--mount agent` returns exactly the agent topology — both
+# read-only trees included, not only the nested one — and nothing about the other
+# automatic sources. Selecting a set named like a tool provisions no tool: the
+# same-named tool's own leaf and its `persist` link are read here, and CM-T9-control
+# shows both present when that tool is the launch instead.
+row_tool_set_explicit() {
+    printf 'CM-T9 agent=%s agent-write=%s skills=%s ro-write=%s readonly=%s readonly-write=%s pi=%s default=%s agent-tool=%s agent-tool-state=%s\n' \
+        "$(marker "$probe/tool/agent/marker")" \
+        "$(rw_write "$probe/tool/agent" explicit-note)" \
+        "$(marker "$probe/tool/agent/skills/marker")" \
+        "$(ro_write "$probe/tool/agent/skills")" \
+        "$(marker "$probe/tool/readonly/marker")" \
+        "$(ro_write "$probe/tool/readonly")" \
+        "$(marker "$pi_home/marker")" "$(tree "$probe/tool/default")" \
+        "$(tree "$probe/tool/agent-tool")" "$(tree "$cm_home/agent-tool-state")"
+}
+
+# CM-T9-control: the positive control for the two observables above. The tool named
+# exactly like the `agent` set *is* this launch, so its own read-only leaf and its
+# declared `persist` link both have to appear; the same statements printing
+# `absent` under `--mount agent` is then a real measurement.
+row_tool_agent_name() {
+    printf 'CM-T9-control agent-tool=%s agent-tool-state=%s\n' \
+        "$(marker "$probe/tool/agent-tool/marker")" "$(tree "$cm_home/agent-tool-state")"
+}
+
+# CM-T10/CM-T11: the same Pi declaration selected explicitly, as a default and
+# through a nested set reads the reused fork and nothing else.
+row_tool_pi_only() {
+    local label="$1"
+    printf '%s pi=%s guest-file=%s agent=%s\n' "$label" \
+        "$(marker "$pi_home/marker")" "$(tree "$pi_home/guest-only")" \
+        "$(marker "$probe/tool/agent/marker")"
+}
+
 case "${1:-}" in
     n1) row_n1 ;;
     n2) row_n2 ;;
@@ -111,6 +276,20 @@ case "${1:-}" in
     # Named sets: the same absent row under its own label, and the access row.
     sets-absent) row_absent CM-S ;;
     sets) row_sets ;;
+    # Tool mounts (#396): one phase per row, because each row is a different
+    # selection route and its own launch.
+    tool-plain) row_tool_plain ;;
+    tool-claude) row_tool_claude ;;
+    tool-pi) row_tool_pi ;;
+    tool-bridge) row_tool_bridge ;;
+    tool-shell) row_tool_shell ;;
+    tool-shell-own) row_tool_shell_own ;;
+    tool-shell-fallback) row_tool_shell_fallback ;;
+    tool-optout) row_tool_optout ;;
+    tool-set-explicit) row_tool_set_explicit ;;
+    tool-agent-name) row_tool_agent_name ;;
+    tool-pi-explicit) row_tool_pi_only CM-T10 ;;
+    tool-fork) row_tool_pi_only CM-T11 ;;
     # One launch covers the three rows that need the default selection, so the
     # rows share a boot instead of paying for three of them.
     all)
@@ -118,5 +297,5 @@ case "${1:-}" in
         row_n2
         row_n3a
         ;;
-    *) die "usage: $0 all|n1|n2|n3a|n3b|n4|n5|sets|sets-absent" ;;
+    *) die "usage: $0 all|n1|n2|n3a|n3b|n4|n5|sets|sets-absent|tool-plain|tool-claude|tool-pi|tool-bridge|tool-shell|tool-shell-own|tool-shell-fallback|tool-optout|tool-set-explicit|tool-agent-name|tool-pi-explicit|tool-fork" ;;
 esac

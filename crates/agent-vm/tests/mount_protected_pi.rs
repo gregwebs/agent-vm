@@ -224,6 +224,44 @@ impl Harness {
         run_with_timeout(cmd, Duration::from_secs(15))
     }
 
+    /// Write `~/.config/agent-vm/config.toml` in the shape the verified-read
+    /// policy expects: a 0600 file in a 0700 directory.
+    fn write_user(&self, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.home_path().join(".config/agent-vm/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    /// [`Self::run_verb`] in root mode *with* `$HOME` set, which is the only way a
+    /// user-declared verb can be reached under `--root` (the verb list comes from
+    /// the user config, which is discovered through `$HOME`).
+    fn run_verb_root(&self, verb: &str, mounts: &[&str], project: &Path) -> Output {
+        let mut cmd = Command::new(agent_vm_bin());
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", self.home.path())
+            .env(
+                "AGENT_VM_STATE_DIR",
+                self.state.path().canonicalize().unwrap(),
+            )
+            .env("MSB_PATH", &self.fake_msb)
+            .env("AGENT_VM_DEBUG_CONFIG", "1")
+            .current_dir(project);
+        cmd.arg("--root");
+        for mount in mounts {
+            cmd.arg("--mount").arg(mount);
+        }
+        cmd.args(["--image", &self.image]).arg(verb);
+        run_with_timeout(cmd, Duration::from_secs(15))
+    }
+
     fn fork_store(&self) -> PathBuf {
         // `<state>/<project-hash>.mounts`, found by name rather than by
         // re-deriving the project hash.
@@ -539,4 +577,94 @@ fn launching_from_the_home_directory_is_refused() {
         "{stderr}"
     );
     assert_no_launch_side_effects(&h, &stderr);
+}
+
+/// #396 AC-guards: a `~/.pi:fork` declared by a **user tool** — own or inherited —
+/// omits the protected Pi auth and models files exactly as a `--mount` fork does,
+/// so tool lists cannot become a route around the Pi protection.
+///
+/// Boot-free: the committed copy is inspected on the host after preparation, which
+/// is the whole deliverable — the guest would see the same bytes.
+#[test]
+fn tool_declared_pi_fork_omits_auth_and_models() {
+    for inherited in [false, true] {
+        let h = Harness::new();
+        let pi_home = h.seed_pi_home();
+        // A file under the Pi home that is not protected, so "omits everything"
+        // cannot pass this row.
+        std::fs::write(pi_home.join("innocuous.txt"), "kept").unwrap();
+        if inherited {
+            h.write_user(
+                "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\ntools = [\"inner\"]\n\
+                 mounts = []\n\
+                 [[tools]]\nname = \"inner\"\ncommand = \"/bin/echo\"\nmounts = [\"~/.pi:fork\"]\n",
+            );
+        } else {
+            h.write_user(
+                "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = [\"~/.pi:fork\"]\n",
+            );
+        }
+        let launched = h.run_verb("t", &[], true, h.project.path());
+        let stderr = stderr_of(&launched);
+        assert!(
+            stderr.contains("[debug] sandbox config JSON:"),
+            "inherited={inherited}: the launch must reach builder wiring: {stderr}"
+        );
+        let data = h
+            .fork_data()
+            .unwrap_or_else(|| panic!("inherited={inherited}: the fork must be published"));
+        // Protected files are absent from the committed copy.
+        for protected in ["agent/auth.json", "agent/models.json"] {
+            assert!(
+                !data.join(protected).exists(),
+                "inherited={inherited}: {protected} must be omitted from a tool-declared fork"
+            );
+        }
+        // The rest of the Pi home is a real copy, so the exclusions are selective.
+        assert_eq!(
+            std::fs::read_to_string(data.join("innocuous.txt")).unwrap(),
+            "kept",
+            "inherited={inherited}: an unprotected file must be copied"
+        );
+        assert!(data.join("settings.json").exists(), "inherited={inherited}");
+        // The source is untouched.
+        assert_eq!(
+            std::fs::read_to_string(pi_home.join("agent/auth.json")).unwrap(),
+            "{\"token\":\"host\"}"
+        );
+    }
+}
+
+/// #396 AC-guards: a *live* bind of the Pi home is refused through a tool
+/// declaration in both guest modes, naming the tool origin, before any launch
+/// side effect.
+#[test]
+fn tool_declared_live_pi_home_is_refused_in_both_guest_modes() {
+    for root in [false, true] {
+        let h = Harness::new();
+        let pi_home = h.seed_pi_home();
+        h.write_user(
+            "[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\nmounts = [\"~/.pi:/pi-live:ro\"]\n",
+        );
+        let launched = if root {
+            h.run_verb_root("t", &[], h.project.path())
+        } else {
+            h.run_verb("t", &[], true, h.project.path())
+        };
+        let stderr = stderr_of(&launched);
+        assert!(
+            !launched.status.success(),
+            "root={root}: a live Pi bind must be refused: {stderr}"
+        );
+        assert!(
+            stderr.contains("tools[0].mounts[0] in"),
+            "root={root}: the refusal must name the tool field: {stderr}"
+        );
+        assert!(
+            stderr.contains(&pi_home.join("agent/auth.json").display().to_string())
+                || stderr.contains("host Pi state"),
+            "root={root}: the refusal must name what it protects: {stderr}"
+        );
+        assert_no_launch_side_effects(&h, &stderr);
+    }
 }

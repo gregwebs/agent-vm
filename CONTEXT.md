@@ -306,9 +306,10 @@ entry, and is the default for a tool named `shell` — means every tool in that
 scope. An omitted `tools` is `[]` for every other name. Unknown names and
 cross-tier references are hard config errors, reported with the declaring file,
 declaration index, tool and field. Every definition's references are validated,
-even one no launch verb reaches. The scope change is implemented (#395); see
-[ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md)
-for the mount half that is still pending, and
+even one no launch verb reaches. The scope change is implemented (#395), and the mount half — named mount sets,
+user-only tool-level `mounts`, and inheritance through the same closure — is
+implemented too (#396/#397); see
+[ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md) and
 [USAGE.md](USAGE.md#tool-references-are-local-to-their-file) for the migration.
 
 _Avoid_: "dependencies" — a named tool is provisioned, not required, and
@@ -322,10 +323,11 @@ Everything one launch provisions: the least fixed point of
 
 over the declaring tool's **Tool reference scope**, where a `"*"` entry expands
 to that scope's tools. It is the **single** gate on every provider-owned facet.
-The same tool closure also selects `persist` paths, and — once tool-level
-`mounts` land — that tool's mount declarations. A tool-reference cycle is a fixed
-point, not an error; this differs from a **Mount set** reference cycle, which is
-invalid. See
+The same tool closure also selects `persist` paths and that tool's **Config
+mount** declarations, own and inherited; tool `env` and `network_requests` are
+the launched tool's own and are deliberately not folded. A tool-reference cycle
+is a fixed point, not an error; this differs from a **Mount set** reference
+cycle, which is invalid. See
 [ADR-0017](docs/adr/0017-tool-declared-provisioning.md), which is amended by the
 implemented tier-local reference half of
 [ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md).
@@ -376,10 +378,12 @@ It also carries its default `argv`, a list of **credential providers**
 (`credentials`, the requirement set), a list of **available tools** (`tools`,
 driving the provisioning set), extra guest-HOME-relative `persist` paths, a
 guest `env` map, an `interactive_shell` flag, and the **tool config tier** it
-came from. A tool declares **no** mounts yet: user-config defaults and named
-**Mount sets** are selected per launch (top-level `mounts` and `--mount NAME`),
-and per-tool `mounts` remain accepted design in
-[ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md).
+came from. A **full user** tool may also declare `mounts`: those are **Config
+mounts** selected for a launch of that tool, own plus inherited through its
+`tools` closure, and a project or built-in tool may not declare them at all.
+User-config defaults and named **Mount sets** are still selected per launch, and
+either list accepts a set name. See
+[USAGE.md](USAGE.md#tool-specific-config-mounts).
 
 `env` is published into the guest **before** the launcher's own environment and
 cannot override `PATH`, `IS_SANDBOX` or `LANG`; `HOME`/`USER`/`LOGNAME` are
@@ -617,19 +621,24 @@ mount", which implies lazy shared backing storage.
 
 ## Config mount
 
-A mount declaration from the user tier's top-level `mounts`, selected for every
-launch unless `--no-config-mounts` suppresses it. It is parsed, claimed and
-prepared exactly like a `--mount` (same grammar, guest-path rules, merge/refuse
-rule and protections); it differs in host spelling (`~/` expands to the `$HOME`
-text, and no other relative form is accepted) and in origin, which diagnostics
-report as `mounts[N] in "<file>"`. Its declarations are read only from a
-**verified file**: the presence of the field, not its contents, is what makes
-the user config authority-bearing under ADR-0040's read policy. See
+A mount declaration the **user** tier selects: an entry of the top-level
+`mounts` defaults, or of a full user `[[tools]]`'s own `mounts`, or a leaf of a
+selected **Mount set**. The defaults apply to every launch; a tool's list applies
+to a launch of that tool, own plus inherited through its `tools` closure. All of
+it is suppressed for one launch by `--no-config-mounts`, which never touches an
+explicit `--mount`. A config mount is parsed, claimed and prepared exactly like a
+`--mount` (same grammar, guest-path rules, merge/refuse rule and protections); it
+differs in host spelling (`~/` expands to the `$HOME` text, and no other relative
+form is accepted) and in origin, which diagnostics report as `mounts[N] in
+"<file>"`, `tools[N].mounts[I] in "<file>"` or `mount_sets["NAME"][I] in
+"<file>"`. Its declarations are read only from a **verified file**: the presence
+of any of those fields, not its contents, is what makes the user config
+authority-bearing under ADR-0040's read policy. See
 [ADR-0046](docs/adr/0046-verified-user-config-mounts.md).
 
 An entry may also be a **Mount set** name, which selects that set's direct
 declarations; the set's leaves are the config mounts, attributed to the set
-entry rather than to `mounts[N]`.
+entry rather than to the list that selected it.
 
 _Avoid_: "default mount" — agent-vm's own project/state/home mounts are not
 this, and a config mount can be read-only or forked; "persisted mount" — a
@@ -639,8 +648,8 @@ copy is persisted but is not a config mount.
 ## Mount set
 
 A named list of mount declarations in the **user** `[mount_sets]` table,
-selectable by its exact name from the top-level `mounts` defaults or from
-`--mount NAME`. A set is a selector, never a mount mode, credential request,
+selectable by its exact name from the top-level `mounts` defaults, from a full
+user tool's own `mounts` list, or from `--mount NAME`. A set is a selector, never a mount mode, credential request,
 tool or store: **declaring one mounts nothing**, and only a launch that selects
 it grants filesystem access. Names are case-sensitive ASCII
 (`[A-Za-z0-9_]` first, then `[A-Za-z0-9_.-]`), so a name can never look like a
@@ -668,17 +677,18 @@ The definitions in the one configuration file that declares a tool, within
 which its `tools` references resolve — including definitions hidden from
 launch-verb selection by another file. A name that only another file declares is
 a config error, never an opt-in to crossing files. A tool defined in that scope
-supplies its own credentials, requested names and `persist` paths even when it
-has no verb; the synthesized fallback `shell` is not a declaration in any file's
-scope, so it cannot be named either. Implemented in #395; see
+supplies its own credentials, requested names, `persist` paths and **Config
+mount** declarations even when it has no verb, and only the **user** tier may
+supply mounts at all; the synthesized fallback `shell` is not a declaration in
+any file's scope, so it cannot be named either and inherits nothing. Implemented in #395; see
 [ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md)
 and [ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
 
 ## Protected config directory
 
-`~/.config/agent-vm`, where `credentials.yaml`, `[network]`, `mounts` and
-`[mount_sets]` authorize launch secrets, egress, config mounts and mount sets,
-respectively. This
+`~/.config/agent-vm`, where `credentials.yaml`, `[network]`, `mounts`,
+`[mount_sets]` and a full tool's own `mounts` authorize launch secrets, egress,
+config mounts, mount sets and tool config mounts respectively. This
 directory is never
 inside a writable live bind. Protection includes directories its lookup searches
 and prospective directories reached through missing components, measuring raw

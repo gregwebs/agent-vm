@@ -460,13 +460,20 @@ Fork mounts:
 
 Config mounts and named mount sets:
   mounts = [\"~/ref:ro\", \"agent\"] in ~/.config/agent-vm/config.toml apply to every launch;
-  [mount_sets] names reusable lists there (verified file, like [network]).
+  a full user [[tools]] may also declare its own mounts = [...] there (user config only).
+  [mount_sets] names reusable lists (verified file, like [network]).
   agent = [\"~/.agents\", \"~/.config/github-app:ro\"] — modes belong to these paths, and a
   set whose closure claims one guest path twice with different declarations is a config error,
   even unused. Sets may name other sets. Definitions alone mount nothing.
+  A launch selects the defaults, then the launched tool's own list together with the lists of
+  every tool it transitively references (one facet, folded in file order), then --mount.
+  No source overrides another: two different declarations at one guest path are refused.
+  A declared `shell` whose `tools` is omitted inherits every same-file tool's mounts; the
+  built-in shell fallback inherits none. tools = [] stops inheritance, not own mounts/defaults.
   agent-vm --mount agent <tool>            select that set for one launch (no modes, exact name)
-  --no-config-mounts skips the automatic mounts list for one launch; an explicit --mount NAME
-  still applies, and every schema/reference/cycle/authority check still runs.
+  --no-config-mounts skips both automatic config mount inputs (defaults and the tool facet) for
+  one launch; an explicit --mount NAME still applies, and every schema/reference/cycle/authority
+  check, plus providers, credential requests and persistence, still runs.
 
 Networking (deny-by-default; flags compose):
   --publish                host  → guest     open an inbound port to a guest service
@@ -625,14 +632,15 @@ pub struct Args {
     )]
     pub(crate) mount: Vec<String>,
 
-    /// Skip this launch's automatic config mounts (`mounts` in `~/.config/agent-vm/config.toml`).
+    /// Skip this launch's automatic config mounts: the top-level `mounts` defaults and the
+    /// launched tool's own and inherited `mounts` in `~/.config/agent-vm/config.toml`.
     ///
-    /// Only that automatic selection is skipped: an explicit `--mount` still applies, including
+    /// Only those automatic selections are skipped: an explicit `--mount` still applies, including
     /// `--mount NAME`, and credentials, persisted paths, agent-vm's own mounts, and every config
-    /// check (schema, mount sets, references and cycles, file authority) are unchanged. A broken
-    /// or untrusted config still fails the launch. There is deliberately no environment variable:
-    /// skipping ambient host exposure is a per-launch decision made at the command line, and the
-    /// same option placed after the tool verb is forwarded to the tool.
+    /// check (schema, mount sets, references and cycles, tool closure, file authority) are
+    /// unchanged. A broken or untrusted config still fails the launch. There is deliberately no
+    /// environment variable: skipping ambient host exposure is a per-launch decision made at the
+    /// command line, and the same option placed after the tool verb is forwarded to the tool.
     #[arg(
         long = "no-config-mounts",
         default_value_t = false,
@@ -792,8 +800,14 @@ pub(crate) async fn launch(
     // for (verified user `mounts` unless `--no-config-mounts`, then argv) and
     // touches nothing. `prepare` below is still the only boundary that inspects
     // a source or publishes a fork.
-    let mut selection =
-        crate::mount_selection::select(user_mounts, config_mount_policy, &args.mount)?;
+    let mut selection = crate::mount_selection::select(
+        crate::mount_selection::AutomaticMounts {
+            user: user_mounts,
+            tool: grant.mounts(),
+        },
+        config_mount_policy,
+        &args.mount,
+    )?;
     // Captured before `prepare` so the error context and the emitted plan share
     // one fact; named for the method, not for `mount_context` above, which is the
     // context *value* `prepare` measures against.

@@ -2,12 +2,18 @@
 
 ## Status
 
-Accepted design, implemented in part. The named-mount-set half — `[mount_sets]`
-and `--mount SET` selection — is implemented and carries native guest-marker
-evidence. Tool-level `mounts` fields remain **not implemented**, so this ADR
-stays partial.
-[ADR-0046](0046-verified-user-config-mounts.md) has since landed the top-level
-user `mounts` defaults this design assumed.
+Accepted design, **implemented**. All three halves have landed: tier-local tool
+reference scopes (#395), named mount sets and `--mount SET` selection (#397), and
+full **user** tool `mounts` lists inherited through that same tier-local closure
+(#396, the design sketched below as future work).
+[ADR-0046](0046-verified-user-config-mounts.md) supplies the verified read and the
+top-level defaults all of this builds on.
+
+Implementation is one thing; native evidence is another. Two recorded runs cover
+this ADR: the #397 rows (CM-S1–S4, with the ten #394 rows), and a later run of the
+#396 rows (CM-T1…T11 with their host oracles) over its own synthetic topology.
+The two runs share no row and neither is rewritten to claim the other's scope; see
+[Native evidence](#native-evidence).
 
 **Implemented:**
 
@@ -15,6 +21,17 @@ user `mounts` defaults this design assumed.
   tool references resolve within their configuration tier before launch verbs are
   merged, so credentials, named credential requests, tool availability and
   persisted paths all follow one tier-local closure.
+- **Full user tool `mounts` inherited through the tier-local closure**
+  ([#396](https://github.com/gregwebs/agent-vm/issues/396)): a full user
+  `[[tools]]` may declare `mounts`; a launch selects its own list plus those of
+  every definition in its transitive same-file `tools` closure, through the one
+  selector and the one compiled set-closure interface the defaults list uses, and
+  under one continued leaf-visit budget that also covers catalog construction.
+  Project and built-in tool fields are refused by presence; `--no-config-mounts`
+  suppresses every automatic input; a declared `shell`'s omitted `tools` inherits
+  those mounts deliberately. Retained lists hold shared leaf handles, so a
+  catalog entry inherits one handle per leaf rather than a payload. Canonical
+  guidance: [USAGE](../../USAGE.md#tool-specific-config-mounts).
 - **Named mount sets and `--mount SET` selection** ([#397](https://github.com/gregwebs/agent-vm/issues/397)):
   a user-only `[mount_sets]` table whose bare, exact names the top-level `mounts`
   defaults and `--mount` may select, with nesting, forward references, iterative
@@ -26,10 +43,20 @@ user `mounts` defaults this design assumed.
   rows, on candidate `8e24b2c` against a digest-pinned image, 18/18. See
   [Native evidence](#native-evidence) below.
 
-**Not implemented:** tool-level `mounts`, partial tool overrides, cross-tier
-tool references, per-set mode overrides and new mount modes. Every `mounts = [...]`
-line *inside a `[[tools]]` table* in the examples below is still future design;
-only the top-level `mounts` list and `--mount` select anything.
+**Not implemented, deliberately:** partial tool overrides, mounts-only
+attachments to shipped tools, cross-tier tool references, project or built-in
+mount authority of any kind, per-set mode/guest/exclusion overrides and new mount
+modes. Inheritance covers mounts only — not `env`, `network_requests` or
+required-provider facts.
+
+**Resource limit, accepted:** this design bounds mount-leaf expansion and the
+retained lists during load and catalog construction. It does **not** bound
+launch-time preparation adjudication: the quadratic phases in `mount::prepare`
+(`validate_plan`'s dedup and candidate-kind scans, followed-target lookup and
+fork reconciliation) remain, and they pre-exist for an equivalent top-level
+`mounts` list. #396 indexed only the guest-path lookup in `mount::claim`, which is
+a local improvement certified by an independent vector oracle; the wider
+preparation work belongs to the follow-up issue.
 
 ## Context
 
@@ -103,8 +130,8 @@ Project tool closures contain no mount declarations.
 
 ### Working example: user defaults and named sets (shipped)
 
-This part is implemented. It is the whole supported surface today: the top-level
-defaults list and `--mount NAME`.
+One supported selection pattern: the top-level defaults list and `--mount NAME`.
+A full user `[[tools]]` list is the other, and the two compose.
 
 ```toml
 # Before any table: optional defaults, including for project tools and shell.
@@ -134,32 +161,24 @@ nested sets, is deduplicated. See
 [USAGE](../../USAGE.md#named-mount-sets-user-config) for names, nesting,
 validation, the expansion budget and the conflict rules.
 
-### Future design: tool-level mounts (not implemented)
+### Tool-level mounts (implemented, #396)
 
-**Design example — no build supports a `mounts` field inside a `[[tools]]`
-table.** It is recorded here because the mount half's selector and expansion path
-is meant to absorb it without a second resolver, not because it ships.
+The design sketched here originally as future work shipped as drawn: a per-tool
+list resolved through the tool's tier-local closure, absorbed by the same selector
+and expansion path rather than by a second resolver.
 
-This is a configuration excerpt, not a complete replacement tool catalog. Copy
-and retain the desired full definitions from
-[`default-tools.toml`](../../crates/agent-vm/src/default-tools.toml), then add:
-
-```toml
-# Future design: a per-tool list, resolved through the tool's tier-local closure.
-# In the full pi tool definition:
-# mounts = ["agent", "~/.pi:fork"]
-
-# In other agent tool definitions:
-# mounts = ["agent"]
-```
-
-Once tool-level `mounts` exist, a user-declared shell whose omitted `tools`
-defaults to `["*"]` would inherit the agent mounts and Pi fork from its own tier.
-Today the same commands show the shipped half of that behaviour: `--mount agent`
-selects only that set, and `--no-config-mounts --mount agent` removes the
-top-level defaults while keeping the explicit set. Neither changes credential
+The canonical, complete replacement catalog is in
+[USAGE → Tool-specific config mounts](../../USAGE.md#tool-specific-config-mounts);
+it retains every shipped definition and adds one `[mount_sets]` entry plus the
+per-tool selections. A user-declared shell whose omitted `tools` defaults to
+`["*"]` now inherits the agent mounts and Pi fork from its own tier — that is the
+deliberate revision recorded in #396, and the reason USAGE warns about it.
+`tools = []` stops the inheritance but keeps the shell's own list and the
+user-wide defaults, and the built-in fallback inherits nothing. `--mount agent`
+selects only that set, and `--no-config-mounts --mount agent` removes every
+automatic input while keeping the explicit set. Neither changes credential
 provisioning or persisted paths, and repeated selection of the same mount across
-nested sets is deduplicated.
+tools or nested sets is deduplicated by the shared claim.
 
 ## Native evidence
 
@@ -214,5 +233,73 @@ paths appear with their declared modes, definitions alone mount nothing, the
 opt-out removes only the defaults, and an explicit `--mount NAME` still selects.
 They do not show general mount safety: a read-only child under a writable parent
 still leaves a writable alias through the parent, the ADR-0038/0040 ancestor and
-replacement gaps are unchanged, and tool-level `mounts` has no row because it
-has no implementation.
+replacement gaps are unchanged, and tool-level `mounts` has no row in the #397
+run — it was not implemented then. Its own rows are CM-T1…T11 with the
+CM-T9-control positive control, recorded separately; that run is never rewritten
+to claim it tested tool mounts.
+
+### #396 tool-mount rows (CM-T1…T11 plus CM-T9-control), a separate later run
+
+The tool-mount rows are their own topology — a Pi home whose protected files are
+sentinels, an agent parent with a read-only child, a declared shell's own leaf and
+a user-wide default — and their own recorded run, on a later candidate:
+
+| fact | value |
+|---|---|
+| command | `AGENT_VM_BIN="$PWD/target/macos-dev/bin/agent-vm" AGENT_VM_LIVE_TEST_IMAGE='localhost:33917/agent-vm-base@sha256:ad149d54…' AGENT_VM_CM_EVIDENCE="$(mktemp -d /tmp/avm-396-native/evidence-run.XXXXXX)" bash script/test/config-mounts-live.sh` |
+| candidate | `target/macos-dev/bin/agent-vm`, `agent-vm 0.7.15 (7bccc2b72dc1699d68e2dc4ec2d8f8f1ed468b7a)` — the run's HEAD, provenance gate `provenance: clean binary matches source HEAD`, empty tracked status, SHA-256 `9055706406cbd367cdb909c7bbdf1808c859a1026b03b319179652d7aad064fd` |
+| runtime | the bundle's own `msb 0.7.4` (SHA-256 `82269f92170d07de8d873cc1f024f32b764c2bda0a8f81cecba38a77ebda7b2d`) and `../lib/libkrunfw.5.dylib` (SHA-256 `ad7263ef96aa2bbb4d5bb2dcedf19303ad718c662ae53aa967af5d728084f8bd`), built by `./script/build/macos.sh --dev` from this commit (23 s) |
+| image | `localhost:33917/agent-vm-base@sha256:ad149d5419a79dd17d2157f92e62aaa996b148f0453fb12b4eb3bc2c391e1b90` — the digit-for-digit reference the earlier pass used. This host's `agent-vm-base:local` tag was rebuilt at 09:26; the run therefore pushed the *older image content* (still present locally) into the local `registry:2`, which returned exactly that digest, so the base image is the same bytes as the recorded pass and the only variable is the candidate. The launch's own pin records the reference with the arm64 manifest digest `sha256:dfff451db9182c3c5d30798d65c52e5cf1f21639720cf1988e8f4079a81b15f2` |
+| rows | **46/46 PASS** — 18 #394/#397 observations (10 guest rows — six CM-N and four CM-S — and 8 host oracles — four CM-N and four CM-S) plus 28 #396 observations: 14 guest rows (CM-T1…T7, CM-T8 on both routes, CM-T9, CM-T9-control, CM-T10, CM-T11 on both routes) and the same 14 host oracles; `totals.json` `{"rows": 46, "passed": 46, "failed": []}`, `errors.json` `[]`, 201 owned-launch records with zero cleanup and zero observation errors |
+| evidence directory | `/tmp/avm-396-native/evidence-run.oLuXzv` (`summary.tsv` SHA-256 `36403f372824ae23f8f97ee9b98ed504526cba09e5058ac02738b465793c28fd`, `totals.json` `2fb7fd8b8901346cdfa9109e2d03050ef8b4a4bbdcdd129a116fd7bafdc814a2`, plus `image-pins.json`, `candidate.txt`, `runtime.txt`, `provenance-check.txt`, `owned.jsonl`, per-row config/command/before/after receipts and logs) |
+| superseded | two earlier 45/45 passes, on `0.7.15 (5778128b…)` at `evidence-run.ZPqZ6U` and `0.7.15 (e564b4d6…)` at `evidence-run.auic4J`, used the *first* tool-mount fixture set. Its oracle was not discriminating — Pi declared the set it was meant to inherit, CM-T8's shell had `tools = []`, and CM-T9's catalog had no tool named `agent` while never probing the `readonly` leaf — so those receipts establish exactly the observations they recorded and not the wider prose. They are retained unchanged. |
+| not a pass | `evidence-run.Qh8fa1` holds one receipt, `rejected: AGENT_VM_BIN must be an absolute path to an executable`. It recorded no row and no `totals.json`; it is a different failure from the earlier firmware-build disk-space block (`/tmp/avm-396/build3.log`), which also recorded no row |
+| platform | macOS arm64. Linux/amd64 native coverage remains outstanding and is not implied |
+
+Every row is one whole guest-printed line compared byte for byte, and the probe
+renders its row even when a read or write fails, so a partial mount cannot pass:
+
+| row | guest-printed line | what it settles |
+|---|---|---|
+| CM-T1 | `CM-T1 agent=absent skills=absent readonly=absent pi=absent project=present` | a tool that declares and references nothing mounts nothing, and no Pi fork exists |
+| CM-T2 | `CM-T2 agent=agent-seed agent-write=wrote skills=skills-seed skills-write=denied readonly=readonly-seed readonly-write=denied pi=absent` | a tool's own `mounts = ["agent"]` gives a writable parent and two read-only trees |
+| CM-T3 | `CM-T3 agent=agent-seed skills=skills-seed readonly=readonly-seed pi=pi-seed pi-write=wrote auth=absent models=absent guest-file=wrote` | the same topology *inherited* through `tools` — `pi` declares the fork only, so `agent` can arrive no other way — plus a `:fork` that reads the seed, keeps the guest's write, omits `auth.json`/`models.json`, and takes a guest-only file |
+| CM-T4 | `CM-T4 pi=pi-guest guest-file=present` | after a host-only source change to `pi-host-later`, the inherited fork still reads `pi-guest` and its own file |
+| CM-T5 | `CM-T5 agent=agent-seed skills=skills-seed ro-write=denied pi=pi-guest project=present` | a declared `shell`'s omitted `tools` wildcard inherits the fork and the agent topology |
+| CM-T6 | `CM-T6 agent=absent skills=absent readonly=absent pi=absent shell-own=shell-own shell-own-write=denied default=default default-write=denied` | `tools = []` drops inheritance while the shell's own list and the user-wide default stay, both read-only |
+| CM-T7 | `CM-T7 agent=absent skills=absent pi=absent shell-own=absent default=default default-write=denied project=present` | with no declared shell the built-in fallback references no user tool but still receives the user-wide default |
+| CM-T8 | `CM-T8 agent=absent skills=absent readonly=absent pi=absent shell-own=absent default=absent project=present` | `--no-config-mounts` removes defaults, own list and inheritance on **both** a tool and the declared shell; the shell is a *wildcard* one, so its inherited facet is non-empty before the opt-out suppresses it |
+| CM-T9 | `CM-T9 agent=agent-seed agent-write=wrote skills=skills-seed ro-write=denied readonly=readonly-seed readonly-write=denied pi=absent default=absent agent-tool=absent agent-tool-state=absent` | `--no-config-mounts --mount agent` returns exactly the explicit set with its modes — both read-only leaves probed — and selecting a set provisions no tool: the catalog has a tool named `agent`, and its own leaf and `persist` link stay absent |
+| CM-T9-control | `CM-T9-control agent-tool=agent-tool-seed agent-tool-state=present` | the positive control for the two observables above: launching the same-named tool itself shows its own leaf and its persist link, so their absence under `--mount agent` is a measurement |
+| CM-T10 | `CM-T10 pi=pi-guest guest-file=present agent=absent` | an absolute `--mount …:fork` of the same source reuses the inherited fork's committed copy |
+| CM-T11 | `CM-T11 pi=pi-guest guest-file=present agent=absent` | the same declaration selected as a top-level default and through a nested set reseeds nothing |
+
+The host oracles read only after each launch's cleanup proved absence:
+`CM-T1-host []` (no Pi-lineage fork), `CM-T2-host` (the parent write reached the
+host, both read-only digests unchanged), `CM-T3-host` (`pi-seed` still on the
+host, protected files `unchanged`, guest-only file `absent` on the host, the
+parent write present) with `CM-T3-host-identity` exactly one Pi fork,
+`CM-T4-host`/`CM-T10-host`/`CM-T11-host-*` (identity unchanged, host source still
+`pi-host-later`, so no reseed and no host→fork sync), and the closing
+`CM-T-host-ro`/`CM-T-host-protected`/`CM-T-host-fork-identity`. Fork identity is
+compared **within the Pi lineage** — manifests whose guest destination ends in
+`/.pi` — so the #394/#397 fork in the same state root neither weakens nor is
+weakened by this run.
+
+What these rows do not show: general isolation from a writable ancestor (the
+read-only child's assertions are about operations at that mounted destination;
+this ADR's alias/rename caveat stands), that a project can acquire mount
+authority (unit and CLI refusals own that), or preparation cost. The boot-free
+budget and storage rows own **load/catalog expansion and retention only**; the
+quadratic phases in `mount::prepare` are the follow-up issue's, and no receipt
+here is a preparation-scaling measurement.
+
+Recording the prerequisite honestly: the first attempt at this run was blocked
+before any row — `./script/build/macos.sh --dev` failed in
+`build_firmware_if_missing` with `Transaction failed: Rpm transaction failed. -
+installing package java-25-openjdk-headless-… needs 109MB more space on the /
+filesystem`, because the Docker VM's filesystem was 97% full. That attempt is
+retained at `/tmp/avm-396/build3.log`. The operator then reclaimed space (45%,
+51.2 GB free); the identical build succeeded (`/tmp/avm-396/build4.log`,
+`EXIT:0`, 1006 s) and the run above is from the resulting bundle. No row was
+recorded from the blocked attempt.
