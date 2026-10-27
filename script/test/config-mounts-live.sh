@@ -4,7 +4,9 @@
 # The rows themselves are script/test/lib/config-mounts.py; this wrapper exists
 # to refuse a host that cannot produce trustworthy evidence *before* allocating
 # native scratch, and to retain the identities a reader needs to decide whether
-# the rows came from the committed candidate (#394 / ADR-0046).
+# the rows came from the committed candidate (#394 / ADR-0046). The named
+# mount-set rows CM-S1..S4 (#397 / ADR-0048) ride the same launches, bounds and
+# receipts: only the config bytes change between cleanly terminated launches.
 set -euo pipefail
 
 evidence="${AGENT_VM_CM_EVIDENCE:-$(mktemp -d /tmp/avm-cm-evidence.XXXXXX)}"

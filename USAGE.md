@@ -823,9 +823,9 @@ Available launch options:
 | `--no-git` | skip gh/git auth injection (still respects `--repo`) |
 | `--repo OWNER/NAME` | add to the GitHub allow-list (repeatable) |
 | `--allow-missing-credentials` | warn and launch when a requested YAML credential is missing or unreadable, instead of refusing — see [Authorizing a stored value for injection](#authorizing-a-stored-value-for-injection). Never covers a built-in provider's own missing host credential |
-| `--mount HOST[:GUEST][:MODE]...` | extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). A live bind that would expose a host Pi credential file is refused — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted). Capacity is host-specific. |
+| `--mount SET\|HOST[:GUEST][:MODE]...` | a bare `SET` name selects that user-defined [mount set](#named-mount-sets-user-config), exactly and case-sensitively, and never a relative path, a directory or a tool; otherwise an extra live bind or project-scoped `:fork`. Directory binds default to writable; a regular file needs an explicit `:ro`. Modes: `:ro`, `:rw`, `:fork`, `:follow-links`, and fork-only repeatable `:exclude=REL`; see [Extra and forked mounts](#extra-and-forked-mounts). A live bind that would expose a host Pi credential file is refused — see [Host Pi credential files are never mounted](#host-pi-credential-files-are-never-mounted). Capacity is host-specific. |
 | `--allow-internet-egress`, `--allow-lan`, `--allow-host`, `--allow-egress`, `--publish`, `--auto-publish` | see [Ports & egress](#ports--egress); egress is denied by default |
-| `--no-config-mounts` | skip this launch's [config mounts](#config-mounts-user-config) (the user config's `mounts`); explicit `--mount`, credentials, persisted paths and every config check still apply |
+| `--no-config-mounts` | skip this launch's automatic [config mounts](#config-mounts-user-config) (the user config's `mounts`); an explicit `--mount`, including `--mount NAME`, credentials, persisted paths and every config check still apply |
 | `--root` | run the guest as root (uid 0) instead of the default host user — see [Guest user](#guest-user----root) |
 
 ### Direct commands
@@ -900,10 +900,14 @@ entry.
 
 ### Extra and forked mounts
 
-`--mount` accepts `HOST[:GUEST][:MODE]...`. `GUEST` defaults to `HOST` (a
-mirror at the same absolute path). Valid mode tokens are `ro`, `rw`, `fork`,
-`follow-links`, and `exclude=REL`; contradictory tokens (`ro`+`rw`,
-`rw`+`follow-links`, `fork`+`ro`, `fork`+`rw`) are parse errors.
+`--mount` accepts either a bare [mount set](#named-mount-sets-user-config) name
+(`--mount agent`) or `HOST[:GUEST][:MODE]...`. A bare name is an exact lookup in
+your config's `[mount_sets]` and takes no modes; every working absolute path keeps
+this grammar, `HOST` must be absolute (the shell expands `~`, so a quoted `~/ref`
+is refused), `GUEST` defaults to `HOST` (a mirror at the same absolute path), and
+valid mode tokens are `ro`, `rw`, `fork`, `follow-links`, and `exclude=REL`.
+Contradictory tokens (`ro`+`rw`, `rw`+`follow-links`, `fork`+`ro`, `fork`+`rw`)
+are parse errors.
 
 | declaration | source and behavior |
 |---|---|
@@ -968,10 +972,11 @@ project:
 mounts = ["~/reference:ro", "~/scratch:/work/scratch:rw"]
 ```
 
-The grammar is [`--mount`](#extra-and-forked-mounts)'s — `HOST[:GUEST][:MODE]...`
-with the same modes (`ro`, `rw`, `fork`, `follow-links`, fork-only
-`exclude=REL`), the same guest-path rules (absolute, not `/`, no `..`, `:`,
-`;`, `,` or control characters), and the same checks (host Pi credential files,
+An entry is either a bare [mount set](#named-mount-sets-user-config) name or the
+[`--mount`](#extra-and-forked-mounts) grammar — `HOST[:GUEST][:MODE]...` with the
+same modes (`ro`, `rw`, `fork`, `follow-links`, fork-only `exclude=REL`), the same
+guest-path rules (absolute, not `/`, no `..`, `:`, `;`, `,` or control
+characters), and the same checks (host Pi credential files,
 the [protected config directory](#agent-vms-config-directory-is-never-writable-from-the-guest),
 core-mount collisions, the file-mount restriction, and collisions with a declared
 `persist` path). Only `HOST` differs:
@@ -1048,13 +1053,15 @@ agent-vm --no-config-mounts --mount ~/x:ro shell   # --mount still applies
 It is a launch option, so it goes before the verb ([launch options go before the
 tool verb](#launch-options)): write `agent-vm --no-config-mounts shell`, not `agent-vm shell --no-config-mounts`,
 because after the tool verb it is a tool argument forwarded verbatim and the
-config mounts still apply. It disables selection and preparation only.
-Explicit `--mount`, credentials, persisted paths, agent-vm's own project/state
-mounts, egress authority, and every config check (schema, mount syntax, file
-trust) are unchanged: a broken or untrusted `mounts` config still fails the
-launch, because that is a `config::load` error and the flag cannot run before it.
-It is also a usage error on a built-in verb (`agent-vm --no-config-mounts
-doctor`), like every other launch option.
+config mounts still apply. It disables the automatic selection and its
+preparation only. Explicit `--mount` (including `--mount NAME`, which still
+applies a [named set](#named-mount-sets-user-config)), credentials, persisted
+paths, agent-vm's own project/state mounts, egress authority, and every config
+check (schema, mount sets, references and cycles, file trust) are unchanged: a
+broken or untrusted mount config still fails the launch, because that is a
+`config::load` error and the flag cannot run before it. It is also a usage error
+on a built-in verb (`agent-vm --no-config-mounts doctor`), like every other launch
+option.
 
 **Where `mounts` lands in the file matters.** TOML assigns a key to the most
 recent `[table]` header, so write it **before the first one**:
@@ -1066,6 +1073,9 @@ recent `[table]` header, so write it **before the first one**:
 | `[[tools]]` … then `mounts = [...]` | a tool field: the fixed schema-repair paragraph, with the line and column and the same "write it before the first table header" sentence |
 | `[mounts]` (table form) | top-level and present, so verified, then `mounts: must be an array of strings` |
 | `[tools.env]` with `mounts = "~/private:ro"` | a legitimate **environment variable** named `mounts`; no mount is selected and no authority is asked for |
+| `[mount_sets]` then `mounts = [...]` | a **set named `mounts`** with one declaration, not the defaults list: `mounts` is a valid set name and is not reserved. Only the position decides |
+| `[mount_sets.foo]` (nested table) | refused: a set's value must be an array of declarations or set names |
+| `mount_sets = []` or any non-table | `mount_sets: must be a table of named arrays of mount declarations` |
 
 A launch that selected config mounts prints one line, naming the file and how
 many declarations it contributed:
@@ -1079,8 +1089,112 @@ Expect no such line when the list is empty or absent, or when a skipped list was
 empty: there is nothing to report.
 
 > **Added in 0.7.4.** ADR-0046 records why the file-trust rule, the merge rule
-> and the preflight order are what they are; named mount sets and per-tool mount
-> fields are deliberately not part of this release.
+> and the preflight order are what they are. Named mount sets arrived in 0.7.13
+> (below); per-tool mount fields are still deliberately deferred.
+
+### Named mount sets (user config)
+
+A **mount set** is a named list of mount declarations in the same user config.
+Declaring one mounts nothing — only the defaults list or an explicit `--mount`
+selects it — and a set may name other sets:
+
+```toml
+# at the top of the file, before any [table] header
+mounts = ["agent"]           # optional automatic selection
+
+[mount_sets]
+agent = [
+  "~/.agents/skills:ro",
+  "~/.agents",
+  "~/.config/github-app:ro",
+]
+pi-agent = ["agent", "~/.pi:fork"]
+empty = []
+```
+
+```sh
+agent-vm --mount agent shell
+agent-vm --no-config-mounts --mount pi-agent shell
+```
+
+The first selects that set for one launch. The second suppresses the automatic
+`mounts` list and still selects `pi-agent` explicitly — `--no-config-mounts`
+removes the defaults, never your own command line. Both are launch options, so
+they go **before** the verb. Neither changes credential provisioning or your
+persisted paths.
+
+**Names.** A set name is case-sensitive ASCII: `[A-Za-z0-9_]` first, then
+`[A-Za-z0-9_.-]`. So `agent`, `pi-agent`, `_local`, `a.b` and `A` are names, and
+`A` differs from `a`. `agent:ro`, `-agent`, `--mount`, `../x`, `./x`, `~x`,
+`a/b`, `a b` and any non-ASCII spelling are not. Tool, route and command words are
+not reserved: a set may be called `pi` or `shell`, and `--mount pi` selects the
+set and never a tool. There is no implicit `agent` set and no inference from tool
+names.
+
+**`--mount` and config entries share one classification.** A host segment
+starting with `/` or `~/` is a path and keeps the whole `HOST[:GUEST][:MODE]...`
+grammar, so every absolute `--mount` that works today still works and is never
+reclassified. A valid bare name is an exact set lookup: no case folding, no
+trimming, no cwd-relative path, no directory discovery and no tool fallback, so a
+directory named `agent` in your project changes nothing. Anything else goes to the
+path grammar and is refused as it always was (`./x`, `~x`, `$X`, `a b`). A name
+with any `:` — `agent:ro`, `agent:fork`, `agent:/guest`, `agent:exclude=x` — is
+refused: a set reference is a bare name, and modes, guest paths and exclusions
+belong to the path declarations *inside* the set.
+
+**Everything is validated at load, whether or not anything selects it.** Unknown
+names, an invalid definition and a set-reference cycle are config errors, in an
+unused set and under `--no-config-mounts` too. A set whose own transitive closure
+claims one guest path twice with *different* declarations is a config error as
+well; two separately valid sets may still disagree at one guest path, and that
+fails only when a launch selects both. `tools` reference cycles stay legal — they
+are a different graph reaching a fixed point.
+
+The closure walk is bounded so a crafted file cannot hang config load: it spends
+at most **65,536 leaf visits** across every declared set's closure. Past that the
+load fails with `mount_sets: expansion work exceeds limit of 65536 leaf visits`,
+under `--no-config-mounts` and in `doctor` too. Hundreds of ordinary small sets
+are far below it; the fix for the message is to compose fewer sets per closure,
+not to opt out, because load validation runs regardless.
+
+**Declarations are inert; selection is what mounts.** A `[mount_sets]` table (an
+empty one included) and an empty set select nothing, and a sets-only file prints
+no `==> Config mounts:` line. Repeated paths, a set named twice and a shared
+nested set all deduplicate to one bind per declaration. Differing declarations at
+one guest path are refused in every combination — default versus set, set versus
+set, and `--mount` versus a selected set, in either order — with both declared
+sites named and no override. Guest spellings are normalized first, host spellings
+are not, precisely as for direct entries.
+
+**Host paths and identity are unchanged.** Inside a set, `~/` expands by
+concatenation onto your host `$HOME` text (not the guest's, and not the config
+file's directory); guest destinations stay absolute; there is no environment or
+other relative expansion. The expanded spelling is preserved, so fork identity is
+unchanged: moving the same declaration between `--mount`, the defaults list and a
+named or nested set reuses the same project-scoped fork, and no set name, nesting,
+config origin or traversal order can reseed it.
+
+**Modes and protections belong to the leaves.** There are no per-set mode
+overrides and no new mount modes; each path declaration carries its own `:ro`,
+`:rw`, `:fork`, `:follow-links` and `:exclude=REL`, and the same protections
+apply (host Pi credential files, the [protected config
+directory](#agent-vms-config-directory-is-never-writable-from-the-guest), core
+guest paths, the file-mount restriction, `persist` collisions). A read-only child
+under a writable parent is allowed, and it does **not** prove the guest has no
+writable alias to that child through the parent.
+
+**Source existence is a launch-time question.** An unused set may name a path
+that does not exist — its source is never stat'd, opened or canonicalized at load
+— so it cannot block an unrelated launch. Selecting it fails that launch in
+preflight, naming `mount_sets["NAME"][I] in "<file>"`, unless an already
+initialized `:fork` copy is reusable. A sets-only config is authority-bearing
+exactly like one with `mounts`, and is refused from the project and built-in
+tiers: a project cannot declare sets and cannot select a user name.
+
+> **Added in 0.7.13.** ADR-0048 is the accepted design for named sets,
+> [ADR-0046](docs/adr/0046-verified-user-config-mounts.md) the verified-file rule
+> they inherit. Tool-level `mounts` and tier-local tool mount inheritance remain
+> unimplemented.
 
 ### agent-vm's config directory is never writable from the guest
 

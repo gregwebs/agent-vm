@@ -2,14 +2,15 @@
 
 ## Status
 
-Accepted for [#394](https://github.com/gregwebs/agent-vm/issues/394).
-**Reconstructed from that issue**: the approved conversation's working-tree
-Markdown was never committed, so this file records the decisions the issue
-carries, checked against the implementation that landed. It builds on
+Accepted for [#394](https://github.com/gregwebs/agent-vm/issues/394), and
+implemented. **Reconstructed from that issue**: the approved conversation's
+working-tree Markdown was never committed, so this file records the decisions the
+issue carries, checked against the implementation that landed. It builds on
 [ADR-0040](0040-persisted-user-network-authority.md)'s verified read, extends
 [ADR-0038](0038-config-dir-exposure-guard.md)'s exposure guard, and adds rows to
 [ADR-0018](0018-machine-checked-boundary-contracts.md). Additive release:
-**0.7.4**.
+**0.7.4**. The native enforcement rows now have a recorded pass; see
+[Verification](#verification).
 
 ## Context
 
@@ -213,6 +214,21 @@ filesystem, sandbox and runtime behaviour. Neither the proofs nor the boot-free
 tests establish that a VM enforces a bind mode; only the native CM rows do, run
 per [CONTRIBUTING](../../CONTRIBUTING.md#config-mounts-live-check).
 
+The native rows passed on the #397 candidate: CM-N1, CM-N2, CM-N3a/b, CM-N4 and
+CM-N5 with their host oracles ran in the same 18/18 run as the named-set rows —
+candidate `agent-vm 0.7.13 (8e24b2cfc57a0c53e434261ccc741d3fd6202a44)`,
+digest-pinned image
+`localhost:32937/agent-vm-base@sha256:dfff451db9182c3c5d30798d65c52e5cf1f21639720cf1988e8f4079a81b15f2`,
+evidence `/tmp/avm-397-native/evidence-run2`. [ADR-0048's native
+evidence](0048-named-mount-sets-and-tier-local-tool-references.md#native-evidence)
+records the command, the rows, the harness observation-race caveat and what the
+rows do not show. Read narrowly: they show the bind semantics observed in a
+guest — `:ro` refuses a write, `:rw` writes through to the host, `:fork` keeps
+the guest's own writes and never synchronizes, `--no-config-mounts` removes the
+defaults while the project mount still works, and an equivalent `--mount` reuses
+the config fork's identity. They do not show general mount safety, and the
+owner-mode refusals remain unit-level only.
+
 ## Accepted gaps
 
 - **Every-project exposure is the feature.** A config mount reaches repositories
@@ -264,3 +280,49 @@ tests through the real CLI and prepared sandbox volumes, and mutation controls
 enforcement is the CM row set in
 [CONTRIBUTING](../../CONTRIBUTING.md#config-mounts-live-check); boot-free
 fake-`msb` runs are never counted as that evidence.
+
+## Amendment: named selectors and a namespace (#397 / ADR-0048)
+
+Named **mount sets** ([ADR-0048](0048-named-mount-sets-and-tier-local-tool-references.md))
+land on top of this decision without changing any of it. The load/launch split,
+the verified-file rule, the `~/`-only host spelling, the preserved source
+spelling, the shared claim rule and the "no source inspection at load" rule are
+all inherited verbatim; `mounts` entries became *selectors*, so an entry may now
+be a bare set name instead of a path.
+
+What this ADR's own rows keep saying:
+
+| row | still true |
+|---|---|
+| `mounts` schema, `~/` expansion, guest normalization, intra-config claim | same, now over selectors: the defaults list is merged after every declared set's closure was validated |
+| project/built-in `mounts` refusal | same, and `[mount_sets]` is refused beside it |
+| no mount-source access at load | same, and it is what makes an unused set's missing source harmless |
+| config-vs-CLI claim, protections, fork identity | same kernel, same identity inputs; a set name, nesting, origin or traversal order enters none of them |
+
+What is new, and recorded in ADR-0048 and USAGE rather than re-derived here:
+
+- `[mount_sets]` is a second authority-bearing field, so presence alone puts the
+  file under ADR-0040's gate (ADR-0040 carries the amendment).
+- A bare name in `mounts` or in `--mount` is an exact set lookup; `["ref"]` is
+  therefore no longer a host-spelling refusal but `mounts[0]: unknown mount set
+  name`. Every *disallowed path spelling* refusal (`~`, `~user/x`, `$HOME/x`,
+  `./x`, relative) keeps its bytes.
+- Every declared set's transitive closure is validated at load (decision A2),
+  with a global leaf-visit budget that turns a pathological config into a
+  value-free error (decision R1). Both are maintainer decisions recorded in
+  ADR-0048.
+- `--no-config-mounts` withholds the defaults list only; an explicit
+  `--mount NAME` still selects its set, and every schema, reference, cycle and
+  authority check still runs.
+
+Status: the named-selector half landed in #397 and is natively evidenced. The
+same run re-verified this ADR's ten #394 rows (CM-N1…N5 with their host oracles)
+on a clean candidate, and CM-S1–S4 passed on guest-printed output; see [ADR-0048's
+native evidence](0048-named-mount-sets-and-tier-local-tool-references.md#native-evidence)
+for the candidate identity, the pinned image digest, the evidence directory and
+the two caveats (a first attempt's harness observation race; prerequisites that
+were solvable rather than absent). So the #394 portion this file specifies is
+implemented: the verified read, the one claim rule, opt-out of selection only,
+and source existence deferred to launch. The rows measure bind semantics as
+observed in the guest, not general mount safety, and the owner-mode refusals stay
+unit-level.

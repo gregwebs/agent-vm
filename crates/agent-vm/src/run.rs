@@ -458,9 +458,15 @@ Fork mounts:
   host-managed project mount store beside `/agent-vm-state`. To reset/reseed, stop users of the
   fork, remove the exact directory printed at launch, then launch the same declaration again.
 
-Config mounts:
-  mounts = [\"~/ref:ro\", ...] in ~/.config/agent-vm/config.toml apply to every launch
-  (verified file, like [network]); --no-config-mounts skips them for one launch.
+Config mounts and named mount sets:
+  mounts = [\"~/ref:ro\", \"agent\"] in ~/.config/agent-vm/config.toml apply to every launch;
+  [mount_sets] names reusable lists there (verified file, like [network]).
+  agent = [\"~/.agents\", \"~/.config/github-app:ro\"] — modes belong to these paths, and a
+  set whose closure claims one guest path twice with different declarations is a config error,
+  even unused. Sets may name other sets. Definitions alone mount nothing.
+  agent-vm --mount agent <tool>            select that set for one launch (no modes, exact name)
+  --no-config-mounts skips the automatic mounts list for one launch; an explicit --mount NAME
+  still applies, and every schema/reference/cycle/authority check still runs.
 
 Networking (deny-by-default; flags compose):
   --publish                host  → guest     open an inbound port to a guest service
@@ -552,14 +558,22 @@ pub struct Args {
     )]
     allow_missing_credentials: bool,
 
-    /// Bind an extra host path into the guest, or seed a persistent fork (repeatable).
+    /// Bind an extra host path into the guest, or select a named mount set (repeatable).
     ///
-    /// Format `HOST[:GUEST][:MODE]...`; `GUEST` defaults to `HOST` (mirror at the same absolute
-    /// path). Valid mode tokens are `ro`, `rw`, `fork`, `follow-links`, and `exclude=REL`; conflicting
-    /// tokens like `ro`+`rw` or `rw`+`follow-links` are errors. `GUEST`, if given, must be an absolute
-    /// path (start with `/`); a trailing token that isn't a path is parsed as a mode keyword, e.g.
-    /// `--mount ~/ref:ro`. Directory binds default to writable (`:rw`); a regular file requires an
-    /// explicit `:ro` — a bare or `:rw` file mount is rejected, and a file cannot be `:fork`ed.
+    /// A bare name selects that user-defined set from `[mount_sets]` in
+    /// `~/.config/agent-vm/config.toml`; it is an exact, case-sensitive lookup and never a
+    /// relative path, a directory or a tool name. Sets may name other sets; an unknown name or a
+    /// set-reference cycle is a config error, and a set name takes no `:MODE` (modes belong to the
+    /// paths declared inside the set). Explicit names still apply under --no-config-mounts.
+    ///
+    /// Otherwise the value is a host path: format `HOST[:GUEST][:MODE]...`; `GUEST` defaults to
+    /// `HOST` (mirror at the same absolute path). Valid mode tokens are `ro`, `rw`, `fork`,
+    /// `follow-links`, and `exclude=REL`; conflicting tokens like `ro`+`rw` or `rw`+`follow-links`
+    /// are errors. `GUEST`, if given, must be an absolute path (start with `/`); a trailing token
+    /// that isn't a path is parsed as a mode keyword, e.g. `--mount ~/ref:ro`. `HOST` must be
+    /// absolute: the shell expands `~`, so a quoted `~/ref` is refused. Directory binds default to
+    /// writable (`:rw`); a regular file requires an explicit `:ro` — a bare or `:rw` file mount is
+    /// rejected, and a file cannot be `:fork`ed.
     ///
     /// `:fork` copies a directory once into project-scoped persistent state. Later launches reuse
     /// that stored copy without synchronizing either direction: source changes do not reach the
@@ -602,23 +616,23 @@ pub struct Args {
     /// host interrupt model and runtime; do not treat a measurement from
     /// one platform as a portable mount limit.
     ///
-    /// Adds to the user config's `mounts`; identical declarations merge and
-    /// different ones at the same guest path are refused (no override).
+    /// Adds to the user config's `mounts` and to any set those select; identical declarations
+    /// merge and different ones at the same guest path are refused (no override).
     #[arg(
         long = "mount",
-        value_name = "HOST[:GUEST][:MODE]...",
+        value_name = "SET|HOST[:GUEST][:MODE]...",
         help_heading = "Mounts & ports"
     )]
     pub(crate) mount: Vec<String>,
 
-    /// Skip this launch's config mounts (`mounts` in `~/.config/agent-vm/config.toml`).
+    /// Skip this launch's automatic config mounts (`mounts` in `~/.config/agent-vm/config.toml`).
     ///
-    /// Only the automatic selection is skipped: explicit `--mount` still applies, and
-    /// credentials, persisted paths, agent-vm's own mounts, and every config check
-    /// (schema, mount syntax, file authority) are unchanged. A broken or untrusted
-    /// config still fails the launch. There is deliberately no environment variable:
-    /// skipping ambient host exposure is a per-launch decision made at the command
-    /// line, and the same option placed after the tool verb is forwarded to the tool.
+    /// Only that automatic selection is skipped: an explicit `--mount` still applies, including
+    /// `--mount NAME`, and credentials, persisted paths, agent-vm's own mounts, and every config
+    /// check (schema, mount sets, references and cycles, file authority) are unchanged. A broken
+    /// or untrusted config still fails the launch. There is deliberately no environment variable:
+    /// skipping ambient host exposure is a per-launch decision made at the command line, and the
+    /// same option placed after the tool verb is forwarded to the tool.
     #[arg(
         long = "no-config-mounts",
         default_value_t = false,

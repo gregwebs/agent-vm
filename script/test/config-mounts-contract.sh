@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Boot-free host controls for the config-mounts evidence (#394 / ADR-0046).
+# Boot-free host controls for the config-mounts evidence (#394 / ADR-0046,
+# #397 / ADR-0048).
 #
 # These are host-only controls, never native VM evidence: no VM, no agent-vm
 # launch and no image. They run the *actual* guest probe the native harness
@@ -110,6 +111,116 @@ out="$(run_probe "$work/full" n4)"
 
 out="$(run_probe "$layout" n5)"
 [[ "$out" == 'CM-N5 read=absent' ]] || fail "N5 probe output: $out"
+
+# --- Named-mount-set rows (#397) --------------------------------------------
+# The probe statements are the native ones; only the layout is synthetic. The
+# N3a control above wrote `guest-fork` and the N3b negative control removed it, so
+# restore the fork marker before the set rows read it.
+printf 'guest-fork' > "$layout/cm/fork/marker"
+chmod 0644 "$layout/cm/fork/marker"
+# The probe's own write is what the rw assertion below checks, so start from the
+# seed: a retained `set-rw` from an earlier run must not pass for a write.
+printf 'seed-rw' > "$layout/cm/rw/marker"
+
+# Two assertions for the row, so the permission-only half can be stated with the
+# verdict this host can actually produce while the rest — the exact seed, the rw
+# write reaching the host, the fork copy and the project control — is required in
+# every case.
+assert_sets_line() {
+    local out="$1" ro_write="$2"
+    [[ "$out" == "CM-S access ro=seed-ro ro-write=$ro_write rw=wrote fork=guest-fork project=present" ]] ||
+        fail "S probe output (ro-write=$ro_write expected): $out"
+}
+
+assert_sets_rw() {
+    [[ "$(cat "$layout/cm/rw/marker")" == 'set-rw' ]] ||
+        fail 'S control did not write the set rw marker through'
+}
+
+# Restore the read-only fixture after a control that may have written through it:
+# make the tree writable first (the directory has to accept a create/rename for
+# the seed rewrite), reset the bytes, and put the modes back. `cm/ro/new` is the
+# probe's own write target, so remove it under every uid.
+restore_ro_fixture() {
+    chmod 0755 "$layout/cm/ro"
+    rm -f "$layout/cm/ro/new" "$layout/cm/ro/marker"
+    printf 'seed-ro' > "$layout/cm/ro/marker"
+    chmod 0444 "$layout/cm/ro/marker"
+    chmod 0555 "$layout/cm/ro"
+}
+
+# Branch coverage for the assertion itself, so both uid paths run the same check:
+# a line with the wrong verdict must be refused, whichever verdict this host can
+# produce.
+# (Each call is a subshell: `fail` exits, and this is the control for a refusal.)
+if ! ( assert_sets_line 'CM-S access ro=seed-ro ro-write=denied rw=wrote fork=guest-fork project=present' denied >/dev/null 2>&1 ); then
+    fail 'S row assertion rejected the denied line'
+fi
+if ! ( assert_sets_line 'CM-S access ro=seed-ro ro-write=allowed rw=wrote fork=guest-fork project=present' allowed >/dev/null 2>&1 ); then
+    fail 'S row assertion rejected the allowed line'
+fi
+if ( assert_sets_line 'CM-S access ro=seed-ro ro-write=denied rw=wrote fork=guest-fork project=present' allowed >/dev/null 2>&1 ); then
+    fail 'S row assertion accepted a line with the wrong read-only verdict'
+fi
+
+# The read-only verdict this host can actually produce, computed once from
+# `is_root` so every row that reports it requires exactly that value — `denied` on
+# a permission-enforcing uid, `allowed` under uid 0, where 0555 does not deny —
+# and never "either".
+if [[ "$is_root" == true ]]; then
+    expected_ro_write=allowed
+else
+    expected_ro_write=denied
+fi
+
+if [[ "$is_root" == true ]]; then
+    # uid 0 writes a 0555/0444 tree, so the permission-only half of this row
+    # cannot be exercised: say so, and keep the rest of the row under test.
+    echo 'NOT RUN CM-S read-only control: running as root, mode 0555 does not deny writes'
+    out="$(run_probe "$layout" sets)"
+    assert_sets_line "$out" "$expected_ro_write"
+    assert_sets_rw
+    # The allowed write may have replaced the marker; restore the seed bytes and
+    # leave no new file, exactly as the nonroot branch does, so the later rows and
+    # the "restored after every allowed-write control" claim both hold.
+    restore_ro_fixture
+else
+    out="$(run_probe "$layout" sets)"
+    assert_sets_line "$out" "$expected_ro_write"
+    assert_sets_rw
+    # Negative control for the read-only half: a *writable* "ro" tree must report
+    # `allowed`, so a probe that always answers "denied" cannot pass this row.
+    chmod 0755 "$layout/cm/ro"
+    chmod 0644 "$layout/cm/ro/marker"
+    out="$(run_probe "$layout" sets)"
+    assert_sets_line "$out" allowed
+    # Restore the fixture bytes the allowed write changed, and leave no new file.
+    restore_ro_fixture
+fi
+
+# Negative control for the fork half: a missing marker must never read as a
+# value, and the row must still render. A directory named `marker` is "not a
+# regular file" under any uid, so this control runs everywhere. The read-only
+# verdict is still required to be exactly this host's, not either of the two.
+rm "$layout/cm/fork/marker"
+mkdir "$layout/cm/fork/marker"
+out="$(run_probe "$layout" sets)"
+expected_missing_fork="CM-S access ro=seed-ro ro-write=$expected_ro_write rw=wrote fork=absent project=present"
+[[ "$out" == "$expected_missing_fork" ]] ||
+    fail "S probe invented a fork value for a missing marker: $out"
+rmdir "$layout/cm/fork/marker"
+printf 'guest-fork' > "$layout/cm/fork/marker"
+# Under uid 0 that row's write was allowed too; restore it here as well so
+# "restored after every allowed-write control" is true without exception.
+restore_ro_fixture
+
+# The definitions-only row reuses the absent verdict under its own label.
+out="$(run_probe "$empty" sets-absent)"
+[[ "$out" == 'CM-S ro=absent rw=absent fork=absent project=present' ]] ||
+    fail "sets-absent probe output: $out"
+out="$(run_probe "$work/full" sets-absent)"
+[[ "$out" == 'CM-S ro=present rw=absent fork=absent project=present' ]] ||
+    fail "sets-absent probe did not see a present mount: $out"
 
 # An unknown phase must fail rather than print nothing (a silent pass).
 if run_probe "$layout" bogus >/dev/null 2>&1; then
@@ -291,4 +402,4 @@ for array, label in (("syntax_check", "bash -n"), ("shellcheck_files", "shellche
         print(f"host-only removal mutation PASS: {array}: {script}")
 PY
 
-echo 'host-only config-mounts controls passed (probe rows, preflight refusals, guard entries; no VM run)'
+echo 'host-only config-mounts controls passed (probe rows including the named-set rows, preflight refusals, guard entries; no VM run)'

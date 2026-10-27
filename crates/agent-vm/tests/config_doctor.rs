@@ -1931,3 +1931,76 @@ fn shell_rows_report_the_tier_local_provisioning_set() {
         "no shipped agent may be restored: {stdout}"
     );
 }
+
+/// A declared mount set is validated whether or not anything selects it, so an
+/// unknown reference or a set-reference cycle is reported in doctor's tool
+/// configuration section — without suppressing the other sections or creating
+/// state — while a *valid* unused set whose source is absent is not an error at
+/// all (source existence is a launch-time question about selected mounts).
+#[test]
+fn an_unused_mount_set_error_is_reported_and_a_missing_source_is_not() {
+    for (body, needle) in [
+        (
+            "[mount_sets]\nisland = [\"island\"]\n",
+            "mount_sets[0][0]: mount-set reference cycle",
+        ),
+        (
+            "[mount_sets]\nunused = [\"nope\"]\n",
+            "mount_sets[0][0]: unknown mount set name",
+        ),
+        (
+            "mounts = [\"nope\"]\n[mount_sets]\nunused = []\n",
+            "mounts[0]: unknown mount set name",
+        ),
+        (
+            "[mount_sets]\nbad = [\"agent:ro\"]\n",
+            "mount_sets[0][0]: a mount-set reference is a bare name",
+        ),
+    ] {
+        let h = Harness::new();
+        h.write_user(body);
+        let before = snapshot_tree(&h.home_root);
+        let out = h.run_doctor();
+        assert_failure(&out);
+        let stdout = stdout_of(&out);
+        for heading in [
+            "==> active microsandbox home",
+            "==> host agent credentials",
+            "==> tool configuration",
+            "==> agent-vm doctor: available operations",
+        ] {
+            assert!(
+                stdout.contains(heading),
+                "{body}: missing {heading}: {stdout}"
+            );
+        }
+        assert!(stdout.contains(needle), "{body}: {stdout}");
+        // The sentence is in the tool-configuration slot, not smuggled into an
+        // unrelated one.
+        let config_index = stdout.find("==> tool configuration").unwrap();
+        let error_index = stdout.find(needle).unwrap();
+        assert!(
+            error_index > config_index,
+            "{body}: the mount error must appear after the config heading: {stdout}"
+        );
+        assert_eq!(
+            snapshot_tree(&h.home_root),
+            before,
+            "{body}: doctor must create no state"
+        );
+        // Help stays available under the broken config.
+        assert_success(&h.base_command().arg("--help").output().unwrap());
+    }
+
+    // Positive control: a valid set whose source does not exist is not an error.
+    let h = Harness::new();
+    h.write_user("[mount_sets]\nunused = [\"/nonexistent-agent-vm-doctor-probe:/g:ro\"]\n");
+    let out = h.run_doctor();
+    assert_success(&out);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("==> tool configuration"), "{stdout}");
+    assert!(
+        !stdout.contains("nonexistent-agent-vm-doctor-probe"),
+        "an unselected source must not be read or named: {stdout}"
+    );
+}
