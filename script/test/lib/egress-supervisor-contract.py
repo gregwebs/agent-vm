@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -294,6 +295,31 @@ class Contracts(unittest.TestCase):
             "/tmp/av302-msb-home/run/sandboxes/e6b31ea46b06a7e0865241dd/control.sock",
             "/tmp/av302-msb-home/run/agent/e6b31ea46b06a7e0865241dd3e4a49ac.sock",
             "/tmp/av302-msb-home/run/agent/e6b31ea46b06a7e0865241dd3e4a49ac.control.sock"])
+
+    def test_unmigrated_catalog_is_not_yet_initialized(self):
+        # #449: the private file exists for ~3 ms before the first migration
+        # commits its tables, and the observer polls every 50 ms. An absent
+        # table is "not yet initialized" (no rows, keep polling); a table that
+        # exists with the wrong columns is still a mismatch.
+        db = self.root / "db/msb.db"
+        self.assertEqual(egress.catalog_rows(self.root), [])
+        db.parent.mkdir(parents=True)
+        sqlite3.connect(db).close()
+        self.assertEqual(egress.catalog_rows(self.root), [])
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute('CREATE TABLE sandbox (id INTEGER, name TEXT, config TEXT, status TEXT)')
+        # Half-migrated: the run table is still absent.
+        self.assertEqual(egress.catalog_rows(self.root), [])
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute('CREATE TABLE run (id INTEGER, sandbox_id INTEGER, pid INTEGER, status TEXT)')
+            conn.execute("INSERT INTO sandbox VALUES (1, 'agent-vm-0123456789ab-1', '{}', 'Running')")
+        self.assertEqual([row["name"] for row in egress.catalog_rows(self.root)],
+                         ["agent-vm-0123456789ab-1"])
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute('DROP TABLE sandbox')
+            conn.execute('CREATE TABLE sandbox (id INTEGER, name TEXT)')
+        with self.assertRaisesRegex(RuntimeError, "private catalog schema mismatch: sandbox"):
+            egress.catalog_rows(self.root)
 
     def test_pid_reuse_and_outside_paths_refuse_signal(self):
         with patch.object(egress, "process_identity", return_value=[2, 0]), patch.object(egress.os, "kill") as kill:
