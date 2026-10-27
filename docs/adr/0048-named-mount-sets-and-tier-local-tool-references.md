@@ -242,7 +242,9 @@ to claim it tested tool mounts.
 
 The tool-mount rows are their own topology — a Pi home whose protected files are
 sentinels, an agent parent with a read-only child, a declared shell's own leaf and
-a user-wide default — and their own recorded run, on a later candidate:
+a user-wide default — and their own recorded runs: the same 46 rows passed twice,
+first on a pre-squash commit and then on the squashed commit that shipped. The
+pre-squash receipt comes first and is retained unchanged:
 
 | fact | value |
 |---|---|
@@ -255,6 +257,22 @@ a user-wide default — and their own recorded run, on a later candidate:
 | superseded | two earlier 45/45 passes, on `0.7.15 (5778128b…)` at `evidence-run.ZPqZ6U` and `0.7.15 (e564b4d6…)` at `evidence-run.auic4J`, used the *first* tool-mount fixture set. Its oracle was not discriminating — Pi declared the set it was meant to inherit, CM-T8's shell had `tools = []`, and CM-T9's catalog had no tool named `agent` while never probing the `readonly` leaf — so those receipts establish exactly the observations they recorded and not the wider prose. They are retained unchanged. |
 | not a pass | `evidence-run.Qh8fa1` holds one receipt, `rejected: AGENT_VM_BIN must be an absolute path to an executable`. It recorded no row and no `totals.json`; it is a different failure from the earlier firmware-build disk-space block (`/tmp/avm-396/build3.log`), which also recorded no row |
 | platform | macOS arm64. Linux/amd64 native coverage remains outstanding and is not implied |
+
+The branch was then squashed onto `origin/main` `241e27a` as `8cdfe71`, and the
+same driver was run again on that commit. That run is the shipped receipt; the
+table above was not rewritten to become it. Both are kept, and every attempt had
+its own `mktemp -d` evidence directory:
+
+| fact | value |
+|---|---|
+| command | `AGENT_VM_BIN="$PWD/target/macos-dev/bin/agent-vm" AGENT_VM_LIVE_TEST_IMAGE='127.0.0.1:33931/agent-vm-base@sha256:ad149d54…' AGENT_VM_CM_EVIDENCE="$(mktemp -d /tmp/avm-396-native/evidence-run.XXXXXX)" bash script/test/config-mounts-live.sh` |
+| candidate | `target/macos-dev/bin/agent-vm`, `agent-vm 0.7.15 (8cdfe71afa45de40a6386abd1ce682c071c6fa7c)` — the squashed commit, rebuilt with `./script/build/macos.sh --dev` (13 s) because the existing dev bundle still reported the previous head; `agent-vm --version` was checked against `8cdfe71…` before the run, provenance gate `provenance: clean binary matches source HEAD`, empty tracked status, SHA-256 `fabd8d3ebd31b6328339d4d3fd4f0c561e413d68e78fd9df447323dc4dfc3547` |
+| runtime | the bundle's own `msb 0.7.4` (SHA-256 `82269f92170d07de8d873cc1f024f32b764c2bda0a8f81cecba38a77ebda7b2d`) and `../lib/libkrunfw.5.dylib` (SHA-256 `ad7263ef96aa2bbb4d5bb2dcedf19303ad718c662ae53aa967af5d728084f8bd`) — by SHA-256 the same two binaries as the receipt above, not the Homebrew `msb` on `PATH` |
+| image | `127.0.0.1:33931/agent-vm-base@sha256:ad149d5419a79dd17d2157f92e62aaa996b148f0453fb12b4eb3bc2c391e1b90` — a fresh digest-pinned `registry:3` on port 33931 whose `Docker-Content-Digest` for the pushed bytes came back digit for digit, so this is the same image content as the receipt above; the launch's own pin records the reference with the arm64 manifest digest `sha256:dfff451db9182c3c5d30798d65c52e5cf1f21639720cf1988e8f4079a81b15f2` |
+| rows | **46/46 PASS**, the same 46 rows in the same order as the receipt above — 18 #394/#397 observations (10 guest, 8 host oracles) plus 28 #396 observations (14 guest, 14 host oracles) — so the arithmetic holds for both: `totals.json` `{"rows": 46, "passed": 46, "failed": []}`, `errors.json` `[]`, 201 owned-launch records with zero cleanup and zero observation errors |
+| evidence directory | `/tmp/avm-396-native/evidence-run.v5BZpU` (`summary.tsv` SHA-256 `6074915b45b2890f8cbaf70eb6b1ca951da3381888724621c2049bdfd983ab21`, `totals.json` `2fb7fd8b8901346cdfa9109e2d03050ef8b4a4bbdcdd129a116fd7bafdc814a2`, plus `image-pins.json`, `candidate.txt`, `runtime.txt`, `provenance-check.txt`, `owned.jsonl`, per-row config/command/before/after receipts and logs) |
+| what distinguishes the two | the shipped commit is a squash: `8cdfe71` sits directly on `origin/main` `241e27a`, while the receipt above ran on `7bccc2b`, a pre-squash commit of the same branch work. Their trees differ in four files — `USAGE.md`, this ADR, `crates/agent-vm/tests/config_mounts.rs` and `script/test/config-mounts-contract.sh` — and in none that the live driver reads: `script/test/config-mounts-live.sh`, `script/test/lib/config-mounts.py` and `script/test/fixtures/config-mounts/guest-cm-probe.sh` hash identically in both runs' `harness.sha256`, whose single differing line is the boot-free companion (`2c2cd73a…` → `509f44f2…`) that this driver never executes. The candidate identity differs because the commit is compiled into the binary |
+| platform | macOS arm64, as above. Linux/amd64 native coverage remains outstanding and is not implied |
 
 Every row is one whole guest-printed line compared byte for byte, and the probe
 renders its row even when a read or write fails, so a partial mount cannot pass:
@@ -301,5 +319,7 @@ installing package java-25-openjdk-headless-… needs 109MB more space on the /
 filesystem`, because the Docker VM's filesystem was 97% full. That attempt is
 retained at `/tmp/avm-396/build3.log`. The operator then reclaimed space (45%,
 51.2 GB free); the identical build succeeded (`/tmp/avm-396/build4.log`,
-`EXIT:0`, 1006 s) and the run above is from the resulting bundle. No row was
-recorded from the blocked attempt.
+`EXIT:0`, 1006 s) and the pre-squash receipt above is from the resulting bundle.
+No row was recorded from the blocked attempt, and the squashed-commit run was
+rebuilt later from committed source in 13 s with the firmware already cached, so
+that block did not recur.
