@@ -3,14 +3,17 @@
 //! The user config is shared by every project on the host, so a guest in one
 //! project can plant a file that a later launch in another project reads. A
 //! field that *grants* something — egress under ADR-0040, host mounts under
-//! ADR-0046 — may therefore only be taken from bytes whose file and immediate
-//! directory this user owns, singly named, and not group- or other-writable.
+//! ADR-0046, named mount sets under ADR-0048 — may therefore only be taken from
+//! bytes whose file and immediate directory this user owns, singly named, and
+//! not group- or other-writable.
 //!
 //! **Presence, not contents, is what makes a file authority-bearing.** An empty
-//! `[network]` table and an empty `mounts` array grant nothing, yet both are the
-//! bytes an attacker would plant: what is being decided is whether the *file*
-//! is the user's own, so a caller that reads contents to decide would skip the
-//! check on exactly the cheapest file to plant.
+//! `[network]` table, an empty `mounts` array and an empty `[mount_sets]` table
+//! grant nothing, yet all three are the bytes an attacker would plant: what is
+//! being decided is whether the *file* is the user's own, so a caller that reads
+//! contents to decide would skip the check on exactly the cheapest file to
+//! plant. A file that declares `mount_sets` without `mounts` is therefore just as
+//! authority-bearing as one that declares `mounts`.
 //!
 //! The rules live in one place. [`verify`] is the only producer of
 //! [`AuthorizedConfig`] and every authority-bearing parser takes that token as
@@ -78,42 +81,53 @@ use crate::host_paths::{FinalComponent, VerifiedRead};
 use std::{fmt, os::unix::fs::MetadataExt, path::Path};
 
 verus! {
-/// Which authority-bearing fields one user file declares. Two named facts
-/// rather than two adjacent booleans, so a call site cannot swap them.
+/// Which authority-bearing fields one user file declares. Named facts rather
+/// than adjacent booleans, so a call site cannot swap them.
 #[derive(Clone, Copy, Debug)]
-pub struct AuthorityTriggers { pub network: bool, pub mounts: bool }
+pub struct AuthorityTriggers { pub network: bool, pub mounts: bool, pub mount_sets: bool }
 
-/// ADR-0040/0046: presence, not contents, makes a user file authority-bearing.
+/// ADR-0040/0046/0048: presence, not contents, makes a user file
+/// authority-bearing.
 pub fn authority_required(t: AuthorityTriggers) -> (r: bool)
-    ensures r == (t.network || t.mounts),
+    ensures r == (t.network || t.mounts || t.mount_sets),
 {
-    if t.network { true } else { t.mounts }
+    if t.network { true } else { t.mounts || t.mount_sets }
 }
 } // verus!
 
 /// The field(s) a refusal is about, so one refusal kernel can report itself
-/// under `[network]`, under `mounts`, or under both.
+/// under `[network]`, under `mounts`, under `mount_sets`, or under any
+/// combination of the three.
 ///
 /// Only diagnostic wording depends on this; which refusals fire does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthoritySubject {
     Network,
     Mounts,
+    MountSets,
     NetworkAndMounts,
+    NetworkAndMountSets,
+    MountsAndMountSets,
+    NetworkMountsAndMountSets,
 }
 
 impl AuthoritySubject {
     // Three slots, because one sentence per refusal is assembled from three
     // grammatical positions and a subject fills each differently. Keeping the
     // tails in one `match` (see `write_refusal`) and the slots here is what lets
-    // `[network]` stay byte-identical while a second field reuses the sentence.
+    // `[network]` and `mounts` stay byte-identical while `mount_sets` reuses the
+    // sentence.
 
     /// Opens every refusal sentence.
     fn label(self) -> &'static str {
         match self {
             Self::Network => "[network]",
             Self::Mounts => "mounts",
+            Self::MountSets => "[mount_sets]",
             Self::NetworkAndMounts => "[network] and mounts",
+            Self::NetworkAndMountSets => "[network] and [mount_sets]",
+            Self::MountsAndMountSets => "mounts and [mount_sets]",
+            Self::NetworkMountsAndMountSets => "[network], mounts and [mount_sets]",
         }
     }
 
@@ -122,30 +136,47 @@ impl AuthoritySubject {
         match self {
             Self::Network => "[network] table",
             Self::Mounts => "mounts list",
+            Self::MountSets => "[mount_sets] table",
             Self::NetworkAndMounts => "[network] table and mounts list",
+            Self::NetworkAndMountSets => "[network] table and [mount_sets] table",
+            Self::MountsAndMountSets => "mounts list and [mount_sets] table",
+            Self::NetworkMountsAndMountSets => {
+                "[network] table, mounts list and [mount_sets] table"
+            }
         }
     }
 
     /// The "a symlinked config without …" aside names the fields, unqualified
-    /// by "table"/"list", because it describes the file's compatibility.
+    /// by "table"/"list", because it describes the file's compatibility. A file
+    /// without `mounts` is *not* safe when it declares `mount_sets`.
     fn without(self) -> &'static str {
         match self {
             Self::Network => "[network]",
             Self::Mounts => "mounts",
+            Self::MountSets => "[mount_sets]",
             Self::NetworkAndMounts => "[network] or mounts",
+            Self::NetworkAndMountSets => "[network] or [mount_sets]",
+            Self::MountsAndMountSets => "mounts or [mount_sets]",
+            Self::NetworkMountsAndMountSets => "[network], mounts or [mount_sets]",
         }
     }
 
     /// Which subject a set of triggers is about.
     ///
-    /// `(false, false)` is unreachable: callers only ask once
+    /// `(false, false, false)` is unreachable: callers only ask once
     /// [`authority_required`] has said yes. Naming the subject never decides
-    /// anything, so it carries no kernel of its own.
+    /// anything, so it carries no kernel of its own; the `match` is exhaustive
+    /// over the three measured facts with no catch-all arm.
     fn of(triggers: AuthorityTriggers) -> Self {
-        match (triggers.network, triggers.mounts) {
-            (true, true) => Self::NetworkAndMounts,
-            (true, false) => Self::Network,
-            (false, _) => Self::Mounts,
+        match (triggers.network, triggers.mounts, triggers.mount_sets) {
+            (false, false, false) => Self::Network,
+            (true, false, false) => Self::Network,
+            (false, true, false) => Self::Mounts,
+            (false, false, true) => Self::MountSets,
+            (true, true, false) => Self::NetworkAndMounts,
+            (true, false, true) => Self::NetworkAndMountSets,
+            (false, true, true) => Self::MountsAndMountSets,
+            (true, true, true) => Self::NetworkMountsAndMountSets,
         }
     }
 }
@@ -308,21 +339,63 @@ mod tests {
     use proptest::prelude::*;
     use std::{fs, os::unix::fs::PermissionsExt};
 
-    const SUBJECTS: [AuthoritySubject; 3] = [
+    const SUBJECTS: [AuthoritySubject; 7] = [
         AuthoritySubject::Network,
         AuthoritySubject::Mounts,
+        AuthoritySubject::MountSets,
         AuthoritySubject::NetworkAndMounts,
+        AuthoritySubject::NetworkAndMountSets,
+        AuthoritySubject::MountsAndMountSets,
+        AuthoritySubject::NetworkMountsAndMountSets,
     ];
+
+    /// The three interchangeable slots one refusal sentence is assembled from,
+    /// written out per subject.
+    ///
+    /// These are literals, so a subject whose wording changes fails here; the
+    /// composition in `pinned_refusal_display` is a `format!` of the same shape
+    /// as `write_refusal`, which is why the `Network` subject additionally has
+    /// whole-sentence literals in `network_subject_display_is_byte_identical`.
+    fn pinned_subject_slots(
+        subject: AuthoritySubject,
+    ) -> (&'static str, &'static str, &'static str) {
+        match subject {
+            AuthoritySubject::Network => ("[network]", "[network] table", "[network]"),
+            AuthoritySubject::Mounts => ("mounts", "mounts list", "mounts"),
+            AuthoritySubject::MountSets => ("[mount_sets]", "[mount_sets] table", "[mount_sets]"),
+            AuthoritySubject::NetworkAndMounts => (
+                "[network] and mounts",
+                "[network] table and mounts list",
+                "[network] or mounts",
+            ),
+            AuthoritySubject::NetworkAndMountSets => (
+                "[network] and [mount_sets]",
+                "[network] table and [mount_sets] table",
+                "[network] or [mount_sets]",
+            ),
+            AuthoritySubject::MountsAndMountSets => (
+                "mounts and [mount_sets]",
+                "mounts list and [mount_sets] table",
+                "mounts or [mount_sets]",
+            ),
+            AuthoritySubject::NetworkMountsAndMountSets => (
+                "[network], mounts and [mount_sets]",
+                "[network] table, mounts list and [mount_sets] table",
+                "[network], mounts or [mount_sets]",
+            ),
+        }
+    }
 
     /// Every refusal's exact sentence for every subject, and whether that
     /// variant can fire on guest- or project-authored bytes (so it must carry
     /// the review caveat).
     ///
-    /// Written as literals, not templates: this is the independent oracle for
-    /// the templated `Display`. The `Network` column *is* the pre-#394 text, so
-    /// the rows below are what prove the extraction of the kernel into this
-    /// module — and the addition of the mount subject — changed no byte of a
-    /// persisted-network diagnostic.
+    /// Each variant's sentence is a literal here and each subject's three slots
+    /// are literals in [`pinned_subject_slots`], so this is the independent
+    /// oracle for the templated `Display`: a reworded tail, a reworded slot, or a
+    /// row that picks the wrong slot all fail. The pre-#394 `Network` bytes have
+    /// their own whole-sentence literals below, because *that* column must not
+    /// depend on the composition being right.
     ///
     /// The `match` is exhaustive over `AuthorityRefusal`, so a new variant fails
     /// to compile here until its row is added.
@@ -331,34 +404,48 @@ mod tests {
         subject: AuthoritySubject,
     ) -> (String, bool) {
         use AuthorityRefusal::*;
-        match subject {
-            AuthoritySubject::Network => match refusal {
-                DirNotDirectory => ("[network] refuses a config.toml whose directory is not a directory".to_string(), false),
-                DirOwner => ("[network] refuses a config.toml whose directory is owned by another user; review the [network] table before trusting the file".to_string(), true),
-                DirWritable => ("[network] refuses a config.toml whose directory is group- or other-writable; a guest or another account may be able to replace the file, so review the [network] table before trusting it".to_string(), true),
-                ThroughSymlink => ("[network] requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [network] table before trusting the file (a symlinked config without [network] still works)".to_string(), true),
-                FileOwner => ("[network] refuses a config.toml owned by another user; review the [network] table before trusting the file".to_string(), true),
-                FileWritable => ("[network] refuses a group- or other-writable config.toml; a guest or another account may have written its [network] table, so review the [network] table before trusting the file (fixing the mode does not establish authorship)".to_string(), true),
-                FileLinks(nlink) => (format!("[network] refuses a config.toml with {nlink} hard links; another name for it may be guest- or project-writable, so review the [network] table before trusting the file"), true),
-            },
-            AuthoritySubject::Mounts => match refusal {
-                DirNotDirectory => ("mounts refuses a config.toml whose directory is not a directory".to_string(), false),
-                DirOwner => ("mounts refuses a config.toml whose directory is owned by another user; review the mounts list before trusting the file".to_string(), true),
-                DirWritable => ("mounts refuses a config.toml whose directory is group- or other-writable; a guest or another account may be able to replace the file, so review the mounts list before trusting it".to_string(), true),
-                ThroughSymlink => ("mounts requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the mounts list before trusting the file (a symlinked config without mounts still works)".to_string(), true),
-                FileOwner => ("mounts refuses a config.toml owned by another user; review the mounts list before trusting the file".to_string(), true),
-                FileWritable => ("mounts refuses a group- or other-writable config.toml; a guest or another account may have written its mounts list, so review the mounts list before trusting the file (fixing the mode does not establish authorship)".to_string(), true),
-                FileLinks(nlink) => (format!("mounts refuses a config.toml with {nlink} hard links; another name for it may be guest- or project-writable, so review the mounts list before trusting the file"), true),
-            },
-            AuthoritySubject::NetworkAndMounts => match refusal {
-                DirNotDirectory => ("[network] and mounts refuses a config.toml whose directory is not a directory".to_string(), false),
-                DirOwner => ("[network] and mounts refuses a config.toml whose directory is owned by another user; review the [network] table and mounts list before trusting the file".to_string(), true),
-                DirWritable => ("[network] and mounts refuses a config.toml whose directory is group- or other-writable; a guest or another account may be able to replace the file, so review the [network] table and mounts list before trusting it".to_string(), true),
-                ThroughSymlink => ("[network] and mounts requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [network] table and mounts list before trusting the file (a symlinked config without [network] or mounts still works)".to_string(), true),
-                FileOwner => ("[network] and mounts refuses a config.toml owned by another user; review the [network] table and mounts list before trusting the file".to_string(), true),
-                FileWritable => ("[network] and mounts refuses a group- or other-writable config.toml; a guest or another account may have written its [network] table and mounts list, so review the [network] table and mounts list before trusting the file (fixing the mode does not establish authorship)".to_string(), true),
-                FileLinks(nlink) => (format!("[network] and mounts refuses a config.toml with {nlink} hard links; another name for it may be guest- or project-writable, so review the [network] table and mounts list before trusting the file"), true),
-            },
+        let (label, object, without) = pinned_subject_slots(subject);
+        match refusal {
+            DirNotDirectory => (
+                format!("{label} refuses a config.toml whose directory is not a directory"),
+                false,
+            ),
+            DirOwner => (
+                format!(
+                    "{label} refuses a config.toml whose directory is owned by another user; review the {object} before trusting the file"
+                ),
+                true,
+            ),
+            DirWritable => (
+                format!(
+                    "{label} refuses a config.toml whose directory is group- or other-writable; a guest or another account may be able to replace the file, so review the {object} before trusting it"
+                ),
+                true,
+            ),
+            ThroughSymlink => (
+                format!(
+                    "{label} requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the {object} before trusting the file (a symlinked config without {without} still works)"
+                ),
+                true,
+            ),
+            FileOwner => (
+                format!(
+                    "{label} refuses a config.toml owned by another user; review the {object} before trusting the file"
+                ),
+                true,
+            ),
+            FileWritable => (
+                format!(
+                    "{label} refuses a group- or other-writable config.toml; a guest or another account may have written its {object}, so review the {object} before trusting the file (fixing the mode does not establish authorship)"
+                ),
+                true,
+            ),
+            FileLinks(nlink) => (
+                format!(
+                    "{label} refuses a config.toml with {nlink} hard links; another name for it may be guest- or project-writable, so review the {object} before trusting the file"
+                ),
+                true,
+            ),
         }
     }
 
@@ -378,16 +465,44 @@ mod tests {
     /// Extracting the verified read into this module changed no byte of a
     /// persisted-network diagnostic.
     ///
-    /// The oracle is the literal pre-#394 text in `pinned_refusal_display`'s
-    /// `Network` column, not a rendering of the new templates, so a change to a
-    /// slot or to a per-variant tail fails here even when every subject changed
-    /// consistently.
+    /// The oracle is the literal pre-#394 text below — whole sentences, not the
+    /// slot table — so a change to a slot *or* to a per-variant tail fails here
+    /// even when every subject changed consistently.
     #[test]
     fn network_subject_display_is_byte_identical() {
+        use AuthorityRefusal::*;
         let subject = AuthoritySubject::Network;
-        for refusal in every_refusal() {
+        for (refusal, pinned) in [
+            (
+                DirNotDirectory,
+                "[network] refuses a config.toml whose directory is not a directory",
+            ),
+            (
+                DirOwner,
+                "[network] refuses a config.toml whose directory is owned by another user; review the [network] table before trusting the file",
+            ),
+            (
+                DirWritable,
+                "[network] refuses a config.toml whose directory is group- or other-writable; a guest or another account may be able to replace the file, so review the [network] table before trusting it",
+            ),
+            (
+                ThroughSymlink,
+                "[network] requires config.toml to be a regular file, but it is reached through a symbolic link; its target may be writable by a guest or project, so review the [network] table before trusting the file (a symlinked config without [network] still works)",
+            ),
+            (
+                FileOwner,
+                "[network] refuses a config.toml owned by another user; review the [network] table before trusting the file",
+            ),
+            (
+                FileWritable,
+                "[network] refuses a group- or other-writable config.toml; a guest or another account may have written its [network] table, so review the [network] table before trusting the file (fixing the mode does not establish authorship)",
+            ),
+            (
+                FileLinks(3),
+                "[network] refuses a config.toml with 3 hard links; another name for it may be guest- or project-writable, so review the [network] table before trusting the file",
+            ),
+        ] {
             let text = UntrustedConfig::Refused { refusal, subject }.to_string();
-            let (pinned, _) = pinned_refusal_display(refusal, subject);
             assert_eq!(text, pinned, "network refusal text changed for {refusal:?}");
         }
         // The unexaminable-directory error is not a refusal variant (it carries
@@ -499,24 +614,68 @@ mod tests {
 
     /// The presence-not-contents rule, against an independent table.
     ///
-    /// The oracle is an explicit `match` on the four rows rather than
-    /// `network || mounts`: written as a disjunction it would be the same
-    /// expression as the contract, so a body that computed something else
+    /// The oracle is an explicit `match` on the eight rows rather than a
+    /// disjunction: written as `network || mounts || mount_sets` it would be the
+    /// same expression as the contract, so a body that computed something else
     /// could only be caught by the proof.
     #[test]
-    fn authority_required_matches_the_four_rows() {
-        for (network, mounts) in [(false, false), (false, true), (true, false), (true, true)] {
-            let expected = match (network, mounts) {
-                (false, false) => false,
-                (false, true) => true,
-                (true, false) => true,
-                (true, true) => true,
-            };
-            assert_eq!(
-                authority_required(AuthorityTriggers { network, mounts }),
-                expected,
-                "network={network} mounts={mounts}"
-            );
+    fn authority_required_matches_the_eight_rows() {
+        for network in [false, true] {
+            for mounts in [false, true] {
+                for mount_sets in [false, true] {
+                    let expected = match (network, mounts, mount_sets) {
+                        (false, false, false) => false,
+                        (false, false, true) => true,
+                        (false, true, false) => true,
+                        (false, true, true) => true,
+                        (true, false, false) => true,
+                        (true, false, true) => true,
+                        (true, true, false) => true,
+                        (true, true, true) => true,
+                    };
+                    assert_eq!(
+                        authority_required(AuthorityTriggers {
+                            network,
+                            mounts,
+                            mount_sets
+                        }),
+                        expected,
+                        "network={network} mounts={mounts} mount_sets={mount_sets}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every nonempty presence combination names a distinct sentence subject,
+    /// and the subject names exactly the fields that are present. This is what
+    /// keeps a `[mount_sets]`-only file from being described as a `mounts` file.
+    #[test]
+    fn subject_names_exactly_the_present_fields() {
+        for network in [false, true] {
+            for mounts in [false, true] {
+                for mount_sets in [false, true] {
+                    if !(network || mounts || mount_sets) {
+                        continue;
+                    }
+                    let subject = AuthoritySubject::of(AuthorityTriggers {
+                        network,
+                        mounts,
+                        mount_sets,
+                    });
+                    let expected = match (network, mounts, mount_sets) {
+                        (true, false, false) => "[network]",
+                        (false, true, false) => "mounts",
+                        (false, false, true) => "[mount_sets]",
+                        (true, true, false) => "[network] and mounts",
+                        (true, false, true) => "[network] and [mount_sets]",
+                        (false, true, true) => "mounts and [mount_sets]",
+                        (true, true, true) => "[network], mounts and [mount_sets]",
+                        (false, false, false) => unreachable!("skipped above"),
+                    };
+                    assert_eq!(subject.label(), expected);
+                }
+            }
         }
     }
 
@@ -539,16 +698,24 @@ mod tests {
         let none = AuthorityTriggers {
             network: false,
             mounts: false,
+            mount_sets: false,
         };
         assert!(verify(&read, none).is_ok_and(|authorized| authorized.is_none()));
         for triggers in [
             AuthorityTriggers {
                 network: true,
                 mounts: false,
+                mount_sets: false,
             },
             AuthorityTriggers {
                 network: false,
                 mounts: true,
+                mount_sets: false,
+            },
+            AuthorityTriggers {
+                network: false,
+                mounts: false,
+                mount_sets: true,
             },
         ] {
             let error = verify(&read, triggers).unwrap_err().to_string();
@@ -573,6 +740,7 @@ mod tests {
         let triggers = AuthorityTriggers {
             network: true,
             mounts: false,
+            mount_sets: false,
         };
         let load = || {
             let read = read_bounded_regular_file_noting_symlink(&file, 100).unwrap();

@@ -99,12 +99,12 @@
 //! guest-HOME link list both guest-user modes provision from.
 //! # Network and mount authority are user-tier only
 //!
-//! ADR-0040 permits verified user [network] tables and ADR-0046 a verified user
-//! top-level `mounts` list; project and built-in tiers cannot declare either.
-//! Whether the file holding one may be trusted is [`crate::config_authority`]'s
-//! decision, taken here once per user file from the *presence* of either key, so
-//! this module and [`crate::config_mounts`] only decide *what* a trusted file
-//! says.
+//! ADR-0040 permits verified user [network] tables, ADR-0046 a verified user
+//! top-level `mounts` list and ADR-0048 a verified user `[mount_sets]` table;
+//! project and built-in tiers cannot declare any of them. Whether the file
+//! holding one may be trusted is [`crate::config_authority`]'s decision, taken
+//! here once per user file from the *presence* of any of those keys, so this
+//! module and [`crate::config_mounts`] only decide *what* a trusted file says.
 
 use crate::config_authority::{self, AuthorityTriggers};
 use crate::config_mounts::{self, UserMounts};
@@ -248,10 +248,11 @@ impl ConfigReport {
         self.user_network.as_ref()
     }
 
-    /// The verified user `mounts`, `Some` even when the list is empty: a file
-    /// that declared the key is authority-bearing and its declarations (zero or
-    /// more) belong to every launch. Read before `into_launch_catalog` consumes
-    /// the report, like [`Self::images`].
+    /// The verified user mount configuration, `Some` when the file declares
+    /// `mounts` or `[mount_sets]` — present-empty and definitions-only included:
+    /// a file that declared either key is authority-bearing, and its namespace is
+    /// what an explicit `--mount NAME` resolves against. Read before
+    /// `into_launch_catalog` consumes the report, like [`Self::images`].
     pub(crate) fn user_mounts(&self) -> Option<&UserMounts> {
         self.user_mounts.as_ref()
     }
@@ -992,7 +993,8 @@ pub(crate) fn load(paths: &ConfigPaths) -> Result<ConfigReport> {
 /// parses.
 struct TierContents {
     network: Option<UserNetwork>,
-    /// The user tier's verified `mounts`, present-empty included.
+    /// The user tier's verified mount configuration (defaults and/or named
+    /// sets), present-empty included.
     mounts: Option<UserMounts>,
     tools: Vec<Tool>,
     image: Option<ConfiguredImage>,
@@ -1065,11 +1067,13 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
         toml::from_str(text).map_err(|error| deserialize_error(path, text, &error))?;
     // Authority is decided by the *presence* of an authority-bearing field, from
     // the same verified read the bytes came from, before any of it is parsed.
-    // Presence, not contents: `mounts = []` and an empty `[network]` grant
-    // nothing yet are exactly the bytes an attacker would plant.
+    // Presence, not contents: `mounts = []`, an empty `[network]` and an empty
+    // `[mount_sets]` grant nothing yet are exactly the bytes an attacker would
+    // plant.
     let triggers = AuthorityTriggers {
         network: raw.network.is_some(),
         mounts: raw.mounts.is_some(),
+        mount_sets: raw.mount_sets.is_some(),
     };
     let authorized = match kind {
         FileTierKind::User => config_authority::verify(&read, triggers)
@@ -1099,23 +1103,31 @@ fn read_file_tier(source: TierSource<'_>) -> Result<(TierReport, TierContents)> 
         }
         None => None,
     };
-    let mounts = match raw.mounts.as_ref() {
-        Some(value) => {
-            // The same invariant as `[network]`: a present `mounts` is a
-            // trigger, so the token exists.
-            let Some(authorized) = authorized.as_ref() else {
-                return Err(anyhow!(
-                    "config: {}: mounts: authority was not measured",
-                    crate::one_line::quoted_path(path)
-                ));
-            };
-            Some(
-                config_mounts::from_verified_value(authorized, value, home).map_err(|error| {
-                    anyhow!("config: {}: {error}", crate::one_line::quoted_path(path))
-                })?,
+    let mounts = if raw.mounts.is_some() || raw.mount_sets.is_some() {
+        // One parser for both fields: a sets-only file still needs the verified
+        // token, because a `--mount NAME` may select one of its sets and the
+        // definitions are authority-bearing whether or not anything selects them.
+        let Some(authorized) = authorized.as_ref() else {
+            return Err(anyhow!(
+                "config: {}: mounts: authority was not measured",
+                crate::one_line::quoted_path(path)
+            ));
+        };
+        Some(
+            config_mounts::from_verified_value(
+                authorized,
+                config_mounts::MountValues {
+                    defaults: raw.mounts.as_ref(),
+                    sets: raw.mount_sets.as_ref(),
+                },
+                home,
             )
-        }
-        None => None,
+            .map_err(|error| anyhow!("config: {}: {error}", crate::one_line::quoted_path(path)))?,
+        )
+    } else {
+        // Not a dropped declaration: every arm above returns an error rather than
+        // silently skipping the definitions a file carries.
+        None
     };
     let image = validate_image(raw.image.as_deref(), path)?;
     let tools = validate_tools(raw.tools, kind.origin(path))?;
@@ -1144,6 +1156,9 @@ fn refuse_project_authority(raw: &RawConfig, path: &Path) -> Result<()> {
     }
     if raw.mounts.is_some() {
         return Err(mounts_refusal(path, RefusingTier::Project));
+    }
+    if raw.mount_sets.is_some() {
+        return Err(mount_sets_refusal(path, RefusingTier::Project));
     }
     Ok(())
 }
@@ -1188,6 +1203,22 @@ fn mounts_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
     )
 }
 
+/// `[mount_sets]` is user-only for the same reason `mounts` is, and a project
+/// table of definitions could otherwise tempt a launch into resolving a project
+/// name against the user namespace. There is deliberately no such shadowing: the
+/// field is refused by its presence alone, empty table included.
+fn mount_sets_refusal(file: &Path, tier: RefusingTier) -> anyhow::Error {
+    let reason = match tier {
+        RefusingTier::Project => "mount_sets cannot be declared by the project config",
+        RefusingTier::BuiltIn => "mount_sets cannot be declared by the built-in config",
+    };
+    anyhow!(
+        "config: {}: {reason}; declare mount sets in the user config and select them with \
+         --mount NAME",
+        crate::one_line::quoted_path(file)
+    )
+}
+
 /// Validate one tier's top-level `image` into an [`ImageRef`]. The reason comes
 /// from [`ImageRef::from_config`] and names no value, so untrusted config text
 /// is never echoed (see the module's diagnostics policy).
@@ -1221,6 +1252,9 @@ fn tools_from_builtin_text(text: &str) -> Result<Vec<Tool>> {
     }
     if raw.mounts.is_some() {
         return Err(mounts_refusal(path, RefusingTier::BuiltIn));
+    }
+    if raw.mount_sets.is_some() {
+        return Err(mount_sets_refusal(path, RefusingTier::BuiltIn));
     }
     validate_tools(raw.tools, ToolOrigin::BuiltIn)
 }
@@ -1722,6 +1756,12 @@ struct RawConfig {
     // *that* is a value-free `mounts[N]` diagnostic rather than a serde message.
     #[serde(default)]
     mounts: Option<toml::Value>,
+    // User tier only (ADR-0048): the named **mount sets**. Untyped at this narrow
+    // seam for the same reason as `mounts` — an empty table, a wrong type and a
+    // named empty array must all reach the authority decision before the schema
+    // complains, because presence is what makes the file authority-bearing.
+    #[serde(default)]
+    mount_sets: Option<toml::Value>,
     /// The session's **boot image**, an OCI reference (D4). Optional: an
     /// image-only file declares no tools and keeps the shipped defaults.
     #[serde(default)]
@@ -2371,9 +2411,11 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
         "config: {}{location}: invalid TOML or tool schema; check syntax and field types. \
          Required: a string `name` and `command`; `args`, `credentials`, `tools`, `persist` and `network_requests` are \
          arrays of strings; `env` is a table of string values; the top-level `image` and each \
-         tool's `command` are strings. A top-level `mounts` is an array of strings and is accepted \
-         only at the top of the user file; TOML assigns keys to the most recent `[table]` header, \
-         so write it before the first one.",
+         tool's `command` are strings. A top-level `mounts` is an array of mount declarations or \
+         mount-set names, `[mount_sets]` is a table of named arrays of the same, and both are \
+         accepted only at the top of the user file; TOML assigns keys to the most recent `[table]` \
+         header, so write `mounts` before the first one and put each set's entries in its own \
+         array. Nested tables are not mount sets.",
         crate::one_line::quoted_path(file)
     )
 }
@@ -2755,6 +2797,30 @@ mod tests {
                 "review the [network] table and mounts list",
                 "without [network] or mounts still",
             ),
+            (
+                "[mount_sets]\n",
+                "[mount_sets]",
+                "review the [mount_sets] table",
+                "without [mount_sets] still",
+            ),
+            (
+                "mounts = []\n[mount_sets]\n",
+                "mounts and [mount_sets]",
+                "review the mounts list and [mount_sets] table",
+                "without mounts or [mount_sets] still",
+            ),
+            (
+                "[mount_sets]\n[network]\n",
+                "[network] and [mount_sets]",
+                "review the [network] table and [mount_sets] table",
+                "without [network] or [mount_sets] still",
+            ),
+            (
+                "mounts = []\n[mount_sets]\n[network]\n",
+                "[network], mounts and [mount_sets]",
+                "review the [network] table, mounts list and [mount_sets] table",
+                "without [network], mounts or [mount_sets] still",
+            ),
         ] {
             let f = Fixture::new();
             f.symlinked_user(body);
@@ -2818,6 +2884,145 @@ mod tests {
                 .to_string()
                 .contains("network access cannot be granted by the built-in config")
         );
+    }
+
+    /// `[mount_sets]` is authority-bearing by presence alone: an empty table, an
+    /// empty named list and a wrong type all trigger the verified read, exactly as
+    /// `mounts = []` does. The positive control is the same symlink without the
+    /// table.
+    #[test]
+    fn mount_sets_presence_requires_a_verified_file() {
+        for body in [
+            "[mount_sets]\n",
+            "[mount_sets]\nagent = []\n",
+            "mount_sets = 7\n",
+            "mount_sets = []\n",
+        ] {
+            let f = Fixture::new();
+            f.symlinked_user(body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(
+                error.contains("[mount_sets] requires config.toml to be a regular file"),
+                "{body}: {error}"
+            );
+            assert!(
+                error.contains("review the [mount_sets] table"),
+                "{body}: {error}"
+            );
+            // A file without any authority-bearing field is still accepted through
+            // a symlink, so the refusal above is about this table.
+            assert!(!error.contains("[network]"), "{body}: {error}");
+        }
+        let f = Fixture::new();
+        f.symlinked_user("");
+        assert!(f.load().unwrap().user_mounts().is_none());
+        write_file(&f.user.with_file_name("dotfile"), "[mount_sets]\n");
+        assert!(
+            f.load()
+                .unwrap_err()
+                .to_string()
+                .contains("[mount_sets] requires config.toml to be a regular file")
+        );
+    }
+
+    /// A sets-only user file is a verified namespace with no automatic selection,
+    /// and it keeps the shipped tools: definitions mount nothing by themselves.
+    #[test]
+    fn mount_sets_definitions_alone_select_nothing() {
+        let f = Fixture::new();
+        let report = f
+            .user("[mount_sets]\nempty = []\nagent = [\"/a:/g:ro\"]\n")
+            .load()
+            .unwrap();
+        assert!(report.uses_defaults());
+        let mounts = report.user_mounts().expect("a sets-only file is present");
+        assert!(!mounts.has_defaults());
+        assert!(mounts.requests().is_empty());
+        let name = crate::config_mounts::MountSetName::parse("agent").unwrap();
+        assert_eq!(mounts.requests_for_set(&name).map(|r| r.len()), Some(1));
+        assert_eq!(
+            mounts
+                .requests_for_set(&crate::config_mounts::MountSetName::parse("empty").unwrap())
+                .map(|requests| requests.len()),
+            Some(0)
+        );
+    }
+
+    /// `mounts` is not a reserved word: written *after* a `[mount_sets]` header it
+    /// is a set named `mounts`, not the defaults list. The position, not the name,
+    /// decides which construct the key reached.
+    #[test]
+    fn mount_sets_can_contain_a_key_named_mounts() {
+        let f = Fixture::new();
+        let report = f
+            .user("[mount_sets]\nmounts = [\"/a:/g:ro\"]\n")
+            .load()
+            .unwrap();
+        let mounts = report.user_mounts().expect("the table is present");
+        assert!(!mounts.has_defaults());
+        let name = crate::config_mounts::MountSetName::parse("mounts").unwrap();
+        assert_eq!(mounts.requests_for_set(&name).map(|r| r.len()), Some(1));
+    }
+
+    /// A project or built-in `[mount_sets]` is refused by presence alone — empty
+    /// table, wrong type and named list alike — and a project *selection* of a
+    /// user set name is refused before any lookup, so a project can never reach the
+    /// user namespace.
+    #[test]
+    fn project_mount_sets_are_refused_even_when_empty() {
+        for body in [
+            "[mount_sets]\n",
+            "[mount_sets]\nagent = []\n",
+            "mount_sets = 7\n",
+        ] {
+            let f = Fixture::new();
+            f.project(body);
+            let error = f.load().unwrap_err().to_string();
+            assert!(
+                error.contains(&format!(
+                    "config: {:?}: mount_sets cannot be declared by the project config; declare \
+                     mount sets in the user config and select them with --mount NAME",
+                    f.project
+                )),
+                "{body}: {error}"
+            );
+        }
+        // A project `mounts = [\"agent\"]` is a `mounts` refusal, which precedes any
+        // resolution — even when the user config really does define `agent`.
+        let f = Fixture::new();
+        f.user("[mount_sets]\nagent = [\"/a:/g:ro\"]\n");
+        f.project("mounts = [\"agent\"]\n");
+        let error = f.load().unwrap_err().to_string();
+        assert!(
+            error.contains("mounts cannot be declared by the project config"),
+            "{error}"
+        );
+        // `[network]` still wins when a project declares both.
+        let f = Fixture::new();
+        f.project("[mount_sets]\n[network]\nallow_host = true\n");
+        let error = f.load().unwrap_err().to_string();
+        assert!(
+            error.contains("network access cannot be granted by the project config"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn builtin_mount_sets_are_refused() {
+        for body in [
+            "[mount_sets]\n",
+            "[mount_sets]\na = []\n",
+            "mount_sets = 7\n",
+        ] {
+            let error = tools_from_builtin_text(body).unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "config: \"default-tools.toml\": mount_sets cannot be declared by the \
+                     built-in config"
+                ),
+                "{body}: {error}"
+            );
+        }
     }
 
     /// A `mounts`-only user file keeps the seven shipped tools (and `shell`),
@@ -3028,8 +3233,15 @@ mod tests {
             f.user(body);
             let error = f.load().unwrap_err().to_string();
             assert!(error.contains("invalid TOML or tool schema"), "{error}");
+            // The fixed repair paragraph still names TOML's scoping rule — now with
+            // `[mount_sets]` guidance, since the same rule decides whether a `mounts`
+            // key is the defaults list or a set named `mounts`.
             assert!(
-                error.contains("so write it before the first one"),
+                error.contains("so write `mounts` before the first one"),
+                "{error}"
+            );
+            assert!(
+                error.contains("Nested tables are not mount sets"),
                 "{error}"
             );
             assert!(!error.contains("s3cr3t-SENTINEL-305"), "{error}");

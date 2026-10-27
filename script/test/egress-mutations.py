@@ -321,10 +321,12 @@ def matrix():
     # Presence, not contents, is what makes a user file authority-bearing
     # (ADR-0040/0046). The anchor is the kernel body, never its `ensures`
     # clause, so replacing it cannot weaken the contract it is checked against.
-    authority_or = "if t.network { true } else { t.mounts }"
-    authority_or_mutant = "if t.network { t.mounts } else { false }"
+    # #397 widened the disjunction from two fields to three, so the anchor and its
+    # test both moved: the body now names `mount_sets` too.
+    authority_or = "if t.network { true } else { t.mounts || t.mount_sets }"
+    authority_or_mutant = "if t.network { t.mounts || t.mount_sets } else { false }"
     add("config-mounts-authority-or", persisted, authority_or, authority_or_mutant,
-        rust("authority_required_matches_the_four_rows"))
+        rust("authority_required_matches_the_eight_rows"))
     add("config-mounts-authority-or-proof", persisted, authority_or, authority_or_mutant,
         gate, "verification results::")
     # The merge/refuse rule decides whether a declaration is silently dropped
@@ -409,10 +411,10 @@ def matrix():
     # included: the trigger reads the *presence* of the field, so both mutants
     # below keep the field but drop its effect, and a symlinked `mounts = []`
     # file then loads through the compatibility path meant for tools-only files.
-    mounts_present = "        mounts: raw.mounts.is_some(),\n    };"
-    mounts_absent_mutant = "        mounts: false,\n    };"
+    mounts_present = "        mounts: raw.mounts.is_some(),\n        mount_sets: raw.mount_sets.is_some(),\n    };"
+    mounts_absent_mutant = "        mounts: false,\n        mount_sets: raw.mount_sets.is_some(),\n    };"
     mounts_nonempty_mutant = (
-        "        mounts: raw.mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),\n    };")
+        "        mounts: raw.mounts.as_ref().and_then(toml::Value::as_array).is_some_and(|a| !a.is_empty()),\n        mount_sets: raw.mount_sets.is_some(),\n    };")
     add("config-mounts-presence-ignored", SRC + "config.rs", mounts_present,
         mounts_absent_mutant, rust("present_empty_mounts_through_a_symlink_is_refused"))
     add("config-mounts-presence-ignored-launch", SRC + "config.rs", mounts_present,
@@ -430,6 +432,107 @@ def matrix():
         "    if raw.mounts.is_some() {\n        return Err(mounts_refusal(path, RefusingTier::Project));\n    }",
         "    if false {\n        return Err(mounts_refusal(path, RefusingTier::Project));\n    }",
         rust("project_mounts_are_refused_even_when_empty"))
+    # -- Named mount sets (#397) -------------------------------------------------
+    # Every replacement below keeps all three `AuthorityTriggers` fields, so a
+    # control can never pass (or fail) on a missing-struct-field compile error
+    # instead of on the behaviour it names.
+    sets_source = SRC + "config_mounts/sets.rs"
+    sets_module = SRC + "config_mounts.rs"
+    presence_sets_absent = "        mounts: raw.mounts.is_some(),\n        mount_sets: false,\n    };"
+    add("mount-sets-presence-ignored", SRC + "config.rs", mounts_present,
+        presence_sets_absent, rust("mount_sets_presence_requires_a_verified_file"))
+    add("mount-sets-presence-ignored-launch", SRC + "config.rs", mounts_present,
+        presence_sets_absent,
+        rust("named_mount_sets_unsafe_file_is_refused_before_launch_state", MOUNTS))
+    # Declaring a set is user-scope only; accepting a project table would let a
+    # checkout plant filesystem access for every launch of it.
+    project_sets = ('    if raw.mount_sets.is_some() {\n'
+                    '        return Err(mount_sets_refusal(path, RefusingTier::Project));\n'
+                    '    }')
+    add("mount-sets-project-accepted", SRC + "config.rs", project_sets,
+        project_sets.replace("if raw.mount_sets.is_some()", "if false"),
+        rust("project_mount_sets_are_refused_even_when_empty"))
+    # Every declared closure is validated, unused sets included (decision A2). A
+    # cycle edge treated as "already seen" is the smallest way to skip that: the
+    # walk completes and nothing is refused.
+    cycle_arm = ('                VisitDecision::Cycle => {\n'
+                 '                    return Err(UserMountsError::Cycle {\n'
+                 '                        site: EntrySite::SetEntry {\n'
+                 '                            definition: set.0,\n'
+                 '                            index,\n'
+                 '                        },\n'
+                 '                    });\n'
+                 '                }')
+    add("mount-sets-cycle-skipped", sets_source, cycle_arm, "                VisitDecision::Cycle => {}", rust("reference_errors_are_named_by_site"))
+    add("mount-sets-cycle-skipped-launch", sets_source, cycle_arm,
+        "                VisitDecision::Cycle => {}",
+        rust("named_mount_sets_reference_errors_refuse_load_under_every_option", MOUNTS))
+    # An unknown reference must be refused at load, in an unused set too.
+    unknown_set = ('                        None => return Err(UserMountsError::UnknownSet { site }),\n'
+                   '                    },\n'
+                   '                    Err(SelectorError::Direct(error)) => {')
+    add("mount-sets-unknown-set-skipped", sets_source, unknown_set,
+        ('                        None => Entry::Reference(SetId(0)),\n'
+         '                    },\n'
+         '                    Err(SelectorError::Direct(error)) => {'),
+        rust("reference_errors_are_named_by_site"))
+    # `--no-config-mounts` removes the defaults, never an explicit name.
+    explicit = "                let selected = explicit_set(user, &name)?;"
+    explicit_mutant = ("                let selected = if policy.suppressed() { Vec::new() } else { "
+                       "explicit_set(user, &name)? };")
+    add("mount-sets-opt-out-drops-explicit-names", selection, explicit, explicit_mutant,
+        rust("explicit_set_names_survive_the_opt_out"))
+    add("mount-sets-opt-out-drops-explicit-names-launch", selection, explicit, explicit_mutant,
+        rust("named_mount_sets_opt_out_keeps_an_explicit_selection", MOUNTS))
+    # Each direct leaf's origin holds one *reference* to its set's name: copying
+    # the key per leaf multiplies retained provenance by the leaf count, below both
+    # the file-size and leaf-visit bounds. The regression observes the allocation
+    # itself (`Arc::ptr_eq` across leaves and across a model clone).
+    shared_name = "                            set: Arc::clone(&shared[definition]),"
+    add("mount-sets-name-copied-per-leaf", sets_source, shared_name,
+        "                            set: Arc::from(names[definition].as_str()),",
+        rust("mount_set_key_is_stored_once_across_leaves_and_clones"))
+    # The differential's left-hand side is the real `mount::claim`, so a fact its
+    # fixtures never isolate is a fact the indexed adapter can ignore without
+    # disagreeing. Each equivalence fact needs one row where that fact alone
+    # differs: with only the fork-vs-read-only pair, an adapter that drops `fork`
+    # still agrees on every fixture (read-only differs in that pair as well). The
+    # anchor is the adapter's call to the shared kernel, replaced by a hand-rolled
+    # conjunction that leaves fork out.
+    equivalent_call = ("            equivalent: same_declaration(&leaves[first.0].mount, "
+                       "&leaves[candidate.0].mount),")
+    equivalent_ignores_fork = (
+        "            equivalent: { let a = &leaves[first.0].mount; "
+        "let b = &leaves[candidate.0].mount; "
+        "a.source_spelling == b.source_spelling && a.host == b.host "
+        "&& matches!(a.policy, crate::mount::MountPolicy::BindReadOnly { .. }) "
+        "== matches!(b.policy, crate::mount::MountPolicy::BindReadOnly { .. }) "
+        "&& matches!(a.policy, crate::mount::MountPolicy::BindReadOnly { follow_links: true } "
+        "| crate::mount::MountPolicy::Fork { follow_links: true }) "
+        "== matches!(b.policy, crate::mount::MountPolicy::BindReadOnly { follow_links: true } "
+        "| crate::mount::MountPolicy::Fork { follow_links: true }) "
+        "&& a.exclusions == b.exclusions },")
+    add("mount-sets-claim-ignores-fork", sets_source, equivalent_call,
+        equivalent_ignores_fork, rust("mount_set_indexed_claim_matches_claim"))
+    # The selector precedence is what keeps the two grammars apart. The literal
+    # "absolute path classified as a name" mutation cannot exist — decision A1
+    # excludes `/` and `~`, so no path spelling can parse as a name — so the
+    # load-bearing direction is the reverse: a valid name classified as a path.
+    selector_body = "    if f.path_spelling {\n        SelectorKind::Path"
+    selector_mutant = "    if f.name_spelling {\n        SelectorKind::Path"
+    add("mount-sets-name-classified-as-path", sets_module, selector_body, selector_mutant,
+        rust("selector_classification_matches_the_table"))
+    add("mount-sets-name-classified-as-path-proof", sets_module, selector_body,
+        selector_mutant, gate, "verification results::")
+    # The expansion budget's polarity: one more leaf admitted past the limit turns
+    # a refused file into a hang. The anchor is the kernel *body*; its `ensures`
+    # spells `<` in a shape the body never uses, so the `-proof` twin still bites.
+    budget_body = "{\n    used < MAX_MOUNT_SET_EXPANSION_WORK\n}"
+    budget_mutant = "{\n    used <= MAX_MOUNT_SET_EXPANSION_WORK\n}"
+    add("mount-sets-budget-off-by-one", sets_source, budget_body, budget_mutant,
+        rust("mount_set_expansion_work_boundary"))
+    add("mount-sets-budget-off-by-one-proof", sets_source, budget_body, budget_mutant,
+        gate, "verification results::")
     add("descriptor-reopen", SRC + "host_paths.rs", "            after_open();",
         "            after_open(); drop(fd); let fd = rfs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;",
         rust("noting_symlink_takes_bytes_and_facts_from_the_opened_descriptor"))

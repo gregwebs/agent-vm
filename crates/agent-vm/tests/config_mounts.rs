@@ -2448,3 +2448,1145 @@ fn broken_mounts_config_reports_through_launch_and_doctor() {
         stderr_of(&help)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Named mount sets (#397 / ADR-0048)
+// ---------------------------------------------------------------------------
+
+/// How a launch-time refusal names entry `index` of the user set `set`: the same
+/// attribution a config entry gets, with the set's escaped name in place of the
+/// `mounts[N]` index.
+fn set_declaration(h: &Harness, set: &str, index: usize) -> String {
+    format!(
+        "mount_sets[\"{set}\"][{index}] in \"{}\"",
+        h.user_config().display()
+    )
+}
+
+/// The `[mount_sets]` body the rows below share: one set per mode, an outer set
+/// that composes them, and a repeated reference.
+const SETS_BODY: &str = "\
+[mount_sets]
+ro-set = [\"~/ro:/ro:ro\"]
+rw-set = [\"~/rw:/rw:rw\"]
+fork-set = [\"~/fork:/fork:fork\"]
+all-set = [\"ro-set\", \"rw-set\", \"fork-set\", \"ro-set\"]
+";
+
+/// A `mounts`/`[mount_sets]` document: the defaults line must precede the table.
+fn with_defaults(defaults: &str) -> String {
+    format!("mounts = [{defaults}]\n{SETS_BODY}")
+}
+
+/// Seed `$HOME/{ro,rw,fork}` so each declared set has a real source.
+fn seed_set_sources(h: &Harness) {
+    for name in ["ro", "rw", "fork"] {
+        let path = seed_source(h, name);
+        std::fs::write(path.join("marker"), format!("seed-{name}")).unwrap();
+    }
+}
+
+/// Definitions alone mount nothing. The differential control is the same launch
+/// with no user config at all, so "declaring a set starts access" would show up
+/// as an extra bind rather than as an assertion about notices.
+#[test]
+fn named_mount_sets_definitions_alone_select_nothing() {
+    let h = Harness::new();
+    seed_set_sources(&h);
+    h.write_user(SETS_BODY);
+    let declared = stderr_of(&h.launch(&[], "shell", &[]));
+    assert!(
+        declared.contains(CONFIG_MARKER),
+        "a sets-only file must still launch: {declared}"
+    );
+    assert!(
+        !declared.contains("==> Config mounts:"),
+        "definitions select nothing, so there is no count to report: {declared}"
+    );
+    let with_sets = sorted_binds(&debug_config_json(&declared));
+
+    std::fs::remove_file(h.user_config()).unwrap();
+    let without = stderr_of(&h.launch(&[], "shell", &[]));
+    assert_eq!(
+        with_sets,
+        sorted_binds(&debug_config_json(&without)),
+        "declaring [mount_sets] must add no bind at all"
+    );
+}
+
+/// A defaults entry names a set, and a set may name sets declared after it: the
+/// selected leaves are exactly the declared hosts, guests and modes.
+#[test]
+fn named_mount_sets_defaults_select_forward_and_nested_names() {
+    let h = Harness::new();
+    seed_set_sources(&h);
+    h.write_user(&with_defaults("\"all-set\""));
+
+    let stderr = stderr_of(&h.launch(&[], "shell", &[]));
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    let home = h.home_root.display().to_string();
+    for (name, guest, readonly) in [("ro", "/ro", true), ("rw", "/rw", false)] {
+        let host = format!("{home}/{name}");
+        assert!(
+            binds
+                .iter()
+                .any(|(bind_host, bind_guest, ro)| bind_host == &host
+                    && bind_guest == guest
+                    && *ro == readonly),
+            "{name} must be bound at {guest} with readonly={readonly}: {binds:?}"
+        );
+    }
+    // The fork leaf binds the committed copy, not the source.
+    let fork = only_fork_data(&h);
+    assert!(
+        binds
+            .iter()
+            .any(|(host, guest, _)| Path::new(host) == fork && guest == "/fork"),
+        "the fork leaf must bind its committed copy: {binds:?}"
+    );
+    // Three declared leaves, one per set; the repeated reference adds nothing.
+    assert!(
+        stderr.contains(&config_notice(&h, 3)),
+        "the notice counts claimed leaves: {stderr}"
+    );
+}
+
+/// `--no-config-mounts` withholds the defaults and nothing else: an explicit set
+/// name still selects that same set, and no unrelated default rides along.
+#[test]
+fn named_mount_sets_opt_out_keeps_an_explicit_selection() {
+    let h = Harness::new();
+    seed_set_sources(&h);
+    h.write_user(&with_defaults("\"rw-set\""));
+    // Positive control first: the defaults select `rw`.
+    let automatic = stderr_of(&h.launch(&[], "shell", &[]));
+    assert!(
+        bind_mounts(&debug_config_json(&automatic))
+            .iter()
+            .any(|(_, guest, _)| guest == "/rw"),
+        "the control must select the default set: {automatic}"
+    );
+
+    let stderr = stderr_of(&h.launch(&["--no-config-mounts", "--mount", "all-set"], "shell", &[]));
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    let home = h.home_root.display().to_string();
+    for (name, guest) in [("ro", "/ro"), ("rw", "/rw")] {
+        assert!(
+            binds
+                .iter()
+                .any(|(host, bind_guest, _)| host == &format!("{home}/{name}")
+                    && bind_guest == guest),
+            "the explicitly selected set must still apply: {binds:?}"
+        );
+    }
+    assert!(
+        stderr.contains("skipped 1 from"),
+        "the skipped defaults are still reported: {stderr}"
+    );
+    // The context says which half the opt-out skips, and never claims it removes
+    // the explicit selection.
+    assert!(
+        !stderr.contains("--no-config-mounts skips them"),
+        "{stderr}"
+    );
+}
+
+/// A `[mount_sets]`-only file is authority-bearing by presence: an untrusted file
+/// that declares nothing but an empty table is refused before any launch state,
+/// exactly as `mounts = []` is.
+#[test]
+fn named_mount_sets_unsafe_file_is_refused_before_launch_state() {
+    for body in [
+        "[mount_sets]\n",
+        "[mount_sets]\nagent = []\n",
+        "mount_sets = 7\n",
+    ] {
+        let h = Harness::new();
+        h.write_user_mode(body, 0o664);
+        let before = h.snapshot();
+        let out = h.launch(&[], "shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("[mount_sets] refuses a group- or other-writable config.toml"),
+            "{body}: {stderr}"
+        );
+        h.assert_refused_before_launch_state(&out, &before, "[mount_sets]");
+    }
+    // The compatibility control: the same file with no authority-bearing field is
+    // accepted, so the refusal above is about the table and not about the mode.
+    let h = Harness::new();
+    h.write_user_mode("[[tools]]\nname = \"t\"\ncommand = \"/bin/echo\"\n", 0o664);
+    let stderr = stderr_of(&h.launch(&[], "t", &[]));
+    assert!(stderr.contains(CONFIG_MARKER), "{stderr}");
+}
+
+/// A bare name is an exact user-set lookup: an existing cwd directory of that
+/// name and a project tool of that name change nothing, and nothing falls back to
+/// a relative path or a directory.
+#[test]
+fn named_mount_sets_unknown_names_never_fall_back() {
+    let h = Harness::new();
+    // Both plausible fallbacks exist: a cwd directory called `agent`, and a tool
+    // called `agent`.
+    std::fs::create_dir(h.project_root.join("agent")).unwrap();
+    h.write_project("[[tools]]\nname = \"agent\"\ncommand = \"/bin/echo\"\ncredentials = []\n");
+    h.write_user("[mount_sets]\nother = []\n");
+
+    let before = h.snapshot();
+    let out = h.launch(&["--mount", "agent"], "shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!(
+            "mount set \"agent\" is not defined by any [mount_sets] in \"{}\"",
+            h.user_config().display()
+        )),
+        "{stderr}"
+    );
+    h.assert_refused_before_launch_state(&out, &before, "parsing --mount");
+
+    // Positive control: the definition that *does* exist is selected by name.
+    seed_set_sources(&h);
+    h.write_user(&with_defaults("\"all-set\""));
+    let stderr = stderr_of(&h.launch(&["--no-config-mounts", "--mount", "all-set"], "shell", &[]));
+    assert!(
+        bind_mounts(&debug_config_json(&stderr))
+            .iter()
+            .any(|(_, guest, _)| guest == "/ro"),
+        "a declared set resolves by name: {stderr}"
+    );
+}
+
+/// A per-selection modifier is refused for a name that exists and for one that
+/// does not: `agent:ro` is never a modified set, and never a relative path.
+#[test]
+fn named_mount_sets_refuse_per_selection_modifiers() {
+    let h = Harness::new();
+    seed_set_sources(&h);
+    h.write_user(SETS_BODY);
+    for (selection, needle) in [
+        ("ro-set:ro", "a mount-set name is a bare name"),
+        ("all-set:fork", "a mount-set name is a bare name"),
+        ("all-set:/guest", "a mount-set name is a bare name"),
+        ("all-set:exclude=x", "a mount-set name is a bare name"),
+        ("unknown:ro", "a mount-set name is a bare name"),
+    ] {
+        let before = h.snapshot();
+        let out = h.launch(&["--mount", selection], "shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(needle), "{selection}: {stderr}");
+        h.assert_refused_before_launch_state(&out, &before, "parsing --mount");
+    }
+    // An ordinary absolute path keeps the historical grammar, `:ro` and all.
+    let stderr = stderr_of(&h.launch(
+        &[
+            "--no-config-mounts",
+            "--mount",
+            &format!("{}:/abs:ro", h.home_root.join("ro").display()),
+        ],
+        "shell",
+        &[],
+    ));
+    assert!(
+        bind_mounts(&debug_config_json(&stderr))
+            .iter()
+            .any(|(_, guest, readonly)| guest == "/abs" && *readonly),
+        "{stderr}"
+    );
+}
+
+/// Every reference error is a load error: unknown names and set-reference cycles
+/// are refused even in a set nothing selects and even under the opt-out, while
+/// `doctor` reports them and `--help` stays usable.
+#[test]
+fn named_mount_sets_reference_errors_refuse_load_under_every_option() {
+    for (body, needle) in [
+        (
+            "mounts = [\"nope\"]\n[mount_sets]\nunused = []\n",
+            "mounts[0]: unknown mount set name",
+        ),
+        (
+            "[mount_sets]\nunused = [\"nope\"]\n",
+            "mount_sets[0][0]: unknown mount set name",
+        ),
+        (
+            "[mount_sets]\na = [\"a\"]\n",
+            "mount_sets[0][0]: mount-set reference cycle",
+        ),
+        (
+            "[mount_sets]\na = [\"b\"]\nb = [\"a\"]\n",
+            "mount_sets[1][0]: mount-set reference cycle",
+        ),
+        (
+            "[mount_sets]\nisland = [\"island\"]\nroot = []\n",
+            "mount_sets[0][0]: mount-set reference cycle",
+        ),
+    ] {
+        let h = Harness::new();
+        h.write_user(body);
+        for options in [vec![], vec!["--no-config-mounts"]] {
+            let before = h.snapshot();
+            let out = h.launch(&options, "shell", &[]);
+            let stderr = stderr_of(&out);
+            assert!(stderr.contains(needle), "{body}: {options:?}: {stderr}");
+            assert!(
+                stderr.contains(&h.user_config().display().to_string()),
+                "{body}: the file must be named: {stderr}"
+            );
+            h.assert_refused_before_launch_state(&out, &before, needle);
+        }
+        let doctor = h.doctor();
+        let text = String::from_utf8_lossy(&doctor.stdout).into_owned();
+        assert!(
+            text.contains(needle),
+            "{body}: doctor must report it: {text}"
+        );
+        assert!(
+            h.help().status.success(),
+            "{body}: help must stay available"
+        );
+    }
+}
+
+/// The pathological one-new-leaf-per-set chain is refused by the load budget
+/// rather than by a hang: the child never reaches builder wiring, in either
+/// option set, and `doctor` reports the same limit.
+///
+/// The harness's 60-second subprocess bound is the regression: a per-closure
+/// quadratic claim made this document cubic, so it could only be observed as a
+/// hang before the bound existed.
+#[test]
+fn named_mount_sets_expansion_chain_refuses_before_state() {
+    fn chain_document(length: usize) -> String {
+        let mut body = String::from("[mount_sets]\n");
+        for index in 0..length {
+            if index + 1 < length {
+                body.push_str(&format!(
+                    "s{index:04} = [\"/h/{index:04}:/g/{index:04}:ro\", \"s{:04}\"]\n",
+                    index + 1
+                ));
+            } else {
+                body.push_str(&format!(
+                    "s{index:04} = [\"/h/{index:04}:/g/{index:04}:ro\"]\n"
+                ));
+            }
+        }
+        body
+    }
+    const LIMIT: &str = "mount_sets: expansion work exceeds limit of 65536 leaf visits";
+
+    let h = Harness::new();
+    h.write_user(&chain_document(4_000));
+    for options in [vec![], vec!["--no-config-mounts"]] {
+        let before = h.snapshot();
+        let out = h.launch(&options, "shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains(LIMIT), "{options:?}: {stderr}");
+        h.assert_refused_before_launch_state(&out, &before, LIMIT);
+    }
+    let doctor = h.doctor();
+    let text = String::from_utf8_lossy(&doctor.stdout).into_owned();
+    assert!(text.contains(LIMIT), "doctor must report the limit: {text}");
+
+    // Positive control: the same shape one leaf shorter than the budget loads.
+    h.write_user(&chain_document(361));
+    let stderr = stderr_of(&h.launch(&[], "shell", &[]));
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "a chain inside the budget must launch: {stderr}"
+    );
+}
+
+/// Source availability is a question about *selected* mounts: an unused set may
+/// name a path that does not exist, and selecting it fails at the usual
+/// pre-preparation boundary.
+#[test]
+fn named_mount_sets_unused_missing_source_is_never_checked() {
+    let h = Harness::new();
+    seed_set_sources(&h);
+    let missing = h.home_root.join("absent");
+    h.write_user(&format!(
+        "{SETS_BODY}absent-set = [\"~/absent:/absent:ro\"]\nmissing-set = [\"{}:/missing:ro\"]\n",
+        missing.display()
+    ));
+    let stderr = stderr_of(&h.launch(&["--mount", "ro-set"], "shell", &[]));
+    assert!(
+        stderr.contains(CONFIG_MARKER),
+        "an unselected set's missing source must not block the launch: {stderr}"
+    );
+    assert!(
+        !bind_mounts(&debug_config_json(&stderr))
+            .iter()
+            .any(|(_, guest, _)| guest == "/absent" || guest == "/missing"),
+        "{stderr}"
+    );
+
+    for name in ["absent-set", "missing-set"] {
+        let before = h.snapshot();
+        let out = h.launch(&["--mount", name], "shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{name}: {stderr}");
+        h.assert_refused_before_launch_state(&out, &before, "canonicalizing");
+        assert!(
+            stderr.contains(&format!("mount_sets[\"{name}\"][0]")),
+            "{name}: the refusing declaration must be named: {stderr}"
+        );
+    }
+}
+
+/// Repeated names, a set named twice and a shared nested set all reach exactly
+/// one bind per declaration.
+#[test]
+fn named_mount_sets_duplicate_selections_bind_once() {
+    let h = Harness::new();
+    seed_set_sources(&h);
+    h.write_user(&format!(
+        "mounts = [\"all-set\", \"ro-set\", \"all-set\"]\n{SETS_BODY}"
+    ));
+    let stderr = stderr_of(&h.launch(&["--mount", "all-set", "--mount", "ro-set"], "shell", &[]));
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    for guest in ["/ro", "/rw", "/fork"] {
+        let count = binds.iter().filter(|(_, bind, _)| bind == guest).count();
+        assert_eq!(count, 1, "{guest} must be bound once: {binds:?}");
+    }
+}
+
+/// Conflicting declarations are refused in both orders and across all three
+/// sources: defaults versus set, set versus set, and explicit CLI versus set.
+#[test]
+fn named_mount_sets_conflicts_are_refused_in_both_orders() {
+    let h = Harness::new();
+    let a = seed_source(&h, "a");
+    let b = seed_source(&h, "b");
+    let conflict = |body: &str, options: &[&str]| {
+        let h2 = Harness::new();
+        seed_source(&h2, "a");
+        seed_source(&h2, "b");
+        h2.write_user(body);
+        let before = h2.snapshot();
+        let out = h2.launch(options, "shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("claims the same guest path"),
+            "{body}: {options:?}: {stderr}"
+        );
+        h2.assert_refused_before_launch_state(&out, &before, "claims the same guest path");
+    };
+    let _ = (&a, &b);
+    // Defaults versus a selected set, both orders.
+    conflict(
+        "mounts = [\"~/a:/g:ro\", \"s\"]\n[mount_sets]\ns = [\"~/b:/g:ro\"]\n",
+        &[],
+    );
+    conflict(
+        "mounts = [\"s\", \"~/b:/g:rw\"]\n[mount_sets]\ns = [\"~/a:/g:ro\"]\n",
+        &[],
+    );
+    // Set versus set, both orders.
+    conflict(
+        "mounts = [\"one\", \"two\"]\n[mount_sets]\none = [\"~/a:/g:ro\"]\ntwo = [\"~/b:/g:ro\"]\n",
+        &[],
+    );
+    conflict(
+        "mounts = [\"two\", \"one\"]\n[mount_sets]\none = [\"~/a:/g:ro\"]\ntwo = [\"~/b:/g:ro\"]\n",
+        &[],
+    );
+    // Explicit CLI versus an explicitly selected set, both orders.
+    for reversed in [false, true] {
+        let h2 = Harness::new();
+        let a = seed_source(&h2, "a");
+        seed_source(&h2, "b");
+        h2.write_user("[mount_sets]\ns = [\"~/b:/g:ro\"]\n");
+        let direct = format!("{}:/g:ro", a.display());
+        let argv: Vec<&str> = if reversed {
+            vec!["--no-config-mounts", "--mount", "s", "--mount", &direct]
+        } else {
+            vec!["--no-config-mounts", "--mount", &direct, "--mount", "s"]
+        };
+        let before = h2.snapshot();
+        let out = h2.launch(&argv, "shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("guest path /g is claimed by different declarations"),
+            "{argv:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&set_declaration(&h2, "s", 0)),
+            "the set entry must be named: {stderr}"
+        );
+        h2.assert_refused_before_launch_state(&out, &before, "claimed by different declarations");
+    }
+}
+
+/// A writable parent with a read-only child is an allowed topology, and the
+/// child's own mode is what the guest sees. (This does not claim the read-only
+/// child blocks writable aliases through its parent — it does not.)
+#[test]
+fn named_mount_sets_allow_a_readwrite_parent_with_a_readonly_child() {
+    let h = Harness::new();
+    let parent = seed_source(&h, "tree");
+    let child = parent.join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(child.join("inner"), "inner").unwrap();
+    h.write_user("[mount_sets]\ntree = [\"~/tree:/tree:rw\", \"~/tree/child:/tree/child:ro\"]\n");
+    let stderr = stderr_of(&h.launch(&["--mount", "tree"], "shell", &[]));
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    assert!(
+        binds
+            .iter()
+            .any(|(host, guest, ro)| host == &parent.display().to_string()
+                && guest == "/tree"
+                && !*ro),
+        "{binds:?}"
+    );
+    assert!(
+        binds
+            .iter()
+            .any(|(host, guest, ro)| host == &child.display().to_string()
+                && guest == "/tree/child"
+                && *ro),
+        "{binds:?}"
+    );
+}
+
+/// Every shared protection applies to a set leaf exactly as to a direct config
+/// entry, and the refusal names the set entry rather than `mounts[N]`.
+#[test]
+fn named_mount_sets_respect_the_shared_protections() {
+    // A writable config-directory ancestor.
+    let h = Harness::new();
+    h.write_user("[mount_sets]\ncfg = [\"~/.config:rw\"]\n");
+    let before = h.snapshot();
+    let out = h.launch(&["--mount", "cfg"], "shell", &[]);
+    h.assert_refused_before_launch_state(&out, &before, &set_declaration(&h, "cfg", 0));
+
+    // A live bind of the host Pi credential file.
+    let h = Harness::new();
+    let auth = h.home_root.join(".pi/agent/auth.json");
+    write_file(&auth, "{\"token\":\"host\"}");
+    h.write_user("[mount_sets]\npi-live = [\"~/.pi:ro\"]\n");
+    let before = h.snapshot();
+    let out = h.launch(&["--mount", "pi-live"], "shell", &[]);
+    h.assert_refused_before_launch_state(
+        &out,
+        &before,
+        &format!(
+            "would expose the host Pi credential file {}",
+            auth.display()
+        ),
+    );
+
+    // A writable regular file.
+    let h = Harness::new();
+    let file = h.home_root.join("bare");
+    std::fs::write(&file, "bare").unwrap();
+    h.write_user(&format!(
+        "[mount_sets]\nfile = [\"~/bare:{}\"]\n",
+        file.display()
+    ));
+    let before = h.snapshot();
+    let out = h.launch(&["--mount", "file"], "shell", &[]);
+    h.assert_refused_before_launch_state(&out, &before, "a file can only be mounted read-only");
+
+    // An agent-vm core guest path: refused with set-specific advice, and never
+    // the opt-out hint an explicit selection ignores.
+    let h = Harness::new();
+    seed_source(&h, "a");
+    h.write_user("[mount_sets]\ncore = [\"~/a:/agent-vm-state:ro\"]\n");
+    let before = h.snapshot();
+    let out = h.launch(&["--mount", "core"], "shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("collides with an agent-vm core mount"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("remove it from that mount set"),
+        "an explicit set must not be told to use --no-config-mounts: {stderr}"
+    );
+    h.assert_refused_before_launch_state(&out, &before, &set_declaration(&h, "core", 0));
+
+    // A fork shadowing a persisted guest-HOME link, refused before publication.
+    let h = Harness::new();
+    h.write_project(PERSIST_CODE);
+    seed_source(&h, "src");
+    h.write_user(&format!(
+        "[mount_sets]\nfork = [\"~/src:{}/code:fork\"]\n",
+        h.home_root.display()
+    ));
+    let before = h.snapshot();
+    let out = h.launch(&["--mount", "fork"], "aider", &[]);
+    assert_eq!(
+        stderr_of(&out).lines().next().unwrap_or_default(),
+        persist_collision_message(&h.home_root.display().to_string())
+    );
+    h.assert_refused_before_launch_state(&out, &before, "would collide with the guest mount point");
+    assert!(h.mount_store().is_none());
+}
+
+/// Modes, follow-links and fork seed options belong to the paths inside a set and
+/// keep their exact behaviour: an independent fork copy that honours `:exclude`
+/// and omits the protected Pi files.
+#[test]
+fn named_mount_sets_keep_modes_follow_links_and_fork_seeding() {
+    let h = Harness::new();
+    let skills = h.home_root.join("skills");
+    std::fs::create_dir_all(skills.join("real")).unwrap();
+    std::fs::write(skills.join("real/marker"), "marker").unwrap();
+    std::os::unix::fs::symlink("real", skills.join("link")).unwrap();
+    let src = seed_excludable_source(&h);
+    let pi = h.home_root.join(".pi");
+    write_file(&pi.join("agent/auth.json"), "{\"token\":\"host-auth\"}");
+    write_file(&pi.join("settings.json"), "{\"theme\":\"dark\"}");
+    h.write_user(
+        "[mount_sets]\n\
+         skills = [\"~/skills:/skills:ro:follow-links\"]\n\
+         seed = [\"~/src:/f:fork:exclude=hidden\"]\n\
+         pi = [\"~/.pi:/pi-fork:fork\"]\n",
+    );
+
+    let stderr = stderr_of(&h.launch(&["--mount", "skills"], "shell", &[]));
+    let binds = bind_mounts(&debug_config_json(&stderr));
+    let real = skills.join("real").display().to_string();
+    assert!(
+        binds
+            .iter()
+            .any(|(host, guest, ro)| host == &real && guest == &real && *ro),
+        "a follow-links target inside a set is discovered read-only: {binds:?}"
+    );
+
+    let stderr = stderr_of(&h.launch(&["--mount", "seed"], "shell", &[]));
+    assert!(
+        stderr.contains(&initialized_fork(&src.display().to_string())),
+        "{stderr}"
+    );
+    let data = only_fork_data(&h);
+    assert!(data.join("visible").exists(), "{}", data.display());
+    assert!(
+        !data.join("hidden").exists(),
+        "an exclusion inside a set must omit the path: {}",
+        data.display()
+    );
+
+    let stderr = stderr_of(&h.launch(&["--mount", "pi"], "shell", &[]));
+    assert!(
+        stderr.contains("Omitted host Pi credential file agent/auth.json"),
+        "{stderr}"
+    );
+    let pi_data = h
+        .fork_dirs()
+        .into_iter()
+        .map(|fork| fork.join("data"))
+        .find(|data| data.join("settings.json").exists())
+        .expect("the Pi fork must exist");
+    assert!(!pi_data.join("agent/auth.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(pi.join("agent/auth.json")).unwrap(),
+        "{\"token\":\"host-auth\"}",
+        "the host credential must be untouched"
+    );
+}
+
+/// A set selection never changes credential provisioning or persisted paths: the
+/// same project tool, with and without a selection, resolves the same facets.
+///
+/// The two facets are the ones a mount could plausibly interfere with: the
+/// header-credential the tool requests, and the `persist` link the provisioning
+/// closure creates inside the project state dir.
+#[test]
+fn named_mount_sets_do_not_change_provisioning() {
+    fn facets(options: &[&str], with_sets: bool) -> (Vec<String>, String) {
+        let h = Harness::new();
+        if with_sets {
+            seed_source(&h, "a");
+            h.write_user("mounts = [\"a-set\"]\n[mount_sets]\na-set = [\"~/a:/a:ro\"]\n");
+        }
+        h.write_project(
+            "[[tools]]\nname = \"t\"\ncommand = \"/bin/true\"\ncredentials = [\"my-service\"]\n\
+             persist = [\"code\"]\n",
+        );
+        write_credentials(&h, MY_SERVICE_YAML);
+        let out = h.launch_with_env(
+            options,
+            "t",
+            &[],
+            &[("AGENT_VM_TEST_CREDENTIAL", "my-service=synthetic")],
+        );
+        let stderr = stderr_of(&out);
+        let config = debug_config_json(&stderr);
+        let references: Vec<String> = config["network"]["secrets"]["header_credentials"]
+            .as_array()
+            .expect("header_credentials must be an array")
+            .iter()
+            .map(|entry| entry["reference"].as_str().expect("reference").to_string())
+            .collect();
+        let link = std::fs::read_link(state_dir(&stderr).join("home/code"))
+            .expect("the persist link must exist")
+            .display()
+            .to_string();
+        (references, link)
+    }
+
+    let baseline = facets(&[], false);
+    assert_eq!(
+        baseline.0,
+        ["my-service"],
+        "the control must resolve the request"
+    );
+    assert_eq!(
+        baseline.1, "/agent-vm-state/persist/code",
+        "the control must create the persisted link"
+    );
+    for options in [
+        vec![],
+        vec!["--no-config-mounts"],
+        vec!["--no-config-mounts", "--mount", "a-set"],
+    ] {
+        assert_eq!(
+            facets(&options, true),
+            baseline,
+            "{options:?}: a set selection must not change provisioning or persisted paths"
+        );
+    }
+}
+
+/// Repo-scan parity: a set leaf widens the GitHub allow-list exactly as its
+/// direct twin, a suppressed default contributes nothing, and an explicitly
+/// selected set still contributes under the opt-out.
+#[test]
+fn named_mount_sets_scan_repos_like_their_direct_twin() {
+    let h = Harness::new();
+    let checkout = seed_github_checkout(&h, "checkout", "example/visible");
+    h.write_user("mounts = [\"s\"]\n[mount_sets]\ns = [\"~/checkout:ro\"]\n");
+    let configured = stderr_of(&h.launch(&[], "shell", &[]));
+    assert_eq!(
+        repo_scope(&configured),
+        "==> GitHub repo scope (1): example/visible",
+        "a set leaf's remote must reach the allow-list"
+    );
+
+    // The same directory as a bare `--mount` with no config in play.
+    std::fs::remove_file(h.user_config()).unwrap();
+    let cli = stderr_of(&h.launch(
+        &["--mount", &format!("{}:ro", checkout.display())],
+        "shell",
+        &[],
+    ));
+    assert_eq!(repo_scope(&cli), repo_scope(&configured));
+
+    // Suppression is proved from *one* document that has both a defaults entry
+    // selecting the set and the definition it selects: only the option changes
+    // between these two launches, so neither the absent nor the present scope can
+    // come from different bytes.
+    h.write_user(&format!(
+        "mounts = [\"scan\"]\n{SETS_BODY}scan = [\"~/checkout:ro\"]\n"
+    ));
+    let unsuppressed = stderr_of(&h.launch(&[], "shell", &[]));
+    assert_eq!(
+        repo_scope(&unsuppressed),
+        "==> GitHub repo scope (1): example/visible",
+        "the same bytes select the set without the opt-out: {unsuppressed}"
+    );
+    assert!(
+        unsuppressed.contains("==> Config mounts: 1 from"),
+        "the defaults entry is what selects it: {unsuppressed}"
+    );
+    let suppressed = stderr_of(&h.launch(&["--no-config-mounts"], "shell", &[]));
+    assert_eq!(
+        repo_scope(&suppressed),
+        "==> GitHub repo scope: <none> (no api.github.com access)",
+        "{suppressed}"
+    );
+    assert!(
+        suppressed.contains("skipped 1 from"),
+        "the opt-out must say what it skipped: {suppressed}"
+    );
+    // ...and the explicit name still contributes under the same opt-out.
+    let explicit = stderr_of(&h.launch(&["--no-config-mounts", "--mount", "scan"], "shell", &[]));
+    assert_eq!(
+        repo_scope(&explicit),
+        "==> GitHub repo scope (1): example/visible",
+        "an explicit set still contributes its scan roots: {explicit}"
+    );
+}
+
+/// Fork identity is untouched by set names, nesting, order and provenance: one
+/// project-scoped fork, reached from every declaration form, with the committed
+/// marker surviving a removed source.
+#[test]
+fn named_mount_sets_fork_identity_survives_every_declaration_form() {
+    let h = Harness::new();
+    let src = h.home_root.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("seed"), "seed").unwrap();
+
+    // 1. Direct CLI seeds the fork.
+    let seeded = stderr_of(&h.launch(
+        &["--mount", &format!("{}:/f:fork", src.display())],
+        "shell",
+        &[],
+    ));
+    assert!(seeded.contains("==> Initialized fork"), "{seeded}");
+    let committed = only_fork_data(&h);
+    // A host-side marker in the committed copy: boot-free evidence that this
+    // exact copy is what later launches bind, never guest evidence.
+    std::fs::write(committed.join("marker"), "committed").unwrap();
+    // Change the host seed and remove it: only a reused copy can still hold both
+    // the old `seed` and the marker.
+    std::fs::write(src.join("seed"), "host-later").unwrap();
+    std::fs::remove_file(src.join("seed")).unwrap();
+    std::fs::remove_dir(&src).unwrap();
+
+    let forms: [(&str, Vec<&str>); 4] = [
+        (
+            // 2. Direct default.
+            "mounts = [\"~/src:/f:fork\"]\n",
+            vec![],
+        ),
+        (
+            // 3. Named default.
+            "mounts = [\"s\"]\n[mount_sets]\ns = [\"~/src:/f:fork\"]\n",
+            vec![],
+        ),
+        (
+            // 4. Nested named default through a renamed, reordered set.
+            "mounts = [\"outer\"]\n[mount_sets]\nouter = [\"zzz\", \"s\"]\n\
+             s = [\"~/src:/f:fork\"]\nzzz = []\n",
+            vec![],
+        ),
+        (
+            // 5. Explicit set under the opt-out.
+            "[mount_sets]\ns = [\"~/src:/f:fork\"]\n",
+            vec!["--no-config-mounts", "--mount", "s"],
+        ),
+    ];
+    for (body, options) in forms {
+        h.write_user(body);
+        let stderr = stderr_of(&h.launch(&options, "shell", &[]));
+        assert!(
+            stderr.contains("==> Reusing fork"),
+            "{body}: only reuse is allowed after the first launch: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Initialized"),
+            "{body}: a reseed would be a new identity: {stderr}"
+        );
+        let binds = bind_mounts(&debug_config_json(&stderr));
+        assert!(
+            binds
+                .iter()
+                .any(|(host, guest, _)| Path::new(host) == committed && guest == "/f"),
+            "{body}: the same committed copy must be bound: {binds:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(committed.join("marker")).unwrap(),
+            "committed",
+            "{body}: the committed copy must be the same one"
+        );
+        assert_eq!(
+            h.fork_dirs().len(),
+            1,
+            "{body}: one project-scoped fork, not two"
+        );
+    }
+
+    // 6. The reverse route: a fresh project seeded from a set, then reached by a
+    // direct `--mount`.
+    let second = Harness::new();
+    let src = second.home_root.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("seed"), "seed").unwrap();
+    second.write_user("[mount_sets]\ns = [\"~/src:/f:fork\"]\n");
+    let seeded = stderr_of(&second.launch(&["--mount", "s"], "shell", &[]));
+    assert!(seeded.contains("==> Initialized fork"), "{seeded}");
+    let set_committed = only_fork_data(&second);
+    std::fs::remove_file(src.join("seed")).unwrap();
+    std::fs::remove_dir(&src).unwrap();
+    let direct = stderr_of(&second.launch(
+        &["--mount", &format!("{}:/f:fork", src.display())],
+        "shell",
+        &[],
+    ));
+    assert!(direct.contains("==> Reusing fork"), "{direct}");
+    let binds = bind_mounts(&debug_config_json(&direct));
+    assert!(
+        binds
+            .iter()
+            .any(|(host, guest, _)| Path::new(host) == set_committed && guest == "/f"),
+        "{binds:?}"
+    );
+
+    // The store is project-scoped by `ProjectSession` alone — no set name,
+    // nesting or origin reaches `fork_id` — so a second project's store is the
+    // unchanged `mount_fork` machinery and is not re-driven here. What this test
+    // must show is the single-store invariant across every declaration form.
+    assert_eq!(second.fork_dirs().len(), 1, "one fork for this project");
+}
+
+/// No implicit `agent` group and no inference from tool names: a set whose name
+/// matches the launch verb (or a shipped tool's name) is not selected by it.
+/// `--mount` is the only selector, and a name that is a tool/route word is an
+/// exact set lookup (decision A1), never a tool selection.
+///
+/// The differential control is the same document plus the explicit selection: if
+/// verb-named sets were inferred, the first launch would show a bind the control
+/// proves only the name can produce.
+#[test]
+fn named_mount_sets_are_never_inferred_from_tool_names() {
+    let h = Harness::new();
+    seed_set_sources(&h);
+    // Two names that collide with real words: `pi` is a shipped launch verb and
+    // `pi-agent` is the canonical example set the issue uses.
+    h.write_user(
+        "[[tools]]\nname = \"pi\"\ncommand = \"/bin/true\"\n\n\
+         [mount_sets]\npi = [\"~/ro:/ro:ro\"]\npi-agent = [\"~/rw:/rw\"]\n",
+    );
+
+    let inferred = stderr_of(&h.launch(&[], "pi", &[]));
+    assert!(
+        inferred.contains(CONFIG_MARKER),
+        "launching the tool must still work: {inferred}"
+    );
+    let unsolicited = sorted_binds(&debug_config_json(&inferred));
+    assert!(
+        !unsolicited
+            .iter()
+            .any(|(_, guest, _)| guest == "/ro" || guest == "/rw"),
+        "launching a tool must not select a set named after it: {unsolicited:?}"
+    );
+    assert!(
+        !inferred.contains("==> Config mounts:"),
+        "definitions alone report no config selection: {inferred}"
+    );
+
+    // The control: the very same document does select both names explicitly, so
+    // the absence above is the *selection rule*, not an unreadable set.
+    let named = stderr_of(&h.launch(&["--mount", "pi", "--mount", "pi-agent"], "shell", &[]));
+    let binds = bind_mounts(&debug_config_json(&named));
+    for guest in ["/ro", "/rw"] {
+        assert!(
+            binds.iter().any(|(_, bind, _)| bind == guest),
+            "{guest} must be bound when its set is named: {binds:?}"
+        );
+    }
+    // ...and `--mount pi` selected the *set*, not the tool: the verb is still
+    // `shell`, and the tool's own command never ran.
+    assert!(
+        named.contains("==> agent-vm-") && !named.contains("/bin/true"),
+        "the selection must not turn into a tool launch: {named}"
+    );
+}
+
+/// Two separately valid sets that disagree at one guest path are a *selection*
+/// conflict, not a config error: the file loads, `doctor` is clean, neither
+/// selected and each alone are fine, and only selecting both (either order)
+/// fails. Decision A2's second half — nothing claims unrelated sets against
+/// each other at load.
+#[test]
+fn named_mount_sets_fail_only_when_a_launch_selects_both() {
+    let h = Harness::new();
+    let a = seed_source(&h, "a");
+    let b = seed_source(&h, "b");
+    h.write_user("[mount_sets]\nx = [\"~/a:/g:ro\"]\ny = [\"~/b:/g:ro\"]\n");
+
+    assert!(
+        h.doctor().status.success(),
+        "two valid sets that disagree must not fail load: {}",
+        stderr_of(&h.doctor())
+    );
+
+    let neither = stderr_of(&h.launch(&[], "shell", &[]));
+    assert!(
+        !bind_mounts(&debug_config_json(&neither))
+            .iter()
+            .any(|(_, guest, _)| guest == "/g"),
+        "selecting neither must bind neither: {neither}"
+    );
+
+    for (name, source) in [("x", &a), ("y", &b)] {
+        let stderr = stderr_of(&h.launch(&["--mount", name], "shell", &[]));
+        let binds = bind_mounts(&debug_config_json(&stderr));
+        assert!(
+            binds
+                .iter()
+                .any(|(host, guest, _)| guest == "/g" && Path::new(host) == source),
+            "selecting {name} alone must bind its own declaration: {binds:?}"
+        );
+    }
+
+    for order in [["x", "y"], ["y", "x"]] {
+        let before = h.snapshot();
+        let out = h.launch(&["--mount", order[0], "--mount", order[1]], "shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("guest path /g is claimed by different declarations"),
+            "{order:?}: {stderr}"
+        );
+        // Both declared sites are named, the first-selected first.
+        let (first, second) = (
+            set_declaration(&h, order[0], 0),
+            set_declaration(&h, order[1], 0),
+        );
+        assert!(
+            stderr.contains(&first),
+            "{order:?} must name {first}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&second),
+            "{order:?} must name {second}: {stderr}"
+        );
+        assert!(
+            stderr.find(&first) < stderr.find(&second),
+            "{order:?} must name the first-selected site first: {stderr}"
+        );
+        h.assert_refused_before_launch_state(&out, &before, "claimed by different declarations");
+    }
+}
+
+/// An empty `[mount_sets]` table and an empty named set are authority-bearing by
+/// *presence* (their file must pass the verified read) and select nothing — a
+/// launch with one is ordinary, not an error, and `--mount` on an empty set is a
+/// legal no-op selection.
+#[test]
+fn named_mount_sets_empty_table_and_empty_set_select_nothing() {
+    let h = Harness::new();
+    seed_set_sources(&h);
+
+    // A control bind from the defaults, so "nothing from the sets" is measured
+    // on a launch that otherwise selects something.
+    h.write_user("mounts = [\"~/ro:/ro:ro\"]\n[mount_sets]\n");
+    let empty_table = stderr_of(&h.launch(&[], "shell", &[]));
+    let binds = sorted_binds(&debug_config_json(&empty_table));
+    assert_eq!(
+        binds.iter().filter(|(_, guest, _)| guest == "/ro").count(),
+        1,
+        "only the defaults entry binds: {binds:?}"
+    );
+    assert!(
+        empty_table.contains(&config_notice(&h, 1)),
+        "an empty table adds no declaration to the notice: {empty_table}"
+    );
+
+    h.write_user("mounts = []\n[mount_sets]\nempty = []\n");
+    let empty_set = stderr_of(&h.launch(&[], "shell", &[]));
+    assert!(
+        empty_set.contains(CONFIG_MARKER),
+        "an empty set is valid: {empty_set}"
+    );
+    assert!(
+        !sorted_binds(&debug_config_json(&empty_set))
+            .iter()
+            .any(|(_, guest, _)| guest == "/ro" || guest == "/rw"),
+        "an empty set selects nothing: {empty_set}"
+    );
+
+    let selected = stderr_of(&h.launch(&["--mount", "empty"], "shell", &[]));
+    assert!(
+        selected.contains(CONFIG_MARKER),
+        "`--mount` on an empty set is a legal no-op: {selected}"
+    );
+    assert!(
+        !sorted_binds(&debug_config_json(&selected))
+            .iter()
+            .any(|(_, guest, _)| guest == "/ro" || guest == "/rw"),
+        "{selected}"
+    );
+}
+
+/// Set names are case-sensitive lookups (decision A1): `A` and `a` are two
+/// sets, and `--mount agent` never finds `Agent`.
+#[test]
+fn named_mount_sets_look_up_names_case_sensitively() {
+    let h = Harness::new();
+    seed_set_sources(&h);
+    h.write_user("[mount_sets]\nA = [\"~/ro:/ro:ro\"]\na = [\"~/rw:/rw\"]\n");
+
+    let upper = stderr_of(&h.launch(&["--mount", "A"], "shell", &[]));
+    let binds = bind_mounts(&debug_config_json(&upper));
+    assert!(
+        binds.iter().any(|(_, guest, _)| guest == "/ro"),
+        "`--mount A` selects the `A` set: {binds:?}"
+    );
+    assert!(
+        !binds.iter().any(|(_, guest, _)| guest == "/rw"),
+        "`A` must not resolve to `a`: {binds:?}"
+    );
+
+    let lower = stderr_of(&h.launch(&["--mount", "a"], "shell", &[]));
+    let binds = bind_mounts(&debug_config_json(&lower));
+    assert!(
+        binds.iter().any(|(_, guest, _)| guest == "/rw"),
+        "`--mount a` selects the `a` set: {binds:?}"
+    );
+
+    let before = h.snapshot();
+    let out = h.launch(&["--mount", "Agent"], "shell", &[]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(&format!(
+            "mount set \"Agent\" is not defined by any [mount_sets] in \"{}\"",
+            h.user_config().display()
+        )),
+        "{stderr}"
+    );
+    h.assert_refused_before_launch_state(&out, &before, "parsing --mount");
+}
+
+/// The project tier cannot introduce a mount-set namespace: it may neither
+/// define `[mount_sets]` (empty or not) nor select a user name from `mounts`.
+/// The refusal is the same project-tier rule `mounts` already had, so a project
+/// file cannot shadow a user set — or plant one in a checkout the guest writes.
+#[test]
+fn named_mount_sets_cannot_be_declared_or_selected_by_the_project() {
+    // A real user set of that name, so "the project defined it" and "the project
+    // selected the user's" are both live possibilities the refusal must exclude.
+    let h = Harness::new();
+    seed_set_sources(&h);
+    h.write_user("[mount_sets]\nagent = [\"~/ro:/ro:ro\"]\n");
+
+    for (body, needle) in [
+        (
+            "[mount_sets]\n",
+            "mount_sets cannot be declared by the project config",
+        ),
+        (
+            "[mount_sets]\nagent = []\n",
+            "mount_sets cannot be declared by the project config",
+        ),
+        (
+            "[mount_sets]\nagent = [\"~/rw:/rw\"]\n",
+            "mount_sets cannot be declared by the project config",
+        ),
+        (
+            "mounts = [\"agent\"]\n",
+            "mounts cannot be declared by the project config",
+        ),
+        (
+            "mounts = []\n",
+            "mounts cannot be declared by the project config",
+        ),
+    ] {
+        h.write_project(body);
+        let before = h.snapshot();
+        let out = h.launch(&[], "shell", &[]);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(&format!(
+                "config: \"{}\": {needle}",
+                h.project_config().display()
+            )),
+            "{body}: {stderr}"
+        );
+        h.assert_refused_before_launch_state(&out, &before, needle);
+    }
+
+    // The user tier is untouched by the project's attempt: the same launch with
+    // no project file selects the user's set by name.
+    h.write_project("");
+    let stderr = stderr_of(&h.launch(&["--mount", "agent"], "shell", &[]));
+    assert!(
+        bind_mounts(&debug_config_json(&stderr))
+            .iter()
+            .any(|(_, guest, _)| guest == "/ro"),
+        "the user set must still be the one that resolves: {stderr}"
+    );
+}

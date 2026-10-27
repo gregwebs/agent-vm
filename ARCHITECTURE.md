@@ -43,9 +43,10 @@ crates/agent-vm/src/
 ├── network.rs              # published ports, proxy notice, launch Plan
 ├── network_requests.rs     # tool requests: parse, coverage report (never authority)
 ├── mount.rs                # --mount grammar and volume wiring
-├── config_mounts.rs        # user-tier `mounts`: typed schema, `~/` expansion, load-time claim
-├── mount_selection.rs      # one launch's declarations: verified user `mounts`, then --mount
-├── config_authority.rs     # ADR-0040 verified read, one gate for [network] and mounts
+├── config_mounts.rs        # user-tier `mounts` + `[mount_sets]`: schema, `~/` expansion, load-time claim
+│   └── sets.rs             #   the set graph: names, references, cycles, indexed bounded closures
+├── mount_selection.rs      # one launch's declarations: verified user defaults, then argv (paths or names)
+├── config_authority.rs     # ADR-0040 verified read, one gate for [network], mounts and mount_sets
 ├── boot_image.rs           # the one boot-image selection seam (CLI/env/config/default)
 │   ├── default_selection.rs#   journal-aware logical default read (bounded shared lock)
 │   └── upgrade.rs          #   set-default command shape: explicit typed target
@@ -118,7 +119,8 @@ A launch is one pass, and the ordering is load-bearing:
    entry at multiple sites, and that a `Direct` target reads none at all.
 4. Still inside `run::launch`, in order: image selection, the network plan,
    the launch's mount selection (`mount_selection::select`: the verified user
-   config's `mounts` unless `--no-config-mounts`, then argv `--mount`) and
+   config's `mounts` defaults unless `--no-config-mounts`, then argv `--mount`,
+   whose bare names select a user `[mount_sets]` entry) and
    `mount::prepare` (which owns the side-effect-free topology rejection and the
    persisted guest-HOME collision, and publishes forks only after both pass),
    the guest-HOME links and the root-mode decision; `session` derives the project
@@ -284,30 +286,49 @@ table.
 
 ### Extra and forked mounts: `ro`, `rw`, `fork`, `follow-links`
 
-**Two declaration sources, one seam.** `--mount` is not the only way a launch
+**Three declaration inputs, one seam.** `--mount` is not the only way a launch
 can ask for a mount: a verified user config's top-level `mounts` selects
-[mounts for every launch](docs/adr/0046-verified-user-config-mounts.md).
+[mounts for every launch](docs/adr/0046-verified-user-config-mounts.md), and its
+`[mount_sets]` table names reusable lists that either input may select by name
+([ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md)).
 `mount_selection::select` is the only place that decides *which sources* one
-launch requests — the user config's declarations unless `--no-config-mounts`,
-then argv — and it does no I/O, so an unselected declaration can name a path
-that does not exist without blocking a launch, `doctor` or `--help`. Everything
-after it is shared: `mount::prepare` receives one ordered `MountRequests` whose
-elements carry their origin, applies one claim rule (identical declarations at
-one guest path merge; different ones are refused, config-versus-CLI included),
-and runs the same protections and topology checks. Nothing downstream can tell a
-config declaration from a CLI one except the origin string in a diagnostic.
+launch requests — the user config's defaults unless `--no-config-mounts`, then
+argv in order, each entry classified as a path or an exact set name — and it does
+no I/O, so an unselected declaration (or an unused set's missing source) can name
+a path that does not exist without blocking a launch, `doctor` or `--help`.
+`--no-config-mounts` removes the defaults only: an explicit `--mount NAME` still
+selects its set, and every load-time check still runs. Everything after it is
+shared: `mount::prepare` receives one ordered `MountRequests` whose elements carry
+their origin, applies one claim rule (identical declarations at one guest path
+merge; different ones are refused, config-versus-CLI included), and runs the same
+protections and topology checks. Nothing downstream can tell a config
+declaration from a CLI one except the origin string in a diagnostic.
+
+**Sets are validated as a graph, not resolved at launch.** `config_mounts::sets`
+parses the table, binds every reference by exact name (forward references
+included), rejects unknown names and reference cycles with an explicit iterative
+walk, and then compiles each set's transitive closure once, dependency-first,
+against an indexed guest-path map — never `mount::claim`'s growing-vector scan.
+Every declared set is validated, even unused and under the opt-out, so a
+self-contradictory closure is a load error; two separately valid sets may still
+disagree until a launch selects both, and that is the shared claim's refusal. The
+whole walk is bounded by one global leaf-visit budget
+(`MAX_MOUNT_SET_EXPANSION_WORK`), which turns a pathological config into a
+value-free config error instead of a hang. `tools` reference cycles are a
+different walker reaching a fixed point and stay legal.
 
 ```text
 BEFORE                                       AFTER
 config.toml ──read──> RawConfig              config.toml ──read──> RawConfig
-  [network]? ─yes─> verify+parse (network)     triggers = {network?, mounts?}   (presence, not contents)
-                                               any? ─yes─> config_authority::verify(read)  ONE check
-                                                  ├─ [network] → user_network::from_verified_table
-                                                  └─ mounts    → config_mounts::from_verified_value
-                                                                  (~/ expansion, shared grammar,
-                                                                   normalize + claim among config)
-argv --mount ──> parse_extra_mounts          mount_selection::select(user_mounts, policy, &args.mount)
-             └─> prepare(Vec<ExtraMount>)      → MountRequests [config…, cli…] with origins
+  [network]? ─yes─> verify+parse (network)     triggers = {network?, mounts?, mount_sets?}  (presence)
+  mounts ───no I/O claim                       any? ─yes─> config_authority::verify(read)  ONE check
+                                                  ├─ [network]     → user_network::from_verified_table
+                                                  └─ mounts/sets   → config_mounts::from_verified_value
+                                                                      (~/ expansion, shared grammar,
+                                                                       names → refs → cycles → closures,
+                                                                       then defaults claim; NO source I/O)
+argv --mount ──> parse_selector              mount_selection::select(user, policy, &args.mount)
+             (path | exact set name)           → MountRequests [defaults…, cli…] with origins
                  └─ run.rs: persist check      → mount::prepare(requests, ctx{.., persisted_home})
                     AFTER prepare_forks            claim → protections → … → validate_plan
                                                    → persisted-HOME check → prepare_forks

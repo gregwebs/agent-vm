@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Guest-side rows for the config-mounts probe (#394 / ADR-0046).
+# Guest-side rows for the config-mounts probe (#394 / ADR-0046, #397 / ADR-0048).
 #
 # Always `bash`, never `bash -l`: a login shell sources /etc/profile and resets
 # PATH (CONTRIBUTING.md). No `set -e` on purpose — one row must not hide the
@@ -59,11 +59,13 @@ row_n3b() {
     printf 'CM-N3b read=%s\n' "$(marker "$probe/fork/marker")"
 }
 
-# The opt-out row: every config mount absent, and the project still visible.
-# `project=present` is the positive control — the guest ran and could see its
-# own project bind, so three "absent" values cannot be a dead guest.
-row_n4() {
-    local name state
+# One verdict per mounted tree: every config mount absent, and the project still
+# visible. `project=present` is the positive control — the guest ran and could see
+# its own project bind, so three "absent" values cannot be a dead guest. The label
+# is a parameter so the same statements carry the named-set rows (CM-S1/CM-S3)
+# without renaming the #394 row's bytes.
+row_absent() {
+    local label="$1" name state
     local -a out=()
     for name in ro rw fork; do
         if [[ -e "$probe/$name" ]]; then state=present; else state=absent; fi
@@ -71,7 +73,28 @@ row_n4() {
     done
     if [[ -f ./project-marker ]]; then state=present; else state=absent; fi
     out+=("project=$state")
-    printf 'CM-N4 %s\n' "${out[*]}"
+    printf '%s %s\n' "$label" "${out[*]}"
+}
+
+row_n4() {
+    row_absent CM-N4
+}
+
+# The named-set row (#397): the same three trees, reached through one selected
+# set, plus the concrete access a selection is supposed to grant. The read-only
+# tree must refuse both a new name and its existing file, the writable leaf must
+# write `set-rw` through to the host, and the fork leaf must read whatever the
+# earlier launch left in the copy — never the host's later write.
+row_sets() {
+    local read write=denied rw fork project
+    read="$(marker "$probe/ro/marker")"
+    attempt "$probe/ro/new" x && write=allowed
+    attempt "$probe/ro/marker" x && write=allowed
+    rw="$( ( printf '%s' set-rw > "$probe/rw/marker" ) 2>/dev/null && printf wrote || printf denied )"
+    fork="$(marker "$probe/fork/marker")"
+    if [[ -f ./project-marker ]]; then project=present; else project=absent; fi
+    printf 'CM-S access ro=%s ro-write=%s rw=%s fork=%s project=%s\n' \
+        "$read" "$write" "$rw" "$fork" "$project"
 }
 
 row_n5() {
@@ -85,6 +108,9 @@ case "${1:-}" in
     n3b) row_n3b ;;
     n4) row_n4 ;;
     n5) row_n5 ;;
+    # Named sets: the same absent row under its own label, and the access row.
+    sets-absent) row_absent CM-S ;;
+    sets) row_sets ;;
     # One launch covers the three rows that need the default selection, so the
     # rows share a boot instead of paying for three of them.
     all)
@@ -92,5 +118,5 @@ case "${1:-}" in
         row_n2
         row_n3a
         ;;
-    *) die "usage: $0 all|n1|n2|n3a|n3b|n4|n5" ;;
+    *) die "usage: $0 all|n1|n2|n3a|n3b|n4|n5|sets|sets-absent" ;;
 esac

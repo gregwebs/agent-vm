@@ -35,10 +35,10 @@ Credentials:
                                    unreadable
 
 Mounts & ports:
-      --mount <HOST[:GUEST][:MODE]...>
-          Bind an extra host path into the guest, or seed a persistent fork (repeatable)
+      --mount <SET|HOST[:GUEST][:MODE]...>
+          Bind an extra host path into the guest, or select a named mount set (repeatable)
       --no-config-mounts
-          Skip this launch's config mounts (`mounts` in `~/.config/agent-vm/config.toml`)
+          Skip this launch's automatic config mounts (`mounts` in `~/.config/agent-vm/config.toml`)
   -p, --publish <[BIND:]HOST_PORT:GUEST_PORT>
           Publish a guest TCP port to the host, docker-style (repeatable)
       --auto-publish

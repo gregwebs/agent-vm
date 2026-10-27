@@ -218,6 +218,26 @@ pub(crate) enum MountOrigin {
         file: PathBuf,
         index: usize,
     },
+    /// A direct declaration inside one verified user mount set: the file, the
+    /// set's exact name and the entry's index within that set.
+    ///
+    /// The name is copied from an already-parsed `MountSetName` (ADR-0048's
+    /// grammar) and is diagnostic provenance only — like `UserConfig`, none of
+    /// it reaches [`same_declaration`] or `fork_id`, so moving a declaration
+    /// between a set, the defaults and `--mount` keeps one fork.
+    ///
+    /// **Shared, not copied per declaration.** A set may hold arbitrarily many
+    /// leaves under one arbitrarily long key (the config file's own 1 MiB is the
+    /// only bound), so each origin holds a reference to the *one* name allocation
+    /// its definition owns. Copying the `String` into every leaf would multiply
+    /// retained memory by the leaf count, and cloning the whole model would
+    /// multiply it again — both outside the leaf-visit budget this feature is
+    /// bounded by.
+    UserSet {
+        file: PathBuf,
+        set: std::sync::Arc<str>,
+        index: usize,
+    },
 }
 
 /// The *name* of an origin, for text that has no rendering policy to choose.
@@ -231,7 +251,9 @@ impl fmt::Display for MountOrigin {
             // Rendering the file through `quoted_path` escapes it the way the
             // rest of the config diagnostics do, so an entry point cannot forge
             // the rest of the sentence and one launch never shows two escapings
-            // of the same file.
+            // of the same file. `quoted_str` for the set name is
+            // `escape_bytes`'s policy: the name is config-chosen text a
+            // diagnostic may compare, not a path the reader has to recognise.
             Self::UserConfig { file, index } => {
                 write!(
                     f,
@@ -239,6 +261,12 @@ impl fmt::Display for MountOrigin {
                     crate::one_line::quoted_path(file)
                 )
             }
+            Self::UserSet { file, set, index } => write!(
+                f,
+                "mount_sets[{}][{index}] in {}",
+                quoted_str(set.as_ref()),
+                crate::one_line::quoted_path(file)
+            ),
         }
     }
 }
@@ -339,6 +367,12 @@ pub(crate) enum Declaration<'a> {
     Argv,
     /// A verified user `mounts` entry: index `index` of `file`.
     UserConfig { file: &'a Path, index: usize },
+    /// Entry `index` of the user `mount_sets` definition named `set`.
+    UserSet {
+        file: &'a Path,
+        set: &'a str,
+        index: usize,
+    },
 }
 
 impl Declaration<'_> {
@@ -349,6 +383,11 @@ impl Declaration<'_> {
             Self::UserConfig { file, index } => {
                 format!("mounts[{index}] in {}", crate::one_line::quoted_path(file))
             }
+            Self::UserSet { file, set, index } => format!(
+                "mount_sets[{}][{index}] in {}",
+                quoted_str(set),
+                crate::one_line::quoted_path(file)
+            ),
         }
     }
 
@@ -368,7 +407,7 @@ impl Declaration<'_> {
     fn spelling(self, spelling: &str) -> String {
         match self {
             Self::Argv => crate::one_line::text(spelling).to_string(),
-            Self::UserConfig { .. } => quoted_str(spelling),
+            Self::UserConfig { .. } | Self::UserSet { .. } => quoted_str(spelling),
         }
     }
 
@@ -379,7 +418,7 @@ impl Declaration<'_> {
     fn spelling_quoted(self, spelling: &str) -> String {
         match self {
             Self::Argv => format!("{spelling:?}"),
-            Self::UserConfig { .. } => quoted_str(spelling),
+            Self::UserConfig { .. } | Self::UserSet { .. } => quoted_str(spelling),
         }
     }
 
@@ -397,7 +436,7 @@ impl Declaration<'_> {
     fn host_path(self, path: &Path) -> String {
         match self {
             Self::Argv => crate::one_line::path(path).to_string(),
-            Self::UserConfig { .. } => quoted_path(path),
+            Self::UserConfig { .. } | Self::UserSet { .. } => quoted_path(path),
         }
     }
 
@@ -415,11 +454,9 @@ impl Declaration<'_> {
     pub(crate) fn fork_root(self, path: &Path) -> String {
         match self {
             Self::Argv => crate::one_line::path(path).to_string(),
-            Self::UserConfig { file, index } => format!(
-                "mounts[{index}] in {} {}",
-                crate::one_line::quoted_path(file),
-                quoted_path(path)
-            ),
+            Self::UserConfig { .. } | Self::UserSet { .. } => {
+                format!("{} {}", self.subject(), quoted_path(path))
+            }
         }
     }
 }
@@ -430,6 +467,11 @@ fn declaration_origin<'a>(mount: &ExtraMount, origins: &'a DeclaredOrigins) -> D
     match origins.get(&mount.guest) {
         Some(MountOrigin::UserConfig { file, index }) => Declaration::UserConfig {
             file,
+            index: *index,
+        },
+        Some(MountOrigin::UserSet { file, set, index }) => Declaration::UserSet {
+            file,
+            set: set.as_ref(),
             index: *index,
         },
         // A discovered bind is not a declaration, and `MountOrigin::Cli` is an
@@ -479,7 +521,7 @@ fn validating_source_context(declaration: Declaration<'_>, host: &Path) -> Strin
 fn fork_root_context(verb: &str, declaration: Declaration<'_>, source: &Path) -> String {
     match declaration {
         Declaration::Argv => format!("{verb} fork root {}", crate::one_line::path(source)),
-        Declaration::UserConfig { .. } => format!(
+        Declaration::UserConfig { .. } | Declaration::UserSet { .. } => format!(
             "{verb} {} fork root {}",
             declaration.subject(),
             quoted_path(source)
@@ -902,6 +944,12 @@ pub(crate) fn parse_mount_spec(
 }
 
 /// Parse the raw `--mount` argv strings into `ExtraMount`s.
+///
+/// The path-only compatibility and test seam: it never consults a mount-set
+/// namespace, so the historical `--mount` grammar and its byte-pinned diagnostics
+/// stay exactly reachable. `mount_selection` classifies each entry first (a bare
+/// name is a set lookup), so production no longer calls this.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_extra_mounts(raw: &[String]) -> Result<Vec<ExtraMount>> {
     raw.iter()
         .map(|entry| {
@@ -3079,10 +3127,17 @@ impl fmt::Display for ClaimError {
                         f,
                         "--mount guest path {guest} collides with an agent-vm core mount"
                     ),
-                    config => write!(
+                    MountOrigin::UserConfig { .. } => write!(
                         f,
-                        "{config}: guest path {guest} collides with an agent-vm core mount; \
+                        "{origin}: guest path {guest} collides with an agent-vm core mount; \
                          pass --no-config-mounts to launch without it"
+                    ),
+                    // `--no-config-mounts` does not remove an explicitly selected
+                    // set, so offering it here would be advice that does not work.
+                    MountOrigin::UserSet { .. } => write!(
+                        f,
+                        "{origin}: guest path {guest} collides with an agent-vm core mount; \
+                         remove it from that mount set"
                     ),
                 }
             }
@@ -3121,25 +3176,17 @@ impl std::error::Error for ClaimError {}
 /// request is what makes the *first-seen* origin the one a conflict names.
 /// Nothing here touches the filesystem, so config load can call it on its own
 /// `mounts` list to reject a self-contradictory file before any launch.
+// The refusal *is* the payload: it carries the origins it names, so boxing it
+// would allocate on every conflict path to save a stack frame at the one call site
+// that reads it.
+#[allow(clippy::result_large_err)]
 pub(crate) fn claim(
     requests: Vec<MountRequest>,
     core: &[PathBuf],
 ) -> Result<Vec<MountRequest>, ClaimError> {
     let mut normalized = Vec::with_capacity(requests.len());
     for request in requests {
-        let MountRequest { origin, mount } = request;
-        let spelling = mount.guest.to_str().ok_or_else(|| ClaimError::Guest {
-            origin: origin.clone(),
-            error: anyhow::anyhow!("--mount guest path must be UTF-8"),
-        })?;
-        let guest = normalize_guest(spelling).map_err(|error| ClaimError::Guest {
-            origin: origin.clone(),
-            error,
-        })?;
-        normalized.push(MountRequest {
-            origin,
-            mount: ExtraMount { guest, ..mount },
-        });
+        normalized.push(normalize_request(request)?);
     }
 
     let mut unique: Vec<MountRequest> = Vec::with_capacity(normalized.len());
@@ -3178,6 +3225,30 @@ pub(crate) fn claim(
         }
     }
     Ok(unique)
+}
+
+/// Normalize one declaration's guest spelling — the first half of [`claim`],
+/// without the cross-declaration adjudication.
+///
+/// Its own function because a mount set validates a *closure* of declarations
+/// against an index rather than against a growing vector: one candidate at a time
+/// is still normalised by this one rule, so a config cannot get two different
+/// guest normalizations.
+#[allow(clippy::result_large_err)] // see [`claim`]
+pub(crate) fn normalize_request(request: MountRequest) -> Result<MountRequest, ClaimError> {
+    let MountRequest { origin, mount } = request;
+    let spelling = mount.guest.to_str().ok_or_else(|| ClaimError::Guest {
+        origin: origin.clone(),
+        error: anyhow::anyhow!("--mount guest path must be UTF-8"),
+    })?;
+    let guest = normalize_guest(spelling).map_err(|error| ClaimError::Guest {
+        origin: origin.clone(),
+        error,
+    })?;
+    Ok(MountRequest {
+        origin,
+        mount: ExtraMount { guest, ..mount },
+    })
 }
 
 /// Prepare a complete, closed mount plan.  This is deliberately the only
@@ -3514,6 +3585,9 @@ fn discovered_by(declarations: &[(Declaration<'_>, String)]) -> String {
                     Declaration::UserConfig { file, .. } => {
                         format!("mounts in {}", crate::one_line::quoted_path(file))
                     }
+                    Declaration::UserSet { file, .. } => {
+                        format!("mount_sets in {}", crate::one_line::quoted_path(file))
+                    }
                 };
                 if !sources.contains(&source) {
                     sources.push(source);
@@ -3661,7 +3735,11 @@ fn sync_fork_representations(unique: &[ExtraMount], expanded: &mut [ExtraMount])
 /// equalities and lets the kernel decide. Host spelling and the measured `host`
 /// are separate facts on purpose — `~/ref` and `~/ref/` can name one guest path
 /// while exposing different bytes, so spelling participates.
-fn same_declaration(a: &ExtraMount, b: &ExtraMount) -> bool {
+///
+/// `pub(crate)` because `config_mounts`'s indexed closure validator applies this
+/// same six-field rule: there is deliberately no second equivalence policy for
+/// mount sets.
+pub(crate) fn same_declaration(a: &ExtraMount, b: &ExtraMount) -> bool {
     declarations_equivalent(DeclarationFacts {
         spelling: a.source_spelling == b.source_spelling,
         host: a.host == b.host,
@@ -3693,7 +3771,7 @@ fn node_kind(
             "{} must be a regular file or directory",
             match declaration {
                 Declaration::Argv => crate::one_line::path(path).to_string(),
-                Declaration::UserConfig { .. } => {
+                Declaration::UserConfig { .. } | Declaration::UserSet { .. } => {
                     format!("{} {}", declaration.subject(), quoted_path(path))
                 }
             }
@@ -4955,6 +5033,116 @@ mod prepare_tests {
                 )
             );
         }
+    }
+
+    /// A declaration inside a named mount set is attributed like a config entry —
+    /// by the set's escaped name and the measured file — and its refusal keeps the
+    /// `--no-config-mounts` advice off it, because that flag does not remove an
+    /// explicitly selected set.
+    #[test]
+    fn a_set_declaration_is_named_by_set_entry_and_file() {
+        let file = Path::new("/home/u/.config/agent-vm/config.toml");
+        let set = Declaration::UserSet {
+            file,
+            set: "agent",
+            index: 2,
+        };
+        assert_eq!(
+            set.subject(),
+            "mount_sets[\"agent\"][2] in \"/home/u/.config/agent-vm/config.toml\""
+        );
+        // The spelling and the resolved host take the config escape policy: an
+        // entry's own text is attacker-chosen, so it cannot end the line.
+        assert_eq!(Spelling::new("/srv/a\nb").render(set), "\"/srv/a\\x0ab\"");
+        assert_eq!(
+            canonicalizing_context(set, &Spelling::new("/srv/café")),
+            "canonicalizing mount_sets[\"agent\"][2] in \
+             \"/home/u/.config/agent-vm/config.toml\" host \"/srv/caf\\xc3\\xa9\""
+        );
+        assert_eq!(
+            fork_root_context("resolving", set, Path::new("/srv/a\nb")),
+            "resolving mount_sets[\"agent\"][2] in \
+             \"/home/u/.config/agent-vm/config.toml\" fork root \"/srv/a\\x0ab\""
+        );
+        // The origin's own name is the same sentence, and it escapes the set name
+        // through the config text policy rather than the measured-path one. A
+        // real name cannot carry these bytes (decision A1); the arm exists so a
+        // future widening of the grammar cannot forge a line.
+        assert_eq!(
+            MountOrigin::UserSet {
+                file: file.to_path_buf(),
+                set: std::sync::Arc::from("a\"b"),
+                index: 0,
+            }
+            .to_string(),
+            "mount_sets[\"a\\\"b\"][0] in \"/home/u/.config/agent-vm/config.toml\""
+        );
+
+        // A core collision names the entry and offers no opt-out advice: the flag
+        // an explicit selection ignores would be wrong advice.
+        let core = ClaimError::Core {
+            origin: MountOrigin::UserSet {
+                file: file.to_path_buf(),
+                set: std::sync::Arc::from("agent"),
+                index: 2,
+            },
+            guest: PathBuf::from("/core"),
+        }
+        .to_string();
+        assert_eq!(
+            core,
+            "mount_sets[\"agent\"][2] in \"/home/u/.config/agent-vm/config.toml\": guest path \
+             /core collides with an agent-vm core mount; remove it from that mount set"
+        );
+        assert!(!core.contains("--no-config-mounts"), "{core}");
+
+        // Two set declarations at one guest path, in either order, name both.
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let conflict = |first_origin: MountRequest, second_origin: MountRequest| {
+            claim(vec![first_origin, second_origin], &[])
+                .unwrap_err()
+                .to_string()
+        };
+        let request = |origin: MountOrigin, host: &Path| MountRequest {
+            origin,
+            mount: parse_mount_spec(
+                &format!("{}:/g:ro", host.display()),
+                HostSyntax::AbsoluteOnly,
+            )
+            .unwrap(),
+        };
+        let set_origin = |index| MountOrigin::UserSet {
+            file: file.to_path_buf(),
+            set: std::sync::Arc::from("agent"),
+            index,
+        };
+        let defaults = MountOrigin::UserConfig {
+            file: file.to_path_buf(),
+            index: 0,
+        };
+        assert_eq!(
+            conflict(
+                request(set_origin(1), &second),
+                request(set_origin(0), &first)
+            ),
+            "guest path /g is claimed by different declarations (mount_sets[\"agent\"][1] in \
+             \"/home/u/.config/agent-vm/config.toml\" and mount_sets[\"agent\"][0] in \
+             \"/home/u/.config/agent-vm/config.toml\"); identical declarations are merged and \
+             different ones are refused"
+        );
+        // The shared sentence names whichever pair it saw, so a default-versus-set
+        // conflict is not mistaken for an argv one.
+        assert_eq!(
+            conflict(request(set_origin(0), &first), request(defaults, &second)),
+            "guest path /g is claimed by different declarations (mount_sets[\"agent\"][0] in \
+             \"/home/u/.config/agent-vm/config.toml\" and mounts[0] in \
+             \"/home/u/.config/agent-vm/config.toml\"); identical declarations are merged and \
+             different ones are refused"
+        );
     }
 
     /// The argv sentences end to end: a non-ASCII source spelling reaches the

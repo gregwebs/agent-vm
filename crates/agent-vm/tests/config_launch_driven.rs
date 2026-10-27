@@ -11450,3 +11450,128 @@ fn a_provisioned_definition_supplies_credentials_and_paths_but_no_metadata() {
         "no provisioned-definition metadata may appear in the sandbox config"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Named mount sets (#397) reach every launch route and change nothing else
+// ---------------------------------------------------------------------------
+
+/// **#397.** A named mount set is a mount-selection input on all three launch
+/// routes — a project tool, the builtin `shell`, and a direct command — and it is
+/// the *only* thing it changes: the resolved guest command line, the credential
+/// files under the project state dir and every persisted guest-HOME link are
+/// identical with the set selected as a default, selected explicitly under the
+/// opt-out, and with no set at all.
+///
+/// The facet pair is the point: a mount that quietly reordered provisioning, or
+/// an opt-out that dropped a persisted link, would show up here rather than in a
+/// mount-specific assertion.
+#[test]
+fn named_mount_sets_join_every_launch_route_without_touching_provisioning() {
+    /// One route's observables: the guest command line, the sandbox's serialized
+    /// `(host, guest, readonly)` binds, and the provisioning snapshot.
+    type Facets = (
+        String,
+        Vec<(String, String, bool)>,
+        BTreeMap<String, String>,
+    );
+
+    fn facets(route: &str, options: &[&str], with_sets: bool) -> Facets {
+        let h = Harness::warm();
+        let source = h.home_root.join("fm");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("marker"), "marker").unwrap();
+        if with_sets {
+            h.write_user(
+                "mounts = [\"fm-set\"]\n[mount_sets]\n\
+                 fm-set = [\"~/fm:/fm:ro\"]\n\
+                 other = [\"/nonexistent-agent-vm-launch-probe:/probe:ro\"]\n",
+            );
+        }
+        h.write_project(
+            "[[tools]]\nname = \"proj\"\ncommand = \"/bin/echo\"\ncredentials = [\"anthropic\"]\n\
+             persist = [\"code\"]\n",
+        );
+        let out = match route {
+            "tool" => h.launch("proj", options),
+            "shell" => h.launch("shell", options),
+            _ => {
+                let mut argv = vec!["--image", BOGUS_IMAGE];
+                argv.extend_from_slice(options);
+                h.direct(DirectInvocation {
+                    form: Form::Run,
+                    options: &argv,
+                    vector: &["/bin/echo", "direct"],
+                    envs: &[],
+                })
+            }
+        };
+        let stderr = stderr_of(&out);
+        let state = state_dir(&stderr);
+        // Two independent observables, asserted apart: the sandbox's serialized
+        // bind list (what the guest would see) and the provisioning snapshot (the
+        // credential files and persisted guest-HOME links under the state dir).
+        let binds: Vec<(String, String, bool)> = debug_config_json(&stderr)["mounts"]
+            .as_array()
+            .expect("config.mounts must be an array")
+            .iter()
+            .filter(|mount| mount["type"] == "Bind")
+            .map(|mount| {
+                (
+                    mount["host"].as_str().expect("host").to_string(),
+                    mount["guest"].as_str().expect("guest").to_string(),
+                    mount["options"]["readonly"].as_bool().expect("readonly"),
+                )
+            })
+            .collect();
+        (debug_guest_command(&stderr), binds, snapshot(&state))
+    }
+
+    for route in ["tool", "shell", "direct"] {
+        let (baseline_command, baseline_binds, baseline_snapshot) = facets(route, &[], false);
+        assert_eq!(
+            baseline_command,
+            match route {
+                "tool" => "/bin/echo",
+                "shell" => "bash -O histappend",
+                _ => "/bin/echo direct",
+            },
+            "{route}: the baseline route must be the expected one"
+        );
+        assert!(
+            !baseline_binds.iter().any(|(_, guest, _)| guest == "/fm"),
+            "{route}: the control must not mount the set's source: {baseline_binds:?}"
+        );
+        // A named default, and the same set selected explicitly under the opt-out.
+        for (label, options) in [
+            ("default", vec![]),
+            (
+                "opt-out plus explicit set",
+                vec!["--no-config-mounts", "--mount", "fm-set"],
+            ),
+        ] {
+            let (command, binds, snapshot) = facets(route, &options, true);
+            // The mount join itself, against the serialized bind list: the selected
+            // set's leaf is bound read-only at its guest path on *every* route, and
+            // the unrelated definition in the same table is not bound at all.
+            let source = binds.iter().find(|(_, guest, _)| guest == "/fm");
+            assert!(
+                source.is_some_and(|(_, _, readonly)| *readonly),
+                "{route} ({label}): the selected set must bind /fm read-only: {binds:?}"
+            );
+            assert!(
+                !binds.iter().any(|(_, guest, _)| guest == "/probe"),
+                "{route} ({label}): an unselected set must bind nothing: {binds:?}"
+            );
+            // Provisioning is a separate facet: the guest command line, the
+            // credential files and every persisted HOME link are unchanged.
+            assert_eq!(
+                command, baseline_command,
+                "{route} ({label}): guest command"
+            );
+            assert_eq!(
+                snapshot, baseline_snapshot,
+                "{route} ({label}): provisioning and persisted paths"
+            );
+        }
+    }
+}

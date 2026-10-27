@@ -622,6 +622,32 @@ synchronizes with the host; CM-N4 proves `--no-config-mounts` removes all three
 while the project mount still works (a positive control that the guest ran);
 CM-N5 proves an equivalent `--mount` reuses the config fork's identity.
 
+The named-mount-set rows (#397, `[mount_sets]`) continue the same run over the
+same owned synthetic `home/cm/{ro,rw,fork}` fixtures, after the N rows' cleanup:
+
+- **CM-S1** — the same file with a `[mount_sets]` table and **no** `mounts`
+  list: all three set mounts are absent while the project marker is present
+  (definitions alone mount nothing).
+- **CM-S2** — `mounts = ["all-set"]` prepended before the table: the `:ro` set
+  leaf reads its exact seed and both write attempts are denied, the `:rw` leaf
+  writes its exact marker through to the host, and the `:fork` leaf reads the
+  copy CM-N3a wrote.
+- **CM-S3** — the same file with `--no-config-mounts`: all three absent, project
+  marker visible.
+- **CM-S4** — the same file with `--no-config-mounts --mount all-set`: the same
+  observable access and modes as S2, no unrelated mount, and the fork still
+  holds the earlier `guest-fork` rather than the host's later write.
+
+The guest probe renders these phases even on failure and the driver compares
+exact whole lines, so a partial mount cannot pass. After proven cleanup the host
+oracle also asserts the read-only tree's digest is unchanged, the `:rw` marker is
+on the host, the host-side fork marker is still the later value, and there is one
+fork directory and manifest identity with no initialization/reseed notice. These
+rows are the only native evidence that a set selection changes *actual* mounted
+access; boot-free tests cannot close them. As with the N rows, a missing
+prerequisite is a receipted `BLOCKED:` line, and native acceptance for #397 stays
+outstanding until S1–S4 pass.
+
 Teardown is bounded and identity-checked: every launch is an owned process
 group, stopping is TERM → bounded wait → KILL, survivors are signalled only
 where their recorded identity still matches, catalog and socket-path absence is
@@ -636,8 +662,9 @@ If a prerequisite is missing, the PR body records
 BLOCKED: AGENT_VM_BIN=… AGENT_VM_LIVE_TEST_IMAGE=… bash script/test/config-mounts-live.sh -> <exact first error line>
 ```
 
-and states that native enforcement evidence for #394 is **outstanding**, so the
-PR says "Part of #394", not "Closes #394".
+and states that the native enforcement evidence (for #394 and/or #397, whichever
+rows were blocked) is **outstanding**, so the PR says "Part of #394"/"Part of
+#397", not "Closes …".
 
 `bash script/test/config-mounts-contract.sh` is the boot-free companion: it runs
 the guest probe against a host-only synthetic layout (permission and negative

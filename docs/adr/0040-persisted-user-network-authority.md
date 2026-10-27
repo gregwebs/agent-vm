@@ -207,3 +207,30 @@ it.
 - The gaps are unchanged, and now cover mounts too: mode `0600` is still not
   required, an immediate parent that is a symlink is still followed, and
   ancestors, ACLs and replacement races are still accepted.
+
+## Amendment: `[mount_sets]` joins the shared gate (ADR-0048, #397)
+
+#397 adds a third authority-bearing user field, the `[mount_sets]` table
+([ADR-0048](0048-named-mount-sets-and-tier-local-tool-references.md)), and it
+reaches Decision 2's read unchanged. Nothing in this ADR's threat model, rule
+sequence or accepted gaps changes; the fields that reach the gate, and the
+sentences that name them, grow from two to three.
+
+- `authority_required({network, mounts, mount_sets}) ==
+  (network || mounts || mount_sets)` — the same kernel, extended from a two-field
+  to a three-field disjunction and still total over every combination.
+- Decision 2's "a present user `[network]` table invokes authority checks" now
+  reads "a present `[network]` **or** `mounts` **or** `[mount_sets]`", and one file
+  declaring any subset is verified once.
+- Diagnostics name the field(s) that made the file authority-bearing, over all
+  seven nonempty combinations: `[network]`, `mounts`, `[mount_sets]`,
+  `[network] and mounts`, `[network] and [mount_sets]`,
+  `mounts and [mount_sets]`, `[network], mounts and [mount_sets]`. The
+  `[network]`-only and `mounts`-only bytes are unchanged, pinned by whole-sentence
+  literals in `config_authority`'s test oracle.
+- A file that declares `mount_sets` without `mounts` is authority-bearing *and*
+  verifies, so "a symlinked config without `mounts` still works" is not a
+  statement that such a file is safe — the aside names the field that is absent.
+- The gaps are unchanged and now cover mount sets too: mode `0600` is not
+  required, an immediate parent that is a symlink is followed, and ancestors,
+  ACLs and replacement races remain accepted.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serial native config-mounts rows (#394 / ADR-0046).
+"""Serial native config-mounts rows (#394 / ADR-0046, #397 / ADR-0048).
 
 Boot-free fake-`msb` assertions are not native enforcement evidence and are
 never counted here: every row below boots the digest-pinned image through the
@@ -72,6 +72,32 @@ def tree_digest(path):
 
 def marker(path):
     return path.read_text() if path.is_file() else "absent"
+
+
+def fork_identity(work):
+    """Every published fork's directory name and manifest digest, sorted.
+
+    Read after a launch's cleanup proved absence. The comparison is the point:
+    selecting a set, nesting it or renaming it must not create a second copy or
+    reseed this one, which would change both values.
+    """
+    identity = []
+    for manifest in sorted((work / "state").glob("*.mounts/forks/*/manifest.json")):
+        digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        identity.append([manifest.parent.name, digest])
+    return identity
+
+
+# The named-mount-set document (#397). Declared only, it selects nothing; with
+# `mounts = ["all-set"]` prepended it selects the three leaves, and a repeated
+# reference inside `all-set` must change nothing.
+SETS_TABLE = """[mount_sets]
+all-set = ["ro-set", "rw-set", "fork-set", "ro-set"]
+ro-set = ["~/cm/ro:/cm/ro:ro"]
+rw-set = ["~/cm/rw:/cm/rw:rw"]
+fork-set = ["~/cm/fork:/cm/fork:fork"]
+"""
+SETS_DEFAULT = 'mounts = ["all-set"]\n'
 
 
 def interrupted(signum, _frame):
@@ -208,6 +234,52 @@ def main():
         l4 = launch("L4", "n5", ("--no-config-mounts", "--mount", f"{home}/cm/fork:/cm/fork:fork"))
         record("CM-N5", "CM-N5 read=guest-fork", guest_line(l4, "CM-N5"))
         cleanup(launches[3], "L4")
+
+        # ---- named mount sets (#397) ---------------------------------------
+        # Every config rewrite below happens only after the previous launch's
+        # cleanup proved absence, and each launch's command line and config bytes
+        # are retained beside its before/after receipts.
+        absent_line = "CM-S ro=absent rw=absent fork=absent project=present"
+        access_line = ("CM-S access ro=seed-ro ro-write=denied rw=wrote fork=guest-fork "
+                       "project=present")
+        fork_before = fork_identity(work)
+
+        def write_config(row, body):
+            config.write_text(body)
+            config.chmod(0o600)
+            shutil.copy2(config, evidence / f"{row}-config.toml")
+
+        # S1: definitions alone must mount nothing.
+        write_config("S1", SETS_TABLE)
+        s1 = launch("S1", "sets-absent")
+        record("CM-S1", absent_line, guest_line(s1, "CM-S"))
+        cleanup(launches[4], "S1")
+
+        # S2: the defaults select the set's three leaves.
+        write_config("S2", SETS_DEFAULT + SETS_TABLE)
+        s2 = launch("S2", "sets")
+        record("CM-S2", access_line, guest_line(s2, "CM-S"))
+        cleanup(launches[5], "S2")
+        if "==> Reusing fork" not in s2 or "Initialized fork" in s2:
+            raise AssertionError("CM-S2: the set-selected fork was not reused")
+
+        # S3: the opt-out removes all three again, project still visible.
+        s3 = launch("S3", "sets-absent", ("--no-config-mounts",))
+        record("CM-S3", absent_line, guest_line(s3, "CM-S"))
+        cleanup(launches[6], "S3")
+
+        # S4: the opt-out plus an explicit name grants exactly S2's access.
+        s4 = launch("S4", "sets", ("--no-config-mounts", "--mount", "all-set"))
+        record("CM-S4", access_line, guest_line(s4, "CM-S"))
+        cleanup(launches[7], "S4")
+        if "==> Reusing fork" not in s4 or "Initialized fork" in s4:
+            raise AssertionError("CM-S4: the explicitly selected set reseeded the fork")
+
+        # Host oracles, read only after the last launch's cleanup proved absence.
+        record("CM-S-host-ro", ro_tree, tree_digest(home / "cm/ro"))
+        record("CM-S-host-rw", "set-rw", marker(rw_marker))
+        record("CM-S-host-fork", "host-later", marker(fork_marker))
+        record("CM-S-host-fork-identity", fork_before, fork_identity(work))
     except (AssertionError, OSError, RuntimeError, InterruptedError, subprocess.SubprocessError) as error:
         errors.append(str(error) or repr(error))
     finally:

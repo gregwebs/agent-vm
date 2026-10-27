@@ -1,80 +1,344 @@
-//! The config mounts a verified user config selects for every launch.
+//! The config mounts a verified user config selects, and the named mount sets it
+//! may declare.
 //!
-//! ADR-0046 accepts one top-level `mounts` array in the *user* config. It is a
-//! declaration list, not a trust source of its own: the file must first pass
-//! ADR-0040's verified-read policy, and [`from_verified_value`] demands the
-//! [`AuthorizedConfig`] token that only [`crate::config_authority::verify`] can
-//! mint — so a `mounts` list cannot be parsed from an unverified read, and there
-//! is no second, laxer path to these declarations.
+//! ADR-0046 accepts one top-level `mounts` array in the *user* config; ADR-0048
+//! adds a `[mount_sets]` table whose entries may be selected by name from that
+//! array and from `--mount`. Neither is a trust source of its own: the file must
+//! first pass ADR-0040's verified-read policy, and [`from_verified_value`]
+//! demands the [`AuthorizedConfig`] token that only
+//! [`crate::config_authority::verify`] can mint — so no mount declaration can be
+//! parsed from an unverified read, and there is no second, laxer path to these
+//! declarations.
 //!
-//! Two rules shape everything here:
+//! Four rules shape everything here:
 //!
-//! * **Presence, not contents.** `mounts = []` still makes the file
-//!   authority-bearing (that is `config_authority`'s trigger, decided before
-//!   this module runs); an empty list simply selects nothing.
+//! * **Presence, not contents.** `mounts = []` and `[mount_sets]` (even an empty
+//!   table, even an empty set) still make the file authority-bearing; that is
+//!   `config_authority`'s trigger, decided before this module runs. An empty list
+//!   or table simply selects nothing.
+//! * **Declarations are inert.** A definition mounts nothing. Only the defaults
+//!   list, or an explicit `--mount NAME`, selects filesystem access.
+//! * **The whole graph is validated at load.** Every declared set's transitive
+//!   closure is resolved and checked — unknown names, set-reference cycles and a
+//!   closure that claims one guest path twice with differing declarations are
+//!   config errors even in an unused set and under `--no-config-mounts`. That is
+//!   the same rule that already made a self-contradictory `mounts` list a load
+//!   error; `config_mounts::sets` owns the graph and bounds its cost.
 //! * **No source access.** Parsing, `~/` expansion, guest normalization and the
-//!   intra-config claim read no mount source: nothing in this module opens,
-//!   stats or canonicalizes a declared path. Whether a source exists is a
-//!   launch-time question about *selected* mounts only, so a config naming a
-//!   path that does not exist — or one that cannot be reached — still loads (an
-//!   opt-out launch must not care).
+//!   closure claims read no mount source: nothing in this module opens, stats or
+//!   canonicalizes a declared path. Whether a source exists is a launch-time
+//!   question about *selected* mounts only, so a config naming a path that does
+//!   not exist — or one that cannot be reached — still loads (an opt-out launch
+//!   must not care). That is also why an unused set's absent source cannot block
+//!   an unrelated tool.
 //!
-//! Load-time diagnostics name the field and the index and never the value: a
-//! `mounts` entry can carry an attacker-chosen path, and the sentence is printed
-//! to a user deciding whether to trust the file. A *launch-time* refusal is a
+//! Load-time diagnostics name the field and the numeric position and never the
+//! value: a `mounts` entry or `mount_sets` key can carry attacker-chosen text,
+//! and the sentence is printed to a user deciding whether to trust the file.
+//! Set-entry sites are `mount_sets[DEFINITION][INDEX]` with both numbers, so even
+//! an invalid *key* is named without echoing it. A *launch-time* refusal is a
 //! different question — it has to name the host or guest path it could not
 //! prepare, or the user cannot fix it — so those sentences name the declaration
-//! as `mounts[N] in "<file>"` and render the **declared host spelling** with
-//! `config`'s escaping (`quoted_str`/`quoted_path`), never raw. That is what keeps
-//! a refusal, a fork notice or an error context to one line when a spelling
-//! carries a newline: the value is echoed escaped, so a config cannot forge a
-//! second diagnostic. (`--mount` keeps its historical unescaped renderings on
-//! purpose; they are byte-pinned and a shell's argv is not a trusted-file
-//! question. A guest path is escaped-or-refused by the shared grammar, which
-//! rejects control characters, and paths taken from the host's own measurement
-//! are not config text at all.)
+//! as `mounts[N] in "<file>"` or `mount_sets["NAME"][I] in "<file>"` and render
+//! the **declared host spelling** with `config`'s escaping
+//! (`quoted_str`/`quoted_path`), never raw. That is what keeps a refusal, a fork
+//! notice or an error context to one line when a spelling carries a newline: the
+//! value is echoed escaped, so a config cannot forge a second diagnostic.
+//! (`--mount` keeps its historical unescaped renderings on purpose; they are
+//! byte-pinned and a shell's argv is not a trusted-file question. A guest path is
+//! escaped-or-refused by the shared grammar, which rejects control characters,
+//! and paths taken from the host's own measurement are not config text at all.)
+
+mod sets;
+
+pub(crate) use sets::UserMounts;
 
 use crate::{
     config_authority::AuthorizedConfig,
-    mount::{
-        ClaimError, HostSyntax, MountOrigin, MountRequest, MountSpecErrorKind, claim,
-        parse_mount_spec,
-    },
+    mount::{ExtraMount, HostSyntax, MountSpecError, MountSpecErrorKind, parse_mount_spec},
 };
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-};
+use std::{fmt, path::Path};
+use vstd::prelude::*;
 
-/// One verified user file's `mounts`: the file it came from and its claimed
-/// declarations in file order.
+verus! {
+/// Bytes an accepted mount-set name may start with: ASCII letter, digit or `_`.
 ///
-/// [`Self::requests`] is already normalized and deduplicated (identical
-/// declarations at one guest path merged into the first), so a later claim
-/// against `--mount` needs no second pass over this list.
-#[derive(Clone, Debug)]
-pub(crate) struct UserMounts {
-    file: PathBuf,
-    requests: Vec<MountRequest>,
+/// Deliberately **not** `ToolName`'s alphabet: a leading `-` would read as a flag
+/// to an outer script, `/` and `:` would make a name look like a path or a
+/// modifier, and reserving launch-verb words would forbid `--mount pi` selecting
+/// the set a user named `pi`.
+pub open spec fn mount_set_name_first_byte_ok(byte: u8) -> bool {
+    (b'a' <= byte && byte <= b'z')
+        || (b'A' <= byte && byte <= b'Z')
+        || (b'0' <= byte && byte <= b'9')
+        || byte == b'_'
 }
 
-impl UserMounts {
-    pub(crate) fn file(&self) -> &Path {
-        &self.file
+/// Bytes an accepted mount-set name may contain after its first byte: the same
+/// alphabet plus `.` and `-`.
+pub open spec fn mount_set_name_byte_ok(byte: u8) -> bool {
+    mount_set_name_first_byte_ok(byte) || byte == b'.' || byte == b'-'
+}
+
+/// The whole name decision (decision A1): accepted iff the bytes are nonempty,
+/// the first byte is `[A-Za-z0-9_]`, and every remaining byte is
+/// `[A-Za-z0-9_.-]`.
+///
+/// "Not all dots" needs no clause of its own: `.`, `..` and any all-dot sequence
+/// fail at byte zero. Case is significant and there is no folding, so `A` and `a`
+/// are two names. Every non-ASCII byte, being outside all three ranges, fails —
+/// so a Unicode name is rejected at its first non-ASCII byte rather than folded
+/// into an ASCII one.
+pub open spec fn mount_set_name_spec(bytes: Seq<u8>) -> bool {
+    bytes.len() >= 1
+        && mount_set_name_first_byte_ok(bytes[0])
+        && forall|i: int| 1 <= i < bytes.len() ==> mount_set_name_byte_ok(bytes[i])
+}
+
+// The `<=` spelling (rather than clippy's suggested `(b'a'..=b'z').contains`) is
+// kept so the exec bytes stay syntactically the predicate the `verus!` spec fn
+// unfolds to — the same allow and the same reason as
+// `secret_store::service_name_is_valid_bytes`.
+#[allow(clippy::manual_range_contains)]
+pub fn mount_set_name_bytes(bytes: &[u8]) -> (r: bool)
+    ensures r == mount_set_name_spec(bytes@),
+{
+    let len = bytes.len();
+    if len == 0 {
+        return false;
+    }
+    let first = bytes[0];
+    if !((b'a' <= first && first <= b'z')
+        || (b'A' <= first && first <= b'Z')
+        || (b'0' <= first && first <= b'9')
+        || first == b'_')
+    {
+        return false;
+    }
+    let mut i: usize = 1;
+    while i < len
+        invariant
+            i <= len,
+            len == bytes@.len(),
+            len >= 1,
+            mount_set_name_first_byte_ok(bytes@[0]),
+            forall|j: int| 1 <= j < i ==> mount_set_name_byte_ok(bytes@[j]),
+        decreases len - i,
+    {
+        let byte = bytes[i];
+        if !((b'a' <= byte && byte <= b'z')
+            || (b'A' <= byte && byte <= b'Z')
+            || (b'0' <= byte && byte <= b'9')
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'-')
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+} // verus!
+
+/// One user-declared mount-set name, in its exact spelling.
+///
+/// The only constructor is [`MountSetName::parse`], so a name that reached a
+/// lookup, a diagnostic or [`crate::mount::MountOrigin::UserSet`] has passed
+/// decision A1. Case is preserved: `A` and `a` are different sets.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct MountSetName(String);
+
+impl MountSetName {
+    /// Decision A1 over one key or selector host segment. No trimming, folding or
+    /// other normalization: a definition key with surrounding spaces is invalid
+    /// rather than silently a different name.
+    pub(crate) fn parse(raw: &str) -> Result<Self, InvalidMountSetName> {
+        if !mount_set_name_bytes(raw.as_bytes()) {
+            return Err(InvalidMountSetName);
+        }
+        Ok(Self(raw.to_owned()))
     }
 
-    pub(crate) fn requests(&self) -> &[MountRequest] {
-        &self.requests
-    }
-
-    /// How many declarations this file selects after intra-file merging — the
-    /// number a launch notice reports, not the number of `mounts` entries.
-    pub(crate) fn len(&self) -> usize {
-        self.requests.len()
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-/// Parse a present `mounts` value from a file that has already been verified.
+/// A name that failed decision A1. Carries no bytes: the caller's sentence names
+/// the numeric site instead of the rejected text.
+#[derive(Debug)]
+pub(crate) struct InvalidMountSetName;
+
+impl fmt::Display for InvalidMountSetName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "a mount-set name is one or more ASCII characters: [A-Za-z0-9_] first, then \
+             [A-Za-z0-9_.-]",
+        )
+    }
+}
+
+/// Where one defaults entry or one set entry sits in the file.
+///
+/// Two variants, not an index plus a flag, so a defaults site can never print a
+/// set's coordinates. Load-time sites are numeric on purpose: a `mount_sets` key
+/// is attacker-chosen text, so an invalid key is named by its sorted position and
+/// a valid one by the same number rather than by its own bytes. A *launch-time*
+/// refusal renders [`crate::mount::MountOrigin::UserSet`] instead, where the name
+/// is escaped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EntrySite {
+    /// Entry `index` of the top-level `mounts` array.
+    Defaults { index: usize },
+    /// Entry `index` of the `definition`th `[mount_sets]` definition, ordered by
+    /// name so the number does not depend on TOML's key order.
+    SetEntry { definition: usize, index: usize },
+}
+
+impl fmt::Display for EntrySite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Defaults { index } => write!(f, "mounts[{index}]"),
+            Self::SetEntry { definition, index } => {
+                write!(f, "mount_sets[{definition}][{index}]")
+            }
+        }
+    }
+}
+
+/// The set table and the defaults list from one already-verified read.
+///
+/// A named bundle rather than two positional arguments: both are untyped
+/// `toml::Value`s at this seam (presence has already decided authority, and the
+/// shape is decided here), so the callee cannot tell them apart by type.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MountValues<'a> {
+    pub(crate) defaults: Option<&'a toml::Value>,
+    pub(crate) sets: Option<&'a toml::Value>,
+}
+
+/// One entry of a defaults list or a set definition, once its name is bound.
+pub(crate) enum MountSelector {
+    /// An ordinary `HOST[:GUEST][:MODE]...` declaration.
+    Direct(ExtraMount),
+    /// A reference to the user-defined set of this name. Selected only when this
+    /// entry is; the definition itself mounts nothing.
+    Set(MountSetName),
+}
+
+/// Why one entry was not a usable selector.
+///
+/// A direct path keeps the whole [`MountSpecError`], because the two consumers
+/// need different halves of it: `--mount` prints its historical byte-pinned
+/// chain, and config load prints the value-free
+/// [`MountSpecErrorKind`].
+#[derive(Debug)]
+pub(crate) enum SelectorError {
+    Direct(MountSpecError),
+    /// A valid set name followed by `:` — `agent:ro`, `agent:fork`,
+    /// `agent:/guest`. Modes, guest paths and exclusions belong to the path
+    /// declarations *inside* a set, so this is refused rather than reinterpreted.
+    SetModifier,
+}
+
+impl SelectorError {
+    /// The `--mount` rendering. A historic grammar refusal keeps its exact bytes;
+    /// the set-reference refusal is new text, so it can only add.
+    pub(crate) fn into_cli(self, entry: &str) -> anyhow::Error {
+        match self {
+            Self::Direct(error) => error.into_cli(),
+            Self::SetModifier => anyhow::anyhow!(
+                "--mount value {entry:?}: a mount-set name is a bare name; modes, a guest path \
+                 or exclusions belong to the paths declared inside the set"
+            ),
+        }
+    }
+}
+
+verus! {
+/// The three measured facts the selector classification needs.
+///
+/// Named fields rather than three adjacent booleans: two of them (`path` and
+/// `name`) are both "this host segment looks like something we know", and a call
+/// site that transposed them would turn a set lookup into a path lookup.
+#[derive(Clone, Copy, Debug)]
+pub struct SelectorFacts {
+    /// The trimmed host segment starts with `/` or `~/`.
+    pub path_spelling: bool,
+    /// The trimmed host segment satisfies decision A1.
+    pub name_spelling: bool,
+    /// The entry has at least one `:` after the host segment.
+    pub has_modifier: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
+pub enum SelectorKind { Path, Set, ModifiedName, Other }
+
+/// ADR-0018 kernel: which grammar one entry belongs to.
+///
+/// Total over the three facts, with path spelling taking precedence, so an
+/// absolute (or `~/`) host can never be reclassified as a set name — the
+/// compatibility rule that keeps every working `--mount /abs:...` a path. A valid
+/// bare name is a set; the same name with a `:` is a refused modifier, whichever
+/// name it is; anything else goes to the direct parser, which refuses relative
+/// host spellings itself.
+pub fn selector_kind(f: SelectorFacts) -> (k: SelectorKind)
+    ensures
+        f.path_spelling ==> k == SelectorKind::Path,
+        (!f.path_spelling && f.name_spelling && !f.has_modifier) ==> k == SelectorKind::Set,
+        (!f.path_spelling && f.name_spelling && f.has_modifier) ==> k == SelectorKind::ModifiedName,
+        (!f.path_spelling && !f.name_spelling) ==> k == SelectorKind::Other,
+{
+    if f.path_spelling {
+        SelectorKind::Path
+    } else if f.name_spelling {
+        if f.has_modifier { SelectorKind::ModifiedName } else { SelectorKind::Set }
+    } else {
+        SelectorKind::Other
+    }
+}
+} // verus!
+
+/// Classify and parse one entry of the defaults list, of a set definition, or of
+/// `--mount`. One function for all three, so CLI and config cannot disagree about
+/// what a name is (ADR-0048).
+///
+/// `syntax` is the caller's grammar: `--mount` refuses a literal `~/`, config
+/// expands it against the captured host home. The classification measures the
+/// **trimmed** host segment, exactly as the shared parser does, but the original
+/// full text is what reaches that parser, so no spelling is rebuilt.
+pub(crate) fn parse_selector(
+    text: &str,
+    syntax: HostSyntax<'_>,
+) -> Result<MountSelector, SelectorError> {
+    let host = text.split(':').next().unwrap_or_default().trim();
+    let name = MountSetName::parse(host).ok();
+    let kind = selector_kind(SelectorFacts {
+        path_spelling: host.starts_with('/') || host.starts_with("~/"),
+        name_spelling: name.is_some(),
+        has_modifier: text.contains(':'),
+    });
+    match kind {
+        SelectorKind::Set => match name {
+            Some(name) => Ok(MountSelector::Set(name)),
+            // Unreachable: the kernel only says `Set` for a measured name.
+            // Falling through to the path grammar keeps a wrong kernel
+            // fail-closed instead of accepting text nothing validated.
+            None => parse_direct(text, syntax),
+        },
+        SelectorKind::ModifiedName => Err(SelectorError::SetModifier),
+        SelectorKind::Path | SelectorKind::Other => parse_direct(text, syntax),
+    }
+}
+
+fn parse_direct(text: &str, syntax: HostSyntax<'_>) -> Result<MountSelector, SelectorError> {
+    parse_mount_spec(text, syntax)
+        .map(MountSelector::Direct)
+        .map_err(SelectorError::Direct)
+}
+
+/// Parse both present mount fields of a file that has already been verified.
 ///
 /// `home` is the `$HOME` the user path was discovered from
 /// ([`crate::config::ConfigPaths::home`]), never a fresh environment read: a
@@ -83,95 +347,96 @@ impl UserMounts {
 /// about.
 pub(crate) fn from_verified_value(
     authorized: &AuthorizedConfig<'_>,
-    value: &toml::Value,
+    values: MountValues<'_>,
     home: Option<&Path>,
 ) -> Result<UserMounts, UserMountsError> {
-    let file = authorized.file().to_path_buf();
-    let entries = value.as_array().ok_or(UserMountsError::NotArray)?;
-    let syntax = HostSyntax::AbsoluteOrHome {
-        home: home.and_then(Path::to_str),
-    };
-    let mut requests = Vec::with_capacity(entries.len());
-    for (index, entry) in entries.iter().enumerate() {
-        let text = entry.as_str().ok_or(UserMountsError::NotString { index })?;
-        let mount = parse_mount_spec(text, syntax).map_err(|error| UserMountsError::Entry {
-            index,
-            kind: error.kind(),
-        })?;
-        requests.push(MountRequest {
-            origin: MountOrigin::UserConfig {
-                file: file.clone(),
-                index,
-            },
-            mount,
-        });
-    }
-    // The claim runs here, with no core paths, so a self-contradictory file is a
-    // *load* error rather than a launch-time surprise after host state exists.
-    // Core collisions stay launch-time because they depend on the launch's own
-    // project/state paths.
-    let requests = claim(requests, &[]).map_err(UserMountsError::from_claim)?;
-    Ok(UserMounts { file, requests })
+    UserMounts::parse(authorized.file().to_path_buf(), values, host_syntax(home))
 }
 
-/// Why a `mounts` value was rejected. Every variant renders without echoing any
-/// config text; `config` adds the file name around it.
+/// [`from_verified_value`], also reporting the leaf visits it admitted — even when
+/// it refuses, where the counter is otherwise observable only as the refusal.
+///
+/// Test-only, and it still demands the token: the budget's behaviour is a
+/// property of the authorized path, so a test must not be able to measure a
+/// construction no launch could reach.
+#[cfg(test)]
+pub(crate) fn from_verified_value_with_work(
+    authorized: &AuthorizedConfig<'_>,
+    values: MountValues<'_>,
+    home: Option<&Path>,
+) -> (Result<UserMounts, UserMountsError>, usize) {
+    UserMounts::parse_with_work(authorized.file().to_path_buf(), values, host_syntax(home))
+}
+
+/// The host grammar one verified file's entries are parsed with: `~/` expands
+/// against the `$HOME` its path was discovered from, never a fresh environment
+/// read, and `None` means the host has no UTF-8 home.
+fn host_syntax(home: Option<&Path>) -> HostSyntax<'_> {
+    HostSyntax::AbsoluteOrHome {
+        home: home.and_then(Path::to_str),
+    }
+}
+
+/// Why a `mounts` list or a `[mount_sets]` table was rejected. Every variant
+/// renders without echoing any config text; `config` adds the file name around it.
 #[derive(Debug)]
 pub(crate) enum UserMountsError {
+    /// `mounts` was present but not an array.
     NotArray,
-    NotString {
-        index: usize,
-    },
+    /// One `mounts` entry was not a string.
+    NotString { index: usize },
     /// One entry failed the shared `HOST[:GUEST][:MODE]...` grammar.
     Entry {
-        index: usize,
+        site: EntrySite,
         kind: MountSpecErrorKind,
     },
     /// The claim refused a guest spelling (`/`, relative, `..`, `:`).
-    GuestNotMountable {
-        index: usize,
-    },
+    GuestNotMountable { site: EntrySite },
     /// Unreachable from config load, which passes no core paths — stated rather
     /// than assumed so the sentence stays value-free if it ever fires.
-    CoreCollision {
-        index: usize,
-    },
-    /// Two entries claim one guest path and do not agree.
-    Conflict {
-        index: usize,
-        other: usize,
-    },
+    CoreCollision { site: EntrySite },
+    /// Two entries claim one guest path and do not agree. At config load both
+    /// sites are in this file; at launch the same kernel reports origins.
+    Conflict { site: EntrySite, other: EntrySite },
+    /// `mount_sets` was present but not a table.
+    SetsNotTable,
+    /// The `definition`th `[mount_sets]` key is not a valid name.
+    SetName { definition: usize },
+    /// The `definition`th set's value is not an array of strings.
+    SetNotArray { definition: usize },
+    /// One entry of the `definition`th set is not a string.
+    SetNotString { definition: usize, index: usize },
+    /// A set name was written with a `:` — modes, a guest path or an exclusion.
+    SetReferenceModified { site: EntrySite },
+    /// A reference names no declared set. Never a path lookup fallback.
+    UnknownSet { site: EntrySite },
+    /// A set reference cycle. `tools` cycles stay legal; this is the mount half.
+    Cycle { site: EntrySite },
+    /// The admitted leaf-visit budget for validating every declared closure is
+    /// exhausted. A value-free resource refusal, not a conflict or source error.
+    ExpansionWorkLimit,
+    /// Unreachable: a dependency's closure was not compiled before its
+    /// dependent's. Refused rather than skipped, so a wrong traversal order can
+    /// never silently drop a set from validation.
+    ReferenceOrder,
 }
 
 impl UserMountsError {
-    fn from_claim(error: ClaimError) -> Self {
+    /// Map a claim failure about one entry of this file onto the entry's site.
+    fn from_claim(error: crate::mount::ClaimError, site: &EntrySite) -> Self {
         match error {
             // The grammar's own sentence names the guest spelling, so only the
             // kind survives to the config route.
-            ClaimError::Guest { origin, .. } => Self::GuestNotMountable {
-                index: index_of(&origin),
-            },
-            ClaimError::Core { origin, .. } => Self::CoreCollision {
-                index: index_of(&origin),
-            },
-            ClaimError::Conflict { first, second, .. } => Self::Conflict {
-                index: index_of(&second),
-                other: index_of(&first),
+            crate::mount::ClaimError::Guest { .. } => {
+                Self::GuestNotMountable { site: site.clone() }
+            }
+            crate::mount::ClaimError::Core { .. } => Self::CoreCollision { site: site.clone() },
+            // A single-entry claim cannot conflict with anything.
+            crate::mount::ClaimError::Conflict { .. } => Self::Conflict {
+                site: site.clone(),
+                other: site.clone(),
             },
         }
-    }
-}
-
-/// The `mounts` index behind a claim error's origin.
-///
-/// [`from_verified_value`] tags every request `UserConfig`, so this is the index
-/// in the file. The `Cli` arm cannot be reached from here; `0` names a real
-/// entry, so even then the sentence stays well-formed and value-free instead of
-/// panicking on a report path.
-fn index_of(origin: &MountOrigin) -> usize {
-    match origin {
-        MountOrigin::UserConfig { index, .. } => *index,
-        MountOrigin::Cli => 0,
     }
 }
 
@@ -180,21 +445,50 @@ impl fmt::Display for UserMountsError {
         match self {
             Self::NotArray => f.write_str("mounts: must be an array of strings"),
             Self::NotString { index } => write!(f, "mounts[{index}]: must be a string"),
-            Self::Entry { index, kind } => write!(f, "mounts[{index}]: {kind}"),
-            Self::GuestNotMountable { index } => write!(
+            Self::Entry { site, kind } => write!(f, "{site}: {kind}"),
+            Self::GuestNotMountable { site } => write!(
                 f,
-                "mounts[{index}]: guest path must be absolute, must not be /, and must not \
-                 contain `..`, `:`, `;`, `,` or control characters"
+                "{site}: guest path must be absolute, must not be /, and must not contain `..`, \
+                 `:`, `;`, `,` or control characters"
             ),
-            Self::CoreCollision { index } => write!(
+            Self::CoreCollision { site } => {
+                write!(f, "{site}: guest path collides with an agent-vm core mount")
+            }
+            Self::Conflict { site, other } => write!(
                 f,
-                "mounts[{index}]: guest path collides with an agent-vm core mount"
+                "{site}: claims the same guest path as {other} with a different declaration"
             ),
-            Self::Conflict { index, other } => write!(
+            Self::SetsNotTable => {
+                f.write_str("mount_sets: must be a table of named arrays of mount declarations")
+            }
+            // One statement of the name grammar: [`InvalidMountSetName`] owns the
+            // sentence, so the key-level refusal cannot drift from the parse.
+            Self::SetName { definition } => write!(
                 f,
-                "mounts[{index}]: claims the same guest path as mounts[{other}] with a \
-                 different declaration"
+                "mount_sets: definition {definition} has an invalid name; {InvalidMountSetName}"
             ),
+            Self::SetNotArray { definition } => write!(
+                f,
+                "mount_sets[{definition}]: must be an array of mount declarations or set names"
+            ),
+            Self::SetNotString { definition, index } => {
+                write!(f, "mount_sets[{definition}][{index}]: must be a string")
+            }
+            Self::SetReferenceModified { site } => write!(
+                f,
+                "{site}: a mount-set reference is a bare name; modes, a guest path and exclusions \
+                 belong to the paths declared inside the set"
+            ),
+            Self::UnknownSet { site } => write!(f, "{site}: unknown mount set name"),
+            Self::Cycle { site } => write!(f, "{site}: mount-set reference cycle"),
+            Self::ExpansionWorkLimit => write!(
+                f,
+                "mount_sets: expansion work exceeds limit of {} leaf visits",
+                sets::MAX_MOUNT_SET_EXPANSION_WORK
+            ),
+            Self::ReferenceOrder => {
+                f.write_str("mount_sets: internal reference order was not resolved (agent-vm bug)")
+            }
         }
     }
 }
@@ -203,6 +497,9 @@ impl std::error::Error for UserMountsError {}
 
 #[cfg(test)]
 mod tests {
+    // The graph's tests are `sets::tests`, a sibling module: the filter that runs
+    // both is `config_mounts::`, *not* `config_mounts::tests`, which matches this
+    // module only.
     use super::*;
     use crate::config_authority::{AuthorityTriggers, verify};
     use crate::host_paths::read_bounded_regular_file_noting_symlink;
@@ -229,6 +526,7 @@ mod tests {
             AuthorityTriggers {
                 network: false,
                 mounts: true,
+                mount_sets: false,
             },
         )
         .unwrap()
@@ -246,7 +544,16 @@ mod tests {
     }
 
     fn parse(text: &str, home: Option<&Path>) -> Result<UserMounts, UserMountsError> {
-        with_authorized(|authorized, _| from_verified_value(authorized, &value(text), home))
+        with_authorized(|authorized, _| {
+            from_verified_value(
+                authorized,
+                MountValues {
+                    defaults: Some(&value(text)),
+                    sets: None,
+                },
+                home,
+            )
+        })
     }
 
     fn sources(mounts: &UserMounts) -> Vec<Spelling> {
@@ -273,6 +580,10 @@ mod tests {
     /// the captured home, `//` is preserved, nothing else is expanded, and every
     /// other relative spelling is refused. The oracle is `starts_with` plus
     /// `format!`, not the kernel's own predicate.
+    ///
+    /// `["ref"]` is deliberately **not** in the refusal table (decision R3): a
+    /// valid bare name is now a set reference, so it has its own row in
+    /// `reclassified_bare_default_is_unknown_reference`.
     #[test]
     fn home_expansion_cases() {
         let plain = Path::new("/h");
@@ -303,10 +614,18 @@ mod tests {
             r#"["$HOME/ref"]"#,
             r#"["${HOME}/ref"]"#,
             r#"["./ref"]"#,
-            r#"["ref"]"#,
+            r#"["."]"#,
+            r#"[".."]"#,
+            r#"["..."]"#,
+            r#"["../ref"]"#,
         ] {
             assert_eq!(rendered(parse(text, Some(plain))), refused, "{text}");
         }
+        // The index is part of the sentence, not a fixed `[0]`.
+        assert_eq!(
+            rendered(parse(r#"["/abs", "./rel"]"#, Some(plain))),
+            refused.replace("mounts[0]", "mounts[1]")
+        );
         // No UTF-8 home rejects only the `~/` spellings.
         assert_eq!(
             rendered(parse(r#"["~/ref"]"#, None)),
@@ -426,7 +745,7 @@ mod tests {
         // The sentinel sits in the invalid position of an otherwise valid
         // declaration, so any echo would put it in the sentence.
         for text in [
-            format!(r#"["{SENTINEL}"]"#),
+            format!(r#"["./{SENTINEL}"]"#),
             format!(r#"["/a:{SENTINEL}"]"#),
             format!(r#"["/a:/g:{SENTINEL}"]"#),
             format!(r#"["/a:/g:exclude={SENTINEL}/../x"]"#),
@@ -500,7 +819,15 @@ mod tests {
     #[test]
     fn the_file_is_the_verified_one() {
         with_authorized(|authorized, file| {
-            let mounts = from_verified_value(authorized, &value(r#"["/a"]"#), None).unwrap();
+            let mounts = from_verified_value(
+                authorized,
+                MountValues {
+                    defaults: Some(&value(r#"["/a"]"#)),
+                    sets: None,
+                },
+                None,
+            )
+            .unwrap();
             assert_eq!(mounts.file(), file);
             assert_eq!(
                 mounts.requests()[0].origin.to_string(),

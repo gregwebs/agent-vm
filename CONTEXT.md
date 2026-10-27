@@ -322,9 +322,10 @@ Everything one launch provisions: the least fixed point of
 
 over the declaring tool's **Tool reference scope**, where a `"*"` entry expands
 to that scope's tools. It is the **single** gate on every provider-owned facet.
-The same tool closure also selects `persist` paths, and — once the mount half
-lands — tool mount declarations. A tool-reference cycle is a fixed point, not an
-error; this differs from a **Mount set** reference cycle, which is invalid. See
+The same tool closure also selects `persist` paths, and — once tool-level
+`mounts` land — that tool's mount declarations. A tool-reference cycle is a fixed
+point, not an error; this differs from a **Mount set** reference cycle, which is
+invalid. See
 [ADR-0017](docs/adr/0017-tool-declared-provisioning.md), which is amended by the
 implemented tier-local reference half of
 [ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md).
@@ -375,8 +376,9 @@ It also carries its default `argv`, a list of **credential providers**
 (`credentials`, the requirement set), a list of **available tools** (`tools`,
 driving the provisioning set), extra guest-HOME-relative `persist` paths, a
 guest `env` map, an `interactive_shell` flag, and the **tool config tier** it
-came from. Mount selections (direct paths or **Mount sets**) belong to the
-accepted but not-yet-implemented mount half of
+came from. A tool declares **no** mounts yet: user-config defaults and named
+**Mount sets** are selected per launch (top-level `mounts` and `--mount NAME`),
+and per-tool `mounts` remain accepted design in
 [ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md).
 
 `env` is published into the guest **before** the launcher's own environment and
@@ -402,9 +404,10 @@ overlay: the user tier is authoritative for every name it declares, the
 project tier may only add names, and a differing project declaration yields a
 `doctor` warning (user definition wins). Only when both tiers declare **zero**
 tools do the compiled-in defaults apply. The authority-bearing fields are
-user-tier only: `[network]` ([persisted grant](#egress-authority)) and `mounts`
-([config mount](#config-mount)). A project or built-in declaration of either is
-refused, even when empty, because presence is what asks for authority. A
+user-tier only: `[network]` ([persisted grant](#egress-authority)), `mounts`
+([config mount](#config-mount)) and `[mount_sets]` ([mount
+set](#mount-set)). A project or built-in declaration of any of them is refused,
+even when empty, because presence is what asks for authority. A
 definition hidden by whole-definition precedence still belongs to its own
 **tool reference scope**, so the rest of its file keeps resolving it.
 
@@ -624,10 +627,40 @@ report as `mounts[N] in "<file>"`. Its declarations are read only from a
 the user config authority-bearing under ADR-0040's read policy. See
 [ADR-0046](docs/adr/0046-verified-user-config-mounts.md).
 
+An entry may also be a **Mount set** name, which selects that set's direct
+declarations; the set's leaves are the config mounts, attributed to the set
+entry rather than to `mounts[N]`.
+
 _Avoid_: "default mount" — agent-vm's own project/state/home mounts are not
 this, and a config mount can be read-only or forked; "persisted mount" — a
 config mount is re-selected at each launch, not stored per project, and a fork
 copy is persisted but is not a config mount.
+
+## Mount set
+
+A named list of mount declarations in the **user** `[mount_sets]` table,
+selectable by its exact name from the top-level `mounts` defaults or from
+`--mount NAME`. A set is a selector, never a mount mode, credential request,
+tool or store: **declaring one mounts nothing**, and only a launch that selects
+it grants filesystem access. Names are case-sensitive ASCII
+(`[A-Za-z0-9_]` first, then `[A-Za-z0-9_.-]`), so a name can never look like a
+flag, a path or a modifier, and tool/route words are not reserved. Sets compose:
+a set's entries are direct declarations or other set names, forward references
+resolve, and a set-reference **cycle** is invalid (a `tools` cycle is not). Each
+declared set's transitive **closure** is validated at load — unknown names,
+invalid definitions, cycles and a closure that claims one guest path twice with
+different declarations are config errors even in an unused set and under
+`--no-config-mounts` — with a bounded number of leaf visits, so a crafted file
+cannot hang load. A set reference is bare: `agent:ro` is refused, and modes,
+guest paths and exclusions belong to the leaves. Selection is deduplicated and
+conflict-checked by the same claim rule as any other mount, and a set name,
+nesting, config origin or traversal order never enters fork identity. Project
+and built-in tiers may neither declare nor select one. Implemented in #397; see
+[ADR-0048](docs/adr/0048-named-mount-sets-and-tier-local-tool-references.md) and
+[USAGE.md](USAGE.md#named-mount-sets-user-config).
+
+_Avoid_: "mount group" / "mount profile" — a set is a list of declarations, not
+a policy; "enabled set" — declaration is not selection.
 
 ## Tool reference scope
 
@@ -643,8 +676,9 @@ and [ADR-0017](docs/adr/0017-tool-declared-provisioning.md).
 
 ## Protected config directory
 
-`~/.config/agent-vm`, where `credentials.yaml`, `[network]` and `mounts`
-authorize launch secrets, egress and config mounts, respectively. This
+`~/.config/agent-vm`, where `credentials.yaml`, `[network]`, `mounts` and
+`[mount_sets]` authorize launch secrets, egress, config mounts and mount sets,
+respectively. This
 directory is never
 inside a writable live bind. Protection includes directories its lookup searches
 and prospective directories reached through missing components, measuring raw
