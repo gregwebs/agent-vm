@@ -87,12 +87,13 @@ agent-vm --allow-internet-egress claude
 ```
 
 Run a guest executable directly — no catalog entry, defaults, environment or
-credential provisioning (partially implemented: stdin, terminal overrides and
-signal forwarding are tracked in #399–#401):
+credential provisioning. Piped stdin is forwarded to the program and host EOF
+closes it; terminal overrides and signal forwarding are tracked in #400–#401:
 
 ```sh
 agent-vm run make test
 agent-vm -- make test        # the same, with the top-level separator
+printf hello | agent-vm run cat   # streams stdin; prints hello
 ```
 
 Full flag, subcommand, networking, and troubleshooting reference:

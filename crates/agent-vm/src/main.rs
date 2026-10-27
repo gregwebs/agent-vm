@@ -13,6 +13,7 @@ mod credential_resolver;
 mod credential_yaml;
 mod debug_config;
 mod defaults;
+mod direct_input;
 mod dns_name;
 mod doctor;
 mod egress_grammar;

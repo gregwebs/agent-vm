@@ -296,6 +296,28 @@ AGENT_VM_RELEASE_BIN=/absolute/release/bin/agent-vm \
   bash script/test/e2e.sh custom-image
 ```
 
+The group pins the vendored runtime this checkout built —
+`vendor/microsandbox/build/{msb,agentd,libkrunfw.5.dylib}` — so every selected
+row, the boot-free `harness-negative` one included, needs those files on disk. A
+signed bundle is not one of them, and `--dev` alone does not produce them: it
+writes `build/msb-dev` and `target/macos-dev/`, while only the release build
+writes `build/msb`. Build release, then dev, before the first custom-image run:
+
+```bash
+./script/build/macos.sh         # writes build/{msb,agentd,libkrunfw.5.dylib}
+                                # and the firmware's .source-sha stamp
+./script/build/macos.sh --dev   # writes build/msb-dev and target/macos-dev/
+```
+
+`AGENT_VM_BIN`/`AGENT_VM_DEV_BIN` name that debug launcher, which every ordinary
+row runs against the release-built runtime; `AGENT_VM_RELEASE_BIN` (default
+`target/macos/bin/agent-vm`) is the release launcher the retained-default,
+upgrade and host-pin rows run and refuse to skip. `AGENT_VM_E2E_ONLY_ROWS` takes
+exact `run_check` names, space separated, and silently ignores a name that
+matches nothing, so an exit 0 or `0 failed` does not prove the rows you meant
+ran: select `harness-negative` explicitly and compare the entered/PASS rows with
+the list.
+
 The release join runs the actual installed candidate with `env -i`, private
 state/cache, no image override/debug seam on first default acquisition, calibrated
 failing Docker/buildx decoys, and a guest six-agent probe as the host UID:GID.
@@ -339,8 +361,8 @@ the retained-default check. It is manual evidence, not CI VM coverage.
 actual native importer under fake Docker without a VM; native e2e is manual, never a substitute for those CLI tests.
 
 The custom-image group's retained-default check is described below.
-The custom-image group needs only Docker, the release
-bundle's `msb`, and a launcher binary — **no dev images** — plus network for the
+The custom-image group needs Docker, the vendored runtime built from this
+checkout (above), and a launcher binary — **no dev images** — plus network for the
 pinned fixture base/`apk add bash` and a digest-pinned local registry service. It
 builds the `script/test/fixtures/marker-free-image` targets, boots them through
 the real CLI, and asserts: a marker-free image runs a program as the host user

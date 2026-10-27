@@ -736,7 +736,10 @@ a launch failure naming the image and the missing piece.
    prelude: it strips IPv6 nameservers from `/etc/resolv.conf`, runs executable
    `/opt/agent-vm/seed.d/*` hooks and the supplied
    `/opt/agent-vm/seed-claude-plugins.sh` entry point when present, and sources
-   the project's `.agent-vm.runtime.sh`. The real acquired image OCI `PATH` is
+   the project's `.agent-vm.runtime.sh`. For a direct command with piped input
+   the prelude runs with stdin at `/dev/null`; the program is the only command
+   that sees the stream. Any bash that can run that prelude will do — no
+   minimum version is required. The real acquired image OCI `PATH` is
    preserved, in order, on first and warm launches; the launcher's fallback
    (`/usr/local/bin:/usr/bin:/usr/sbin:/bin`) applies **only** when the image
    declares no `PATH` at all, never merely because a cold launch had no cached
@@ -864,7 +867,7 @@ reserved-looking one. The direct route adds only its own failures:
 |---|---|
 | 127 | the executable is absent from the effective guest `PATH` (also: a bare name that resolves to a *directory*, which `type -P` does not treat as an executable) |
 | 126 | the path exists but is not executable, or a directory named by path |
-| 125 | the launcher itself failed: configuration, guest setup, transport/output or cleanup |
+| 125 | the launcher itself failed: configuration, guest setup, stdin forwarding, transport/output or cleanup |
 | 2 | a pre-boot usage error (absent/empty PROGRAM, invalid UTF-8, malformed launch options) |
 
 125 does not cover panics, aborts or signals. Sink failures count as 125: a
@@ -893,10 +896,50 @@ entry.
 > is refused with a rename diagnostic. Rename it (for example `run-tool`) and
 > launch it by the new name, or use `agent-vm run PROGRAM` for a direct launch.
 
-> **Slice 1.** Streamed stdin, terminal overrides (`-t`/`-T`) and signal
-> forwarding are not implemented yet; see issues #399–#401. Piped input to
-> `agent-vm run cat` does not reach the guest, and the PTY choice is still the
-> host stdin's.
+**Input.** When stdin is not a terminal — a pipe, a file, a heredoc — the launch
+streams, and the program owns that input exclusively:
+
+```sh
+printf hello | agent-vm run cat          # prints hello, then exits at EOF
+: | agent-vm -- wc -c                    # prints 0
+printf 'a\0\377' | agent-vm run od -An -tx1
+```
+
+Bytes are forwarded unchanged, including NUL and non-UTF-8 bytes: the Unicode
+rule above is a rule for argv, not for stdin. Host EOF closes the guest's stdin,
+so an empty input and a command that waits for EOF both terminate normally.
+
+That ownership is exclusive to a direct launch: a `shell` launch keeps the legacy
+ordering, so a hook that reads stdin can block there. On a direct launch the
+image seed hooks, the IPv6-nameserver strip and the project's
+`.agent-vm.runtime.sh` run with stdin at `/dev/null` and see EOF, while their
+exports, `cd` and exit status still apply to the program — setup runs in the
+launch's own shell as one group, never a subshell. A hook's own
+descriptors are inherited exactly as on any other launch, with one exception:
+bash's internal range (10 and above) is unsafe for a hook, because one of those
+numbers is bash's saved copy of the command's input and is closed when setup
+ends. Keep hook descriptors below 10, or scope them to the command that uses
+them.
+
+This is not an isolation boundary. Runtime hooks are trusted code running inside
+the launch's own shell process: the guarantee covers ordinary reads of stdin and
+unintended inherited descriptors, not a hook that deliberately inspects bash's
+internal saved descriptors.
+
+Guest stdout and stderr stay separate and are written as they are produced, so a
+long command's progress stays visible while input is still flowing. A guest that
+stops reading early is not an error: the launcher stops feeding it and reports
+the guest's own status. The launcher's own read-ahead is at most about three
+chunks (192 KiB: one in the reader's hand, one queued, one in a pending write),
+and **that is the only bound there is**. The runtime acknowledges a write when it
+accepts a frame, not when the program reads it, and it queues accepted stdin
+itself, so a guest that closes stdin early can leave substantially more than
+192 KiB consumed but never read. There is no end-to-end loss bound. Host read
+errors and stdin forwarding failures are launcher failures (125).
+
+> **Still open.** Terminal overrides (`-t`/`-T`) and signal forwarding are not
+> implemented yet; see issues #400–#401. A terminal stdin still attaches to a
+> PTY, and the PTY choice is still the host stdin's.
 
 ### Extra and forked mounts
 

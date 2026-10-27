@@ -28,6 +28,7 @@ in [open issues](https://github.com/gregwebs/agent-vm/issues?q=is%3Aissue%20is%3
 crates/agent-vm/src/
 ├── main.rs                 # clap entry; pins MSB_PATH/MSB_HOME before the runtime
 ├── run.rs                  # launch(): build the sandbox, attach or stream-exec
+├── direct_input.rs         # host stdin → direct-command stdin: detached reader, bounded pump
 ├── launch_target.rs        # lower a selected target once: catalog Tool or Direct command
 ├── session.rs              # project hash, state dirs, sandbox name, guest home
 ├── secrets.rs              # capture host credentials; write guest placeholders
@@ -589,9 +590,10 @@ credential requirement, network request, transitive tool or `persist`
 declaration can be read for it. The credential resolver and network policy
 remain the authority; `Direct` simply requests an empty name set, which makes
 their decisions empty (ADR-0017). `GuestInvocation` carries the program, argv,
-display text and a `ProgramGuard`; `AgentShellLine` branches only in
-`program_guard()`, so `ImageContract` rendering stays byte-identical for every
-existing tool.
+display text and a `ProgramGuard`; `AgentShellLine` branches in
+`program_guard()` and in `GuestInput` (who owns non-terminal stdin, #399), and
+the `GuestInput::DiscardWhenNotTerminal` rendering is byte-identical for every
+existing tool, shell and direct-attach launch.
 
 Shared state is unchanged: image selection, cwd, identity, mounts, HOME links,
 default-deny network, GitHub policy, bootstrap and the project hook all still
@@ -615,6 +617,51 @@ non-interactive run look hung.
 The exec loop races the event stream against `Sandbox::wait()` so a VMM that
 dies mid-stream produces a diagnostic rather than a hang on `recv()`; see
 [Sandbox liveness](#sandbox-liveness-idle-detection-and-runtime-exits).
+
+**Streamed stdin (#399).** A direct streamed launch is the only one that
+requests the runtime's `stdin_pipe()`, and the lifecycle — not `launch()` —
+takes the sink out of the handle it owns:
+
+```
+ fd 0 ─► std::thread "agent-vm-stdin" (detached) ─► 1-chunk channel ─► pump task ─► ExecStdin frames
+          blocking read(2)                          (64 KiB)          cancellable      └ empty frame = EOF
+```
+
+Three resources with three lifetimes, and the differences are the design
+([ADR-0052](docs/adr/0052-direct-command-input-ownership.md)):
+
+- The reader is a **detached std thread**, never `tokio::io::stdin()`: the tokio
+  form reads on the blocking pool, whose task cannot be cancelled, and
+  `Runtime::drop` waits for it — so a launch that fails while a FIFO writer
+  still holds stdin open would hang instead of reporting its status.
+- The channel holds **one** chunk, so a stalled guest bounds launcher memory to
+  about three chunks instead of the whole stream. This is a launcher-side bound
+  only; the transport's own credit is the runtime's.
+- EOF is an **empty** `ExecStdin` frame (`ExecSink::close`), which is why the
+  chunk type cannot be empty: a zero-length write would close the guest's stdin
+  early.
+- A failed guest write arrives as a non-terminal `ExecEvent::StdinError`: EPIPE
+  is the guest closing its read end (expected — stop the pump, keep its status),
+  anything else is a forwarding failure (125).
+
+`StdinMode::Null` does **not** by itself give the guest `/dev/null`: agentd
+always hands a non-PTY child a pipe, so the guest bootstrap supplies the
+redirect. Legacy and attach launches do it with `[ -t 0 ] || exec < /dev/null`;
+a direct streamed launch instead runs setup, the project hook and the guard in
+one `{ … } </dev/null` group and lets bash restore the real stdin for the
+program's `exec`. That group is why setup children inherit no copy of the input,
+and why a direct command's input is exclusive (`GuestInput`, ADR-0052).
+
+The loop is a `biased;` select whose order is a correctness property: the pump
+outcome, then an expired transport-failure grace, then exec events. The pump
+ends at most once, so it cannot starve anything, and an input failure that has
+already happened must beat a ready `Exited` — stream loss is never a guest
+success. The grace sits ahead of the event stream so a continuously ready stdout
+stream cannot hold the bounded failure return open. `stream_exec_with_cleanup`
+has exactly one release sequence for every outcome, including an input start-up
+failure: stop the pump, drop the wait future, drop the handle, then tear down —
+in that order, because the wait future may hold the child-handle mutex (#258) and
+a pending sink write must not outlive the handle it writes through.
 
 `stream_exec_with_cleanup` owns that loop. It also owns the sink policy: a
 catalog tool or the fallback shell keeps the legacy **best-effort** sink (a
@@ -1666,6 +1713,7 @@ directories the user never asked for. The state-root precedence is in
 | One dialect rule for a printed command (#434) | [ADR-0049](docs/adr/0049-one-dialect-rule-for-printed-commands.md) |
 | One rule for a relative state root (#437) | [ADR-0050](docs/adr/0050-one-rule-for-a-relative-state-root.md) |
 | The reset undo refuses a recreated db (#432) | [ADR-0051](docs/adr/0051-the-reset-undo-refuses-a-recreated-db.md) |
+| Direct-command input ownership and the detached stdin reader (#399) | [ADR-0052](docs/adr/0052-direct-command-input-ownership.md) |
 
 ## Deliberate non-goals
 

@@ -1,9 +1,11 @@
 # Direct command launches
 
-Status: partially implemented — #398 (`run` / top-level `--`, literal Unicode
+Status: partially implemented. #398 (`run` / top-level `--`, literal Unicode
 argv without catalog selection or provisioning, and the 127/126/125 status
-distinctions) landed in 0.7.3. #399 (streamed stdin), #400 (terminal policy)
-and #401 (signals) are pending; the sections below describe the whole
+distinctions) landed in 0.7.3. The streamed-input implementation for #399
+(stdin and EOF for a non-terminal launch) is included here; accepting it
+requires the native checks below. Terminal policy (#400) and signals (#401)
+remain separate and pending, so the sections below describe the whole
 four-slice feature and are not all delivered yet.
 
 ## Purpose

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016  # guest-side commands deliberately single-quote `$(...)`
+# shellcheck disable=SC2030,SC2031  # the boot-free self-test stubs CAPTURE_STATUS inside a subshell on purpose
 #
 # Native VM verification; CI runs only the boot-free harness contracts.
 #
@@ -27,6 +28,23 @@
 #   AGENT_VM_BIN / AGENT_VM_DEV_BIN  validated debug launcher
 #   AGENT_VM_RELEASE_BIN            validated release launcher
 #   AGENT_VM_E2E_BUILDER            optional existing docker-container builder
+# Custom-image selection (optional):
+#   AGENT_VM_E2E_ONLY_ROWS          space-separated exact run_check names to run;
+#                                   every other row is skipped without a result.
+#                                   Fixture builds/imports run only when a
+#                                   selected name starts with `custom-image-`.
+#
+# Custom-image runtime selection (**required for every launch of this group,**
+# including the boot-free "harness-negative" controls): the group runs the
+# vendored runtime this checkout pins — vendor/microsandbox/build/msb,
+# libkrunfw.5.dylib and the bundle's agentd artifact — with inherited
+# MSB_PATH/MSB_LIBKRUNFW_PATH/MSB_AGENTD_PATH cleared, so the runtime hashes in
+# every evidence line describe the runtime that actually ran. This is a
+# *testing* selection with a real cost: an installation that would have supplied
+# its own bundle `msb` (or an external agentd) still needs these vendored files
+# on disk, and the group dies before any work when one is missing. Naming the
+# prerequisite here is deliberate — the identity receipts are worthless if the
+# pinned runtime silently came from somewhere else.
 #
 # All launches use owned private HOME/state/cache. Real native joins remain
 # manual; see CONTRIBUTING.md. No debug recommendation seam in released-image.
@@ -68,6 +86,25 @@ die() {
 }
 
 [[ $# -le 1 ]] || die "expected at most one group"
+# Targeted evidence runs: exact row names, space separated. A run with a filter
+# is reproducible from its own log because the argv and filter are echoed below.
+E2E_ONLY_ROWS="${AGENT_VM_E2E_ONLY_ROWS:-}"
+row_selected() {
+  local row
+  for row in $E2E_ONLY_ROWS; do
+    [ "$row" = "$1" ] && return 0
+  done
+  return 1
+}
+rows_need_fixtures() {
+  [ -z "$E2E_ONLY_ROWS" ] && return 0
+  local row
+  for row in $E2E_ONLY_ROWS; do
+    case "$row" in custom-image-*) return 0 ;; esac
+  done
+  return 1
+}
+
 if [[ "$GROUP" == released-image || "$GROUP" == all ]]; then
   bash "$REPO_ROOT/script/test/e2e-released-image.sh"
   [[ "$GROUP" != released-image ]] || exit 0
@@ -129,6 +166,21 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/agent-vm-e2e.XXXXXX")"
 # to this run's own $WORK.
 cleanup_work() {
   local status=$?
+  # Only the run's own shell may clean up. A helper subshell — a FIFO writer, an
+  # RSS sampler, a command substitution — inherits this trap, and its exit must
+  # never delete $WORK or report the run as failed when the row killed it on
+  # purpose (#399). BASH_SUBSHELL exists in bash 3.2, where BASHPID does not and
+  # a subshell's `$$` is the parent's, so the former BASHPID guard could never
+  # reject a worker on the native 3.2 leg (#399 N2).
+  if [ "${BASH_SUBSHELL:-0}" -ne 0 ]; then
+    return 0
+  fi
+  # A failed row must not leave a row-owned FIFO writer, a live capture or an
+  # RSS sampler behind: any of them can keep a pipe open and turn a failure
+  # into an unbounded wait (#399 F2). A helper that fails is itself a failure.
+  if ! cleanup_row_helpers; then
+    [ "$status" -ne 0 ] || status=1
+  fi
   if [ -n "$OWNED_BUILDER" ]; then
     if ! docker buildx rm "$OWNED_BUILDER"; then
       [ "$status" -ne 0 ] || status=1
@@ -139,6 +191,24 @@ cleanup_work() {
     exit "$status"
   fi
   rm -rf "$WORK"
+}
+# The row helpers are defined below; cleanup_work runs only at exit, when bash
+# has already parsed them. `declare -F` keeps an early exit (before the helper
+# block) from turning cleanup into a `command not found`.
+cleanup_row_helpers() {
+  local fn status=0
+  for fn in stdin_writer_stop stdin_producer_stop stdin_capture_stop rss_sampler_stop; do
+    if declare -F "$fn" >/dev/null 2>&1; then
+      # A helper that cannot stop its worker is a real failure: the run's own
+      # evidence (and the exit status) must say so rather than deleting $WORK
+      # over a leftover writer or a capture that never exited.
+      if ! "$fn" >/dev/null 2>&1; then
+        echo "    FAIL: cleanup helper $fn failed" >&2
+        status=1
+      fi
+    fi
+  done
+  return "$status"
 }
 trap cleanup_work EXIT
 # A fresh basename per run keeps the per-run custom-image fixture refs (and the
@@ -169,6 +239,34 @@ CUSTOM_HOME="$WORK/home"
 CUSTOM_CREDENTIAL_SEED="$CUSTOM_HOME/.claude/.credentials.json"
 CUSTOM_CREDENTIAL_ACCESS='sk-ant-synthetic-e2e-258-access'
 CUSTOM_CREDENTIAL_REFRESH='sk-ant-synthetic-e2e-258-refresh'
+# The runtime this group pins for every launch. `msb_install.rs` prefers an
+# inherited MSB_PATH and a candidate's sibling `msb` over the vendored source
+# build, and the pinned SDK honours MSB_PATH / MSB_LIBKRUNFW_PATH /
+# MSB_AGENTD_PATH directly (vendor SDK `PathsConfigPatch::from_env_or_sdk`). An
+# inherited value would therefore run a different runtime than the one the
+# evidence lines hash (#399 R2-5). This checkout has no `target/debug/msb`, so
+# the pinned paths are exactly what the launcher's own ladder resolves.
+#
+# MSB_AGENTD_PATH is cleared but deliberately *not* pinned: setting it makes
+# the vendored runtime load an external agentd and log an INFO override line on
+# every launch, which is a different runtime shape from the bundle's embedded
+# agentd. Clearing it keeps the embedded payload while still refusing a
+# caller's injection.
+#
+# This is a deliberate side effect on the whole group, not a free one: the check
+# below makes every launch — `harness-negative` included, which boots nothing —
+# require the vendor-built msb, agentd and firmware, even on a host whose
+# candidate would have supplied a complete bundle runtime of its own. That
+# trade is taken so the evidence can bind the runtime that ran (#399 R2-5); a
+# bundle-only installation needs `vendor/microsandbox` built first.
+CUSTOM_RUNTIME_DIR="$REPO_ROOT/vendor/microsandbox/build"
+CUSTOM_MSB="$CUSTOM_RUNTIME_DIR/msb"
+CUSTOM_AGENTD="$CUSTOM_RUNTIME_DIR/agentd"
+CUSTOM_LIBKRUNFW="$CUSTOM_RUNTIME_DIR/libkrunfw.5.dylib"
+for pinned in "$CUSTOM_MSB" "$CUSTOM_AGENTD" "$CUSTOM_LIBKRUNFW"; do
+  [ -f "$pinned" ] || die "the vendored runtime is incomplete: no $pinned"
+done
+
 # The one environment every command that touches the custom root runs under.
 # The host may export AGENT_VM_SHARE_MSB_CACHE, and the pinned SDK reads
 # MSB_CONFIG_PATH instead of MSB_HOME/config.json when it is set (a loaded
@@ -176,13 +274,22 @@ CUSTOM_CREDENTIAL_REFRESH='sk-ant-synthetic-e2e-258-refresh'
 # isolated import write one cache while a launch reads another and falls
 # through to a registry pull, so neutralise both here: the private
 # $CUSTOM_STATE/msb-home/cache is the only store this group exercises.
-CUSTOM_ENV=(env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u AGENT_VM_SHARE_MSB_CACHE -u AGENT_VM_MSB_CACHE_DIR -u MSB_CONFIG_PATH AGENT_VM_STATE_DIR="$CUSTOM_STATE")
+#
+# The runtime paths are cleared and then pinned for the same reason (#399
+# R2-5): the identity receipts must describe the runtime that actually ran, so
+# the rows cannot inherit a caller's MSB_PATH.
+CUSTOM_ENV=(env -u AGENT_VM_IMAGE_TAG -u AGENT_VM_ROOT -u AGENT_VM_SHARE_MSB_CACHE -u AGENT_VM_MSB_CACHE_DIR -u MSB_CONFIG_PATH -u MSB_PATH -u MSB_LIBKRUNFW_PATH -u MSB_AGENTD_PATH MSB_PATH="$CUSTOM_MSB" MSB_LIBKRUNFW_PATH="$CUSTOM_LIBKRUNFW" AGENT_VM_STATE_DIR="$CUSTOM_STATE")
 if [ -n "${AGENT_VM_SHARE_MSB_CACHE:-}" ]; then
   echo "e2e: neutralized inherited AGENT_VM_SHARE_MSB_CACHE=$AGENT_VM_SHARE_MSB_CACHE for the isolated custom root"
 fi
 if [ -n "${MSB_CONFIG_PATH:-}" ]; then
   echo "e2e: unset inherited MSB_CONFIG_PATH=$MSB_CONFIG_PATH for the isolated custom root"
 fi
+for runtime_var in MSB_PATH MSB_LIBKRUNFW_PATH MSB_AGENTD_PATH; do
+  if [ -n "${!runtime_var:-}" ]; then
+    echo "e2e: replaced inherited $runtime_var=${!runtime_var} with the vendored $CUSTOM_RUNTIME_DIR runtime"
+  fi
+done
 
 # Valid only with MSB_CONFIG_PATH unset (then the SDK's config path is
 # $CUSTOM_STATE/msb-home/config.json). A config.json there means a cache/state
@@ -333,6 +440,11 @@ SKIPPED=0
 run_check() {
   local name="$1"
   shift
+  # `negative/*` rows are the harness self-test's deliberate failures; they
+  # belong to whichever selected row invoked them, never to the filter.
+  if [ -n "$E2E_ONLY_ROWS" ] && [[ "$name" != negative/* ]] && ! row_selected "$name"; then
+    return 0
+  fi
   echo
   echo "==> $name"
   # Decoy calls accumulate across every launch inside one check, so the
@@ -354,6 +466,9 @@ run_check() {
 run_optional() {
   local name="$1" var="$2"
   shift 2
+  if [ -n "$E2E_ONLY_ROWS" ] && ! row_selected "$name"; then
+    return 0
+  fi
   echo
   echo "==> $name"
   if [[ -n "${!var:-}" ]]; then
@@ -487,6 +602,8 @@ CUSTOM_SCRIPT="agent-vm-e2e-258-$RUN_ID:script-provided"
 CUSTOM_USER_HOME="agent-vm-e2e-258-$RUN_ID:user-home-set"
 CUSTOM_NONSTANDARD="agent-vm-e2e-258-$RUN_ID:nonstandard-path"
 CUSTOM_STAMP="agent-vm-e2e-258-$RUN_ID:stamp-present"
+# #399: the direct-stdin `hook-read` row's image (a seed hook that reports EOF).
+CUSTOM_STDIN_SEED="agent-vm-e2e-258-$RUN_ID:stdin-seed-399"
 # The exact body the `stamp-present` fixture target writes to
 # `/etc/agent-vm-image-version`; the e2e check asserts the guest observes this
 # literal. Keep in sync with that target in the fixture Dockerfile.
@@ -598,6 +715,7 @@ $CUSTOM_SCRIPT script-provided
 $CUSTOM_USER_HOME user-home-set
 $CUSTOM_NONSTANDARD nonstandard-path
 $CUSTOM_STAMP stamp-present
+$CUSTOM_STDIN_SEED stdin-seed-399
 EOF
 }
 
@@ -609,7 +727,7 @@ check_custom_fixtures_imported() {
   local ref
   for ref in "$CUSTOM_MARKER" "$CUSTOM_NO_BASH" "$CUSTOM_WRAPPER" \
     "$CUSTOM_INTEGRATIONS" "$CUSTOM_SCRIPT" "$CUSTOM_USER_HOME" \
-    "$CUSTOM_NONSTANDARD" "$CUSTOM_STAMP"; do
+    "$CUSTOM_NONSTANDARD" "$CUSTOM_STAMP" "$CUSTOM_STDIN_SEED"; do
     image_catalog_has "$ref" "$ref" present || return 1
   done
 }
@@ -716,11 +834,16 @@ runtime_pids() {
   ps -axo pid=,comm= | awk '{ n=$2; sub(/.*\//,"",n); if (n ~ /^(agent-vm|msb|microsandbox|.*krun.*)$/) print $1 }'
 }
 
-# Transitive descendants of $1 (bounded depth), one `pid:comm` per line.
+# Transitive descendants of $1 (bounded depth), one `pid:comm` per line. The
+# comm is the **whole** `ps -o comm=` field, not its first whitespace-separated
+# word: an executable path may contain a space, and a comm that was truncated
+# can never be matched again by `signal_inventory`, which compares the whole
+# field, so such a descendant escaped both the TERM and the KILL pass (#399
+# R3-2).
 descendants_of() {
   local root="$1"
   ps -axo pid=,ppid=,comm= | awk -v root="$root" '
-    { p[$1]=$2; c[$1]=$3 }
+    { p[$1]=$2; line=$0; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", line); c[$1]=line }
     END {
       for (i in p) {
         x=i
@@ -732,22 +855,76 @@ descendants_of() {
     }'
 }
 
-# Bounded teardown of an in-flight observed launch: the watchdog is stopped
-# first so it cannot later signal a recycled PID, then the recorded launcher is
-# TERMed, given 5s, and KILLed. Both children are reaped so a failed observation
-# cannot return while a VM process is still starting.
-stop_observed_launch() {
-  local pid="$1" watchdog="$2" i=0
-  kill -TERM "$watchdog" 2>/dev/null || true
-  kill -TERM "$pid" 2>/dev/null || true
+# Signal one recorded launcher PID, but only while `ps -o comm=` still names the
+# executable the receipt bound it to. The comm comparison is a guard, not a birth
+# identity (#399 R3-2); with no expected executable there is nothing to verify,
+# so nothing is signalled and the caller's descendant inventory is the only
+# record used.
+signal_launcher_pid() { # pid signal expected_executable
+  local pid="$1" sig="$2" expected="$3"
+  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+  [ -n "$expected" ] || return 0
+  same_executable "$(ps -p "$pid" -o comm= 2>/dev/null)" "$expected" || return 0
+  kill "-$sig" "$pid" 2>/dev/null || true
+}
+
+# Stop one launch this shell owns, bounded, together with every process in its
+# descendant tree. The launch *job* PID is only the launcher when no
+# `/usr/bin/time` wrapper was added: with the wrapper the launcher is a child of
+# the job, so stopping the job alone leaves the real launcher (and its VM)
+# running with no record left to reap it (#399 R3-1). Both passes use the
+# inventory taken before the first TERM, so a reparented child cannot escape the
+# KILL.
+stop_owned_launch_tree() { # job_pid [exec_pid] [expected_executable]
+  local job="$1" exec_pid="${2:-}" expected="${3:-}" inventory i=0
+  inventory="$(descendants_of "$job")" || inventory=""
+  signal_inventory "$inventory" TERM
+  signal_launcher_pid "$exec_pid" TERM "$expected"
+  kill -TERM "$job" 2>/dev/null || true
+  sleep 1
+  signal_inventory "$inventory" KILL
+  signal_launcher_pid "$exec_pid" KILL "$expected"
+  kill -KILL "$job" 2>/dev/null || true
   while [ "$i" -lt 5 ]; do
-    kill -0 "$pid" 2>/dev/null || break
+    kill -0 "$job" 2>/dev/null || break
     sleep 1
     i=$((i + 1))
   done
-  kill -KILL "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  wait "$job" 2>/dev/null || true
+}
+
+# Bounded teardown of an in-flight observed launch: the watchdog is stopped
+# first so it cannot later signal a recycled PID, then the owned launch tree is
+# torn down. `exec_pid` is the PID the launch receipt named (the real launcher
+# when the job is a wrapper); it is signalled only while its comm still matches
+# `expected_executable`. The job is reaped so a failed observation cannot return
+# while a VM process is still starting. A signal delivered to this harness from
+# outside is not covered here: the EXIT trap's row-helper cleanup is a separate,
+# separately controlled path.
+stop_observed_launch() { # job_pid watchdog [exec_pid] [expected_executable]
+  local pid="$1" watchdog="$2" exec_pid="${3:-}" expected="${4:-}"
+  kill -TERM "$watchdog" 2>/dev/null || true
+  stop_owned_launch_tree "$pid" "$exec_pid" "$expected"
   wait "$watchdog" 2>/dev/null || true
+}
+
+# The launcher PID a launch receipt names, best effort: empty when there is no
+# receipt (yet) or its pid field is absent or non-numeric.
+launch_receipt_pid() { # receipt
+  local pid
+  pid="$(sed -n 's/^pid=//p' "$1" 2>/dev/null || true)"
+  case "$pid" in '' | *[!0-9]*) pid="" ;; esac
+  printf '%s' "$pid"
+}
+
+# The one teardown every failure path inside `observe_launch` uses: the launch
+# tree plus, when this observation sampled RSS, the PID its receipt named.
+observe_launch_teardown() { # job_pid watchdog
+  local receipt_pid=""
+  if [ -n "${OBSERVE_RSS_FILE:-}" ]; then
+    receipt_pid="$(launch_receipt_pid "$OBSERVE_RSS_FILE.receipt")"
+  fi
+  stop_observed_launch "$1" "$2" "$receipt_pid" "${OBSERVE_LAUNCHER_EXE:-$AGENT_VM}"
 }
 
 # Run `command` (after `--`) as a background launch under a 120s watchdog and a
@@ -770,12 +947,54 @@ observe_launch() {
   # Opt-in split capture (#398): a caller that needs guest stdout bytes apart
   # from the launcher's stderr sets OBSERVE_STDOUT_FILE for its own call. Every
   # other row keeps the merged stream it has always read.
+  #
+  # Opt-in stdin (#399): OBSERVE_STDIN_FILE replaces the /dev/null redirect, so
+  # a stdin row hands the launcher a file or its own FIFO. A FIFO open blocks
+  # until the row's writer opens the other end, which is why this stays inside
+  # the backgrounded subshell.
+  local stdin_file="${OBSERVE_STDIN_FILE:-/dev/null}"
+  # Opt-in corroborating `/usr/bin/time -l -o` report (#399 B1). It is evidence
+  # only: on macOS the maximum RSS includes waited-for descendants, so the RSS
+  # oracle stays the launcher-only sampler.
+  local -a launch_cmd=("$@")
+  if [ -n "${OBSERVE_RSS_FILE:-}" ]; then
+    # The sampler cannot sample `$!` when `/usr/bin/time` wraps the launch: `$!`
+    # is then the time wrapper, a constant few hundred KiB (#399 R2-1). The
+    # wrapper records the PID it is about to exec into, and the sampler
+    # verifies that PID's comm before measuring it.
+    ensure_launch_wrapper || { echo "    FAIL: could not write the launch wrapper"; return 1; }
+    # Clear this launch's sampler files **before** the child exists. The
+    # wrapper writes its one-shot receipt as its first act, so a legal
+    # child-first schedule can publish it before the sampler is even started;
+    # a delete inside the sampler would then discard a live identity record and
+    # wait forever for one that is never rewritten (#399 R3-1).
+    reset_launcher_rss_files "$OBSERVE_RSS_FILE" || {
+      echo "    FAIL: could not clear the launcher-RSS files for $OBSERVE_RSS_FILE"
+      return 1
+    }
+    launch_cmd=("$LAUNCH_WRAPPER" "$OBSERVE_RSS_FILE.receipt" "${launch_cmd[@]}")
+  fi
+  if [ -n "${OBSERVE_TIME_FILE:-}" ]; then
+    launch_cmd=(/usr/bin/time -l -o "$OBSERVE_TIME_FILE" "${launch_cmd[@]}")
+  fi
   if [ -n "${OBSERVE_STDOUT_FILE:-}" ]; then
-    (cd "$proj" || exit 1; exec "$@") >"$OBSERVE_STDOUT_FILE" 2>"$out" </dev/null &
+    (cd "$proj" || exit 1; exec "${launch_cmd[@]}") >"$OBSERVE_STDOUT_FILE" 2>"$out" <"$stdin_file" &
   else
-    (cd "$proj" || exit 1; exec "$@") >"$out" 2>&1 </dev/null &
+    (cd "$proj" || exit 1; exec "${launch_cmd[@]}") >"$out" 2>&1 <"$stdin_file" &
   fi
   local pid=$!
+  # Opt-in launcher RSS sampling (#399): the PID exists only here, so the
+  # sampler is started and bounded inside the observation. If it cannot start,
+  # the launcher must not be left running while this returns — and the launcher
+  # is the receipt's PID (a child of the job when `/usr/bin/time` wraps it), not
+  # the job PID (#399 R3-1).
+  if [ -n "${OBSERVE_RSS_FILE:-}" ]; then
+    if ! sample_launcher_rss "$pid" "$OBSERVE_RSS_FILE" "${OBSERVE_LAUNCHER_EXE:-$AGENT_VM}"; then
+      echo "    FAIL: could not start the launcher RSS sampler"
+      observe_launch_teardown "$pid" ""
+      return 1
+    fi
+  fi
   (
     local i=0
     while [ "$i" -lt 120 ]; do
@@ -791,18 +1010,21 @@ observe_launch() {
   local watchdog=$!
 
   # An observation that errors must never leave the launcher or its watchdog
-  # running, so every early exit below goes through the same bounded teardown.
+  # running, so both `ps`-observation failure paths below go through the same
+  # bounded teardown (as does the sampler-start failure above). A signal
+  # delivered to the harness from outside is a different path with its own
+  # control (#399 h16-trap).
   local start elapsed snap
   start=$(date +%s)
   while kill -0 "$pid" 2>/dev/null; do
     if ! ps -axo pid=,ppid=,comm= >/dev/null; then
       echo "    FAIL: ps snapshot failed"
-      stop_observed_launch "$pid" "$watchdog"
+      observe_launch_teardown "$pid" "$watchdog"
       return 1
     fi
     if ! snap="$(descendants_of "$pid")"; then
       echo "    FAIL: descendant observation failed"
-      stop_observed_launch "$pid" "$watchdog"
+      observe_launch_teardown "$pid" "$watchdog"
       return 1
     fi
     LAUNCH_DESCENDANTS+="$snap"$'\n'
@@ -901,6 +1123,35 @@ capture_custom_direct() {
     "$AGENT_VM" "$@"
 }
 
+# A direct capture whose stdin the row owns (#399): the same split stdout
+# capture as capture_custom_direct, plus OBSERVE_STDIN_FILE. A missing or
+# unreadable input is a failed observation, never an empty stream.
+capture_custom_direct_input() {
+  local name="$1" proj="$2" input="$3"
+  shift 3
+  [ "${1:-}" = "--" ] && shift
+  if [ ! -e "$input" ]; then
+    echo "    FAIL: no stdin input for $name: $input"
+    return 1
+  fi
+  local OBSERVE_STDOUT_FILE="$WORK/$name.stdout" OBSERVE_STDIN_FILE="$input" arg
+  : >"$OBSERVE_STDOUT_FILE" || return 1
+  # The exact launcher argv, so a row log binds its evidence to a command rather
+  # than a row name (#399 evidence discipline). This is the one place every
+  # stdin row -- including `shell-unchanged`, which does not use stdin_capture --
+  # passes through.
+  printf '    exec: %q' "$AGENT_VM"
+  for arg in "$@"; do printf ' %q' "$arg"; done
+  printf '\n'
+  observe_launch "$name" "$proj" "$WORK/$name.out" -- \
+    "${CUSTOM_ENV[@]}" "${OFFLINE_ENV[@]}" \
+    XDG_CONFIG_HOME="$WORK/offline-config" PATH="$SHIM_DIR:/usr/bin:/bin" \
+    HOME="$CUSTOM_HOME" \
+    HOST_SHIM_LOG="$HOST_SHIM_LOG" \
+    ${DIRECT_CAPTURE_ENV[@]+"${DIRECT_CAPTURE_ENV[@]}"} \
+    "$AGENT_VM" "$@"
+}
+
 # Path of a direct capture's guest stdout.
 direct_stdout_file() {
   local name="$1"
@@ -952,6 +1203,1152 @@ assert_direct_stdout_empty() {
     od -c "$WORK/$name.stdout" | head -5 || true
     return 1
   fi
+}
+
+# ── #399: streamed stdin for direct launches ──────────────────────────────
+#
+# A stdin row needs what the rest of the harness never did: a capture whose
+# stdin the *row* owns (a file, or a FIFO whose write end only the row can
+# close), a way to observe a capture while the launcher still runs, and
+# launcher-RSS samples. Each helper is defined once and has its own negative
+# control in check_harness_negative, so a helper that silently stops observing
+# is caught without a VM.
+
+# The row-owned FIFO writer. `close` writes the payload and closes the write end
+# at once (the guest sees EOF); `hold` keeps it open until the row closes it, so
+# a guest that must observe a *live* stdin really does. The PID is recorded
+# because each path that returns from a row has to kill and wait for it: a
+# forgotten writer keeps a guest's stdin open forever and turns the row into a
+# timeout. The controls cover the helper's stop path and the EXIT trap, not a
+# signal delivered to the harness mid-row.
+#
+# Two properties keep a *failed* row from blocking (#399 F2):
+# * the worker opens the FIFO `O_WRONLY|O_NONBLOCK` and retries ENXIO under a
+#   deadline, so it never blocks in `open` waiting for a launcher that already
+#   died. A launcher arriving later still completes the FIFO handshake.
+# * a readiness file records that the worker has cleared the inherited EXIT
+#   trap; the row proceeds only after that receipt, never on a `sleep` race
+#   (bash 3.2 has no BASHPID; #399 N2).
+STDIN_WRITER_PID=""
+STDIN_WRITER_FIFO=""
+# Seconds a row-side producer may stay in open/write before it is a failure.
+STDIN_WRITER_TIMEOUT="${STDIN_WRITER_TIMEOUT:-30}"
+
+stdin_writer_start() {
+  local fifo="$1" payload="$2" mode="$3" ready i=0
+  [ -p "$fifo" ] || { echo "    FAIL: $fifo is not a FIFO"; return 1; }
+  case "$mode" in
+  hold | close) ;;
+  *)
+    echo "    FAIL: unknown stdin writer mode: $mode"
+    return 1
+    ;;
+  esac
+  ready="$fifo.ready"
+  rm -f "$ready"
+  (
+    # A background writer must not inherit the run's EXIT trap: that trap
+    # deletes $WORK and reports a failure status, so a reaped writer would look
+    # like a failed run (and racing it with bash's own job bookkeeping prints
+    # `wait_for: No record of process`).
+    trap - EXIT
+    # Hold nothing the caller may be reading from: the launcher keeps the row's
+    # stdout, and a command substitution would never return while this holds it.
+    exec >/dev/null 2>&1
+    # Opening a FIFO for writing blocks until a reader appears, so a launcher
+    # that failed before opening stdin would block this worker (and any cleanup
+    # that waited for it) forever. `O_NONBLOCK` turns that into ENXIO, retried
+    # under a deadline; the first readiness receipt proves the inherited EXIT
+    # trap is already gone, which is the ownership protocol bash 3.2 can give
+    # (no BASHPID; #399 F2/N2).
+    exec python3 - "$fifo" "$mode" "$payload" "$ready" "$STDIN_WRITER_TIMEOUT" <<'PY'
+import errno, os, sys, time
+
+fifo, mode, payload, ready, timeout = sys.argv[1:6]
+deadline = time.monotonic() + float(timeout)
+
+with open(ready, "w", encoding="utf-8") as receipt:
+    receipt.write("ready")
+
+fd = None
+while time.monotonic() < deadline:
+    try:
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        break
+    except OSError as error:
+        if error.errno != errno.ENXIO:
+            raise
+        time.sleep(0.05)
+
+if fd is None:
+    print("no launcher opened the FIFO's read end", file=sys.stderr)
+    sys.exit(1)
+
+os.set_blocking(fd, True)
+if payload:
+    with os.fdopen(os.dup(fd), "wb", closefd=True) as stream:
+        stream.write(payload.encode())
+
+if mode == "close":
+    os.close(fd)
+else:
+    while True:
+        time.sleep(3600)
+PY
+  ) &
+  STDIN_WRITER_PID=$!
+  STDIN_WRITER_FIFO="$fifo"
+  while [ "$i" -lt 50 ]; do
+    if [ -e "$ready" ]; then
+      rm -f "$ready"
+      return 0
+    fi
+    kill -0 "$STDIN_WRITER_PID" 2>/dev/null || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  echo "    FAIL: the stdin writer did not open $fifo"
+  stdin_writer_stop
+  return 1
+}
+
+# Feed a FIFO with a deadline. A guest that stopped reading fills the pipe and
+# then blocks the producer; the row must fail bounded rather than sit in that
+# write forever (#399 F2).
+# `exec cat`, not `cat`: the subshell running the file producer must *become*
+# `cat`, because the timeout below can only signal the PID it recorded. Bash
+# does not exec a `case` branch on its own, so the old shape left `cat` alive
+# after the subshell was killed, still holding the FIFO's write end (#399 R2-3).
+STDIN_PRODUCER_PID=""
+
+# Reap a producer this shell started, bounded. EXIT cleanup calls it; the
+# synchronous helper below calls it before returning too, so ownership is never
+# left pointing at a reaped PID.
+stdin_producer_stop() {
+  [ -n "$STDIN_PRODUCER_PID" ] || return 0
+  local pid="$STDIN_PRODUCER_PID" i=0
+  STDIN_PRODUCER_PID=""
+  kill -TERM "$pid" 2>/dev/null || true
+  kill -KILL "$pid" 2>/dev/null || true
+  while [ "$i" -lt 50 ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  wait "$pid" 2>/dev/null || true
+}
+
+stdin_writer_write_bounded() {
+  local fifo="$1" kind="$2" data="$3" pid status i=0 limit
+  case "$kind" in
+  string | file) ;;
+  *)
+    echo "    FAIL: unknown stdin producer kind: $kind"
+    return 1
+    ;;
+  esac
+  [ -p "$fifo" ] || { echo "    FAIL: $fifo is not a FIFO"; return 1; }
+  limit=$((STDIN_WRITER_TIMEOUT * 5))
+  (
+    trap - EXIT
+    exec >/dev/null 2>&1
+    case "$kind" in
+    string) printf '%s' "$data" >"$fifo" ;;
+    file) exec cat "$data" >"$fifo" ;;
+    esac
+  ) &
+  pid=$!
+  STDIN_PRODUCER_PID="$pid"
+  while [ "$i" -lt "$limit" ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    stdin_producer_stop
+    echo "    FAIL: the stdin producer for $fifo blocked for ${STDIN_WRITER_TIMEOUT}s"
+    return 1
+  fi
+  wait "$pid"
+  status=$?
+  STDIN_PRODUCER_PID=""
+  [ "$status" -eq 0 ] || {
+    echo "    FAIL: writing stdin to $fifo failed (exit $status)"
+    return 1
+  }
+}
+
+# Write more bytes through the FIFO this row holds open.
+stdin_writer_send() {
+  local fifo="$1" payload="$2"
+  [ -n "$STDIN_WRITER_PID" ] || { echo "    FAIL: no stdin writer is running"; return 1; }
+  stdin_writer_write_bounded "$fifo" string "$payload"
+}
+
+# Close the held writer (this is the guest's EOF); the writer is reaped later.
+stdin_writer_close() {
+  [ -n "$STDIN_WRITER_PID" ] || return 0
+  kill -TERM "$STDIN_WRITER_PID" 2>/dev/null || true
+}
+
+# Reap the writer, bounded. Safe to call twice, and every returning path that
+# owns a writer calls it (the EXIT trap is the backstop; h16-trap checks it).
+stdin_writer_stop() {
+  [ -n "$STDIN_WRITER_PID" ] || return 0
+  local pid="$STDIN_WRITER_PID" i=0
+  STDIN_WRITER_PID=""
+  [ -n "$STDIN_WRITER_FIFO" ] && rm -f "$STDIN_WRITER_FIFO.ready"
+  STDIN_WRITER_FIFO=""
+  kill -TERM "$pid" 2>/dev/null || true
+  while [ "$i" -lt 50 ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+# A fresh FIFO already written with `payload` and closed by the row. The path
+# lands in `STDIN_FIFO`, **not** on stdout: a command substitution would wait for
+# the background writer to close its inherited stdout, and a held writer never
+# does. One FIFO per launch: a FIFO is consumed by the reader that opens it.
+STDIN_FIFO=""
+
+stdin_fifo_closed() {
+  local name="$1" payload="$2"
+  STDIN_FIFO="$WORK/$name.fifo"
+  rm -f "$STDIN_FIFO" || return 1
+  mkfifo "$STDIN_FIFO" || return 1
+  stdin_writer_start "$STDIN_FIFO" "$payload" close || return 1
+}
+
+# Poll a capture file for a marker (`grep -q`, 0.2 s steps). A deadline miss is
+# a failure, never a pass: this is the oracle for "output arrived *before*
+# input ended", which only a live observation can answer.
+wait_for_marker() {
+  local file="$1" pattern="$2" seconds="$3" waited=0 steps
+  steps=$((seconds * 5))
+  # The capture file appears when the background launch starts observing, so a
+  # missing file is "not yet", never an immediate failure; it fails at the
+  # deadline with the same message as a missing marker.
+  while [ "$waited" -lt "$steps" ]; do
+    if grep -qE -- "$pattern" "$file" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  echo "    FAIL: $(printf '%q' "$pattern") did not appear in $file within ${seconds}s"
+  return 1
+}
+
+# ── launcher-RSS oracle (#399 R2-1) ────────────────────────────────────────
+#
+# A launch may be wrapped in `/usr/bin/time -l -o …`, which forks the command
+# and waits: the backgrounded job's `$!` is then the *wrapper*, a constant few
+# hundred KiB. Sampling that PID measures nothing about the launcher and would
+# accept a launcher that buffered the whole stream (the first version of this
+# oracle did exactly that). The wrapper below writes an identity receipt: its
+# own PID, which `exec` preserves for the launcher, plus the argv it is about to
+# execute. The sampler measures the receipt's PID only after `ps -o comm=` names
+# the expected launcher, and every sample re-checks the same comm, so the
+# receipt claims the process that was measured rather than the job that was
+# started. The `/usr/bin/time` report stays as corroboration only.
+LAUNCH_WRAPPER=""
+
+ensure_launch_wrapper() {
+  [ -n "$LAUNCH_WRAPPER" ] && [ -x "$LAUNCH_WRAPPER" ] && return 0
+  LAUNCH_WRAPPER="$WORK/launch-wrapper.sh"
+  cat >"$LAUNCH_WRAPPER" <<'WRAPPER' || return 1
+#!/bin/bash
+# $1 is the receipt path, the rest is the launch argv. `$$` is this bash
+# process, and `exec` keeps that PID for the launcher, so the receipt names the
+# exact process the RSS sampler must measure. It is written before the exec, so
+# the sampler also verifies the comm it finds.
+receipt=$1
+shift
+printf 'pid=%s\nbefore_comm=%s\nexec_argv0=%s\n' \
+  "$$" "$(ps -p $$ -o comm=)" "$1" >"$receipt" || exit 1
+exec "$@"
+WRAPPER
+  chmod +x "$LAUNCH_WRAPPER"
+}
+
+# Print the launch receipt's field $2. Missing or empty is a failure: an
+# identity claim that cannot be read is not an identity claim.
+launch_receipt_field() {
+  local receipt="$1" field="$2" value
+  value="$(sed -n "s/^$field=//p" "$receipt" 2>/dev/null)" || {
+    echo "    FAIL: cannot read $field from the launch receipt $receipt" >&2
+    return 1
+  }
+  if [ -z "$value" ]; then
+    echo "    FAIL: the launch receipt $receipt has no $field" >&2
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+# Two paths name the same executable. `comm` reports the path the kernel kept
+# for the exec, which can differ from the caller's spelling only through a
+# symlinked directory, so compare the resolved directories.
+same_executable() {
+  local left="$1" right="$2" left_dir right_dir
+  [ -n "$left" ] && [ -n "$right" ] || return 1
+  [ "$left" = "$right" ] && return 0
+  left_dir="$(cd "$(dirname "$left")" 2>/dev/null && pwd -P)" || return 1
+  right_dir="$(cd "$(dirname "$right")" 2>/dev/null && pwd -P)" || return 1
+  [ "$left_dir/$(basename "$left")" = "$right_dir/$(basename "$right")" ]
+}
+
+# Sample `pid`'s RSS until it exits, writing one Kibibyte value per line to
+# `out` (the `max_rss_kib` contract) and a receipt to `meta`. A comm change or a
+# non-numeric `ps` line is recorded as a mismatch and stops the sampler rather
+# than being averaged into the result. `expected_comm` is checked on the first
+# sample, so a recycled or wrong PID can never be reported as the launcher.
+# Is one `ps -o rss=,comm=` reading a placeholder for **our own** target
+# finishing? macOS reports a process that is tearing down with `<defunct>` once
+# it is a zombie, or `(<pbi_comm>)` while the kernel has already dropped its
+# argument area, and reports 0 KiB of RSS for it. Such a reading is the launch
+# ending, not a different process — the sampler has already matched every
+# earlier sample — so it stops the loop instead of recording a mismatch. The
+# rule stays narrow: a placeholder for a *different* name, or any comm change
+# with a live RSS, is still a mismatch. h23 is the control.
+rss_exit_transition() { # comm rss expected_name
+  case "$1:$2" in
+  "<defunct>:0") return 0 ;;
+  "($3):0")
+    [ -n "$3" ] || return 1
+    return 0
+    ;;
+  esac
+  return 1
+}
+
+rss_sample_until_exit() { # pid out meta [expected_comm]
+  local pid="$1" out="$2" meta="$3" expected_comm="${4:-}" expected_name=""
+  [ -n "$expected_comm" ] && expected_name="${expected_comm##*/}"
+  : >"$out" || return 1
+  (
+    trap - EXIT
+    local line rss comm samples=0 started ended mismatch="" comm0="" exit_seen=no
+    started="$(date +%s)"
+    while kill -0 "$pid" 2>/dev/null; do
+      line="$(ps -p "$pid" -o rss=,comm= 2>/dev/null)" || break
+      read -r rss comm <<<"$line"
+      case "$rss" in
+      '' | *[!0-9]*)
+        mismatch="nonnumeric ps line '$line'"
+        break
+        ;;
+      esac
+      if [ -z "$comm0" ]; then
+        comm0="$comm"
+        if [ -n "$expected_comm" ] && [ "$comm" != "$expected_comm" ]; then
+          mismatch="sampled comm '$comm' is not '$expected_comm'"
+          break
+        fi
+      elif [ "$comm" = "$comm0" ]; then
+        :
+      elif rss_exit_transition "$comm" "$rss" "$expected_name"; then
+        # The strict comparison failed a healthy `large` launch whose last read
+        # raced its exit (post3 native sweep); a comm change to anything else,
+        # or with a live RSS, still fails.
+        exit_seen=yes
+        break
+      else
+        mismatch="sampled comm changed '$comm0' -> '$comm'"
+        break
+      fi
+      printf '%s\n' "$rss" >>"$out" || {
+        mismatch="could not append to $out"
+        break
+      }
+      samples=$((samples + 1))
+      sleep "$RSS_SAMPLE_INTERVAL"
+    done
+    ended="$(date +%s)"
+    {
+      printf 'samples=%s\n' "$samples"
+      printf 'sampled_comm=%s\n' "$comm0"
+      printf 'sampling_started_ts=%s\n' "$started"
+      printf 'sampling_ended_ts=%s\n' "$ended"
+      printf 'sampling_exit_transition=%s\n' "$exit_seen"
+      printf 'sampling_mismatch=%s\n' "$mismatch"
+    } >>"$meta"
+  ) &
+  STDIN_RSS_PID=$!
+}
+
+# Clear one launch's sampler files (samples, receipt, meta) **before** the child
+# starts. The wrapper writes its one-shot identity receipt as its first act, so a
+# legal child-first schedule can publish it before the sampler is started; a
+# delete inside the sampler would discard the live receipt and then wait for one
+# that is never rewritten (#399 R3-1). Called by every caller that spawns a
+# launch this sampler is going to measure.
+reset_launcher_rss_files() { # out
+  local out="$1"
+  rm -f -- "$out" "$out.receipt" "$out.meta"
+}
+
+# Start the launcher sampler: wait for the launch receipt, verify the named
+# process is the expected launcher, then sample it at $RSS_SAMPLE_INTERVAL
+# across the whole run (the receipt is written before the launcher opens stdin,
+# so the window covers the transfer, not just its end). `$STDIN_RSS_PID` is the
+# sampler; the shell that started it must reap it (`rss_sampler_stop`), because
+# a command substitution cannot `wait` for another shell's child (#399 N3).
+STDIN_RSS_PID=""
+RSS_SAMPLE_INTERVAL="${RSS_SAMPLE_INTERVAL:-0.05}"
+RSS_RECEIPT_WAIT_SECONDS="${RSS_RECEIPT_WAIT_SECONDS:-20}"
+RSS_MIN_SAMPLES="${RSS_MIN_SAMPLES:-3}"
+
+# Resolve the expected launcher comm to the path form `ps -o comm=` reports.
+absolute_executable() {
+  local path="$1" dir
+  dir="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
+  [ -x "$dir/$(basename "$path")" ] || return 1
+  printf '%s' "$dir/$(basename "$path")"
+}
+
+sample_launcher_rss() { # launch_job_pid out expected_executable
+  local launch_job_pid="$1" out="$2" expected="$3"
+  local receipt="$out.receipt" meta="$out.meta" steps waited pid target current job_comm
+  # The receipt/meta/sample files are cleared by `reset_launcher_rss_files`
+  # *before* the child starts, never here: a child-first schedule can publish
+  # the receipt before this function runs, and deleting it would drop the live
+  # identity record and then wait for a rewrite that never comes (#399 R3-1).
+  if ! expected="$(absolute_executable "$expected")"; then
+    echo "    FAIL: the expected launcher $3 is not an executable file" >&2
+    return 1
+  fi
+  steps=$((RSS_RECEIPT_WAIT_SECONDS * 50))
+  waited=0
+  while [ "$waited" -lt "$steps" ]; do
+    [ -s "$receipt" ] && break
+    kill -0 "$launch_job_pid" 2>/dev/null || break
+    sleep 0.02
+    waited=$((waited + 1))
+  done
+  if [ ! -s "$receipt" ]; then
+    echo "    FAIL: the launch wrote no identity receipt at $receipt" >&2
+    return 1
+  fi
+  pid="$(launch_receipt_field "$receipt" pid)" || return 1
+  target="$(launch_receipt_field "$receipt" before_comm)" || return 1
+  case "$pid" in
+  '' | *[!0-9]*)
+    echo "    FAIL: the launch receipt names a non-numeric PID '$pid'" >&2
+    return 1
+    ;;
+  esac
+  job_comm="$(ps -p "$launch_job_pid" -o comm= 2>/dev/null)"
+  # The receipt is written before the exec, so wait (bounded) for the named PID
+  # to *be* the launcher: the sampler must never measure the pre-exec shell.
+  waited=0
+  current=""
+  while [ "$waited" -lt "$steps" ]; do
+    current="$(ps -p "$pid" -o comm= 2>/dev/null)" || {
+      echo "    FAIL: the launcher PID $pid exited before it could be sampled" >&2
+      return 1
+    }
+    same_executable "$current" "$expected" && break
+    sleep 0.02
+    waited=$((waited + 1))
+  done
+  if ! same_executable "$current" "$expected"; then
+    echo "    FAIL: PID $pid never became $expected (last comm '$current', receipt comm '$target')" >&2
+    return 1
+  fi
+  {
+    printf 'sampled_pid=%s\n' "$pid"
+    printf 'sampled_expected_comm=%s\n' "$expected"
+    printf 'sampled_receipt_before_comm=%s\n' "$target"
+    printf 'launch_job_pid=%s\n' "$launch_job_pid"
+    printf 'launch_job_comm=%s\n' "$job_comm"
+    printf 'sampling_interval_seconds=%s\n' "$RSS_SAMPLE_INTERVAL"
+  } >"$meta" || return 1
+  rss_sample_until_exit "$pid" "$out" "$meta" "$expected"
+}
+
+# Print one launcher-RSS sample receipt as `key=value` words, for the row log,
+# and assert that the comm the sampler **observed** is the expected launcher's.
+# Printing only `sampled_expected_comm` let a native receipt look identity-bound
+# while the observed field was never shown (#399 review 3, observation 1).
+launcher_rss_receipt() { # out
+  local meta="$1.meta" field observed expected
+  [ -f "$meta" ] || {
+    echo "    FAIL: no launcher-RSS receipt at $meta" >&2
+    return 1
+  }
+  for field in sampled_pid sampled_expected_comm sampled_comm \
+    sampled_receipt_before_comm launch_job_pid launch_job_comm \
+    sampling_interval_seconds samples sampling_started_ts sampling_ended_ts \
+    sampling_exit_transition sampling_mismatch; do
+    printf '%s=%s ' "$field" "$(sed -n "s/^$field=//p" "$meta")"
+  done
+  printf '\n'
+  observed="$(sed -n 's/^sampled_comm=//p' "$meta")"
+  expected="$(sed -n 's/^sampled_expected_comm=//p' "$meta")"
+  if [ -z "$observed" ]; then
+    echo "    FAIL: the launcher-RSS receipt $meta records no observed sampled_comm" >&2
+    return 1
+  fi
+  if [ "$observed" != "$expected" ]; then
+    echo "    FAIL: the launcher-RSS receipt observed comm '$observed' is not the expected launcher '$expected'" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Fail unless the receipt proves the sampler measured the launcher itself: a
+# numeric sampled PID, the expected comm observed on every sample, enough
+# samples to have covered the run, no mismatch, and — when the launch job was
+# `/usr/bin/time` — a sampled PID distinct from that wrapper. The originals
+# this replaces passed a constant 1056 KiB with growth 0 (#399 R2-1).
+assert_launcher_rss_identity() { # out
+  local out="$1" meta="$1.meta" desc="$2"
+  local sampled launch_job expected observed samples mismatch launch_comm rc=0
+  [ -s "$meta" ] || {
+    echo "    FAIL: $desc: no launcher-RSS receipt at $meta"
+    return 1
+  }
+  sampled="$(sed -n 's/^sampled_pid=//p' "$meta")"
+  launch_job="$(sed -n 's/^launch_job_pid=//p' "$meta")"
+  launch_comm="$(sed -n 's/^launch_job_comm=//p' "$meta")"
+  expected="$(sed -n 's/^sampled_expected_comm=//p' "$meta")"
+  observed="$(sed -n 's/^sampled_comm=//p' "$meta")"
+  samples="$(sed -n 's/^samples=//p' "$meta")"
+  mismatch="$(sed -n 's/^sampling_mismatch=//p' "$meta")"
+  case "$sampled" in
+  '' | *[!0-9]*)
+    echo "    FAIL: $desc: the RSS receipt names no sampled PID ('$sampled')"
+    rc=1
+    ;;
+  esac
+  case "$expected" in
+  '' | /*) ;;
+  *)
+    echo "    FAIL: $desc: the RSS receipt's expected comm is not an absolute path ('$expected')"
+    rc=1
+    ;;
+  esac
+  # The comm the sampler observed must be recorded and must be the launcher: the
+  # receipt claims the process that was measured, not just the one intended.
+  case "$observed" in
+  '')
+    echo "    FAIL: $desc: the RSS receipt records no observed sampled_comm"
+    rc=1
+    ;;
+  "$expected") ;;
+  *)
+    echo "    FAIL: $desc: the RSS sampler observed comm '$observed', not the expected launcher '$expected'"
+    rc=1
+    ;;
+  esac
+  case "$samples" in
+  '' | *[!0-9]*)
+    echo "    FAIL: $desc: the RSS sampler recorded no sample count ('$samples')"
+    rc=1
+    ;;
+  *)
+    if [ "$samples" -lt "$RSS_MIN_SAMPLES" ]; then
+      echo "    FAIL: $desc: only $samples RSS sample(s) (need $RSS_MIN_SAMPLES) — the window did not cover the run"
+      rc=1
+    fi
+    ;;
+  esac
+  if [ -n "$mismatch" ]; then
+    echo "    FAIL: $desc: the RSS sampler rejected its own samples: $mismatch"
+    rc=1
+  fi
+  case "$launch_comm" in
+  */time)
+    if [ "$sampled" = "$launch_job" ]; then
+      echo "    FAIL: $desc: the RSS oracle sampled the $launch_comm wrapper, not the launcher"
+      rc=1
+    fi
+    ;;
+  esac
+  return "$rc"
+}
+
+# Reap the sampler in the shell that started it, bounded. Safe twice; a failed
+# row's cleanup calls it on the way out.
+rss_sampler_stop() {
+  [ -n "$STDIN_RSS_PID" ] || return 0
+  local pid="$STDIN_RSS_PID" i=0
+  STDIN_RSS_PID=""
+  while [ "$i" -lt 100 ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+# Print the largest launcher RSS sample, in KiB. Pure parser: it neither waits
+# for nor clears the sampler (that is `rss_sampler_stop`, #399 N3), so a command
+# substitution can call it safely.
+#
+# Fails closed (#399 F3): a nonempty file is not enough. Every sample must be a
+# decimal number after trimming only the padding `ps -o rss=` emits; an
+# unterminated final line counts (the former `while read` skipped it, so a JSON
+# file without a newline returned 0), and at least one sample must validate.
+max_rss_kib() {
+  local out="$1" max=0 line saw=0
+  if [ ! -f "$out" ] || [ ! -s "$out" ]; then
+    echo "    FAIL: no RSS samples in $out" >&2
+    return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    # `ps` pads on the left (and can pad on the right); internal whitespace is
+    # never legitimate and must stay visible to the numeric check.
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+    '' | *[!0-9]*)
+      echo "    FAIL: non-numeric RSS sample '$line' in $out" >&2
+      return 1
+      ;;
+    esac
+    if [ "$line" -gt "$max" ]; then
+      max="$line"
+    fi
+    saw=1
+  done <"$out"
+  if [ "$saw" -ne 1 ]; then
+    echo "    FAIL: no validated RSS sample in $out" >&2
+    return 1
+  fi
+  printf '%s' "$max"
+}
+
+# Plan §6.5's memory criterion in one place, so the `large` row and the
+# sensitivity control cannot drift apart. Prints the growth in KiB and returns
+# success only when it is under the limit. The 64 MiB limit is not a guess: on
+# this host the debug launcher peaks at ~80 MB on both a 1 MiB and a 256 MiB
+# input (growth ~5 MB), while a 256 MiB whole-stream buffer adds 256 MiB, four
+# times the limit — the measured separation is recorded in verifications.md.
+RSS_GROWTH_LIMIT_KIB="${RSS_GROWTH_LIMIT_KIB:-65536}"
+
+rss_growth_verdict() { # baseline_median_kib measured_median_kib
+  local growth
+  growth=$(( $2 - $1 ))
+  printf '%s' "$growth"
+  [ "$growth" -lt "$RSS_GROWTH_LIMIT_KIB" ]
+}
+
+# Count one byte value, given as a C-style octal escape, in a file. LC_ALL=C so
+# multibyte decoding cannot change what "a byte" means.
+count_byte() {
+  local file="$1" escape="$2"
+  [ -f "$file" ] || { echo "    FAIL: no capture file $file" >&2; return 1; }
+  LC_ALL=C tr -dc -- "$escape" <"$file" | wc -c | tr -d ' '
+}
+
+# The concurrent-streams oracle, over captured files only, so the harness
+# self-test can run a mock launcher through the very same checks.
+#
+# Guest bytes are channel-distinct and non-ASCII on purpose: the launcher's own
+# `==> …` notices contain ASCII letters, so counting ASCII in a capture cannot
+# distinguish guest output from diagnostics.
+assert_concurrent_stdout() {
+  local desc="$1" expected="$2" actual="$3" stray
+  if ! cmp -s "$expected" "$actual"; then
+    echo "    FAIL: $desc (stdout is not the exact guest bytes)"
+    cmp -l "$expected" "$actual" | head -5 || true
+    return 1
+  fi
+  stray="$(count_byte "$actual" '\361')" || return 1
+  assert_eq "$desc: no stderr byte on stdout" "0" "$stray" || return 1
+}
+
+# The launcher's complete progress-notice vocabulary for one direct launch. A
+# `==>` line outside this set is either guest-byte contamination or a changed
+# launcher, and both must fail rather than be accepted as "some notice"
+# (#399 N1). Guest bytes cannot match: they are 0xE9/0xF1.
+CONCURRENT_NOTICE_PATTERNS=(
+  '^==> agent-vm-[0-9a-f]+-[0-9]+ in .+ [(]state: .+[)]$'
+  '^==> Agent credentials: .+$'
+  '^==> Git author identity: .+$'
+  '^==> GitHub repo scope: .+$'
+  '^==> GitHub repo scope [(][0-9]+[)]: .+$'
+  '^==> Boot image: .+$'
+  '^==> Booting sandbox from .+$'
+  '^==> Project path .+$'
+  '^==> --no-git skips .+$'
+  '^==> Mounting .+$'
+  '^==> Config mounts: .+$'
+  '^==> Egress authority: .+$'
+  '^==> Egress policy: .+$'
+  '^==> TLS interception: .+$'
+  '^==> Egress DNS: .+$'
+  '^==> Tool network requests .+$'
+  '^==>   (unmet|to grant): .+$'
+  '^==>   … and [0-9]+ more not shown$'
+  '^==> WARNING: potentially sensitive guest-managed Pi credentials .+$'
+  '^==> Running .+ in sandbox [(]no TTY; streaming output[)]$'
+  '^==> Stopping sandbox$'
+)
+
+# A notice is the launcher's own diagnostic: printable ASCII plus the three
+# punctuation characters its vocabulary uses (`…`, `—`, `→`). Any other byte on
+# a notice line — the guest's 0xE9/0xF1, a control byte, DEL — is contamination.
+# This check is deliberately independent of the vocabulary: in C locale `.`
+# matches any byte, so `^==> GitHub repo scope: .+$` accepts
+# `owner/<0xF1>repo`. The vocabulary alone can therefore never carry the
+# no-guest-byte property (#399 R2-2).
+notice_bytes_clean() {
+  local line="$1"
+  local LC_ALL=C
+  line="${line//$'\342\200\246'/}" # …
+  line="${line//$'\342\200\224'/}" # —
+  line="${line//$'\342\206\222'/}" # →
+  case "$line" in
+  *[$'\001'-$'\037']* | *[$'\177'-$'\377']*) return 1 ;;
+  esac
+  return 0
+}
+
+# Does one line match the launcher's stated notice vocabulary? Kept separate
+# from `assert_expected_notices` so a control can show that a wildcard-injected
+# notice is *accepted* by the vocabulary and rejected by the byte rule above.
+notice_vocabulary_matches() {
+  local line="$1" pattern
+  local LC_ALL=C
+  for pattern in "${CONCURRENT_NOTICE_PATTERNS[@]}"; do
+    if [[ "$line" =~ $pattern ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+assert_expected_notices() {
+  # A UTF-8 locale makes bash 5.2's `read` fail on a line holding a non-UTF-8
+  # byte and silently skip its body -- that would make this oracle green for
+  # exactly the contamination it exists to catch (#399 N1). Scan bytes.
+  local desc="$1" stderr="$2" line
+  local LC_ALL=C
+  [ -f "$stderr" ] || {
+    echo "    FAIL: $desc: no stderr capture"
+    return 1
+  }
+  # `|| [ -n "$line" ]` also scans an unterminated final line: a guest byte in a
+  # last line without a newline must not be skipped (#399 R2-2).
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '==> '*) ;; *) continue ;; esac
+    if ! notice_bytes_clean "$line"; then
+      echo "    FAIL: $desc: guest byte or control byte on a launcher notice: $line"
+      printf '    notice bytes:'
+      printf '%s' "$line" | LC_ALL=C od -An -tx1 | head -2 || true
+      return 1
+    fi
+    if ! notice_vocabulary_matches "$line"; then
+      echo "    FAIL: $desc: unexpected launcher notice: $line"
+      return 1
+    fi
+  done <"$stderr"
+}
+
+# Bytes above 0x7F on this capture that the notice oracle already vetted: the
+# launcher's own `…`/`—`/`→` on lines that are accepted notices. `notice_bytes_clean`
+# removes those three sequences and then rejects every remaining byte above
+# 0x7F, so *all* high bytes on an accepted notice line are that punctuation. The
+# allowance is line-scoped: a high byte on any other line (guest output, a
+# rejected notice, a stray sequence) is never subtracted here.
+notice_punctuation_bytes() { # file
+  local file="$1" line count total=0
+  local LC_ALL=C
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '==> '*) ;; *) continue ;; esac
+    notice_bytes_clean "$line" || continue
+    notice_vocabulary_matches "$line" || continue
+    count="$(printf '%s' "$line" | LC_ALL=C tr -cd '\200-\377' | wc -c | tr -d ' ')"
+    total=$((total + count))
+  done <"$file"
+  printf '%s' "$total"
+}
+
+assert_concurrent_stderr() {
+  local desc="$1" stderr="$2" total="$3" count stray allowed
+  count="$(count_byte "$stderr" '\361')" || return 1
+  assert_eq "$desc: guest stderr bytes" "$total" "$count" || return 1
+  count="$(count_byte "$stderr" '\351')" || return 1
+  assert_eq "$desc: no stdout byte on stderr" "0" "$count" || return 1
+  # Only 0xF1 may be non-ASCII: remove it, then nothing above 0x7F may remain —
+  # except the launcher's own notice punctuation (`…`, `—`, `→`) on lines the
+  # notice oracle below accepts. Without that allowance this rule rejected a
+  # valid `TLS interception: … — global` notice before the notice check ran, so
+  # the punctuation allowance lived only inside `notice_bytes_clean` while the
+  # whole-stream rule refused the same bytes (#399 review 3, observation 3).
+  # `notice_punctuation_bytes` is line-scoped: punctuation on any line that is
+  # not an accepted notice stays countable, so no guest byte can ride along.
+  stray="$(LC_ALL=C tr -d '\361' <"$stderr" | LC_ALL=C tr -cd '\200-\377' | wc -c |
+    tr -d ' ')" || return 1
+  allowed="$(notice_punctuation_bytes "$stderr")" || return 1
+  stray=$((stray - allowed))
+  assert_eq "$desc: no other non-ASCII byte on stderr" "0" "$stray" || return 1
+  # Guest bytes never ride on a notice, and only the launcher's known notices
+  # are allowed at all.
+  assert_expected_notices "$desc: notices" "$stderr" || return 1
+  # Counts alone accept an arbitrarily long ASCII injection on a line the notice
+  # oracle skips: every byte that is not part of an accepted notice must be the
+  # guest's own flood byte, so the remaining lines are checked, not just counted.
+  assert_stderr_is_notices_and_flood "$desc" "$stderr" || return 1
+}
+
+# Every stderr line is either a launcher notice the oracle accepts, or nothing
+# but the guest's 0xF1 flood (#399 review: byte counts alone let an injected
+# ASCII line through).
+assert_stderr_is_notices_and_flood() {
+  local desc="$1" stderr="$2" line rest
+  local LC_ALL=C
+  [ -f "$stderr" ] || {
+    echo "    FAIL: $desc: no stderr capture"
+    return 1
+  }
+  while IFS= read -r line || [ -n "$line" ]; do
+    # The guest flood carries no line structure, so a launcher notice can be
+    # glued to its tail (`0xF1 × 4 MiB` then `==> Stopping sandbox` with no
+    # newline between them). Remove the flood bytes first and judge what is
+    # left: an accepted notice line, or nothing.
+    rest="$(printf '%s' "$line" | LC_ALL=C tr -d '\361')" || return 1
+    [ -n "$rest" ] || continue
+    if [[ "$rest" == '==> '* ]] && notice_bytes_clean "$rest" &&
+      notice_vocabulary_matches "$rest"; then
+      continue
+    fi
+    echo "    FAIL: $desc: stderr line is neither a launcher notice nor the guest flood"
+    printf '    remaining bytes:'
+    printf '%s' "$rest" | LC_ALL=C od -An -tx1 | head -2 || true
+    printf '    text:'
+    printf '%s' "$rest" | LC_ALL=C head -c 200 || true
+    printf '\n'
+    return 1
+  done <"$stderr"
+}
+
+# One stdin capture in one direct syntax form: `$1` capture name, `$2` project,
+# `$3` input path, `$4` form (`run` or `dash`), rest: the program's literal argv.
+stdin_capture() {
+  local capture="$1" proj="$2" input="$3" form="$4" status=0
+  shift 4
+  case "$form" in
+  run | dash) ;;
+  *)
+    echo "    FAIL: unknown direct form: $form"
+    return 1
+    ;;
+  esac
+  case "$form" in
+  run) capture_custom_direct_input "$capture" "$proj" "$input" -- run "$@" || status=$? ;;
+  dash) capture_custom_direct_input "$capture" "$proj" "$input" -- -- "$@" || status=$? ;;
+  esac
+  printf '    observed: form=%s observation=%s launcher_status=%s\n' \
+    "$form" "$status" "${CAPTURE_STATUS:-unset}"
+  return "$status"
+}
+
+# The same capture in the background, so a row can observe the guest while the
+# launcher still runs. Two independent outcomes are recorded (#399 F1):
+# * `<capture>.observed` — did the *observation* succeed?
+# * `<capture>.status` — the launcher's own exit status, kept in CAPTURE_STATUS
+#   by observe_launch. The old wrapper wrote `$?` (observation success) here, so
+#   a launcher that emitted every expected byte and exited 7 was recorded as 0.
+stdin_capture_async() {
+  local capture="$1" proj="$2" input="$3" form="$4"
+  shift 4
+  : >"$WORK/$capture.observed" || return 1
+  (
+    trap - EXIT
+    local observation=0
+    CAPTURE_STATUS=""
+    stdin_capture "$capture" "$proj" "$input" "$form" "$@" || observation=$?
+    printf '%s' "$observation" >"$WORK/$capture.observed"
+    printf '%s' "${CAPTURE_STATUS:-}" >"$WORK/$capture.status"
+  ) &
+  STDIN_CAPTURE_PID=$!
+}
+
+# Background capture PID, for the row's bounded `wait`.
+STDIN_CAPTURE_PID=""
+
+# How long a background capture may take to finish. The launch itself has a
+# 120 s watchdog, so this is a backstop, never the primary deadline (#399 F2).
+STDIN_CAPTURE_WAIT_SECONDS="${STDIN_CAPTURE_WAIT_SECONDS:-130}"
+
+# Signal one recorded `pid:comm` inventory. Every PID is re-checked against the
+# comm recorded *before* the first signal. That comm match is a reuse *guard*,
+# not a process birth identity: another process can reuse the PID with the same
+# comm, and the check-to-kill window is a race, so this narrows — it does not
+# eliminate — the chance of signalling a stranger. The inventory is the caller's
+# snapshot: recomputing descendants after a TERM cannot find a child that was
+# reparented when its parent died (#399 R2-4).
+signal_inventory() { # inventory signal
+  local inventory="$1" sig="$2" line pid comm current
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    pid="${line%%:*}"
+    comm="${line#*:}"
+    current="$(ps -p "$pid" -o comm= 2>/dev/null)" || continue
+    [ "$current" = "$comm" ] || continue
+    kill "-$sig" "$pid" 2>/dev/null || true
+  done <<<"$inventory"
+}
+
+# Wait for an async capture, bounded, and reap it. A capture still running at
+# the deadline is killed together with its descendants so a failed row cannot
+# leave a launcher behind. The descendant inventory is taken once, before the
+# TERM pass: a TERM-resistant child is reparented to init as soon as its capture
+# parent dies, so rediscovering descendants after the TERM would miss exactly
+# the process that needs the KILL and leave it unreachable from EXIT cleanup
+# (#399 R2-4).
+wait_capture_bounded() {
+  local capture="$1" i=0 inventory
+  [ -n "$STDIN_CAPTURE_PID" ] || return 0
+  while [ "$i" -lt "$STDIN_CAPTURE_WAIT_SECONDS" ]; do
+    kill -0 "$STDIN_CAPTURE_PID" 2>/dev/null || break
+    sleep 1
+    i=$((i + 1))
+  done
+  if kill -0 "$STDIN_CAPTURE_PID" 2>/dev/null; then
+    echo "    FAIL: the background capture $capture did not finish within ${STDIN_CAPTURE_WAIT_SECONDS}s"
+    inventory="$(descendants_of "$STDIN_CAPTURE_PID")" || inventory=""
+    signal_inventory "$inventory" TERM
+    kill -TERM "$STDIN_CAPTURE_PID" 2>/dev/null || true
+    sleep 1
+    signal_inventory "$inventory" KILL
+    kill -KILL "$STDIN_CAPTURE_PID" 2>/dev/null || true
+    wait "$STDIN_CAPTURE_PID" 2>/dev/null || true
+    STDIN_CAPTURE_PID=""
+    return 1
+  fi
+  wait "$STDIN_CAPTURE_PID" 2>/dev/null || true
+  STDIN_CAPTURE_PID=""
+}
+
+# How long a control that killed a process waits for it to disappear. A
+# SIGKILLed process is not absent on the next instruction: it can be
+# mid-teardown or an unreaped zombie, and `kill -0` reports both as alive
+# (#399 verification 4, h19). Ten seconds is far beyond observed teardown and
+# still finite, so a descendant the KILL pass never reached (the control's child
+# ignores TERM and loops forever) still fails it.
+KILL_GRACE_SECONDS="${KILL_GRACE_SECONDS:-10}"
+
+# Poll, bounded, for `pid` to be gone. Success means the process no longer
+# exists or is an unreaped zombie — a process that was killed, not a survivor.
+# A PID still carrying a live comm at the deadline returns 1.
+wait_pid_absent() { # pid [seconds]
+  local pid="$1" seconds="${2:-$KILL_GRACE_SECONDS}" steps waited=0 comm
+  steps=$((seconds * 10))
+  while :; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
+    if [ "$comm" = "<defunct>" ]; then
+      return 0
+    fi
+    [ "$waited" -lt "$steps" ] || return 1
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+}
+
+# Backstop for cleanup_work: stop a capture a failed row left running.
+stdin_capture_stop() {
+  [ -n "$STDIN_CAPTURE_PID" ] || return 0
+  wait_capture_bounded "background capture"
+}
+
+# Abort a live row whose readiness deadline was missed. It closes its writer and
+# reaps the capture; it never opens the FIFO for another synchronous write,
+# which is what used to block a failed row forever (#399 F2).
+abort_live_capture() {
+  local capture="$1" status=0
+  stdin_writer_close
+  stdin_writer_stop || status=1
+  wait_capture_bounded "$capture" || status=1
+  return "$status"
+}
+
+# Poll until a capture file has at least one byte (a live guest is producing).
+wait_for_nonempty() {
+  local file="$1" seconds="$2" waited=0 steps
+  steps=$((seconds * 5))
+  while [ "$waited" -lt "$steps" ]; do
+    [ -s "$file" ] && return 0
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  echo "    FAIL: $file stayed empty for ${seconds}s"
+  return 1
+}
+
+# Byte-exact comparison of a capture's guest stdout with an **expected file**,
+# for expectations that carry bytes a shell string cannot (random bytes, a
+# trailing newline a `$(...)` would strip).
+assert_direct_stdout_file() {
+  local desc="$1" name="$2" expected_file="$3"
+  direct_stdout_file "$name" >/dev/null || return 1
+  if ! cmp -s "$expected_file" "$WORK/$name.stdout"; then
+    echo "    FAIL: $desc (guest stdout bytes differ)"
+    cmp -l "$expected_file" "$WORK/$name.stdout" | head -5 || true
+    return 1
+  fi
+}
+
+# The observation outcome of a capture started with stdin_capture_async: 0
+# only when observe_launch completed, never the launcher's own status (#399
+# F1). A missing receipt is a failure, not an assumed success.
+stdin_capture_observation() {
+  local capture="$1" observed
+  observed="$(cat "$WORK/$capture.observed" 2>/dev/null)" || {
+    echo "    FAIL: the background capture $capture never reported its observation"
+    return 1
+  }
+  case "$observed" in
+  '' | *[!0-9]*)
+    echo "    FAIL: the background capture $capture reported a non-numeric observation '$observed'"
+    return 1
+    ;;
+  esac
+  printf '%s' "$observed"
+}
+
+# The launcher's own exit status, valid only when the observation succeeded.
+# The previous helper returned the observation status here, so a launcher that
+# exited 7 was reported as 0 whenever its bytes looked right (#399 F1).
+stdin_capture_launcher_status() {
+  local capture="$1" observed status
+  observed="$(stdin_capture_observation "$capture")" || return 1
+  if [ "$observed" -ne 0 ]; then
+    echo "    FAIL: $capture: the observation itself failed (exit $observed); the launcher status is unknown"
+    return 1
+  fi
+  status="$(cat "$WORK/$capture.status" 2>/dev/null)" || {
+    echo "    FAIL: the background capture $capture never reported a launcher status"
+    return 1
+  }
+  case "$status" in
+  '' | *[!0-9]*)
+    echo "    FAIL: the background capture $capture reported a non-numeric launcher status '$status'"
+    return 1
+    ;;
+  esac
+  printf '%s' "$status"
+}
+
+# Assert both halves of an async capture: the observation completed and the
+# launcher exited with `want`.
+assert_async_launcher_status() {
+  local desc="$1" capture="$2" want="$3" status
+  status="$(stdin_capture_launcher_status "$capture")" || return 1
+  assert_eq "$desc" "$want" "$status"
+}
+
+# ── evidence receipts (#399 follow-up) ─────────────────────────────────────
+#
+# A row PASS label is not evidence. Every stdin row logs the exact launcher
+# argv (in stdin_capture), then one receipt per form naming the candidate and
+# the runtime this group pinned. Hashes are computed once and reused.
+#
+# The runtime receipt covers the paths the **rows actually launch with**
+# (#399 R2-5): `CUSTOM_ENV` clears an inherited MSB_PATH / MSB_LIBKRUNFW_PATH /
+# MSB_AGENTD_PATH and pins these exact files, so a caller's environment cannot
+# make a launch execute a different runtime than the one recorded here. The
+# version comes from the pinned binary itself, never from `agent-vm msb
+# --version`, which resolves MSB_HOME and can create or read the caller's DB.
+STDIN_EVIDENCE_CANDIDATE=""
+STDIN_EVIDENCE_RUNTIME=""
+STDIN_EVIDENCE_READY=""
+
+# A Git object id, as the probes below must see it. A probe that succeeds while
+# printing nothing, and the literal `unknown` some Git commands print for an
+# unresolved revision, are failures here: neither may reach a receipt as an
+# identity (#399 review).
+stdin_object_id() {
+  case "$1" in
+  '' | unknown | *[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#1}" -eq 40 ] || [ "${#1}" -eq 64 ]
+}
+
+# The commit the pinned runtime's own `vendor/libkrunfw` gitlink names: the
+# source the firmware receipt must match. The `ls-tree` status is checked before
+# its output is parsed, so a failed or empty resolution cannot compare equal to
+# a failed or empty receipt (#399 review).
+stdin_firmware_gitlink() {
+  local tree mode type link path
+  tree="$(git -C "$REPO_ROOT/vendor/microsandbox" ls-tree HEAD vendor/libkrunfw)" || return 1
+  read -r mode type link path <<<"$tree"
+  if [ "$mode" != 160000 ] || [ "$type" != commit ] || [ "$path" != vendor/libkrunfw ]; then
+    echo "    evidence: no vendor/libkrunfw gitlink in the pinned runtime: [$tree]" >&2
+    return 1
+  fi
+  stdin_object_id "$link" || {
+    echo "    evidence: the pinned runtime's vendor/libkrunfw gitlink is not an object id: [$link]" >&2
+    return 1
+  }
+  printf '%s' "$link"
+}
+
+# A named object id, or a failure that says which probe answered wrongly.
+require_object_id() {
+  stdin_object_id "$2" && return 0
+  echo "    evidence: $1 is not a Git object id: [$2]" >&2
+  return 1
+}
+
+stdin_identity_init() {
+  [ -z "$STDIN_EVIDENCE_READY" ] || return 0
+  local cand_sha version head runtime_source firmware_source firmware_gitlink
+  local runtime_msb runtime_agentd runtime_fw msb_version
+  # The rows call this under `if`/`||`, where implicit errexit is ineffective, so
+  # every probe carries its own `|| return 1` and its value is validated rather
+  # than interpolated. An empty or `unknown` answer is a failed probe (#399 review).
+  cand_sha="$(shasum -a 256 "$AGENT_VM" | cut -d' ' -f1)" || return 1
+  version="$("$AGENT_VM" --version 2>&1)" || return 1
+  head="$(git -C "$REPO_ROOT" rev-parse HEAD)" || return 1
+  runtime_source="$(git -C "$REPO_ROOT/vendor/microsandbox" rev-parse --verify HEAD)" || return 1
+  firmware_source="$(cat "$CUSTOM_RUNTIME_DIR/libkrunfw.5.dylib.source-sha")" || return 1
+  firmware_gitlink="$(stdin_firmware_gitlink)" || return 1
+  require_object_id "the candidate HEAD" "$head" || return 1
+  require_object_id "the pinned runtime HEAD" "$runtime_source" || return 1
+  require_object_id "the firmware source receipt" "$firmware_source" || return 1
+  [ "$firmware_source" = "$firmware_gitlink" ] || {
+    echo "    evidence: firmware source $firmware_source is not the pinned runtime gitlink $firmware_gitlink" >&2
+    return 1
+  }
+  STDIN_EVIDENCE_CANDIDATE="path=$AGENT_VM version=[$version] sha256=$cand_sha commit=$head"
+  runtime_msb="$(shasum -a 256 "$CUSTOM_MSB" | cut -d' ' -f1)" || return 1
+  runtime_agentd="$(shasum -a 256 "$CUSTOM_AGENTD" | cut -d' ' -f1)" || return 1
+  runtime_fw="$(shasum -a 256 "$CUSTOM_LIBKRUNFW" | cut -d' ' -f1)" || return 1
+  msb_version="$("$CUSTOM_MSB" --version 2>&1)" || return 1
+  STDIN_EVIDENCE_RUNTIME="msb_path=$CUSTOM_MSB (pinned) sha256=$runtime_msb version=[$msb_version]; agentd=embedded in the pinned msb (MSB_AGENTD_PATH cleared; the bundle ships $CUSTOM_AGENTD sha256=$runtime_agentd); libkrunfw_path=$CUSTOM_LIBKRUNFW (pinned) sha256=$runtime_fw; microsandbox=$runtime_source; firmware-source=$firmware_source (the pinned vendor/libkrunfw gitlink)"
+  STDIN_EVIDENCE_READY=1
+}
+
+# One per-form receipt: command form, observed status, candidate/runtime
+# identities, and the checks that ran.
+stdin_form_evidence() {
+  local form="$1" status="$2" assertions="$3"
+  stdin_identity_init || return 1
+  printf '    evidence: form=%s launcher_status=%s assertions=[%s]\n' \
+    "$form" "$status" "$assertions"
+  printf '    evidence: candidate=%s\n' "$STDIN_EVIDENCE_CANDIDATE"
+  printf '    evidence: runtime=%s\n' "$STDIN_EVIDENCE_RUNTIME"
+}
+
+# A project pinned to one image, for a stdin row.
+stdin_row_project() {
+  local name="$1" image="$2" proj="$WORK/$1"
+  mkdir -p "$proj/.agent-vm" || return 1
+  printf 'image = "%s"\n' "$image" >"$proj/.agent-vm/config.toml" || return 1
+  printf '%s' "$proj"
 }
 
 # The single state directory this run owns for `proj`: exactly one 12-hex child
@@ -1311,6 +2708,20 @@ check_harness_negative() {
   FAILED=0
   reset_host_shim_log || return 1
   : >"$log" || return 1
+  # Every control logs its own outcome, so the log binds each claimed property
+  # to an observation instead of one aggregate `PASS: harness-negative` line.
+  local ctl_before=""
+  # `result` is a monotonic failure count inside this check, so a control that
+  # fails *after* an earlier one cannot compare equal and be reported ok. The
+  # old shared 0/1 flag did exactly that once any control had failed.
+  control_report() {
+    local name="$1" before="$2"
+    if [ "$result" -eq "$before" ]; then
+      echo "    control $name: ok"
+    else
+      echo "    control $name: FAILED"
+    fi
+  }
 
   # shellcheck disable=SC2317,SC2329  # invoked indirectly through run_check;
   # 0.9 (the Ubuntu CI version) reports the body as unreachable instead.
@@ -1337,7 +2748,7 @@ check_harness_negative() {
   local result=0 accepted="$MSB_SCRIPTS_PREFIX:$NONSTANDARD_OCI_PATH" bad_path
   if ! expect_effective_path "oracle-accepted" "$(path_oracle_row "$accepted")" >/dev/null 2>&1; then
     echo "    FAIL: PATH oracle rejected the accepted row"
-    result=1
+    result=$((result + 1))
   fi
   for bad_path in \
     "$NONSTANDARD_OCI_PATH" \
@@ -1349,12 +2760,12 @@ check_harness_negative() {
     "$NONSTANDARD_OCI_PATH:/extra"; do
     if expect_effective_path "oracle-negative" "$(path_oracle_row "$bad_path")" >/dev/null 2>&1; then
       echo "    FAIL: PATH oracle accepted a rejected row: path=$bad_path"
-      result=1
+      result=$((result + 1))
     fi
   done
   if expect_effective_path "oracle-two-lines" "$(path_oracle_row "$accepted")"$'\n'"path=$accepted" >/dev/null 2>&1; then
     echo "    FAIL: PATH oracle accepted two path= lines"
-    result=1
+    result=$((result + 1))
   fi
 
   # #258: the real corrected subjects, probed in isolated subshells with stub
@@ -1364,21 +2775,25 @@ check_harness_negative() {
   local removed_state37 removed_rm38 probe_target
   if ! mkdir -p "$probe_dir"; then
     echo "    FAIL: could not create the harness-negative probe dir"
-    result=1
+    result=$((result + 1))
   fi
 
   # (a) An evidence reader that prints complete, expected-looking lines and then
   # exits nonzero must fail the guarded read, never pass on its printed output.
+  ctl_before="$result"
   if (
     launch_output() { printf 'credsprobe=ok\nhome=/x\nuid=1 gid=1\n'; return 37; }
     read_launch_evidence "probe" >/dev/null 2>&1
   ); then
     echo "    FAIL: guarded evidence read accepted a reader that failed after printing"
-    result=1
+    result=$((result + 1))
   fi
+  control_report "a evidence-read-guard" "$ctl_before"
+
 
   # (b) A grep error (status 2) must not be treated as proof that a synthetic
   # token is absent from guest output.
+  ctl_before="$result"
   if (
     # shellcheck disable=SC2317,SC2329  # invoked indirectly by assert_no_match;
     # 0.9 (the Ubuntu CI version) reports the stub as unreachable instead.
@@ -1386,13 +2801,16 @@ check_harness_negative() {
     assert_no_credential_leak "grep2 probe" "haystack with no tokens" >/dev/null 2>&1
   ); then
     echo "    FAIL: grep status 2 was treated as proven absence"
-    result=1
+    result=$((result + 1))
   fi
+  control_report "b grep-error-is-not-absence" "$ctl_before"
+
 
   # (c) A state-dir resolution failure must fail cleanup while the other
   # project's private token is still attempted.
+  ctl_before="$result"
   removed_state37="$probe_dir/removed-state37.txt"
-  : >"$removed_state37" || result=1
+  : >"$removed_state37" || result=$((result + 1))
   if (
     host_state_dir() {
       if [ "$1" = "$WORK/custom-cred" ]; then return 37; fi
@@ -1402,30 +2820,35 @@ check_harness_negative() {
     remove_custom_credential_material
   ) >/dev/null 2>&1; then
     echo "    FAIL: cleanup succeeded despite a state-dir resolution failure"
-    result=1
+    result=$((result + 1))
   fi
   if ! grep -qF -- "$probe_dir/state-missing.secrets/anthropic" "$removed_state37"; then
     echo "    FAIL: cleanup skipped the other project after a resolution failure"
-    result=1
+    result=$((result + 1))
   fi
+  control_report "c state-dir-resolution-failure" "$ctl_before"
+
 
   # (d) An rm failure must fail cleanup while other removals are attempted.
+  ctl_before="$result"
   removed_rm38="$probe_dir/removed-rm38.txt"
-  : >"$removed_rm38" || result=1
+  : >"$removed_rm38" || result=$((result + 1))
   if (
     host_state_dir() { printf '%s' "$probe_dir/state-ok"; }
     rm() { printf '%s\n' "$*" >>"$removed_rm38"; return 38; }
     remove_custom_credential_material
   ) >/dev/null 2>&1; then
     echo "    FAIL: cleanup succeeded despite an rm failure"
-    result=1
+    result=$((result + 1))
   fi
   for probe_target in "$CUSTOM_CREDENTIAL_SEED" "$probe_dir/state-ok.secrets/anthropic"; do
     if ! grep -qF -- "$probe_target" "$removed_rm38"; then
       echo "    FAIL: rm-failure cleanup did not attempt removing $probe_target"
-      result=1
+      result=$((result + 1))
     fi
   done
+  control_report "d rm-failure" "$ctl_before"
+
 
   # (e) The real stamp subject: an evidence reader that prints the complete
   # expected lines and then exits nonzero must make custom_image_stamp_present
@@ -1433,6 +2856,7 @@ check_harness_negative() {
   # capture would accept the printed output, return success, and turn this
   # probe red. No VM boots and no host path is removed: the launcher and reader
   # are stubbed inside the subshell.
+  ctl_before="$result"
   if (
     custom_project() { printf '%s' "$probe_dir/proj"; }
     capture_custom_launch() { return 0; }
@@ -1450,23 +2874,26 @@ check_harness_negative() {
     custom_image_stamp_present
   ) >/dev/null 2>&1; then
     echo "    FAIL: stamp subject accepted a reader that failed after printing expected lines"
-    result=1
+    result=$((result + 1))
   fi
+  control_report "e stamp-reader-failure" "$ctl_before"
+
 
   # (f) The acquisition-dump oracle and the zero-builder absence oracle. The
   # accepted capture passes; every malformed capture fails. This is the
   # permanent negative control for the substring-false-pass class (Standards S1)
   # and the missing/unreadable-log class (Spec S2).
+  ctl_before="$result"
   local acquire_name='native-image-acquire' verify_name='agent-vm-setup-verify'
   local ref='localhost:1/project:latest'
   local good=$'native-image-acquire\tlocalhost:1/project:latest\nagent-vm-setup-verify\tlocalhost:1/project:latest'
   if ! assert_dump "$good" "$acquire_name" "$ref" >/dev/null 2>&1; then
     echo "    FAIL: assert_dump rejected the accepted capture"
-    result=1
+    result=$((result + 1))
   fi
   if ! assert_dump "$good" "$verify_name" "$ref" >/dev/null 2>&1; then
     echo "    FAIL: assert_dump rejected the accepted capture (verify name)"
-    result=1
+    result=$((result + 1))
   fi
   local -a bad_dumps=(
     $'native-image-acquire\tlocalhost:1/project:latest-WRONG\nagent-vm-setup-verify\tlocalhost:1/project:latest-WRONG'
@@ -1481,7 +2908,7 @@ check_harness_negative() {
     if assert_dump "$bad" "$acquire_name" "$ref" >/dev/null 2>&1; then
       echo "    FAIL: assert_dump accepted a malformed capture:"
       printf '%s\n' "$bad"
-      result=1
+      result=$((result + 1))
     fi
   done
 
@@ -1494,46 +2921,48 @@ check_harness_negative() {
   local split=$'native-image-acquire\tlocalhost:1/project:latest\nagent-vm-setup-verify\tlocalhost:1/project@sha256:0000000000000000000000000000000000000000000000000000000000000000'
   if ! assert_dump "$split" "$verify_name" "$ref" "$acquired" >/dev/null 2>&1; then
     echo "    FAIL: assert_dump rejected the split accepted capture"
-    result=1
+    result=$((result + 1))
   fi
   for bad in "$good" \
       $'native-image-acquire\tlocalhost:1/project@sha256:0000000000000000000000000000000000000000000000000000000000000000\nagent-vm-setup-verify\tlocalhost:1/project:latest'; do
     if assert_dump "$bad" "$verify_name" "$ref" "$acquired" >/dev/null 2>&1; then
       echo "    FAIL: assert_dump accepted a stale or swapped two-reference capture:"
       printf '%s\n' "$bad"
-      result=1
+      result=$((result + 1))
     fi
   done
 
   # The zero-builder oracle must reject a missing, unreadable and non-empty log,
   # and accept a readable empty one.
   local oracle_log="$probe_dir/builder.log"
-  : >"$oracle_log" || result=1
+  : >"$oracle_log" || result=$((result + 1))
   if ! assert_no_builder_calls "probe-empty" "$oracle_log" >/dev/null 2>&1; then
     echo "    FAIL: assert_no_builder_calls rejected an empty readable log"
-    result=1
+    result=$((result + 1))
   fi
-  rm -f "$oracle_log" || result=1
+  rm -f "$oracle_log" || result=$((result + 1))
   if assert_no_builder_calls "probe-missing" "$oracle_log" >/dev/null 2>&1; then
     echo "    FAIL: assert_no_builder_calls accepted a missing log"
-    result=1
+    result=$((result + 1))
   fi
-  printf 'docker build\n' >"$oracle_log" || result=1
+  printf 'docker build\n' >"$oracle_log" || result=$((result + 1))
   if assert_no_builder_calls "probe-nonempty" "$oracle_log" >/dev/null 2>&1; then
     echo "    FAIL: assert_no_builder_calls accepted a non-empty log"
-    result=1
+    result=$((result + 1))
   fi
   # Unreadable (skip as root, where the permission check is bypassed).
   if [ "$(id -u)" -ne 0 ]; then
-    : >"$oracle_log" || result=1
-    chmod 000 "$oracle_log" || result=1
+    : >"$oracle_log" || result=$((result + 1))
+    chmod 000 "$oracle_log" || result=$((result + 1))
     if assert_no_builder_calls "probe-unreadable" "$oracle_log" >/dev/null 2>&1; then
       echo "    FAIL: assert_no_builder_calls accepted an unreadable log"
-      result=1
+      result=$((result + 1))
     fi
-    chmod 600 "$oracle_log" || result=1
+    chmod 600 "$oracle_log" || result=$((result + 1))
   fi
-  rm -f "$oracle_log" || result=1
+  rm -f "$oracle_log" || result=$((result + 1))
+  control_report "f acquisition-dump-oracle" "$ctl_before"
+
 
   # (g) The #262 registry access-record oracle. A genuine access record counts
   # once; a duplicate telemetry span naming the same path does not; an
@@ -1541,29 +2970,33 @@ check_harness_negative() {
   # (status 2) is a failure, never a zero. Without the last case a matcher that
   # stopped matching would make "warm default makes zero registry reads" pass
   # vacuously.
+  ctl_before="$result"
   local access_record telemetry_span oracle_status=0
   access_record='10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] "GET /v2/lib/manifests/tag HTTP/1.1" 200 3 "-" "docker/1"'
   telemetry_span='time="2025-01-01T00:00:00Z" level=info msg="GET /v2/lib/manifests/tag" span=abc'
   assert_eq "access-record oracle counts a real record" "1" \
-    "$(upgrade_access_record_count "$access_record")" || result=1
+    "$(upgrade_access_record_count "$access_record")" || result=$((result + 1))
   assert_eq "access-record oracle ignores a telemetry-only span" "0" \
-    "$(upgrade_access_record_count "$telemetry_span")" || result=1
+    "$(upgrade_access_record_count "$telemetry_span")" || result=$((result + 1))
   assert_eq "access-record oracle counts a mixed log once" "1" \
-    "$(upgrade_access_record_count "$access_record"$'\n'"$telemetry_span")" || result=1
+    "$(upgrade_access_record_count "$access_record"$'\n'"$telemetry_span")" || result=$((result + 1))
   assert_eq "access-record oracle treats an unmatched format as a legitimate zero" "0" \
-    "$(upgrade_access_record_count 'unrecognized log format')" || result=1
+    "$(upgrade_access_record_count 'unrecognized log format')" || result=$((result + 1))
   (
     # shellcheck disable=SC2329  # invoked indirectly by upgrade_access_record_count
     grep() { return 2; }
     upgrade_access_record_count "$access_record"
   ) >/dev/null 2>&1 || oracle_status=$?
-  assert_eq "access-record oracle propagates a matcher error" "2" "$oracle_status" || result=1
+  assert_eq "access-record oracle propagates a matcher error" "2" "$oracle_status" || result=$((result + 1))
 
   # (h) #398: the direct-row helpers own their own negative controls.
   #
+  control_report "g registry-record-oracle" "$ctl_before"
+
   # (h1) `direct_state_child` accepts exactly one 12-hex child of the private
   # state root and refuses every other resolution, so the delete target cannot
   # widen from a resolution surprise.
+  ctl_before="$result"
   local state_case stub accepted_state
   for state_case in \
     'outside:$CUSTOM_STATE/../escape' \
@@ -1577,7 +3010,7 @@ check_harness_negative() {
       direct_state_child "/proj"
     ) >/dev/null 2>&1; then
       echo "    FAIL: direct_state_child accepted ${state_case%%:*} path $stub"
-      result=1
+      result=$((result + 1))
     fi
   done
   if ! accepted_state="$(
@@ -1585,17 +3018,20 @@ check_harness_negative() {
     direct_state_child "/proj"
   )" || [ "$accepted_state" != "$CUSTOM_STATE/0123456789ab" ]; then
     echo "    FAIL: direct_state_child rejected a valid 12-hex state child"
-    result=1
+    result=$((result + 1))
   fi
+  control_report "h1 direct-state-child" "$ctl_before"
+
 
   # (h2) A failed row keeps its evidence: `rm` must not be called at all. A
   # passed row removes exactly the verified child and its sibling `.secrets`.
   # A fake child of the *real* private state root, created and removed here: the
   # helper resolves through host_state_dir, and nothing global is reassigned in a
   # subshell.
+  ctl_before="$result"
   local fake_state="$CUSTOM_STATE/0123456789ab" removals="$probe_dir/direct-removals.txt"
-  mkdir -p "$fake_state" "$fake_state.secrets" || result=1
-  : >"$removals" || result=1
+  mkdir -p "$fake_state" "$fake_state.secrets" || result=$((result + 1))
+  : >"$removals" || result=$((result + 1))
   if (
     # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly; see the notes
     # on direct_stdout above.
@@ -1605,12 +3041,12 @@ check_harness_negative() {
     direct_cleanup "probe" "/proj" "ref" 1
   ) >/dev/null 2>&1; then
     echo "    FAIL: direct_cleanup reported success for a failed row"
-    result=1
+    result=$((result + 1))
   fi
   if [ -s "$removals" ]; then
     echo "    FAIL: direct_cleanup removed a failed row's evidence:"
     cat "$removals"
-    result=1
+    result=$((result + 1))
   fi
   if ! (
     # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly
@@ -1620,7 +3056,7 @@ check_harness_negative() {
     direct_cleanup "probe" "/proj" "ref" 0
   ) >/dev/null 2>&1; then
     echo "    FAIL: direct_cleanup failed for a passed row"
-    result=1
+    result=$((result + 1))
   fi
   for expected_removal in \
     "-rf $fake_state" \
@@ -1628,15 +3064,18 @@ check_harness_negative() {
     if ! grep -qxF -- "$expected_removal" "$removals"; then
       echo "    FAIL: direct_cleanup did not remove exactly $expected_removal"
       cat "$removals"
-      result=1
+      result=$((result + 1))
     fi
   done
-  rm -rf "$fake_state" "$fake_state.secrets" || result=1
+  rm -rf "$fake_state" "$fake_state.secrets" || result=$((result + 1))
+  control_report "h2 cleanup-keeps-failure-evidence" "$ctl_before"
+
 
   # (h3) A surviving catalog record fails cleanup and removes nothing: the state
   # is the evidence for the leak, so the status alone is not the observation.
-  mkdir -p "$fake_state" || result=1
-  : >"$removals" || result=1
+  ctl_before="$result"
+  mkdir -p "$fake_state" || result=$((result + 1))
+  : >"$removals" || result=$((result + 1))
   if (
     # shellcheck disable=SC2317,SC2329  # stubs invoked indirectly
     host_state_dir() { printf '%s' "$CUSTOM_STATE/0123456789ab"; }
@@ -1645,54 +3084,1254 @@ check_harness_negative() {
     direct_cleanup "probe" "/proj" "ref" 0
   ) >/dev/null 2>&1; then
     echo "    FAIL: direct_cleanup ignored a surviving catalog record"
-    result=1
+    result=$((result + 1))
   fi
   if [ -s "$removals" ]; then
     echo "    FAIL: direct_cleanup removed state despite a surviving catalog record:"
     cat "$removals"
-    result=1
+    result=$((result + 1))
   fi
-  rm -rf "$fake_state" || result=1
+  rm -rf "$fake_state" || result=$((result + 1))
+  control_report "h3 surviving-catalog" "$ctl_before"
+
 
   # (h4) The absence oracle fails on an existing entry and passes on a missing
   # one; only ENOENT counts as evidence.
-  mkdir -p "$probe_dir/absent-probe" || result=1
-  : >"$probe_dir/absent-probe/exists" || result=1
+  ctl_before="$result"
+  mkdir -p "$probe_dir/absent-probe" || result=$((result + 1))
+  : >"$probe_dir/absent-probe/exists" || result=$((result + 1))
   if assert_state_entries_absent "probe-existing" "$probe_dir/absent-probe" \
     "exists" >/dev/null 2>&1; then
     echo "    FAIL: assert_state_entries_absent accepted an existing entry"
-    result=1
+    result=$((result + 1))
   fi
   if ! assert_state_entries_absent "probe-missing" "$probe_dir/absent-probe" \
     "missing" >/dev/null 2>&1; then
     echo "    FAIL: assert_state_entries_absent rejected a missing entry"
-    result=1
+    result=$((result + 1))
   fi
+  control_report "h4 absence-oracle" "$ctl_before"
+
 
   # (h5) The byte-exact stdout oracle rejects a trailing-newline difference that
   # `$(cat …)` would have hidden.
-  printf '%s' '$HOME' >"$WORK/probe-bytes.stdout" || result=1
+  ctl_before="$result"
+  printf '%s' '$HOME' >"$WORK/probe-bytes.stdout" || result=$((result + 1))
   if assert_direct_stdout_bytes "probe-bytes" "probe-bytes" $'$HOME\n' >/dev/null 2>&1; then
     echo "    FAIL: the byte-exact oracle accepted a missing trailing newline"
-    result=1
+    result=$((result + 1))
   fi
   if ! assert_direct_stdout_bytes "probe-bytes" "probe-bytes" '$HOME' >/dev/null 2>&1; then
     echo "    FAIL: the byte-exact oracle rejected the exact bytes"
-    result=1
+    result=$((result + 1))
   fi
-  rm -f "$WORK/probe-bytes.stdout" "$WORK/probe-bytes.expected" || result=1
+  rm -f "$WORK/probe-bytes.stdout" "$WORK/probe-bytes.expected" || result=$((result + 1))
+  control_report "h5 byte-exact-stdout" "$ctl_before"
+
 
   # (h6) A missing host-decoy log is a failed observation, not a vacuous zero.
-  rm -f "$probe_dir/missing-shim.log" || result=1
+  ctl_before="$result"
+  rm -f "$probe_dir/missing-shim.log" || result=$((result + 1))
   if assert_no_host_calls "$probe_dir/missing-shim.log" >/dev/null 2>&1; then
     echo "    FAIL: assert_no_host_calls accepted a missing decoy log"
-    result=1
+    result=$((result + 1))
   fi
-  : >"$probe_dir/present-shim.log" || result=1
+  : >"$probe_dir/present-shim.log" || result=$((result + 1))
   if ! assert_no_host_calls "$probe_dir/present-shim.log" >/dev/null 2>&1; then
     echo "    FAIL: assert_no_host_calls rejected a readable empty decoy log"
-    result=1
+    result=$((result + 1))
   fi
+  control_report "h6 missing-decoy-log" "$ctl_before"
+
+
+  # (h7) #399: the stdin-row helpers and the two live oracles, each against the
+  # defect it exists to catch. These run without a VM: a helper that silently
+  # stopped observing would otherwise turn a native row green for free.
+  ctl_before="$result"
+  if [ -e "$probe_dir/absent-stdin" ]; then
+    # A precondition that silently skips the control would report it ok without
+    # running it, which is the same false green the control exists to prevent.
+    echo "    FAIL: h7 probe path already exists; the missing-input control cannot run"
+    result=$((result + 1))
+  elif capture_custom_direct_input "probe-missing-stdin" "$probe_dir" \
+    "$probe_dir/absent-stdin" -- run true >/dev/null 2>&1; then
+    echo "    FAIL: the stdin capture accepted a missing input file"
+    result=$((result + 1))
+  fi
+  control_report "h7 missing-stdin-refused" "$ctl_before"
+
+
+  # (h8) The FIFO writer this shell owns is reaped after stop: its pid is gone.
+  # A helper that leaked it would keep a guest's stdin open forever. This is the
+  # helper's own stop path; `every possible way a row can end` is not what these
+  # controls claim (a signal to the harness while a writer is held is a separate,
+  # uncovered path; h16-trap covers the EXIT trap).
+  ctl_before="$result"
+  local probe_fifo="$WORK/probe-stdin.fifo" writer_pid
+  rm -f "$probe_fifo" || result=$((result + 1))
+  mkfifo "$probe_fifo" || result=$((result + 1))
+  stdin_writer_start "$probe_fifo" "" hold || result=$((result + 1))
+  writer_pid="$STDIN_WRITER_PID"
+  if [ -z "$writer_pid" ]; then
+    echo "    FAIL: stdin_writer_start recorded no pid"
+    result=$((result + 1))
+  fi
+  stdin_writer_stop
+  if [ -n "$STDIN_WRITER_PID" ]; then
+    echo "    FAIL: stdin_writer_stop left a pid behind"
+    result=$((result + 1))
+  fi
+  if [ -n "$writer_pid" ] && kill -0 "$writer_pid" 2>/dev/null; then
+    echo "    FAIL: stdin_writer_stop did not reap the writer"
+    kill -KILL "$writer_pid" 2>/dev/null || true
+    result=$((result + 1))
+  fi
+  # A writer mode it does not know is refused, not guessed.
+  if stdin_writer_start "$probe_fifo" "" sometimes >/dev/null 2>&1; then
+    echo "    FAIL: stdin_writer_start accepted an unknown mode"
+    result=$((result + 1))
+  fi
+  control_report "h8 writer-reaped" "$ctl_before"
+
+
+  # (h9) wait_for_marker fails on its deadline; it never reports a pass for a
+  # file that never gets the marker.
+  ctl_before="$result"
+  : >"$WORK/probe-marker.log" || result=$((result + 1))
+  if wait_for_marker "$WORK/probe-marker.log" 'never-appears' 1 >/dev/null 2>&1; then
+    echo "    FAIL: wait_for_marker passed without the marker"
+    result=$((result + 1))
+  fi
+  printf 'the-marker\n' >"$WORK/probe-marker.log" || result=$((result + 1))
+  if ! wait_for_marker "$WORK/probe-marker.log" '^the-marker$' 1 >/dev/null 2>&1; then
+    echo "    FAIL: wait_for_marker missed a present marker"
+    result=$((result + 1))
+  fi
+  if wait_for_marker "$WORK/probe-marker-absent.log" 'x' 1 >/dev/null 2>&1; then
+    echo "    FAIL: wait_for_marker accepted a missing file"
+    result=$((result + 1))
+  fi
+  rm -f "$WORK/probe-marker.log" || result=$((result + 1))
+  control_report "h9 marker-deadline" "$ctl_before"
+
+
+  # (h10) max_rss_kib fails closed (#399 F3): an empty or newline-only file, a
+  # non-numeric line, an **unterminated** non-numeric final line (the old
+  # `while read` skipped it and returned success), and a file whose only line
+  # has internal whitespace (`tr -d '[:space:]'` used to turn `12 34` into
+  # `1234`). Real samples, including an unterminated decimal one, still parse.
+  ctl_before="$result"
+  : >"$WORK/probe-rss-empty" || result=$((result + 1))
+  if max_rss_kib "$WORK/probe-rss-empty" >/dev/null 2>&1; then
+    echo "    FAIL: max_rss_kib accepted an empty sample file"
+    result=$((result + 1))
+  fi
+  printf '\n\n' >"$WORK/probe-rss-blank" || result=$((result + 1))
+  if max_rss_kib "$WORK/probe-rss-blank" >/dev/null 2>&1; then
+    echo "    FAIL: max_rss_kib accepted a blank sample file (no validated sample)"
+    result=$((result + 1))
+  fi
+  printf '1200\nnot-a-number\n' >"$WORK/probe-rss-garbage" || result=$((result + 1))
+  if max_rss_kib "$WORK/probe-rss-garbage" >/dev/null 2>&1; then
+    echo "    FAIL: max_rss_kib accepted a non-numeric sample"
+    result=$((result + 1))
+  fi
+  printf '{"install": {"prefix": "/x"}}' >"$WORK/probe-rss-json" || result=$((result + 1))
+  if max_rss_kib "$WORK/probe-rss-json" >/dev/null 2>&1; then
+    echo "    FAIL: max_rss_kib accepted an unterminated non-numeric line as a sample"
+    result=$((result + 1))
+  fi
+  printf '  12 34' >"$WORK/probe-rss-internal" || result=$((result + 1))
+  if max_rss_kib "$WORK/probe-rss-internal" >/dev/null 2>&1; then
+    echo "    FAIL: max_rss_kib accepted internal whitespace as a sample (12 34 -> 1234)"
+    result=$((result + 1))
+  fi
+  printf '  12 34\n' >"$WORK/probe-rss-internal-nl" || result=$((result + 1))
+  if max_rss_kib "$WORK/probe-rss-internal-nl" >/dev/null 2>&1; then
+    echo "    FAIL: max_rss_kib accepted a terminated line with internal whitespace"
+    result=$((result + 1))
+  fi
+  printf '1024\n3072\n2048\n' >"$WORK/probe-rss" || result=$((result + 1))
+  assert_eq "max_rss_kib reports the largest sample" "3072" \
+    "$(max_rss_kib "$WORK/probe-rss")" || result=$((result + 1))
+  printf '  1024 \n\t3072\n 2048' >"$WORK/probe-rss-padded" || result=$((result + 1))
+  assert_eq "max_rss_kib trims only surrounding padding and reads an unterminated final line" \
+    "3072" "$(max_rss_kib "$WORK/probe-rss-padded")" || result=$((result + 1))
+  rm -f "$WORK/probe-rss-empty" "$WORK/probe-rss-blank" "$WORK/probe-rss-garbage" \
+    "$WORK/probe-rss-json" "$WORK/probe-rss-internal" "$WORK/probe-rss-internal-nl" \
+    "$WORK/probe-rss" "$WORK/probe-rss-padded" || result=$((result + 1))
+  control_report "h10 rss-fail-closed" "$ctl_before"
+
+
+  # (h11) The live-handshake oracle: a launcher stand-in that prints every
+  # marker only at exit must fail the first deadline. This is the
+  # collect-until-exit defect (#399 B5) at the harness level.
+  ctl_before="$result"
+  (
+    trap - EXIT
+    sleep 2
+    printf 'out-ready\nout-got:ping\nout-eof\n'
+  ) >"$WORK/probe-collect.stdout" 2>/dev/null &
+  local collect_pid=$!
+  if wait_for_marker "$WORK/probe-collect.stdout" '^out-ready$' 1 >/dev/null 2>&1; then
+    echo "    FAIL: the live-handshake oracle passed a collect-until-exit stream"
+    result=$((result + 1))
+  fi
+  wait "$collect_pid" 2>/dev/null || true
+  rm -f "$WORK/probe-collect.stdout" || result=$((result + 1))
+  control_report "h11 collect-until-exit" "$ctl_before"
+
+
+  # (h12) The concurrent-streams oracle (#399 R2-B1). A mock launcher emits the
+  # prescribed guest bytes plus the real `==> Running …` notice: that must pass.
+  # Two negative controls must fail: guest stderr bytes misrouted to stdout, and
+  # a dropped guest chunk. The oracle counts 0xF1 (0xF1 is the stderr byte) on
+  # stderr and compares stdout byte for byte, so ASCII notices cannot be counted
+  # as guest output.
+  ctl_before="$result"
+  local oracle_bytes=64 mock_out="$WORK/probe-concurrent.stdout" mock_err="$WORK/probe-concurrent.err"
+  LC_ALL=C tr '\0' '\351' < <(head -c "$oracle_bytes" /dev/zero) \
+    >"$WORK/probe-concurrent.expected" || result=$((result + 1))
+  # The mock stands in for the launcher: guest bytes on their own channel, the
+  # mandatory `==> Running …` notice on stderr.
+  (
+    head -c "$oracle_bytes" /dev/zero | LC_ALL=C tr '\0' '\351'
+  ) >"$mock_out" 2>/dev/null || result=$((result + 1))
+  (
+    printf '==> Running cat in sandbox (no TTY; streaming output)\n' >&2
+    head -c "$oracle_bytes" /dev/zero | LC_ALL=C tr '\0' '\361' >&2
+  ) 2>"$mock_err" >/dev/null || result=$((result + 1))
+  if ! assert_concurrent_stdout "probe-concurrent mock" \
+    "$WORK/probe-concurrent.expected" "$mock_out" >/dev/null 2>&1; then
+    echo "    FAIL: the concurrent oracle rejected the prescribed guest stdout"
+    result=$((result + 1))
+  fi
+  if ! assert_concurrent_stderr "probe-concurrent mock" "$mock_err" "$oracle_bytes" \
+    >/dev/null 2>&1; then
+    echo "    FAIL: the concurrent oracle rejected the prescribed guest stderr"
+    result=$((result + 1))
+  fi
+  control_report "h12 concurrent-oracle" "$ctl_before"
+
+  # (i) guest stderr bytes misrouted to stdout.
+  ctl_before="$result"
+  cp "$WORK/probe-concurrent.expected" "$WORK/probe-misrouted.expected" || result=$((result + 1))
+  head -c "$oracle_bytes" /dev/zero | LC_ALL=C tr '\0' '\361' \
+    >>"$WORK/probe-misrouted.expected" || result=$((result + 1))
+  if assert_concurrent_stdout "probe-misrouted" "$WORK/probe-concurrent.expected" \
+    "$WORK/probe-misrouted.expected" >/dev/null 2>&1; then
+    echo "    FAIL: the concurrent oracle accepted stderr bytes on stdout"
+    result=$((result + 1))
+  fi
+  control_report "h12-i misrouted-stderr" "$ctl_before"
+
+  # (ii) a dropped guest chunk: stderr one byte short.
+  ctl_before="$result"
+  head -c $((oracle_bytes - 1)) /dev/zero | LC_ALL=C tr '\0' '\361' \
+    >"$WORK/probe-dropped.err" || result=$((result + 1))
+  if assert_concurrent_stderr "probe-dropped" "$WORK/probe-dropped.err" "$oracle_bytes" \
+    >/dev/null 2>&1; then
+    echo "    FAIL: the concurrent oracle accepted a dropped guest chunk"
+    result=$((result + 1))
+  fi
+  control_report "h12-ii dropped-chunk" "$ctl_before"
+
+  # (iii) #399 N1: one expected 0xF1 guest byte moved **into** a `==>` notice,
+  # keeping the total 0xF1 count identical. The byte checks all pass (the count
+  # is right, no 0xE9, no other non-ASCII after removing 0xF1), so only the
+  # expected-notice oracle can reject it. The old control inserted 0xE9, which
+  # the earlier no-stdout-byte check rejected first: deleting the notice check
+  # left it green.
+  ctl_before="$result"
+  {
+    printf '==> Running cat in sandbox (no TTY; streaming output)\361\n' >&2
+    head -c $((oracle_bytes - 1)) /dev/zero | LC_ALL=C tr '\0' '\361' >&2
+  } 2>"$WORK/probe-notice.err" >/dev/null || result=$((result + 1))
+  if assert_concurrent_stderr "probe-notice" "$WORK/probe-notice.err" "$oracle_bytes" \
+    >/dev/null 2>&1; then
+    echo "    FAIL: the concurrent oracle accepted an expected guest byte inside a notice"
+    result=$((result + 1))
+  fi
+  control_report "h12-iii guest-byte-in-notice" "$ctl_before"
+
+  # (iv) An unexpected printable-ASCII notice: every byte check passes, so this
+  # is the control that proves the notice **set** is enforced rather than "any
+  # printable `==>` text".
+  ctl_before="$result"
+  {
+    printf '==> Unexpected diagnostic\n' >&2
+    head -c "$oracle_bytes" /dev/zero | LC_ALL=C tr '\0' '\361' >&2
+  } 2>"$WORK/probe-unexpected.err" >/dev/null || result=$((result + 1))
+  if assert_concurrent_stderr "probe-unexpected" "$WORK/probe-unexpected.err" "$oracle_bytes" \
+    >/dev/null 2>&1; then
+    echo "    FAIL: the concurrent oracle accepted an unexpected launcher notice"
+    result=$((result + 1))
+  fi
+  rm -f "$WORK/probe-concurrent.stdout" "$WORK/probe-concurrent.err" \
+    "$WORK/probe-concurrent.expected" "$WORK/probe-misrouted.expected" \
+    "$WORK/probe-dropped.err" "$WORK/probe-notice.err" "$WORK/probe-unexpected.err" \
+    "$WORK/probe-notice-field.err" "$WORK/probe-notice-final.err" || result=$((result + 1))
+  control_report "h12-iv unexpected-notice" "$ctl_before"
+
+  # (v) #399 R2-2: the guest byte hides in a **wildcard field** of a notice the
+  # vocabulary accepts. The byte counts all stay right, so only a rule that is
+  # independent of the vocabulary can reject it. The control proves both halves:
+  # the vocabulary accepts this exact line, and the byte rule (therefore the
+  # full oracle) rejects it.
+  ctl_before="$result"
+  local notice_field_line
+  notice_field_line="==> GitHub repo scope: owner/$(printf '\361')repo"
+  if ! notice_vocabulary_matches "$notice_field_line"; then
+    echo "    FAIL: the notice vocabulary no longer accepts the wildcard field this control needs"
+    result=$((result + 1))
+  fi
+  if notice_bytes_clean "$notice_field_line"; then
+    echo "    FAIL: the notice byte rule accepted a guest byte in a wildcard field"
+    result=$((result + 1))
+  fi
+  {
+    printf '%s\n' "$notice_field_line" >&2
+    head -c $((oracle_bytes - 1)) /dev/zero | LC_ALL=C tr '\0' '\361' >&2
+  } 2>"$WORK/probe-notice-field.err" >/dev/null || result=$((result + 1))
+  if assert_concurrent_stderr "probe-notice-field" "$WORK/probe-notice-field.err" "$oracle_bytes" \
+    >/dev/null 2>&1; then
+    echo "    FAIL: the concurrent oracle accepted a guest byte in a notice wildcard field"
+    result=$((result + 1))
+  fi
+  control_report "h12-v guest-byte-in-notice-field" "$ctl_before"
+
+  # (vi) #399 R2-2: the same injection in an **unterminated final line**. The
+  # old `while read` loop dropped it, so the byte was never examined at all.
+  ctl_before="$result"
+  {
+    head -c $((oracle_bytes - 1)) /dev/zero | LC_ALL=C tr '\0' '\361' >&2
+    printf '\n' >&2
+    printf '==> Running c\361at in sandbox (no TTY; streaming output)' >&2
+  } 2>"$WORK/probe-notice-final.err" >/dev/null || result=$((result + 1))
+  if assert_concurrent_stderr "probe-notice-final" "$WORK/probe-notice-final.err" "$oracle_bytes" \
+    >/dev/null 2>&1; then
+    echo "    FAIL: the concurrent oracle accepted a guest byte in an unterminated final notice line"
+    result=$((result + 1))
+  fi
+  control_report "h12-vi guest-byte-in-unterminated-notice" "$ctl_before"
+
+  # (vii) A valid notice line with the allowed punctuation still passes the byte
+  # rule: the new check rejects guest bytes without rejecting the launcher's own
+  # vocabulary. The **whole** oracle is exercised too — the inner byte rule alone
+  # proved nothing about the stream-wide "no other non-ASCII byte" check, which
+  # used to reject these very sequences before reaching the notice rule (#399
+  # review 3, observation 3).
+  ctl_before="$result"
+  if ! notice_bytes_clean "==>   $(printf '\342\200\246') and 3 more not shown"; then
+    echo "    FAIL: the notice byte rule rejected the launcher's own ellipsis notice"
+    result=$((result + 1))
+  fi
+  if ! notice_bytes_clean "==> TLS interception: ports 443 $(printf '\342\200\224') global"; then
+    echo "    FAIL: the notice byte rule rejected the launcher's own em-dash notice"
+    result=$((result + 1))
+  fi
+  # A full stderr stream: exactly `oracle_bytes` guest bytes plus the two
+  # punctuation notices the launcher really emits. It must pass end to end.
+  {
+    printf '==>   %s and 3 more not shown\n' "$(printf '\342\200\246')" >&2
+    printf '==> TLS interception: ports 443 %s global\n' "$(printf '\342\200\224')" >&2
+    head -c "$oracle_bytes" /dev/zero | LC_ALL=C tr '\0' '\361' >&2
+  } 2>"$WORK/probe-punct.err" >/dev/null || result=$((result + 1))
+  if ! assert_concurrent_stderr "probe-punct" "$WORK/probe-punct.err" "$oracle_bytes" \
+    >/dev/null 2>&1; then
+    echo "    FAIL: the full concurrent oracle rejected a valid punctuation notice"
+    assert_concurrent_stderr "probe-punct" "$WORK/probe-punct.err" "$oracle_bytes" || true
+    result=$((result + 1))
+  fi
+  # ...and the allowance is notice-scoped: the same em dash on a line that is
+  # not an accepted notice is still a stray byte.
+  {
+    printf 'guest %s output\n' "$(printf '\342\200\224')" >&2
+    head -c "$oracle_bytes" /dev/zero | LC_ALL=C tr '\0' '\361' >&2
+  } 2>"$WORK/probe-punct-stray.err" >/dev/null || result=$((result + 1))
+  if assert_concurrent_stderr "probe-punct-stray" "$WORK/probe-punct-stray.err" \
+    "$oracle_bytes" >/dev/null 2>&1; then
+    echo "    FAIL: the concurrent oracle accepted notice punctuation on an unvetted line"
+    result=$((result + 1))
+  fi
+  rm -f "$WORK/probe-punct.err" "$WORK/probe-punct-stray.err" || result=$((result + 1))
+  control_report "h12-vii notice-punctuation-allowed" "$ctl_before"
+
+
+  # (h13) #399 F1: an async capture records the observation outcome and the
+  # launcher status independently. A mock that emits the exact expected bytes
+  # and exits 7 must be recorded as 7 and must fail a status-0 assertion. The
+  # old wrapper wrote the observation's `$?` (0) into `.status`, so this shape
+  # passed as status 0.
+  ctl_before="$result"
+  local f1_status=0 f1_capture="probe-async-status"
+  (
+    trap - EXIT
+    stdin_capture() {
+      printf 'hello' >"$WORK/$1.stdout"
+      CAPTURE_STATUS=7
+      return 0
+    }
+    stdin_capture_async "$f1_capture" "$probe_dir" /dev/null run cat || exit 20
+    wait_capture_bounded "$f1_capture" || exit 21
+    [ "$(cat "$WORK/$f1_capture.observed" 2>/dev/null)" = 0 ] || exit 22
+    [ "$(cat "$WORK/$f1_capture.status" 2>/dev/null)" = 7 ] || exit 23
+    if assert_async_launcher_status "probe" "$f1_capture" 0 >/dev/null 2>&1; then exit 24; fi
+    assert_async_launcher_status "probe" "$f1_capture" 7 >/dev/null 2>&1 || exit 25
+    # An observation failure fails even when the launcher status is 0.
+    stdin_capture() {
+      printf 'hello' >"$WORK/$1.stdout"
+      CAPTURE_STATUS=0
+      return 1
+    }
+    stdin_capture_async "${f1_capture}-obs" "$probe_dir" /dev/null run cat || exit 26
+    wait_capture_bounded "${f1_capture}-obs" || exit 27
+    if assert_async_launcher_status "probe" "${f1_capture}-obs" 0 >/dev/null 2>&1; then exit 28; fi
+    exit 0
+  )
+  f1_status=$?
+  if [ "$f1_status" -ne 0 ]; then
+    echo "    FAIL: async status control ($f1_status): observation and launcher status are not independent"
+    result=$((result + 1))
+  fi
+  rm -f "$WORK/$f1_capture.observed" "$WORK/$f1_capture.status" \
+    "$WORK/$f1_capture.stdout" "$WORK/$f1_capture.observed.observed" \
+    "$WORK/$f1_capture.observed.status" "$WORK/$f1_capture.observed.stdout" || result=$((result + 1))
+  control_report "h13 async-status-independence" "$ctl_before"
+
+
+  # (h14) #399 F2: a missed readiness deadline aborts the handshake -- closes
+  # the writer, reaps the capture -- and returns within a bound, instead of
+  # opening the FIFO for another synchronous write that can block forever.
+  ctl_before="$result"
+  local f2_status=0 f2_elapsed=0
+  (
+    trap - EXIT
+    local fifo="$WORK/probe-abort.fifo" started writer
+    rm -f "$fifo"
+    mkfifo "$fifo" || exit 40
+    stdin_writer_start "$fifo" "" hold || exit 41
+    writer="$STDIN_WRITER_PID"
+    stdin_capture() { sleep 0.2; return 0; }
+    stdin_capture_async "probe-abort" "$probe_dir" "$fifo" run cat || exit 42
+    if wait_for_marker "$WORK/probe-abort.stdout" '^never$' 1 >/dev/null 2>&1; then exit 43; fi
+    started="$(date +%s)"
+    abort_live_capture "probe-abort" || exit 44
+    f2_elapsed=$(( $(date +%s) - started ))
+    printf '%s' "$f2_elapsed" >"$WORK/probe-abort.elapsed" || exit 49
+    [ "$f2_elapsed" -le 10 ] || exit 45
+    kill -0 "$writer" 2>/dev/null && exit 46
+    [ -z "$STDIN_WRITER_PID" ] || exit 47
+    [ -z "$STDIN_CAPTURE_PID" ] || exit 48
+    exit 0
+  )
+  f2_status=$?
+  f2_elapsed="$(cat "$WORK/probe-abort.elapsed" 2>/dev/null || echo unknown)"
+  if [ "$f2_status" -ne 0 ]; then
+    echo "    FAIL: readiness-abort control ($f2_status): a missed marker did not abort bounded"
+    result=$((result + 1))
+  fi
+  case "$f2_elapsed" in
+  '' | *[!0-9]*)
+    echo "    FAIL: readiness-abort control recorded no elapsed time"
+    result=$((result + 1))
+    ;;
+  *)
+    if [ "$f2_elapsed" -gt 10 ]; then
+      echo "    FAIL: readiness-abort control took ${f2_elapsed}s (limit 10)"
+      result=$((result + 1))
+    else
+      echo "    control h14: readiness-abort elapsed=${f2_elapsed}s (limit 10)"
+    fi
+    ;;
+  esac
+  control_report "h14 readiness-abort-bounded" "$ctl_before"
+
+
+  # (h15) #399 F2: a producer with no reader at all is bounded too, so a row
+  # cannot hang in the FIFO open after the launcher died.
+  ctl_before="$result"
+  local f3_status=0 f3_elapsed=0
+  (
+    trap - EXIT
+    local fifo="$WORK/probe-producer.fifo" started
+    rm -f "$fifo"
+    mkfifo "$fifo" || exit 50
+    STDIN_WRITER_TIMEOUT=1
+    started="$(date +%s)"
+    if stdin_writer_write_bounded "$fifo" string x >/dev/null 2>&1; then exit 51; fi
+    f3_elapsed=$(( $(date +%s) - started ))
+    printf '%s' "$f3_elapsed" >"$WORK/probe-producer.elapsed" || exit 53
+    [ "$f3_elapsed" -le 5 ] || exit 52
+    exit 0
+  )
+  f3_status=$?
+  f3_elapsed="$(cat "$WORK/probe-producer.elapsed" 2>/dev/null || echo unknown)"
+  if [ "$f3_status" -ne 0 ]; then
+    echo "    FAIL: bounded-producer control ($f3_status): a reader-less FIFO write was not bounded"
+    result=$((result + 1))
+  fi
+  echo "    control h15: reader-less producer returned in ${f3_elapsed}s (limit 5)"
+  control_report "h15 producer-bounded" "$ctl_before"
+
+
+  # (h16) #399 F2: the EXIT-trap cleanup helper reaps a writer a failed row left
+  # behind. cleanup_work calls this helper on the run's own shell path.
+  ctl_before="$result"
+  local f4_status=0
+  (
+    trap - EXIT
+    local fifo="$WORK/probe-cleanup.fifo" writer
+    rm -f "$fifo"
+    mkfifo "$fifo" || exit 60
+    stdin_writer_start "$fifo" "" hold || exit 61
+    writer="$STDIN_WRITER_PID"
+    cleanup_row_helpers
+    kill -0 "$writer" 2>/dev/null && exit 62
+    [ -z "$STDIN_WRITER_PID" ] || exit 63
+    exit 0
+  )
+  f4_status=$?
+  if [ "$f4_status" -ne 0 ]; then
+    echo "    FAIL: cleanup-helper control ($f4_status): a leftover writer was not reaped"
+    result=$((result + 1))
+  fi
+  rm -f "$WORK/probe-abort.fifo" "$WORK/probe-abort.observed" "$WORK/probe-abort.status" \
+    "$WORK/probe-abort.out" "$WORK/probe-abort.stdout" "$WORK/probe-abort.elapsed" \
+    "$WORK/probe-producer.fifo" "$WORK/probe-producer.elapsed" \
+    "$WORK/probe-cleanup.fifo" || result=$((result + 1))
+  control_report "h16 exit-cleanup-reaps-writer" "$ctl_before"
+
+
+  # (h16-trap) #399 R2-3: the *real* EXIT trap, not only the helper. A child
+  # shell installs the production `cleanup_work`, leaves a held FIFO writer and a
+  # running RSS sampler behind, and exits 7. The trap must reap both helpers and
+  # keep the failure status. (The earlier control called cleanup_row_helpers
+  # directly, so deleting the call from the trap left it green.)
+  ctl_before="$result"
+  local f5_status=0 trap_work="$WORK/probe-trap-work" trap_defs helper helper_pid sleeper_pid
+  local sleeper_waited=0
+  rm -rf "$trap_work" || result=$((result + 1))
+  mkdir -p "$trap_work" || result=$((result + 1))
+  trap_defs="$(declare -f cleanup_work cleanup_row_helpers stdin_writer_stop \
+    stdin_producer_stop stdin_capture_stop rss_sampler_stop stdin_writer_start \
+    rss_sample_until_exit)"
+  {
+    printf '%s\n' "$trap_defs"
+    cat <<'CHILD'
+set -u
+# The production globals the reapers read; the harness initialises them at the
+# top level, so the child must too (set -u otherwise aborts the trap itself).
+STDIN_CAPTURE_PID=""
+STDIN_PRODUCER_PID=""
+STDIN_RSS_PID=""
+trap cleanup_work EXIT
+fifo="$WORK/w.fifo"
+mkfifo "$fifo" || exit 90
+stdin_writer_start "$fifo" "" hold || exit 91
+printf "%s" "$STDIN_WRITER_PID" >"$WORK/writer.pid"
+( exec /bin/sleep 30 ) &
+sleeper=$!
+printf "%s" "$sleeper" >"$WORK/sleeper.pid"
+rss_sample_until_exit "$sleeper" "$WORK/long.rss" "$WORK/long.rss.meta"
+printf "%s" "$STDIN_RSS_PID" >"$WORK/sampler.pid"
+exit 7
+CHILD
+  } >"$trap_work/child.sh" || result=$((result + 1))
+  if (
+    WORK="$trap_work" OWNED_BUILDER="" STDIN_WRITER_TIMEOUT=30 RSS_SAMPLE_INTERVAL=0.05 \
+      bash "$trap_work/child.sh" >"$WORK/probe-trap.out" 2>&1
+  ); then
+    f5_status=0
+  else
+    f5_status=$?
+  fi
+  if [ "$f5_status" -ne 7 ]; then
+    echo "    FAIL: EXIT-trap control: the child exited $f5_status, not 7 (trap changed the status)"
+    sed -n '1,20p' "$WORK/probe-trap.out" || true
+    result=$((result + 1))
+  fi
+  # A positive receipt that the real trap code ran: cleanup_work reports the
+  # preserved work dir on a non-zero exit.
+  if ! grep -q 'preserving .*probe-trap-work' "$WORK/probe-trap.out" 2>/dev/null; then
+    echo "    FAIL: EXIT-trap control: cleanup_work did not report its own run"
+    sed -n '1,20p' "$WORK/probe-trap.out" || true
+    result=$((result + 1))
+  fi
+  for helper in writer sampler; do
+    helper_pid="$(cat "$trap_work/$helper.pid" 2>/dev/null || true)"
+    case "$helper_pid" in
+    '' | *[!0-9]*)
+      echo "    FAIL: EXIT-trap control: the child recorded no $helper pid"
+      result=$((result + 1))
+      ;;
+    *)
+      if kill -0 "$helper_pid" 2>/dev/null; then
+        echo "    FAIL: EXIT-trap control: cleanup_work left the $helper ($helper_pid) running"
+        kill -KILL "$helper_pid" 2>/dev/null || true
+        result=$((result + 1))
+      fi
+      ;;
+    esac
+  done
+  # The passive sleeper is the sampler's *target*: `cleanup_work` must not reap
+  # it (it is not one of the row's helpers), so the control that started it must
+  # stop it -- on success and on every failure above (#399 review 3,
+  # observation 2). It must still be alive here, which is the receipt that this
+  # control really had a target to leak.
+  sleeper_pid="$(cat "$trap_work/sleeper.pid" 2>/dev/null || true)"
+  case "$sleeper_pid" in
+  '' | *[!0-9]*)
+    echo "    FAIL: EXIT-trap control: the child recorded no sleeper pid"
+    result=$((result + 1))
+    ;;
+  *)
+    if kill -0 "$sleeper_pid" 2>/dev/null; then
+      echo "    control h16-trap: stopping the passive sampler target $sleeper_pid"
+    else
+      echo "    FAIL: EXIT-trap control: the passive sampler target $sleeper_pid was already gone"
+      result=$((result + 1))
+    fi
+    kill -KILL "$sleeper_pid" 2>/dev/null || true
+    # It is reparented to init by now, so there is nothing to `wait` for; the
+    # absence check is bounded instead of instantaneous.
+    while [ "$sleeper_waited" -lt 50 ]; do
+      kill -0 "$sleeper_pid" 2>/dev/null || break
+      sleep 0.1
+      sleeper_waited=$((sleeper_waited + 1))
+    done
+    if kill -0 "$sleeper_pid" 2>/dev/null; then
+      echo "    FAIL: EXIT-trap control: the passive sampler target $sleeper_pid survived the control's own stop"
+      result=$((result + 1))
+    fi
+    ;;
+  esac
+  rm -rf "$trap_work" || result=$((result + 1))
+  control_report "h16-trap real-exit-trap-reaps-helpers" "$ctl_before"
+
+
+  # (h17) #399 R2-1: the sampler measures the process the launch receipt names,
+  # not the `/usr/bin/time` wrapper the job was started under. A `sleep` stands
+  # in for the launcher; the receipt comes from the same wrapper the row uses.
+  # The sampled comm must be `/bin/sleep` while the job's comm is
+  # `/usr/bin/time` and the sampled PID differs from the job PID.
+  ctl_before="$result"
+  local rss_id="$WORK/probe-rss-identity" rss_job rss_sampled rss_comm rss_job_comm
+  ensure_launch_wrapper || result=$((result + 1))
+  # Stale files go before the child, never inside the sampler (#399 R3-1).
+  reset_launcher_rss_files "$rss_id.rss" || result=$((result + 1))
+  ( cd "$WORK" || exit 1
+    exec /usr/bin/time -l -o "$rss_id.time" \
+      "$LAUNCH_WRAPPER" "$rss_id.rss.receipt" /bin/sleep 1 ) &
+  rss_job=$!
+  if ! sample_launcher_rss "$rss_job" "$rss_id.rss" /bin/sleep; then
+    echo "    FAIL: the launcher-RSS sampler could not bind to the receipt's PID"
+    result=$((result + 1))
+  fi
+  wait "$rss_job" 2>/dev/null || true
+  rss_sampler_stop
+  if ! assert_launcher_rss_identity "$rss_id.rss" "probe-rss-identity"; then
+    result=$((result + 1))
+  fi
+  rss_sampled="$(sed -n 's/^sampled_pid=//p' "$rss_id.rss.meta" 2>/dev/null)"
+  rss_job_comm="$(sed -n 's/^launch_job_comm=//p' "$rss_id.rss.meta" 2>/dev/null)"
+  if [ "$rss_job_comm" != /usr/bin/time ]; then
+    echo "    FAIL: the identity control did not run under a /usr/bin/time wrapper (job comm '$rss_job_comm')"
+    result=$((result + 1))
+  fi
+  if [ -z "$rss_sampled" ] || [ "$rss_sampled" = "$rss_job" ]; then
+    echo "    FAIL: the identity control sampled the job PID '$rss_job' instead of the launcher"
+    result=$((result + 1))
+  fi
+  echo "    control h17: sampled_pid=$rss_sampled sampled_comm=$(sed -n 's/^sampled_comm=//p' "$rss_id.rss.meta" 2>/dev/null) job_pid=$rss_job job_comm=$rss_job_comm"
+  # The receipt must carry the comm the sampler *observed*, equal to the
+  # expected launcher's (#399 review 3, observation 1).
+  rss_comm="$(sed -n 's/^sampled_comm=//p' "$rss_id.rss.meta" 2>/dev/null)"
+  if [ -z "$rss_comm" ]; then
+    echo "    FAIL: the identity control's receipt records no observed sampled_comm"
+    result=$((result + 1))
+  elif [ "$rss_comm" != /bin/sleep ]; then
+    echo "    FAIL: the identity control observed comm '$rss_comm', not /bin/sleep"
+    result=$((result + 1))
+  fi
+  rm -f "$rss_id.rss" "$rss_id.rss.meta" "$rss_id.rss.receipt" "$rss_id.time" || result=$((result + 1))
+  control_report "h17 launcher-rss-identity" "$ctl_before"
+
+
+  # (h18) #399 R2-1: the oracle is proven **sensitive** against a known
+  # whole-stream-buffering stand-in that keeps ~256 MiB live, using the same
+  # sampler, parser and criterion as the `large` row. A streaming stand-in with
+  # the same input must pass, so the control also proves the criterion is not
+  # simply failing everything.
+  ctl_before="$result"
+  local buf_base="$WORK/probe-buffer-base.rss" buf_meas="$WORK/probe-buffer-meas.rss"
+  local stream_base="$WORK/probe-stream-base.rss" stream_meas="$WORK/probe-stream-meas.rss"
+  local buf_base_kib buf_meas_kib stream_base_kib stream_meas_kib buf_growth stream_growth
+  cat >"$WORK/probe-rss-standin.py" <<'STANDIN' || result=$((result + 1))
+import sys, time
+
+mode, limit = sys.argv[1], int(sys.argv[2])
+time.sleep(0.3)  # let the interpreter reach steady state before anything is read
+if mode == "buffer":
+    data = sys.stdin.buffer.read(limit)
+    time.sleep(3)  # keep the whole input live so the sampler must see it
+    sys.stderr.write("buffered=%d\n" % len(data))
+else:
+    total = 0
+    while True:
+        chunk = sys.stdin.buffer.read(1048576)
+        if not chunk:
+            break
+        total += len(chunk)
+        time.sleep(0.01)  # a real transfer takes real time
+    sys.stderr.write("streamed=%d\n" % total)
+STANDIN
+  # The stand-in must be measured as the interpreter, never as the subshell that
+  # is about to `exec` it. The old shape sampled `$!` at once, so a `ps` landing
+  # before the `exec` recorded a bash footprint, the sampler stopped with
+  # `sampling_mismatch=sampled comm changed …`, and the criterion summed the one
+  # tiny sample and never consulted the mismatch — which is how a whole-stream
+  # buffer could be "accepted" on a bash-sized number (#399 verification 4,
+  # h18). Wait (bounded) for the interpreter's comm to *hold still*, hand that
+  # comm to the sampler so every sample is checked against it, and assert the
+  # receipt before any number is used.
+  probe_rss_standin() { # mode bytes out
+    local mode="$1" bytes="$2" out="$3" standin host_comm expected current
+    local steps waited=0 streak=0 observed mismatch samples
+    host_comm="$(ps -p $$ -o comm= 2>/dev/null)"
+    head -c "$bytes" /dev/zero |
+      ( exec python3 "$WORK/probe-rss-standin.py" "$mode" "$bytes" ) >/dev/null 2>&1 &
+    standin=$!
+    steps=$((RSS_RECEIPT_WAIT_SECONDS * 50))
+    expected=""
+    while [ "$waited" -lt "$steps" ]; do
+      current="$(ps -p "$standin" -o comm= 2>/dev/null)"
+      if [ "$current" = "$expected" ] && [ -n "$expected" ]; then
+        streak=$((streak + 1))
+      else
+        # A first match is not yet an identity: the interpreter can re-exec
+        # itself once at start-up (Homebrew's `python3` becomes the
+        # Python.app binary), so require five unchanged readings.
+        expected=""
+        streak=0
+        if [ -n "$current" ] && [ "$current" != "$host_comm" ]; then
+          case "$current" in
+          *[Pp]ython*) expected="$current" ;;
+          esac
+        fi
+      fi
+      [ "$streak" -ge 5 ] && break
+      sleep 0.02
+      waited=$((waited + 1))
+    done
+    if [ "$streak" -lt 5 ]; then
+      if kill -0 "$standin" 2>/dev/null; then
+        echo "    FAIL: control h18 ($mode ${bytes}B): the RSS stand-in PID $standin never settled on the python interpreter (last comm '$current', host shell comm '$host_comm')"
+      else
+        echo "    FAIL: control h18 ($mode ${bytes}B): the RSS stand-in PID $standin exited before it could be sampled"
+      fi
+      kill -KILL "$standin" 2>/dev/null || true
+      wait "$standin" 2>/dev/null || true
+      return 1
+    fi
+    rss_sample_until_exit "$standin" "$out" "$out.meta" "$expected"
+    wait "$standin" 2>/dev/null || true
+    rss_sampler_stop
+    observed="$(sed -n 's/^sampled_comm=//p' "$out.meta" 2>/dev/null)"
+    mismatch="$(sed -n 's/^sampling_mismatch=//p' "$out.meta" 2>/dev/null)"
+    samples="$(sed -n 's/^samples=//p' "$out.meta" 2>/dev/null)"
+    if [ "$observed" != "$expected" ]; then
+      echo "    FAIL: control h18 ($mode ${bytes}B): the sampler observed comm '$observed', not the stand-in '$expected'"
+      return 1
+    fi
+    if [ -n "$mismatch" ]; then
+      echo "    FAIL: control h18 ($mode ${bytes}B): the sampler rejected its own samples: $mismatch"
+      return 1
+    fi
+    # A numeric count only: the 1 MiB streaming stand-in lives for ~0.3 s, so a
+    # minimum here would be its own load-sensitive failure. The samples are
+    # validated by `max_rss_kib`, which fails on none.
+    case "$samples" in
+    '' | *[!0-9]*)
+      echo "    FAIL: control h18 ($mode ${bytes}B): the sampler recorded no sample count ('$samples')"
+      return 1
+      ;;
+    esac
+  }
+  probe_rss_standin buffer 1048576 "$buf_base" || result=$((result + 1))
+  probe_rss_standin buffer 268435456 "$buf_meas" || result=$((result + 1))
+  if ! buf_base_kib="$(max_rss_kib "$buf_base")"; then
+    result=$((result + 1))
+    buf_base_kib=invalid
+  fi
+  if ! buf_meas_kib="$(max_rss_kib "$buf_meas")"; then
+    result=$((result + 1))
+    buf_meas_kib=invalid
+  fi
+  if [ "$buf_base_kib" != invalid ] && [ "$buf_meas_kib" != invalid ]; then
+    if buf_growth="$(rss_growth_verdict "$buf_base_kib" "$buf_meas_kib")"; then
+      echo "    FAIL: the memory criterion accepted a whole-stream buffer (baseline=${buf_base_kib}KiB measured=${buf_meas_kib}KiB growth=${buf_growth}KiB, limit=$RSS_GROWTH_LIMIT_KIB)"
+      result=$((result + 1))
+    else
+      echo "    control h18: whole-stream buffer baseline=${buf_base_kib}KiB measured=${buf_meas_kib}KiB growth=${buf_growth}KiB >= limit $RSS_GROWTH_LIMIT_KIB (rejected as required)"
+    fi
+  fi
+  probe_rss_standin stream 1048576 "$stream_base" || result=$((result + 1))
+  probe_rss_standin stream 268435456 "$stream_meas" || result=$((result + 1))
+  if ! stream_base_kib="$(max_rss_kib "$stream_base")"; then
+    result=$((result + 1))
+    stream_base_kib=invalid
+  fi
+  if ! stream_meas_kib="$(max_rss_kib "$stream_meas")"; then
+    result=$((result + 1))
+    stream_meas_kib=invalid
+  fi
+  if [ "$stream_base_kib" != invalid ] && [ "$stream_meas_kib" != invalid ]; then
+    if stream_growth="$(rss_growth_verdict "$stream_base_kib" "$stream_meas_kib")"; then
+      echo "    control h18: streaming stand-in baseline=${stream_base_kib}KiB measured=${stream_meas_kib}KiB growth=${stream_growth}KiB < limit $RSS_GROWTH_LIMIT_KIB (accepted)"
+    else
+      echo "    FAIL: the memory criterion rejected a streaming stand-in (baseline=${stream_base_kib}KiB measured=${stream_meas_kib}KiB growth=${stream_growth}KiB)"
+      result=$((result + 1))
+    fi
+  fi
+  rm -f "$buf_base" "$buf_base.meta" "$buf_meas" "$buf_meas.meta" \
+    "$stream_base" "$stream_base.meta" "$stream_meas" "$stream_meas.meta" \
+    "$WORK/probe-rss-standin.py" || result=$((result + 1))
+  control_report "h18 launcher-rss-sensitivity" "$ctl_before"
+
+
+  # (h19) #399 R2-4: a TERM-ignoring descendant is reparented the moment its
+  # capture parent dies, so the KILL pass must use the inventory taken **before**
+  # the TERM. The control's descendant records its own PID and ignores TERM; if
+  # the escalation rediscovered descendants after the TERM it would miss it and
+  # report success while the process survived.
+  ctl_before="$result"
+  local f6_status=0 child_pid i
+  (
+    trap - EXIT
+    (
+      trap - EXIT
+      bash -c 'trap "" TERM; printf "%s" "$$" >"$1"; while :; do sleep 1; done' \
+        _ "$WORK/probe-escalate.pid"
+      wait
+    ) &
+    STDIN_CAPTURE_PID=$!
+    for i in $(seq 1 100); do
+      [ -s "$WORK/probe-escalate.pid" ] && break
+      sleep 0.1
+    done
+    if [ ! -s "$WORK/probe-escalate.pid" ]; then
+      echo "    FAIL: escalation control: the descendant never recorded its PID"
+      kill -KILL "$STDIN_CAPTURE_PID" 2>/dev/null || true
+      exit 72
+    fi
+    child_pid="$(cat "$WORK/probe-escalate.pid")"
+    STDIN_CAPTURE_WAIT_SECONDS=0
+    if wait_capture_bounded "probe-escalate" >"$WORK/probe-escalate.out" 2>&1; then
+      kill -KILL "$child_pid" 2>/dev/null || true
+      exit 70
+    fi
+    # A SIGKILLed process is not necessarily absent on the next instruction
+    # (mid-teardown, or an unreaped zombie that `kill -0` calls alive), so give
+    # the disappearance a bounded grace instead of one instantaneous reading
+    # (#399 verification 4, h19). A child the KILL pass never reached ignores
+    # TERM and loops forever, so the deadline still fails this control.
+    if ! wait_pid_absent "$child_pid"; then
+      kill -KILL "$child_pid" 2>/dev/null || true
+      exit 71
+    fi
+    exit 0
+  )
+  f6_status=$?
+  case "$f6_status" in
+  0) echo "    control h19: capture escalation killed the reparented TERM-ignoring descendant" ;;
+  *)
+    echo "    FAIL: escalation control ($f6_status): a recorded descendant survived the KILL pass"
+    sed -n '1,10p' "$WORK/probe-escalate.out" 2>/dev/null || true
+    result=$((result + 1))
+    ;;
+  esac
+  rm -f "$WORK/probe-escalate.pid" "$WORK/probe-escalate.out" || result=$((result + 1))
+  control_report "h19 capture-escalation-inventory" "$ctl_before"
+
+
+  # (h19b) #399 R3-2: the same pre-TERM inventory must keep a descendant whose
+  # executable **path contains a space**. `descendants_of` used to take the third
+  # whitespace-separated `ps` field, so the recorded comm was truncated at the
+  # space while `signal_inventory` compares the whole comm: the child matched in
+  # neither pass and survived both TERM and KILL. The symlink makes the shape
+  # real without executing anything but `/bin/sleep`.
+  ctl_before="$result"
+  local f8_status=0 space_dir="$WORK/probe-space" space_link space_out space_pid
+  space_link="$space_dir/sleep with space"
+  space_out="$WORK/probe-space.out"
+  rm -rf "$space_dir" || result=$((result + 1))
+  mkdir -p "$space_dir" || result=$((result + 1))
+  ln -sf /bin/sleep "$space_link" || result=$((result + 1))
+  # The PID of a live process whose *whole* comm is this path. `awk` matches its
+  # own command line, so the comparison is on comm, never on the full argv.
+  probe_space_child_pid() {
+    ps -axo pid=,comm= | awk -v link="$space_link" '
+      { line=$0; sub(/^[ \t]*/, "", line); split(line, f, /[ \t]+/); pid=f[1]
+        comm=line; sub(/^[^ \t]+[ \t]+/, "", comm)
+        if (comm == link) { print pid; exit } }'
+  }
+  (
+    trap - EXIT
+    (
+      trap - EXIT
+      "$space_link" 30 &
+      wait
+    ) &
+    STDIN_CAPTURE_PID=$!
+    for i in $(seq 1 100); do
+      space_pid="$(probe_space_child_pid)"
+      [ -n "$space_pid" ] && break
+      sleep 0.1
+    done
+    if [ -z "$space_pid" ]; then
+      echo "    FAIL: space-path control: the descendant never appeared"
+      kill -KILL "$STDIN_CAPTURE_PID" 2>/dev/null || true
+      exit 72
+    fi
+    STDIN_CAPTURE_WAIT_SECONDS=0
+    if wait_capture_bounded "probe-space" >"$space_out" 2>&1; then
+      kill -KILL "$space_pid" 2>/dev/null || true
+      exit 70
+    fi
+    if kill -0 "$space_pid" 2>/dev/null; then
+      kill -KILL "$space_pid" 2>/dev/null || true
+      exit 71
+    fi
+    exit 0
+  )
+  f8_status=$?
+  case "$f8_status" in
+  0) echo "    control h19b: capture escalation killed the descendant whose comm contains a space" ;;
+  *)
+    echo "    FAIL: space-path-control ($f8_status): a space-named descendant survived the KILL pass"
+    sed -n '1,10p' "$space_out" 2>/dev/null || true
+    result=$((result + 1))
+    ;;
+  esac
+  # The same comm oracle again, from outside: no process may still carry it.
+  space_pid="$(probe_space_child_pid)"
+  if [ -n "$space_pid" ]; then
+    echo "    FAIL: space-path-control: the descendant $space_pid survived the control"
+    kill -KILL "$space_pid" 2>/dev/null || true
+    result=$((result + 1))
+  fi
+  rm -rf "$space_dir"
+  rm -f "$space_out" || result=$((result + 1))
+  control_report "h19b space-path-descendant" "$ctl_before"
+
+
+  # (h20) #399 R2-3: a **file** producer blocked on a full pipe (a reader that
+  # stops reading but keeps the FIFO open) must fail bounded and must not orphan
+  # the `cat` it started. The old shape timed out the wrapper subshell only, so
+  # `cat` survived holding the write end. The oracle is process-based: no
+  # process may still be writing this control's own data file. Scope: the
+  # **timeout/full-pipe** branch of the producer helper — not every signal a row
+  # could receive while a producer is writing.
+  ctl_before="$result"
+  local f7_status=0
+  (
+    trap - EXIT
+    local fifo="$WORK/probe-full.fifo" data="$WORK/probe-full.data" reader i
+    head -c 4194304 /dev/urandom >"$data" || exit 80
+    rm -f "$fifo" || exit 81
+    mkfifo "$fifo" || exit 81
+    (
+      exec python3 -c '
+import sys, time
+f = open(sys.argv[1], "rb", buffering=0)
+f.read(4096)
+time.sleep(8)
+' "$fifo"
+    ) &
+    reader=$!
+    for i in $(seq 1 50); do
+      [ -p "$fifo" ] && break
+      sleep 0.1
+    done
+    sleep 0.5
+    STDIN_WRITER_TIMEOUT=1
+    if stdin_writer_write_bounded "$fifo" file "$data" >/dev/null 2>&1; then
+      kill -KILL "$reader" 2>/dev/null || true
+      exit 82
+    fi
+    sleep 0.3
+    if ps -axo pid=,command= | awk -v d="$data" '$2 != "grep" && $2 != "awk" && index($0, d) { f = 1 } END { exit !f }'; then
+      echo "    orphaned producer still writing $data:"
+      ps -axo pid=,command= | awk -v d="$data" '$2 != "grep" && $2 != "awk" && index($0, d)'
+      kill -KILL "$reader" 2>/dev/null || true
+      exit 83
+    fi
+    kill -KILL "$reader" 2>/dev/null || true
+    wait "$reader" 2>/dev/null || true
+    exit 0
+  )
+  f7_status=$?
+  if [ "$f7_status" -ne 0 ]; then
+    echo "    FAIL: file-producer control ($f7_status): a full-pipe file producer was not bounded cleanly"
+    result=$((result + 1))
+  else
+    echo "    control h20: full-pipe file producer bounded with no orphaned cat"
+  fi
+  rm -f "$WORK/probe-full.fifo" "$WORK/probe-full.data" || result=$((result + 1))
+  control_report "h20 file-producer-no-orphan" "$ctl_before"
+
+
+  # (h21) #399 R3-1: a legal **child-first** schedule publishes the launch
+  # receipt before the sampler is started. The sampler used to `rm -f` the
+  # receipt on entry, which discarded a live identity record and then waited for
+  # a rewrite that never comes. This control waits for the receipt, then starts
+  # the sampler, and requires it to bind and to leave the receipt alone.
+  ctl_before="$result"
+  local rss_early="$WORK/probe-rss-early" early_job early_pid early_sampled
+  ensure_launch_wrapper || result=$((result + 1))
+  reset_launcher_rss_files "$rss_early.rss" || {
+    echo "    FAIL: child-first control: could not clear the sampler files"
+    result=$((result + 1))
+  }
+  ( cd "$WORK" || exit 1
+    exec /usr/bin/time -l -o "$rss_early.time" \
+      "$LAUNCH_WRAPPER" "$rss_early.rss.receipt" /bin/sleep 3 ) &
+  early_job=$!
+  for i in $(seq 1 250); do
+    [ -s "$rss_early.rss.receipt" ] && break
+    sleep 0.02
+  done
+  if [ ! -s "$rss_early.rss.receipt" ]; then
+    echo "    FAIL: child-first control: the launch published no receipt to start the sampler on"
+    kill -KILL "$early_job" 2>/dev/null || true
+    result=$((result + 1))
+  else
+    early_pid="$(launch_receipt_pid "$rss_early.rss.receipt")"
+    echo "    control h21: receipt published before sampler startup names pid=${early_pid:-none}"
+    if ! sample_launcher_rss "$early_job" "$rss_early.rss" /bin/sleep; then
+      echo "    FAIL: child-first control: the sampler rejected a receipt published before it started"
+      result=$((result + 1))
+    fi
+    wait "$early_job" 2>/dev/null || true
+    rss_sampler_stop
+    # The receipt the launch wrote must still be there, and it must be the one
+    # the sampler bound to.
+    if [ ! -s "$rss_early.rss.receipt" ]; then
+      echo "    FAIL: child-first control: the sampler deleted the live launch receipt"
+      result=$((result + 1))
+    fi
+    if ! assert_launcher_rss_identity "$rss_early.rss" "probe-rss-early"; then
+      result=$((result + 1))
+    fi
+    early_sampled="$(sed -n 's/^sampled_pid=//p' "$rss_early.rss.meta" 2>/dev/null)"
+    if [ -z "$early_pid" ] || [ "$early_sampled" != "$early_pid" ]; then
+      echo "    FAIL: child-first control: sampled PID '$early_sampled' is not the receipt PID '$early_pid'"
+      result=$((result + 1))
+    fi
+  fi
+  rm -f "$rss_early.rss" "$rss_early.rss.meta" "$rss_early.rss.receipt" \
+    "$rss_early.time" || result=$((result + 1))
+  control_report "h21 receipt-survives-child-first-schedule" "$ctl_before"
+
+
+  # (h22) #399 R3-1: when the sampler cannot start, the observation fails — and
+  # the **launcher it already started** must not be left running. The old
+  # failure path stopped the `/usr/bin/time` job only, so the real launcher (a
+  # child of that job) and its children survived with no record left to reap
+  # them. The stand-in launcher records its own PID (the receipt's) and its
+  # child's, so both are checked absent afterwards.
+  ctl_before="$result"
+  local rss_fail="$WORK/probe-rss-fail" fail_rc=0 fail_pid fail_child probe
+  reset_launcher_rss_files "$rss_fail.rss" || result=$((result + 1))
+  cat >"$WORK/probe-rss-fail.sh" <<'LAUNCH' || result=$((result + 1))
+#!/bin/bash
+printf '%s' "$$" >"$1"
+/bin/sleep 30 &
+printf '%s' "$!" >"$2"
+wait
+LAUNCH
+  chmod +x "$WORK/probe-rss-fail.sh" || result=$((result + 1))
+  # The sampler is told to expect an executable this launcher is not, so it
+  # burns its (1 s) receipt budget and fails after the tree is fully up.
+  # The observation's own FAIL diagnostics are the expected outcome here, so they
+  # are captured in a work file rather than pasted into the control log.
+  if (
+    OBSERVE_RSS_FILE="$rss_fail.rss" OBSERVE_TIME_FILE="$rss_fail.time" \
+      OBSERVE_LAUNCHER_EXE=/bin/echo RSS_RECEIPT_WAIT_SECONDS=1 \
+      observe_launch "probe-rss-fail" "$probe_dir" "$WORK/probe-rss-fail.out" -- \
+      /bin/bash "$WORK/probe-rss-fail.sh" "$WORK/probe-rss-fail.pid" \
+      "$WORK/probe-rss-fail.child" >"$WORK/probe-rss-fail.log" 2>&1
+  ); then
+    fail_rc=0
+  else
+    fail_rc=$?
+  fi
+  if [ "$fail_rc" -eq 0 ]; then
+    echo "    FAIL: sampler-failure control: observe_launch reported success although its sampler could not bind"
+    result=$((result + 1))
+  fi
+  fail_pid="$(cat "$WORK/probe-rss-fail.pid" 2>/dev/null || true)"
+  fail_child="$(cat "$WORK/probe-rss-fail.child" 2>/dev/null || true)"
+  for probe in fail_pid fail_child; do
+    case "${!probe}" in
+    '' | *[!0-9]*)
+      echo "    FAIL: sampler-failure control: the launch recorded no $probe"
+      result=$((result + 1))
+      ;;
+    *)
+      if kill -0 "${!probe}" 2>/dev/null; then
+        echo "    FAIL: sampler-failure control: $probe ${!probe} survived the sampler-start failure path"
+        kill -KILL "${!probe}" 2>/dev/null || true
+        result=$((result + 1))
+      fi
+      ;;
+    esac
+  done
+  echo "    control h22: launcher pid=${fail_pid:-none} child=${fail_child:-none} both absent after the failure path (diagnostics: $(basename "$WORK/probe-rss-fail.log"))"
+  rm -f "$rss_fail.rss" "$rss_fail.rss.meta" "$rss_fail.rss.receipt" \
+    "$rss_fail.time" "$WORK/probe-rss-fail.sh" "$WORK/probe-rss-fail.pid" \
+    "$WORK/probe-rss-fail.child" "$WORK/probe-rss-fail.log" || result=$((result + 1))
+  control_report "h22 sampler-start-failure-stops-launch-tree" "$ctl_before"
+
+
+  # (h23) #399 post-3: the sampler stops cleanly when its own target is caught
+  # *finishing* — macOS then reports `<defunct>`/`(<name>)` for the comm and
+  # 0 KiB of RSS. A native `large` launch failed on exactly that reading, so the
+  # rule needs its own receipt: benign only for our own name and only at 0 KiB.
+  # Anything else (another name, or a placeholder with a live RSS) stays a
+  # mismatch, so the allowance cannot hide a real comm change.
+  ctl_before="$result"
+  if ! rss_exit_transition "<defunct>" 0 agent-vm; then
+    echo "    FAIL: exit-transition rule rejected a zombie of the sampled target"
+    result=$((result + 1))
+  fi
+  if ! rss_exit_transition "(agent-vm)" 0 agent-vm; then
+    echo "    FAIL: exit-transition rule rejected the target's own placeholder comm"
+    result=$((result + 1))
+  fi
+  if rss_exit_transition "(other)" 0 agent-vm; then
+    echo "    FAIL: exit-transition rule accepted another process's placeholder comm"
+    result=$((result + 1))
+  fi
+  if rss_exit_transition "(agent-vm)" 4096 agent-vm; then
+    echo "    FAIL: exit-transition rule accepted a placeholder comm with a live RSS"
+    result=$((result + 1))
+  fi
+  if rss_exit_transition "/bin/sh" 0 agent-vm; then
+    echo "    FAIL: exit-transition rule accepted an unrelated comm"
+    result=$((result + 1))
+  fi
+  control_report "h23 rss-exit-transition-rule" "$ctl_before"
+
+
+  # (h24) #399 review: the runtime identity receipt now probes the pinned runtime
+  # HEAD and the firmware source stamp with checked statuses, validates them as
+  # object ids and requires the stamp to equal the pinned nested
+  # `vendor/libkrunfw` gitlink. The real `stdin_identity_init` runs in a
+  # subshell with only `git` stubbed and the receipt path real, so this control
+  # exercises the shipped probes rather than a copy; every launch outside it
+  # keeps the real git. A rejected probe must leave READY unset and publish no
+  # runtime receipt, because a later successful assignment would otherwise hide
+  # the failure under the conditional call the rows use.
+  ctl_before="$result"
+  local identity_dir="$probe_dir/stdin-identity"
+  local identity_stamp="$identity_dir/libkrunfw.5.dylib.source-sha"
+  local stub_head=3333333333333333333333333333333333333333
+  local stub_runtime=1111111111111111111111111111111111111111
+  local stub_stamp=2222222222222222222222222222222222222222
+  local stub_gitlink="160000 commit $stub_stamp"$'\t'"vendor/libkrunfw"
+  mkdir -p "$identity_dir" || result=$((result + 1))
+
+  # Args: want (ok|fail), runtime HEAD (`fail`/`empty`/id), ls-tree line
+  # (`fail`/`empty`/line), firmware stamp (id or `missing`/`unreadable`/`empty`).
+  stdin_identity_probe() {
+    local want="$1" stub_rt="$2" stub_tree="$3" stamp_mode="$4" accepted
+    rm -rf "$identity_stamp"
+    case "$stamp_mode" in
+    missing) ;;
+    unreadable) mkdir "$identity_stamp" || return 1 ;;
+    empty) : >"$identity_stamp" || return 1 ;;
+    *) printf '%s\n' "$stamp_mode" >"$identity_stamp" || return 1 ;;
+    esac
+    (
+      STDIN_EVIDENCE_CANDIDATE=""
+      STDIN_EVIDENCE_RUNTIME=""
+      STDIN_EVIDENCE_READY=""
+      AGENT_VM=/usr/bin/true
+      CUSTOM_RUNTIME_DIR="$identity_dir"
+      CUSTOM_MSB=/usr/bin/true
+      CUSTOM_AGENTD=/usr/bin/true
+      CUSTOM_LIBKRUNFW=/usr/bin/true
+      # shellcheck disable=SC2317,SC2329  # invoked indirectly by stdin_identity_init;
+      # 0.9 (the Ubuntu CI version) reports the body as unreachable instead.
+      git() {
+        case "$*" in
+        *"ls-tree HEAD vendor/libkrunfw"*)
+          [ "$stub_tree" != fail ] || return 1
+          [ "$stub_tree" != empty ] || return 0
+          printf '%s\n' "$stub_tree"
+          ;;
+        *"rev-parse --verify HEAD"*)
+          [ "$stub_rt" != fail ] || return 1
+          [ "$stub_rt" != empty ] || return 0
+          printf '%s\n' "$stub_rt"
+          ;;
+        *"rev-parse HEAD"*) printf '%s\n' "$stub_head" ;;
+        esac
+      }
+      if stdin_identity_init; then accepted=ok; else accepted=fail; fi
+      [ "$accepted" = "$want" ] || return 1
+      if [ "$want" = ok ]; then
+        [ "$STDIN_EVIDENCE_READY" = 1 ] || return 1
+        case "$STDIN_EVIDENCE_RUNTIME" in
+        *"microsandbox=$stub_runtime"*"firmware-source=$stub_stamp"*) return 0 ;;
+        esac
+        return 1
+      fi
+      [ -z "$STDIN_EVIDENCE_READY" ] && [ -z "$STDIN_EVIDENCE_RUNTIME" ]
+    )
+  }
+
+  # A rejected identity is the expected outcome here; the FAIL is acceptance.
+  stdin_identity_must_reject() {
+    local desc="$1"
+    shift
+    stdin_identity_probe fail "$@" && return 0
+    echo "    FAIL: stdin_identity_init accepted $desc"
+    result=$((result + 1))
+  }
+
+  if ! stdin_identity_probe ok "$stub_runtime" "$stub_gitlink" "$stub_stamp"; then
+    echo "    FAIL: stdin_identity_init rejected the valid pinned identity"
+    result=$((result + 1))
+  fi
+  stdin_identity_must_reject "a missing firmware receipt" \
+    "$stub_runtime" "$stub_gitlink" missing
+  stdin_identity_must_reject "an unreadable firmware receipt" \
+    "$stub_runtime" "$stub_gitlink" unreadable
+  stdin_identity_must_reject "an empty firmware receipt" \
+    "$stub_runtime" "$stub_gitlink" empty
+  stdin_identity_must_reject "an unresolvable firmware receipt" \
+    "$stub_runtime" "$stub_gitlink" unknown
+  stdin_identity_must_reject "a firmware receipt that is not the pinned gitlink" \
+    "$stub_runtime" "$stub_gitlink" 4444444444444444444444444444444444444444
+  stdin_identity_must_reject "a failed pinned-runtime HEAD probe" \
+    fail "$stub_gitlink" "$stub_stamp"
+  stdin_identity_must_reject "an empty pinned-runtime HEAD probe" \
+    empty "$stub_gitlink" "$stub_stamp"
+  stdin_identity_must_reject "an unresolvable pinned-runtime HEAD probe" \
+    unknown "$stub_gitlink" "$stub_stamp"
+  stdin_identity_must_reject "a failed firmware gitlink probe" \
+    "$stub_runtime" fail "$stub_stamp"
+  stdin_identity_must_reject "an empty firmware gitlink probe" \
+    "$stub_runtime" empty "$stub_stamp"
+  stdin_identity_must_reject "a firmware gitlink that is not an object id" \
+    "$stub_runtime" "160000 commit nope"$'\t'"vendor/libkrunfw" "$stub_stamp"
+  stdin_identity_must_reject "a firmware gitlink for another path" \
+    "$stub_runtime" "160000 commit $stub_stamp"$'\t'"vendor/other" "$stub_stamp"
+  control_report "h24 stdin-identity-receipts" "$ctl_before"
+
 
   local observed_pass="$PASSED" observed_fail="$FAILED"
   if [ "$observed_pass" -ne 0 ] || [ "$observed_fail" -ne 2 ]; then
@@ -1700,9 +4339,9 @@ check_harness_negative() {
     # The deliberately expected FAIL output is captured, not shown as the
     # summary's own failures.
     cat "$log"
-    result=1
+    result=$((result + 1))
   fi
-  assert_no_host_calls || result=1
+  assert_no_host_calls || result=$((result + 1))
 
   PASSED="$saved_passed"
   FAILED="$saved_failed"
@@ -4395,6 +7034,10 @@ custom_image_host_pins() {
 # --------------------------------------------------------------- run all ----
 
 echo "e2e: group=$GROUP"
+printf 'e2e: argv=%q ' "$0" "$@"
+printf '\n'
+echo "e2e: repo=$REPO_ROOT commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+echo "e2e: only-rows=${E2E_ONLY_ROWS:-<all>}"
 echo "e2e: launcher=$AGENT_VM"
 make_host_shims
 run_check "harness-negative" check_harness_negative
@@ -5217,9 +7860,645 @@ custom_image_direct_chrome_furniture() {
   return "$result"
 }
 
+# ── #399: native streamed-stdin rows (both direct syntax forms) ────────────
+#
+# Every row runs `agent-vm run PROGRAM` and `agent-vm -- PROGRAM` over an input
+# the row owns, asserts on the split captures, and closes its writer on every
+# exit path. Guest stdout is compared byte for byte; the launcher's notices stay
+# on stderr.
+
+# `small`: a FIFO written with `hello` and closed by the row.
+custom_image_direct_stdin_small() {
+  local name=direct-stdin-small form capture proj result=0 status
+  proj="$(stdin_row_project "$name" "$CUSTOM_MARKER")" || return 1
+  for form in run dash; do
+    capture="$name-$form"
+    stdin_fifo_closed "$capture" hello || { result=1; continue; }
+    if stdin_capture "$capture" "$proj" "$STDIN_FIFO" "$form" cat; then
+      stdin_writer_stop
+      status="$CAPTURE_STATUS"
+      assert_eq "$capture: guest exit status" "0" "$status" || result=1
+      assert_direct_stdout_bytes "$capture: guest stdout is exactly the input" \
+        "$capture" hello || result=1
+      assert_no_match "$capture: no launcher notice on guest stdout" '^==>' \
+        "$(direct_stdout "$capture")" || result=1
+      stdin_form_evidence "$form" "$status" "stdout==hello; no-notice-on-stdout" || result=1
+    else
+      stdin_writer_stop
+      result=1
+    fi
+    assert_no_host_calls || result=1
+  done
+  direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+  return "$result"
+}
+
+# `empty`: /dev/null, and an empty FIFO the writer opens and closes.
+custom_image_direct_stdin_empty() {
+  local name=direct-stdin-empty form kind capture proj fifo result=0 status
+  proj="$(stdin_row_project "$name" "$CUSTOM_MARKER")" || return 1
+  for form in run dash; do
+    for kind in dev-null empty-fifo; do
+      # One FIFO per launch: a FIFO is consumed by the reader that opens it, so
+      # a second launch over the same one would block waiting for a writer.
+      for program in cat wc-count; do
+        capture="$name-$form-$kind-$program"
+        fifo=/dev/null
+        if [ "$kind" = empty-fifo ]; then
+          stdin_fifo_closed "$capture" "" || { result=1; continue; }
+          fifo="$STDIN_FIFO"
+        fi
+        if [ "$program" = cat ]; then
+          if ! stdin_capture "$capture" "$proj" "$fifo" "$form" cat; then
+            stdin_writer_stop
+            result=1
+            continue
+          fi
+        else
+          if ! stdin_capture "$capture" "$proj" "$fifo" "$form" wc -c; then
+            stdin_writer_stop
+            result=1
+            continue
+          fi
+        fi
+        stdin_writer_stop
+        status="$CAPTURE_STATUS"
+        assert_eq "$capture: guest exit status" "0" "$status" || result=1
+        if [ "$program" = cat ]; then
+          assert_direct_stdout_empty "$capture: cat sees an empty stream" \
+            "$capture" || result=1
+          stdin_form_evidence "$form" "$status" "$kind: stdout-empty" || result=1
+        else
+          assert_eq "$capture: the guest sees EOF, not a pending stdin" "0" \
+            "$(direct_stdout "$capture")" || result=1
+          stdin_form_evidence "$form" "$status" "$kind: stdout==0" || result=1
+        fi
+      done
+    done
+  done
+  direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+  return "$result"
+}
+
+# The row's binary input: a block of all 256 byte values (0x00..0xFF) repeated
+# 1024 times, then a separate 1024-byte NUL run, so the stream is neither ASCII
+# nor valid UTF-8 and every byte value occurs inside a block (#399 N4).
+stdin_binary_input() {
+  local out="$1" chunky i=0
+  chunky="$(for byte in $(seq 0 255); do printf '\\%03o' "$byte"; done)" || return 1
+  {
+    while [ "$i" -lt 1024 ]; do
+      printf '%b' "$chunky" || return 1
+      i=$((i + 1))
+    done
+    head -c 1024 /dev/zero || return 1
+  } >"$out" || return 1
+}
+
+# `binary`: the same file through `cat` (byte equality) and `sha256sum`.
+custom_image_direct_stdin_binary() {
+  local name=direct-stdin-binary form capture proj input result=0 want got status
+  proj="$(stdin_row_project "$name" "$CUSTOM_MARKER")" || return 1
+  input="$WORK/$name.input"
+  stdin_binary_input "$input" || return 1
+  want="$(shasum -a 256 "$input" | cut -d' ' -f1)"
+  for form in run dash; do
+    capture="$name-cat-$form"
+    if stdin_capture "$capture" "$proj" "$input" "$form" cat; then
+      status="$CAPTURE_STATUS"
+      assert_eq "$capture: guest exit status" "0" "$status" || result=1
+      if ! cmp -s "$input" "$WORK/$capture.stdout"; then
+        echo "    FAIL: $capture: the guest did not receive the exact bytes"
+        cmp -l "$input" "$WORK/$capture.stdout" | head -5 || true
+        result=1
+      fi
+      stdin_form_evidence "$form" "$status" "cat: cmp==input" || result=1
+    else
+      result=1
+    fi
+    capture="$name-sha-$form"
+    if stdin_capture "$capture" "$proj" "$input" "$form" sha256sum; then
+      status="$CAPTURE_STATUS"
+      assert_eq "$capture: guest exit status" "0" "$status" || result=1
+      got="$(direct_stdout "$capture" | cut -d' ' -f1)"
+      assert_eq "$capture: guest checksum matches the host's" "$want" "$got" || result=1
+      stdin_form_evidence "$form" "$status" "sha256sum==host-sha256" || result=1
+    else
+      result=1
+    fi
+  done
+  direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || result=1
+  return "$result"
+}
+
+# `hook-read`: a real image seed hook and a project hook that each read before
+# the program runs; both must see EOF, and the hook's export must survive.
+custom_image_direct_stdin_hook_read() {
+  local name=direct-stdin-hook-read form capture proj result=0 input fifo out status
+  proj="$(stdin_row_project "$name" "$CUSTOM_STDIN_SEED")" || return 1
+  cat >"$proj/.agent-vm.runtime.sh" <<'HOOK' || return 1
+if IFS= read -r _line; then echo "hook-read=GOT" >&2; else echo "hook-read=EOF" >&2; fi
+V=hook-value
+export V
+HOOK
+  for form in run dash; do
+    capture="$name-$form"
+    stdin_fifo_closed "$capture" "hello-stdin" || { result=1; continue; }
+    fifo="$STDIN_FIFO"
+    if stdin_capture "$capture" "$proj" "$fifo" "$form" bash -c \
+      'cat; printf "v=%s\n" "$V" >&2'; then
+      stdin_writer_stop
+      status="$CAPTURE_STATUS"
+      assert_eq "$capture: guest exit status" "0" "$status" || result=1
+      assert_direct_stdout_bytes "$capture: guest stdout is exactly the input" \
+        "$capture" "hello-stdin" || result=1
+      out="$(launch_output "$capture")" || result=1
+      assert_match "$capture: the image seed hook saw EOF" '^seed-read=EOF$' "$out" || result=1
+      assert_no_match "$capture: the seed hook did not consume the input" \
+        '^seed-read=GOT$' "$out" || result=1
+      assert_match "$capture: the project hook saw EOF" '^hook-read=EOF$' "$out" || result=1
+      assert_match "$capture: the hook's export reached the program" '^v=hook-value$' "$out" || result=1
+      stdin_form_evidence "$form" "$status" "stdout==input; seed-read=EOF; hook-read=EOF; export-hook-value" || result=1
+    else
+      stdin_writer_stop
+      result=1
+    fi
+  done
+  rm -f "$proj/.agent-vm.runtime.sh" || result=1
+  direct_cleanup "$name" "$proj" "$CUSTOM_STDIN_SEED" "$result" || result=1
+  return "$result"
+}
+
+# The `/usr/bin/time -l -o` corroboration: macOS reports "maximum resident set
+# size" in bytes. It is evidence only (it can include waited-for descendants),
+# so the oracle stays the launcher-only RSS sampler.
+time_max_rss_bytes() {
+  local file="$1" value
+  [ -s "$file" ] || {
+    echo "    FAIL: /usr/bin/time wrote no report to $file" >&2
+    return 1
+  }
+  value="$(awk '/maximum resident set size/ { print $1; found = 1 }
+    END { exit !found }' "$file")" || {
+    echo "    FAIL: no maximum-resident-set-size line in $file" >&2
+    return 1
+  }
+  printf '%s' "$value"
+}
+
+# `large`: 256 MiB hashed and 64 MiB round-tripped through `cat`, plus the
+# calibrated launcher-RSS comparison **per syntax form** (one warm-up, three
+# baseline samples over 1 MiB, three measured samples over 256 MiB). Every
+# sample's status and checksum is verified before its RSS is used, and every
+# sample records both the launcher-PID sampler and `/usr/bin/time -l -o`
+# (#399 B1).
+custom_image_direct_stdin_large() {
+  local name=direct-stdin-large proj input want base_want got form sample result=0 status
+  local cap base_median measured_median growth growth_ok rss time_bytes assertions form_status
+  local rss_receipt
+  local -a baseline=() measured=()
+  proj="$(stdin_row_project "$name" "$CUSTOM_MARKER")" || return 1
+  input="$WORK/$name.input"
+  head -c 268435456 /dev/urandom >"$input" || return 1
+  want="$(shasum -a 256 "$input" | cut -d' ' -f1)" || return 1
+  head -c 67108864 "$input" >"$WORK/$name.cat.input" || return 1
+  head -c 1048576 "$input" >"$WORK/$name.baseline.input" || return 1
+  base_want="$(shasum -a 256 "$WORK/$name.baseline.input" | cut -d' ' -f1)" || return 1
+  stdin_identity_init || return 1
+
+  for form in run dash; do
+    baseline=()
+    measured=()
+    form_status=unknown
+    # Warm-up: one checked launch so the image is hot. Its checksum is
+    # verified too; a failed warm-up must not silently precede the samples.
+    cap="$name-warm-$form"
+    if stdin_capture "$cap" "$proj" "$WORK/$name.baseline.input" "$form" sha256sum; then
+      status="$CAPTURE_STATUS"
+      form_status="$status"
+      assert_eq "$cap: warm-up exit status" "0" "$status" || result=1
+      got="$(direct_stdout "$cap" | cut -d' ' -f1)"
+      assert_eq "$cap: warm-up checksum" "$base_want" "$got" || result=1
+      printf '    sample: form=%s kind=warm-up status=%s checksum=%s rss_kib=not-sampled time_maxrss_bytes=not-sampled\n' \
+        "$form" "$status" "$base_want"
+    else
+      form_status=observation_failed
+      result=1
+    fi
+
+    for sample in 1 2 3; do
+      cap="$name-baseline-$form-$sample"
+      OBSERVE_RSS_FILE="$WORK/$cap.rss"
+      OBSERVE_TIME_FILE="$WORK/$cap.time"
+      if stdin_capture "$cap" "$proj" "$WORK/$name.baseline.input" "$form" sha256sum; then
+        status="$CAPTURE_STATUS"
+        form_status="$status"
+        rss_sampler_stop
+        if assert_eq "$cap: baseline exit status" "0" "$status" &&
+          assert_eq "$cap: baseline checksum" "$base_want"             "$(direct_stdout "$cap" | cut -d' ' -f1)" &&
+          assert_launcher_rss_identity "$WORK/$cap.rss" "$cap"; then
+          rss="$(max_rss_kib "$WORK/$cap.rss")" || { rss=invalid; result=1; }
+          time_bytes="$(time_max_rss_bytes "$WORK/$cap.time")" || { time_bytes=invalid; result=1; }
+          baseline+=("$rss")
+          printf '    sample: form=%s kind=baseline-%s status=%s checksum=%s rss_kib=%s time_maxrss_bytes=%s\n' \
+            "$form" "$sample" "$status" "$base_want" "$rss" "$time_bytes"
+          # The receipt line is printed from a checked read: printing it
+          # through `$(...)` discarded the check's status (#399 review 3).
+          rss_receipt="$(launcher_rss_receipt "$WORK/$cap.rss")" || result=1
+          printf '    rss_receipt: form=%s kind=baseline-%s %s\n' "$form" "$sample" \
+            "$rss_receipt"
+        else
+          result=1
+        fi
+      else
+        form_status=observation_failed
+        rss_sampler_stop
+        result=1
+      fi
+      unset OBSERVE_RSS_FILE OBSERVE_TIME_FILE
+
+      cap="$name-sha-$form-$sample"
+      OBSERVE_RSS_FILE="$WORK/$cap.rss"
+      OBSERVE_TIME_FILE="$WORK/$cap.time"
+      if stdin_capture "$cap" "$proj" "$input" "$form" sha256sum; then
+        status="$CAPTURE_STATUS"
+        form_status="$status"
+        rss_sampler_stop
+        if assert_eq "$cap: measured exit status" "0" "$status" &&
+          assert_eq "$cap: 256 MiB checksum matches the host's" "$want" \
+            "$(direct_stdout "$cap" | cut -d' ' -f1)" &&
+          assert_launcher_rss_identity "$WORK/$cap.rss" "$cap"; then
+          rss="$(max_rss_kib "$WORK/$cap.rss")" || { rss=invalid; result=1; }
+          time_bytes="$(time_max_rss_bytes "$WORK/$cap.time")" || { time_bytes=invalid; result=1; }
+          measured+=("$rss")
+          printf '    sample: form=%s kind=measured-%s status=%s checksum=%s rss_kib=%s time_maxrss_bytes=%s\n' \
+            "$form" "$sample" "$status" "$want" "$rss" "$time_bytes"
+          rss_receipt="$(launcher_rss_receipt "$WORK/$cap.rss")" || result=1
+          printf '    rss_receipt: form=%s kind=measured-%s %s\n' "$form" "$sample" \
+            "$rss_receipt"
+        else
+          result=1
+        fi
+      else
+        form_status=observation_failed
+        rss_sampler_stop
+        result=1
+      fi
+      unset OBSERVE_RSS_FILE OBSERVE_TIME_FILE
+    done
+
+    if [ "${#baseline[@]}" -eq 3 ] && [ "${#measured[@]}" -eq 3 ]; then
+      base_median="$(median3 "${baseline[0]}" "${baseline[1]}" "${baseline[2]}")" || result=1
+      measured_median="$(median3 "${measured[0]}" "${measured[1]}" "${measured[2]}")" || result=1
+      if growth="$(rss_growth_verdict "$base_median" "$measured_median")"; then
+        growth_ok=yes
+      else
+        growth_ok=no
+        result=1
+      fi
+      printf '    rss_kib form=%s baseline=%s,%s,%s median=%s measured=%s,%s,%s median=%s growth=%s limit=%s growth_within_limit=%s\n' \
+        "$form" "${baseline[0]}" "${baseline[1]}" "${baseline[2]}" "$base_median" \
+        "${measured[0]}" "${measured[1]}" "${measured[2]}" "$measured_median" "$growth" \
+        "$RSS_GROWTH_LIMIT_KIB" "$growth_ok"
+      if [ "$growth_ok" = no ]; then
+        echo "    FAIL: $name ($form): launcher RSS grew ${growth} KiB (limit $RSS_GROWTH_LIMIT_KIB)"
+      fi
+      assertions="warmup+baseline status/checksum+sampler-identity; 256MiB checksum+sampler-identity; growth<$RSS_GROWTH_LIMIT_KIB KiB"
+    else
+      echo "    FAIL: $name ($form): did not collect three validated baseline and measured samples"
+      result=1
+      assertions="sample collection failed"
+    fi
+    # The per-form receipt carries the status the launcher was observed to
+    # exit with, never a success-shaped constant on a failed form (#399 R2).
+    stdin_form_evidence "$form" "$form_status" "$assertions" || result=1
+  done
+
+  # The byte-exact round trip, both forms, over the 64 MiB slice.
+  for form in run dash; do
+    if stdin_capture "$name-cat-$form" "$proj" "$WORK/$name.cat.input" "$form" cat; then
+      status="$CAPTURE_STATUS"
+      assert_eq "$name-cat-$form: guest exit status" "0" "$status" || result=1
+      if ! cmp -s "$WORK/$name.cat.input" "$WORK/$name-cat-$form.stdout"; then
+        echo "    FAIL: $name-cat-$form: the 64 MiB round trip is not byte-identical"
+        cmp -l "$WORK/$name.cat.input" "$WORK/$name-cat-$form.stdout" | head -5 || true
+        result=1
+      fi
+      stdin_form_evidence "$form" "$status" "cat 64MiB: cmp==input" || result=1
+    else
+      result=1
+    fi
+  done
+
+  direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || return 1
+  return "$result"
+}
+
+# The median of three integers.
+median3() {
+  local a="$1" b="$2" c="$3" low middle
+  if [ "$a" -gt "$b" ]; then low="$b"; middle="$a"; else low="$a"; middle="$b"; fi
+  if [ "$c" -le "$low" ]; then printf '%s' "$low"
+  elif [ "$c" -le "$middle" ]; then printf '%s' "$c"
+  else printf '%s' "$middle"; fi
+}
+
+# `early-close`: 64 MiB of input, a guest that reads 16 bytes and exits. The
+# guest's own status stands and nothing is reported as a broken pipe.
+custom_image_direct_stdin_early_close() {
+  local name=direct-stdin-early-close proj input result=0 form capture started elapsed status
+  proj="$(stdin_row_project "$name" "$CUSTOM_MARKER")" || return 1
+  input="$WORK/$name.input"
+  head -c 67108864 /dev/urandom >"$input" || return 1
+  head -c 16 "$input" >"$WORK/$name.expected" || return 1
+  for form in run dash; do
+    capture="$name-$form"
+    started="$(date +%s)"
+    if stdin_capture "$capture" "$proj" "$input" "$form" head -c 16; then
+      elapsed=$(( $(date +%s) - started ))
+      status="$CAPTURE_STATUS"
+      assert_eq "$capture: guest exit status" "0" "$status" || result=1
+      assert_direct_stdout_file "$capture: the guest received the first 16 bytes" \
+        "$capture" "$WORK/$name.expected" || result=1
+      assert_no_match "$capture: an early close is not a forwarding failure" \
+        'forwarding stdin' "$(launch_output "$capture")" || result=1
+      assert_no_match "$capture: an early close is not a broken pipe" \
+        'broken pipe' "$(launch_output "$capture")" || result=1
+      if [ "$elapsed" -ge 60 ]; then
+        echo "    FAIL: $capture: an early-closing guest took ${elapsed}s (limit 60)"
+        result=1
+      fi
+      stdin_form_evidence "$form" "$status" "stdout==first-16-bytes; no-forwarding-failure; <60s" ||
+        result=1
+    else
+      result=1
+    fi
+  done
+  direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || return 1
+  return "$result"
+}
+
+# `live-handshake`: both streams are observed, and a line is echoed, *before*
+# input ends. A collect-until-exit implementation fails the first deadline.
+#
+# Readiness is a handshake gate, not a report: a missed marker aborts the form
+# (close the writer, reap the capture) instead of opening the FIFO for another
+# synchronous write, which could block forever when no reader remains (#399 F2).
+custom_image_direct_stdin_live_handshake() {
+  local name=direct-stdin-live-handshake proj fifo result=0 form capture guest status
+  proj="$(stdin_row_project "$name" "$CUSTOM_MARKER")" || return 1
+  guest='printf "out-ready\n"; printf "err-ready\n" >&2;
+    if IFS= read -r l; then printf "out-got:%s\n" "$l"; printf "err-got:%s\n" "$l" >&2; fi;
+    cat >/dev/null; printf "out-eof\n"; printf "err-eof\n" >&2'
+  for form in run dash; do
+    capture="$name-$form"
+    fifo="$WORK/$capture.fifo"
+    rm -f "$fifo" || { result=1; continue; }
+    mkfifo "$fifo" || { result=1; continue; }
+    stdin_writer_start "$fifo" "" hold || { result=1; continue; }
+    if ! stdin_capture_async "$capture" "$proj" "$fifo" "$form" bash -c "$guest"; then
+      echo "    FAIL: $capture: could not start the background capture"
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    # Nothing has been written yet: the guest must still be producing output.
+    if ! wait_for_marker "$WORK/$capture.stdout" '^out-ready$' 120; then
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    if ! wait_for_marker "$WORK/$capture.out" '^err-ready$' 10; then
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    if ! stdin_writer_send "$fifo" "ping
+"; then
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    if ! wait_for_marker "$WORK/$capture.stdout" '^out-got:ping$' 10; then
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    if ! wait_for_marker "$WORK/$capture.out" '^err-got:ping$' 10; then
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    # The writer is still open and the launcher still running.
+    if ! kill -0 "$STDIN_WRITER_PID" 2>/dev/null; then
+      echo "    FAIL: $capture: the row's writer died before the handshake"
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    stdin_writer_close
+    if ! wait_for_marker "$WORK/$capture.stdout" '^out-eof$' 10; then
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    if ! wait_for_marker "$WORK/$capture.out" '^err-eof$' 10; then
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    wait_capture_bounded "$capture" || result=1
+    stdin_writer_stop
+    if ! status="$(stdin_capture_launcher_status "$capture")"; then
+      result=1
+      continue
+    fi
+    assert_eq "$capture: guest exit status" "0" "$status" || result=1
+    assert_direct_stdout_bytes "$capture: guest stdout is the three ordered lines" \
+      "$capture" $'out-ready\nout-got:ping\nout-eof\n' || result=1
+    # The stderr lines are ordered, and every line is either a guest line or a
+    # launcher notice.
+    if ! awk '/^==> /{next} /^(err-ready|err-got:ping|err-eof)$/{n++; next} {print; bad=1}
+      END {exit !(n == 3 && !bad)}' "$WORK/$capture.out" >/dev/null; then
+      echo "    FAIL: $capture: guest stderr lines are missing, out of order or mixed"
+      grep -aE 'err-|==>' "$WORK/$capture.out" | head -20 || true
+      result=1
+    fi
+    printf 'err-ready\nerr-got:ping\nerr-eof\n' >"$WORK/$capture.stderr.expected" || result=1
+    if ! LC_ALL=C grep -a -E '^err-(ready|got:ping|eof)$' "$WORK/$capture.out" |
+      cmp -s - "$WORK/$capture.stderr.expected"; then
+      echo "    FAIL: $capture: guest stderr lines are missing or out of order"
+      result=1
+    fi
+    stdin_form_evidence "$form" "$status" \
+      "out-ready before input; ping round-trip with writer open; EOF; ordered stderr" || result=1
+  done
+  direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || return 1
+  return "$result"
+}
+
+# `concurrent-streams`: 4 MiB of 0xE9 on stdout and 4 MiB of 0xF1 on stderr at
+# once, while 1 MiB of input is consumed. The bytes are channel-distinct and
+# non-ASCII so no launcher diagnostic can be counted as guest output.
+custom_image_direct_stdin_concurrent_streams() {
+  local name=direct-stdin-concurrent proj fifo result=0 form capture guest status
+  proj="$(stdin_row_project "$name" "$CUSTOM_MARKER")" || return 1
+  LC_ALL=C tr '\0' '\351' < <(head -c 4194304 /dev/zero) \
+    >"$WORK/$name.stdout.expected" || return 1
+  # LC_ALL=C in the guest too: `tr` in a UTF-8 locale would emit the UTF-8
+  # encoding of U+00E9/U+00F1 instead of one byte.
+  guest='(head -c 4194304 /dev/zero | LC_ALL=C tr "\0" "\351") &
+    (head -c 4194304 /dev/zero | LC_ALL=C tr "\0" "\361" >&2) &
+    cat >/dev/null; wait'
+  for form in run dash; do
+    capture="$name-$form"
+    fifo="$WORK/$capture.fifo"
+    rm -f "$fifo" || { result=1; continue; }
+    mkfifo "$fifo" || { result=1; continue; }
+    stdin_writer_start "$fifo" "" hold || { result=1; continue; }
+    if ! stdin_capture_async "$capture" "$proj" "$fifo" "$form" bash -c "$guest"; then
+      echo "    FAIL: $capture: could not start the background capture"
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    # The guest must be alive and producing: wait for the first stdout byte,
+    # then feed the 1 MiB and let the guest see EOF.
+    if ! wait_for_nonempty "$WORK/$capture.stdout" 120; then
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    head -c 1048576 /dev/urandom >"$WORK/$capture.input" || {
+      abort_live_capture "$capture"
+      result=1
+      continue
+    }
+    if ! stdin_writer_write_bounded "$fifo" file "$WORK/$capture.input"; then
+      abort_live_capture "$capture"
+      result=1
+      continue
+    fi
+    stdin_writer_close
+    wait_capture_bounded "$capture" || result=1
+    stdin_writer_stop
+    if ! status="$(stdin_capture_launcher_status "$capture")"; then
+      result=1
+      continue
+    fi
+    assert_eq "$capture: guest exit status" "0" "$status" || result=1
+    assert_concurrent_stdout "$capture" "$WORK/$name.stdout.expected" \
+      "$WORK/$capture.stdout" || result=1
+    assert_concurrent_stderr "$capture" "$WORK/$capture.out" 4194304 || result=1
+    stdin_form_evidence "$form" "$status" \
+      "stdout==4MiB 0xE9; stderr==4MiB 0xF1; zero cross-channel; expected notices" || result=1
+  done
+  direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || return 1
+  return "$result"
+}
+
+# `host-open`: the guest exits while the row's writer is still open. A reader
+# that is joined at teardown, or a launcher that waits for stdin EOF, misses the
+# 30 s bound.
+custom_image_direct_stdin_host_open() {
+  local name=direct-stdin-host-open proj fifo result=0 form capture started elapsed expected
+  local program want status
+  local -a argv=()
+  proj="$(stdin_row_project "$name" "$CUSTOM_MARKER")" || return 1
+  for form in run dash; do
+    for expected in true:0 exit7:7; do
+      program="${expected%%:*}"
+      want="${expected##*:}"
+      case "$program" in
+      true) argv=(true) ;;
+      exit7) argv=(sh -c 'exit 7') ;;
+      esac
+      capture="$name-$form-$program"
+      fifo="$WORK/$capture.fifo"
+      rm -f "$fifo" || { result=1; continue; }
+      mkfifo "$fifo" || { result=1; continue; }
+      stdin_writer_start "$fifo" "" hold || { result=1; continue; }
+      started="$(date +%s)"
+      if stdin_capture "$capture" "$proj" "$fifo" "$form" "${argv[@]}"; then
+        elapsed=$(( $(date +%s) - started ))
+        status="$CAPTURE_STATUS"
+        # The launcher returned while the writer was still alive.
+        if ! kill -0 "$STDIN_WRITER_PID" 2>/dev/null; then
+          echo "    FAIL: $capture: the row's writer was gone before the launcher exited"
+          result=1
+        fi
+        stdin_writer_stop
+        assert_eq "$capture: guest exit status while host stdin is open" "$want" \
+          "$status" || result=1
+        if [ "$elapsed" -ge 30 ]; then
+          echo "    FAIL: $capture: the launcher waited ${elapsed}s on open host stdin (limit 30)"
+          result=1
+        fi
+        stdin_form_evidence "$form" "$status" "guest=${argv[*]}; writer-open; <30s" || result=1
+      else
+        stdin_writer_stop
+        result=1
+      fi
+    done
+  done
+  direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || return 1
+  return "$result"
+}
+
+# `eof-wait`: a command that waits for EOF gets it.
+custom_image_direct_stdin_eof_wait() {
+  local name=direct-stdin-eof-wait proj fifo result=0 form capture status
+  proj="$(stdin_row_project "$name" "$CUSTOM_MARKER")" || return 1
+  for form in run dash; do
+    capture="$name-$form"
+    stdin_fifo_closed "$capture" abc || { result=1; continue; }
+    fifo="$STDIN_FIFO"
+    if stdin_capture "$capture" "$proj" "$fifo" "$form" sh -c 'cat >/dev/null; echo done'; then
+      stdin_writer_stop
+      status="$CAPTURE_STATUS"
+      assert_eq "$capture: guest exit status" "0" "$status" || result=1
+      assert_direct_stdout_bytes "$capture: the command ran to EOF" "$capture" \
+        $'done\n' || result=1
+      stdin_form_evidence "$form" "$status" "stdout==done; EOF observed" || result=1
+    else
+      stdin_writer_stop
+      result=1
+    fi
+  done
+  direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || return 1
+  return "$result"
+}
+
+# `shell-unchanged`: the legacy contract, natively. A `shell` launch keeps the
+# bootstrap's `/dev/null`, so bytes waiting on stdin never reach the program.
+custom_image_direct_stdin_shell_unchanged() {
+  local name=direct-stdin-shell-unchanged proj capture status result=0
+  proj="$(stdin_row_project "$name" "$CUSTOM_MARKER")" || return 1
+  capture="$name-run"
+  stdin_fifo_closed "$capture" hello || return 1
+  # The writer is reaped on both of this row's returns, the failed capture
+  # included: the row used to return before stopping it (#399 F2). These two
+  # paths are what h15/h16-trap cover; no claim is made about every signal.
+  if ! capture_custom_direct_input "$capture" "$proj" "$STDIN_FIFO" -- \
+    shell bash -c 'cat; echo end'; then
+    stdin_writer_stop
+    return 1
+  fi
+  stdin_writer_stop
+  status="$CAPTURE_STATUS"
+  assert_eq "$capture: shell exit status" "0" "$status" || result=1
+  assert_direct_stdout_bytes "$capture: a shell launch still sees /dev/null" \
+    "$capture" $'end\n' || result=1
+  stdin_form_evidence "shell" "$status" "stdout==end; input never reaches the program" || result=1
+  direct_cleanup "$name" "$proj" "$CUSTOM_MARKER" "$result" || return 1
+  return "$result"
+}
+
 run_check "explicit-build-archive-workflow" custom_explicit_build_workflow
 
-prepare_custom_fixtures || die "could not build/import the custom-image fixtures"
+if rows_need_fixtures; then
+  prepare_custom_fixtures || die "could not build/import the custom-image fixtures"
+fi
 run_check "explicit-docker-import-workflow" custom_docker_import_workflow
 run_check "custom-image-fixtures-imported" check_custom_fixtures_imported
 run_check "custom-image-env-isolation-audit" check_custom_env_isolation
@@ -5234,6 +8513,17 @@ run_check "custom-image-direct-both-forms" custom_image_direct_both_forms
 run_check "custom-image-direct-argv" custom_image_direct_argv
 run_check "custom-image-direct-statuses" custom_image_direct_statuses
 run_check "custom-image-direct-hook" custom_image_direct_hook
+run_check "custom-image-direct-stdin-small" custom_image_direct_stdin_small
+run_check "custom-image-direct-stdin-empty" custom_image_direct_stdin_empty
+run_check "custom-image-direct-stdin-binary" custom_image_direct_stdin_binary
+run_check "custom-image-direct-stdin-large" custom_image_direct_stdin_large
+run_check "custom-image-direct-stdin-hook-read" custom_image_direct_stdin_hook_read
+run_check "custom-image-direct-stdin-early-close" custom_image_direct_stdin_early_close
+run_check "custom-image-direct-stdin-live-handshake" custom_image_direct_stdin_live_handshake
+run_check "custom-image-direct-stdin-concurrent-streams" custom_image_direct_stdin_concurrent_streams
+run_check "custom-image-direct-stdin-host-open" custom_image_direct_stdin_host_open
+run_check "custom-image-direct-stdin-eof-wait" custom_image_direct_stdin_eof_wait
+run_check "custom-image-direct-stdin-shell-unchanged" custom_image_direct_stdin_shell_unchanged
 run_check "custom-image-direct-host-decoy" custom_image_direct_host_decoy
 run_check "custom-image-direct-nonstandard" custom_image_direct_nonstandard
 run_check "custom-image-direct-zero-provisioning" custom_image_direct_zero_provisioning
