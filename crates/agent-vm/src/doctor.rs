@@ -1166,11 +1166,17 @@ fn timestamp_suffix(now: SystemTime) -> String {
 /// User-facing text for a [`ResetOutcome`]. Pure so the AC wording lives in
 /// one testable place.
 ///
-/// `from:`/`to:` above are [`crate::one_line`] diagnostics, so the undo `mv`
+/// `from:`/`to:` above are [`crate::one_line`] diagnostics, so the undo command
 /// takes raw path bytes through [`crate::shell::PastedWord`] instead; `mv --`
 /// keeps the leading operand a path rather than an option, and
 /// [`crate::shell::bash_zsh_note`] names the shell when not every shell reads
 /// the operand.
+///
+/// The undo command is guarded rather than a bare `mv` (#432). It runs later,
+/// possibly after a launch has recreated `db/`; `mv` would then move the backup
+/// *inside* the new db and exit 0, so the operator would read a nested copy as a
+/// restore. The guard refuses while the original name is taken, names it, and
+/// exits nonzero, so nothing is restored without the status saying so.
 fn render(outcome: &ResetOutcome) -> String {
     use std::os::unix::ffi::OsStrExt as _;
     match outcome {
@@ -1182,13 +1188,25 @@ fn render(outcome: &ResetOutcome) -> String {
             let shell_note = crate::shell::bash_zsh_note(&[&to_word, &from_word])
                 .map(|note| format!("\n({note})"))
                 .unwrap_or_default();
+            // `[ -e ]` is about the name, not the contents: an empty recreated
+            // `db/` is exactly the conflict this refuses. `false` rather than
+            // `exit` so pasting into an interactive shell does not close it.
+            // Both paths go on stderr as `%s` arguments, so the operator can tell
+            // which backup was left where, and so no byte of a name is read as
+            // part of the format.
+            let refusal = "printf 'refusing to undo: %s exists; %s was not restored; \
+                           move the existing db aside, then run this again\\n'";
+            let undo = format!(
+                "if [ -e {from_word} ]; then {refusal} {from_word} {to_word} >&2; false; \
+                 else mv -- {to_word} {from_word}; fi"
+            );
             format!(
                 "==> Moved microsandbox db aside (nothing was deleted)\n\
                  from: {}\n\
                  to:   {}\n\
                  The database will be recreated at the bundled schema on the next \
                  `agent-vm shell`/`run`, and images will be re-pulled on first boot.\n\
-                 To undo: mv -- {to_word} {from_word}{shell_note}",
+                 To undo: {undo}{shell_note}",
                 crate::one_line::path(from),
                 crate::one_line::path(to),
             )
@@ -1613,7 +1631,7 @@ selected (without --image): not selected; initial recommendation [<fixture>/home
 from: <fixture>/state/msb-home/db
 to:   <fixture>/state/msb-home/db.reset-<timestamp>
 The database will be recreated at the bundled schema on the next `agent-vm shell`/`run`, and images will be re-pulled on first boot.
-To undo: mv -- <fixture>/state/msb-home/db.reset-<timestamp> <fixture>/state/msb-home/db
+To undo: if [ -e <fixture>/state/msb-home/db ]; then printf 'refusing to undo: %s exists; %s was not restored; move the existing db aside, then run this again\n' <fixture>/state/msb-home/db <fixture>/state/msb-home/db.reset-<timestamp> >&2; false; else mv -- <fixture>/state/msb-home/db.reset-<timestamp> <fixture>/state/msb-home/db; fi
 "###
             } else {
                 r###"==> No microsandbox db to reset — nothing was moved.
@@ -1909,18 +1927,18 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
             .expect("the undo line");
         // Written out rather than counted: the target begins with the source, so a
         // `matches(prefix).count() == 2` would also accept `mv … "{to}" "{to}"`.
-        assert_eq!(
-            undo,
-            "To undo: mv -- $'/state/m\\x0aFORGED-FROM/db.reset-123' \
-             $'/state/m\\x0aFORGED-FROM/db'"
+        let db = "$'/state/m\\x0aFORGED-FROM/db'";
+        let backup = "$'/state/m\\x0aFORGED-FROM/db.reset-123'";
+        let expected = format!(
+            "To undo: if [ -e {db} ]; then printf 'refusing to undo: %s exists; %s was not \
+             restored; move the existing db aside, then run this again\\n' {db} {backup} >&2; false; \
+             else mv -- {backup} {db}; fi"
         );
+        assert_eq!(undo, expected);
         // Only bash and zsh read `$'…'`, so the report says so; the note is its
         // own line, leaving the `To undo: ` line a command and nothing else.
         assert!(
-            text.contains(
-                "To undo: mv -- $'/state/m\\x0aFORGED-FROM/db.reset-123' \
-                 $'/state/m\\x0aFORGED-FROM/db'\n(quoted for bash or zsh)"
-            ),
+            text.contains(&format!("{expected}\n(quoted for bash or zsh)")),
             "the undo command did not name its shell: {text:?}"
         );
 
@@ -1953,30 +1971,60 @@ A fresh database will be created on the next `agent-vm shell`/`run`.
             to: to.clone(),
         });
 
-        let operands = text
+        let instruction = text
             .lines()
-            .find_map(|line| line.strip_prefix("To undo: mv -- "))
+            .find_map(|line| line.strip_prefix("To undo: "))
             .expect("the undo line");
-        // `set --` in place of the command: the shell decodes each word to one
-        // argument, and nothing is moved.
-        let probe =
-            format!("set -- {operands}; [ \"$#\" -eq 2 ] || exit 99; printf '%s\\0' \"$1\" \"$2\"");
+
+        // The whole printed command runs, with a recording `mv` on PATH: nothing
+        // holds these names (APFS will not create them here), so the guard falls
+        // through to `mv`, which logs the argv it was handed instead of moving.
+        let bin = tempfile::tempdir().unwrap();
+        let log = bin.path().join("argv");
+        let mv = bin.path().join("mv");
+        std::fs::write(
+            &mv,
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"${MV_ARGV_LOG:?}\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&mv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let out = std::process::Command::new("bash")
             .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .args(["-c", &probe])
+            .env("PATH", path)
+            .env("MV_ARGV_LOG", &log)
+            // Own cwd: another test may run in this process and remove the one
+            // Bash would otherwise inherit, which Bash reports on stderr.
+            .current_dir(bin.path())
+            .args(["-c", instruction])
             .output()
             .expect("bash must be on PATH for this test");
         assert!(
             out.status.success(),
-            "bash rejected the undo operands ({operands}): {}",
+            "bash rejected the undo command ({instruction}): {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let mut expected = to.as_os_str().as_bytes().to_vec();
+        assert!(out.stdout.is_empty(), "the undo command wrote to stdout");
+        assert!(
+            out.stderr.is_empty(),
+            "the undo command refused an absent destination: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut expected = b"--\0".to_vec();
+        expected.extend_from_slice(to.as_os_str().as_bytes());
         expected.push(0);
         expected.extend_from_slice(from.as_os_str().as_bytes());
         expected.push(0);
-        assert_eq!(out.stdout, expected, "undo operands were {operands}");
+        assert_eq!(
+            std::fs::read(&log).unwrap(),
+            expected,
+            "undo operands were {instruction}"
+        );
     }
 
     /// The discriminator against [`crate::config::escape_str`]: a measured path

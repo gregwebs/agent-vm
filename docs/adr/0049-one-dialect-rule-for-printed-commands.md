@@ -59,15 +59,22 @@ The commands above are quoted for bash or zsh.
 The imported reference must match the --image value exactly.
 ```
 
-`doctor --reset-msb-db` puts the note on its own line, so its `To undo: mv --
-…` line stays a command and nothing else. The paths below hold a space: POSIX
+`doctor --reset-msb-db` puts the note on its own line, so its `To undo: …`
+line stays a command and nothing else. The paths below hold a space: POSIX
 single quotes could spell that (`'/state/my db'`), but the paste encoder takes
-`$'…'` for every value outside its bare set, so a space alone earns the note:
+`$'…'` for every value outside its bare set, so a space alone earns the note.
+The command is a guard rather than a bare `mv` (ADR-0051), and each word it
+needs is encoded once:
 
 ```text
-To undo: mv -- $'/state/my db.reset-1' $'/state/my db'
+To undo: if [ -e $'/state/my db' ]; then printf 'refusing to undo: %s exists; %s was not restored; move the existing db aside, then run this again\n' $'/state/my db' $'/state/my db.reset-1' >&2; false; else mv -- $'/state/my db.reset-1' $'/state/my db'; fi
 (quoted for bash or zsh)
 ```
+
+The note narrows which shell reads the *words*, not which shell parses the
+command. This one is a POSIX `if`/`then`/`fi` compound (ADR-0051), so `sh`,
+bash and zsh run it; a plain-word variant does not widen that to fish, whose
+syntax differs.
 
 `PastedWord`'s dialect field is private and set only by the encoder, so a word
 cannot claim to be plain while holding bytes the encoding does not fit; the

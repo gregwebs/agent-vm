@@ -1558,7 +1558,9 @@ it reports computed paths rather than validating that binary. The only mutating
 operation remains `--reset-msb-db`, below.
 
 `--reset-msb-db` moves `MSB_HOME/db` aside to a timestamped sibling rather than
-deleting it: reversible by construction, and the undo `mv` is printed. msb owns
+deleting it: reversible by construction, and the undo command is printed. That
+command refuses — naming the path, with a nonzero exit — if a launch has
+recreated `db/` since (ADR-0051). msb owns
 that directory outright — no agent-vm code creates, opens, or writes it — so it
 recreates it at the bundled schema on next boot and re-pulls images.
 
@@ -1642,6 +1644,7 @@ directories the user never asked for. The state-root precedence is in
 | Host-wide OCI image approval and pinned consumption (#390) | [ADR-0047](docs/adr/0047-host-wide-oci-image-approval.md) |
 | One dialect rule for a printed command (#434) | [ADR-0049](docs/adr/0049-one-dialect-rule-for-printed-commands.md) |
 | One rule for a relative state root (#437) | [ADR-0050](docs/adr/0050-one-rule-for-a-relative-state-root.md) |
+| The reset undo refuses a recreated db (#432) | [ADR-0051](docs/adr/0051-the-reset-undo-refuses-a-recreated-db.md) |
 
 ## Deliberate non-goals
 
