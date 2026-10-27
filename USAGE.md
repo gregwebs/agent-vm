@@ -1888,13 +1888,19 @@ agent-vm doctor --reset-msb-db
 
 This moves `msb-home/db/` (including the `-wal`/`-shm`/lock files) aside to
 a timestamped `db.reset-<epoch-seconds>` sibling — non-destructive, and
-reversible: the command prints the exact `mv` to undo it. That instruction is
-one line even when the path holds a control byte, and it names the bytes the
-filesystem actually holds (not the escaped spelling the `from:`/`to:` lines
-show). A path that needs no quoting prints as itself and any shell can run it;
-one that needs `$'…'` is read only by bash or zsh, so the report prints
-`(quoted for bash or zsh)` on the next line. Interactive Bash with history
-expansion on is the one exception: if the path contains `!`, enter `set +H` on
+reversible: the command prints the instruction that puts it back. That
+instruction is one line even when the path holds a control byte, and it names
+the bytes the filesystem actually holds (not the escaped spelling the
+`from:`/`to:` lines show). It is a guard, not a bare `mv`: if a launch has
+recreated `db/` in the meantime, it refuses — naming both paths on stderr, with
+a nonzero exit — because moving the backup then would nest it inside the new
+database instead of restoring anything. Move the current `db/` aside and paste
+it again, or keep the new database. A path that needs no quoting prints as
+itself, so no shell reinterprets it; one that needs `$'…'` is read only by bash
+or zsh, so the report prints `(quoted for bash or zsh)` on the next line. That
+note is about the words: the command itself is POSIX shell syntax, so run it
+with `sh`, bash or zsh, not fish. Interactive Bash with history expansion on is
+the one exception: if the path contains `!`, enter `set +H` on
 an earlier line first, or paste into zsh instead. The command resolves
 `MSB_HOME` the same way `agent-vm` itself does, so it only ever touches
 agent-vm's private state, never a separate `~/.microsandbox` install. The instruction names absolute paths, so it works

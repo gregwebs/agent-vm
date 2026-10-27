@@ -1241,6 +1241,9 @@ const HOSTILE_STATE_LEAF: &str =
 /// twice cannot pass.
 const DB_BYTES: &[u8] = b"forward-migrated-schema";
 const DB_WAL_BYTES: &[u8] = b"write-ahead-log";
+/// The database the next launch recreates at `db/` after a reset — distinct from
+/// [`DB_BYTES`], so a refusal that overwrote it cannot pass.
+const RECREATED_DB_BYTES: &[u8] = b"recreated-at-the-bundled-schema";
 
 /// The one `db.reset-*` directory under `msb_home`, found by enumerating the raw
 /// filesystem: the printed `to:` is a diagnostic, so an operand taken from it
@@ -1277,15 +1280,11 @@ fn undo_instruction(report: &str) -> &str {
         .unwrap_or_else(|| panic!("no undo instruction in:\n{report}"))
 }
 
-/// Run the real CLI against a seeded db, execute the undo instruction it printed
-/// in Bash as-is, and assert the move was reversed byte for byte. Returns the
-/// report so a caller can assert its shape.
-///
-/// Executing (rather than comparing the line to a string) is the only oracle that
-/// catches operand reversal, display escaping reused as argv, and substitution at
-/// once. Bash runs the instruction as printed; when it needs `$'…'` the report
-/// says so, because dash reads that differently (USAGE.md).
-fn reset_then_undo_in_bash(h: &Harness) -> String {
+/// Seed `msb-home/db` with a database only a reset can move, run the real
+/// `--reset-msb-db`, and return its report plus the two paths: the name the db
+/// left behind and the backup it became. Enumerating `msb-home` (rather than
+/// reading the printed `to:`) keeps a wrong report from confirming itself.
+fn reset_seeded_db(h: &Harness) -> (String, PathBuf, PathBuf) {
     let msb_home = h.state_root.join("msb-home");
     let db = msb_home.join("db");
     std::fs::create_dir_all(&db).unwrap();
@@ -1303,19 +1302,35 @@ fn reset_then_undo_in_bash(h: &Harness) -> String {
         std::fs::read(backup.join("msb.db-wal")).unwrap(),
         DB_WAL_BYTES
     );
+    (report, db, backup)
+}
 
-    let instruction = undo_instruction(&report).to_owned();
-    // Pasted later, from a terminal whose cwd is not doctor's (#433) — so the
-    // instruction is run from one it has never seen.
+/// Run an undo instruction in Bash exactly as the report printed it, from a
+/// directory doctor has never seen — pasted later, from a terminal whose cwd is
+/// not doctor's (#433). Executing (rather than comparing the line to a string)
+/// is the only oracle that catches operand reversal, display escaping reused as
+/// argv, and substitution at once. That directory is returned too, so a caller
+/// can check a substitution did not run there.
+fn bash_elsewhere(h: &Harness, instruction: &str) -> (Output, tempfile::TempDir) {
     let elsewhere = tempfile::tempdir_in("/tmp").unwrap();
-    let undo = Command::new("bash")
+    let out = Command::new("bash")
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", &h.home_root)
         .current_dir(elsewhere.path())
-        .args(["-c", &instruction])
+        .args(["-c", instruction])
         .output()
         .expect("bash must be on PATH for this test");
+    (out, elsewhere)
+}
+
+/// Reset a seeded db, execute the undo instruction it printed in Bash as-is, and
+/// assert the move was reversed byte for byte. Returns the report so a caller
+/// can assert its shape.
+fn reset_then_undo_in_bash(h: &Harness) -> String {
+    let (report, db, backup) = reset_seeded_db(h);
+    let instruction = undo_instruction(&report).to_owned();
+    let (undo, elsewhere) = bash_elsewhere(h, &instruction);
     assert!(
         undo.status.success(),
         "the printed undo instruction failed ({}):\n{instruction}\nstderr: {}",
@@ -1340,6 +1355,98 @@ fn reset_then_undo_in_bash(h: &Harness) -> String {
         );
     }
     report
+}
+
+/// A plain-word instruction prints no bash/zsh note, because no shell
+/// reinterprets the words; the command itself is POSIX shell syntax (ADR-0051),
+/// so `/bin/sh` must run it — nothing in the guard may be a bashism.
+#[test]
+fn the_plain_undo_runs_under_the_system_sh() {
+    let h = Harness::new();
+    let (report, db, backup) = reset_seeded_db(&h);
+    let instruction = undo_instruction(&report).to_owned();
+    assert!(
+        !report.contains("quoted for bash or zsh"),
+        "the fixture is not a plain-word instruction:\n{report}"
+    );
+
+    let elsewhere = tempfile::tempdir_in("/tmp").unwrap();
+    let undo = Command::new("/bin/sh")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", &h.home_root)
+        .current_dir(elsewhere.path())
+        .args(["-c", &instruction])
+        .output()
+        .expect("/bin/sh must exist for this test");
+    assert!(
+        undo.status.success(),
+        "/bin/sh could not run the plain undo instruction:\n{instruction}\nstderr: {}",
+        stderr_of(&undo)
+    );
+    assert_eq!(std::fs::read(db.join("msb.db")).unwrap(), DB_BYTES);
+    assert_eq!(std::fs::read(db.join("msb.db-wal")).unwrap(), DB_WAL_BYTES);
+    assert!(!backup.exists(), "the backup survived the undo: {backup:?}");
+}
+
+/// The report says the db "will be recreated ... on the next `agent-vm
+/// shell`/`run`", so an operator may reset, launch, and only then paste the undo
+/// instruction. By then it is not a restore: a bare `mv` moves the backup
+/// *inside* the new `db/` and exits 0, and the operator reads a nested copy as
+/// restored (#432). The instruction must refuse instead — nonzero, naming the
+/// path that is in the way — and leave both databases as they are.
+#[test]
+fn the_undo_refuses_once_the_db_exists_again() {
+    let h = Harness::new();
+    let (report, db, backup) = reset_seeded_db(&h);
+    // The launch the report promises.
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(db.join("msb.db"), RECREATED_DB_BYTES).unwrap();
+
+    let instruction = undo_instruction(&report).to_owned();
+    let (undo, _elsewhere) = bash_elsewhere(&h, &instruction);
+    assert!(
+        !undo.status.success(),
+        "the undo reported success without restoring anything:\n{instruction}"
+    );
+    let stderr = stderr_of(&undo);
+    assert!(
+        stderr.contains("refusing to undo"),
+        "the undo failed without saying why:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&db.to_string_lossy().into_owned()),
+        "the refusal does not name the path in the way:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&backup.to_string_lossy().into_owned()),
+        "the refusal does not say which backup was left unrestored:\n{stderr}"
+    );
+    assert!(
+        undo.stdout.is_empty(),
+        "the refusal wrote to stdout: {:?}",
+        stdout_of(&undo)
+    );
+
+    // A move would leave exactly one entry here, named after the backup.
+    let names: Vec<String> = std::fs::read_dir(&db)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        ["msb.db"],
+        "the backup was moved into the recreated db: {names:?}"
+    );
+    assert_eq!(
+        std::fs::read(db.join("msb.db")).unwrap(),
+        RECREATED_DB_BYTES
+    );
+    assert_eq!(std::fs::read(backup.join("msb.db")).unwrap(), DB_BYTES);
+    assert_eq!(
+        std::fs::read(backup.join("msb.db-wal")).unwrap(),
+        DB_WAL_BYTES
+    );
 }
 
 /// A report whose only physical lines are doctor's own, so an operator can read

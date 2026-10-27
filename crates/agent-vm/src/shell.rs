@@ -123,8 +123,9 @@ impl fmt::Display for PastedWord {
 
 /// The sentence a hint adds when at least one word it prints is
 /// [`Dialect::BashZsh`], so a reader about to paste into `sh`/`dash` knows to
-/// switch. `None` when every word is plain: a note there would misdescribe a
-/// command every shell runs correctly.
+/// switch. `None` when every word is plain: no shell reinterprets such a value,
+/// so there is nothing to warn about. The note speaks about the *words* only —
+/// a command's own syntax can still restrict which shells run it (ADR-0049).
 pub(crate) fn bash_zsh_note(words: &[&PastedWord]) -> Option<&'static str> {
     words
         .iter()
