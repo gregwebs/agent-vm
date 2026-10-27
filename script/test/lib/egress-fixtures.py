@@ -904,6 +904,13 @@ def _catalog_query(db: Path, deadline: float) -> list[dict]:
         for table, columns in (("sandbox", {"id", "name", "config", "status"}),
                                ("run", {"id", "sandbox_id", "pid", "status"})):
             observed = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+            if not observed:
+                # A fresh private state's file exists for a few milliseconds
+                # before the first migration commits its tables (#449). An
+                # absent table is "not yet initialized", not a mismatch: the
+                # 50 ms observer polls again. A table that exists with the
+                # wrong columns still fails loudly.
+                return []
             if not columns <= observed:
                 raise RuntimeError(f"private catalog schema mismatch: {table}")
         conn.row_factory = sqlite3.Row

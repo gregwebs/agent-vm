@@ -263,6 +263,10 @@ def matrix():
     # Real timeout/catalog/socket contracts exercise these independent omissions.
     for name, old, new in (
         ("cleanup-no-kill", 'for identity in launch.alive():', 'for identity in []:'),
+        ("catalog-unmigrated-mismatch", '            if not observed:', '            if False:'),
+        ("catalog-mismatch-silenced",
+         '            if not columns <= observed:\n                raise RuntimeError(f"private catalog schema mismatch: {table}")',
+         '            if not columns <= observed:\n                return []'),
         ("cleanup-no-unlink", '                            path.unlink()', '                            pass'),
         ("cleanup-no-remove", '("remove", ("remove", name), 10)):', '("list", ("list",), 10)):'),
         ("cleanup-suppress", '    return errors\n\n\ndef cleanup_run', '    return []\n\n\ndef cleanup_run'),

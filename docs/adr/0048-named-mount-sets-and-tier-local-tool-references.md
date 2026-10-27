@@ -200,8 +200,10 @@ over:
   `RuntimeError("private catalog schema mismatch: sandbox")`; the measured window
   on a fresh private state's first launch is ~3.4 ms. The identical command,
   re-run unchanged, passed every row. The failed attempt is retained at
-  `/tmp/avm-397-native/evidence`; the flake is a harness candidate ticket, not a
-  product defect and not evidence against the feature.
+  `/tmp/avm-397-native/evidence`; the flake was a harness defect, not a product
+  defect and not evidence against the feature. #449 makes an absent table
+  "not yet initialized" (no rows, poll again) while a table with missing
+  columns still fails loudly.
 - **The prerequisites earlier reported as blocking were each solvable here, not
   absent.** `vendor/microsandbox/build/agentd` was stale only by mtime (rebuilt
   with `just --unstable build-agentd`; `build/` is gitignored inside the vendored
